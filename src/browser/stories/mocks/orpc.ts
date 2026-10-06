@@ -26,7 +26,11 @@ import type {
   AgentDefinitionDescriptor,
   AgentDefinitionPackage,
 } from "@/common/types/agentDefinition";
-import type { AgentSkillDescriptor, AgentSkillIssue } from "@/common/types/agentSkill";
+import type {
+  AgentSkillDescriptor,
+  AgentSkillIssue,
+  AgentSkillUnavailableSource,
+} from "@/common/types/agentSkill";
 import type {
   FrontendWorkspaceMetadata,
   WorkspaceActivitySnapshot,
@@ -349,6 +353,8 @@ export interface MockORPCClientOptions {
   agentSkills?: AgentSkillDescriptor[];
   /** Agent skills that were discovered but couldn't be loaded (SKILL.md parse errors, etc.) */
   invalidAgentSkills?: AgentSkillIssue[];
+  /** Skills roots that could not be read (e.g. the SSH host did not answer) */
+  unavailableAgentSkillSources?: AgentSkillUnavailableSource[];
   /** Mock log entries for Output tab (subscribeLogs snapshot) */
   logEntries?: Array<{
     timestamp: number;
@@ -483,6 +489,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     layoutPresets: initialLayoutPresets,
     agentSkills = [],
     invalidAgentSkills = [],
+    unavailableAgentSkillSources = [],
     logEntries = [],
     backupSettings: initialBackupSettings,
     backupValidation,
@@ -1123,9 +1130,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       listRuns: () => Promise.resolve([]),
     },
     agentSkills: {
-      list: () => Promise.resolve(agentSkills),
-      listDiagnostics: () =>
-        Promise.resolve({ skills: agentSkills, invalidSkills: invalidAgentSkills }),
+      list: () =>
+        Promise.resolve({
+          skills: agentSkills,
+          invalidSkills: invalidAgentSkills,
+          unavailableSources: unavailableAgentSkillSources,
+        }),
       get: () =>
         Promise.resolve({
           scope: "built-in" as const,

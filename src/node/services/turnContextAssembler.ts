@@ -28,6 +28,7 @@ import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
+import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { InstructionSources } from "@/common/types/instructions";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -61,7 +62,10 @@ import {
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
-import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import {
+  discoverAgentSkills,
+  requireReachableSkills,
+} from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { buildSystemMessageFromSources, loadWorkspaceInstructionSources } from "./systemMessage";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
@@ -595,7 +599,7 @@ export interface StreamSystemContextResult {
   /** Available subagent definitions for tool descriptions (undefined for subagent workspaces). */
   agentDefinitions: Awaited<ReturnType<typeof discoverAgentDefinitions>> | undefined;
   /** Available skills for tool descriptions. */
-  availableSkills: Awaited<ReturnType<typeof discoverAgentSkills>> | undefined;
+  availableSkills: AgentSkillDescriptor[] | undefined;
   /** Exact ancestor plan files surfaced in the prompt and forwarded through tool configuration. */
   ancestorPlanFilePaths: string[];
   /** Instruction snapshot used for the prompt; reuse it for tool-scoped instructions. */
@@ -1003,12 +1007,14 @@ export async function buildStreamSystemContext(
       containment: skillCtx.containment,
       // Used only for the project-runtime default-roots fallback (skillCtx.roots undefined).
       includeClaudeSkills: opts.claudeSkillsCompatEnabled,
-    }).catch((error: unknown) => {
-      // An unreachable host must fail the turn, not silently drop the skills index (#4438).
-      if (isRuntimeTransportError(error)) throw error;
-      workspaceLog.warn("Failed to discover agent skills for tool description", { error });
-      return undefined;
-    }),
+    })
+      .then(requireReachableSkills)
+      .catch((error: unknown) => {
+        // An unreachable host must fail the turn, not silently drop the skills index (#4438).
+        if (isRuntimeTransportError(error)) throw error;
+        workspaceLog.warn("Failed to discover agent skills for tool description", { error });
+        return undefined;
+      }),
     // Rebuilds within one turn pass the earlier snapshot, so the prompt and
     // tool-scoped instructions always come from a single read.
     opts.instructionSources ??

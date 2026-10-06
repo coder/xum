@@ -182,7 +182,7 @@ export async function buildWorkspaceComposition(
         }
       : undefined;
 
-  const skillDescriptors = await discoverAgentSkills(args.runtime, args.workspacePath, {
+  const { skills: skillDescriptors } = await discoverAgentSkills(args.runtime, args.workspacePath, {
     dedupeByName: false,
     ...(checkoutSkillRoots ?? {}),
   });

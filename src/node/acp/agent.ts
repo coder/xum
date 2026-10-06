@@ -38,7 +38,7 @@ import {
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { RuntimeConfigSchema } from "@/common/orpc/schemas";
 import type { OnChatMode, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { AgentSkillDescriptor, AgentSkillListResult } from "@/common/types/agentSkill";
 import type { CompactionRequestData } from "@/common/types/message";
 import { buildAgentSkillMetadata } from "@/common/types/message";
 import { isWorktreeRuntime, type RuntimeConfig, type RuntimeMode } from "@/common/types/runtime";
@@ -1394,10 +1394,9 @@ export class MuxAgent implements Agent {
     let advertisedSkills: AgentSkillDescriptor[];
 
     try {
-      const skills = await this.server.client.agentSkills.list({ workspaceId });
-      const skillsByName = mapSkillsByName(skills);
-      this.sessionSkillsById.set(sessionId, skillsByName);
-      advertisedSkills = skills;
+      const result = await this.server.client.agentSkills.list({ workspaceId });
+      this.cacheSessionSkills(sessionId, result);
+      advertisedSkills = result.skills;
     } catch (error) {
       // Command advertisement should not block session creation/loading.
       console.error("[acp] Failed to load skills while publishing slash commands", error);
@@ -1429,9 +1428,22 @@ export class MuxAgent implements Agent {
       return cached;
     }
 
-    const skills = await this.server.client.agentSkills.list({ workspaceId });
-    const skillsByName = mapSkillsByName(skills);
-    this.sessionSkillsById.set(sessionId, skillsByName);
+    return this.cacheSessionSkills(
+      sessionId,
+      await this.server.client.agentSkills.list({ workspaceId })
+    );
+  }
+
+  private cacheSessionSkills(
+    sessionId: string,
+    result: AgentSkillListResult
+  ): Map<string, AgentSkillDescriptor> {
+    const skillsByName = mapSkillsByName(result.skills);
+    // A partial list (e.g. SSH host unreachable) must not stick for the whole
+    // session; leave it uncached so the next prompt asks again.
+    if (result.unavailableSources.length === 0) {
+      this.sessionSkillsById.set(sessionId, skillsByName);
+    }
     return skillsByName;
   }
 

@@ -5,6 +5,7 @@ import {
   isRuntimeReadFailure,
   isRuntimeTransportError,
   type Runtime,
+  type RuntimeError,
 } from "@/node/runtime/Runtime";
 import type { ORPCContext } from "@/node/orpc/context";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -37,8 +38,10 @@ import {
 import type {
   AgentSkillDescriptor,
   AgentSkillIssue,
+  AgentSkillListResult,
   AgentSkillPackage,
   AgentSkillScope,
+  AgentSkillUnavailableSource,
   SkillName,
 } from "@/common/types/agentSkill";
 import { log } from "@/node/services/log";
@@ -589,6 +592,18 @@ async function readSkillDescriptorFromDir(
   }
 }
 
+export interface AgentSkillDiscoveryResult {
+  skills: AgentSkillDescriptor[];
+  invalidSkills: AgentSkillIssue[];
+  /** Each entry keeps the original error so strict callers can rethrow it. */
+  unavailableSources: Array<AgentSkillUnavailableSource & { error: unknown }>;
+}
+
+/**
+ * Discover skills from every root. A list is partial by design: a root that
+ * cannot be read (e.g. a project root on an unreachable SSH host) becomes an
+ * unavailable source, and the other roots and the built-ins still load.
+ */
 export async function discoverAgentSkills(
   runtime: Runtime,
   workspacePath: string,
@@ -602,7 +617,7 @@ export async function discoverAgentSkills(
     /** Inclusive checkout/repository root for subproject ancestor discovery. */
     projectSearchRoot?: string;
   }
-): Promise<AgentSkillDescriptor[]> {
+): Promise<AgentSkillDiscoveryResult> {
   if (!workspacePath) {
     throw new Error("discoverAgentSkills: workspacePath is required");
   }
@@ -619,156 +634,11 @@ export async function discoverAgentSkills(
 
   const byName = new Map<SkillName, AgentSkillDescriptor>();
   const discoveredSkills: AgentSkillDescriptor[] = [];
-
-  // Scan order encodes precedence: earlier roots win when names collide.
-  const scans = await buildScanCandidates(runtime, workspacePath, roots, containment);
-
-  for (const scan of scans) {
-    let resolvedRoot: string;
-    try {
-      resolvedRoot = await scan.runtime.resolvePath(scan.root);
-    } catch (err) {
-      if (isRuntimeTransportError(err)) throw err;
-      log.warn(`Failed to resolve skills root ${scan.root}: ${getErrorMessage(err)}`);
-      continue;
-    }
-
-    const directoryNames =
-      scan.runtime instanceof RemoteRuntime
-        ? await listSkillDirectoriesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
-        : await listSkillDirectoriesFromLocalFs(resolvedRoot);
-
-    for (const directoryNameRaw of directoryNames) {
-      const nameParsed = SkillNameSchema.safeParse(directoryNameRaw);
-      if (!nameParsed.success) {
-        log.warn(`Skipping invalid skill directory name '${directoryNameRaw}' in ${resolvedRoot}`);
-        continue;
-      }
-
-      const directoryName = nameParsed.data;
-      if (scan.importedSkills != null && !scan.importedSkills.includes(directoryName)) continue;
-
-      if (dedupeByName && byName.has(directoryName)) {
-        continue;
-      }
-
-      const skillDir = scan.runtime.normalizePath(directoryName, resolvedRoot);
-      const skillFilePath = scan.runtime.normalizePath("SKILL.md", skillDir);
-
-      if (scan.pluginRoot != null) {
-        // Plugin candidates use plugin-root containment; the plugin root itself
-        // was already validated against the project containment root.
-        const contained = await isPluginSkillContained({
-          pluginRoot: scan.pluginRoot,
-          skillDir,
-          skillFilePath,
-          directoryName,
-        });
-        if (!contained) continue;
-      } else if (scan.scope === "project") {
-        try {
-          await assertProjectSkillContained({
-            runtime: scan.runtime,
-            containment,
-            skillDir,
-            skillFilePath,
-          });
-        } catch (error) {
-          if (isRuntimeTransportError(error)) throw error;
-          if (hasErrorCode(error, "ENOENT")) {
-            continue;
-          }
-
-          log.warn(
-            `Skipping escaped project skill '${directoryName}' at '${skillFilePath}' for containment kind '${containment.kind}': ${getErrorMessage(error)}`
-          );
-          continue;
-        }
-      }
-
-      const descriptor = await readSkillDescriptorFromDir(
-        scan.runtime,
-        skillDir,
-        directoryName,
-        scan.scope,
-        {
-          ...(scan.pluginName !== undefined ? { pluginName: scan.pluginName } : {}),
-          ...(scan.pluginRoot !== undefined ? { pluginRoot: scan.pluginRoot } : {}),
-        }
-      );
-      if (!descriptor) continue;
-
-      if (dedupeByName) {
-        // First discovered descriptor wins because duplicates are skipped above.
-        byName.set(descriptor.name, descriptor);
-      } else {
-        discoveredSkills.push(descriptor);
-      }
-    }
-  }
-
-  for (const builtIn of getBuiltInSkillDescriptors()) {
-    if (dedupeByName) {
-      // Built-ins are lowest precedence and are omitted when overridden by project/global skills.
-      if (!byName.has(builtIn.name)) {
-        byName.set(builtIn.name, builtIn);
-      }
-      continue;
-    }
-
-    discoveredSkills.push(builtIn);
-  }
-
-  const skills = dedupeByName ? Array.from(byName.values()) : discoveredSkills;
-  return skills.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-export interface DiscoverAgentSkillsDiagnosticsResult {
-  skills: AgentSkillDescriptor[];
-  invalidSkills: AgentSkillIssue[];
-}
-
-export async function discoverAgentSkillsDiagnostics(
-  runtime: Runtime,
-  workspacePath: string,
-  options?: {
-    roots?: AgentSkillsRoots;
-    containment?: ProjectSkillContainment;
-    projectContainmentRoot?: string | null;
-    /** claude-skills-compat experiment: also scan .claude/skills roots (used only when `roots` is absent). */
-    includeClaudeSkills?: boolean;
-    /** Inclusive checkout/repository root for subproject ancestor discovery. */
-    projectSearchRoot?: string;
-  }
-): Promise<DiscoverAgentSkillsDiagnosticsResult> {
-  if (!workspacePath) {
-    throw new Error("discoverAgentSkillsDiagnostics: workspacePath is required");
-  }
-
-  const roots =
-    options?.roots ??
-    getDefaultAgentSkillsRoots(runtime, workspacePath, {
-      includeClaudeSkills: options?.includeClaudeSkills,
-      projectSearchRoot: options?.projectSearchRoot,
-    });
-
-  const containment = resolveProjectSkillContainment(options);
-
-  const byName = new Map<SkillName, AgentSkillDescriptor>();
   const invalidSkills: AgentSkillIssue[] = [];
+  const unavailableSources: AgentSkillDiscoveryResult["unavailableSources"] = [];
 
-  // Scan order encodes precedence: earlier roots win when names collide.
-  const scans = await buildScanCandidates(runtime, workspacePath, roots, containment);
-
-  for (const scan of scans) {
-    let resolvedRoot: string;
-    try {
-      resolvedRoot = await scan.runtime.resolvePath(scan.root);
-    } catch (err) {
-      log.warn(`Failed to resolve skills root ${scan.root}: ${getErrorMessage(err)}`);
-      continue;
-    }
-
+  const scanRoot = async (scan: AgentSkillScanCandidate): Promise<void> => {
+    const resolvedRoot = await scan.runtime.resolvePath(scan.root);
     const directoryNames =
       scan.runtime instanceof RemoteRuntime
         ? await listSkillDirectoriesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
@@ -791,12 +661,21 @@ export async function discoverAgentSkillsDiagnostics(
       const directoryName = nameParsed.data;
       if (scan.importedSkills != null && !scan.importedSkills.includes(directoryName)) continue;
 
-      if (byName.has(directoryName)) {
+      if (dedupeByName && byName.has(directoryName)) {
         continue;
       }
 
       const skillDir = scan.runtime.normalizePath(directoryName, resolvedRoot);
       const skillFilePath = scan.runtime.normalizePath("SKILL.md", skillDir);
+      const pushInvalidSkill = (message: string, hint: string): void => {
+        invalidSkills.push({
+          directoryName,
+          scope: scan.scope,
+          displayPath: skillFilePath,
+          message,
+          hint,
+        });
+      };
 
       if (scan.pluginRoot != null) {
         // Plugin candidates use plugin-root containment; the plugin root itself
@@ -806,15 +685,11 @@ export async function discoverAgentSkillsDiagnostics(
           skillDir,
           skillFilePath,
           directoryName,
-          onEscape: (message) => {
-            invalidSkills.push({
-              directoryName,
-              scope: scan.scope,
-              displayPath: skillFilePath,
+          onEscape: (message) =>
+            pushInvalidSkill(
               message,
-              hint: "Remove the symlink escaping the plugin root or move the skill inside the plugin.",
-            });
-          },
+              "Remove the symlink escaping the plugin root or move the skill inside the plugin."
+            ),
         });
         if (!contained) continue;
       } else if (scan.scope === "project") {
@@ -826,17 +701,18 @@ export async function discoverAgentSkillsDiagnostics(
             skillFilePath,
           });
         } catch (error) {
+          if (isRuntimeTransportError(error)) throw error;
           if (hasErrorCode(error, "ENOENT")) {
             continue;
           }
 
-          invalidSkills.push({
-            directoryName,
-            scope: scan.scope,
-            displayPath: skillFilePath,
-            message: `Project skill path escapes containment root: ${getErrorMessage(error)}`,
-            hint: "Move the skill directory back under the workspace root or remove the escaping symlink.",
-          });
+          log.warn(
+            `Skipping escaped project skill '${directoryName}' at '${skillFilePath}' for containment kind '${containment.kind}': ${getErrorMessage(error)}`
+          );
+          pushInvalidSkill(
+            `Project skill path escapes containment root: ${getErrorMessage(error)}`,
+            "Move the skill directory back under the workspace root or remove the escaping symlink."
+          );
           continue;
         }
       }
@@ -854,36 +730,73 @@ export async function discoverAgentSkillsDiagnostics(
       );
       if (!descriptor) continue;
 
-      // First discovered descriptor wins because duplicates are skipped above.
-      byName.set(descriptor.name, descriptor);
+      if (dedupeByName) {
+        // First discovered descriptor wins because duplicates are skipped above.
+        byName.set(descriptor.name, descriptor);
+      } else {
+        discoveredSkills.push(descriptor);
+      }
+    }
+  };
+
+  // Scan order encodes precedence: earlier roots win when names collide.
+  const scans = await buildScanCandidates(runtime, workspacePath, roots, containment);
+  // After one transport failure, the host's other roots fail at once instead
+  // of each waiting out the same connection timeout.
+  const transportFailures = new Map<Runtime, RuntimeError>();
+  for (const scan of scans) {
+    try {
+      const transportFailure = transportFailures.get(scan.runtime);
+      if (transportFailure) throw transportFailure;
+      await scanRoot(scan);
+    } catch (error) {
+      if (isRuntimeTransportError(error)) transportFailures.set(scan.runtime, error);
+      const message = getErrorMessage(error) || "Unknown error";
+      log.warn(`Skills root ${scan.root} is unavailable: ${message}`);
+      unavailableSources.push({ scope: scan.scope, displayPath: scan.root, message, error });
     }
   }
 
-  // Add built-in skills (lowest precedence - only if not overridden by project/global)
   for (const builtIn of getBuiltInSkillDescriptors()) {
-    if (!byName.has(builtIn.name)) {
-      byName.set(builtIn.name, builtIn);
+    if (dedupeByName) {
+      // Built-ins are lowest precedence and are omitted when overridden by project/global skills.
+      if (!byName.has(builtIn.name)) {
+        byName.set(builtIn.name, builtIn);
+      }
+      continue;
     }
+
+    discoveredSkills.push(builtIn);
   }
 
-  const skills = Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
+  const skills = dedupeByName ? Array.from(byName.values()) : discoveredSkills;
+  skills.sort((a, b) => a.name.localeCompare(b.name));
 
   const scopeOrder: Readonly<Record<AgentSkillScope, number>> = {
     project: 0,
     global: 1,
     "built-in": 2,
   };
-
   invalidSkills.sort((a, b) => {
-    const scopeDiff = (scopeOrder[a.scope] ?? 0) - (scopeOrder[b.scope] ?? 0);
+    const scopeDiff = scopeOrder[a.scope] - scopeOrder[b.scope];
     if (scopeDiff !== 0) return scopeDiff;
     return a.directoryName.localeCompare(b.directoryName);
   });
 
-  return {
-    skills,
-    invalidSkills,
-  };
+  return { skills, invalidSkills, unavailableSources };
+}
+
+/**
+ * Strict callers (the system-prompt skill index, agent_skill_list) must not
+ * act on a list that silently lost a project root to an unreachable host
+ * (#4438), so they rethrow the first transport failure.
+ */
+export function requireReachableSkills(result: AgentSkillDiscoveryResult): AgentSkillDescriptor[] {
+  const transportFailure = result.unavailableSources.find((source) =>
+    isRuntimeTransportError(source.error)
+  );
+  if (transportFailure) throw transportFailure.error;
+  return result.skills;
 }
 
 export interface ResolvedAgentSkill {
@@ -1146,23 +1059,21 @@ async function getAgentSkillContext(
 export async function listAgentSkills(
   context: AgentSkillsContext,
   input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
-) {
+): Promise<AgentSkillListResult> {
   const skillContext = await getAgentSkillContext(context, input);
-  return discoverAgentSkills(skillContext.runtime, skillContext.workspacePath, {
+  const result = await discoverAgentSkills(skillContext.runtime, skillContext.workspacePath, {
     roots: skillContext.roots,
     containment: skillContext.containment,
   });
-}
-
-export async function listAgentSkillDiagnostics(
-  context: AgentSkillsContext,
-  input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
-) {
-  const skillContext = await getAgentSkillContext(context, input);
-  return discoverAgentSkillsDiagnostics(skillContext.runtime, skillContext.workspacePath, {
-    roots: skillContext.roots,
-    containment: skillContext.containment,
-  });
+  return {
+    skills: result.skills,
+    invalidSkills: result.invalidSkills,
+    unavailableSources: result.unavailableSources.map(({ scope, displayPath, message }) => ({
+      scope,
+      displayPath,
+      message,
+    })),
+  };
 }
 
 export async function getAgentSkill(

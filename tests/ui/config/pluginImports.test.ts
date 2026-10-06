@@ -298,7 +298,8 @@ describeIntegration("Selective plugin imports", () => {
       await user.click(await canvas.findByRole("checkbox", { name: "review" }));
 
       // Model a still-mounted availability consumer with real discovery, not an event-name assertion.
-      const readSkills = () => app.env.orpc.agentSkills.list({ workspaceId: app.workspaceId });
+      const readSkills = async () =>
+        (await app.env.orpc.agentSkills.list({ workspaceId: app.workspaceId })).skills;
       let available = await readSkills();
       expect(available.some((skill) => skill.name === "review")).toBe(true);
       let consumerRefresh = Promise.resolve();

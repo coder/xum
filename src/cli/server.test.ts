@@ -224,7 +224,7 @@ describe("oRPC Server Endpoints", () => {
         const skillContent = `---\nname: ${skillName}\ndescription: Test skill\n---\n\nTest body\n`;
         await fs.writeFile(path.join(skillDir, "SKILL.md"), skillContent, "utf-8");
 
-        const descriptors = await client.agentSkills.list({ projectPath });
+        const { skills: descriptors } = await client.agentSkills.list({ projectPath });
         expect(descriptors.some((d) => d.name === skillName && d.scope === "project")).toBe(true);
 
         const pkg = await client.agentSkills.get({ projectPath, skillName });

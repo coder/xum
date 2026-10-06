@@ -153,11 +153,7 @@ import {
 import { checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
 import { DEFAULT_LAYOUT_PRESETS_CONFIG } from "@/common/types/uiLayouts";
 
-import {
-  getAgentSkill,
-  listAgentSkillDiagnostics,
-  listAgentSkills,
-} from "@/node/services/agentSkills/agentSkillsService";
+import { getAgentSkill, listAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import {
   getAgentDefinition,
   listAgentDefinitions,
@@ -780,10 +776,6 @@ export const router = (authToken?: string) => {
         .input(schemas.agentSkills.list.input)
         .output(schemas.agentSkills.list.output)
         .handler(({ context, input }) => listAgentSkills(context, input)),
-      listDiagnostics: t
-        .input(schemas.agentSkills.listDiagnostics.input)
-        .output(schemas.agentSkills.listDiagnostics.output)
-        .handler(({ context, input }) => listAgentSkillDiagnostics(context, input)),
       get: t
         .input(schemas.agentSkills.get.input)
         .output(schemas.agentSkills.get.output)

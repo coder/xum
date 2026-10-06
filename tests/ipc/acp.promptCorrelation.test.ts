@@ -338,10 +338,7 @@ function createHarness(options?: HarnessOptions): Harness {
       list: async () => [],
     },
     agentSkills: {
-      list: async () => [],
-      listDiagnostics: async () => {
-        throw new Error("createHarness: listDiagnostics not implemented for this test");
-      },
+      list: async () => ({ skills: [], invalidSkills: [], unavailableSources: [] }),
       get: async () => {
         throw new Error("createHarness: get not implemented for this test");
       },
