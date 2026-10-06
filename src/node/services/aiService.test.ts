@@ -82,6 +82,7 @@ import {
 } from "@/common/utils/tools/toolAvailability";
 import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
+import { assembleBudgetCheckedPromptPayload } from "./turnRequestBuilder";
 import * as messagePipeline from "./messagePipeline";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
@@ -1791,6 +1792,46 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     } finally {
       unregister();
       removeLive?.();
+    }
+  });
+
+  // #5286: turn-start stage decisions re-measure a candidate history after `request.assemble`.
+  // The measure-only assembly must reproduce the sent request without rerunning plugin hooks.
+  it("a measure-only reassembly reproduces the sent request without rerunning hooks", async () => {
+    using xumHome = new DisposableTempDir("ai-measure-only-assembly");
+    const metadata = createLocalWorkspaceMetadata("measure-only", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata);
+    const hook = mock((ctx: RequestAssembleContext) => {
+      ctx.systemMessage += "\nhooked-context";
+    });
+    const removeHook = eventSpine.useBefore("request.assemble", hook, {
+      workspaceId: metadata.id,
+    });
+    const assembled = spyOn(turnContextAssembler, "assemblePromptPayload");
+    try {
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: KNOWN_MODELS.SONNET.id,
+        thinkingLevel: "off",
+        experiments: { tokenBudget: true, memory: true },
+      });
+      expect(result.success).toBe(true);
+      expect(hook).toHaveBeenCalledTimes(1);
+      const sent = harness.startStreamCalls[0];
+      const measured = await assembleBudgetCheckedPromptPayload(assembled.mock.calls[0][0], {
+        enabled: true,
+        measureOnly: true,
+      });
+      // Anthropic carries the system prompt as leading message rows.
+      expect(JSON.stringify(sent.messages)).toContain("hooked-context");
+      expect(measured.messages).toEqual(sent.messages);
+      expect(measured.system).toEqual(sent.system);
+      expect(measured.contextBudgetEstimate).toBeDefined();
+      expect(hook).toHaveBeenCalledTimes(1);
+    } finally {
+      assembled.mockRestore();
+      removeHook();
     }
   });
 

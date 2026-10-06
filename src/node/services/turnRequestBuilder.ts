@@ -6,7 +6,7 @@ import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
 import type { OnStepSettled } from "./streamManager";
-import { checkAssembledRequestBudgetForModel } from "./contextBudgetCounting";
+import { measureAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import {
@@ -462,17 +462,28 @@ function pinCoderInstanceRawProvidersConfig(
   };
 }
 
-/** Shared assembly path for primary, fallback, and thinking-rebuild provider attempts. */
+/**
+ * Shared assembly path for primary, fallback, and thinking-rebuild provider attempts.
+ * `contextBudgetEstimate` is the full estimate the check enforced (undefined when the budget is
+ * off or the limit is unknown). `measureOnly` returns that estimate instead of throwing.
+ */
 export async function assembleBudgetCheckedPromptPayload(
   options: Parameters<typeof assemblePromptPayload>[0],
   budget: {
     enabled: boolean;
     providerOptions?: MuxProviderOptions;
     activeTools?: readonly string[];
+    measureOnly?: boolean;
   }
-): Promise<Awaited<ReturnType<typeof assemblePromptPayload>> & { contextBudgetLimit?: number }> {
+): Promise<
+  Awaited<ReturnType<typeof assemblePromptPayload>> & {
+    contextBudgetLimit?: number;
+    contextBudgetEstimate?: number;
+  }
+> {
   const payload = await assemblePromptPayload(options);
   let contextBudgetLimit: number | undefined;
+  let contextBudgetEstimate: number | undefined;
   // Check after provider transforms and system/schema assembly: history-only
   // estimates cannot prevent oversized requests from reaching the provider.
   if (budget.enabled) {
@@ -493,15 +504,18 @@ export async function assembleBudgetCheckedPromptPayload(
         model: options.modelString,
       });
     }
-    const exceeded = await checkAssembledRequestBudgetForModel(payload, {
+    const measured = await measureAssembledRequestBudgetForModel(payload, {
       model: options.modelString,
       metadataModel: resolveModelForMetadata(options.modelString, options.providersConfig ?? null),
       modelContextLimit: contextBudgetLimit,
       activeTools: budget.activeTools,
     });
-    if (exceeded) throw new ContextBudgetExceededError(exceeded);
+    contextBudgetEstimate = measured?.estimate;
+    if (measured?.exceeded && !budget.measureOnly) {
+      throw new ContextBudgetExceededError(measured.exceeded);
+    }
   }
-  return { ...payload, contextBudgetLimit };
+  return { ...payload, contextBudgetLimit, contextBudgetEstimate };
 }
 
 function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
@@ -2958,11 +2972,17 @@ export class TurnRequestBuilder {
           forcedFirstStepToolNames?.length ? forcedFirstStepToolNames : toolNamesForSentinel
         );
         // Shared by the initial build and thinking rebuilds so their assembly
-        // inputs cannot drift apart mid-turn.
-        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
+        // inputs cannot drift apart mid-turn. `measureOnly` assembles a candidate history and
+        // returns its estimate without throwing: it runs after `request.assemble`, so no hook,
+        // tool-search seeding or skill step reruns. Turn-start stage decisions (#5286) count a
+        // candidate message list here.
+        const assemblePayloadForThinkingLevel = (
+          level: ThinkingLevel,
+          measureOnly?: { history: MuxMessage[] }
+        ) =>
           assembleBudgetCheckedPromptPayload(
             {
-              history: options.sourceMessages,
+              history: measureOnly?.history ?? options.sourceMessages,
               systemMessage: attemptSystem,
               volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
               tools: attemptTools,
@@ -2988,6 +3008,7 @@ export class TurnRequestBuilder {
               activeTools: forcedFirstStepToolNames?.length
                 ? forcedFirstStepToolNames
                 : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
+              measureOnly: measureOnly != null,
             }
           );
         const prepareMessagesForProviderStartedAt = Date.now();
@@ -3044,6 +3065,9 @@ export class TurnRequestBuilder {
           system: attemptSystem,
           engineSystem: attemptPayload.system,
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
+          contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
+          measureMessages: (history: MuxMessage[]) =>
+            assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel, { history }),
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
           engineTools: attemptPayload.tools ?? attemptTools,
@@ -3070,6 +3094,7 @@ export class TurnRequestBuilder {
               engineSystem: payload.system,
               messages: payload.messages,
               contextBudgetLimit: payload.contextBudgetLimit,
+              contextBudgetEstimate: payload.contextBudgetEstimate,
             };
           },
         };
