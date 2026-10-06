@@ -85,8 +85,9 @@ Scripts that the agent runs in the bash tool (test harnesses, `make bug-bash`, S
 
 - Xum sends the calls with the provider keys from this page. The command never sees the real key.
 - Only Local and Worktree commands get the variables. SSH, Coder, Docker and devcontainer commands keep their environment.
+- Bash commands in `xum run` and `xum workflow` sessions do not get the variables.
 - Commands in untrusted projects, and every command while `XUM_DISABLE_PROJECT_AUTOMATION=1` is set, get no variables: Xum blanks provider keys there, so repo code cannot spend through the proxy. Revoking a project's trust also refuses calls from its commands that are still running.
-- A provider without a Xum API key (for example OpenAI with Codex OAuth only) gets no variables. A provider that your [project secrets](/config/project-secrets) configure keeps the secret values.
+- A provider without a Xum API key (for example OpenAI with Codex OAuth only) gets no variables. A provider that your [project secrets](/config/project-secrets) configure keeps the secret values. This includes `OPENAI_ORG_ID` and `OPENAI_PROJECT_ID`.
 - The proxy allows Messages, Responses, Chat Completions, token counting and model listing. Other paths get 404.
 - The port and keys change when Xum restarts. A background command started before the restart gets connection errors. Start it again.
 - A key stops working when its workspace is removed.

@@ -218,3 +218,24 @@ export const CoderModelRouting: Story = {
     await canvas.findByText(/openai-removed is not a known OpenAI provider/);
   },
 };
+
+/** The Bash commands switch saves through the API and stays on. */
+export const BashCommandsSwitch: Story = {
+  render: () => (
+    <SettingsSectionStory setup={() => setupSettingsStory({ providersConfig: {} })}>
+      <ProvidersSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole(
+      "switch",
+      { name: "Count AI calls from bash commands" },
+      { timeout: 5000 }
+    );
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+    await userEvent.click(toggle);
+    // A failed save rolls the switch back.
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+  },
+};
