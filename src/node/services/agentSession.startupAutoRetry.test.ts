@@ -22,6 +22,7 @@ import {
 import { makeTestEffectRunner, type TestEffectRunner } from "./di/testEffectRunner";
 import { Duration } from "effect";
 import { createTestHistoryService } from "./testHistoryService";
+import { createContextBudgetWarning } from "./contextWindowRollover";
 import { waitForCondition } from "./testDispatchHelpers";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { HistoryService } from "./historyService";
@@ -177,6 +178,22 @@ async function sendIntoScheduledRetry(
 /** The durable auto-retry preference file that a restarted session reads. */
 function autoRetryPreferencePath(config: Config, workspaceId: string): string {
   return path.join(config.sessionsDir, workspaceId, "auto-retry-preference.json");
+}
+
+/**
+ * A Token Budget warning row as the token-budget strategy publishes it. #5286 appends it after
+ * the turn's user row; it is a notice, never the request that recovery must replay or match.
+ */
+function tokenBudgetWarning(): MuxMessage {
+  return createContextBudgetWarning({
+    contextTokens: 90_000,
+    maxTokens: 128_000,
+    budgetTokens: 119_808,
+    sessionHistoryAvailable: true,
+    handoff: true,
+    handoffTokens: 89_600,
+    newContextAvailable: true,
+  });
 }
 
 describe("AgentSession startup auto-retry recovery", () => {
@@ -876,62 +893,70 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
-  test("restores persisted retry send options for startup auto-retry", async () => {
-    const workspaceId = "startup-retry-preserve-options";
-    const clock = makeTestEffectRunner();
-    const { session, historyService, events, cleanup } = await createSessionBundle(
-      workspaceId,
-      undefined,
-      { clock }
-    );
-    cleanups.push(() => clock.dispose(), cleanup);
+  test.each([false, true])(
+    "restores persisted retry send options for startup auto-retry (Token Budget warning after the user row: %p)",
+    async (warningAfterUser) => {
+      const workspaceId = `startup-retry-preserve-options-${warningAfterUser}`;
+      const clock = makeTestEffectRunner();
+      const { session, historyService, events, cleanup } = await createSessionBundle(
+        workspaceId,
+        undefined,
+        { clock }
+      );
+      cleanups.push(() => clock.dispose(), cleanup);
 
-    const appendResult = await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "Interrupted with custom send options", {
-        timestamp: Date.now(),
-        kind: GOAL_CONTINUATION_KIND,
-        retrySendOptions: {
-          model: "anthropic:claude-sonnet-4-5",
-          agentId: "exec",
-          thinkingLevel: "high",
-          toolPolicy: [{ regex_match: "bash", action: "disable" }],
-          additionalSystemInstructions: "Use one sentence.",
-          maxOutputTokens: 2048,
-          providerOptions: {
-            anthropic: {
-              use1MContext: true,
-              use1MContextModels: ["anthropic:claude-sonnet-4-5"],
+      const appendResult = await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-1", "user", "Interrupted with custom send options", {
+          timestamp: Date.now(),
+          kind: GOAL_CONTINUATION_KIND,
+          retrySendOptions: {
+            model: "anthropic:claude-sonnet-4-5",
+            agentId: "exec",
+            thinkingLevel: "high",
+            toolPolicy: [{ regex_match: "bash", action: "disable" }],
+            additionalSystemInstructions: "Use one sentence.",
+            maxOutputTokens: 2048,
+            providerOptions: {
+              anthropic: {
+                use1MContext: true,
+                use1MContextModels: ["anthropic:claude-sonnet-4-5"],
+              },
             },
+            disableWorkspaceAgents: true,
           },
-          disableWorkspaceAgents: true,
-        },
-      })
-    );
-    expect(appendResult.success).toBe(true);
+        })
+      );
+      expect(appendResult.success).toBe(true);
+      if (warningAfterUser) {
+        expect(
+          (await historyService.appendToHistory(workspaceId, tokenBudgetWarning())).success
+        ).toBe(true);
+      }
 
-    await session.ensureStartupAutoRetryCheck();
+      await session.ensureStartupAutoRetryCheck();
 
-    // The scheduled retry resumes with every persisted option and the goal attribution.
-    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
-    await fireScheduledRetry(clock, events);
-    expect(resumeStream).toHaveBeenCalledTimes(1);
-    const [options, internal] = resumeStream.mock.calls[0];
-    const retryOptions = { options, goalKind: internal?.goalKind };
+      // The scheduled retry resumes with every persisted option and the goal attribution.
+      const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
+      await fireScheduledRetry(clock, events);
+      expect(resumeStream).toHaveBeenCalledTimes(1);
+      const [options, internal] = resumeStream.mock.calls[0];
+      const retryOptions = { options, goalKind: internal?.goalKind };
 
-    expect(retryOptions.options.model).toBe("anthropic:claude-sonnet-4-5");
-    expect(retryOptions.options.agentId).toBe("exec");
-    expect(retryOptions.options.thinkingLevel).toBe("high");
-    expect(retryOptions.options.additionalSystemInstructions).toBe("Use one sentence.");
-    expect(retryOptions.options.maxOutputTokens).toBe(2048);
-    expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: "bash", action: "disable" }]);
-    expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
-    expect(retryOptions.goalKind).toBe(GOAL_CONTINUATION_KIND);
+      expect(retryOptions.options.model).toBe("anthropic:claude-sonnet-4-5");
+      expect(retryOptions.options.agentId).toBe("exec");
+      expect(retryOptions.options.thinkingLevel).toBe("high");
+      expect(retryOptions.options.additionalSystemInstructions).toBe("Use one sentence.");
+      expect(retryOptions.options.maxOutputTokens).toBe(2048);
+      expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: "bash", action: "disable" }]);
+      expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
+      expect(retryOptions.goalKind).toBe(GOAL_CONTINUATION_KIND);
 
-    expect(retryOptions.options.providerOptions?.anthropic?.use1MContext).toBe(true);
+      expect(retryOptions.options.providerOptions?.anthropic?.use1MContext).toBe(true);
 
-    await session.dispose();
-  });
+      await session.dispose();
+    }
+  );
 
   // Startup auto-retry replays the interrupted turn through resumeStream; an automatic task
   // turn must stream again as that task turn (set_goal stays gated). Both durable copies are
@@ -1083,14 +1108,17 @@ describe("AgentSession startup auto-retry recovery", () => {
     { reason: "aborted", userMessageId: undefined, stopped: true },
     { reason: "aborted", userMessageId: "older-user", stopped: false },
     { reason: "context_exceeded", userMessageId: "user-1", stopped: false },
+    // A Token Budget warning after the stopped row is a notice, not newer user intent.
+    { reason: "aborted", userMessageId: "user-1", stopped: true, warningAfterUser: true },
   ])("reads applicable durable user-stop evidence: %j", async (marker) => {
     const workspaceId = "startup-task-stop";
     const { session, config, historyService, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
-    await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "Current intent")
-    );
+    const seeded = [
+      createMuxMessage("user-1", "user", "Current intent"),
+      ...(marker.warningAfterUser ? [tokenBudgetWarning()] : []),
+    ];
+    expect((await historyService.appendManyToHistory(workspaceId, seeded)).success).toBe(true);
     await fsPromises.writeFile(
       path.join(config.sessionsDir, workspaceId, "auto-retry-preference.json"),
       JSON.stringify({
@@ -1102,10 +1130,52 @@ describe("AgentSession startup auto-retry recovery", () => {
         marker.stopped ? "stopped" : "interrupted"
       );
       const history = await historyService.getLastMessages(workspaceId, 20);
-      expect(history.success && history.data.map((message) => message.id)).toEqual(["user-1"]);
+      expect(history.success && history.data.map((message) => message.id)).toEqual(
+        seeded.map((message) => message.id)
+      );
     } finally {
       await session.dispose();
     }
+  });
+
+  test("startup auto-retry honors a Stop of the user row that a Token Budget warning follows", async () => {
+    const workspaceId = "startup-retry-stop-before-budget-warning";
+    const clock = makeTestEffectRunner();
+    const { session, config, historyService, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      undefined,
+      { clock }
+    );
+    cleanups.push(() => clock.dispose(), cleanup);
+    expect(
+      (
+        await historyService.appendManyToHistory(workspaceId, [
+          createMuxMessage("user-1", "user", "Stopped request"),
+          tokenBudgetWarning(),
+        ])
+      ).success
+    ).toBe(true);
+    // The user pressed Stop on user-1 before the restart.
+    await fsPromises.writeFile(
+      autoRetryPreferencePath(config, workspaceId),
+      JSON.stringify({ startupAutoRetryAbandon: { reason: "aborted", userMessageId: "user-1" } })
+    );
+    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
+
+    await session.ensureStartupAutoRetryCheck();
+
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    expect(resumeStream).not.toHaveBeenCalled();
+    expect(
+      events
+        .filter(
+          (event): event is Extract<WorkspaceChatMessage, { type: "auto-retry-abandoned" }> =>
+            event.type === "auto-retry-abandoned"
+        )
+        .map((event) => event.reason)
+    ).toEqual(["aborted"]);
+
+    await session.dispose();
   });
 
   test("preserves a scoped Stop until history proves a newer user intent", async () => {

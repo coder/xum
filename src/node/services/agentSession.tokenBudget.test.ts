@@ -3064,6 +3064,48 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test("context_exceeded recovery copies the interrupted user row, not a Token Budget warning after it", async () => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    // #5286 appends the Token Budget warning after the turn's user row. Resuming that tail and
+    // overflowing must carry the user's request into the fresh window, not the advisory.
+    expect(
+      (
+        await h.historyService.appendManyToHistory(workspaceId, [
+          createMuxMessage("interrupted-user", "user", "Finish the migration"),
+          rolloverMessages.createContextBudgetWarning({
+            contextTokens: 90_000,
+            maxTokens: 128_000,
+            budgetTokens: 119_808,
+            sessionHistoryAvailable: true,
+            handoff: true,
+            handoffTokens: 89_600,
+            newContextAvailable: true,
+          }),
+        ])
+      ).success
+    ).toBe(true);
+    expect((await h.session.resumeStream(options)).success).toBe(true);
+    await h.waitForRequest(1);
+    const streamError = {
+      workspaceId,
+      messageId: "assistant-1",
+      error: "context limit",
+      errorType: "context_exceeded" as const,
+    };
+    h.aiEmitter.emit("error", streamError);
+    h.completions[0].settle({ status: "failed", streamError });
+    expect(await h.session.waitForPendingStreamErrorRecoveryDecision(streamError.messageId)).toBe(
+      "retry-started"
+    );
+    const fresh = sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages);
+    const freshUsers = fresh.filter(
+      (row) => row.role === "user" && row.metadata?.uiVisible !== false
+    );
+    expect(freshUsers.map(text)).toEqual(["Finish the migration"]);
+    expect(warningRows(fresh)).toHaveLength(0);
+  });
+
   /**
    * Records the recovery path's preparation fence and the protected calls it guards. Each
    * valid fence check queues a microtask; protected work that starts before that microtask

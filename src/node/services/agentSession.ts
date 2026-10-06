@@ -194,6 +194,7 @@ import {
   pickStartupRetrySendOptions,
   prepareUserMessageForSend,
   type AgentSkillReference,
+  isContextBudgetWarningMessage,
   isSyntheticSnapshotUserMessage,
   type CompactionFollowUpRequest,
   type MuxMessageMetadata,
@@ -2813,6 +2814,9 @@ export class AgentSession {
       return false;
     }
     if (isSyntheticSnapshotUserMessage(message)) {
+      return false;
+    }
+    if (isContextBudgetWarningMessage(message)) {
       return false;
     }
 
@@ -8213,7 +8217,9 @@ export class AgentSession {
         // Model-hidden records (plan-review snapshot/resolve/reopen rows) are UI state that can
         // land after the resumable row without changing provider-visible history; resume from
         // the newest visible row so such a record cannot silently cancel the request.
-        const target = tail.data.findLast((message) => !isModelHiddenMessage(message));
+        const target = tail.data.findLast(
+          (message) => !isModelHiddenMessage(message) && !isContextBudgetWarningMessage(message)
+        );
         if (!target) return await fail(createUnknownSendMessageError(EMPTY_RESUME_HISTORY_ERROR));
         if (target.metadata?.contextBudgetRejected) return await refuseRejectedResume(target);
         if (target.role !== "assistant" && !this.shouldUseUserMessageForRetry(target))

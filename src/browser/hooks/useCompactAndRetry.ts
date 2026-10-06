@@ -43,7 +43,8 @@ function findTriggerUserMessage(
 ): Extract<DisplayedMessage, { type: "user" }> | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
-    if (msg.type === "user") {
+    // Token Budget warnings are notices, never the request to re-send.
+    if (msg.type === "user" && msg.contextBudgetWarning == null) {
       return msg;
     }
   }

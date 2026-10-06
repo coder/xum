@@ -1193,6 +1193,49 @@ describe("injectAgentTransition", () => {
     expect(result[3]).toEqual(messages[2]); // Last user message shifted
   });
 
+  it("injects the transition before the user prompt, not before a trailing Token Budget warning", () => {
+    const messages: MuxMessage[] = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "Here's the plan..." }],
+        metadata: { timestamp: 1000, agentId: "plan" },
+      },
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "Now execute it" }],
+        metadata: { timestamp: 2000 },
+      },
+      {
+        id: "warning-1",
+        role: "user",
+        parts: [{ type: "text", text: "Token budget warning" }],
+        metadata: {
+          timestamp: 3000,
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: {
+            type: "context-budget-warning",
+            contextTokens: 80,
+            maxTokens: 100,
+            budgetTokens: 90,
+          },
+        },
+      },
+    ];
+
+    const result = injectAgentTransition(messages, "exec");
+
+    expect(result.map((message) => message.id)).toEqual([
+      "assistant-1",
+      result[1].id,
+      "user-1",
+      "warning-1",
+    ]);
+    expect(result[1].metadata?.synthetic).toBe(true);
+  });
+
   it("should not inject transition when agent is the same", () => {
     const messages: MuxMessage[] = [
       {

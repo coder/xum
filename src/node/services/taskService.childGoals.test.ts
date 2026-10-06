@@ -9,6 +9,7 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { StreamEndEvent } from "@/common/types/stream";
 import { createMuxMessage } from "@/common/types/message";
+import { createContextBudgetWarning } from "@/node/services/contextWindowRollover";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/common/types/project";
 import type { SendMessageOptions } from "@/common/orpc/types";
@@ -451,20 +452,41 @@ describe("TaskService child goals", () => {
     expect((await t.goals.getGoal(childId))?.status).toBe("active");
   });
 
-  test("a tool-free goal continuation completes the goal and publishes exactly one report", async () => {
-    const t = await setup();
-    const goal = await t.setChildGoal();
-    await t.appendGoalContinuationRow(goal.goalId);
+  test.each([
+    { tail: "goal_continuation row", appendWarning: false },
+    // A Token Budget warning row is a synthetic user row appended after the turn's trigger; it is
+    // a notice, not a newer trigger, so the ended turn still counts as the goal continuation.
+    { tail: "goal_continuation row then a Token Budget warning", appendWarning: true },
+  ])(
+    "a tool-free goal continuation completes the goal and publishes exactly one report ($tail)",
+    async ({ appendWarning }) => {
+      const t = await setup();
+      const goal = await t.setChildGoal();
+      await t.appendGoalContinuationRow(goal.goalId);
+      if (appendWarning) {
+        const appended = await t.historyService.appendToHistory(
+          childId,
+          createContextBudgetWarning({
+            contextTokens: 90_000,
+            maxTokens: 128_000,
+            budgetTokens: 119_808,
+            handoff: true,
+            sessionHistoryAvailable: true,
+          })
+        );
+        expect(appended.success).toBe(true);
+      }
 
-    const event = t.proseEnd("assistant-1", { tools: false });
-    await streamEnd(t.taskService, event);
-    await streamEnd(t.taskService, event);
+      const event = t.proseEnd("assistant-1", { tools: false });
+      await streamEnd(t.taskService, event);
+      await streamEnd(t.taskService, event);
 
-    expect((await t.goals.getGoal(childId))?.status).toBe("complete");
-    expect(t.child()?.taskStatus).toBe("reported");
-    expect(await t.parentReports()).toHaveLength(1);
-    expect(t.sends()).toHaveLength(0);
-  });
+      expect((await t.goals.getGoal(childId))?.status).toBe("complete");
+      expect(t.child()?.taskStatus).toBe("reported");
+      expect(await t.parentReports()).toHaveLength(1);
+      expect(t.sends()).toHaveLength(0);
+    }
+  );
 
   test("a goal continuation turn with tool work does not complete the goal", async () => {
     const t = await setup();

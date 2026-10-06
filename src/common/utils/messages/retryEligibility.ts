@@ -181,6 +181,12 @@ export function getLastMainRetryCandidateMessage(
     ) {
       continue;
     }
+    if (candidate.type === "user" && candidate.contextBudgetWarning != null) {
+      // A warning is never the request: prefer the older user row it annotates. Otherwise keep
+      // it, so an interrupted stream before a pending hidden Continue still shows its barrier.
+      const older = getLastMainRetryCandidateMessage(messages.slice(0, i));
+      return older?.type === "user" ? older : candidate;
+    }
     return candidate;
   }
   return undefined;

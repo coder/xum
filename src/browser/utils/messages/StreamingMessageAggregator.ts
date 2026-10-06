@@ -10,6 +10,7 @@ import {
   createMuxMessage,
   getMcpPromptReferenceKey,
   isCompactionSummaryMetadata,
+  isContextBudgetWarningMessage,
   sanitizeAgentSkillRefs,
   sanitizeMcpPromptRefs,
 } from "@/common/types/message";
@@ -3328,6 +3329,11 @@ export class StreamingMessageAggregator {
 
     if (isInTurnHiddenNoticeRow(incomingMessage)) {
       // Kept above as edit evidence; the turn it belongs to is already pending.
+      return;
+    }
+
+    if (isContextBudgetWarningMessage(incomingMessage)) {
+      // A Token Budget warning is a notice, not a request: keep the turn state of its user row.
       return;
     }
 
