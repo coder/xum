@@ -283,7 +283,9 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
           )}
           <DetailSection>
             <DetailLabel>Script</DetailLabel>
-            <DetailContent className="px-2 py-1.5">{args.script}</DetailContent>
+            {/* Capped at the block's max height; the bottom edge fades while more of the command
+                is below the cut, since phones hide the scrollbar (#5769). */}
+            <DetailContent className="scroll-fade-y px-2 py-1.5">{args.script}</DetailContent>
           </DetailSection>
 
           {/* Truncation notices */}

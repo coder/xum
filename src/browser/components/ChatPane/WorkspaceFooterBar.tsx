@@ -130,12 +130,15 @@ function WorkspaceBranchControls(props: {
   workspaceName: string;
   devcontainerChip: ReturnType<typeof getDevcontainerStatusChip>;
 }) {
+  // The branch is the one footer item that can shrink (its name truncates with an ellipsis), so a
+  // long name no longer pushes the row wider than a phone screen (#5769).
   return (
-    <div className="flex shrink-0 items-center gap-1">
+    <div className="flex min-w-0 items-center gap-1">
       <BranchSelector
         key={props.workspaceId}
         workspaceId={props.workspaceId}
         workspaceName={props.workspaceName}
+        className="min-w-0"
       />
       {props.devcontainerChip && (
         <span
