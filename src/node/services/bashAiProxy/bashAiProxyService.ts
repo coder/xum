@@ -296,16 +296,16 @@ export class BashAiProxyService {
 
   async stop(): Promise<void> {
     this.stopped = true;
-    this.forwards.closeAll();
+    const forwardsClosed = this.forwards.closeAll();
     const server = this.server;
     this.server = undefined;
     if (server) {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
-    // closeAll() makes a late restore job close its own forward, so a short wait is enough: an
-    // SSH connect still in flight must not hold up shutdown.
-    if (this.restoring) await Promise.race([this.restoring, sleep(1000)]);
+    // Setups in flight close the forward they open once they see closeAll(). Wait for them, but
+    // briefly: an SSH connect that hangs must not hold up shutdown.
+    await Promise.race([Promise.allSettled([forwardsClosed, this.restoring]), sleep(1000)]);
     await this.state.flush();
   }
 
