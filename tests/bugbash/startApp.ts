@@ -43,6 +43,7 @@ import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { type AiMode, AiModeError, resolveAiMode } from "./aiMode";
+import { startFakeProvider } from "./fakeProvider";
 import { seedMcpChat, writeMcpConfig } from "./mcpapps/seed";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "../..");
@@ -220,7 +221,8 @@ async function seed(
   projectPath: string,
   xumRoot: string,
   child: ChildProcess,
-  ai: AiMode
+  ai: AiMode,
+  fakeProviderOrigin: string | undefined
 ): Promise<string> {
   await api(base, "splashScreens/markSplashScreenViewed", { splashId: "onboarding-wizard-v1" });
   await api(base, "experiments/setOverride", { experimentId: "artifacts", enabled: true });
@@ -239,7 +241,9 @@ async function seed(
     await api(base, "config/updateModelPreferences", { defaultModel: ai.model });
   } else {
     // The composer refuses to send without a configured provider. Mock AI never calls it, and
-    // the dead loopback port keeps any stray background call from leaving the machine.
+    // the dead loopback port keeps any stray background call from leaving the machine. The
+    // bash-ai-proxy scenario points both providers at the loopback fake instead.
+    const providerBase = fakeProviderOrigin ?? "http://127.0.0.1:9";
     await api(base, "providers/setProviderConfig", {
       provider: "anthropic",
       keyPath: ["apiKey"],
@@ -248,8 +252,20 @@ async function seed(
     await api(base, "providers/setProviderConfig", {
       provider: "anthropic",
       keyPath: ["baseUrl"],
-      value: "http://127.0.0.1:9/v1",
+      value: `${providerBase}/v1`,
     });
+    if (fakeProviderOrigin !== undefined) {
+      await api(base, "providers/setProviderConfig", {
+        provider: "openai",
+        keyPath: ["apiKey"],
+        value: "sk-openai-bugbash-fake",
+      });
+      await api(base, "providers/setProviderConfig", {
+        provider: "openai",
+        keyPath: ["baseUrl"],
+        value: `${providerBase}/v1`,
+      });
+    }
   }
   await api(base, "projects/create", { projectPath });
   await api(base, "projects/setTrust", { projectPath, trusted: true });
@@ -314,6 +330,20 @@ async function main(): Promise<void> {
   // e2e writes this line to the target's command log.
   console.log(`[bugbash startApp] app AI: ${ai.mode} (${ai.reason})`);
 
+  // BUGBASH_SCENARIO=bash-ai-proxy: instead of the mock, a loopback fake provider (fakeProvider.ts)
+  // is the chat model and the upstream of Xum's bash AI proxy, so the agent runs real bash
+  // commands whose AI calls go through the proxy. The fake only ever asks for its own fixed
+  // scripts, so agent tools stay on; nothing leaves the machine. It replaces the mock, so the
+  // explorer context (e2e.config.ts) must not describe a real model.
+  const scenario = process.env.BUGBASH_SCENARIO ?? "";
+  if (scenario !== "" && scenario !== "bash-ai-proxy") {
+    fail(`BUGBASH_SCENARIO must be empty or bash-ai-proxy, got "${scenario}"`);
+  }
+  if (scenario !== "" && ai.mode !== "mock") {
+    fail("BUGBASH_SCENARIO=bash-ai-proxy replaces the mock: run it with BUGBASH_AI=mock");
+  }
+  const fakeProvider = scenario === "bash-ai-proxy" ? await startFakeProvider() : undefined;
+
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-"));
   const xumRoot = path.join(tempRoot, "xum");
   const home = path.join(tempRoot, "home");
@@ -326,13 +356,17 @@ async function main(): Promise<void> {
     // Real mode: a real model answers in the app on this host. It gets no tools, and the explorer
     // gets no terminal or project init hooks, so injected text in a reply that the explorer
     // follows cannot run host commands through them (see the header).
-    ...(ai.mode === "mock"
-      ? { XUM_MOCK_AI: "1" }
-      : {
-          XUM_DISABLE_AGENT_TOOLS: "1",
-          XUM_DISABLE_TERMINALS: "1",
-          XUM_DISABLE_PROJECT_AUTOMATION: "1",
-        }),
+    ...(fakeProvider
+      ? // The explorer gets no terminal. Project automation stays on: the kill switch also
+        // withholds the proxy variables from bash, and the seeded demo repo has no hooks.
+        { XUM_DISABLE_TERMINALS: "1" }
+      : ai.mode === "mock"
+        ? { XUM_MOCK_AI: "1" }
+        : {
+            XUM_DISABLE_AGENT_TOOLS: "1",
+            XUM_DISABLE_TERMINALS: "1",
+            XUM_DISABLE_PROJECT_AUTOMATION: "1",
+          }),
     // Bug-bash clicks are not product usage.
     XUM_DISABLE_TELEMETRY: "1",
     // Git inside the app must not read or write the user's real ~/.gitconfig.
@@ -361,7 +395,14 @@ async function main(): Promise<void> {
     let workspaceId: string;
     try {
       await waitForHealth(`http://127.0.0.1:${seedPort}`, current);
-      workspaceId = await seed(`http://127.0.0.1:${seedPort}`, projectPath, xumRoot, current, ai);
+      workspaceId = await seed(
+        `http://127.0.0.1:${seedPort}`,
+        projectPath,
+        xumRoot,
+        current,
+        ai,
+        fakeProvider?.origin
+      );
     } finally {
       current.kill("SIGTERM");
       await waitForExit(current);
@@ -373,6 +414,7 @@ async function main(): Promise<void> {
       code = await waitForExit(current);
     }
   } finally {
+    fakeProvider?.close();
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
   process.exit(code ?? 0);
