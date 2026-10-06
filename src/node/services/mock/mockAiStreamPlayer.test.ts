@@ -678,6 +678,38 @@ describe("MockAiStreamPlayer", () => {
     expect(extractText(partial)).toBe("Streaming response before context limit.");
   });
 
+  test("retries a request that ends with the error partial on the user message that started it", async () => {
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+
+    const workspaceId = "workspace-error-retry";
+    const userMessage = createMuxMessage(
+      "user-error-retry",
+      "user",
+      "[mock:error:context] Trigger context error",
+      { timestamp: Date.now() }
+    );
+    const first = await player.play([userMessage], workspaceId);
+    if (!first.success || !first.data) throw new Error("expected a stream handle");
+    await first.data.completion;
+    const partial = await historyService.readPartial(workspaceId);
+    if (!partial) throw new Error("expected the error partial");
+
+    // A retry or resume sends the history with the kept partial last. Real requests continue it
+    // (addInterruptedSentinel), so the mock must answer the same user prompt again, not refuse
+    // the request or echo a [CONTINUE] sentinel.
+    const retry = await player.play([userMessage, partial], workspaceId);
+    if (!retry.success || !retry.data) throw new Error("expected a stream handle for the retry");
+    expect(await retry.data.completion).toMatchObject({
+      status: "failed",
+      streamError: { error: "Context length exceeded in mock stream." },
+    });
+  });
+
   test("passes the mock rate limit's Retry-After to the turn completion", async () => {
     const aiServiceStub = new EventEmitter();
     aiServiceStub.on("error", () => undefined);

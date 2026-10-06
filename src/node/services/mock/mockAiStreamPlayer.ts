@@ -338,7 +338,15 @@ export class MockAiStreamPlayer {
       return Ok(undefined);
     }
 
-    const latest = messages[messages.length - 1];
+    // A request that ends with a partial assistant continues an interrupted or errored turn:
+    // stream-error now keeps that partial, as StreamManager does (#5700). Real requests get a
+    // [CONTINUE] row at transform time (addInterruptedSentinel), which this mock never sees, so
+    // answer the user message that started the turn, as a provider would.
+    const last = messages[messages.length - 1];
+    const latest =
+      last?.role === "assistant" && last.metadata?.partial === true
+        ? messages[messages.length - 2]
+        : last;
     if (!latest || latest.role !== "user") {
       return Err({ type: "unknown", raw: "Mock AI expected a user message" });
     }
