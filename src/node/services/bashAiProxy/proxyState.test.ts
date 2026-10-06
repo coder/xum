@@ -43,6 +43,54 @@ describe("ProxyStateStore", () => {
     expect((await new ProxyStateStore(rootDir).load()).port).toBe(21001);
   });
 
+  test("backends that find a malformed file together adopt one new secret", async () => {
+    const file = path.join(rootDir, BASH_AI_PROXY_STATE_FILE);
+    await fsp.writeFile(file, "{not json");
+    const loaded = await Promise.all(
+      Array.from({ length: 4 }, () => new ProxyStateStore(rootDir).load())
+    );
+    const secrets = new Set(loaded.map((state) => state.secret));
+    expect(secrets.size).toBe(1);
+    expect((await new ProxyStateStore(rootDir).load()).secret).toBe([...secrets][0]);
+  });
+
+  test("a bad port is dropped, but the secret and its keys stay", async () => {
+    const { secret } = await new ProxyStateStore(rootDir).load();
+    const file = path.join(rootDir, BASH_AI_PROXY_STATE_FILE);
+    await fsp.writeFile(file, JSON.stringify({ version: 1, secret, port: "21234" }));
+    const healed = await new ProxyStateStore(rootDir).load();
+    expect(healed).toEqual({ version: 1, secret, forwards: {} });
+  });
+
+  test("backends on one root keep each other's forwards", async () => {
+    const a = new ProxyStateStore(rootDir);
+    const b = new ProxyStateStore(rootDir);
+    await a.load();
+    await b.load(); // both hold a snapshot without forwards
+    await a.update((state) => {
+      state.forwards["host-a"] = { remotePort: 25000, workspaceIds: ["ws-a"], usedAt: 1 };
+    });
+    await b.update((state) => {
+      state.forwards["host-b"] = { remotePort: 25001, workspaceIds: ["ws-b"], usedAt: 2 };
+    });
+    const { forwards } = await new ProxyStateStore(rootDir).load();
+    expect(Object.keys(forwards).sort()).toEqual(["host-a", "host-b"]);
+  });
+
+  test("a bad forward entry is dropped, the others stay", async () => {
+    const { secret } = await new ProxyStateStore(rootDir).load();
+    const good = { remotePort: 25000, workspaceIds: ["ws-1"], usedAt: 1 };
+    await fsp.writeFile(
+      path.join(rootDir, BASH_AI_PROXY_STATE_FILE),
+      JSON.stringify({ version: 1, secret, forwards: { good, bad: { remotePort: "x" } } })
+    );
+    expect(await new ProxyStateStore(rootDir).load()).toEqual({
+      version: 1,
+      secret,
+      forwards: { good },
+    });
+  });
+
   test("a malformed file heals to a fresh secret instead of failing", async () => {
     const { secret } = await new ProxyStateStore(rootDir).load();
     await fsp.writeFile(path.join(rootDir, BASH_AI_PROXY_STATE_FILE), '{"version":1,"secret":"x"}');
