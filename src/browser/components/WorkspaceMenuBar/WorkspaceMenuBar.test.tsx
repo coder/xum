@@ -38,6 +38,8 @@ import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
 import { focusRightSidebarTab, readRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
+import { collectAllTabs } from "@/browser/utils/rightSidebarLayout";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CODER_RUNTIME_PLACEHOLDER, type RuntimeConfig } from "@/common/types/runtime";
@@ -803,6 +805,67 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       act(() => media.fireChange());
       expect([name, isOpen()]).toEqual([name, false]);
     }
+  });
+
+  describe("widening selects the dialog's tab (#5795)", () => {
+    const activeTab = () => {
+      const root = readRightSidebarLayout(workspaceId).root;
+      return root.type === "tabset" ? root.activeTab : null;
+    };
+    const allTabs = () => collectAllTabs(readRightSidebarLayout(workspaceId).root);
+    const widenable = () => {
+      // Radix portals do not render in happy-dom; this test is about the sidebar layout.
+      spyOn(ArtifactsDialogModule, "ArtifactsDialog").mockImplementation(
+        (() => null) as unknown as typeof ArtifactsDialogModule.ArtifactsDialog
+      );
+      let isNarrow = true;
+      const media = stubMatchMedia(
+        (query) => isNarrow && query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`
+      );
+      return () => {
+        isNarrow = false;
+        act(() => media.fireChange());
+      };
+    };
+
+    it("Timeline and Artifacts select their tab once the sidebar shows again", () => {
+      window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), "true");
+      for (const [tab, open] of [
+        ["timeline", { key: "T", shiftKey: true }],
+        ["artifacts", { key: "K", ctrlKey: true, shiftKey: true }],
+      ] as const) {
+        const widen = widenable();
+        focusRightSidebarTab(workspaceId, "review");
+        const view = render(<WorkspaceMenuBar {...defaultProps} />);
+        act(() => {
+          fireEvent.keyDown(window, open);
+        });
+        // Not on open: the hidden sidebar stays mounted, so that would render a second copy.
+        expect([tab, activeTab()]).toEqual([tab, "review"]);
+        widen();
+        expect([tab, activeTab()]).toEqual([tab, tab]);
+        view.unmount();
+      }
+    });
+
+    it("does not add the Artifacts tab once its experiment is off", () => {
+      window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), "true");
+      const widen = widenable();
+      focusRightSidebarTab(workspaceId, "review");
+      const before = allTabs();
+      expect(before).not.toContain("artifacts");
+      render(<WorkspaceMenuBar {...defaultProps} />);
+      act(() => {
+        fireEvent.keyDown(window, { key: "K", ctrlKey: true, shiftKey: true });
+      });
+      // The experiment turns off while the dialog is open (e.g. from another window).
+      act(() => {
+        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), false);
+      });
+      widen();
+      expect(allTabs()).toEqual(before);
+      expect(activeTab()).toBe("review");
+    });
   });
 
   it("closes the timeline dialog when switching workspaces", () => {

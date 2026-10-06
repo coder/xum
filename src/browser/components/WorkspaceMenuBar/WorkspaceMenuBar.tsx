@@ -259,17 +259,19 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // container query (e.g. expanding the left sidebar squeezes the shell under 684px).
   const [timelineSidebarHidden, setTimelineSidebarHidden] = useState(false);
   // The Timeline, Artifacts and Stats tabs live in the right sidebar, so small viewports reach
-  // them through these dialogs (see useSidebarTabDialog).
+  // them through these dialogs (see useSidebarTabDialog). Each selects its tab when the sidebar
+  // shows again, so the user keeps the view they were reading (#5767, #5795).
   const [timelineDialogOpen, setTimelineDialogWorkspaceId] = useSidebarTabDialog(
     workspaceId,
-    timelineSidebarHidden
+    timelineSidebarHidden,
+    "timeline"
   );
+  // Only while its experiment is on: selecting the tab would otherwise add a disabled tab.
   const [artifactsDialogOpen, setArtifactsDialogWorkspaceId] = useSidebarTabDialog(
     workspaceId,
-    timelineSidebarHidden
+    timelineSidebarHidden,
+    artifactsExperimentEnabled ? "artifacts" : undefined
   );
-  // Stats also selects its tab when the sidebar shows again (#5767), so the user keeps the view
-  // they were reading. Timeline and Artifacts do not yet (#5795).
   const [statsDialogOpen, setStatsDialogWorkspaceId] = useSidebarTabDialog(
     workspaceId,
     timelineSidebarHidden,
