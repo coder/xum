@@ -48,6 +48,12 @@ export interface ReverseForward {
   close(): void;
 }
 
+/**
+ * The host refused the forward itself (port in use, `AllowTcpForwarding no`). Other errors from
+ * openReverseForward mean the connection failed, which is often transient.
+ */
+export class ReverseForwardRefusedError extends Error {}
+
 export interface SSHTransport {
   /** Spawn a command on the remote host, returning a ChildProcess-compatible object. */
   spawnRemoteProcess(command: string, options: SpawnOptions): Promise<SpawnResult>;
@@ -67,7 +73,8 @@ export interface SSHTransport {
   /**
    * Starts a reverse forward. Resolving means the request was made, not that the remote port is
    * bound: the caller must prove the forward end to end (the bash AI proxy probes its health
-   * endpoint through it). Rejects when the forward cannot start at all.
+   * endpoint through it). Rejects when the forward cannot start at all, with
+   * ReverseForwardRefusedError when the host refused it.
    */
   openReverseForward(remotePort: number, localPort: number): Promise<ReverseForward>;
 }

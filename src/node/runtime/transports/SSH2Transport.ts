@@ -12,14 +12,15 @@ import { ssh2ConnectionPool } from "../SSH2ConnectionPool";
 import { DEFAULT_SSH_MAX_WAIT_MS } from "../sshBackoff";
 import { SSH2_CHANNEL_OPEN_TIMEOUT_MS } from "@/constants/sshChannels";
 import type { SpawnResult } from "../RemoteRuntime";
-import type {
-  SSHTransport,
-  SSHTransportAcquireOptions,
-  SSHTransportConfig,
-  SpawnOptions,
-  PtyHandle,
-  PtySessionParams,
-  ReverseForward,
+import {
+  ReverseForwardRefusedError,
+  type SSHTransport,
+  type SSHTransportAcquireOptions,
+  type SSHTransportConfig,
+  type SpawnOptions,
+  type PtyHandle,
+  type PtySessionParams,
+  type ReverseForward,
 } from "./SSHTransport";
 
 /**
@@ -468,7 +469,10 @@ export class SSH2Transport implements SSHTransport {
     routeForwardedConnections(client, localPort);
     try {
       await new Promise<void>((resolve, reject) => {
-        client.forwardIn("127.0.0.1", remotePort, (err) => (err ? reject(err) : resolve()));
+        // forwardIn fails only when the host answers the request with a refusal.
+        client.forwardIn("127.0.0.1", remotePort, (err) =>
+          err ? reject(new ReverseForwardRefusedError(err.message)) : resolve()
+        );
       });
     } catch (error) {
       client.destroy();

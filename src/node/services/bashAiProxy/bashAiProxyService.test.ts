@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as net from "node:net";
@@ -10,7 +10,7 @@ import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
 import type { ProviderConfigRaw } from "@/node/utils/providerRequirements";
 
-import type { ReverseForward } from "@/node/runtime/transports";
+import { ReverseForwardRefusedError, type ReverseForward } from "@/node/runtime/transports";
 
 import { BashAiProxyService } from "./bashAiProxyService";
 import type { ForwardTarget } from "./reverseForwards";
@@ -114,7 +114,9 @@ describe("BashAiProxyService", () => {
       isEnabled: () => enabled,
       workspaceExists: (workspaceId) => !removed.has(workspaceId),
       isWorkspaceTrusted: (workspaceId) => Promise.resolve(!untrusted.has(workspaceId)),
-      forwardTargetFor: (workspaceId) => Promise.resolve(sshTargets.get(workspaceId)),
+      // Like the app: a removed workspace has no metadata, so no runtime.
+      forwardTargetFor: (workspaceId) =>
+        Promise.resolve(removed.has(workspaceId) ? undefined : sshTargets.get(workspaceId)),
       loadProviderConfig: (provider) => configs[provider] ?? {},
       recordUsage: (workspaceId, modelString, usage) => {
         recorded.push({ workspaceId, modelString, usage });
@@ -126,6 +128,11 @@ describe("BashAiProxyService", () => {
       },
       onUsageRecorded: (workspaceId) => liveDeltas.push(workspaceId),
     });
+  }
+
+  async function readState(): Promise<{ forwards: Record<string, { usedAt: number }> }> {
+    const text = await fs.promises.readFile(path.join(rootDir, "bash-ai-proxy.json"), "utf8");
+    return JSON.parse(text) as { forwards: Record<string, { usedAt: number }> };
   }
 
   afterEach(async () => {
@@ -343,7 +350,12 @@ describe("BashAiProxyService", () => {
      */
     function fakeSshHost(
       hostKey: string,
-      options: { refuse?: boolean; coder?: boolean; survivesClose?: boolean } = {}
+      options: {
+        refuse?: boolean;
+        unreachable?: boolean;
+        coder?: boolean;
+        survivesClose?: boolean;
+      } = {}
     ) {
       const opened: number[] = [];
       const relays = new Set<net.Server>();
@@ -357,7 +369,8 @@ describe("BashAiProxyService", () => {
         restoreAtStartup: options.coder !== true,
         openReverseForward: async (remotePort, localPort): Promise<ReverseForward> => {
           opened.push(remotePort);
-          if (options.refuse) throw new Error("remote port forwarding failed");
+          if (options.refuse) throw new ReverseForwardRefusedError("remote port forwarding failed");
+          if (options.unreachable) throw new Error("ssh: connect to host: Connection timed out");
           const relay = net.createServer((socket) => {
             sockets.add(socket);
             socket.once("close", () => sockets.delete(socket));
@@ -466,6 +479,92 @@ describe("BashAiProxyService", () => {
         expect(host.opened.length).toBeGreaterThan(1);
       } finally {
         stranger.close();
+      }
+    });
+
+    test("a connection failure is retried after a short wait, a refusal is not", async () => {
+      const flakyOptions = { unreachable: true };
+      const flaky = fakeSshHost("ssh-host-8", flakyOptions);
+      const refusing = fakeSshHost("ssh-host-9", { refuse: true });
+      sshTargets.set("flaky-ws", flaky.target);
+      sshTargets.set("refusing-ws", refusing.target);
+      expect(await proxy.envFor("flaky-ws", "ssh", [])).toEqual({});
+      expect(await proxy.envFor("refusing-ws", "ssh", [])).toEqual({});
+      const refusedAttempts = refusing.opened.length;
+
+      flakyOptions.unreachable = false; // the VPN is back
+      setSystemTime(new Date(Date.now() + 60_000));
+      try {
+        expect((await proxy.envFor("flaky-ws", "ssh", [])).ANTHROPIC_BASE_URL).toBeDefined();
+        expect(await proxy.envFor("refusing-ws", "ssh", [])).toEqual({});
+        expect(refusing.opened).toHaveLength(refusedAttempts);
+      } finally {
+        setSystemTime();
+      }
+    });
+
+    test("restore goes through another workspace on the host when the saved one is gone", async () => {
+      const host = fakeSshHost("ssh-host-6");
+      sshTargets.set("ws-a", host.target);
+      sshTargets.set("ws-b", host.target);
+      await proxy.envFor("ws-a", "ssh", []);
+      const fromB = await proxy.envFor("ws-b", "ssh", []); // reuses ws-a's forward
+      removed.add("ws-a");
+      await proxy.stop();
+
+      proxy = makeProxy();
+      await proxy.restore();
+      await Bun.sleep(50);
+      expect(host.opened).toHaveLength(2);
+      const res = await fetch(`${fromB.ANTHROPIC_BASE_URL}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": fromB.ANTHROPIC_API_KEY },
+        body: "{}",
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+    });
+
+    test("a forward whose save failed is saved on the next turn", async () => {
+      const host = fakeSshHost("ssh-host-7");
+      sshTargets.set("ssh-ws", host.target);
+      await proxy.envFor("local-ws", "local", []); // the listener and its port are saved
+      await fs.promises.chmod(rootDir, 0o500); // the next state write fails
+      try {
+        await proxy.envFor("ssh-ws", "ssh", []);
+      } finally {
+        await fs.promises.chmod(rootDir, 0o700);
+      }
+      await proxy.envFor("ssh-ws", "ssh", []);
+      expect(Object.keys((await readState()).forwards)).toEqual(["ssh-host-7"]);
+    });
+
+    test("traffic through a forward and restoring it keep it restorable", async () => {
+      const host = fakeSshHost("ssh-host-10");
+      sshTargets.set("ssh-ws", host.target);
+      const env = await proxy.envFor("ssh-ws", "ssh", []);
+      const usedAt = async () => (await readState()).forwards["ssh-host-10"].usedAt;
+      const first = await usedAt();
+      try {
+        // A long job keeps calling without a new turn.
+        setSystemTime(new Date(first + 2 * 60 * 60_000));
+        const res = await fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages`, {
+          method: "POST",
+          headers: { "x-api-key": env.ANTHROPIC_API_KEY },
+          body: "{}",
+        });
+        await res.text();
+        const afterTraffic = await usedAt();
+        expect(afterTraffic).toBeGreaterThan(first);
+
+        await proxy.stop();
+        setSystemTime(new Date(first + 4 * 60 * 60_000));
+        proxy = makeProxy();
+        await proxy.restore();
+        await Bun.sleep(50);
+        expect(await usedAt()).toBeGreaterThan(afterTraffic);
+      } finally {
+        setSystemTime();
       }
     });
 

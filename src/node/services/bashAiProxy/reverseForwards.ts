@@ -11,7 +11,7 @@
  * still reaches a proxy of this root is adopted instead of replaced.
  */
 import { log } from "@/node/services/log";
-import type { ReverseForward } from "@/node/runtime/transports";
+import { ReverseForwardRefusedError, type ReverseForward } from "@/node/runtime/transports";
 
 import { candidatePorts, newHealthNonce } from "./stableIdentity";
 
@@ -42,7 +42,9 @@ const REMOTE_PORT_CANDIDATES = 4;
 const ESTABLISH_TIMEOUT_MS = 20_000;
 const PROBE_INTERVAL_MS = 500;
 /** A host that refused every candidate is not retried on every turn. */
-const RETRY_AFTER_FAILURE_MS = 5 * 60_000;
+const RETRY_AFTER_REFUSAL_MS = 5 * 60_000;
+/** A failed connection or probe is often transient (VPN, agent, host restart): retry sooner. */
+const RETRY_AFTER_TRANSIENT_MS = 30_000;
 /** An adopted forward (not ours) is probed again after this long. */
 const REVERIFY_ADOPTED_MS = 60_000;
 
@@ -52,7 +54,8 @@ interface HostState {
   owned?: ReverseForward;
   ownedClosed?: boolean;
   verifiedAt?: number;
-  failedAt?: number;
+  /** No new attempt before this time, after a failed setup. */
+  retryAt?: number;
   establishing?: Promise<number | undefined>;
 }
 
@@ -84,9 +87,7 @@ export class ReverseForwardManager {
       this.hosts.set(target.hostKey, state);
     }
     if (this.isUp(state)) return state.remotePort;
-    if (state.failedAt !== undefined && this.now() - state.failedAt < RETRY_AFTER_FAILURE_MS) {
-      return undefined;
-    }
+    if (state.retryAt !== undefined && this.now() < state.retryAt) return undefined;
     // Only the call that starts a setup waits for it: later turns on the host must not each
     // stall for the wait while a slow setup is still running.
     if (state.establishing) return waitMs === Infinity ? state.establishing : undefined;
@@ -143,25 +144,33 @@ export class ReverseForwardManager {
       REMOTE_PORT_CANDIDATES
     );
     const candidates = [...new Set([...(saved !== undefined ? [saved] : []), ...seeded])];
+    // The long cooldown is only for a host that refused forwarding on every candidate.
+    let transient = false;
     for (const remotePort of candidates) {
       if (this.closed) return undefined;
       let forward: ReverseForward;
       try {
         forward = await target.openReverseForward(remotePort, localPort);
       } catch (error) {
-        log.debug("[bash-ai-proxy] reverse forward refused", {
+        const refused = error instanceof ReverseForwardRefusedError;
+        log.debug("[bash-ai-proxy] reverse forward failed", {
           host: target.hostKey,
           remotePort,
+          refused,
           error: error instanceof Error ? error.message : String(error),
         });
-        continue;
+        if (refused) continue;
+        // The connection failed: the other candidates would fail the same way.
+        transient = true;
+        break;
       }
       if (await this.waitHealthy(target, remotePort, forward)) {
         return this.markUp(target, state, remotePort, forward);
       }
       forward.close();
+      transient = true; // the forward came up but the probe did not pass
     }
-    state.failedAt = this.now();
+    state.retryAt = this.now() + (transient ? RETRY_AFTER_TRANSIENT_MS : RETRY_AFTER_REFUSAL_MS);
     log.warn(
       "[bash-ai-proxy] no reverse forward to this SSH host; its bash AI calls stay uncounted",
       {
@@ -201,7 +210,7 @@ export class ReverseForwardManager {
     state.owned = owned;
     state.ownedClosed = false;
     state.verifiedAt = this.now();
-    state.failedAt = undefined;
+    state.retryAt = undefined;
     if (owned) {
       void owned.closed.then(() => {
         // The next ensure() re-establishes it (the SSH connection dropped, the host restarted).
