@@ -22,6 +22,7 @@ import { useMcpIcon } from "@/browser/hooks/useMcpIcon";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
 import { AppWindow, Braces } from "lucide-react";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -62,19 +63,24 @@ function useMcpAppViewsSupported(): boolean {
  */
 const OpenMcpAppViewButton: React.FC<{ workspaceId: string; view: McpAppViewRef }> = (props) => {
   if (!useMcpAppViewsSupported()) return null;
+  // Narrow cards (phones, a narrow chat) show the icon only, so the action never pushes the
+  // header past the card's right edge.
   return (
-    <button
-      type="button"
-      onClick={(e) => {
-        // The header toggles expansion; this action must not.
-        e.stopPropagation();
-        openMcpAppView(props.workspaceId, props.view);
-      }}
-      className="text-muted hover:text-foreground focus-visible:ring-accent ml-auto inline-flex shrink-0 items-center gap-1 rounded text-[11px] focus-visible:ring-1"
-    >
-      <AppWindow className="h-3 w-3" />
-      Open in Artifacts
-    </button>
+    <TooltipIfPresent tooltip="Open in Artifacts">
+      <button
+        type="button"
+        aria-label="Open in Artifacts"
+        onClick={(e) => {
+          // The header toggles expansion; this action must not.
+          e.stopPropagation();
+          openMcpAppView(props.workspaceId, props.view);
+        }}
+        className="text-muted hover:text-foreground focus-visible:ring-accent ml-auto inline-flex shrink-0 items-center gap-1 rounded text-[11px] focus-visible:ring-1"
+      >
+        <AppWindow className="h-3 w-3" />
+        <span className="hidden @[32rem]:inline">Open in Artifacts</span>
+      </button>
+    </TooltipIfPresent>
   );
 };
 
@@ -190,7 +196,7 @@ export const GenericToolCall: React.FC<GenericToolCallProps> = ({
         {TOOL_NAME_TO_ICON[toolName] && <ToolIcon toolName={toolName} />}
         {/* Display only: a plugin's stable installation ID stays in the model-facing
             name (dispatch, history, sticky expansion) but not in the readable label. */}
-        <ToolName>
+        <ToolName className={appView ? "min-w-0 truncate" : undefined}>
           {mcpServer ? mcpToolDisplayName(toolName, mcpServer.connection) : toolName}
         </ToolName>
         <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>

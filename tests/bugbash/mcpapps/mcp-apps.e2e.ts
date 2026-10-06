@@ -84,7 +84,21 @@ describe("MCP Apps views", { tags: ["mcp-apps"] }, () => {
     await agent.act("move keyboard focus to that card's 'Show input/output' button with Tab");
     const toggle = screen.getByRole("button", "Show input/output");
     await expect(toggle).toBeFocused();
-    await expect(browser).toHaveClass(toggle, /focus-visible:ring/);
+    // globals.css removes the browser outline: the button must draw its own focus style.
+    const focus = await browser.evaluate(() => {
+      const el = document.activeElement;
+      if (!(el instanceof HTMLElement)) throw new Error("nothing focused");
+      const style = getComputedStyle(el);
+      return {
+        focusVisible: el.matches(":focus-visible"),
+        boxShadow: style.boxShadow,
+        outline: style.outlineStyle,
+      };
+    });
+    expect(focus.focusVisible, JSON.stringify(focus)).toBe(true);
+    expect(focus.boxShadow !== "none" || focus.outline !== "none", JSON.stringify(focus)).toBe(
+      true
+    );
   });
 });
 

@@ -44,6 +44,9 @@ export default {
   ...base,
   // The MCP Apps suite; `e2e explore` charters ignore this glob.
   tests: "mcpapps/**/*.e2e.ts",
+  // Serial: every test shares one seeded app. In one run with 4 workers a view's re-roll
+  // (tools/call) never answered while the same click works alone; the cause is not known.
+  workers: 1,
   agents,
   targets,
 } satisfies E2EConfig;

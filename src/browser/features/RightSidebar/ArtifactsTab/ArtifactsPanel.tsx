@@ -60,7 +60,7 @@ import { useArtifactInteractions } from "./useArtifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { createCappedMemory, useCappedMemory } from "./cappedMemory";
 import { McpAppFrame } from "./McpAppFrame";
-import { mcpAppSelectionKey, summarizeToolArguments, useMcpAppViews } from "./mcpAppViewsStore";
+import { appViewPickerDetails, mcpAppSelectionKey, useMcpAppViews } from "./mcpAppViewsStore";
 import {
   type ArtifactSelection,
   type ArtifactSelectionScope,
@@ -321,6 +321,7 @@ export function ArtifactsPanel(props: {
   const setSelection = (next: Partial<ArtifactSelection>) =>
     writeArtifactSelection(props.workspaceId, next);
   const appViews = useMcpAppViews(props.workspaceId);
+  const appViewDetails = appViewPickerDetails(appViews);
   const selectedApp =
     appViews.find((view) => mcpAppSelectionKey(view.toolCallId) === selectedPath) ?? null;
 
@@ -618,13 +619,22 @@ export function ArtifactsPanel(props: {
     ...visibleOtherFiles.map((entry) => ({ scope: "artifact" as const, path: entry.path })),
   ];
   options.push(
-    ...shelfEntries.map((entry) => ({ scope: "shelf" as const, path: shelfSelectionPath(entry) }))
+    ...shelfEntries.map((entry) => ({ scope: "shelf" as const, path: shelfSelectionPath(entry) })),
+    // App views come last, as in the picker.
+    ...appViews.map((view) => ({
+      scope: "artifact" as const,
+      path: mcpAppSelectionKey(view.toolCallId),
+    }))
   );
 
   const selectRelative = (offset: number) => {
     if (options.length === 0) return;
-    const index = selected
-      ? options.findIndex((o) => o.scope === selected.scope && o.path === selected.path)
+    const current =
+      selectedApp != null
+        ? { scope: "artifact" as const, path: mcpAppSelectionKey(selectedApp.toolCallId) }
+        : selected;
+    const index = current
+      ? options.findIndex((o) => o.scope === current.scope && o.path === current.path)
       : -1;
     const next = options[Math.min(Math.max(index + offset, 0), options.length - 1)];
     if (next) select(next);
@@ -1055,7 +1065,7 @@ export function ArtifactsPanel(props: {
           {appViews.length > 0 && (
             <SelectGroup>
               <SelectLabel>App views</SelectLabel>
-              {appViews.map((view) => (
+              {appViews.map((view, index) => (
                 <SelectItem
                   key={view.toolCallId}
                   value={mcpAppSelectionKey(view.toolCallId)}
@@ -1068,8 +1078,7 @@ export function ArtifactsPanel(props: {
                       {view.label} · {view.serverName}
                     </span>
                     <span className="text-muted min-w-0 truncate text-[10px]">
-                      {view.failed ? "failed · " : view.cancelled ? "interrupted · " : ""}
-                      {summarizeToolArguments(view.arguments)}
+                      {appViewDetails[index]}
                     </span>
                   </span>
                 </SelectItem>

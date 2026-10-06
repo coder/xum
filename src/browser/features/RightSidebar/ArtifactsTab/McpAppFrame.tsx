@@ -23,6 +23,7 @@ import {
 import { closeMcpAppView, type McpAppViewRef } from "./mcpAppViewsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
+import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 import { ARTIFACT_IFRAME_SANDBOX } from "./SandboxedArtifactFrame";
 import { Notice, NoteBar } from "./SourceText";
 
@@ -144,6 +145,11 @@ export type McpAppFrameVariant = "panel" | "inline";
 const INLINE_INITIAL_HEIGHT = 160;
 const INLINE_MAX_HEIGHT = 720;
 
+/** Inline cap: INLINE_MAX_HEIGHT, but at most 80% of the window, so a phone shows the end. */
+function inlineMaxHeight(): number {
+  return Math.min(INLINE_MAX_HEIGHT, Math.round(window.innerHeight * 0.8));
+}
+
 export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
@@ -221,7 +227,7 @@ export function McpAppFrame(props: {
       containerDimensions: {
         width: containerRef.current?.clientWidth ?? 0,
         // An inline container is as tall as the frame, so its own height is no limit.
-        maxHeight: inline ? INLINE_MAX_HEIGHT : (containerRef.current?.clientHeight ?? 0),
+        maxHeight: inline ? inlineMaxHeight() : (containerRef.current?.clientHeight ?? 0),
       },
       locale: navigator.language,
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -401,7 +407,7 @@ export function McpAppFrame(props: {
       <div
         ref={containerRef}
         className={inline ? "overflow-auto" : "min-h-0 flex-1 overflow-auto"}
-        style={inline ? { maxHeight: INLINE_MAX_HEIGHT } : undefined}
+        style={inline ? { maxHeight: inlineMaxHeight() } : undefined}
       >
         {/* SECURITY AUDIT: MCP Apps view sink (see the component comment). sandbox stays exactly
             ARTIFACT_IFRAME_SANDBOX, srcdoc carries the view CSP meta first in <head>, and no
@@ -435,27 +441,6 @@ export function McpAppFrame(props: {
  * The tool call's full arguments under the consent question, scrollable, so the user sees
  * everything Allow sends.
  */
-/** Bidi format characters, which reorder how the surrounding text displays. */
-const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
-/**
- * For one-line names: bidi format characters, C0/C1 control characters and the Unicode line and
- * paragraph separators (the set mcpServerIdentity.ts treats as unsafe), which could reorder,
- * break or hide the question around the name. Backslashes too, so the escaping stays
- * unambiguous: `foo\u202e` (literal text) and `foo` + U+202E must not display alike.
- */
-const NAME_CONTROLS = /[\\\p{Cc}\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu;
-
-/**
- * Review-only rendering: the matched characters become visible `\uXXXX` escapes (a matched
- * backslash becomes `\\`), so a view cannot make the text it asks the user to approve display
- * reordered or hidden. The request itself is unchanged.
- */
-function escapeControls(text: string, pattern: RegExp = BIDI_CONTROLS): string {
-  return text.replace(pattern, (char) =>
-    char === "\\" ? "\\\\" : `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
-  );
-}
-
 function ConsentArgs(props: { json: string | null }) {
   if (props.json == null) return null;
   return (

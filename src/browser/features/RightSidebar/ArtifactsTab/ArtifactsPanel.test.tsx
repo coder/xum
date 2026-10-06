@@ -28,7 +28,12 @@ import {
 } from "@/common/constants/storage";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
-import { closeMcpAppView, openMcpAppView } from "./mcpAppViewsStore";
+import {
+  appViewPickerDetails,
+  closeMcpAppView,
+  openMcpAppView,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
 import { openArtifact } from "./openArtifact";
 
 function entry(path: string, modifiedMs: number, kind: ArtifactEntry["kind"]): ArtifactEntry {
@@ -960,6 +965,14 @@ describe("ArtifactsPanel", () => {
       act(() => writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-running" }));
       expect(await view.findByText("Report")).toBeTruthy();
       expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+
+      // J/K walk the picker into the app views and back out to the files.
+      fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "j" });
+      await view.findByTestId("mcp-app-frame");
+      expect(readArtifactSelection("ws-app-transcript").path).toBe("mcp-app:call-done");
+      fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "k" });
+      expect(await view.findByText("Report")).toBeTruthy();
+      expect(readArtifactSelection("ws-app-transcript").path).toBe("report.md");
     } finally {
       registered.mockRestore();
       getState.mockRestore();
@@ -1792,5 +1805,46 @@ describe("ArtifactsPanel", () => {
 
     fireEvent.keyDown(dialog, { key: "Escape" });
     await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+  });
+});
+
+describe("appViewPickerDetails", () => {
+  const view = (toolCallId: string, args: unknown, failed = false): McpAppViewRef => ({
+    toolCallId,
+    serverName: "dice",
+    resourceUri: "ui://dice/board.html",
+    toolName: "show_dice_board",
+    label: "show_dice_board",
+    arguments: args,
+    cancelled: failed,
+    failed,
+  });
+
+  test("tells apart calls that differ only by arguments or outcome", () => {
+    const details = appViewPickerDetails([
+      view("c", { count: 4 }, true),
+      view("b", { count: 2 }),
+      view("a", { count: 4 }),
+    ]);
+    expect(new Set(details).size).toBe(3);
+    expect(details[0]).toContain("failed");
+  });
+
+  test("numbers repeats of the same call, oldest first", () => {
+    const details = appViewPickerDetails([
+      view("new", { count: 4 }),
+      view("other", { count: 6 }),
+      view("old", { count: 4 }),
+    ]);
+    expect(new Set(details).size).toBe(3);
+    expect(details[0].endsWith("#2")).toBe(true);
+    expect(details[2].endsWith("#1")).toBe(true);
+    expect(details[1]).not.toContain("#");
+  });
+
+  test("shows control and bidi characters from model arguments as escapes", () => {
+    const [detail] = appViewPickerDetails([view("a", { label: "safe\u202Eexe.txt\nnext" })]);
+    expect(detail).not.toMatch(/[\u202E\n]/);
+    expect(detail).toContain("\\u202e");
   });
 });

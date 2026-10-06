@@ -5,6 +5,7 @@ import type { DisplayedMessage } from "@/common/types/message";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
+import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 
 /**
  * MCP Apps views (artifacts experiment), per workspace, for the Artifacts tab's "App views"
@@ -33,7 +34,8 @@ const SUMMARY_MAX_CHARS = 80;
 
 /**
  * One line naming a call by its arguments (`count: 4, sides: 6`), so the picker can tell
- * several views of the same tool apart. Strings show unquoted; other values as JSON.
+ * several views of the same tool apart. Strings show unquoted; other values as JSON. The model
+ * writes the arguments, so control and bidi characters show as visible escapes.
  */
 export function summarizeToolArguments(args: unknown): string {
   if (typeof args !== "object" || args === null || Array.isArray(args)) return "";
@@ -41,7 +43,33 @@ export function summarizeToolArguments(args: unknown): string {
     .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`)
     .join(", ")
     .replace(/\s+/g, " ");
-  return text.length > SUMMARY_MAX_CHARS ? `${text.slice(0, SUMMARY_MAX_CHARS - 1)}…` : text;
+  const short = text.length > SUMMARY_MAX_CHARS ? `${text.slice(0, SUMMARY_MAX_CHARS - 1)}…` : text;
+  return escapeControls(short, NAME_CONTROLS);
+}
+
+/**
+ * Picker detail per view (same order): the outcome, the argument summary, and `#n` when two
+ * views would otherwise read the same (the same call made twice). `#1` is the oldest, so a
+ * number stays with its call as newer calls arrive.
+ */
+export function appViewPickerDetails(views: readonly McpAppViewRef[]): string[] {
+  const details = views.map(
+    (view) =>
+      `${view.failed ? "failed · " : view.cancelled ? "interrupted · " : ""}` +
+      summarizeToolArguments(view.arguments)
+  );
+  const keys = views.map((view, i) => `${view.label}\u0000${view.serverName}\u0000${details[i]}`);
+  const total = new Map<string, number>();
+  for (const key of keys) total.set(key, (total.get(key) ?? 0) + 1);
+  const seen = new Map<string, number>();
+  return details.map((detail, i) => {
+    const count = total.get(keys[i]) ?? 0;
+    if (count < 2) return detail;
+    // Views are newest first: the first one met is the newest, number `count`.
+    const index = count - (seen.get(keys[i]) ?? 0);
+    seen.set(keys[i], (seen.get(keys[i]) ?? 0) + 1);
+    return detail === "" ? `#${index}` : `${detail} · #${index}`;
+  });
 }
 
 /** Artifacts picker value for an app view; file paths never start with this prefix. */
@@ -116,21 +144,20 @@ function sameViews(a: readonly McpAppViewRef[], b: readonly McpAppViewRef[]): bo
 }
 
 /**
- * Transcript views per workspace, newest first. The messages array changes on every stream
- * delta; the cached list keeps its identity until the set of views really changes, which
- * useSyncExternalStore needs and which spares the panel a re-render per delta.
+ * Transcript views, newest first. The messages array changes on every stream delta; the list
+ * keeps its identity until the set of views really changes, which useSyncExternalStore needs
+ * and which spares the panel a re-render per delta. Messages arrays are held only weakly, and
+ * a workspace's last list is dropped once the store no longer has the workspace.
  */
-const transcriptCache = new Map<
-  string,
-  { messages: readonly DisplayedMessage[]; views: readonly McpAppViewRef[] }
->();
+const viewsByMessages = new WeakMap<readonly DisplayedMessage[], readonly McpAppViewRef[]>();
+const lastTranscriptViews = new Map<string, readonly McpAppViewRef[]>();
 
 function transcriptViews(
   workspaceId: string,
   messages: readonly DisplayedMessage[]
 ): readonly McpAppViewRef[] {
-  const cached = transcriptCache.get(workspaceId);
-  if (cached?.messages === messages) return cached.views;
+  const known = viewsByMessages.get(messages);
+  if (known !== undefined) return known;
   const views: McpAppViewRef[] = [];
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
@@ -138,8 +165,10 @@ function transcriptViews(
     const view = mcpAppViewRefFor(message);
     if (view != null) views.push(view);
   }
-  const stable = cached != null && sameViews(cached.views, views) ? cached.views : views;
-  transcriptCache.set(workspaceId, { messages, views: stable });
+  const previous = lastTranscriptViews.get(workspaceId);
+  const stable = previous !== undefined && sameViews(previous, views) ? previous : views;
+  viewsByMessages.set(messages, stable);
+  lastTranscriptViews.set(workspaceId, stable);
   return stable;
 }
 
@@ -159,10 +188,13 @@ export function useMcpAppViews(workspaceId: string): readonly McpAppViewRef[] {
   const opened = useSyncExternalStore(subscribe, () => getMcpAppViews(workspaceId));
   const fromTranscript = useSyncExternalStore(
     (listener) => store.subscribeKey(workspaceId, listener),
-    () =>
-      store.hasRegisteredWorkspace(workspaceId)
-        ? transcriptViews(workspaceId, store.getWorkspaceState(workspaceId).messages)
-        : EMPTY
+    () => {
+      if (store.hasRegisteredWorkspace(workspaceId)) {
+        return transcriptViews(workspaceId, store.getWorkspaceState(workspaceId).messages);
+      }
+      lastTranscriptViews.delete(workspaceId);
+      return EMPTY;
+    }
   );
   return mergeViews(fromTranscript, opened);
 }

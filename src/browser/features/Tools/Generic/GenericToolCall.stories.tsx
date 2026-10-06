@@ -152,10 +152,27 @@ export const McpAppInline: Story = {
   play: ({ canvasElement }) => playMcpAppCall(canvasElement),
 };
 
+/**
+ * Phone width. The test runner plays at desktop size and ignores `globals.viewport`, so the
+ * story pins the width itself (AGENTS.md, Storybook responsive validation).
+ */
 export const McpAppInlinePhone: Story = {
   args: { toolName: "demo_app_show_dice_board" },
   globals: { viewport: { value: "phone390", isRotated: false } },
   parameters: { pixel: PIXEL_DISABLED },
-  render: () => renderMcpAppCall(),
-  play: ({ canvasElement }) => playMcpAppCall(canvasElement),
+  render: () => (
+    <div data-testid="phone-width" style={{ width: 358 }}>
+      {renderMcpAppCall()}
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    await playMcpAppCall(canvasElement);
+    // The header action stays inside the card instead of pushing past its right edge.
+    const canvas = within(canvasElement);
+    const card = canvas.getByTestId("phone-width").getBoundingClientRect();
+    const action = canvas
+      .getByRole("button", { name: "Open in Artifacts" })
+      .getBoundingClientRect();
+    await expect(action.right).toBeLessThanOrEqual(card.right);
+  },
 };
