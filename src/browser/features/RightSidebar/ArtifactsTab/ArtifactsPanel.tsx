@@ -601,7 +601,17 @@ export function ArtifactsPanel(props: {
     // at once. Script focus is not :focus-visible in Chrome, so mark the ring by hand.
     panel.focus();
     setShortcutFocused(document.activeElement === panel);
+    // The dialog's focus scope also caught focus that fell out with a removed node: a poll that
+    // swaps the viewer for a new version, or a closing comment box. Focus then sat on <body>, so
+    // J/K and Escape missed the panel (Escape could even reach Escape-to-interrupt). Do the same.
+    const observer = new MutationObserver(() => {
+      if (document.activeElement == null || document.activeElement === document.body) {
+        panel.focus();
+      }
+    });
+    observer.observe(panel, { childList: true, subtree: true });
     return () => {
+      observer.disconnect();
       restore();
       // Back to the panel, so J/K keep working without another click.
       if (!panel.contains(document.activeElement)) panel.focus();

@@ -942,6 +942,39 @@ export const BridgeEscapeExitsFullscreen: Story = {
   },
 };
 
+// Fullscreen has no focus trap, so when the viewer is swapped out from under a focused control
+// (here a selection change; in the app also a poll that finds a new version), focus would fall
+// to <body> and Escape would miss the panel. A real browser is needed: happy-dom holds
+// MutationObserver callbacks through a WeakRef, so long-lived observers die on GC there.
+const SWAP_WORKSPACE_ID = `${WORKSPACE_ID}-fullscreen-swap`;
+export const FullscreenKeepsFocusWhenViewerSwaps: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderPanel(
+      "tree.json",
+      {
+        "tree.json": ok("tree.json", '{"runs":[1,2]}'),
+        "notes.txt": ok("notes.txt", "notes"),
+      },
+      { workspaceId: SWAP_WORKSPACE_ID }
+    ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("button", { name: /^runs:/ });
+    await userEvent.click(canvas.getByRole("button", { name: "Fullscreen" }));
+    const dialog = await canvas.findByRole("dialog", { name: "Artifact tree.json" });
+    const toggle = within(dialog).getByRole("button", { name: /^runs:/ });
+    toggle.focus();
+    await expect(toggle).toHaveFocus();
+
+    writeArtifactSelection(SWAP_WORKSPACE_ID, { scope: "artifact", path: "notes.txt" });
+    await waitFor(() => expect(toggle.isConnected).toBe(false));
+    await waitFor(() => expect(dialog).toHaveFocus());
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(canvas.queryByRole("dialog")).toBeNull());
+  },
+};
+
 // MCP Apps view (artifacts experiment): a fake server view implementing the spec handshake.
 // The frame is opaque-origin, so the play test reads progress from the heights the view
 // reports: 321px only after initialize -> initialized -> tool-input -> tool-result, then
