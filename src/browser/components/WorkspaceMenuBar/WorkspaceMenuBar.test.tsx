@@ -636,11 +636,13 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       // Escape included (it interrupts a stream).
       fireEvent.keyDown(details, { key: ",", code: "Comma", ctrlKey: true, shiftKey: true });
       fireEvent.keyDown(details, { key: "Escape" });
+      // A modified Enter is another shortcut (run the latest plan), not the button's activation.
+      fireEvent.keyDown(details, { key: "Enter", altKey: true });
       // The keys the button owns stay with it.
       fireEvent.keyDown(details, { key: "Enter" });
       fireEvent.keyDown(details, { key: " " });
 
-      expect(seen).toEqual([",", "Escape"]);
+      expect(seen).toEqual([",", "Escape", "Enter"]);
     } finally {
       window.removeEventListener("keydown", recordKey);
     }
