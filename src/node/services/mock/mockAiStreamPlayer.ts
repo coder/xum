@@ -4,7 +4,7 @@ import { createMuxMessage } from "@/common/types/message";
 import type { HistoryService } from "@/node/services/historyService";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
-import type { SendMessageError } from "@/common/types/errors";
+import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import type { AIService } from "@/node/services/aiService";
 import { createErrorEvent } from "@/node/services/utils/sendMessageError";
 import {
@@ -338,7 +338,20 @@ export class MockAiStreamPlayer {
       return Ok(undefined);
     }
 
-    const latest = messages[messages.length - 1];
+    // A request that ends with a partial assistant continues an interrupted or errored turn:
+    // stream-error now keeps that partial, as StreamManager does (#5700). Real requests get a
+    // [CONTINUE] row at transform time (addInterruptedSentinel), which this mock never sees, so
+    // answer the user message that started the turn, as a provider would. commitPartial keeps
+    // `partial: true` on errored partials, so repeated retries leave several in a row.
+    let latestIndex = messages.length - 1;
+    while (
+      latestIndex >= 0 &&
+      messages[latestIndex].role === "assistant" &&
+      messages[latestIndex].metadata?.partial === true
+    ) {
+      latestIndex -= 1;
+    }
+    const latest = latestIndex >= 0 ? messages[latestIndex] : undefined;
     if (!latest || latest.role !== "user") {
       return Err({ type: "unknown", raw: "Mock AI expected a user message" });
     }
@@ -768,9 +781,11 @@ export class MockAiStreamPlayer {
   // parts here keeps mock-mode reconnects aligned with the real stream manager.
   private async writePartialFromActiveStream(
     workspaceId: string,
-    active: ActiveStream
+    active: ActiveStream,
+    // Set only by stream-error, which keeps the partial even when nothing streamed yet.
+    streamError?: { error: string; errorType: StreamErrorType }
   ): Promise<void> {
-    if (active.parts.length === 0 || active.cancelled) {
+    if ((active.parts.length === 0 && !streamError) || active.cancelled) {
       return;
     }
 
@@ -785,6 +800,7 @@ export class MockAiStreamPlayer {
         ...(active.agentId && { agentId: active.agentId }),
         ...(active.thinkingLevel && { thinkingLevel: active.thinkingLevel }),
         ...(active.muxMetadata && { muxMetadata: active.muxMetadata }),
+        ...(streamError && { error: streamError.error, errorType: streamError.errorType }),
         partial: true,
       },
       parts: structuredClone(active.parts),
@@ -973,31 +989,38 @@ export class MockAiStreamPlayer {
           return;
         }
         active.finalizing = true;
-
-        const deletePartialResult = await this.deps.historyService.deletePartial(workspaceId);
-        if (!deletePartialResult.success) {
-          log.error(`Failed to clear mock partial for ${messageId}: ${deletePartialResult.error}`);
+        // Error-path only (#5700): stream-delta and stream-end handling are unchanged.
+        if (active.partialWriteTimer) {
+          clearTimeout(active.partialWriteTimer);
+          active.partialWriteTimer = null;
         }
 
-        // Replacement streams can cancel this handler while deletePartial() is in flight.
-        // Ignore the stale error once the original active stream has been cancelled or replaced.
+        // Keep the streamed partial with its error details, as StreamManager.persistStreamError
+        // does. Deleting it left an empty assistant row after a reload, so the mock's error flow
+        // differed from a real one (#5700).
+        await this.writePartialFromActiveStream(workspaceId, active, {
+          error: payload.error,
+          errorType: payload.errorType,
+        });
+
+        // Replacement streams can cancel this handler while the write is in flight. Ignore the
+        // stale error once the original active stream has been cancelled or replaced: the stop
+        // that cancelled it joins this handler, then commits or deletes the partial by its id.
         if (!this.isCurrentActiveStream(workspaceId, active)) {
           return;
         }
 
-        active.terminalCompletion = {
-          status: "failed",
-          streamError: { messageId, error: payload.error, errorType: payload.errorType },
+        // AgentSession schedules auto-retry from the completion's streamError, so retryAfterMs
+        // must reach it (StreamManager's buildStreamErrorPayload sets it the same way).
+        const streamError = {
+          messageId,
+          error: payload.error,
+          errorType: payload.errorType,
+          ...(payload.retryAfterMs != null ? { retryAfterMs: payload.retryAfterMs } : {}),
         };
+        active.terminalCompletion = { status: "failed", streamError };
         try {
-          this.deps.aiService.emit(
-            "error",
-            createErrorEvent(workspaceId, {
-              messageId,
-              error: payload.error,
-              errorType: payload.errorType,
-            })
-          );
+          this.deps.aiService.emit("error", createErrorEvent(workspaceId, streamError));
         } finally {
           this.cleanup(workspaceId);
           active.settleCompletion(active.terminalCompletion);

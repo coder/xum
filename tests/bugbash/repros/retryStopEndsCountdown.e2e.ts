@@ -6,7 +6,7 @@ import { expect } from "e2e";
 import { openPlayground, sendMessage } from "./helpers";
 
 // The mock answers this prompt with a rate-limit error on every attempt, so auto-retry keeps
-// counting down (no Retry-After: the backoff starts at 2 s and doubles).
+// counting down (its Retry-After is 60 s, as the error text says).
 const RATE_LIMIT_PROMPT = "[mock:error:rate-limit] Trigger rate limit error";
 
 async function startRetryCountdown(screen: Screen): Promise<void> {

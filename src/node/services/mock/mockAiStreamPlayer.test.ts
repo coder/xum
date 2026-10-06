@@ -484,15 +484,19 @@ describe("MockAiStreamPlayer", () => {
       aiService: aiServiceStub as unknown as AIService,
     });
 
-    const originalDeletePartial = historyService.deletePartial.bind(historyService);
-    let deletePartialCallCount = 0;
-    spyOn(historyService, "deletePartial").mockImplementation(async (workspaceIdToDelete) => {
-      deletePartialCallCount += 1;
-      if (deletePartialCallCount === 1) {
-        await new Promise((resolve) => setTimeout(resolve, 300));
+    // Hold the error handler's partial write open, so the replacement cancels it mid-write.
+    // The API error streams no text, so the first write is the stream-error one.
+    const originalWritePartial = historyService.writePartial.bind(historyService);
+    let writePartialCallCount = 0;
+    spyOn(historyService, "writePartial").mockImplementation(
+      async (workspaceIdToWrite, message) => {
+        writePartialCallCount += 1;
+        if (writePartialCallCount === 1) {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+        return await originalWritePartial(workspaceIdToWrite, message);
       }
-      return await originalDeletePartial(workspaceIdToDelete);
-    });
+    );
 
     const workspaceId = "workspace-stale-stream-error";
     const errorEvents: Array<{ messageId?: string }> = [];
@@ -515,7 +519,7 @@ describe("MockAiStreamPlayer", () => {
     const firstPlayResult = await player.play([firstUserMessage], workspaceId);
     expect(firstPlayResult.success).toBe(true);
 
-    await waitForCondition(() => deletePartialCallCount >= 1, 1000);
+    await waitForCondition(() => writePartialCallCount >= 1, 1000);
 
     const replacementUserMessage = createMuxMessage(
       "user-stream-error-second",
@@ -638,6 +642,112 @@ describe("MockAiStreamPlayer", () => {
     const assistantMessage = historyMessages.find((message) => message.role === "assistant");
     expect(assistantMessage).toBeDefined();
     expect(extractText(assistantMessage)).toContain("Here are three programming languages");
+  });
+
+  test("keeps the streamed partial with its error details on stream error, like StreamManager", async () => {
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+
+    const workspaceId = "workspace-error-partial";
+    const userMessage = createMuxMessage(
+      "user-error-partial",
+      "user",
+      "[mock:error:context] Trigger context error",
+      { timestamp: Date.now() }
+    );
+
+    const playResult = await player.play([userMessage], workspaceId);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    const completion = await playResult.data.completion;
+    expect(completion).toMatchObject({ status: "failed" });
+
+    // StreamManager.persistStreamError keeps the partial with its error details. The mock used
+    // to delete it, which left an empty assistant row after a reload (#5700).
+    const partial = await historyService.readPartial(workspaceId);
+    if (completion.status !== "failed") throw new Error("expected a failed completion");
+    expect(partial?.id).toBe(completion.streamError.messageId);
+    expect(partial?.metadata).toMatchObject({
+      partial: true,
+      error: "Context length exceeded in mock stream.",
+      errorType: "context_exceeded",
+    });
+    expect(extractText(partial)).toBe("Streaming response before context limit.");
+  });
+
+  test("retries a request that ends with the error partial on the user message that started it", async () => {
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+
+    const workspaceId = "workspace-error-retry";
+    const userMessage = createMuxMessage(
+      "user-error-retry",
+      "user",
+      "[mock:error:context] Trigger context error",
+      { timestamp: Date.now() }
+    );
+    const first = await player.play([userMessage], workspaceId);
+    if (!first.success || !first.data) throw new Error("expected a stream handle");
+    await first.data.completion;
+    const partial = await historyService.readPartial(workspaceId);
+    if (!partial) throw new Error("expected the error partial");
+
+    // A retry or resume sends the history with the kept partial last. Real requests continue it
+    // (addInterruptedSentinel), so the mock must answer the same user prompt again, not refuse
+    // the request or echo a [CONTINUE] sentinel.
+    const retry = await player.play([userMessage, partial], workspaceId);
+    if (!retry.success || !retry.data) throw new Error("expected a stream handle for the retry");
+    expect(await retry.data.completion).toMatchObject({
+      status: "failed",
+      streamError: { error: "Context length exceeded in mock stream." },
+    });
+
+    // commitPartial keeps `partial: true` on an errored partial, so a second retry sends both
+    // partials. The mock must walk back past every one of them.
+    const secondPartial = await historyService.readPartial(workspaceId);
+    if (!secondPartial) throw new Error("expected the second error partial");
+    expect(secondPartial.id).not.toBe(partial.id);
+    const secondRetry = await player.play([userMessage, partial, secondPartial], workspaceId);
+    if (!secondRetry.success || !secondRetry.data) {
+      throw new Error("expected a stream handle for the second retry");
+    }
+    expect(await secondRetry.data.completion).toMatchObject({
+      status: "failed",
+      streamError: { error: "Context length exceeded in mock stream." },
+    });
+  });
+
+  test("passes the mock rate limit's Retry-After to the turn completion", async () => {
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+
+    const workspaceId = "workspace-rate-limit";
+    const userMessage = createMuxMessage(
+      "user-rate-limit",
+      "user",
+      "[mock:error:rate-limit] Trigger rate limit error",
+      { timestamp: Date.now() }
+    );
+
+    const playResult = await player.play([userMessage], workspaceId);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    // AgentSession schedules auto-retry from the completion's streamError, so the retry waits
+    // as long as the error text says, as with a real provider's Retry-After.
+    expect(await playResult.data.completion).toMatchObject({
+      status: "failed",
+      streamError: { errorType: "rate_limit", retryAfterMs: 60_000 },
+    });
   });
 
   test("preserves agent and workspace-turn metadata through mock stream completion", async () => {
