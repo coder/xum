@@ -119,15 +119,19 @@ test(
       await expect(search).toBeHidden();
       await expect(screen.getByRole("combobox").filter({ hasText: label })).toBeVisible();
     };
-    // Haiku 4.5 has no fast mode on any route, so the toast must name the model, not the route.
-    await pickModel("Opus 5.5", "anthropic:claude-haiku-4-5", "Haiku 4.5");
     try {
+      // Haiku 4.5 has no fast mode on any route, so the toast must name the model, not the route.
+      await pickModel("Opus 5.5", "anthropic:claude-haiku-4-5", "Haiku 4.5");
       await composer.tap();
       await browser.keyboard.press("Control+Shift+F");
       await expect(screen.getByText(/this model has no fast mode/)).toBeVisible();
     } finally {
       // Every repro in a run shares this workspace: put its model back, also after a failure.
-      await pickModel("Haiku 4.5", "anthropic:claude-opus-5-5", "Opus 5.5");
+      // The first switch can fail before it changes the model, so restore only when it did.
+      const onOpus = await screen.getByRole("combobox").filter({ hasText: "Opus 5.5" }).isVisible();
+      if (!onOpus) {
+        await pickModel("Haiku 4.5", "anthropic:claude-opus-5-5", "Opus 5.5");
+      }
     }
   }
 );
