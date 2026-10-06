@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import * as fs from "fs";
+import * as fs from "fs/promises";
 import * as path from "path";
 import type { Workspace } from "@/common/types/project";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -31,6 +31,11 @@ describe("WorkspaceService single-row metadata reads", () => {
     runtimeConfig: { type: "local" },
     ...fields,
   });
+
+  type MetadataEvent = { workspaceId: string; metadata: FrontendWorkspaceMetadata | null };
+
+  /** TaskService emits through its WorkspaceHost; this double records those emits. */
+  const hostEmit = () => mock((_event: string, _payload: MetadataEvent) => true);
 
   /** Rows emitted for each id, in order; the service emits through its own `metadata` event. */
   function recordEmits() {
@@ -67,7 +72,7 @@ describe("WorkspaceService single-row metadata reads", () => {
       row("kid", { parentWorkspaceId: "dup" }),
     ]);
     const emitted = recordEmits();
-    const emitWorkspace = mock(() => true);
+    const emitWorkspace = hostEmit();
     const { taskService } = createTaskServiceStack(harness.config, {
       workspaceService: createWorkspaceServiceMocks({ emit: emitWorkspace }).workspaceService,
     });
@@ -79,9 +84,7 @@ describe("WorkspaceService single-row metadata reads", () => {
         await taskService.emitWorkspaceMetadata(id);
       }
       expect((await harness.service.getInfo("dup"))?.title).toBe("first");
-      const taskEmits = emitWorkspace.mock.calls as unknown as Array<
-        [string, { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }]
-      >;
+      const taskEmits = emitWorkspace.mock.calls;
       expect(
         taskEmits.map(([, event]) => [event.workspaceId, event.metadata?.rootWorkspaceId])
       ).toEqual([
@@ -112,12 +115,12 @@ describe("WorkspaceService single-row metadata reads", () => {
       // Worktree checkout deleted outside Xum: reads must report it as transcript-only.
       row("gone", { runtimeConfig: { type: "worktree", srcBaseDir: harness.config.srcDir } }),
     ]);
-    fs.mkdirSync(path.join(harness.config.rootDir, "checkouts", "child"), { recursive: true });
+    await fs.mkdir(path.join(harness.config.rootDir, "checkouts", "child"), { recursive: true });
     const full = await harness.config.getAllWorkspaceMetadata();
     const expected = (id: string) => full.find((metadata) => metadata.id === id)!;
     expect(expected("gone").transcriptOnly).toBe(true);
     const emitted = recordEmits();
-    const emitWorkspace = mock(() => true);
+    const emitWorkspace = hostEmit();
     const { taskService } = createTaskServiceStack(harness.config, {
       workspaceService: createWorkspaceServiceMocks({ emit: emitWorkspace }).workspaceService,
     });

@@ -9,7 +9,7 @@
  * Keep helpers in this file: bench-compare resolves imports from each side's own tree, and test
  * harnesses import bun:test, which does not load on Node.
  */
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { bench } from "mitata";
 import type { ProjectConfig, Workspace } from "@/common/types/project";
@@ -45,7 +45,7 @@ function workspaceId(index: number): string {
  * root row, 99% worktree runtime and 76% of checkout paths missing (each missing path costs a
  * failed fs access in the full build).
  */
-function makeProjects(root: string, count: number): Map<string, ProjectConfig> {
+async function makeProjects(root: string, count: number): Promise<Map<string, ProjectConfig>> {
   const spread = (index: number, salt: number, percent: number) =>
     (index * salt + salt) % 100 < percent;
   const projects = new Map<string, ProjectConfig>();
@@ -81,7 +81,7 @@ function makeProjects(root: string, count: number): Map<string, ProjectConfig> {
       lastRoot = { id, project };
     }
     if (spread(i, 37, 57)) workspace.archivedAt = "2026-09-15T12:00:00.000Z";
-    if (!spread(i, 53, 76)) fs.mkdirSync(workspacePath, { recursive: true });
+    if (!spread(i, 53, 76)) await fs.mkdir(workspacePath, { recursive: true });
     projectList[project].workspaces.push(workspace);
   }
   return projects;
@@ -102,7 +102,7 @@ function stubAIService(): AIService {
 
 async function makeService(count: number): Promise<{ service: WorkspaceService; lastId: string }> {
   const root = path.join(tempDir.path, `n${count}`);
-  const projects = makeProjects(root, count);
+  const projects = await makeProjects(root, count);
   const config = new Config(root);
   await config.editConfig((snapshot) => {
     snapshot.projects = projects;
