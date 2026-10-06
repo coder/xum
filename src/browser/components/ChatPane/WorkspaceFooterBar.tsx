@@ -172,10 +172,11 @@ function FooterRepositoryLabel(props: { workspaceId: string; projectLabel: strin
           target="_blank"
           rel="noopener noreferrer"
           data-testid="workspace-footer-repository"
-          className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 shrink-0 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1"
+          className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 min-w-0 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1"
         >
           <Github className="h-3 w-3 shrink-0" aria-hidden="true" />
-          <span className="font-mono">{slug}</span>
+          {/* Truncates like the branch name, so a long owner/repo fits a phone screen (#5769). */}
+          <span className="truncate font-mono">{slug}</span>
         </a>
       </TooltipTrigger>
       <TooltipContent side="top">Open on GitHub</TooltipContent>

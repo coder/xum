@@ -36,6 +36,19 @@ const LONG_SCRIPT = [
   "echo five",
 ].join("\n");
 
+const PR_DETECTION_JSON = JSON.stringify({
+  number: 5769,
+  url: "https://github.com/a-long-organization-name/a-long-repository-name/pull/5769",
+  state: "OPEN",
+  mergeable: "MERGEABLE",
+  mergeStateStatus: "CLEAN",
+  title: "Phone footer fits",
+  isDraft: false,
+  headRefName: "bugbash-playground-with-a-long-name",
+  baseRefName: "main",
+  statusCheckRollup: [],
+});
+
 export const FooterAndScriptBlock: AppStory = {
   // A phone viewport for local viewing (the fixed frame does not move innerWidth).
   globals: {
@@ -49,6 +62,14 @@ export const FooterAndScriptBlock: AppStory = {
           // A long branch name: the footer row must truncate it instead of scrolling sideways.
           workspaceName: "bugbash-playground-with-a-long-name",
           projectName: "demo-app",
+          // A detected PR swaps the project label for the PR's owner/repo, which can be long too.
+          executeBash: (_workspaceId, script) =>
+            Promise.resolve({
+              success: true as const,
+              output: script.includes("gh pr view") ? PR_DETECTION_JSON : "",
+              exitCode: 0,
+              wall_duration_ms: 5,
+            }),
           messages: [
             createUserMessage("msg-1", "Call the API three times", {
               historySequence: 1,
@@ -95,6 +116,9 @@ export const FooterAndScriptBlock: AppStory = {
     });
     await waitFor(() => {
       if (!footerRow.textContent?.includes("Last prompt")) throw new Error("Footer still loading");
+      if (!storyRoot.querySelector('[data-testid="workspace-footer-repository"]')) {
+        throw new Error("PR repository label not shown yet");
+      }
       // Everything fits: nothing sits past the right edge, so no item can look missing.
       void expect(footerRow.scrollWidth).toBeLessThanOrEqual(footerRow.clientWidth);
     });
