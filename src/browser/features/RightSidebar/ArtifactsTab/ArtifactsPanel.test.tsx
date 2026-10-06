@@ -1560,7 +1560,9 @@ describe("ArtifactsPanel", () => {
     )!;
     // userEvent: under happy-dom, fireEvent.change on a textarea never reaches React's onChange
     // (InstructionsSection.test.tsx works around the same thing).
-    await userEvent.setup({ document: textarea.ownerDocument }).type(textarea, "Where is this from?");
+    await userEvent
+      .setup({ document: textarea.ownerDocument })
+      .type(textarea, "Where is this from?");
     first.unmount();
 
     const second = renderPanel(workspaceId);
