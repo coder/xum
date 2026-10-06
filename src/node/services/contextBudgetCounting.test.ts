@@ -16,6 +16,7 @@ import {
   estimateAssembledRequestTokensForModel,
   estimateFreshRequestTokensForModel,
   estimateToolResultTokensForModel,
+  measureAssembledRequestBudgetForModel,
 } from "./contextBudgetCounting";
 
 const model = "openai:gpt-4o";
@@ -772,6 +773,32 @@ describe("anchored request estimate (#4858)", () => {
       "context_budget_exceeded"
     );
     expect(await checkAssembledRequestBudgetForModel(payload, options, anchor)).toBeUndefined();
+  });
+
+  // #5286: turn-start stage decisions read this measure, so it must be the count the check enforces.
+  test.each([
+    ["a fitting request", 200_000],
+    ["an over-ceiling request", 4_000],
+  ])("%s measures the estimate the turn-start check enforces", async (_name, limit) => {
+    const opts = { ...options, modelContextLimit: limit };
+    const measured = await measureAssembledRequestBudgetForModel(payload, opts);
+    const full = (await estimateAssembledRequestTokensForModel(payload, opts))!;
+    expect(measured).toMatchObject(full);
+    expect(measured!.exceeded).toEqual(await checkAssembledRequestBudgetForModel(payload, opts));
+    expect(measured!.exceeded != null).toBe(limit < 200_000);
+    expect(measured!.exceeded == null || !("delta" in measured!.exceeded)).toBe(true);
+  });
+
+  test("an exact append reports the counted delta; a rewritten prefix reports none", async () => {
+    const appended = (await measureAssembledRequestBudgetForModel(payload, options, anchor))!;
+    expect(appended.delta).toBeDefined();
+    expect(anchor.providerTokens + appended.delta!).toBe(appended.estimate);
+    const rewritten = { ...payload, messages: [{ ...prefix[0] }, prefix[1], ...delta] };
+    const full = (await measureAssembledRequestBudgetForModel(rewritten, options, anchor))!;
+    expect(full.delta).toBeUndefined();
+    expect(full.estimate).toBe(
+      (await estimateAssembledRequestTokensForModel(rewritten, options))!.estimate
+    );
   });
 });
 

@@ -864,3 +864,148 @@ describe("settled context hard ceiling", () => {
     }
   }, 20000);
 });
+
+// #5286: turn-start stage decisions (PR1b/PR2) reuse the settled step's appended-message delta only
+// while every budget count of the turn was an exact append; any full count or rebuild must say so.
+describe("exact-append chain (#5286)", () => {
+  const usage = {
+    inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+    outputTokens: { total: 10, text: 10, reasoning: 0 },
+  };
+  const toolCall = (id: string): LanguageModelV3StreamPart[] => [
+    { type: "stream-start", warnings: [] },
+    { type: "tool-call", toolCallId: id, toolName: "read", input: "{}" },
+    { type: "finish", finishReason: { unified: "tool-calls", raw: "tool_calls" }, usage },
+  ];
+  const text: LanguageModelV3StreamPart[] = [
+    { type: "stream-start", warnings: [] },
+    { type: "text-start", id: "answer" },
+    { type: "text-delta", id: "answer", delta: "Done" },
+    { type: "text-end", id: "answer" },
+    { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
+  ];
+  // Answers each provider call with the next scripted chunk list.
+  const scripted = (calls: LanguageModelV3StreamPart[][]) => {
+    let call = 0;
+    return new MockLanguageModelV3({
+      doStream: () =>
+        Promise.resolve({ stream: simulateReadableStream({ chunks: calls[call++] ?? text }) }),
+    });
+  };
+
+  async function runTurn(mode: "exact" | "thinking" | "fallback"): Promise<SettledStepBudget[]> {
+    const h = await createTestHistoryService();
+    const workspaceId = `exact-append-${mode}`;
+    const messageId = `assistant-${mode}`;
+    const settled: SettledStepBudget[] = [];
+    const thinkingOverrideState: { pending?: "high" } = {};
+    const tools = {
+      read: tool({
+        inputSchema: z.object({}),
+        execute: () => {
+          // A thinking change written while the first tool runs is consumed by the next step.
+          if (mode === "thinking" && settled.length === 0) thinkingOverrideState.pending = "high";
+          return "part text line ".repeat(50);
+        },
+      }),
+    };
+    const refusal: LanguageModelV3StreamPart[] = [
+      { type: "stream-start", warnings: [] },
+      { type: "finish", finishReason: { unified: "content-filter", raw: "refusal" }, usage },
+    ];
+    const manager = new StreamManager(h.historyService);
+    const runtimeDir = path.join(h.tempDir, "runtime");
+    await fs.mkdir(runtimeDir);
+    try {
+      expect(
+        (
+          await h.historyService.appendManyToHistory(workspaceId, [
+            createMuxMessage("user", "user", "Read the part"),
+            createMuxMessage(messageId, "assistant", ""),
+          ])
+        ).success
+      ).toBe(true);
+      const started = await manager.startStream({
+        workspaceId,
+        messageId,
+        historySequence: 1,
+        model: scripted(
+          mode === "fallback" ? [refusal] : [toolCall("first"), toolCall("second"), text]
+        ),
+        modelString: "openai:gpt-4o",
+        messages: [{ role: "user", content: "Read the part" }],
+        system: "Small system",
+        runtime: new LocalRuntime(h.tempDir),
+        providedRuntimeTempDir: runtimeDir,
+        tools,
+        contextBudgetLimit: 100_000,
+        ...(mode === "thinking"
+          ? {
+              thinkingOverrideState,
+              rebuildProviderOptionsForThinkingLevel: () => ({
+                providerOptions: {},
+                effectiveLevel: "high" as const,
+              }),
+            }
+          : {}),
+        ...(mode === "fallback"
+          ? {
+              modelFallback: {
+                chain: ["openai:gpt-4o-mini"],
+                prepare: (modelString: string) =>
+                  Promise.resolve({
+                    success: true as const,
+                    data: {
+                      model: scripted([toolCall("first"), text]),
+                      modelString,
+                      messages: [{ role: "user" as const, content: "Read the part" }],
+                      system: "Small system",
+                      tools,
+                      contextBudgetLimit: 100_000,
+                    },
+                  }),
+              },
+            }
+          : {}),
+        onStepSettled: (step) => {
+          settled.push(step);
+          return Promise.resolve({ decision: "continue" });
+        },
+      });
+      if (!started.success) throw new Error("Expected stream startup");
+      const completion = await started.data.completion;
+      expect(completion.status).toBe("completed");
+      return settled;
+    } finally {
+      await manager.stopStream(workspaceId);
+      await h.cleanup();
+    }
+  }
+
+  test("a turn of exact appends reports the chain and the counted delta on every step", async () => {
+    const settled = await runTurn("exact");
+    expect(settled).toHaveLength(2);
+    for (const step of settled) {
+      expect(step.exactAppendChain).toBe(true);
+      expect(step.nextRequestDeltaTokens).toBeDefined();
+      expect(step.usage!.inputTokens! + step.nextRequestDeltaTokens!).toBe(step.nextRequestTokens!);
+    }
+  });
+
+  test("a mid-turn thinking rebuild breaks the chain for later steps", async () => {
+    const settled = await runTurn("thinking");
+    expect(settled).toHaveLength(2);
+    expect(settled[0].exactAppendChain).toBe(true);
+    // Its own settle estimate was still an exact append; the rebuilt request broke the chain.
+    expect(settled[1].nextRequestDeltaTokens).toBeDefined();
+    expect(settled[1].exactAppendChain).toBe(false);
+  });
+
+  test("a fallback hop's full step-0 count breaks the chain", async () => {
+    const settled = await runTurn("fallback");
+    expect(settled).toHaveLength(1);
+    expect(settled[0].model).toBe("openai:gpt-4o-mini");
+    expect(settled[0].nextRequestDeltaTokens).toBeDefined();
+    expect(settled[0].exactAppendChain).toBe(false);
+  });
+});

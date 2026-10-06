@@ -3,6 +3,7 @@ import { tool } from "ai";
 import { z } from "zod";
 import { getContextBudgetHardCeiling } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError } from "./contextBudgetError";
+import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -417,6 +418,36 @@ describe("TurnRequestBuilder assembled preflight", () => {
   it("leaves legacy behavior unchanged when the effective budget flag is disabled", async () => {
     const payload = await assembleBudgetCheckedPromptPayload(options(), { enabled: false });
     expect(payload.messages.length).toBeGreaterThan(0);
+  });
+
+  // #5286: turn-start stage decisions read E from the payload instead of counting it again.
+  it("keeps the enforced estimate on the payload", async () => {
+    const request = options("openai:large-context-model");
+    const payload = await assembleBudgetCheckedPromptPayload(request, { enabled: true });
+    expect(payload.contextBudgetEstimate).toBe(
+      (await estimateAssembledRequestTokensForModel(payload, {
+        model: request.modelString,
+        modelContextLimit: payload.contextBudgetLimit,
+      }))!.estimate
+    );
+    const off = await assembleBudgetCheckedPromptPayload(request, { enabled: false });
+    expect(off.contextBudgetEstimate).toBeUndefined();
+  });
+
+  it("measure-only mode returns the over-ceiling estimate instead of refusing", async () => {
+    const refused = await assembleBudgetCheckedPromptPayload(options(), { enabled: true }).catch(
+      (error: unknown) => error
+    );
+    if (!(refused instanceof ContextBudgetExceededError)) throw new Error("Expected refusal");
+    const measured = await assembleBudgetCheckedPromptPayload(options(), {
+      enabled: true,
+      measureOnly: true,
+    });
+    expect(measured.contextBudgetEstimate).toBe(refused.details.estimate);
+    const unchecked = await assembleBudgetCheckedPromptPayload(options(), { enabled: false });
+    expect(measured.messages).toEqual(unchecked.messages);
+    expect(measured.system).toEqual(unchecked.system);
+    expect(Object.keys(measured.tools ?? {})).toEqual(Object.keys(unchecked.tools ?? {}));
   });
 });
 
