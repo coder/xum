@@ -1,0 +1,352 @@
+/**
+ * Runs one bug-bash e2e job in a disposable container: the bug-bash sandbox (#5714).
+ * Usage, from tests/bugbash:
+ *   bun sandbox/launch.ts -- run --config e2e.config.ts --output .e2e/<folder> [e2e args...]
+ *
+ * The container runs the e2e CLI, Chromium and the seeded app. It gets no network, no
+ * capabilities, a read-only root, copies of the git-listed inputs, and read-only dist/ and
+ * node_modules/. Its output comes back on its stdout as an export stream (exportStream.ts).
+ *
+ * BUGBASH_SANDBOX=auto (default): without usable Docker, or with the real app AI (that needs the
+ * provider proxy, a later step of #5714), the exact-step job runs on the host as before.
+ * BUGBASH_SANDBOX=require refuses instead. Only `e2e run` (exact-step tests) falls back: any
+ * other e2e command, such as `explore`, lets a model pick the actions, so it never runs on the host.
+ * Exit codes: the job's code, 2 when the launcher refuses, 4 when the evidence is incomplete.
+ */
+import { spawn, spawnSync } from "child_process";
+import * as crypto from "crypto";
+import * as fs from "fs";
+import { createRequire } from "module";
+import * as os from "os";
+import * as path from "path";
+import { receiveExport } from "./exportStream";
+
+const ROOT = path.resolve(import.meta.dir, "../../..");
+const BUGBASH_DIR = path.join(ROOT, "tests/bugbash");
+const DEADLINE_MS = 30 * 60_000;
+// The container reads copies of these git-listed inputs. A symlink stops the launch.
+const INPUTS = ["src", "tests/bugbash", "tsconfig.json", "package.json"];
+// The host env names that e2e.config.ts and startApp.ts read. No other host value passes.
+const PASS_ENV = [
+  "BUGBASH_AI",
+  "BUGBASH_AI_RESOLVED",
+  "BUGBASH_AI_REASON",
+  "BUGBASH_APP_MODEL",
+  "BUGBASH_MODEL",
+  "BUGBASH_EFFORT",
+  "BUGBASH_APP_LOG",
+  "E2E_TELEMETRY_DISABLED",
+];
+
+export class Refusal extends Error {}
+const log = (message: string) => console.error(`sandbox ${message}`);
+const sha = (text: string) => crypto.createHash("sha256").update(text).digest("hex");
+
+// The docker CLI gets only what it needs to find the daemon: no keys, no tokens.
+function dockerEnv(): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([k]) => k === "PATH" || k === "HOME" || k.startsWith("DOCKER_")
+    )
+  );
+}
+
+function docker(args: string[], options: { timeoutMs: number; input?: string; quiet?: boolean }) {
+  const r = spawnSync("docker", args, {
+    env: dockerEnv(),
+    encoding: "utf8",
+    timeout: options.timeoutMs,
+    input: options.input,
+    stdio: [
+      options.input == null ? "ignore" : "pipe",
+      options.quiet === false ? 2 : "pipe",
+      "pipe",
+    ],
+  });
+  const error = r.error?.message ?? (r.status === 0 ? "" : (r.stderr || `exit ${r.status}`).trim());
+  return { ok: error === "", stdout: (r.stdout ?? "").trim(), error };
+}
+
+/** Why this host cannot run the sandbox, or null. It runs before any image build. */
+export function checkEndpoint(): string | null {
+  if (process.platform !== "linux") return `${process.platform}: the sandbox needs Linux`;
+  if (process.getuid?.() === 0) return "the sandbox does not run as root";
+  const host = docker(["context", "inspect", "--format", "{{.Endpoints.docker.Host}}"], {
+    timeoutMs: 10_000,
+  });
+  if (!host.ok) return `docker: ${host.error}`;
+  if (!host.stdout.startsWith("unix://"))
+    return `docker endpoint ${host.stdout}: not a local socket`;
+  const info = docker(["info", "--format", "{{json .}}"], { timeoutMs: 15_000 });
+  if (!info.ok) return `docker info: ${info.error}`;
+  const daemon = JSON.parse(info.stdout) as {
+    OSType?: string;
+    OperatingSystem?: string;
+    SecurityOptions?: string[];
+  };
+  if (daemon.OSType !== "linux" || /docker desktop/i.test(daemon.OperatingSystem ?? ""))
+    return "Docker Desktop is not supported";
+  if ((daemon.SecurityOptions ?? []).some((o) => o.includes("rootless")))
+    return "rootless Docker is not supported";
+  return null;
+}
+
+function ensureImage(): string {
+  const dockerfile = fs.readFileSync(path.join(import.meta.dir, "Dockerfile"), "utf8");
+  // The Chromium build that the checkout's @e2e-dev/web expects.
+  const web = createRequire(path.join(ROOT, "package.json")).resolve("@e2e-dev/web");
+  const playwright = (createRequire(web)("playwright-core/package.json") as { version: string })
+    .version;
+  const image = `xum-bugbash-sandbox:${sha(`${dockerfile}\0${playwright}`).slice(0, 12)}`;
+  if (docker(["image", "inspect", image], { timeoutMs: 15_000 }).ok) return image;
+  log(`building ${image}`);
+  const args = ["build", "--build-arg", `PLAYWRIGHT_CORE_VERSION=${playwright}`, "-t", image, "-"];
+  const built = docker(args, { timeoutMs: 20 * 60_000, input: dockerfile, quiet: false });
+  if (!built.ok) throw new Refusal(`image build: ${built.error}`);
+  return image;
+}
+
+function stage(into: string): number {
+  // Tracked files, and new files that git does not ignore (a new repro). Ignored files stay out:
+  // old .e2e runs, app logs and local env files.
+  // prettier-ignore
+  const listArgs = ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--deduplicate"];
+  const listed = spawnSync("git", ["-C", ROOT, ...listArgs, "--", ...INPUTS], {
+    encoding: "utf8",
+    maxBuffer: 64 << 20,
+  });
+  if (listed.status !== 0) throw new Refusal(`git ls-files: ${listed.stderr}`);
+  let count = 0;
+  for (const rel of listed.stdout.split("\0").filter((name) => name !== "")) {
+    const st = fs.lstatSync(path.join(ROOT, rel), { throwIfNoEntry: false });
+    if (st == null) continue; // deleted in the work tree
+    if (!st.isFile()) throw new Refusal(`stage: ${rel} is not a regular file`);
+    fs.mkdirSync(path.join(into, path.dirname(rel)), { recursive: true });
+    fs.copyFileSync(path.join(ROOT, rel), path.join(into, rel), fs.constants.COPYFILE_EXCL);
+    count += 1;
+  }
+  // Mount points for the read-only build outputs and the job's tmpfs.
+  for (const dir of ["dist", "node_modules", "tests/bugbash/.e2e"])
+    fs.mkdirSync(path.join(into, dir), { recursive: true });
+  return count;
+}
+
+// --mount, not -v: a missing source fails instead of creating an empty folder.
+function bind(src: string, dst: string): string[] {
+  if (`${src}${dst}`.includes(",")) throw new Refusal(`a comma in a mount path: ${src}`);
+  return ["--mount", `type=bind,src=${src},dst=${dst},readonly`];
+}
+
+/** Same boot id: the daemon shares this kernel. Same nonce: it sees this host's files at these paths. */
+function checkSameHost(image: string, stageDir: string): string | null {
+  const nonce = crypto.randomUUID();
+  fs.writeFileSync(path.join(stageDir, ".nonce"), nonce, { flag: "wx" });
+  // prettier-ignore
+  const probe = ["run", "--rm", "--network", "none", ...bind(stageDir, "/probe"), image,
+    "cat", "/proc/sys/kernel/random/boot_id", "/probe/.nonce"];
+  const r = docker(probe, { timeoutMs: 60_000 });
+  if (!r.ok) return `probe container: ${r.error}`;
+  const [boot, seen] = r.stdout.split("\n");
+  if (boot !== fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim())
+    return "the daemon runs on another kernel";
+  return seen === nonce ? null : "the daemon sees other files at these paths";
+}
+
+/** boot id : PID namespace : PID : start time of this launcher. A later sweep reads it. */
+function ownerLabel(): string {
+  const boot = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  const pidns = fs.readlinkSync("/proc/self/ns/pid").replace(/\D/g, "");
+  const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+  return `${boot}:${pidns}:${process.pid}:${stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]}`;
+}
+
+// No credential reaches the container, also not through a caller's extra values.
+const CREDENTIAL = /(_API_KEY|_AUTH_TOKEN|_TOKEN|_BASE_URL|_SECRET|_PASSWORD)$/;
+
+/** The container env: fixed values, the allowlisted host names and the caller's extra values. */
+export function containerEnv(
+  host: NodeJS.ProcessEnv,
+  extra: Record<string, string>
+): Record<string, string> {
+  const env: Record<string, string> = { HOME: "/home/bugbash", TMPDIR: "/tmp" };
+  for (const key of PASS_ENV) if (host[key] != null) env[key] = host[key];
+  Object.assign(env, extra, { BUGBASH_CONTAINER: "1" });
+  for (const key of Object.keys(env))
+    if (CREDENTIAL.test(key)) throw new Refusal(`${key}: no credential enters the sandbox`);
+  return env;
+}
+
+export interface SandboxRun {
+  command: string[];
+  /** The job's output folder, relative to tests/bugbash. It comes back to the same host path. */
+  exportDir: string;
+  env?: Record<string, string>;
+}
+
+export async function runInSandbox(run: SandboxRun): Promise<number> {
+  const dest = path.join(BUGBASH_DIR, run.exportDir);
+  if (fs.existsSync(dest)) throw new Refusal(`${run.exportDir} exists: remove it first`);
+  const image = ensureImage();
+  const checkoutId = sha(ROOT).slice(0, 12);
+  const name = `xbb-${checkoutId.slice(0, 6)}-${crypto.randomBytes(3).toString("hex")}`;
+  const jobDir = path.join(os.tmpdir(), "xum-bugbash-sandbox", checkoutId, name);
+  fs.mkdirSync(jobDir, { recursive: true, mode: 0o700 });
+  try {
+    const stageDir = path.join(jobDir, "stage");
+    const started = Date.now();
+    const files = stage(stageDir);
+    log(`${name} staged ${files} files in ${((Date.now() - started) / 1000).toFixed(2)} s`);
+    const different = checkSameHost(image, stageDir);
+    if (different != null) throw new Refusal(different);
+    const uid = process.getuid?.() ?? 1000;
+    const gid = process.getgid?.() ?? 1000;
+    fs.writeFileSync(
+      path.join(jobDir, "passwd"),
+      `root:x:0:0::/root:/usr/sbin/nologin\nbugbash:x:${uid}:${gid}::/home/bugbash:/bin/sh\n`
+    );
+    fs.writeFileSync(path.join(jobDir, "group"), `root:x:0:\nbugbash:x:${gid}:\n`);
+    const env = containerEnv(process.env, run.env ?? {});
+    const owner = ownerLabel();
+    // prettier-ignore
+    const args = ["run", "--rm", "-i", "--init", "--name", name,
+      "--label", `xum.bugbash.checkout=${checkoutId}`, "--label", `xum.bugbash.owner=${owner}`,
+      "--log-driver", "none", "--network", "none", "--user", `${uid}:${gid}`,
+      "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
+      "--pids-limit", "4096", "--memory", "4g", "--memory-swap", "4g",
+      "--tmpfs", "/tmp:rw,nosuid,nodev,size=4g", "--tmpfs", "/home/bugbash:rw,nosuid,nodev,size=1g",
+      "--tmpfs", `/repo/tests/bugbash/.e2e:rw,nosuid,nodev,size=1g,uid=${uid},gid=${gid}`,
+      ...bind(stageDir, "/repo"), ...bind(path.join(ROOT, "dist"), "/repo/dist"),
+      ...bind(path.join(ROOT, "node_modules"), "/repo/node_modules"),
+      ...bind(path.join(jobDir, "passwd"), "/etc/passwd"), ...bind(path.join(jobDir, "group"), "/etc/group"),
+      ...Object.entries(env).flatMap(([key, value]) => ["-e", `${key}=${value}`]),
+      "-w", "/repo/tests/bugbash", "--entrypoint", "bun", image,
+      "sandbox/entry.ts", "--export", run.exportDir, "--", ...run.command];
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    log(`${name} --network none, ${process.env.BUGBASH_AI_RESOLVED ?? "no"} app AI, no proxy`);
+    return await runContainer(args, { name, owner, dest });
+  } finally {
+    fs.rmSync(jobDir, { recursive: true, force: true });
+  }
+}
+
+async function runContainer(args: string[], job: { name: string; owner: string; dest: string }) {
+  // The lifeline: this process holds the container's stdin. When it dies, the pipe closes and
+  // entry.ts stops the job (measured: the container was gone 0.59 s after a SIGKILL).
+  const child = spawn("docker", args, { env: dockerEnv(), stdio: ["pipe", "pipe", "inherit"] });
+  child.stdin.on("error", () => undefined);
+  const exported = receiveExport(child.stdout, job.dest);
+  let stopped: string | null = null;
+  const stop = (reason: string) => {
+    if (stopped != null) return;
+    stopped = reason;
+    log(`${job.name} stopping: ${reason}`);
+    removeContainer(job);
+  };
+  const timer = setTimeout(() => stop("the 30 min deadline"), DEADLINE_MS);
+  const onSignal = (signal: NodeJS.Signals) => stop(signal);
+  process.on("SIGINT", onSignal).on("SIGTERM", onSignal);
+  const code = await new Promise<number>((resolve) => {
+    child.on("error", () => resolve(125)).on("exit", (exit) => resolve(exit ?? 125));
+  });
+  clearTimeout(timer);
+  process.off("SIGINT", onSignal).off("SIGTERM", onSignal);
+  const result = await exported;
+  const size = `${result.files} files, ${(result.bytes / 1e6).toFixed(1)} MB`;
+  log(
+    `${job.name} job exit ${code}, export ${size}, ${result.complete ? "complete" : `incomplete: ${result.error}`}`
+  );
+  log(`${job.name} ${removeContainer(job)}`);
+  if (stopped != null) return stopped === "SIGINT" ? 130 : 143;
+  return result.complete ? code : 4;
+}
+
+/** Removes the job's container. It matches the name AND the owner label, never the name alone. */
+function removeContainer(job: { name: string; owner: string }): string {
+  const filters = [
+    "--filter",
+    `name=^/${job.name}$`,
+    "--filter",
+    `label=xum.bugbash.owner=${job.owner}`,
+  ];
+  const find = () => docker(["ps", "-aq", "--no-trunc", ...filters], { timeoutMs: 15_000 });
+  const found = find();
+  if (!found.ok) return `container state unknown: ${found.error}`;
+  if (found.stdout === "") return "removed";
+  docker(["rm", "-f", found.stdout], { timeoutMs: 30_000 });
+  const after = find();
+  if (!after.ok) return `container state unknown: ${after.error}`;
+  return after.stdout === "" ? "removed" : `still present: docker rm -f ${found.stdout}`;
+}
+
+/** Why this job runs on the host, or null for the sandbox. */
+function hostReason(): string | null {
+  if (process.env.BUGBASH_AI_RESOLVED !== "mock")
+    return "the real app AI needs the sandbox's provider proxy, which is not built yet (#5714)";
+  return checkEndpoint();
+}
+
+function runOnHost(args: string[]): Promise<number> {
+  const spec = process.env.E2E_NODE ?? "node";
+  const node = spec.includes("/") ? spec : Bun.which(spec);
+  if (node == null) throw new Refusal(`E2E_NODE ${spec}: not found`);
+  // The node directory leads PATH, so the app command and its children use the same node.
+  const PATH = `${path.dirname(node)}${path.delimiter}${process.env.PATH ?? ""}`;
+  const child = spawn(node, [path.join(ROOT, "node_modules/.bin/e2e"), ...args], {
+    stdio: "inherit",
+    env: { ...process.env, PATH },
+  });
+  return new Promise((resolve) => child.on("exit", (code) => resolve(code ?? 1)));
+}
+
+/** The one `--output .e2e/<folder>` of the e2e args. The export comes back to that folder only. */
+export function outputDir(args: string[]): string {
+  const values = args.flatMap((arg, i) =>
+    arg === "--output" ? [args[i + 1] ?? ""] : arg.startsWith("--output=") ? [arg.slice(9)] : []
+  );
+  const [dir] = values;
+  if (
+    values.length !== 1 ||
+    !/^\.e2e(\/[\w.-]+)+$/.test(dir) ||
+    dir.split("/").some((part) => /^\.+$/.test(part) && part !== ".e2e")
+  )
+    throw new Refusal(
+      `the e2e args need exactly one --output .e2e/<folder>, got ${JSON.stringify(values)}`
+    );
+  return dir;
+}
+
+async function main(): Promise<number> {
+  // bun removes the first "--" after the script; a launcher started another way keeps it.
+  const given = process.argv.slice(2);
+  const e2eArgs = given[0] === "--" ? given.slice(1) : given;
+  if (e2eArgs.length === 0) throw new Refusal("usage: launch.ts -- <e2e args...>");
+  const mode = process.env.BUGBASH_SANDBOX ?? "auto";
+  if (mode !== "auto" && mode !== "require")
+    throw new Refusal(`BUGBASH_SANDBOX must be auto or require, got ${mode}`);
+  const why = hostReason();
+  if (why != null && mode === "require") throw new Refusal(`${why} (BUGBASH_SANDBOX=require)`);
+  if (why != null && e2eArgs[0] !== "run")
+    throw new Refusal(`${why}. Only exact-step \`e2e run\` tests run on the host.`);
+  if (why != null) {
+    log(`not used: ${why}. These exact-step tests run on the host, as before.`);
+    return runOnHost(e2eArgs);
+  }
+  const output = outputDir(e2eArgs);
+  const command = ["node", "../../node_modules/e2e/dist/cli/bin.js", ...e2eArgs];
+  // The app log goes into the output folder, so that it comes back with the report.
+  return runInSandbox({
+    command,
+    exportDir: output,
+    env: { BUGBASH_APP_LOG: process.env.BUGBASH_APP_LOG ?? `${output}/app.log` },
+  });
+}
+
+if (import.meta.main) {
+  main().then(
+    (code) => process.exit(code),
+    (error: unknown) => {
+      log(`refused: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(error instanceof Refusal ? 2 : 1);
+    }
+  );
+}
