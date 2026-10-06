@@ -3328,7 +3328,12 @@ describe("CoderOauthService", () => {
           discoveredModels: ["anthropic/old-model"],
         },
       };
-      let listingRequests = 0;
+      // Count only this login's listings: a committed login's discovery fiber outlives its
+      // test and calls whichever fetch mock is installed, so an earlier test's retries land
+      // here under load (#5758). A wait on the raw count could overshoot and never match.
+      let ownListingRequests = 0;
+      let ownListingStarted!: () => void;
+      const loginDiscoveryListing = new Promise<void>((resolve) => (ownListingStarted = resolve));
       const probeRequests: string[] = [];
       let afterLoginDiscovery: { probes: string[]; coder: Record<string, unknown> } | undefined;
       mockFetch(async (input, init) => {
@@ -3355,10 +3360,14 @@ describe("CoderOauthService", () => {
         }
         // Provider listing unavailable (member RBAC / older coderd).
         if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
-          listingRequests++;
+          if (new Headers(init?.headers).get("authorization") !== "Bearer at_no_catalog") {
+            return new Response("forbidden", { status: 403 });
+          }
+          ownListingRequests++;
+          if (ownListingRequests === 1) ownListingStarted();
           // The second listing is the explicit catalog load, queued behind the
           // login's discovery on the refresh mutex: capture what login left.
-          if (listingRequests === 2) {
+          if (ownListingRequests === 2) {
             afterLoginDiscovery = {
               probes: [...probeRequests],
               coder: structuredClone(deps.providersConfig.coder as Record<string, unknown>),
@@ -3391,7 +3400,9 @@ describe("CoderOauthService", () => {
       // probing is a catalog load, which only the user triggers. A previous
       // deployment's catalog does not survive the re-login (unknown, not
       // empty), and the user-configured list is left alone.
-      await waitUntil(() => listingRequests === 1);
+      // The login's discovery holds the catalog refresh mutex while it lists, so the explicit
+      // load below queues behind it. Wait for that listing itself, not a wall-clock poll.
+      await loginDiscoveryListing;
       expect(await service.refreshModels()).toEqual(Ok(undefined));
 
       expect(afterLoginDiscovery?.probes).toEqual([]);
