@@ -12,18 +12,23 @@ import { TUTORIAL_STATE_KEY } from "../../../src/common/constants/storage";
 export const WORKSPACE_TITLE = "Bug bash playground";
 
 /**
- * Opens the app and selects the seeded workspace. Tutorials are switched off before the page
- * loads (a fresh context would show one over the workspace); tutorial repros skip this helper.
+ * Switches tutorials off from the next page load on (a fresh context would show one over the
+ * workspace). Tutorial repros skip this helper.
  */
+export async function disableTutorials(browser: Browser): Promise<void> {
+  await browser.addInitScript(
+    (key: string) => localStorage.setItem(key, JSON.stringify({ disabled: true, completed: {} })),
+    TUTORIAL_STATE_KEY
+  );
+}
+
+/** Opens the app with tutorials off and selects the seeded workspace. */
 export async function openPlayground(
   app: { open(path?: string): Promise<void> },
   screen: Screen,
   browser: Browser
 ): Promise<void> {
-  await browser.addInitScript(
-    (key: string) => localStorage.setItem(key, JSON.stringify({ disabled: true, completed: {} })),
-    TUTORIAL_STATE_KEY
-  );
+  await disableTutorials(browser);
   await app.open();
   // A fresh context starts with the project collapsed in the sidebar.
   const expand = screen.getByRole("button", "Expand project demo-app");
