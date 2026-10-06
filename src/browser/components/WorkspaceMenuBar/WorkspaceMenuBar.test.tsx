@@ -37,6 +37,7 @@ import * as StatsDialogModule from "@/browser/features/RightSidebar/StatsDialog"
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
+import { focusRightSidebarTab, readRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CODER_RUNTIME_PLACEHOLDER, type RuntimeConfig } from "@/common/types/runtime";
@@ -733,14 +734,24 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       const media = stubMatchMedia(
         (query) => isNarrow && query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`
       );
+      // The hidden sidebar shows another tab. Opening the dialog must leave that alone (the
+      // sidebar stays mounted, so selecting Stats here would render a second copy behind it).
+      focusRightSidebarTab(workspaceId, "review");
+      const activeTab = () => {
+        const root = readRightSidebarLayout(workspaceId).root;
+        return root.type === "tabset" ? root.activeTab : null;
+      };
       render(<WorkspaceMenuBar {...defaultProps} />);
       openFromPalette();
       expect(getLastStatsDialogProps()?.open).toBe(true);
+      expect(activeTab()).toBe("review");
 
-      // E.g. a phone rotated to landscape: the sidebar's own Stats tab is back.
+      // E.g. a phone rotated to landscape: the sidebar is back and shows Stats, the view the
+      // user was reading, in place of the dialog.
       isNarrow = false;
       act(() => media.fireChange());
       expect(getLastStatsDialogProps()?.open).toBe(false);
+      expect(activeTab()).toBe("costs");
 
       isNarrow = true;
       act(() => media.fireChange());

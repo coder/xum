@@ -72,6 +72,7 @@ import { TimelineDialog } from "@/browser/features/RightSidebar/Timeline/Timelin
 import { ArtifactsDialog } from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
 import { StatsDialog } from "@/browser/features/RightSidebar/StatsDialog";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
+import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
 import type { AgentSkillDescriptor, AgentSkillIssue } from "@/common/types/agentSkill";
 
 interface WorkspaceMenuBarProps {
@@ -240,10 +241,19 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // container query (e.g. expanding the left sidebar squeezes the shell under 684px).
   const [timelineSidebarHidden, setTimelineSidebarHidden] = useState(false);
   // The Stats dialog stands in for the hidden sidebar's Stats tab. Once the sidebar shows again
-  // (a phone rotated to landscape), the tab is back, so the dialog closes for good.
-  if (statsDialogWorkspaceId !== null && !timelineSidebarHidden) {
+  // (a phone rotated to landscape), that tab takes over: select it so the user keeps the view
+  // they were reading, then close the dialog for good. Only at this transition, not on open: the
+  // hidden sidebar stays mounted, so selecting Stats earlier would render a second copy behind
+  // the dialog and change the layout even if the user never widens. An effect, not a render-time
+  // reset, because selecting the tab writes the persisted sidebar layout.
+  const statsDialogOpen = statsDialogWorkspaceId === workspaceId;
+  useEffect(() => {
+    if (!statsDialogOpen || timelineSidebarHidden) {
+      return;
+    }
+    focusRightSidebarTab(workspaceId, "costs");
     setStatsDialogWorkspaceId(null);
-  }
+  }, [statsDialogOpen, timelineSidebarHidden, workspaceId]);
   useEffect(() => {
     const compute = () => setTimelineSidebarHidden(isTimelineSidebarHidden());
     compute();
@@ -989,7 +999,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       />
       <StatsDialog
         workspaceId={workspaceId}
-        open={statsDialogWorkspaceId === workspaceId}
+        open={statsDialogOpen}
         onOpenChange={(open) => setStatsDialogWorkspaceId(open ? workspaceId : null)}
       />
       <ArtifactsDialog
