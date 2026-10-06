@@ -19,6 +19,11 @@ import {
 // still answer the row the full build gives (src/node/config/snapshot.test.ts proves that
 // equivalence). One malformed shape is the exception: duplicate ids with conflicting parents. There
 // the answer is the first row with its own ancestor chain.
+interface MetadataEvent {
+  workspaceId: string;
+  metadata: FrontendWorkspaceMetadata | null;
+}
+
 describe("WorkspaceService single-row metadata reads", () => {
   let harness: WorkspaceServiceHarness;
   let projectPath: string;
@@ -32,15 +37,14 @@ describe("WorkspaceService single-row metadata reads", () => {
     ...fields,
   });
 
-  type MetadataEvent = { workspaceId: string; metadata: FrontendWorkspaceMetadata | null };
 
   /** TaskService emits through its WorkspaceHost; this double records those emits. */
   const hostEmit = () => mock((_event: string, _payload: MetadataEvent) => true);
 
   /** Rows emitted for each id, in order; the service emits through its own `metadata` event. */
   function recordEmits() {
-    const emitted: Array<{ workspaceId: string; metadata: FrontendWorkspaceMetadata | null }> = [];
-    const listener = (event: (typeof emitted)[number]) => emitted.push(event);
+    const emitted: MetadataEvent[] = [];
+    const listener = (event: MetadataEvent) => emitted.push(event);
     harness.service.on("metadata", listener);
     return emitted;
   }
