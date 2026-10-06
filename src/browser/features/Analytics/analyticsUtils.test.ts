@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  formatAgentLabel,
   formatBucketLabel,
   formatBucketTooltipLabel,
   formatResultNumber,
@@ -93,5 +94,24 @@ describe("formatResultNumber", () => {
     expect(formatResultNumber("duration_ms", 1.8e12)).toBe("1.8T");
     expect(formatResultNumber("total_cost_usd", 0.5)).toBe("$0.50");
     expect(formatResultNumber("input_tokens", 1234567)).toBe("1,234,567");
+  });
+});
+
+// #5766: the agent breakdown showed headless rows as "unknown".
+describe("formatAgentLabel", () => {
+  test("names a headless source as background work", () => {
+    expect(formatAgentLabel("headless:workspace_status")).toBe("workspace status (background)");
+    expect(formatAgentLabel("headless:continuous-compaction")).toBe(
+      "continuous compaction (background)"
+    );
+  });
+
+  test("labels a source it has never seen without code of its own", () => {
+    expect(formatAgentLabel("headless:bash_proxy")).toBe("bash proxy (background)");
+  });
+
+  test("leaves agent IDs and unknown as they are", () => {
+    expect(formatAgentLabel("exec")).toBe("exec");
+    expect(formatAgentLabel("unknown")).toBe("unknown");
   });
 });
