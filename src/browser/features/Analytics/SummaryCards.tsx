@@ -41,7 +41,9 @@ export function SummaryCards(props: SummaryCardsProps) {
     {
       label: "Cache Hit Ratio",
       value: cacheHitRatio,
-      helper: props.data ? `${formatCompactNumber(props.data.totalResponses)} responses` : null,
+      helper: props.data
+        ? `${formatCompactNumber(props.data.totalResponses)} ${props.data.totalResponses === 1 ? "response" : "responses"}`
+        : null,
     },
   ] as const;
 

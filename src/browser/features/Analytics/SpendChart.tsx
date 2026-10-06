@@ -18,6 +18,7 @@ import {
   formatBucketLabel,
   formatBucketTooltipLabel,
   formatUsd,
+  formatUsdAxisTick,
 } from "./analyticsUtils";
 
 interface SpendChartProps {
@@ -102,7 +103,7 @@ export function SpendChart(props: SpendChartProps) {
               />
               <YAxis
                 tick={CHART_AXIS_TICK}
-                tickFormatter={(value: number) => formatUsd(Number(value))}
+                tickFormatter={(value: number) => formatUsdAxisTick(Number(value))}
                 width={64}
                 stroke={CHART_AXIS_STROKE}
               />

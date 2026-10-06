@@ -24,6 +24,7 @@ import {
   CHART_TOOLTIP_CONTENT_STYLE,
   formatProjectDisplayName,
   formatUsd,
+  formatUsdAxisTick,
 } from "./analyticsUtils";
 
 interface ModelBreakdownProps {
@@ -78,7 +79,7 @@ export function ModelBreakdown(props: ModelBreakdownProps) {
                 <XAxis
                   type="number"
                   tick={CHART_AXIS_TICK}
-                  tickFormatter={(value: number) => formatUsd(Number(value))}
+                  tickFormatter={(value: number) => formatUsdAxisTick(Number(value))}
                   stroke={CHART_AXIS_STROKE}
                 />
                 <YAxis

@@ -7,6 +7,7 @@ import {
   CHART_AXIS_TICK,
   formatCompactNumber,
   formatUsd,
+  formatUsdAxisTick,
 } from "./analyticsUtils";
 
 interface AgentCostChartProps {
@@ -96,7 +97,7 @@ export function AgentCostChart(props: AgentCostChartProps) {
               <XAxis
                 type="number"
                 tick={CHART_AXIS_TICK}
-                tickFormatter={(value: number) => formatUsd(Number(value))}
+                tickFormatter={(value: number) => formatUsdAxisTick(Number(value))}
                 stroke={CHART_AXIS_STROKE}
               />
               <YAxis
