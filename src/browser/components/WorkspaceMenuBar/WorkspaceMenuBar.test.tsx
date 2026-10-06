@@ -623,6 +623,27 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     terminal.remove();
   });
 
+  it("lets global shortcuts through while the Workspace details button has focus", () => {
+    const seen: string[] = [];
+    const recordKey = (e: KeyboardEvent) => seen.push(e.key);
+    window.addEventListener("keydown", recordKey);
+    try {
+      const view = render(<WorkspaceMenuBar {...defaultProps} />);
+      const details = view.getByLabelText("Workspace details");
+      details.focus();
+
+      // Radix returns focus here when the popover closes; window shortcuts must still see keys.
+      fireEvent.keyDown(details, { key: ",", code: "Comma", ctrlKey: true, shiftKey: true });
+      // The keys the button owns stay with it.
+      fireEvent.keyDown(details, { key: "Escape" });
+      fireEvent.keyDown(details, { key: "Enter" });
+
+      expect(seen).toEqual([","]);
+    } finally {
+      window.removeEventListener("keydown", recordKey);
+    }
+  });
+
   it("closes the timeline dialog when switching workspaces", () => {
     stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
 

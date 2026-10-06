@@ -1,12 +1,12 @@
-// Known failure, open issue #5671: after Ctrl+Shift+D and Escape, focus returns to the Workspace
-// details button, which stops every key, so global shortcuts do nothing. Fails until #5671 is fixed.
+// #5671: after Ctrl+Shift+D and Escape, focus returns to the Workspace details button. The button
+// stopped every key, so global shortcuts did nothing until you clicked elsewhere.
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { expectNotifyOnAllResponses, openPlayground } from "./helpers";
 
 test(
   "global shortcuts still work after the Workspace details popover closes",
-  { tags: ["bugbash", "known-failure", "5671"] },
+  { tags: ["bugbash", "5671"] },
   async ({ app, screen, browser }) => {
     // The web target's size, set here so the repro runs the same on every target: the bug is a
     // desktop keyboard flow.
@@ -18,6 +18,8 @@ test(
     await browser.keyboard.press("Control+Shift+D");
     const details = screen.getByRole("dialog");
     await expect(details).toBeVisible();
+    // Radix moves focus into the popover once it can take Escape. Pressing earlier loses the key.
+    await expect(details).toBeFocused();
     await browser.keyboard.press("Escape");
     await expect(details).toBeHidden();
     // The precondition of the bug: Radix returns focus to the trigger.

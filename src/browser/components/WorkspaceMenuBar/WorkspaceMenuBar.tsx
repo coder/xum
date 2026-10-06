@@ -646,7 +646,14 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                   type="button"
                   className="text-muted hover:text-foreground focus-visible:ring-accent flex shrink-0 cursor-pointer items-center border-0 bg-transparent p-0 transition-colors focus-visible:ring-1"
                   aria-label="Workspace details"
-                  onKeyDown={stopKeyboardPropagation}
+                  onKeyDown={(e) => {
+                    // Stop only the keys this button owns. Stopping every key also hid global
+                    // shortcuts from the window listeners while the button had focus, which it
+                    // gets back every time the popover closes (#5671).
+                    if (e.key === "Enter" || e.key === " " || e.key === "Escape") {
+                      stopKeyboardPropagation(e);
+                    }
+                  }}
                 >
                   <Info className="h-3.5 w-3.5" />
                 </button>

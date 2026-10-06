@@ -110,8 +110,6 @@ const context = [
   "On narrow screens the terminal opens in a separate popup window, not in this page.",
   "The demo repo has no 'origin' remote, so Review's default base origin/main shows a git error:",
   "pick the base 'main' instead. Workspace names must be lowercase branch names such as 'alpha-test'.",
-  "Already tracked: after the 'Workspace details' button has focus, global shortcuts stop working",
-  "until you click elsewhere; click the chat area before testing shortcuts.",
   // Triaged as by design in loop round 2.
   "Also by design: closing a sidebar tab selects its neighbor, like browser tabs; workspace",
   "shortcuts (Ctrl+N, notifications) need a selected workspace; number fields clamp when they lose",
