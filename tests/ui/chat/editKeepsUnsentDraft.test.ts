@@ -11,7 +11,8 @@ jest.mock("lottie-react", () => ({
 import { act, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { DraftStore, getDraftStore } from "@/browser/stores/DraftStore";
+import { createTestApiClient } from "@/browser/testUtils";
 import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
 import type { ReviewNoteData } from "@/common/types/review";
@@ -72,10 +73,54 @@ async function expectUnsentDraftKept(app: AppHarness, scope: DraftScope) {
   expect(saved.attachments.map(({ id }) => id)).toEqual(["file-unsent"]);
 }
 
+/** Another renderer on the same backend: a reload of this window, or a second window. */
+async function otherRenderer(app: AppHarness): Promise<DraftStore> {
+  const store = new DraftStore();
+  store.setClient(createTestApiClient(app.env.orpc));
+  await store.whenReady();
+  return store;
+}
+
 describe("Completing an edit of an older message", () => {
   beforeAll(async () => {
     await preloadTestModules();
   });
+
+  // The edit text lives in this window's memory only: the shared draft keeps the unsent draft,
+  // so a reload (#5672) and a second window (#5571) both see the unsent draft, never the edit.
+  test("a reload during an edit keeps the unsent draft (#5672)", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-reload-keeps-draft" });
+    let reloaded: DraftStore | null = null;
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      await startEditWithUnsentDraft(app, scope);
+      await getDraftStore().flush(scope);
+      expect((await app.env.services.draftService.get(scope)).text).toBe("unsent draft");
+      reloaded = await otherRenderer(app);
+      expect(reloaded.getText(scope)).toBe("unsent draft");
+      expect(reloaded.getView(scope).attachments.map(({ id }) => id)).toEqual(["file-unsent"]);
+    } finally {
+      reloaded?.setClient(null);
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("an edit in one window does not reach another window's composer (#5571)", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-other-window" });
+    const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+    const secondWindow = await otherRenderer(app);
+    try {
+      await startEditWithUnsentDraft(app, scope);
+      await getDraftStore().flush(scope);
+      // The second window saw the unsent draft arrive; the edit text never follows it.
+      await waitFor(() => expect(secondWindow.getText(scope)).toBe("unsent draft"));
+      await getDraftStore().flush(scope);
+      expect(secondWindow.getText(scope)).toBe("unsent draft");
+    } finally {
+      secondWindow.setClient(null);
+      await app.dispose();
+    }
+  }, 120_000);
 
   test("keeps the unsent draft, with its attachments", async () => {
     const app = await createAppHarness({ branchPrefix: "edit-keeps-draft" });
