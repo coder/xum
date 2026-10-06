@@ -296,6 +296,54 @@ describe("ChunkedStreamingMarkdown", () => {
     ).toHaveLength(1);
   });
 
+  // The stream ends while older chunks are still mounting, a few per frame. Completion joins the
+  // cut list into one chunk, so every chunk after it moves to a lower index.
+  test.each([
+    // At least one sealed chunk after the list is mounted, but no list item yet.
+    ["after the cut list", (row: Element) => row.children.length > 1 && !row.querySelector("li")],
+    // Some ranges of the list are mounted, but not its first item.
+    [
+      "inside the cut list",
+      (row: Element) => row.querySelector("li") !== null && !row.textContent?.includes("item 1 "),
+    ],
+  ])(
+    "completion during the backfill, with the oldest mounted chunk %s, unmounts nothing",
+    (_where, isOldestMounted) => {
+      const paragraph = (k: number) =>
+        `Paragraph ${k}: ${"lorem ipsum dolor sit amet ".repeat(24)}`;
+      const after = Array.from({ length: 16 }, (_, k) => paragraph(k)).join("\n\n");
+      const reply = `Intro.\n\n${hugeList(14_000, bulletLine)}\n${after}`;
+      const frames: FrameRequestCallback[] = [];
+      const originalRequest = globalThis.requestAnimationFrame;
+      const originalCancel = globalThis.cancelAnimationFrame;
+      globalThis.requestAnimationFrame = (callback) => frames.push(callback);
+      globalThis.cancelAnimationFrame = (id) => {
+        frames[id - 1] = () => undefined;
+      };
+      try {
+        renderRow(reply, true);
+        for (let next = 0; !isOldestMounted(container.firstElementChild!); next++) {
+          expect(next).toBeLessThan(frames.length);
+          flushSync(() => frames[next](0));
+        }
+        // Every mounted chunk but the open last one, which remounts when the stream ends (#5664).
+        const visible = [...container.firstElementChild!.children].slice(0, -1);
+        const sealedAfterList = visible.filter((chunk) => !chunk.querySelector("li"));
+        expect(sealedAfterList.length).toBeGreaterThan(0);
+
+        renderRow(reply, false);
+        const text = container.textContent?.replace(/\s+/g, "");
+        for (const chunk of visible) {
+          expect(text).toContain(chunk.textContent.replace(/\s+/g, ""));
+        }
+        for (const chunk of sealedAfterList) expect(chunk.isConnected).toBe(true);
+      } finally {
+        globalThis.requestAnimationFrame = originalRequest;
+        globalThis.cancelAnimationFrame = originalCancel;
+      }
+    }
+  );
+
   // #5664: a loose list longer than a chunk, streamed item by item. Some frames end mid-marker
   // (`…\n\n30` before the `.`), where the partial marker parses as a paragraph after the list.
   test.each([

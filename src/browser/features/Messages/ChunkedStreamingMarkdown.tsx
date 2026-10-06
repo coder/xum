@@ -150,25 +150,32 @@ export const ChunkedStreamingMarkdown: React.FC<ChunkedStreamingMarkdownProps> =
   // list joins back into one chunk. Keys are source offsets plus length: a sealed chunk keeps its
   // key, so MarkdownCore's memo still skips it, and a joined list gets a new one.
   const keys: string[] = [];
+  const starts: number[] = [];
   let offset = 0;
   for (const [index, chunk] of chunks.entries()) {
     keys.push(
       props.isStreaming && index === lastIndex ? `open-${offset}` : `${offset}:${chunk.length}`
     );
+    starts.push(offset);
     offset += chunk.length;
   }
 
-  // Index of the oldest mounted chunk.
-  const [firstMounted, setFirstMounted] = useState(() => Math.max(0, lastIndex));
+  // Source offset of the oldest mounted chunk. An index would go stale when completion joins a
+  // cut list: every chunk after the list moves to a lower index, and the mounted ones unmount.
+  const [firstMounted, setFirstMounted] = useState(() => starts.at(-1) ?? 0);
+  // The chunk that contains that offset. After a join the offset can fall inside the joined
+  // list, which then stays mounted as a whole.
+  const start = Math.max(
+    0,
+    starts.findLastIndex((chunkStart) => chunkStart <= firstMounted)
+  );
+  const nextFirstMounted = starts[Math.max(0, start - CHUNKED_STREAMING_CHUNKS_PER_FRAME)] ?? 0;
   useEffect(() => {
-    if (firstMounted === 0) return;
-    const frame = requestAnimationFrame(() => {
-      setFirstMounted((index) => Math.max(0, index - CHUNKED_STREAMING_CHUNKS_PER_FRAME));
-    });
+    if (nextFirstMounted === firstMounted) return;
+    const frame = requestAnimationFrame(() => setFirstMounted(nextFirstMounted));
     return () => cancelAnimationFrame(frame);
-  }, [firstMounted]);
+  }, [firstMounted, nextFirstMounted]);
 
-  const start = Math.min(firstMounted, Math.max(0, lastIndex));
   return (
     <div className="space-y-2">
       {chunks.slice(start).map((chunk, offset) => (
