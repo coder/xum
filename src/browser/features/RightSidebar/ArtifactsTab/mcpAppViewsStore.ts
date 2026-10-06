@@ -5,6 +5,7 @@ import type { DisplayedMessage } from "@/common/types/message";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
+import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolUtils";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 
 /**
@@ -162,6 +163,25 @@ function transcriptViews(
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
     if (message.type !== "tool") continue;
+    // MCP tools called from code_execution render as nested cards with their own views.
+    const nested = message.nestedCalls ?? [];
+    for (let j = nested.length - 1; j >= 0; j--) {
+      const call = nested[j];
+      const view = mcpAppViewRefFor({
+        toolCallId: call.toolCallId,
+        toolName: call.toolName,
+        args: call.input,
+        // The status its nested card shows (NestedToolsContainer).
+        status: getNestedToolStatus(
+          call.state,
+          call.output,
+          message.status === "interrupted",
+          call.failed
+        ),
+        mcpServer: call.mcpServer,
+      });
+      if (view != null) views.push(view);
+    }
     const view = mcpAppViewRefFor(message);
     if (view != null) views.push(view);
   }

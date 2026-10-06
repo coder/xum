@@ -1074,10 +1074,11 @@ export function ArtifactsPanel(props: {
                   {/* Several calls of one tool share a label: the arguments and the outcome
                       tell them apart. */}
                   <span className="flex min-w-0 items-center gap-2">
-                    <span className="shrink-0">
+                    <span className="min-w-0 truncate">
                       {view.label} · {view.serverName}
                     </span>
-                    <span className="text-muted min-w-0 truncate text-[10px]">
+                    {/* The detail gives way first; long names truncate too. */}
+                    <span className="text-muted min-w-0 shrink-[3] truncate text-[10px]">
                       {appViewDetails[index]}
                     </span>
                   </span>

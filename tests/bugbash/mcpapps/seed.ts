@@ -15,12 +15,18 @@ import * as path from "path";
 const MCP_SERVER_ENTRY = path.join(import.meta.dir, "server.mjs");
 const VIEW_URI = "ui://prototype/board.html";
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 export function writeMcpConfig(xumRoot: string): void {
   if (!fs.existsSync(MCP_SERVER_ENTRY)) throw new Error(`missing ${MCP_SERVER_ENTRY}`);
   fs.mkdirSync(xumRoot, { recursive: true });
   fs.writeFileSync(
     path.join(xumRoot, "mcp.jsonc"),
-    JSON.stringify({ servers: { "demo-app": `node ${MCP_SERVER_ENTRY}` } }, null, 2)
+    // mcp.jsonc stdio servers are shell command strings (the object form takes no args), so
+    // the path is single-quoted: checkout paths can hold spaces.
+    JSON.stringify({ servers: { "demo-app": `node ${shellQuote(MCP_SERVER_ENTRY)}` } }, null, 2)
   );
 }
 

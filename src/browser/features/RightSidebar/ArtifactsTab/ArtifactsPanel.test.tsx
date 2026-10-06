@@ -934,8 +934,24 @@ describe("ArtifactsPanel", () => {
     // The loaded transcript holds a settled call and a still-running one; neither was opened
     // from its card.
     const store = useWorkspaceStoreRaw();
+    // A code_execution call that made one nested MCP Apps call.
+    const parent = {
+      ...(toolCall("call-code", "completed") as object),
+      toolName: "code_execution",
+      mcpServer: undefined,
+      nestedCalls: [
+        {
+          toolCallId: "call-nested",
+          toolName: "dice_show_dice_board",
+          input: { count: 2 },
+          output: { content: [] },
+          state: "output-available",
+          mcpServer: (toolCall("x", "completed") as unknown as { mcpServer: unknown }).mcpServer,
+        },
+      ],
+    } as unknown as DisplayedMessage;
     const state = {
-      messages: [toolCall("call-done", "completed"), toolCall("call-running", "executing")],
+      messages: [toolCall("call-done", "completed"), toolCall("call-running", "executing"), parent],
     } as unknown as WorkspaceState;
     const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
       (id) => id === "ws-app-transcript"
@@ -961,6 +977,10 @@ describe("ArtifactsPanel", () => {
       act(() => writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-done" }));
       await view.findByTestId("mcp-app-frame");
 
+      // A nested MCP Apps call (inside code_execution) is listed too.
+      act(() => writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-nested" }));
+      await view.findByTestId("mcp-app-frame");
+
       // A call that has not settled has no view yet.
       act(() => writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-running" }));
       expect(await view.findByText("Report")).toBeTruthy();
@@ -969,7 +989,8 @@ describe("ArtifactsPanel", () => {
       // J/K walk the picker into the app views and back out to the files.
       fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "j" });
       await view.findByTestId("mcp-app-frame");
-      expect(readArtifactSelection("ws-app-transcript").path).toBe("mcp-app:call-done");
+      // The newest app view comes first: the nested call of the last message.
+      expect(readArtifactSelection("ws-app-transcript").path).toBe("mcp-app:call-nested");
       fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "k" });
       expect(await view.findByText("Report")).toBeTruthy();
       expect(readArtifactSelection("ws-app-transcript").path).toBe("report.md");

@@ -137,7 +137,18 @@ export const GenericToolCall: React.FC<GenericToolCallProps> = ({
   workspaceId,
   toolCallId,
 }) => {
-  const { expanded, toggleExpanded } = useToolExpansion();
+  const sticky = useToolExpansion();
+  // This card's own toggle. A call with an app view expands only on it: the sticky per-tool
+  // preference would otherwise open every earlier call of the tool after a reload, and each
+  // expanded card mounts its view (an iframe plus a resource read). A toggle made before the
+  // call settled (the view arrives with the result) carries over.
+  const [localExpanded, setLocalExpanded] = React.useState<boolean | null>(null);
+  const isAppCall = mcpServer?.app != null && workspaceId != null && toolCallId != null;
+  const expanded = isAppCall ? (localExpanded ?? false) : sticky.expanded;
+  const toggleExpanded = () => {
+    setLocalExpanded(!expanded);
+    if (!isAppCall) sticky.toggleExpanded();
+  };
 
   const hasDetails = args !== undefined || result !== undefined;
   const images = extractImagesFromToolResult(result);
