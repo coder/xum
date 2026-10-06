@@ -646,7 +646,18 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                   type="button"
                   className="text-muted hover:text-foreground focus-visible:ring-accent flex shrink-0 cursor-pointer items-center border-0 bg-transparent p-0 transition-colors focus-visible:ring-1"
                   aria-label="Workspace details"
-                  onKeyDown={stopKeyboardPropagation}
+                  onKeyDown={(e) => {
+                    // Stop only the keys this button owns: unmodified Enter and Space activate
+                    // it. Stopping every key also hid global shortcuts from the window
+                    // listeners while the button had focus, which it gets back every time the
+                    // popover closes (#5671). Modified keys are other shortcuts. The popover's
+                    // dismiss key is not the button's either: the open popover marks it handled,
+                    // and with the popover closed the stream-interrupt shortcut must still work.
+                    const modified = e.altKey || e.ctrlKey || e.metaKey || e.shiftKey;
+                    if (!modified && (e.key === "Enter" || e.key === " ")) {
+                      stopKeyboardPropagation(e);
+                    }
+                  }}
                 >
                   <Info className="h-3.5 w-3.5" />
                 </button>
