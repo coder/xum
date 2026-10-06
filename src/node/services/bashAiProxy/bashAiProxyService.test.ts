@@ -200,6 +200,40 @@ describe("BashAiProxyService", () => {
     expect(upstream.seen[0].body).toBe(body);
   });
 
+  test("an origin-only OpenAI base URL gets /v1, like chat requests", async () => {
+    configs.openai = { ...configs.openai, baseUrl: upstream.baseUrl.replace(/\/v1$/, "") };
+    const env = await proxy.envFor("ws-origin", "local", []);
+    const res = await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+    expect(upstream.seen.map((r) => r.url)).toEqual(["/v1/chat/completions"]);
+  });
+
+  test("a base URL query stays a query, merged with the request's", async () => {
+    configs.anthropic = { ...configs.anthropic, baseUrl: `${upstream.baseUrl}?token=abc` };
+    const env = await proxy.envFor("ws-query", "local", []);
+    await fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages?beta=true`, {
+      method: "POST",
+      headers: { "x-api-key": env.ANTHROPIC_API_KEY },
+      body: "{}",
+    });
+    expect(upstream.seen.map((r) => r.url)).toEqual(["/v1/messages?token=abc&beta=true"]);
+  });
+
+  test("a configured OpenAI-Project header goes upstream, a command's own does not", async () => {
+    configs.openai = { ...configs.openai, headers: { "OpenAI-Project": "proj_config" } };
+    const env = await proxy.envFor("ws-project", "local", []);
+    await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.OPENAI_API_KEY}`, "openai-project": "proj_child" },
+      body: "{}",
+    });
+    expect(upstream.seen[0].headers["openai-project"]).toBe("proj_config");
+  });
+
   test("refusals never reach the provider", async () => {
     const env = await proxy.envFor("ws-3", "local", []);
     const post = (url: string, key: string) =>
