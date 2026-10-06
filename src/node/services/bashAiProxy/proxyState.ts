@@ -16,6 +16,7 @@ import * as path from "node:path";
 import { z } from "zod";
 
 import { log } from "@/node/services/log";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 
 export const BASH_AI_PROXY_STATE_FILE = "bash-ai-proxy.json";
 
@@ -63,6 +64,35 @@ export class ProxyStateStore {
         await this.write(state, "replace");
       } catch (error) {
         log.warn("[bash-ai-proxy] could not save proxy state", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }
+
+  /**
+   * Saves `port` unless the file already has one. Two backends on one root can start together
+   * with no saved port and bind different ports: the lock and the re-read make only the first
+   * one durable, so a restart binds the port that commands already hold. Errors are logged.
+   */
+  claimPort(port: number): Promise<void> {
+    return this.serialize(async () => {
+      try {
+        const release = await acquireCrossProcessLock({
+          lockPath: `${this.file}.lock`,
+          acquireTimeoutMs: 10_000,
+          staleMs: 60_000,
+          timeoutMessage: "Another Xum process is saving the bash AI proxy port.",
+        });
+        await using _lock = { [Symbol.asyncDispose]: release };
+        const state = (await this.read()) ?? (this.cached ??= await this.readOrCreate());
+        if (state.port === undefined) {
+          state.port = port;
+          await this.write(state, "replace");
+        }
+        this.cached = state;
+      } catch (error) {
+        log.warn("[bash-ai-proxy] could not save the proxy port", {
           error: error instanceof Error ? error.message : String(error),
         });
       }
