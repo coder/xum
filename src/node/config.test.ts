@@ -211,6 +211,98 @@ describe("Config", () => {
       errorSpy.mockRestore();
     });
 
+    // #5757: an unreadable (not corrupt) file must be reported as unreadable, both by the edit
+    // refusal and by getConfigLoadError, which callers use instead of "not found".
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "reports an unreadable config as unreadable, not corrupt",
+      async () => {
+        const configFile = configFilePath();
+        await config.setUpdateChannel("stable");
+        // Warm the snapshot, as a running server has: chmod keeps its stat key.
+        config.loadConfigOrDefault();
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        fs.chmodSync(configFile, 0o000);
+        try {
+          const refused = await config.setUpdateChannel("nightly").then(
+            () => null,
+            (e: unknown) => String(e)
+          );
+          expect(refused).toMatch(/could not be read/);
+          expect(refused).not.toMatch(/corrupt/);
+          expect(config.getConfigLoadError()).toMatch(/could not be read/);
+        } finally {
+          fs.chmodSync(configFile, 0o600);
+          errorSpy.mockRestore();
+        }
+        await config.setUpdateChannel("nightly");
+        expect(config.getConfigLoadError()).toBeNull();
+      }
+    );
+
+    it("reports a malformed config through getConfigLoadError", () => {
+      fs.writeFileSync(configFilePath(), '{ "projects": ');
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      config.loadConfigOrDefault();
+      expect(config.getConfigLoadError()).toMatch(/could not be parsed/);
+      errorSpy.mockRestore();
+    });
+
+    // A short-lived Config (e.g. runtimeFactory's) that fails a read must not make a healthy
+    // instance report that failure: the failure map is shared by path.
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "reports only load failures this instance observed",
+      async () => {
+        const configFile = configFilePath();
+        await config.setUpdateChannel("stable");
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          // This instance fails once and then recovers on its own read.
+          fs.chmodSync(configFile, 0o000);
+          config.loadConfigOrDefault();
+          expect(config.getConfigLoadError()).toMatch(/could not be read/);
+          fs.chmodSync(configFile, 0o600);
+          config.loadConfigOrDefault();
+          expect(config.getConfigLoadError()).toBeNull();
+
+          fs.chmodSync(configFile, 0o000);
+          const shortLived = new Config(tempDir);
+          shortLived.loadConfigOrDefault();
+          expect(shortLived.getConfigLoadError()).toMatch(/could not be read/);
+          // chmod keeps the stat key, so the recovered instance still serves its snapshot.
+          expect(config.loadConfigOrDefault().updateChannel).toBe("stable");
+          expect(config.getConfigLoadError()).toBeNull();
+
+          // Instances whose own last load failed share one state and both report it.
+          const failedMain = new Config(tempDir);
+          failedMain.loadConfigOrDefault();
+          new Config(tempDir).loadConfigOrDefault();
+          expect(failedMain.getConfigLoadError()).toMatch(/could not be read/);
+        } finally {
+          fs.chmodSync(configFile, 0o600);
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "does not point to a .corrupt- backup that could not be written",
+      () => {
+        fs.writeFileSync(configFilePath(), '{ "projects": ');
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        // A read-only config dir makes the sidecar write fail.
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          config.loadConfigOrDefault();
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+        const loadError = config.getConfigLoadError();
+        expect(loadError).toMatch(/could not be parsed/);
+        expect(loadError).not.toMatch(/restore it from/);
+      }
+    );
+
     it("backs up malformed JSON before rethrowing for cleanup guards", () => {
       const corruptData = '{ "projects": ';
       fs.writeFileSync(configFilePath(), corruptData);

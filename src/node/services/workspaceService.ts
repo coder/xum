@@ -8805,6 +8805,14 @@ export class WorkspaceService
 
     return { containerName, containerWorkspacePath, hostWorkspacePath };
   }
+  /**
+   * The error for a workspace missing from config. A failed config load hides every
+   * workspace, so report that cause instead of "Workspace not found" (#5757).
+   */
+  private workspaceNotFoundError(): string {
+    return this.config.getConfigLoadError() ?? "Workspace not found";
+  }
+
   async getInfo(workspaceId: string): Promise<FrontendWorkspaceMetadata | null> {
     const allMetadata = await this.config.getAllWorkspaceMetadata();
     const found = allMetadata.find((metadata) => metadata.id === workspaceId) ?? null;
@@ -8829,7 +8837,7 @@ export class WorkspaceService
 
     const found = this.config.findWorkspace(normalizedWorkspaceId);
     if (!found) {
-      return Err("Workspace not found");
+      return Err(this.workspaceNotFoundError());
     }
 
     const config = this.config.loadConfigOrDefault();
@@ -8846,7 +8854,7 @@ export class WorkspaceService
         (workspace) => workspace.path === found.workspacePath && !workspace.id
       );
     if (!workspaceEntry) {
-      return Err("Workspace not found");
+      return Err(this.workspaceNotFoundError());
     }
 
     return Ok({
@@ -9035,7 +9043,7 @@ export class WorkspaceService
       const { normalizedWorkspaceId, projectPath, workspacePath } = resolved.data;
       // Mutate inside the serialized editConfig transform against the FRESH entry (see
       // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
-      let outcome: Result<void, string> = Err("Workspace not found");
+      let outcome: Result<void, string> = Err(this.workspaceNotFoundError());
       await this.config.editConfig((freshConfig) => {
         const entry = this.findFreshWorkspaceEntry(freshConfig, {
           projectPath,
@@ -9043,7 +9051,7 @@ export class WorkspaceService
           workspacePath,
         });
         if (!entry) {
-          outcome = Err("Workspace not found");
+          outcome = Err(this.workspaceNotFoundError());
           return freshConfig;
         }
         outcome = Ok(undefined);
@@ -9104,7 +9112,7 @@ export class WorkspaceService
       }
 
       const { normalizedWorkspaceId, projectPath, workspacePath } = resolved.data;
-      let outcome: Result<void, string> = Err("Workspace not found");
+      let outcome: Result<void, string> = Err(this.workspaceNotFoundError());
       await this.config.editConfig((freshConfig) => {
         const entry = this.findFreshWorkspaceEntry(freshConfig, {
           projectPath,
@@ -9350,7 +9358,7 @@ export class WorkspaceService
    */
   async keepInterruptedDelegatedWorkspace(workspaceId: string): Promise<Result<void>> {
     if (findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId) == null) {
-      return Err("Workspace not found");
+      return Err(this.workspaceNotFoundError());
     }
     try {
       await this.config.editConfig((freshConfig) => {
@@ -9442,7 +9450,7 @@ export class WorkspaceService
       // heartbeat edit, and persisting the stale snapshot could resurrect concurrently
       // removed workspaces (lost-update race). Entry gone meanwhile → Err.
       let mergeResult: Result<{ settings: WorkspaceHeartbeatSettings; changed: boolean }, string> =
-        Err("Workspace not found");
+        Err(this.workspaceNotFoundError());
       await this.config.editConfig((freshConfig) => {
         const workspaceEntry = this.findFreshWorkspaceEntry(freshConfig, {
           projectPath,
@@ -9450,7 +9458,7 @@ export class WorkspaceService
           workspacePath,
         });
         if (!workspaceEntry) {
-          mergeResult = Err("Workspace not found");
+          mergeResult = Err(this.workspaceNotFoundError());
           return freshConfig;
         }
 
@@ -9640,7 +9648,7 @@ export class WorkspaceService
 
       const found = this.config.findWorkspace(normalizedWorkspaceId);
       if (!found) {
-        return Err("Workspace not found");
+        return Err(this.workspaceNotFoundError());
       }
 
       const { projectPath, workspacePath } = found;
@@ -9682,7 +9690,7 @@ export class WorkspaceService
       // Compare against the FRESH entry inside the serialized editConfig transform
       // (see findFreshWorkspaceEntry): persisting a pre-read snapshot loses concurrent
       // edits and can resurrect removed workspaces. Entry gone meanwhile → Err.
-      let writeResult: Result<{ changed: boolean }, string> = Err("Workspace not found");
+      let writeResult: Result<{ changed: boolean }, string> = Err(this.workspaceNotFoundError());
       await this.config.editConfig((freshConfig) => {
         const workspaceEntry = this.findFreshWorkspaceEntry(freshConfig, {
           projectPath,
@@ -9690,7 +9698,7 @@ export class WorkspaceService
           workspacePath,
         });
         if (!workspaceEntry) {
-          writeResult = Err("Workspace not found");
+          writeResult = Err(this.workspaceNotFoundError());
           return freshConfig;
         }
 
@@ -10281,7 +10289,7 @@ export class WorkspaceService
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
-        return Err("Workspace not found");
+        return Err(this.workspaceNotFoundError());
       }
       const { projectPath, workspacePath } = workspace;
 
@@ -10481,7 +10489,7 @@ export class WorkspaceService
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
-        return Err("Workspace not found");
+        return Err(this.workspaceNotFoundError());
       }
 
       let finalTags: Record<string, string> = {};
@@ -10513,7 +10521,7 @@ export class WorkspaceService
         return config;
       });
       if (!applied) {
-        return Err("Workspace not found");
+        return Err(this.workspaceNotFoundError());
       }
 
       await this.emitCurrentWorkspaceMetadata(workspaceId);
@@ -10548,7 +10556,7 @@ export class WorkspaceService
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
-        return Err("Workspace not found");
+        return Err(this.workspaceNotFoundError());
       }
       const { projectPath, workspacePath } = workspace;
 
@@ -10823,7 +10831,7 @@ export class WorkspaceService
 
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
-        return Err("Workspace not found");
+        return Err(this.workspaceNotFoundError());
       }
 
       const snapshotBehaviorEnabled = this.isSnapshotArchiveEligibilityMutationSensitive(
@@ -11789,7 +11797,7 @@ export class WorkspaceService
       const hasIdlessRow = [...config.projects.values()].some((project) =>
         project.workspaces.some((row) => !row.id)
       );
-      return hasIdlessRow ? Err("Workspace not found") : Ok(undefined);
+      return hasIdlessRow ? Err(this.workspaceNotFoundError()) : Ok(undefined);
     }
     return Err(
       "This workspace's config entry has no ID yet (it predates workspace IDs), so it cannot be archived safely. Reload Xum so the ID is recorded, then archive it again."
@@ -12074,7 +12082,7 @@ export class WorkspaceService
       }
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
-        return Err("Workspace not found");
+        return Err(this.workspaceNotFoundError());
       }
       if (
         this.agentTaskIntegration?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true
@@ -12549,7 +12557,7 @@ export class WorkspaceService
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
-        return Err("Workspace not found");
+        return Err(this.workspaceNotFoundError());
       }
       const { projectPath, workspacePath } = workspace;
 
@@ -12791,7 +12799,7 @@ export class WorkspaceService
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspaceMetadata = allMetadata.find((metadata) => metadata.id === workspaceId);
       if (!workspaceMetadata) {
-        return Err("Workspace not found");
+        return Err(this.workspaceNotFoundError());
       }
 
       if (!isWorkspaceArchived(workspaceMetadata.archivedAt, workspaceMetadata.unarchivedAt)) {
@@ -13333,7 +13341,7 @@ export class WorkspaceService
   ): Promise<Result<boolean, string>> {
     const found = this.config.findWorkspace(workspaceId);
     if (!found) {
-      return Err("Workspace not found");
+      return Err(this.workspaceNotFoundError());
     }
 
     const { projectPath, workspacePath } = found;
@@ -13373,7 +13381,7 @@ export class WorkspaceService
         workspacePath,
       });
       if (!snapshotEntry) {
-        return Err("Workspace not found");
+        return Err(this.workspaceNotFoundError());
       }
       const prev = snapshotEntry.aiSettingsByAgent?.[normalizedAgentId];
       const aiSettingsChanged =
@@ -13397,7 +13405,7 @@ export class WorkspaceService
     // Compare/merge against the FRESH entry inside the serialized editConfig transform
     // (see findFreshWorkspaceEntry): persisting a pre-read snapshot loses concurrent
     // edits and can resurrect removed workspaces. Entry gone meanwhile → Err.
-    let writeResult: Result<boolean, string> = Err("Workspace not found");
+    let writeResult: Result<boolean, string> = Err(this.workspaceNotFoundError());
     await this.config.editConfig((freshConfig) => {
       const workspaceEntry = this.findFreshWorkspaceEntry(freshConfig, {
         projectPath,
@@ -13405,7 +13413,7 @@ export class WorkspaceService
         workspacePath,
       });
       if (!workspaceEntry) {
-        writeResult = Err("Workspace not found");
+        writeResult = Err(this.workspaceNotFoundError());
         return freshConfig;
       }
 
@@ -15221,7 +15229,7 @@ export class WorkspaceService
 
     const metadata = await this.getInfo(input.workspaceId);
     if (metadata == null) {
-      return Err("Workspace not found");
+      return Err(this.workspaceNotFoundError());
     }
     if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
       return Err("Workspace is archived. Unarchive it before attaching files.");
@@ -15264,7 +15272,7 @@ export class WorkspaceService
 
     const metadata = await this.getInfo(input.workspaceId);
     if (metadata == null) {
-      return Err("Workspace not found");
+      return Err(this.workspaceNotFoundError());
     }
     if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
       return Err("Workspace is archived. Unarchive it before downloading attachments.");
@@ -15666,7 +15674,7 @@ export class WorkspaceService
       if (!workspaceConfig) {
         return Err({
           type: "unknown",
-          raw: "Workspace not found. It may have been deleted.",
+          raw: this.config.getConfigLoadError() ?? "Workspace not found. It may have been deleted.",
         });
       }
 
@@ -16485,7 +16493,7 @@ export class WorkspaceService
       if (!this.config.findWorkspace(workspaceId)) {
         return Err({
           type: "unknown",
-          raw: "Workspace not found. It may have been deleted.",
+          raw: this.config.getConfigLoadError() ?? "Workspace not found. It may have been deleted.",
         });
       }
 

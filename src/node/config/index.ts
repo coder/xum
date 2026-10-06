@@ -1030,6 +1030,10 @@ interface ConfigLoadFailureState {
    * the most recent failed load (re-checked every failed load, never trusted across loads).
    */
   backupSignature: string | null;
+  /** True when no bytes could be read (EACCES, EISDIR, ...), as opposed to bytes that failed to parse. */
+  unreadable: boolean;
+  /** Error from the most recent failed load, reported by getConfigLoadError (#5757). */
+  errorMessage: string;
 }
 
 // Process-scoped, keyed by config file path: production creates short-lived Config
@@ -1045,7 +1049,7 @@ export function configFilePath(rootDir: string): string {
 function configLoadFailureState(configFile: string): ConfigLoadFailureState {
   let state = configLoadFailureStates.get(configFile);
   if (!state) {
-    state = { failureSignature: null, backupSignature: null };
+    state = { failureSignature: null, backupSignature: null, unreadable: false, errorMessage: "" };
     configLoadFailureStates.set(configFile, state);
   }
   return state;
@@ -1396,6 +1400,7 @@ export class Config {
 
   private handleConfigLoadFailure(rawBytes: Buffer | undefined, error: unknown): void {
     const state = configLoadFailureState(this.configFile);
+    this.observedLoadFailure = state;
     const errorMessage = error instanceof Error ? error.message : String(error);
     // Backup confirmation is keyed on content alone: the same corrupt bytes need only one
     // sidecar regardless of which error message they produced.
@@ -1479,6 +1484,8 @@ export class Config {
     // Until a sidecar is confirmed for these exact bytes, enqueueConfigEdit refuses to
     // overwrite the corrupt source.
     state.backupSignature = backupConfirmed ? contentSignature : null;
+    state.unreadable = rawBytes === undefined;
+    state.errorMessage = errorMessage;
 
     // Dedupe on content + error + actionable backup detail: repeated loads of the same
     // state stay silent, while any change in remediation (backup gained or lost, sidecar
@@ -1623,6 +1630,8 @@ export class Config {
     return { ids, hasWorkspaceEntriesWithoutIds };
   }
 
+  /** Failure state this instance's last failed load wrote; see getConfigLoadError. */
+  private observedLoadFailure: ConfigLoadFailureState | undefined;
   private configSnapshot?: {
     key: string;
     config: ProjectsConfig;
@@ -3283,6 +3292,10 @@ export class Config {
       log.error(message);
       throw new Error(message);
     };
+    // An unreadable file is not corrupt: telling the user to move it aside would be wrong (#5757).
+    if (failureState.unreadable) {
+      rejectEdit(this.describeConfigLoadFailure(failureState));
+    }
     if (failureState.backupSignature === null) {
       rejectEdit(
         "the existing corrupt config has no confirmed backup yet. Fix the reported backup failure or move the corrupt file aside, then retry."
@@ -3304,6 +3317,32 @@ export class Config {
         "the file changed after this edit loaded it and the new content has no confirmed backup. Retry the settings change."
       );
     }
+  }
+
+  private describeConfigLoadFailure(state: ConfigLoadFailureState): string {
+    if (state.unreadable) {
+      return `config.json could not be read (${state.errorMessage}). Check that ${this.configFile} is a regular file readable by this user, then retry.`;
+    }
+    const parseError = `config.json could not be parsed (${state.errorMessage}).`;
+    return state.backupSignature === null
+      ? `${parseError} Xum could not back it up yet, so fix ${this.configFile} by hand and see the log for the backup failure.`
+      : `${parseError} Fix ${this.configFile} or restore it from its .corrupt- backup, then retry.`;
+  }
+
+  /**
+   * Why the most recent load of config.json failed, or null when it succeeded. Callers that
+   * found no workspace report this instead of "not found": the defaults view a failed load
+   * returns has no workspaces, but they are still registered on disk (#5757). A map lookup
+   * with no I/O, so hot paths can call it.
+   */
+  getConfigLoadError(): string | null {
+    const state = configLoadFailureStates.get(this.configFile);
+    // The map is shared by every Config for this path, and a successful load deletes its
+    // entry. Report it only if this instance's own last load created or refreshed it: another
+    // instance's failure says nothing about the snapshot this one serves.
+    return state !== undefined && state === this.observedLoadFailure
+      ? this.describeConfigLoadFailure(state)
+      : null;
   }
 
   getUpdateChannel(): UpdateChannel {
