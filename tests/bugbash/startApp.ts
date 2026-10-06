@@ -134,15 +134,19 @@ function failIfExited(child: ChildProcess): void {
   }
 }
 
-async function waitForHealth(base: string, child: ChildProcess): Promise<void> {
+export async function waitForHealth(base: string, child: ChildProcess): Promise<void> {
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     failIfExited(child);
     try {
-      const response = await fetch(`${base}/health`);
+      // Bound each probe: a server that accepts the connection but never answers would
+      // otherwise keep fetch pending, and the loop would never recheck its deadline or the exit.
+      const response = await fetch(`${base}/health`, {
+        signal: AbortSignal.timeout(Math.max(1, Math.min(2000, deadline - Date.now()))),
+      });
       if (response.ok) return;
     } catch {
-      // Not listening yet.
+      // Not listening yet, or the probe timed out.
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
@@ -372,7 +376,9 @@ async function main(): Promise<void> {
   process.exit(code ?? 0);
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exit(2);
-});
+if (import.meta.main) {
+  main().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exit(2);
+  });
+}

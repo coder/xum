@@ -27,8 +27,12 @@ export interface UseWorkspaceHeartbeatResult {
   save: (next: HeartbeatFormSettings) => Promise<boolean>;
   /** Global default prompt from config, for use as placeholder text. */
   globalDefaultPrompt: string | undefined;
-  /** Interval new workspaces start with: the configured global default, else the built-in one. */
-  globalDefaultIntervalMs: number;
+  /**
+   * Interval new workspaces start with: the configured global default, else the built-in one.
+   * Undefined while loading or when the config could not load, so the dialog never states a
+   * default the app does not know.
+   */
+  globalDefaultIntervalMs: number | undefined;
 }
 
 function normalizeHeartbeatDefaultMessage(message?: string): string | undefined {
@@ -92,8 +96,8 @@ export function useWorkspaceHeartbeat(
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [globalDefaultPrompt, setGlobalDefaultPrompt] = useState<string | undefined>(undefined);
-  const [globalDefaultIntervalMs, setGlobalDefaultIntervalMs] = useState(
-    HEARTBEAT_DEFAULT_INTERVAL_MS
+  const [globalDefaultIntervalMs, setGlobalDefaultIntervalMs] = useState<number | undefined>(
+    undefined
   );
 
   // Guards for out-of-order async responses (e.g., rapid toggles or workspace switches).
@@ -107,7 +111,7 @@ export function useWorkspaceHeartbeat(
     setIsSaving(false);
     setError(null);
     setGlobalDefaultPrompt(undefined);
-    setGlobalDefaultIntervalMs(HEARTBEAT_DEFAULT_INTERVAL_MS);
+    setGlobalDefaultIntervalMs(undefined);
 
     if (!workspaceId) {
       setIsLoading(false);
@@ -135,7 +139,7 @@ export function useWorkspaceHeartbeat(
 
         setSettings(normalizeHeartbeatSettings(heartbeat, globalDefaults));
         setGlobalDefaultPrompt(config?.heartbeatDefaultPrompt?.trim() ?? undefined);
-        setGlobalDefaultIntervalMs(globalDefaults?.intervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS);
+        setGlobalDefaultIntervalMs(globalDefaults?.intervalMs);
         setError(null);
         setIsLoading(false);
       })
