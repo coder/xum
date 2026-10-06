@@ -103,7 +103,10 @@ test(
 
 test(
   "The fast mode shortcut says when the model has no fast mode",
-  { tags: ["bugbash", "5753"] },
+  // mock-only: the test switches the shared workspace's model and must put it back. With mock AI
+  // the workspace starts on Opus 5.5. Real mode starts it on BUGBASH_APP_MODEL, which can be any
+  // model, and the model search matches ids, not the labels the test can read.
+  { tags: ["bugbash", "5753", "mock-only"] },
   async ({ app, screen, browser }) => {
     await browser.setViewport({ width: 1440, height: 900 });
     await openPlayground(app, screen, browser);
@@ -118,11 +121,13 @@ test(
     };
     // Haiku 4.5 has no fast mode on any route, so the toast must name the model, not the route.
     await pickModel("Opus 5.5", "anthropic:claude-haiku-4-5", "Haiku 4.5");
-    await composer.tap();
-    await browser.keyboard.press("Control+Shift+F");
-    await expect(screen.getByText(/this model has no fast mode/)).toBeVisible();
-
-    // Every repro in a run shares this workspace: put its model back.
-    await pickModel("Haiku 4.5", "anthropic:claude-opus-5-5", "Opus 5.5");
+    try {
+      await composer.tap();
+      await browser.keyboard.press("Control+Shift+F");
+      await expect(screen.getByText(/this model has no fast mode/)).toBeVisible();
+    } finally {
+      // Every repro in a run shares this workspace: put its model back, also after a failure.
+      await pickModel("Haiku 4.5", "anthropic:claude-opus-5-5", "Opus 5.5");
+    }
   }
 );
