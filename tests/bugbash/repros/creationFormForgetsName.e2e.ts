@@ -18,8 +18,8 @@ test(
     await name.fill("n3-repro");
     await screen.getByRole("textbox", "Message").fill("create from the default form");
     await screen.getByRole("button", "Send message").tap();
-    // The new workspace opens; its menu bar shows the notifications toggle.
-    await expect(screen.getByRole("button", "Notify on all responses")).toBeVisible({
+    // The new workspace opens; its menu bar shows the notifications button.
+    await expect(screen.getByRole("button", "Notifications")).toBeVisible({
       timeout: 30_000,
     });
 

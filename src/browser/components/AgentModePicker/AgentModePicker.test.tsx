@@ -1,6 +1,7 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { createCustomEvent, CUSTOM_EVENTS } from "@/common/constants/events";
 import { installDom } from "../../../../tests/ui/dom";
 
 import { AgentProvider, type AgentContextValue } from "@/browser/contexts/AgentContext";
@@ -143,6 +144,20 @@ describe("AgentModePicker", () => {
     view.rerender(<Harness />);
     expect(view.queryAllByTestId("agent-option").length).toBe(0);
     expect(view.getByLabelText("Select agent").getAttribute("aria-expanded")).toBe("false");
+  });
+
+  test("Escape closes the picker right after the open shortcut", () => {
+    const view = renderPicker();
+    // The hotkey and the palette open the picker through this event. Escape can arrive before
+    // the next animation frame, so the list must already own focus when the open commits.
+    act(() => {
+      window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.OPEN_AGENT_PICKER));
+    });
+    expect(view.getAllByTestId("agent-option").length).toBe(3);
+
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+    expect(view.queryAllByTestId("agent-option").length).toBe(0);
   });
 
   test("uiSelectable false without lock flag does not disable the picker", async () => {

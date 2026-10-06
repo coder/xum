@@ -447,12 +447,12 @@ describe("Auto-follow-up and compaction notification behavior (mock AI router)",
       globalThis as { Notification: unknown }
     ).Notification;
 
-    // Enable notifications via UI (click bell button in workspace header)
-    const notifyButton = app.view.container.querySelector(
-      '[data-testid="notify-on-response-button"]'
-    );
-    if (!notifyButton) throw new Error("Notify button not found");
-    fireEvent.click(notifyButton);
+    // Enable notifications with the toggle shortcut. The bell only opens the settings popover,
+    // and Radix popover content does not render in happy-dom.
+    if (!app.view.container.querySelector('[data-testid="notify-on-response-button"]')) {
+      throw new Error("Notify button not found");
+    }
+    fireEvent.keyDown(window, { key: ",", code: "Comma", ctrlKey: true, shiftKey: true });
 
     // Send seed message and wait for notification
     await app.chat.send(seedMessage);
