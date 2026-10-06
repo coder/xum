@@ -3,6 +3,7 @@ import nativeFs, * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from ".";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { log } from "@/node/services/log";
 import type { ProjectConfig, ProjectsConfig, Workspace } from "@/common/types/project";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -401,17 +402,61 @@ describe("Config snapshots", () => {
   });
 
   it("builds the same metadata for a single id with just one checkout probe", async () => {
+    // Single-row readers (getInfo, metadata emits) rely on the by-id build returning exactly the
+    // row that `getAllWorkspaceMetadata().find(id)` returns, so cover the shapes where the two
+    // builds resolve identity differently: ancestors outside the built row set, cycles, duplicate
+    // ids (first row wins, as with .find), id-less legacy rows and the multi-project bucket.
+    const legacyPath = path.join(root, "legacy");
+    const legacyId = config.generateLegacyId(projectPath, legacyPath);
     await saveWorkspaces([
       workspace("root", { archivedAt: older }),
-      workspace("child", { parentWorkspaceId: "root" }),
+      workspace("mid", { parentWorkspaceId: "root", archivedAt: older }),
+      // Missing worktree checkout: both builds must mark it transcript-only.
+      workspace("child", {
+        parentWorkspaceId: "mid",
+        runtimeConfig: { type: "worktree", srcBaseDir: root },
+      }),
+      workspace("cycle-a", { parentWorkspaceId: "cycle-b" }),
+      workspace("cycle-b", { parentWorkspaceId: "cycle-a" }),
+      workspace("cycle-child", { parentWorkspaceId: "cycle-b" }),
+      workspace("dup", { title: "first" }),
+      workspace("dup", { title: "second" }),
+      // createdAt keeps the unpersisted legacy fallback stable across the two builds.
+      { path: legacyPath, createdAt: older },
+      workspace("legacy-child", { parentWorkspaceId: legacyId }),
     ]);
-    const all = await config.getAllWorkspaceMetadata();
+    await config.editConfig((snapshot) => {
+      snapshot.projects.set(MULTI_PROJECT_CONFIG_KEY, {
+        workspaces: [
+          workspace("multi", {
+            projects: [
+              { projectPath, projectName: "project" },
+              { projectPath: path.join(root, "other"), projectName: "other" },
+            ],
+          }),
+        ],
+      });
+      return snapshot;
+    });
+    // Keep the legacy row id-less on disk for every read below.
+    const all = await config.getAllWorkspaceMetadata({ persistMigrations: false });
+    const ids = [...new Set(all.map((metadata) => metadata.id))];
+    expect(ids).toContain(legacyId);
+    expect(ids).toContain("multi");
+    expect(all.find((metadata) => metadata.id === "child")?.transcriptOnly).toBe(true);
     const access = spyOn(fs.promises, "access");
     const enumerate = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() => {
       throw new Error("Unexpected full metadata enumeration");
     });
     try {
-      expect(await config.getWorkspaceMetadataById("child")).toEqual(all[1]);
+      for (const id of ids) {
+        access.mockClear();
+        const byId = await config.getWorkspaceMetadataById(id, { persistMigrations: false });
+        expect({ id, row: byId }).toEqual({ id, row: all.find((metadata) => metadata.id === id)! });
+        expect(access).toHaveBeenCalledTimes(1);
+      }
+      access.mockClear();
+      expect(await config.getWorkspaceMetadataById("child")).toEqual(all[2]);
       expect(access.mock.calls.map(([file]) => file)).toEqual([path.join(root, "child")]);
       expect(await config.getWorkspaceMetadataById("missing")).toBeNull();
       expect(access).toHaveBeenCalledTimes(1);
