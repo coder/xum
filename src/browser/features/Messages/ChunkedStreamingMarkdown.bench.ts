@@ -1,6 +1,7 @@
 /**
  * Per-frame cost of the chunked switch-back path on one huge list (#5666).
- * Run: make bench BENCH=ChunkedStreamingMarkdown
+ * Run: make bench BENCH=ChunkedStreamingMarkdown RUNTIME=bun
+ * (Node cannot load this module chain: MarkdownCore imports KaTeX's CSS.)
  *
  * Each iteration feeds the next frame of a 120-frame prefix sequence of a 50k list to one
  * MarkdownChunker, the way a row that mounted mid-stream sees a live reply.
