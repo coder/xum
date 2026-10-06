@@ -728,6 +728,25 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       expect(getLastStatsDialogProps()?.open).toBe(false);
     });
 
+    it("closes once the sidebar shows again and stays closed when it hides again", () => {
+      let isNarrow = true;
+      const media = stubMatchMedia(
+        (query) => isNarrow && query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`
+      );
+      render(<WorkspaceMenuBar {...defaultProps} />);
+      openFromPalette();
+      expect(getLastStatsDialogProps()?.open).toBe(true);
+
+      // E.g. a phone rotated to landscape: the sidebar's own Stats tab is back.
+      isNarrow = false;
+      act(() => media.fireChange());
+      expect(getLastStatsDialogProps()?.open).toBe(false);
+
+      isNarrow = true;
+      act(() => media.fireChange());
+      expect(getLastStatsDialogProps()?.open).toBe(false);
+    });
+
     it("closes when switching workspaces and does not come back", () => {
       narrow();
       const view = render(<WorkspaceMenuBar {...defaultProps} />);

@@ -239,6 +239,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // listener covers viewport transitions and the ResizeObserver covers the shell
   // container query (e.g. expanding the left sidebar squeezes the shell under 684px).
   const [timelineSidebarHidden, setTimelineSidebarHidden] = useState(false);
+  // The Stats dialog stands in for the hidden sidebar's Stats tab. Once the sidebar shows again
+  // (a phone rotated to landscape), the tab is back, so the dialog closes for good.
+  if (statsDialogWorkspaceId !== null && !timelineSidebarHidden) {
+    setStatsDialogWorkspaceId(null);
+  }
   useEffect(() => {
     const compute = () => setTimelineSidebarHidden(isTimelineSidebarHidden());
     compute();
