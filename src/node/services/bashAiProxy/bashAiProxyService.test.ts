@@ -355,9 +355,12 @@ describe("BashAiProxyService", () => {
         unreachable?: boolean;
         coder?: boolean;
         survivesClose?: boolean;
+        /** openReverseForward waits for this, like a slow SSH connect. */
+        gate?: Promise<void>;
       } = {}
     ) {
       const opened: number[] = [];
+      let closes = 0;
       const relays = new Set<net.Server>();
       const sockets = new Set<net.Socket>();
       const destroyAll = (relay: net.Server) => {
@@ -371,6 +374,7 @@ describe("BashAiProxyService", () => {
           opened.push(remotePort);
           if (options.refuse) throw new ReverseForwardRefusedError("remote port forwarding failed");
           if (options.unreachable) throw new Error("ssh: connect to host: Connection timed out");
+          await options.gate;
           const relay = net.createServer((socket) => {
             sockets.add(socket);
             socket.once("close", () => sockets.delete(socket));
@@ -390,6 +394,7 @@ describe("BashAiProxyService", () => {
           return {
             closed,
             close: () => {
+              closes++;
               if (options.survivesClose) return; // like an ssh process left after a crash
               relays.delete(relay);
               destroyAll(relay);
@@ -410,6 +415,7 @@ describe("BashAiProxyService", () => {
       return {
         target,
         opened,
+        closes: () => closes,
         dropAll: () => {
           for (const relay of relays) destroyAll(relay);
           relays.clear();
@@ -566,6 +572,48 @@ describe("BashAiProxyService", () => {
       } finally {
         setSystemTime();
       }
+    });
+
+    /** A host whose forward opens only when `open()` is called. */
+    function slowSshHost(hostKey: string) {
+      let open!: () => void;
+      const gate = new Promise<void>((resolve) => (open = resolve));
+      return { ...fakeSshHost(hostKey, { gate }), open };
+    }
+
+    async function until(condition: () => boolean): Promise<void> {
+      for (let i = 0; i < 200 && !condition(); i++) await Bun.sleep(5);
+      expect(condition()).toBe(true);
+    }
+
+    test("turning the switch off during a forward setup closes the forward it returns", async () => {
+      const host = slowSshHost("ssh-host-12");
+      sshTargets.set("ssh-ws", host.target);
+      const pending = proxy.envFor("ssh-ws", "ssh", []);
+      await until(() => host.opened.length === 1);
+
+      enabled = false;
+      expect(await proxy.envFor("ssh-ws", "ssh", [])).toEqual({});
+      host.open(); // the setup finishes after the switch went off
+      expect(await pending).toEqual({});
+      await until(() => host.closes() === 1);
+
+      // Back on: a fresh forward, not the cancelled one.
+      enabled = true;
+      expect((await proxy.envFor("ssh-ws", "ssh", [])).ANTHROPIC_BASE_URL).toBeDefined();
+      expect(host.opened).toHaveLength(2);
+    });
+
+    test("stop waits for a forward setup in flight and closes its forward", async () => {
+      const host = slowSshHost("ssh-host-13");
+      sshTargets.set("ssh-ws", host.target);
+      const pending = proxy.envFor("ssh-ws", "ssh", []);
+      await until(() => host.opened.length === 1);
+
+      setTimeout(() => host.open(), 50);
+      await proxy.stop();
+      expect(host.closes()).toBe(1); // nothing (an ssh child) outlives the service
+      expect(await pending).toEqual({});
     });
 
     test("a workspace that would get no variables opens no forward", async () => {

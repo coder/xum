@@ -57,6 +57,8 @@ interface HostState {
   /** No new attempt before this time, after a failed setup. */
   retryAt?: number;
   establishing?: Promise<number | undefined>;
+  /** Set by closeOwned()/closeAll(): a setup in flight closes what it opens and reports nothing. */
+  cancelled?: boolean;
 }
 
 export class ReverseForwardManager {
@@ -98,19 +100,38 @@ export class ReverseForwardManager {
     return waitMs === Infinity ? host.establishing : raceTimeout(host.establishing, waitMs);
   }
 
-  /** Closes the forwards this process owns; later ensure() calls open them again. */
+  /**
+   * Closes the forwards this process owns; later ensure() calls open them again. Setups in flight
+   * close their forward on their own when they end.
+   */
   closeOwned(): void {
-    for (const [hostKey, state] of this.hosts) {
-      if (state.establishing) continue; // it ends on its own; ensure() sees the result
-      state.owned?.close();
-      this.hosts.delete(hostKey);
-    }
+    void this.cancelAll();
   }
 
-  closeAll(): void {
+  /**
+   * Closes everything for good. Resolves when the setups in flight have ended, each closing the
+   * forward it opened, so no ssh process outlives the manager.
+   */
+  async closeAll(): Promise<void> {
     this.closed = true;
-    for (const state of this.hosts.values()) state.owned?.close();
+    await Promise.allSettled(this.cancelAll());
+  }
+
+  /** Closes owned forwards and cancels setups in flight; returns those setups. */
+  private cancelAll(): Array<Promise<number | undefined>> {
+    const pending: Array<Promise<number | undefined>> = [];
+    for (const state of this.hosts.values()) {
+      state.cancelled = true;
+      state.owned?.close();
+      if (state.establishing) pending.push(state.establishing);
+    }
+    // A setup in flight keeps its detached state; the next ensure() starts a fresh one.
     this.hosts.clear();
+    return pending;
+  }
+
+  private stopped(state: HostState): boolean {
+    return this.closed || state.cancelled === true;
   }
 
   private isUp(state: HostState): boolean {
@@ -147,7 +168,7 @@ export class ReverseForwardManager {
     // The long cooldown is only for a host that refused forwarding on every candidate.
     let transient = false;
     for (const remotePort of candidates) {
-      if (this.closed) return undefined;
+      if (this.stopped(state)) return undefined;
       let forward: ReverseForward;
       try {
         forward = await target.openReverseForward(remotePort, localPort);
@@ -164,10 +185,11 @@ export class ReverseForwardManager {
         transient = true;
         break;
       }
-      if (await this.waitHealthy(target, remotePort, forward)) {
+      if (await this.waitHealthy(target, state, remotePort, forward)) {
         return this.markUp(target, state, remotePort, forward);
       }
       forward.close();
+      if (this.stopped(state)) return undefined;
       transient = true; // the forward came up but the probe did not pass
     }
     state.retryAt = this.now() + (transient ? RETRY_AFTER_TRANSIENT_MS : RETRY_AFTER_REFUSAL_MS);
@@ -183,13 +205,14 @@ export class ReverseForwardManager {
   /** Polls the health probe until it passes, the forward ends, or the deadline passes. */
   private async waitHealthy(
     target: ForwardTarget,
+    state: HostState,
     remotePort: number,
     forward: ReverseForward
   ): Promise<boolean> {
     let ended = false;
     void forward.closed.then(() => (ended = true));
     const deadline = this.now() + ESTABLISH_TIMEOUT_MS;
-    while (!ended && !this.closed && this.now() < deadline) {
+    while (!ended && !this.stopped(state) && this.now() < deadline) {
       if (await this.healthy(target, remotePort)) return !ended;
       await this.sleep(PROBE_INTERVAL_MS);
     }
@@ -201,10 +224,10 @@ export class ReverseForwardManager {
     state: HostState,
     remotePort: number,
     owned: ReverseForward | undefined
-  ): number {
-    if (this.closed) {
+  ): number | undefined {
+    if (this.stopped(state)) {
       owned?.close();
-      return remotePort;
+      return undefined;
     }
     state.remotePort = remotePort;
     state.owned = owned;
