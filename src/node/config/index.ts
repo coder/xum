@@ -116,6 +116,7 @@ import { loadOrCreateInstallationId } from "./installationIdentity";
 import {
   decodeCyberReasoningModesFromDisk,
   encodeCyberReasoningModesForDisk,
+  hasCyberReasoningMode,
 } from "./cyberReasoningModeDisk";
 import {
   type ProjectRegistrationLockHandle,
@@ -2646,16 +2647,23 @@ export class Config {
           }
         }
       }
-      // Encode a copy: `data` still shares settings objects with runtime state.
-      const diskData = structuredClone(data);
-      encodeCyberReasoningModesForDisk(diskData);
+      // Encode a copy: `data` still shares settings objects with runtime state. Without a Cyber
+      // slot the encode is a no-op, so skip the whole-config clone (about 27 ms per save at
+      // ~4,700 workspaces).
+      let diskData: typeof data = data;
+      if (hasCyberReasoningMode(data)) {
+        diskData = structuredClone(data);
+        encodeCyberReasoningModesForDisk(diskData);
+      }
+      // Serialize in the same synchronous step as the check: without the clone, `diskData` is
+      // live runtime state, and a later fiber yield could let a Cyber value the check missed in.
+      const text = JSON.stringify(diskData, null, 2);
       // writeFileAtomic writes the whole payload and verifies the temp file's size before
       // the rename: a filling disk makes write(2) accept a short count without an error,
       // and the npm write-file-atomic package renamed that truncated file over
       // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
-        try: async () =>
-          writeFileAtomic(self.configFile, JSON.stringify(diskData, null, 2), "utf-8"),
+        try: async () => writeFileAtomic(self.configFile, text, "utf-8"),
         catch: (error) => error,
       });
       // A competing rename may already have replaced our write; only a fresh read can publish it.

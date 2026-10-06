@@ -930,6 +930,110 @@ describe("Config", () => {
       ]).toEqual(["cyber", "cyber", "cyber", "cyber", "cyber", "cyber"]);
     });
 
+    it("keeps Cyber in runtime state after a save that encodes it", async () => {
+      // The only Cyber slot is nested: the save must find it, encode it on disk, and leave the
+      // settings object it shares with runtime state untouched.
+      let edited: ReturnType<Config["loadConfigOrDefault"]> | undefined;
+      await config.editConfig((cfg) => {
+        edited = {
+          ...cfg,
+          projects: new Map([
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    path: "/repo/ws",
+                    id: "ws",
+                    name: "ws",
+                    taskAiPins: { reasoningMode: "cyber" },
+                  },
+                ],
+              },
+            ],
+          ]),
+        };
+        return edited;
+      });
+
+      const raw = fs.readFileSync(path.join(tempDir, "config.json"), "utf-8");
+      expect(raw).not.toContain('"cyber"');
+      const onDisk = JSON.parse(raw) as {
+        projects: Array<[string, { workspaces: Array<{ taskAiPins?: unknown }> }]>;
+      };
+      expect(onDisk.projects[0][1].workspaces[0].taskAiPins).toEqual({ cyberReasoningMode: true });
+      expect(edited?.projects.get("/repo")?.workspaces[0].taskAiPins?.reasoningMode).toBe("cyber");
+    });
+
+    // The save shares settings objects with runtime state and only clones them when a slot holds
+    // Cyber, so it must serialize before its first suspension. Pause the save at its first await
+    // (the atomic write's realpath), change the supplied settings, then let it finish: the file
+    // must still hold the state the edit returned.
+    for (const withCyber of [false, true]) {
+      it(`writes the returned state even if settings change mid-save (${withCyber ? "Cyber" : "no Cyber"})`, async () => {
+        const execSettings: Record<string, unknown> = { ...cyberSettings, reasoningMode: "pro" };
+        const pins: Record<string, unknown> = withCyber ? { reasoningMode: "cyber" } : {};
+        const paused = Promise.withResolvers<void>();
+        const resume = Promise.withResolvers<void>();
+        const realRealpath = cjsFs.realpath.bind(cjsFs);
+        let pausedOnce = false;
+        const spy = spyOn(cjsFs, "realpath").mockImplementation(((
+          target: string,
+          callback: (error: NodeJS.ErrnoException | null, resolved: string) => void
+        ) => {
+          if (!pausedOnce && path.basename(String(target)) === "config.json") {
+            pausedOnce = true;
+            paused.resolve();
+            void resume.promise.then(() => realRealpath(target, callback));
+            return;
+          }
+          realRealpath(target, callback);
+        }) as unknown as typeof cjsFs.realpath);
+        try {
+          const edit = config.editConfig((cfg) => ({
+            ...cfg,
+            projects: new Map([
+              [
+                "/repo",
+                {
+                  workspaces: [
+                    {
+                      path: "/repo/ws",
+                      id: "ws",
+                      name: "ws",
+                      aiSettingsByAgent: { exec: execSettings as never },
+                      taskAiPins: pins as never,
+                    },
+                  ],
+                },
+              ],
+            ]),
+          }));
+          // Race the edit so a save that never reaches the paused realpath fails the
+          // `pausedOnce` check below instead of hanging until the test timeout.
+          await Promise.race([paused.promise, edit]);
+          execSettings.reasoningMode = "cyber";
+          execSettings.model = "openai:mutated-mid-save";
+          resume.resolve();
+          await edit;
+        } finally {
+          spy.mockRestore();
+        }
+
+        expect(pausedOnce).toBe(true);
+        const onDisk = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+          projects: Array<
+            [string, { workspaces: Array<{ aiSettingsByAgent?: unknown; taskAiPins?: unknown }> }]
+          >;
+        };
+        const workspace = onDisk.projects[0][1].workspaces[0];
+        expect(workspace.aiSettingsByAgent).toEqual({
+          exec: { ...cyberSettings, reasoningMode: "pro" },
+        });
+        expect(workspace.taskAiPins).toEqual(withCyber ? { cyberReasoningMode: true } : {});
+      });
+    }
+
     it("lets a mode written by an older build win over a stale Cyber marker", () => {
       writeRawConfig({
         projects: [
