@@ -5682,6 +5682,16 @@ describe("MCPServerManager", () => {
     expect(result.error.length).toBeLessThanOrEqual(300);
   });
 
+  test("test() reports a rejected setup step as a bounded failure (#5678)", async () => {
+    configService.listServers = mock(() => Promise.reject(new Error("x".repeat(5000))));
+    const result = await manager.test({ projectPath: PROJECT_PATH, name: "any" });
+    if (result.success) {
+      throw new Error("Expected test() to fail");
+    }
+    expect(result.error).toStartWith("xxx");
+    expect(result.error.length).toBeLessThanOrEqual(300);
+  });
+
   test("tool execution failure with closed-client error marks instance isClosed for restart", async () => {
     const workspaceId = "ws-tool-closed";
     configService.listServers = mock(() =>

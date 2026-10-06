@@ -1148,7 +1148,10 @@ async function runServerTest(
         ...(serverInfo ? { serverInfo } : {}),
       };
     } catch (error) {
-      const message = formatServerTestError(error);
+      // Only remote servers answer with web pages. A stdio parse error that quotes an
+      // HTML-looking line keeps its own (bounded) message.
+      const message =
+        server.transport === "stdio" ? getErrorMessage(error) : formatServerTestError(error);
       log.warn(`[MCP] ${logContext} test failed`, { error: message });
 
       if (client) {
@@ -5201,7 +5204,13 @@ export class MCPServerManager {
    * before a connection starts too (missing secrets, unknown names) (#5678).
    */
   async test(options: MCPServerTestOptions): Promise<MCPTestResult> {
-    const result = await this.testUnbounded(options);
+    let result: MCPTestResult;
+    try {
+      result = await this.testUnbounded(options);
+    } catch (error) {
+      // Setup steps (config listing, plugin data dirs) can reject; report them as a failed test.
+      result = { success: false, error: getErrorMessage(error) };
+    }
     return result.success ? result : { ...result, error: boundServerTestError(result.error) };
   }
 
