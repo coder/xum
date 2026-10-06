@@ -5618,6 +5618,55 @@ describe("MCPServerManager", () => {
     }
   });
 
+  test("test() reports an HTML error page as a short status message, not its source (#5678)", async () => {
+    // A URL that serves a web page (not an MCP endpoint) answers with HTML.
+    // The page body is untrusted server text: it must not reach the error.
+    const page = `<!DOCTYPE html><html><head><title>Not here</title></head><body>${"<p>filler</p>".repeat(500)}<script>alert(1)</script></body></html>`;
+    const server = createServer((req, res) => {
+      res.statusCode = 404;
+      if (req.url === "/text") {
+        res.setHeader("Content-Type", "text/plain");
+        res.end("not an mcp endpoint ".repeat(500));
+        return;
+      }
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.end(page);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Failed to bind HTML test server");
+      }
+      const url = `http://127.0.0.1:${address.port}/`;
+
+      for (const transport of ["http", "auto"] as const) {
+        const result = await manager.test({ projectPath: PROJECT_PATH, transport, url });
+        if (result.success) {
+          throw new Error(`Expected ${transport} test() to fail`);
+        }
+        expect(result.error).not.toMatch(/<html|<!doctype|<script|filler/i);
+        expect(result.error).toContain("404");
+        expect(result.error.length).toBeLessThanOrEqual(300);
+      }
+
+      // Any other long body is cut to the same bound.
+      const text = await manager.test({
+        projectPath: PROJECT_PATH,
+        transport: "http",
+        url: `${url}text`,
+      });
+      if (text.success) {
+        throw new Error("Expected plain-text test() to fail");
+      }
+      expect(text.error).toContain("not an mcp endpoint");
+      expect(text.error.length).toBeLessThanOrEqual(300);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test("tool execution failure with closed-client error marks instance isClosed for restart", async () => {
     const workspaceId = "ws-tool-closed";
     configService.listServers = mock(() =>

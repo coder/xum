@@ -260,6 +260,8 @@ type MCPOAuthAPI = NonNullable<ReturnType<typeof useAPI>["api"]>["mcpOauth"];
  * URL error for a remote add/edit draft. Stdio drafts hold a command, and a blank
  * URL is already gated by the required-field check, so neither shows an error.
  */
+const DUPLICATE_SERVER_NAME_ERROR = "A server with this name already exists";
+
 function getDraftUrlError(draft: { transport: MCPServerTransport; value: string }): string | null {
   if (draft.transport === "stdio" || !draft.value.trim()) return null;
   return getMcpServerUrlError(draft.value);
@@ -1017,6 +1019,9 @@ export const MCPSettingsSection: React.FC = () => {
       if (!api) return;
       const generation = loadGeneration.current;
       setTestingServer(name);
+      // Drop the old result while the test runs (#5680): a re-test usually writes the
+      // same result back, so keeping it on screen made the click look like a no-op.
+      clearTestResult(name);
       // The new result replaces the old test, even if it fails or has no identity.
       setBranding((prev) => {
         const { [name]: _previous, ...remaining } = prev;
@@ -1039,7 +1044,7 @@ export const MCPSettingsSection: React.FC = () => {
         setTestingServer(null);
       }
     },
-    [api, cacheTestResult]
+    [api, cacheTestResult, clearTestResult]
   );
 
   const serverDisplayValue = (entry: MCPServerInfo): string =>
@@ -1049,6 +1054,12 @@ export const MCPSettingsSection: React.FC = () => {
     if (!api || !newServer.name.trim() || !newServer.value.trim()) return;
 
     const serverName = newServer.name.trim();
+    // mcp.add is add-or-replace (Edit saves through it), so Add must refuse a taken
+    // name itself: replacing a server silently loses its config (#5679).
+    if (servers[serverName]) {
+      setError(DUPLICATE_SERVER_NAME_ERROR);
+      return;
+    }
     const serverTransport = newServer.transport;
     const serverValue = newServer.value.trim();
     const serverHeadersRows = newServer.headersRows;
@@ -1105,7 +1116,16 @@ export const MCPSettingsSection: React.FC = () => {
     } finally {
       setAddingServer(false);
     }
-  }, [api, newServer, newTestResult, refresh, cacheTestResult, handleTest, globalSecretKeys]);
+  }, [
+    api,
+    newServer,
+    newTestResult,
+    servers,
+    refresh,
+    cacheTestResult,
+    handleTest,
+    globalSecretKeys,
+  ]);
 
   const handleStartEdit = useCallback((name: string, entry: MCPServerInfo) => {
     setEditing({
@@ -1172,8 +1192,10 @@ export const MCPSettingsSection: React.FC = () => {
         }).validation;
 
   const newServerUrlError = getDraftUrlError(newServer);
+  const newServerNameTaken = servers[newServer.name.trim()] !== undefined;
   const canAdd =
     newServer.name.trim().length > 0 &&
+    !newServerNameTaken &&
     newServer.value.trim().length > 0 &&
     newServerUrlError === null &&
     (newServer.transport === "stdio" || newHeadersValidation.errors.length === 0);
@@ -1576,6 +1598,12 @@ export const MCPSettingsSection: React.FC = () => {
                       </div>
                     )}
                   </div>
+                  {isTesting && !isEditing && (
+                    <div className="border-border-medium text-content-secondary flex items-center gap-1.5 border-t px-3 py-2 text-xs">
+                      <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+                      <span>Testing connection…</span>
+                    </div>
+                  )}
                   {cached && !cached.result.success && !isEditing && (
                     <div className="border-border-medium border-t px-3 py-2 text-xs">
                       <div className="text-destructive flex items-start gap-1.5">
@@ -1647,6 +1675,9 @@ export const MCPSettingsSection: React.FC = () => {
                 disabled={newServerOauthPending}
                 className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 text-sm focus:outline-none"
               />
+              {newServerNameTaken && (
+                <p className="text-destructive mt-1 text-xs">{DUPLICATE_SERVER_NAME_ERROR}</p>
+              )}
             </div>
 
             <div>

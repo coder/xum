@@ -687,6 +687,29 @@ function shouldAutoFallbackToSse(error: unknown): boolean {
   return status === 400 || status === 404 || status === 405;
 }
 
+const MCP_TEST_ERROR_MAX_CHARS = 300;
+const HTML_DOCUMENT_PATTERN = /<!doctype\s+html|<html[\s>]|<head[\s>]|<body[\s>]/i;
+
+/**
+ * User-facing message for a failed connection test (#5678). MCP clients embed
+ * the raw response body in their errors ("Error POSTing to endpoint: <body>"),
+ * and a URL that serves a web page answers with a whole HTML document. That
+ * body is untrusted server text: replace an HTML page with its status, and
+ * bound every message so one response cannot flood the Settings card.
+ */
+function formatServerTestError(error: unknown): string {
+  const message = getErrorMessage(error);
+  if (HTML_DOCUMENT_PATTERN.test(message)) {
+    const status = extractHttpStatusCode(error) ?? /\bHTTP (\d{3})\b/.exec(message)?.[1];
+    const prefix = status != null ? `HTTP ${status}: the server` : "The server";
+    return `${prefix} returned an HTML page instead of an MCP response. Check the server URL.`;
+  }
+  if (message.length <= MCP_TEST_ERROR_MAX_CHARS) {
+    return message;
+  }
+  return `${message.slice(0, MCP_TEST_ERROR_MAX_CHARS - 1)}…`;
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -1121,7 +1144,7 @@ async function runServerTest(
         ...(serverInfo ? { serverInfo } : {}),
       };
     } catch (error) {
-      const message = getErrorMessage(error);
+      const message = formatServerTestError(error);
       log.warn(`[MCP] ${logContext} test failed`, { error: message });
 
       if (client) {
