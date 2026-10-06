@@ -21,6 +21,7 @@ import { z } from "zod";
 
 import { log } from "@/node/services/log";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 export const BASH_AI_PROXY_STATE_FILE = "bash-ai-proxy.json";
 
@@ -125,10 +126,10 @@ export class ProxyStateStore {
     return state.value;
   }
 
+  // Durable (fsyncs the file and its directory): commands get keys signed with this secret, so
+  // a power loss must not bring back an older file with another secret.
   private async write(state: ProxyState): Promise<void> {
-    const tmp = `${this.file}.${process.pid}.tmp`;
-    await fs.writeFile(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
-    await fs.rename(tmp, this.file);
+    await writeFileAtomic(this.file, JSON.stringify(state, null, 2), { mode: 0o600 });
   }
 }
 

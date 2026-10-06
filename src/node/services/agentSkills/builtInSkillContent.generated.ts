@@ -5031,6 +5031,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- A provider without a Xum API key (for example OpenAI with Codex OAuth only) gets no variables. A provider that your [project secrets](/config/project-secrets) configure keeps the secret values. This includes `OPENAI_ORG_ID` and `OPENAI_PROJECT_ID`.",
       "- The proxy allows Messages, Responses, Chat Completions, token counting and model listing. Other paths get 404.",
       "- The port and the keys stay the same when Xum restarts, so background commands keep working. Xum keeps them in `~/.xum/bash-ai-proxy.json`. Deleting that file changes all keys.",
+      "- If the saved port is busy when Xum starts, Xum uses another port for that session and keeps the saved one. Commands started in that session lose access after the next restart.",
       "- A key stops working when its workspace is removed.",
       "- A script that exports its own `ANTHROPIC_API_KEY` but keeps the proxy URL gets 401. Set both the key and the base URL, or neither.",
       "- Agent CLIs that read these variables also go through the proxy. `claude -p` in a bash command then bills the Xum Anthropic key instead of a Claude subscription login.",
