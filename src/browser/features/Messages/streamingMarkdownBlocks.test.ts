@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { Lexer } from "marked";
+import { Lexer, type Tokens } from "marked";
 import { listItemRanges } from "./streamingMarkdownBlocks";
 
 function topLevelItems(markdown: string): number {
-  const list = Lexer.lex(markdown, { gfm: true }).find((token) => token.type === "list");
-  return list?.type === "list" ? list.items.length : 0;
+  // marked's Token union includes a generic `{ type: string }` member, so `type` does not narrow.
+  const list = Lexer.lex(markdown, { gfm: true }).find((token) => token.type === "list") as
+    | Tokens.List
+    | undefined;
+  return list?.items.length ?? 0;
 }
 
 // Lists whose items hold the constructs that must not be cut: a nested list, an indented fence
