@@ -39,7 +39,7 @@ import {
   type ProviderConfigRaw,
 } from "@/node/utils/providerRequirements";
 
-import { ProxyStateStore } from "./proxyState";
+import { ProxyStateStore, type PersistedForward } from "./proxyState";
 import { ReverseForwardManager, type ForwardTarget } from "./reverseForwards";
 import {
   BASH_AI_PROXY_HEALTH_PATH,
@@ -62,6 +62,8 @@ const SSH_FORWARD_WAIT_MS = 10_000;
 const RESTORE_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
 /** Refresh a forward's `usedAt` at most this often (it only gates restore). */
 const USED_AT_REFRESH_MS = 60 * 60_000;
+/** Workspaces kept per SSH host for restore (it needs one that still exists). */
+const MAX_SAVED_WORKSPACES_PER_HOST = 8;
 
 /** Analytics source: rows land as `tool_name = headless:bash_proxy`. */
 export const BASH_AI_PROXY_ANALYTICS_SOURCE = "bash_proxy";
@@ -206,8 +208,8 @@ export class BashAiProxyService {
   private stopped = false;
   private readonly state: ProxyStateStore;
   private readonly forwards: ReverseForwardManager;
-  /** Remote port and usedAt last saved per SSH host, to skip redundant writes. */
-  private readonly savedForwards = new Map<string, { remotePort: number; usedAt: number }>();
+  /** The forward last saved per SSH host, to skip redundant writes. */
+  private readonly savedForwards = new Map<string, PersistedForward>();
   private restoring: Promise<unknown> | undefined;
 
   constructor(private readonly options: BashAiProxyServiceOptions) {
@@ -266,9 +268,16 @@ export class BashAiProxyService {
     const jobs = Object.entries(forwards)
       .filter(([, forward]) => now - forward.usedAt < RESTORE_MAX_AGE_MS)
       .map(async ([hostKey, forward]) => {
-        const target = await this.options.forwardTargetFor(forward.workspaceId);
-        if (!target?.restoreAtStartup || target.hostKey !== hostKey) return;
-        await this.forwards.ensure(target, port, Infinity);
+        for (const workspaceId of forward.workspaceIds) {
+          const target = await this.options.forwardTargetFor(workspaceId);
+          if (target?.hostKey !== hostKey) continue; // removed, or on another host
+          if (!target.restoreAtStartup) return;
+          const remotePort = await this.forwards.ensure(target, port, Infinity);
+          // A restored forward is in use: keep it eligible for the next restart too.
+          if (remotePort !== undefined)
+            await this.rememberForward(hostKey, remotePort, workspaceId);
+          return;
+        }
       });
     this.restoring = Promise.allSettled(jobs);
   }
@@ -300,18 +309,54 @@ export class BashAiProxyService {
     if (!target) return undefined;
     const remotePort = await this.forwards.ensure(target, port, SSH_FORWARD_WAIT_MS);
     if (remotePort === undefined) return undefined;
-    this.rememberForward(target.hostKey, remotePort, workspaceId);
+    await this.rememberForward(target.hostKey, remotePort, workspaceId);
     return `http://127.0.0.1:${remotePort}`;
   }
 
-  private rememberForward(hostKey: string, remotePort: number, workspaceId: string): void {
+  /**
+   * Saves a host's forward for restore(): its port, the workspaces that use it (restore needs
+   * one that still exists), and `usedAt`, refreshed at most hourly. The cache that skips
+   * redundant writes changes only after a write succeeded, so a failed write is tried again.
+   */
+  private async rememberForward(
+    hostKey: string,
+    remotePort: number,
+    workspaceId: string
+  ): Promise<void> {
+    if (this.stopped) return;
     const saved = this.savedForwards.get(hostKey);
     const now = Date.now();
-    if (saved?.remotePort === remotePort && now - saved.usedAt < USED_AT_REFRESH_MS) return;
-    this.savedForwards.set(hostKey, { remotePort, usedAt: now });
-    void this.state.update((state) => {
-      state.forwards[hostKey] = { remotePort, workspaceId, usedAt: now };
+    if (
+      saved?.remotePort === remotePort &&
+      saved.workspaceIds.includes(workspaceId) &&
+      now - saved.usedAt < USED_AT_REFRESH_MS
+    ) {
+      return;
+    }
+    const others = (saved?.workspaceIds ?? []).filter(
+      (id) => id !== workspaceId && this.options.workspaceExists(id)
+    );
+    const forward: PersistedForward = {
+      remotePort,
+      workspaceIds: [workspaceId, ...others].slice(0, MAX_SAVED_WORKSPACES_PER_HOST),
+      usedAt: now,
+    };
+    const written = await this.state.update((state) => {
+      state.forwards[hostKey] = forward;
     });
+    if (written) this.savedForwards.set(hostKey, forward);
+  }
+
+  /**
+   * Authenticated traffic from an SSH workspace keeps its host's forward eligible for restore,
+   * so a long-running job outlives the age limit as long as it makes calls.
+   */
+  private async noteForwardTraffic(workspaceId: string): Promise<void> {
+    for (const [hostKey, saved] of this.savedForwards) {
+      if (!saved.workspaceIds.includes(workspaceId)) continue;
+      await this.rememberForward(hostKey, saved.remotePort, workspaceId);
+      return;
+    }
   }
 
   private keyFor(workspaceId: string): string {
@@ -350,7 +395,7 @@ export class BashAiProxyService {
     const persisted = await this.state.load();
     this.secret ??= persisted.secret;
     for (const [hostKey, forward] of Object.entries(persisted.forwards)) {
-      this.savedForwards.set(hostKey, { remotePort: forward.remotePort, usedAt: forward.usedAt });
+      this.savedForwards.set(hostKey, forward);
     }
     const server = http.createServer((req, res) => {
       this.handle(req, res).catch((error: unknown) => {
@@ -475,6 +520,7 @@ export class BashAiProxyService {
         "Xum bash AI proxy: the workspace's project is not trusted, so its commands cannot call providers through Xum."
       );
     }
+    await this.noteForwardTraffic(workspaceId);
 
     let path = url.pathname.slice(route.prefix.length) || "/";
     if (path !== "/v1" && !path.startsWith("/v1/")) path = `/v1${path}`;

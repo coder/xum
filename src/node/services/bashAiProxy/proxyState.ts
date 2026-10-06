@@ -3,8 +3,9 @@
  * - `secret`: signs the workspace keys (stableIdentity.ts), so keys survive a restart.
  * - `port`: the listener port that commands already have in their env. A restart binds it again
  *   first, so background processes keep working.
- * - `forwards`: the remote port each SSH host uses, and one workspace on that host. Startup uses
- *   it to restore the reverse forwards that running remote commands depend on.
+ * - `forwards`: the remote port each SSH host uses, and the workspaces on that host that used it
+ *   (most recent first). Startup restores the reverse forwards that running remote commands
+ *   depend on, through the first of those workspaces that still exists.
  *
  * A missing or malformed file self-heals to a fresh state. That only rotates the keys and ports.
  */
@@ -22,8 +23,8 @@ export const BASH_AI_PROXY_STATE_FILE = "bash-ai-proxy.json";
 
 const PersistedForwardSchema = z.object({
   remotePort: z.number().int().min(1).max(65535),
-  /** A workspace on that host: startup rebuilds the runtime from its metadata. */
-  workspaceId: z.string().min(1),
+  /** Workspaces on that host: startup rebuilds the runtime from one that still exists. */
+  workspaceIds: z.array(z.string().min(1)).min(1),
   usedAt: z.number(),
 });
 
@@ -55,17 +56,22 @@ export class ProxyStateStore {
     });
   }
 
-  /** Applies `mutate` to the current state and writes it. Errors are logged, never thrown. */
-  update(mutate: (state: ProxyState) => void): Promise<void> {
+  /**
+   * Applies `mutate` to the current state and writes it. Errors are logged, never thrown; the
+   * result says whether the write reached the disk.
+   */
+  update(mutate: (state: ProxyState) => void): Promise<boolean> {
     return this.serialize(async () => {
       const state = (this.cached ??= await this.readOrCreate());
       mutate(state);
       try {
         await this.write(state, "replace");
+        return true;
       } catch (error) {
         log.warn("[bash-ai-proxy] could not save proxy state", {
           error: error instanceof Error ? error.message : String(error),
         });
+        return false;
       }
     });
   }
