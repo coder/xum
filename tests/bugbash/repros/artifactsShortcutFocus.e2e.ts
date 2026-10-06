@@ -8,6 +8,9 @@ test(
   "Ctrl+Shift+K focuses the Artifacts panel and shows its focus ring",
   { tags: ["bugbash", "B3"] },
   async ({ app, screen, browser }) => {
+    // The web target's size, set here so the repro runs the same on every target: the narrow
+    // layout hides the right sidebar.
+    await browser.setViewport({ width: 1440, height: 900 });
     await openPlayground(app, screen, browser);
     // The bug showed when the shortcut came from the chat input.
     await screen.getByRole("textbox", "Message").tap();

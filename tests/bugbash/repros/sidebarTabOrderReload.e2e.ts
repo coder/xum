@@ -8,6 +8,9 @@ test(
   "the right sidebar keeps its saved tab order across a reload",
   { tags: ["bugbash", "N10"] },
   async ({ app, screen, browser }) => {
+    // The web target's size, set here so the repro runs the same on every target: the narrow
+    // layout hides the right sidebar.
+    await browser.setViewport({ width: 1440, height: 900 });
     await openPlayground(app, screen, browser);
     const tablist = screen.getByRole("tablist", "Sidebar views");
     const artifactsTab = tablist.getByRole("tab", /^Artifacts/);

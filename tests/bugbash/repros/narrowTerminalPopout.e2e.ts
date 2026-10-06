@@ -5,13 +5,16 @@ import { expect } from "e2e";
 import { openPlayground } from "./helpers";
 
 // The browser fixture does not follow new tabs, so a spy records every window.open URL and
-// opens nothing. Run with `--target phone`: at 1440px the terminal opens in the sidebar.
+// opens nothing.
 const OPENED_URLS_KEY = "__bugbashOpenedUrls";
 
 test(
   "New terminal at phone width opens the terminal popup",
   { tags: ["bugbash", "B2"] },
   async ({ app, screen, browser }) => {
+    // The phone target's width, set here so the repro runs the same on every target: on a wide
+    // screen the terminal correctly opens in the visible sidebar.
+    await browser.setViewport({ width: 390, height: 844 });
     await browser.addInitScript((key: string) => {
       const opened: string[] = [];
       Reflect.set(window, key, opened);

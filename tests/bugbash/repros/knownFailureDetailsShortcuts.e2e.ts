@@ -8,6 +8,9 @@ test(
   "global shortcuts still work after the Workspace details popover closes",
   { tags: ["bugbash", "known-failure", "5671"] },
   async ({ app, screen, browser }) => {
+    // The web target's size, set here so the repro runs the same on every target: the bug is a
+    // desktop keyboard flow.
+    await browser.setViewport({ width: 1440, height: 900 });
     await openPlayground(app, screen, browser);
     const bell = screen.getByRole("button", "Notify on all responses");
     await expect(bell).toHaveAttribute("aria-pressed", "false");
