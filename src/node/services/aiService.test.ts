@@ -4786,6 +4786,41 @@ describe("AIService.streamMessage multi-project trust gating", () => {
     expect(trustedFromFirstGetToolsCall(harness.getToolsForModelSpy)).toBe(false);
   });
 
+  // Untrusted repos and the project-automation kill switch get blanked provider keys in bash, so
+  // the bash AI proxy must not hand them a proxy URL either (it would pair with a blank key).
+  for (const [label, trusted, killSwitch, expected] of [
+    ["trusted project", true, false, "http://proxy"],
+    ["untrusted project", false, false, undefined],
+    ["project automation kill switch", true, true, undefined],
+  ] as const) {
+    it(`adds bash AI proxy variables only for shared-trusted execution (${label})`, async () => {
+      using xumHome = new DisposableTempDir("ai-service-bash-ai-proxy-trust");
+      const projectPath = path.join(xumHome.path, "project-a");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "workspace-bash-ai-proxy-trust";
+      const harness = createHarness(xumHome.path, createTrustMetadata(workspaceId, [projectPath]));
+      harness.service.turnRequestBuilderBindings.bashAiProxy = {
+        envFor: () => Promise.resolve({ ANTHROPIC_BASE_URL: "http://proxy" }),
+      };
+      await harness.config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { workspaces: [], trusted });
+        return cfg;
+      });
+      const previous = process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+      if (killSwitch) process.env.XUM_DISABLE_PROJECT_AUTOMATION = "1";
+      try {
+        await streamOnce(harness, workspaceId);
+      } finally {
+        if (previous === undefined) delete process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+        else process.env.XUM_DISABLE_PROJECT_AUTOMATION = previous;
+      }
+      const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1] as
+        | { xumEnv?: Record<string, string> }
+        | undefined;
+      expect(toolConfig?.xumEnv?.ANTHROPIC_BASE_URL).toBe(expected);
+    });
+  }
+
   it("uses the persisted workspace root as cwd for multi-project ssh startup", async () => {
     using xumHome = new DisposableTempDir("ai-service-multi-project-persisted-cwd");
     const projectAPath = path.join(xumHome.path, "project-a");

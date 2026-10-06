@@ -3149,6 +3149,7 @@ export const config = {
       llmDebugLogs: z.boolean(),
       keepScreenAwake: z.boolean(),
       toolSearchEnabled: z.boolean(),
+      bashAiProxyEnabled: z.boolean(),
       agentHeartbeatsEnabled: z.boolean(),
       heartbeatDefaultPrompt: z.string().optional(),
       heartbeatDefaultIntervalMs: z.number().optional(),
@@ -3287,6 +3288,7 @@ export const config = {
   updateLlmDebugLogs: booleanToggleRoute,
   updateKeepScreenAwake: booleanToggleRoute,
   updateToolSearchEnabled: booleanToggleRoute,
+  updateBashAiProxyEnabled: booleanToggleRoute,
   updateAgentHeartbeatsEnabled: booleanToggleRoute,
   updateHeartbeatDefaultPrompt: {
     input: z

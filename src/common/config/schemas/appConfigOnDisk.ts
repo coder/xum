@@ -177,6 +177,8 @@ export const AppConfigOnDiskSchema = z
     keepScreenAwake: z.boolean().optional(),
     /** Defer MCP tool definitions behind tool_catalog_search. Absent = on. */
     toolSearchEnabled: z.boolean().optional(),
+    /** Route AI calls from bash tool commands through Xum's cost-tracking proxy. Absent = off. */
+    bashAiProxyEnabled: z.boolean().optional(),
     /** Expose the `heartbeat` tool so agents can schedule their own recurring turns. Absent = off. */
     agentHeartbeatsEnabled: z.boolean().optional(),
     heartbeatDefaultPrompt: z.string().optional(),

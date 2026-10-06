@@ -2294,6 +2294,7 @@ export class Config {
       llmDebugLogs: parseOptionalBoolean(parsed.llmDebugLogs),
       keepScreenAwake: parseOptionalBoolean(parsed.keepScreenAwake),
       toolSearchEnabled: parseOptionalBoolean(parsed.toolSearchEnabled),
+      bashAiProxyEnabled: parseOptionalBoolean(parsed.bashAiProxyEnabled),
       agentHeartbeatsEnabled: parseOptionalBoolean(parsed.agentHeartbeatsEnabled),
       heartbeatDefaultPrompt: parseOptionalNonEmptyString(parsed.heartbeatDefaultPrompt),
       heartbeatDefaultIntervalMs: parseOptionalHeartbeatIntervalMs(
@@ -2414,6 +2415,11 @@ export class Config {
       // Default-on flag: only the opt-out is written so "on" leaves no key behind.
       if (parseOptionalBoolean(config.toolSearchEnabled) === false) {
         data.toolSearchEnabled = false;
+      }
+
+      // Default-off flag: only the opt-in is written.
+      if (parseOptionalBoolean(config.bashAiProxyEnabled) === true) {
+        data.bashAiProxyEnabled = true;
       }
 
       if (parseOptionalBoolean(config.agentHeartbeatsEnabled) === true) {
@@ -2850,6 +2856,7 @@ export class Config {
       llmDebugLogs: config.llmDebugLogs === true,
       keepScreenAwake: config.keepScreenAwake === true,
       toolSearchEnabled: config.toolSearchEnabled !== false,
+      bashAiProxyEnabled: config.bashAiProxyEnabled === true,
       agentHeartbeatsEnabled: config.agentHeartbeatsEnabled === true,
       heartbeatDefaultPrompt: config.heartbeatDefaultPrompt ?? undefined,
       heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs ?? undefined,
@@ -2900,6 +2907,14 @@ export class Config {
     await this.editConfig((config) => {
       if (enabled) delete config.toolSearchEnabled;
       else config.toolSearchEnabled = false;
+      return config;
+    });
+  }
+
+  async updateBashAiProxyEnabled(enabled: boolean): Promise<void> {
+    await this.editConfig((config) => {
+      if (enabled) config.bashAiProxyEnabled = true;
+      else delete config.bashAiProxyEnabled;
       return config;
     });
   }

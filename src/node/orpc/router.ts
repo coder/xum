@@ -574,6 +574,16 @@ export const router = (authToken?: string) => {
             yield* atomicPromise(async () => context.config.updateToolSearchEnabled(input.enabled));
           })
         ),
+      updateBashAiProxyEnabled: t
+        .input(schemas.config.updateBashAiProxyEnabled.input)
+        .output(schemas.config.updateBashAiProxyEnabled.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () =>
+              context.config.updateBashAiProxyEnabled(input.enabled)
+            );
+          })
+        ),
       updateAgentHeartbeatsEnabled: t
         .input(schemas.config.updateAgentHeartbeatsEnabled.input)
         .output(schemas.config.updateAgentHeartbeatsEnabled.output)
