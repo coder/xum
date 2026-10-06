@@ -438,7 +438,6 @@ interface DraftAgentListItemWrapperProps {
   draftNumber: number;
   isSelected: boolean;
   sectionId?: string;
-  onVisibilityChange?: (isVisible: boolean) => void;
   projectBadgeName?: string;
   projectBadgeColor?: string;
   onOpen: () => void;
@@ -498,9 +497,40 @@ function isDraftVisible(
   return hasTextContent || hasAttachments || hasNameState;
 }
 
+/**
+ * Reports one draft's sidebar visibility. Rendered for every listed draft, whether or not its
+ * row is mounted (a collapsed section unmounts rows), so the sidebar's count, placeholder and
+ * draft numbers never read a stale value (#5677).
+ */
+function DraftVisibilityWatcher(props: {
+  projectPath: string;
+  draftId: string;
+  onVisibilityChange: (projectPath: string, draftId: string, isVisible: boolean) => void;
+}) {
+  const draft = useDraft({
+    kind: "creation",
+    projectPath: props.projectPath,
+    draftId: props.draftId,
+  });
+  const [workspaceNameState] = usePersistedState<unknown>(
+    getWorkspaceNameStateKey(getDraftScopeId(props.projectPath, props.draftId)),
+    null,
+    { listener: true }
+  );
+  const isVisible = isDraftVisible(props.projectPath, props.draftId, {
+    draftPrompt: draft.text,
+    workspaceNameState,
+    draftAttachmentCount: draft.attachmentCount,
+  });
+  const { projectPath, draftId, onVisibilityChange } = props;
+  useEffect(() => {
+    onVisibilityChange(projectPath, draftId, isVisible);
+  }, [projectPath, draftId, isVisible, onVisibilityChange]);
+  return null;
+}
+
 function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
   const scopeId = getDraftScopeId(props.projectPath, props.draftId);
-  const onVisibilityChange = props.onVisibilityChange;
 
   const draft = useDraft({
     kind: "creation",
@@ -528,10 +558,6 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
     workspaceNameState,
     draftAttachmentCount: draft.attachmentCount,
   });
-
-  useEffect(() => {
-    onVisibilityChange?.(isVisible);
-  }, [isVisible, onVisibilityChange]);
 
   if (!isVisible) {
     return null;
@@ -1840,7 +1866,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     .sort((a, b) => b.createdAt - a.createdAt);
   // Empty drafts render no row (DraftAgentListItemWrapper), so counts, placeholders and draft
   // numbers use only drafts that show one: a hidden draft must not count as a chat or renumber
-  // the visible drafts (#5677). The reactive map wins; the store read covers the first render.
+  // the visible drafts (#5677). DraftVisibilityWatcher keeps the reactive map current for every
+  // draft; the store read covers the render before its first report.
   const isDraftShownInSidebar = (projectPath: string, draftId: string): boolean =>
     draftVisibilityByProject[projectPath]?.[draftId] ?? isDraftVisible(projectPath, draftId);
   const getVisibleDraftNumbers = (
@@ -2538,9 +2565,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             isSelected={isSelected}
             projectBadgeName={draftBadge?.name}
             projectBadgeColor={draftBadge?.color}
-            onVisibilityChange={(isVisible) => {
-              handleDraftVisibilityChange(projectPath, draft.draftId, isVisible);
-            }}
             onOpen={() => handleOpenWorkspaceDraft(projectPath, draft.draftId)}
             onDelete={() => {
               if (isSelected) {
@@ -2637,6 +2661,16 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                   </button>
                 )}
               </div>
+              {Object.entries(workspaceDraftsByProject).flatMap(([projectPath, drafts]) =>
+                drafts.map((draft) => (
+                  <DraftVisibilityWatcher
+                    key={`${projectPath}:${draft.draftId}`}
+                    projectPath={projectPath}
+                    draftId={draft.draftId}
+                    onVisibilityChange={handleDraftVisibilityChange}
+                  />
+                ))
+              )}
               <ScrollArea
                 className="flex-1"
                 viewportRef={projectListScrollRef}
@@ -2696,13 +2730,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               draftId={draft.draftId}
                               draftNumber={scratchDraftNumberById.get(draft.draftId) ?? 0}
                               isSelected={isSelected}
-                              onVisibilityChange={(isVisible) => {
-                                handleDraftVisibilityChange(
-                                  SCRATCH_PROJECT_CONFIG_KEY,
-                                  draft.draftId,
-                                  isVisible
-                                );
-                              }}
                               onOpen={() =>
                                 handleOpenWorkspaceDraft(SCRATCH_PROJECT_CONFIG_KEY, draft.draftId)
                               }
@@ -3404,13 +3431,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                       draftNumber={draftNumber}
                                       isSelected={isSelected}
                                       sectionId={sectionId ?? undefined}
-                                      onVisibilityChange={(isVisible) => {
-                                        handleDraftVisibilityChange(
-                                          projectPath,
-                                          draft.draftId,
-                                          isVisible
-                                        );
-                                      }}
                                       onOpen={() =>
                                         handleOpenWorkspaceDraft(projectPath, draft.draftId)
                                       }

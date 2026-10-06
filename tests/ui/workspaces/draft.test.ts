@@ -375,6 +375,24 @@ describeIntegration("Draft workspace behavior", () => {
         },
         { timeout: 5_000 }
       );
+
+      // Collapsed, the section mounts no draft rows; typing into the draft must still count it.
+      fireEvent.click(
+        view.container.querySelector<HTMLElement>('[aria-label="Collapse scratch chats"]')!
+      );
+      getDraftStore().setText(
+        { kind: "creation", projectPath: SCRATCH_PROJECT_CONFIG_KEY, draftId: scratchDraftId },
+        "scratch text"
+      );
+      await waitFor(
+        () => {
+          const header = view.container.querySelector(
+            '[aria-label="Expand scratch chats"]'
+          )?.parentElement;
+          expect(header?.textContent).toBe("Chats(1)");
+        },
+        { timeout: 5_000 }
+      );
     } finally {
       // Backend drafts outlive the persisted draft list: drop them so later tests start clean.
       await Promise.all(createdScopes.map((scope) => getDraftStore().deleteDraft(scope)));
