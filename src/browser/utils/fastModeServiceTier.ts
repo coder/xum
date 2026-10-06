@@ -65,6 +65,19 @@ export function getFastModeProvider(
 }
 
 /**
+ * Why getFastModeProvider returned null: "model" when the model has no Fast mode on any route,
+ * "route" when the model has one but this route (gateway, custom base URL, ...) cannot send it.
+ * The shortcut's toast used to blame the route for every model, Gemini included (#5753).
+ */
+export function getFastModeUnavailableReason(modelString: string): "model" | "route" {
+  // The model's own provider, called directly, is the route where Fast mode works if the model
+  // has it at all.
+  return getFastModeProvider(normalizeToCanonical(modelString), { resolvedRouteProvider: "direct" })
+    ? "route"
+    : "model";
+}
+
+/**
  * Fast mode is a temporary priority-tier override. The restore target lives in
  * providers.jsonc so every browser origin and desktop client observes the same state.
  */

@@ -249,6 +249,15 @@ export function isDialogOpen(): boolean {
 }
 
 /**
+ * True when a key event comes from inside the command palette. isDialogOpen() does not see the
+ * palette (cmdk renders no modal overlay), so global shortcuts that move focus check this too:
+ * focus must not move behind the open palette.
+ */
+export function isCommandPaletteTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest("[cmdk-root]") != null;
+}
+
+/**
  * Format a keybind for display to users.
  * Returns Mac-style symbols on macOS, or Windows-style text elsewhere.
  */

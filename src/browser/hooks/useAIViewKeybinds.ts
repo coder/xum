@@ -9,6 +9,7 @@ import {
   isDesktopViewportFocused,
   isTerminalFocused,
   isDialogOpen,
+  isCommandPaletteTarget,
 } from "@/browser/utils/ui/keybinds";
 import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { isCompactingStream, cancelCompaction } from "@/browser/utils/compaction/handler";
@@ -143,7 +144,8 @@ export function useAIViewKeybinds({
       // Focus chat input works anywhere (even in input fields)
       if (matchesKeybind(e, KEYBINDS.FOCUS_CHAT)) {
         e.preventDefault();
-        if (!dialogOpen) chatInputAPI.current?.focus();
+        // Same rule as the creation screen: focus must not move behind the command palette (#5752).
+        if (!dialogOpen && !isCommandPaletteTarget(e.target)) chatInputAPI.current?.focus();
         return;
       }
 

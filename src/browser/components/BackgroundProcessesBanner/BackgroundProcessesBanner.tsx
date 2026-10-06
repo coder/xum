@@ -15,6 +15,7 @@ import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   KEYBINDS,
   formatKeybind,
+  isCommandPaletteTarget,
   isDialogOpen,
   isTerminalFocused,
   matchesKeybind,
@@ -126,8 +127,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (!matchesKeybind(event, KEYBINDS.FOCUS_BACKGROUND_PROCESSES) || isDialogOpen()) return;
-      // isDialogOpen() misses the command palette (cmdk); focus must not move behind it.
-      if (event.target instanceof Element && event.target.closest("[cmdk-root]")) return;
+      if (isCommandPaletteTarget(event.target)) return;
       if (isTerminalFocused(event.target)) return; // the terminal owns its keystrokes
       if (rootRef.current?.closest("[inert]")) return;
       event.preventDefault();

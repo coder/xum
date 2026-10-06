@@ -84,3 +84,45 @@ test(
     await expect(screen.getByText(/^Fast mode is not available/)).toBeVisible();
   }
 );
+
+test(
+  "Ctrl+I in the workspace view leaves focus in the command palette",
+  { tags: ["bugbash", "5752"] },
+  async ({ app, screen, browser }) => {
+    await browser.setViewport({ width: 1440, height: 900 });
+    await openPlayground(app, screen, browser);
+    await screen.getByRole("textbox", "Message").tap();
+
+    await browser.keyboard.press("Control+Shift+P");
+    const palette = screen.getByRole("combobox", "Command palette");
+    await expect(palette).toBeFocused();
+    await browser.keyboard.press("Control+i");
+    await expect(palette).toBeFocused();
+  }
+);
+
+test(
+  "The fast mode shortcut says when the model has no fast mode",
+  { tags: ["bugbash", "5753"] },
+  async ({ app, screen, browser }) => {
+    await browser.setViewport({ width: 1440, height: 900 });
+    await openPlayground(app, screen, browser);
+    const composer = screen.getByRole("textbox", "Message");
+    const search = screen.getByRole("textbox", "Search [provider:model-name]");
+    const pickModel = async (from: string, model: string, label: string) => {
+      await screen.getByRole("combobox").filter({ hasText: from }).tap();
+      await search.fill(model);
+      await browser.keyboard.press("Enter");
+      await expect(search).toBeHidden();
+      await expect(screen.getByRole("combobox").filter({ hasText: label })).toBeVisible();
+    };
+    // Haiku 4.5 has no fast mode on any route, so the toast must name the model, not the route.
+    await pickModel("Opus 5.5", "anthropic:claude-haiku-4-5", "Haiku 4.5");
+    await composer.tap();
+    await browser.keyboard.press("Control+Shift+F");
+    await expect(screen.getByText(/this model has no fast mode/)).toBeVisible();
+
+    // Every repro in a run shares this workspace: put its model back.
+    await pickModel("Haiku 4.5", "anthropic:claude-opus-5-5", "Opus 5.5");
+  }
+);

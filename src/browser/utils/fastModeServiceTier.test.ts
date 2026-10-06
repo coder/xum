@@ -6,6 +6,7 @@ import {
   applyFastModeToggle,
   getFastModeProvider,
   getFastModeServiceTierChange,
+  getFastModeUnavailableReason,
   isFastModeActive,
 } from "./fastModeServiceTier";
 
@@ -22,6 +23,17 @@ function createWriter() {
 }
 
 describe("fast mode service tier", () => {
+  test("says whether the model or its route lacks fast mode (#5753)", () => {
+    // No route gives these models fast mode.
+    expect(getFastModeUnavailableReason("google:gemini-3-pro")).toBe("model");
+    expect(getFastModeUnavailableReason("anthropic:claude-haiku-4-5")).toBe("model");
+    expect(getFastModeUnavailableReason("xai:grok-code-fast-1")).toBe("model");
+    // These models have fast mode, so a null provider means the route cannot send it.
+    expect(getFastModeUnavailableReason("mux-gateway:anthropic/claude-opus-5-5")).toBe("route");
+    expect(getFastModeUnavailableReason("openrouter:openai/gpt-6-astra")).toBe("route");
+    expect(getFastModeUnavailableReason("xai:grok-4.7")).toBe("route");
+  });
+
   test("resolves direct native providers and rejects gateway routes", () => {
     expect(getFastModeProvider("openai:gpt-5.6-sol", { resolvedRouteProvider: "direct" })).toBe(
       "openai"
