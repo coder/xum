@@ -139,6 +139,10 @@ export default {
     { name: "phone", engine: web({ viewport: { width: 390, height: 844 } }), app },
   ],
   retries: 0,
+  // One app (and one seeded workspace) serves every test of a target in a run, so parallel repro
+  // tests would see each other's messages, drafts and retries. `e2e explore` charters each start
+  // their own app, so this does not slow a bug bash.
+  workers: 1,
   agents: {
     default: persona,
     newcomer: {
