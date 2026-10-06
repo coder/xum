@@ -121,6 +121,39 @@ describe("textAnchorFromSelection", () => {
     );
   });
 
+  // Bug bash (#5689): a selection in a JSON artifact quoted the Tree/Raw buttons ("treeraw{").
+  test("leaves viewer controls out of the quote and its context", () => {
+    const container = document.createElement("div");
+    container.innerHTML =
+      '<div data-annotation-skip=""><button>tree</button><button>raw</button></div><pre>{"runs": 2}</pre>';
+    document.body.appendChild(container);
+    const tree = container.querySelector("button")!.firstChild!;
+    const raw = container.querySelector("pre")!.firstChild!;
+    const range = document.createRange();
+    range.setStart(tree, 0);
+    range.setEnd(raw, 1);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+
+    expect(textAnchorFromSelection(container, selection)?.anchor).toEqual({
+      kind: "text",
+      quote: "{",
+      prefix: "",
+      suffix: '"runs": 2}',
+    });
+    // Context next to a selection inside the content skips the controls too.
+    expect(textAnchorFromSelection(container, select(raw, 2, 6))?.anchor).toEqual({
+      kind: "text",
+      quote: "runs",
+      prefix: '{"',
+      suffix: '": 2}',
+    });
+    // A selection made only of controls is no selection.
+    expect(textAnchorFromSelection(container, select(tree, 0, 4))).toBeNull();
+    container.remove();
+  });
+
   test("ignores empty selections and selections outside the container", () => {
     const container = document.createElement("div");
     container.textContent = "inside";

@@ -597,6 +597,9 @@ export function ArtifactsPanel(props: {
   useEffect(() => {
     const panel = panelRef.current;
     if (!showFullscreen || panel == null) return;
+    // Where focus was when fullscreen opened (the Fullscreen button, or the panel for Shift+F).
+    // Closing returns there, as dialogs do (#5694).
+    const opener = document.activeElement;
     const restore = makeOthersInert(panel);
     // Focus the panel itself, not the button that opened fullscreen, so J/K, Shift+F and C work
     // at once. Script focus is not :focus-visible in Chrome, so mark the ring by hand.
@@ -605,19 +608,30 @@ export function ArtifactsPanel(props: {
     // The dialog's focus scope also caught focus that fell out with a removed node: a poll that
     // swaps the viewer for a new version, or a closing comment box. Focus then sat on <body>, so
     // J/K and Escape missed the panel (Escape could even reach Escape-to-interrupt). Do the same.
+    // Watch all of <body>, not just the panel: a portaled menu outside it can take focus away
+    // too, and watching only the panel restored focus at its next change (#5715).
     const observer = new MutationObserver(() => {
       if (document.activeElement == null || document.activeElement === document.body) {
         panel.focus();
       }
     });
-    observer.observe(panel, { childList: true, subtree: true });
+    observer.observe(document.body, { childList: true, subtree: true });
     return () => {
       observer.disconnect();
       restore();
-      // Back to the panel, so J/K keep working without another click. Always, as the dialog's
-      // close did: focus left on a control or an HTML frame inside the viewer (Escape in a frame
-      // arrives over the bridge) would keep J/K, C and R from reaching the panel.
-      panel.focus();
+      // Back to the opener when it is still a control of this panel, else to the panel, so J/K
+      // keep working without another click: keys from the panel's controls bubble to it. Not to
+      // whatever had focus at close: a control or an HTML frame inside the viewer (Escape in a
+      // frame arrives over the bridge) would keep J/K, C and R from reaching the panel. The
+      // opener is never a frame: a frame can only leave fullscreen.
+      const returnTo =
+        opener instanceof HTMLElement && opener.isConnected && panel.contains(opener)
+          ? opener
+          : panel;
+      returnTo.focus();
+      // An opener that cannot take focus any more (disabled once nothing is selected) would leave
+      // focus on <body>.
+      if (document.activeElement !== returnTo) panel.focus();
     };
   }, [showFullscreen]);
 
@@ -1387,11 +1401,12 @@ export function ArtifactsPanel(props: {
 /**
  * Makes every element outside `element` inert (no focus, pointer input or accessibility tree),
  * walking up to <body> and marking the siblings at each level. Returns the undo. Elements that
- * were already inert are left alone, and nodes added later (portaled menus and tooltips opened
- * from the fullscreen toolbar) stay interactive.
+ * were already inert are left alone, and so are elements whose `inert` someone else changes
+ * meanwhile. Nodes added later (portaled menus and tooltips opened from the fullscreen toolbar)
+ * stay interactive.
  */
 function makeOthersInert(element: HTMLElement): () => void {
-  const marked: HTMLElement[] = [];
+  const marked = new Set<HTMLElement>();
   for (let node: HTMLElement = element; node !== document.body; ) {
     const parent = node.parentElement;
     // The panel must be attached under <body>; anything else means the walk is wrong.
@@ -1399,11 +1414,22 @@ function makeOthersInert(element: HTMLElement): () => void {
     for (const sibling of parent.children) {
       if (sibling === node || !(sibling instanceof HTMLElement) || sibling.inert) continue;
       sibling.inert = true;
-      marked.push(sibling);
+      marked.add(sibling);
     }
     node = parent;
   }
+  // Another component that sets or clears `inert` on one of these meanwhile (ChatPane does under
+  // immersive review) owns it from then on: the undo must not clear its state (#5715).
+  const forget = (records: MutationRecord[]) => {
+    for (const record of records) {
+      if (record.target instanceof HTMLElement) marked.delete(record.target);
+    }
+  };
+  const observer = new MutationObserver(forget);
+  for (const sibling of marked) observer.observe(sibling, { attributeFilter: ["inert"] });
   return () => {
+    forget(observer.takeRecords());
+    observer.disconnect();
     for (const sibling of marked) sibling.inert = false;
   };
 }
