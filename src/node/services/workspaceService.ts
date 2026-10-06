@@ -15674,7 +15674,7 @@ export class WorkspaceService
       if (!workspaceConfig) {
         return Err({
           type: "unknown",
-          raw: "Workspace not found. It may have been deleted.",
+          raw: this.config.getConfigLoadError() ?? "Workspace not found. It may have been deleted.",
         });
       }
 
@@ -16493,7 +16493,7 @@ export class WorkspaceService
       if (!this.config.findWorkspace(workspaceId)) {
         return Err({
           type: "unknown",
-          raw: "Workspace not found. It may have been deleted.",
+          raw: this.config.getConfigLoadError() ?? "Workspace not found. It may have been deleted.",
         });
       }
 

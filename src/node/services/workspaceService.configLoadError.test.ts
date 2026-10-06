@@ -69,6 +69,17 @@ describeAsNonRoot("WorkspaceService with an unreadable config.json", () => {
       expect(result.error).not.toMatch(/corrupt|Workspace not found/);
     }
 
+    // Sending and resuming must not claim the workspace was deleted.
+    const options = { model: "test-model", agentId: "exec" };
+    for (const result of [
+      await service.sendMessage(WORKSPACE_ID, "hello", options),
+      await service.resumeStream(WORKSPACE_ID, options),
+    ]) {
+      if (result.success) throw new Error("Expected the turn to be refused");
+      if (result.error.type !== "unknown") throw new Error(`Unexpected ${result.error.type}`);
+      expect(result.error.raw).toMatch(/could not be read/);
+    }
+
     // Recovery needs no restart.
     await fs.chmod(configFile, 0o600);
     expect((await service.updateTitle(WORKSPACE_ID, "readable again")).success).toBe(true);

@@ -1400,6 +1400,7 @@ export class Config {
 
   private handleConfigLoadFailure(rawBytes: Buffer | undefined, error: unknown): void {
     const state = configLoadFailureState(this.configFile);
+    this.observedLoadFailure = state;
     const errorMessage = error instanceof Error ? error.message : String(error);
     // Backup confirmation is keyed on content alone: the same corrupt bytes need only one
     // sidecar regardless of which error message they produced.
@@ -1629,6 +1630,8 @@ export class Config {
     return { ids, hasWorkspaceEntriesWithoutIds };
   }
 
+  /** Failure state this instance's last failed load wrote; see getConfigLoadError. */
+  private observedLoadFailure: ConfigLoadFailureState | undefined;
   private configSnapshot?: {
     key: string;
     config: ProjectsConfig;
@@ -3317,9 +3320,13 @@ export class Config {
   }
 
   private describeConfigLoadFailure(state: ConfigLoadFailureState): string {
-    return state.unreadable
-      ? `config.json could not be read (${state.errorMessage}). Check that ${this.configFile} is a regular file readable by this user, then retry.`
-      : `config.json could not be parsed (${state.errorMessage}). Fix ${this.configFile} or restore it from its .corrupt- backup, then retry.`;
+    if (state.unreadable) {
+      return `config.json could not be read (${state.errorMessage}). Check that ${this.configFile} is a regular file readable by this user, then retry.`;
+    }
+    const parseError = `config.json could not be parsed (${state.errorMessage}).`;
+    return state.backupSignature === null
+      ? `${parseError} Xum could not back it up yet, so fix ${this.configFile} by hand and see the log for the backup failure.`
+      : `${parseError} Fix ${this.configFile} or restore it from its .corrupt- backup, then retry.`;
   }
 
   /**
@@ -3330,7 +3337,12 @@ export class Config {
    */
   getConfigLoadError(): string | null {
     const state = configLoadFailureStates.get(this.configFile);
-    return state ? this.describeConfigLoadFailure(state) : null;
+    // The map is shared by every Config for this path, and a successful load deletes its
+    // entry. Report it only if this instance's own last load created or refreshed it: another
+    // instance's failure says nothing about the snapshot this one serves.
+    return state !== undefined && state === this.observedLoadFailure
+      ? this.describeConfigLoadFailure(state)
+      : null;
   }
 
   getUpdateChannel(): UpdateChannel {
