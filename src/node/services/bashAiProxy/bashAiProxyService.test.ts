@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
@@ -10,6 +10,7 @@ import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
 import type { ProviderConfigRaw } from "@/node/utils/providerRequirements";
 
 import { BashAiProxyService } from "./bashAiProxyService";
+import { candidatePorts } from "./stableIdentity";
 
 interface SeenRequest {
   method: string;
@@ -274,6 +275,42 @@ describe("BashAiProxyService", () => {
     expect(res.status).toBe(200);
     await res.text();
     expect(recorded.map((r) => r.workspaceId)).toEqual(["ws-r"]);
+  });
+
+  test("a workspace ID with spaces still gets a key that works as a Bearer token", async () => {
+    const env = await proxy.envFor("legacy project ws", "local", []);
+    const res = await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(recorded.map((r) => r.workspaceId)).toEqual(["legacy project ws"]);
+  });
+
+  test("a candidate port that cannot be bound for another reason is skipped", async () => {
+    // Windows can exclude a port (EACCES); a saved port can be privileged. Neither may disable
+    // the proxy for good.
+    const blocked = candidatePorts(rootDir, 1)[0];
+    const listen = Reflect.get(http.Server.prototype, "listen") as (...a: unknown[]) => http.Server;
+    const spy = spyOn(http.Server.prototype, "listen").mockImplementation(function (
+      this: http.Server,
+      ...args: unknown[]
+    ) {
+      if (args[0] !== blocked) return listen.apply(this, args);
+      process.nextTick(() =>
+        this.emit("error", Object.assign(new Error("denied"), { code: "EACCES" }))
+      );
+      return this;
+    });
+    try {
+      const env = await proxy.envFor("ws-eacces", "local", []);
+      expect(env.ANTHROPIC_BASE_URL).toBeDefined();
+      expect(new URL(env.ANTHROPIC_BASE_URL).port).not.toBe(String(blocked));
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test("a busy port moves to the next candidate, and the saved port comes back when free", async () => {
