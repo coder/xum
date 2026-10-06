@@ -23,11 +23,6 @@ export async function disableTutorials(browser: Browser): Promise<void> {
 }
 
 /**
- * Sends `text` from the composer and returns the Edit button of that message. Every repro in one
- * run shares the seeded workspace, so pick a text no other repro sends: other repros' messages
- * have Edit buttons too.
- */
-/**
  * Sends a chat message with the Send button and waits until the composer has taken it. Pressing
  * Enter right after `fill` can arrive before the composer is ready (seen on the phone target).
  */
@@ -38,6 +33,11 @@ export async function sendMessage(screen: Screen, text: string): Promise<void> {
   await expect(composer).toHaveValue("", { timeout: 15_000 });
 }
 
+/**
+ * Sends `text` from the composer and returns the Edit button of that message. Every repro in one
+ * run shares the seeded workspace, so pick a text no other repro sends: other repros' messages
+ * have Edit buttons too.
+ */
 export async function sendMessageForEdit(
   screen: Screen,
   browser: Browser,
