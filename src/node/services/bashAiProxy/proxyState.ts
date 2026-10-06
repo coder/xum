@@ -125,8 +125,12 @@ export class ProxyStateStore {
     let raw: unknown;
     try {
       raw = JSON.parse(await fs.readFile(this.file, "utf8"));
-    } catch {
-      raw = undefined; // missing or not JSON
+    } catch (error) {
+      // Only a missing file or bad JSON is repaired. Any other read error (EIO, a sharing
+      // violation) propagates: replacing a file we could not read would rotate every key.
+      const missing = (error as NodeJS.ErrnoException).code === "ENOENT";
+      if (!missing && !(error instanceof SyntaxError)) throw error;
+      raw = undefined;
     }
     const state = parseState(raw);
     if (state.repaired) {
