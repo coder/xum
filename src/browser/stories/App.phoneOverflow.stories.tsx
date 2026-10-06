@@ -4,7 +4,7 @@
  */
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { ComponentType } from "react";
-import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
@@ -37,7 +37,7 @@ const LONG_SCRIPT = [
 ].join("\n");
 
 export const FooterAndScriptBlock: AppStory = {
-  // Mirrors the Pixel phone variant for local viewing (the fixed frame does not move innerWidth).
+  // A phone viewport for local viewing (the fixed frame does not move innerWidth).
   globals: {
     viewport: { value: "mobile2", isRotated: false },
   },
@@ -79,12 +79,9 @@ export const FooterAndScriptBlock: AppStory = {
     />
   ),
   decorators: [PhoneFrame],
-  // Pixel captures the phone layout this story is about. The play's own 390px frame keeps the
-  // assertions narrow in the test runner, which ignores both settings.
-  parameters: {
-    ...appMeta.parameters,
-    pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } },
-  },
+  // No Pixel capture: the snapshot budget (scripts/check-storybook-snapshot-budget.mjs) is full,
+  // and Pixel's animation reset would also remove the scroll-driven fade this story checks.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
     await waitForScrollStabilization(storyRoot);
