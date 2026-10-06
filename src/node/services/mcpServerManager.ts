@@ -369,7 +369,11 @@ export function effectiveToolAllowlist(
   projectAllowlist: string[] | undefined,
   workspaceOverrides: WorkspaceMCPOverrides | undefined
 ): Set<string> | null {
-  const workspaceAllowlist = workspaceOverrides?.toolAllowlist?.[serverName];
+  // Own-property read: a server may be named "constructor" (#5740).
+  const workspaceAllowlist =
+    workspaceOverrides?.toolAllowlist != null
+      ? getOwn(workspaceOverrides.toolAllowlist, serverName)
+      : undefined;
   if (projectAllowlist && workspaceAllowlist) {
     const projectSet = new Set(projectAllowlist);
     return new Set(workspaceAllowlist.filter((t) => projectSet.has(t)));
@@ -2858,7 +2862,10 @@ export class MCPServerManager {
     projectAllowlist?: string[],
     workspaceOverrides?: WorkspaceMCPOverrides
   ): Record<string, Tool> {
-    const workspaceAllowlist = workspaceOverrides?.toolAllowlist?.[serverName];
+    const workspaceAllowlist =
+      workspaceOverrides?.toolAllowlist != null
+        ? getOwn(workspaceOverrides.toolAllowlist, serverName)
+        : undefined;
     const effectiveAllowlist = effectiveToolAllowlist(
       serverName,
       projectAllowlist,

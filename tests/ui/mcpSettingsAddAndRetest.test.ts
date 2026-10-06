@@ -122,6 +122,33 @@ describeIntegration("MCP settings add and re-test", () => {
     await within(serverRow(canvas, "constructor")).findByText(/HTTP 500/, {}, { timeout: 10000 });
   }, 60000);
 
+  test("the workspace MCP modal lists and tests a server named constructor (#5740)", async () => {
+    const added = await app.env.orpc.mcp.add({ name: "constructor", transport: "http", url });
+    if (!added.success) throw new Error(added.error);
+
+    fireEvent.keyDown(window, { key: "m", ctrlKey: true, shiftKey: true });
+    const body = within(app.view.container.ownerDocument.body);
+    const dialog = await body.findByRole("dialog", { name: "Workspace MCP Configuration" });
+    const toggle = await within(dialog).findByRole(
+      "switch",
+      { name: "Toggle constructor MCP server" },
+      { timeout: 10000 }
+    );
+    const card = toggle.closest(".p-4");
+    if (!(card instanceof HTMLElement)) throw new Error("MCP modal row not found");
+    fireEvent.click(within(card).getByRole("button", { name: /^(Fetch|Refresh) Tools$/ }));
+    await waitFor(() => expect(held.heldCount()).toBeGreaterThan(0), { timeout: 10000 });
+    held.releaseAll(500);
+    await waitFor(
+      () =>
+        expect(
+          within(card).getByRole<HTMLButtonElement>("button", { name: /^(Fetch|Refresh) Tools$/ })
+            .disabled
+        ).toBe(false),
+      { timeout: 10000 }
+    );
+  }, 60000);
+
   test("the add-server OAuth draft flow sends the draft for a name like constructor (#5740)", async () => {
     // A remote server that asks for OAuth on every request.
     const oauthServer: Server = createServer((_req, res) => {
