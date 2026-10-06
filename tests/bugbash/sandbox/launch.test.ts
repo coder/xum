@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test";
-import { appAi, containerEnv, outputDir } from "./launch";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import { appAi, containerEnv, outputDir, plainFolders } from "./launch";
 
 test("the container env holds the allowlisted names, the fixed values and no host secret", () => {
   const host = {
@@ -24,7 +27,8 @@ test("the container env holds the allowlisted names, the fixed values and no hos
 });
 
 test("a credential from a caller is refused, not passed", () => {
-  for (const name of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_BASE_URL", "GH_TOKEN"]) {
+  // prettier-ignore
+  for (const name of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_BASE_URL", "GH_TOKEN", "openai_api_key"]) {
     expect(() => containerEnv({}, { [name]: "x" })).toThrow("no credential enters the sandbox");
   }
 });
@@ -51,4 +55,24 @@ test("the launcher reads the app AI mode the way e2e.config.ts does", () => {
   expect(appAi({ BUGBASH_AI: "mock" })).toBe("mock");
   expect(appAi({ BUGBASH_AI: "mock", BUGBASH_AI_RESOLVED: "real" })).toBe("real");
   expect(appAi({ BUGBASH_AI: "auto" })).toBeUndefined();
+});
+
+test("a symlinked folder cannot lead a copy or an export out of the checkout", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-launch-test-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-launch-test-"));
+  try {
+    fs.symlinkSync(outside, path.join(base, ".e2e"));
+    fs.mkdirSync(path.join(base, "src"));
+    fs.writeFileSync(path.join(base, "src/file"), "");
+    expect(() => plainFolders(base, ".e2e/run", true)).toThrow("not a plain folder");
+    expect(() => plainFolders(base, ".e2e", false)).toThrow("not a plain folder");
+    expect(() => plainFolders(base, "src/file", true)).toThrow("not a plain folder");
+    expect(fs.readdirSync(outside)).toEqual([]);
+    plainFolders(base, "src/new/run", true);
+    expect(fs.lstatSync(path.join(base, "src/new/run")).isDirectory()).toBe(true);
+    expect(() => plainFolders(base, "src/missing", false)).toThrow("not a plain folder");
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
 });

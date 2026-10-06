@@ -35,6 +35,7 @@ const PASS_ENV = [
   "BUGBASH_MODEL",
   "BUGBASH_EFFORT",
   "BUGBASH_APP_LOG",
+  "BUGBASH_SCENARIO",
   "E2E_TELEMETRY_DISABLED",
 ];
 
@@ -108,6 +109,23 @@ function ensureImage(): string {
   return image;
 }
 
+/**
+ * Checks each folder of `rel` under `base` without following a symlink; with `create`, it makes
+ * the missing ones. So a symlinked folder cannot lead a copy or an export out of the checkout.
+ */
+export function plainFolders(base: string, rel: string, create: boolean, seen = new Set<string>()) {
+  let dir = base;
+  for (const part of rel.split("/").filter((p) => p !== "" && p !== ".")) {
+    dir = path.join(dir, part);
+    if (seen.has(dir)) continue;
+    const st = fs.lstatSync(dir, { throwIfNoEntry: false });
+    if (st == null && create) fs.mkdirSync(dir);
+    else if (st?.isDirectory() !== true)
+      throw new Refusal(`${path.relative(base, dir)}: not a plain folder (a symlink?)`);
+    seen.add(dir);
+  }
+}
+
 function stage(into: string): number {
   // Tracked files, and new files that git does not ignore (a new repro). Ignored files stay out:
   // old .e2e runs, app logs and local env files.
@@ -119,9 +137,11 @@ function stage(into: string): number {
   });
   if (listed.status !== 0) throw new Refusal(`git ls-files: ${listed.stderr}`);
   let count = 0;
+  const seen = new Set<string>();
   for (const rel of listed.stdout.split("\0").filter((name) => name !== "")) {
     const st = fs.lstatSync(path.join(ROOT, rel), { throwIfNoEntry: false });
     if (st == null) continue; // deleted in the work tree
+    plainFolders(ROOT, path.dirname(rel), false, seen); // lstat above follows symlinked folders
     if (!st.isFile()) throw new Refusal(`stage: ${rel} is not a regular file`);
     fs.mkdirSync(path.join(into, path.dirname(rel)), { recursive: true });
     fs.copyFileSync(path.join(ROOT, rel), path.join(into, rel), fs.constants.COPYFILE_EXCL);
@@ -163,7 +183,7 @@ function ownerLabel(): string {
 }
 
 // No credential reaches the container, also not through a caller's extra values.
-const CREDENTIAL = /(_API_KEY|_AUTH_TOKEN|_TOKEN|_BASE_URL|_SECRET|_PASSWORD)$/;
+const CREDENTIAL = /(_API_KEY|_AUTH_TOKEN|_TOKEN|_BASE_URL|_SECRET|_PASSWORD)$/i;
 
 /** The container env: fixed values, the allowlisted host names and the caller's extra values. */
 export function containerEnv(
@@ -223,7 +243,7 @@ export async function runInSandbox(run: SandboxRun): Promise<number> {
       ...Object.entries(env).flatMap(([key, value]) => ["-e", `${key}=${value}`]),
       "-w", "/repo/tests/bugbash", "--entrypoint", "bun", image,
       "sandbox/entry.ts", "--export", run.exportDir, "--", ...run.command];
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    plainFolders(BUGBASH_DIR, path.dirname(run.exportDir), true);
     log(`${name} --network none, ${appAi() ?? "no"} app AI, no proxy`);
     return await runContainer(args, { name, owner, dest });
   } finally {
