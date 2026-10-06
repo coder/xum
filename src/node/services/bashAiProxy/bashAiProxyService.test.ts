@@ -380,6 +380,15 @@ describe("BashAiProxyService", () => {
     // A project secret that names any provider var turns off that provider's whole pair.
     const withSecret = await proxy.envFor("ws-5", "local", ["ANTHROPIC_BASE_URL"]);
     expect(Object.keys(withSecret).sort()).toEqual(["OPENAI_API_KEY", "OPENAI_BASE_URL"]);
+    // So does an OpenAI organization or project secret: the proxy would replace the header
+    // that the SDK builds from it with the Xum account's.
+    for (const name of ["OPENAI_ORG_ID", "OPENAI_PROJECT_ID"]) {
+      expect(Object.keys(await proxy.envFor("ws-5", "local", [name])).sort()).toEqual([
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+      ]);
+    }
 
     // Runtimes that cannot reach the backend's loopback get nothing.
     for (const runtime of ["ssh", "docker", "devcontainer"] as const) {

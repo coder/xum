@@ -2043,6 +2043,23 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         ]
   );
 
+  // Keyboard route for the Settings → Providers → Bash commands switch.
+  actions.push(() => [
+    {
+      id: CommandIds.settingsToggleBashAiProxy(),
+      title: "Toggle Count AI Calls from Bash Commands",
+      subtitle: "Route bash commands' Anthropic and OpenAI calls through Xum to count their cost",
+      section: section.settings,
+      keywords: ["bash", "proxy", "cost", "usage", "anthropic", "openai", "billing"],
+      run: async () => {
+        if (!p.api) return;
+        // The flag lives in config.json (not localStorage), so read the current value first.
+        const cfg = await p.api.config.getConfig();
+        await p.api.config.updateBashAiProxyEnabled({ enabled: !cfg.bashAiProxyEnabled });
+      },
+    },
+  ]);
+
   // Settings
   if (p.onOpenSettings) {
     const openSettings = p.onOpenSettings;
