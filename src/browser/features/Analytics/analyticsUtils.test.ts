@@ -67,6 +67,11 @@ describe("formatUsdAxisTick", () => {
     expect(labels).toEqual(["$0.00", "$0.0035", "$0.007", "$0.0105", "$0.014"]);
   });
 
+  test("gives distinct labels to ticks below one microdollar", () => {
+    const ticks = [0, 2.5e-7, 5e-7, 7.5e-7, 1e-6];
+    expect(new Set(ticks.map(formatUsdAxisTick)).size).toBe(ticks.length);
+  });
+
   test("keeps cents for amounts of a dollar or more", () => {
     expect(formatUsdAxisTick(1.5)).toBe("$1.50");
     expect(formatUsdAxisTick(1250)).toBe("$1,250.00");

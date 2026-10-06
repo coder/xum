@@ -112,7 +112,9 @@ export function formatUsdAxisTick(amount: number): string {
   if (!Number.isFinite(amount) || magnitude === 0 || magnitude >= 1) {
     return formatUsd(amount);
   }
-  const fractionDigits = Math.min(6, Math.max(2, Math.ceil(-Math.log10(magnitude)) + 2));
+  // 20 is the widest maximumFractionDigits every Intl engine accepts. A lower cap brought the
+  // repeated labels back for sub-microdollar spend (per-token prices reach that scale).
+  const fractionDigits = Math.min(20, Math.max(2, Math.ceil(-Math.log10(magnitude)) + 2));
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: "USD",
