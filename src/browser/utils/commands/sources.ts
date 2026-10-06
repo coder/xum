@@ -4,6 +4,7 @@ import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
+import { showFeedbackToast as showCommandFeedbackToast } from "@/browser/utils/feedbackToast";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
 import type { AutoRoutingDimension } from "@/browser/utils/modelChange";
@@ -284,43 +285,6 @@ const NO_RUNNABLE_PLAN_MESSAGE =
 
 // Module-level: palette sources are rebuilt on every render, so a closure flag would reset.
 let reportSlownessRunning = false;
-
-const showCommandFeedbackToast = (feedback: {
-  type: "success" | "error";
-  message: string;
-  title?: string;
-  copyText?: string;
-  duration?: number;
-}) => {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  // Analytics view does not mount ChatInput, so keep a basic alert fallback
-  // for command palette actions that need user feedback.
-  const hasChatInputToastHost =
-    typeof document !== "undefined" &&
-    document.querySelector('[data-component="ChatInputSection"]') !== null;
-
-  if (hasChatInputToastHost) {
-    window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, feedback));
-    return;
-  }
-
-  const alertMessage = feedback.title
-    ? `${feedback.title}\n\n${feedback.message}`
-    : feedback.message;
-  // A native alert's text cannot be selected, so copyable text (a server-side report path)
-  // goes into a prompt's prefilled field instead. Electron does not implement prompt(),
-  // so the desktop app (which has `window.api` and reveals the folder itself) keeps alert.
-  if (feedback.copyText !== undefined && !window.api && typeof window.prompt === "function") {
-    window.prompt(alertMessage, feedback.copyText);
-    return;
-  }
-  if (typeof window.alert === "function") {
-    window.alert(alertMessage);
-  }
-};
 
 const findFirstTerminalSessionTab = (
   node: RightSidebarLayoutState["root"]

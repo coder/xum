@@ -1606,12 +1606,18 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       // they need to know if the pop-out itself failed.
       // Carry the known OSC title into the pop-out; it is deleted from the
       // sidebar map below and the new window only sees future title changes.
-      void openTerminalPopout(api, workspaceId, sessionId, terminalTitles.get(tab)).catch(
-        (err: unknown) => {
-          console.error("[RightSidebar] Failed to open terminal pop-out:", err);
-          terminalCreateError.showError("terminal-popout", getErrorMessage(err));
-        }
-      );
+      let popoutOpened: Promise<void>;
+      try {
+        popoutOpened = openTerminalPopout(api, workspaceId, sessionId, terminalTitles.get(tab));
+      } catch (err) {
+        // The browser blocked the window: keep the tab, since it is the only view of the session.
+        terminalCreateError.showError("terminal-popout", getErrorMessage(err));
+        return;
+      }
+      void popoutOpened.catch((err: unknown) => {
+        console.error("[RightSidebar] Failed to open terminal pop-out:", err);
+        terminalCreateError.showError("terminal-popout", getErrorMessage(err));
+      });
 
       // Remove the tab from the sidebar (terminal now lives in its own window)
       // Don't close the session - the pop-out window takes over

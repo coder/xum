@@ -12,6 +12,14 @@ import { resolveBrowserAssetUrl } from "@/browser/utils/frontendBasePath";
 
 type APIClient = RouterClient<AppRouter>;
 
+/** Thrown when the browser blocks the terminal pop-out window (window.open returned null). */
+export class TerminalPopupBlockedError extends Error {
+  constructor() {
+    super("The browser blocked the terminal window. Allow pop-ups for this site, then try again.");
+    this.name = "TerminalPopupBlockedError";
+  }
+}
+
 /** Default terminal size used when creating sessions before the terminal is mounted */
 
 export interface TerminalSessionCreateOptions {
@@ -31,7 +39,9 @@ export const DEFAULT_TERMINAL_SIZE = { cols: 80, rows: 24 };
  * surface backend failures. Without this, an Electron-side `terminalWindowManager` reject
  * would become an unhandled promise rejection — the same silent-freeze symptom we are
  * trying to fix on the Run-button path. The browser-mode `window.open` call is synchronous
- * and not part of the returned promise.
+ * and not part of the returned promise: when the browser blocks it, this function throws
+ * `TerminalPopupBlockedError` synchronously, before calling the backend, so callers can keep
+ * the session reachable (or close it) instead of losing it.
  *
  * @param api - The API client
  * @param workspaceId - Workspace ID
@@ -53,11 +63,14 @@ export function openTerminalPopout(
       params.set("title", initialTitle);
     }
     const terminalUrl = resolveBrowserAssetUrl(`terminal.html?${params.toString()}`);
-    window.open(
+    const popup = window.open(
       terminalUrl,
       `terminal-${workspaceId}-${Date.now()}`,
       "width=1000,height=600,popup=yes"
     );
+    if (popup == null) {
+      throw new TerminalPopupBlockedError();
+    }
   }
 
   // Open via backend (Electron pops up BrowserWindow, browser already opened above).
