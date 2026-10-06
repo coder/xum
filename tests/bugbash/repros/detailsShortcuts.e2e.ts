@@ -2,7 +2,12 @@
 // stopped every key, so global shortcuts did nothing until you clicked elsewhere.
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
-import { expectNotifyOnAllResponses, openPlayground } from "./helpers";
+import {
+  armLayerProbe,
+  expectNotifyOnAllResponses,
+  openPlayground,
+  waitForLayerEscapeReady,
+} from "./helpers";
 
 test(
   "global shortcuts still work after the Workspace details popover closes",
@@ -15,11 +20,13 @@ test(
     // A fresh workspace starts with "Notify on all responses" off. The check opens the bell's
     // popover, so it runs only at the end: it would move focus away from the details button.
     await screen.getByRole("textbox", "Message").tap();
+    // The details popover is the only Radix popover open here.
+    await armLayerProbe(browser, "[data-radix-popper-content-wrapper] [role=dialog]");
     await browser.keyboard.press("Control+Shift+D");
     const details = screen.getByRole("dialog");
     await expect(details).toBeVisible();
-    // Radix moves focus into the popover once it can take Escape. Pressing earlier loses the key.
-    await expect(details).toBeFocused();
+    // Focus inside the popover does not prove that Radix takes Escape yet (see layerProbeInit).
+    await waitForLayerEscapeReady(browser);
     await browser.keyboard.press("Escape");
     await expect(details).toBeHidden();
     // The precondition of the bug: Radix returns focus to the trigger.
