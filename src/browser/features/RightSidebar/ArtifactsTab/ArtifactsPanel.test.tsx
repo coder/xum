@@ -1721,6 +1721,89 @@ describe("ArtifactsPanel", () => {
     await waitFor(() => expect(document.activeElement).toBe(panel));
   });
 
+  // #5694: closing fullscreen returns focus to the button that opened it, as dialogs do.
+  test("closing fullscreen returns focus to the Fullscreen button that opened it", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 2, "text"), entry("b.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha"), "b.txt": textFile("b.txt", "text", "beta") }
+    );
+    const view = renderPanel();
+    expect(await view.findByText("alpha")).toBeTruthy();
+    const button = view.getByRole("button", { name: "Fullscreen" });
+    // A real click focuses the button before it activates.
+    act(() => button.focus());
+    fireEvent.click(button);
+    const dialog = await view.findByRole("dialog", { name: "Artifact a.txt" });
+    await waitFor(() => expect(document.activeElement).toBe(dialog));
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    expect(document.activeElement).toBe(button);
+    // J/K still reach the panel from the button.
+    fireEvent.keyDown(button, { key: "j" });
+    expect(await view.findByText("beta")).toBeTruthy();
+  });
+
+  // #5715: the undo cleared inert that another component set while fullscreen was open.
+  test("leaving fullscreen keeps inert that another component set meanwhile", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha") }
+    );
+    const mine = document.body.appendChild(document.createElement("div"));
+    const theirs = document.body.appendChild(document.createElement("div"));
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("alpha")).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    await view.findByRole("dialog", { name: "Artifact a.txt" });
+    expect([mine.inert, theirs.inert]).toEqual([true, true]);
+    // Another component (ChatPane under immersive review sets the attribute) marks it as well.
+    theirs.setAttribute("inert", "");
+
+    fireEvent.keyDown(panel, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    expect([mine.inert, theirs.inert]).toEqual([false, true]);
+    mine.remove();
+    theirs.remove();
+  });
+
+  // #5715: focus that fell to <body> with a removed node outside the panel (a portaled menu) came
+  // back only after the next change inside the panel.
+  test("in fullscreen, focus lost with a node outside the panel returns to the panel", async () => {
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha") }
+    );
+    const view = renderPanel();
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("alpha")).toBeTruthy();
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact a.txt" });
+    // Portaled menus open after fullscreen, so they are not inert.
+    const menu = document.body.appendChild(document.createElement("button"));
+    act(() => menu.focus());
+    expect(document.activeElement).toBe(menu);
+
+    act(() => menu.remove());
+    await waitFor(() => expect(document.activeElement).toBe(dialog));
+  });
+
   test("the fullscreen dialog shows its focus ring while shortcuts focus it", async () => {
     fake = createFakeArtifactsApi(
       {

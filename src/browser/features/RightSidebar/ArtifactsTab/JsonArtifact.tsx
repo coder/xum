@@ -4,6 +4,7 @@ import { cn } from "@/common/lib/utils";
 import { ARTIFACT_TABLE_MAX_COLUMNS, ARTIFACT_TABLE_MAX_ROWS, DataTable } from "./DataTable";
 import { createCappedMemory, useCappedMemory } from "./cappedMemory";
 import { SourceText } from "./SourceText";
+import { ARTIFACT_ANNOTATION_SKIP_PROPS } from "./artifactAnnotation";
 import {
   countJsonNodes,
   JSON_TREE_MAX_NODES,
@@ -143,7 +144,11 @@ export function JsonArtifact(props: { content: string; path: string; viewKey?: s
   }
   return (
     <div className="flex min-h-0 flex-col">
-      <div className="border-border-light flex items-center gap-1 border-b px-3 py-1.5 text-[11px]">
+      <div
+        // Controls, not artifact text: annotate-mode quotes skip this row (#5689).
+        {...ARTIFACT_ANNOTATION_SKIP_PROPS}
+        className="border-border-light flex items-center gap-1 border-b px-3 py-1.5 text-[11px] select-none"
+      >
         {modes.map((option) => (
           <button
             key={option}

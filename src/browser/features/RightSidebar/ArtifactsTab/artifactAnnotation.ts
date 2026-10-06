@@ -35,6 +35,30 @@ export function getArtifactAnnotationSupport(kind: string): ArtifactAnnotationSu
 }
 
 /**
+ * Marks viewer controls inside the annotatable area (the JSON Tree/Raw/Table row): their labels
+ * are not artifact text, so quotes and context skip them (#5689). Such rows are also
+ * `select-none`, but a drag across them still puts their text inside the range.
+ */
+export const ARTIFACT_ANNOTATION_SKIP_PROPS = { "data-annotation-skip": "" } as const;
+const SKIP_SELECTOR = "[data-annotation-skip]";
+
+/** The range's text inside `container`, without text under a skip-marked element. */
+function annotatableText(container: HTMLElement, range: Range): string {
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+  let text = "";
+  for (let node = walker.nextNode(); node != null; node = walker.nextNode()) {
+    if (!range.intersectsNode(node)) continue;
+    const skipped = node.parentElement?.closest(SKIP_SELECTOR);
+    if (skipped != null && container.contains(skipped)) continue;
+    const value = node.nodeValue ?? "";
+    const start = node === range.startContainer ? range.startOffset : 0;
+    const end = node === range.endContainer ? range.endOffset : value.length;
+    text += value.slice(start, end);
+  }
+  return text;
+}
+
+/**
  * Text anchor for a selection inside `container`: the quote (capped) and a little context on
  * each side, taken from the rendered text. Null when the selection is empty or leaves the
  * container.
@@ -48,7 +72,7 @@ export function textAnchorFromSelection(
   if (!container.contains(range.startContainer) || !container.contains(range.endContainer)) {
     return null;
   }
-  const quote = range.toString().trim();
+  const quote = annotatableText(container, range).trim();
   if (quote.length === 0) return null;
 
   const before = document.createRange();
@@ -63,8 +87,8 @@ export function textAnchorFromSelection(
     anchor: {
       kind: "text",
       quote: quote.slice(0, ARTIFACT_ANNOTATION_QUOTE_MAX_CHARS),
-      prefix: before.toString().slice(-ARTIFACT_ANNOTATION_CONTEXT_CHARS),
-      suffix: after.toString().slice(0, ARTIFACT_ANNOTATION_CONTEXT_CHARS),
+      prefix: annotatableText(container, before).slice(-ARTIFACT_ANNOTATION_CONTEXT_CHARS),
+      suffix: annotatableText(container, after).slice(0, ARTIFACT_ANNOTATION_CONTEXT_CHARS),
     },
     clientX: rect.left,
     clientY: rect.bottom,
