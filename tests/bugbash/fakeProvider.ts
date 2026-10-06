@@ -68,6 +68,12 @@ const PLANS: Plan[] = [
     calls: ["bad-key"],
     background: false,
   },
+  {
+    keyword: "[proxy:status]",
+    displayName: "no new call, only the background results so far",
+    calls: [],
+    background: false,
+  },
   { keyword: "probe", displayName: "one Anthropic call", calls: ["anthropic"], background: false },
 ];
 
@@ -252,6 +258,9 @@ function chatText(res: http.ServerResponse, body: Json, text: string): void {
  * A chat request. Agent turns (their system prompt names the worktree) make the plan's proxy
  * calls; everything else the app asks (titles, status) gets a short "ok".
  */
+/** The latest background plan per workspace and its HTTP results. */
+const backgroundRuns = new Map<string, { results: string[]; done: boolean }>();
+
 async function anthropicChat(
   res: http.ServerResponse,
   body: Json,
@@ -265,25 +274,46 @@ async function anthropicChat(
   }
   const userText = textOf([...messages].reverse().find((m) => m.role === "user")?.content);
   const plan = pickPlan(userText);
+  // Background results so far, so the explorer can read them in the next reply.
+  const background = backgroundRuns.get(workspaceId);
+  const backgroundLines = background
+    ? [
+        `Background calls (${background.done ? "finished" : "still running"}):`,
+        ...background.results.map((r, i) => `  call ${i + 1}: ${r}`),
+      ]
+    : [];
   if (plan.background) {
-    chatText(res, body, `Started ${plan.displayName}. Watch the Cost tab.`);
-    // Like a background command: the calls outlive the turn. Each result goes to the app log.
+    const run = { results: [] as string[], done: false };
+    backgroundRuns.set(workspaceId, run);
+    chatText(
+      res,
+      body,
+      `Started ${plan.displayName}. Send '[proxy:status]' to see their HTTP results; it says "finished" when all calls ran.`
+    );
+    // Like a background command: the calls outlive the turn.
     (async () => {
       for (const [i, call] of plan.calls.entries()) {
         if (i > 0) await new Promise((resolve) => setTimeout(resolve, 5000));
-        console.log(
-          `[fake-provider] background call ${i + 1}: ${await proxyCall(xumRoot, workspaceId, call)}`
-        );
+        const result = await proxyCall(xumRoot, workspaceId, call);
+        run.results.push(result);
+        console.log(`[fake-provider] background call ${i + 1}: ${result}`);
       }
-    })().catch((error: unknown) =>
-      console.log(`[fake-provider] background calls failed: ${String(error)}`)
-    );
+    })()
+      .catch((error: unknown) => run.results.push(`harness error: ${String(error)}`))
+      .finally(() => {
+        run.done = true;
+      });
     return `chat-background:${plan.keyword}`;
   }
   const results: string[] = [];
   for (const call of plan.calls)
     results.push(`${call}: ${await proxyCall(xumRoot, workspaceId, call)}`);
-  chatText(res, body, `Done: ${plan.displayName} through the Xum proxy.\n${results.join("\n")}`);
+  // Neutral wording: an expected refusal (401, 403, 503) is a result, not a success.
+  const lines =
+    plan.calls.length > 0
+      ? [`Results of ${plan.displayName} through the Xum proxy:`, ...results]
+      : [];
+  chatText(res, body, [...lines, ...backgroundLines].join("\n") || "No background calls yet.");
   return `chat-plan:${plan.keyword}`;
 }
 
