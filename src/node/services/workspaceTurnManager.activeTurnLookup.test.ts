@@ -710,6 +710,20 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
       if (kind === "claimedTag" || kind === "claimedMark") confirmed.add(target);
     }
 
+    // More agent chains (#5569 PR2), each depth with one to three records from random ancestors,
+    // so active records, cross-owner newest records and cross-owner ties all occur.
+    for (let index = 0; index < 16; index++) {
+      const chain = [`chain${index}`];
+      rows.push({ dir: chain[0], id: chain[0] });
+      for (let depth = 1; depth <= 1 + next(5); depth++) {
+        const agent = `chain${index}a${depth}`;
+        rows.push({ dir: agent, id: agent, options: { parentWorkspaceId: chain.at(-1) } });
+        for (let n = 1 + next(3); n > 0; n--)
+          records.push(randomTurn(chain[next(chain.length)], agent));
+        chain.push(agent);
+      }
+    }
+
     const config = await seedOnDisk(
       (projectPath) =>
         rows.map((row) => projectWorkspace(projectPath, row.dir, row.id, row.options)),
@@ -757,7 +771,11 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
    * Report delivery, terminal-attention drains and the queue drain all look the parent's turn up.
    * Returns how many lookups, global scans and handle-file reads the settle ran.
    */
-  async function settleChildUnderParent(config: Config, mode: "fg" | "bg" | "busy") {
+  async function settleChildUnderParent(
+    config: Config,
+    mode: "fg" | "bg" | "busy",
+    expectedWakes: number
+  ) {
     // busy: the parent streams a cuttable turn until `release`, then goes idle.
     const busy = { streaming: mode === "busy", turn: Symbol("parent-turn") };
     let release = () => undefined as void;
@@ -868,9 +886,9 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
     await flushTerminalAttentionDrains(taskService);
     await taskService.queueDrainSettled();
 
-    // The settle really happened: the child reported and the parent woke (busy: cut + idle).
+    // The settle really happened: the child reported and the parent woke.
     expect(findWorkspaceInConfig(config, "child")?.taskStatus).toBe("reported");
-    expect(wakes()).toBe(mode === "busy" ? 2 : 1);
+    expect(wakes()).toBe(expectedWakes);
     expect(lookups.mock.calls.length).toBeGreaterThan(0);
     return {
       lookups: lookups.mock.calls.length,
@@ -929,7 +947,8 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
         }
       }
 
-      const settle = await settleChildUnderParent(config, mode);
+      // busy: the cut wake plus the after-idle wake.
+      const settle = await settleChildUnderParent(config, mode, mode === "busy" ? 2 : 1);
       expect(settle.scans).toBe(0);
       expect(settle.reads).toBeLessThanOrEqual(settle.lookups * creatorFiles + 30);
     }
@@ -976,7 +995,9 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
         }
       }
 
-      const settle = await settleChildUnderParent(config, mode);
+      // busy: the parent is an agent task, so its report-less turn end adds a third wake (the
+      // final-response reminder).
+      const settle = await settleChildUnderParent(config, mode, mode === "busy" ? 3 : 1);
       expect(settle.scans).toBe(0);
       expect(settle.reads).toBeLessThanOrEqual(settle.lookups * rootFiles + 30);
     }
