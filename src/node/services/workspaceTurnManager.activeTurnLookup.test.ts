@@ -139,11 +139,14 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
         [workspaceTurnRecord("root", "leaf", "wst_grand", "running")]
       )
     ).taskService;
+    const scans = globalScans(backendA);
 
     expect(await lookup(backendA, "leaf")).toMatchObject({
       taskHandleId: "wst_grand",
       ownerWorkspaceId: "root",
     });
+    // The config ancestors' directories answer alone (#5569).
+    expect(scans).not.toHaveBeenCalled();
   });
 
   test("T4: follows another backend's settle, revive and follow-up of a root's turn", async () => {
@@ -208,11 +211,13 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
         ]
       )
     ).taskService;
+    const scans = globalScans(backendA);
 
     expect(await lookup(backendA, "leaf")).toMatchObject({
       taskHandleId: "wst_newer",
       ownerWorkspaceId: "mid",
     });
+    expect(scans).not.toHaveBeenCalled();
   });
 
   test("T6: a restarted backend finds surviving turns of a root and of an agent task", async () => {
@@ -241,8 +246,8 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
       taskHandleId: "wst_agent",
       ownerWorkspaceId: parentId,
     });
-    // Agent tasks still use the global scan.
-    expect(scans).toHaveBeenCalledTimes(1);
+    // The agent task's config ancestors answer too (#5569).
+    expect(scans).not.toHaveBeenCalled();
   });
 
   // T7 pins the owner rule the narrowed lookup relies on (#5569). Case (a), a
@@ -444,6 +449,137 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
     expect(scans).toHaveBeenCalledTimes(1);
   });
 
+  /** Seeds `rows` and `records`, then expects the global scan to answer `target` with `expected`. */
+  async function expectGlobalScanAnswer(
+    rows: (projectPath: string) => WorkspaceConfigEntry[],
+    records: WorkspaceTurnTaskHandleRecord[],
+    target: string,
+    expected: { taskHandleId: string; ownerWorkspaceId: string }
+  ) {
+    const backendA = createWorkspaceTurnManagerHarness(await seedOnDisk(rows, records)).taskService;
+    const scans = globalScans(backendA);
+    expect(await lookup(backendA, target)).toMatchObject(expected);
+    expect(scans).toHaveBeenCalledTimes(1);
+  }
+  /** A chain `${prefix}0` (the target) up to the root `${prefix}${levels}`. */
+  const chain = (projectPath: string, prefix: string, levels: number) =>
+    Array.from({ length: levels + 1 }, (_, level) =>
+      projectWorkspace(projectPath, `${prefix}${level}`, `${prefix}${level}`, {
+        ...(level < levels ? { parentWorkspaceId: `${prefix}${level + 1}` } : {}),
+      })
+    );
+
+  test("T11a: an ancestor ID on two config rows falls back to the global scan", async () => {
+    // The first "mid" row is a root. The second has parent "grand", which holds the running record.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const otherProjectPath = path.join(rootDir, "repo2");
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "leaf", "leaf", { parentWorkspaceId: "mid" }),
+        projectWorkspace(projectPath, "mid", "mid"),
+        projectWorkspace(projectPath, "grand", "grand"),
+      ],
+      {
+        taskSettings: testTaskSettings(),
+        extraProjects: [
+          [
+            otherProjectPath,
+            {
+              trusted: true,
+              workspaces: [
+                projectWorkspace(otherProjectPath, "mid", "mid", { parentWorkspaceId: "grand" }),
+              ],
+            },
+          ],
+        ],
+      }
+    );
+    await new TaskHandleStore(config).upsertWorkspaceTurn(
+      workspaceTurnRecord("grand", "leaf", "wst_grand", "running")
+    );
+    const backendA = createWorkspaceTurnManagerHarness(config).taskService;
+    const scans = globalScans(backendA);
+
+    expect(await lookup(backendA, "leaf")).toMatchObject({
+      taskHandleId: "wst_grand",
+      ownerWorkspaceId: "grand",
+    });
+    expect(scans).toHaveBeenCalledTimes(1);
+  });
+
+  test("T11b: a missing ancestor row falls back to the global scan", async () => {
+    await expectGlobalScanAnswer(
+      (projectPath) => [
+        projectWorkspace(projectPath, "leaf", "leaf", { parentWorkspaceId: "gone" }),
+        projectWorkspace(projectPath, "above", "above"),
+      ],
+      [workspaceTurnRecord("above", "leaf", "wst_above", "running")],
+      "leaf",
+      { taskHandleId: "wst_above", ownerWorkspaceId: "above" }
+    );
+  });
+
+  test("T11c: more than 64 ancestor levels, or a cycle, fall back to the global scan", async () => {
+    await expectGlobalScanAnswer(
+      (projectPath) => chain(projectPath, "deep", 65),
+      [workspaceTurnRecord("deep65", "deep0", "wst_deep", "running")],
+      "deep0",
+      { taskHandleId: "wst_deep", ownerWorkspaceId: "deep65" }
+    );
+
+    // 64 levels still resolve from the ancestors' directories.
+    const backendA = createWorkspaceTurnManagerHarness(
+      await seedOnDisk(
+        (projectPath) => chain(projectPath, "edge", 64),
+        [workspaceTurnRecord("edge64", "edge0", "wst_edge", "running")]
+      )
+    ).taskService;
+    const scans = globalScans(backendA);
+    expect(await lookup(backendA, "edge0")).toMatchObject({ taskHandleId: "wst_edge" });
+    expect(scans).not.toHaveBeenCalled();
+
+    // Last: without the level limit this walk never ends. "ring1" is an ancestor of "ring0"
+    // through the cycle, so the owner rule admits its record.
+    await expectGlobalScanAnswer(
+      (projectPath) => [
+        projectWorkspace(projectPath, "ring0", "ring0", { parentWorkspaceId: "ring1" }),
+        projectWorkspace(projectPath, "ring1", "ring1", { parentWorkspaceId: "ring0" }),
+      ],
+      [workspaceTurnRecord("ring1", "ring0", "wst_ring", "running")],
+      "ring0",
+      { taskHandleId: "wst_ring", ownerWorkspaceId: "ring1" }
+    );
+  });
+
+  test("T12: an unreadable ancestor directory falls back to the global scan", async () => {
+    const backendA = createWorkspaceTurnManagerHarness(
+      await seedOnDisk(
+        (projectPath) => [
+          projectWorkspace(projectPath, "root", "root"),
+          projectWorkspace(projectPath, "mid", "mid", { parentWorkspaceId: "root" }),
+          projectWorkspace(projectPath, "leaf", "leaf", { parentWorkspaceId: "mid" }),
+        ],
+        [workspaceTurnRecord("mid", "leaf", "wst_mid", "running")]
+      )
+    ).taskService;
+    const store = workspaceTurnManagerInternals(backendA).taskHandleStore;
+    const scans = globalScans(backendA);
+    const denied = Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+    const listings = spyOn(store, "listWorkspaceTurns").mockImplementationOnce(() =>
+      Promise.reject(denied)
+    );
+
+    expect(await lookup(backendA, "leaf")).toMatchObject({
+      taskHandleId: "wst_mid",
+      ownerWorkspaceId: "mid",
+    });
+    expect(listings.mock.calls[0]?.[0]).toBe("mid");
+    expect(scans).toHaveBeenCalledTimes(1);
+  });
+
   test("T9: matches the global scan on generated stores that obey the owner rule", async () => {
     // Deterministic LCG so a failure reproduces exactly.
     let seed = 5569;
@@ -493,6 +629,20 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
     records.push(
       workspaceTurnRecord("own2", "fixedwrong", handle(), "completed", { createdWorkspace: true }),
       workspaceTurnRecord("own2", "fixedwrong", handle(), "running", { createdAt: at(1) })
+    );
+    // Fixed agent cases: the grandparent holds the newest record, then a cross-owner tie.
+    for (const prefix of ["fixedgrand", "fixedtie"]) {
+      rows.push(
+        { dir: prefix, id: prefix },
+        { dir: `${prefix}a`, id: `${prefix}a`, options: { parentWorkspaceId: prefix } },
+        { dir: `${prefix}b`, id: `${prefix}b`, options: { parentWorkspaceId: `${prefix}a` } }
+      );
+    }
+    records.push(
+      workspaceTurnRecord("fixedgranda", "fixedgrandb", handle(), "running", { createdAt: at(1) }),
+      workspaceTurnRecord("fixedgrand", "fixedgrandb", handle(), "running", { createdAt: at(3) }),
+      workspaceTurnRecord("fixedtiea", "fixedtieb", handle(), "running", { createdAt: at(2) }),
+      workspaceTurnRecord("fixedtie", "fixedtieb", handle(), "starting", { createdAt: at(2) })
     );
 
     const kinds = [
@@ -575,9 +725,19 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
     const scans = globalScans(backendA);
 
     expect(rows.length).toBeGreaterThanOrEqual(40);
+    const agentTasks = new Set(
+      rows.filter((row) => row.options?.parentWorkspaceId).map((r) => r.id)
+    );
     for (const { id } of rows) {
       const active = await oracleStore.listAllWorkspaceTurns({ statuses: ["starting", "running"] });
       const expected = active.toReversed().find((record) => record.workspaceId === id);
+      // An agent task falls back only when another owner ties its newest record's createdAt.
+      const tiedAcrossOwners = active.some(
+        (record) =>
+          record.workspaceId === id &&
+          record.ownerWorkspaceId !== expected?.ownerWorkspaceId &&
+          record.createdAt === expected?.createdAt
+      );
       const scansBefore = scans.mock.calls.length;
       const actual = await lookup(backendA, id);
       expect({ id, handle: actual?.taskHandleId, owner: actual?.ownerWorkspaceId }).toEqual({
@@ -587,10 +747,137 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
       });
       expect({ id, scans: scans.mock.calls.length - scansBefore }).toEqual({
         id,
-        scans: confirmed.has(id) ? 0 : 1,
+        scans: confirmed.has(id) || (agentTasks.has(id) && !tiedAcrossOwners) ? 0 : 1,
       });
     }
   });
+
+  /**
+   * Drives one sub-agent settle of "child" under "parent" through the real TaskService stack.
+   * Report delivery, terminal-attention drains and the queue drain all look the parent's turn up.
+   * Returns how many lookups, global scans and handle-file reads the settle ran.
+   */
+  async function settleChildUnderParent(config: Config, mode: "fg" | "bg" | "busy") {
+    // busy: the parent streams a cuttable turn until `release`, then goes idle.
+    const busy = { streaming: mode === "busy", turn: Symbol("parent-turn") };
+    let release = () => undefined as void;
+    const idle = new Promise<void>((resolve) => (release = resolve));
+    const { aiService } = createAIServiceMocks(config, {
+      isStreaming: mock((id: string) => busy.streaming && id === "parent"),
+    });
+    const { workspaceService, resumeStream, sendMessage } = createWorkspaceServiceMocks({
+      remove: mock(async (workspaceId: string): Promise<Result<void>> => {
+        await removeWorkspaceFromTestConfig(config, workspaceId);
+        return Ok(undefined);
+      }),
+      getActiveTurnGeneration: mock((id: string) =>
+        busy.streaming && id === "parent" ? busy.turn : undefined
+      ),
+      waitForIdleAndNoQueuedMessages: mock((id: string) =>
+        busy.streaming && id === "parent" ? idle : Promise.resolve()
+      ),
+    });
+    const { taskService, partialService, historyService, workspaceTurnManager } =
+      createTaskServiceHarness(config, { aiService, workspaceService });
+
+    if (mode === "fg") {
+      // fg: the parent waits on the task tool, so the report finalizes the parent's partial.
+      const parentPartial = createMuxMessage(
+        "assistant-parent-partial",
+        "assistant",
+        "Waiting on subagent",
+        { timestamp: Date.now() },
+        [
+          {
+            type: "dynamic-tool",
+            toolCallId: "task-call-1",
+            toolName: "task",
+            input: { subagent_type: "explore", prompt: "do the thing", title: "Test task" },
+            state: "input-available",
+          },
+        ]
+      );
+      expect((await partialService.writePartial("parent", parentPartial)).success).toBe(true);
+    }
+    const prompt = createMuxMessage("user-child-prompt", "user", "do the thing", {
+      timestamp: Date.now(),
+    });
+    expect((await historyService.appendToHistory("child", prompt)).success).toBe(true);
+    const placeholder = createMuxMessage("assistant-child-partial", "assistant", "", {
+      timestamp: Date.now(),
+    });
+    expect((await historyService.appendToHistory("child", placeholder)).success).toBe(true);
+    const parts: StreamEndEvent["parts"] = [
+      {
+        type: "dynamic-tool",
+        toolCallId: "agent-report-call-1",
+        toolName: "agent_report",
+        input: { reportMarkdown: "Hello from child", title: "Result" },
+        state: "output-available",
+        output: { success: true },
+      },
+      { type: "text", text: "Hello from child" },
+    ];
+    const childPartial = createMuxMessage(
+      "assistant-child-partial",
+      "assistant",
+      "",
+      { timestamp: Date.now(), historySequence: placeholder.metadata?.historySequence },
+      parts
+    );
+    expect((await partialService.writePartial("child", childPartial)).success).toBe(true);
+    expect((await partialService.commitPartial("child")).success).toBe(true);
+
+    const scans = spyOn(TaskHandleStore.prototype, "scanAllWorkspaceTurns");
+    const reads = spyOn(
+      TaskHandleStore.prototype as unknown as { readWorkspaceTurnFile: () => unknown },
+      "readWorkspaceTurnFile"
+    );
+    const lookups = spyOn(
+      workspaceTurnManager as unknown as {
+        getActiveWorkspaceTurnRecordForWorkspace: () => unknown;
+      },
+      "getActiveWorkspaceTurnRecordForWorkspace"
+    );
+    const wakes = () => resumeStream.mock.calls.length + sendMessage.mock.calls.length;
+
+    await streamEnd(taskService, {
+      type: "stream-end",
+      workspaceId: "child",
+      messageId: "assistant-child-partial",
+      metadata: { model: "test-model", finishReason: "stop" },
+      parts,
+    });
+    if (mode === "busy") {
+      // The cut wake runs while the parent still streams; the after-idle drain waits on
+      // `idle`, so drains cannot be flushed until the parent's turn ends.
+      for (let spin = 0; spin < 10_000 && wakes() === 0; spin++) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      expect(wakes()).toBe(1);
+      busy.streaming = false;
+      release();
+      await streamEnd(taskService, {
+        type: "stream-end",
+        workspaceId: "parent",
+        messageId: "assistant-parent-turn",
+        metadata: { model: "test-model", finishReason: "stop" },
+        parts: [],
+      });
+    }
+    await flushTerminalAttentionDrains(taskService);
+    await taskService.queueDrainSettled();
+
+    // The settle really happened: the child reported and the parent woke (busy: cut + idle).
+    expect(findWorkspaceInConfig(config, "child")?.taskStatus).toBe("reported");
+    expect(wakes()).toBe(mode === "busy" ? 2 : 1);
+    expect(lookups.mock.calls.length).toBeGreaterThan(0);
+    return {
+      lookups: lookups.mock.calls.length,
+      scans: scans.mock.calls.length,
+      reads: reads.mock.calls.length,
+    };
+  }
 
   // T10: the whole sub-agent settle under a claimed root parent stays inside the creator's
   // directory: report delivery, terminal-attention drains and the queue drain all look the
@@ -642,124 +929,56 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
         }
       }
 
-      // busy: the parent streams a cuttable turn until `release`, then goes idle.
-      const busy = { streaming: mode === "busy", turn: Symbol("parent-turn") };
-      let release = () => undefined as void;
-      const idle = new Promise<void>((resolve) => (release = resolve));
-      const { aiService } = createAIServiceMocks(config, {
-        isStreaming: mock((id: string) => busy.streaming && id === "parent"),
-      });
-      const { workspaceService, resumeStream, sendMessage } = createWorkspaceServiceMocks({
-        remove: mock(async (workspaceId: string): Promise<Result<void>> => {
-          await removeWorkspaceFromTestConfig(config, workspaceId);
-          return Ok(undefined);
-        }),
-        getActiveTurnGeneration: mock((id: string) =>
-          busy.streaming && id === "parent" ? busy.turn : undefined
-        ),
-        waitForIdleAndNoQueuedMessages: mock((id: string) =>
-          busy.streaming && id === "parent" ? idle : Promise.resolve()
-        ),
-      });
-      const { taskService, partialService, historyService, workspaceTurnManager } =
-        createTaskServiceHarness(config, { aiService, workspaceService });
+      const settle = await settleChildUnderParent(config, mode);
+      expect(settle.scans).toBe(0);
+      expect(settle.reads).toBeLessThanOrEqual(settle.lookups * creatorFiles + 30);
+    }
+  );
 
-      if (mode === "fg") {
-        // fg: the parent waits on the task tool, so the report finalizes the parent's partial.
-        const parentPartial = createMuxMessage(
-          "assistant-parent-partial",
-          "assistant",
-          "Waiting on subagent",
-          { timestamp: Date.now() },
-          [
-            {
-              type: "dynamic-tool",
-              toolCallId: "task-call-1",
-              toolName: "task",
-              input: { subagent_type: "explore", prompt: "do the thing", title: "Test task" },
-              state: "input-available",
-            },
-          ]
+  // T13: the same settle under an agent-task parent reads only the parent's config ancestors.
+  test.each(["fg", "bg", "busy"] as const)(
+    "T13: a sub-agent settle under an agent-task parent runs no global scan (%s)",
+    async (mode) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const rootFiles = 20;
+      const otherOwners = ["other0", "other1", "other2"];
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "root", "root"),
+          ...otherOwners.map((owner) => projectWorkspace(projectPath, owner, owner)),
+          projectWorkspace(projectPath, "parent", "parent", {
+            parentWorkspaceId: "root",
+            agentType: "explore",
+            taskStatus: "running",
+          }),
+          projectWorkspace(projectPath, "child", "child", {
+            parentWorkspaceId: "parent",
+            agentType: "explore",
+            taskStatus: "running",
+          }),
+        ],
+        testTaskSettings()
+      );
+      const store = new TaskHandleStore(config);
+      for (let index = 0; index < rootFiles; index++) {
+        await store.upsertWorkspaceTurn(
+          workspaceTurnRecord("root", `done${index}`, `wst_r${index}`, "completed")
         );
-        expect((await partialService.writePartial("parent", parentPartial)).success).toBe(true);
       }
-      const prompt = createMuxMessage("user-child-prompt", "user", "do the thing", {
-        timestamp: Date.now(),
-      });
-      expect((await historyService.appendToHistory("child", prompt)).success).toBe(true);
-      const placeholder = createMuxMessage("assistant-child-partial", "assistant", "", {
-        timestamp: Date.now(),
-      });
-      expect((await historyService.appendToHistory("child", placeholder)).success).toBe(true);
-      const parts: StreamEndEvent["parts"] = [
-        {
-          type: "dynamic-tool",
-          toolCallId: "agent-report-call-1",
-          toolName: "agent_report",
-          input: { reportMarkdown: "Hello from child", title: "Result" },
-          state: "output-available",
-          output: { success: true },
-        },
-        { type: "text", text: "Hello from child" },
-      ];
-      const childPartial = createMuxMessage(
-        "assistant-child-partial",
-        "assistant",
-        "",
-        { timestamp: Date.now(), historySequence: placeholder.metadata?.historySequence },
-        parts
-      );
-      expect((await partialService.writePartial("child", childPartial)).success).toBe(true);
-      expect((await partialService.commitPartial("child")).success).toBe(true);
-
-      const scans = spyOn(TaskHandleStore.prototype, "scanAllWorkspaceTurns");
-      const reads = spyOn(
-        TaskHandleStore.prototype as unknown as { readWorkspaceTurnFile: () => unknown },
-        "readWorkspaceTurnFile"
-      );
-      const lookups = spyOn(
-        workspaceTurnManager as unknown as {
-          getActiveWorkspaceTurnRecordForWorkspace: () => unknown;
-        },
-        "getActiveWorkspaceTurnRecordForWorkspace"
-      );
-      const wakes = () => resumeStream.mock.calls.length + sendMessage.mock.calls.length;
-
-      await streamEnd(taskService, {
-        type: "stream-end",
-        workspaceId: "child",
-        messageId: "assistant-child-partial",
-        metadata: { model: "test-model", finishReason: "stop" },
-        parts,
-      });
-      if (mode === "busy") {
-        // The cut wake runs while the parent still streams; the after-idle drain waits on
-        // `idle`, so drains cannot be flushed until the parent's turn ends.
-        for (let spin = 0; spin < 10_000 && wakes() === 0; spin++) {
-          await new Promise((resolve) => setImmediate(resolve));
+      for (const owner of otherOwners) {
+        for (let index = 0; index < 40; index++) {
+          await store.upsertWorkspaceTurn(
+            workspaceTurnRecord(owner, `${owner}t${index}`, `wst_${owner}_${index}`, "completed")
+          );
         }
-        expect(wakes()).toBe(1);
-        busy.streaming = false;
-        release();
-        await streamEnd(taskService, {
-          type: "stream-end",
-          workspaceId: "parent",
-          messageId: "assistant-parent-turn",
-          metadata: { model: "test-model", finishReason: "stop" },
-          parts: [],
-        });
       }
-      await flushTerminalAttentionDrains(taskService);
-      await taskService.queueDrainSettled();
 
-      // The settle really happened: the child reported and the parent woke (busy: cut + idle).
-      expect(findWorkspaceInConfig(config, "child")?.taskStatus).toBe("reported");
-      expect(wakes()).toBe(mode === "busy" ? 2 : 1);
-      expect(lookups.mock.calls.length).toBeGreaterThan(0);
-      expect(scans).not.toHaveBeenCalled();
-      expect(reads.mock.calls.length).toBeLessThanOrEqual(
-        lookups.mock.calls.length * creatorFiles + 30
-      );
+      const settle = await settleChildUnderParent(config, mode);
+      expect(settle.scans).toBe(0);
+      expect(settle.reads).toBeLessThanOrEqual(settle.lookups * rootFiles + 30);
     }
   );
 });
