@@ -26,7 +26,10 @@ test("the rule catches a suite that drives flows with agent.act", () => {
 });
 
 test("no repro lets a model pick actions", () => {
-  const files = fs.readdirSync(REPROS).filter((name) => name.endsWith(".e2e.ts"));
+  // Recursive, like the runner's repros/**/*.e2e.ts.
+  const files = fs
+    .readdirSync(REPROS, { recursive: true, encoding: "utf8" })
+    .filter((name) => name.endsWith(".e2e.ts"));
   expect(files.length).toBeGreaterThan(0);
   const found = files.flatMap((name) => {
     const why = modelDriven(fs.readFileSync(path.join(REPROS, name), "utf8"));

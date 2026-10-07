@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -58,13 +58,15 @@ afterAll(async () => {
   fs.rmSync(bin, { recursive: true, force: true });
 });
 
-function run(command: string[], env: Record<string, string> = {}) {
+// Async on purpose: spawnSync would block this event loop, so the fake provider could not
+// count a request that the child sends before it refuses.
+async function run(command: string[], env: Record<string, string> = {}) {
   fs.rmSync(started, { force: true });
   modelRequests = 0;
   const base = `http://127.0.0.1:${provider.port}/v1`;
-  const r = spawnSync(command[0], command.slice(1), {
+  const child = spawn(command[0], command.slice(1), {
     cwd: DIR,
-    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
     timeout: 60_000,
     env: {
       PATH: `${bin}:${process.env.PATH ?? ""}`,
@@ -78,9 +80,15 @@ function run(command: string[], env: Record<string, string> = {}) {
       ...env,
     },
   });
+  let output = "";
+  child.stdout.on("data", (chunk: Buffer) => (output += chunk.toString()));
+  child.stderr.on("data", (chunk: Buffer) => (output += chunk.toString()));
+  const status = await new Promise<number | null>((resolve, reject) => {
+    child.on("error", reject).on("close", (code) => resolve(code));
+  });
   return {
-    status: r.status,
-    output: `${r.stdout}${r.stderr}`,
+    status,
+    output,
     started: fs.existsSync(started) ? fs.readFileSync(started, "utf8") : "",
   };
 }
@@ -96,6 +104,8 @@ test.each([
     { BUGBASH_AI: "mock" },
   ],
   ["e2e run, MCP Apps", e2e("run", "--config", "e2e.mcpapps.config.ts"), { BUGBASH_AI: "mock" }],
+  // No app AI mode: e2e.config.ts would throw its own error first, without the pause.
+  ["e2e list, MCP Apps, no app AI mode", e2e("list", "--config", "e2e.mcpapps.config.ts"), {}],
   [
     "e2e explore, real app AI",
     e2e("explore", "--config", "e2e.config.ts", "x"),
@@ -109,8 +119,8 @@ test.each([
   ],
 ] as const)(
   "%s refuses before any app, e2e or model starts",
-  (_name, command, env) => {
-    const r = run([...command], { ...env, E2E_NODE: path.join(bin, "e2e-node") });
+  async (_name, command, env) => {
+    const r = await run([...command], { ...env, E2E_NODE: path.join(bin, "e2e-node") });
     expect({ status: r.status, started: r.started, modelRequests }).toEqual({
       status: 2,
       started: "",
@@ -123,8 +133,8 @@ test.each([
   60_000
 );
 
-test("control: exact-step repros still load and list", () => {
-  const r = run(e2e("list", "--config", "e2e.config.ts", "--tag", "mock-only"), {
+test("control: exact-step repros still load and list", async () => {
+  const r = await run(e2e("list", "--config", "e2e.config.ts", "--tag", "mock-only"), {
     BUGBASH_AI: "mock",
   });
   expect([r.status, r.started, modelRequests]).toEqual([0, "", 0]);

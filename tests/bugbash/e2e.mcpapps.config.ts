@@ -8,12 +8,10 @@
  * Paused on the host (hostPause.ts, #5714): the suite drives every flow with `agent.act`, so a
  * model picks its actions. Every e2e command with this config, also `run`, refuses as it loads.
  */
+// First import: the pause refuses before e2e.config.ts runs (mcpapps/hostPause.ts).
+import "./mcpapps/hostPause";
 import type { E2EConfig } from "e2e";
 import base from "./e2e.config";
-import { modelDrivenRefusal } from "./hostPause";
-
-const paused = modelDrivenRefusal("the MCP Apps suite (agent.act, e2e.mcpapps.config.ts)");
-if (paused != null) throw new Error(paused);
 
 const mcpContext = [
   "MCP Apps setup for this run: the 'Bug bash playground' chat already holds MCP tool calls from",
