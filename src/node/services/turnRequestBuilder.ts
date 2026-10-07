@@ -1597,7 +1597,7 @@ export class TurnRequestBuilder {
       !isCompactionRequest &&
       sessionHistoryEnabled &&
       !experiments.continuousCompaction &&
-      !isRlmModeEnabled(experiments, isExperimentEnabled);
+      !isRlmModeEnabled(isExperimentEnabled);
     const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
     const memoryAccess: MemoryScopeAccess = resolveMemoryAccessPolicy({
       planLike: agentIsPlanLike,
@@ -2507,7 +2507,7 @@ export class TurnRequestBuilder {
       enableFamilyMessaging:
         Boolean(metadata.parentWorkspaceId) &&
         metadata.workflowTask == null &&
-        isRlmModeEnabled(experiments, isExperimentEnabled),
+        isRlmModeEnabled(isExperimentEnabled),
       workflowAgentOutputSchema: metadata.workflowTask?.outputSchema,
       allowLegacyInvalidWorkflowAgentOutputSchema,
       recordFileState,

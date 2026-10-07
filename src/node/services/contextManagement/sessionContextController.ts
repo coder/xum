@@ -523,9 +523,7 @@ export class SessionContextController {
       // RLM keep-recent floor: stamp on-send auto-compaction requests with
       // the durable tail-start sequence. No-op when RLM is off.
       if (autoCompactionRequest.metadata.type === "compaction-request") {
-        const enabled = isRlmModeEnabled(optionsForStream.experiments, (id) =>
-          this.deps.aiService.isExperimentEnabled(id)
-        );
+        const enabled = isRlmModeEnabled((id) => this.deps.aiService.isExperimentEnabled(id));
         const stamp = await computeKeepRecentTailStamp(
           this.deps.historyService,
           this.host.workspaceId,

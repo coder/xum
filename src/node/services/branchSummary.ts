@@ -66,36 +66,16 @@ export type BranchSummaryAiService = Pick<
   "createModelWithPinnedMetadata" | "getWorkspaceMetadata"
 >;
 
-/** Send-option experiment flags relevant to RLM gating (subset of ExperimentsSchema). */
-export interface RlmExperimentFlags {
-  rlm?: boolean;
-  programmaticToolCalling?: boolean;
-}
-
-/**
- * True when RLM mode applies. RLM is a sub-experiment of Programmatic Tool
- * Calling: without a PTC parent flag it stays inert (matching the experiments
- * registry). Flags resolve PER-FIELD: an explicit renderer
- * boolean is authoritative — `rlm: false` wins over machine overrides — but a
- * MISSING field falls back to the backend's persisted overrides. A
- * defined-but-empty experiments object is exactly what the renderer sends
- * when flags are enabled only through backend overrides
- * (useExperimentOverrideValue sends no explicit values), and treating it as
- * authoritative-false desynced this predicate from tool assembly: the
- * workspace got the persistent RLM kernel while edit-resend summaries,
- * keep-recent stamps, and read-file reinjection stayed silently off (r22).
- */
+/** RLM is a sub-experiment of Programmatic Tool Calling: without PTC it stays inert. */
 export function isRlmModeEnabled(
-  experiments: RlmExperimentFlags | undefined,
   isExperimentEnabled: ((experimentId: ExperimentId) => boolean) | undefined
 ): boolean {
   // Guard for test mocks that may not implement isExperimentEnabled.
-  const backend = (id: ExperimentId): boolean =>
-    typeof isExperimentEnabled === "function" ? isExperimentEnabled(id) : false;
-  const rlm = experiments?.rlm ?? backend(EXPERIMENT_IDS.RLM);
-  const ptc =
-    experiments?.programmaticToolCalling ?? backend(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
-  return rlm && ptc;
+  if (typeof isExperimentEnabled !== "function") return false;
+  return (
+    isExperimentEnabled(EXPERIMENT_IDS.RLM) &&
+    isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING)
+  );
 }
 
 function extractTextForTranscript(message: MuxMessage): string {
@@ -643,8 +623,6 @@ export interface AbandonedBranchSummaryInput {
   workspaceId: string;
   /** The removed tail, as returned by HistoryService.truncateAfterMessage. */
   abandonedMessages: MuxMessage[];
-  /** Send-option experiments when available (edit path); omit for IPC ops without send options (fork). */
-  experiments?: RlmExperimentFlags;
   /**
    * Explicit side-channel candidates resolved by the caller
    * (deriveSideChannelModelCandidates). The fork path MUST supply these from
@@ -656,7 +634,7 @@ export interface AbandonedBranchSummaryInput {
    * omit this and use the metadata-derived path.
    */
   modelCandidates?: string[];
-  /** Machine-override fallback (ExperimentsService/AIService.isExperimentEnabled). */
+  /** Experiment flags from ExperimentsService (AIService.isExperimentEnabled). */
   isExperimentEnabled?: (experimentId: ExperimentId) => boolean;
   /**
    * Cost telemetry sink: the side-channel call bills real tokens, and without
@@ -703,7 +681,7 @@ export async function maybeAppendAbandonedBranchSummary(
 ): Promise<MuxMessage | null> {
   try {
     // RLM off => byte-identical behavior to today: no model call, no row.
-    if (!isRlmModeEnabled(input.experiments, input.isExperimentEnabled)) {
+    if (!isRlmModeEnabled(input.isExperimentEnabled)) {
       return null;
     }
     if (input.abandonedMessages.length === 0) {

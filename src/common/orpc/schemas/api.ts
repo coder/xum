@@ -88,7 +88,6 @@ import {
 import { SecretSchema } from "./secrets";
 import {
   CompletedMessagePartSchema,
-  ExperimentsSchema,
   HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
@@ -1585,11 +1584,7 @@ export type RefineRecordPayload = z.infer<typeof RefineRecordSchema>;
 export const refinements = {
   /** Manual /refine trajectory-distillation pass (RLM mode only; the backend refuses otherwise). Stages edits; nothing is applied until `apply`. */
   run: {
-    // experiments: the renderer's effective flags ride the request (same
-    // authority as send options.experiments) because persisting overrides to
-    // the backend is asynchronous/best-effort — a backend-only gate could
-    // refuse /refine while the workspace already runs with the RLM kernel.
-    input: z.object({ workspaceId: z.string(), experiments: ExperimentsSchema.optional() }),
+    input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(RefineRecordSchema, z.string()),
   },
   /** Apply the staged edits from the last run (explicit user approval step). */
@@ -1604,7 +1599,6 @@ export const refinements = {
        * alone; apply refuses when this hash no longer matches the staged set.
        */
       approvedProposalHash: z.string().min(1),
-      experiments: ExperimentsSchema.optional(),
     }),
     output: ResultSchema(RefineRecordSchema, z.string()),
   },
