@@ -113,6 +113,7 @@ import { SettingsPage } from "@/browser/features/Settings/SettingsPage";
 import { AnalyticsDashboard } from "@/browser/features/Analytics/AnalyticsDashboard";
 import { MuxGatewaySessionExpiredDialog } from "./components/MuxGatewaySessionExpiredDialog/MuxGatewaySessionExpiredDialog";
 import { SshPromptDialog } from "./components/SshPromptDialog/SshPromptDialog";
+import { TerminalDialog } from "./components/TerminalView/TerminalDialog";
 import { SplashScreenProvider } from "./features/SplashScreens/SplashScreenProvider";
 import { TutorialProvider } from "./contexts/TutorialContext";
 import { PowerModeProvider } from "./contexts/PowerModeContext";
@@ -1631,6 +1632,7 @@ function AppInner() {
         <AboutDialog />
         <MuxGatewaySessionExpiredDialog />
         <SshPromptDialog />
+        <TerminalDialog />
       </div>
     </>
   );
