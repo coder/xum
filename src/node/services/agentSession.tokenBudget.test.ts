@@ -173,6 +173,8 @@ interface TurnStartControl {
    * drives the stage; a send that skipped that projection (edit, retry) counts as 0.
    */
   estimate?: (attempt: number, projected: number | undefined) => number;
+  /** Runs after the stage fit, right before the session's publish (a Stop can land here). */
+  beforePublish?: () => void;
 }
 
 /**
@@ -197,9 +199,9 @@ async function emulateTurnStartStage(
     model: request.modelString,
     messages: request.messages,
   });
-  if (stage?.fits(estimate + TURN_START_ROW_TOKENS) && (await stage.publish())) {
-    request.messages.push(stage.row);
-  }
+  if (!stage?.fits(estimate + TURN_START_ROW_TOKENS)) return;
+  control.beforePublish?.();
+  if (await stage.publish()) request.messages.push(stage.row);
 }
 
 describe("AgentSession token-budget lifecycle", () => {
@@ -4204,6 +4206,13 @@ describe("AgentSession token-budget lifecycle", () => {
           published ? ["Keep working", "handoff"] : ["Completed old work", "Keep working"]
         );
         expect(handoffClaimed(h)).toBe(published);
+        // Live subscribers receive the published row as a chat message, like the turn's other rows.
+        const warningIds = warningRows(rows).map((row) => row.id);
+        expect(
+          h.events.filter(
+            (event) => event.type === "message" && "id" in event && warningIds.includes(event.id)
+          )
+        ).toHaveLength(published ? 1 : 0);
         if (published) return;
         // The row that did not fit claimed nothing: the next send with room still gets it.
         await stopStream(h, 0, 95_000);
@@ -4279,9 +4288,11 @@ describe("AgentSession token-budget lifecycle", () => {
     );
 
     // An edit send has no on-send projection, so it leaves no measure that could guard settlement.
+    // A resumed stream has none either, and must not reuse the measure the earlier send consumed.
     test.each([
       { kind: "user", decision: "continue" },
       { kind: "edit", decision: "warn" },
+      { kind: "resume", decision: "warn" },
     ] as const)(
       "settlement after a $kind send that opened no stage is guarded only by that send's own measure",
       async ({ kind, decision }) => {
@@ -4305,6 +4316,9 @@ describe("AgentSession token-budget lifecycle", () => {
               })
             ).success
           ).toBe(true);
+        } else if (kind === "resume") {
+          h.turnStart.estimate = () => 118_000;
+          expect((await h.session.resumeStream(options)).success).toBe(true);
         } else {
           await sendWithoutRoom(h, "Second try");
         }
@@ -4367,7 +4381,47 @@ describe("AgentSession token-budget lifecycle", () => {
         // The handoff claimed before the restart is never repeated; only the final stage remains.
         expect(warningRows(rows).map(isFinalFlushRow)).toEqual(final ? [false, true] : [false]);
         expect(text(rows.at(final ? -2 : -1)!)).toBe("After restart");
+        if (!final) return;
+        // The claimed final prompt closes the window's stages: a later send past F gets none.
+        await stopStream(h, 0, estimate);
+        expect((await h.session.sendMessage("Still working", options)).success).toBe(true);
+        expect(warningRows(await allRows(h)).map(isFinalFlushRow)).toEqual([false, true]);
       }
     );
+
+    // The builder drops a stage once its abort signal fires. The session's publish fence covers a
+    // Stop that is already in progress when the warning would be published.
+    test("a Stop that lands before the turn-start warning is published writes no warning", async () => {
+      const h = await setup();
+      await seedHistory(h, 95_000);
+      h.turnStart.estimate = () => 100_000;
+      let stop: Promise<unknown> | undefined;
+      h.turnStart.beforePublish = () => {
+        stop ??= h.session.interruptStream();
+      };
+      expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+      expect(stop).toBeDefined();
+      await stop;
+      // The controlled provider still started its stream; the Stop ends it.
+      h.aiEmitter.emit("stream-abort", {
+        type: "stream-abort",
+        workspaceId,
+        messageId: "assistant-1",
+        abortReason: "user",
+        metadata: { duration: 1 },
+      });
+      h.completions[0].settle({
+        status: "aborted",
+        abortReason: "user",
+        streamAbort: { type: "stream-abort", workspaceId, metadata: { duration: 1 } },
+      });
+      await h.session.waitForIdle();
+      expect(warningRows(await allRows(h))).toHaveLength(0);
+      expect(handoffClaimed(h)).toBe(false);
+      // Nothing was claimed, so the next send still delivers the handoff.
+      h.turnStart.beforePublish = undefined;
+      expect((await h.session.sendMessage("Resume the work", options)).success).toBe(true);
+      expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
+    });
   });
 });
