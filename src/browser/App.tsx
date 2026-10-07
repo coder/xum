@@ -73,7 +73,6 @@ import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
   getAgentIdKey,
   getAgentsInitNudgeKey,
-  getModelKey,
   getNotifyOnResponseKey,
   getProjectScopeId,
   getThinkingLevelByModelKey,
@@ -128,6 +127,7 @@ import { RosettaBanner } from "./components/RosettaBanner/RosettaBanner";
 
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { getAutoRoutingKey, setAutoRoutingChoice } from "@/browser/utils/modelChange";
+import { readScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -505,10 +505,10 @@ function AppInner() {
   const getModelForWorkspace = useCallback(
     (workspaceId: string): string => {
       const defaultModel = getDefaultModel();
-      const preferredModel = readPersistedState<string | null>(getModelKey(workspaceId), null);
+      const preferredModel = readScopedAiDefault(workspaceId, "model") ?? null;
       const metadata = workspaceMetadata.get(workspaceId);
       const persistedAgentId =
-        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
+        (readScopedAiDefault(workspaceId, "agentId") ?? WORKSPACE_DEFAULTS.agentId)
           .trim()
           .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
       const agentId =

@@ -51,14 +51,13 @@ import {
   setWorkspaceModelWithOrigin,
   setWorkspaceThinkingLevelWithOrigin,
 } from "@/browser/utils/modelChange";
+import { readScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import {
   resolveAutoRoutingForAgent,
   resolveWorkspaceAiSettingsForAgent,
 } from "@/browser/utils/workspaceModeAi";
 import {
-  getModelKey,
   getReasoningModeKey,
-  getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   AGENT_AI_DEFAULTS_KEY,
   RUNTIME_ENABLEMENT_KEY,
@@ -1082,8 +1081,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     const scopeId = getProjectScopeId(creationParentProjectPath);
-    const modelKey = getModelKey(scopeId);
-    const thinkingKey = getThinkingLevelKey(scopeId);
 
     const fallbackModel = defaultModel;
 
@@ -1098,8 +1095,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     prevCreationAgentIdRef.current = normalizedAgentId;
     prevCreationScopeIdRef.current = scopeId;
 
-    const existingModel = readPersistedState<string>(modelKey, fallbackModel);
-    const existingThinking = readPersistedState<ThinkingLevel>(thinkingKey, "off");
+    const existingModel = readScopedAiDefault(scopeId, "model") ?? fallbackModel;
+    const existingThinking = readScopedAiDefault(scopeId, "thinkingLevel") ?? "off";
     // Configured defaults (direct or base-chain, field-wise) must reach the
     // first turn of a new workspace too, not just post-creation agent syncs:
     // a custom agent inheriting model/thinking/pro from its base would

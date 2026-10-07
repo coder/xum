@@ -18,11 +18,16 @@ import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
-  getAgentIdKey,
   getProjectScopeId,
   getDisableWorkspaceAgentsKey,
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
+import {
+  readScopedAiDefault,
+  useScopedAiDefault,
+  writeScopedAiDefault,
+} from "@/browser/utils/scopedAiDefaults";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { sortAgentsStable } from "@/browser/utils/agents";
 import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
@@ -101,21 +106,12 @@ function AgentProviderWithState(props: {
   const scopeId = getScopeId(props.workspaceId, props.projectPath);
   const isProjectScope = !props.workspaceId && Boolean(props.projectPath);
 
-  const [globalDefaultAgentId] = usePersistedState<string>(
-    getAgentIdKey(GLOBAL_SCOPE_ID),
-    WORKSPACE_DEFAULTS.agentId,
-    {
-      listener: true,
-    }
-  );
+  const globalDefaultAgentId =
+    useUserPreferences((preferences) => preferences.ai?.globalDefaults?.agentId) ??
+    WORKSPACE_DEFAULTS.agentId;
 
-  const [scopedAgentId, setAgentIdRaw] = usePersistedState<string | null>(
-    getAgentIdKey(scopeId),
-    isProjectScope ? null : WORKSPACE_DEFAULTS.agentId,
-    {
-      listener: true,
-    }
-  );
+  const scopedAgentId =
+    useScopedAiDefault(scopeId, "agentId") ?? (isProjectScope ? null : WORKSPACE_DEFAULTS.agentId);
   const explicitScopedAgentId =
     typeof scopedAgentId === "string" && scopedAgentId.trim().length > 0 ? scopedAgentId : null;
 
@@ -136,15 +132,14 @@ function AgentProviderWithState(props: {
 
   const setAgentId: Dispatch<SetStateAction<string>> = useCallback(
     (value) => {
-      setAgentIdRaw((prev) => {
-        const explicitPrevAgentId =
-          typeof prev === "string" && prev.trim().length > 0 ? prev : globalDefaultAgentId;
-        const previousAgentId = coerceAgentId(isProjectScope ? explicitPrevAgentId : prev);
-        const next = typeof value === "function" ? value(previousAgentId) : value;
-        return coerceAgentId(next);
-      });
+      const prev = readScopedAiDefault(scopeId, "agentId");
+      const explicitPrevAgentId =
+        typeof prev === "string" && prev.trim().length > 0 ? prev : globalDefaultAgentId;
+      const previousAgentId = coerceAgentId(isProjectScope ? explicitPrevAgentId : prev);
+      const next = typeof value === "function" ? value(previousAgentId) : value;
+      writeScopedAiDefault(scopeId, "agentId", coerceAgentId(next));
     },
-    [globalDefaultAgentId, isProjectScope, setAgentIdRaw]
+    [globalDefaultAgentId, isProjectScope, scopeId]
   );
 
   const [agents, setAgents] = useState<AgentDefinitionDescriptor[]>([]);
@@ -272,19 +267,18 @@ function AgentProviderWithState(props: {
     if (
       !canResolveRemovedBuiltinAgentId ||
       effectiveAgentId === normalizedAgentId ||
-      (isProjectScope && explicitScopedAgentId == null)
+      isProjectScope
     ) {
       return;
     }
 
-    setAgentIdRaw(effectiveAgentId);
+    writeScopedAiDefault(scopeId, "agentId", effectiveAgentId);
   }, [
     canResolveRemovedBuiltinAgentId,
     effectiveAgentId,
     isProjectScope,
     normalizedAgentId,
-    explicitScopedAgentId,
-    setAgentIdRaw,
+    scopeId,
   ]);
 
   const selectableAgents = useMemo(
