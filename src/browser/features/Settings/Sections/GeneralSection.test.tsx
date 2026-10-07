@@ -13,14 +13,15 @@ import {
   resetTestExperiments,
   type TestClientConfig,
 } from "@/browser/testUtils";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { flushUserPreferences, getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { useExperiment } from "@/browser/hooks/useExperiments";
 import * as RealSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as RealTelemetryModule from "@/browser/hooks/useTelemetry";
 import { GeneralSection } from "./GeneralSection";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import { BASH_COLLAPSED_SUMMARY_MODE_KEY, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
+import { DEFAULT_TERMINAL_FONT_CONFIG, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
   type CoderWorkspaceArchiveBehavior,
@@ -47,6 +48,7 @@ interface MockAPIClient {
     updateChatTranscriptFullWidth: (input: { enabled: boolean }) => Promise<void>;
     updateLlmDebugLogs: (input: { enabled: boolean }) => Promise<void>;
     updateKeepScreenAwake: (input: { enabled: boolean }) => Promise<void>;
+    updateUserPreferences: (input: { patches: unknown[] }) => Promise<void>;
     onConfigChanged: (
       input?: unknown,
       options?: { signal?: AbortSignal }
@@ -336,6 +338,15 @@ function createMockAPI(
           return Promise.resolve();
         }),
         updateKeepScreenAwake: updateKeepScreenAwakeMock,
+        updateUserPreferences: ({ patches }: { patches: unknown[] }) => {
+          for (const patch of patches) {
+            config.userPreferences = applyMergePatch(
+              config.userPreferences,
+              patch
+            ) as MockConfig["userPreferences"];
+          }
+          return Promise.resolve();
+        },
         onConfigChanged,
       },
       server: {
@@ -659,7 +670,8 @@ describe("GeneralSection", () => {
   });
 
   test("persists the collapsed bash summaries display mode", async () => {
-    const { view } = renderGeneralSection();
+    const setup = renderGeneralSection();
+    const view = setup.view;
 
     await waitFor(() => {
       expect(getSelectTrigger(view, "Collapsed bash summaries").textContent).toContain(
@@ -669,9 +681,26 @@ describe("GeneralSection", () => {
 
     await chooseSelectOption(view, "Collapsed bash summaries", "Intent");
 
-    expect(window.localStorage.getItem(BASH_COLLAPSED_SUMMARY_MODE_KEY)).toBe(
-      JSON.stringify("intent")
-    );
+    await flushUserPreferences();
+    expect(setup.config.userPreferences?.appearance?.bashCollapsedSummaryMode).toBe("intent");
+  });
+
+  test("clearing the terminal font family keeps the field empty and the font size", async () => {
+    const setup = renderGeneralSection();
+    setup.config.userPreferences = {
+      appearance: { terminalFontConfig: { fontFamily: "Menlo", fontSize: 16 } },
+    };
+    await act(() => getAppConfigStore().refresh());
+    const input = setup.view.getByPlaceholderText(DEFAULT_TERMINAL_FONT_CONFIG.fontFamily);
+    expect((input as HTMLInputElement).value).toBe("Menlo");
+
+    await userEvent
+      .setup({ document: input.ownerDocument })
+      .type(input, "{Backspace}".repeat("Menlo".length));
+    await act(() => flushUserPreferences());
+
+    expect(setup.config.userPreferences?.appearance?.terminalFontConfig).toEqual({ fontSize: 16 });
+    expect((input as HTMLInputElement).value).toBe("");
   });
 
   test("loads the SSH host setting in browser mode", async () => {

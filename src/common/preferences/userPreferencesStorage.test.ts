@@ -107,12 +107,6 @@ describe("user preference localStorage registry", () => {
 
   test("all flattened preference entries are recognized, applied, and removable", () => {
     const preferences: UserPreferences = {
-      appearance: {
-        transcriptDensity: "hyper",
-        bashCollapsedSummaryMode: "intent",
-        terminalFontConfig: { fontFamily: "Geist Mono", fontSize: 13 },
-        editorConfig: { editor: "custom", customCommand: "code --goto" },
-      },
       ai: {
         globalDefaults: { agentId: "exec", thinkingLevel: "medium" },
         projectDefaults: {
