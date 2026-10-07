@@ -36,6 +36,7 @@ import {
   isKimiK3Model,
   openaiSupportsProMode,
   OPENROUTER_REASONING_EFFORT,
+  stripModelProviderPrefixes,
 } from "@/common/types/thinking";
 import {
   isGeminiFlashMinimalRejectingModelName,
@@ -181,7 +182,22 @@ type ProviderOptions =
   | { zai: ZaiLanguageModelChatOptions }
   | { xai: XaiBuiltProviderOptions }
   | { "github-copilot": OpenAICompatibleGatewayProviderOptions }
+  | { bedrock: BedrockProviderOptions }
   | Record<string, never>; // Empty object for unsupported providers
+
+/** The subset of @ai-sdk/amazon-bedrock options Xum sends. */
+interface BedrockProviderOptions {
+  [key: string]: JSONValue | undefined;
+  additionalModelRequestFields?: Record<string, JSONValue>;
+}
+
+/**
+ * Claude Haiku 5+ on Bedrock. Haiku 5.5 thinks adaptively when the request omits
+ * `thinking`, unlike Haiku 4.5, which does not think unless asked.
+ */
+function isBedrockAdaptiveDefaultHaiku(capabilityModel: string): boolean {
+  return /(?:^|\.)claude-haiku-(?:[5-9]|\d{2,})/.test(stripModelProviderPrefixes(capabilityModel));
+}
 
 function resolveAnthropic1MCapabilityModel(
   modelString: string,
@@ -895,6 +911,33 @@ export function buildProviderOptions(
       },
     } satisfies { "github-copilot": OpenAICompatibleGatewayProviderOptions };
     log.debug("buildProviderOptions: Returning OpenAI-compatible gateway options", options);
+    return options;
+  }
+
+  // Bedrock gets no thinking options yet, so Claude runs with the model's own
+  // default there (#5839). For Haiku 4.5 that default is no thinking, so the
+  // `haiku` alias kept "off" on Bedrock. Haiku 5.5 thinks adaptively when
+  // `thinking` is omitted, so "off" must be sent explicitly: otherwise Bedrock users
+  // silently pay for reasoning, and the workspace-naming fallback (which runs at "off")
+  // loses its forced tool choice. Mirror the direct route: disabled thinking at low
+  // effort (Haiku 5.5 accepts disabled thinking at high effort or below). The SDK
+  // serializes `reasoningConfig: { type: "disabled" }` as nothing for Claude, so the
+  // fields go through additionalModelRequestFields verbatim.
+  if (
+    formatProvider === "bedrock" &&
+    origin === "anthropic" &&
+    effectiveThinking === "off" &&
+    isBedrockAdaptiveDefaultHaiku(capabilityModel)
+  ) {
+    const options = {
+      bedrock: {
+        additionalModelRequestFields: {
+          thinking: { type: "disabled" },
+          output_config: { effort: getAnthropicEffort(effectiveThinking, capabilityModel) },
+        },
+      },
+    } satisfies { bedrock: BedrockProviderOptions };
+    log.debug("buildProviderOptions: Returning Bedrock options", options);
     return options;
   }
 

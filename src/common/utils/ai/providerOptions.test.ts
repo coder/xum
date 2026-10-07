@@ -4,6 +4,7 @@
 
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createAnthropic } from "@ai-sdk/anthropic";
+import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
 import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import { generateText, streamText } from "ai";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -3684,5 +3685,87 @@ describe("custom provider wire origins", () => {
 
     expect("anthropic" in result).toBe(false);
     expect("openai" in result).toBe(false);
+  });
+});
+
+describe("buildProviderOptions - Claude on Bedrock", () => {
+  const bedrockOptions = (model: string, level: Parameters<typeof buildProviderOptions>[1]) =>
+    buildProviderOptions(
+      model,
+      level,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "bedrock"
+    );
+
+  // Haiku 5.5 thinks adaptively when `thinking` is omitted, so "off" (the `haiku`
+  // alias default and the workspace-naming fallback level) must be explicit. The real
+  // Bedrock provider drops `reasoningConfig: { type: "disabled" }` for Claude, so this
+  // checks the bytes it actually sends.
+  test.each([
+    ["the canonical alias routed to Bedrock", "anthropic:claude-haiku-5-5"],
+    ["an explicit Bedrock model", "bedrock:anthropic.claude-haiku-5-5"],
+  ])("Haiku 5.5 off disables thinking for %s", async (_label, model) => {
+    const options = bedrockOptions(model, "off");
+    const captured: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const captureFetch = Object.assign(
+      (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1]
+      ): Promise<Response> => {
+        if (typeof init?.body !== "string") {
+          throw new Error("Expected the Bedrock provider to send a JSON string body");
+        }
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        captured.push({
+          path: decodeURIComponent(new URL(url).pathname),
+          body: JSON.parse(init.body) as Record<string, unknown>,
+        });
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+              stopReason: "end_turn",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } }
+          )
+        );
+      },
+      { preconnect: fetch.preconnect.bind(fetch) }
+    );
+    // Mirrors providerModelFactory's bearer-token Bedrock handler.
+    const bedrock = createAmazonBedrock({
+      region: "us-east-1",
+      apiKey: "test-bearer",
+      fetch: captureFetch,
+    });
+
+    await generateText({
+      model: bedrock("anthropic.claude-haiku-5-5"),
+      prompt: "Return ok.",
+      providerOptions: options as Parameters<typeof generateText>[0]["providerOptions"],
+      maxRetries: 0,
+    });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].path).toBe("/model/anthropic.claude-haiku-5-5/converse");
+    expect(captured[0].body.additionalModelRequestFields).toEqual({
+      thinking: { type: "disabled" },
+      output_config: { effort: "low" },
+    });
+  });
+
+  test("leaves other levels and older Claude models on the Bedrock defaults", () => {
+    // The Bedrock route sends no thinking options for these yet (#5839). Haiku 4.5
+    // does not think unless asked, so omitting `thinking` already means "off".
+    expect(bedrockOptions("anthropic:claude-haiku-5-5", "low")).toEqual({});
+    expect(bedrockOptions("anthropic:claude-haiku-4-5", "off")).toEqual({});
+    expect(bedrockOptions("anthropic:claude-sonnet-5-5", "off")).toEqual({});
   });
 });
