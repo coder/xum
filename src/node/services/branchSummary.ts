@@ -75,8 +75,7 @@ export interface RlmExperimentFlags {
 /**
  * True when RLM mode applies. RLM is a sub-experiment of Programmatic Tool
  * Calling: without a PTC parent flag it stays inert (matching the experiments
- * registry). Flags resolve PER-FIELD, mirroring
- * resolveBackendGatedPtcExperiments (toolAssembly.ts): an explicit renderer
+ * registry). Flags resolve PER-FIELD: an explicit renderer
  * boolean is authoritative — `rlm: false` wins over machine overrides — but a
  * MISSING field falls back to the backend's persisted overrides. A
  * defined-but-empty experiments object is exactly what the renderer sends

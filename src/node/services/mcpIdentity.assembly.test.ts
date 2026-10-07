@@ -2,6 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import * as path from "node:path";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Ok } from "@/common/types/result";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { shellQuote } from "@/common/utils/shell";
@@ -121,14 +122,12 @@ async function runScriptedTurn(
   collector: StreamCollector,
   env: Awaited<ReturnType<typeof createTestEnvironment>>,
   workspaceId: string,
-  message: string,
-  options?: { experiments?: { programmaticToolCalling: boolean } }
+  message: string
 ): Promise<void> {
   collector.clear();
   const sent = await sendMessageWithModel(env, workspaceId, message, HAIKU_MODEL, {
     thinkingLevel: "off",
     agentId: "exec",
-    ...options,
   });
   expect(sent.success).toBe(true);
   expect(await collector.waitForEvent("stream-end", 60_000)).not.toBeNull();
@@ -222,9 +221,11 @@ describe("MCP identity through real turn assembly", () => {
           toolName: "code_execution",
           input: { code: `return xum.${MCP_TOOL_NAME}({});` },
         });
-      await runScriptedTurn(scopedCollector, env, workspaceId, "probe it from the sandbox", {
-        experiments: { programmaticToolCalling: true },
-      });
+      await env.services.experimentsService.setOverride(
+        EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+        true
+      );
+      await runScriptedTurn(scopedCollector, env, workspaceId, "probe it from the sandbox");
       const nestedEnd = await waitForToolCallEnd(
         scopedCollector,
         (e) => e.toolName === MCP_TOOL_NAME && e.parentToolCallId !== undefined
@@ -255,6 +256,10 @@ describe("MCP identity through real turn assembly", () => {
       // connection-derived snapshot the wrapper published before rethrowing.
       nextModel = () =>
         scriptedModel({ toolName: MCP_TOOL_NAME, input: { fail: true }, toolCallId: "failed" });
+      await env.services.experimentsService.setOverride(
+        EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+        false
+      );
       await runScriptedTurn(scopedCollector, env, workspaceId, "make the probe fail");
       const failedEnd = await waitForToolCallEnd(scopedCollector, (e) => e.toolCallId === "failed");
       expect(failedEnd.result).toMatchObject({ success: false });
