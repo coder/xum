@@ -5,7 +5,6 @@ import { expect, userEvent, waitFor, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
@@ -146,11 +145,9 @@ const WorkspaceMCPModalStoryShell: FC<{ setup: () => APIClient; children: ReactN
     <ThemeProvider>
       <TooltipProvider>
         <APIProvider client={clientRef.current}>
-          <ExperimentsProvider>
-            <RouterProvider>
-              <SettingsProvider>{children}</SettingsProvider>
-            </RouterProvider>
-          </ExperimentsProvider>
+          <RouterProvider>
+            <SettingsProvider>{children}</SettingsProvider>
+          </RouterProvider>
         </APIProvider>
       </TooltipProvider>
     </ThemeProvider>

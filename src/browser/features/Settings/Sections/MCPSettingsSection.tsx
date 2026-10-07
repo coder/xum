@@ -1,4 +1,4 @@
-import { useClaudeDesignRevision } from "@/browser/contexts/ExperimentsContext";
+import { useClaudeDesignRevision } from "@/browser/hooks/useClaudeDesignRevision";
 import { getOwn } from "@/common/utils/getOwn";
 import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";

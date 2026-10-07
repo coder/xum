@@ -12,7 +12,6 @@ import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { BackgroundBashProvider } from "@/browser/contexts/BackgroundBashContext";
 import { CommandRegistryProvider } from "@/browser/contexts/CommandRegistryContext";
 import { ConfirmDialogProvider } from "@/browser/contexts/ConfirmDialogContext";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { PowerModeProvider } from "@/browser/contexts/PowerModeContext";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { ProviderOptionsProvider } from "@/browser/contexts/ProviderOptionsContext";
@@ -150,38 +149,36 @@ function RightSidebarStoryShell(props: { setup: () => APIClient; children: React
           <ProjectProvider>
             <WorkspaceProvider>
               <TerminalRouterProvider>
-                <ExperimentsProvider>
-                  <UILayoutsProvider>
-                    <TooltipProvider delayDuration={200}>
-                      <SettingsProvider>
-                        <AboutDialogProvider>
-                          <ProviderOptionsProvider>
-                            <SplashScreenProvider>
-                              <TutorialProvider>
-                                <CommandRegistryProvider>
-                                  <PowerModeProvider>
-                                    <ConfirmDialogProvider>
-                                      <AgentProvider
-                                        workspaceId={workspaceId}
-                                        projectPath={STORY_PROJECT_PATH}
-                                      >
-                                        <ThinkingProvider workspaceId={workspaceId}>
-                                          <BackgroundBashProvider workspaceId={workspaceId}>
-                                            {props.children}
-                                          </BackgroundBashProvider>
-                                        </ThinkingProvider>
-                                      </AgentProvider>
-                                    </ConfirmDialogProvider>
-                                  </PowerModeProvider>
-                                </CommandRegistryProvider>
-                              </TutorialProvider>
-                            </SplashScreenProvider>
-                          </ProviderOptionsProvider>
-                        </AboutDialogProvider>
-                      </SettingsProvider>
-                    </TooltipProvider>
-                  </UILayoutsProvider>
-                </ExperimentsProvider>
+                <UILayoutsProvider>
+                  <TooltipProvider delayDuration={200}>
+                    <SettingsProvider>
+                      <AboutDialogProvider>
+                        <ProviderOptionsProvider>
+                          <SplashScreenProvider>
+                            <TutorialProvider>
+                              <CommandRegistryProvider>
+                                <PowerModeProvider>
+                                  <ConfirmDialogProvider>
+                                    <AgentProvider
+                                      workspaceId={workspaceId}
+                                      projectPath={STORY_PROJECT_PATH}
+                                    >
+                                      <ThinkingProvider workspaceId={workspaceId}>
+                                        <BackgroundBashProvider workspaceId={workspaceId}>
+                                          {props.children}
+                                        </BackgroundBashProvider>
+                                      </ThinkingProvider>
+                                    </AgentProvider>
+                                  </ConfirmDialogProvider>
+                                </PowerModeProvider>
+                              </CommandRegistryProvider>
+                            </TutorialProvider>
+                          </SplashScreenProvider>
+                        </ProviderOptionsProvider>
+                      </AboutDialogProvider>
+                    </SettingsProvider>
+                  </TooltipProvider>
+                </UILayoutsProvider>
               </TerminalRouterProvider>
             </WorkspaceProvider>
           </ProjectProvider>

@@ -1,4 +1,4 @@
-import { useClaudeDesignRevision } from "@/browser/contexts/ExperimentsContext";
+import { useClaudeDesignRevision } from "@/browser/hooks/useClaudeDesignRevision";
 import { useEffect, useState, useRef } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { Button } from "@/browser/components/Button/Button";
