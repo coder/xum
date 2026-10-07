@@ -1,8 +1,6 @@
 import {
-  getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
-  getModelKey,
   getReasoningModeKey,
   getThinkingLevelByModelKey,
   getThinkingLevelKey,
@@ -23,6 +21,7 @@ import {
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { readScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 function getProviderOptions(): MuxProviderOptions {
@@ -36,14 +35,14 @@ function getProviderOptions(): MuxProviderOptions {
  */
 export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptions {
   const defaultModel = getDefaultModel();
-  const rawModel = readPersistedState<string>(getModelKey(workspaceId), defaultModel);
+  const rawModel = readScopedAiDefault(workspaceId, "model") ?? defaultModel;
   const baseModel = normalizeModelPreference(rawModel, defaultModel);
 
   // Read thinking level (workspace-scoped).
   // Migration: if the workspace-scoped value is missing, fall back to legacy per-model storage
   // once, then persist into the workspace-scoped key.
   const scopedKey = getThinkingLevelKey(workspaceId);
-  const existingScoped = readPersistedState<ThinkingLevel | undefined>(scopedKey, undefined);
+  const existingScoped = readScopedAiDefault(workspaceId, "thinkingLevel");
   const thinkingLevel =
     existingScoped ??
     readPersistedState<ThinkingLevel>(
@@ -55,10 +54,7 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
     updatePersistedState<ThinkingLevel>(scopedKey, thinkingLevel);
   }
 
-  const agentId = readPersistedState<string>(
-    getAgentIdKey(workspaceId),
-    WORKSPACE_DEFAULTS.agentId
-  );
+  const agentId = readScopedAiDefault(workspaceId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
 
   // OpenAI pro reasoning mode (workspace-scoped); absent = standard.
   // Coerce untrusted persisted values so corrupt entries self-heal to "standard"

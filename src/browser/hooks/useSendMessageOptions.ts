@@ -7,7 +7,8 @@ import {
   buildSendMessageOptions,
   normalizeModelPreference,
 } from "@/browser/utils/messages/buildSendMessageOptions";
-import { DEFAULT_MODEL_KEY, getModelKey } from "@/common/constants/storage";
+import { DEFAULT_MODEL_KEY } from "@/common/constants/storage";
+import { useScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { useProviderOptions } from "./useProviderOptions";
 import { useExperimentValue } from "./useExperiments";
@@ -68,11 +69,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const defaultModel = normalizeModelPreference(defaultModelPref, WORKSPACE_DEFAULTS.model);
 
   // Workspace-scoped model preference. If unset, fall back to metadata, then global default.
-  // Note: we intentionally *don't* pass defaultModel as the usePersistedState initialValue;
-  // initialValue is sticky and would lock in the fallback before startup seeding.
-  const [preferredModel] = usePersistedState<string | null>(getModelKey(workspaceId), null, {
-    listener: true,
-  });
+  const preferredModel = useScopedAiDefault(workspaceId, "model") ?? null;
 
   const [autoModelRouting] = useAutoRoutingSelection(workspaceId, "model");
   const [autoThinkingLevel] = useAutoRoutingSelection(workspaceId, "thinkingLevel");
