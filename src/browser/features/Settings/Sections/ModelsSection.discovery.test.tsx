@@ -368,7 +368,7 @@ describe("ModelsSection catalogue suggestions", () => {
     const option = await ui.view.findByRole("option", { name: /claude-fable-5$/ });
     expect(option.textContent).toContain("Anthropic");
     // The built-in successor is already selectable, so it is not offered.
-    expect(ui.view.queryByRole("option", { name: /claude-fable-5-1/ })).toBeNull();
+    expect(ui.view.queryByRole("option", { name: /claude-fable-5-5/ })).toBeNull();
     fireEvent.click(option);
     expect(ui.save.mock.calls[0][0]).toEqual({ provider: "anthropic", models: ["claude-fable-5"] });
     expect(ui.view.getByRole("combobox", { name: "Provider" }).textContent).toContain("Anthropic");

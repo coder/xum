@@ -143,6 +143,8 @@ export const AppConfigMigrationsSchema = z
      * source key.
      */
     defaultModelFallbacksSeededFable51: z.boolean().optional(),
+    /** Same one-time re-run for the fable alias move to Fable 5.5. */
+    defaultModelFallbacksSeededFable55: z.boolean().optional(),
     /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
     persistentSubagentsDefaulted: z.boolean().optional(),
     /** One-time carry-over of the former workspace-heartbeats experiment into agentHeartbeatsEnabled. */
