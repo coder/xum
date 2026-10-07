@@ -985,8 +985,10 @@ export function GeneralSection() {
       <div className="border-border-light border-t pt-6">
         <h3 className="text-foreground mb-4 text-sm font-medium">Terminal</h3>
         <div className="space-y-4">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex-1">
+          {/* flex-wrap + label minimum: at phone width the fixed-width input moves below
+              the label instead of running past the screen edge. */}
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div className="min-w-48 flex-1">
               <div className="text-foreground text-sm">Terminal Font</div>
               {terminalFontWarning ? (
                 <div className="text-warning text-xs">{terminalFontWarning}</div>
@@ -999,14 +1001,14 @@ export function GeneralSection() {
                 </span>
               </div>
             </div>
-            <div className="flex flex-col items-end gap-2">
+            <div className="flex max-w-full min-w-0 flex-col items-end gap-2">
               <Input
                 value={terminalFontConfig.fontFamily}
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   handleTerminalFontFamilyChange(e.target.value)
                 }
                 placeholder={DEFAULT_TERMINAL_FONT_CONFIG.fontFamily}
-                className="border-border-medium bg-background-secondary h-9 w-80"
+                className="border-border-medium bg-background-secondary h-9 w-80 max-w-full"
               />
             </div>
           </div>

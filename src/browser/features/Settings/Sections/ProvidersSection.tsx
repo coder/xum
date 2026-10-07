@@ -2820,7 +2820,9 @@ export function ProvidersSection() {
                                     });
                                   }}
                                   size="sm"
-                                  className="h-9"
+                                  // Two nowrap labels are wider than a phone screen: let the
+                                  // items wrap onto a second row instead of overflowing.
+                                  className="h-auto min-h-9 max-w-full flex-wrap"
                                   disabled={!api || !codexOauthDefaultAuthIsEditable}
                                 >
                                   <ToggleGroupItem
@@ -3272,7 +3274,10 @@ export function ProvidersSection() {
             {section.key === "custom" && (
               <div className="border-border-medium bg-background-secondary/50 space-y-3 rounded-md border px-3 py-3">
                 <div className="flex items-center justify-between gap-3">
-                  <div>
+                  {/* min-w-0 + shrink-0 on the button: at phone width the description must
+                      wrap; otherwise the flex row shrinks the nowrap button and its label
+                      overflows the button. */}
+                  <div className="min-w-0">
                     <div className="text-foreground text-xs font-medium">Add a custom provider</div>
                     <div className="text-muted text-xs">
                       Add providers that use OpenAI Chat Completions, OpenAI Responses, or Anthropic
@@ -3282,6 +3287,7 @@ export function ProvidersSection() {
                   <Button
                     size="sm"
                     variant="secondary"
+                    className="shrink-0"
                     onClick={() => {
                       setCustomProviderFormOpen((prev) => {
                         const next = !prev;
