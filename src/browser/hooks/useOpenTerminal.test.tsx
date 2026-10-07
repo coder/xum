@@ -117,7 +117,8 @@ describe("useOpenTerminal in browser mode (#5684)", () => {
       expect(dialog.result.current).toEqual({ workspaceId: "ws-1", sessionId: "session-1" });
     });
 
-    test("a second terminal while the dialog shows one closes only the new session", async () => {
+    // A toast would render behind the dialog, so it only showed up, stale, after closing it.
+    test("a second terminal while the dialog shows one closes only the new session, without a toast", async () => {
       const { result, create, close } = renderOpenTerminal();
       const dialog = renderHook(() => useTerminalDialogSession());
       await act(() => result.current("ws-1"));
@@ -129,8 +130,7 @@ describe("useOpenTerminal in browser mode (#5684)", () => {
 
       expect(dialog.result.current?.sessionId).toBe("session-1");
       expect(close.mock.calls).toEqual([[{ sessionId: "session-2" }]]);
-      expect(toasts).toHaveLength(1);
-      expect(toasts[0]).toMatchObject({ type: "error" });
+      expect(toasts).toHaveLength(0);
     });
   });
 });

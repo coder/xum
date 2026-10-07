@@ -5,6 +5,7 @@ import { isSSHRuntime, isDevcontainerRuntime } from "@/common/types/runtime";
 import {
   createTerminalSession,
   openTerminalPopout,
+  TerminalDialogBusyError,
   TerminalPopupBlockedError,
   type TerminalSessionCreateOptions,
 } from "@/browser/utils/terminal";
@@ -61,7 +62,6 @@ export function useOpenTerminal() {
           await api.terminal.openNative({ workspaceId });
         }
       } catch (err) {
-        console.error("[useOpenTerminal] Failed to open terminal:", err);
         if (err instanceof TerminalPopupBlockedError && createdSessionId != null) {
           // No window will attach to this session. Close it, or the right sidebar would later
           // adopt the hidden shell as a terminal tab.
@@ -69,6 +69,11 @@ export function useOpenTerminal() {
             console.warn("[useOpenTerminal] Failed to close unused terminal session:", closeErr);
           });
         }
+        // The open dialog covers every entry point, so only a repeated tap or shortcut made while
+        // the first session was being created gets here: the dialog shown is its answer. A toast
+        // would also sit hidden behind the dialog until it closed.
+        if (err instanceof TerminalDialogBusyError) return;
+        console.error("[useOpenTerminal] Failed to open terminal:", err);
         // Callers fire and forget, so this toast is the only sign that the click failed.
         showFeedbackToast({
           type: "error",

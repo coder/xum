@@ -27,6 +27,14 @@ export class TerminalPopupBlockedError extends Error {
   }
 }
 
+/** Thrown when the in-app terminal dialog already shows another session. */
+export class TerminalDialogBusyError extends TerminalPopupBlockedError {
+  constructor() {
+    super("Another terminal is already open.");
+    this.name = "TerminalDialogBusyError";
+  }
+}
+
 /** Default terminal size used when creating sessions before the terminal is mounted */
 
 export interface TerminalSessionCreateOptions {
@@ -68,9 +76,7 @@ export function openTerminalPopout(
     // A Home Screen web app has a single window: window.open showed terminal.html in place of
     // the app, with no way back to it.
     if (!showTerminalDialog({ workspaceId, sessionId, initialTitle })) {
-      throw new TerminalPopupBlockedError(
-        "Another terminal is already open. Close it, then try again."
-      );
+      throw new TerminalDialogBusyError();
     }
     return Promise.resolve();
   }
