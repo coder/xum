@@ -427,6 +427,8 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                         <Button
                           variant="ghost"
                           size="sm"
+                          // Safari lets a flex-item button shrink below its nowrap label.
+                          className="shrink-0"
                           onClick={() => void fetchTools(name)}
                           disabled={isLoadingTools}
                         >

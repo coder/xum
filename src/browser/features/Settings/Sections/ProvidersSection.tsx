@@ -2820,7 +2820,9 @@ export function ProvidersSection() {
                                     });
                                   }}
                                   size="sm"
-                                  className="h-9"
+                                  // Two nowrap labels are wider than a phone screen: let the
+                                  // items wrap onto a second row instead of overflowing.
+                                  className="h-auto min-h-9 max-w-full flex-wrap"
                                   disabled={!api || !codexOauthDefaultAuthIsEditable}
                                 >
                                   <ToggleGroupItem
