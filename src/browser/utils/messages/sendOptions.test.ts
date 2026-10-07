@@ -27,19 +27,6 @@ describe("getSendOptionsFromStorage", () => {
     cleanupDom = null;
   });
 
-  test.each([true, false])(
-    "captures the latest memoryIntuition override %s before host persistence",
-    (enabled) => {
-      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY_INTUITION), enabled);
-      const options = getSendOptionsFromStorage("ws-intuition");
-      expect(options.experiments?.memoryIntuition).toBe(enabled);
-      expect(
-        SendMessageOptionsSchema.parse(JSON.parse(JSON.stringify(options))).experiments
-          ?.memoryIntuition
-      ).toBe(enabled);
-    }
-  );
-
   test.each([
     { experiment: true, selected: true, expected: true },
     { experiment: false, selected: true, expected: undefined },
@@ -71,20 +58,6 @@ describe("getSendOptionsFromStorage", () => {
     expect(SendMessageOptionsSchema.parse(JSON.parse(JSON.stringify(options))).thinkingLevel).toBe(
       options.thinkingLevel
     );
-  });
-
-  test.each([true, false])("preserves explicit continuous compaction overrides (%s)", (enabled) => {
-    expect(getSendOptionsFromStorage("ws-1").experiments?.continuousCompaction).toBeUndefined();
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION), enabled);
-    expect(getSendOptionsFromStorage("ws-1").experiments?.continuousCompaction).toBe(enabled);
-  });
-
-  test.each([true, false])("preserves explicit token-budget overrides (%s)", (enabled) => {
-    expect(getSendOptionsFromStorage("ws-1").experiments?.tokenBudget).toBeUndefined();
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET), enabled);
-    const options = getSendOptionsFromStorage("ws-1");
-    expect(options.experiments?.tokenBudget).toBe(enabled);
-    expect(SendMessageOptionsSchema.parse(options).experiments?.tokenBudget).toBe(enabled);
   });
 
   test("preserves explicit gateway-scoped stored model preferences", () => {

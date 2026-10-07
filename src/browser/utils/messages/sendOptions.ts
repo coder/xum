@@ -105,13 +105,5 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
     disableWorkspaceAgents,
     autoModelRouting,
     autoThinkingLevel,
-    experiments: {
-      programmaticToolCalling: isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
-      rlm: isExperimentEnabled(EXPERIMENT_IDS.RLM),
-      memory: isExperimentEnabled(EXPERIMENT_IDS.MEMORY),
-      memoryIntuition: isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION),
-      continuousCompaction: isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION),
-      tokenBudget: isExperimentEnabled(EXPERIMENT_IDS.TOKEN_BUDGET),
-    },
   });
 }
