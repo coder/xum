@@ -412,7 +412,29 @@ describe("getThinkingPolicyForModel", () => {
       });
       expect(enforceThinkingPolicy(model, "off")).toBe("off");
     }
-    expect(getDefaultMinimumThinkingLevel("anthropic:claude-haiku-5-5")).toBe("medium");
+    // Haiku stays the cheap tier: its default floor stays "off" (as for Haiku 4.5), so
+    // `/haiku+0` and a stored "off" still disable thinking, and an explicit floor still wins.
+    const mapped: ProvidersConfigMap = {
+      anthropic: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "team-haiku", mappedToModel: "anthropic:claude-haiku-5-5" }],
+      },
+    };
+    for (const [model, config] of [
+      ["anthropic:claude-haiku-5-5", null],
+      ["mux-gateway:anthropic/claude-haiku-5-5", null],
+      ["bedrock:anthropic.claude-haiku-5-5", null],
+      ["anthropic:team-haiku", mapped],
+    ] as const) {
+      const floor = resolveMinimumThinkingLevel(model, null, config);
+      expect({ model, floor }).toEqual({ model, floor: "off" });
+      expect(resolveThinkingInput(0, model, config)).toBe("off");
+      expect(enforceThinkingPolicy(model, "off", floor, config)).toBe("off");
+      expect(enforceThinkingPolicy(model, "off", "medium", config)).toBe("medium");
+      expect(getAvailableThinkingLevels(model, floor, config)).toEqual(allLevels);
+    }
     // Haiku 4.5 (budget_tokens thinking, no effort) keeps the 4-level default.
     expect(getThinkingPolicyForModel("anthropic:claude-haiku-4-5")).toEqual([
       "off",
