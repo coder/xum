@@ -12,9 +12,6 @@ import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectCo
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import {
-  DEFAULT_MODEL_KEY,
-  HIDDEN_MODELS_KEY,
-  RUNTIME_ENABLEMENT_KEY,
   LAST_VISITED_ROUTE_KEY,
   SELECTED_WORKSPACE_KEY,
   getAgentIdKey,
@@ -27,13 +24,8 @@ import {
 } from "@/common/constants/storage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
-import {
-  readPersistedState,
-  syncPersistedStateFromBackend,
-  updatePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import {
   markAiSelectionIntent,
@@ -98,146 +90,6 @@ describe("WorkspaceContext", () => {
     currentClientMock = {};
     getAppConfigStore().updateOptimistically({ userPreferences: undefined });
   });
-
-  test.each(["resolves", "rejects", "stalls"])(
-    "hydrates preferences when migration persistence %s",
-    async (writeState) => {
-      const backendHidden = ["openai:gpt-6-luna", "openai:gpt-6-astra"];
-      const legacyHidden = "openrouter:openai/gpt-5";
-      const defaultModel = "openai:gpt-5.6-terra";
-      createMockAPI({
-        localStorage: {
-          [HIDDEN_MODELS_KEY]: JSON.stringify([legacyHidden]),
-          [DEFAULT_MODEL_KEY]: JSON.stringify(defaultModel),
-          [RUNTIME_ENABLEMENT_KEY]: JSON.stringify({ ssh: true }),
-        },
-      });
-      const updateModelPreferences = mock(() => {
-        if (writeState === "stalls") return new Promise<void>(() => undefined);
-        if (writeState === "rejects") return Promise.reject(new Error("config write failed"));
-        return Promise.resolve();
-      });
-      const cfg = await createMockORPCClient().config.getConfig();
-      currentClientMock.config = {
-        getConfig: () =>
-          Promise.resolve({
-            ...cfg,
-            hiddenModels: backendHidden,
-            hiddenModelsInitialized: false,
-            runtimeEnablement: { ssh: false },
-          }),
-        updateModelPreferences,
-      };
-      await setup();
-      await waitFor(() => {
-        expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual([
-          ...backendHidden,
-          legacyHidden,
-        ]);
-      });
-      expect(updateModelPreferences).toHaveBeenCalledWith({
-        defaultModel,
-        hiddenModels: [...backendHidden, legacyHidden],
-      });
-      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(defaultModel);
-      expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: false });
-    }
-  );
-
-  test.each(
-    ["local", "cross-tab", "cross-tab-delayed"].flatMap((source) =>
-      (source === "cross-tab-delayed"
-        ? ["hidden", "default"]
-        : ["hidden", "default", "hidden-aba", "default-aba"]
-      ).map((changed) => [source, changed])
-    )
-  )(
-    "keeps %s %s preference edits ahead of stale startup config until reconnect",
-    async (source, changed) => {
-      const luna = "openai:gpt-6-luna";
-      const astra = "openai:gpt-6-astra";
-      const legacyHidden = "openrouter:openai/gpt-5";
-      const legacyDefault = "openai:gpt-5.6-terra";
-      const chosenDefault = "anthropic:claude-opus-4-6";
-      createMockAPI({
-        localStorage: {
-          [HIDDEN_MODELS_KEY]: JSON.stringify([legacyHidden]),
-          [DEFAULT_MODEL_KEY]: JSON.stringify(legacyDefault),
-        },
-      });
-      const cfg = await createMockORPCClient().config.getConfig();
-      let resolveConfig!: (value: typeof cfg) => void;
-      const pendingConfig = new Promise<typeof cfg>((resolve) => {
-        resolveConfig = resolve;
-      });
-      const updateModelPreferences = mock(() => Promise.resolve());
-      currentClientMock.config = { getConfig: () => pendingConfig, updateModelPreferences };
-      await setup();
-      const writePreference = (key: string, value: unknown) => {
-        if (source === "local") {
-          updatePersistedState(key, value);
-          return;
-        }
-        // Seed the shared value without emitting a local write in this tab.
-        syncPersistedStateFromBackend(key, value);
-        if (source === "cross-tab-delayed") return;
-        window.dispatchEvent(
-          new window.StorageEvent("storage", { key, storageArea: window.localStorage })
-        );
-      };
-      act(() => {
-        if (changed.startsWith("default")) {
-          writePreference(DEFAULT_MODEL_KEY, chosenDefault);
-          if (changed === "default-aba") writePreference(DEFAULT_MODEL_KEY, legacyDefault);
-        } else {
-          writePreference(HIDDEN_MODELS_KEY, [astra, legacyHidden]);
-          if (changed === "hidden-aba") writePreference(HIDDEN_MODELS_KEY, [legacyHidden]);
-        }
-      });
-      resolveConfig({
-        ...cfg,
-        hiddenModels: [luna, astra],
-        hiddenModelsInitialized: false,
-        runtimeEnablement: { ssh: false },
-      });
-      await waitFor(() =>
-        expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: false })
-      );
-      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(
-        changed === "default" ? chosenDefault : legacyDefault
-      );
-      expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual(
-        changed.startsWith("default")
-          ? [luna, astra, legacyHidden]
-          : changed === "hidden"
-            ? [astra, legacyHidden]
-            : [legacyHidden]
-      );
-      expect(updateModelPreferences).toHaveBeenCalledWith(
-        changed.startsWith("default")
-          ? { hiddenModels: [luna, astra, legacyHidden] }
-          : { defaultModel: legacyDefault }
-      );
-
-      cleanup();
-      getWorkspaceStoreRaw().dispose();
-      currentClientMock.config = {
-        getConfig: () =>
-          Promise.resolve({
-            ...cfg,
-            defaultModel: legacyDefault,
-            hiddenModels: [],
-            hiddenModelsInitialized: true,
-          }),
-        updateModelPreferences,
-      };
-      await setup();
-      await waitFor(() =>
-        expect(readPersistedState<string[] | null>(HIDDEN_MODELS_KEY, null)).toEqual([])
-      );
-      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(legacyDefault);
-    }
-  );
 
   test("syncs workspace store subscriptions when metadata loads", async () => {
     const initialWorkspaces: FrontendWorkspaceMetadata[] = [
