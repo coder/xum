@@ -1,6 +1,6 @@
 import {
   LaunchBehaviorSchema,
-  parseThemePreference,
+  ThemePreferenceSchema,
   pruneUserPreferences,
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
@@ -231,7 +231,7 @@ export function applyStoredUserPreference(
   const next = cloneUserPreferences(preferences);
 
   if (key === UI_THEME_KEY) {
-    const parsed = parseThemePreference(value);
+    const parsed = parseEnum(ThemePreferenceSchema.options, value);
     if (!parsed) {
       return removeStoredUserPreference(next, key);
     }
