@@ -153,8 +153,10 @@ export function AnalyticsDashboard() {
           size="icon"
           onClick={navigateFromAnalytics}
           // Phones get a 44px touch target that still fits the header's pr-12 gutter; md+ keeps
-          // the compact Settings-style button.
-          className="absolute top-[calc(env(safe-area-inset-top)+0.125rem)] right-1 h-11 w-11 md:top-[calc(env(safe-area-inset-top)+0.75rem)] md:right-4 md:h-6 md:w-6"
+          // the compact Settings-style button. Placed by its center (translate classes) so the
+          // touch 44px minimum cannot push it below the title at exactly 768px, where the md: size
+          // and that minimum both apply.
+          className="absolute top-[calc(env(safe-area-inset-top)+1.5rem)] right-[1.625rem] h-11 w-11 translate-x-1/2 -translate-y-1/2 md:right-7 md:h-6 md:w-6"
           aria-label="Close analytics"
         >
           <X className="h-4 w-4" />

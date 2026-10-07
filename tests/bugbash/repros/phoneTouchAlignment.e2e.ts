@@ -49,28 +49,34 @@ function centerGap(browser: Browser, a: string, b: string): Promise<number> {
 }
 
 async function openSettings(browser: Browser, screen: Parameters<typeof openPlayground>[1]) {
-  await screen.getByRole("button", "Open sidebar menu").tap();
+  // The settings button lives in the sidebar, which narrow layouts hide behind a menu button.
+  const sidebarMenu = screen.getByRole("button", "Open sidebar menu");
+  if (await sidebarMenu.isVisible()) await sidebarMenu.tap();
   await browser.locator('[data-testid="settings-button"]').tap();
   await expect(screen.getByRole("dialog", "Settings")).toBeVisible();
 }
 
-test(
-  "Settings close button lines up with the title on a touch phone",
-  { tags: ["bugbash", "touch-alignment"] },
-  async ({ app, screen, browser }) => {
-    await browser.setViewport({ width: 390, height: 844 });
-    await openPlayground(app, screen, browser);
-    await openSettings(browser, screen);
-    await applyTouchPointerRules(browser);
+// 768px is the edge where Tailwind's md: layout and the touch 44px minimum both apply (iPad mini
+// in portrait), so a fix that only covers phone widths still fails there.
+for (const width of [390, 768]) {
+  test(
+    `Settings close button lines up with the title on a touch screen ${width}px wide`,
+    { tags: ["bugbash", "touch-alignment"] },
+    async ({ app, screen, browser }) => {
+      await browser.setViewport({ width, height: 844 });
+      await openPlayground(app, screen, browser);
+      await openSettings(browser, screen);
+      await applyTouchPointerRules(browser);
 
-    // Before the fix the X sat about 10px below the title's middle.
-    await expect
-      .poll(() =>
-        centerGap(browser, "[role=dialog] h2", '[role=dialog] [aria-label="Close settings"] svg')
-      )
-      .toBeLessThanOrEqual(2);
-  }
-);
+      // Before the fix the X sat about 10px below the title's middle.
+      await expect
+        .poll(() =>
+          centerGap(browser, "[role=dialog] h2", '[role=dialog] [aria-label="Close settings"] svg')
+        )
+        .toBeLessThanOrEqual(2);
+    }
+  );
+}
 
 test(
   "Backup checkboxes keep their size and line up with their labels on a touch phone",
