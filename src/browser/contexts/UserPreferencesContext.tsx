@@ -12,10 +12,10 @@ import {
   normalizeUserPreferences,
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
+import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   applyStoredUserPreference,
   entriesFromUserPreferences,
-  getStoredUserPreferenceEntries,
   getStoredUserPreferenceKeys,
   isUserPreferenceStorageKey,
   readStoredUserPreferenceValue,
@@ -66,28 +66,9 @@ export function overlayDirtyLocalValues(
   return next;
 }
 
-export function mergeMissingLocalPreferences(
-  backendPreferences: UserPreferences | undefined,
-  storage: Storage
-): UserPreferences | undefined {
-  const backendKeys = new Set(
-    entriesFromUserPreferences(backendPreferences).map((entry) => entry.key)
-  );
-  let next = backendPreferences;
-  for (const entry of getStoredUserPreferenceEntries(storage)) {
-    if (backendKeys.has(entry.key)) {
-      continue;
-    }
-    next = applyStoredUserPreference(next, entry.key, entry.value);
-  }
-
-  return next;
-}
-
 export function mirrorBackendPreferences(params: {
   backendPreferences: UserPreferences | undefined;
   dirtyKeys: ReadonlySet<string>;
-  initial: boolean;
   storage: Storage;
 }) {
   const backendEntries = entriesFromUserPreferences(params.backendPreferences);
@@ -99,14 +80,22 @@ export function mirrorBackendPreferences(params: {
     }
   }
 
-  if (params.initial) {
-    return;
-  }
-
   for (const key of getStoredUserPreferenceKeys(params.storage)) {
     if (!backendKeys.has(key) && !params.dirtyKeys.has(key)) {
       removeBackendEntryFromLocalStorage(key, params.storage);
     }
+  }
+}
+
+/** Writes the store's preferences into the local copies that RouterProvider reads at mount. */
+export function mirrorUserPreferencesLocalCache(): void {
+  const storage = getLocalStorage();
+  if (storage) {
+    mirrorBackendPreferences({
+      backendPreferences: getUserPreferences(),
+      dirtyKeys: new Set(),
+      storage,
+    });
   }
 }
 
@@ -214,85 +203,8 @@ function waitForRetryDelay(delayMs: number, signal: AbortSignal): Promise<void> 
   });
 }
 
-export async function retryUserPreferenceHydration(params: {
-  signal: AbortSignal;
-  applyBackendConfig: () => Promise<void>;
-  onError: (message: string, error: unknown) => void;
-  getRetryDelayMs?: (retryAttempt: number) => number;
-  waitForDelay?: (delayMs: number, signal: AbortSignal) => Promise<void>;
-}): Promise<void> {
-  const getRetryDelayMs = params.getRetryDelayMs ?? getUserPreferenceRetryDelayMs;
-  const waitForDelay = params.waitForDelay ?? waitForRetryDelay;
-  let retryAttempt = 0;
-
-  while (!params.signal.aborted) {
-    try {
-      await params.applyBackendConfig();
-      return;
-    } catch (error) {
-      const retryDelayMs = getRetryDelayMs(retryAttempt);
-      retryAttempt += 1;
-      params.onError(`Failed to hydrate user preferences, retrying in ${retryDelayMs}ms:`, error);
-      await waitForDelay(retryDelayMs, params.signal);
-    }
-  }
-}
-
 interface UserPreferenceConfigClient {
-  getConfig: () => Promise<{ userPreferences?: unknown; userPreferencesInitialized?: boolean }>;
   saveConfig: (input: { userPreferences?: UserPreferences | null }) => Promise<void>;
-}
-
-export function applyLocalPreferenceWrite(params: {
-  preferences: UserPreferences | undefined;
-  key: string;
-  newValue: unknown;
-  storage: Storage;
-}): UserPreferences | undefined {
-  const basePreferences =
-    params.preferences ?? mergeMissingLocalPreferences(undefined, params.storage);
-  return params.newValue === undefined || params.newValue === null
-    ? removeStoredUserPreference(basePreferences, params.key)
-    : applyStoredUserPreference(basePreferences, params.key, params.newValue);
-}
-
-export function shouldBackfillLocalPreferences(params: {
-  backendPreferences: UserPreferences | undefined;
-  userPreferencesInitialized: boolean | undefined;
-}): boolean {
-  return params.userPreferencesInitialized !== true && params.backendPreferences === undefined;
-}
-
-export async function hydrateUserPreferencesLocalCache(params: {
-  configClient: UserPreferenceConfigClient;
-  signal?: AbortSignal;
-  storage?: Storage | null;
-}): Promise<UserPreferences | undefined> {
-  const storage = params.storage ?? getLocalStorage();
-  if (!storage || params.signal?.aborted) {
-    return undefined;
-  }
-
-  const config = await params.configClient.getConfig();
-  if (params.signal?.aborted) {
-    return undefined;
-  }
-
-  const backendPreferences = normalizeUserPreferences(config.userPreferences);
-  const shouldBackfill = shouldBackfillLocalPreferences({
-    backendPreferences,
-    userPreferencesInitialized: config.userPreferencesInitialized,
-  });
-  mirrorBackendPreferences({
-    backendPreferences,
-    dirtyKeys: new Set(),
-    initial: shouldBackfill,
-    storage,
-  });
-
-  return shouldBackfill
-    ? mergeMissingLocalPreferences(backendPreferences, storage)
-    : backendPreferences;
 }
 
 const USER_PREFERENCE_SAVE_FAILED_MESSAGE = "Settings could not be saved";
@@ -576,8 +488,7 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
       return;
     }
 
-    // Treat every concrete API client identity as a fresh backend source. Electron normally
-    // reconnects through null, but direct client swaps should still rerun the initial backfill.
+    // Treat every concrete API client identity as a fresh backend source.
     currentPreferencesRef.current = undefined;
     dirtyKeysRef.current.clear();
     hydratedRef.current = false;
@@ -590,7 +501,6 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
 
     const abortController = new AbortController();
     const { signal } = abortController;
-    let iterator: AsyncIterator<unknown> | null = null;
 
     const saveQueue = createUserPreferenceSaveQueue({
       configClient: api.config,
@@ -606,29 +516,21 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
 
     saveQueueRef.current = saveQueue;
 
-    const applyBackendConfig = async () => {
-      const config = await api.config.getConfig();
-      if (signal.aborted) {
+    const appConfigStore = getAppConfigStore();
+    let mirroredPreferences: UserPreferences | undefined;
+    const applyBackendPreferences = () => {
+      const snapshotPreferences = appConfigStore.getSnapshot()?.userPreferences;
+      // The store keeps the previous object for unchanged values, so unrelated config writes skip.
+      if (snapshotPreferences === undefined || snapshotPreferences === mirroredPreferences) {
         return;
       }
+      mirroredPreferences = snapshotPreferences;
+      // Empty preferences normalize to undefined, so pruning them finds nothing to save.
+      const backendPreferences = normalizeUserPreferences(snapshotPreferences);
 
-      const backendPreferences = normalizeUserPreferences(config.userPreferences);
-      const shouldBackfill = shouldBackfillLocalPreferences({
-        backendPreferences,
-        userPreferencesInitialized: config.userPreferencesInitialized,
-      });
-      mirrorBackendPreferences({
-        backendPreferences,
-        dirtyKeys: dirtyKeysRef.current,
-        initial: shouldBackfill,
-        storage,
-      });
-
-      const withLocalBackfill = shouldBackfill
-        ? mergeMissingLocalPreferences(backendPreferences, storage)
-        : backendPreferences;
+      mirrorBackendPreferences({ backendPreferences, dirtyKeys: dirtyKeysRef.current, storage });
       const nextPreferences = overlayDirtyLocalValues(
-        withLocalBackfill,
+        backendPreferences,
         dirtyKeysRef.current,
         storage
       );
@@ -638,7 +540,7 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
       setHydrated(true);
 
       if (
-        (shouldBackfill || dirtyKeysRef.current.size > 0) &&
+        dirtyKeysRef.current.size > 0 &&
         stableStringify(nextPreferences) !== stableStringify(backendPreferences)
       ) {
         // Dirty keys written before hydration were reserved, not enqueued; this save carries
@@ -656,12 +558,10 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
       }
 
       dirtyKeysRef.current.add(event.key);
-      currentPreferencesRef.current = applyLocalPreferenceWrite({
-        preferences: currentPreferencesRef.current,
-        key: event.key,
-        newValue: event.newValue,
-        storage,
-      });
+      currentPreferencesRef.current =
+        event.newValue === undefined || event.newValue === null
+          ? removeStoredUserPreference(currentPreferencesRef.current, event.key)
+          : applyStoredUserPreference(currentPreferencesRef.current, event.key, event.newValue);
 
       if (!hydratedRef.current) {
         // Not saved yet (hydration will carry it), but a sender waiting on this key must not
@@ -673,50 +573,13 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
       saveQueue.enqueue(currentPreferencesRef.current, [event.key]);
     });
 
-    const initialSync = retryUserPreferenceHydration({
-      signal,
-      applyBackendConfig,
-      onError: (message, error) => {
-        console.warn(message, error);
-      },
-    });
-    initialSync.catch((error) => {
-      console.warn("Failed to retry user preference hydration:", error);
-    });
-
-    const subscription = (async () => {
-      try {
-        const subscribedIterator = await api.config.onConfigChanged(undefined, { signal });
-        if (signal.aborted) {
-          const cleanup = subscribedIterator.return?.();
-          cleanup?.catch(() => undefined);
-          return;
-        }
-
-        iterator = subscribedIterator;
-        for await (const _ of subscribedIterator) {
-          if (signal.aborted) {
-            break;
-          }
-          const refresh = applyBackendConfig();
-          refresh.catch((error) => {
-            console.warn("Failed to refresh user preferences:", error);
-          });
-        }
-      } catch {
-        // Config subscriptions are cancelled during unmounts and API reconnects.
-      }
-    })();
-
-    subscription.catch((error) => {
-      console.warn("Failed to subscribe to user preference changes:", error);
-    });
+    const unsubscribeStore = appConfigStore.subscribe(applyBackendPreferences);
+    applyBackendPreferences();
 
     return () => {
       abortController.abort();
       unsubscribeWrites();
-      const cleanup = iterator?.return?.();
-      cleanup?.catch(() => undefined);
+      unsubscribeStore();
       saveQueueRef.current = null;
     };
   }, [api]);

@@ -100,8 +100,8 @@ function resetStorybookPersistedStateForStory(): void {
     // stories with terminals don't render order-dependent badge overlays.
     localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
   }
-  // Startup waits for this story's own experiments instead of the previous story's snapshot.
-  getAppConfigStore().updateOptimistically({ experiments: undefined });
+  // Startup waits for this story's own snapshot instead of the previous story's.
+  getAppConfigStore().updateOptimistically({ experiments: undefined, userPreferences: undefined });
 }
 function getStorybookRenderKey(): string | null {
   if (typeof window === "undefined") {

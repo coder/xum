@@ -90,9 +90,13 @@ void mock.module("@/browser/contexts/API", () => ({
 }));
 
 void mock.module("@/browser/components/LoadingScreen/LoadingScreen", () => ({
-  LoadingScreen: () => {
+  LoadingScreen: (props: { statusText?: string }) => {
     const { theme } = useTheme();
-    return <div data-testid="LoadingScreenMock">{theme}</div>;
+    return (
+      <div data-testid="LoadingScreenMock">
+        {props.statusText} {theme}
+      </div>
+    );
   },
 }));
 
@@ -165,5 +169,15 @@ describe("AppLoader", () => {
 
     // If ThemeProvider is missing, useTheme() will throw.
     expect(getByTestId("LoadingScreenMock").textContent).toBeTruthy();
+  });
+
+  test("leaves the preferences screen after the bound while the backend never connects", async () => {
+    apiStatus = "connecting";
+    apiError = null;
+
+    const { findByText, getByText } = render(<AppLoader />);
+
+    expect(getByText(/Loading preferences/)).toBeTruthy();
+    expect(await findByText(/Loading Xum/, undefined, { timeout: 3000 })).toBeTruthy();
   });
 });
