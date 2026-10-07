@@ -393,6 +393,56 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
     expect(scans).toHaveBeenCalledTimes(1);
   });
 
+  test("T8e: a workspace ID on two config rows falls back to the global scan", async () => {
+    // Corrupted config: the first row is a confirmed claimed root, a second row with the same ID is
+    // an agent task whose parent holds a newer running record. Trusting the first row would hide it.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const otherProjectPath = path.join(rootDir, "repo2");
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "owner", "owner"),
+        projectWorkspace(projectPath, "parent", "parent"),
+        projectWorkspace(projectPath, "target", "target", claimTag("owner")),
+      ],
+      {
+        taskSettings: testTaskSettings(),
+        extraProjects: [
+          [
+            otherProjectPath,
+            {
+              trusted: true,
+              workspaces: [
+                projectWorkspace(otherProjectPath, "target", "target", {
+                  parentWorkspaceId: "parent",
+                }),
+              ],
+            },
+          ],
+        ],
+      }
+    );
+    const store = new TaskHandleStore(config);
+    for (const record of [
+      ...createdAndRunning("owner", "target"),
+      workspaceTurnRecord("parent", "target", "wst_agent_target", "running", {
+        createdAt: "2026-06-19T00:00:09.000Z",
+      }),
+    ]) {
+      await store.upsertWorkspaceTurn(record);
+    }
+    const backendA = createWorkspaceTurnManagerHarness(config).taskService;
+    const scans = globalScans(backendA);
+
+    expect(await lookup(backendA, "target")).toMatchObject({
+      taskHandleId: "wst_agent_target",
+      ownerWorkspaceId: "parent",
+    });
+    expect(scans).toHaveBeenCalledTimes(1);
+  });
+
   test("T9: matches the global scan on generated stores that obey the owner rule", async () => {
     // Deterministic LCG so a failure reproduces exactly.
     let seed = 5569;
