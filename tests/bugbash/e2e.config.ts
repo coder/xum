@@ -1,41 +1,23 @@
 /**
  * e2e (TesterArmy, https://e2e.tester.army) config for agent bug bashes against Xum.
  *
- * `make bug-bash` runs `e2e explore` once per charter in charters.txt. Each run starts its own
- * seeded `xum server` (real or mock AI, see resolvedAppAi) through startApp.ts on a free port (`http://127.0.0.1:0`).
+ * The repro tests (repros/*.e2e.ts, `make test-bugbash-repros`) run with it: exact steps, no
+ * model. Each run starts a seeded `xum server` (real or mock AI, see resolvedAppAi) through
+ * startApp.ts on a free port (`http://127.0.0.1:0`).
  *
- * Explorer model: `BUGBASH_MODEL` as `<provider>:<model>`, default `anthropic:claude-opus-5-5`.
- * Providers: `anthropic` and `openai` (for example `openai:gpt-6.1-sol`). run.ts sets it once per
- * entry in BUGBASH_MODELS (default Opus 5.5 and Sonnet 5.5); set it yourself only when running
- * e2e directly, for example for a repro test.
- * Reasoning: `BUGBASH_EFFORT` (low, medium, high, xhigh, max; default medium) sets Anthropic
- * `effort` and OpenAI `reasoningEffort`, so runs on different models are comparable.
- * Each provider reads only its standard variables (ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL,
- * OPENAI_API_KEY and OPENAI_BASE_URL), so set them for the run when a gateway needs other
- * values. These credentials stay in the e2e runner: startApp.ts does not pass them to the app.
+ * `e2e explore` charters (`make bug-bash`) are paused on the host (hostPause.ts, #5714): this
+ * config refuses every e2e command except `run` and `list` as it loads, before any app, browser
+ * or model starts. Its agents keep their personas but hold no model, so an `agent.*` step in a
+ * repro fails with MODEL_UNAVAILABLE before any model request. The sandbox work (#5714) brings
+ * the explorer model (`BUGBASH_MODEL`, `BUGBASH_EFFORT`) back.
  */
 import type { E2EConfig } from "e2e";
 import { web } from "@e2e-dev/web";
-import { anthropic } from "@ai-sdk/anthropic";
-import { openai } from "@ai-sdk/openai";
+import { e2eCommandRefusal } from "./hostPause";
 
-function explorerModel() {
-  const spec = process.env.BUGBASH_MODEL ?? "anthropic:claude-opus-5-5";
-  const separator = spec.indexOf(":");
-  const provider = spec.slice(0, separator);
-  const modelId = spec.slice(separator + 1);
-  if (separator <= 0 || modelId === "") {
-    throw new Error(`BUGBASH_MODEL must be <provider>:<model>, got "${spec}"`);
-  }
-  switch (provider) {
-    case "anthropic":
-      return anthropic(modelId);
-    case "openai":
-      return openai(modelId);
-    default:
-      throw new Error(`BUGBASH_MODEL provider must be anthropic or openai, got "${provider}"`);
-  }
-}
+// First, before anything else in this config runs.
+const paused = e2eCommandRefusal();
+if (paused != null) throw new Error(paused);
 
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 type Effort = (typeof EFFORTS)[number];
@@ -167,8 +149,9 @@ const context = scenario === "bash-ai-proxy" ? bashAiProxyContext : mockOrRealCo
 // Exploration steps need large per-step budgets (`e2e guide bug-bash`, step 1).
 // Only the active provider reads its key, so both can be set at once.
 const effort = explorerEffort();
+// No `model` during the host pause (hostPause.ts): explore is refused above, and an agent.* step
+// in a repro must find no model to call.
 const persona = {
-  model: explorerModel(),
   maxSteps: 40,
   maxModelCalls: 40,
   context,

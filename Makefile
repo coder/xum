@@ -219,7 +219,9 @@ dev-desktop-sandbox: ## Start an isolated Electron dev instance (fresh XUM_ROOT 
 dev-server-sandbox: ## Start an isolated dev-server instance (fresh XUM_ROOT + free ports)
 	@bun scripts/dev-server-sandbox.ts $(DEV_SERVER_SANDBOX_ARGS)
 
-bug-bash: build-main build-renderer build-static ## Agent bug bash: e2e explore charters x models (BUGBASH_MODELS, BUGBASH_EFFORT, BUGBASH_ARGS="--only <slug,...>"; tests/bugbash/)
+# bug-bash and mcp-apps-e2e are paused on the host (tests/bugbash/hostPause.ts, #5714): a model
+# picks their actions. Their recipes refuse at once, so they build nothing first.
+bug-bash: ## Agent bug bash: e2e explore charters x models (paused on the host until the sandbox lands, #5714)
 	@bun tests/bugbash/run.ts $(BUGBASH_ARGS)
 
 # Bug-bash repro tests (tests/bugbash/repros/*.e2e.ts): exact UI steps, no model calls, against a
@@ -245,7 +247,7 @@ test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash 
 
 # e2e needs Node 22.22.3+/24.8+: E2E_NODE, else the first node on PATH. Its directory leads PATH so
 # the app command and its children use the same node (as tests/bugbash/run.ts does).
-mcp-apps-e2e: build-main build-renderer build-static ## MCP Apps e2e suite, agent.act driven (E2E_NODE, BUGBASH_MODEL; MCP_APPS_E2E_ARGS="--target web")
+mcp-apps-e2e: ## MCP Apps e2e suite, agent.act driven (paused on the host until the sandbox lands, #5714)
 	@# Its seed writes the MCP chat directly, so it runs on the mock app AI (tests/bugbash/aiMode.ts).
 	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="MCP Apps suite"; node="$${E2E_NODE:-$$(command -v node)}"; cd tests/bugbash && PATH="$$(dirname "$$node"):$$PATH" E2E_TELEMETRY_DISABLED=1 "$$node" ../../node_modules/e2e/dist/cli/bin.js run --config e2e.mcpapps.config.ts $(MCP_APPS_E2E_ARGS)
 

@@ -2,6 +2,9 @@
  * Agent bug bash: runs one TesterArmy `e2e explore` per charter and explorer model against
  * disposable Xum servers, then merges every explorer's findings into one Markdown file.
  *
+ * Paused on the host (hostPause.ts, #5714): it refuses with exit 2 before any probe, job or
+ * child process starts.
+ *
  * Usage: make bug-bash [BUGBASH_ARGS="--only composer,settings --parallel 4 --max-steps 6"], or
  *        bun tests/bugbash/run.ts [--charters <file>] [--only <slug,...>] [--parallel 8]
  *          [--max-steps 6]
@@ -34,6 +37,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { type AiMode, aiModeEnv, resolveAiMode } from "./aiMode";
+import { modelDrivenRefusal } from "./hostPause";
 
 const projectDir = import.meta.dir;
 const repoRoot = path.resolve(projectDir, "../..");
@@ -288,6 +292,11 @@ function readModels(): string[] {
 }
 
 async function main(): Promise<void> {
+  const paused = modelDrivenRefusal("make bug-bash (tests/bugbash/run.ts)");
+  if (paused != null) {
+    console.error(paused);
+    process.exit(2);
+  }
   const { values } = parseArgs({
     options: {
       charters: { type: "string" },

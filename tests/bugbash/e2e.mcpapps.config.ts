@@ -4,7 +4,12 @@
  * comes from e2e.config.ts. Run it with `make mcp-apps-e2e`, or explore with
  * `make bug-bash BUGBASH_ARGS="--config tests/bugbash/e2e.mcpapps.config.ts
  * --charters tests/bugbash/mcpapps/charters.txt"`.
+ *
+ * Paused on the host (hostPause.ts, #5714): the suite drives every flow with `agent.act`, so a
+ * model picks its actions. Every e2e command with this config, also `run`, refuses as it loads.
  */
+// First import: the pause refuses before e2e.config.ts runs (mcpapps/hostPause.ts).
+import "./mcpapps/hostPause";
 import type { E2EConfig } from "e2e";
 import base from "./e2e.config";
 
