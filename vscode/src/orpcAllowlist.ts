@@ -102,9 +102,10 @@ export function isAllowedOrpcPath(path: string[]): boolean {
  * task settings. Only the fields AppConfigStore reads are forwarded (an allow-list, so fields added
  * later stay in the host).
  * Of the task settings, only proposePlanImplementReplacesChatHistory (a boolean) is forwarded (#4942).
- * Of the user preferences, only appearance.bashCollapsedSummaryMode (a valid mode) and
- * appearance.transcriptDensity (a valid density) are forwarded, and agentAiDefaults is forwarded
- * rebuilt by normalizeAgentAiDefaults (#4972, #4979, #4962).
+ * Of the user preferences, only appearance.bashCollapsedSummaryMode (a valid mode),
+ * appearance.transcriptDensity (a valid density) and appearance.vimEnabled (a boolean) are
+ * forwarded, and agentAiDefaults is forwarded rebuilt by normalizeAgentAiDefaults (#4972, #4979,
+ * #4962).
  *
  * providers.getConfig (#4766): it carries no keys (only apiKeySet-style booleans), but base URLs and
  * the deployment URL can embed credentials and apiKeyFile is a local path; no webview code reads
@@ -180,6 +181,10 @@ function projectAppConfig(value: unknown): Record<string, unknown> {
   }
   if (isTranscriptDensity(transcriptDensity)) {
     projectedAppearance.transcriptDensity = transcriptDensity;
+  }
+  const vimEnabled = appearance?.vimEnabled;
+  if (typeof vimEnabled === "boolean") {
+    projectedAppearance.vimEnabled = vimEnabled;
   }
   if (Object.keys(projectedAppearance).length > 0) {
     projected.userPreferences = { appearance: projectedAppearance };

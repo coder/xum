@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, RefreshCw } from "lucide-react";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { getLastMainRetryCandidateMessage } from "@/common/utils/messages/retryEligibility";
@@ -12,7 +12,6 @@ import {
   isEditableElement,
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { stopStream } from "@/browser/utils/stopStream";
@@ -148,7 +147,9 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
   const [manualRetryError, setManualRetryError] = useState<string | null>(null);
   const [isManualRetrying, setIsManualRetrying] = useState(false);
 
-  const [vimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, { listener: true });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const stopKeybind = formatKeybind(
     vimEnabled ? KEYBINDS.INTERRUPT_STREAM_VIM : KEYBINDS.INTERRUPT_STREAM_NORMAL
   );

@@ -115,7 +115,7 @@ describe("plan implement setting (#4942)", () => {
 });
 
 describe("webview preferences (#4972, #4962)", () => {
-  test("forwards a valid bash collapsed-summary mode and transcript density and nothing else from userPreferences", () => {
+  test("forwards a valid bash collapsed-summary mode, transcript density and vim flag and nothing else from userPreferences", () => {
     expect(
       redactWebviewOrpcResult(["config", "getConfig"], {
         userPreferences: {
@@ -135,7 +135,11 @@ describe("webview preferences (#4972, #4962)", () => {
       })
     ).toEqual({
       userPreferences: {
-        appearance: { bashCollapsedSummaryMode: "intent", transcriptDensity: "hyper" },
+        appearance: {
+          bashCollapsedSummaryMode: "intent",
+          transcriptDensity: "hyper",
+          vimEnabled: true,
+        },
       },
     });
   });

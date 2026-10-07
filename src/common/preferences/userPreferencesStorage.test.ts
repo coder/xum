@@ -11,7 +11,6 @@ import {
   PROJECT_ORDER_KEY,
   PROVIDER_OPTIONS_ANTHROPIC_KEY,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
-  UI_THEME_KEY,
   getAgentIdKey,
   getAutoCompactionThresholdKey,
   getLastRuntimeConfigKey,
@@ -60,7 +59,6 @@ describe("user preference localStorage registry", () => {
   test("collects semantic preferences from legacy localStorage keys", () => {
     const storage = new MemoryStorage();
     const projectScope = getProjectScopeId("/repo");
-    storage.setJSON(UI_THEME_KEY, "dark");
     storage.setJSON(PROJECT_ORDER_KEY, ["/repo"]);
     storage.setJSON(getAgentIdKey(projectScope), "plan");
     storage.setJSON(getModelKey(projectScope), "openai:gpt-4.1");
@@ -75,7 +73,6 @@ describe("user preference localStorage registry", () => {
     storage.setJSON(getReviewDefaultBaseKey("/repo"), "origin/main");
 
     expect(collectForTest(storage)).toEqual({
-      appearance: { theme: "dark" },
       navigation: { projectOrder: ["/repo"] },
       ai: {
         projectDefaults: {
@@ -114,12 +111,10 @@ describe("user preference localStorage registry", () => {
   test("all flattened preference entries are recognized, applied, and removable", () => {
     const preferences: UserPreferences = {
       appearance: {
-        theme: "flexoki-dark",
         transcriptDensity: "hyper",
         bashCollapsedSummaryMode: "intent",
         terminalFontConfig: { fontFamily: "Geist Mono", fontSize: 13 },
         editorConfig: { editor: "custom", customCommand: "code --goto" },
-        vimEnabled: true,
       },
       navigation: { launchBehavior: "new-chat", projectOrder: ["/repo"] },
       ai: {
@@ -163,7 +158,6 @@ describe("user preference localStorage registry", () => {
 
   test("round trips backend preferences to localStorage entries", () => {
     const preferences = {
-      appearance: { theme: "flexoki-light" as const },
       ai: {
         globalDefaults: { agentId: "exec" },
         projectDefaults: { "/repo": { model: "anthropic:claude-sonnet-4-20250514" } },
@@ -172,7 +166,6 @@ describe("user preference localStorage registry", () => {
     };
 
     expect(entriesFromUserPreferences(preferences)).toEqual([
-      { key: UI_THEME_KEY, value: "flexoki-light" },
       { key: getAgentIdKey("__global__"), value: "exec" },
       {
         key: getModelKey(getProjectScopeId("/repo")),
@@ -183,19 +176,21 @@ describe("user preference localStorage registry", () => {
   });
 
   test("removes a single localStorage preference without dropping siblings", () => {
-    let preferences = applyStoredUserPreference(undefined, UI_THEME_KEY, "dark");
-    preferences = applyStoredUserPreference(preferences, "vimEnabled", true);
-    preferences = removeStoredUserPreference(preferences, UI_THEME_KEY);
+    let preferences = applyStoredUserPreference(undefined, REVIEW_INCLUDE_UNCOMMITTED_KEY, true);
+    preferences = applyStoredUserPreference(preferences, getReviewDefaultBaseKey("/repo"), "main");
+    preferences = removeStoredUserPreference(preferences, REVIEW_INCLUDE_UNCOMMITTED_KEY);
 
-    expect(preferences).toEqual({ appearance: { vimEnabled: true } });
-    expect(entryKeys(preferences)).not.toContain(UI_THEME_KEY);
+    expect(preferences).toEqual({ review: { defaultBaseByProject: { "/repo": "main" } } });
+    expect(entryKeys(preferences)).not.toContain(REVIEW_INCLUDE_UNCOMMITTED_KEY);
   });
 
   test("returns only valid entries for backfill", () => {
     const storage = new MemoryStorage();
-    storage.setJSON(UI_THEME_KEY, "dark");
+    storage.setJSON(REVIEW_INCLUDE_UNCOMMITTED_KEY, true);
     storage.setJSON(getAutoCompactionThresholdKey("bad"), 200);
 
-    expect(getStoredUserPreferenceEntries(storage)).toEqual([{ key: UI_THEME_KEY, value: "dark" }]);
+    expect(getStoredUserPreferenceEntries(storage)).toEqual([
+      { key: REVIEW_INCLUDE_UNCOMMITTED_KEY, value: true },
+    ]);
   });
 });

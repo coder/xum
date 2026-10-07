@@ -599,7 +599,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     ] satisfies AgentDefinitionDescriptor[]);
 
-  let userPreferences = normalizeUserPreferences(initialUserPreferences);
+  // Stories paint dark by default, so the theme preference shown in Settings matches.
+  let userPreferences = normalizeUserPreferences(
+    applyMergePatch({ appearance: { theme: "dark" } }, initialUserPreferences ?? {})
+  );
   let taskSettings = normalizeTaskSettings(initialTaskSettings ?? DEFAULT_TASK_SETTINGS);
 
   let agentAiDefaults = normalizeAgentAiDefaults(initialAgentAiDefaults ?? {});

@@ -1,6 +1,5 @@
 import {
   LaunchBehaviorSchema,
-  ThemePreferenceSchema,
   pruneUserPreferences,
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
@@ -22,8 +21,6 @@ import {
   TERMINAL_FONT_CONFIG_KEY,
   TRANSCRIPT_DENSITIES,
   TRANSCRIPT_DENSITY_KEY,
-  UI_THEME_KEY,
-  VIM_ENABLED_KEY,
   getAgentIdKey,
   getAutoCompactionThresholdKey,
   getLastRuntimeConfigKey,
@@ -67,13 +64,11 @@ export interface StoredUserPreferenceEntry {
 
 const PROJECT_SCOPE_PREFIX = "__project__/";
 const STATIC_USER_PREFERENCE_KEYS = new Set<string>([
-  UI_THEME_KEY,
   TRANSCRIPT_DENSITY_KEY,
   BASH_COLLAPSED_SUMMARY_MODE_KEY,
   TERMINAL_BADGE_CONFIG_KEY,
   TERMINAL_FONT_CONFIG_KEY,
   EDITOR_CONFIG_KEY,
-  VIM_ENABLED_KEY,
   LAUNCH_BEHAVIOR_KEY,
   PROJECT_ORDER_KEY,
   PROVIDER_OPTIONS_ANTHROPIC_KEY,
@@ -230,15 +225,6 @@ export function applyStoredUserPreference(
 ): UserPreferences | undefined {
   const next = cloneUserPreferences(preferences);
 
-  if (key === UI_THEME_KEY) {
-    const parsed = parseEnum(ThemePreferenceSchema.options, value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureAppearance(next).theme = parsed;
-    return pruneUserPreferences(next);
-  }
-
   if (key === TRANSCRIPT_DENSITY_KEY) {
     const parsed = parseEnum<TranscriptDensity>(TRANSCRIPT_DENSITIES, value);
     if (!parsed) {
@@ -278,15 +264,6 @@ export function applyStoredUserPreference(
       return removeStoredUserPreference(next, key);
     }
     ensureAppearance(next).editorConfig = normalizeEditorConfig(value);
-    return pruneUserPreferences(next);
-  }
-
-  if (key === VIM_ENABLED_KEY) {
-    const parsed = parseBoolean(value);
-    if (parsed === undefined) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureAppearance(next).vimEnabled = parsed;
     return pruneUserPreferences(next);
   }
 
@@ -458,14 +435,12 @@ export function removeStoredUserPreference(
 ): UserPreferences | undefined {
   const next = cloneUserPreferences(preferences);
 
-  if (key === UI_THEME_KEY) delete next.appearance?.theme;
-  else if (key === TRANSCRIPT_DENSITY_KEY) delete next.appearance?.transcriptDensity;
+  if (key === TRANSCRIPT_DENSITY_KEY) delete next.appearance?.transcriptDensity;
   else if (key === BASH_COLLAPSED_SUMMARY_MODE_KEY)
     delete next.appearance?.bashCollapsedSummaryMode;
   else if (key === TERMINAL_FONT_CONFIG_KEY) delete next.appearance?.terminalFontConfig;
   else if (key === TERMINAL_BADGE_CONFIG_KEY) delete next.appearance?.terminalBadgeConfig;
   else if (key === EDITOR_CONFIG_KEY) delete next.appearance?.editorConfig;
-  else if (key === VIM_ENABLED_KEY) delete next.appearance?.vimEnabled;
   else if (key === LAUNCH_BEHAVIOR_KEY) delete next.navigation?.launchBehavior;
   else if (key === PROJECT_ORDER_KEY) delete next.navigation?.projectOrder;
   else if (key === getAgentIdKey(GLOBAL_SCOPE_ID)) delete next.ai?.globalDefaults?.agentId;
@@ -514,7 +489,6 @@ export function entriesFromUserPreferences(
   }
 
   const appearance = preferences.appearance;
-  if (appearance?.theme !== undefined) entries.push({ key: UI_THEME_KEY, value: appearance.theme });
   if (appearance?.transcriptDensity !== undefined)
     entries.push({ key: TRANSCRIPT_DENSITY_KEY, value: appearance.transcriptDensity });
   if (appearance?.bashCollapsedSummaryMode !== undefined)
@@ -528,8 +502,6 @@ export function entriesFromUserPreferences(
     entries.push({ key: TERMINAL_BADGE_CONFIG_KEY, value: appearance.terminalBadgeConfig });
   if (appearance?.editorConfig !== undefined)
     entries.push({ key: EDITOR_CONFIG_KEY, value: appearance.editorConfig });
-  if (appearance?.vimEnabled !== undefined)
-    entries.push({ key: VIM_ENABLED_KEY, value: appearance.vimEnabled });
 
   const navigation = preferences.navigation;
   if (navigation?.launchBehavior !== undefined)

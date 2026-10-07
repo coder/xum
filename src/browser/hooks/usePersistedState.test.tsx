@@ -153,7 +153,11 @@ describe("persisted state writes under storage quota pressure", () => {
         "branch:aaaaaaaaaa",
       ];
       for (const key of cacheKeys) storage.seed(key, "x".repeat(300));
-      const keptKeys = ["review-state:aaaaaaaaaa", "inputAttachments:aaaaaaaaaa", "uiTheme"];
+      const keptKeys = [
+        "review-state:aaaaaaaaaa",
+        "inputAttachments:aaaaaaaaaa",
+        "expandedProjects",
+      ];
       for (const key of keptKeys) storage.seed(key, "y".repeat(150));
 
       write(LAST_VISITED_ROUTE_KEY, "z".repeat(600));
