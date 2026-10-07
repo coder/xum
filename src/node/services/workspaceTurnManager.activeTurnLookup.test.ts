@@ -495,7 +495,7 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
           ? {
               delegatedCreation: { handleId: createHandle, ownerWorkspaceId: creator },
               // The mark outranks a tag that names someone else.
-              ...(index % 2 === 0 ? claimTag(other) : {}),
+              ...(next(2) === 0 ? claimTag(other) : {}),
             }
           : kind === "wrongClaim"
             ? claimTag(other)
