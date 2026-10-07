@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { spawnSync } from "child_process";
+import * as crypto from "crypto";
 import { appAi, containerEnv, exactStepRefusal, exitCode, outputDir, plainFolders } from "./launch";
 
 test("the container env holds the allowlisted names, the fixed values and no host secret", () => {
@@ -143,16 +144,18 @@ const FAKE_DOCKER = String.raw`
 } >> "$FAKE_LOG"
 case "$1" in
   context)
+    if [ "$DOCKER_CONTEXT" = missing ]; then echo 'context "missing": not found' >&2; exit 1; fi
     if [ -n "$DOCKER_HOST" ]; then echo "$DOCKER_HOST"
     elif [ "$DOCKER_CONTEXT" = remote ]; then echo tcp://10.0.0.1:2376
     elif [ "$DOCKER_CONTEXT" = other ]; then echo unix:///run/other.sock
     else echo unix:///var/run/docker.sock; fi ;;
   info) echo '{"OSType":"linux","OperatingSystem":"Ubuntu","SecurityOptions":[]}' ;;
   image) [ "$FAKE_IMAGE" = present ] ;;
-  build) cat > /dev/null ;;
+  build) cat > "$FAKE_LOG.dockerfile" ;;
   run)
     src=$(printf '%s\n' "$@" | sed -n 's/^type=bind,src=\([^,]*\),dst=\/probe,readonly$/\1/p')
     if [ -z "$src" ]; then printf '{"end":true}\n'; exit 0; fi
+    if [ "$FAKE_SLOW" = probe ]; then touch "$FAKE_LOG.ready"; sleep 3; fi
     [ "$FAKE_PROBE" = fail ] && exit 1
     cat /proc/sys/kernel/random/boot_id; cat "$src/.nonce"; echo ;;
   ps) [ -e "$FAKE_LOG.rm" ] || echo cid123 ;;
@@ -162,76 +165,178 @@ esac
 `;
 
 interface Launch {
-  sandbox?: boolean;
+  /** The real app AI: the launcher refuses before any docker call. */
+  realAi?: boolean;
   cwd?: string;
   env?: Record<string, string>;
-  /** The fake's same-host probe fails (default), so a sandbox job falls back to the host. */
+  /** The fake's same-host probe fails. */
   probeFails?: boolean;
   /** The image is missing, so the launcher builds it. */
   build?: boolean;
+  /** This step waits 3 s and touches `<calls>.ready` first (git ls-files for the staging). */
+  slow?: "stage" | "probe";
 }
 
-/**
- * Runs the launcher with a fake docker and a fake e2e node, which log each call. `sandbox`
- * (default true): the mock app AI, so the launcher picks the sandbox. Else the real app AI sends
- * the job to the host fallback.
- */
-function launch(args: string[], options: Launch = {}) {
+const REAL_GIT = Bun.which("git") ?? "git";
+
+/** A bin folder with the fake docker (and, for a slow staging, a git that waits first). */
+function fakeBin(options: Launch) {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-launch-test-"));
   const calls = path.join(bin, "calls.log");
   const script = FAKE_DOCKER.replaceAll("$FAKE_LOG", calls)
-    .replaceAll("$FAKE_PROBE", options.probeFails === false ? "ok" : "fail")
-    .replaceAll("$FAKE_IMAGE", options.build === true ? "missing" : "present");
+    .replaceAll("$FAKE_PROBE", options.probeFails === true ? "fail" : "ok")
+    .replaceAll("$FAKE_IMAGE", options.build === true ? "missing" : "present")
+    .replaceAll("$FAKE_SLOW", options.slow ?? "");
   fs.writeFileSync(path.join(bin, "docker"), `#!/bin/sh${script}`, { mode: 0o755 });
-  fs.writeFileSync(path.join(bin, "e2e-node"), `#!/bin/sh\necho "CALL e2e-node $*" >> ${calls}\n`, {
-    mode: 0o755,
-  });
+  if (options.slow === "stage")
+    fs.writeFileSync(
+      path.join(bin, "git"),
+      `#!/bin/sh\ncase "$*" in *ls-files*) touch ${calls}.ready; sleep 3 ;; esac\nexec ${REAL_GIT} "$@"\n`,
+      { mode: 0o755 }
+    );
+  return { bin, calls };
+}
+
+function launchEnv(bin: string, options: Launch): Record<string, string> {
+  return {
+    PATH: `${bin}:${process.env.PATH ?? ""}`,
+    HOME: process.env.HOME ?? "",
+    BUGBASH_AI_RESOLVED: options.realAi === true ? "real" : "mock",
+    ...options.env,
+  };
+}
+
+/** Runs the launcher with the fake docker, which logs each call. */
+function launch(args: string[], options: Launch = {}) {
+  const { bin, calls } = fakeBin(options);
   try {
     const r = spawnSync(
       process.execPath,
       [path.join(import.meta.dir, "launch.ts"), "--", ...args],
-      {
-        cwd: options.cwd ?? BUGBASH_DIR,
-        encoding: "utf8",
-        env: {
-          PATH: `${bin}:${process.env.PATH ?? ""}`,
-          HOME: process.env.HOME,
-          E2E_NODE: path.join(bin, "e2e-node"),
-          BUGBASH_AI_RESOLVED: options.sandbox === false ? "real" : "mock",
-          ...options.env,
-        },
-      }
+      { cwd: options.cwd ?? BUGBASH_DIR, encoding: "utf8", env: launchEnv(bin, options) }
     );
     const log = fs.existsSync(calls) ? fs.readFileSync(calls, "utf8") : "";
-    return { status: r.status, stderr: r.stderr, log };
+    const dockerfile = fs.existsSync(`${calls}.dockerfile`)
+      ? fs.readFileSync(`${calls}.dockerfile`, "utf8")
+      : null;
+    return { status: r.status, stderr: r.stderr, log, dockerfile };
   } finally {
     fs.rmSync(bin, { recursive: true, force: true });
     fs.rmSync(path.join(BUGBASH_DIR, ".e2e/launch-test"), { recursive: true, force: true });
   }
 }
 
-test("the launcher runs nothing else, in the sandbox and on the host fallback", () => {
-  // Controls: the exact-step run reaches the docker run (sandbox) or the e2e node (host).
+test("the launcher runs exact-step repros in the sandbox, and nothing else anywhere", () => {
+  // Control: the exact-step run reaches the probe and the job container.
   const sandboxed = launch(OK);
-  expect(sandboxed.log).toContain("CALL run");
-  const hosted = launch(OK, { sandbox: false });
-  expect(hosted.log).toContain(
-    `CALL e2e-node ${path.resolve(BUGBASH_DIR, "../..")}/node_modules/.bin/e2e run`
-  );
-  for (const sandbox of [true, false])
-    for (const args of NOT_EXACT) {
-      const r = launch(args, { sandbox });
-      expect({ args, status: r.status, ran: r.log.match(/CALL (run|build|e2e-node)/g) }).toEqual({
-        args,
-        status: 2,
-        ran: null,
-      });
-      expect(r.stderr).toContain("exact-step repros");
-    }
+  expect([sandboxed.status, sandboxed.log.match(/CALL run/g)?.length]).toEqual([0, 2]);
+  for (const args of NOT_EXACT) {
+    const r = launch(args);
+    expect({ args, status: r.status, ran: r.log.match(/CALL (run|build)/g) }).toEqual({
+      args,
+      status: 2,
+      ran: null,
+    });
+    expect(r.stderr).toContain("exact-step repros");
+  }
   // The same args from another cwd would load another e2e.config.ts.
-  const elsewhere = launch(OK, { sandbox: false, cwd: path.resolve(BUGBASH_DIR, "../..") });
-  expect([elsewhere.status, elsewhere.log.includes("CALL e2e-node")]).toEqual([2, false]);
+  const elsewhere = launch(OK, { cwd: path.resolve(BUGBASH_DIR, "../..") });
+  expect([elsewhere.status, elsewhere.log.includes("CALL run")]).toEqual([2, false]);
 });
+
+test("without the sandbox the launcher refuses: no host fallback", () => {
+  // The real app AI needs the provider proxy: refused before any docker call.
+  const real = launch(OK, { realAi: true });
+  expect([real.status, real.log]).toEqual([2, ""]);
+  expect(real.stderr).toContain("sandbox only");
+  // No usable Docker, or a failed same-host probe: refused, and no job runs.
+  for (const options of [{ env: { DOCKER_CONTEXT: "missing" } }, { probeFails: true }]) {
+    const r = launch(OK, options);
+    expect([r.status, r.log.match(/CALL run/g)?.length ?? 0]).toEqual([
+      2,
+      options.probeFails === true ? 1 : 0,
+    ]);
+    expect(r.stderr).toContain("refused:");
+  }
+});
+
+test("the image builds from the committed Dockerfile on stdin, with no context and one build arg", () => {
+  const r = launch(OK, { build: true });
+  expect(r.status).toBe(0);
+  const build = r.log.split("\n").find((line) => line.startsWith("CALL build"));
+  expect(build).toMatch(
+    /^CALL build --build-arg PLAYWRIGHT_CORE_VERSION=\d+\.\d+\.\d+\S* -t xum-bugbash-sandbox:[0-9a-f]{12} -$/
+  );
+  const committed = spawnSync("git", ["show", "HEAD:tests/bugbash/sandbox/Dockerfile"], {
+    cwd: BUGBASH_DIR,
+    encoding: "utf8",
+  });
+  expect(committed.status).toBe(0);
+  expect(r.dockerfile).toBe(committed.stdout);
+});
+
+const CHECKOUT_ID = crypto
+  .createHash("sha256")
+  .update(path.resolve(BUGBASH_DIR, "../.."))
+  .digest("hex")
+  .slice(0, 12);
+
+test.each([
+  ["stage", "SIGINT", 130],
+  ["stage", "SIGTERM", 143],
+  ["probe", "SIGINT", 130],
+  ["probe", "SIGTERM", 143],
+] as const)(
+  "a %s step stopped by %s removes this job's folder only",
+  async (slow, signal, code) => {
+    const options: Launch = { slow };
+    const { bin, calls } = fakeBin(options);
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-launch-test-"));
+    // Another job of this checkout, and a job of another checkout: both must stay.
+    const jobs = path.join(tmp, "xum-bugbash-sandbox");
+    for (const other of [`${CHECKOUT_ID}/xbb-other-job`, "0123456789ab/xbb-another-checkout"]) {
+      fs.mkdirSync(path.join(jobs, other), { recursive: true });
+      fs.writeFileSync(path.join(jobs, other, "keep"), "");
+    }
+    const listJobs = () =>
+      fs
+        .readdirSync(jobs, { recursive: true })
+        .map(String)
+        .filter((entry) => entry.split("/").length === 2)
+        .sort();
+    try {
+      const child = Bun.spawn(
+        [process.execPath, path.join(import.meta.dir, "launch.ts"), "--", ...OK],
+        {
+          cwd: BUGBASH_DIR,
+          env: { ...launchEnv(bin, options), TMPDIR: tmp },
+          stderr: "pipe",
+        }
+      );
+      const deadline = Date.now() + 15_000;
+      while (!fs.existsSync(`${calls}.ready`) && Date.now() < deadline) await Bun.sleep(50);
+      expect(fs.existsSync(`${calls}.ready`)).toBe(true);
+      // The launcher's own folder exists while the step runs.
+      expect(listJobs().length).toBe(3);
+      child.kill(signal);
+      expect(await child.exited).toBe(code);
+      expect(await new Response(child.stderr).text()).toContain(`stopped by ${signal}`);
+      expect(listJobs()).toEqual(
+        [`${CHECKOUT_ID}/xbb-other-job`, "0123456789ab/xbb-another-checkout"].sort()
+      );
+      expect(fs.readdirSync(tmp).sort()).toEqual(["xum-bugbash-sandbox"]); // no docker client folder
+      // The job container never started.
+      expect(fs.readFileSync(calls, "utf8").match(/CALL run/g)?.length ?? 0).toBe(
+        slow === "probe" ? 1 : 0
+      );
+    } finally {
+      fs.rmSync(bin, { recursive: true, force: true });
+      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(path.join(BUGBASH_DIR, ".e2e/launch-test"), { recursive: true, force: true });
+    }
+  },
+  30_000
+);
 
 /** The calls in a fake docker log, one record per call. */
 function dockerCalls(log: string) {
@@ -254,7 +359,7 @@ function dockerCalls(log: string) {
         marker: line("MARKER"),
       };
     })
-    .filter((call) => !call.command.startsWith("e2e-node"));
+    .filter((call) => call.command !== "");
 }
 
 /** A client config with an authenticated proxy: the CLI would copy it into builds and containers. */
@@ -270,7 +375,6 @@ test("docker commands never see the user's client config, HOME or other DOCKER_*
   const userConfig = syntheticDockerConfig();
   try {
     const r = launch(OK, {
-      probeFails: false,
       build: true,
       env: {
         DOCKER_CONFIG: userConfig,
@@ -323,15 +427,11 @@ test("the selected context is resolved once; a remote one is refused, not swappe
     { DOCKER_HOST: "ssh://user@host" },
     { DOCKER_HOST: "unix://run/relative.sock" },
   ]) {
-    const required = launch(OK, { env: { ...env, BUGBASH_SANDBOX: "require" } });
-    expect([
-      required.status,
-      dockerCalls(required.log).map((c) => c.command.split(" ")[0]),
-    ]).toEqual([2, ["context"]]);
-    expect(required.stderr).toContain("not a local socket");
-    // auto: the exact-step run goes to the host, with no further docker command.
-    const auto = launch(OK, { env });
-    expect(dockerCalls(auto.log).length).toBe(1);
-    expect(auto.log).toContain("CALL e2e-node");
+    const refused = launch(OK, { env });
+    expect([refused.status, dockerCalls(refused.log).map((c) => c.command.split(" ")[0])]).toEqual([
+      2,
+      ["context"],
+    ]);
+    expect(refused.stderr).toContain("not a local socket");
   }
 });

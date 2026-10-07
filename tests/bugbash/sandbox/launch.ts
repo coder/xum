@@ -7,14 +7,14 @@
  * capabilities, a read-only root, copies of the git-listed inputs, and read-only dist/ and
  * node_modules/. Its output comes back on its stdout as an export stream (exportStream.ts).
  *
- * It runs only exact-step jobs: `e2e run --config e2e.config.ts` (the repros). Other e2e commands
- * and configs (`explore`, the MCP Apps suite) let a model pick the actions. They need a model,
- * which the sandbox reaches only through its provider proxy (a later step of #5714), and they
- * never run on the host. So the launcher refuses them for now.
- * BUGBASH_SANDBOX=auto (default): without usable Docker, or with the real app AI (that needs the
- * provider proxy too), the exact-step job runs on the host as before. BUGBASH_SANDBOX=require
- * refuses instead.
- * Exit codes: the job's code, 2 when the launcher refuses, 4 when the evidence is incomplete.
+ * It runs only exact-step jobs: `e2e run --config e2e.config.ts` (the repros), with the mock
+ * app AI. Other e2e commands and configs (`explore`, the MCP Apps suite) let a model pick the
+ * actions, and the real app AI calls a provider. Both need the sandbox's provider proxy (a later
+ * step of #5714), so the launcher refuses them for now.
+ * It launches containers only. It has no host fallback: without usable Docker it refuses. The
+ * make targets keep their own host path (no change in this step).
+ * Exit codes: the job's code, 2 when the launcher refuses, 4 when the evidence is incomplete,
+ * 130 or 143 when SIGINT or SIGTERM stopped it.
  */
 import { spawn, spawnSync } from "child_process";
 import * as crypto from "crypto";
@@ -43,8 +43,12 @@ const PASS_ENV = [
 ];
 
 export class Refusal extends Error {}
-/** The sandbox cannot run on this host. It is thrown before the job's container starts. */
-class Unusable extends Refusal {}
+/** SIGINT or SIGTERM stopped the launcher before the job's container started. */
+class Stopped extends Error {
+  constructor(readonly signal: NodeJS.Signals) {
+    super(`stopped by ${signal}`);
+  }
+}
 const log = (message: string) => console.error(`sandbox ${message}`);
 const sha = (text: string) => crypto.createHash("sha256").update(text).digest("hex");
 
@@ -138,18 +142,47 @@ export function checkEndpoint(): string | null {
   return null;
 }
 
-function ensureImage(): string {
-  const dockerfile = fs.readFileSync(path.join(import.meta.dir, "Dockerfile"), "utf8");
+const DOCKERFILE = "tests/bugbash/sandbox/Dockerfile";
+
+/**
+ * The image build runs outside the job sandbox: on the daemon, with the default build network
+ * (apt and the Chromium download need it). So its inputs come only from reviewed harness source:
+ * - the Dockerfile as committed at HEAD. A work-tree change refuses: commit it first.
+ * - no build context: `docker build -` with the Dockerfile on stdin sends no folder, so no
+ *   demo repo, no .e2e evidence and no file that a job wrote can reach the build.
+ * - one build arg, the Playwright version of the installed @e2e-dev/web (from bun.lock). No
+ *   build arg comes from the env, and the private client config (clientEnv) adds no proxies.
+ */
+function buildInputs(): { dockerfile: string; playwright: string } {
+  const committed = spawnSync("git", ["-C", ROOT, "show", `HEAD:${DOCKERFILE}`], {
+    encoding: "utf8",
+  });
+  if (committed.status !== 0) throw new Refusal(`git show HEAD:${DOCKERFILE}: ${committed.stderr}`);
+  const st = fs.lstatSync(path.join(ROOT, DOCKERFILE), { throwIfNoEntry: false });
+  if (
+    st?.isFile() !== true ||
+    fs.readFileSync(path.join(ROOT, DOCKERFILE), "utf8") !== committed.stdout
+  )
+    throw new Refusal(
+      `${DOCKERFILE} differs from HEAD: the image builds only from committed source`
+    );
   // The Chromium build that the checkout's @e2e-dev/web expects.
   const web = createRequire(path.join(ROOT, "package.json")).resolve("@e2e-dev/web");
   const playwright = (createRequire(web)("playwright-core/package.json") as { version: string })
     .version;
+  if (!/^\d+\.\d+\.\d+(-[\w.]+)?$/.test(playwright))
+    throw new Refusal(`playwright-core version ${JSON.stringify(playwright)}: not a plain version`);
+  return { dockerfile: committed.stdout, playwright };
+}
+
+function ensureImage(): string {
+  const { dockerfile, playwright } = buildInputs();
   const image = `xum-bugbash-sandbox:${sha(`${dockerfile}\0${playwright}`).slice(0, 12)}`;
   if (docker(["image", "inspect", image], { timeoutMs: 15_000 }).ok) return image;
   log(`building ${image}`);
   const args = ["build", "--build-arg", `PLAYWRIGHT_CORE_VERSION=${playwright}`, "-t", image, "-"];
   const built = docker(args, { timeoutMs: 20 * 60_000, input: dockerfile, quiet: false });
-  if (!built.ok) throw new Unusable(`image build: ${built.error}`);
+  if (!built.ok) throw new Refusal(`image build: ${built.error}`);
   return image;
 }
 
@@ -256,14 +289,37 @@ export async function runInSandbox(run: SandboxRun): Promise<number> {
   const checkoutId = sha(ROOT).slice(0, 12);
   const name = `xbb-${checkoutId.slice(0, 6)}-${crypto.randomBytes(3).toString("hex")}`;
   const jobDir = path.join(os.tmpdir(), "xum-bugbash-sandbox", checkoutId, name);
-  fs.mkdirSync(jobDir, { recursive: true, mode: 0o700 });
+  // Cleanup has an owner before the job folder exists. A signal handler stops the default exit,
+  // which would skip the `finally` below. Staging and the probe are synchronous, and a handler
+  // runs only from the event loop, so each checkpoint first yields to it (measured: without the
+  // yield, the signal was seen only once the container had started). Only this job's folder
+  // goes: the folder is created without `recursive`, so it is ours or the launch fails.
+  let signal: NodeJS.Signals | null = null;
+  let onStop: ((reason: string) => void) | null = null;
+  const onSignal = (received: NodeJS.Signals) => {
+    signal ??= received;
+    onStop?.(received);
+  };
+  const checkpoint = async () => {
+    await new Promise((resolve) => setImmediate(resolve));
+    if (signal != null) throw new Stopped(signal);
+  };
+  process.on("SIGINT", onSignal).on("SIGTERM", onSignal);
+  try {
+    fs.mkdirSync(path.dirname(jobDir), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(jobDir, { mode: 0o700 });
+  } catch (error) {
+    process.off("SIGINT", onSignal).off("SIGTERM", onSignal);
+    throw error;
+  }
   try {
     const stageDir = path.join(jobDir, "stage");
     const started = Date.now();
     const files = stage(stageDir);
+    await checkpoint();
     log(`${name} staged ${files} files in ${((Date.now() - started) / 1000).toFixed(2)} s`);
     const different = checkSameHost(image, stageDir);
-    if (different != null) throw new Unusable(different);
+    if (different != null) throw new Refusal(different);
     const uid = process.getuid?.() ?? 1000;
     const gid = process.getgid?.() ?? 1000;
     fs.writeFileSync(
@@ -289,8 +345,11 @@ export async function runInSandbox(run: SandboxRun): Promise<number> {
       "sandbox/entry.ts", "--export", run.exportDir, "--", ...run.command];
     plainFolders(BUGBASH_DIR, path.dirname(run.exportDir), true);
     log(`${name} --network none, ${appAi() ?? "no"} app AI, no proxy`);
-    return await runContainer(args, { name, owner, checkout: checkoutId, dest });
+    await checkpoint();
+    const job = { name, owner, checkout: checkoutId, dest };
+    return await runContainer(args, job, (stop) => (onStop = stop));
   } finally {
+    process.off("SIGINT", onSignal).off("SIGTERM", onSignal);
     fs.rmSync(jobDir, { recursive: true, force: true });
   }
 }
@@ -301,7 +360,11 @@ interface Job {
   checkout: string;
 }
 
-async function runContainer(args: string[], job: Job & { dest: string }) {
+async function runContainer(
+  args: string[],
+  job: Job & { dest: string },
+  onSignal: (stop: (reason: string) => void) => void
+) {
   // The lifeline: this process holds the container's stdin. When it dies, the pipe closes and
   // entry.ts stops the job (measured: the container was gone 0.59 s after a SIGKILL).
   const child = spawn("docker", args, { env: clientEnv(), stdio: ["pipe", "pipe", "inherit"] });
@@ -319,13 +382,15 @@ async function runContainer(args: string[], job: Job & { dest: string }) {
     child.kill("SIGKILL");
   };
   const timer = setTimeout(() => stop("the 30 min deadline"), DEADLINE_MS);
-  const onSignal = (signal: NodeJS.Signals) => stop(signal);
-  process.on("SIGINT", onSignal).on("SIGTERM", onSignal);
+  onSignal(stop); // runInSandbox owns the signal handlers
   const code = await new Promise<number>((resolve) => {
-    child.on("error", () => resolve(125)).on("exit", (exit) => resolve(exit ?? 125));
+    child
+      .on("error", () => resolve(125))
+      .on("exit", (exit, signal) =>
+        resolve(exit == null && signal == null ? 125 : exitCode(exit, signal))
+      );
   });
   clearTimeout(timer);
-  process.off("SIGINT", onSignal).off("SIGTERM", onSignal);
   const result = await exported;
   const size = `${result.files} files, ${(result.bytes / 1e6).toFixed(1)} MB`;
   log(
@@ -358,30 +423,11 @@ export function removeContainer(job: Job): string {
 export const appAi = (env: NodeJS.ProcessEnv = process.env) =>
   env.BUGBASH_AI_RESOLVED ?? (env.BUGBASH_AI === "mock" ? "mock" : undefined);
 
-/** Why this job runs on the host, or null for the sandbox. */
-function hostReason(): string | null {
+/** Why this job cannot run in the sandbox, or null. There is no host fallback. */
+function sandboxRefusal(): string | null {
   if (appAi() !== "mock")
     return "the real app AI needs the sandbox's provider proxy, which is not built yet (#5714)";
   return checkEndpoint();
-}
-
-function runOnHost(args: string[]): Promise<number> {
-  const spec = process.env.E2E_NODE ?? "node";
-  const node = spec.includes("/") ? spec : Bun.which(spec);
-  if (node == null) throw new Refusal(`E2E_NODE ${spec}: not found`);
-  // The node directory leads PATH, so the app command and its children use the same node.
-  const PATH = `${path.dirname(node)}${path.delimiter}${process.env.PATH ?? ""}`;
-  const child = spawn(node, [path.join(ROOT, "node_modules/.bin/e2e"), ...args], {
-    cwd: BUGBASH_DIR, // where exactStepRefusal() checked e2e.config.ts
-    stdio: "inherit",
-    env: { ...process.env, PATH },
-  });
-  // A signal to this launcher alone reaches e2e too, and the launcher waits for e2e's teardown.
-  const forward = (signal: NodeJS.Signals) => child.kill(signal);
-  process.on("SIGINT", forward).on("SIGTERM", forward);
-  return new Promise((resolve) =>
-    child.on("exit", (code, signal) => resolve(exitCode(code, signal)))
-  );
 }
 
 /** The shell convention: the exit code, or 128 + the number of the signal that ended the process. */
@@ -400,8 +446,9 @@ const RUN_FLAGS = ["--pass-with-no-tests", "--last-failed", "--debug"];
 
 /**
  * Why these e2e args are not an exact-step repro run, or null. Only `e2e run` with the repro
- * config passes: its tests are repros/** (no agent fixture: reproRules.test.ts). e2e resolves
- * --config from its cwd, so the cwd must be tests/bugbash and the config a regular file there.
+ * config passes: its tests are repros/**. A repro that took the agent fixture anyway would find
+ * no model: the container has no network and no provider key. e2e resolves --config from its
+ * cwd, so the cwd must be tests/bugbash and the config a regular file there.
  */
 export function exactStepRefusal(args: string[], cwd: string, dir = BUGBASH_DIR): string | null {
   if (args[0] !== "run") return `${JSON.stringify(args[0] ?? "")} is not \`e2e run\``;
@@ -446,40 +493,29 @@ async function main(): Promise<number> {
   const given = process.argv.slice(2);
   const e2eArgs = given[0] === "--" ? given.slice(1) : given;
   if (e2eArgs.length === 0) throw new Refusal("usage: launch.ts -- <e2e args...>");
-  const mode = process.env.BUGBASH_SANDBOX ?? "auto";
-  if (mode !== "auto" && mode !== "require")
-    throw new Refusal(`BUGBASH_SANDBOX must be auto or require, got ${mode}`);
-  // Before the sandbox and the host fallback both: neither runs anything else.
   const notExact = exactStepRefusal(e2eArgs, process.cwd());
   if (notExact != null)
     throw new Refusal(
       `${notExact}: only \`e2e run --config e2e.config.ts\` (exact-step repros) runs for now. ` +
         "Model-driven runs wait for the sandbox's provider proxy (#5714)."
     );
-  const why = hostReason();
-  if (why != null && mode === "require") throw new Refusal(`${why} (BUGBASH_SANDBOX=require)`);
-  if (why != null) {
-    log(`not used: ${why}. These exact-step tests run on the host, as before.`);
-    return runOnHost(e2eArgs);
-  }
   const output = outputDir(e2eArgs);
+  const why = sandboxRefusal();
+  if (why != null) throw new Refusal(`${why}. The launcher runs jobs in the sandbox only.`);
   const command = ["node", "../../node_modules/e2e/dist/cli/bin.js", ...e2eArgs];
   // The app log goes into the output folder, so that it comes back with the report.
   const env = { BUGBASH_APP_LOG: process.env.BUGBASH_APP_LOG ?? `${output}/app.log` };
-  try {
-    return await runInSandbox({ command, exportDir: output, env });
-  } catch (error) {
-    // A failed image build or same-host probe: as without Docker (the job did not start).
-    if (!(error instanceof Unusable) || mode === "require") throw error;
-    log(`not used: ${error.message}. These exact-step tests run on the host, as before.`);
-    return runOnHost(e2eArgs);
-  }
+  return runInSandbox({ command, exportDir: output, env });
 }
 
 if (import.meta.main) {
   main().then(
     (code) => process.exit(code),
     (error: unknown) => {
+      if (error instanceof Stopped) {
+        log(error.message);
+        process.exit(exitCode(null, error.signal));
+      }
       log(`refused: ${error instanceof Error ? error.message : String(error)}`);
       process.exit(error instanceof Refusal ? 2 : 1);
     }
