@@ -70,17 +70,6 @@ export function mirrorBackendPreferences(params: {
   }
 }
 
-/** Writes the store's preferences into the local copies that RouterProvider reads at mount. */
-export function mirrorUserPreferencesLocalCache(): void {
-  const storage = getLocalStorage();
-  if (storage) {
-    mirrorBackendPreferences({
-      backendPreferences: getUserPreferences(),
-      storage,
-    });
-  }
-}
-
 export function prunePreferenceScopes(params: {
   preferences: UserPreferences | undefined;
   projectPaths: Set<string>;

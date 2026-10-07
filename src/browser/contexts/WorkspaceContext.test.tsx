@@ -4,6 +4,7 @@ import { beforeEach, afterEach, describe, expect, mock, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { QuotaLimitedStorage, restartLocalStorage } from "../../../tests/ui/quotaLimitedStorage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { WorkspaceContext } from "./WorkspaceContext";
 import { WorkspaceProvider, useWorkspaceContext } from "./WorkspaceContext";
@@ -15,7 +16,6 @@ import {
   HIDDEN_MODELS_KEY,
   RUNTIME_ENABLEMENT_KEY,
   LAST_VISITED_ROUTE_KEY,
-  LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
   getAgentIdKey,
   getDraftScopeId,
@@ -23,6 +23,7 @@ import {
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
   getThinkingLevelKey,
+  type LaunchBehavior,
 } from "@/common/constants/storage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -95,6 +96,7 @@ describe("WorkspaceContext", () => {
     restoreDomGlobals();
 
     currentClientMock = {};
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
   });
 
   test.each(["resolves", "rejects", "stalls"])(
@@ -399,9 +401,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${childId}`,
     });
 
@@ -450,9 +450,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${workspaceId}`,
     });
 
@@ -508,9 +506,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${workspaceId}`,
     });
 
@@ -565,9 +561,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${archivedId}`,
     });
 
@@ -644,9 +638,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       // Parent is selected, not the child
       locationPath: `/workspace/${parentId}`,
     });
@@ -1092,9 +1084,7 @@ describe("WorkspaceContext", () => {
       workspace: {
         list: () => Promise.resolve(initialWorkspaces),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: "/workspace/ws-remove",
     });
 
@@ -1128,9 +1118,7 @@ describe("WorkspaceContext", () => {
             }),
           ]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${selected}`,
     });
     currentClientMock.tasks = {
@@ -1164,9 +1152,7 @@ describe("WorkspaceContext", () => {
             }),
           ]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${workspaceId}`,
     });
 
@@ -1563,9 +1549,7 @@ describe("WorkspaceContext", () => {
       workspace: {
         list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-existing", "/existing")]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: "/workspace/ws-existing",
     });
 
@@ -1588,9 +1572,7 @@ describe("WorkspaceContext", () => {
       workspace: {
         list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-existing", "/existing")]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: "/workspace/ws-existing",
     });
 
@@ -1648,7 +1630,7 @@ describe("WorkspaceContext", () => {
     createMockAPI({
       workspace: { list: () => Promise.resolve([workspace]) },
       projects: { list: () => Promise.resolve([[projectPath, { workspaces: [] }]]) },
-      localStorage: { [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace") },
+      launchBehavior: "last-workspace",
     });
     const first = await setup();
     await waitFor(() => expect(first().loading).toBe(false));
@@ -1702,9 +1684,7 @@ describe("WorkspaceContext", () => {
       workspace: {
         list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-open-chat", "/existing")]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
       locationPath: "/workspace/ws-open-chat",
       navigationType: "reload",
     });
@@ -1733,9 +1713,7 @@ describe("WorkspaceContext", () => {
             }),
           ]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
       locationPath: `/workspace/${workspaceId}`,
       navigationType: "navigate",
     });
@@ -1755,9 +1733,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([["/existing", { workspaces: [] }]]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
       locationPath: "/workspace/ws-missing",
       navigationType: "navigate",
     });
@@ -1787,8 +1763,8 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([["/existing", { workspaces: [] }]]),
       },
+      launchBehavior: "dashboard",
       localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
         [SELECTED_WORKSPACE_KEY]: JSON.stringify(persistedSelection),
       },
       locationPath: "/workspace/ws-maybe-alive",
@@ -1849,9 +1825,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
     });
 
     const ctx = await setup();
@@ -1874,9 +1848,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
       desktopMode: true,
     });
 
@@ -1933,9 +1905,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
     });
 
     const ctx = await setup();
@@ -1959,9 +1929,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
     });
 
     const ctx = await setup();
@@ -1985,9 +1953,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -2012,9 +1978,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -2039,9 +2003,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -2082,9 +2044,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -2118,9 +2078,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -2145,9 +2103,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: "/workspace/ws-existing",
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
@@ -2679,6 +2635,7 @@ interface MockAPIOptions {
   projects?: TestApiOverrides<APIClient["projects"]>;
   server?: TestApiOverrides<APIClient["server"]>;
   localStorage?: Record<string, string>;
+  launchBehavior?: LaunchBehavior;
   locationHash?: string;
   locationPath?: string;
   desktopMode?: boolean;
@@ -2697,6 +2654,12 @@ function createMockAPI(options: MockAPIOptions = {}) {
     for (const [key, value] of Object.entries(options.localStorage)) {
       globalThis.localStorage.setItem(key, value);
     }
+  }
+
+  if (options.launchBehavior) {
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { navigation: { launchBehavior: options.launchBehavior } },
+    });
   }
 
   if (options.desktopMode) {

@@ -34,10 +34,8 @@ import {
   GATEWAY_ENABLED_KEY,
   GATEWAY_MODELS_KEY,
   HIDDEN_MODELS_KEY,
-  LAUNCH_BEHAVIOR_KEY,
   RUNTIME_ENABLEMENT_KEY,
   SELECTED_WORKSPACE_KEY,
-  type LaunchBehavior,
 } from "@/common/constants/storage";
 import { deleteWorkspaceStorage, migrateWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -54,6 +52,7 @@ import {
 } from "@/browser/hooks/usePersistedState";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { isTerminalTab } from "@/browser/types/rightSidebar";
 import {
   collectAllTabs,
@@ -2055,7 +2054,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       return;
     }
 
-    const behavior = readPersistedState<LaunchBehavior>(LAUNCH_BEHAVIOR_KEY, "dashboard");
+    const behavior = getUserPreferences().navigation?.launchBehavior ?? "dashboard";
     let cancelled = false;
 
     const resolveStartupRootRoute = async () => {

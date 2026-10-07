@@ -10,6 +10,7 @@ import {
 import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
 import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useAPI } from "@/browser/contexts/API";
@@ -25,7 +26,6 @@ import {
   TERMINAL_BADGE_CONFIG_KEY,
   TERMINAL_BADGE_POSITIONS,
   DEFAULT_TERMINAL_BADGE_CONFIG,
-  LAUNCH_BEHAVIOR_KEY,
   BASH_COLLAPSED_SUMMARY_MODE_KEY,
   BASH_COLLAPSED_SUMMARY_MODES,
   CHAT_TRANSCRIPT_FULL_WIDTH_KEY,
@@ -230,9 +230,8 @@ export function GeneralSection() {
     telemetry.experimentOverridden(EXPERIMENT_IDS.CONTINUOUS_COMPACTION, value === "continuous");
     telemetry.experimentOverridden(EXPERIMENT_IDS.TOKEN_BUDGET, value === "token-budget");
   };
-  const [launchBehavior, setLaunchBehavior] = usePersistedState<LaunchBehavior>(
-    LAUNCH_BEHAVIOR_KEY,
-    "dashboard"
+  const launchBehavior = useUserPreferences(
+    (preferences) => preferences.navigation?.launchBehavior ?? "dashboard"
   );
   const [rawBashCollapsedSummaryMode, setBashCollapsedSummaryMode] = usePersistedState<unknown>(
     BASH_COLLAPSED_SUMMARY_MODE_KEY,
@@ -787,7 +786,9 @@ export function GeneralSection() {
             </div>
             <Select
               value={launchBehavior}
-              onValueChange={(value) => setLaunchBehavior(value as LaunchBehavior)}
+              onValueChange={(value) =>
+                updateUserPreferences({ navigation: { launchBehavior: value as LaunchBehavior } })
+              }
             >
               <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
                 <SelectValue />

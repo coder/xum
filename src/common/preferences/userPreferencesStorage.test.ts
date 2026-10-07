@@ -8,7 +8,6 @@ import {
   removeStoredUserPreference,
 } from "./userPreferencesStorage";
 import {
-  PROJECT_ORDER_KEY,
   PROVIDER_OPTIONS_ANTHROPIC_KEY,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
   getAgentIdKey,
@@ -59,7 +58,6 @@ describe("user preference localStorage registry", () => {
   test("collects semantic preferences from legacy localStorage keys", () => {
     const storage = new MemoryStorage();
     const projectScope = getProjectScopeId("/repo");
-    storage.setJSON(PROJECT_ORDER_KEY, ["/repo"]);
     storage.setJSON(getAgentIdKey(projectScope), "plan");
     storage.setJSON(getModelKey(projectScope), "openai:gpt-4.1");
     storage.setJSON(getThinkingLevelKey(projectScope), "high");
@@ -73,7 +71,6 @@ describe("user preference localStorage registry", () => {
     storage.setJSON(getReviewDefaultBaseKey("/repo"), "origin/main");
 
     expect(collectForTest(storage)).toEqual({
-      navigation: { projectOrder: ["/repo"] },
       ai: {
         projectDefaults: {
           "/repo": {
@@ -116,7 +113,6 @@ describe("user preference localStorage registry", () => {
         terminalFontConfig: { fontFamily: "Geist Mono", fontSize: 13 },
         editorConfig: { editor: "custom", customCommand: "code --goto" },
       },
-      navigation: { launchBehavior: "new-chat", projectOrder: ["/repo"] },
       ai: {
         globalDefaults: { agentId: "exec", thinkingLevel: "medium" },
         projectDefaults: {

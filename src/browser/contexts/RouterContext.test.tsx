@@ -5,12 +5,21 @@ import { GlobalWindow } from "happy-dom";
 import { StrictMode } from "react";
 import { useLocation, useNavigate, type NavigateFunction } from "react-router-dom";
 import type { WorkspaceSelection } from "@/browser/components/AgentListItem/AgentListItem";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   LAST_VISITED_ROUTE_KEY,
-  LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
+  type LaunchBehavior,
 } from "@/common/constants/storage";
 import { RouterProvider, useRouter, type RouterContext } from "./RouterContext";
+
+function setLaunchBehavior(launchBehavior: LaunchBehavior) {
+  getAppConfigStore().updateOptimistically({ userPreferences: { navigation: { launchBehavior } } });
+}
+
+afterEach(() => {
+  getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+});
 
 function createMatchMedia(isStandalone = false): typeof window.matchMedia {
   return ((query: string) =>
@@ -327,7 +336,7 @@ describe("browser startup launch behavior", () => {
 
   test("dashboard mode preserves a direct /workspace/:id URL", async () => {
     installWindow("https://mux.example.com/workspace/direct-123");
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("dashboard"));
+    setLaunchBehavior("dashboard");
 
     const view = render(
       <RouterProvider>
@@ -342,7 +351,7 @@ describe("browser startup launch behavior", () => {
 
   test("same-tab browser reload preserves a /workspace/:id URL in dashboard mode", async () => {
     installWindow("https://mux.example.com/workspace/reload-me", { navigationType: "reload" });
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("dashboard"));
+    setLaunchBehavior("dashboard");
 
     const view = render(
       <RouterProvider>
@@ -357,7 +366,7 @@ describe("browser startup launch behavior", () => {
 
   test("last-workspace mode preserves a /workspace/:id URL", async () => {
     installWindow("https://mux.example.com/workspace/stale-123");
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("last-workspace"));
+    setLaunchBehavior("last-workspace");
 
     const view = render(
       <RouterProvider>
@@ -372,7 +381,7 @@ describe("browser startup launch behavior", () => {
 
   test("dashboard mode still preserves non-workspace routes", async () => {
     installWindow("https://mux.example.com/settings/general");
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("dashboard"));
+    setLaunchBehavior("dashboard");
 
     const view = render(
       <RouterProvider>
@@ -523,7 +532,7 @@ describe("browser tab history (#5699)", () => {
 
   test("a startup redirect replaces the tab's entry instead of adding one", async () => {
     installWindow("https://mux.example.com/");
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("last-workspace"));
+    setLaunchBehavior("last-workspace");
     window.localStorage.setItem(
       SELECTED_WORKSPACE_KEY,
       JSON.stringify({ workspaceId: "saved" } satisfies Pick<WorkspaceSelection, "workspaceId">)
@@ -586,7 +595,7 @@ describe("desktop startup route restoration", () => {
     };
 
     window.localStorage.setItem(LAST_VISITED_ROUTE_KEY, JSON.stringify("/"));
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("last-workspace"));
+    setLaunchBehavior("last-workspace");
     window.localStorage.setItem(SELECTED_WORKSPACE_KEY, JSON.stringify(savedWorkspace));
 
     const view = render(
@@ -766,7 +775,7 @@ describe("standalone PWA startup", () => {
       projectName: "Test Project",
       namedWorkspacePath: "/tmp/project/workspace-123",
     };
-    window.localStorage.setItem(LAUNCH_BEHAVIOR_KEY, JSON.stringify("last-workspace"));
+    setLaunchBehavior("last-workspace");
     window.localStorage.setItem(SELECTED_WORKSPACE_KEY, JSON.stringify(savedWorkspace));
 
     const view = render(
