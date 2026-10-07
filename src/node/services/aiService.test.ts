@@ -19,7 +19,7 @@ import { HistoryService } from "./historyService";
 import { CompactionCancellation } from "./compactionCancellation";
 import { InitStateManager } from "./initStateManager";
 import { ProviderService } from "./providerService";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { Config, ProvidersConfigStore } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -154,6 +154,18 @@ const TEST_CODEX_OAUTH = {
   expires: Date.now() + 60_000,
   accountId: "test-account-id",
 };
+
+async function experimentsServiceWith(
+  xumHome: string,
+  enabled: ExperimentId[]
+): Promise<ExperimentsService> {
+  const service = new ExperimentsService({
+    telemetryService: new TelemetryService(xumHome),
+    xumHome,
+  });
+  for (const id of enabled) await service.setOverride(id, true);
+  return service;
+}
 
 function createBasicAIService(
   root?: string,
@@ -1320,7 +1332,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     async (identity) => {
       using xumHome = new DisposableTempDir("ai-service-compaction-budget");
       const metadata = createLocalWorkspaceMetadata("compaction-budget", xumHome.path);
-      const harness = createHarness(xumHome.path, metadata);
+      const harness = createHarness(xumHome.path, metadata, {
+        experimentsService: await experimentsServiceWith(xumHome.path, [
+          EXPERIMENT_IDS.TOKEN_BUDGET,
+          EXPERIMENT_IDS.MEMORY,
+        ]),
+      });
       const compactionMetadata = {
         type: "compaction-request" as const,
         rawCommand: "/compact",
@@ -1354,7 +1371,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         messages,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { tokenBudget: true, memory: true },
         ...(identity === "send-metadata" ? { muxMetadata: compactionMetadata } : {}),
       });
       const shouldBypass = identity !== "ordinary" && identity !== "historical";
@@ -1729,7 +1745,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId,
       modelString: sourceModel,
       thinkingLevel: "off",
-      experiments: { memory: true },
       resolveMemoryContext,
     });
     expect(result.success).toBe(true);
@@ -1761,6 +1776,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const harness = createHarness(xumHome.path, metadata, {
       allTools: { session_history: { inputSchema: jsonSchema({ type: "object" }) } },
       useRequestedModelString: true,
+      experimentsService: await experimentsServiceWith(
+        xumHome.path,
+        tokenBudget ? [EXPERIMENT_IDS.TOKEN_BUDGET, EXPERIMENT_IDS.MEMORY] : [EXPERIMENT_IDS.MEMORY]
+      ),
     });
     const seenModels: string[] = [];
     const unregister = eventSpine.useRequestContext(
@@ -1786,7 +1805,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId: metadata.id,
         modelString: sourceModel,
         thinkingLevel: "off" as const,
-        experiments: { tokenBudget, memory: true },
       };
       expect(
         (
@@ -1823,7 +1841,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   it("a measure-only reassembly reproduces the sent request without rerunning hooks", async () => {
     using xumHome = new DisposableTempDir("ai-measure-only-assembly");
     const metadata = createLocalWorkspaceMetadata("measure-only", xumHome.path);
-    const harness = createHarness(xumHome.path, metadata);
+    const harness = createHarness(xumHome.path, metadata, {
+      experimentsService: await experimentsServiceWith(xumHome.path, [
+        EXPERIMENT_IDS.TOKEN_BUDGET,
+        EXPERIMENT_IDS.MEMORY,
+      ]),
+    });
     const hook = mock((ctx: RequestAssembleContext) => {
       ctx.systemMessage += "\nhooked-context";
     });
@@ -1837,7 +1860,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId: metadata.id,
         modelString: KNOWN_MODELS.SONNET.id,
         thinkingLevel: "off",
-        experiments: { tokenBudget: true, memory: true },
       });
       expect(result.success).toBe(true);
       expect(hook).toHaveBeenCalledTimes(1);
@@ -2050,6 +2072,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for memory availability gating
     const stubTool: Tool = {} as never;
     const harness = createHarness(xumHome.path, metadata, {
+      experimentsService: await experimentsServiceWith(xumHome.path, [EXPERIMENT_IDS.MEMORY]),
       allTools: { memory: stubTool },
       // Tool policy strips the memory tool: the final prompt must not claim
       // the memory tool is enabled (memoryToolAvailable gates the
@@ -2068,7 +2091,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { memory: true },
       resolveMemoryContext: (_modelString, options) => {
         memoryCalls.push({ includeHotMemories: options?.includeHotMemories !== false });
         return Promise.resolve({ indexEntries: [], hotMemoriesBlock: null });
@@ -2129,42 +2151,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       ...definition,
     })),
     {
-      name: "per-send false overriding host true",
-      memory: true,
-      intuition: true,
-      memoryIntuitionOverride: false,
-      child: false,
-      service: true,
-      eligible: false,
-    },
-    {
-      name: "per-send true overriding host false",
-      memory: true,
-      intuition: false,
-      memoryIntuitionOverride: true,
-      child: false,
-      service: true,
-      eligible: true,
-    },
-    {
-      name: "per-send true still gated by parent memory",
-      memory: false,
-      intuition: false,
-      memoryIntuitionOverride: true,
-      child: false,
-      service: true,
-      eligible: false,
-    },
-    {
-      name: "per-send true still gated in subagents",
-      memory: true,
-      intuition: false,
-      memoryIntuitionOverride: true,
-      child: true,
-      service: true,
-      eligible: false,
-    },
-    {
       name: "disabled memory",
       memory: false,
       intuition: true,
@@ -2197,7 +2183,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         xumHome: xumHome.path,
       });
       spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION && scenario.intuition
+        (id) =>
+          (id === EXPERIMENT_IDS.MEMORY_INTUITION && scenario.intuition) ||
+          (id === EXPERIMENT_IDS.MEMORY && scenario.memory)
       );
       const harness = createHarness(xumHome.path, metadata, { experimentsService });
       const agent = resolvedAgentResultFor(metadata);
@@ -2243,11 +2231,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId: metadata.id,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: {
-          memory: scenario.memory,
-          memoryIntuition:
-            "memoryIntuitionOverride" in scenario ? scenario.memoryIntuitionOverride : undefined,
-        },
       });
       expect(result.success).toBe(true);
       const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime;
@@ -2281,7 +2264,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         xumHome: xumHome.path,
       });
       spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
       );
       const harness = createHarness(xumHome.path, metadata, { experimentsService });
       harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
@@ -2322,7 +2305,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId: metadata.id,
         modelString: selected,
         thinkingLevel: "high",
-        experiments: { memory: true },
       });
       expect(result.success).toBe(true);
       expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.thinkingLevel).toBe(
@@ -2348,7 +2330,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         xumHome: xumHome.path,
       });
       spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
       );
       const harness = createHarness(xumHome.path, metadata, { experimentsService });
       harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
@@ -2366,7 +2348,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId: metadata.id,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { memory: true },
       });
       expect(result.success).toBe(true);
       const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime;
@@ -2408,7 +2389,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         xumHome: xumHome.path,
       });
       spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
       );
       const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
       const harness = createHarness(xumHome.path, metadata, {
@@ -2431,7 +2412,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId: metadata.id,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { memory: true },
       });
       expect(result.success).toBe(true);
       expect(harness.startStreamCalls[0]?.tools?.intuition).toBeUndefined();
@@ -2614,7 +2594,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         xumHome: xumHome.path,
       });
       spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
       );
       const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
       const harness = createHarness(xumHome.path, metadata, {
@@ -2638,7 +2618,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           workspaceId: metadata.id,
           modelString: "openai:gpt-5.2",
           thinkingLevel: "off",
-          experiments: { memory: true },
         });
         expect(result.success).toBe(true);
         expect(harness.startStreamCalls[0]?.tools?.intuition).toBeUndefined();
@@ -2662,6 +2641,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for memory availability gating
     const stubTool: Tool = {} as never;
     const harness = createHarness(xumHome.path, metadata, {
+      experimentsService: await experimentsServiceWith(xumHome.path, [EXPERIMENT_IDS.MEMORY]),
       allTools: { memory: stubTool },
     });
     harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
@@ -2675,7 +2655,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { memory: true },
       resolveMemoryContext: (_modelString, options) => {
         memoryCalls.push({ includeHotMemories: options?.includeHotMemories !== false });
         return Promise.resolve({ indexEntries: [], hotMemoriesBlock: null });
@@ -2892,7 +2871,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           xumHome: xumHomePath,
         });
         spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-          (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+          (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
         );
       }
       const harness = createHarness(
@@ -2947,7 +2926,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           modelString: "openai:gpt-5.2",
           thinkingLevel: "off",
           agentId,
-          experiments: { memory: options?.memory },
           workspaceGoalService: options?.workspaceGoalService,
         });
         expect(result.success).toBe(true);
@@ -3152,7 +3130,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         xumHome: xumHomePath,
       });
       spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY
+        (id) => id === EXPERIMENT_IDS.MEMORY || id === EXPERIMENT_IDS.TOKEN_BUDGET
       );
       const harness = createHarness(
         xumHomePath,
@@ -3229,7 +3207,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           modelString: KNOWN_MODELS.SONNET.id,
           thinkingLevel: "off",
           agentId: state.agentId ?? "exec",
-          experiments: { tokenBudget: true, memory: true },
           contextBudgetRolloverAvailable: state.rolloverAvailable === true,
           workspaceGoalService: goalService,
         });
@@ -3396,7 +3373,15 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const workspaceId = "workspace-session-scope";
       const harness = createHarness(
         xumHome.path,
-        createLocalWorkspaceMetadata(workspaceId, projectPath)
+        createLocalWorkspaceMetadata(workspaceId, projectPath),
+        {
+          experimentsService: await experimentsServiceWith(
+            xumHome.path,
+            tokenBudget
+              ? [EXPERIMENT_IDS.TOKEN_BUDGET, EXPERIMENT_IDS.MEMORY]
+              : [EXPERIMENT_IDS.MEMORY]
+          ),
+        }
       );
 
       const result = await harness.service.streamMessage({
@@ -3404,7 +3389,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { tokenBudget, memory: true },
       });
 
       expect(result.success).toBe(true);
@@ -4348,7 +4332,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       xumHome: xumHome.path,
     });
     spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-      (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+      (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
     );
     const harness = createHarness(xumHome.path, metadata, { experimentsService });
     harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
@@ -4372,7 +4356,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       workspaceId: metadata.id,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      experiments: { memory: true },
     });
     expect(result.success).toBe(true);
     const tools = harness.getToolsForModelSpy.mock.calls[0]?.[1];
@@ -4421,7 +4404,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         xumHome: xumHome.path,
       });
       spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
       );
       const harness = createHarness(xumHome.path, metadata, {
         sessionUsageService,
@@ -4461,7 +4444,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { memory: true },
       });
 
       expect(result.success).toBe(true);
@@ -5233,7 +5215,6 @@ describe("AIService.streamMessage volatile system content (#5251)", () => {
         workspaceId,
         modelString: KNOWN_MODELS.SONNET.id,
         thinkingLevel: "off",
-        experiments: { memory: true },
         resolveMemoryContext: () =>
           Promise.resolve({ indexEntries: [], hotMemoriesBlock: turn.hot }),
       });

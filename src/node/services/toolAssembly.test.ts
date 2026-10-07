@@ -9,7 +9,7 @@ import * as path from "node:path";
 import { z } from "zod";
 import type { Tool } from "ai";
 
-import { applyToolPolicyAndExperiments, resolveBackendGatedPtcExperiments } from "./toolAssembly";
+import { applyToolPolicyAndExperiments } from "./toolAssembly";
 import { buildToolsetManifest } from "./turnEnvelope";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -746,40 +746,6 @@ describe("toolset composition (PTC × RLM)", () => {
   });
 });
 
-describe("resolveBackendGatedPtcExperiments", () => {
-  const backendEnabled = new Set(["rlm-mode", "programmatic-tool-calling"]);
-  const isEnabled = (id: string) => backendEnabled.has(id);
-
-  test("backfills undefined flags from the backend override", () => {
-    // A renderer with no origin-local override sends undefined; the persisted
-    // backend override must win or tool assembly diverges from the effective
-    // UI / refine gate.
-    const resolved = resolveBackendGatedPtcExperiments(undefined, isEnabled);
-    expect(resolved.rlm).toBe(true);
-    expect(resolved.programmaticToolCalling).toBe(true);
-  });
-
-  test("explicit renderer values (true or false) win over the backend", () => {
-    const resolved = resolveBackendGatedPtcExperiments({ rlm: false }, isEnabled);
-    // Explicit false is NOT backfilled to the backend's true.
-    expect(resolved.rlm).toBe(false);
-    // Undefined still backfills.
-    expect(resolved.programmaticToolCalling).toBe(true);
-
-    // Explicit true wins over a backend-disabled flag.
-    const explicitTrue = resolveBackendGatedPtcExperiments(
-      { programmaticToolCalling: true },
-      () => false
-    );
-    expect(explicitTrue.programmaticToolCalling).toBe(true);
-  });
-
-  test("preserves unrelated experiment flags untouched", () => {
-    const resolved = resolveBackendGatedPtcExperiments({ memory: true }, isEnabled);
-    expect(resolved.memory).toBe(true);
-  });
-});
-
 describe("token budget history policy", () => {
   test.each([
     { add: [], allowed: false },
@@ -892,17 +858,6 @@ describe("token budget history policy", () => {
       { toolCallId: "history-ptc", messages: [], context: undefined }
     )) as { success: boolean; result?: unknown };
     expect(execution).toMatchObject({ success: true, result: "undefined" });
-  });
-
-  test("token budget honors renderer overrides before backend defaults and needs memory", () => {
-    const tokenBudget = (
-      experiments: Parameters<typeof resolveBackendGatedPtcExperiments>[0],
-      enabled: boolean
-    ) => resolveBackendGatedPtcExperiments(experiments, () => enabled).tokenBudget;
-    expect(tokenBudget(undefined, true)).toBe(true);
-    expect(tokenBudget({ tokenBudget: false }, true)).toBe(false);
-    expect(tokenBudget({ tokenBudget: true, memory: true }, false)).toBe(true);
-    expect(tokenBudget({ tokenBudget: true, memory: false }, true)).toBe(false);
   });
 });
 

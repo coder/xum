@@ -28,7 +28,11 @@ import {
   resolveHeadlessAgentDefinition,
   resolveHeadlessAgentSettings,
 } from "@/node/services/memoryConsolidationService";
-import { EXPERIMENT_IDS, isTokenBudgetActive } from "@/common/constants/experiments";
+import {
+  EXPERIMENT_IDS,
+  isTokenBudgetActive,
+  type ExperimentId,
+} from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
@@ -235,11 +239,7 @@ import {
   simulateToolPolicyNoop,
   type SimulationContext,
 } from "./streamSimulation";
-import {
-  applyToolPolicyAndExperiments,
-  captureMcpToolTelemetry,
-  resolveBackendGatedPtcExperiments,
-} from "./toolAssembly";
+import { applyToolPolicyAndExperiments, captureMcpToolTelemetry } from "./toolAssembly";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 
 const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
@@ -348,7 +348,6 @@ export interface StreamMessageOptions {
     modelString: string,
     options?: { includeHotMemories?: boolean }
   ) => Promise<MemorySessionContext | undefined>;
-  experiments?: SendMessageOptions["experiments"];
   workspaceGoalService?: WorkspaceGoalService;
   /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
   goalTurnKind?: GoalSyntheticMessageKind;
@@ -629,7 +628,7 @@ interface TurnRequestBuilderDependencies {
   backgroundProcessManager?: BackgroundProcessManager;
   sessionUsageService?: SessionUsageService;
   devToolsService?: DevToolsService;
-  experimentsService?: ExperimentsService;
+  experimentsService?: Pick<ExperimentsService, "isExperimentEnabled">;
   lastLlmRequestByWorkspace: Map<string, DebugLlmRequestSnapshot>;
   bindings: TurnRequestBuilderBindings;
   emit: (event: string, ...args: unknown[]) => boolean;
@@ -999,7 +998,6 @@ export class TurnRequestBuilder {
       recordProposedPlan,
       postCompactionAttachments,
       resolveMemoryContext,
-      experiments: experimentsFromOptions,
       workspaceGoalService,
       goalTurnKind,
       goalTurnGoalId,
@@ -1019,11 +1017,14 @@ export class TurnRequestBuilder {
     let modelString = opts.modelString;
     let autoModelRouting = opts.autoModelRouting;
     let activeTurnThinkingOverride = opts.activeTurnThinkingOverride;
-    const experiments: StreamMessageOptions["experiments"] = resolveBackendGatedPtcExperiments(
-      experimentsFromOptions,
-      (experimentId) =>
-        this.dependencies.experimentsService?.isExperimentEnabled(experimentId) === true
-    );
+    const isExperimentEnabled = (id: ExperimentId) =>
+      this.dependencies.experimentsService?.isExperimentEnabled(id) === true;
+    const experiments = {
+      programmaticToolCalling: isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
+      rlm: isExperimentEnabled(EXPERIMENT_IDS.RLM),
+      tokenBudget: isTokenBudgetActive(undefined, isExperimentEnabled),
+      continuousCompaction: isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION),
+    };
     const combinedAbortSignal = context.abortSignal;
     const syntheticMessageId = context.syntheticMessageId;
     const startTime = context.startTime;
@@ -1517,26 +1518,14 @@ export class TurnRequestBuilder {
       : undefined;
 
     const cfg = this.dependencies.config.loadConfigOrDefault();
-    const memoryExperimentEnabled =
-      experiments?.memory ??
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) === true;
-    const isExperimentEnabled = (id: Parameters<ExperimentsService["isExperimentEnabled"]>[0]) =>
-      this.dependencies.experimentsService?.isExperimentEnabled(id) === true;
-    const sessionHistoryEnabled = isTokenBudgetActive(experiments, isExperimentEnabled);
+    const memoryExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.MEMORY);
+    const sessionHistoryEnabled = experiments.tokenBudget;
     // Tool search is a host-level user setting (default on); sub-agents and CLI
     // runs follow the same config.
     const toolSearchEnabled = cfg.toolSearchEnabled !== false;
-    const artifactsExperimentEnabled =
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS) === true;
-    const memoryIntuitionExperimentEnabled =
-      experiments?.memoryIntuition ??
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION) ===
-        true;
-    const memoryHotSetExperimentEnabled =
-      this.dependencies.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) ===
-      true;
-    // claude-skills-compat is host-evaluated (like memory-hot-set): sub-agents share the
-    // host ExperimentsService, so it is not inherited through SendMessageOptions.experiments.
+    const artifactsExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS);
+    const memoryIntuitionExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION);
+    const memoryHotSetExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
     const claudeSkillsCompatExperimentEnabled = this.dependencies.isClaudeSkillsCompatEnabled();
     // Once final tool policy keeps the memory tool, upgrade the index-only
     // memory context (resolved pre-policy with includeHotMemories: false) to
@@ -1607,10 +1596,7 @@ export class TurnRequestBuilder {
     const tokenBudgetEnabled =
       !isCompactionRequest &&
       sessionHistoryEnabled &&
-      !(
-        experiments?.continuousCompaction ??
-        isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION)
-      ) &&
+      !experiments.continuousCompaction &&
       !isRlmModeEnabled(experiments, isExperimentEnabled);
     const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
     const memoryAccess: MemoryScopeAccess = resolveMemoryAccessPolicy({
@@ -2661,7 +2647,7 @@ export class TurnRequestBuilder {
       runtime: toolsForModelConfig.runtime,
       hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
     });
-    const ptcEnabled = experiments?.programmaticToolCalling === true;
+    const ptcEnabled = experiments.programmaticToolCalling;
     const mcpWarningSection = mcpStats
       ? formatMcpWarningSection(mcpStats.failedServerCount, mcpStats.failedServerNames)
       : undefined;
