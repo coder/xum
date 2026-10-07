@@ -205,7 +205,6 @@ interface RenderGeneralSectionOptions {
   keepScreenAwake?: boolean;
   /** Render as the Electron app (window.api set by the preload) instead of browser mode. */
   desktop?: boolean;
-  localOverrides?: ExperimentOverrides;
   backendOverrides?: ExperimentOverrides;
   children?: React.ReactNode;
 }
@@ -378,9 +377,6 @@ describe("GeneralSection", () => {
   });
 
   function renderGeneralSection(options: RenderGeneralSectionOptions = {}) {
-    for (const [id, enabled] of Object.entries(options.localOverrides ?? {})) {
-      window.localStorage.setItem(getExperimentKey(id as ExperimentId), JSON.stringify(enabled));
-    }
     const setup = createMockAPI(
       {
         chatTranscriptFullWidth: options.chatTranscriptFullWidth,
@@ -470,31 +466,24 @@ describe("GeneralSection", () => {
     });
   }
 
-  for (const source of ["localOverrides", "backendOverrides"] as const) {
-    test.each(legacyStrategies)(
-      `displays ${source} continuous=$continuous budget=$budget without normalizing on mount`,
-      async ({ continuous, budget, label }) => {
-        const overrides = {
-          [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: continuous,
-          [EXPERIMENT_IDS.TOKEN_BUDGET]: budget,
-          [EXPERIMENT_IDS.MEMORY]: true,
-        };
-        const setup = renderGeneralSection({ [source]: overrides });
-        await hydrateExperiments(setup);
-        expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
-          label
-        );
-        expect(setup.backendOverrides).toEqual(source === "backendOverrides" ? overrides : {});
-        expect(experimentOverriddenMock).not.toHaveBeenCalled();
-        expect(setup.setMock).not.toHaveBeenCalled();
-        for (const [id, enabled] of Object.entries(overrides)) {
-          expect(window.localStorage.getItem(getExperimentKey(id as ExperimentId))).toBe(
-            source === "localOverrides" ? JSON.stringify(enabled) : null
-          );
-        }
-      }
-    );
-  }
+  test.each(legacyStrategies)(
+    "displays continuous=$continuous budget=$budget without normalizing on mount",
+    async ({ continuous, budget, label }) => {
+      const overrides = {
+        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: continuous,
+        [EXPERIMENT_IDS.TOKEN_BUDGET]: budget,
+        [EXPERIMENT_IDS.MEMORY]: true,
+      };
+      const setup = renderGeneralSection({ backendOverrides: overrides });
+      await hydrateExperiments(setup);
+      expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
+        label
+      );
+      expect(setup.backendOverrides).toEqual(overrides);
+      expect(experimentOverriddenMock).not.toHaveBeenCalled();
+      expect(setup.setMock).not.toHaveBeenCalled();
+    }
+  );
 
   test("defaults to Summarize without persisting an implicit choice", async () => {
     const setup = renderGeneralSection();
@@ -509,39 +498,6 @@ describe("GeneralSection", () => {
     ).toBeNull();
     expect(window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET))).toBeNull();
   });
-
-  test.each([
-    {
-      local: { [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: false },
-      backend: {
-        [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: true,
-        [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
-        [EXPERIMENT_IDS.MEMORY]: true,
-      },
-      label: "Token Budget",
-    },
-    {
-      local: { [EXPERIMENT_IDS.TOKEN_BUDGET]: false },
-      backend: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true },
-      label: "Summarize",
-    },
-    {
-      local: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true },
-      backend: { [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: true },
-      label: "Continuous",
-    },
-  ])(
-    "resolves local overrides before backend values and defaults ($label)",
-    async ({ local, backend, label }) => {
-      const setup = renderGeneralSection({ localOverrides: local, backendOverrides: backend });
-      await hydrateExperiments(setup);
-      expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
-        label
-      );
-      expect(setup.backendOverrides).toEqual(backend);
-      expect(setup.setMock).not.toHaveBeenCalled();
-    }
-  );
 
   for (const initial of legacyStrategies) {
     test.each(legacyStrategies.slice(0, 3).filter((next) => next.label !== initial.label))(
