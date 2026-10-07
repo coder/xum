@@ -16,9 +16,9 @@
  *     [--scenarios bigfile-stats,control-quick] [--configs ptc-only,rlm-base,rlm-nudge] \
  *     [--out /tmp/rlm-eval-results.jsonl]
  *
- * Each cell gets a fresh scratch workspace; experiment flags ride the send
- * options (they win over machine overrides), so no Settings mutation is
- * needed. Results append to the --out JSONL (git SHA recorded per row for
+ * Each cell gets a fresh scratch workspace, and the config's experiment flags
+ * are written to the sandbox's experiment settings before it runs (cells run
+ * one at a time). Results append to the --out JSONL (git SHA recorded per row for
  * cross-build tool-description comparisons) and an aggregate table prints at
  * the end.
  */
@@ -246,6 +246,14 @@ async function runCell(
   if (workspaceId === "") throw new Error("createScratch returned no workspace id");
   const sessionDir = path.join(args.root, "sessions", workspaceId);
 
+  await post(args.baseUrl, "/experiments/set", {
+    experimentId: "programmatic-tool-calling",
+    enabled: config.experiments.programmaticToolCalling,
+  });
+  await post(args.baseUrl, "/experiments/set", {
+    experimentId: "rlm-mode",
+    enabled: config.experiments.rlm,
+  });
   for (let i = 0; i < turns.length; i++) {
     await post(args.baseUrl, "/workspace/sendMessage", {
       workspaceId,
@@ -254,7 +262,6 @@ async function runCell(
         model: args.model,
         thinkingLevel: args.thinking,
         agentId: "exec",
-        experiments: config.experiments,
         ...(config.nudge !== undefined ? { additionalSystemInstructions: config.nudge } : {}),
       },
     });
