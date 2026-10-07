@@ -28,11 +28,6 @@ import {
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   getWorkspaceNameStateKey,
-  AGENT_AI_DEFAULTS_KEY,
-  DEFAULT_MODEL_KEY,
-  DEFAULT_RUNTIME_KEY,
-  HIDDEN_MODELS_KEY,
-  RUNTIME_ENABLEMENT_KEY,
   SELECTED_WORKSPACE_KEY,
 } from "@/common/constants/storage";
 import { deleteWorkspaceStorage, migrateWorkspaceStorage } from "@/browser/utils/workspaceStorage";
@@ -40,14 +35,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { useAPI } from "@/browser/contexts/API";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
-import {
-  readPersistedState,
-  readPersistedString,
-  isPersistedStateStorageEvent,
-  subscribePersistedStateWrites,
-  syncPersistedStateFromBackend,
-  updatePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getUserPreferences } from "@/browser/stores/AppConfigStore";
@@ -57,13 +45,11 @@ import {
   parseRightSidebarLayoutState,
   removeTabEverywhere,
 } from "@/browser/utils/rightSidebarLayout";
-import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { appendPinnedTimestamp, reassignPinnedTimestamps } from "@/common/utils/pin";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
 import { useRouter } from "@/browser/contexts/RouterContext";
-import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
@@ -85,62 +71,6 @@ import {
   type WorkspaceDraft,
 } from "@/browser/stores/DraftStore";
 import { createDraftId } from "@/common/utils/drafts";
-
-/**
- * Preserve legacy local model choices across port/origin changes.
- * Exported for focused migration tests.
- */
-export function migrateLocalModelPrefsToBackend(
-  api: APIClient,
-  cfg: Pick<
-    Awaited<ReturnType<APIClient["config"]["getConfig"]>>,
-    "defaultModel" | "hiddenModels" | "hiddenModelsInitialized"
-  >,
-  dirtyKeys: ReadonlySet<string> = new Set()
-) {
-  if (!api.config.updateModelPreferences) return cfg;
-
-  const localDefaultModelRaw = readPersistedString(DEFAULT_MODEL_KEY);
-  const localDefaultModel =
-    typeof localDefaultModelRaw === "string"
-      ? normalizeSelectedModel(localDefaultModelRaw).trim()
-      : undefined;
-  const localHiddenModels = readPersistedState<string[] | null>(HIDDEN_MODELS_KEY, null);
-
-  const patch: {
-    defaultModel?: string;
-    hiddenModels?: string[];
-  } = {};
-
-  // localStorage presence implies explicit user choice (usePersistedState never
-  // writes fallback defaults). Always migrate to backend so the preference
-  // survives future changes to the built-in default constant.
-  if (!dirtyKeys.has(DEFAULT_MODEL_KEY) && cfg.defaultModel === undefined && localDefaultModel) {
-    patch.defaultModel = localDefaultModel;
-  }
-
-  if (
-    !dirtyKeys.has(HIDDEN_MODELS_KEY) &&
-    (cfg.hiddenModelsInitialized === false ||
-      (cfg.hiddenModels === undefined &&
-        Array.isArray(localHiddenModels) &&
-        localHiddenModels.length > 0))
-  ) {
-    // Backend defaults are not evidence that legacy local preferences were imported.
-    patch.hiddenModels = [
-      ...new Set([
-        ...(cfg.hiddenModels ?? []),
-        ...(Array.isArray(localHiddenModels) ? localHiddenModels : []),
-      ]),
-    ];
-  }
-
-  if (Object.keys(patch).length > 0) {
-    // Migration persistence must not delay hydration of unrelated settings.
-    api.config.updateModelPreferences(patch).catch(() => undefined);
-  }
-  return { ...cfg, ...patch };
-}
 
 /**
  * Seed per-workspace localStorage from backend workspace metadata.
@@ -619,79 +549,6 @@ function buildActiveWorkspaceMetadataMap(
 export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const { api } = useAPI();
 
-  // Cache global agent defaults (plus legacy mode defaults) so non-react code paths can read them.
-  useEffect(() => {
-    if (!api?.config?.getConfig) return;
-
-    let active = true;
-    // Track writes, not just equality: toggling twice is still local intent.
-    const dirtyKeys = new Set<string>();
-    const initialPreferences = [DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY].map((key) => ({
-      key,
-      value: JSON.stringify(readPersistedState<unknown>(key, undefined)),
-    }));
-    const markDirty = (key: string | null) => {
-      for (const preference of initialPreferences) {
-        if (key === null || key === preference.key) dirtyKeys.add(preference.key);
-      }
-    };
-    const unsubscribeWrites = subscribePersistedStateWrites(({ key, source }) => {
-      if (source === "local") markDirty(key);
-    });
-    const storageWindow = window;
-    const onStorage = (event: StorageEvent) => {
-      if (isPersistedStateStorageEvent(event)) markDirty(event.key);
-    };
-    storageWindow.addEventListener("storage", onStorage);
-    const stopTrackingWrites = () => {
-      unsubscribeWrites();
-      storageWindow.removeEventListener("storage", onStorage);
-    };
-
-    api.config
-      .getConfig()
-      .then((cfg) => {
-        if (!active) return;
-        // Cross-tab writes can land before their queued storage events arrive.
-        for (const { key, value } of initialPreferences) {
-          if (JSON.stringify(readPersistedState<unknown>(key, undefined)) !== value)
-            dirtyKeys.add(key);
-        }
-        // Read legacy local preferences before backend hydration can overwrite them.
-        const modelPrefs = migrateLocalModelPrefsToBackend(api, cfg, dirtyKeys);
-        updatePersistedState(
-          AGENT_AI_DEFAULTS_KEY,
-          normalizeAgentAiDefaults(cfg.agentAiDefaults ?? {})
-        );
-
-        // Seed global model preferences from backend so switching ports doesn't reset the UI.
-        if (!dirtyKeys.has(DEFAULT_MODEL_KEY) && modelPrefs.defaultModel !== undefined) {
-          syncPersistedStateFromBackend(DEFAULT_MODEL_KEY, modelPrefs.defaultModel);
-        }
-        if (!dirtyKeys.has(HIDDEN_MODELS_KEY) && modelPrefs.hiddenModels !== undefined) {
-          syncPersistedStateFromBackend(HIDDEN_MODELS_KEY, modelPrefs.hiddenModels);
-        }
-
-        // Seed runtime enablement from backend so switching ports doesn't reset the UI.
-        if (cfg.runtimeEnablement !== undefined) {
-          updatePersistedState(RUNTIME_ENABLEMENT_KEY, cfg.runtimeEnablement);
-        }
-
-        // Seed global default runtime so workspace defaults survive port changes.
-        if (cfg.defaultRuntime !== undefined) {
-          updatePersistedState(DEFAULT_RUNTIME_KEY, cfg.defaultRuntime);
-        }
-      })
-      .catch(() => {
-        // Best-effort only.
-      })
-      .finally(stopTrackingWrites);
-
-    return () => {
-      active = false;
-      stopTrackingWrites();
-    };
-  }, [api]);
   // Get project refresh function from ProjectContext
   const {
     resolveProjectPath,

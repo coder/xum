@@ -98,16 +98,6 @@ export const EXPANDED_PROJECTS_KEY = "expandedProjects";
 export const WORKSPACE_DRAFTS_BY_PROJECT_KEY = "workspaceDraftsByProject";
 
 /**
- * Storage key for runtime enablement settings (shared via ~/.xum/config.json).
- */
-export const RUNTIME_ENABLEMENT_KEY = "runtimeEnablement";
-
-/**
- * Storage key for global default runtime selection (shared via ~/.xum/config.json).
- */
-export const DEFAULT_RUNTIME_KEY = "defaultRuntime";
-
-/**
  * Browser-mode server auth token. Stored as a raw string (not JSON): older builds read it with a
  * raw getItem, so the format must stay raw for downgrades.
  */
@@ -372,25 +362,9 @@ export function getAgentsInitNudgeKey(projectPath: string): string {
   return `agentsInitNudge:${projectPath}`;
 }
 
-/**
- * Get the localStorage key for the default model (global).
- *
- * Note: This is used as a fallback when creating new workspaces.
- * Format: "model-default"
- */
+/** Legacy global default model and hidden models, still repaired on provider removal. */
 export const DEFAULT_MODEL_KEY = "model-default";
-
-/**
- * Get the localStorage key for the hidden models list (global).
- * Format: "hidden-models"
- */
 export const HIDDEN_MODELS_KEY = "hidden-models";
-
-/**
- * Get the localStorage key for cached per-agent AI defaults (global).
- * Format: "agentAiDefaults"
- */
-export const AGENT_AI_DEFAULTS_KEY = "agentAiDefaults";
 
 /**
  * Git status indicator display mode (global)
@@ -1095,12 +1069,8 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Legacy creation draft list, now in the backend drafts/list.json (imported once by DraftStore,
   // then removed, #5225). Never written again, so no budget (0).
   globalKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, "draft", 0),
-  globalKey(RUNTIME_ENABLEMENT_KEY, "synced", 1024),
-  globalKey(DEFAULT_RUNTIME_KEY, "synced", 256),
   globalKey(DEFAULT_MODEL_KEY, "synced", 256),
-  // string[] of model ids; Record<agentId, defaults>.
   globalKey(HIDDEN_MODELS_KEY, "synced", 32 * 1024),
-  globalKey(AGENT_AI_DEFAULTS_KEY, "synced", 32 * 1024),
   globalKey(GIT_STATUS_INDICATOR_MODE_KEY, "ui", 32),
   globalKey(TUTORIAL_STATE_KEY, "ui", 256),
   globalKey(REVIEW_SORT_ORDER_KEY, "ui", 32),
