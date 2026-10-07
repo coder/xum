@@ -245,7 +245,7 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
     expect(scans).toHaveBeenCalledTimes(1);
   });
 
-  // T7 pins the owner rule the narrowed lookup relies on (#5569 plan §4, §7.2). Case (a), a
+  // T7 pins the owner rule the narrowed lookup relies on (#5569). Case (a), a
   // root follow-up by an owner without the root's creating record, is pinned by
   // workspaceTurnManager.createWorkspaceTurn.test.ts ("other-parent" and "independently created
   // root" cases).

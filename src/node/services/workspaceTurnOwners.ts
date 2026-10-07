@@ -5,7 +5,7 @@ import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 /**
  * Which owner directory can hold a target's workspace-turn records (#5569).
  *
- * The active-turn lookup used to scan every owner's task-handle directory on each map miss. For a
+ * Without it, the active-turn lookup scans every owner's task-handle directory on a map miss. For a
  * ROOT target (no `parentWorkspaceId`) createWorkspaceTurn's owner rule allows a record only for
  * the owner holding the target's creating (`createdWorkspace`) record, so every record of that
  * root lives in its creator's directory. This module names the claimed creator: the creator's own

@@ -5751,7 +5751,7 @@ export class WorkspaceTurnManager {
     if (!forTarget.some((record) => record.createdWorkspace)) {
       return { kind: "fallback", reason: "creator claim not confirmed" };
     }
-    // Same statuses as the global scan below (queued stays excluded).
+    // Same statuses as the caller's global scan (queued stays excluded).
     const record = forTarget.findLast(
       (candidate) => candidate.status === "starting" || candidate.status === "running"
     );
