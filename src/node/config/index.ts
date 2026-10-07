@@ -3098,7 +3098,6 @@ export class Config {
 
   async saveUserConfig(input: {
     taskSettings?: unknown;
-    userPreferences?: unknown;
     advisorModelString?: string | null;
     advisorThinkingLevel?: string | null;
     advisorReasoningMode?: OpenAIReasoningMode | null;
@@ -3122,10 +3121,6 @@ export class Config {
           ...normalizeTaskSettings(config.taskSettings),
           ...definedInput,
         });
-      }
-
-      if (input.userPreferences !== undefined) {
-        result.userPreferences = normalizeUserPreferences(input.userPreferences);
       }
 
       if (input.advisorModelString !== undefined) {

@@ -410,6 +410,7 @@ describe("router config transcript mutation", () => {
     return {
       config,
       experimentsService: new ExperimentsService({ telemetryService, xumHome: tempDir }),
+      taskService: { maybeStartQueuedTasks: () => Promise.resolve() },
       perfFlightRecorder: {
         beginRpcCall: () => null,
         openRpcSubscription: () => null,
@@ -537,6 +538,19 @@ describe("router config transcript mutation", () => {
     expect((await clientB.config.getConfig()).userPreferences).toEqual({
       appearance: { theme: "dark" },
       navigation: { launchBehavior: "new-chat" },
+    });
+  });
+
+  test("saveConfig ignores a full userPreferences snapshot from an old bundle", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    await client.config.updateUserPreferences({ patches: [{ appearance: { theme: "dark" } }] });
+
+    await client.config.saveConfig({
+      userPreferences: { appearance: { theme: "light" } },
+    } as Parameters<typeof client.config.saveConfig>[0]);
+
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual({
+      appearance: { theme: "dark" },
     });
   });
 

@@ -2219,10 +2219,6 @@ describe("Config", () => {
         proposePlanImplementReplacesChatHistory: true,
       });
       expect(saved.agentAiDefaults?.foo?.subagent?.reasoningMode).toBe("pro");
-
-      await config.saveUserConfig({ userPreferences: null });
-      const cleared = config.loadConfigOrDefault();
-      expect(cleared.userPreferences).toBeUndefined();
     });
 
     it("preserves advisor validation errors", async () => {

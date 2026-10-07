@@ -237,19 +237,9 @@ export async function seedAutoCompactionThreshold(
   model: string,
   percent: number
 ): Promise<void> {
-  const current = config.loadConfigOrDefault().userPreferences;
-  await config.saveUserConfig({
-    userPreferences: {
-      ...current,
-      ai: {
-        ...current?.ai,
-        autoCompactionThresholdByModel: {
-          ...current?.ai?.autoCompactionThresholdByModel,
-          [model]: percent,
-        },
-      },
-    },
-  });
+  await config.updateUserPreferences([
+    { ai: { autoCompactionThresholdByModel: { [model]: percent } } },
+  ]);
 }
 
 export async function createAgentSessionHarness(
