@@ -14,10 +14,6 @@ export function parseBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
-export function parseEnum<T extends string>(values: readonly T[], value: unknown): T | undefined {
-  return typeof value === "string" && values.includes(value as T) ? (value as T) : undefined;
-}
-
 export function parseAgentId(value: unknown): string | undefined {
   if (typeof value !== "string" || value.trim().length === 0) {
     return undefined;

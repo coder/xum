@@ -18,7 +18,6 @@ import {
   SELECTED_WORKSPACE_KEY,
   SIDEBAR_AGE_GROUPING_KEY,
   SIDEBAR_FLAT_MODE_KEY,
-  TERMINAL_BADGE_CONFIG_KEY,
 } from "@/common/constants/storage";
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -94,9 +93,6 @@ function resetStorybookPersistedStateForStory(): void {
     // persisted-state helper so a mounted sidebar's subscribed snapshot
     // observes the reset instead of keeping the flat layout.
     updatePersistedState(SIDEBAR_FLAT_MODE_KEY, undefined);
-    // Terminal badge stories seed an enabled badge config; clear it so other
-    // stories with terminals don't render order-dependent badge overlays.
-    localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
   }
   // Startup waits for this story's own snapshot instead of the previous story's.
   getAppConfigStore().updateOptimistically({ experiments: undefined, userPreferences: undefined });

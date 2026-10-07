@@ -495,9 +495,10 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     }
     const providersConfigStore = getProvidersConfigStore();
     const appConfigStore = getAppConfigStore();
-    // Until this server's config loads, the seeded keys may hold another server's values: the
-    // store keeps the previous server's snapshot, and localStorage can outlive the previous webview
-    // session. Clear them first so a send in that window never uses another server's agent defaults.
+    // Until this server's config loads, the store and the seeded keys may hold another server's
+    // values, and localStorage can outlive the previous webview session. Clear both first so
+    // nothing in that window, a send included, uses another server's preferences or agent defaults.
+    appConfigStore.clearCachedState();
     seedWebviewPreferences(null);
     const unsubscribeSeed = appConfigStore.subscribe(() => {
       seedWebviewPreferences(appConfigStore.getSnapshot());

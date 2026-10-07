@@ -1,10 +1,5 @@
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { lightweightMeta } from "@/browser/stories/meta.js";
-import {
-  DEFAULT_TERMINAL_BADGE_CONFIG,
-  TERMINAL_BADGE_CONFIG_KEY,
-  type TerminalBadgeConfig,
-} from "@/common/constants/storage";
+import { DEFAULT_TERMINAL_BADGE_CONFIG } from "@/common/constants/storage";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { within } from "@storybook/test";
 import { GeneralSection } from "./GeneralSection.js";
@@ -37,16 +32,17 @@ export const General: Story = {
 export const TerminalBadgeEnabledPhone: Story = {
   render: () => (
     <SettingsSectionStory
-      setup={() => {
-        const client = setupSettingsStory({});
-        // Seed after the story reset so the enabled-only badge rows render;
-        // the phone Pixel snapshot guards their narrow-width wrapping.
-        updatePersistedState<TerminalBadgeConfig>(TERMINAL_BADGE_CONFIG_KEY, {
-          ...DEFAULT_TERMINAL_BADGE_CONFIG,
-          enabled: true,
-        });
-        return client;
-      }}
+      // Enabled so the enabled-only badge rows render; the phone Pixel snapshot guards their
+      // narrow-width wrapping.
+      setup={() =>
+        setupSettingsStory({
+          userPreferences: {
+            appearance: {
+              terminalBadgeConfig: { ...DEFAULT_TERMINAL_BADGE_CONFIG, enabled: true },
+            },
+          },
+        })
+      }
     >
       <GeneralSection />
     </SettingsSectionStory>

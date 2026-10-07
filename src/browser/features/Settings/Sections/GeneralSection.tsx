@@ -19,17 +19,11 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
-  EDITOR_CONFIG_KEY,
-  DEFAULT_EDITOR_CONFIG,
-  TERMINAL_FONT_CONFIG_KEY,
-  DEFAULT_TERMINAL_FONT_CONFIG,
-  TERMINAL_BADGE_CONFIG_KEY,
-  TERMINAL_BADGE_POSITIONS,
   DEFAULT_TERMINAL_BADGE_CONFIG,
-  BASH_COLLAPSED_SUMMARY_MODE_KEY,
+  DEFAULT_TERMINAL_FONT_CONFIG,
+  TERMINAL_BADGE_POSITIONS,
   BASH_COLLAPSED_SUMMARY_MODES,
   CHAT_TRANSCRIPT_FULL_WIDTH_KEY,
-  DEFAULT_BASH_COLLAPSED_SUMMARY_MODE,
   SIDEBAR_AGE_GROUPING_KEY,
   SIDEBAR_FLAT_MODE_KEY,
   SIDEBAR_HIDE_SUBAGENTS_KEY,
@@ -233,11 +227,9 @@ export function GeneralSection() {
   const launchBehavior = useUserPreferences(
     (preferences) => preferences.navigation?.launchBehavior ?? "dashboard"
   );
-  const [rawBashCollapsedSummaryMode, setBashCollapsedSummaryMode] = usePersistedState<unknown>(
-    BASH_COLLAPSED_SUMMARY_MODE_KEY,
-    DEFAULT_BASH_COLLAPSED_SUMMARY_MODE
+  const bashCollapsedSummaryMode = useUserPreferences((preferences) =>
+    normalizeBashCollapsedSummaryMode(preferences.appearance?.bashCollapsedSummaryMode)
   );
-  const bashCollapsedSummaryMode = normalizeBashCollapsedSummaryMode(rawBashCollapsedSummaryMode);
   const [sidebarAgeGrouping, setSidebarAgeGrouping] = usePersistedState<boolean>(
     SIDEBAR_AGE_GROUPING_KEY,
     true
@@ -255,9 +247,8 @@ export function GeneralSection() {
     { listener: true }
   );
   const [transcriptDensity, setTranscriptDensity] = useTranscriptDensity();
-  const [rawTerminalFontConfig, setTerminalFontConfig] = usePersistedState<TerminalFontConfig>(
-    TERMINAL_FONT_CONFIG_KEY,
-    DEFAULT_TERMINAL_FONT_CONFIG
+  const rawTerminalFontConfig = useUserPreferences(
+    (preferences) => preferences.appearance?.terminalFontConfig
   );
   const terminalFontConfig = normalizeTerminalFontConfig(rawTerminalFontConfig);
   const terminalFontWarning = getTerminalFontAvailabilityWarning(terminalFontConfig);
@@ -272,19 +263,12 @@ export function GeneralSection() {
     String.fromCodePoint(0xf135), // fa-rocket
   ].join(" ");
 
-  // The command palette also toggles this key, so stay subscribed to
-  // external updates while Settings is mounted.
-  const [rawTerminalBadgeConfig, setTerminalBadgeConfig] = usePersistedState<TerminalBadgeConfig>(
-    TERMINAL_BADGE_CONFIG_KEY,
-    DEFAULT_TERMINAL_BADGE_CONFIG,
-    { listener: true }
+  const rawTerminalBadgeConfig = useUserPreferences(
+    (preferences) => preferences.appearance?.terminalBadgeConfig
   );
   const terminalBadgeConfig = normalizeTerminalBadgeConfig(rawTerminalBadgeConfig);
 
-  const [rawEditorConfig, setEditorConfig] = usePersistedState<EditorConfig>(
-    EDITOR_CONFIG_KEY,
-    DEFAULT_EDITOR_CONFIG
-  );
+  const rawEditorConfig = useUserPreferences((preferences) => preferences.appearance?.editorConfig);
   const editorConfig = normalizeEditorConfig(rawEditorConfig);
   const [sshHost, setSshHost] = useState<string>("");
   const [sshHostLoaded, setSshHostLoaded] = useState(false);
@@ -656,12 +640,28 @@ export function GeneralSection() {
       });
   }, [api]);
 
-  const handleEditorChange = (editor: EditorType) => {
-    setEditorConfig((prev) => ({ ...normalizeEditorConfig(prev), editor }));
+  // Config objects are written whole: a merge patch keeps omitted fields, so a partial object
+  // over a missing server value would fail the schema.
+  const setEditorConfig = (next: EditorConfig) => {
+    updateUserPreferences({
+      appearance: {
+        editorConfig: { editor: next.editor, customCommand: next.customCommand ?? null },
+      },
+    });
+  };
+  const setTerminalBadgeConfig = (next: TerminalBadgeConfig) => {
+    updateUserPreferences({ appearance: { terminalBadgeConfig: next } });
   };
 
+  const handleEditorChange = (editor: EditorType) => {
+    setEditorConfig({ ...editorConfig, editor });
+  };
+
+  // Font fields are patched one at a time so a concurrent edit of the other field survives.
   const handleTerminalFontFamilyChange = (fontFamily: string) => {
-    setTerminalFontConfig((prev) => ({ ...normalizeTerminalFontConfig(prev), fontFamily }));
+    updateUserPreferences({
+      appearance: { terminalFontConfig: { fontFamily: fontFamily.trim() ? fontFamily : null } },
+    });
   };
 
   const handleTerminalFontSizeChange = (rawValue: string) => {
@@ -670,22 +670,25 @@ export function GeneralSection() {
       return;
     }
 
-    setTerminalFontConfig((prev) => ({ ...normalizeTerminalFontConfig(prev), fontSize: parsed }));
+    updateUserPreferences({ appearance: { terminalFontConfig: { fontSize: parsed } } });
   };
   const handleCustomCommandChange = (customCommand: string) => {
-    setEditorConfig((prev) => ({ ...normalizeEditorConfig(prev), customCommand }));
+    setEditorConfig({
+      ...editorConfig,
+      customCommand: customCommand.trim() ? customCommand : undefined,
+    });
   };
 
   const handleTerminalBadgeEnabledChange = (enabled: boolean) => {
-    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), enabled }));
+    setTerminalBadgeConfig({ ...terminalBadgeConfig, enabled });
   };
 
   const handleTerminalBadgeTemplateChange = (template: string) => {
-    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), template }));
+    setTerminalBadgeConfig({ ...terminalBadgeConfig, template });
   };
 
   const handleTerminalBadgePositionChange = (position: TerminalBadgePosition) => {
-    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), position }));
+    setTerminalBadgeConfig({ ...terminalBadgeConfig, position });
   };
 
   const handleTerminalBadgeOpacityChange = (rawValue: string) => {
@@ -694,10 +697,7 @@ export function GeneralSection() {
       return;
     }
 
-    setTerminalBadgeConfig((prev) => ({
-      ...normalizeTerminalBadgeConfig(prev),
-      opacity: parsed / 100,
-    }));
+    setTerminalBadgeConfig({ ...terminalBadgeConfig, opacity: parsed / 100 });
   };
 
   const handleTerminalBadgeFontSizeChange = (rawValue: string) => {
@@ -706,7 +706,7 @@ export function GeneralSection() {
       return;
     }
 
-    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), fontSize: parsed }));
+    setTerminalBadgeConfig({ ...terminalBadgeConfig, fontSize: parsed });
   };
 
   const handleSshHostChange = useCallback(
@@ -907,7 +907,9 @@ export function GeneralSection() {
             <Select
               value={bashCollapsedSummaryMode}
               onValueChange={(value) =>
-                setBashCollapsedSummaryMode(value as BashCollapsedSummaryMode)
+                updateUserPreferences({
+                  appearance: { bashCollapsedSummaryMode: value as BashCollapsedSummaryMode },
+                })
               }
             >
               <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
@@ -998,7 +1000,8 @@ export function GeneralSection() {
             </div>
             <div className="flex max-w-full min-w-0 flex-col items-end gap-2">
               <Input
-                value={terminalFontConfig.fontFamily}
+                // Stored value: a cleared field stays empty instead of snapping back to the default.
+                value={rawTerminalFontConfig?.fontFamily ?? ""}
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   handleTerminalFontFamilyChange(e.target.value)
                 }

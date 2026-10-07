@@ -118,12 +118,8 @@ void mock.module("@/browser/terminal/TerminalRouterContext", () => ({
 }));
 
 import { TerminalView } from "./TerminalView";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  DEFAULT_TERMINAL_BADGE_CONFIG,
-  TERMINAL_BADGE_CONFIG_KEY,
-  type TerminalBadgeConfig,
-} from "@/common/constants/storage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { DEFAULT_TERMINAL_BADGE_CONFIG } from "@/common/constants/storage";
 
 function createRouter(): MockRouter {
   unsubscribeMock = mock(() => undefined);
@@ -175,6 +171,7 @@ describe("TerminalView", () => {
 
   afterEach(() => {
     cleanup();
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     cleanupDom?.();
     cleanupDom = null;
     mock.restore();
@@ -222,9 +219,10 @@ describe("TerminalView", () => {
   });
 
   test("renders the badge overlay with substituted template when enabled", async () => {
-    updatePersistedState<TerminalBadgeConfig>(TERMINAL_BADGE_CONFIG_KEY, {
-      ...DEFAULT_TERMINAL_BADGE_CONFIG,
-      enabled: true,
+    getAppConfigStore().updateOptimistically({
+      userPreferences: {
+        appearance: { terminalBadgeConfig: { ...DEFAULT_TERMINAL_BADGE_CONFIG, enabled: true } },
+      },
     });
 
     const view = render(

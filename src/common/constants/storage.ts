@@ -440,12 +440,6 @@ export const PROVIDER_OPTIONS_GOOGLE_KEY = "provider_options_google";
 
 export const GIT_STATUS_INDICATOR_MODE_KEY = "gitStatusIndicatorMode";
 
-/**
- * Editor configuration for "Open in Editor" feature (global)
- * Format: "editorConfig"
- */
-export const EDITOR_CONFIG_KEY = "editorConfig";
-
 export type EditorType = "vscode" | "cursor" | "zed" | "custom";
 
 export interface EditorConfig {
@@ -478,12 +472,6 @@ export function normalizeEditorConfig(value: unknown): EditorConfig {
   return { editor, customCommand };
 }
 
-/**
- * Transcript density display preference (global)
- * Stores: "normal" | "hyper"
- */
-export const TRANSCRIPT_DENSITY_KEY = "transcriptDensity";
-
 export const TRANSCRIPT_DENSITIES = ["normal", "hyper"] as const;
 
 export type TranscriptDensity = (typeof TRANSCRIPT_DENSITIES)[number];
@@ -497,12 +485,6 @@ export function isTranscriptDensity(value: unknown): value is TranscriptDensity 
 export function normalizeTranscriptDensity(value: unknown): TranscriptDensity {
   return isTranscriptDensity(value) ? value : DEFAULT_TRANSCRIPT_DENSITY;
 }
-
-/**
- * Collapsed bash tool summary display mode (global)
- * Stores: "command" | "intent-command" | "intent"
- */
-export const BASH_COLLAPSED_SUMMARY_MODE_KEY = "bashCollapsedSummaryMode";
 
 export const BASH_COLLAPSED_SUMMARY_MODES = ["command", "intent-command", "intent"] as const;
 
@@ -520,12 +502,6 @@ export function isBashCollapsedSummaryMode(value: unknown): value is BashCollaps
 export function normalizeBashCollapsedSummaryMode(value: unknown): BashCollapsedSummaryMode {
   return isBashCollapsedSummaryMode(value) ? value : DEFAULT_BASH_COLLAPSED_SUMMARY_MODE;
 }
-
-/**
- * Integrated terminal font configuration (global)
- * Stores: { fontFamily: string; fontSize: number }
- */
-export const TERMINAL_FONT_CONFIG_KEY = "terminalFontConfig";
 
 export interface TerminalFontConfig {
   fontFamily: string;
@@ -555,13 +531,6 @@ export function normalizeTerminalFontConfig(value: unknown): TerminalFontConfig 
 
   return { fontFamily, fontSize };
 }
-
-/**
- * Terminal badge overlay configuration (global)
- * Scroll-fixed workspace/tab watermark rendered above the terminal canvas,
- * similar to iTerm2 badges. Stores: { enabled, template, position, opacity, fontSize }
- */
-export const TERMINAL_BADGE_CONFIG_KEY = "terminalBadgeConfig";
 
 export const TERMINAL_BADGE_POSITIONS = [
   "top-left",
@@ -1220,11 +1189,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(PROVIDER_OPTIONS_ANTHROPIC_KEY, "synced", 4096),
   globalKey(PROVIDER_OPTIONS_GOOGLE_KEY, "synced", 4096),
   globalKey(GIT_STATUS_INDICATOR_MODE_KEY, "ui", 32),
-  globalKey(EDITOR_CONFIG_KEY, "synced", 2048),
-  globalKey(TRANSCRIPT_DENSITY_KEY, "synced", 32),
-  globalKey(BASH_COLLAPSED_SUMMARY_MODE_KEY, "synced", 32),
-  globalKey(TERMINAL_FONT_CONFIG_KEY, "synced", 1024),
-  globalKey(TERMINAL_BADGE_CONFIG_KEY, "synced", 2048),
   globalKey(TUTORIAL_STATE_KEY, "ui", 256),
   globalKey(REVIEW_INCLUDE_UNCOMMITTED_KEY, "synced", 16),
   globalKey(REVIEW_SORT_ORDER_KEY, "ui", 32),
