@@ -20,7 +20,6 @@ import { ProjectProvider, useProjectContext } from "../../contexts/ProjectContex
 import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
 import { WorkspaceProvider, useWorkspaceContext } from "../../contexts/WorkspaceContext";
 import { RouterProvider } from "../../contexts/RouterContext";
-import { UserPreferencesProvider } from "@/browser/contexts/UserPreferencesContext";
 import { TerminalRouterProvider } from "../../terminal/TerminalRouterContext";
 import { UpdateRestartOverlay } from "@/browser/components/UpdateRestartOverlay/UpdateRestartOverlay";
 
@@ -141,9 +140,7 @@ export function AppLoader(props: AppLoaderProps) {
           <RouterProvider>
             <ProjectProvider>
               <WorkspaceProvider>
-                <UserPreferencesProvider>
-                  <AppLoaderInner />
-                </UserPreferencesProvider>
+                <AppLoaderInner />
               </WorkspaceProvider>
             </ProjectProvider>
           </RouterProvider>
