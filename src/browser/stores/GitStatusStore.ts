@@ -11,7 +11,8 @@ import {
   canRunPassiveRuntimeCommand,
   onPassiveRuntimeEligible,
 } from "@/browser/utils/runtimeExecutionPolicy";
-import { STORAGE_KEYS, WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { STORAGE_KEYS } from "@/constants/workspaceDefaults";
+import { readReviewDefaultBase } from "@/browser/utils/reviewDefaultBase";
 import { isSSHRuntime } from "@/common/types/runtime";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import assert from "@/common/utils/assert";
@@ -521,11 +522,10 @@ export class GitStatusStore {
   }
 
   private getBaseRef(metadata: FrontendWorkspaceMetadata): string {
-    const projectDefaultBase = readPersistedState<string>(
-      STORAGE_KEYS.reviewDefaultBase(metadata.projectPath),
-      WORKSPACE_DEFAULTS.reviewBase
+    return readPersistedState<string>(
+      STORAGE_KEYS.reviewDiffBase(metadata.id),
+      readReviewDefaultBase(metadata.projectPath)
     );
-    return readPersistedState<string>(STORAGE_KEYS.reviewDiffBase(metadata.id), projectDefaultBase);
   }
 
   private buildMultiProjectSummary(results: ProjectGitStatusResult[]): MultiProjectGitSummary {

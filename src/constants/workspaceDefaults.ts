@@ -1,13 +1,11 @@
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
-import { getReviewDefaultBaseKey, getReviewDiffBaseKey } from "@/common/constants/storage";
+import { getReviewDiffBaseKey } from "@/common/constants/storage";
 import { THINKING_LEVEL_OFF } from "@/common/types/thinking";
 
 /**
  * Storage key helpers for persisted settings.
  */
 export const STORAGE_KEYS = {
-  /** Per-project default diff base for code review. Pass projectPath. */
-  reviewDefaultBase: getReviewDefaultBaseKey,
   /** Per-workspace diff base override. Pass workspaceId. */
   reviewDiffBase: getReviewDiffBaseKey,
 } as const;

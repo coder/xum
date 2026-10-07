@@ -3,12 +3,10 @@ import {
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
 import {
-  REVIEW_INCLUDE_UNCOMMITTED_KEY,
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
-  getReviewDefaultBaseKey,
 } from "@/common/constants/storage";
-import { parseBoolean, parseNonEmptyString } from "@/common/preferences/userPreferenceParsing";
+import { parseBoolean } from "@/common/preferences/userPreferenceParsing";
 
 export interface UserPreferenceStorageArea {
   readonly length: number;
@@ -21,12 +19,9 @@ export interface StoredUserPreferenceEntry {
   value: unknown;
 }
 
-const STATIC_USER_PREFERENCE_KEYS = new Set<string>([REVIEW_INCLUDE_UNCOMMITTED_KEY]);
-
 const DYNAMIC_USER_PREFERENCE_PREFIXES = [
   getNotifyOnResponseAutoEnableKey(""),
   getNotifyOnResponseKey(""),
-  getReviewDefaultBaseKey(""),
 ] as const;
 
 function cloneUserPreferences(preferences: UserPreferences | undefined): UserPreferences {
@@ -55,10 +50,6 @@ function readSuffix(key: string, prefix: string): string | undefined {
 }
 
 function getPreferenceKind(key: string): string | undefined {
-  if (STATIC_USER_PREFERENCE_KEYS.has(key)) {
-    return key;
-  }
-
   return DYNAMIC_USER_PREFERENCE_PREFIXES.find((prefix) => key.startsWith(prefix));
 }
 
@@ -81,11 +72,6 @@ function ensureNotifications(
 ): NonNullable<UserPreferences["notifications"]> {
   preferences.notifications ??= {};
   return preferences.notifications;
-}
-
-function ensureReview(preferences: UserPreferences): NonNullable<UserPreferences["review"]> {
-  preferences.review ??= {};
-  return preferences.review;
 }
 
 export function applyStoredUserPreference(
@@ -117,27 +103,6 @@ export function applyStoredUserPreference(
     return pruneUserPreferences(next);
   }
 
-  if (key === REVIEW_INCLUDE_UNCOMMITTED_KEY) {
-    const parsed = parseBoolean(value);
-    if (parsed === undefined) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureReview(next).includeUncommitted = parsed;
-    return pruneUserPreferences(next);
-  }
-
-  const reviewDefaultProjectPath = readSuffix(key, getReviewDefaultBaseKey(""));
-  if (reviewDefaultProjectPath) {
-    const parsed = parseNonEmptyString(value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    const review = ensureReview(next);
-    review.defaultBaseByProject ??= {};
-    review.defaultBaseByProject[reviewDefaultProjectPath] = parsed;
-    return pruneUserPreferences(next);
-  }
-
   return pruneUserPreferences(next);
 }
 
@@ -147,19 +112,12 @@ export function removeStoredUserPreference(
 ): UserPreferences | undefined {
   const next = cloneUserPreferences(preferences);
 
-  if (key === REVIEW_INCLUDE_UNCOMMITTED_KEY) delete next.review?.includeUncommitted;
-  else {
-    const autoNotifyProjectPath = readSuffix(key, getNotifyOnResponseAutoEnableKey(""));
-    const notifyWorkspaceId = readSuffix(key, getNotifyOnResponseKey(""));
-    const reviewDefaultProjectPath = readSuffix(key, getReviewDefaultBaseKey(""));
-
-    if (autoNotifyProjectPath)
-      delete next.workspaceCreation?.byProject?.[autoNotifyProjectPath]?.notifyOnResponseAutoEnable;
-    else if (notifyWorkspaceId)
-      delete next.notifications?.notifyOnResponseByWorkspace?.[notifyWorkspaceId];
-    else if (reviewDefaultProjectPath)
-      delete next.review?.defaultBaseByProject?.[reviewDefaultProjectPath];
-  }
+  const autoNotifyProjectPath = readSuffix(key, getNotifyOnResponseAutoEnableKey(""));
+  const notifyWorkspaceId = readSuffix(key, getNotifyOnResponseKey(""));
+  if (autoNotifyProjectPath)
+    delete next.workspaceCreation?.byProject?.[autoNotifyProjectPath]?.notifyOnResponseAutoEnable;
+  else if (notifyWorkspaceId)
+    delete next.notifications?.notifyOnResponseByWorkspace?.[notifyWorkspaceId];
 
   return pruneUserPreferences(next);
 }
@@ -186,17 +144,6 @@ export function entriesFromUserPreferences(
     preferences.notifications?.notifyOnResponseByWorkspace ?? {}
   )) {
     entries.push({ key: getNotifyOnResponseKey(workspaceId), value: enabled });
-  }
-
-  if (preferences.review?.includeUncommitted !== undefined)
-    entries.push({
-      key: REVIEW_INCLUDE_UNCOMMITTED_KEY,
-      value: preferences.review.includeUncommitted,
-    });
-  for (const [projectPath, defaultBase] of Object.entries(
-    preferences.review?.defaultBaseByProject ?? {}
-  )) {
-    entries.push({ key: getReviewDefaultBaseKey(projectPath), value: defaultBase });
   }
 
   return entries;

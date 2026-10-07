@@ -17,13 +17,15 @@ import { cleanupView, setupTestDom, setupWorkspaceView } from "../helpers";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
-function renderReviewPanelForUndoTests(params: {
+async function renderReviewPanelForUndoTests(params: {
   apiClient: APIClient;
   metadata: FrontendWorkspaceMetadata;
   workspaceId: string;
-}): RenderedApp {
+}): Promise<RenderedApp> {
   updatePersistedState(STORAGE_KEYS.reviewDiffBase(params.workspaceId), "HEAD");
-  updatePersistedState("review-include-uncommitted", true);
+  await params.apiClient.config.updateUserPreferences({
+    patches: [{ review: { includeUncommitted: true } }],
+  });
   updatePersistedState("review-show-read", false);
   updatePersistedState(REVIEW_SORT_ORDER_KEY, "file-order");
 
@@ -85,7 +87,7 @@ describeIntegration("Immersive review undo (UI + ORPC)", () => {
       const cleanupDom = setupTestDom();
       await seedTwoHunkReviewDiff(env.orpc, workspaceId);
 
-      const view = renderReviewPanelForUndoTests({
+      const view = await renderReviewPanelForUndoTests({
         apiClient: env.orpc,
         metadata,
         workspaceId,
