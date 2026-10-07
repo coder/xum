@@ -4222,12 +4222,20 @@ describe("AgentSession token-budget lifecycle", () => {
       }
     );
 
-    /** A send whose turn start opened nothing (no room); returns that send's stage measure. */
-    async function sendWithoutRoom(h: Awaited<ReturnType<typeof setup>>, message = "Work") {
+    /** E below H (not due) or past it without room for the row (a fit decline). */
+    const NOT_DUE = 80_000;
+    const NO_ROOM = 118_000;
+
+    /** A send whose turn start opened nothing; returns that send's stage measure. */
+    async function sendWithoutRoom(
+      h: Awaited<ReturnType<typeof setup>>,
+      message = "Work",
+      estimate = NO_ROOM
+    ) {
       let measure: number | undefined;
       h.turnStart.estimate = (_attempt, projected) => {
         measure = projected;
-        return 118_000;
+        return estimate;
       };
       expect((await h.session.sendMessage(message, options)).success).toBe(true);
       expect(warningRows(await allRows(h))).toHaveLength(0);
@@ -4240,16 +4248,20 @@ describe("AgentSession token-budget lifecycle", () => {
       step(projected - 10, { exactAppendChain });
 
     test.each([
-      { growth: 2_047, exactAppendChain: true, decision: "continue" },
-      { growth: 2_048, exactAppendChain: true, decision: "warn" },
+      // Not due: the stop waits until the stage measure grew past the send's by the reserve.
+      { estimate: NOT_DUE, growth: 2_047, exactAppendChain: true, decision: "continue" },
+      { estimate: NOT_DUE, growth: 2_048, exactAppendChain: true, decision: "warn" },
+      // Fit decline: exact appends only grow the request, so no growth reopens the stage.
+      { estimate: NO_ROOM, growth: 10_000, exactAppendChain: true, decision: "continue" },
       // A full count or a rebuild ends the guard: the request may have shrunk since that send.
-      { growth: 100, exactAppendChain: false, decision: "warn" },
+      { estimate: NOT_DUE, growth: 100, exactAppendChain: false, decision: "warn" },
+      { estimate: NO_ROOM, growth: 100, exactAppendChain: false, decision: "warn" },
     ] as const)(
-      "settlement after a send that opened no stage waits for reserve growth (growth=$growth, exact=$exactAppendChain)",
-      async ({ growth, exactAppendChain, decision }) => {
+      "settlement after a send that opened no stage (E=$estimate) waits for growth or a rebuild (growth=$growth, exact=$exactAppendChain)",
+      async ({ estimate, growth, exactAppendChain, decision }) => {
         const h = await setup();
         await seedHistory(h, 90_000);
-        const measure = await sendWithoutRoom(h);
+        const measure = await sendWithoutRoom(h, "Work", estimate);
         expect(
           (await h.requests[0].onStepSettled?.(grownStep(measure + growth, exactAppendChain)))
             ?.decision
@@ -4302,7 +4314,7 @@ describe("AgentSession token-budget lifecycle", () => {
         await stopStream(h, 0, 90_000);
         const first = (await allRows(h)).find((row) => text(row) === "First try")!;
         if (kind === "edit") {
-          h.turnStart.estimate = () => 118_000;
+          h.turnStart.estimate = () => NOT_DUE;
           const historyEditPrecondition = buildHistoryEditPrecondition(
             (await allRows(h)).map((row) => MuxMessageSchema.parse(row) as MuxMessage),
             first.id
@@ -4317,10 +4329,10 @@ describe("AgentSession token-budget lifecycle", () => {
             ).success
           ).toBe(true);
         } else if (kind === "resume") {
-          h.turnStart.estimate = () => 118_000;
+          h.turnStart.estimate = () => NOT_DUE;
           expect((await h.session.resumeStream(options)).success).toBe(true);
         } else {
-          await sendWithoutRoom(h, "Second try");
+          await sendWithoutRoom(h, "Second try", NOT_DUE);
         }
         const second = await h.waitForRequest(2);
         expect(warningRows(await allRows(h))).toHaveLength(0);

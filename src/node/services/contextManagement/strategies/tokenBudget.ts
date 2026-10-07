@@ -69,7 +69,8 @@ export class TokenBudgetStrategy {
   /** One final prompt per window; derived from history on restart. */
   private contextBudgetFinalClaimed = false;
   private contextBudgetGeneration = 0;
-  /** Settlement guard (#5286), scheduling only: stage measures of the last assessing send. */
+  // Settlement guard (#5286), scheduling only: the last assessing send's stage measure, or
+  // Infinity after a fit decline (until a full count or rebuild, requests only grow).
   private stageBaseline?: number;
   private sendProjected?: number;
 
@@ -473,14 +474,13 @@ export class TokenBudgetStrategy {
         return notice?.type === "context-budget-warning" && notice[key] === true;
       });
     // Same precedence as settlement: the final prompt supersedes the handoff request.
-    const stage = claimed("final")
-      ? undefined
-      : !claimed("handoff") &&
-          budget.estimate >= getContextBudgetHandoffPoint(budget.limit, threshold)
-        ? "handoff"
-        : budget.estimate >= getContextBudgetFinalPoint(budget.limit)
-          ? "final"
-          : undefined;
+    const points = {
+      handoff: getContextBudgetHandoffPoint(budget.limit, threshold),
+      final: getContextBudgetFinalPoint(budget.limit),
+    };
+    const stage = (["handoff", "final"] as const).find(
+      (key) => budget.estimate >= points[key] && !claimed(key) && !claimed("final")
+    );
     if (stage == null) return undefined;
     const receipt = this.capturePreparation();
     const permissions = await this.resolveContextBudgetAdvisoryPermissions(options);
@@ -492,12 +492,15 @@ export class TokenBudgetStrategy {
       contextTokens: budget.estimate,
       maxTokens: budget.limit,
       budgetTokens: ceiling,
-      ...(stage === "handoff"
-        ? { handoffTokens: getContextBudgetHandoffPoint(budget.limit, threshold), handoff: true }
-        : { final: true }),
+      ...(stage === "handoff" ? { handoffTokens: points.handoff, handoff: true } : { final: true }),
       ...permissions,
     });
-    return { row, fits: (estimate) => estimate + reserve < ceiling, publish: () => publish(row) };
+    const fits = (estimate: number) => {
+      if (estimate + reserve < ceiling) return true;
+      if (this.validatePreparation(receipt)) this.stageBaseline = Infinity;
+      return false;
+    };
+    return { row, fits, publish: () => publish(row) };
   }
 
   async onContextBudgetStepSettled(step: SettledStepBudget): Promise<SettledStepOutcome> {

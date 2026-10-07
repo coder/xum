@@ -3077,11 +3077,8 @@ export class StreamManager {
           stepTracker.providerRequestPrepared = true;
           // A thinking change rebuilds the request (mid-turn, step 0's first-step rebuild, or the
           // pre-stream fold in TurnRequestBuilder.start(), the only earlier writer of `applied`).
-          if (
-            thinkingOverride !== undefined ||
-            (firstTurnRequest && request.thinkingOverrideState?.applied !== undefined)
-          )
-            stepTracker.exactAppendChainBroken = true;
+          const folded = firstTurnRequest && overrideState?.applied != null;
+          if (thinkingOverride !== undefined || folded) stepTracker.exactAppendChainBroken = true;
         }
         if (escalation && escalationState) {
           // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
