@@ -82,7 +82,20 @@ import {
 } from "@/common/utils/tools/toolAvailability";
 import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
-import { assembleBudgetCheckedPromptPayload } from "./turnRequestBuilder";
+import type { OnTurnStartBudget } from "./turnRequestBuilder";
+import { TokenBudgetStrategy } from "./contextManagement/strategies/tokenBudget";
+import type { ContextManagementDependencies } from "./contextManagement/contextManagementService";
+import type { SessionContextHost } from "./contextManagement/sessionContextHost";
+import type { CompactionHandler } from "./compactionHandler";
+import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
+import { createContextBudgetWarning } from "./contextWindowRollover";
+import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
+import * as budgetCountingModule from "./contextBudgetCounting";
+import {
+  getContextBudgetHandoffPoint,
+  getContextBudgetHardCeiling,
+} from "@/common/utils/compaction/contextBudget";
+import { WARNING_RESERVE_TOKENS } from "@/common/constants/contextBudget";
 import * as messagePipeline from "./messagePipeline";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
@@ -883,6 +896,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     resolveAndCreateModelSpy: ResolveAndCreateModelSpy;
     streamManager: StreamManager;
     providerService: ProviderService;
+    historyService: HistoryService;
   }
 
   function initialMetadataFromStartStreamCall(
@@ -996,6 +1010,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       resolveAndCreateModelSpy,
       streamManager,
       providerService,
+      historyService,
     };
   }
 
@@ -1807,32 +1822,410 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const removeHook = eventSpine.useBefore("request.assemble", hook, {
       workspaceId: metadata.id,
     });
-    const assembled = spyOn(turnContextAssembler, "assemblePromptPayload");
-    try {
-      const result = await harness.service.streamMessage({
-        messages: [createMuxMessage("user", "user", "continue")],
+    const user = createMuxMessage("user", "user", "continue");
+    const warning = createContextBudgetWarning({
+      contextTokens: 100,
+      maxTokens: 1_000,
+      budgetTokens: 900,
+      handoff: true,
+      handoffTokens: 500,
+      sessionHistoryAvailable: true,
+      newContextAvailable: true,
+    });
+    const send = (messages: MuxMessage[], onTurnStartBudget: OnTurnStartBudget) =>
+      harness.service.streamMessage({
+        messages,
         workspaceId: metadata.id,
         modelString: KNOWN_MODELS.SONNET.id,
         thinkingLevel: "off",
         experiments: { tokenBudget: true, memory: true },
+        onTurnStartBudget,
       });
-      expect(result.success).toBe(true);
+    const measured: number[] = [];
+    const fullEstimates: number[] = [];
+    try {
+      // start() counts the candidate [user, warning] through measureMessages and sends it.
+      const staged = await send([user], () =>
+        Promise.resolve({
+          row: warning,
+          fits: (estimate) => {
+            measured.push(estimate);
+            return true;
+          },
+          publish: () => Promise.resolve(true),
+        })
+      );
+      expect(staged.success).toBe(true);
+      expect(measured).toHaveLength(1);
       expect(hook).toHaveBeenCalledTimes(1);
-      const sent = harness.startStreamCalls[0];
-      const measured = await assembleBudgetCheckedPromptPayload(assembled.mock.calls[0][0], {
-        enabled: true,
-        measureOnly: true,
+      // The same history assembled in full, hooks included.
+      const full = await send([user, warning], (budget) => {
+        fullEstimates.push(budget.estimate);
+        return Promise.resolve(undefined);
       });
+      expect(full.success).toBe(true);
+      expect(hook).toHaveBeenCalledTimes(2);
+      const [measuredRequest, fullRequest] = harness.startStreamCalls;
       // Anthropic carries the system prompt as leading message rows.
-      expect(JSON.stringify(sent.messages)).toContain("hooked-context");
-      expect(measured.messages).toEqual(sent.messages);
-      expect(measured.system).toEqual(sent.system);
-      expect(measured.contextBudgetEstimate).toBeDefined();
-      expect(hook).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(measuredRequest.messages)).toContain("hooked-context");
+      expect(measuredRequest.messages).toEqual(fullRequest.messages);
+      expect(measuredRequest.system).toEqual(fullRequest.system);
+      expect(measured).toEqual(fullEstimates);
     } finally {
-      assembled.mockRestore();
       removeHook();
     }
+  });
+
+  // #5286: TurnRequestBuilder.start() decides a Token Budget stage from the built request's full
+  // estimate E, counts the request with the warning row appended (E′), and dispatches that
+  // payload only when the stage fits. The real stage policy decides due, claims and fit.
+  describe("turn-start Token Budget stages (#5286)", () => {
+    // Puts the handoff point (100 tokens of the 1M window) below these small requests, so the
+    // handoff stage is due.
+    const DUE_SLIDER = 0.0001;
+    const USER_TEXT = "continue the deployment";
+    const sendOptions = { model: KNOWN_MODELS.SONNET.id, agentId: "exec" };
+
+    interface StageTurnOptions {
+      /** Rows appended before the turn's snapshot read; default: one user row. */
+      append?: MuxMessage[];
+      contextWindowTokens?: number;
+      slider?: number;
+      /** false: send without a stage callback (the no-Token-Budget-stage baseline). */
+      stageCallback?: boolean;
+      /** Runs after the candidate assembly, before the stage is published. */
+      afterCandidate?: () => void;
+      /** Runs after the warning row was appended to history. */
+      afterPublish?: (historyService: HistoryService, workspaceId: string) => Promise<void>;
+      abortController?: AbortController;
+      activeTurnThinkingOverride?: ActiveTurnThinkingOverride;
+    }
+
+    async function runStageTurn(xumHomePath: string, options: StageTurnOptions = {}) {
+      const metadata = createLocalWorkspaceMetadata("turn-start-stage", xumHomePath);
+      const harness = createHarness(xumHomePath, metadata);
+      // Real history: the snapshot, the published warning and the assistant row are on disk.
+      spyOn(harness.historyService, "appendToHistory").mockRestore();
+      // Real provider messages: the dispatched payload is what the provider would receive.
+      spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
+      if (options.contextWindowTokens != null) {
+        new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+          anthropic: {
+            apiKey: "sk-test",
+            models: [{ id: "claude-sonnet-5-5", contextWindowTokens: options.contextWindowTokens }],
+          },
+        });
+      }
+      for (const row of options.append ?? [createMuxMessage("user-1", "user", USER_TEXT)]) {
+        expect((await harness.historyService.appendToHistory(metadata.id, row)).success).toBe(true);
+      }
+      const readHistory = async () => {
+        const read = await harness.historyService.getHistoryFromLatestBoundary(metadata.id);
+        if (!read.success) throw new Error(read.error);
+        return read.data;
+      };
+      const snapshot = await readHistory();
+      // A fresh policy holds no in-memory claims, as after a restart.
+      const strategy = new TokenBudgetStrategy(
+        {
+          aiService: harness.service,
+          config: harness.config,
+        } as unknown as ContextManagementDependencies,
+        { workspaceId: metadata.id } as unknown as SessionContextHost,
+        () => options.slider ?? DUE_SLIDER,
+        {} as unknown as CompactionHandler,
+        () => true
+      );
+      const budgets: Array<Parameters<OnTurnStartBudget>[0]> = [];
+      const offered: MuxMessage[] = [];
+      const measured: number[] = [];
+      let publishCalls = 0;
+      const onTurnStartBudget: OnTurnStartBudget = async (budget) => {
+        budgets.push({ ...budget, messages: [...budget.messages] });
+        const stage = await strategy.prepareTurnStartStage(budget, sendOptions, async (row) => {
+          publishCalls += 1;
+          const appended = await harness.historyService.appendToHistory(metadata.id, row);
+          await options.afterPublish?.(harness.historyService, metadata.id);
+          return appended.success;
+        });
+        if (!stage) return undefined;
+        offered.push(stage.row);
+        return {
+          ...stage,
+          fits: (estimate) => {
+            measured.push(estimate);
+            options.afterCandidate?.();
+            return stage.fits(estimate);
+          },
+        };
+      };
+      // Call-through spies: how many assemblies and budget counts the turn ran, and with which
+      // count options.
+      const assemblies = spyOn(turnContextAssembler, "assemblePromptPayload");
+      const counts = spyOn(budgetCountingModule, "measureAssembledRequestBudgetForModel");
+      const result = await harness.service.streamMessage({
+        messages: snapshot,
+        workspaceId: metadata.id,
+        modelString: KNOWN_MODELS.SONNET.id,
+        thinkingLevel: "off",
+        experiments: { tokenBudget: true, memory: true },
+        ...(options.stageCallback === false ? {} : { onTurnStartBudget }),
+        ...(options.abortController ? { abortSignal: options.abortController.signal } : {}),
+        ...(options.activeTurnThinkingOverride
+          ? { activeTurnThinkingOverride: options.activeTurnThinkingOverride }
+          : {}),
+      });
+      const assemblyCalls = assemblies.mock.calls.length;
+      const countOptions = counts.mock.calls.map(([, countOption]) => countOption);
+      assemblies.mockRestore();
+      counts.mockRestore();
+      expect(result.success).toBe(true);
+      return {
+        harness,
+        assemblyCalls,
+        countOptions,
+        workspaceId: metadata.id,
+        sent: harness.startStreamCalls.at(0),
+        budgets,
+        offered,
+        measured,
+        publishCalls: () => publishCalls,
+        history: await readHistory(),
+      };
+    }
+
+    const isWarning = (row: MuxMessage) =>
+      row.metadata?.muxMetadata?.type === "context-budget-warning";
+    const textOf = (message: unknown) => JSON.stringify(message);
+    // The dispatched conversation as the model reads it (consecutive user rows are merged).
+    const conversationText = (sent: TurnExecutionOptions) =>
+      sent.messages
+        .filter((message) => message.role !== "system")
+        .flatMap((message) =>
+          typeof message.content === "string"
+            ? [message.content]
+            : message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+        )
+        .join("\n");
+    const occurrences = (text: string, needle: string) => text.split(needle).length - 1;
+    const warningTextOf = (row: MuxMessage) =>
+      row.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("");
+    // A fresh count of dispatched messages, with the options of the turn-start check.
+    const countRequest = async (
+      turn: Awaited<ReturnType<typeof runStageTurn>>,
+      messages: TurnExecutionOptions["messages"]
+    ) =>
+      (await estimateAssembledRequestTokensForModel(
+        { system: turn.sent!.system, messages, tools: turn.sent!.tools },
+        turn.countOptions[0]
+      ))!.estimate;
+    // Smallest model limit whose hard ceiling is `ceiling` (every ceiling value is reachable).
+    const limitForCeiling = (ceiling: number) => {
+      let limit = ceiling;
+      while (getContextBudgetHardCeiling(limit) < ceiling) limit += 1;
+      expect(getContextBudgetHardCeiling(limit)).toBe(ceiling);
+      return limit;
+    };
+
+    it("publishes the warning after the user row and dispatches the payload it counted", async () => {
+      using xumHome = new DisposableTempDir("ai-turn-start-stage-opens");
+      const turn = await runStageTurn(path.join(xumHome.path, "stage"));
+      const [row] = turn.offered;
+      expect(row?.metadata?.muxMetadata).toMatchObject({ handoff: true });
+      const sent = turn.sent!;
+      // The dispatched conversation ends with the user text, then the warning text.
+      const conversation = conversationText(sent);
+      const warningText = warningTextOf(row);
+      expect(conversation.endsWith(warningText)).toBe(true);
+      expect(occurrences(conversation, warningText)).toBe(1);
+      expect(conversation.indexOf(USER_TEXT)).toBeGreaterThanOrEqual(0);
+      expect(conversation.indexOf(USER_TEXT)).toBeLessThan(conversation.indexOf(warningText));
+      // History holds [user, warning, assistant], and the assistant answers the warning.
+      const history = turn.history;
+      expect(history.map((message) => message.id)).toEqual(["user-1", row.id, sent.messageId]);
+      expect(history[2].metadata?.requestHistorySequence).toBe(
+        history[1].metadata?.historySequence
+      );
+      // E′ is a fresh count of exactly the dispatched payload (a candidate history through
+      // measureMessages), and E is the same turn's request without the stage.
+      expect(turn.measured).toEqual([await countRequest(turn, sent.messages)]);
+      const withoutStage = await runStageTurn(path.join(xumHome.path, "no-stage"), {
+        stageCallback: false,
+      });
+      const estimate = await countRequest(withoutStage, withoutStage.sent!.messages);
+      expect(turn.budgets.map((budget) => budget.estimate)).toEqual([estimate]);
+      expect(turn.measured[0]).toBeGreaterThan(estimate);
+      // The row reports E, the estimate the turn-start check counted.
+      expect(row.metadata?.muxMetadata).toMatchObject({ contextTokens: estimate });
+    });
+
+    it.each([
+      { gap: 1, opens: true },
+      { gap: 0, opens: false },
+    ])(
+      "opens only while E′ plus the reserve stays below the ceiling (gap $gap)",
+      async ({ gap, opens }) => {
+        using xumHome = new DisposableTempDir("ai-turn-start-stage-boundary");
+        // A few-thousand-token window: the handoff point stays a few dozen tokens.
+        const SMALL_WINDOW_SLIDER = 0.01;
+        // The warning text names the limit, so E′ depends on it: iterate to a fixed point.
+        let measured = (await runStageTurn(path.join(xumHome.path, "probe-0"))).measured[0];
+        let limit = 0;
+        for (let attempt = 1; attempt <= 5; attempt += 1) {
+          limit = limitForCeiling(measured + WARNING_RESERVE_TOKENS + gap);
+          const next = (
+            await runStageTurn(path.join(xumHome.path, `probe-${attempt}`), {
+              contextWindowTokens: limit,
+              slider: SMALL_WINDOW_SLIDER,
+            })
+          ).measured[0];
+          if (next === measured) break;
+          measured = next;
+        }
+        const turn = await runStageTurn(path.join(xumHome.path, "turn"), {
+          contextWindowTokens: limit,
+          slider: SMALL_WINDOW_SLIDER,
+        });
+        const [budget] = turn.budgets;
+        // Non-vacuous: the stage is due and E′ sits exactly `gap` below the ceiling's margin.
+        expect(budget.limit).toBe(limit);
+        expect(turn.offered).toHaveLength(1);
+        expect(turn.measured[0] + WARNING_RESERVE_TOKENS).toBe(
+          getContextBudgetHardCeiling(limit) - gap
+        );
+        // Either way the turn is dispatched, not refused.
+        expect(turn.sent).toBeDefined();
+        const sent = turn.sent!;
+        expect(turn.history.filter(isWarning)).toHaveLength(opens ? 1 : 0);
+        expect(turn.publishCalls()).toBe(opens ? 1 : 0);
+        expect(conversationText(sent).endsWith(warningTextOf(turn.offered[0]))).toBe(opens);
+        // The dispatched payload is the counted one: E′ (with the row) or E, both below C.
+        expect(await countRequest(turn, sent.messages)).toBe(
+          opens ? turn.measured[0] : budget.estimate
+        );
+      },
+      20_000
+    );
+
+    it("a stage that is not due adds no assembly and no count", async () => {
+      using xumHome = new DisposableTempDir("ai-turn-start-stage-not-due");
+      const baseline = await runStageTurn(path.join(xumHome.path, "baseline"), {
+        stageCallback: false,
+      });
+      // A 50% slider puts the handoff point far above this request.
+      const notDue = await runStageTurn(path.join(xumHome.path, "not-due"), { slider: 0.5 });
+      // Non-vacuous: the stage decision ran and declined.
+      expect(notDue.budgets).toHaveLength(1);
+      expect(notDue.offered).toHaveLength(0);
+      expect(baseline.countOptions.length).toBeGreaterThan(0);
+      expect({
+        assemblies: notDue.assemblyCalls,
+        counts: notDue.countOptions.length,
+      }).toEqual({ assemblies: baseline.assemblyCalls, counts: baseline.countOptions.length });
+      expect(notDue.sent!.messages).toEqual(baseline.sent!.messages);
+    });
+
+    it("a warning row in the turn's messages claims its stage without in-memory claims", async () => {
+      using xumHome = new DisposableTempDir("ai-turn-start-stage-claimed");
+      const first = await runStageTurn(xumHome.path);
+      const [row] = first.offered;
+      expect(row).toBeDefined();
+      // The next send reads the warning from history, through a fresh policy (as after a restart).
+      const next = await runStageTurn(xumHome.path, {
+        append: [createMuxMessage("user-2", "user", "next request")],
+      });
+      const [budget] = next.budgets;
+      // Non-vacuous: the handoff stage is still due by E; only the row's claim closes it.
+      expect(budget.estimate).toBeGreaterThanOrEqual(
+        getContextBudgetHandoffPoint(budget.limit, DUE_SLIDER)
+      );
+      expect(next.offered).toHaveLength(0);
+      expect(next.history.filter(isWarning)).toHaveLength(1);
+      expect(occurrences(conversationText(next.sent!), warningTextOf(row))).toBe(1);
+    });
+
+    it("dispatches the snapshot it was given even when history is rewritten after the read", async () => {
+      using xumHome = new DisposableTempDir("ai-turn-start-stage-rewrite");
+      let rewrites = 0;
+      const turn = await runStageTurn(xumHome.path, {
+        // A same-ID tail rewrite lands after the snapshot read, while the stage is published.
+        afterPublish: async (historyService, workspaceId) => {
+          const read = await historyService.getHistoryFromLatestBoundary(workspaceId);
+          if (!read.success) throw new Error(read.error);
+          const user = read.data.find((message) => message.id === "user-1")!;
+          const rewritten: MuxMessage = {
+            ...user,
+            parts: [{ type: "text", text: "rewritten tail" }],
+          };
+          expect((await historyService.updateHistory(workspaceId, rewritten)).success).toBe(true);
+          rewrites += 1;
+        },
+      });
+      // Non-vacuous: history now holds the rewrite.
+      expect(rewrites).toBe(1);
+      expect(textOf(turn.history[0])).toContain("rewritten tail");
+      const sent = turn.sent!;
+      const conversation = conversationText(sent);
+      expect(conversation).not.toContain("rewritten tail");
+      expect(conversation).toContain(USER_TEXT);
+      expect(conversation.endsWith(warningTextOf(turn.offered[0]))).toBe(true);
+      // The dispatched payload is the counted assembly of the snapshot plus the warning.
+      expect(turn.measured).toEqual([await countRequest(turn, sent.messages)]);
+    });
+
+    it("a Stop after the candidate assembly writes no warning", async () => {
+      using xumHome = new DisposableTempDir("ai-turn-start-stage-stop-before-publish");
+      const abortController = new AbortController();
+      const turn = await runStageTurn(xumHome.path, {
+        abortController,
+        afterCandidate: () => abortController.abort(),
+      });
+      // Non-vacuous: the candidate was counted and would have fit.
+      expect(turn.offered).toHaveLength(1);
+      expect(turn.measured).toHaveLength(1);
+      expect(turn.publishCalls()).toBe(0);
+      expect(turn.sent).toBeUndefined();
+      expect(turn.history.filter(isWarning)).toHaveLength(0);
+    });
+
+    it("a Stop after publication keeps the warning, and the next send does not repeat it", async () => {
+      using xumHome = new DisposableTempDir("ai-turn-start-stage-stop-after-publish");
+      const abortController = new AbortController();
+      const stopped = await runStageTurn(xumHome.path, {
+        abortController,
+        afterPublish: () => {
+          abortController.abort();
+          return Promise.resolve();
+        },
+      });
+      expect(stopped.publishCalls()).toBe(1);
+      expect(stopped.sent).toBeUndefined();
+      const kept = stopped.history.filter(isWarning);
+      expect(kept.map((row) => row.id)).toEqual([stopped.offered[0].id]);
+      // The next send reads the history the stopped turn left behind.
+      const next = await runStageTurn(xumHome.path, {
+        append: [createMuxMessage("user-2", "user", "try again")],
+      });
+      const [budget] = next.budgets;
+      expect(budget.estimate).toBeGreaterThanOrEqual(
+        getContextBudgetHandoffPoint(budget.limit, DUE_SLIDER)
+      );
+      expect(next.offered).toHaveLength(0);
+      expect(next.history.filter(isWarning)).toHaveLength(1);
+    });
+
+    it("a pre-stream thinking fold re-assembles the request with the warning", async () => {
+      using xumHome = new DisposableTempDir("ai-turn-start-stage-thinking-fold");
+      const override: ActiveTurnThinkingOverride = { pending: "high" };
+      const turn = await runStageTurn(xumHome.path, { activeTurnThinkingOverride: override });
+      // Non-vacuous: start() folded the pending level after its stage decision.
+      expect(override.applied).toBe("high");
+      expect(turn.offered).toHaveLength(1);
+      const conversation = conversationText(turn.sent!);
+      expect(conversation).toContain(USER_TEXT);
+      expect(occurrences(conversation, warningTextOf(turn.offered[0]))).toBe(1);
+      expect(conversation.endsWith(warningTextOf(turn.offered[0]))).toBe(true);
+    });
   });
 
   it("emits startup breadcrumbs as runtime-status events before stream start", async () => {
@@ -3107,6 +3500,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       agentId?: string;
       // Earlier turns, sent before the latest user message.
       history?: MuxMessage[];
+      onTurnStartBudget?: OnTurnStartBudget;
     }
 
     // Captured right after each request, while its state is current.
@@ -3209,6 +3603,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           experiments: { tokenBudget: true, memory: true },
           contextBudgetRolloverAvailable: state.rolloverAvailable === true,
           workspaceGoalService: goalService,
+          onTurnStartBudget: state.onTurnStartBudget,
         });
         expect(result.success).toBe(true);
         const request = harness.startStreamCalls.at(-1)!;
@@ -3309,47 +3704,50 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(stableSystemRow(plan)).not.toBe(stableSystemRow(exec));
     });
 
+    // Native tool_reference targets in a request, in order (repeats included).
+    const referencedTools = (request: TurnExecutionOptions) =>
+      request.messages.flatMap((message) =>
+        message.role !== "tool"
+          ? []
+          : message.content.flatMap((part) =>
+              part.type === "tool-result" && part.output.type === "content"
+                ? part.output.value.map((item) =>
+                    item.type === "custom" ? item.providerOptions?.anthropic?.toolName : null
+                  )
+                : []
+            )
+      );
+    // A turn whose tool search loaded alpha_lookup.
+    const searchTurn = (id: string): MuxMessage[] => [
+      createMuxMessage(`${id}-user`, "user", "look something up"),
+      createMuxMessage(`${id}-assistant`, "assistant", "", undefined, [
+        {
+          type: "dynamic-tool",
+          toolCallId: `${id}-call`,
+          toolName: "tool_catalog_search",
+          state: "output-available",
+          input: { query: "lookup" },
+          output: {
+            query: "lookup",
+            matches: [{ name: "alpha_lookup", description: "Look something up" }],
+            totalDeferred: 1,
+          },
+        },
+      ]),
+    ];
+
     // Native deferred loading (#5262, #5297): a search loads a tool through a
     // tool_reference in the transcript, so a later turn that replays the search
     // must send the same tools (deferLoading markers included) as the turn
     // before it (#5406).
     it("keeps the tool block across a replayed native tool search activation", async () => {
       using xumHome = new DisposableTempDir("ai-service-prefix-guard");
-      const searchTurn: MuxMessage[] = [
-        createMuxMessage("search-user", "user", "look something up"),
-        createMuxMessage("search-assistant", "assistant", "", undefined, [
-          {
-            type: "dynamic-tool",
-            toolCallId: "search-call",
-            toolName: "tool_catalog_search",
-            state: "output-available",
-            input: { query: "lookup" },
-            output: {
-              query: "lookup",
-              matches: [{ name: "alpha_lookup", description: "Look something up" }],
-              totalDeferred: 1,
-            },
-          },
-        ]),
-      ];
-      const referencedTools = (request: TurnExecutionOptions) =>
-        request.messages.flatMap((message) =>
-          message.role !== "tool"
-            ? []
-            : message.content.flatMap((part) =>
-                part.type === "tool-result" && part.output.type === "content"
-                  ? part.output.value.map((item) =>
-                      item.type === "custom" ? item.providerOptions?.anthropic?.toolName : null
-                    )
-                  : []
-              )
-        );
       const {
         requests: [before, after],
         observations,
       } = await streamPair(
         xumHome.path,
-        [{ toolSearch: true }, { toolSearch: true, history: searchTurn }],
+        [{ toolSearch: true }, { toolSearch: true, history: searchTurn("search") }],
         referencedTools
       );
       // Non-vacuous: the MCP tool is deferred, and only the second request
@@ -3361,6 +3759,51 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(breakpointTools(after)).toEqual(breakpointTools(before));
       expect(toolBlock(after)).toBe(toolBlock(before));
       expect(stableSystemRow(after)).toBe(stableSystemRow(before));
+    });
+
+    // #5286 with #5416: the turn-start stage decision reads E from the turn-start check, which
+    // charges each repeated tool_reference its expanded schema again.
+    it("the turn-start stage decision reads E with repeated tool references charged", async () => {
+      using xumHome = new DisposableTempDir("ai-service-stage-tool-reference");
+      const estimates: number[] = [];
+      const recordEstimate: OnTurnStartBudget = (budget) => {
+        estimates.push(budget.estimate);
+        return Promise.resolve(undefined);
+      };
+      const {
+        requests: [, twice],
+        observations,
+      } = await streamPair(
+        xumHome.path,
+        [
+          { toolSearch: true, history: searchTurn("first"), onTurnStartBudget: recordEstimate },
+          {
+            toolSearch: true,
+            history: [...searchTurn("first"), ...searchTurn("second")],
+            onTurnStartBudget: recordEstimate,
+          },
+        ],
+        referencedTools
+      );
+      // Non-vacuous: the second request references the deferred tool twice.
+      expect(observations).toEqual([
+        JSON.stringify(["alpha_lookup"]),
+        JSON.stringify(["alpha_lookup", "alpha_lookup"]),
+      ]);
+      expect(estimates).toHaveLength(2);
+      const schemaCost = async (activeTools: string[]) =>
+        (await estimateAssembledRequestTokensForModel(
+          { tools: twice.tools, messages: [] },
+          {
+            model: twice.modelString,
+            modelContextLimit: twice.contextBudgetLimit,
+            activeTools,
+          }
+        ))!.estimate;
+      // The repeat costs at least one more copy of the deferred tool's schema.
+      expect(estimates[1] - estimates[0]).toBeGreaterThanOrEqual(
+        (await schemaCost(["alpha_lookup"])) - (await schemaCost([]))
+      );
     });
   });
 
