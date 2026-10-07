@@ -891,13 +891,12 @@ export const MAX_PERSISTED_KEY_CHARS = 8192;
  * - `cache`: derived data the app can refetch; the only kind the quota handler may evict.
  * - `draft`: unsent composer/creation input; never evicted.
  * - `workspace-scoped`: per-workspace review data and UI state; never evicted.
- * - `synced`: frontend copy of backend-owned preferences; never evicted.
- * - `ui`: small UI preferences; never evicted.
+ * - `ui`: small UI state and preferences not yet stored on the backend; never evicted.
  *
  * Removal is always allowed, registered or not, so legacy cleanups keep working. A legacy key that
  * is only read and removed needs no registration; registered legacy keys use `maxValueChars: 0`.
  */
-export type PersistedKeyKind = "ui" | "cache" | "workspace-scoped" | "draft" | "synced";
+export type PersistedKeyKind = "ui" | "cache" | "workspace-scoped" | "draft";
 
 /**
  * `workspaceId` keys append a scope id to a fixed prefix. The scope id is usually a workspace id,
@@ -978,8 +977,7 @@ function projectPrefix(getKey: (projectPath: string) => string): string {
 
 // Budget sizing: booleans/numbers 16-32, enums and ids 32-128, paths/refs/URLs 256-2048, structured
 // values from their shapes with headroom. Per-workspace keys count once per workspace in the
-// budget model, so they are sized tightly; global and backend-synced keys generously (a refused
-// sync would leave a stale frontend copy).
+// budget model, so they are sized tightly; global keys generously.
 //
 // Budget policy (#5225): a key's budget must cover the largest value its owner writes. An owner
 // whose value grows with user input (paths, ids, URLs, free text, per-item maps) bounds it where
@@ -991,7 +989,7 @@ function projectPrefix(getKey: (projectPath: string) => string): string {
 export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Copied on fork.
   // Record<agentId, { model, thinkingLevel, reasoningMode? }>, hydrated from workspace metadata.
-  workspaceKey(getWorkspaceAISettingsByAgentKey, "synced", true, 1024),
+  workspaceKey(getWorkspaceAISettingsByAgentKey, "ui", true, 1024),
   workspaceKey(getModelKey, "ui", true, MODEL_KEY_MAX_CHARS),
   workspaceKey(getAutoModelRoutingKey, "ui", true, 16),
   workspaceKey(getAutoThinkingLevelKey, "ui", true, 16),
@@ -1004,7 +1002,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // The VS Code webview composer's unsent text. Longer drafts still work for the session (kept in
   // memory); the webview then persists only the last text that fit.
   workspaceKey(getInputKey, "draft", false, 8192, "webview"),
-  workspaceKey(getAgentIdKey, "synced", true, 128),
+  workspaceKey(getAgentIdKey, "ui", true, 128),
   workspaceKey(getPinnedAgentIdKey, "ui", true, 128),
   workspaceKey(getThinkingLevelKey, "ui", true, 32),
   workspaceKey(getReviewSelectedHunkKey, "workspace-scoped", true, 256),
