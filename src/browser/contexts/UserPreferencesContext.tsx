@@ -1,8 +1,6 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 
 import { useAPI } from "@/browser/contexts/API";
-import { useProjectContext } from "@/browser/contexts/ProjectContext";
-import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import {
   getPersistedStateStorage,
   subscribePersistedStateWrites,
@@ -25,9 +23,7 @@ import {
   isUserPreferenceStorageKey,
   removeStoredUserPreference,
 } from "@/common/preferences/userPreferencesStorage";
-import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { isPlainObject } from "@/common/utils/isPlainObject";
-import { normalizeOrder } from "@/common/utils/projectOrdering";
 import { stableStringify } from "@/common/utils/stableStringify";
 
 // Tests inject their own Storage; production reads the persisted-state storage and writes to it
@@ -70,79 +66,6 @@ export function mirrorBackendPreferences(params: {
   }
 }
 
-export function prunePreferenceScopes(params: {
-  preferences: UserPreferences | undefined;
-  projectPaths: Set<string>;
-  workspaceIds: Set<string>;
-  userProjects: Parameters<typeof normalizeOrder>[1];
-}): UserPreferences | undefined {
-  const next = params.preferences
-    ? (JSON.parse(JSON.stringify(params.preferences)) as UserPreferences)
-    : undefined;
-  if (!next) {
-    return undefined;
-  }
-
-  const pruneProjectRecord = <T,>(record: Record<string, T> | undefined) => {
-    if (!record) {
-      return;
-    }
-    for (const projectPath of Object.keys(record)) {
-      // The scratch composer persists AI prefs under the scratch system project
-      // scope, which userProjects excludes and which may not exist in config yet.
-      // Keep it valid here or pruning deletes those prefs and the picker reverts.
-      if (projectPath === SCRATCH_PROJECT_CONFIG_KEY) {
-        continue;
-      }
-      if (!params.projectPaths.has(projectPath)) {
-        delete record[projectPath];
-      }
-    }
-  };
-
-  if (next.navigation?.projectOrder) {
-    next.navigation.projectOrder = normalizeOrder(
-      next.navigation.projectOrder,
-      params.userProjects
-    );
-  }
-
-  pruneProjectRecord(next.ai?.projectDefaults);
-  pruneProjectRecord(next.workspaceCreation?.byProject);
-  pruneProjectRecord(next.review?.defaultBaseByProject);
-
-  const workspaceNotifications = next.notifications?.notifyOnResponseByWorkspace;
-  if (workspaceNotifications) {
-    for (const workspaceId of Object.keys(workspaceNotifications)) {
-      if (!params.workspaceIds.has(workspaceId)) {
-        delete workspaceNotifications[workspaceId];
-      }
-    }
-  }
-
-  return normalizeUserPreferences(next);
-}
-
-export function canPrunePreferenceScopes(params: {
-  hydrated: boolean;
-  projectLoading: boolean;
-  projectLoaded: boolean;
-  projectLoadError: string | null | undefined;
-  workspaceLoading: boolean;
-  workspaceLoaded: boolean;
-  workspaceLoadError: string | null | undefined;
-}): boolean {
-  return (
-    params.hydrated &&
-    !params.projectLoading &&
-    params.projectLoaded &&
-    params.projectLoadError == null &&
-    !params.workspaceLoading &&
-    params.workspaceLoaded &&
-    params.workspaceLoadError == null
-  );
-}
-
 /**
  * Builds the merge patch that turns `before` into `after`. Temporary: only this provider's
  * key-based writes need it until callers patch typed preferences directly.
@@ -170,17 +93,11 @@ function createMergePatch(before: UserPreferences, after: UserPreferences): User
 
 export function UserPreferencesProvider(props: { children: ReactNode }) {
   const { api } = useAPI();
-  const projectContext = useProjectContext();
-  const workspaceContext = useWorkspaceContext();
-  const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
     if (!api) {
-      setHydrated(false);
       return;
     }
-
-    setHydrated(false);
 
     const storage = getLocalStorage();
     if (!storage) {
@@ -200,7 +117,6 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
         backendPreferences: normalizeUserPreferences(snapshotPreferences),
         storage,
       });
-      setHydrated(true);
     };
 
     const unsubscribeWrites = subscribePersistedStateWrites((event) => {
@@ -224,46 +140,6 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
       unsubscribeStore();
     };
   }, [api]);
-
-  useEffect(() => {
-    if (
-      !canPrunePreferenceScopes({
-        hydrated,
-        projectLoading: projectContext.loading,
-        projectLoaded: projectContext.loaded,
-        projectLoadError: projectContext.loadError,
-        workspaceLoading: workspaceContext.loading,
-        workspaceLoaded: workspaceContext.loaded,
-        workspaceLoadError: workspaceContext.loadError,
-      })
-    ) {
-      return;
-    }
-
-    const projectPaths = new Set(projectContext.userProjects.keys());
-    const workspaceIds = new Set(workspaceContext.workspaceMetadata.keys());
-    const current = getUserPreferences();
-    const pruned = prunePreferenceScopes({
-      preferences: current,
-      projectPaths,
-      workspaceIds,
-      userProjects: projectContext.userProjects,
-    });
-
-    if (stableStringify(pruned) !== stableStringify(normalizeUserPreferences(current))) {
-      updateUserPreferences(createMergePatch(current, pruned ?? {}));
-    }
-  }, [
-    hydrated,
-    projectContext.loading,
-    projectContext.loaded,
-    projectContext.loadError,
-    projectContext.userProjects,
-    workspaceContext.loading,
-    workspaceContext.loaded,
-    workspaceContext.loadError,
-    workspaceContext.workspaceMetadata,
-  ]);
 
   return props.children;
 }

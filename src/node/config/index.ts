@@ -42,9 +42,12 @@ import {
   normalizeAutoModelRoutingConfig,
   type AutoModelRoutingConfigInput,
 } from "@/common/types/autoModelRouting";
-import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
+import {
+  normalizeUserPreferences,
+  UserPreferencesSchema,
+  type UserPreferences,
+} from "@/common/config/schemas/userPreferences";
 import { applyMergePatch } from "@/common/utils/applyMergePatch";
-import { UserPreferencesSchema } from "@/common/config/schemas/userPreferences";
 import { SettingsBackupSchema } from "@/common/config/schemas/settingsBackup";
 import {
   isLayoutPresetsConfigEmpty,
@@ -752,6 +755,29 @@ function delegatedCreationInterruptedField(workspace: Workspace): {
   return workspace.delegatedCreation?.interruptedAt != null
     ? { delegatedCreationInterrupted: true }
     : {};
+}
+
+/** The notify map gains an entry per auto-notified workspace, so entries of removed ones go. */
+function dropRemovedWorkspaceNotifications(
+  preferences: UserPreferences | undefined,
+  projects: Map<string, ProjectConfig>
+): UserPreferences | undefined {
+  const notifyByWorkspace = preferences?.notifications?.notifyOnResponseByWorkspace;
+  if (!notifyByWorkspace) {
+    return preferences;
+  }
+  const workspaceIds = new Set(
+    [...projects.values()].flatMap((project) => project.workspaces.map((workspace) => workspace.id))
+  );
+  return normalizeUserPreferences({
+    ...preferences,
+    notifications: {
+      ...preferences.notifications,
+      notifyOnResponseByWorkspace: Object.fromEntries(
+        Object.entries(notifyByWorkspace).filter(([workspaceId]) => workspaceIds.has(workspaceId))
+      ),
+    },
+  });
 }
 
 function normalizePersistedWorkspace(
@@ -2246,7 +2272,10 @@ export class Config {
     const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
     const defaultRuntime = normalizeRuntimeEnablementId(parsed.defaultRuntime);
 
-    const userPreferences = normalizeUserPreferences(parsed.userPreferences);
+    const userPreferences = dropRemovedWorkspaceNotifications(
+      normalizeUserPreferences(parsed.userPreferences),
+      projectsMap
+    );
     const migrations = normalizeConfigMigrations(parsed.migrations);
 
     const layoutPresetsRaw = normalizeLayoutPresetsConfig(parsed.layoutPresets);
