@@ -321,6 +321,24 @@ interface EditSession {
   settled: boolean;
   /** An edit send for it has not returned yet: that send settles it, not releaseEndedEdit. */
   sendInFlight: boolean;
+  /** The edit's notes when its composer unmounted (a workspace switch), restored on return. */
+  editReviews: ReviewNoteDataForDisplay[] | null;
+}
+
+// The open edit's session per workspace, next to its buffer (useComposerDraft): both outlive
+// the composer, which a workspace switch remounts while ChatPane keeps the edit open (#5808).
+// Memory only, like the buffer. An entry goes when its edit settles; one left by a workspace
+// removed mid-edit is small and stays until reload.
+const editSessions = new Map<string, EditSession>();
+function keepEditReviews(session: EditSession | null, reviews: ReviewNoteDataForDisplay[] | null) {
+  if (session && !session.settled) session.editReviews = reviews;
+}
+/** Settle an edit session: it restores nothing again, and its workspace forgets it. */
+function settleEditSession(session: EditSession) {
+  session.settled = true;
+  for (const [workspaceId, kept] of editSessions) {
+    if (kept === session) editSessions.delete(workspaceId);
+  }
 }
 
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
@@ -515,7 +533,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     pushToast,
   });
   const { input, setInput, attachments, setAttachments, draftReviews, setDraftReviews } = draft;
-  const { getDraft, setDraft, getLiveText, beginEditDraft, endEditDraft } = draft;
+  const { getDraft, setDraft, getLiveText, beginEditDraft, endEditDraft, updateEditDraft } = draft;
   const { reviewOverrideActive, reviewData, reviewIdsForCheck, reviewPanelItems } = draft;
   const { removeDraftReview, updateDraftReviewNote, draftScope, latestInputValueRef } = draft;
   const {
@@ -1250,7 +1268,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // The latest edit's session. Settled explicitly: the edit target also leaves the live
   // transcript when the accepted edit replaces it (possibly before the send returns), and that
   // is not a cancel.
-  const editSessionRef = useRef<EditSession | null>(null);
+  const editSessionRef = useRef<EditSession | null>(
+    workspaceId ? (editSessions.get(workspaceId) ?? null) : null
+  );
   // Live review override for completions that settle after the render they started in.
   const draftReviewsRef = useRef(draftReviews);
   useLayoutEffect(() => {
@@ -1259,7 +1279,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const restorePreEditDraft = () => {
     const session = editSessionRef.current;
     if (!session || session.settled || session.id !== editingMessageIdRef.current) return;
-    session.settled = true;
+    settleEditSession(session);
     // The edit text is dropped; the composer shows the unsent draft again.
     endEditDraft();
     setDraftReviews(session.preEditReviews);
@@ -1276,7 +1296,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     dropEditReviews = false
   ): boolean => {
     if (!session || session.settled) return false;
-    session.settled = true;
+    settleEditSession(session);
     const { preEditReviews } = session;
     if (dropEditReviews) setDraftReviews(null);
     // The composer goes back to the unsent draft; what was typed in the edit buffer while the
@@ -1314,6 +1334,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const markEditSendInFlight = (session: EditSession | null, inFlight: boolean) => {
     if (session) session.sendInFlight = inFlight;
   };
+  // A workspace switch unmounts this composer while the edit stays open: keep the edit's notes
+  // in its session, as its text and files are kept in the buffer (#5808).
+  useEffect(() => {
+    const sessionRef = editSessionRef;
+    const reviewsRef = draftReviewsRef;
+    return () => keepEditReviews(sessionRef.current, reviewsRef.current);
+  }, []);
   // After every commit: the edit's end arrives as a prop change, and settled sessions no-op.
   useEffect(() => {
     releaseEndedEdit();
@@ -1437,17 +1464,25 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
     if (appliedEditIdRef.current === editingMessage.id) return;
     appliedEditIdRef.current = editingMessage.id;
-    editSessionRef.current = {
-      id: editingMessage.id,
-      preEditReviews: draftReviews,
-      settled: false,
-      sendInFlight: false,
-    };
+    const kept = editSessionRef.current;
+    // Back from another workspace, the edit's session and buffer outlived the composer: keep
+    // them (and the pre-edit notes) instead of starting the edit over.
+    if (!kept || kept.id !== editingMessage.id || kept.settled) {
+      const session: EditSession = {
+        id: editingMessage.id,
+        preEditReviews: draftReviews,
+        settled: false,
+        sendInFlight: false,
+        editReviews: null,
+      };
+      editSessionRef.current = session;
+      if (workspaceId) editSessions.set(workspaceId, session);
+    }
     beginEditDraft(editingMessage.id, {
       text: editingMessage.pending.content,
       attachments: pendingChatAttachments(editingMessage.pending, `edit-${editingMessage.id}`),
     });
-    setDraftReviews(editingMessage.pending.reviews);
+    setDraftReviews(editSessionRef.current?.editReviews ?? editingMessage.pending.reviews);
     // Auto-resize textarea and focus
     setTimeout(() => {
       if (inputRef.current) {
@@ -1457,7 +1492,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         inputRef.current.focus();
       }
     }, 0);
-  }, [editingMessage, draftReviews, beginEditDraft, setDraftReviews]);
+  }, [editingMessage, draftReviews, beginEditDraft, setDraftReviews, workspaceId]);
 
   // Project live workflow run cards for foreground slash invocations after reloads.
   useEffect(() => {
@@ -2082,7 +2117,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       for (const action of actions) {
         switch (action.type) {
           case "clear-input":
-            if (!editCancelled()) setInput("");
+            // An editing command clears its edit's buffer only: its row can already be gone.
+            if (commandEditSession) {
+              if (!commandEditSession.settled) updateEditDraft(commandEditSession.id, { text: "" });
+            } else if (!editCancelled()) setInput("");
             break;
           case "reset-input-height":
             if (inputRef.current) inputRef.current.style.height = "";
@@ -2100,7 +2138,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             setSendingCount((count) => count + (action.sending ? 1 : -1));
             break;
           case "clear-attachments":
-            if (!editCancelled()) setAttachments([]);
+            if (commandEditSession) {
+              if (!commandEditSession.settled) {
+                updateEditDraft(commandEditSession.id, { attachments: [] });
+              }
+            } else if (!editCancelled()) setAttachments([]);
             break;
           case "detach-reviews":
             if (variant === "workspace") props.onDetachAllReviews?.();

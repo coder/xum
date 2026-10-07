@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   defaultCreationDraftScope,
   getDraftStore,
@@ -7,6 +7,7 @@ import {
 } from "@/browser/stores/DraftStore";
 import type { ReviewNoteDataForDisplay } from "@/common/types/message";
 import type { Review } from "@/common/types/review";
+import assert from "@/common/utils/assert";
 import { DRAFT_ID_PATTERN } from "@/constants/drafts";
 import type { ChatAttachment } from "./ChatAttachments";
 import type { Toast } from "./ChatInputToast";
@@ -52,6 +53,27 @@ interface EditDraft {
   attachments: ChatAttachment[];
 }
 
+// The open edit's buffer per workspace, in module memory. A workspace switch remounts the
+// composer (ChatPane keys it by workspace) while ChatPane keeps the edit open, so the buffer
+// must outlive the composer (#5808). Module memory, not the draft store: a reload still drops
+// the edit, and another window never sees it (#5672, #5571).
+const editDrafts = new Map<string, EditDraft>();
+const editDraftListeners = new Map<string, Set<() => void>>();
+function writeStoredEditDraft(key: string, next: EditDraft | null) {
+  if (next) editDrafts.set(key, next);
+  else editDrafts.delete(key);
+  for (const listener of editDraftListeners.get(key) ?? []) listener();
+}
+function subscribeEditDraft(key: string, listener: () => void) {
+  const listeners = editDraftListeners.get(key) ?? new Set<() => void>();
+  editDraftListeners.set(key, listeners);
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) editDraftListeners.delete(key);
+  };
+}
+
 type Update<T> = T | ((previous: T) => T);
 const applyUpdate = <T>(value: Update<T>, previous: T): T =>
   typeof value === "function" ? (value as (previous: T) => T)(previous) : value;
@@ -66,21 +88,28 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   // While a message is edited, the composer edits this buffer instead of the draft: the edit
   // text stays in this window's memory, so a reload keeps the unsent draft (#5672) and another
   // window never shows the edit (#5571). A reload drops the edit; that is the chosen tradeoff.
-  // The ref is the live copy for writes that run after an await; renders read the state.
-  const [editDraft, setEditDraftState] = useState<EditDraft | null>(null);
-  const editDraftRef = useRef<EditDraft | null>(null);
+  // Edits exist only in a workspace composer, so the workspace keys the buffer (editDrafts).
+  const editKey = options.variant === "workspace" ? options.workspaceId : null;
+  const readEditDraft = () => (editKey ? (editDrafts.get(editKey) ?? null) : null);
+  const editDraft = useSyncExternalStore(
+    (listener) => (editKey ? subscribeEditDraft(editKey, listener) : () => undefined),
+    readEditDraft
+  );
   const editIdRef = useRef(options.editMessageId);
   useLayoutEffect(() => {
     editIdRef.current = options.editMessageId;
   });
   const writeEditDraft = (next: EditDraft | null) => {
-    editDraftRef.current = next;
-    setEditDraftState(next);
+    if (!editKey) {
+      assert(next === null, "An edit buffer needs a workspace composer");
+      return;
+    }
+    writeStoredEditDraft(editKey, next);
   };
   // Only the open edit's buffer counts. One left behind by an edit that ended without settling
-  // (its row was replaced, a workspace switch) is ignored and discarded like a cancelled edit.
+  // (its row was replaced) is ignored until the composer releases it.
   const liveEditDraft = () => {
-    const current = editDraftRef.current;
+    const current = readEditDraft();
     return current !== null && current.editId === editIdRef.current ? current : null;
   };
   const editActive = editDraft !== null && editDraft.editId === options.editMessageId;
@@ -185,12 +214,25 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     setInput,
     /** The live composer text (the open edit's, else the draft's), for code after an await. */
     getLiveText: () => liveEditDraft()?.text ?? draftStore.getText(draftScope),
-    /** Fill the edit buffer; from now on the composer edits it, not the draft. */
-    beginEditDraft: (editId: string, next: { text: string; attachments: ChatAttachment[] }) =>
-      writeEditDraft({ editId, ...next }),
+    /**
+     * Fill the edit buffer; from now on the composer edits it, not the draft. A buffer this edit
+     * already has (it outlived a workspace switch) is kept with its typed changes.
+     */
+    beginEditDraft: (editId: string, next: { text: string; attachments: ChatAttachment[] }) => {
+      if (readEditDraft()?.editId === editId) return;
+      writeEditDraft({ editId, ...next });
+    },
+    /**
+     * Change this edit's buffer, whether or not ChatPane still shows the edit (an accepted edit
+     * command replaces its row before it clears the composer). Never the shared draft.
+     */
+    updateEditDraft: (editId: string, patch: Partial<Pick<EditDraft, "text" | "attachments">>) => {
+      const edit = readEditDraft();
+      if (edit?.editId === editId) writeEditDraft({ ...edit, ...patch });
+    },
     /** Drop the edit buffer and return what it held (text typed during an edit send). */
     endEditDraft: () => {
-      const edit = editDraftRef.current;
+      const edit = readEditDraft();
       writeEditDraft(null);
       return edit;
     },

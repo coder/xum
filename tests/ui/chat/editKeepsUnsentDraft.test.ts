@@ -194,7 +194,10 @@ describe("Completing an edit of an older message", () => {
         expect(composerText(app)).toContain("edit-removed.md");
       }, LOAD_TOLERANT_WAIT);
       const textarea = await startEditWithUnsentDraft(app, scope);
-      await waitFor(() => expect(composerText(app)).toContain("edit-removed.md"), LOAD_TOLERANT_WAIT);
+      await waitFor(
+        () => expect(composerText(app)).toContain("edit-removed.md"),
+        LOAD_TOLERANT_WAIT
+      );
       typeIntoEdit(textarea, "edited before switch");
       await waitFor(() => expect(textarea.value).toBe("edited before switch"));
       const removeButton = [
@@ -236,6 +239,34 @@ describe("Completing an edit of an older message", () => {
       const saved = await app.env.services.draftService.get(scope);
       expect(saved.text).toBe("unsent draft");
       expect(saved.attachments.map(({ id }) => id)).toEqual(["file-unsent"]);
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // A kept edit whose row goes while another workspace is shown ends on return, like any edit
+  // whose row is deleted: its text stays as a normal draft after the unsent draft.
+  test("a kept edit whose row is deleted while another workspace is shown ends on return", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-switch-row-deleted" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      const created = await app.env.orpc.workspace.create({
+        projectPath: app.repoPath,
+        branchName: generateBranchName("edit-switch-row-deleted-other"),
+        trunkBranch: await detectDefaultTrunkBranch(app.repoPath),
+      });
+      if (!created.success) throw new Error(created.error);
+      workspaceStore.addWorkspace(created.metadata);
+      await showWorkspace(app, created.metadata.id, created.metadata.name);
+
+      const cleared = await app.env.services.workspaceService.truncateHistory(app.workspaceId);
+      expect(cleared.success).toBe(true);
+      await showWorkspace(app, app.workspaceId, app.metadata.name);
+      await waitFor(() => expect(editTextarea(app)).toBeNull(), LOAD_TOLERANT_WAIT);
+      await expectEditKeptAsDraft(app, scope);
     } finally {
       await app.dispose();
     }

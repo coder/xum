@@ -6,6 +6,7 @@ import React, {
   useRef,
   useDeferredValue,
   useMemo,
+  useSyncExternalStore,
 } from "react";
 import { Lightbulb } from "lucide-react";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
@@ -311,6 +312,44 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   );
 };
 
+// The open edit per workspace, in module memory: a workspace switch keeps it, so switching back
+// shows the edit with its typed changes, whose buffer the composer keeps (#5808). Not React
+// state: the shell unmounts this pane while a workspace loads. Memory only, so a reload drops
+// it. An entry goes when its edit ends; one left by a workspace removed mid-edit is small and
+// stays until reload.
+let editTargets: Readonly<Record<string, EditingMessageState>> = {};
+const editTargetListeners = new Set<() => void>();
+const readEditTargets = () => editTargets;
+function subscribeEditTargets(listener: () => void) {
+  editTargetListeners.add(listener);
+  return () => {
+    editTargetListeners.delete(listener);
+  };
+}
+function setEditingByWorkspace(
+  update: (
+    previous: Readonly<Record<string, EditingMessageState>>
+  ) => Readonly<Record<string, EditingMessageState>>
+) {
+  const next = update(editTargets);
+  if (next === editTargets) return;
+  editTargets = next;
+  for (const listener of editTargetListeners) listener();
+}
+
+/** `edits` with this workspace's edit set or removed; the same object when nothing changes. */
+function withWorkspaceEdit(
+  edits: Readonly<Record<string, EditingMessageState>>,
+  workspaceId: string,
+  edit: EditingMessageState | undefined
+): Readonly<Record<string, EditingMessageState>> {
+  if (edits[workspaceId] === edit) return edits;
+  if (edit) return { ...edits, [workspaceId]: edit };
+  if (!(workspaceId in edits)) return edits;
+  const { [workspaceId]: _removed, ...rest } = edits;
+  return rest;
+}
+
 const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const {
     workspaceId,
@@ -378,30 +417,24 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       ? queuedActionErrorState.error
       : null;
 
-  const [editingState, setEditingState] = useState(() => ({
-    workspaceId,
-    message: undefined as EditingMessageState | undefined,
-  }));
-  const editingMessage =
-    editingState.workspaceId === workspaceId ? editingState.message : undefined;
+  const editingByWorkspace = useSyncExternalStore(subscribeEditTargets, readEditTargets);
+  const editingMessage = editingByWorkspace[workspaceId];
   const setEditingMessage = useCallback(
     (message: EditingMessageState | undefined) => {
       // Any change of edit target ends the conflict recovery of the previous edit (no-op
       // when none is pending); only the composer's own updater keeps a request alive.
       storeRaw.cancelTranscriptRefresh(workspaceId);
-      setEditingState({
-        workspaceId,
-        message: transcriptOnly ? undefined : message,
-      });
+      setEditingByWorkspace((previous) =>
+        withWorkspaceEdit(previous, workspaceId, transcriptOnly ? undefined : message)
+      );
     },
     [storeRaw, workspaceId, transcriptOnly]
   );
   const updateEditingMessage = (update: (current: EditingMessageState) => EditingMessageState) => {
-    setEditingState((previous) =>
-      previous.workspaceId === workspaceId && previous.message
-        ? { ...previous, message: update(previous.message) }
-        : previous
-    );
+    setEditingByWorkspace((previous) => {
+      const current = previous[workspaceId];
+      return current ? withWorkspaceEdit(previous, workspaceId, update(current)) : previous;
+    });
   };
   // The workspace with an unresolved edit send: no edit starts there meanwhile (#5226).
   const [editSendPendingIn, setEditSendPendingIn] = useState<string | null>(null);
@@ -434,7 +467,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // stale edit state instead of leaving the transcript stuck at an edit cutoff.
   useEffect(() => {
     if (transcriptOnly && editingMessage) {
-      setEditingState({ workspaceId, message: undefined });
+      setEditingByWorkspace((previous) => withWorkspaceEdit(previous, workspaceId, undefined));
     }
   }, [editingMessage, transcriptOnly, workspaceId]);
 
@@ -890,8 +923,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     clearBackgroundBashError();
   }, [clearBackgroundBashError, workspaceId]);
 
+  // A switch keeps each workspace's open edit (editingByWorkspace).
   useEffect(() => {
-    setEditingState({ workspaceId, message: undefined });
     setPendingTimelineReveal(null);
   }, [workspaceId]);
 
@@ -1354,6 +1387,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Must be before early return to satisfy React Hooks rules
   useEffect(() => {
     if (!workspaceState || !editingMessage) return;
+    // Back from another workspace, a kept edit's rows replay first: only a caught-up
+    // transcript can show that its row is gone (#5808).
+    if (!workspaceState.isTranscriptCaughtUp) return;
     // Conflict recovery re-reads the transcript (a full replay empties the aggregator first,
     // a pre-window range discards cached pages); the refresh outcome decides whether the
     // edited row is gone, not the transient absence of its row.
