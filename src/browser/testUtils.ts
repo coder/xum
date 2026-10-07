@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import type { APIClient } from "@/browser/contexts/API";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import type { ExperimentId } from "@/common/constants/experiments";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
@@ -229,6 +230,11 @@ export function setTestExperiment(experimentId: ExperimentId, enabled: boolean |
   store.updateOptimistically({
     experiments: { ...store.getSnapshot()?.experiments, [experimentId]: enabled === true },
   });
+}
+
+/** Sets agentAiDefaults in the shared AppConfigStore snapshot; undefined clears it. */
+export function setTestAgentAiDefaults(agentAiDefaults: AgentAiDefaults | undefined): void {
+  getAppConfigStore().updateOptimistically({ agentAiDefaults });
 }
 
 /** Clears the experiments snapshot so the store singleton does not leak flags between tests. */

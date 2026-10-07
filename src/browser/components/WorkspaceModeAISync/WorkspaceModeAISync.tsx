@@ -1,17 +1,13 @@
 import { useEffect, useRef } from "react";
 import { useAgent } from "@/browser/contexts/AgentContext";
-import {
-  readPersistedState,
-  updatePersistedState,
-  usePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { useAgentAiDefaults } from "@/browser/stores/AppConfigStore";
 import {
   getAutoRoutingChoiceByAgentKey,
   getModelKey,
   getReasoningModeKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
-  AGENT_AI_DEFAULTS_KEY,
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import {
@@ -28,7 +24,6 @@ import {
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 
 export function WorkspaceModeAISync(props: { workspaceId: string }): null {
@@ -36,11 +31,7 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
   const { agentId, agents } = useAgent();
   const autoRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
 
-  const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
-    AGENT_AI_DEFAULTS_KEY,
-    {},
-    { listener: true }
-  );
+  const agentAiDefaults = useAgentAiDefaults();
 
   // User request: this effect runs on mount and during background sync (defaults/config).
   // Only treat *real* agentId changes as explicit (origin "agent"); everything else is "sync"

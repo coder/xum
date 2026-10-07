@@ -22,11 +22,9 @@ import {
   type AutoRoutingDimension,
 } from "@/browser/utils/modelChange";
 import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
-  AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
   getReasoningModeKey,
   getThinkingLevelKey,
@@ -38,7 +36,11 @@ import {
   getProjectScopeId,
   getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
-import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
+import {
+  getAppConfigStore,
+  getUserPreferences,
+  updateUserPreferences,
+} from "@/browser/stores/AppConfigStore";
 import type { SendMessageError } from "@/common/types/errors";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -148,7 +150,7 @@ function syncCreationPreferences(
   // defaults would prevent later Settings changes from taking effect.
   const configuredDefaults = resolveConfiguredAiDefaults(
     effectiveAgentId,
-    readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {}),
+    getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {},
     agentBaseById
   );
   const routingChoice: Partial<Record<AutoRoutingDimension, boolean>> = {};

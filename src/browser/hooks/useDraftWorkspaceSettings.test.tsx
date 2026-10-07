@@ -6,7 +6,7 @@ import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { DEFAULT_MODEL_KEY, DEFAULT_RUNTIME_KEY, getRuntimeKey } from "@/common/constants/storage";
+import { DEFAULT_MODEL_KEY, getRuntimeKey } from "@/common/constants/storage";
 import { CODER_RUNTIME_PLACEHOLDER } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "./useDraftWorkspaceSettings";
 import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
@@ -68,7 +68,10 @@ describe("useDraftWorkspaceSettings", () => {
 
   afterEach(() => {
     cleanup();
-    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+    getAppConfigStore().updateOptimistically({
+      userPreferences: undefined,
+      defaultRuntime: undefined,
+    });
     mock.restore();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
@@ -220,7 +223,7 @@ describe("useDraftWorkspaceSettings", () => {
   test("keeps Coder default even after plain SSH usage", async () => {
     const projectPath = "/tmp/project";
 
-    updatePersistedState(DEFAULT_RUNTIME_KEY, "coder");
+    getAppConfigStore().updateOptimistically({ defaultRuntime: "coder" });
     updatePersistedState(getRuntimeKey(projectPath), "ssh dev@host");
     const lastRuntimeConfig = {
       ssh: {

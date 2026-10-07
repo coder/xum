@@ -31,8 +31,6 @@ import {
   AGENT_AI_DEFAULTS_KEY,
   DEFAULT_MODEL_KEY,
   DEFAULT_RUNTIME_KEY,
-  GATEWAY_ENABLED_KEY,
-  GATEWAY_MODELS_KEY,
   HIDDEN_MODELS_KEY,
   RUNTIME_ENABLEMENT_KEY,
   SELECTED_WORKSPACE_KEY,
@@ -142,44 +140,6 @@ export function migrateLocalModelPrefsToBackend(
     api.config.updateModelPreferences(patch).catch(() => undefined);
   }
   return { ...cfg, ...patch };
-}
-
-/**
- * One-time best-effort migration for gateway preferences.
- * Users upgrading from builds that only stored gateway state in localStorage
- * (keys: "gateway-enabled", "gateway-models") need their preferences migrated
- * to config.json so they aren't lost when localStorage is no longer read.
- */
-function migrateLocalGatewayPrefsToBackend(
-  api: APIClient,
-  cfg: { muxGatewayEnabled?: boolean; muxGatewayModels?: string[] }
-): void {
-  // Only migrate if the backend doesn't have these values yet
-  if (cfg.muxGatewayEnabled !== undefined && cfg.muxGatewayModels !== undefined) return;
-
-  // Read legacy localStorage keys
-  const localEnabled = readPersistedState<boolean>(GATEWAY_ENABLED_KEY, true);
-  const localModels = readPersistedState<string[]>(GATEWAY_MODELS_KEY, []);
-
-  const shouldMigrateEnabled = cfg.muxGatewayEnabled === undefined && localEnabled === false;
-  const shouldMigrateModels = cfg.muxGatewayModels === undefined && localModels.length > 0;
-
-  const clearLegacyGatewayPrefs = () => {
-    updatePersistedState<boolean | undefined>(GATEWAY_ENABLED_KEY, undefined);
-    updatePersistedState<string[] | undefined>(GATEWAY_MODELS_KEY, undefined);
-  };
-
-  if (shouldMigrateEnabled || shouldMigrateModels) {
-    api.config
-      .updateMuxGatewayPrefs({
-        muxGatewayEnabled: cfg.muxGatewayEnabled ?? localEnabled,
-        muxGatewayModels: cfg.muxGatewayModels ?? localModels,
-      })
-      .then(clearLegacyGatewayPrefs)
-      .catch(() => {
-        // Best-effort only.
-      });
-  }
 }
 
 /**
@@ -721,11 +681,6 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         if (cfg.defaultRuntime !== undefined) {
           updatePersistedState(DEFAULT_RUNTIME_KEY, cfg.defaultRuntime);
         }
-
-        // One-time gateway pref migration: if the backend doesn't have gateway prefs yet,
-        // check if the user had non-default values in the old localStorage keys.
-        // This covers users upgrading from builds that only stored gateway state locally.
-        migrateLocalGatewayPrefsToBackend(api, cfg);
       })
       .catch(() => {
         // Best-effort only.

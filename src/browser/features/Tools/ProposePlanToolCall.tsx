@@ -42,7 +42,6 @@ import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import {
-  AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
   getModelKey,
   getReasoningModeKey,
@@ -544,7 +543,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     const existingModel = readPersistedState<string>(modelKey, fallbackModel);
     const existingThinking = readPersistedState<ThinkingLevel>(thinkingKey, "off");
     const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
-    const agentAiDefaults = readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {});
+    const agentAiDefaults: AgentAiDefaults =
+      getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {};
     const workspaceByAgent = readPersistedState<WorkspaceAISettingsCache>(
       getWorkspaceAISettingsByAgentKey(args.workspaceId),
       {}

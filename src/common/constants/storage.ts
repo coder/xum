@@ -98,15 +98,6 @@ export const EXPANDED_PROJECTS_KEY = "expandedProjects";
 export const WORKSPACE_DRAFTS_BY_PROJECT_KEY = "workspaceDraftsByProject";
 
 /**
- * LocalStorage keys for Xum Gateway routing preferences (global).
- *
- * Note: localStorage is origin-scoped (includes port), so these values are also
- * mirrored into ~/.xum/config.json for portability across server ports.
- */
-export const GATEWAY_MODELS_KEY = "gateway-models"; // enabled model IDs (canonical)
-export const GATEWAY_ENABLED_KEY = "gateway-enabled"; // global on/off toggle
-
-/**
  * Storage key for runtime enablement settings (shared via ~/.xum/config.json).
  */
 export const RUNTIME_ENABLEMENT_KEY = "runtimeEnablement";
