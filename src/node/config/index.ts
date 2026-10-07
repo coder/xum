@@ -6,6 +6,7 @@ import { EventEmitter } from "events";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { isTaskAttemptId } from "@/node/utils/taskAttemptId";
 import { Effect, Semaphore } from "effect";
+import { ORPCError } from "@orpc/server";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
 import { EXPERIMENT_OVERRIDES_FILE_NAME } from "@/node/services/experimentsService";
@@ -42,6 +43,8 @@ import {
   type AutoModelRoutingConfigInput,
 } from "@/common/types/autoModelRouting";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
+import { UserPreferencesSchema } from "@/common/config/schemas/userPreferences";
 import { SettingsBackupSchema } from "@/common/config/schemas/settingsBackup";
 import {
   isLayoutPresetsConfigEmpty,
@@ -3084,6 +3087,21 @@ export class Config {
         next.defaultRuntime = defaultRuntime;
       }
       return next;
+    });
+  }
+
+  async updateUserPreferences(patches: readonly unknown[]): Promise<void> {
+    await this.editConfig((config) => {
+      const merged = patches.reduce<unknown>(
+        (prefs, patch) => applyMergePatch(prefs, patch),
+        config.userPreferences
+      );
+      // Normalization drops invalid fields, so an invalid patch would silently delete the
+      // stored value; refuse it instead.
+      if (!UserPreferencesSchema.safeParse(merged ?? {}).success) {
+        throw new ORPCError("BAD_REQUEST", { message: "Invalid user preferences patch" });
+      }
+      return { ...config, userPreferences: normalizeUserPreferences(merged) };
     });
   }
 

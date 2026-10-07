@@ -47,7 +47,9 @@ const trimmedNonBlank = (value: unknown) => nonBlank(value)?.trim();
 const repairAgentId = (value: unknown) => normalizeAgentId(value, "") || undefined;
 const repairFontSize = (value: unknown) =>
   Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : undefined;
-const BranchSchema = repairOnLoad(z.string().min(1), trimmedNonBlank);
+// A fresh schema per field, since each one registers its own repair.
+const nonBlankString = () => z.string().refine((value) => value.trim().length > 0);
+const BranchSchema = repairOnLoad(nonBlankString(), trimmedNonBlank);
 
 function repairModelString(value: unknown): string | undefined {
   const model = trimmedNonBlank(value);
@@ -70,7 +72,7 @@ export const UserPreferencesSchema = z.object({
       // Independent fields, so an invalid or cleared family does not drop the size.
       terminalFontConfig: z
         .object({
-          fontFamily: repairOnLoad(z.string().min(1), nonBlank).optional(),
+          fontFamily: repairOnLoad(nonBlankString(), nonBlank).optional(),
           fontSize: repairOnLoad(z.number().positive(), repairFontSize).optional(),
         })
         .optional(),
@@ -79,7 +81,7 @@ export const UserPreferencesSchema = z.object({
           enabled: z.boolean(),
           template: z.string(),
           position: z.enum(TERMINAL_BADGE_POSITIONS),
-          opacity: z.number().min(0).max(1),
+          opacity: z.number().positive().max(1),
           fontSize: z.number().positive(),
         }),
         (value) => (isPlainObject(value) ? normalizeTerminalBadgeConfig(value) : undefined)
@@ -87,7 +89,7 @@ export const UserPreferencesSchema = z.object({
       editorConfig: repairOnLoad(
         z.object({
           editor: z.enum(EDITOR_TYPES),
-          customCommand: z.string().min(1).optional(),
+          customCommand: nonBlankString().optional(),
         }),
         (value) => (isPlainObject(value) ? normalizeEditorConfig(value) : undefined)
       ).optional(),
@@ -97,14 +99,14 @@ export const UserPreferencesSchema = z.object({
   navigation: z
     .object({
       launchBehavior: LaunchBehaviorSchema.optional(),
-      projectOrder: repairOnLoad(z.array(z.string()), repairStringArray).optional(),
+      projectOrder: repairOnLoad(z.array(nonBlankString()), repairStringArray).optional(),
     })
     .optional(),
   ai: z
     .object({
       globalDefaults: z
         .object({
-          agentId: repairOnLoad(z.string().min(1), repairAgentId).optional(),
+          agentId: repairOnLoad(nonBlankString(), repairAgentId).optional(),
           thinkingLevel: repairOnLoad(ThinkingLevelSchema, coerceThinkingLevel).optional(),
         })
         .optional(),
@@ -112,8 +114,11 @@ export const UserPreferencesSchema = z.object({
         .record(
           z.string(),
           z.object({
-            agentId: repairOnLoad(z.string().min(1), repairAgentId).optional(),
-            model: repairOnLoad(z.string().min(1), repairModelString).optional(),
+            agentId: repairOnLoad(nonBlankString(), repairAgentId).optional(),
+            model: repairOnLoad(
+              z.string().refine((model) => repairModelString(model) !== undefined),
+              repairModelString
+            ).optional(),
             thinkingLevel: repairOnLoad(ThinkingLevelSchema, coerceThinkingLevel).optional(),
           })
         )

@@ -236,7 +236,7 @@ describe("backup payload", () => {
         navigation: { launchBehavior: "dashboard", projectOrder: ["/private/project"] },
         ai: {
           globalDefaults: { agentId: "exec" },
-          projectDefaults: { "/private/project": { model: "secret/model" } },
+          projectDefaults: { "/private/project": { model: "openai:secret-model" } },
           autoCompactionThresholdByModel: { "openai/gpt": 75 },
         },
         workspaceCreation: { byProject: { "/private/project": { trunkBranch: "main" } } },

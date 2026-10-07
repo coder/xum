@@ -451,6 +451,95 @@ describe("router config transcript mutation", () => {
     expect(recorderEnabled).toHaveBeenLastCalledWith(true);
   });
 
+  test("updateUserPreferences refuses an invalid value and keeps the stored one", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    await client.config.updateUserPreferences({
+      patches: [{ appearance: { transcriptDensity: "hyper" } }],
+    });
+
+    const outcome = await client.config
+      .updateUserPreferences({ patches: [{ appearance: { transcriptDensity: "bogus" } }] })
+      .then(
+        () => "resolved",
+        (error: ORPCError<string, unknown>) => error.code
+      );
+
+    expect(outcome).toBe("BAD_REQUEST");
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual({
+      appearance: { transcriptDensity: "hyper" },
+    });
+  });
+
+  test("updateUserPreferences refuses values that loading would discard", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    const stored = {
+      navigation: { projectOrder: ["/repo/a"] },
+      ai: { projectDefaults: { "/repo/a": { model: "openai:gpt-4.1" } } },
+    };
+    await client.config.updateUserPreferences({ patches: [stored] });
+
+    const badge = { enabled: true, template: "", position: "top-left", fontSize: 20, opacity: 0 };
+    for (const patch of [
+      { ai: { projectDefaults: { "/repo/a": { model: "nonsense" } } } },
+      { ai: { projectDefaults: { "/repo/a": { agentId: " " } } } },
+      { ai: { globalDefaults: { agentId: " " } } },
+      { navigation: { projectOrder: ["/repo/a", " "] } },
+      { appearance: { terminalBadgeConfig: badge } },
+      { appearance: { terminalFontConfig: { fontFamily: " " } } },
+      { appearance: { editorConfig: { editor: "custom", customCommand: " " } } },
+      { workspaceCreation: { byProject: { "/repo/a": { trunkBranch: " " } } } },
+      { review: { defaultBaseByProject: { "/repo/a": " " } } },
+    ]) {
+      const outcome = await client.config.updateUserPreferences({ patches: [patch] }).then(
+        () => "resolved",
+        (error: ORPCError<string, unknown>) => error.code
+      );
+      expect(outcome).toBe("BAD_REQUEST");
+    }
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual(stored);
+  });
+
+  test("terminal font family and size are patched and cleared independently", async () => {
+    const clientA = createRouterClient(router(), { context: createContext() });
+    const clientB = createRouterClient(router(), { context: createContext() });
+
+    await clientA.config.updateUserPreferences({
+      patches: [{ appearance: { terminalFontConfig: { fontSize: 16 } } }],
+    });
+    await clientB.config.updateUserPreferences({
+      patches: [{ appearance: { terminalFontConfig: { fontFamily: "Menlo" } } }],
+    });
+    await clientB.config.updateUserPreferences({
+      patches: [{ appearance: { terminalFontConfig: { fontFamily: null } } }],
+    });
+
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual({
+      appearance: { terminalFontConfig: { fontSize: 16 } },
+    });
+  });
+
+  test("updateUserPreferences merges patches from separate clients and null deletes a key", async () => {
+    const clientA = createRouterClient(router(), { context: createContext() });
+    const clientB = createRouterClient(router(), { context: createContext() });
+
+    await clientA.config.updateUserPreferences({
+      patches: [{ appearance: { vimEnabled: true } }],
+    });
+    await clientB.config.updateUserPreferences({
+      patches: [{ appearance: { theme: "dark" } }, { navigation: { launchBehavior: "new-chat" } }],
+    });
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual({
+      appearance: { vimEnabled: true, theme: "dark" },
+      navigation: { launchBehavior: "new-chat" },
+    });
+
+    await clientA.config.updateUserPreferences({ patches: [{ appearance: { vimEnabled: null } }] });
+    expect((await clientB.config.getConfig()).userPreferences).toEqual({
+      appearance: { theme: "dark" },
+      navigation: { launchBehavior: "new-chat" },
+    });
+  });
+
   test("persists the full-width chat transcript config flag", async () => {
     const client = createRouterClient(router(), { context: createContext() });
 
