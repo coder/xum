@@ -34,12 +34,6 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
   const bootstrappedRef = useRef(false);
 
-  // Connected here so startup can wait for the first config snapshot (experiments); the gate
-  // stays mounted, so this also follows reconnects.
-  useEffect(() => {
-    getAppConfigStore().setClient(apiState.api ?? null);
-  }, [apiState.api]);
-
   useEffect(() => {
     if (bootstrappedRef.current || !apiState.api) {
       return;

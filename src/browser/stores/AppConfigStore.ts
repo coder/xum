@@ -1,4 +1,7 @@
+import { useSyncExternalStore } from "react";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { APIClient } from "@/browser/contexts/API";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { BashCollapsedSummaryMode, TranscriptDensity } from "@/common/constants/storage";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -26,6 +29,41 @@ export interface AppConfigSnapshot {
   keepScreenAwake?: boolean;
   /** Backend experiment values; the only experiment state the renderer reads. */
   experiments?: Partial<Record<ExperimentId, boolean>>;
+  userPreferences?: UserPreferences;
+}
+
+const EMPTY_SNAPSHOT: AppConfigSnapshot = {};
+const EMPTY_USER_PREFERENCES: UserPreferences = {};
+
+/**
+ * Returns `previous` when it deep-equals `next`, else `next` rebuilt around the unchanged children
+ * of `previous`. onConfigChanged fires after every config write (workspace metadata too), so this
+ * keeps selectors over unchanged slices from re-rendering on unrelated writes.
+ */
+function reuseUnchanged<T>(previous: unknown, next: T): T;
+function reuseUnchanged(previous: unknown, next: unknown): unknown {
+  if (Object.is(previous, next)) return previous;
+  if (Array.isArray(next) && Array.isArray(previous)) {
+    const previousItems: unknown[] = previous;
+    const nextItems: unknown[] = next;
+    const merged = nextItems.map((value, index) => reuseUnchanged(previousItems[index], value));
+    const unchanged =
+      merged.length === previousItems.length &&
+      merged.every((value, index) => value === previousItems[index]);
+    return unchanged ? previousItems : merged;
+  }
+  if (isPlainObject(next) && isPlainObject(previous)) {
+    const merged: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(next)) {
+      merged[key] = reuseUnchanged(previous[key], value);
+    }
+    const keys = Object.keys(merged);
+    const unchanged =
+      keys.length === Object.keys(previous).length &&
+      keys.every((key) => key in previous && merged[key] === previous[key]);
+    return unchanged ? previous : merged;
+  }
+  return next;
 }
 
 /**
@@ -52,6 +90,8 @@ export class AppConfigStore {
   private subscriptionIterator: AsyncIterator<unknown> | null = null;
 
   setClient(client: APIClient | null): void {
+    // Reconnecting the current client (stories wire it beside APIProvider) keeps its subscription.
+    if (client === this.client) return;
     this.client = client;
 
     this.subscriptionController?.abort();
@@ -91,7 +131,7 @@ export class AppConfigStore {
         const taskSettings = config.taskSettings as
           | { proposePlanImplementReplacesChatHistory?: boolean }
           | undefined;
-        this.snapshot = {
+        const next = reuseUnchanged(this.snapshot, {
           routePriority: config.routePriority,
           routeOverrides: config.routeOverrides,
           minThinkingLevelByModel: config.minThinkingLevelByModel,
@@ -103,8 +143,12 @@ export class AppConfigStore {
           agentAiDefaults: config.agentAiDefaults,
           keepScreenAwake: config.keepScreenAwake === true,
           experiments: config.experiments ?? {},
-        };
-        this.notify();
+          userPreferences: config.userPreferences ?? EMPTY_USER_PREFERENCES,
+        });
+        if (next !== this.snapshot) {
+          this.snapshot = next;
+          this.notify();
+        }
       }
     } catch {
       // Best-effort only; consumers degrade to defaults.
@@ -170,4 +214,18 @@ let storeInstance: AppConfigStore | null = null;
 export function getAppConfigStore(): AppConfigStore {
   storeInstance ??= new AppConfigStore();
   return storeInstance;
+}
+
+/** `select` must return a slice of the snapshot, not a new object, or the hook re-renders forever. */
+export function useAppConfig<T>(select: (config: AppConfigSnapshot) => T): T {
+  const store = getAppConfigStore();
+  return useSyncExternalStore(store.subscribe, () => select(store.getSnapshot() ?? EMPTY_SNAPSHOT));
+}
+
+export function getUserPreferences(): UserPreferences {
+  return getAppConfigStore().getSnapshot()?.userPreferences ?? EMPTY_USER_PREFERENCES;
+}
+
+export function useUserPreferences<T>(select: (preferences: UserPreferences) => T): T {
+  return useAppConfig((config) => select(config.userPreferences ?? EMPTY_USER_PREFERENCES));
 }

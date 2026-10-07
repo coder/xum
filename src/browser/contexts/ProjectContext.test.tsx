@@ -103,12 +103,13 @@ describe("ProjectContext", () => {
     const projectsApi = createMockAPI({
       list: () => Promise.resolve(projects),
     });
-    let triggerConfigChange: (() => void) | null = null;
+    // The shared AppConfigStore subscribes too, so signal every subscriber.
+    const triggerConfigChange: Array<() => void> = [];
     const onConfigChanged = mock(() =>
       Promise.resolve(
         (async function* () {
           await new Promise<void>((resolve) => {
-            triggerConfigChange = resolve;
+            triggerConfigChange.push(resolve);
           });
           yield undefined;
         })()
@@ -124,14 +125,14 @@ describe("ProjectContext", () => {
     const ctx = await setup();
 
     await waitFor(() => expect(ctx().userProjects.size).toBe(1));
-    await waitFor(() => expect(triggerConfigChange).not.toBeNull());
+    await waitFor(() => expect(triggerConfigChange.length).toBeGreaterThan(0));
     projects = [
       ["/alpha", { workspaces: [] }],
       ["/beta", { workspaces: [] }],
     ];
 
     act(() => {
-      triggerConfigChange?.();
+      for (const trigger of triggerConfigChange) trigger();
     });
 
     await waitFor(() => expect(ctx().userProjects.size).toBe(2));

@@ -285,7 +285,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   // The API context wraps the whole webview app: its body calls shared hooks that read it
   // (useResumeStream for the interrupted divider and its keybind).
   return (
-    <APIProvider client={apiClient}>
+    <APIProvider client={apiClient} skipAppConfigStore>
       <WebviewApp bridge={bridge} apiClient={apiClient} />
     </APIProvider>
   );
