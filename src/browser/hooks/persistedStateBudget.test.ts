@@ -11,12 +11,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { installDom } from "../../../tests/ui/dom";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  EXPERIMENTS,
-  getExperimentKey,
-  getLegacyPtcExclusiveExperimentKey,
-  type ExperimentId,
-} from "@/common/constants/experiments";
+import { EXPERIMENTS, getExperimentKey, type ExperimentId } from "@/common/constants/experiments";
 import * as storageModule from "@/common/constants/storage";
 import {
   GLOBAL_SCOPE_ID,
@@ -85,10 +80,7 @@ const draftScopeIds = Array.from({ length: DRAFT_SCOPE_COUNT }, (_, index) =>
   getDraftScopeId(projectPaths[index % PROJECT_COUNT], `${index}`.padStart(36, "d"))
 );
 const projectScopeIds = [...projectPaths.map(getProjectScopeId), GLOBAL_SCOPE_ID];
-const experimentKeys = [
-  ...(Object.keys(EXPERIMENTS) as ExperimentId[]).map(getExperimentKey),
-  getLegacyPtcExclusiveExperimentKey(),
-];
+const experimentKeys = (Object.keys(EXPERIMENTS) as ExperimentId[]).map(getExperimentKey);
 
 /** Every concrete key the worst-case model writes for one registration. */
 function modelledKeys(entry: PersistedKeyRegistration): string[] {

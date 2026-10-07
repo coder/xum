@@ -7,7 +7,7 @@ import {
   EXPERIMENT_IDS,
   type ExperimentId,
   getExperimentKey,
-  getLegacyPtcExclusiveExperimentKey,
+  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
 } from "@/common/constants/experiments";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { APIProvider, type APIClient } from "./API";
@@ -104,7 +104,7 @@ describe("ExperimentsProvider", () => {
         };
         reject = fail;
       });
-      const setOverride = mock(() => pending);
+      const set = mock(() => pending);
       currentClientMock = {
         experiments: {
           onDesignChange: (_input, { signal } = {}) => {
@@ -113,7 +113,7 @@ describe("ExperimentsProvider", () => {
           },
           getOverrides: () =>
             Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: backendEnabled }),
-          setOverride,
+          set,
         },
       };
       function Toggle() {
@@ -129,7 +129,7 @@ describe("ExperimentsProvider", () => {
       );
       await waitFor(() => expect(view.getByRole("button").textContent).toBe("true"));
       fireEvent.click(view.getByRole("button"));
-      expect(setOverride).toHaveBeenCalledTimes(1);
+      expect(set).toHaveBeenCalledTimes(1);
       expect(view.getByRole("button").textContent).toBe("true");
       expect(
         window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP))
@@ -147,7 +147,7 @@ describe("ExperimentsProvider", () => {
     const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
     updates.push({ enabled: true, revision: 1 });
     let acknowledge!: () => void;
-    const setOverride = mock(
+    const set = mock(
       () =>
         new Promise<void>((resolve) => {
           acknowledge = resolve;
@@ -162,7 +162,7 @@ describe("ExperimentsProvider", () => {
     );
     currentClientMock = {
       experiments: {
-        setOverride,
+        set,
         getOverrides,
         onDesignChange: (_input, { signal } = {}) => {
           signal?.addEventListener("abort", updates.end, { once: true });
@@ -201,10 +201,10 @@ describe("ExperimentsProvider", () => {
 
   test("stale local Design enablement is neither uploaded nor displayed on reconnect", async () => {
     window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP), "true");
-    const setOverride = mock(() => Promise.resolve());
+    const set = mock(() => Promise.resolve());
     currentClientMock = {
       experiments: {
-        setOverride,
+        set,
         getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: false }),
       },
     };
@@ -219,7 +219,7 @@ describe("ExperimentsProvider", () => {
       </APIProvider>
     );
     await waitFor(() => expect(view.getByText("false")).toBeDefined());
-    expect(setOverride).not.toHaveBeenCalled();
+    expect(set).not.toHaveBeenCalled();
   });
 
   test("renderer flight recording follows the backend status stream, not stale storage", async () => {
@@ -248,10 +248,10 @@ describe("ExperimentsProvider", () => {
     window.localStorage.setItem(getExperimentKey(perf), "false");
     const statuses = createAsyncMessageQueue<FlightRecorderStatus>();
     statuses.push({ enabled: true, state: "collecting" });
-    const setOverride = mock(() => Promise.resolve());
+    const set = mock(() => Promise.resolve());
     currentClientMock = {
       experiments: {
-        setOverride,
+        set,
         getOverrides: () => Promise.resolve({ [perf]: false }),
         onPerfFlightRecorderChange: (_input, { signal } = {}) => {
           signal?.addEventListener("abort", statuses.end, { once: true });
@@ -278,7 +278,7 @@ describe("ExperimentsProvider", () => {
         </APIProvider>
       );
       await waitFor(() => expect(view.getByRole("button").textContent).toBe("true/true"));
-      expect(setOverride).not.toHaveBeenCalled();
+      expect(set).not.toHaveBeenCalled();
       // Only new entries: no `buffered` import of frames recorded while the experiment was off.
       await waitFor(() => expect(connectedCount()).toBe(2));
       expect(observers.map((observer) => observer.init)).toEqual([
@@ -288,7 +288,7 @@ describe("ExperimentsProvider", () => {
 
       // A Settings toggle requests the change; the streamed status publishes it.
       fireEvent.click(view.getByRole("button"));
-      expect(setOverride).toHaveBeenCalledWith({ experimentId: perf, enabled: false });
+      expect(set).toHaveBeenCalledWith({ experimentId: perf, enabled: false });
       expect(view.getByRole("button").textContent).toBe("true/true");
       await act(async () => {
         statuses.push({ enabled: false, state: "off" });
@@ -329,8 +329,8 @@ describe("ExperimentsProvider", () => {
       const budget = EXPERIMENT_IDS.TOKEN_BUDGET;
       const backend: Partial<Record<ExperimentId, boolean>> = {};
       const pending: Array<{ finish: () => void; fail: () => void }> = [];
-      const setOverride = mock(
-        ({ experimentId, enabled }: Parameters<APIClient["experiments"]["setOverride"]>[0]) =>
+      const set = mock(
+        ({ experimentId, enabled }: Parameters<APIClient["experiments"]["set"]>[0]) =>
           new Promise<void>((resolve, reject) => {
             if (typeof enabled !== "boolean") throw new Error("Expected an explicit override");
             pending.push({
@@ -343,10 +343,8 @@ describe("ExperimentsProvider", () => {
           })
       );
       currentClientMock = {
-        experiments: { setOverride, getOverrides: () => Promise.resolve({ ...backend }) },
+        experiments: { set, getOverrides: () => Promise.resolve({ ...backend }) },
       };
-      // Start a reconnect upload before any selection; it must not overtake later choices.
-      window.localStorage.setItem(getExperimentKey(continuous), "true");
       function Settings() {
         const [continuousEnabled, setContinuous] = useExperiment(continuous);
         const [budgetEnabled, setBudget] = useExperiment(budget);
@@ -388,35 +386,34 @@ describe("ExperimentsProvider", () => {
         </APIProvider>
       );
       const view = render(tree(true));
-      await waitFor(() => expect(setOverride).toHaveBeenCalledTimes(1));
       fireEvent.click(view.getByText("budget"));
+      await waitFor(() => expect(set).toHaveBeenCalledTimes(1));
       fireEvent.click(view.getByText("continuous"));
       view.rerender(tree(false));
       view.rerender(tree(true));
       fireEvent.click(view.getByText("summarize"));
       expect(view.getByRole("status").textContent).toBe("false/false");
-      expect(setOverride).toHaveBeenCalledTimes(1);
+      expect(set).toHaveBeenCalledTimes(1);
 
       // Unrelated flags retain their immediate dispatch even while compaction is blocked.
       fireEvent.click(view.getByText("unrelated"));
-      expect(setOverride).toHaveBeenCalledTimes(2);
+      expect(set).toHaveBeenCalledTimes(2);
       await act(async () => {
         pending[1].finish();
         await Promise.resolve();
       });
-      for (let index = 0; index < 7; index++) {
+      for (let index = 0; index < 6; index++) {
         const pendingIndex = index === 0 ? 0 : index + 1;
         await act(async () => {
           if (index === 0 && failFirstWrite) pending[pendingIndex].fail();
           else pending[pendingIndex].finish();
           await Promise.resolve();
         });
-        expect(setOverride).toHaveBeenCalledTimes(Math.min(index + 3, 8));
+        expect(set).toHaveBeenCalledTimes(Math.min(index + 3, 7));
       }
-      expect(setOverride.mock.calls.map(([input]) => input)).toEqual([
-        { experimentId: continuous, enabled: true },
-        { experimentId: EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES, enabled: true },
+      expect(set.mock.calls.map(([input]) => input)).toEqual([
         { experimentId: budget, enabled: true },
+        { experimentId: EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES, enabled: true },
         { experimentId: continuous, enabled: false },
         { experimentId: continuous, enabled: true },
         { experimentId: budget, enabled: false },
@@ -432,41 +429,38 @@ describe("ExperimentsProvider", () => {
     }
   );
 
-  test("syncs existing local overrides to the backend on connect", async () => {
+  test("stale local PTC keys are not written to the backend on connect or reconnect", async () => {
     globalThis.window.localStorage.setItem(
-      getExperimentKey(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES),
+      getExperimentKey(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
       JSON.stringify(true)
     );
-
-    const setOverrideMock = mock(() => Promise.resolve());
-    currentClientMock = {
-      experiments: {
-        setOverride: setOverrideMock,
-        getOverrides: mock(() => Promise.resolve({})),
-      },
-    };
-
-    render(
-      <APIProvider client={createTestApiClient(currentClientMock)}>
+    globalThis.window.localStorage.setItem(
+      `experiment:${LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID}`,
+      JSON.stringify(true)
+    );
+    const set = mock(() => Promise.resolve());
+    const getOverrides = mock(() => Promise.resolve({}));
+    const tree = () => (
+      <APIProvider client={createTestApiClient({ experiments: { set, getOverrides } })}>
         <ExperimentsProvider>
           <div />
         </ExperimentsProvider>
       </APIProvider>
     );
 
-    await waitFor(() => {
-      expect(setOverrideMock).toHaveBeenCalledWith({
-        experimentId: EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES,
-        enabled: true,
-      });
-    });
+    const view = render(tree());
+    await waitFor(() => expect(getOverrides).toHaveBeenCalledTimes(1));
+    // A new client is what a reconnect hands the provider.
+    view.rerender(tree());
+    await waitFor(() => expect(getOverrides).toHaveBeenCalledTimes(2));
+    expect(set).not.toHaveBeenCalled();
   });
 
   test("adopts a backend override when this client has no local state, and clears nothing", async () => {
-    const setOverrideMock = mock(() => Promise.resolve());
+    const setMock = mock(() => Promise.resolve());
     currentClientMock = {
       experiments: {
-        setOverride: setOverrideMock,
+        set: setMock,
         getOverrides: mock(() =>
           Promise.resolve({ [EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES]: true })
         ),
@@ -490,7 +484,7 @@ describe("ExperimentsProvider", () => {
       expect(getByTestId("enabled").textContent).toBe("true");
     });
 
-    expect(setOverrideMock).not.toHaveBeenCalled();
+    expect(setMock).not.toHaveBeenCalled();
   });
 
   test("returns false for a platform-restricted experiment on unsupported platforms", () => {
@@ -518,10 +512,10 @@ describe("ExperimentsProvider", () => {
   });
 
   test("persists backend overrides when a user toggles an experiment", async () => {
-    const setOverrideMock = mock(() => Promise.resolve());
+    const setMock = mock(() => Promise.resolve());
     currentClientMock = {
       experiments: {
-        setOverride: setOverrideMock,
+        set: setMock,
         getOverrides: mock(() => Promise.resolve({})),
       },
     };
@@ -546,105 +540,11 @@ describe("ExperimentsProvider", () => {
     fireEvent.click(getByTestId("toggle"));
 
     await waitFor(() => {
-      expect(setOverrideMock).toHaveBeenCalledWith({
+      expect(setMock).toHaveBeenCalledWith({
         experimentId: EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES,
         enabled: true,
       });
       expect(getByTestId("toggle").textContent).toBe("true");
     });
-  });
-
-  test("initialization stamps the legacy mirror over a stale explicit false", async () => {
-    // An old renderer can leave ptc:true beside a stale legacy exclusive
-    // `false`; upgrading without touching the toggle previously never rewrote
-    // the mirror, and a downgraded renderer treats the stale explicit key as
-    // an override that wins over the backend flag — resuming the removed
-    // supplement posture (r33). Initialization reconciles it.
-    currentClientMock = {
-      experiments: {
-        setOverride: mock(() => Promise.resolve()),
-        getOverrides: mock(() => Promise.resolve({})),
-      },
-    };
-
-    globalThis.window.localStorage.setItem(
-      getExperimentKey(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
-      JSON.stringify(true)
-    );
-    globalThis.window.localStorage.setItem(
-      getLegacyPtcExclusiveExperimentKey(),
-      JSON.stringify(false)
-    );
-
-    function Probe() {
-      const enabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
-      return <div data-testid="probe">{String(enabled)}</div>;
-    }
-
-    const { getByTestId } = render(
-      <APIProvider client={createTestApiClient(currentClientMock)}>
-        <ExperimentsProvider>
-          <Probe />
-        </ExperimentsProvider>
-      </APIProvider>
-    );
-
-    expect(getByTestId("probe").textContent).toBe("true");
-    await waitFor(() => {
-      expect(globalThis.window.localStorage.getItem(getLegacyPtcExclusiveExperimentKey())).toBe(
-        "true"
-      );
-    });
-  });
-
-  test("stale legacy exclusive true reads as PTC on, and toggling PTC rewrites the legacy key", async () => {
-    currentClientMock = {
-      experiments: {
-        setOverride: mock(() => Promise.resolve()),
-        getOverrides: mock(() => Promise.resolve({})),
-      },
-    };
-
-    // Pre-merge state: "PTC Exclusive Mode" enabled — exactly the posture
-    // merged PTC activates, so the upgrade must keep PTC on.
-    globalThis.window.localStorage.setItem(
-      getLegacyPtcExclusiveExperimentKey(),
-      JSON.stringify(true)
-    );
-
-    function Toggle() {
-      const [enabled, setEnabled] = useExperiment(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
-      return (
-        <button data-testid="toggle" onClick={() => setEnabled(!enabled)}>
-          {String(enabled)}
-        </button>
-      );
-    }
-
-    const { getByTestId } = render(
-      <APIProvider client={createTestApiClient(currentClientMock)}>
-        <ExperimentsProvider>
-          <Toggle />
-        </ExperimentsProvider>
-      </APIProvider>
-    );
-
-    expect(getByTestId("toggle").textContent).toBe("true");
-
-    // Toggling PTC off must rewrite the legacy key too: a downgraded renderer
-    // treats it as an explicit override that wins over the mirrored backend
-    // value, so a stale entry would resurrect the pre-merge posture.
-    fireEvent.click(getByTestId("toggle"));
-    await waitFor(() => {
-      expect(getByTestId("toggle").textContent).toBe("false");
-    });
-    expect(globalThis.window.localStorage.getItem(getLegacyPtcExclusiveExperimentKey())).toBe(
-      "false"
-    );
-    expect(
-      globalThis.window.localStorage.getItem(
-        getExperimentKey(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING)
-      )
-    ).toBe("false");
   });
 });

@@ -33,8 +33,8 @@ export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
 
 /**
  * Pre-merge experiment ID: "PTC Exclusive Mode" was a separate experiment
- * before Programmatic Tool Calling became exclusive-only. Persistence layers
- * (backend feature_flags.json, renderer localStorage) alias a stored `true`
+ * before Programmatic Tool Calling became exclusive-only. The backend
+ * (feature_flags.json and persisted flag objects) aliases a stored `true`
  * onto the merged PTC key on read and mirror the merged PTC value back onto
  * this key on write, so upgrades keep the user's exclusive posture and a
  * downgraded build runs exclusive mode instead of the removed (~2x cost)
@@ -339,15 +339,6 @@ export function getExperimentPlatformRestrictionLabel(
  */
 export function getExperimentKey(experimentId: ExperimentId): string {
   return `experiment:${experimentId}`;
-}
-
-/**
- * localStorage key of the removed exclusive experiment (see
- * LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID). Kept out of getExperimentKey's
- * signature so ordinary call sites can't target a removed experiment.
- */
-export function getLegacyPtcExclusiveExperimentKey(): string {
-  return `experiment:${LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID}`;
 }
 
 /**

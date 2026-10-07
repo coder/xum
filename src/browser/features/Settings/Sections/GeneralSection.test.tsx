@@ -35,7 +35,7 @@ type ExperimentOverrides = Partial<Record<ExperimentId, boolean>>;
 interface MockAPIClient {
   experiments: {
     getOverrides: () => Promise<ExperimentOverrides>;
-    setOverride: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => Promise<void>;
+    set: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => Promise<void>;
   };
   config: {
     getConfig: () => Promise<MockConfig>;
@@ -213,7 +213,7 @@ interface RenderGeneralSectionOptions {
 interface MockAPISetup {
   api: MockAPIClient;
   backendOverrides: ExperimentOverrides;
-  setOverrideMock: ReturnType<typeof mock<MockAPIClient["experiments"]["setOverride"]>>;
+  setMock: ReturnType<typeof mock<MockAPIClient["experiments"]["set"]>>;
   getOverridesMock: ReturnType<typeof mock<MockAPIClient["experiments"]["getOverrides"]>>;
   getConfigMock: ReturnType<typeof mock<() => Promise<MockConfig>>>;
   updateCoderPrefsMock: ReturnType<
@@ -244,7 +244,7 @@ function createMockAPI(
 ): MockAPISetup {
   const backendOverrides = { ...experimentOverrides };
   const getOverridesMock = mock(() => Promise.resolve({ ...backendOverrides }));
-  const setOverrideMock = mock(
+  const setMock = mock(
     ({ experimentId, enabled }: { experimentId: ExperimentId; enabled?: boolean | null }) => {
       // Like the backend, a null/omitted value clears the override.
       if (enabled == null) {
@@ -326,7 +326,7 @@ function createMockAPI(
 
   return {
     api: {
-      experiments: { getOverrides: getOverridesMock, setOverride: setOverrideMock },
+      experiments: { getOverrides: getOverridesMock, set: setMock },
       config: {
         getConfig: getConfigMock,
         updateCoderPrefs: updateCoderPrefsMock,
@@ -349,7 +349,7 @@ function createMockAPI(
       },
     },
     backendOverrides,
-    setOverrideMock,
+    setMock,
     getOverridesMock,
     getConfigMock,
     updateCoderPrefsMock,
@@ -484,17 +484,9 @@ describe("GeneralSection", () => {
         expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
           label
         );
-        expect(setup.backendOverrides).toEqual(overrides);
+        expect(setup.backendOverrides).toEqual(source === "backendOverrides" ? overrides : {});
         expect(experimentOverriddenMock).not.toHaveBeenCalled();
-        // The provider uploads explicit local values; mounting the dropdown must add no writes.
-        if (source === "localOverrides") {
-          for (const [experimentId, enabled] of Object.entries(overrides)) {
-            expect(setup.setOverrideMock).toHaveBeenCalledWith({ experimentId, enabled });
-          }
-        }
-        expect(setup.setOverrideMock).toHaveBeenCalledTimes(
-          source === "localOverrides" ? Object.keys(overrides).length : 0
-        );
+        expect(setup.setMock).not.toHaveBeenCalled();
         for (const [id, enabled] of Object.entries(overrides)) {
           expect(window.localStorage.getItem(getExperimentKey(id as ExperimentId))).toBe(
             source === "localOverrides" ? JSON.stringify(enabled) : null
@@ -510,7 +502,7 @@ describe("GeneralSection", () => {
     expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
       "Summarize"
     );
-    expect(setup.setOverrideMock).not.toHaveBeenCalled();
+    expect(setup.setMock).not.toHaveBeenCalled();
     expect(setup.backendOverrides).toEqual({});
     expect(
       window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION))
@@ -546,8 +538,8 @@ describe("GeneralSection", () => {
       expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
         label
       );
-      expect(setup.backendOverrides).toEqual({ ...backend, ...local });
-      expect(setup.setOverrideMock).toHaveBeenCalledTimes(Object.keys(local).length);
+      expect(setup.backendOverrides).toEqual(backend);
+      expect(setup.setMock).not.toHaveBeenCalled();
     }
   );
 
@@ -576,7 +568,7 @@ describe("GeneralSection", () => {
             [EXPERIMENT_IDS.TOKEN_BUDGET]: budget,
           })
         );
-        expect(setup.setOverrideMock).toHaveBeenCalledTimes(2);
+        expect(setup.setMock).toHaveBeenCalledTimes(2);
         expect(experimentOverriddenMock).toHaveBeenCalledTimes(2);
         expect(experimentOverriddenMock).toHaveBeenCalledWith(
           EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
@@ -650,7 +642,7 @@ describe("GeneralSection", () => {
     );
     expect(within(portalRoot).queryAllByText("Token Budget")).toHaveLength(0);
     expect(setup.backendOverrides).toEqual({ [EXPERIMENT_IDS.TOKEN_BUDGET]: true });
-    expect(setup.setOverrideMock).not.toHaveBeenCalled();
+    expect(setup.setMock).not.toHaveBeenCalled();
   });
 
   test("persists flat chat list mode from the Sidebar group", () => {

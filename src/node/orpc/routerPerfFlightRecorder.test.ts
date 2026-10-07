@@ -127,7 +127,7 @@ describe("perf flight recorder procedures", () => {
 
   test("experiment overrides start and stop collection without a restart", async () => {
     const { client, overrides } = createClient();
-    await client.experiments.setOverride({
+    await client.experiments.set({
       experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
       enabled: true,
     });
@@ -157,7 +157,7 @@ describe("perf flight recorder procedures", () => {
     try {
       expect((await stream.next()).value).toEqual({ enabled: false, state: "off" });
       const setPerf = (enabled: boolean) =>
-        client.experiments.setOverride({
+        client.experiments.set({
           experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
           enabled,
         });
@@ -172,7 +172,7 @@ describe("perf flight recorder procedures", () => {
 
   test("an oversized renderer batch is rejected at the schema boundary", async () => {
     const { client } = createClient();
-    await client.experiments.setOverride({
+    await client.experiments.set({
       experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
       enabled: true,
     });
@@ -187,7 +187,7 @@ describe("perf flight recorder procedures", () => {
     // The path reaches subscription handlers only through the middleware's context; a broken
     // hand-off would leave subscriptions unrecorded while procedure stats still look fine.
     const { client } = createClient();
-    await client.experiments.setOverride({
+    await client.experiments.set({
       experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
       enabled: true,
     });
@@ -221,7 +221,7 @@ describe("perf flight recorder procedures", () => {
       client.perfCaptures.captureNow({ process: "backend", durationMs: 60_000 })
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
 
-    await client.experiments.setOverride({
+    await client.experiments.set({
       experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
       enabled: true,
     });
@@ -240,7 +240,7 @@ describe("perf flight recorder procedures", () => {
     await expect(client.perfCaptures.captureNow({ process: "backend" })).rejects.toMatchObject({
       code: "PRECONDITION_FAILED",
     });
-    await client.experiments.setOverride({
+    await client.experiments.set({
       experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
       enabled: true,
     });
@@ -260,7 +260,7 @@ describe("perf flight recorder procedures", () => {
     await expect(client.perfReports.create()).rejects.toMatchObject({
       code: "PRECONDITION_FAILED",
     });
-    await client.experiments.setOverride({
+    await client.experiments.set({
       experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
       enabled: true,
     });
