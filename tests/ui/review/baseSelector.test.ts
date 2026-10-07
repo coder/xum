@@ -132,9 +132,8 @@ describeIntegration("ReviewPanel base selector", () => {
     await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
       const cleanupDom = installDom();
 
-      // Reset persisted review-base keys so this test validates trunk auto-detection
+      // Reset the persisted workspace review base so this test validates trunk auto-detection
       // rather than inheriting state from prior tests in the same browser storage.
-      updatePersistedState(STORAGE_KEYS.reviewDefaultBase(metadata.projectPath), null);
       updatePersistedState(STORAGE_KEYS.reviewDiffBase(workspaceId), null);
 
       const view = renderReviewPanel({

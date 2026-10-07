@@ -616,20 +616,6 @@ export function getHunkFirstSeenKey(workspaceId: string): string {
 }
 
 /**
- * Project-scoped default diff base for code review.
- * Format: "review-default-base:{projectPath}"
- */
-export function getReviewDefaultBaseKey(projectPath: string): string {
-  return `review-default-base:${projectPath}`;
-}
-
-/**
- * Global code review behavior for including uncommitted changes.
- * Format: "review-include-uncommitted"
- */
-export const REVIEW_INCLUDE_UNCOMMITTED_KEY = "review-include-uncommitted";
-
-/**
  * Get the localStorage key for review sort order preference (global)
  * Format: "review-sort-order"
  */
@@ -1152,7 +1138,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(AGENT_AI_DEFAULTS_KEY, "synced", 32 * 1024),
   globalKey(GIT_STATUS_INDICATOR_MODE_KEY, "ui", 32),
   globalKey(TUTORIAL_STATE_KEY, "ui", 256),
-  globalKey(REVIEW_INCLUDE_UNCOMMITTED_KEY, "synced", 16),
   globalKey(REVIEW_SORT_ORDER_KEY, "ui", 32),
   globalKey(REVIEW_FILE_TREE_VIEW_MODE_KEY, "ui", 32),
   globalKey(LEFT_SIDEBAR_COLLAPSED_KEY, "ui", 16),
@@ -1195,7 +1180,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Project-scoped families ("{prefix}{projectPath}").
   globalPrefix(projectPrefix(getRuntimeKey), "ui", 256, "project"),
   globalPrefix(projectPrefix(getAgentsInitNudgeKey), "ui", 16, "project"),
-  globalPrefix(projectPrefix(getReviewDefaultBaseKey), "synced", 256, "project"),
   globalPrefix(projectPrefix(getNotifyOnResponseAutoEnableKey), "synced", 16, "project"),
   globalPrefix(projectPrefix(getArchivedWorkspacesExpandedKey), "ui", 16, "project"),
   globalPrefix(projectPrefix(getBrowserSelectedSessionKey), "ui", 256, "project"),

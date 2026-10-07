@@ -1,8 +1,9 @@
 import React, { useState, useCallback } from "react";
 import type { GitStatus } from "@/common/types/workspace";
 import { GIT_STATUS_INDICATOR_MODE_KEY } from "@/common/constants/storage";
-import { STORAGE_KEYS, WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { STORAGE_KEYS } from "@/constants/workspaceDefaults";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useReviewDefaultBase } from "@/browser/utils/reviewDefaultBase";
 import { invalidateGitStatus, useGitStatusRefreshing } from "@/browser/stores/GitStatusStore";
 import {
   GitStatusIndicatorView,
@@ -42,11 +43,7 @@ export const GitStatusIndicator: React.FC<GitStatusIndicatorProps> = ({
   );
 
   // Per-project default base (fallback for new workspaces)
-  const [projectDefaultBase] = usePersistedState<string>(
-    STORAGE_KEYS.reviewDefaultBase(projectPath),
-    WORKSPACE_DEFAULTS.reviewBase,
-    { listener: true }
-  );
+  const projectDefaultBase = useReviewDefaultBase(projectPath);
 
   // Per-workspace base ref (shared with review panel, syncs via listener)
   const [baseRef, setBaseRef] = usePersistedState<string>(

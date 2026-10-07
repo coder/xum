@@ -4,7 +4,8 @@
 
 import React from "react";
 import { ArrowLeft, Maximize2, Sparkles } from "lucide-react";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
+import { setReviewDefaultBase, useReviewDefaultBase } from "@/browser/utils/reviewDefaultBase";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 import {
   Tooltip,
@@ -13,7 +14,6 @@ import {
   TooltipTrigger,
 } from "@/browser/components/Tooltip/Tooltip";
 import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
-import { STORAGE_KEYS, WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import type { ReviewFilters, ReviewStats, ReviewSortOrder } from "@/common/types/review";
 import type { LastRefreshInfo, RefreshFailureInfo } from "@/browser/utils/RefreshController";
 import { RefreshButton } from "./RefreshButton";
@@ -78,11 +78,7 @@ export const ReviewControls: React.FC<ReviewControlsProps> = ({
   assistedUnreadCount = 0,
 }) => {
   // Per-project default base (used for new workspaces in this project)
-  const [defaultBase, setDefaultBase] = usePersistedState<string>(
-    STORAGE_KEYS.reviewDefaultBase(projectPath),
-    WORKSPACE_DEFAULTS.reviewBase,
-    { listener: true }
-  );
+  const defaultBase = useReviewDefaultBase(projectPath);
   const { startSequence } = useTutorial();
 
   // Show the immersive review tutorial the first time the review panel is visible
@@ -100,7 +96,7 @@ export const ReviewControls: React.FC<ReviewControlsProps> = ({
 
   const handleUncommittedToggle = (e: React.ChangeEvent<HTMLInputElement>) => {
     const checked = e.target.checked;
-    onFiltersChange((prev) => ({ ...prev, includeUncommitted: checked }));
+    updateUserPreferences({ review: { includeUncommitted: checked } });
   };
 
   // While Assisted is on the "Read:" toggle binds to the assisted-scoped
@@ -128,7 +124,7 @@ export const ReviewControls: React.FC<ReviewControlsProps> = ({
   };
 
   const handleSetDefault = () => {
-    setDefaultBase(filters.diffBase);
+    setReviewDefaultBase(projectPath, filters.diffBase);
   };
 
   // Show "Set Default" button if current base is different from default
