@@ -9,8 +9,13 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
-import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
-import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  getAppConfigStore,
+  updateUserPreferences,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
+import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useAPI } from "@/browser/contexts/API";
@@ -23,7 +28,6 @@ import {
   DEFAULT_TERMINAL_FONT_CONFIG,
   TERMINAL_BADGE_POSITIONS,
   BASH_COLLAPSED_SUMMARY_MODES,
-  CHAT_TRANSCRIPT_FULL_WIDTH_KEY,
   SIDEBAR_AGE_GROUPING_KEY,
   SIDEBAR_FLAT_MODE_KEY,
   SIDEBAR_HIDE_SUBAGENTS_KEY,
@@ -287,7 +291,7 @@ export function GeneralSection() {
     DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR
   );
   const [archiveSettingsLoaded, setArchiveSettingsLoaded] = useState(false);
-  const [chatTranscriptFullWidth, setChatTranscriptFullWidth] = useState(false);
+  const chatTranscriptFullWidth = useChatTranscriptFullWidth();
   const [llmDebugLogs, setLlmDebugLogs] = useState(false);
   const [keepScreenAwake, setKeepScreenAwake] = useState(false);
   const archiveBehaviorLoadNonceRef = useRef(0);
@@ -296,7 +300,6 @@ export function GeneralSection() {
     DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR
   );
 
-  const chatTranscriptFullWidthLoadNonceRef = useRef(0);
   const llmDebugLogsLoadNonceRef = useRef(0);
   const keepScreenAwakeLoadNonceRef = useRef(0);
   const keepScreenAwakeSavedRef = useRef(false);
@@ -327,7 +330,6 @@ export function GeneralSection() {
 
     setArchiveSettingsLoaded(false);
     const archiveBehaviorNonce = ++archiveBehaviorLoadNonceRef.current;
-    const chatTranscriptFullWidthNonce = ++chatTranscriptFullWidthLoadNonceRef.current;
     const llmDebugLogsNonce = ++llmDebugLogsLoadNonceRef.current;
     const keepScreenAwakeNonce = ++keepScreenAwakeLoadNonceRef.current;
 
@@ -352,16 +354,7 @@ export function GeneralSection() {
           setArchiveSettingsLoaded(true);
         }
 
-        // Use independent nonces so appearance/debug toggles do not discard archive updates.
-        if (chatTranscriptFullWidthNonce === chatTranscriptFullWidthLoadNonceRef.current) {
-          const enabled = cfg.chatTranscriptFullWidth === true;
-          setChatTranscriptFullWidth(enabled);
-          updatePersistedState<boolean | undefined>(
-            CHAT_TRANSCRIPT_FULL_WIDTH_KEY,
-            enabled ? true : undefined
-          );
-        }
-
+        // Use independent nonces so debug toggles do not discard archive updates.
         if (llmDebugLogsNonce === llmDebugLogsLoadNonceRef.current) {
           setLlmDebugLogs(cfg.llmDebugLogs === true);
         }
@@ -454,13 +447,7 @@ export function GeneralSection() {
   );
 
   const handleChatTranscriptFullWidthChange = (checked: boolean) => {
-    // Invalidate any in-flight config load so it does not overwrite the user's selection.
-    chatTranscriptFullWidthLoadNonceRef.current++;
-    setChatTranscriptFullWidth(checked);
-    updatePersistedState<boolean | undefined>(
-      CHAT_TRANSCRIPT_FULL_WIDTH_KEY,
-      checked ? true : undefined
-    );
+    getAppConfigStore().updateOptimistically({ chatTranscriptFullWidth: checked });
 
     if (!api?.config?.updateChatTranscriptFullWidth) {
       return;

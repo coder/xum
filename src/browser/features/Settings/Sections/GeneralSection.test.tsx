@@ -750,6 +750,18 @@ describe("GeneralSection", () => {
     });
   });
 
+  test("the full-width toggle shows the shared config store value", async () => {
+    // The transcript reads the store, so the switch must not show a value from its own read.
+    const setup = renderGeneralSection({ chatTranscriptFullWidth: true });
+    const toggle = setup.view.getByRole("switch", { name: "Toggle full-width chat transcript" });
+    await settleMountLoads(setup);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    act(() => getAppConfigStore().updateOptimistically({ chatTranscriptFullWidth: false }));
+
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+  });
+
   test("shows the keep screen awake toggle only in the desktop app", async () => {
     const browser = renderGeneralSection();
     await settleMountLoads(browser);

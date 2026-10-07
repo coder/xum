@@ -28,6 +28,7 @@ export interface AppConfigSnapshot {
    * hydrates it through WorkspaceContext instead.
    */
   agentAiDefaults?: AgentAiDefaults;
+  chatTranscriptFullWidth?: boolean;
   /** Read by the command palette to show the toggle's current state (#5791). */
   keepScreenAwake?: boolean;
   /** Backend experiment values; the only experiment state the renderer reads. */
@@ -192,6 +193,7 @@ export class AppConfigStore {
           proposePlanImplementReplacesChatHistory:
             taskSettings?.proposePlanImplementReplacesChatHistory === true,
           agentAiDefaults: config.agentAiDefaults,
+          chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
           keepScreenAwake: config.keepScreenAwake === true,
           experiments: config.experiments ?? {},
           userPreferences: config.userPreferences ?? EMPTY_USER_PREFERENCES,

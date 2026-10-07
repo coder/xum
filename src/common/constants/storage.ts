@@ -83,11 +83,6 @@ export const LAST_VISITED_ROUTE_KEY = "lastVisitedRoute";
 export type LaunchBehavior = "dashboard" | "new-chat" | "last-workspace";
 
 /**
- * Synchronous mirror for the backend full-width transcript preference.
- */
-export const CHAT_TRANSCRIPT_FULL_WIDTH_KEY = "chatTranscriptFullWidth";
-
-/**
  * Get the localStorage key for expanded projects in sidebar (global)
  * Format: "expandedProjects"
  */
@@ -1105,7 +1100,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // { workspaceId } (older builds also stored paths; readers use only the id).
   globalKey(SELECTED_WORKSPACE_KEY, "ui", 256),
   globalKey(LAST_VISITED_ROUTE_KEY, "ui", 4096),
-  globalKey(CHAT_TRANSCRIPT_FULL_WIDTH_KEY, "synced", 16),
   globalKey(EXPANDED_PROJECTS_KEY, "ui", 32 * 1024),
   // Legacy creation draft list, now in the backend drafts/list.json (imported once by DraftStore,
   // then removed, #5225). Never written again, so no budget (0).

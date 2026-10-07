@@ -1,8 +1,6 @@
 import { createContext, useContext, type ReactNode } from "react";
 import { CHAT_DOCK_GUTTER_CLASS } from "@/constants/layout";
 
-// Read from context rather than useChatTranscriptFullWidth because that hook also syncs the backend
-// config, and one fetch plus subscription per docked surface would be wasteful.
 const ChatDockFullWidthContext = createContext(false);
 
 export const ChatDockColumnProvider = ChatDockFullWidthContext.Provider;
