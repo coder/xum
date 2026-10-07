@@ -3,8 +3,7 @@ import { useAutoResizeTextarea } from "@/browser/hooks/useAutoResizeTextarea";
 import * as vim from "@/browser/utils/vim";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { cn } from "@/common/lib/utils";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 
 /**
  * VimTextArea – minimal Vim-like editing for a textarea.
@@ -46,7 +45,9 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
       if (typeof ref === "function") ref(textareaRef.current);
       else ref.current = textareaRef.current;
     }, [ref]);
-    const [vimEnabled] = usePersistedState(VIM_ENABLED_KEY, false, { listener: true });
+    const vimEnabled = useUserPreferences(
+      (preferences) => preferences.appearance?.vimEnabled === true
+    );
 
     const [vimMode, setVimMode] = useState<VimMode>("insert");
     useEffect(() => {

@@ -8,6 +8,7 @@ import { removeDroppedCacheKeys } from "@/browser/utils/legacyLocalStorageCleanu
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
 import { initTelemetry } from "@/common/telemetry";
 import { trackAppStarted } from "@/browser/utils/telemetryLifecycle";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { initTitlebarInsets } from "@/browser/hooks/useDesktopTitlebar";
 import { resolveBrowserAssetUrl } from "@/browser/utils/frontendBasePath";
 
@@ -34,7 +35,11 @@ installWindowOpenLocalhostProxyNormalization();
 installViewportHeightSync();
 
 initTelemetry();
-trackAppStarted();
+// vimEnabled lives in config.json, so the startup event waits for the first config snapshot.
+const stopWaitingForAppConfig = getAppConfigStore().subscribe(() => {
+  stopWaitingForAppConfig();
+  trackAppStarted();
+});
 
 // Initialize titlebar CSS custom properties (platform-specific insets)
 initTitlebarInsets();

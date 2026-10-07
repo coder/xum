@@ -19,7 +19,6 @@ import {
   SELECTED_WORKSPACE_KEY,
   SIDEBAR_AGE_GROUPING_KEY,
   TERMINAL_BADGE_CONFIG_KEY,
-  UI_THEME_KEY,
 } from "@/common/constants/storage";
 import type { ProvidersConfigMap, ServerAuthSession } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -37,7 +36,6 @@ interface SettingsSectionStoryProps {
 export function resetStorybookPersistedStateForStory(): void {
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
-    localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
 
     // Sidebar stories can write sidebarAgeGrouping=false into the shared
     // origin; clear it so the GeneralSection switch snapshots its default.

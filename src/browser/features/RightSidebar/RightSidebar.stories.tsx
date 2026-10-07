@@ -38,7 +38,6 @@ import {
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   SELECTED_WORKSPACE_KEY,
-  UI_THEME_KEY,
   getAutoCompactionThresholdKey,
   getRightSidebarLayoutKey,
 } from "@/common/constants/storage";
@@ -89,7 +88,6 @@ function resetStorybookPersistedStateForStory(): void {
   }
 
   localStorage.removeItem(SELECTED_WORKSPACE_KEY);
-  localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
 }
 
 function getStorybookRenderKey(): string | null {

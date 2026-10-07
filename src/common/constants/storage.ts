@@ -444,12 +444,6 @@ export const PROVIDER_OPTIONS_ANTHROPIC_KEY = "provider_options_anthropic";
 export const PROVIDER_OPTIONS_GOOGLE_KEY = "provider_options_google";
 
 /**
- * Get the localStorage key for vim mode preference (global)
- * Format: "vimEnabled"
- */
-export const VIM_ENABLED_KEY = "vimEnabled";
-
-/**
  * Git status indicator display mode (global)
  * Stores: "line-delta" | "divergence"
  */
@@ -1214,7 +1208,8 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getReviewDiffBaseKey, "ui", false, 256),
 
   // Global UI state.
-  globalKey(UI_THEME_KEY, "synced", 64),
+  // Paint cache of appearance.theme for index.html, written by ThemeProvider.
+  globalKey(UI_THEME_KEY, "cache", 64),
   globalKey(POWER_MODE_ENABLED_KEY, "ui", 16),
   globalKey(ARTIFACTS_SELECTION_KEY, "ui", ARTIFACTS_SELECTION_MAX_CHARS),
   globalKey(LAST_CUSTOM_MODEL_PROVIDER_KEY, "ui", 128),
@@ -1237,7 +1232,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(AGENT_AI_DEFAULTS_KEY, "synced", 32 * 1024),
   globalKey(PROVIDER_OPTIONS_ANTHROPIC_KEY, "synced", 4096),
   globalKey(PROVIDER_OPTIONS_GOOGLE_KEY, "synced", 4096),
-  globalKey(VIM_ENABLED_KEY, "synced", 16),
   globalKey(GIT_STATUS_INDICATOR_MODE_KEY, "ui", 32),
   globalKey(EDITOR_CONFIG_KEY, "synced", 2048),
   globalKey(TRANSCRIPT_DENSITY_KEY, "synced", 32),

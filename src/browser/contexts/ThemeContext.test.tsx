@@ -13,10 +13,14 @@ const originalLocation = globalThis.location;
 /* eslint-enable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { ThemeProvider, type ThemeMode, type ThemePreference, useTheme } from "./ThemeContext";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { createTestApiClient, createTestConfig } from "@/browser/testUtils";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import { UI_THEME_KEY } from "@/common/constants/storage";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 
 // Unit shards run many files in one Bun process, so later files would inherit this window.
 afterAll(() => {
@@ -86,6 +90,29 @@ function setSystemTheme(theme: "light" | "dark") {
 
 const mockMatchMedia = mock(() => mediaQueryList);
 
+let serverPreferences: UserPreferences = {};
+
+function connectConfigServer(preferences: UserPreferences) {
+  serverPreferences = preferences;
+  getAppConfigStore().setClient(
+    createTestApiClient({
+      config: {
+        getConfig: () =>
+          Promise.resolve(
+            createTestConfig({ userPreferences: structuredClone(serverPreferences) })
+          ),
+        updateUserPreferences: ({ patches }) => {
+          serverPreferences = patches.reduce<UserPreferences>(
+            (current, patch) => applyMergePatch(current, patch) as UserPreferences,
+            serverPreferences
+          );
+          return Promise.resolve();
+        },
+      },
+    })
+  );
+}
+
 const TestComponent = () => {
   const { theme, themePreference, toggleTheme, setTheme } = useTheme();
 
@@ -114,10 +141,13 @@ describe("ThemeContext", () => {
 
     window.matchMedia = mockMatchMedia;
     window.localStorage.clear();
+    connectConfigServer({});
   });
 
   afterEach(() => {
     cleanup();
+    getAppConfigStore().setClient(null);
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     window.localStorage.clear();
   });
 
@@ -132,17 +162,22 @@ describe("ThemeContext", () => {
     expect(getByTestId("theme-value").textContent).toBe("dark");
   });
 
-  test("normalizes invalid stored preferences to auto", () => {
-    window.localStorage.setItem(UI_THEME_KEY, JSON.stringify("totally-invalid"));
+  test("paints the cached theme until the first snapshot, then caches the server theme", async () => {
+    getAppConfigStore().setClient(null);
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+    window.localStorage.setItem(UI_THEME_KEY, JSON.stringify("flexoki-light"));
 
     const { getByTestId } = render(
       <ThemeProvider>
         <TestComponent />
       </ThemeProvider>
     );
+    expect(getByTestId("theme-value").textContent).toBe("flexoki-light");
 
-    expect(getByTestId("theme-preference").textContent).toBe("auto");
-    expect(JSON.parse(window.localStorage.getItem(UI_THEME_KEY)!)).toBe("auto");
+    act(() => connectConfigServer({ appearance: { theme: "dark" } }));
+
+    await waitFor(() => expect(getByTestId("theme-value").textContent).toBe("dark"));
+    expect(JSON.parse(window.localStorage.getItem(UI_THEME_KEY)!)).toBe("dark");
   });
 
   test("follows OS theme changes while preference is auto", () => {

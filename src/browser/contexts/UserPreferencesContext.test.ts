@@ -8,7 +8,12 @@ import {
   prunePreferenceScopes,
 } from "./UserPreferencesContext";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
-import { LAUNCH_BEHAVIOR_KEY, UI_THEME_KEY, VIM_ENABLED_KEY } from "@/common/constants/storage";
+import {
+  GLOBAL_SCOPE_ID,
+  LAUNCH_BEHAVIOR_KEY,
+  REVIEW_INCLUDE_UNCOMMITTED_KEY,
+  getAgentIdKey,
+} from "@/common/constants/storage";
 
 class MemoryStorage implements Storage {
   private values = new Map<string, string>();
@@ -64,16 +69,16 @@ describe("UserPreferencesProvider bridge helpers", () => {
 
   test("removes stale local cache entries on a backend refresh", () => {
     const storage = new MemoryStorage();
-    storage.setJSON(UI_THEME_KEY, "dark");
-    storage.setJSON(VIM_ENABLED_KEY, true);
+    storage.setJSON(REVIEW_INCLUDE_UNCOMMITTED_KEY, false);
+    storage.setJSON(getAgentIdKey(GLOBAL_SCOPE_ID), "plan");
 
     mirrorBackendPreferences({
-      backendPreferences: { appearance: { theme: "light" } },
+      backendPreferences: { review: { includeUncommitted: true } },
       storage,
     });
 
-    expect(JSON.parse(storage.getItem(UI_THEME_KEY) ?? "null")).toBe("light");
-    expect(storage.getItem(VIM_ENABLED_KEY)).toBeNull();
+    expect(JSON.parse(storage.getItem(REVIEW_INCLUDE_UNCOMMITTED_KEY) ?? "null")).toBe(true);
+    expect(storage.getItem(getAgentIdKey(GLOBAL_SCOPE_ID))).toBeNull();
   });
 
   test("only prunes scoped preferences after successful project and workspace loads", () => {

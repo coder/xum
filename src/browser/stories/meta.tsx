@@ -19,7 +19,6 @@ import {
   SIDEBAR_AGE_GROUPING_KEY,
   SIDEBAR_FLAT_MODE_KEY,
   TERMINAL_BADGE_CONFIG_KEY,
-  UI_THEME_KEY,
 } from "@/common/constants/storage";
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -85,10 +84,9 @@ interface AppWithMocksProps {
 
 function resetStorybookPersistedStateForStory(): void {
   // Storybook can preserve localStorage across story renders on one origin.
-  // Reset persisted state so each story starts from a known route + theme.
+  // Reset persisted state so each story starts from a known route.
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
-    localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
     // Stories that disable sidebar age grouping must not leak the setting
     // into later stories via the shared localStorage origin.
     localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
