@@ -116,6 +116,7 @@ import { formatReawakenChangedMessage } from "@/constants/taskMessages";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
 import { getErrorMessage } from "@/common/utils/errors";
+import { resolveWorkspaceTurnOwners } from "@/node/services/workspaceTurnOwners";
 import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibility";
 import type { StreamErrorType } from "@/common/types/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
@@ -5716,10 +5717,45 @@ export class WorkspaceTurnManager {
       this.activeWorkspaceTurnHandleByWorkspaceId.delete(workspaceId);
     }
 
+    // #5569: a confirmed creator's directory holds every record of a root target (see
+    // workspaceTurnOwners.ts), so read that one directory instead of every owner's.
+    const fromCreator = await this.findActiveWorkspaceTurnInCreatorDir(workspaceId);
+    if (fromCreator.kind === "found") return fromCreator.record;
+    log.debug("Active workspace-turn lookup fell back to a global scan", {
+      workspaceId,
+      reason: fromCreator.reason,
+    });
+
     const records = await this.taskHandleStore.listAllWorkspaceTurns({
       statuses: ["starting", "running"],
     });
     return records.toReversed().find((record) => record.workspaceId === workspaceId) ?? null;
+  }
+
+  private async findActiveWorkspaceTurnInCreatorDir(
+    workspaceId: string
+  ): Promise<
+    | { kind: "found"; record: WorkspaceTurnTaskHandleRecord | null }
+    | { kind: "fallback"; reason: string }
+  > {
+    const owners = resolveWorkspaceTurnOwners(this.config.loadConfigOrDefault(), workspaceId);
+    if (owners.kind === "fallback") return owners;
+    let records: WorkspaceTurnTaskHandleRecord[];
+    try {
+      // One unfiltered listing both confirms the claim and answers it, so the two cannot disagree.
+      records = await this.taskHandleStore.listWorkspaceTurns(owners.ownerWorkspaceId);
+    } catch (error) {
+      return { kind: "fallback", reason: `creator listing failed: ${getErrorMessage(error)}` };
+    }
+    const forTarget = records.filter((record) => record.workspaceId === workspaceId);
+    if (!forTarget.some((record) => record.createdWorkspace)) {
+      return { kind: "fallback", reason: "creator claim not confirmed" };
+    }
+    // Same statuses as the caller's global scan (queued stays excluded).
+    const record = forTarget.findLast(
+      (candidate) => candidate.status === "starting" || candidate.status === "running"
+    );
+    return { kind: "found", record: record ?? null };
   }
 
   async getActiveWorkspaceTurnMuxMetadataForWorkspace(
