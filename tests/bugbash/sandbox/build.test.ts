@@ -71,3 +71,24 @@ test("the version comes only from the @e2e-dev/web copy, and must be unique", ()
   expect(key()).toMatchObject({ status: 2, out: "" });
   expect(key().err).toContain("found 0");
 });
+
+test("--push for an existing tag reports the digest of its manifest bytes, and builds nothing", () => {
+  setup();
+  // A fake docker: `imagetools inspect --raw` prints a manifest, any other command fails.
+  const bin = path.join(repo, "bin");
+  fs.mkdirSync(bin);
+  const manifest = '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}\n';
+  fs.writeFileSync(path.join(bin, "manifest.json"), manifest);
+  fs.writeFileSync(
+    path.join(bin, "docker"),
+    `#!/bin/sh\n[ "$1 $2 $3 $4" = "buildx imagetools inspect --raw" ] || exit 9\ncat "${bin}/manifest.json"\n`,
+    { mode: 0o755 }
+  );
+  const r = spawnSync(path.join(repo, SANDBOX, "build.sh"), ["--push"], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+  });
+  expect(r.status).toBe(0);
+  const digest = `sha256:${new Bun.CryptoHasher("sha256").update(manifest).digest("hex")}`;
+  expect(JSON.parse(r.stdout)).toMatchObject({ digest, playwrightCore: "1.63.0" });
+});

@@ -26,7 +26,11 @@ die() {
   echo "build.sh: $*" >&2
   exit 2
 }
-sha() { sha256sum "$1" | cut -d' ' -f1; }
+# sha256 of stdin. Stock macOS has shasum, not sha256sum.
+sha_stdin() {
+  if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
+}
+sha() { sha_stdin <"$1"; }
 
 cd "$ROOT"
 for f in "$DOCKERFILE" "$SCRIPT" bun.lock; do
@@ -36,14 +40,16 @@ git diff --quiet HEAD -- "$DOCKERFILE" "$SCRIPT" bun.lock ||
   die "$DOCKERFILE, $SCRIPT or bun.lock differs from HEAD: the image builds from committed source"
 
 # The copy that e2e drives Chromium with. The root playwright-core is a different copy.
-mapfile -t versions < <(grep -oE '"@e2e-dev/web/playwright-core": \["playwright-core@[^"]+"' bun.lock |
-  sed -E 's/.*playwright-core@//; s/"$//')
-[ "${#versions[@]}" -eq 1 ] || die "expected one @e2e-dev/web/playwright-core entry in bun.lock, found ${#versions[@]}"
-PLAYWRIGHT=${versions[0]}
+# No mapfile: the system bash of macOS is 3.2.
+versions=$(grep -oE '"@e2e-dev/web/playwright-core": \["playwright-core@[^"]+"' bun.lock |
+  sed -E 's/.*playwright-core@//; s/"$//') || true
+count=$(printf '%s' "$versions" | grep -c . || true)
+[ "$count" -eq 1 ] || die "expected one @e2e-dev/web/playwright-core entry in bun.lock, found $count"
+PLAYWRIGHT=$versions
 [[ $PLAYWRIGHT =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "unexpected playwright-core version: $PLAYWRIGHT"
 
 KEY=$(printf 'dockerfile %s\nbuild.sh %s\nplaywright-core %s\n' "$(sha "$DOCKERFILE")" "$(sha "$SCRIPT")" "$PLAYWRIGHT" |
-  sha256sum | cut -d' ' -f1)
+  sha_stdin)
 [[ $KEY =~ ^[0-9a-f]{64}$ ]] || die "bad inputs key: $KEY"
 
 mode=${1:-local}
@@ -58,7 +64,7 @@ case "$mode" in
 esac
 
 context=$(mktemp -d)
-trap 'rm -rf "$context" "$context.json"' EXIT
+trap 'rm -rf "$context" "$context.json" "$context.raw"' EXIT
 build() {
   docker buildx build --platform linux/amd64 --no-cache --pull --provenance=false --sbom=false \
     --build-arg "PLAYWRIGHT_CORE_VERSION=$PLAYWRIGHT" --build-arg "INPUTS_SHA256=$KEY" \
@@ -73,7 +79,10 @@ fi
 
 # --push
 TAG="$IMAGE:inputs-$KEY"
-if digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$TAG" 2>/dev/null); then
+# The digest of a manifest is the sha256 of its raw bytes. Hash the file, not a --format value:
+# some buildx versions ignore --format here and print a table (docker/buildx#4006).
+if docker buildx imagetools inspect --raw "$TAG" >"$context.raw" 2>/dev/null; then
+  digest="sha256:$(sha "$context.raw")"
   echo "build.sh: $TAG exists, no build" >&2
 else
   build --push --tag "$TAG"
