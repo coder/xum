@@ -9,14 +9,10 @@ import {
 } from "./userPreferencesStorage";
 import {
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
-  getAgentIdKey,
   getLastRuntimeConfigKey,
-  getModelKey,
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
-  getProjectScopeId,
   getReviewDefaultBaseKey,
-  getThinkingLevelKey,
   getTrunkBranchKey,
 } from "@/common/constants/storage";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
@@ -55,10 +51,6 @@ function entryKeys(preferences: UserPreferences | undefined): string[] {
 describe("user preference localStorage registry", () => {
   test("collects semantic preferences from legacy localStorage keys", () => {
     const storage = new MemoryStorage();
-    const projectScope = getProjectScopeId("/repo");
-    storage.setJSON(getAgentIdKey(projectScope), "plan");
-    storage.setJSON(getModelKey(projectScope), "openai:gpt-4.1");
-    storage.setJSON(getThinkingLevelKey(projectScope), "high");
     storage.setJSON(getTrunkBranchKey("/repo"), "origin/main");
     storage.setJSON(getLastRuntimeConfigKey("/repo"), { ssh: { host: "devbox" } });
     storage.setJSON(getNotifyOnResponseAutoEnableKey("/repo"), true);
@@ -67,15 +59,6 @@ describe("user preference localStorage registry", () => {
     storage.setJSON(getReviewDefaultBaseKey("/repo"), "origin/main");
 
     expect(collectForTest(storage)).toEqual({
-      ai: {
-        projectDefaults: {
-          "/repo": {
-            agentId: "plan",
-            model: "openai:gpt-4.1",
-            thinkingLevel: "high",
-          },
-        },
-      },
       workspaceCreation: {
         byProject: {
           "/repo": {
@@ -97,16 +80,6 @@ describe("user preference localStorage registry", () => {
 
   test("all flattened preference entries are recognized, applied, and removable", () => {
     const preferences: UserPreferences = {
-      ai: {
-        globalDefaults: { agentId: "exec", thinkingLevel: "medium" },
-        projectDefaults: {
-          "/repo": {
-            agentId: "plan",
-            model: "openai:gpt-4.1",
-            thinkingLevel: "high",
-          },
-        },
-      },
       workspaceCreation: {
         byProject: {
           "/repo": {
@@ -133,20 +106,13 @@ describe("user preference localStorage registry", () => {
 
   test("round trips backend preferences to localStorage entries", () => {
     const preferences = {
-      ai: {
-        globalDefaults: { agentId: "exec" },
-        projectDefaults: { "/repo": { model: "anthropic:claude-sonnet-4-20250514" } },
-      },
+      review: { includeUncommitted: true },
       notifications: { notifyOnResponseByWorkspace: { "ws-1": false } },
     };
 
     expect(entriesFromUserPreferences(preferences)).toEqual([
-      { key: getAgentIdKey("__global__"), value: "exec" },
-      {
-        key: getModelKey(getProjectScopeId("/repo")),
-        value: "anthropic:claude-sonnet-4-20250514",
-      },
       { key: getNotifyOnResponseKey("ws-1"), value: false },
+      { key: REVIEW_INCLUDE_UNCOMMITTED_KEY, value: true },
     ]);
   });
 

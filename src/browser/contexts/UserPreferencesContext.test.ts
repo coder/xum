@@ -5,11 +5,7 @@ import {
   mirrorBackendPreferences,
   prunePreferenceScopes,
 } from "./UserPreferencesContext";
-import {
-  GLOBAL_SCOPE_ID,
-  REVIEW_INCLUDE_UNCOMMITTED_KEY,
-  getAgentIdKey,
-} from "@/common/constants/storage";
+import { REVIEW_INCLUDE_UNCOMMITTED_KEY, getTrunkBranchKey } from "@/common/constants/storage";
 
 class MemoryStorage implements Storage {
   private values = new Map<string, string>();
@@ -47,7 +43,7 @@ describe("UserPreferencesProvider bridge helpers", () => {
   test("removes stale local cache entries on a backend refresh", () => {
     const storage = new MemoryStorage();
     storage.setJSON(REVIEW_INCLUDE_UNCOMMITTED_KEY, false);
-    storage.setJSON(getAgentIdKey(GLOBAL_SCOPE_ID), "plan");
+    storage.setJSON(getTrunkBranchKey("/repo"), "main");
 
     mirrorBackendPreferences({
       backendPreferences: { review: { includeUncommitted: true } },
@@ -55,7 +51,7 @@ describe("UserPreferencesProvider bridge helpers", () => {
     });
 
     expect(JSON.parse(storage.getItem(REVIEW_INCLUDE_UNCOMMITTED_KEY) ?? "null")).toBe(true);
-    expect(storage.getItem(getAgentIdKey(GLOBAL_SCOPE_ID))).toBeNull();
+    expect(storage.getItem(getTrunkBranchKey("/repo"))).toBeNull();
   });
 
   test("only prunes scoped preferences after successful project and workspace loads", () => {

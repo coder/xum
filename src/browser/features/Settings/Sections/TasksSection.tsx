@@ -20,12 +20,8 @@ import { getDefaultModel, useModelsFromSettings } from "@/browser/hooks/useModel
 import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { resolveAdvisorEnabledForAgent } from "@/common/constants/advisor";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import {
-  AGENT_AI_DEFAULTS_KEY,
-  GLOBAL_SCOPE_ID,
-  getAgentIdKey,
-  getModelKey,
-} from "@/common/constants/storage";
+import { AGENT_AI_DEFAULTS_KEY, getModelKey } from "@/common/constants/storage";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import {
@@ -432,14 +428,9 @@ export function TasksSection() {
   const pendingSaveRef = useRef<TasksSectionSavePayload | null>(null);
 
   const { models, hiddenModelsForSelector } = useModelsFromSettings();
-  const [globalDefaultAgentIdRaw, setGlobalDefaultAgentIdRaw] = usePersistedState<string>(
-    getAgentIdKey(GLOBAL_SCOPE_ID),
-    WORKSPACE_DEFAULTS.agentId,
-    {
-      listener: true,
-    }
+  const newWorkspaceDefaultAgentId = coerceAgentId(
+    useUserPreferences((preferences) => preferences.ai?.globalDefaults?.agentId)
   );
-  const newWorkspaceDefaultAgentId = coerceAgentId(globalDefaultAgentIdRaw);
   const portableDesktopEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   // Dream only runs when both flags are on (see memoryConsolidationService);
@@ -688,7 +679,7 @@ export function TasksSection() {
   };
 
   const setNewWorkspaceDefaultAgentId = (agentId: string) => {
-    setGlobalDefaultAgentIdRaw(coerceAgentId(agentId));
+    updateUserPreferences({ ai: { globalDefaults: { agentId: coerceAgentId(agentId) } } });
   };
 
   const setAgentModel = (agentId: string, value: string) => {
