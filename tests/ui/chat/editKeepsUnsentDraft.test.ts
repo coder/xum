@@ -122,6 +122,40 @@ async function showWorkspace(app: AppHarness, workspaceId: string, name: string)
   }, LOAD_TOLERANT_WAIT);
 }
 
+/** Stage a file in the composer, so the next sent message (and an edit of it) carries it. */
+async function attachComposerFile(app: AppHarness, filename: string) {
+  const input = await waitFor(() => {
+    const element = app.view.container.querySelector<HTMLInputElement>(
+      '[data-component="ChatInputSection"] input[type="file"]'
+    );
+    if (!element) throw new Error("File input not found");
+    return element;
+  }, LOAD_TOLERANT_WAIT);
+  fireEvent.change(input, {
+    target: { files: [new File(["# file"], filename, { type: "text/markdown" })] },
+  });
+  await waitFor(() => expect(composerText(app)).toContain(filename), LOAD_TOLERANT_WAIT);
+}
+
+/**
+ * An edit that lost its target without a settle: its text follows the unsent draft, and its
+ * file joins the unsent draft's file, in memory and on the backend.
+ */
+async function expectEditContentsInDraft(app: AppHarness, scope: DraftScope, filename: string) {
+  await waitFor(() => {
+    const text = getDraftStore().getText(scope);
+    expect(text.startsWith("unsent draft")).toBe(true);
+    expect(text.trimEnd().endsWith("edited message")).toBe(true);
+  }, LOAD_TOLERANT_WAIT);
+  const names = (attachments: { filename?: string; id: string }[]) =>
+    attachments.map((attachment) => attachment.filename ?? attachment.id);
+  expect(names(getDraftStore().getView(scope).attachments)).toEqual(["unsent.txt", filename]);
+  await getDraftStore().flush(scope);
+  const saved = await app.env.services.draftService.get(scope);
+  expect(saved.text).toBe(getDraftStore().getText(scope));
+  expect(saved.attachments).toHaveLength(2);
+}
+
 /** Another renderer on the same backend: a reload of this window, or a second window. */
 async function otherRenderer(app: AppHarness): Promise<DraftStore> {
   const store = new DraftStore();
@@ -340,6 +374,58 @@ describe("Completing an edit of an older message", () => {
       expect(getDraftStore().getText(scope)).toBe("unsent draft");
     } finally {
       stateSpy?.mockRestore();
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // An unsettled edit that loses its target keeps its contents in the workspace's draft, after
+  // the unsent draft (#5801 review): here the workspace turns transcript-only mid-edit, and the
+  // composer is replaced by the read-only notice.
+  test("an edit keeps its text and files in the draft when the workspace turns transcript-only", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-transcript-only-keeps" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      await attachComposerFile(app, "edit-file.md");
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      app.env.services.workspaceService.emit("metadata", {
+        workspaceId: app.workspaceId,
+        metadata: { ...app.metadata, transcriptOnly: true },
+      });
+      await waitFor(() => expect(editTextarea(app)).toBeNull(), LOAD_TOLERANT_WAIT);
+      await expectEditContentsInDraft(app, scope, "edit-file.md");
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // Same rule when a second Edit replaces the open edit's target: the first edit's contents
+  // join the draft, and the second edit starts from its own message.
+  test("a second Edit keeps the first edit's text and files in the draft", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-second-edit-keeps" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      await app.chat.send("earlier message");
+      await app.chat.expectTranscriptContains(
+        "Mock response: earlier message",
+        LOAD_TOLERANT_WAIT.timeout
+      );
+      await app.chat.expectStreamComplete();
+      await attachComposerFile(app, "edit-file.md");
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+
+      await editRow(app, "earlier message");
+      expect(composerText(app)).not.toContain("edit-file.md");
+      await expectEditContentsInDraft(app, scope, "edit-file.md");
+      // Cancelling the second edit shows the draft with the first edit's contents.
+      fireEvent.keyDown(editTextarea(app)!, { key: "Escape" });
+      await waitFor(() => expect(editTextarea(app)).toBeNull(), LOAD_TOLERANT_WAIT);
+      expect(messageTextarea(app).value).toBe(getDraftStore().getText(scope));
+      expect(composerText(app)).toContain("edit-file.md");
+    } finally {
       await app.dispose();
     }
   }, 120_000);
