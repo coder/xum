@@ -24,6 +24,8 @@ export interface AppConfigSnapshot {
   /** Plan Implement / Continue in Auto replace the chat history first (task setting). */
   proposePlanImplementReplacesChatHistory?: boolean;
   agentAiDefaults?: AgentAiDefaults;
+  defaultModel?: string;
+  hiddenModels?: string[];
   runtimeEnablement?: Record<string, boolean>;
   defaultRuntime?: string | null;
   chatTranscriptFullWidth?: boolean;
@@ -158,6 +160,8 @@ export class AppConfigStore {
           proposePlanImplementReplacesChatHistory:
             taskSettings?.proposePlanImplementReplacesChatHistory === true,
           agentAiDefaults: config.agentAiDefaults ?? {},
+          defaultModel: config.defaultModel,
+          hiddenModels: config.hiddenModels ?? [],
           runtimeEnablement: config.runtimeEnablement,
           defaultRuntime: config.defaultRuntime ?? null,
           chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,

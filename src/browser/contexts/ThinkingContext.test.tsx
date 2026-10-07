@@ -292,7 +292,6 @@ function renderWithWorkspaceMetadata(props: {
 
 describe("ThinkingContext", () => {
   // Make getDefaultModel deterministic.
-  // (getDefaultModel reads from the global "model-default" localStorage key.)
   beforeEach(() => {
     currentClientMock = {
       workspace: {
@@ -306,12 +305,15 @@ describe("ThinkingContext", () => {
     };
     metadataMap = new Map();
     window.localStorage.clear();
-    window.localStorage.setItem("model-default", JSON.stringify("openai:default"));
+    getAppConfigStore().updateOptimistically({ defaultModel: "openai:default" });
   });
 
   afterEach(() => {
     cleanup();
-    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+    getAppConfigStore().updateOptimistically({
+      userPreferences: undefined,
+      defaultModel: undefined,
+    });
     metadataMap = new Map();
     currentClientMock = {};
   });

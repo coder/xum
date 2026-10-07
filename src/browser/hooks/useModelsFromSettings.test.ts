@@ -17,8 +17,7 @@ import type {
   ProviderModelEntry,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
-import { updatePersistedState } from "./usePersistedState";
-import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 function countOccurrences(haystack: string[], needle: string): number {
   return haystack.filter((v) => v === needle).length;
@@ -127,6 +126,7 @@ async function setupUseModelsHookTest() {
   routePriority = ["direct"];
   routeOverrides = {};
   apiMock = null;
+  getAppConfigStore().updateOptimistically({ defaultModel: undefined, hiddenModels: undefined });
   await installUseModelsModuleMocks();
 }
 
@@ -220,7 +220,7 @@ describe("useModelsFromSettings selected model preservation", () => {
 
   test("getDefaultModel preserves explicit gateway-scoped defaults", () => {
     const gatewayModel = "openrouter:openai/gpt-5";
-    globalThis.window.localStorage.setItem(DEFAULT_MODEL_KEY, JSON.stringify(gatewayModel));
+    getAppConfigStore().updateOptimistically({ defaultModel: gatewayModel });
 
     expect(getDefaultModel()).toBe(gatewayModel);
   });
@@ -238,9 +238,6 @@ describe("useModelsFromSettings selected model preservation", () => {
     });
 
     await waitFor(() => expect(result.current.defaultModel).toBe("openrouter:openai/gpt-5"));
-    expect(globalThis.window.localStorage.getItem(DEFAULT_MODEL_KEY)).toBe(
-      JSON.stringify("openrouter:openai/gpt-5")
-    );
     expect(updateModelPreferences).toHaveBeenCalledWith({
       defaultModel: "openrouter:openai/gpt-5",
     });
@@ -727,10 +724,7 @@ describe("useModelsFromSettings provider availability gating", () => {
   });
 
   test("keeps persisted hiddenModels separate from provider-hidden models", () => {
-    globalThis.window.localStorage.setItem(
-      HIDDEN_MODELS_KEY,
-      JSON.stringify([KNOWN_MODELS.GPT.id])
-    );
+    getAppConfigStore().updateOptimistically({ hiddenModels: [KNOWN_MODELS.GPT.id] });
 
     providersConfig = {
       anthropic: { apiKeySet: false, isEnabled: true, isConfigured: false },
@@ -854,8 +848,10 @@ describe("useModelsFromSettings hidden-model persistence", () => {
     providersConfig = { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } };
     const persist = mock(() => Promise.resolve());
     apiMock = { config: { updateModelPreferences: persist } };
-    updatePersistedState(DEFAULT_MODEL_KEY, KNOWN_MODELS.GPT.id);
-    updatePersistedState(HIDDEN_MODELS_KEY, [luna]);
+    getAppConfigStore().updateOptimistically({
+      defaultModel: KNOWN_MODELS.GPT.id,
+      hiddenModels: [luna],
+    });
     let hook = renderHook(() => useModelsFromSettings());
     expect(hook.result.current.models).not.toContain(luna);
 

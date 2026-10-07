@@ -5,8 +5,6 @@ import {
   updatePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import {
-  DEFAULT_MODEL_KEY,
-  HIDDEN_MODELS_KEY,
   LAST_CUSTOM_MODEL_PROVIDER_KEY,
   getModelKey,
   getWorkspaceAISettingsByAgentKey,
@@ -30,21 +28,6 @@ function repairPersistedModelString(key: string, provider: string, replacement: 
   const model = readPersistedString(key);
   if (model !== undefined && modelStringStartsWithProvider(model, provider)) {
     updatePersistedState(key, replacement);
-  }
-}
-
-function repairHiddenModels(provider: string): void {
-  const hiddenModels = readPersistedState<unknown>(HIDDEN_MODELS_KEY, undefined);
-  if (!Array.isArray(hiddenModels)) {
-    return;
-  }
-
-  const filteredModels = hiddenModels.filter(
-    (model) => typeof model !== "string" || !modelStringStartsWithProvider(model, provider)
-  );
-
-  if (filteredModels.length !== hiddenModels.length) {
-    updatePersistedState(HIDDEN_MODELS_KEY, filteredModels);
   }
 }
 
@@ -94,8 +77,6 @@ export function repairLocalModelPreferencesForRemovedProvider(
   provider: string,
   workspaceIds: Iterable<string>
 ): void {
-  repairPersistedModelString(DEFAULT_MODEL_KEY, provider, WORKSPACE_DEFAULTS.model);
-  repairHiddenModels(provider);
   repairLastCustomModelProvider(provider);
 
   for (const workspaceId of new Set(workspaceIds)) {

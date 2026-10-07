@@ -7,8 +7,6 @@ import {
   updatePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import {
-  DEFAULT_MODEL_KEY,
-  HIDDEN_MODELS_KEY,
   LAST_CUSTOM_MODEL_PROVIDER_KEY,
   getModelKey,
   getWorkspaceAISettingsByAgentKey,
@@ -63,21 +61,6 @@ describe("repairLocalModelPreferencesForRemovedProvider", () => {
     cleanupDom = null;
   });
 
-  test("resets default model only when it belongs to the removed provider", () => {
-    writeState(DEFAULT_MODEL_KEY, `${REMOVED_PROVIDER}:legacy-model`);
-
-    repairLocalModelPreferencesForRemovedProvider(REMOVED_PROVIDER, []);
-
-    expect(readString(DEFAULT_MODEL_KEY)).toBe(WORKSPACE_DEFAULTS.model);
-
-    const unrelatedModel = `${OTHER_PROVIDER}:kept-model`;
-    writeState(DEFAULT_MODEL_KEY, unrelatedModel);
-
-    repairLocalModelPreferencesForRemovedProvider(REMOVED_PROVIDER, []);
-
-    expect(readString(DEFAULT_MODEL_KEY)).toBe(unrelatedModel);
-  });
-
   test("resets per-workspace model only when it belongs to the removed provider", () => {
     const affectedWorkspaceId = nextWorkspaceId();
     const unaffectedWorkspaceId = nextWorkspaceId();
@@ -96,20 +79,6 @@ describe("repairLocalModelPreferencesForRemovedProvider", () => {
 
     expect(readString(affectedKey)).toBe(WORKSPACE_DEFAULTS.model);
     expect(readString(unaffectedKey)).toBe(unaffectedModel);
-  });
-
-  test("filters hidden models for the removed provider and preserves other entries", () => {
-    const keptModels = [`${OTHER_PROVIDER}:kept-model`, `${REMOVED_PROVIDER}-fork:similar-name`];
-    writeState(HIDDEN_MODELS_KEY, [
-      `${REMOVED_PROVIDER}:hidden-a`,
-      keptModels[0],
-      `${REMOVED_PROVIDER}:hidden-b`,
-      keptModels[1],
-    ]);
-
-    repairLocalModelPreferencesForRemovedProvider(REMOVED_PROVIDER, []);
-
-    expect(readState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual(keptModels);
   });
 
   test("clears last custom model provider only when it matches the removed provider", () => {
@@ -178,15 +147,11 @@ describe("repairLocalModelPreferencesForRemovedProvider", () => {
       },
     };
 
-    writeState(DEFAULT_MODEL_KEY, `${OTHER_PROVIDER}:default-model`);
-    writeState(HIDDEN_MODELS_KEY, [`${OTHER_PROVIDER}:hidden-model`]);
     writeState(LAST_CUSTOM_MODEL_PROVIDER_KEY, OTHER_PROVIDER);
     writeState(workspaceModelKey, `${OTHER_PROVIDER}:workspace-model`);
     writeState(workspaceSettingsKey, unchangedSettings);
 
     const before = {
-      defaultModel: readString(DEFAULT_MODEL_KEY),
-      hiddenModels: readState<string[]>(HIDDEN_MODELS_KEY, []),
       lastProvider: readString(LAST_CUSTOM_MODEL_PROVIDER_KEY),
       workspaceModel: readString(workspaceModelKey),
       workspaceSettings: readState(workspaceSettingsKey, {}),
@@ -198,8 +163,6 @@ describe("repairLocalModelPreferencesForRemovedProvider", () => {
     ]);
 
     expect({
-      defaultModel: readString(DEFAULT_MODEL_KEY),
-      hiddenModels: readState<string[]>(HIDDEN_MODELS_KEY, []),
       lastProvider: readString(LAST_CUSTOM_MODEL_PROVIDER_KEY),
       workspaceModel: readString(workspaceModelKey),
       workspaceSettings: readState(workspaceSettingsKey, {}),
