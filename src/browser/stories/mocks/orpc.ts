@@ -873,17 +873,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           agentHeartbeatsEnabled,
           experiments,
         }),
-      saveConfig: (input: {
-        taskSettings?: unknown;
-        userPreferences?: unknown;
-        agentAiDefaults?: unknown;
-      }) => {
+      saveConfig: (input: { taskSettings?: unknown; agentAiDefaults?: unknown }) => {
         if (input.taskSettings != null) {
           taskSettings = normalizeTaskSettings(input.taskSettings);
-        }
-
-        if (input.userPreferences !== undefined) {
-          userPreferences = normalizeUserPreferences(input.userPreferences);
         }
 
         if (input.agentAiDefaults !== undefined) {
