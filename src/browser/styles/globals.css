@@ -865,15 +865,6 @@ body,
     min-width: 44px;
   }
 
-  /* Radix checkboxes draw their box on the <button> itself, so the 44px minimum above turned the
-     box into a 44px square and pushed it off its label's line. Keep the drawn size: every checkbox
-     sits in a <label> or a clickable row, and that row is the touch target. (A 44px pseudo-element
-     hit area overlapped the next row in dense lists such as ToolSelector.) */
-  button[role="checkbox"] {
-    min-height: 0;
-    min-width: 0;
-  }
-
   /* Full-width rows above the composer (TODO, sub-agents, background bash) read as a list;
      44px each made a short stack taller than the composer. */
   .mobile-touch-row {

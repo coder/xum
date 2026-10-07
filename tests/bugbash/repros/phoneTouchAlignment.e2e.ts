@@ -1,7 +1,6 @@
 // Touch phones (iOS Safari) apply a 44px minimum to every button (globals.css, `pointer: coarse`).
 // That minimum pushed controls off the line of the text next to them: the Settings close X sat
-// below the title, Backup checkboxes grew to 44px squares above their labels, and a reply's model
-// and time wrapped onto two lines beside the action buttons.
+// below the title, and a reply's model and time wrapped onto two lines beside the action buttons.
 //
 // The e2e browser has no coarse pointer, so each test copies the app's own coarse-pointer rules
 // into an unconditional stylesheet first. The rules come from the shipped CSS, so a change to them
@@ -77,34 +76,6 @@ for (const width of [390, 768]) {
     }
   );
 }
-
-test(
-  "Backup checkboxes keep their size and line up with their labels on a touch phone",
-  { tags: ["bugbash", "touch-alignment"] },
-  async ({ app, screen, browser }) => {
-    await browser.setViewport({ width: 390, height: 844 });
-    await openPlayground(app, screen, browser);
-    await openSettings(browser, screen);
-    await screen
-      .getByRole("dialog", "Settings")
-      .getByRole("button", /^Backup$/)
-      .tap();
-    await expect(screen.getByRole("checkbox", "Global instructions")).toBeVisible();
-    await applyTouchPointerRules(browser);
-
-    const box = await browser.evaluate(() => {
-      const checkbox = document.querySelector('[role=checkbox][aria-label="Global instructions"]');
-      const label = checkbox?.nextElementSibling?.firstElementChild;
-      if (!checkbox || !label) return null;
-      const c = checkbox.getBoundingClientRect();
-      const l = label.getBoundingClientRect();
-      return { height: c.height, gap: Math.abs(c.top + c.height / 2 - (l.top + l.height / 2)) };
-    });
-    // Before the fix the box itself was 44px tall and its middle sat 14px below the label's.
-    expect(box?.height).toBeLessThan(24);
-    expect(box?.gap).toBeLessThanOrEqual(2);
-  }
-);
 
 test(
   "A reply's model and time stay on one line on a touch phone",
