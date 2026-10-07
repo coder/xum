@@ -1022,7 +1022,7 @@ export class TurnRequestBuilder {
     const experiments = {
       programmaticToolCalling: isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
       rlm: isExperimentEnabled(EXPERIMENT_IDS.RLM),
-      tokenBudget: isTokenBudgetActive(undefined, isExperimentEnabled),
+      tokenBudget: isTokenBudgetActive(isExperimentEnabled),
       continuousCompaction: isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION),
     };
     const combinedAbortSignal = context.abortSignal;
@@ -2328,7 +2328,6 @@ export class TurnRequestBuilder {
                     additionalSystemInstructions: scratchpadAdditionalSystemInstructions,
                     maxOutputTokens,
                     providerOptions: effectiveMuxProviderOptions,
-                    experiments,
                     skipAiSettingsPersistence: true,
                     muxMetadata: {
                       type: WORKFLOW_RESULT_METADATA_TYPE,

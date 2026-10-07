@@ -8,7 +8,7 @@ import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 import type { SessionUsageService } from "./sessionUsageService";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import {
   createMuxMessage,
@@ -35,11 +35,7 @@ import { waitForCondition } from "./testDispatchHelpers";
 
 const workspaceId = "continuous-session";
 const model = "openai:gpt-4o";
-const sendOptions: SendMessageOptions = {
-  model,
-  agentId: "exec",
-  experiments: { continuousCompaction: true },
-};
+const sendOptions: SendMessageOptions = { model, agentId: "exec" };
 
 interface ContinuousStrategyInternals {
   continuousCompactor: ContinuousCompactor;
@@ -115,8 +111,14 @@ describe("AgentSession continuous compaction wiring", () => {
     mock.restore();
   });
 
+  const enabledExperiments = new Set<ExperimentId>();
   async function setup(usagePercent = 0, streamManager?: AgentSessionStreamManager) {
     harness = await createAgentSessionHarness({ workspaceId, captureEvents: true, streamManager });
+    enabledExperiments.clear();
+    enabledExperiments.add(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
+    spyOn(harness.aiService, "isExperimentEnabled").mockImplementation((id) =>
+      enabledExperiments.has(id)
+    );
     if (usagePercent > 0) {
       await harness.historyService.appendToHistory(
         workspaceId,
@@ -427,10 +429,11 @@ describe("AgentSession continuous compaction wiring", () => {
     if (mode === "disabled-usage-terminal") {
       // Kept private: a real send here would be queued behind the live source stream, so the
       // disabled usage observation needs the turn context seeded directly (cleared below).
+      enabledExperiments.delete(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
       internals(h.session).activeStreamContext = {
         modelString: model,
         providersConfig: null,
-        options: { ...sendOptions, experiments: { continuousCompaction: false } },
+        options: sendOptions,
       };
       const observed = deferred<void>();
       const observe = compactor.observe.bind(compactor);
@@ -448,6 +451,7 @@ describe("AgentSession continuous compaction wiring", () => {
       await observed.promise;
       expect(await store.read()).not.toBeNull();
       internals(h.session).activeStreamContext = undefined;
+      enabledExperiments.add(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
     }
     source.parts.push({ type: "text", text: "post-swap crash growth" });
     await h.historyService.writePartial(workspaceId, source);
@@ -523,7 +527,8 @@ describe("AgentSession continuous compaction wiring", () => {
     }
     if (mode !== "startup") {
       const strategy = continuous(h.session);
-      const options = { ...sendOptions, experiments: { continuousCompaction: false } };
+      enabledExperiments.delete(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
+      const options = sendOptions;
       if (mode === "terminal-error") {
         spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(() =>
           Promise.reject(new Error("temporary terminal history failure"))
@@ -593,18 +598,14 @@ describe("AgentSession continuous compaction wiring", () => {
         });
         expect(compacting.success).toBe(true);
       }
+      enabledExperiments.delete(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
+      enabledExperiments.add(EXPERIMENT_IDS.MEMORY);
+      if (guard === "token-budget") enabledExperiments.add(EXPERIMENT_IDS.TOKEN_BUDGET);
       const state = internals(h.session);
       state.activeStreamContext = {
         modelString: model,
         providersConfig: null,
-        options: {
-          ...sendOptions,
-          experiments: {
-            continuousCompaction: false,
-            tokenBudget: guard === "token-budget",
-            memory: true,
-          },
-        },
+        options: sendOptions,
       };
       const strategy = continuous(h.session);
       spyOn(strategy.continuousCompactor, "hasConsumedSwap").mockReturnValue(true);
@@ -772,11 +773,12 @@ describe("AgentSession continuous compaction wiring", () => {
           return "applied";
         }
       );
+      if (tokenBudget) {
+        enabledExperiments.add(EXPERIMENT_IDS.TOKEN_BUDGET);
+        enabledExperiments.add(EXPERIMENT_IDS.MEMORY);
+      }
       const stream = spyOn(h.aiService, "streamMessage");
-      const result = await h.session.sendMessage("Keep going with the next task", {
-        ...sendOptions,
-        experiments: { continuousCompaction: true, tokenBudget },
-      });
+      const result = await h.session.sendMessage("Keep going with the next task", sendOptions);
       expect(result.success).toBe(true);
       expect(stream).toHaveBeenCalledTimes(1);
       // Continuous must actually apply, not merely suppress the competing budget callback.
@@ -812,26 +814,6 @@ describe("AgentSession continuous compaction wiring", () => {
       }
     }
   );
-
-  test("explicit experiment disable wins over backend enable and keeps legacy on-send policy", async () => {
-    const h = await setup(72);
-    spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-      (id) => id === EXPERIMENT_IDS.CONTINUOUS_COMPACTION
-    );
-    const observe = spyOn(continuous(h.session).continuousCompactor, "observe");
-    expect(
-      (
-        await h.session.sendMessage("New work", {
-          ...sendOptions,
-          experiments: { continuousCompaction: false },
-        })
-      ).success
-    ).toBe(true);
-    expect(observe).not.toHaveBeenCalled();
-    expect(
-      (await rows(h)).some((row) => row.metadata?.muxMetadata?.type === "compaction-request")
-    ).toBe(true);
-  });
 
   test("threshold 100 disables both automatic strategies even above the context limit", async () => {
     const h = await setup(110);

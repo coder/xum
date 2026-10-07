@@ -43,35 +43,6 @@ export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
 export const LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID = "programmatic-tool-calling-exclusive";
 
 /**
- * Read-side alias for persisted experiment-flag objects (camelCase form used
- * by startup-retry send options): a legacy
- * exclusive `true` opted into exactly the posture merged PTC activates, so it
- * wins even over an explicit `programmaticToolCalling: false`.
- */
-export function aliasLegacyPtcExclusive<
-  T extends { programmaticToolCalling?: boolean; programmaticToolCallingExclusive?: boolean },
->(
-  experiments: T | undefined
-): (Omit<T, "programmaticToolCalling"> & { programmaticToolCalling?: boolean }) | undefined {
-  if (experiments?.programmaticToolCallingExclusive !== true) return experiments;
-  if (experiments.programmaticToolCalling === true) return experiments;
-  return { ...experiments, programmaticToolCalling: true };
-}
-
-/**
- * Write-side mirror for persisted experiment-flag objects: an enabled merged
- * PTC also stamps the legacy exclusive key so a downgraded build runs the
- * exclusive posture instead of reading bare PTC as the removed (~2x cost)
- * supplement mode.
- */
-export function withLegacyPtcExclusiveMirror<T extends { programmaticToolCalling?: boolean }>(
-  experiments: T | undefined
-): (T & { programmaticToolCallingExclusive?: boolean }) | undefined {
-  if (experiments?.programmaticToolCalling !== true) return experiments;
-  return { ...experiments, programmaticToolCallingExclusive: true };
-}
-
-/**
  * Former experiment IDs whose features are now always on. CLI `-e` parsing
  * accepts them as no-ops so existing automation (for example terminal-bench)
  * keeps working instead of failing on an unknown experiment.
@@ -285,16 +256,9 @@ function getPlatformDisplayName(platform: NodeJS.Platform): string {
 /**
  * Token budget hard-depends on Agent Memory: an agent keeps its rollover checkpoint in the
  * /memories/session/ scope, so without the memory tool a fresh window could not recover its state.
- * A missing explicit flag falls back to the backend value, like every other experiment read.
  */
-export function isTokenBudgetActive(
-  experiments: { tokenBudget?: boolean; memory?: boolean } | undefined,
-  isEnabled: (id: ExperimentId) => boolean
-): boolean {
-  return (
-    (experiments?.tokenBudget ?? isEnabled(EXPERIMENT_IDS.TOKEN_BUDGET)) &&
-    (experiments?.memory ?? isEnabled(EXPERIMENT_IDS.MEMORY))
-  );
+export function isTokenBudgetActive(isEnabled: (id: ExperimentId) => boolean): boolean {
+  return isEnabled(EXPERIMENT_IDS.TOKEN_BUDGET) && isEnabled(EXPERIMENT_IDS.MEMORY);
 }
 
 export function isExperimentSupportedOnPlatform(

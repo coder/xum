@@ -4075,6 +4075,13 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
   });
 
+  test("experiments on a send, as an old bundle sends them, do not override the service", async () => {
+    const h = await setup();
+    const oldBundleOptions = { ...options, experiments: { tokenBudget: false } };
+    expect((await h.session.sendMessage("Budget still on", oldBundleOptions)).success).toBe(true);
+    expect(h.requests[0].onStepSettled).toBeDefined();
+  });
+
   test.each([
     { off: [EXPERIMENT_IDS.TOKEN_BUDGET], on: [] },
     { off: [], on: [EXPERIMENT_IDS.CONTINUOUS_COMPACTION] },

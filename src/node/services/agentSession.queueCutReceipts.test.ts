@@ -1,4 +1,5 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -80,6 +81,9 @@ async function setup(args?: { failure?: boolean }) {
     aiServiceOverrides: {
       streamMessage,
       buildMemorySessionContext: mock(() => Promise.resolve(null)),
+      isExperimentEnabled: mock(
+        (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+      ),
     },
   });
   spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(
@@ -98,7 +102,6 @@ async function setup(args?: { failure?: boolean }) {
     const sent = await h.session.sendMessage("Work through the task", {
       model: BUDGET_MODEL,
       agentId: "exec",
-      experiments: { tokenBudget: true, memory: true },
     });
     expect(sent.success).toBe(true);
     return firstRequest.promise;

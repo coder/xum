@@ -957,43 +957,6 @@ export const ToolPolicySchema = z.array(ToolPolicyFilterSchema).meta({
     "Tool policy - array of filters applied in order. Default behavior is allow all tools.",
 });
 
-// Experiments schema for feature gating.
-//
-// Unknown keys (e.g. `goals` from older persisted send-options written
-// before the Goals experiment graduated to GA) are stripped by Zod's
-// default behavior, so we do not need to retain a deprecated field.
-export const ExperimentsSchema = z.preprocess(
-  // Legacy alias: startup-retry snapshots persisted by builds where "PTC
-  // Exclusive Mode" was a separate experiment may carry only the exclusive
-  // flag; the merged PTC experiment activates exactly that posture (`true`
-  // wins over an explicit programmaticToolCalling: false).
-  (value) =>
-    typeof value === "object" &&
-    value !== null &&
-    (value as Record<string, unknown>).programmaticToolCallingExclusive === true
-      ? { ...value, programmaticToolCalling: true }
-      : value,
-  z.object({
-    programmaticToolCalling: z.boolean().optional(),
-    /**
-     * Downgrade-compat mirror (see withLegacyPtcExclusiveMirror): retained
-     * through parsing and stamped alongside programmaticToolCalling in
-     * persisted startup-retry snapshots so a downgraded build resumes in the
-     * exclusive posture instead of supplement mode.
-     */
-    programmaticToolCallingExclusive: z.boolean().optional(),
-    /**
-     * RLM mode (sub-experiment of Programmatic Tool Calling): persistent
-     * sandbox kernel for code_execution. Inert unless a PTC flag is also on.
-     */
-    rlm: z.boolean().optional(),
-    memory: z.boolean().optional(),
-    memoryIntuition: z.boolean().optional(),
-    continuousCompaction: z.boolean().optional(),
-    tokenBudget: z.boolean().optional(),
-  })
-);
-
 /**
  * `steer` is accepted for older clients, but the backend treats every manual
  * user message as a pause because active goal mode is derived from the latest
@@ -1105,7 +1068,6 @@ export const SendMessageOptionsSchema = z.object({
       reasoningMode: z.literal(true).optional(),
     })
     .optional(),
-  experiments: ExperimentsSchema.optional(),
   /**
    * Composer model set to "Auto" (auto-model-routing experiment): classify the prompt's
    * difficulty and run on the matching tier's model. `model` stays the concrete

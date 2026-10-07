@@ -2207,7 +2207,6 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
   additionalSystemInstructions: true,
   maxOutputTokens: true,
   providerOptions: true,
-  experiments: true,
   disableWorkspaceAgents: true,
   strictAgentResolution: true,
 });

@@ -313,11 +313,7 @@ import {
   SKILL_DYNAMIC_COMMAND_TIMEOUT_MS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
 } from "@/node/services/agentSkills/skillDynamicContext";
-import {
-  aliasLegacyPtcExclusive,
-  EXPERIMENT_IDS,
-  type ExperimentId,
-} from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import {
   awaitPendingBranchSummary,
   clearPendingBranchSummary,
@@ -2933,10 +2929,6 @@ export class AgentSession {
         ? persistedRetrySendOptions.maxOutputTokens
         : undefined;
     const persistedProviderOptions = persistedRetrySendOptions?.providerOptions;
-    // History rows load as raw JSON (no schema parse), so the legacy exclusive
-    // alias must be applied here: an old snapshot may carry only the exclusive
-    // flag, which activates exactly the posture merged PTC now provides.
-    const persistedExperiments = aliasLegacyPtcExclusive(persistedRetrySendOptions?.experiments);
 
     const lastUserMuxMetadata = lastUserMessage?.metadata?.muxMetadata;
     if (isCompactionRequestMetadata(lastUserMuxMetadata)) {
@@ -2975,9 +2967,6 @@ export class AgentSession {
       }
       if (persistedProviderOptions) {
         compactionRequest.providerOptions = persistedProviderOptions;
-      }
-      if (persistedExperiments) {
-        compactionRequest.experiments = persistedExperiments;
       }
       if (persistedRetrySendOptions?.agentInitiated === true) {
         compactionRequest.agentInitiated = true;
@@ -3024,9 +3013,6 @@ export class AgentSession {
     }
     if (persistedProviderOptions) {
       retryRequest.providerOptions = persistedProviderOptions;
-    }
-    if (persistedExperiments) {
-      retryRequest.experiments = persistedExperiments;
     }
     if (persistedGoalKind != null) {
       retryRequest.goalKind = persistedGoalKind;
@@ -12123,13 +12109,6 @@ export class AgentSession {
       reasoningMode: followUp.reasoningMode,
       additionalSystemInstructions: followUp.additionalSystemInstructions,
       providerOptions: followUp.providerOptions,
-      // Raw JSON boundary (same as the startup-retry snapshot read above): an
-      // older build may have persisted {programmaticToolCalling: false,
-      // programmaticToolCallingExclusive: true}, and the explicit false would
-      // otherwise win over backend overrides while the removed legacy field
-      // is ignored — silently downgrading the crash-safe follow-up to
-      // PTC-off (and making its rlm flag inert).
-      experiments: aliasLegacyPtcExclusive(followUp.experiments),
       disableWorkspaceAgents: followUp.disableWorkspaceAgents,
       ...(persistedToolPolicy?.success ? { toolPolicy: persistedToolPolicy.data } : {}),
       // Explicit-agent turns stay loud on the resumed turn too: the requested agent

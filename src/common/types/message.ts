@@ -10,7 +10,6 @@ import type {
 } from "@/common/constants/contextBoundary";
 import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { SendMessageOptions } from "@/common/orpc/types";
-import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import type { z } from "zod";
 import type { AgentMode } from "./mode";
 import type { AgentSkillScope } from "./agentSkill";
@@ -65,7 +64,6 @@ type PreservedSendOptions = Pick<
   | "reasoningMode"
   | "additionalSystemInstructions"
   | "providerOptions"
-  | "experiments"
   | "disableWorkspaceAgents"
   | "toolPolicy"
   | "strictAgentResolution"
@@ -87,11 +85,6 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
       ? { additionalSystemInstructions: options.additionalSystemInstructions }
       : {}),
     ...(options.providerOptions !== undefined ? { providerOptions: options.providerOptions } : {}),
-    // Downgrade-compat (see withLegacyPtcExclusiveMirror): preserved options
-    // can persist across restarts and build versions.
-    ...(options.experiments !== undefined
-      ? { experiments: withLegacyPtcExclusiveMirror(options.experiments) }
-      : {}),
     ...(options.disableWorkspaceAgents !== undefined
       ? { disableWorkspaceAgents: options.disableWorkspaceAgents }
       : {}),
@@ -120,7 +113,6 @@ export type StartupRetrySendOptions = Pick<
   | "additionalSystemInstructions"
   | "maxOutputTokens"
   | "providerOptions"
-  | "experiments"
   | "disableWorkspaceAgents"
   | "strictAgentResolution"
 > & {
@@ -171,9 +163,6 @@ export function pickStartupRetrySendOptions(
     additionalSystemInstructions: options.additionalSystemInstructions,
     maxOutputTokens: options.maxOutputTokens,
     providerOptions: options.providerOptions,
-    // Downgrade-compat: retry snapshots persist to chat.jsonl and cross build
-    // versions, so an enabled merged PTC also stamps the legacy exclusive key.
-    experiments: withLegacyPtcExclusiveMirror(options.experiments),
     disableWorkspaceAgents: options.disableWorkspaceAgents,
     // Keep explicit-agent turns loud across restart recovery (see pickPreservedSendOptions).
     strictAgentResolution: options.strictAgentResolution,

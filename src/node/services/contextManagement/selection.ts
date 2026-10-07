@@ -3,7 +3,6 @@ import {
   isTokenBudgetActive,
   type ExperimentId,
 } from "@/common/constants/experiments";
-import type { SendMessageOptions } from "@/common/orpc/types";
 import { isRlmModeEnabled } from "../branchSummary";
 
 export interface ContextStrategySelection {
@@ -13,14 +12,11 @@ export interface ContextStrategySelection {
 
 /** Resolve configuration only; lifecycle eligibility and pending work stay with each hook. */
 export function resolveContextStrategy(input: {
-  experiments?: SendMessageOptions["experiments"];
   isEnabled: (id: ExperimentId) => boolean;
   isCompactionRequest: boolean;
 }): ContextStrategySelection {
-  const tokenBudget = isTokenBudgetActive(input.experiments, input.isEnabled);
-  const continuous =
-    input.experiments?.continuousCompaction ??
-    input.isEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
+  const tokenBudget = isTokenBudgetActive(input.isEnabled);
+  const continuous = input.isEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
   const configured = continuous ? "continuous" : tokenBudget ? "token-budget" : "summarize";
 
   if (!tokenBudget) return { configured };
