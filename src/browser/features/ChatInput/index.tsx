@@ -59,8 +59,6 @@ import {
 import {
   getReasoningModeKey,
   getWorkspaceAISettingsByAgentKey,
-  AGENT_AI_DEFAULTS_KEY,
-  RUNTIME_ENABLEMENT_KEY,
   getProjectScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
@@ -105,6 +103,8 @@ import {
   flushUserPreferences,
   getUserPreferences,
   updateUserPreferences,
+  useAgentAiDefaults,
+  useAppConfig,
   useUserPreferences,
 } from "@/browser/stores/AppConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
@@ -146,9 +146,8 @@ import {
   type PendingUserMessage,
 } from "@/browser/utils/chatEditing";
 
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { type OpenAIReasoningMode, type ThinkingLevel } from "@/common/types/thinking";
-import { DEFAULT_RUNTIME_ENABLEMENT, normalizeRuntimeEnablement } from "@/common/types/runtime";
+import { normalizeRuntimeEnablement } from "@/common/types/runtime";
 import {
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
@@ -434,11 +433,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const onModelChange = props.onModelChange;
 
   // User request: keep creation runtime controls synced with Settings enablement toggles.
-  const [rawRuntimeEnablement] = usePersistedState(
-    RUNTIME_ENABLEMENT_KEY,
-    DEFAULT_RUNTIME_ENABLEMENT,
-    { listener: true }
-  );
+  const rawRuntimeEnablement = useAppConfig((config) => config.runtimeEnablement);
   const runtimeEnablement = normalizeRuntimeEnablement(rawRuntimeEnablement);
 
   // Track concurrent sends with a counter (not boolean) to handle queued follow-ups correctly.
@@ -622,13 +617,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { models, hiddenModelsForSelector, ensureModelInSettings, defaultModel, setDefaultModel } =
     useModelsFromSettings();
 
-  const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
-    AGENT_AI_DEFAULTS_KEY,
-    {},
-    {
-      listener: true,
-    }
-  );
+  const agentAiDefaults = useAgentAiDefaults();
   const telemetry = useTelemetry();
   const vimEnabled = useUserPreferences(
     (preferences) => preferences.appearance?.vimEnabled === true

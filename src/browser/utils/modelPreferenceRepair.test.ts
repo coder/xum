@@ -7,7 +7,6 @@ import {
   updatePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import {
-  AGENT_AI_DEFAULTS_KEY,
   DEFAULT_MODEL_KEY,
   HIDDEN_MODELS_KEY,
   LAST_CUSTOM_MODEL_PROVIDER_KEY,
@@ -125,31 +124,6 @@ describe("repairLocalModelPreferencesForRemovedProvider", () => {
     repairLocalModelPreferencesForRemovedProvider(REMOVED_PROVIDER, []);
 
     expect(readString(LAST_CUSTOM_MODEL_PROVIDER_KEY)).toBe(OTHER_PROVIDER);
-  });
-
-  test("clears agent default models for the removed provider", () => {
-    writeState(AGENT_AI_DEFAULTS_KEY, {
-      exec: {
-        modelString: `${REMOVED_PROVIDER}:exec-model`,
-        thinkingLevel: "high",
-      },
-      plan: {
-        modelString: `${OTHER_PROVIDER}:plan-model`,
-        thinkingLevel: "medium",
-      },
-    });
-
-    repairLocalModelPreferencesForRemovedProvider(REMOVED_PROVIDER, []);
-
-    expect(readState(AGENT_AI_DEFAULTS_KEY, {})).toEqual({
-      exec: {
-        thinkingLevel: "high",
-      },
-      plan: {
-        modelString: `${OTHER_PROVIDER}:plan-model`,
-        thinkingLevel: "medium",
-      },
-    });
   });
 
   test("resets affected per-agent workspace models while preserving entries and fields", () => {

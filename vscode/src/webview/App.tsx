@@ -102,7 +102,6 @@ import { CHAT_BUFFER_LIMITS } from "./config";
 import { createVscodeOrpcLink } from "./createVscodeOrpcLink";
 import { WebviewLiveBashOutput } from "./liveBashOutput";
 import { WebviewTranscriptBarrier } from "./transcriptBarrier";
-import { seedWebviewPreferences } from "./seedPreferences";
 import type { VscodeBridge } from "./vscodeBridge";
 
 // Shared chat components need these providers; the webview has no desktop shell to supply them
@@ -487,29 +486,22 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   // server connection (it rejects calls in file mode), and reconnect them for each server, so a
   // recovery or a switch to another server fetches them again. The host
   // redacts both results (see redactWebviewOrpcResult).
-  // The app config snapshot also seeds the backend preferences shared components read from
-  // localStorage (#4972, #4962), on connect and on every config change.
   useEffect(() => {
     if (apiConnectionKey === null) {
       return;
     }
     const providersConfigStore = getProvidersConfigStore();
     const appConfigStore = getAppConfigStore();
-    // Until this server's config loads, the store and the seeded keys may hold another server's
-    // values, and localStorage can outlive the previous webview session. Clear both first so
-    // nothing in that window, a send included, uses another server's preferences or agent defaults.
+    // Until this server's config loads, the store still holds the previous server's config. Clear
+    // it first so nothing in that window, a send included, uses another server's preferences or
+    // agent defaults.
     appConfigStore.clearCachedState();
-    seedWebviewPreferences(null);
-    const unsubscribeSeed = appConfigStore.subscribe(() => {
-      seedWebviewPreferences(appConfigStore.getSnapshot());
-    });
     providersConfigStore.setClient(apiClient);
     appConfigStore.setClient(apiClient);
     // The background processes strip and the bash tool cards' live process status (#5092). A
     // server switch already dropped the previous server's cached rows (connectionStatus handler).
     backgroundBashStore.setClient(apiClient);
     return () => {
-      unsubscribeSeed();
       providersConfigStore.setClient(null);
       appConfigStore.setClient(null);
       backgroundBashStore.setClient(null);

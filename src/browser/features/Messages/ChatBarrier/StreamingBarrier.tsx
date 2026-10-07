@@ -2,10 +2,9 @@ import React from "react";
 import { StreamingBarrierView } from "./StreamingBarrierView";
 import { getModelName } from "@/common/utils/ai/models";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
-import { AGENT_AI_DEFAULTS_KEY, getModelKey } from "@/common/constants/storage";
+import { getModelKey } from "@/common/constants/storage";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import { getUserPreferences } from "@/browser/stores/AppConfigStore";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   useWorkspaceState,
   useWorkspaceAggregator,
@@ -365,7 +364,7 @@ export const StreamingBarrierContent: React.FC<StreamingBarrierContentProps> = (
   const showCompactionHint =
     phase === "compacting" &&
     onConfigureCompaction != null &&
-    !readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {}).compact?.modelString;
+    !getAppConfigStore().getSnapshot()?.agentAiDefaults?.compact?.modelString;
 
   return (
     <StreamingBarrierView

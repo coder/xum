@@ -11,7 +11,6 @@ import * as DraftWorkspaceSettingsModule from "@/browser/hooks/useDraftWorkspace
 import * as ChatCommandsModule from "@/browser/utils/chatCommands";
 import type { ProjectConfig } from "@/common/types/project";
 import {
-  AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
@@ -682,6 +681,7 @@ describe("useCreationWorkspace", () => {
     mockProjectConfigMap = new Map([[TEST_PROJECT_PATH, { workspaces: [], trusted: true }]]);
     persistedPreferences = {};
     setPreferences(undefined);
+    getAppConfigStore().updateOptimistically({ agentAiDefaults: undefined });
     readPersistedStateCalls.length = 0;
     updatePersistedStateCalls.length = 0;
     draftSettingsInvocations = [];
@@ -1998,7 +1998,9 @@ describe("useCreationWorkspace", () => {
       });
 
       const projectScopeId = getProjectScopeId(TEST_PROJECT_PATH);
-      persistedPreferences[AGENT_AI_DEFAULTS_KEY] = { exec: { autoModelRouting: true } };
+      getAppConfigStore().updateOptimistically({
+        agentAiDefaults: { exec: { autoModelRouting: true } },
+      });
       setPreferences({
         ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "exec", model: "gpt-4" } } },
       });

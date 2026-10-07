@@ -4,13 +4,10 @@ import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
-import { createTestApiClient } from "@/browser/testUtils";
+import { createTestApiClient, setTestAgentAiDefaults } from "@/browser/testUtils";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isCompactionRecoveryError, useCompactAndRetry } from "./useCompactAndRetry";
 import type {
   DisplayedMessage,
@@ -161,13 +158,14 @@ describe("useCompactAndRetry trigger message", () => {
     sendMessage.mockClear();
     // A configured compaction model makes a suggestion available, so context_exceeded
     // auto-compacts through executeCompaction.
-    updatePersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       compact: { modelString: COMPACT_MODEL },
     });
   });
 
   afterEach(() => {
     cleanup();
+    setTestAgentAiDefaults(undefined);
     const store = useWorkspaceStoreRaw();
     store.setClient(null);
     store.dispose();

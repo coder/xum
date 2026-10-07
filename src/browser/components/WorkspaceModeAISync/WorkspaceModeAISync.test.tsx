@@ -7,9 +7,12 @@ import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { consumeWorkspaceModelChange, setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
 import {
-  AGENT_AI_DEFAULTS_KEY,
+  resetTestExperiments,
+  setTestAgentAiDefaults,
+  setTestExperiment,
+} from "@/browser/testUtils";
+import {
   getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
@@ -66,6 +69,7 @@ describe("WorkspaceModeAISync", () => {
 
   afterEach(() => {
     resetTestExperiments();
+    setTestAgentAiDefaults(undefined);
     cleanup();
     cleanupDom?.();
     cleanupDom = null;
@@ -77,7 +81,7 @@ describe("WorkspaceModeAISync", () => {
     const execModel = "openai:gpt-4o-mini";
     const planModel = "anthropic:claude-3-5-sonnet-latest";
 
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: execModel },
       plan: { modelString: planModel },
     });
@@ -104,7 +108,7 @@ describe("WorkspaceModeAISync", () => {
 
   test("an explicit agent switch that changes the thinking level leaves thinking Auto", async () => {
     const workspaceId = nextWorkspaceId();
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: "openai:gpt-5.2", thinkingLevel: "low" },
       plan: { modelString: "openai:gpt-5.2", thinkingLevel: "high" },
     });
@@ -130,7 +134,7 @@ describe("WorkspaceModeAISync", () => {
   test("an explicit agent switch that keeps the stored settings still leaves Auto", async () => {
     const workspaceId = nextWorkspaceId();
     // Both agents resolve to what is already stored, so neither setter runs.
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: "openai:gpt-5.2", thinkingLevel: "high" },
       plan: { modelString: "openai:gpt-5.2", thinkingLevel: "high" },
     });
@@ -160,7 +164,7 @@ describe("WorkspaceModeAISync", () => {
     const workspaceModel = "openai:gpt-5.2";
     const workspaceThinking = "high";
 
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: configuredModel, thinkingLevel: configuredThinking },
     });
     updatePersistedState(getWorkspaceAISettingsByAgentKey(workspaceId), {
@@ -184,8 +188,8 @@ describe("WorkspaceModeAISync", () => {
     const existingModel = "some-legacy-model";
     const existingThinking = "off";
 
-    // Inherit in Settings removes explicit per-agent defaults from AGENT_AI_DEFAULTS_KEY.
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {});
+    // Inherit in Settings removes explicit per-agent defaults from agentAiDefaults.
+    setTestAgentAiDefaults({});
     updatePersistedState(getWorkspaceAISettingsByAgentKey(workspaceId), {
       exec: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
     });
@@ -209,7 +213,7 @@ describe("WorkspaceModeAISync", () => {
     const execWorkspaceModel = "openai:gpt-5.2-pro";
     const execWorkspaceThinking = "medium";
 
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {});
+    setTestAgentAiDefaults({});
     updatePersistedState(getWorkspaceAISettingsByAgentKey(workspaceId), {
       exec: { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking },
     });
@@ -242,7 +246,7 @@ describe("WorkspaceModeAISync", () => {
     const existingModel = "some-legacy-model";
     const existingThinking = "high";
 
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: "anthropic:claude-haiku-4-5", thinkingLevel: "off" },
     });
     updatePersistedState(getWorkspaceAISettingsByAgentKey(workspaceId), {
@@ -266,7 +270,7 @@ describe("WorkspaceModeAISync", () => {
     const configuredModel = "anthropic:claude-haiku-4-5";
     const userModel = "anthropic:claude-sonnet-4-5";
 
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: configuredModel },
     });
     updatePersistedState(getModelKey(workspaceId), configuredModel);
@@ -306,7 +310,7 @@ describe("WorkspaceModeAISync", () => {
     const customConfiguredModel = "anthropic:claude-haiku-4-5";
     const baseConfiguredThinking = "off";
 
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       custom: { modelString: customConfiguredModel },
       exec: { thinkingLevel: baseConfiguredThinking },
     });
@@ -346,7 +350,7 @@ describe("WorkspaceModeAISync", () => {
 
     test("agent switches turn Auto on for a configured-Auto agent and off for others", async () => {
       const workspaceId = nextWorkspaceId();
-      updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+      setTestAgentAiDefaults({
         exec: { modelString: "openai:gpt-5.2", autoModelRouting: true, autoThinkingLevel: true },
         plan: { modelString: "openai:gpt-5.2" },
       });
@@ -368,7 +372,7 @@ describe("WorkspaceModeAISync", () => {
 
     test("mount sync applies configured Auto only when the agent has no workspace bucket", async () => {
       const autoExec = { exec: { autoModelRouting: true, autoThinkingLevel: true } };
-      updatePersistedState(AGENT_AI_DEFAULTS_KEY, autoExec);
+      setTestAgentAiDefaults(autoExec);
 
       const fresh = nextWorkspaceId();
       renderAt(fresh, "exec");
@@ -387,7 +391,7 @@ describe("WorkspaceModeAISync", () => {
 
     test("an explicit concrete pick survives an agent round trip over an Auto default", async () => {
       const workspaceId = nextWorkspaceId();
-      updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+      setTestAgentAiDefaults({
         exec: { autoModelRouting: true, autoThinkingLevel: true },
       });
 
@@ -409,7 +413,7 @@ describe("WorkspaceModeAISync", () => {
 
     test("an explicit Auto pick survives an agent round trip over a concrete default", async () => {
       const workspaceId = nextWorkspaceId();
-      updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+      setTestAgentAiDefaults({
         exec: { modelString: "openai:gpt-5.2", thinkingLevel: "low" },
       });
 

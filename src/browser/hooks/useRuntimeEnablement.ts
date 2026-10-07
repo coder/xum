@@ -1,9 +1,7 @@
 import { useRef } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { DEFAULT_RUNTIME_KEY, RUNTIME_ENABLEMENT_KEY } from "@/common/constants/storage";
+import { getAppConfigStore, useAppConfig } from "@/browser/stores/AppConfigStore";
 import {
-  DEFAULT_RUNTIME_ENABLEMENT,
   RUNTIME_ENABLEMENT_IDS,
   normalizeRuntimeEnablement,
   type RuntimeEnablement,
@@ -33,16 +31,9 @@ function normalizeDefaultRuntime(value: unknown): RuntimeEnablementId | null {
 
 export function useRuntimeEnablement(): RuntimeEnablementState {
   const { api } = useAPI();
-  const [rawEnablement, setRawEnablement] = usePersistedState<unknown>(
-    RUNTIME_ENABLEMENT_KEY,
-    DEFAULT_RUNTIME_ENABLEMENT,
-    { listener: true }
-  );
-  const [rawDefaultRuntime, setRawDefaultRuntime] = usePersistedState<unknown>(
-    DEFAULT_RUNTIME_KEY,
-    null,
-    { listener: true }
-  );
+  const store = getAppConfigStore();
+  const rawEnablement = useAppConfig((config) => config.runtimeEnablement);
+  const rawDefaultRuntime = useAppConfig((config) => config.defaultRuntime);
 
   // Normalize persisted values so corrupted/legacy payloads don't break toggles.
   // Stabilize the reference: normalizeRuntimeEnablement returns a fresh object every call,
@@ -69,13 +60,6 @@ export function useRuntimeEnablement(): RuntimeEnablementState {
       [id]: enabled,
     };
 
-    // Persist locally first so Settings reflects changes immediately and stays in sync.
-    setRawEnablement(nextMap);
-    if (nextDefaultRuntime !== undefined) {
-      setRawDefaultRuntime(nextDefaultRuntime);
-    }
-
-    // Best-effort backend write keeps ~/.xum/config.json aligned across devices.
     const payload: {
       runtimeEnablement: RuntimeEnablement;
       defaultRuntime?: RuntimeEnablementId | null;
@@ -85,17 +69,16 @@ export function useRuntimeEnablement(): RuntimeEnablementState {
       payload.defaultRuntime = nextDefaultRuntime;
     }
 
+    store.updateOptimistically(payload);
     api?.config?.updateRuntimeEnablement(payload).catch(() => {
-      // Best-effort only.
+      void store.refresh();
     });
   };
 
   const setDefaultRuntime = (id: RuntimeEnablementId | null) => {
-    // Keep the local cache and config.json aligned for the global default runtime.
-    setRawDefaultRuntime(id);
-
+    store.updateOptimistically({ defaultRuntime: id });
     api?.config?.updateRuntimeEnablement({ defaultRuntime: id }).catch(() => {
-      // Best-effort only.
+      void store.refresh();
     });
   };
 
