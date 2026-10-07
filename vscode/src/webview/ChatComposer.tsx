@@ -129,13 +129,15 @@ function ChatComposerInner(props: {
   } = useModelsFromSettings();
 
   const modelKey = getModelKey(props.workspaceId);
-  const [preferredModel, setPreferredModel] = usePersistedState<string>(modelKey, defaultModel, {
+  // Not defaultModel as the initial value: it is sticky, and the default arrives with the config,
+  // which can load after the composer mounts. Sends read the live default too.
+  const [preferredModel, setPreferredModel] = usePersistedState<string | null>(modelKey, null, {
     listener: true,
   });
 
   // Gateway-preserving, like the desktop composer: an explicit gateway pick (e.g.
   // openrouter:openai/gpt-5) stays selected instead of showing as its direct-provider model.
-  const storedModel = normalizeSelectedModel(preferredModel);
+  const storedModel = normalizeSelectedModel(preferredModel ?? defaultModel);
 
   const inputKey = getInputKey(props.workspaceId);
   const [input, setInput] = usePersistedState<string>(inputKey, "", { listener: true });

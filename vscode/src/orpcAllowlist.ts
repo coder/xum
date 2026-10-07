@@ -130,6 +130,8 @@ const WEBVIEW_APP_CONFIG_FIELDS = [
   "routeOverrides",
   "minThinkingLevelByModel",
   "experiments",
+  "defaultModel",
+  "hiddenModels",
 ];
 const REDACTED_PROVIDER_CONFIG_FIELDS = new Set([
   "baseUrl",

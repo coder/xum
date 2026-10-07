@@ -19,7 +19,7 @@ import {
   getWorkspaceAISettingsByAgentKey,
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
+import { useDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { normalizeSelectedModel, normalizeToCanonical } from "@/common/utils/ai/models";
 import { enforceThinkingPolicy, getAvailableThinkingLevels } from "@/common/utils/thinking/policy";
 import { useMinThinkingLevels } from "@/browser/hooks/useMinThinkingLevels";
@@ -87,7 +87,7 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   const { getMinimum } = useMinThinkingLevels();
   // Resolve mapped aliases so keybind stepping walks the target model's ladder.
   const { config: providersConfig } = useProvidersConfig();
-  const defaultModel = getDefaultModel();
+  const defaultModel = useDefaultModel();
   const scopeId = getScopeId(props.workspaceId, props.projectPath);
   const metadataAgentId = readScopedAiDefault(scopeId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
   const metadataSettings = getWorkspaceAiSettingsFromMetadata(

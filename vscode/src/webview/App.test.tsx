@@ -1619,8 +1619,11 @@ describe("vscode webview app and providers config", () => {
 
   afterEach(() => {
     cleanup();
-    // The store is an app-wide singleton; drop the floors a test loaded so later tests start clean.
-    getAppConfigStore().updateOptimistically({ minThinkingLevelByModel: undefined });
+    // The store is an app-wide singleton; drop what a test loaded so later tests start clean.
+    getAppConfigStore().updateOptimistically({
+      minThinkingLevelByModel: undefined,
+      defaultModel: undefined,
+    });
     cleanupDom?.();
     cleanupDom = null;
   });
@@ -1664,6 +1667,27 @@ describe("vscode webview app and providers config", () => {
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
     expect(bridge.orpcCalls("config.getConfig")).toHaveLength(1);
     expect(bridge.orpcCalls("providers.getConfig")).toHaveLength(1);
+  });
+
+  test("shows and sends the configured default model when the config loads after the composer", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    await bridge.answer("config.getConfig", { defaultModel: "openai:gpt-5.6-terra" });
+    expect(view.getByRole("combobox").textContent).toContain(
+      formatModelDisplayName("gpt-5.6-terra")
+    );
+
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    await typeInto(textarea, "hello");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+    const sends = bridge.orpcCalls("workspace.sendMessage");
+    expect(sends).toHaveLength(1);
+    expect(sends[0].input).toMatchObject({ options: { model: "openai:gpt-5.6-terra" } });
   });
 });
 

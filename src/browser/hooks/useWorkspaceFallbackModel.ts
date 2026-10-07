@@ -1,7 +1,8 @@
 import { usePersistedState } from "./usePersistedState";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { DEFAULT_MODEL_KEY, getModelKey } from "@/common/constants/storage";
+import { getModelKey } from "@/common/constants/storage";
+import { useAppConfig } from "@/browser/stores/AppConfigStore";
 
 /**
  * Resolves the effective model for a workspace by combining the global default
@@ -11,15 +12,7 @@ import { DEFAULT_MODEL_KEY, getModelKey } from "@/common/constants/storage";
  * (including backend-seeded values on fresh origins) propagate immediately.
  */
 export function useWorkspaceFallbackModel(workspaceId: string): string {
-  // Subscribe to the global default model preference so backend-seeded values
-  // apply immediately on fresh origins (e.g., when switching ports).
-  const [defaultModelPref] = usePersistedState<string>(
-    DEFAULT_MODEL_KEY,
-    WORKSPACE_DEFAULTS.model,
-    {
-      listener: true,
-    }
-  );
+  const defaultModelPref = useAppConfig((config) => config.defaultModel) ?? "";
   const defaultModel = normalizeToCanonical(defaultModelPref).trim() || WORKSPACE_DEFAULTS.model;
 
   // Workspace-scoped model preference. If unset, fall back to the global default model.

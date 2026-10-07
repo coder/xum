@@ -338,11 +338,13 @@ describe("app and providers config (#4766)", () => {
     expect(isAllowedOrpcPath(["config", "updateRoutePreferences"])).toBe(false);
   });
 
-  test("projects config.getConfig to the model-routing and thinking-floor fields", () => {
+  test("projects config.getConfig to the model-routing, thinking-floor and model-preference fields", () => {
     const config = {
       routePriority: ["mux-gateway", "direct"],
       routeOverrides: { "openai:gpt-5.6-terra": "direct" },
       minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
+      defaultModel: "openai:gpt-5.6-terra",
+      hiddenModels: ["anthropic:claude-opus-5-5"],
       heartbeatDefaultPrompt: "private prompt",
       userPreferences: { name: "alice" },
       taskSettings: { maxParallelAgentTasks: 3 },
@@ -351,6 +353,8 @@ describe("app and providers config (#4766)", () => {
       routePriority: ["mux-gateway", "direct"],
       routeOverrides: { "openai:gpt-5.6-terra": "direct" },
       minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
+      defaultModel: "openai:gpt-5.6-terra",
+      hiddenModels: ["anthropic:claude-opus-5-5"],
     });
   });
 

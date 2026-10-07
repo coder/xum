@@ -1,5 +1,4 @@
 import { useCallback, useMemo } from "react";
-import { readPersistedString, usePersistedState } from "./usePersistedState";
 import { isCodexOauthAllowedModel } from "@/common/constants/codexOAuth";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { useProvidersConfig } from "./useProvidersConfig";
@@ -15,7 +14,7 @@ import {
 } from "@/common/utils/ai/models";
 import { isModelAvailable } from "@/common/routing";
 import type { ProviderModelEntry, ProvidersConfigMap } from "@/common/orpc/types";
-import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
+import { getAppConfigStore, useAppConfig } from "@/browser/stores/AppConfigStore";
 
 import {
   BUILT_IN_MODELS,
@@ -34,7 +33,7 @@ import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 export { filterHiddenModels, getSuggestedModels };
 
 const BUILT_IN_MODEL_SET = new Set<string>(BUILT_IN_MODELS);
-// Module-level so the persisted-state default keeps a stable identity across renders.
+// Module-level so the default keeps a stable identity across renders.
 const NO_HIDDEN_MODELS: string[] = [];
 
 function getAllCustomModels(config: ProvidersConfigMap | null): string[] {
@@ -71,13 +70,23 @@ function isSupportedSettingsProvider(
   return info?.isCustom === true && isCustomProviderConfig(info);
 }
 
-export function getDefaultModel(): string {
-  const fallback = WORKSPACE_DEFAULTS.model;
-  const persisted = readPersistedString(DEFAULT_MODEL_KEY);
-  if (!persisted) return fallback;
+function getHiddenModels(): string[] {
+  return getAppConfigStore().getSnapshot()?.hiddenModels ?? NO_HIDDEN_MODELS;
+}
 
-  const selectedModel = normalizeSelectedModel(persisted);
-  return selectedModel || fallback;
+function resolveDefaultModel(persisted: string | undefined): string {
+  const fallback = WORKSPACE_DEFAULTS.model;
+  if (!persisted) return fallback;
+  return normalizeSelectedModel(persisted) || fallback;
+}
+
+export function getDefaultModel(): string {
+  return resolveDefaultModel(getAppConfigStore().getSnapshot()?.defaultModel);
+}
+
+/** getDefaultModel for values captured at render: re-renders once the configured default loads. */
+export function useDefaultModel(): string {
+  return resolveDefaultModel(useAppConfig((appConfig) => appConfig.defaultModel));
 }
 
 /**
@@ -92,12 +101,10 @@ export function useModelsFromSettings() {
 
   const persistModelPrefs = useCallback(
     (patch: { defaultModel?: string; hiddenModels?: string[] }) => {
-      if (!api?.config?.updateModelPreferences) {
-        return;
-      }
-
-      api.config.updateModelPreferences(patch).catch(() => {
-        // Best-effort only; startup seeding will heal the cache next time.
+      const store = getAppConfigStore();
+      store.updateOptimistically(patch);
+      api?.config?.updateModelPreferences(patch).catch(() => {
+        void store.refresh();
       });
     },
     [api]
@@ -105,36 +112,22 @@ export function useModelsFromSettings() {
   const { config, refresh } = useProvidersConfig();
   const { routePriority, routeOverrides } = useRouting();
 
-  const [defaultModel, setDefaultModel] = usePersistedState<string>(
-    DEFAULT_MODEL_KEY,
-    WORKSPACE_DEFAULTS.model,
-    { listener: true }
-  );
+  const defaultModel =
+    useAppConfig((appConfig) => appConfig.defaultModel) ?? WORKSPACE_DEFAULTS.model;
 
   const setDefaultModelAndPersist = useCallback(
     (next: string | ((prev: string) => string)) => {
-      setDefaultModel((prev) => {
-        const resolved = typeof next === "function" ? next(prev) : next;
-        const selectedModel = normalizeSelectedModel(resolved);
-        const previousSelectedModel = normalizeSelectedModel(prev);
-
-        if (selectedModel !== previousSelectedModel) {
-          persistModelPrefs({ defaultModel: selectedModel });
-        }
-
-        return selectedModel;
-      });
+      const prev = getAppConfigStore().getSnapshot()?.defaultModel ?? WORKSPACE_DEFAULTS.model;
+      const resolved = typeof next === "function" ? next(prev) : next;
+      const selectedModel = normalizeSelectedModel(resolved);
+      if (selectedModel !== normalizeSelectedModel(prev)) {
+        persistModelPrefs({ defaultModel: selectedModel });
+      }
     },
-    [persistModelPrefs, setDefaultModel]
+    [persistModelPrefs]
   );
 
-  const [hiddenModels, setHiddenModels] = usePersistedState<string[]>(
-    HIDDEN_MODELS_KEY,
-    NO_HIDDEN_MODELS,
-    {
-      listener: true,
-    }
-  );
+  const hiddenModels = useAppConfig((appConfig) => appConfig.hiddenModels) ?? NO_HIDDEN_MODELS;
 
   const isConfigured = useCallback(
     (provider: string) => isProviderConfigured(config, provider),
@@ -282,17 +275,12 @@ export function useModelsFromSettings() {
         return;
       }
 
-      setHiddenModels((prev) => {
-        if (prev.includes(canonical)) {
-          return prev;
-        }
-
-        const nextHiddenModels = [...prev, canonical];
-        persistModelPrefs({ hiddenModels: nextHiddenModels });
-        return nextHiddenModels;
-      });
+      const prev = getHiddenModels();
+      if (!prev.includes(canonical)) {
+        persistModelPrefs({ hiddenModels: [...prev, canonical] });
+      }
     },
-    [persistModelPrefs, setHiddenModels]
+    [persistModelPrefs]
   );
 
   const unhideModel = useCallback(
@@ -302,17 +290,13 @@ export function useModelsFromSettings() {
         return;
       }
 
-      setHiddenModels((prev) => {
-        const nextHiddenModels = prev.filter((m) => m !== canonical);
-        if (nextHiddenModels.length === prev.length) {
-          return prev;
-        }
-
+      const prev = getHiddenModels();
+      const nextHiddenModels = prev.filter((m) => m !== canonical);
+      if (nextHiddenModels.length !== prev.length) {
         persistModelPrefs({ hiddenModels: nextHiddenModels });
-        return nextHiddenModels;
-      });
+      }
     },
-    [persistModelPrefs, setHiddenModels]
+    [persistModelPrefs]
   );
 
   return {

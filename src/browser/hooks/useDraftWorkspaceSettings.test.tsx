@@ -6,7 +6,7 @@ import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { DEFAULT_MODEL_KEY, getRuntimeKey } from "@/common/constants/storage";
+import { getRuntimeKey } from "@/common/constants/storage";
 import { CODER_RUNTIME_PLACEHOLDER } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "./useDraftWorkspaceSettings";
 import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
@@ -82,6 +82,7 @@ describe("useDraftWorkspaceSettings", () => {
     cleanup();
     getAppConfigStore().updateOptimistically({
       userPreferences: undefined,
+      defaultModel: undefined,
       defaultRuntime: undefined,
     });
     mock.restore();
@@ -142,7 +143,7 @@ describe("useDraftWorkspaceSettings", () => {
   test("preserves explicit gateway model in the global default preference", async () => {
     const projectPath = "/tmp/project";
 
-    updatePersistedState(DEFAULT_MODEL_KEY, "openrouter:openai/gpt-5");
+    getAppConfigStore().updateOptimistically({ defaultModel: "openrouter:openai/gpt-5" });
 
     const wrapper = createWrapper(projectPath);
 

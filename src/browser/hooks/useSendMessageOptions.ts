@@ -7,13 +7,13 @@ import {
   buildSendMessageOptions,
   normalizeModelPreference,
 } from "@/browser/utils/messages/buildSendMessageOptions";
-import { DEFAULT_MODEL_KEY } from "@/common/constants/storage";
 import { useScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { useProviderOptions } from "./useProviderOptions";
 import { useExperimentValue } from "./useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   getAutoRoutingKey,
@@ -59,13 +59,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const { workspaceMetadata } = useWorkspaceContext();
   const { options: providerOptions } = useProviderOptions();
 
-  // Subscribe to the global default model preference so backend-seeded values apply
-  // immediately on fresh origins (e.g., when switching ports).
-  const [defaultModelPref] = usePersistedState<string>(
-    DEFAULT_MODEL_KEY,
-    WORKSPACE_DEFAULTS.model,
-    { listener: true }
-  );
+  const defaultModelPref = useAppConfig((config) => config.defaultModel);
   const defaultModel = normalizeModelPreference(defaultModelPref, WORKSPACE_DEFAULTS.model);
 
   // Workspace-scoped model preference. If unset, fall back to metadata, then global default.

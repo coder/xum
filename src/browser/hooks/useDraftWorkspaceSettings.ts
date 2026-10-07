@@ -22,7 +22,7 @@ import {
   useRuntimeOptionDefaults,
   writeSshOptionDefaults,
 } from "@/browser/utils/runtimeOptionDefaults";
-import { DEFAULT_MODEL_KEY, getRuntimeKey } from "@/common/constants/storage";
+import { getRuntimeKey } from "@/common/constants/storage";
 import {
   updateUserPreferences,
   useAppConfig,
@@ -243,13 +243,7 @@ export function useDraftWorkspaceSettings(
       ? coerceAgentId(projectAgentId)
       : coerceAgentId(globalDefaultAgentId);
 
-  // Subscribe to the global default model preference so backend-seeded values apply
-  // immediately on fresh origins (e.g., when switching ports).
-  const [defaultModelPref] = usePersistedState<string>(
-    DEFAULT_MODEL_KEY,
-    WORKSPACE_DEFAULTS.model,
-    { listener: true }
-  );
+  const defaultModelPref = useAppConfig((config) => config.defaultModel) ?? "";
   // normalizeSelectedModel (not normalizeToCanonical) to preserve explicit
   // gateway routing choices like "openrouter:openai/gpt-5".
   const defaultModel = normalizeSelectedModel(defaultModelPref).trim() || WORKSPACE_DEFAULTS.model;

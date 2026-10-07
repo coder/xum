@@ -23,12 +23,15 @@ describe("getSendOptionsFromStorage", () => {
   beforeEach(() => {
     cleanupDom = installDom();
     window.localStorage.clear();
-    window.localStorage.setItem("model-default", JSON.stringify("openai:default"));
+    getAppConfigStore().updateOptimistically({ defaultModel: "openai:default" });
   });
 
   afterEach(() => {
     resetTestExperiments();
-    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+    getAppConfigStore().updateOptimistically({
+      userPreferences: undefined,
+      defaultModel: undefined,
+    });
     window.localStorage.clear();
     cleanupDom?.();
     cleanupDom = null;

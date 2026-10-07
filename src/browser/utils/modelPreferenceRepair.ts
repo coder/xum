@@ -94,6 +94,7 @@ export function repairLocalModelPreferencesForRemovedProvider(
   provider: string,
   workspaceIds: Iterable<string>
 ): void {
+  // The legacy localStorage migration would re-upload these after the backend clears its copies.
   repairPersistedModelString(DEFAULT_MODEL_KEY, provider, WORKSPACE_DEFAULTS.model);
   repairHiddenModels(provider);
   repairLastCustomModelProvider(provider);

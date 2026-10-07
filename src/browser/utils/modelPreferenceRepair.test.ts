@@ -178,15 +178,11 @@ describe("repairLocalModelPreferencesForRemovedProvider", () => {
       },
     };
 
-    writeState(DEFAULT_MODEL_KEY, `${OTHER_PROVIDER}:default-model`);
-    writeState(HIDDEN_MODELS_KEY, [`${OTHER_PROVIDER}:hidden-model`]);
     writeState(LAST_CUSTOM_MODEL_PROVIDER_KEY, OTHER_PROVIDER);
     writeState(workspaceModelKey, `${OTHER_PROVIDER}:workspace-model`);
     writeState(workspaceSettingsKey, unchangedSettings);
 
     const before = {
-      defaultModel: readString(DEFAULT_MODEL_KEY),
-      hiddenModels: readState<string[]>(HIDDEN_MODELS_KEY, []),
       lastProvider: readString(LAST_CUSTOM_MODEL_PROVIDER_KEY),
       workspaceModel: readString(workspaceModelKey),
       workspaceSettings: readState(workspaceSettingsKey, {}),
@@ -198,8 +194,6 @@ describe("repairLocalModelPreferencesForRemovedProvider", () => {
     ]);
 
     expect({
-      defaultModel: readString(DEFAULT_MODEL_KEY),
-      hiddenModels: readState<string[]>(HIDDEN_MODELS_KEY, []),
       lastProvider: readString(LAST_CUSTOM_MODEL_PROVIDER_KEY),
       workspaceModel: readString(workspaceModelKey),
       workspaceSettings: readState(workspaceSettingsKey, {}),

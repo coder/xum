@@ -292,7 +292,6 @@ function renderWithWorkspaceMetadata(props: {
 
 describe("ThinkingContext", () => {
   // Make getDefaultModel deterministic.
-  // (getDefaultModel reads from the global "model-default" localStorage key.)
   beforeEach(() => {
     currentClientMock = {
       workspace: {
@@ -306,12 +305,15 @@ describe("ThinkingContext", () => {
     };
     metadataMap = new Map();
     window.localStorage.clear();
-    window.localStorage.setItem("model-default", JSON.stringify("openai:default"));
+    getAppConfigStore().updateOptimistically({ defaultModel: "openai:default" });
   });
 
   afterEach(() => {
     cleanup();
-    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+    getAppConfigStore().updateOptimistically({
+      userPreferences: undefined,
+      defaultModel: undefined,
+    });
     metadataMap = new Map();
     currentClientMock = {};
   });
@@ -401,6 +403,32 @@ describe("ThinkingContext", () => {
     }, METADATA_WAIT_OPTIONS);
 
     expect(updateAgentAISettings).not.toHaveBeenCalled();
+  });
+
+  test("setting thinking uses the default model that loaded after the provider rendered", async () => {
+    const workspaceId = "ws-set-thinking-late-default";
+    getAppConfigStore().updateOptimistically({ defaultModel: undefined });
+    const view = renderWithWorkspaceMetadata({
+      workspaceId,
+      modelOverride: null,
+      children: (
+        <ThinkingProvider workspaceId={workspaceId}>
+          <ThinkingSetterComponent />
+        </ThinkingProvider>
+      ),
+    });
+
+    const button = await view.findByTestId("set-thinking-medium", undefined, METADATA_WAIT_OPTIONS);
+    act(() => {
+      getAppConfigStore().updateOptimistically({ defaultModel: "openai:configured" });
+    });
+    act(() => {
+      button.click();
+    });
+
+    await waitFor(() => {
+      expect(readWorkspaceAISettingsCache(workspaceId).exec?.model).toBe("openai:configured");
+    }, METADATA_WAIT_OPTIONS);
   });
 
   test("setting thinking preserves an explicit Coder gateway model identity", async () => {
