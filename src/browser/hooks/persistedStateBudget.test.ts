@@ -204,12 +204,7 @@ describe("localStorage budget", () => {
   // silently stop persisting.
   test("every key constant and key function resolves to a registration", () => {
     // Legacy keys that are only read and removed (migrations/cleanups), never written.
-    const legacyOnly = new Set([
-      "GATEWAY_MODELS_KEY",
-      "GATEWAY_ENABLED_KEY",
-      "getInputAttachmentsKey",
-      "getAutoRetryKey",
-    ]);
+    const legacyOnly = new Set(["getInputAttachmentsKey", "getAutoRetryKey"]);
     const unregistered: string[] = [];
     for (const [name, value] of Object.entries(storageModule)) {
       if (legacyOnly.has(name)) continue;

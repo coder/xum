@@ -5,7 +5,6 @@ import {
   updatePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import {
-  AGENT_AI_DEFAULTS_KEY,
   DEFAULT_MODEL_KEY,
   HIDDEN_MODELS_KEY,
   LAST_CUSTOM_MODEL_PROVIDER_KEY,
@@ -22,8 +21,6 @@ type UnknownRecord = Record<string, unknown>;
 type WorkspaceAISettingsRepairEntry = Partial<NonNullable<WorkspaceAISettingsCache[string]>> &
   UnknownRecord;
 type WorkspaceAISettingsRepairCache = Record<string, WorkspaceAISettingsRepairEntry | undefined>;
-type AgentAiDefaultsRepairEntry = { modelString?: unknown } & UnknownRecord;
-type AgentAiDefaultsRepairCache = Record<string, AgentAiDefaultsRepairEntry | undefined>;
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -48,38 +45,6 @@ function repairHiddenModels(provider: string): void {
 
   if (filteredModels.length !== hiddenModels.length) {
     updatePersistedState(HIDDEN_MODELS_KEY, filteredModels);
-  }
-}
-
-function repairAgentAiDefaults(provider: string): void {
-  const defaults = readPersistedState<AgentAiDefaultsRepairCache | undefined>(
-    AGENT_AI_DEFAULTS_KEY,
-    undefined
-  );
-  if (!isRecord(defaults)) {
-    return;
-  }
-
-  let changed = false;
-  const nextDefaults: AgentAiDefaultsRepairCache = { ...defaults };
-  for (const [agentId, entry] of Object.entries(defaults)) {
-    if (!isRecord(entry)) {
-      continue;
-    }
-
-    const modelString = entry.modelString;
-    if (typeof modelString !== "string" || !modelStringStartsWithProvider(modelString, provider)) {
-      continue;
-    }
-
-    const nextEntry = { ...entry };
-    delete nextEntry.modelString;
-    nextDefaults[agentId] = nextEntry;
-    changed = true;
-  }
-
-  if (changed) {
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, nextDefaults);
   }
 }
 
@@ -131,7 +96,6 @@ export function repairLocalModelPreferencesForRemovedProvider(
 ): void {
   repairPersistedModelString(DEFAULT_MODEL_KEY, provider, WORKSPACE_DEFAULTS.model);
   repairHiddenModels(provider);
-  repairAgentAiDefaults(provider);
   repairLastCustomModelProvider(provider);
 
   for (const workspaceId of new Set(workspaceIds)) {

@@ -22,8 +22,12 @@ import {
   useRuntimeOptionDefaults,
   writeSshOptionDefaults,
 } from "@/browser/utils/runtimeOptionDefaults";
-import { DEFAULT_MODEL_KEY, DEFAULT_RUNTIME_KEY, getRuntimeKey } from "@/common/constants/storage";
-import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { DEFAULT_MODEL_KEY, getRuntimeKey } from "@/common/constants/storage";
+import {
+  updateUserPreferences,
+  useAppConfig,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -261,9 +265,7 @@ export function useDraftWorkspaceSettings(
       : defaultModel
   );
 
-  const [rawGlobalDefaultRuntime] = usePersistedState<unknown>(DEFAULT_RUNTIME_KEY, null, {
-    listener: true,
-  });
+  const rawGlobalDefaultRuntime = useAppConfig((config) => config.defaultRuntime);
   const globalDefaultRuntime = normalizeRuntimeChoice(rawGlobalDefaultRuntime);
 
   // Project-scoped default runtime (persisted when the creation tooltip checkbox is used).

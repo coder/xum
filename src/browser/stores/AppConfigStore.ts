@@ -23,11 +23,9 @@ export interface AppConfigSnapshot {
   minThinkingLevelByModel?: Record<string, ThinkingLevel>;
   /** Plan Implement / Continue in Auto replace the chat history first (task setting). */
   proposePlanImplementReplacesChatHistory?: boolean;
-  /**
-   * Read only by the VS Code webview to seed its local preference cache (#4972, #4962). Desktop
-   * hydrates it through WorkspaceContext instead.
-   */
   agentAiDefaults?: AgentAiDefaults;
+  runtimeEnablement?: Record<string, boolean>;
+  defaultRuntime?: string | null;
   chatTranscriptFullWidth?: boolean;
   /** Read by the command palette to show the toggle's current state (#5791). */
   keepScreenAwake?: boolean;
@@ -42,6 +40,7 @@ const EMPTY_SNAPSHOT: AppConfigSnapshot = {};
 const INITIAL_READ_RETRY_MS = 250;
 const MAX_INITIAL_READ_RETRY_MS = 5_000;
 const EMPTY_USER_PREFERENCES: UserPreferences = {};
+const EMPTY_AGENT_AI_DEFAULTS: AgentAiDefaults = {};
 const USER_PREFERENCE_SAVE_FAILED_MESSAGE = "Settings could not be saved";
 const USER_PREFERENCE_SAVE_UNCONFIRMED_MESSAGE =
   "Connection lost: settings may not have been saved";
@@ -192,7 +191,9 @@ export class AppConfigStore {
           minThinkingLevelByModel: config.minThinkingLevelByModel,
           proposePlanImplementReplacesChatHistory:
             taskSettings?.proposePlanImplementReplacesChatHistory === true,
-          agentAiDefaults: config.agentAiDefaults,
+          agentAiDefaults: config.agentAiDefaults ?? {},
+          runtimeEnablement: config.runtimeEnablement,
+          defaultRuntime: config.defaultRuntime ?? null,
           chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
           keepScreenAwake: config.keepScreenAwake === true,
           experiments: config.experiments ?? {},
@@ -357,6 +358,10 @@ export function getAppConfigStore(): AppConfigStore {
 export function useAppConfig<T>(select: (config: AppConfigSnapshot) => T): T {
   const store = getAppConfigStore();
   return useSyncExternalStore(store.subscribe, () => select(store.getSnapshot() ?? EMPTY_SNAPSHOT));
+}
+
+export function useAgentAiDefaults(): AgentAiDefaults {
+  return useAppConfig((config) => config.agentAiDefaults ?? EMPTY_AGENT_AI_DEFAULTS);
 }
 
 export function getUserPreferences(): UserPreferences {

@@ -16,7 +16,6 @@ import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
-  AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
@@ -30,8 +29,10 @@ import {
   createTestConfig,
   type TestClientConfig,
   resetTestExperiments,
+  setTestAgentAiDefaults,
   setTestExperiment,
 } from "@/browser/testUtils";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 
@@ -277,7 +278,16 @@ function createMockApi(
   } = {}
 ): MockApi {
   return {
-    config: { getConfig: () => Promise.resolve(overrides.config ?? DEFAULT_CONFIG) },
+    // APIProvider connects AppConfigStore, whose fetch must keep the agent defaults a test seeded.
+    config: {
+      getConfig: () =>
+        Promise.resolve(
+          overrides.config ?? {
+            ...DEFAULT_CONFIG,
+            agentAiDefaults: getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {},
+          }
+        ),
+    },
     workspace: {
       getPlanContent:
         overrides.getPlanContent ??
@@ -360,6 +370,7 @@ describe("ProposePlanToolCall", () => {
 
   afterEach(async () => {
     resetTestExperiments();
+    setTestAgentAiDefaults(undefined);
     cleanup();
     await restoreProposePlanModuleMocks();
     barrierSpy?.mockRestore();
@@ -556,7 +567,7 @@ describe("ProposePlanToolCall", () => {
     const execThinking = "low";
 
     startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: execModel, thinkingLevel: execThinking },
     });
 
@@ -602,7 +613,7 @@ describe("ProposePlanToolCall", () => {
     // drop the Auto flag.
     const execModel = "openai:gpt-5.2";
     startInPlanMode(WORKSPACE_ID, execModel, "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, { exec: { modelString: execModel } });
+    setTestAgentAiDefaults({ exec: { modelString: execModel } });
     setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
     updatePersistedState(getAutoModelRoutingKey(WORKSPACE_ID), true);
 
@@ -620,7 +631,7 @@ describe("ProposePlanToolCall", () => {
   test("Implement sends unrouted, then leaves the composer on exec's Auto default", async () => {
     const execModel = "openai:gpt-5.2";
     startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: execModel, autoModelRouting: true, autoThinkingLevel: true },
     });
     setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
@@ -644,7 +655,7 @@ describe("ProposePlanToolCall", () => {
     const execWorkspaceThinking = "medium";
 
     startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {});
+    setTestAgentAiDefaults({});
     updatePersistedState(getWorkspaceAISettingsByAgentKey(WORKSPACE_ID), {
       exec: { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking },
     });
