@@ -126,6 +126,7 @@ export class ExperimentsService {
 
   private initialized = false;
   private initialization: Promise<void> | undefined;
+  private readonly changeListeners = new Set<() => void>();
 
   constructor(options: {
     telemetryService: TelemetryService;
@@ -204,6 +205,18 @@ export class ExperimentsService {
       // A successful acknowledgement means the change survives a restart.
       this.adoptOverrides(next);
     });
+    this.notifyChange();
+  }
+
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  private notifyChange(): void {
+    for (const listener of this.changeListeners) listener();
   }
 
   private async withOverridesLock<T>(
@@ -233,6 +246,24 @@ export class ExperimentsService {
     return this.overrides.get(experimentId) === true;
   }
 
+  /**
+   * Re-reads disk first so this backend adopts writes a sibling backend made to the
+   * shared file. A busy lock keeps the last adopted state.
+   */
+  async getEnabledStates(): Promise<Partial<Record<ExperimentId, boolean>>> {
+    await this.ensureInitialized();
+    try {
+      await this.withOverridesLock(() => this.loadOverridesFromDisk());
+    } catch {
+      // The next read retries.
+    }
+    const states: Partial<Record<ExperimentId, boolean>> = {};
+    for (const experimentId of Object.values(EXPERIMENT_IDS)) {
+      states[experimentId] = this.isExperimentEnabled(experimentId);
+    }
+    return states;
+  }
+
   private async ensureInitialized(): Promise<void> {
     if (this.initialized) {
       return;
@@ -251,7 +282,9 @@ export class ExperimentsService {
     const { overrides, hasLegacyPtcMirror, unknownOverrides } = await readOverridesFile(
       this.overridesFilePath
     );
-    this.adoptOverrides(overrides);
+    // Other clients refetch only on a change signal. Without one they keep showing the old
+    // value while turns already use the adopted one.
+    if (this.adoptOverrides(overrides)) this.notifyChange();
     return {
       needsLegacyPtcMirrorRewrite:
         overrides.get(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) === true && !hasLegacyPtcMirror,
@@ -259,17 +292,19 @@ export class ExperimentsService {
     };
   }
 
-  private adoptOverrides(next: Map<ExperimentId, boolean>): void {
+  /** Returns whether an experiment's effective value changed. */
+  private adoptOverrides(next: Map<ExperimentId, boolean>): boolean {
+    let changed = false;
     // Disk reconciliation also changes telemetry, including removed overrides.
     for (const id of new Set([...this.overrides.keys(), ...next.keys()])) {
       if (this.overrides.get(id) !== next.get(id)) {
-        this.telemetryService.setFeatureFlagVariant(
-          id,
-          this.isExperimentSupported(id) ? (next.get(id) ?? null) : null
-        );
+        const supported = this.isExperimentSupported(id);
+        this.telemetryService.setFeatureFlagVariant(id, supported ? (next.get(id) ?? null) : null);
+        changed ||= supported && (this.overrides.get(id) === true) !== (next.get(id) === true);
       }
     }
     this.overrides = next;
+    return changed;
   }
 
   private async writeOverridesToDisk(

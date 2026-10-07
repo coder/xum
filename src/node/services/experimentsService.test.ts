@@ -100,6 +100,23 @@ describe("ExperimentsService", () => {
     expect(service.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP)).toBe(false);
   });
 
+  test("a read that adopts another backend's write notifies change listeners once", async () => {
+    const { telemetryService } = createTelemetryService();
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    const sibling = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    const ptc = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+    await service.getEnabledStates();
+    const listener = mock(() => undefined);
+    service.onChange(listener);
+
+    await sibling.setOverride(ptc, true);
+    // Concurrent reads adopt the write once, and a read that adopts nothing new stays quiet.
+    const reads = await Promise.all([service.getEnabledStates(), service.getEnabledStates()]);
+    expect(reads.map((states) => states[ptc])).toEqual([true, true]);
+    expect((await service.getEnabledStates())[ptc]).toBe(true);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
   test("experiments are disabled until the user sets an override", async () => {
     const { telemetryService } = createTelemetryService();
     const service = new ExperimentsService({ telemetryService, xumHome: tempDir });

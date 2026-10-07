@@ -123,7 +123,15 @@ export function subscribeConfigChanges(
   return runtimeSubscription<undefined>(context, {
     signal,
     buffer: "latest",
-    subscribe: (emit) => context.config.onConfigChanged(() => emit.push(undefined)),
+    subscribe: (emit) => {
+      const push = () => emit.push(undefined);
+      const unsubscribeConfig = context.config.onConfigChanged(push);
+      const unsubscribeExperiments = context.experimentsService.onChange(push);
+      return () => {
+        unsubscribeConfig();
+        unsubscribeExperiments();
+      };
+    },
   });
 }
 

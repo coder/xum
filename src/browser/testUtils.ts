@@ -164,6 +164,7 @@ export function createTestConfig(overrides: Partial<TestClientConfig> = {}): Tes
     bashAiProxyEnabled: false,
     agentHeartbeatsEnabled: false,
     goalDefaults: DEFAULT_GOAL_DEFAULTS,
+    experiments: {},
     ...overrides,
   };
 }

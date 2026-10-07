@@ -1,11 +1,17 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-unsafe-argument, @typescript-eslint/require-await, local/no-sync-fs-methods */
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createRouterClient, ORPCError } from "@orpc/server";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Context, Effect } from "effect";
 import { Config } from "@/node/config";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  EXPERIMENT_OVERRIDES_FILE_NAME,
+  ExperimentsService,
+} from "@/node/services/experimentsService";
+import type { TelemetryService } from "@/node/services/telemetryService";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
 import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
@@ -398,9 +404,52 @@ describe("router config transcript mutation", () => {
   });
 
   function createContext(): ORPCContext {
-    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- Only Config is used by this route.
-    return { config } as ORPCContext;
+    const telemetryService = {
+      setFeatureFlagVariant: () => undefined,
+    } as unknown as TelemetryService;
+    return {
+      config,
+      experimentsService: new ExperimentsService({ telemetryService, xumHome: tempDir }),
+      perfFlightRecorder: {
+        beginRpcCall: () => null,
+        openRpcSubscription: () => null,
+        setEnabled: () => undefined,
+      },
+      perfCaptures: { setEnabled: () => undefined },
+    } as unknown as ORPCContext;
   }
+
+  test("experiments.set signals onConfigChanged and the next getConfig carries the value", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    const ptc = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(false);
+
+    const controller = new AbortController();
+    const changes = await client.config.onConfigChanged(undefined, { signal: controller.signal });
+    const changed = changes.next();
+    await client.experiments.set({ experimentId: ptc, enabled: true });
+    expect((await changed).done).toBe(false);
+    controller.abort();
+
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(true);
+  });
+
+  test("getConfig adopts experiment writes another backend made on disk", async () => {
+    const context = createContext();
+    const recorderEnabled = spyOn(context.perfFlightRecorder, "setEnabled");
+    const client = createRouterClient(router(), { context });
+    const ptc = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+    const perf = EXPERIMENT_IDS.PERF_FLIGHT_RECORDER;
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(false);
+
+    fs.writeFileSync(
+      path.join(tempDir, EXPERIMENT_OVERRIDES_FILE_NAME),
+      JSON.stringify({ version: 1, experiments: {}, overrides: { [ptc]: true, [perf]: true } })
+    );
+
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(true);
+    expect(recorderEnabled).toHaveBeenLastCalledWith(true);
+  });
 
   test("persists the full-width chat transcript config flag", async () => {
     const client = createRouterClient(router(), { context: createContext() });
