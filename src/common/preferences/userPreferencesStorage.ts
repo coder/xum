@@ -4,17 +4,11 @@ import {
 } from "@/common/config/schemas/userPreferences";
 import {
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
-  getLastRuntimeConfigKey,
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
   getReviewDefaultBaseKey,
-  getTrunkBranchKey,
 } from "@/common/constants/storage";
-import {
-  parseBoolean,
-  parseNonEmptyString,
-  parseRecord,
-} from "@/common/preferences/userPreferenceParsing";
+import { parseBoolean, parseNonEmptyString } from "@/common/preferences/userPreferenceParsing";
 
 export interface UserPreferenceStorageArea {
   readonly length: number;
@@ -30,8 +24,6 @@ export interface StoredUserPreferenceEntry {
 const STATIC_USER_PREFERENCE_KEYS = new Set<string>([REVIEW_INCLUDE_UNCOMMITTED_KEY]);
 
 const DYNAMIC_USER_PREFERENCE_PREFIXES = [
-  getTrunkBranchKey(""),
-  getLastRuntimeConfigKey(""),
   getNotifyOnResponseAutoEnableKey(""),
   getNotifyOnResponseKey(""),
   getReviewDefaultBaseKey(""),
@@ -103,26 +95,6 @@ export function applyStoredUserPreference(
 ): UserPreferences | undefined {
   const next = cloneUserPreferences(preferences);
 
-  const trunkProjectPath = readSuffix(key, getTrunkBranchKey(""));
-  if (trunkProjectPath) {
-    const parsed = parseNonEmptyString(value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureWorkspaceCreationProject(next, trunkProjectPath).trunkBranch = parsed;
-    return pruneUserPreferences(next);
-  }
-
-  const runtimeProjectPath = readSuffix(key, getLastRuntimeConfigKey(""));
-  if (runtimeProjectPath) {
-    const parsed = parseRecord(value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureWorkspaceCreationProject(next, runtimeProjectPath).lastRuntimeConfig = parsed;
-    return pruneUserPreferences(next);
-  }
-
   const autoNotifyProjectPath = readSuffix(key, getNotifyOnResponseAutoEnableKey(""));
   if (autoNotifyProjectPath) {
     const parsed = parseBoolean(value);
@@ -177,16 +149,11 @@ export function removeStoredUserPreference(
 
   if (key === REVIEW_INCLUDE_UNCOMMITTED_KEY) delete next.review?.includeUncommitted;
   else {
-    const trunkProjectPath = readSuffix(key, getTrunkBranchKey(""));
-    const runtimeProjectPath = readSuffix(key, getLastRuntimeConfigKey(""));
     const autoNotifyProjectPath = readSuffix(key, getNotifyOnResponseAutoEnableKey(""));
     const notifyWorkspaceId = readSuffix(key, getNotifyOnResponseKey(""));
     const reviewDefaultProjectPath = readSuffix(key, getReviewDefaultBaseKey(""));
 
-    if (trunkProjectPath) delete next.workspaceCreation?.byProject?.[trunkProjectPath]?.trunkBranch;
-    else if (runtimeProjectPath)
-      delete next.workspaceCreation?.byProject?.[runtimeProjectPath]?.lastRuntimeConfig;
-    else if (autoNotifyProjectPath)
+    if (autoNotifyProjectPath)
       delete next.workspaceCreation?.byProject?.[autoNotifyProjectPath]?.notifyOnResponseAutoEnable;
     else if (notifyWorkspaceId)
       delete next.notifications?.notifyOnResponseByWorkspace?.[notifyWorkspaceId];
@@ -208,13 +175,6 @@ export function entriesFromUserPreferences(
   for (const [projectPath, defaults] of Object.entries(
     preferences.workspaceCreation?.byProject ?? {}
   )) {
-    if (defaults.trunkBranch !== undefined)
-      entries.push({ key: getTrunkBranchKey(projectPath), value: defaults.trunkBranch });
-    if (defaults.lastRuntimeConfig !== undefined)
-      entries.push({
-        key: getLastRuntimeConfigKey(projectPath),
-        value: defaults.lastRuntimeConfig,
-      });
     if (defaults.notifyOnResponseAutoEnable !== undefined)
       entries.push({
         key: getNotifyOnResponseAutoEnableKey(projectPath),
