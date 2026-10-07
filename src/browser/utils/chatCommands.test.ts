@@ -26,7 +26,7 @@ import {
 // Note: command helpers read from window.localStorage, so we set both globalThis.localStorage
 // and window.localStorage for test isolation.
 beforeEach(() => {
-  // Ensure `window` exists for browser-environment functions like isExperimentEnabled.
+  // Ensure `window` exists for browser-environment functions.
   if (typeof globalThis.window === "undefined") {
     (globalThis as unknown as { window: typeof globalThis }).window = globalThis;
   }

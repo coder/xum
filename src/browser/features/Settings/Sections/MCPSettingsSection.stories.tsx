@@ -587,7 +587,6 @@ function setupDesignStory(
       signal?.addEventListener("abort", updates.end, { once: true });
       return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
     },
-    getOverrides: () => Promise.resolve({ [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled }),
     set: () => Promise.resolve(),
     // The flight recorder status stream: off, like a fresh profile.
     onPerfFlightRecorderChange: () =>

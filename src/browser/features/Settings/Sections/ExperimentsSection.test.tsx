@@ -3,7 +3,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "b
 import { GlobalWindow } from "happy-dom";
 import type { ReactNode } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
+import * as ActualExperimentsModule from "@/browser/hooks/useExperiments";
 import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
 import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 
@@ -12,7 +12,7 @@ const actualExperiments = { ...ActualExperimentsModule };
 const actualTelemetry = { ...ActualTelemetryModule };
 
 afterAll(() => {
-  void mock.module("@/browser/contexts/ExperimentsContext", () => actualExperiments);
+  void mock.module("@/browser/hooks/useExperiments", () => actualExperiments);
   void mock.module("@/browser/hooks/useTelemetry", () => actualTelemetry);
 });
 
@@ -38,7 +38,7 @@ function ApiWrapper(props: { children: ReactNode }) {
   return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
 }
 
-void mock.module("@/browser/contexts/ExperimentsContext", () => ({
+void mock.module("@/browser/hooks/useExperiments", () => ({
   ...actualExperiments,
   useExperiment: (experimentId: string) => [
     experimentValues[experimentId] ?? experimentEnabled,

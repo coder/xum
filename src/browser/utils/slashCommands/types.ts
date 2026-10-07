@@ -65,10 +65,7 @@ export type SuggestionsHandler = (args: SuggestionsHandlerArgs) => SlashSuggesti
 export interface SlashCommandVisibilityContext {
   /** Variant determines which commands are available */
   variant?: "workspace" | "creation";
-  /**
-   * Optional resolver for experiment state. Tests and React callers can inject
-   * hook-derived values instead of reading from localStorage directly.
-   */
+  /** Experiment state; experiment-gated commands stay hidden without it. */
   isExperimentEnabled?: (experimentId: ExperimentId) => boolean | undefined;
 }
 

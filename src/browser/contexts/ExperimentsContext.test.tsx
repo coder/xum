@@ -6,11 +6,8 @@ import { GlobalWindow } from "happy-dom";
 import { EXPERIMENT_IDS, LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID } from "@/common/constants/experiments";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { APIProvider, type APIClient } from "./API";
-import {
-  ExperimentsProvider,
-  useExperiment,
-  usePerfFlightRecorderCollecting,
-} from "./ExperimentsContext";
+import { ExperimentsProvider, usePerfFlightRecorderCollecting } from "./ExperimentsContext";
+import { useExperiment } from "@/browser/hooks/useExperiments";
 import type { FlightRecorderStatus } from "@/common/orpc/schemas/perfFlightRecorder";
 import { PerfFlightRecorder } from "@/browser/components/PerfFlightRecorder/PerfFlightRecorder";
 import { FLIGHT_RECORDER_EVENT_DURATION_THRESHOLD_MS } from "@/constants/perfFlightRecorder";

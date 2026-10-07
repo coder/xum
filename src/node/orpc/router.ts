@@ -2669,15 +2669,6 @@ export const router = (authToken?: string) => {
         .input(schemas.experiments.onPerfFlightRecorderChange.input)
         .output(schemas.experiments.onPerfFlightRecorderChange.output)
         .handler(({ context, signal }) => subscribePerfFlightRecorderStatus(context, signal)),
-      getOverrides: t
-        .input(schemas.experiments.getOverrides.input)
-        .output(schemas.experiments.getOverrides.output)
-        .handler(async ({ context }) => {
-          const overrides = await context.experimentsService.getOverrides();
-          // getOverrides re-reads disk, so another process may have toggled the recorder.
-          syncPerfFlightRecorder(context);
-          return overrides;
-        }),
       set: t
         .input(schemas.experiments.set.input)
         .output(schemas.experiments.set.output)

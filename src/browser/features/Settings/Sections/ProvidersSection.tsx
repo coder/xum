@@ -64,7 +64,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { CoderCanonicalRoutes } from "./CoderCanonicalRoutes";
 import { TypeSafeProviderCard } from "./TypeSafeProviderCard";
-import { useExperimentValue } from "@/browser/contexts/ExperimentsContext";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 

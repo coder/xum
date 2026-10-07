@@ -1,31 +1,19 @@
-import React, { createContext, useContext, useSyncExternalStore, useEffect, useState } from "react";
-import { type ExperimentId } from "@/common/constants/experiments";
+import React, { createContext, useContext, useEffect, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 interface ExperimentsContextValue {
   designRevision: number;
-  setExperiment: (experimentId: ExperimentId, enabled: boolean) => Promise<void>;
   /** Whether the backend perf flight recorder is collecting (renderer collects only then). */
   perfFlightRecorderCollecting: boolean;
 }
 
 const ExperimentsContext = createContext<ExperimentsContextValue | null>(null);
 
-/**
- * Provider for experiment writes and backend status streams. Experiment values come only from
- * the AppConfigStore snapshot, which refetches after every backend experiment write.
- */
+/** Provider for the backend Claude Design and perf flight recorder status streams. */
 export function ExperimentsProvider(props: { children: React.ReactNode }) {
   const apiState = useAPI();
   const [designRevision, setDesignRevision] = useState(0);
   const [perfFlightRecorderCollecting, setPerfFlightRecorderCollecting] = useState(false);
-
-  // No optimistic state: the toggle shows the next config snapshot after the backend write.
-  const setExperiment = async (experimentId: ExperimentId, enabled: boolean) => {
-    if (!apiState.api) throw new Error("Not connected to the backend");
-    await apiState.api.experiments.set({ experimentId, enabled });
-  };
 
   useEffect(() => {
     if (!apiState.api) {
@@ -82,7 +70,6 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
   return (
     <ExperimentsContext.Provider
       value={{
-        setExperiment,
         designRevision,
         perfFlightRecorderCollecting,
       }}
@@ -100,60 +87,4 @@ export function usePerfFlightRecorderCollecting(): boolean {
 /** Settings revisions also cover sibling Disconnect, source, and allowlist changes. */
 export function useClaudeDesignRevision(): number {
   return useContext(ExperimentsContext)?.designRevision ?? 0;
-}
-
-/** The backend value of one experiment from the AppConfigStore snapshot (off until it loads). */
-export function useExperimentValue(experimentId: ExperimentId): boolean {
-  const store = getAppConfigStore();
-  return useSyncExternalStore(
-    store.subscribe,
-    () => store.getSnapshot()?.experiments?.[experimentId] === true
-  );
-}
-
-/**
- * useExperimentValue, or null until the first config snapshot with experiments arrives. Code that
- * rewrites persisted state from a flag (the right-sidebar tab sync) must wait on null: acting on
- * the provisional default and then on the loaded value removed a saved Artifacts tab and re-added
- * it at the end without its selection on every reload.
- */
-export function useSettledExperimentValue(experimentId: ExperimentId): boolean | null {
-  const store = getAppConfigStore();
-  return useSyncExternalStore(store.subscribe, () => {
-    const experiments = store.getSnapshot()?.experiments;
-    return experiments ? experiments[experimentId] === true : null;
-  });
-}
-
-/**
- * Hook to get setter function for experiments.
- * Use this in components that need to toggle experiments (e.g., Settings).
- *
- * @returns Function to set experiment state
- */
-
-export function useSetExperiment(): (
-  experimentId: ExperimentId,
-  enabled: boolean
-) => Promise<void> {
-  const context = useContext(ExperimentsContext);
-  if (!context) {
-    throw new Error("useSetExperiment must be used within ExperimentsProvider");
-  }
-  return context.setExperiment;
-}
-
-/**
- * Hook to get both value and setter for an experiment.
- * Combines useExperimentValue and useSetExperiment for convenience.
- *
- * @param experimentId - The experiment to subscribe to
- * @returns [enabled, setEnabled] tuple
- */
-export function useExperiment(
-  experimentId: ExperimentId
-): [boolean, (enabled: boolean) => Promise<void>] {
-  const enabled = useExperimentValue(experimentId);
-  const setExperiment = useSetExperiment();
-  return [enabled, (value: boolean) => setExperiment(experimentId, value)];
 }

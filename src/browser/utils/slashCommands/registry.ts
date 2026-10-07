@@ -15,7 +15,6 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 import { SLASH_COMMAND_HINTS } from "@/common/constants/slashCommandHints";
 import { assert } from "@/common/utils/assert";
-import { isExperimentEnabled as readExperimentEnabled } from "@/browser/hooks/useExperiments";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { parseGoalBudgetInputCents } from "@/common/utils/goals/budgetParser";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
@@ -736,13 +735,7 @@ export function isSlashCommandVisible(
     return true;
   }
 
-  try {
-    const resolveExperiment = context.isExperimentEnabled ?? readExperimentEnabled;
-    return resolveExperiment(definition.experimentGate) === true;
-  } catch {
-    // Experiment check unavailable (e.g., test environments without window) — hide by default.
-    return false;
-  }
+  return context.isExperimentEnabled?.(definition.experimentGate) === true;
 }
 
 export function getCommandGhostHint(
