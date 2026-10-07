@@ -6,7 +6,8 @@ import {
 // Legacy per-workspace cache prefixes, kept only so startup can delete them. These caches
 // duplicated backend-owned data (plan text, post-compaction state) and now live in memory;
 // leaving them in localStorage wastes quota (QuotaExceededError blocked draft persistence).
-const DROPPED_CACHE_KEY_PREFIXES = ["planContent:", "postCompactionState:"] as const;
+// Experiment values live only on the backend; an older build would re-upload stale local copies.
+const DROPPED_CACHE_KEY_PREFIXES = ["planContent:", "postCompactionState:", "experiment:"] as const;
 
 /**
  * Remove localStorage keys written by caches that no longer persist. Runs on every startup

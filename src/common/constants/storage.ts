@@ -1075,14 +1075,9 @@ export type WorkspaceKeyScopes = "workspace" | "draft" | "webview";
 
 /**
  * How many keys a global prefix registration expands to in the budget model: one per project,
- * per project and per workspace, per model, per defined experiment, or a fixed count (LRU caches).
+ * per project and per workspace, per model, or a fixed count (LRU caches).
  */
-export type PersistedKeyInstances =
-  | "project"
-  | "project+workspace"
-  | "model"
-  | "experiment"
-  | number;
+export type PersistedKeyInstances = "project" | "project+workspace" | "model" | number;
 
 export interface WorkspaceKeyRegistration {
   scope: "workspaceId";
@@ -1290,9 +1285,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(EXPANDED_COMPLETED_SUB_AGENTS_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
   globalKey(EXPANDED_TASK_GROUPS_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
 
-  // One boolean per experiment (getExperimentKey in experiments.ts), including the legacy PTC
-  // exclusive mirror that is kept equal to PTC for downgrades.
-  globalPrefix("experiment:", "ui", 16, "experiment"),
   // Per-model auto-compaction threshold percentage (synced).
   globalPrefix(getAutoCompactionThresholdKey(""), "synced", 16, "model"),
 

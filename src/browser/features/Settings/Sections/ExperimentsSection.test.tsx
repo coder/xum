@@ -31,6 +31,7 @@ function createDeferred<T>() {
 let mockApi: TestApiOverrides<APIClient>;
 let experimentEnabled = false;
 let experimentValues: Record<string, boolean> = {};
+let writeExperiment: () => Promise<void> = () => Promise.resolve();
 
 // Inject the current client through the real provider; mocking the API module leaks across
 // files. The wrapper reads mockApi on every render, so rerenders pick up swapped clients.
@@ -44,6 +45,7 @@ void mock.module("@/browser/contexts/ExperimentsContext", () => ({
     experimentValues[experimentId] ?? experimentEnabled,
     (enabled: boolean) => {
       experimentValues[experimentId] = enabled;
+      return writeExperiment();
     },
   ],
   useExperimentValue: (experimentId: string) => experimentValues[experimentId] ?? experimentEnabled,
@@ -106,6 +108,7 @@ describe("PortableDesktopExperimentWarning", () => {
     globalThis.window.api = { platform: "linux", versions: {} };
     experimentEnabled = true;
     experimentValues = {};
+    writeExperiment = () => Promise.resolve();
     const stoppedServerStatus = {
       running: false,
       baseUrl: null,
@@ -173,6 +176,26 @@ describe("PortableDesktopExperimentWarning", () => {
         [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: enabled,
         [EXPERIMENT_IDS.TOKEN_BUDGET]: enabled,
       });
+    }
+  );
+
+  test.each([true, false])(
+    "turning LAN exposure off resets the bind settings only once the write is saved (saved=%p)",
+    async (saved) => {
+      experimentEnabled = false;
+      experimentValues = { [EXPERIMENT_IDS.CONFIGURABLE_BIND_URL]: true };
+      let settle!: () => void;
+      writeExperiment = () =>
+        new Promise<void>((resolve, reject) => {
+          settle = () => (saved ? resolve() : reject(new Error("offline")));
+        });
+      const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
+      fireEvent.click(view.getByRole("switch", { name: "Toggle Expose API server on LAN/VPN" }));
+      await act(() => Promise.resolve());
+      expect(mockApi.server?.setApiServerSettings).not.toHaveBeenCalled();
+      settle();
+      await act(() => Promise.resolve());
+      expect(mockApi.server?.setApiServerSettings).toHaveBeenCalledTimes(saved ? 1 : 0);
     }
   );
 

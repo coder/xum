@@ -182,9 +182,8 @@ export class ExperimentsService {
   }
 
   /**
-   * Update a single override. Writes are per-experiment so a client cannot clear
-   * overrides it never knew about: localStorage is origin-scoped, and a second
-   * renderer starting empty must not wipe state persisted for this machine.
+   * Update a single override. Writes are per-experiment and merge into current
+   * disk state, so a writer never clears overrides it did not change.
    */
   async setOverride(
     experimentId: ExperimentId,

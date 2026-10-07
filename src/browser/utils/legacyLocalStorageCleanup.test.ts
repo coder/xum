@@ -14,7 +14,12 @@ describe("removeDroppedCacheKeys", () => {
   test("removes only keys with a dropped cache prefix", () => {
     const keptKeys = ["statusState:c", "input:d", "x-planContent:e", "notpostCompactionState:f"];
     // Adjacent dropped keys: removing while iterating by index would skip the second one.
-    const droppedKeys = ["planContent:a", "planContent:a2", "postCompactionState:b"];
+    const droppedKeys = [
+      "planContent:a",
+      "planContent:a2",
+      "postCompactionState:b",
+      "experiment:programmatic-tool-calling",
+    ];
     for (const key of [...droppedKeys, ...keptKeys]) {
       window.localStorage.setItem(key, JSON.stringify({ value: key }));
     }
