@@ -1893,6 +1893,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       slider?: number;
       /** false: send without a stage callback (the no-Token-Budget-stage baseline). */
       stageCallback?: boolean;
+      /** Runs when the builder asks for a stage decision, before the candidate assembly. */
+      beforeStage?: (historyService: HistoryService, workspaceId: string) => Promise<void>;
       /** Runs after the candidate assembly, before the stage is published. */
       afterCandidate?: () => void;
       /** Runs after the warning row was appended to history. */
@@ -1942,6 +1944,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       let publishCalls = 0;
       const onTurnStartBudget: OnTurnStartBudget = async (budget) => {
         budgets.push({ ...budget, messages: [...budget.messages] });
+        await options.beforeStage?.(harness.historyService, metadata.id);
         const stage = await strategy.prepareTurnStartStage(budget, sendOptions, async (row) => {
           publishCalls += 1;
           const appended = await harness.historyService.appendToHistory(metadata.id, row);
@@ -2148,8 +2151,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       using xumHome = new DisposableTempDir("ai-turn-start-stage-rewrite");
       let rewrites = 0;
       const turn = await runStageTurn(xumHome.path, {
-        // A same-ID tail rewrite lands after the snapshot read, while the stage is published.
-        afterPublish: async (historyService, workspaceId) => {
+        // A same-ID tail rewrite lands after the snapshot read, before the candidate assembly.
+        beforeStage: async (historyService, workspaceId) => {
           const read = await historyService.getHistoryFromLatestBoundary(workspaceId);
           if (!read.success) throw new Error(read.error);
           const user = read.data.find((message) => message.id === "user-1")!;
