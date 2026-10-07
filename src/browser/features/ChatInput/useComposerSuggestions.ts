@@ -5,6 +5,11 @@ import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getPendingDraftSkillDiscoveryKey } from "@/common/constants/storage";
+import {
+  getAgentSkillsStore,
+  useAgentSkills,
+  type AgentSkillsDiscovery,
+} from "@/browser/stores/AgentSkillsStore";
 import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { findAtMentionAtCursor } from "@/common/utils/atMentions";
 import { findInlineSkillReferenceAtCursor } from "@/browser/utils/agentSkills/inlineSkillReferences";
@@ -195,18 +200,26 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     tokenKey: string;
     suggestions: SlashSuggestion[];
   }>({ tokenKey: "", suggestions: [] });
-  const [agentSkills, setAgentSkills] = useState<AgentSkillDescriptor[]>([]);
   const [mcpPrompts, setMcpPrompts] = useState<MCPPromptDescriptor[]>([]);
   const [pluginCommands, setPluginCommands] = useState<PluginSlashCommandDescriptor[]>([]);
   const [pluginMutationTick, setPluginMutationTick] = useState(0);
   const fileRequestId = useRef(0);
-  const skillRequestId = useRef(0);
   const mcpRequestId = useRef(0);
   const mcpRequest = useRef<Promise<void> | null>(null);
   const mcpLoadedAt = useRef(0);
   const mcpWorkspace = useRef<string | null>(null);
   const mcpAbort = useRef<AbortController | null>(null);
   const listId = useId();
+  const skillDiscovery: AgentSkillsDiscovery | null =
+    variant === "workspace" && workspaceId
+      ? {
+          workspaceId,
+          disableWorkspaceAgents: disableWorkspaceAgents || transferredDraftProjectDiscovery,
+        }
+      : variant === "creation" && projectPath
+        ? { projectPath }
+        : null;
+  const agentSkills = useAgentSkills(skillDiscovery).skills;
 
   const activeToken = detectActiveComposerToken(input, cursor);
   const activeTokenKey = tokenKey(activeToken) ?? "";
@@ -237,44 +250,6 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     () => subscribeAgentPluginsMutated(() => setPluginMutationTick((tick) => tick + 1)),
     []
   );
-
-  useEffect(() => {
-    let mounted = true;
-    const requestId = ++skillRequestId.current;
-    const discovery =
-      variant === "workspace" && workspaceId
-        ? {
-            workspaceId,
-            disableWorkspaceAgents: disableWorkspaceAgents || transferredDraftProjectDiscovery,
-          }
-        : variant === "creation" && projectPath
-          ? { projectPath }
-          : null;
-    if (!api || !discovery) {
-      setAgentSkills([]);
-      return;
-    }
-    api.agentSkills
-      .list(discovery)
-      .then(({ skills }) => {
-        if (mounted && skillRequestId.current === requestId) setAgentSkills(skills);
-      })
-      .catch((error: unknown) => {
-        console.error("Failed to load agent skills:", error);
-        if (mounted && skillRequestId.current === requestId) setAgentSkills([]);
-      });
-    return () => {
-      mounted = false;
-    };
-  }, [
-    api,
-    variant,
-    workspaceId,
-    projectPath,
-    disableWorkspaceAgents,
-    transferredDraftProjectDiscovery,
-    pluginMutationTick,
-  ]);
 
   useEffect(() => {
     let mounted = true;
@@ -468,13 +443,26 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
 
   useEffect(() => () => mcpAbort.current?.abort(), []);
 
+  const updateCaret = (nextInput: string, nextCursor: number) => {
+    setCaretState({ input: nextInput, cursor: nextCursor });
+    // While the caret is in a `$` or `/` token, ask again for a skill list that
+    // missed a source, e.g. an SSH host that was still connecting. This keeps
+    // no per-token memory, so draft restores, sends and clears cannot leave it
+    // stale. The store makes this a no-op for a complete list and keeps at most
+    // one request per list in flight.
+    const nextToken = detectActiveComposerToken(nextInput, nextCursor);
+    if (skillDiscovery && (nextToken?.kind === "slash" || nextToken?.kind === "inline")) {
+      getAgentSkillsStore().ensureFresh(skillDiscovery);
+    }
+  };
+
   const handleCursorActivity = () => {
     const element = inputRef.current;
-    if (element) setCaretState({ input, cursor: element.selectionStart ?? input.length });
+    if (element) updateCaret(input, element.selectionStart ?? input.length);
   };
 
   const handleInputCaretChange = (caret: number | undefined, nextInput: string) => {
-    setCaretState({ input: nextInput, cursor: caret ?? nextInput.length });
+    updateCaret(nextInput, caret ?? nextInput.length);
   };
 
   const ghostHint = getCommandGhostHint(input, isVisible && activeToken?.kind === "slash", {
