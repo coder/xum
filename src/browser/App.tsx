@@ -22,6 +22,7 @@ import { openServerWindow } from "./utils/openServerWindow";
 import {
   applyFastModeToggle,
   getFastModeProvider,
+  getFastModeUnavailableReason,
   isFastModeActive,
 } from "./utils/fastModeServiceTier";
 import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
@@ -732,7 +733,10 @@ function AppInner() {
         createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
           type: "error",
           title: "Fast mode",
-          message: `Fast mode is not available for ${model} on its current provider route, for example through a gateway or a custom base URL.`,
+          message:
+            getFastModeUnavailableReason(model, providersConfig) === "model"
+              ? `Fast mode is not available for ${model}: this model has no fast mode.`
+              : `Fast mode is not available for ${model} on its current provider route, for example through a gateway or a custom base URL.`,
         })
       );
       return;

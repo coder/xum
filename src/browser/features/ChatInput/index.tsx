@@ -116,6 +116,7 @@ import {
   formatKeybind,
   KEYBINDS,
   isDesktopViewportFocused,
+  isCommandPaletteTarget,
   isDialogOpen,
   isEditableElement,
 } from "@/browser/utils/ui/keybinds";
@@ -1359,10 +1360,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         return;
       }
       event.preventDefault();
-      // isDialogOpen() misses the command palette (cmdk); focus must not move behind it.
-      const inCommandPalette =
-        event.target instanceof Element && event.target.closest("[cmdk-root]") != null;
-      if (!isDialogOpen() && !inCommandPalette) focusMessageInput();
+      if (!isDialogOpen() && !isCommandPaletteTarget(event.target)) focusMessageInput();
     };
     window.addEventListener("keydown", handleFocusChat, { capture: true });
     return () => window.removeEventListener("keydown", handleFocusChat, { capture: true });
