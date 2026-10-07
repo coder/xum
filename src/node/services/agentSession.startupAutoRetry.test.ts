@@ -3,6 +3,7 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import path from "path";
@@ -795,6 +796,9 @@ describe("AgentSession startup auto-retry recovery", () => {
       const { session, config, historyService, aiService, events, cleanup } =
         await createSessionBundle(workspaceId, undefined, { clock });
       cleanups.push(() => clock.dispose(), cleanup);
+      spyOn(aiService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+      );
       const model = "openai:gpt-4o";
       if ("seed" in fixture) {
         await seedAutoCompactionThreshold(config, model, fixture.seed);
@@ -822,7 +826,6 @@ describe("AgentSession startup auto-retry recovery", () => {
           retrySendOptions: pickStartupRetrySendOptions({
             model,
             agentId: "exec",
-            experiments: { tokenBudget: true, memory: true },
           }),
         })
       );

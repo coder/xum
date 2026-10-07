@@ -78,11 +78,19 @@ describe("turn experiments", () => {
       await collector.waitForSubscription(5_000);
       const sendWithPtc = async (programmaticToolCalling: boolean) => {
         collector!.clear();
-        const sent = await sendMessageWithModel(env, workspaceId, "hello", HAIKU_MODEL, {
+        // Old bundles still send `experiments`; the field is no longer in the schema.
+        const oldBundleOptions = {
           thinkingLevel: "off",
           agentId: "exec",
           experiments: { programmaticToolCalling },
-        });
+        } as const;
+        const sent = await sendMessageWithModel(
+          env,
+          workspaceId,
+          "hello",
+          HAIKU_MODEL,
+          oldBundleOptions
+        );
         expect(sent.success).toBe(true);
         expect(await collector!.waitForEvent("stream-end", 60_000)).not.toBeNull();
         assertStreamSuccess(collector!);

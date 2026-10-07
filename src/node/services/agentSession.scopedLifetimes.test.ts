@@ -8,6 +8,7 @@ import { createTestHistoryService } from "./testHistoryService";
 import { createMuxMessage } from "@/common/types/message";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { describe, expect, mock, spyOn, test } from "bun:test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Effect, Exit, Scope } from "effect";
 import { Err, Ok } from "@/common/types/result";
 import { defaultEffectRunner as runner } from "./di/effectRunner";
@@ -304,6 +305,9 @@ describe("AgentSession scoped turn lifetimes", () => {
               } as FrontendWorkspaceMetadata)
             )
           ),
+          isExperimentEnabled: mock(
+            (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+          ),
         },
       });
       const entered = Promise.withResolvers<void>();
@@ -355,10 +359,7 @@ describe("AgentSession scoped turn lifetimes", () => {
         const large = ("漢".repeat(100) + "\n").repeat(40);
         if (branch === "materialized")
           await fs.writeFile(path.join(history.config.rootDir, "oversized.txt"), large);
-        send = h.session.sendMessage(branch === "initial" ? large : "Read @oversized.txt", {
-          ...options,
-          experiments: { tokenBudget: true, memory: true },
-        });
+        send = h.session.sendMessage(branch === "initial" ? large : "Read @oversized.txt", options);
         await entered.promise;
         expect(h.session.isBusy()).toBe(false);
         closing = runner.runPromise(Scope.close(appFiberScope, Exit.void)).then(() => {

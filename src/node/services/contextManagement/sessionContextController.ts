@@ -239,7 +239,6 @@ export class SessionContextController {
 
   isTokenBudgetActive(options?: SendMessageOptions): boolean {
     const selection = resolveContextStrategy({
-      experiments: options?.experiments,
       isEnabled: (id) => this.deps.aiService.isExperimentEnabled(id),
       isCompactionRequest: isCompactionRequestMetadata(options?.muxMetadata),
     });
