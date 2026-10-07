@@ -6,11 +6,12 @@ import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 
+import { RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import {
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
-  getNotifyOnResponseKey,
-  getNotifyOnResponseAutoEnableKey,
-} from "@/common/constants/storage";
+  getUserPreferences,
+  updateUserPreferences,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
 import { WorkspaceUnrelatedMessagingModal } from "../WorkspaceUnrelatedMessagingModal";
 import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
@@ -134,6 +135,12 @@ function useSidebarTabDialog(
   return [open, setOpenWorkspaceId];
 }
 
+function setWorkspaceNotifyOnResponse(workspaceId: string, enabled: boolean): void {
+  updateUserPreferences({
+    notifications: { notifyOnResponseByWorkspace: { [workspaceId]: enabled || null } },
+  });
+}
+
 export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   workspaceId,
   projectName,
@@ -205,20 +212,28 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   });
 
   // Notification on response toggle (workspace-level) - defaults to disabled
-  const [notifyOnResponse, setNotifyOnResponse] = usePersistedState<boolean>(
-    getNotifyOnResponseKey(workspaceId),
-    false,
-    { listener: true }
-  );
+  const notifyOnResponse =
+    useUserPreferences(
+      (preferences) => preferences.notifications?.notifyOnResponseByWorkspace?.[workspaceId]
+    ) ?? false;
+  const setNotifyOnResponse = (enabled: boolean) =>
+    setWorkspaceNotifyOnResponse(workspaceId, enabled);
 
   const notificationScope =
     workspaceEntry?.kind === "scratch" ? SCRATCH_PROJECT_CONFIG_KEY : projectPath;
   // Auto-enable notifications for new workspaces (project-level)
-  const [autoEnableNotifications, setAutoEnableNotifications] = usePersistedState<boolean>(
-    getNotifyOnResponseAutoEnableKey(notificationScope),
-    false,
-    { listener: true }
-  );
+  const autoEnableNotifications =
+    useUserPreferences(
+      (preferences) =>
+        preferences.workspaceCreation?.byProject?.[notificationScope]?.notifyOnResponseAutoEnable
+    ) ?? false;
+  const setAutoEnableNotifications = (enabled: boolean) => {
+    updateUserPreferences({
+      workspaceCreation: {
+        byProject: { [notificationScope]: { notifyOnResponseAutoEnable: enabled || null } },
+      },
+    });
+  };
 
   // Popover state for notification settings (interactive on click)
   const [notificationPopoverOpen, setNotificationPopoverOpen] = useState(false);
@@ -544,12 +559,15 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     const handler = (e: KeyboardEvent) => {
       if (matchesKeybind(e, KEYBINDS.TOGGLE_NOTIFICATIONS)) {
         e.preventDefault();
-        setNotifyOnResponse((prev) => !prev);
+        setWorkspaceNotifyOnResponse(
+          workspaceId,
+          !getUserPreferences().notifications?.notifyOnResponseByWorkspace?.[workspaceId]
+        );
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [setNotifyOnResponse]);
+  }, [workspaceId]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {

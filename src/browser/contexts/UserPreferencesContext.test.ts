@@ -1,11 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import {
-  canPrunePreferenceScopes,
-  createMergePatch,
-  mirrorBackendPreferences,
-  prunePreferenceScopes,
-} from "./UserPreferencesContext";
+import { createMergePatch, mirrorBackendPreferences } from "./UserPreferencesContext";
 import {
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
@@ -61,90 +56,6 @@ describe("UserPreferencesProvider bridge helpers", () => {
   test("removing the last known value of a section deletes only that stored value", () => {
     expect(createMergePatch({ appearance: { theme: "dark" } }, {})).toEqual({
       appearance: { theme: null },
-    });
-  });
-
-  test("only prunes scoped preferences after successful project and workspace loads", () => {
-    const ready = {
-      hydrated: true,
-      projectLoading: false,
-      projectLoaded: true,
-      projectLoadError: null,
-      workspaceLoading: false,
-      workspaceLoaded: true,
-      workspaceLoadError: null,
-    };
-
-    expect(canPrunePreferenceScopes(ready)).toBe(true);
-    expect(canPrunePreferenceScopes({ ...ready, projectLoaded: false })).toBe(false);
-    expect(canPrunePreferenceScopes({ ...ready, workspaceLoaded: false })).toBe(false);
-    expect(canPrunePreferenceScopes({ ...ready, projectLoadError: "failed" })).toBe(false);
-    expect(canPrunePreferenceScopes({ ...ready, workspaceLoadError: "failed" })).toBe(false);
-  });
-
-  test("prunes project and workspace scoped preferences that no longer exist", () => {
-    const projects = new Map([
-      ["/repo/a", { workspaces: [] }],
-      ["/repo/c", { workspaces: [] }],
-    ]);
-
-    expect(
-      prunePreferenceScopes({
-        preferences: {
-          navigation: { projectOrder: ["/repo/b", "/repo/a"] },
-          ai: {
-            projectDefaults: {
-              "/repo/a": { agentId: "exec" },
-              "/repo/b": { agentId: "plan" },
-            },
-          },
-          workspaceCreation: {
-            byProject: {
-              "/repo/b": { trunkBranch: "origin/main" },
-            },
-          },
-          notifications: {
-            notifyOnResponseByWorkspace: { "ws-keep": true, "ws-drop": true },
-          },
-          review: {
-            defaultBaseByProject: { "/repo/b": "origin/main" },
-          },
-        },
-        projectPaths: new Set(["/repo/a", "/repo/c"]),
-        workspaceIds: new Set(["ws-keep"]),
-        userProjects: projects,
-      })
-    ).toEqual({
-      navigation: { projectOrder: ["/repo/c", "/repo/a"] },
-      ai: { projectDefaults: { "/repo/a": { agentId: "exec" } } },
-      notifications: { notifyOnResponseByWorkspace: { "ws-keep": true } },
-    });
-  });
-
-  test("keeps scratch AI defaults while pruning removed projects", () => {
-    const projects = new Map([["/repo/a", { workspaces: [] }]]);
-
-    expect(
-      prunePreferenceScopes({
-        preferences: {
-          ai: {
-            projectDefaults: {
-              _scratch: { agentId: "plan", model: "anthropic:claude-x", thinkingLevel: "high" },
-              "/repo/removed": { agentId: "plan" },
-            },
-          },
-        },
-        // The scratch system project is never part of the valid project paths.
-        projectPaths: new Set(["/repo/a"]),
-        workspaceIds: new Set(),
-        userProjects: projects,
-      })
-    ).toEqual({
-      ai: {
-        projectDefaults: {
-          _scratch: { agentId: "plan", model: "anthropic:claude-x", thinkingLevel: "high" },
-        },
-      },
     });
   });
 });

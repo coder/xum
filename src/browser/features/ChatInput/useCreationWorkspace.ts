@@ -28,8 +28,6 @@ import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions"
 import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
-  getNotifyOnResponseAutoEnableKey,
-  getNotifyOnResponseKey,
   getReasoningModeKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
@@ -40,7 +38,7 @@ import {
   getProjectScopeId,
   getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
-import { getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { SendMessageError } from "@/common/types/errors";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -228,12 +226,12 @@ function syncCreationPreferences(
   }
 
   // Auto-enable notifications if the project-level preference is set
-  const autoEnableNotifications = readPersistedState<boolean>(
-    getNotifyOnResponseAutoEnableKey(projectPath),
-    false
-  );
-  if (autoEnableNotifications) {
-    updatePersistedState(getNotifyOnResponseKey(workspaceId), true);
+  if (
+    getUserPreferences().workspaceCreation?.byProject?.[projectPath]?.notifyOnResponseAutoEnable
+  ) {
+    updateUserPreferences({
+      notifications: { notifyOnResponseByWorkspace: { [workspaceId]: true } },
+    });
   }
 }
 
