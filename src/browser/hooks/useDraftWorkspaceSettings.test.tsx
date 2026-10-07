@@ -6,16 +6,11 @@ import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  DEFAULT_MODEL_KEY,
-  DEFAULT_RUNTIME_KEY,
-  getLastRuntimeConfigKey,
-  getRuntimeKey,
-} from "@/common/constants/storage";
+import { DEFAULT_MODEL_KEY, DEFAULT_RUNTIME_KEY, getRuntimeKey } from "@/common/constants/storage";
 import { CODER_RUNTIME_PLACEHOLDER } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "./useDraftWorkspaceSettings";
 import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 
 function createStubApiClient(preferences?: UserPreferences): APIClient {
@@ -37,6 +32,10 @@ function createStubApiClient(preferences?: UserPreferences): APIClient {
     },
   });
 }
+
+const runtimeConfigPrefs = (path: string, lastRuntimeConfig: Record<string, unknown>) => ({
+  workspaceCreation: { byProject: { [path]: { lastRuntimeConfig } } },
+});
 
 function createWrapper(
   projectPath: string,
@@ -163,19 +162,35 @@ describe("useDraftWorkspaceSettings", () => {
     });
   });
 
+  test("applies remembered runtime options that load after mount", async () => {
+    const projectPath = "/tmp/project";
+    updatePersistedState(DEFAULT_RUNTIME_KEY, "docker");
+    const lastRuntimeConfig = { docker: { image: "ubuntu:22.04" } };
+    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
+
+    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
+      wrapper,
+    });
+    expect(result.current.settings.selectedRuntime).toMatchObject({ image: "" });
+    await waitFor(() => {
+      expect(result.current.settings.selectedRuntime).toMatchObject({ image: "ubuntu:22.04" });
+    });
+  });
+
   test("seeds SSH host from the remembered value when switching modes", async () => {
     const projectPath = "/tmp/project";
 
-    updatePersistedState(getLastRuntimeConfigKey(projectPath), {
+    const lastRuntimeConfig = {
       ssh: { host: "remembered@host" },
-    });
+    };
 
-    const wrapper = createWrapper(projectPath);
+    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
 
     const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
       wrapper,
     });
 
+    await waitFor(() => expect(getUserPreferences().workspaceCreation).toBeDefined());
     act(() => {
       // Simulate UI switching into ssh mode with an empty field.
       result.current.setSelectedRuntime({ mode: "ssh", host: "" });
@@ -192,16 +207,17 @@ describe("useDraftWorkspaceSettings", () => {
   test("seeds Docker image from the remembered value when switching modes", async () => {
     const projectPath = "/tmp/project";
 
-    updatePersistedState(getLastRuntimeConfigKey(projectPath), {
+    const lastRuntimeConfig = {
       docker: { image: "ubuntu:22.04", shareCredentials: true },
-    });
+    };
 
-    const wrapper = createWrapper(projectPath);
+    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
 
     const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
       wrapper,
     });
 
+    await waitFor(() => expect(getUserPreferences().workspaceCreation).toBeDefined());
     act(() => {
       // Simulate UI switching into docker mode with an empty field.
       result.current.setSelectedRuntime({ mode: "docker", image: "" });
@@ -221,15 +237,15 @@ describe("useDraftWorkspaceSettings", () => {
 
     updatePersistedState(DEFAULT_RUNTIME_KEY, "coder");
     updatePersistedState(getRuntimeKey(projectPath), "ssh dev@host");
-    updatePersistedState(getLastRuntimeConfigKey(projectPath), {
+    const lastRuntimeConfig = {
       ssh: {
         host: "dev@host",
         coderEnabled: false,
         coderConfig: { existingWorkspace: false },
       },
-    });
+    };
 
-    const wrapper = createWrapper(projectPath);
+    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
 
     const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
       wrapper,
@@ -248,15 +264,15 @@ describe("useDraftWorkspaceSettings", () => {
   test("persists Coder default string when toggling default", async () => {
     const projectPath = "/tmp/project";
 
-    updatePersistedState(getLastRuntimeConfigKey(projectPath), {
+    const lastRuntimeConfig = {
       ssh: {
         host: "dev@host",
         coderEnabled: false,
         coderConfig: { existingWorkspace: false },
       },
-    });
+    };
 
-    const wrapper = createWrapper(projectPath);
+    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
 
     const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
       wrapper,
@@ -285,15 +301,15 @@ describe("useDraftWorkspaceSettings", () => {
     const projectPath = "/tmp/project";
     const savedCoderConfig = { existingWorkspace: true, workspaceName: "saved-workspace" };
 
-    updatePersistedState(getLastRuntimeConfigKey(projectPath), {
+    const lastRuntimeConfig = {
       ssh: {
         host: "dev@host",
         coderEnabled: false,
         coderConfig: savedCoderConfig,
       },
-    });
+    };
 
-    const wrapper = createWrapper(projectPath);
+    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
 
     const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
       wrapper,
@@ -307,13 +323,13 @@ describe("useDraftWorkspaceSettings", () => {
   test("exposes persisted SSH host as fallback when leaving Coder", async () => {
     const projectPath = "/tmp/project";
 
-    updatePersistedState(getLastRuntimeConfigKey(projectPath), {
+    const lastRuntimeConfig = {
       ssh: {
         host: "dev@host",
       },
-    });
+    };
 
-    const wrapper = createWrapper(projectPath);
+    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
 
     const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
       wrapper,

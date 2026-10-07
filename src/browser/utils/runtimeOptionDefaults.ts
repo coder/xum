@@ -1,7 +1,59 @@
+import {
+  getUserPreferences,
+  updateUserPreferences,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { CoderWorkspaceConfig } from "@/common/orpc/schemas/coder";
 import { CODER_RUNTIME_PLACEHOLDER, RUNTIME_MODE, type RuntimeMode } from "@/common/types/runtime";
 
 export type RuntimeOptionDefaults = Partial<Record<RuntimeMode, unknown>>;
+
+const NO_RUNTIME_OPTION_DEFAULTS: RuntimeOptionDefaults = {};
+
+function selectRuntimeOptionDefaults(
+  preferences: UserPreferences,
+  projectPath: string
+): RuntimeOptionDefaults | undefined {
+  return preferences.workspaceCreation?.byProject?.[projectPath]?.lastRuntimeConfig;
+}
+
+/** The project's remembered runtime options; creation and Settings edit the same value. */
+export function useRuntimeOptionDefaults(projectPath: string | null): RuntimeOptionDefaults {
+  return (
+    useUserPreferences((preferences) =>
+      projectPath === null ? undefined : selectRuntimeOptionDefaults(preferences, projectPath)
+    ) ?? NO_RUNTIME_OPTION_DEFAULTS
+  );
+}
+
+export function readRuntimeOptionDefaults(projectPath: string): RuntimeOptionDefaults {
+  return (
+    selectRuntimeOptionDefaults(getUserPreferences(), projectPath) ?? NO_RUNTIME_OPTION_DEFAULTS
+  );
+}
+
+// Changed leaves only (removed keys as null): resent unchanged fields would undo others' edits.
+function changedLeaves(prev: unknown, next: Record<string, unknown>): Record<string, unknown> {
+  const before = isOptionRecord(prev) ? prev : {};
+  const patch: Record<string, unknown> = {};
+  for (const key of new Set([...Object.keys(before), ...Object.keys(next)])) {
+    const value = next[key];
+    if (value !== before[key]) {
+      patch[key] = isOptionRecord(value) ? changedLeaves(before[key], value) : (value ?? null);
+    }
+  }
+  return patch;
+}
+
+export function updateRuntimeOptionDefaults(
+  projectPath: string,
+  update: (prev: RuntimeOptionDefaults) => RuntimeOptionDefaults
+): void {
+  const prev = readRuntimeOptionDefaults(projectPath);
+  const byProject = { [projectPath]: { lastRuntimeConfig: changedLeaves(prev, update(prev)) } };
+  updateUserPreferences({ workspaceCreation: { byProject } });
+}
 
 export interface SshOptionDefaults {
   host: string;

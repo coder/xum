@@ -3,11 +3,7 @@ import {
   persistWorkspaceCreationPrefill,
   type StartWorkspaceCreationDetail,
 } from "./useStartWorkspaceCreation";
-import {
-  getAutoModelRoutingKey,
-  getProjectScopeId,
-  getTrunkBranchKey,
-} from "@/common/constants/storage";
+import { getAutoModelRoutingKey, getProjectScopeId } from "@/common/constants/storage";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
 import type { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -32,6 +28,10 @@ describe("persistWorkspaceCreationPrefill", () => {
 
   function projectModel() {
     return getUserPreferences().ai?.projectDefaults?.[projectPath]?.model;
+  }
+
+  function projectTrunk() {
+    return getUserPreferences().workspaceCreation?.byProject?.[projectPath]?.trunkBranch;
   }
 
   function createPersistSpy() {
@@ -62,10 +62,10 @@ describe("persistWorkspaceCreationPrefill", () => {
 
     expect(getDraftStore().getText(defaultCreationDraftScope(projectPath))).toBe("Ship it");
     expect(projectModel()).toBe("provider:model");
-    expect(callMap.get(getTrunkBranchKey(projectPath))).toBe("main");
+    expect(projectTrunk()).toBe("main");
     expect(callMap.get(getAutoModelRoutingKey(getProjectScopeId(projectPath)))).toBe(false);
     // runtime is intentionally not persisted - default can only be changed via icon selector
-    expect(calls.length).toBe(2);
+    expect(calls.length).toBe(1);
   });
 
   test("a prefilled model is an explicit pick and leaves the project's Auto routing", () => {
@@ -79,20 +79,16 @@ describe("persistWorkspaceCreationPrefill", () => {
   });
 
   test("clears persisted values when empty strings are provided", () => {
-    const detail: StartWorkspaceCreationDetail = {
-      projectPath,
-      trunkBranch: "   ",
-    };
-    const { persist, calls } = createPersistSpy();
+    getAppConfigStore().updateOptimistically({
+      userPreferences: {
+        workspaceCreation: { byProject: { [projectPath]: { trunkBranch: "dev" } } },
+      },
+    });
+    const { persist } = createPersistSpy();
 
-    persistWorkspaceCreationPrefill(projectPath, detail, persist);
+    persistWorkspaceCreationPrefill(projectPath, { projectPath, trunkBranch: "   " }, persist);
 
-    const callMap = new Map<string, unknown>();
-    for (const [key, value] of calls) {
-      callMap.set(key, value);
-    }
-
-    expect(callMap.get(getTrunkBranchKey(projectPath))).toBeUndefined();
+    expect(projectTrunk()).toBeUndefined();
   });
 
   test("no-op when detail is undefined", () => {

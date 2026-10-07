@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { readPersistedState, usePersistedState } from "./usePersistedState";
+import { usePersistedState } from "./usePersistedState";
 import { useReasoningMode } from "./useReasoningMode";
 import { useThinkingLevel } from "./useThinkingLevel";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
@@ -15,18 +15,15 @@ import {
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import {
   readOptionField,
+  readRuntimeOptionDefaults,
   readSshOptionDefaults,
   type RuntimeOptionDefaults,
+  updateRuntimeOptionDefaults,
+  useRuntimeOptionDefaults,
   writeSshOptionDefaults,
 } from "@/browser/utils/runtimeOptionDefaults";
-import {
-  DEFAULT_MODEL_KEY,
-  DEFAULT_RUNTIME_KEY,
-  getRuntimeKey,
-  getTrunkBranchKey,
-  getLastRuntimeConfigKey,
-} from "@/common/constants/storage";
-import { useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { DEFAULT_MODEL_KEY, DEFAULT_RUNTIME_KEY, getRuntimeKey } from "@/common/constants/storage";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -292,21 +289,24 @@ export function useDraftWorkspaceSettings(
   const parsedDefault = buildRuntimeFromChoice(settingsDefaultRuntime);
   const defaultRuntimeMode: RuntimeMode = parsedDefault?.mode ?? RUNTIME_MODE.WORKTREE;
 
-  // Project-scoped trunk branch preference (persisted per project)
-  const [trunkBranch, setTrunkBranch] = usePersistedState<string>(
-    getTrunkBranchKey(projectPath),
-    "",
-    { listener: true }
+  // A stored trunk that is not (or no longer) a branch falls back to the recommendation
+  // without writing it: only an explicit pick becomes the project preference.
+  const storedTrunkBranch = useUserPreferences(
+    (preferences) => preferences.workspaceCreation?.byProject?.[projectPath]?.trunkBranch
   );
+  const trunkBranch =
+    branches.length > 0 && (!storedTrunkBranch || !branches.includes(storedTrunkBranch))
+      ? (recommendedTrunk ?? branches[0])
+      : (storedTrunkBranch ?? "");
+  const setTrunkBranch = (branch: string) => {
+    updateUserPreferences({
+      workspaceCreation: { byProject: { [projectPath]: { trunkBranch: branch || null } } },
+    });
+  };
 
   type LastRuntimeConfigs = RuntimeOptionDefaults;
 
-  // Project-scoped last runtime config (persisted per provider, stored as an object)
-  const [lastRuntimeConfigs, setLastRuntimeConfigs] = usePersistedState<LastRuntimeConfigs>(
-    getLastRuntimeConfigKey(projectPath),
-    {},
-    { listener: true }
-  );
+  const lastRuntimeConfigs = useRuntimeOptionDefaults(projectPath);
 
   const readRuntimeConfigFlag = (
     configs: LastRuntimeConfigs,
@@ -372,7 +372,7 @@ export function useDraftWorkspaceSettings(
   const setLastRuntimeConfig = useCallback(
     // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     (mode: RuntimeMode, field: string, value: string | boolean | object | null) => {
-      setLastRuntimeConfigs((prev) => {
+      updateRuntimeOptionDefaults(projectPath, (prev) => {
         const existing = prev[mode];
         const existingObj =
           existing && typeof existing === "object" && !Array.isArray(existing)
@@ -382,13 +382,13 @@ export function useDraftWorkspaceSettings(
         return { ...prev, [mode]: { ...existingObj, [field]: value } };
       });
     },
-    [setLastRuntimeConfigs]
+    [projectPath]
   );
 
   // Persist SSH config while keeping the legacy field shape hidden from callsites.
   const writeSshRuntimeConfig = useCallback(
     (config: SshRuntimeConfig) => {
-      setLastRuntimeConfigs((prev) =>
+      updateRuntimeOptionDefaults(projectPath, (prev) =>
         writeSshOptionDefaults(prev, {
           host: config.host,
           coderEnabled: config.coder !== undefined,
@@ -396,49 +396,8 @@ export function useDraftWorkspaceSettings(
         })
       );
     },
-    [setLastRuntimeConfigs]
+    [projectPath]
   );
-
-  const seededProjectPathRef = useRef<string | null>(null);
-
-  // If the default runtime string contains a host/image (e.g. older persisted values like "ssh devbox"),
-  // prefer it as the initial remembered value.
-  // This initialization runs once per project mount instead of reacting to ongoing field edits.
-  useEffect(() => {
-    if (seededProjectPathRef.current === projectPath) {
-      return;
-    }
-    seededProjectPathRef.current = projectPath;
-
-    if (
-      parsedDefault?.mode === RUNTIME_MODE.SSH &&
-      !lastSsh.host.trim() &&
-      parsedDefault.host.trim()
-    ) {
-      setLastRuntimeConfig(RUNTIME_MODE.SSH, "host", parsedDefault.host);
-    }
-    if (
-      parsedDefault?.mode === RUNTIME_MODE.DOCKER &&
-      !lastDockerImage.trim() &&
-      parsedDefault.image.trim()
-    ) {
-      setLastRuntimeConfig(RUNTIME_MODE.DOCKER, "image", parsedDefault.image);
-    }
-    if (
-      parsedDefault?.mode === RUNTIME_MODE.DEVCONTAINER &&
-      !lastDevcontainerConfigPath.trim() &&
-      parsedDefault.configPath.trim()
-    ) {
-      setLastRuntimeConfig(RUNTIME_MODE.DEVCONTAINER, "configPath", parsedDefault.configPath);
-    }
-  }, [
-    projectPath,
-    parsedDefault,
-    lastSsh.host,
-    lastDockerImage,
-    lastDevcontainerConfigPath,
-    setLastRuntimeConfig,
-  ]);
 
   const defaultSshHost =
     parsedDefault?.mode === RUNTIME_MODE.SSH && parsedDefault.host.trim()
@@ -474,7 +433,10 @@ export function useDraftWorkspaceSettings(
 
   // Currently selected runtime for this session (initialized from default)
   // Uses discriminated union: SSH has host, Docker has image
-  const [selectedRuntime, setSelectedRuntimeState] = useState<ParsedRuntime>(() => defaultRuntime);
+  // Until the user or a Settings change picks one it follows the defaults, so options that
+  // load after mount apply.
+  const [runtimePick, setSelectedRuntimeState] = useState<ParsedRuntime | null>(null);
+  const selectedRuntime = runtimePick ?? defaultRuntime;
 
   // Project changes remount ChatInput (key includes projectPath), so this effect only handles
   // live Settings updates to the default runtime while staying on the same project.
@@ -505,14 +467,6 @@ export function useDraftWorkspaceSettings(
     defaultDevcontainerConfigPath,
     lastDevcontainerShareCredentials,
   ]);
-
-  // Initialize trunk branch from backend recommendation or first branch
-  useEffect(() => {
-    if (branches.length > 0 && (!trunkBranch || !branches.includes(trunkBranch))) {
-      const defaultBranch = recommendedTrunk ?? branches[0];
-      setTrunkBranch(defaultBranch);
-    }
-  }, [branches, recommendedTrunk, trunkBranch, setTrunkBranch]);
 
   const lastSshHost = lastSsh.host;
   const lastSshCoder = lastSsh.coder;
@@ -565,10 +519,7 @@ export function useDraftWorkspaceSettings(
   // Setter for default runtime choice (persists via checkbox in tooltip)
   const setDefaultRuntimeChoice = (choice: RuntimeChoice) => {
     // Defaults should only change when the checkbox is toggled, not when last-used SSH flips.
-    const freshRuntimeConfigs = readPersistedState<LastRuntimeConfigs>(
-      getLastRuntimeConfigKey(projectPath),
-      {}
-    );
+    const freshRuntimeConfigs = readRuntimeOptionDefaults(projectPath);
     const freshSshState = readSshRuntimeState(freshRuntimeConfigs);
 
     const newMode = choice === "coder" ? RUNTIME_MODE.SSH : choice;

@@ -4,11 +4,7 @@ import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/even
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
-import {
-  getAutoModelRoutingKey,
-  getProjectScopeId,
-  getTrunkBranchKey,
-} from "@/common/constants/storage";
+import { getAutoModelRoutingKey, getProjectScopeId } from "@/common/constants/storage";
 import {
   getFirstTopLevelProjectPath,
   resolveWorkspaceCreationScope,
@@ -44,10 +40,9 @@ export function persistWorkspaceCreationPrefill(
 
   if (detail.trunkBranch !== undefined) {
     const normalizedTrunk = detail.trunkBranch.trim();
-    persist(
-      getTrunkBranchKey(projectPath),
-      normalizedTrunk.length > 0 ? normalizedTrunk : undefined
-    );
+    updateUserPreferences({
+      workspaceCreation: { byProject: { [projectPath]: { trunkBranch: normalizedTrunk || null } } },
+    });
   }
 
   // Note: runtime is intentionally NOT persisted here - it's a one-time override.

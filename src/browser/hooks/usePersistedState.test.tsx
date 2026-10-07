@@ -7,11 +7,11 @@ import {
 } from "../../../tests/ui/quotaLimitedStorage";
 
 import {
+  EXPANDED_SECTIONS_KEY,
   LAST_CUSTOM_MODEL_PROVIDER_KEY,
   LAST_VISITED_ROUTE_KEY,
   MAX_PERSISTED_KEY_CHARS,
   UI_THEME_KEY,
-  getLastRuntimeConfigKey,
   getPersistedKeyRegistration,
   getTimelineFilterKey,
 } from "@/common/constants/storage";
@@ -28,7 +28,7 @@ import {
   type PersistedStateWriteEvent,
 } from "./usePersistedState";
 
-const QUOTA_FULL_KEY = getLastRuntimeConfigKey("/repo/quota-full");
+const QUOTA_FULL_KEY = EXPANDED_SECTIONS_KEY;
 
 describe("raw persisted strings when storage access is denied", () => {
   let cleanupDom: (() => void) | null = null;
