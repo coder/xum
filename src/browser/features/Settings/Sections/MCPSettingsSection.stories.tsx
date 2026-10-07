@@ -11,7 +11,6 @@ import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -118,9 +117,7 @@ const MCPSettingsSectionStoryShell: FC<{ setup: () => APIClient; children: React
   return (
     <ThemeProvider>
       <TooltipProvider>
-        <APIProvider client={clientRef.current}>
-          <ExperimentsProvider>{children}</ExperimentsProvider>
-        </APIProvider>
+        <APIProvider client={clientRef.current}>{children}</APIProvider>
       </TooltipProvider>
     </ThemeProvider>
   );

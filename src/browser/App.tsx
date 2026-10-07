@@ -119,7 +119,6 @@ import { TutorialProvider } from "./contexts/TutorialContext";
 import { PowerModeProvider } from "./contexts/PowerModeContext";
 import { TooltipProvider } from "./components/Tooltip/Tooltip";
 import { UILayoutsProvider, useUILayouts } from "@/browser/contexts/UILayoutsContext";
-import { ExperimentsProvider } from "./contexts/ExperimentsContext";
 import { PerfFlightRecorder } from "./components/PerfFlightRecorder/PerfFlightRecorder";
 import { ProviderOptionsProvider } from "./contexts/ProviderOptionsContext";
 import { getWorkspaceSidebarKey } from "./utils/workspace";
@@ -1642,7 +1641,7 @@ function AppInner() {
 
 function App() {
   return (
-    <ExperimentsProvider>
+    <>
       <PerfFlightRecorder />
       <UILayoutsProvider>
         <TooltipProvider delayDuration={200}>
@@ -1665,7 +1664,7 @@ function App() {
           </SettingsProvider>
         </TooltipProvider>
       </UILayoutsProvider>
-    </ExperimentsProvider>
+    </>
   );
 }
 

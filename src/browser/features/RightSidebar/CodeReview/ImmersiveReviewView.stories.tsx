@@ -5,7 +5,6 @@ import type { ComponentProps, ComponentType, FC, ReactNode } from "react";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createReview } from "@/browser/stories/helpers/reviews";
@@ -361,9 +360,7 @@ const ImmersiveStoryShell: FC<{ client: APIClient; children: ReactNode }> = ({
   return (
     <ThemeProvider>
       <TooltipProvider>
-        <APIProvider client={client}>
-          <ExperimentsProvider>{children}</ExperimentsProvider>
-        </APIProvider>
+        <APIProvider client={client}>{children}</APIProvider>
       </TooltipProvider>
     </ThemeProvider>
   );

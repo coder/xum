@@ -1,20 +1,21 @@
 import { wrapAsyncIterator } from "@orpc/shared";
 import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
-import { EXPERIMENT_IDS, LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID } from "@/common/constants/experiments";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
-import { APIProvider, type APIClient } from "./API";
-import { ExperimentsProvider, usePerfFlightRecorderCollecting } from "./ExperimentsContext";
-import { useExperiment } from "@/browser/hooks/useExperiments";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import type { FlightRecorderStatus } from "@/common/orpc/schemas/perfFlightRecorder";
-import { PerfFlightRecorder } from "@/browser/components/PerfFlightRecorder/PerfFlightRecorder";
+import { PerfFlightRecorder } from "./PerfFlightRecorder";
 import { FLIGHT_RECORDER_EVENT_DURATION_THRESHOLD_MS } from "@/constants/perfFlightRecorder";
 
 // Keep the API client local to each render so this suite does not leak a process-global
 // mock.module override into ProjectContext and other later context tests.
 let currentClientMock: TestApiOverrides<APIClient> = {};
+
+// Like the real oRPC client, which is a callable proxy that React must not invoke as an updater.
+const callableClient = (overrides: TestApiOverrides<APIClient>): APIClient =>
+  Object.assign(() => undefined, createTestApiClient(overrides));
 
 let originalWindow: typeof globalThis.window;
 let originalDocument: typeof globalThis.document;
@@ -27,7 +28,7 @@ let originalClearTimeout: typeof globalThis.clearTimeout;
 let originalSetInterval: typeof globalThis.setInterval;
 let originalClearInterval: typeof globalThis.clearInterval;
 
-describe("ExperimentsProvider", () => {
+describe("PerfFlightRecorder", () => {
   beforeEach(() => {
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
@@ -46,7 +47,7 @@ describe("ExperimentsProvider", () => {
 
     // Broader browser runs can leave bare globals, event constructors, and timer functions pointed
     // at stale or fake implementations from earlier suites. Rebind the globals
-    // ExperimentsProvider reaches through indirectly so each case runs against the fresh
+    // PerfFlightRecorder reaches through indirectly so each case runs against the fresh
     // happy-dom window installed for it.
     globalThis.localStorage = dom.localStorage;
     globalThis.location = dom.location as unknown as Location;
@@ -81,7 +82,6 @@ describe("ExperimentsProvider", () => {
 
   test("renderer flight recording follows the backend status stream", async () => {
     // A CLI toggle or reload must not leave this page diverged from the backend.
-    const perf = EXPERIMENT_IDS.PERF_FLIGHT_RECORDER;
     // happy-dom has no long-animation-frame support: record what the renderer observes.
     const observers: Array<{ init: unknown; connected: boolean }> = [];
     class FakePerformanceObserver {
@@ -104,40 +104,20 @@ describe("ExperimentsProvider", () => {
     const connectedCount = () => observers.filter((observer) => observer.connected).length;
     const statuses = createAsyncMessageQueue<FlightRecorderStatus>();
     statuses.push({ enabled: true, state: "collecting" });
-    const set = mock(() => Promise.resolve());
     currentClientMock = {
       experiments: {
-        set,
         onPerfFlightRecorderChange: (_input, { signal } = {}) => {
           signal?.addEventListener("abort", statuses.end, { once: true });
           return Promise.resolve(wrapAsyncIterator(statuses.iterate(), {}));
         },
       },
     };
-    function Toggle() {
-      const [, setEnabled] = useExperiment(perf);
-      const collecting = usePerfFlightRecorderCollecting();
-      return (
-        <button
-          onClick={() => {
-            setEnabled(false).catch(() => undefined);
-          }}
-        >
-          {String(collecting)}
-        </button>
-      );
-    }
     try {
-      const view = render(
-        <APIProvider client={createTestApiClient(currentClientMock)}>
-          <ExperimentsProvider>
-            <Toggle />
-            <PerfFlightRecorder />
-          </ExperimentsProvider>
+      render(
+        <APIProvider client={callableClient(currentClientMock)}>
+          <PerfFlightRecorder />
         </APIProvider>
       );
-      await waitFor(() => expect(view.getByRole("button").textContent).toBe("true"));
-      expect(set).not.toHaveBeenCalled();
       // Only new entries: no `buffered` import of frames recorded while the experiment was off.
       await waitFor(() => expect(connectedCount()).toBe(2));
       expect(observers.map((observer) => observer.init)).toEqual([
@@ -145,23 +125,18 @@ describe("ExperimentsProvider", () => {
         { type: "event", durationThreshold: FLIGHT_RECORDER_EVENT_DURATION_THRESHOLD_MS },
       ]);
 
-      // A Settings toggle requests the change; the streamed status publishes it.
-      fireEvent.click(view.getByRole("button"));
-      expect(set).toHaveBeenCalledWith({ experimentId: perf, enabled: false });
-      expect(view.getByRole("button").textContent).toBe("true");
       await act(async () => {
         statuses.push({ enabled: false, state: "off" });
         await Promise.resolve();
       });
-      await waitFor(() => expect(view.getByRole("button").textContent).toBe("false"));
-      expect(connectedCount()).toBe(0);
+      await waitFor(() => expect(connectedCount()).toBe(0));
 
       // A failed backend recorder stays enabled but stops renderer collection.
       await act(async () => {
         statuses.push({ enabled: true, state: "failed" });
         await Promise.resolve();
       });
-      await waitFor(() => expect(view.getByRole("button").textContent).toBe("false"));
+      await act(() => Promise.resolve());
       expect(observers).toHaveLength(2);
 
       // A dropped status stream (e.g. backend restart) stops collection until it reconnects.
@@ -174,62 +149,59 @@ describe("ExperimentsProvider", () => {
         statuses.end();
         await Promise.resolve();
       });
-      await waitFor(() => expect(view.getByRole("button").textContent).toBe("false"));
-      expect(connectedCount()).toBe(0);
+      await waitFor(() => expect(connectedCount()).toBe(0));
     } finally {
       globalThis.PerformanceObserver = originalPerformanceObserver;
     }
   });
 
-  test("stale local PTC keys are not written to the backend on connect or reconnect", async () => {
-    globalThis.window.localStorage.setItem(
-      `experiment:${EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING}`,
-      JSON.stringify(true)
-    );
-    globalThis.window.localStorage.setItem(
-      `experiment:${LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID}`,
-      JSON.stringify(true)
-    );
-    const set = mock(() => Promise.resolve());
-    const tree = () => (
-      <APIProvider client={createTestApiClient({ experiments: { set } })}>
-        <ExperimentsProvider>
-          <div />
-        </ExperimentsProvider>
-      </APIProvider>
-    );
-
-    const view = render(tree());
-    await act(() => Promise.resolve());
-    // A new client is what a reconnect hands the provider.
-    view.rerender(tree());
-    await act(() => Promise.resolve());
-    expect(set).not.toHaveBeenCalled();
-  });
-
-  test("a failed toggle write keeps showing the backend value", async () => {
-    const setMock = mock(() => Promise.reject(new Error("write failed")));
-    const client = createTestApiClient({ experiments: { set: setMock } });
-
-    function Toggle() {
-      const [enabled, setEnabled] = useExperiment(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
-      const toggle = () => {
-        setEnabled(!enabled).catch(() => undefined);
-      };
-      return <button onClick={toggle}>{String(enabled)}</button>;
+  test("a reconnected client collects only once its own stream reports collecting", async () => {
+    let connected = 0;
+    class FakePerformanceObserver {
+      static readonly supportedEntryTypes = ["long-animation-frame", "event"];
+      observe = () => connected++;
+      disconnect = () => connected--;
     }
+    const originalPerformanceObserver = globalThis.PerformanceObserver;
+    globalThis.PerformanceObserver =
+      FakePerformanceObserver as unknown as typeof PerformanceObserver;
+    const clientWith = (
+      statuses: ReturnType<typeof createAsyncMessageQueue<FlightRecorderStatus>>
+    ) =>
+      callableClient({
+        experiments: {
+          onPerfFlightRecorderChange: (_input, { signal } = {}) => {
+            signal?.addEventListener("abort", statuses.end, { once: true });
+            return Promise.resolve(wrapAsyncIterator(statuses.iterate(), {}));
+          },
+        },
+      });
+    const before = createAsyncMessageQueue<FlightRecorderStatus>();
+    before.push({ enabled: true, state: "collecting" });
+    const after = createAsyncMessageQueue<FlightRecorderStatus>();
+    try {
+      const view = render(
+        <APIProvider client={clientWith(before)}>
+          <PerfFlightRecorder />
+        </APIProvider>
+      );
+      await waitFor(() => expect(connected).toBe(2));
 
-    const view = render(
-      <APIProvider client={client}>
-        <ExperimentsProvider>
-          <Toggle />
-        </ExperimentsProvider>
-      </APIProvider>
-    );
-    fireEvent.click(view.getByRole("button"));
-    await waitFor(() => expect(setMock).toHaveBeenCalledTimes(1));
-    await act(() => Promise.resolve());
+      view.rerender(
+        <APIProvider client={clientWith(after)}>
+          <PerfFlightRecorder />
+        </APIProvider>
+      );
+      await act(() => Promise.resolve());
+      expect(connected).toBe(0);
 
-    expect(view.getByRole("button").textContent).toBe("false");
+      await act(async () => {
+        after.push({ enabled: true, state: "collecting" });
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(connected).toBe(2));
+    } finally {
+      globalThis.PerformanceObserver = originalPerformanceObserver;
+    }
   });
 });

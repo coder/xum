@@ -7,14 +7,13 @@
 // this via a relative path.
 //
 // Only the providers the design bundle can afford under the 5 MB cap are wired:
-// theme, API, experiments, settings, tooltip. The workspace/router/
+// theme, API, settings, tooltip. The workspace/router/
 // project chain is intentionally omitted (it pushes the bundle over cap) — a
 // component that hard-requires those contexts is handled in its own preview.
 import { useRef, type ReactNode } from "react";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
@@ -53,17 +52,15 @@ export function MuxPreviewShell(props: MuxPreviewShellProps) {
       <style>{PREVIEW_HEIGHT_RESET}</style>
       <ThemeProvider>
         <APIProvider client={client}>
-          <ExperimentsProvider>
-            <RouterProvider>
-              <ProjectProvider>
-                <SettingsProvider>
-                  <AboutDialogProvider>
-                    <TooltipProvider>{props.children}</TooltipProvider>
-                  </AboutDialogProvider>
-                </SettingsProvider>
-              </ProjectProvider>
-            </RouterProvider>
-          </ExperimentsProvider>
+          <RouterProvider>
+            <ProjectProvider>
+              <SettingsProvider>
+                <AboutDialogProvider>
+                  <TooltipProvider>{props.children}</TooltipProvider>
+                </AboutDialogProvider>
+              </SettingsProvider>
+            </ProjectProvider>
+          </RouterProvider>
         </APIProvider>
       </ThemeProvider>
     </>

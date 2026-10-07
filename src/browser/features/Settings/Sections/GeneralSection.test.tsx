@@ -14,7 +14,6 @@ import {
   type TestClientConfig,
 } from "@/browser/testUtils";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { useExperiment } from "@/browser/hooks/useExperiments";
 import * as RealSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as RealTelemetryModule from "@/browser/hooks/useTelemetry";
@@ -193,9 +192,7 @@ void mock.module("@/browser/hooks/useTelemetry", () => ({
 function TestProviders(props: { children: React.ReactNode }) {
   return (
     <APIProvider client={createTestApiClient(mockApi)}>
-      <ExperimentsProvider>
-        <ThemeProvider forcedTheme="dark">{props.children}</ThemeProvider>
-      </ExperimentsProvider>
+      <ThemeProvider forcedTheme="dark">{props.children}</ThemeProvider>
     </APIProvider>
   );
 }

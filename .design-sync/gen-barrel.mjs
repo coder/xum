@@ -251,7 +251,6 @@ const PROVIDER_LINES = [
   `export { ThemeProvider } from "@/browser/contexts/ThemeContext";`,
   `export { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";`,
   `export { APIProvider } from "@/browser/contexts/API";`,
-  `export { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";`,
   `export { SettingsProvider } from "@/browser/contexts/SettingsContext";`,
   `export { RouterProvider } from "@/browser/contexts/RouterContext";`,
   `export { ProjectProvider } from "@/browser/contexts/ProjectContext";`,
