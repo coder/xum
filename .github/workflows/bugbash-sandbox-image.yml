@@ -1,0 +1,88 @@
+# The bug-bash sandbox image (#5714): tests/bugbash/sandbox/Dockerfile, built by build.sh.
+#
+# Pull requests build it with a read-only token and push nothing. Only a push to main (or a
+# manual run on main) publishes, from that exact commit, with no cache and no artifact from any
+# other run. A person then copies the digest from the job summary into image.json in a pull
+# request: no workflow writes to the repo. Nothing here deletes an image.
+name: Bug-bash sandbox image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - tests/bugbash/sandbox/Dockerfile
+      - tests/bugbash/sandbox/build.sh
+      - bun.lock
+      - .github/workflows/bugbash-sandbox-image.yml
+  pull_request:
+    paths:
+      - tests/bugbash/sandbox/Dockerfile
+      - tests/bugbash/sandbox/build.sh
+      - bun.lock
+      - .github/workflows/bugbash-sandbox-image.yml
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Never cancel a publish half way. Pull request runs may cancel.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build (no push)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: |
+          id=$(./tests/bugbash/sandbox/build.sh)
+          size=$(docker image inspect --format '{{.Size}}' "$id")
+          echo "Image $id: $size bytes (inputs key $(./tests/bugbash/sandbox/build.sh --key))" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Push ghcr.io/coder/xum-bugbash-sandbox. Only this job, only on main.
+      packages: write
+      # Build provenance for audit (the runner trusts the digest in image.json).
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        id: push
+        run: |
+          ./tests/bugbash/sandbox/build.sh --push > image.json
+          echo "digest=$(jq -r .digest image.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo '### tests/bugbash/sandbox/image.json'
+            echo
+            echo '```json'
+            cat image.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/coder/xum-bugbash-sandbox
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
