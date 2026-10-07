@@ -10441,7 +10441,14 @@ export class WorkspaceService
 
     try {
       const candidates = await this.getWorkspaceNamingCandidates(workspaceId);
-      const result = await generateWorkspaceIdentity(trimmedMessage, candidates, this.aiService);
+      const result = await generateWorkspaceIdentity(
+        trimmedMessage,
+        candidates,
+        this.aiService,
+        undefined,
+        undefined,
+        workspaceId
+      );
       if (result.success) {
         const persistResult = await this.updateWorkspaceTitleState(workspaceId, {
           title: result.data.title,
@@ -10806,7 +10813,8 @@ export class WorkspaceService
       candidates,
       this.aiService,
       conversationContext,
-      latestUserText
+      latestUserText,
+      workspaceId
     );
     if (!result.success) {
       return Err("Title generation failed");
