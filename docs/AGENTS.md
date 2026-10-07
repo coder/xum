@@ -246,8 +246,9 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 
 ## Bug Bash and Repro Tests (tests/bugbash)
 
-- `make bug-bash` runs AI explorers (`e2e explore` charters) against seeded `xum server`s. This section is the repo's rule set: `.xum/skills/bug-bash/` is vendored, so do not edit it; where the two differ (repros are tracked), follow this section.
-- A finding is a bug only once a repro fails for the reported reason. Put it in `tests/bugbash/repros/<slug>.e2e.ts` (tracked) with exact `screen`/`browser`/`expect` steps, never `agent.*`, so it needs no model key and gives the same result every run.
+- Host pause (#5714): model-driven runs are paused on this host until they run in the bug-bash sandbox. `make bug-bash`, `make mcp-apps-e2e`, `tests/bugbash/run.ts`, any `e2e explore` and every e2e command with `e2e.mcpapps.config.ts` refuse with exit 2 before any app, browser or model starts (`tests/bugbash/hostPause.ts`). `e2e.config.ts` loads only for `e2e run` and `e2e list`, and its agents hold no model, so an `agent.*` step in a repro fails with `MODEL_UNAVAILABLE` and makes no model request. No override exists. Exact-step repros run as before.
+- `make bug-bash` runs AI explorers (`e2e explore` charters) against seeded `xum server`s (paused, see above). This section is the repo's rule set: `.xum/skills/bug-bash/` is vendored, so do not edit it; where the two differ (repros are tracked), follow this section.
+- A finding is a bug only once a repro fails for the reported reason. Put it in `tests/bugbash/repros/<slug>.e2e.ts` (tracked) with exact `screen`/`browser`/`expect` steps, never `agent.*`, so it needs no model key and gives the same result every run. `tests/bugbash/reproRules.test.ts` fails on a repro that takes the `agent` fixture.
 - Prove every repro: restore the bug in a scratch edit, rebuild, see `ASSERTION_FAILED` on the bug's own assertion, then restore and see it pass.
 - Tags: `bugbash` plus the bug ID. Add `mock-only` when the test needs a `[mock:...]` prompt or a terminal (real mode turns terminals off). Add `known-failure` plus the issue number for an open bug, and remove that tag in the PR that fixes it.
 - `make test-bugbash-repros` runs the repros (known failures excluded); `make test-bugbash-known-failures` runs the open-bug repros, which fail until fixed. `make test-e2e` runs the repros after Playwright unless `BUGBASH_REPROS=0`; CI runs them once, on linux shard 1, without provider secrets (so with the mock).
@@ -258,6 +259,7 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 
 ## Agent E2E (tests/bugbash)
 
+- Paused on the host (#5714, see the host pause above): the targets below refuse until the bug-bash sandbox lands.
 - `make bug-bash` runs `e2e explore` charters against seeded servers (app AI mode: see the section above). `BUGBASH_ARGS="--config <file>"` picks another e2e config.
 - MCP Apps: `make mcp-apps-e2e` runs `tests/bugbash/mcpapps/mcp-apps.e2e.ts` through `e2e.mcpapps.config.ts`; explore it with `BUGBASH_ARGS="--config tests/bugbash/e2e.mcpapps.config.ts --charters tests/bugbash/mcpapps/charters.txt"`. Its seed (`startApp.ts --mcp-apps`, `mcpapps/seed.ts`) writes the chat directly because mock AI cannot call MCP tools, so `make mcp-apps-e2e` pins the mock app AI.
 - Both need Node 22.22.3+ or 24.8+ (`E2E_NODE` or PATH) and an explorer model key (`tests/bugbash/e2e.config.ts`). They make paid model calls; no CI job runs them.

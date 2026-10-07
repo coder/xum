@@ -4,9 +4,16 @@
  * comes from e2e.config.ts. Run it with `make mcp-apps-e2e`, or explore with
  * `make bug-bash BUGBASH_ARGS="--config tests/bugbash/e2e.mcpapps.config.ts
  * --charters tests/bugbash/mcpapps/charters.txt"`.
+ *
+ * Paused on the host (hostPause.ts, #5714): the suite drives every flow with `agent.act`, so a
+ * model picks its actions. Every e2e command with this config, also `run`, refuses as it loads.
  */
 import type { E2EConfig } from "e2e";
 import base from "./e2e.config";
+import { modelDrivenRefusal } from "./hostPause";
+
+const paused = modelDrivenRefusal("the MCP Apps suite (agent.act, e2e.mcpapps.config.ts)");
+if (paused != null) throw new Error(paused);
 
 const mcpContext = [
   "MCP Apps setup for this run: the 'Bug bash playground' chat already holds MCP tool calls from",
