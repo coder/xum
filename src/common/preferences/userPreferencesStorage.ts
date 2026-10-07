@@ -1,5 +1,4 @@
 import {
-  LaunchBehaviorSchema,
   pruneUserPreferences,
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
@@ -12,8 +11,6 @@ import {
   BASH_COLLAPSED_SUMMARY_MODES,
   EDITOR_CONFIG_KEY,
   GLOBAL_SCOPE_ID,
-  LAUNCH_BEHAVIOR_KEY,
-  PROJECT_ORDER_KEY,
   PROVIDER_OPTIONS_ANTHROPIC_KEY,
   PROVIDER_OPTIONS_GOOGLE_KEY,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
@@ -35,7 +32,6 @@ import {
   normalizeTerminalBadgeConfig,
   normalizeTerminalFontConfig,
   type BashCollapsedSummaryMode,
-  type LaunchBehavior,
   type TranscriptDensity,
 } from "@/common/constants/storage";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
@@ -47,7 +43,6 @@ import {
   parseModelString,
   parseNonEmptyString,
   parseRecord,
-  parseStringArray,
   parseThinkingLevel,
 } from "@/common/preferences/userPreferenceParsing";
 
@@ -69,8 +64,6 @@ const STATIC_USER_PREFERENCE_KEYS = new Set<string>([
   TERMINAL_BADGE_CONFIG_KEY,
   TERMINAL_FONT_CONFIG_KEY,
   EDITOR_CONFIG_KEY,
-  LAUNCH_BEHAVIOR_KEY,
-  PROJECT_ORDER_KEY,
   PROVIDER_OPTIONS_ANTHROPIC_KEY,
   PROVIDER_OPTIONS_GOOGLE_KEY,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
@@ -104,10 +97,6 @@ function parseStoredValue(raw: string | null): unknown {
   } catch {
     return raw;
   }
-}
-
-function parseLaunchBehavior(value: unknown): LaunchBehavior | undefined {
-  return parseEnum<LaunchBehavior>(LaunchBehaviorSchema.options, value);
 }
 
 function parseThreshold(value: unknown): number | undefined {
@@ -156,13 +145,6 @@ function ensureAppearance(
 ): NonNullable<UserPreferences["appearance"]> {
   preferences.appearance ??= {};
   return preferences.appearance;
-}
-
-function ensureNavigation(
-  preferences: UserPreferences
-): NonNullable<UserPreferences["navigation"]> {
-  preferences.navigation ??= {};
-  return preferences.navigation;
 }
 
 function ensureAi(preferences: UserPreferences): NonNullable<UserPreferences["ai"]> {
@@ -264,24 +246,6 @@ export function applyStoredUserPreference(
       return removeStoredUserPreference(next, key);
     }
     ensureAppearance(next).editorConfig = normalizeEditorConfig(value);
-    return pruneUserPreferences(next);
-  }
-
-  if (key === LAUNCH_BEHAVIOR_KEY) {
-    const parsed = parseLaunchBehavior(value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureNavigation(next).launchBehavior = parsed;
-    return pruneUserPreferences(next);
-  }
-
-  if (key === PROJECT_ORDER_KEY) {
-    const parsed = parseStringArray(value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureNavigation(next).projectOrder = parsed;
     return pruneUserPreferences(next);
   }
 
@@ -441,8 +405,6 @@ export function removeStoredUserPreference(
   else if (key === TERMINAL_FONT_CONFIG_KEY) delete next.appearance?.terminalFontConfig;
   else if (key === TERMINAL_BADGE_CONFIG_KEY) delete next.appearance?.terminalBadgeConfig;
   else if (key === EDITOR_CONFIG_KEY) delete next.appearance?.editorConfig;
-  else if (key === LAUNCH_BEHAVIOR_KEY) delete next.navigation?.launchBehavior;
-  else if (key === PROJECT_ORDER_KEY) delete next.navigation?.projectOrder;
   else if (key === getAgentIdKey(GLOBAL_SCOPE_ID)) delete next.ai?.globalDefaults?.agentId;
   else if (key === getThinkingLevelKey(GLOBAL_SCOPE_ID))
     delete next.ai?.globalDefaults?.thinkingLevel;
@@ -502,12 +464,6 @@ export function entriesFromUserPreferences(
     entries.push({ key: TERMINAL_BADGE_CONFIG_KEY, value: appearance.terminalBadgeConfig });
   if (appearance?.editorConfig !== undefined)
     entries.push({ key: EDITOR_CONFIG_KEY, value: appearance.editorConfig });
-
-  const navigation = preferences.navigation;
-  if (navigation?.launchBehavior !== undefined)
-    entries.push({ key: LAUNCH_BEHAVIOR_KEY, value: navigation.launchBehavior });
-  if (navigation?.projectOrder !== undefined)
-    entries.push({ key: PROJECT_ORDER_KEY, value: navigation.projectOrder });
 
   const ai = preferences.ai;
   if (ai?.globalDefaults?.agentId !== undefined)

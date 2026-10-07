@@ -23,9 +23,9 @@ import {
   prependInitialAppProxyBasePath,
   stripInitialAppProxyBasePathFromPathname,
 } from "@/browser/utils/frontendBasePath";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   LAST_VISITED_ROUTE_KEY,
-  LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
   type LaunchBehavior,
 } from "@/common/constants/storage";
@@ -200,8 +200,9 @@ function getInitialRoute(): string {
   const isStorybook = routePathname.endsWith("iframe.html");
   const isStandalone = isStandalonePwa();
   const navigationType = getStartupNavigationType();
+  // The startup gate holds RouterProvider until the store's first snapshot (or its timeout).
   const launchBehavior = !isStandalone
-    ? readPersistedState<LaunchBehavior>(LAUNCH_BEHAVIOR_KEY, "dashboard")
+    ? (getUserPreferences().navigation?.launchBehavior ?? "dashboard")
     : null;
 
   if (window.location.protocol === "file:") {

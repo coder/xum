@@ -1,17 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { installDom } from "../../../tests/ui/dom";
 
 import {
   canPrunePreferenceScopes,
   createMergePatch,
   mirrorBackendPreferences,
-  mirrorUserPreferencesLocalCache,
   prunePreferenceScopes,
 } from "./UserPreferencesContext";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   GLOBAL_SCOPE_ID,
-  LAUNCH_BEHAVIOR_KEY,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
   TERMINAL_FONT_CONFIG_KEY,
   getAgentIdKey,
@@ -52,25 +48,6 @@ class MemoryStorage implements Storage {
 }
 
 describe("UserPreferencesProvider bridge helpers", () => {
-  // Production passes no storage: writes must be routed to the helpers because the default storage
-  // is the (write-refusing) persisted-state view, recognized by identity.
-  test("mirrors the store into the real localStorage through the default persisted-state view", () => {
-    const cleanupDom = installDom();
-    try {
-      getAppConfigStore().updateOptimistically({
-        userPreferences: { navigation: { launchBehavior: "last-workspace" } },
-      });
-      mirrorUserPreferencesLocalCache();
-
-      expect(JSON.parse(window.localStorage.getItem(LAUNCH_BEHAVIOR_KEY) ?? "null")).toBe(
-        "last-workspace"
-      );
-    } finally {
-      getAppConfigStore().updateOptimistically({ userPreferences: undefined });
-      cleanupDom();
-    }
-  });
-
   test("removes stale local cache entries on a backend refresh", () => {
     const storage = new MemoryStorage();
     storage.setJSON(REVIEW_INCLUDE_UNCOMMITTED_KEY, false);

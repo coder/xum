@@ -36,7 +36,8 @@ import {
   reorderProjects,
   normalizeOrder,
 } from "@/common/utils/projectOrdering";
-import { PROJECT_ORDER_KEY, SIDEBAR_EXPANSION_MAP_MAX_CHARS } from "@/common/constants/storage";
+import { SIDEBAR_EXPANSION_MAP_MAX_CHARS } from "@/common/constants/storage";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 import {
   matchesKeybind,
@@ -1634,8 +1635,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     showProjectColorPicker,
   ]);
 
-  // UI preference: project order persists in localStorage
-  const [projectOrder, setProjectOrder] = usePersistedState<string[]>(PROJECT_ORDER_KEY, []);
+  const storedProjectOrder = useUserPreferences(
+    (preferences) => preferences.navigation?.projectOrder
+  );
 
   // Build a stable signature of the project keys so effects don't fire on Map identity churn
   const projectPathsSignature = React.useMemo(() => {
@@ -1644,35 +1646,17 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     return keys.join("\u0001"); // use non-printable separator
   }, [userProjects]);
 
-  // Normalize order when the set of projects changes (not on every parent render)
-  useEffect(() => {
-    // Skip normalization if projects haven't loaded yet (empty Map on initial render)
-    // This prevents clearing projectOrder before projects load from backend
-    if (userProjects.size === 0) {
-      return;
-    }
-
-    const normalized = normalizeOrder(projectOrder, userProjects);
-    if (
-      normalized.length !== projectOrder.length ||
-      normalized.some((p, i) => p !== projectOrder[i])
-    ) {
-      setProjectOrder(normalized);
-    }
-    // Only re-run when project keys change (projectPathsSignature captures projects Map keys)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectPathsSignature]);
-
   // Memoize sorted project PATHS (not entries) to avoid capturing stale config objects.
   // Sorting depends only on keys + order; we read configs from the live Map during render.
   const sortedProjectPaths = React.useMemo(
     () =>
-      sortProjectsByOrder(userProjects, projectOrder)
+      // Normalized on read, never written back: new projects sort first until a drag saves.
+      sortProjectsByOrder(userProjects, normalizeOrder(storedProjectOrder ?? [], userProjects))
         .filter(([, config]) => !config.parentProjectPath)
         .map(([p]) => p),
     // projectPathsSignature captures projects Map keys
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [projectPathsSignature, projectOrder]
+    [projectPathsSignature, storedProjectOrder]
   );
 
   const isWorkspaceLiveActive = (workspaceId: string): boolean => {
@@ -1979,10 +1963,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const handleReorder = useCallback(
     (draggedPath: string, targetPath: string) => {
-      const next = reorderProjects(projectOrder, userProjects, draggedPath, targetPath);
-      setProjectOrder(next);
+      const order = normalizeOrder(storedProjectOrder ?? [], userProjects);
+      const next = reorderProjects(order, userProjects, draggedPath, targetPath);
+      updateUserPreferences({ navigation: { projectOrder: next } });
     },
-    [projectOrder, userProjects, setProjectOrder]
+    [storedProjectOrder, userProjects]
   );
 
   // Pinned-chat reordering, shared by row drag-drop and the move keybinds.

@@ -78,24 +78,14 @@ export const SELECTED_WORKSPACE_KEY = "selectedWorkspace";
 export const LAST_VISITED_ROUTE_KEY = "lastVisitedRoute";
 
 /**
- * User preference for what to show on app launch (global).
- * Values: "dashboard" (legacy storage value that now opens the recent project page)
- * | "new-chat" | "last-workspace"
+ * What to show on app launch. "dashboard" is a legacy value that now opens the recent project page.
  */
-export const LAUNCH_BEHAVIOR_KEY = "launchBehavior";
-
 export type LaunchBehavior = "dashboard" | "new-chat" | "last-workspace";
 
 /**
  * Synchronous mirror for the backend full-width transcript preference.
  */
 export const CHAT_TRANSCRIPT_FULL_WIDTH_KEY = "chatTranscriptFullWidth";
-
-/**
- * Ordered project paths in the left sidebar.
- * Format: "mux:projectOrder"
- */
-export const PROJECT_ORDER_KEY = "mux:projectOrder";
 
 /**
  * Get the localStorage key for expanded projects in sidebar (global)
@@ -1216,10 +1206,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // { workspaceId } (older builds also stored paths; readers use only the id).
   globalKey(SELECTED_WORKSPACE_KEY, "ui", 256),
   globalKey(LAST_VISITED_ROUTE_KEY, "ui", 4096),
-  globalKey(LAUNCH_BEHAVIOR_KEY, "synced", 32),
   globalKey(CHAT_TRANSCRIPT_FULL_WIDTH_KEY, "synced", 16),
-  // string[] of project paths.
-  globalKey(PROJECT_ORDER_KEY, "synced", 32 * 1024),
   globalKey(EXPANDED_PROJECTS_KEY, "ui", 32 * 1024),
   // Legacy creation draft list, now in the backend drafts/list.json (imported once by DraftStore,
   // then removed, #5225). Never written again, so no budget (0).
