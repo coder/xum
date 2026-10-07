@@ -4,18 +4,13 @@ import {
   getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
   getAutoThinkingLevelKey,
-  getModelKey,
-  getThinkingLevelKey,
 } from "@/common/constants/storage";
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import {
-  readPersistedState,
-  readPersistedString,
-  updatePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import type { AutoRoutingChoiceByAgent, AutoRoutingOutcome } from "@/browser/utils/workspaceModeAi";
 import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 
@@ -43,7 +38,7 @@ export function recordWorkspaceModelChange(
   if (origin === "sync") return;
 
   const normalized = normalizeExplicitModel(model);
-  const current = readPersistedString(getModelKey(workspaceId));
+  const current = readScopedAiDefault(workspaceId, "model");
   const normalizedCurrent = current ? normalizeExplicitModel(current) : null;
 
   // Avoid leaving stale explicit-change entries when the effective model doesn't change
@@ -92,7 +87,7 @@ export function setWorkspaceModelWithOrigin(
   origin: ModelChangeOrigin
 ): void {
   recordWorkspaceModelChange(workspaceId, model, origin);
-  updatePersistedState(getModelKey(workspaceId), model);
+  writeScopedAiDefault(workspaceId, "model", model);
   if (origin === "user") {
     setAutoRoutingChoice(workspaceId, "model", false);
   } else if (origin === "agent") {
@@ -175,7 +170,7 @@ export function setWorkspaceThinkingLevelWithOrigin(
   level: ThinkingLevel,
   origin: ModelChangeOrigin
 ): void {
-  updatePersistedState(getThinkingLevelKey(workspaceId), level);
+  writeScopedAiDefault(workspaceId, "thinkingLevel", level);
   if (origin !== "sync") {
     updatePersistedState(getAutoThinkingLevelKey(workspaceId), false);
   }

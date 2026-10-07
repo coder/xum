@@ -1,8 +1,6 @@
 import {
-  getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
-  getModelKey,
   getReasoningModeKey,
   getThinkingLevelByModelKey,
   getThinkingLevelKey,
@@ -23,6 +21,7 @@ import {
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { getServerScope, readScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { migrateGlobalToPerModel } from "@/browser/contexts/ProviderOptionsContext";
 
@@ -40,29 +39,31 @@ function getProviderOptions(): MuxProviderOptions {
  */
 export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptions {
   const defaultModel = getDefaultModel();
-  const rawModel = readPersistedState<string>(getModelKey(workspaceId), defaultModel);
+  const rawModel = readScopedAiDefault(workspaceId, "model") ?? defaultModel;
   const baseModel = normalizeModelPreference(rawModel, defaultModel);
 
   // Read thinking level (workspace-scoped).
   // Migration: if the workspace-scoped value is missing, fall back to legacy per-model storage
   // once, then persist into the workspace-scoped key.
   const scopedKey = getThinkingLevelKey(workspaceId);
-  const existingScoped = readPersistedState<ThinkingLevel | undefined>(scopedKey, undefined);
+  const existingScoped = readScopedAiDefault(workspaceId, "thinkingLevel");
+  // Project and global scopes are typed preferences, so only workspace scopes migrate.
+  const migratesLegacyLevel =
+    existingScoped === undefined && getServerScope(workspaceId) === undefined;
   const thinkingLevel =
     existingScoped ??
-    readPersistedState<ThinkingLevel>(
-      getThinkingLevelByModelKey(baseModel),
-      WORKSPACE_DEFAULTS.thinkingLevel
-    );
-  if (existingScoped === undefined) {
+    (migratesLegacyLevel
+      ? readPersistedState<ThinkingLevel>(
+          getThinkingLevelByModelKey(baseModel),
+          WORKSPACE_DEFAULTS.thinkingLevel
+        )
+      : WORKSPACE_DEFAULTS.thinkingLevel);
+  if (migratesLegacyLevel) {
     // Best-effort: avoid losing a user's existing per-model preference.
     updatePersistedState<ThinkingLevel>(scopedKey, thinkingLevel);
   }
 
-  const agentId = readPersistedState<string>(
-    getAgentIdKey(workspaceId),
-    WORKSPACE_DEFAULTS.agentId
-  );
+  const agentId = readScopedAiDefault(workspaceId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
 
   // OpenAI pro reasoning mode (workspace-scoped); absent = standard.
   // Coerce untrusted persisted values so corrupt entries self-heal to "standard"

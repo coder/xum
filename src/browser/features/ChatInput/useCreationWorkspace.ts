@@ -94,7 +94,7 @@ import {
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { resolveDevcontainerSelection } from "@/browser/utils/devcontainerSelection";
 import { getErrorMessage } from "@/common/utils/errors";
-import { normalizeAgentId } from "@/common/utils/agentIds";
+import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
@@ -123,6 +123,18 @@ interface UseCreationWorkspaceOptions {
   autoRoutingEnabled?: boolean;
 }
 
+// Project defaults can still name a removed built-in agent, and only user actions write
+// preferences, so creation resolves it at read time. An empty map means the agents have not
+// loaded, and a custom agent may reuse a removed id.
+function resolveCreationAgentId(
+  agentId: string,
+  agentBaseById: ReadonlyMap<string, string | undefined> | undefined
+): string {
+  return agentBaseById && agentBaseById.size > 0
+    ? resolveRemovedBuiltinAgentId(agentId, agentBaseById.keys())
+    : agentId;
+}
+
 function syncCreationPreferences(
   projectPath: string,
   workspaceId: string,
@@ -142,10 +154,12 @@ function syncCreationPreferences(
     getAgentIdKey(GLOBAL_SCOPE_ID),
     WORKSPACE_DEFAULTS.agentId
   );
-  const effectiveAgentId =
+  const effectiveAgentId = resolveCreationAgentId(
     typeof projectAgentId === "string" && projectAgentId.trim().length > 0
       ? normalizeAgentId(projectAgentId, WORKSPACE_DEFAULTS.agentId)
-      : normalizeAgentId(globalDefaultAgentId, WORKSPACE_DEFAULTS.agentId);
+      : normalizeAgentId(globalDefaultAgentId, WORKSPACE_DEFAULTS.agentId),
+    agentBaseById
+  );
   updatePersistedState(getAgentIdKey(workspaceId), effectiveAgentId);
 
   // Preserve only creation choices that differ from configured defaults; recording
@@ -391,6 +405,7 @@ export function useCreationWorkspace({
     setDefaultRuntimeChoice,
     setTrunkBranch,
   } = useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk);
+  const creationAgentId = resolveCreationAgentId(settings.agentId, agentBaseById);
 
   // Persist draft workspace name generation state per draft (so multiple drafts don't share a
   // single auto-naming/manual-name state).
@@ -580,7 +595,7 @@ export function useCreationWorkspace({
         // project/global/default resolution chain as the creation UI.
         const sendMessageOptions = {
           ...getSendOptionsFromStorage(projectScopeId),
-          agentId: settings.agentId,
+          agentId: creationAgentId,
         };
         // Use normalized override if provided, otherwise fall back to already-normalized storage model
         const normalizedOverride = optionsOverride?.model
@@ -685,7 +700,7 @@ export function useCreationWorkspace({
         const initialAiSettingsPersisted = api.workspace
           .updateAgentAISettings({
             workspaceId: metadata.id,
-            agentId: settings.agentId,
+            agentId: creationAgentId,
             aiSettings: {
               model: settings.model,
               thinkingLevel: settings.thinkingLevel,
@@ -1040,7 +1055,7 @@ export function useCreationWorkspace({
       settings.selectedRuntime,
       runtimeAvailabilityState,
       setSelectedRuntime,
-      settings.agentId,
+      creationAgentId,
       settings.model,
       settings.thinkingLevel,
       settings.reasoningMode,

@@ -5,7 +5,9 @@ import { GlobalWindow } from "happy-dom";
 
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import { GLOBAL_SCOPE_ID, getAgentIdKey, getProjectScopeId } from "@/common/constants/storage";
+import { getAgentIdKey } from "@/common/constants/storage";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
+import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { AgentProvider, useAgent, type AgentContextValue } from "./AgentContext";
@@ -13,7 +15,7 @@ import { APIProvider, type APIClient } from "./API";
 import { ProjectProvider } from "./ProjectContext";
 import { RouterProvider } from "./RouterContext";
 import { WorkspaceProvider } from "./WorkspaceContext";
-import { createTestApiClient } from "@/browser/testUtils";
+import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
 
 let mockAgentDefinitions: AgentDefinitionDescriptor[] = [];
 let mockWorkspaceMetadata = new Map<string, { parentWorkspaceId?: string; agentId?: string }>();
@@ -98,13 +100,14 @@ function createEmptyAsyncIterable<T>(): AsyncIterable<T> {
   };
 }
 
-function createApiClient(): APIClient {
+function createApiClient(preferences?: UserPreferences): APIClient {
   const workspaceMetadata = Array.from(
     mockWorkspaceMetadata.entries(),
     ([workspaceId, overrides]) => createWorkspaceMetadata(workspaceId, overrides)
   );
 
   return createTestApiClient({
+    config: createTestPreferencesConfig(preferences),
     agents: {
       list: () => Promise.resolve(mockAgentDefinitions),
     },
@@ -147,10 +150,11 @@ function createApiClient(): APIClient {
 function renderAgentHarness(props: {
   projectPath: string;
   workspaceId?: string;
+  preferences?: UserPreferences;
   onChange: (value: AgentContextValue) => void;
 }) {
   return render(
-    <APIProvider client={createApiClient()}>
+    <APIProvider client={createApiClient(props.preferences)}>
       <RouterProvider>
         <ProjectProvider>
           <WorkspaceProvider>
@@ -191,6 +195,7 @@ describe("AgentContext", () => {
 
   afterEach(() => {
     cleanup();
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     getWorkspaceStoreRaw().dispose();
     mock.restore();
     globalThis.window = originalWindow;
@@ -200,29 +205,36 @@ describe("AgentContext", () => {
 
   test("project-scoped agent falls back to global default when project preference is unset", async () => {
     const projectPath = "/tmp/project";
-    window.localStorage.setItem(getAgentIdKey(GLOBAL_SCOPE_ID), JSON.stringify("ask"));
 
     let contextValue: AgentContextValue | undefined;
 
-    renderAgentHarness({ projectPath, onChange: (value) => (contextValue = value) });
+    renderAgentHarness({
+      projectPath,
+      preferences: { ai: { globalDefaults: { agentId: "ask" } } },
+      onChange: (value) => (contextValue = value),
+    });
 
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("exec");
     });
-    expect(window.localStorage.getItem(getAgentIdKey(getProjectScopeId(projectPath)))).toBeNull();
+    expect(getUserPreferences().ai?.projectDefaults).toBeUndefined();
   });
 
   test("project-scoped preference takes precedence over global default", async () => {
     const projectPath = "/tmp/project";
-    window.localStorage.setItem(getAgentIdKey(GLOBAL_SCOPE_ID), JSON.stringify("ask"));
-    window.localStorage.setItem(
-      getAgentIdKey(getProjectScopeId(projectPath)),
-      JSON.stringify("plan")
-    );
 
     let contextValue: AgentContextValue | undefined;
 
-    renderAgentHarness({ projectPath, onChange: (value) => (contextValue = value) });
+    renderAgentHarness({
+      projectPath,
+      preferences: {
+        ai: {
+          globalDefaults: { agentId: "ask" },
+          projectDefaults: { [projectPath]: { agentId: "plan" } },
+        },
+      },
+      onChange: (value) => (contextValue = value),
+    });
 
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("plan");
@@ -232,11 +244,14 @@ describe("AgentContext", () => {
   test("cycle shortcut advances to next agent", async () => {
     const projectPath = "/tmp/project";
     mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT];
-    window.localStorage.setItem(getAgentIdKey(GLOBAL_SCOPE_ID), JSON.stringify("exec"));
 
     let contextValue: AgentContextValue | undefined;
 
-    renderAgentHarness({ projectPath, onChange: (value) => (contextValue = value) });
+    renderAgentHarness({
+      projectPath,
+      preferences: { ai: { globalDefaults: { agentId: "exec" } } },
+      onChange: (value) => (contextValue = value),
+    });
 
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("exec");
@@ -259,11 +274,14 @@ describe("AgentContext", () => {
   test("cycle shortcut advances away from a custom auto agent", async () => {
     const projectPath = "/tmp/project";
     mockAgentDefinitions = [AUTO_PROJECT_AGENT, REVIEW_PROJECT_AGENT];
-    window.localStorage.setItem(getAgentIdKey(GLOBAL_SCOPE_ID), JSON.stringify("auto"));
 
     let contextValue: AgentContextValue | undefined;
 
-    renderAgentHarness({ projectPath, onChange: (value) => (contextValue = value) });
+    renderAgentHarness({
+      projectPath,
+      preferences: { ai: { globalDefaults: { agentId: "auto" } } },
+      onChange: (value) => (contextValue = value),
+    });
 
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("auto");
@@ -349,9 +367,7 @@ describe("AgentContext", () => {
 
   test("removed non-selectable agent in mutable workspace remaps and does not block shortcut actions", async () => {
     const projectPath = "/tmp/project";
-    const scopeKey = getAgentIdKey(getProjectScopeId(projectPath));
     mockAgentDefinitions = [LOCKED_AGENT, EXEC_AGENT, PLAN_AGENT];
-    window.localStorage.setItem(scopeKey, JSON.stringify("mux"));
 
     let contextValue: AgentContextValue | undefined;
     let openPickerEvents = 0;
@@ -361,12 +377,17 @@ describe("AgentContext", () => {
     window.addEventListener(CUSTOM_EVENTS.OPEN_AGENT_PICKER, handleOpenPicker as EventListener);
 
     try {
-      renderAgentHarness({ projectPath, onChange: (value) => (contextValue = value) });
+      renderAgentHarness({
+        projectPath,
+        preferences: { ai: { projectDefaults: { [projectPath]: { agentId: "mux" } } } },
+        onChange: (value) => (contextValue = value),
+      });
 
       await waitFor(() => {
         expect(contextValue?.agentId).toBe("exec");
       });
-      expect(window.localStorage.getItem(scopeKey)).toBe(JSON.stringify("exec"));
+      // The removed agent resolves at read time; no repair write reaches config.json.
+      expect(getUserPreferences().ai?.projectDefaults?.[projectPath]?.agentId).toBe("mux");
 
       window.api = { platform: "darwin", versions: {} };
 

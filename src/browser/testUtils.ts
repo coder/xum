@@ -3,10 +3,12 @@ import type { APIClient } from "@/browser/contexts/API";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import type { ExperimentId } from "@/common/constants/experiments";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import { getDefaultAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
 import { DEFAULT_RUNTIME_ENABLEMENT } from "@/common/types/runtime";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 
 // Shared test utilities for browser tests
@@ -167,6 +169,18 @@ export function createTestConfig(overrides: Partial<TestClientConfig> = {}): Tes
     goalDefaults: DEFAULT_GOAL_DEFAULTS,
     experiments: {},
     ...overrides,
+  };
+}
+
+/** `config` procedures whose user preferences live in memory and take merge-patch writes. */
+export function createTestPreferencesConfig(initial: UserPreferences = {}) {
+  let userPreferences = initial;
+  return {
+    getConfig: () => Promise.resolve(createTestConfig({ userPreferences })),
+    updateUserPreferences: (input: { patches: unknown[] }) => {
+      userPreferences = input.patches.reduce(applyMergePatch, userPreferences) as UserPreferences;
+      return Promise.resolve();
+    },
   };
 }
 

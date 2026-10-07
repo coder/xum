@@ -7,6 +7,9 @@ import {
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
   getModelKey,
+  getProjectScopeId,
+  getThinkingLevelByModelKey,
+  getThinkingLevelKey,
 } from "@/common/constants/storage";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { installDom } from "../../../../tests/ui/dom";
@@ -74,6 +77,14 @@ describe("getSendOptionsFromStorage", () => {
 
     expect(options.model).toBe(rawModel);
     expect(options.thinkingLevel).toBe(WORKSPACE_DEFAULTS.thinkingLevel);
+  });
+
+  test("a project scope ignores the legacy per-model thinking level and writes nothing", () => {
+    const projectScopeId = getProjectScopeId("/repo");
+    window.localStorage.setItem(getThinkingLevelByModelKey("openai:default"), '"high"');
+
+    expect(getSendOptionsFromStorage(projectScopeId).thinkingLevel).toBe("off");
+    expect(window.localStorage.getItem(getThinkingLevelKey(projectScopeId))).toBeNull();
   });
 
   test("keeps direct-provider model preferences normalized via the shared helper", () => {

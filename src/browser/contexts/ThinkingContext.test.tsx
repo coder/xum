@@ -26,7 +26,13 @@ import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
-import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import {
+  createTestApiClient,
+  createTestPreferencesConfig,
+  type TestApiOverrides,
+} from "@/browser/testUtils";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
+import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 
 let currentClientMock: TestApiOverrides<APIClient> = {};
 let metadataMap = new Map<string, FrontendWorkspaceMetadata>();
@@ -113,9 +119,16 @@ const ReasoningModeComponent: React.FC = () => {
   return <div data-testid="reasoning-mode">{reasoningMode}</div>;
 };
 
-function renderWithAPI(children: React.ReactNode) {
+function renderWithAPI(children: React.ReactNode, preferences?: UserPreferences) {
   return render(
-    <APIProvider client={createTestApiClient(currentClientMock)}>{children}</APIProvider>
+    <APIProvider
+      client={createTestApiClient({
+        config: createTestPreferencesConfig(preferences),
+        ...currentClientMock,
+      })}
+    >
+      {children}
+    </APIProvider>
   );
 }
 
@@ -298,6 +311,7 @@ describe("ThinkingContext", () => {
 
   afterEach(() => {
     cleanup();
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     metadataMap = new Map();
     currentClientMock = {};
   });
@@ -715,12 +729,7 @@ describe("ThinkingContext", () => {
     // Project/global scopes have no active turn to override; the route must
     // not fire (persisted settings alone drive the next turn).
     await waitFor(() => {
-      expect(
-        readPersistedState<ThinkingLevel | null>(
-          getThinkingLevelKey(getProjectScopeId(projectPath)),
-          null
-        )
-      ).toBe("medium");
+      expect(getUserPreferences().ai?.projectDefaults?.[projectPath]?.thinkingLevel).toBe("medium");
     }, METADATA_WAIT_OPTIONS);
     expect(setActiveTurnThinkingLevel).not.toHaveBeenCalled();
   });
@@ -728,18 +737,17 @@ describe("ThinkingContext", () => {
   test("cycles thinking level via keybind in project-scoped (creation) flow", async () => {
     const projectPath = "/Users/dev/my-project";
 
-    // Force a model with a multi-level thinking policy.
-    updatePersistedState(getModelKey(getProjectScopeId(projectPath)), "openai:gpt-4.1");
-
     const ProjectChild: React.FC = () => {
       const [thinkingLevel] = useThinkingLevel();
       return <div data-testid="thinking-project">{thinkingLevel}</div>;
     };
 
+    // Force a model with a multi-level thinking policy.
     const view = renderWithAPI(
       <ThinkingProvider projectPath={projectPath}>
         <ProjectChild />
-      </ThinkingProvider>
+      </ThinkingProvider>,
+      { ai: { projectDefaults: { [projectPath]: { model: "openai:gpt-4.1" } } } }
     );
 
     await waitFor(() => {
@@ -762,13 +770,13 @@ describe("ThinkingContext", () => {
   test("a concrete pick via setter or keybind leaves Auto thinking routing", async () => {
     const projectPath = "/Users/dev/auto-thinking";
     const scopeId = getProjectScopeId(projectPath);
-    updatePersistedState(getModelKey(scopeId), "openai:gpt-4.1");
     updatePersistedState(getAutoThinkingLevelKey(scopeId), true);
 
     const view = renderWithAPI(
       <ThinkingProvider projectPath={projectPath}>
         <ThinkingSetterComponent />
-      </ThinkingProvider>
+      </ThinkingProvider>,
+      { ai: { projectDefaults: { [projectPath]: { model: "openai:gpt-4.1" } } } }
     );
 
     const button = await view.findByTestId("set-thinking-medium", undefined, METADATA_WAIT_OPTIONS);

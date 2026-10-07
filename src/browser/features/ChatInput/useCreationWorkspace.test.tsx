@@ -21,6 +21,7 @@ import {
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
   getThinkingLevelKey,
+  getWorkspaceAISettingsByAgentKey,
   getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
@@ -1969,6 +1970,57 @@ describe("useCreationWorkspace", () => {
     expect(sendRequest?.options?.agentId).toBe("ask");
   });
 
+  test("resolves a project default naming a removed built-in agent before copying it", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({ success: true as const, data: {} })
+    );
+    const updateAgentAISettingsMock = mock(
+      (_args: WorkspaceUpdateAgentAISettingsArgs): Promise<WorkspaceUpdateAgentAISettingsResult> =>
+        Promise.resolve({ success: true, data: undefined } as WorkspaceUpdateAgentAISettingsResult)
+    );
+    setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+      sendMessage: sendMessageMock,
+      updateAgentAISettings: updateAgentAISettingsMock,
+      create: mock(
+        (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+          Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+      ),
+    });
+
+    const projectScopeId = getProjectScopeId(TEST_PROJECT_PATH);
+    persistedPreferences[getAgentIdKey(projectScopeId)] = "mux";
+    persistedPreferences[getModelKey(projectScopeId)] = "gpt-4";
+    draftSettingsState = createDraftSettingsHarness({ agentId: "mux" });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+      agentBaseById: new Map([
+        ["exec", undefined],
+        ["plan", undefined],
+      ]),
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+    await act(async () => {
+      await getHook().handleSend("launch workspace");
+    });
+
+    expect(updatePersistedStateCalls).toContainEqual([getAgentIdKey(TEST_WORKSPACE_ID), "exec"]);
+    const cachedAgentIds = updatePersistedStateCalls
+      .filter(([key]) => key === getWorkspaceAISettingsByAgentKey(TEST_WORKSPACE_ID))
+      .map(([, updater]) => Object.keys((updater as (prev: unknown) => object)({})));
+    expect(cachedAgentIds).toEqual([["exec"]]);
+    expect(updateAgentAISettingsMock.mock.calls[0]?.[0]?.agentId).toBe("exec");
+    expect(sendMessageMock.mock.calls[0]?.[0]?.options?.agentId).toBe("exec");
+  });
+
   test.each([true, false])(
     "records only creation routing picks that differ from the agent's Auto default (experiment %p)",
     async (autoRoutingEnabled) => {
@@ -2511,6 +2563,7 @@ interface HookOptions {
       markPendingInitialSend?: boolean;
     }
   ) => void;
+  agentBaseById?: ReadonlyMap<string, string | undefined>;
   autoRoutingEnabled?: boolean;
   message?: string;
   draftId?: string | null;
