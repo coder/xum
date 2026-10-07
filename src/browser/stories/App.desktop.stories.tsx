@@ -1,7 +1,7 @@
 import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
 import type { APIClient } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   getRightSidebarLayoutKey,
   LEFT_SIDEBAR_COLLAPSED_KEY,
@@ -48,6 +48,7 @@ function setupDesktopStory(phone = false): APIClient {
     projectName: "desktop-demo",
     messages: [],
     additionalWorkspaces: [isolatedWorkspace],
+    experiments: { [EXPERIMENT_IDS.PORTABLE_DESKTOP]: true },
   });
   // Only bootstrap carries the binding; a capability probe must not determine the viewer's label.
   client.desktop = {
@@ -61,7 +62,6 @@ function setupDesktopStory(phone = false): APIClient {
     getCapability: () => Promise.resolve(capability),
     getBootstrap,
   };
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.PORTABLE_DESKTOP), true);
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, phone);
   updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "desktop");
   updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, 320);
@@ -106,7 +106,6 @@ export default {
   beforeEach: () => () => {
     for (const viewer of DesktopRfb.instances) viewer.disconnect();
     DesktopRfb.instances = [];
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.PORTABLE_DESKTOP), undefined);
   },
 };
 

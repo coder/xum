@@ -17,6 +17,7 @@ import { createWorkspace, groupWorkspacesByProject } from "../mocks/workspaces";
 import { createStaticChatHandler, createStreamingChatHandler } from "../mocks/chatHandlers";
 import type { GitStatusFixture } from "../mocks/git";
 import { createMockORPCClient, type MockSessionUsage } from "@/browser/stories/mocks/orpc";
+import type { ExperimentId } from "@/common/constants/experiments";
 import { collapseRightSidebar, selectWorkspace } from "./uiState";
 import { createGitStatusExecutor, type GitDiffFixture } from "./git";
 
@@ -98,6 +99,8 @@ export interface SimpleChatSetupOptions {
   clearLogsResult?: { success: boolean; error?: string | null };
   /** Full-width transcript preference returned by the mock config API. */
   chatTranscriptFullWidth?: boolean;
+  /** Backend experiment values returned by the mock config API. */
+  experiments?: Partial<Record<ExperimentId, boolean>>;
   /** Timeline events served by the mock workspace.timeline endpoints. */
   timelineEvents?: TimelineEvent[];
   /** Render the chat workspace as transcript-only (worktree gone; no composer). */
@@ -194,6 +197,7 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
     logEntries: opts.logEntries,
     clearLogsResult: opts.clearLogsResult,
     chatTranscriptFullWidth: opts.chatTranscriptFullWidth,
+    experiments: opts.experiments,
     timelineEvents: opts.timelineEvents,
     mcpIcons: opts.mcpIcons,
   });

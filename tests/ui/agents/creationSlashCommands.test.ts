@@ -23,7 +23,7 @@ import {
 } from "../helpers";
 import { ChatHarness } from "../harness";
 
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import {
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
@@ -31,7 +31,7 @@ import {
   getModelKey,
   getProjectScopeId,
 } from "@/common/constants/storage";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -44,12 +44,11 @@ interface CreationView {
   chat: ChatHarness;
 }
 
-async function setupCreationView(options?: { beforeRender?: () => void }): Promise<CreationView> {
+async function setupCreationView(): Promise<CreationView> {
   const env = getSharedEnv();
   const projectPath = getSharedRepoPath();
 
   const cleanupDom = setupTestDom();
-  options?.beforeRender?.();
 
   const view = renderApp({ apiClient: env.orpc });
 
@@ -142,10 +141,11 @@ describeIntegration("Creation slash commands", () => {
     await env.orpc.config.updateAgentAiDefaults({
       agentAiDefaults: { exec: { autoModelRouting: true } },
     });
-    const { projectPath, view, cleanupDom } = await setupCreationView({
-      beforeRender: () =>
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true),
+    await env.orpc.experiments.set({
+      experimentId: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
+      enabled: true,
     });
+    const { projectPath, view, cleanupDom } = await setupCreationView();
 
     try {
       const projectScopeId = getProjectScopeId(projectPath);
@@ -159,6 +159,10 @@ describeIntegration("Creation slash commands", () => {
     } finally {
       await cleanupView(view, cleanupDom);
       await env.orpc.config.updateAgentAiDefaults({ agentAiDefaults: {} });
+      await env.orpc.experiments.set({
+        experimentId: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
+        enabled: null,
+      });
     }
   }, 30_000);
 });
