@@ -5,7 +5,6 @@ import { GenericToolCall } from "@/browser/features/Tools/GenericToolCall";
 import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 const meta = {
   ...lightweightMeta,
@@ -96,12 +95,10 @@ const DICE_RESULT = {
 };
 
 function renderMcpAppCall() {
-  getAppConfigStore().setClient(
-    createMockORPCClient({ experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true } })
-  );
   return (
     <APIProvider
       client={createMockORPCClient({
+        experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true },
         mcpApps: {
           views: {
             "call-dice-1": {

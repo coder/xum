@@ -9,6 +9,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 
+import { useMinThinkingLevels } from "./useMinThinkingLevels";
 import { useRouting } from "./useRouting";
 import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
 
@@ -232,5 +233,28 @@ describe("useRouting", () => {
     expect(result.current.routePriority).toEqual(["mux-gateway", "direct"]);
 
     await waitFor(() => expect(result.current.routePriority).toEqual(["direct"]));
+  });
+
+  test("a preferences-only update does not re-render routing or thinking-floor consumers", async () => {
+    getProvidersConfigStore().setClient(stubClient);
+    let renders = 0;
+    const { result } = renderHook(
+      () => {
+        renders++;
+        return [useRouting(), useMinThinkingLevels()] as const;
+      },
+      { wrapper }
+    );
+    await waitFor(() => expect(getAppConfigStore().getSnapshot()).not.toBeNull());
+    await waitFor(() => expect(result.current[0].routePriority).toEqual(["direct"]));
+    const rendersBefore = renders;
+
+    act(() => {
+      getAppConfigStore().updateOptimistically({
+        userPreferences: { appearance: { theme: "light" } },
+      });
+    });
+
+    expect(renders).toBe(rendersBefore);
   });
 });

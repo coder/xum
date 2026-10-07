@@ -10,7 +10,6 @@ import type {
 } from "@/common/orpc/schemas/memory";
 
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { MemoryTab } from "./MemoryTab";
 
 const meta: Meta<typeof MemoryTab> = {
@@ -96,12 +95,10 @@ const CONSOLIDATION_RECORD: MemoryConsolidationRecordPayload = {
 // The Memory tab lives in the narrow right sidebar, so pin the story to a
 // sidebar-like width (also exercises the ~375px mobile layout contract).
 function renderTab(width: string) {
-  getAppConfigStore().setClient(
-    createMockORPCClient({ experiments: { [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true } })
-  );
   return (
     <APIProvider
       client={createMockORPCClient({
+        experiments: { [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true },
         memoryFiles: MEMORY_FILES,
         memoryConsolidationStatus: {
           workspaceRecord: null,

@@ -1,4 +1,7 @@
+import { useSyncExternalStore } from "react";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { APIClient } from "@/browser/contexts/API";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { BashCollapsedSummaryMode, TranscriptDensity } from "@/common/constants/storage";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -26,6 +29,43 @@ export interface AppConfigSnapshot {
   keepScreenAwake?: boolean;
   /** Backend experiment values; the only experiment state the renderer reads. */
   experiments?: Partial<Record<ExperimentId, boolean>>;
+  userPreferences?: UserPreferences;
+}
+
+const EMPTY_SNAPSHOT: AppConfigSnapshot = {};
+const INITIAL_READ_RETRY_MS = 250;
+const MAX_INITIAL_READ_RETRY_MS = 5_000;
+const EMPTY_USER_PREFERENCES: UserPreferences = {};
+
+/**
+ * Returns `previous` when it deep-equals `next`, else `next` rebuilt around the unchanged children
+ * of `previous`. onConfigChanged fires after every config write (workspace metadata too), so this
+ * keeps selectors over unchanged slices from re-rendering on unrelated writes.
+ */
+function reuseUnchanged<T>(previous: unknown, next: T): T;
+function reuseUnchanged(previous: unknown, next: unknown): unknown {
+  if (Object.is(previous, next)) return previous;
+  if (Array.isArray(next) && Array.isArray(previous)) {
+    const previousItems: unknown[] = previous;
+    const nextItems: unknown[] = next;
+    const merged = nextItems.map((value, index) => reuseUnchanged(previousItems[index], value));
+    const unchanged =
+      merged.length === previousItems.length &&
+      merged.every((value, index) => value === previousItems[index]);
+    return unchanged ? previousItems : merged;
+  }
+  if (isPlainObject(next) && isPlainObject(previous)) {
+    const merged: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(next)) {
+      merged[key] = reuseUnchanged(previous[key], value);
+    }
+    const keys = Object.keys(merged);
+    const unchanged =
+      keys.length === Object.keys(previous).length &&
+      keys.every((key) => key in previous && merged[key] === previous[key]);
+    return unchanged ? previous : merged;
+  }
+  return next;
 }
 
 /**
@@ -50,8 +90,16 @@ export class AppConfigStore {
   // Live onConfigChanged iterator, kept on the instance so setClient can
   // force-close it (see ProvidersConfigStore for the leak rationale).
   private subscriptionIterator: AsyncIterator<unknown> | null = null;
+  private loadedCurrentClient = false;
+  private readonly wait: (ms: number) => Promise<void>;
+
+  constructor(wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))) {
+    this.wait = wait;
+  }
 
   setClient(client: APIClient | null): void {
+    // Reconnecting the current client (stories wire it beside APIProvider) keeps its subscription.
+    if (client === this.client) return;
     this.client = client;
 
     this.subscriptionController?.abort();
@@ -60,13 +108,28 @@ export class AppConfigStore {
     this.subscriptionIterator = null;
     // Invalidate in-flight fetches from the previous client.
     this.fetchVersion++;
+    this.loadedCurrentClient = false;
 
     if (!client) {
       return;
     }
 
-    void this.refresh();
-    this.runConfigChangedSubscription(client);
+    const controller = new AbortController();
+    this.subscriptionController = controller;
+    void this.loadInitialConfig(controller.signal);
+    this.runConfigChangedSubscription(client, controller);
+  }
+
+  // onConfigChanged may never fire on an idle backend, so a failed first read is retried until
+  // one succeeds; otherwise the app would stay on defaults with no base for later writes.
+  private async loadInitialConfig(signal: AbortSignal): Promise<void> {
+    for (let delayMs = INITIAL_READ_RETRY_MS; ; ) {
+      await this.refresh();
+      if (signal.aborted || this.loadedCurrentClient) return;
+      await this.wait(delayMs);
+      if (signal.aborted || this.loadedCurrentClient) return;
+      delayMs = Math.min(delayMs * 2, MAX_INITIAL_READ_RETRY_MS);
+    }
   }
 
   subscribe = (listener: () => void): (() => void) => {
@@ -91,7 +154,7 @@ export class AppConfigStore {
         const taskSettings = config.taskSettings as
           | { proposePlanImplementReplacesChatHistory?: boolean }
           | undefined;
-        this.snapshot = {
+        const next = reuseUnchanged(this.snapshot, {
           routePriority: config.routePriority,
           routeOverrides: config.routeOverrides,
           minThinkingLevelByModel: config.minThinkingLevelByModel,
@@ -103,8 +166,13 @@ export class AppConfigStore {
           agentAiDefaults: config.agentAiDefaults,
           keepScreenAwake: config.keepScreenAwake === true,
           experiments: config.experiments ?? {},
-        };
-        this.notify();
+          userPreferences: config.userPreferences ?? EMPTY_USER_PREFERENCES,
+        });
+        this.loadedCurrentClient = true;
+        if (next !== this.snapshot) {
+          this.snapshot = next;
+          this.notify();
+        }
       }
     } catch {
       // Best-effort only; consumers degrade to defaults.
@@ -122,16 +190,21 @@ export class AppConfigStore {
     this.notify();
   };
 
+  /** Forgets the loaded config, so nothing shows another server's values before the next fetch. */
+  clearCachedState = (): void => {
+    this.fetchVersion++;
+    this.snapshot = null;
+    this.notify();
+  };
+
   private notify(): void {
     for (const listener of this.listeners) {
       listener();
     }
   }
 
-  private runConfigChangedSubscription(client: APIClient): void {
-    const controller = new AbortController();
+  private runConfigChangedSubscription(client: APIClient, controller: AbortController): void {
     const { signal } = controller;
-    this.subscriptionController = controller;
 
     let iterator: AsyncIterator<unknown> | null = null;
 
@@ -170,4 +243,18 @@ let storeInstance: AppConfigStore | null = null;
 export function getAppConfigStore(): AppConfigStore {
   storeInstance ??= new AppConfigStore();
   return storeInstance;
+}
+
+/** `select` must return a slice of the snapshot, not a new object, or the hook re-renders forever. */
+export function useAppConfig<T>(select: (config: AppConfigSnapshot) => T): T {
+  const store = getAppConfigStore();
+  return useSyncExternalStore(store.subscribe, () => select(store.getSnapshot() ?? EMPTY_SNAPSHOT));
+}
+
+export function getUserPreferences(): UserPreferences {
+  return getAppConfigStore().getSnapshot()?.userPreferences ?? EMPTY_USER_PREFERENCES;
+}
+
+export function useUserPreferences<T>(select: (preferences: UserPreferences) => T): T {
+  return useAppConfig((config) => select(config.userPreferences ?? EMPTY_USER_PREFERENCES));
 }

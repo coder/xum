@@ -991,11 +991,12 @@ describe("GeneralSection", () => {
     const { api, updateCoderPrefsMock } = createMockAPI({
       worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
     });
-    let rejectGetConfig: ((error?: unknown) => void) | undefined;
+    // The shared AppConfigStore fetches too, so settle every pending call.
+    const rejectGetConfig: Array<(error?: unknown) => void> = [];
     api.config.getConfig = mock(
       () =>
         new Promise<MockConfig>((_resolve, reject) => {
-          rejectGetConfig = reject;
+          rejectGetConfig.push(reject);
         })
     );
     mockApi = api;
@@ -1007,13 +1008,13 @@ describe("GeneralSection", () => {
     );
 
     await waitFor(() => {
-      expect(rejectGetConfig).toBeDefined();
+      expect(rejectGetConfig.length).toBeGreaterThan(0);
     });
 
     const trigger = getSelectTrigger(view, "Worktree archive behavior");
     expect(trigger.hasAttribute("disabled")).toBe(true);
 
-    rejectGetConfig?.(new Error("config read failed"));
+    for (const reject of rejectGetConfig) reject(new Error("config read failed"));
 
     await waitFor(() => {
       expect(trigger.hasAttribute("disabled")).toBe(false);
@@ -1034,11 +1035,11 @@ describe("GeneralSection", () => {
       worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
     });
     const loadedConfig = await getConfigMock();
-    let resolveGetConfig: ((value: MockConfig) => void) | undefined;
+    const resolveGetConfig: Array<(value: MockConfig) => void> = [];
     api.config.getConfig = mock(
       () =>
         new Promise<MockConfig>((resolve) => {
-          resolveGetConfig = resolve;
+          resolveGetConfig.push(resolve);
         })
     );
     mockApi = api;
@@ -1050,7 +1051,7 @@ describe("GeneralSection", () => {
     );
 
     await waitFor(() => {
-      expect(resolveGetConfig).toBeDefined();
+      expect(resolveGetConfig.length).toBeGreaterThan(0);
     });
 
     const trigger = getSelectTrigger(view, "Worktree archive behavior");
@@ -1059,11 +1060,13 @@ describe("GeneralSection", () => {
     fireEvent.mouseDown(trigger);
     expect(updateCoderPrefsMock).not.toHaveBeenCalled();
 
-    resolveGetConfig?.({
-      ...loadedConfig,
-      coderWorkspaceArchiveBehavior: "delete",
-      worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
-    });
+    for (const resolve of resolveGetConfig) {
+      resolve({
+        ...loadedConfig,
+        coderWorkspaceArchiveBehavior: "delete",
+        worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
+      });
+    }
 
     await waitFor(() => {
       expect(updateCoderPrefsMock).not.toHaveBeenCalled();

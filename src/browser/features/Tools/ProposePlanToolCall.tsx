@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useSyncExternalStore } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import type {
   ProposePlanToolResult,
   ProposePlanToolError,
@@ -62,7 +62,7 @@ import {
   useHostTranscriptMutationCheck,
 } from "@/browser/utils/transcriptBarrier";
 import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import {
   resolveAutoRoutingForAgent,
@@ -270,11 +270,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   // silently sending without the replacement.
   // Live from the shared app config store (refreshed on config changes), so a setting change
   // while the card is mounted updates the affordance. Dispatch re-reads the config anyway.
-  const appConfig = useSyncExternalStore(
-    getAppConfigStore().subscribe,
-    getAppConfigStore().getSnapshot
-  );
-  const implementReplacesChatHistory = appConfig?.proposePlanImplementReplacesChatHistory ?? false;
+  const implementReplacesChatHistory =
+    useAppConfig((config) => config.proposePlanImplementReplacesChatHistory) ?? false;
   const canReplaceChatHistory =
     useChatHostContext().uiSupport.chatHistoryReplacement === "supported";
   const historyReplacementUnavailable = implementReplacesChatHistory && !canReplaceChatHistory;

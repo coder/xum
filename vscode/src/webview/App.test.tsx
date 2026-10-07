@@ -1110,6 +1110,12 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://y" } });
     await emitBackgroundBashes(bridge, WORKSPACE.id);
     expect(view.queryByText(script)).not.toBeNull();
+
+    // A deep-equal config from the new server still restores the mode.
+    await bridge.answer("config.getConfig", {
+      userPreferences: { appearance: { bashCollapsedSummaryMode: "intent" } },
+    });
+    expect(view.queryByText(script)).toBeNull();
   });
 
   test("hyper transcript density collapses a finished turn's work into a work bundle (#4979)", async () => {
