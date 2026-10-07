@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   getAutoModelRoutingKey,
@@ -24,6 +25,7 @@ describe("getSendOptionsFromStorage", () => {
 
   afterEach(() => {
     resetTestExperiments();
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     window.localStorage.clear();
     cleanupDom?.();
     cleanupDom = null;
@@ -83,12 +85,9 @@ describe("getSendOptionsFromStorage", () => {
   test("includes Anthropic prompt cache TTL from persisted provider options", () => {
     const workspaceId = "ws-3";
 
-    window.localStorage.setItem(
-      "provider_options_anthropic",
-      JSON.stringify({
-        cacheTtl: "1h",
-      })
-    );
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { ai: { providerOptions: { anthropic: { cacheTtl: "1h" } } } },
+    });
 
     const options = getSendOptionsFromStorage(workspaceId);
     expect(options.providerOptions?.anthropic?.cacheTtl).toBe("1h");

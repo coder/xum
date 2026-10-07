@@ -24,7 +24,7 @@ import { UILayoutsProvider } from "@/browser/contexts/UILayoutsContext";
 import { WorkspaceProvider } from "@/browser/contexts/WorkspaceContext";
 import { SplashScreenProvider } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { TerminalRouterProvider } from "@/browser/terminal/TerminalRouterContext";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
@@ -38,7 +38,6 @@ import {
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   SELECTED_WORKSPACE_KEY,
-  getAutoCompactionThresholdKey,
   getRightSidebarLayoutKey,
 } from "@/common/constants/storage";
 import type { Meta, StoryObj } from "@storybook/react-vite";
@@ -1263,15 +1262,15 @@ export const CompactionModelWarning: Story = {
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-compact-warning"));
 
-        // Set auto-compact threshold to 80% for anthropic:claude-opus-4-1
-        // 80% of 200k = 160k, which exceeds gpt-4o's 128k context
-        updatePersistedState(getAutoCompactionThresholdKey("anthropic:claude-opus-4-1"), 80);
-
         const client = setupSimpleChatStory({
           workspaceId: "ws-compact-warning",
           workspaceName: "feature/compaction",
           projectName: "my-app",
           agentAiDefaults: { compact: { modelString: "openai:gpt-4o" } },
+          // 80% of 200k = 160k, which exceeds gpt-4o's 128k context
+          userPreferences: {
+            ai: { autoCompactionThresholdByModel: { "anthropic:claude-opus-4-1": 80 } },
+          },
           messages: [
             createUserMessage("msg-1", "Help me refactor this large codebase", {
               historySequence: 1,

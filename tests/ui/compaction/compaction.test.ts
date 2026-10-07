@@ -16,10 +16,8 @@ import { BackgroundProcessManager } from "@/node/services/backgroundProcessManag
 import { fireEvent } from "@testing-library/react";
 import { createAppHarness } from "../harness";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getAppConfigStore, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { resolveAutoCompactionThreshold } from "@/common/utils/compaction/autoCompactionThreshold";
 
 interface ServiceContainerPrivates {
@@ -83,12 +81,13 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
 const FORCE_THRESHOLD_PERCENT = 10;
 
 /**
- * Move the per-model slider the way the UI does (a persisted-state write that the
- * UserPreferencesProvider mirrors into config.json). 10% threshold + 5% force buffer =>
- * force compaction triggers at 15%.
+ * Move the per-model slider the way the UI does (a merge patch to config.json).
+ * 10% threshold + 5% force buffer => force compaction triggers at 15%.
  */
 function moveThresholdSlider(percent: number): void {
-  updatePersistedState(getAutoCompactionThresholdKey(WORKSPACE_DEFAULTS.model), percent);
+  updateUserPreferences({
+    ai: { autoCompactionThresholdByModel: { [WORKSPACE_DEFAULTS.model]: percent } },
+  });
 }
 
 /** The backend reads the threshold from config.json; wait until the mirrored write landed. */
