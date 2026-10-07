@@ -81,6 +81,7 @@ describe("supportsAnthropicNativeWebFetch", () => {
     ["claude-mythos-5-1", true],
     ["claude-opus-5-5", true],
     ["claude-sonnet-5-5", true],
+    ["claude-haiku-5-5", true],
     ["claude-sonnet-4-6", true],
     ["claude-opus-4-6", true],
     ["claude-opus-4-8", true],

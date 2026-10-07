@@ -456,7 +456,8 @@ export function buildProviderOptions(
     // Opus 4.5 uses enabled thinking with a budgetTokens ceiling.
     const isOpus45 = capModelName?.includes("opus-4-5") ?? false;
     const isOpus46 = capModelName?.includes("opus-4-6") ?? false;
-    // Opus 4.7+ and Sonnet 5+ — the native-xhigh tier, which also uses adaptive thinking.
+    // Opus 4.7+, Sonnet 5+ and Haiku 5+ — the native-xhigh tier, which also uses adaptive
+    // thinking. Haiku 5.5 must land here: it rejects `budget_tokens` (400).
     const supportsNativeXhigh = anthropicSupportsNativeXhigh(capabilityModel);
     const isSonnet46 = capModelName?.includes("sonnet-4-6") ?? false;
     const usesAdaptiveThinking = isOpus46 || supportsNativeXhigh || isSonnet46;

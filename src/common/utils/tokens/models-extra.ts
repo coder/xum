@@ -598,6 +598,33 @@ export const modelsExtra: Record<string, ModelData> = {
     knowledge_cutoff: "2025-01",
   },
 
+  // Claude Haiku 5.5 - Released October 7, 2026
+  // Official tiered pricing, split at 100K prompt tokens (5x above):
+  //   <=100K: $0.10/M input, $0.50/M output, 5-minute cache write $0.125/M, cache read $0.01/M
+  //   >100K:  $0.50/M input, $2.50/M output, 5-minute cache write $0.625/M, cache read $0.05/M
+  // The 1-hour cache-write tier ($0.20/M, $1/M above 100K) has no field here, matching the
+  // other Claude entries. Native 1M context, 128K max output, adaptive thinking only.
+  // https://platform.claude.com/docs/en/models/haiku-5-5/overview
+  "claude-haiku-5-5": {
+    max_input_tokens: 1000000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.0000001, // $0.10 per million input tokens
+    input_cost_per_token_above_200k_tokens: 0.0000005, // $0.50 per million input tokens (>100K)
+    output_cost_per_token: 0.0000005, // $0.50 per million output tokens
+    output_cost_per_token_above_200k_tokens: 0.0000025, // $2.50 per million output tokens (>100K)
+    cache_creation_input_token_cost: 0.000000125, // $0.125 per million tokens (1.25x input)
+    cache_creation_input_token_cost_above_200k_tokens: 0.000000625, // $0.625 per million (>100K)
+    cache_read_input_token_cost: 0.00000001, // $0.01 per million tokens (0.1x input)
+    cache_read_input_token_cost_above_200k_tokens: 0.00000005, // $0.05 per million (>100K)
+    tiered_pricing_threshold_tokens: 100000, // Anthropic's published boundary is 100K (field names say 200K)
+    litellm_provider: "anthropic",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Claude Haiku 4.5 - Released October 15, 2025
   // $1/M input, $5/M output
   "claude-haiku-4-5": {

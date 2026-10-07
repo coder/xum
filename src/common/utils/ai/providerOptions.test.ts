@@ -142,10 +142,16 @@ describe("buildProviderOptions - Anthropic", () => {
     });
   }
 
-  // Native-xhigh models (Opus 4.7+ / Sonnet 5+): xhigh is a distinct native
+  // Native-xhigh models (Opus 4.7+ / Sonnet 5+ / Haiku 5+): xhigh is a distinct native
   // effort and adaptive thinking requires `display: "summarized"` to return
-  // thinking content.
-  for (const model of ["claude-opus-4-7", "claude-opus-5", "claude-sonnet-5"] as const) {
+  // thinking content. Haiku 5.5 rejects `budget_tokens` but accepts `disabled`, so it
+  // must take this path rather than the budgetTokens path Haiku 4.5 still uses.
+  for (const model of [
+    "claude-opus-4-7",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-5-5",
+  ] as const) {
     describe(`${model} (native xhigh effort + summarized display)`, () => {
       for (const { thinking, expectedThinking, effort } of [
         {
@@ -459,6 +465,7 @@ describe("buildProviderOptions - Anthropic", () => {
       for (const model of [
         "claude-opus-5-5",
         "claude-sonnet-5-5",
+        "claude-haiku-5-5",
         "claude-fable-5-1",
         "claude-mythos-5-1",
       ]) {
