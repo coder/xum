@@ -148,7 +148,6 @@ export type TestClientConfig = Awaited<ReturnType<APIClient["config"]["getConfig
  */
 export function createTestConfig(overrides: Partial<TestClientConfig> = {}): TestClientConfig {
   return {
-    userPreferencesInitialized: false,
     taskSettings: DEFAULT_TASK_SETTINGS,
     autoModelRouting: getDefaultAutoModelRoutingConfig(),
     advisorModelString: null,

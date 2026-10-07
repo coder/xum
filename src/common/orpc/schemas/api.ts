@@ -3100,7 +3100,6 @@ export const config = {
   getConfig: {
     input: z.void(),
     output: z.object({
-      userPreferencesInitialized: z.boolean(),
       userPreferences: UserPreferencesSchema.optional(),
       taskSettings: ResolvedTaskSettingsSchema,
       muxGatewayEnabled: z.boolean().optional(),

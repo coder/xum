@@ -21,7 +21,7 @@ import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
 import { WorkspaceProvider, useWorkspaceContext } from "../../contexts/WorkspaceContext";
 import { RouterProvider } from "../../contexts/RouterContext";
 import {
-  hydrateUserPreferencesLocalCache,
+  mirrorUserPreferencesLocalCache,
   UserPreferencesProvider,
 } from "@/browser/contexts/UserPreferencesContext";
 import { TerminalRouterProvider } from "../../terminal/TerminalRouterContext";
@@ -34,8 +34,10 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
   const bootstrappedRef = useRef(false);
 
+  // The bound starts at mount, not on connect, so an unreachable backend cannot hold the boot
+  // screen either; AppLoaderInner shows the connection state from there.
   useEffect(() => {
-    if (bootstrappedRef.current || !apiState.api) {
+    if (bootstrappedRef.current) {
       return;
     }
 
@@ -44,28 +46,21 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
     const timeoutPromise = new Promise<"timeout">((resolve) => {
       timeoutId = setTimeout(resolve, USER_PREFERENCES_BOOTSTRAP_TIMEOUT_MS, "timeout");
     });
-    const hydratePromise = hydrateUserPreferencesLocalCache({
-      configClient: apiState.api.config,
-      signal: abortController.signal,
-    }).catch((error) => {
-      console.warn("Failed to bootstrap user preferences:", error);
-      return undefined;
-    });
 
     const appConfigStore = getAppConfigStore();
     let unsubscribeAppConfig: (() => void) | undefined;
     const appConfigPromise = new Promise<void>((resolve) => {
       const resolveWhenLoaded = () => {
-        if (appConfigStore.getSnapshot()?.experiments) resolve();
+        if (appConfigStore.getSnapshot()?.userPreferences) resolve();
       };
       unsubscribeAppConfig = appConfigStore.subscribe(resolveWhenLoaded);
       abortController.signal.addEventListener("abort", () => resolve(), { once: true });
       resolveWhenLoaded();
     }).finally(() => unsubscribeAppConfig?.());
 
-    const startup = Promise.race([Promise.all([hydratePromise, appConfigPromise]), timeoutPromise]);
-    // User preference hydration must happen before RouterProvider reads launch behavior, but
-    // startup still needs a hard fallback so a slow backend cannot trap users on the boot screen.
+    const startup = Promise.race([appConfigPromise, timeoutPromise]);
+    // The local preference copies must hold the first snapshot before RouterProvider reads launch
+    // behavior, but a slow backend must not trap users on the boot screen.
     void startup
       .then((result) => {
         if (result === "timeout") {
@@ -73,6 +68,9 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
         }
         if (abortController.signal.aborted && result !== "timeout") {
           return;
+        }
+        if (result !== "timeout") {
+          mirrorUserPreferencesLocalCache();
         }
 
         bootstrappedRef.current = true;
@@ -90,7 +88,7 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
         clearTimeout(timeoutId);
       }
     };
-  }, [apiState.api]);
+  }, []);
 
   // bootstrappedRef is set together with `ready`, so `ready` alone decides here; reading
   // the ref during render would make React Compiler skip this component.

@@ -2248,9 +2248,6 @@ export class Config {
 
     const userPreferences = normalizeUserPreferences(parsed.userPreferences);
     const migrations = normalizeConfigMigrations(parsed.migrations);
-    if (parsed.userPreferences !== undefined) {
-      migrations.userPreferencesInitialized = true;
-    }
 
     const layoutPresetsRaw = normalizeLayoutPresetsConfig(parsed.layoutPresets);
     const layoutPresets = isLayoutPresetsConfigEmpty(layoutPresetsRaw)
@@ -2569,14 +2566,9 @@ export class Config {
       const migrations = normalizeConfigMigrations(config.migrations);
       // Any true flag (known or from a newer version) must persist; the spread
       // below writes them all, so gate only on presence.
-      if (
-        Object.keys(migrations).length > 0 ||
-        config.userPreferences !== undefined ||
-        config.agentAiDefaults?.exec != null
-      ) {
+      if (Object.keys(migrations).length > 0 || config.agentAiDefaults?.exec != null) {
         data.migrations = {
           ...migrations,
-          ...(config.userPreferences !== undefined ? { userPreferencesInitialized: true } : {}),
           // Written for downgrade compatibility so older builds do not re-run
           // their exec split migration against the projected legacy map.
           ...(config.agentAiDefaults?.exec != null ? { execSubagentDefaultsSplit: true } : {}),
@@ -2810,7 +2802,6 @@ export class Config {
   getClientConfig() {
     const config = this.loadConfigOrDefault();
     return {
-      userPreferencesInitialized: config.migrations?.userPreferencesInitialized === true,
       userPreferences: config.userPreferences,
       taskSettings: config.taskSettings ?? DEFAULT_TASK_SETTINGS,
       muxGatewayEnabled: config.muxGatewayEnabled,
@@ -3135,10 +3126,6 @@ export class Config {
 
       if (input.userPreferences !== undefined) {
         result.userPreferences = normalizeUserPreferences(input.userPreferences);
-        result.migrations = {
-          ...(result.migrations ?? {}),
-          userPreferencesInitialized: true,
-        };
       }
 
       if (input.advisorModelString !== undefined) {

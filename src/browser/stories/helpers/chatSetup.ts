@@ -11,6 +11,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { BackgroundProcessInfo } from "@/common/orpc/schemas/api";
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { APIClient } from "@/browser/contexts/API";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { createWorkspace, groupWorkspacesByProject } from "../mocks/workspaces";
@@ -101,6 +102,7 @@ export interface SimpleChatSetupOptions {
   chatTranscriptFullWidth?: boolean;
   /** Backend experiment values returned by the mock config API. */
   experiments?: Partial<Record<ExperimentId, boolean>>;
+  userPreferences?: UserPreferences;
   /** Timeline events served by the mock workspace.timeline endpoints. */
   timelineEvents?: TimelineEvent[];
   /** Render the chat workspace as transcript-only (worktree gone; no composer). */
@@ -198,6 +200,7 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
     clearLogsResult: opts.clearLogsResult,
     chatTranscriptFullWidth: opts.chatTranscriptFullWidth,
     experiments: opts.experiments,
+    userPreferences: opts.userPreferences,
     timelineEvents: opts.timelineEvents,
     mcpIcons: opts.mcpIcons,
   });

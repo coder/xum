@@ -2,17 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { installDom } from "../../../tests/ui/dom";
 
 import {
-  applyLocalPreferenceWrite,
   canPrunePreferenceScopes,
   createUserPreferenceSaveQueue,
-  hydrateUserPreferencesLocalCache,
-  mergeMissingLocalPreferences,
   mirrorBackendPreferences,
+  mirrorUserPreferencesLocalCache,
   overlayDirtyLocalValues,
   prunePreferenceScopes,
-  retryUserPreferenceHydration,
-  shouldBackfillLocalPreferences,
 } from "./UserPreferencesContext";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getPersistedStateStorage, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   LAUNCH_BEHAVIOR_KEY,
@@ -114,113 +111,26 @@ async function waitUntil(assertion: () => void): Promise<void> {
 }
 
 describe("UserPreferencesProvider bridge helpers", () => {
-  test("seeds local writes from the full local cache before hydration", () => {
-    const storage = new MemoryStorage();
-    storage.setJSON(UI_THEME_KEY, "dark");
-    storage.setJSON(VIM_ENABLED_KEY, true);
-
-    expect(
-      applyLocalPreferenceWrite({
-        preferences: undefined,
-        key: PROJECT_ORDER_KEY,
-        newValue: ["/repo"],
-        storage,
-      })
-    ).toEqual({
-      appearance: { theme: "dark", vimEnabled: true },
-      navigation: { projectOrder: ["/repo"] },
-    });
-  });
-
-  test("keeps local backfill active until backend preferences are initialized", () => {
-    expect(
-      shouldBackfillLocalPreferences({
-        backendPreferences: undefined,
-        userPreferencesInitialized: false,
-      })
-    ).toBe(true);
-    expect(
-      shouldBackfillLocalPreferences({
-        backendPreferences: undefined,
-        userPreferencesInitialized: undefined,
-      })
-    ).toBe(true);
-    expect(
-      shouldBackfillLocalPreferences({
-        backendPreferences: undefined,
-        userPreferencesInitialized: true,
-      })
-    ).toBe(false);
-    expect(
-      shouldBackfillLocalPreferences({
-        backendPreferences: { appearance: { theme: "dark" } },
-        userPreferencesInitialized: false,
-      })
-    ).toBe(false);
-  });
-
-  test("hydrates backend preferences into the local startup cache", async () => {
-    const storage = new MemoryStorage();
-
-    await hydrateUserPreferencesLocalCache({
-      storage,
-      configClient: {
-        getConfig: () =>
-          Promise.resolve({
-            userPreferences: { navigation: { launchBehavior: "last-workspace" } },
-          }),
-        saveConfig: () => Promise.resolve(),
-      },
-    });
-
-    expect(JSON.parse(storage.getItem(LAUNCH_BEHAVIOR_KEY) ?? "null")).toBe("last-workspace");
-  });
-
   // Production passes no storage: writes must be routed to the helpers because the default storage
   // is the (write-refusing) persisted-state view, recognized by identity.
-  test("hydrates into the real localStorage through the default persisted-state view", async () => {
+  test("mirrors the store into the real localStorage through the default persisted-state view", () => {
     const cleanupDom = installDom();
     try {
-      await hydrateUserPreferencesLocalCache({
-        configClient: {
-          getConfig: () =>
-            Promise.resolve({
-              userPreferences: { navigation: { launchBehavior: "last-workspace" } },
-            }),
-          saveConfig: () => Promise.resolve(),
-        },
+      getAppConfigStore().updateOptimistically({
+        userPreferences: { navigation: { launchBehavior: "last-workspace" } },
       });
+      mirrorUserPreferencesLocalCache();
 
       expect(JSON.parse(window.localStorage.getItem(LAUNCH_BEHAVIOR_KEY) ?? "null")).toBe(
         "last-workspace"
       );
     } finally {
+      getAppConfigStore().updateOptimistically({ userPreferences: undefined });
       cleanupDom();
     }
   });
 
-  test("does not backfill stale local cache after backend preferences are initialized", async () => {
-    const storage = new MemoryStorage();
-    storage.setJSON(UI_THEME_KEY, "dark");
-    storage.setJSON(VIM_ENABLED_KEY, true);
-
-    await hydrateUserPreferencesLocalCache({
-      storage,
-      configClient: {
-        getConfig: () =>
-          Promise.resolve({
-            userPreferencesInitialized: true,
-            userPreferences: undefined,
-          }),
-        saveConfig: () => Promise.resolve(),
-      },
-    });
-
-    expect(storage.getItem(UI_THEME_KEY)).toBeNull();
-    expect(storage.getItem(VIM_ENABLED_KEY)).toBeNull();
-  });
-
-  test("removes stale local cache entries on non-initial backend refresh", () => {
+  test("removes stale local cache entries on a backend refresh", () => {
     const storage = new MemoryStorage();
     storage.setJSON(UI_THEME_KEY, "dark");
     storage.setJSON(VIM_ENABLED_KEY, true);
@@ -228,7 +138,6 @@ describe("UserPreferencesProvider bridge helpers", () => {
     mirrorBackendPreferences({
       backendPreferences: { appearance: { theme: "light" } },
       dirtyKeys: new Set(),
-      initial: false,
       storage,
     });
 
@@ -243,14 +152,13 @@ describe("UserPreferencesProvider bridge helpers", () => {
     mirrorBackendPreferences({
       backendPreferences: { appearance: { theme: "light" } },
       dirtyKeys: new Set([UI_THEME_KEY]),
-      initial: false,
       storage,
     });
 
     expect(JSON.parse(storage.getItem(UI_THEME_KEY) ?? "null")).toBe("flexoki-dark");
   });
 
-  test("keeps dirty local cache entries on non-initial backend refresh", () => {
+  test("keeps dirty local cache entries on a backend refresh", () => {
     const storage = new MemoryStorage();
     storage.setJSON(UI_THEME_KEY, "dark");
     storage.setJSON(VIM_ENABLED_KEY, true);
@@ -258,30 +166,11 @@ describe("UserPreferencesProvider bridge helpers", () => {
     mirrorBackendPreferences({
       backendPreferences: { appearance: { theme: "light" } },
       dirtyKeys: new Set([VIM_ENABLED_KEY]),
-      initial: false,
       storage,
     });
 
     expect(JSON.parse(storage.getItem(UI_THEME_KEY) ?? "null")).toBe("light");
     expect(JSON.parse(storage.getItem(VIM_ENABLED_KEY) ?? "null")).toBe(true);
-  });
-
-  test("backfills only local preferences that are missing from backend config", () => {
-    const storage = new MemoryStorage();
-    storage.setJSON(UI_THEME_KEY, "light");
-    storage.setJSON(PROJECT_ORDER_KEY, ["/repo/a", "/repo/b"]);
-
-    expect(
-      mergeMissingLocalPreferences(
-        {
-          appearance: { theme: "dark" },
-        },
-        storage
-      )
-    ).toEqual({
-      appearance: { theme: "dark" },
-      navigation: { projectOrder: ["/repo/a", "/repo/b"] },
-    });
   });
 
   test("overlays dirty local values over a backend refresh", () => {
@@ -405,32 +294,6 @@ describe("UserPreferencesProvider bridge helpers", () => {
     });
   });
 
-  test("retries initial hydration failures until backend config loads", async () => {
-    const controller = new AbortController();
-    const errors: string[] = [];
-    let attempts = 0;
-
-    await retryUserPreferenceHydration({
-      signal: controller.signal,
-      applyBackendConfig: () => {
-        attempts += 1;
-        if (attempts === 1) {
-          return Promise.reject(new Error("temporary config failure"));
-        }
-        return Promise.resolve();
-      },
-      getRetryDelayMs: () => 0,
-      waitForDelay: () => Promise.resolve(),
-      onError: (message) => {
-        errors.push(message);
-      },
-    });
-
-    expect(attempts).toBe(2);
-    expect(errors).toHaveLength(1);
-    expect(errors[0]).toContain("retrying");
-  });
-
   test("save queue retries failed saves without dropping pending preferences", async () => {
     const controller = new AbortController();
     const saves: Array<UserPreferences | null | undefined> = [];
@@ -442,7 +305,6 @@ describe("UserPreferencesProvider bridge helpers", () => {
     const queue = createUserPreferenceSaveQueue({
       signal: controller.signal,
       configClient: {
-        getConfig: () => Promise.resolve({}),
         saveConfig: (input) => {
           saveAttempts += 1;
           if (saveAttempts === 1) {
@@ -478,7 +340,6 @@ describe("UserPreferencesProvider bridge helpers", () => {
     const queue = createUserPreferenceSaveQueue({
       signal: controller.signal,
       configClient: {
-        getConfig: () => Promise.resolve({}),
         saveConfig: () => {
           saveAttempts += 1;
           return Promise.reject(new Error("temporary failure"));
@@ -513,7 +374,6 @@ describe("UserPreferencesProvider bridge helpers", () => {
     const queue = createUserPreferenceSaveQueue({
       signal: controller.signal,
       configClient: {
-        getConfig: () => Promise.resolve({}),
         saveConfig: async (input) => {
           saveCalls += 1;
           if (saveCalls === 1) {
@@ -559,7 +419,6 @@ describe("UserPreferencesProvider bridge helpers", () => {
       const queue = createUserPreferenceSaveQueue({
         signal: controller.signal,
         configClient: {
-          getConfig: () => Promise.resolve({}),
           saveConfig: saveConfig.saveConfig,
         },
         getCurrentPreferences: () => preferences,
