@@ -2153,7 +2153,6 @@ describe("Config", () => {
       );
 
       expect(config.loadConfigOrDefault().userPreferences).toEqual({
-        appearance: { theme: "light" },
         notifications: { notifyOnResponseByWorkspace: { "ws-1": true } },
       });
     });

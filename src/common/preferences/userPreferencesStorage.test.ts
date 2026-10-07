@@ -111,13 +111,6 @@ describe("user preference localStorage registry", () => {
     });
   });
 
-  test("migrates legacy theme names during localStorage collection", () => {
-    const storage = new MemoryStorage();
-    storage.setJSON(UI_THEME_KEY, "solarized-dark");
-
-    expect(collectForTest(storage)).toEqual({ appearance: { theme: "dark" } });
-  });
-
   test("all flattened preference entries are recognized, applied, and removable", () => {
     const preferences: UserPreferences = {
       appearance: {

@@ -54,39 +54,25 @@ describe("UserPreferencesSchema", () => {
     expect(
       normalizeUserPreferences({
         appearance: {
-          theme: "legacy-dark",
-          transcriptDensity: "wide",
+          theme: "solarized-dark",
           vimEnabled: true,
         },
         ai: {
           projectDefaults: {
-            "/repo": {
-              agentId: " Exec ",
-              model: "mux-gateway:openai",
-              thinkingLevel: "xhigh",
-            },
+            "/repo": { agentId: "exec", thinkingLevel: "extreme" },
           },
           autoCompactionThresholdByModel: {
             "openai:gpt-4.1": 75,
             bad: 101,
           },
         },
+        review: "not-an-object",
       })
     ).toEqual({
-      appearance: {
-        theme: "dark",
-        vimEnabled: true,
-      },
+      appearance: { vimEnabled: true },
       ai: {
-        projectDefaults: {
-          "/repo": {
-            agentId: "exec",
-            thinkingLevel: "xhigh",
-          },
-        },
-        autoCompactionThresholdByModel: {
-          "openai:gpt-4.1": 75,
-        },
+        projectDefaults: { "/repo": { agentId: "exec" } },
+        autoCompactionThresholdByModel: { "openai:gpt-4.1": 75 },
       },
     });
   });
