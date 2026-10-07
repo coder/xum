@@ -621,6 +621,7 @@ export const modelsExtra: Record<string, ModelData> = {
     mode: "chat",
     supports_function_calling: true,
     supports_vision: true,
+    supports_pdf_input: true,
     supports_reasoning: true,
     supports_response_schema: true,
   },
