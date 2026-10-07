@@ -94,35 +94,6 @@ describe("WorkflowTaskServiceAdapter", () => {
     );
   });
 
-  test("inherits experiments for task creation", async () => {
-    let createArgs: unknown;
-    const create = mock(async (args: unknown) => {
-      createArgs = args;
-      return Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const });
-    });
-    const waitForAgentReport = mock(async () => ({ reportMarkdown: "child report" }));
-    const adapter = new WorkflowTaskServiceAdapter({
-      taskService: { create, waitForAgentReport },
-      parentWorkspaceId: "parent_1",
-      workflowRunId: "wfr_123",
-      defaultAgentId: "explore",
-      experiments: { programmaticToolCalling: true },
-    });
-
-    await adapter.runAgent({
-      id: "claims",
-      agentId: "exec",
-      prompt: "Extract claims",
-      outputSchema: { type: "object" },
-    });
-
-    expect(createArgs).toMatchObject({
-      agentId: "exec",
-      prompt: "Extract claims",
-      experiments: { programmaticToolCalling: true },
-    });
-  });
-
   test("passes onRefusal and isolation through to task creation", async () => {
     let createArgs: unknown;
     const create = mock(async (args: unknown) => {
@@ -220,29 +191,6 @@ describe("WorkflowTaskServiceAdapter", () => {
     });
   });
 
-  test("passes workflow experiments to Explore workflow task creation", async () => {
-    let createArgs: unknown;
-    const create = mock(async (args: unknown) => {
-      createArgs = args;
-      return Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const });
-    });
-    const waitForAgentReport = mock(async () => ({ reportMarkdown: "child report" }));
-    const adapter = new WorkflowTaskServiceAdapter({
-      taskService: { create, waitForAgentReport },
-      parentWorkspaceId: "parent_1",
-      workflowRunId: "wfr_123",
-      defaultAgentId: "explore",
-      experiments: { programmaticToolCalling: true },
-    });
-
-    await adapter.runAgent({ id: "source", prompt: "Read source" });
-
-    expect(createArgs).toMatchObject({
-      agentId: "explore",
-      experiments: { programmaticToolCalling: true },
-    });
-  });
-
   test("bulk creates workflow child tasks with workflow metadata", async () => {
     const createMany = mock(
       async (
@@ -270,7 +218,6 @@ describe("WorkflowTaskServiceAdapter", () => {
       parentWorkspaceId: "parent_1",
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
-      experiments: { programmaticToolCalling: true },
     });
 
     const created: Array<[number, string]> = [];
@@ -302,7 +249,6 @@ describe("WorkflowTaskServiceAdapter", () => {
         prompt: "Do first",
         title: "First",
         workflowTask: { runId: "wfr_123", stepId: "first" },
-        experiments: { programmaticToolCalling: true },
       },
       {
         parentWorkspaceId: "parent_1",
@@ -311,7 +257,6 @@ describe("WorkflowTaskServiceAdapter", () => {
         prompt: "Do second",
         title: "second",
         workflowTask: { runId: "wfr_123", stepId: "second", outputSchema: { type: "object" } },
-        experiments: { programmaticToolCalling: true },
       },
     ]);
     const createManyOptions: unknown = createMany.mock.calls[0]?.[1];

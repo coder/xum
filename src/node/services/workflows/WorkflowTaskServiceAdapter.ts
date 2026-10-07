@@ -20,11 +20,6 @@ import {
 
 export const DEFAULT_WORKFLOW_AGENT_ID = "exec";
 
-interface WorkflowTaskExperiments {
-  programmaticToolCalling?: boolean;
-  subagentFileReports?: boolean;
-}
-
 // Shared shape for agent task creation so the single-step `create` and the
 // batched `createMany` stay in lockstep; adding a field (e.g. onRefusal) in one
 // place must not silently diverge from the other.
@@ -40,7 +35,6 @@ interface WorkflowTaskCreateArgs {
     workflowName?: string;
     outputSchema?: unknown;
   };
-  experiments?: WorkflowTaskExperiments;
   modelString?: string;
   thinkingLevel?: ParsedThinkingInput;
   isolation?: "fork" | "none";
@@ -140,7 +134,6 @@ export interface WorkflowTaskServiceAdapterOptions {
    */
   workflowName?: string;
   defaultAgentId: string;
-  experiments?: WorkflowTaskExperiments;
   modelString?: string;
   thinkingLevel?: ParsedThinkingInput;
   patchToolConfig?: TaskGitPatchApplyConfig;
@@ -179,7 +172,6 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
   private readonly patchEngine: Pick<TaskGitPatchEngine, "applyPatch">;
   private readonly getProjectTrusted?: () => boolean | Promise<boolean>;
   private readonly patchApplyMutex = new AsyncMutex();
-  private readonly experiments?: WorkflowTaskExperiments;
   private readonly modelString?: string;
   private readonly thinkingLevel?: ParsedThinkingInput;
   // Present only when the TaskService can answer authoritatively. The runner treats an absent
@@ -222,7 +214,6 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     this.patchToolConfig = options.patchToolConfig;
     this.patchEngine = options.patchEngine ?? taskGitPatchEngine;
     this.getProjectTrusted = options.getProjectTrusted;
-    this.experiments = options.experiments;
     this.modelString = options.modelString;
     this.thinkingLevel = options.thinkingLevel;
     const taskService = options.taskService;
@@ -438,7 +429,6 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     }
 
     const agentId = spec.agentId ?? this.defaultAgentId;
-    const experiments = this.getExperimentsForAgent(agentId);
     const modelString = spec.modelString ?? this.modelString;
     const thinkingLevel = spec.thinkingLevel ?? this.thinkingLevel;
     return {
@@ -449,7 +439,6 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
       title: spec.title ?? spec.id,
       workflowTask,
       ...(spec.isolation !== undefined ? { isolation: spec.isolation } : {}),
-      ...(experiments !== undefined ? { experiments } : {}),
       ...(modelString !== undefined ? { modelString } : {}),
       ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
       // Refusal policy must survive both the single-step and parallel
@@ -476,21 +465,6 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     await lifecycle?.onTaskCreated?.(createResult.data.taskId);
 
     return await this.waitForAgentTask(createResult.data.taskId, spec, waitOptions);
-  }
-
-  private getExperimentsForAgent(agentId: string): WorkflowTaskExperiments | undefined {
-    const experiments = this.experiments;
-    if (experiments == null) {
-      return undefined;
-    }
-
-    if (agentId.trim().toLowerCase() !== "explore" || experiments.subagentFileReports !== true) {
-      return experiments;
-    }
-
-    // Explore is intentionally read-only and cannot create report.md/structured-output.json.
-    // Keep workflow Explore steps compatible when file-backed reporting is enabled globally.
-    return { ...experiments, subagentFileReports: false };
   }
 
   async requestAgentFinalReportForTimeout(

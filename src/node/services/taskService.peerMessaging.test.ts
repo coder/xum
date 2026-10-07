@@ -172,7 +172,6 @@ describe("TaskService", () => {
           taskStatus: "running",
           taskModelString: "openai:gpt-5.2",
           taskThinkingLevel: "medium",
-          taskExperiments: { rlm: true },
           aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
         }),
       ],
@@ -210,7 +209,6 @@ describe("TaskService", () => {
         agentId: "explore",
         thinkingLevel: "medium",
         reasoningMode: undefined,
-        experiments: { rlm: true },
         queueDispatchMode: "turn-end",
       },
       expect.objectContaining({

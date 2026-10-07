@@ -101,7 +101,7 @@ import type { BashAiProxyService } from "@/node/services/bashAiProxy/bashAiProxy
 import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
-import { findWorkspaceEntry, resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
+import { resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import {
   effectiveAdditionalSystemContext,
@@ -2268,7 +2268,6 @@ export class TurnRequestBuilder {
                   trusted: getWorkflowProjectTrusted(),
                 },
                 getProjectTrusted: getWorkflowProjectTrusted,
-                experiments,
               }),
             resolveWorkflowScript: (scriptPath) =>
               resolveWorkflowScript({
@@ -2517,21 +2516,12 @@ export class TurnRequestBuilder {
       goalToolContext,
       // Only child workspaces (tasks) can report to a parent.
       enableAgentReport: Boolean(metadata.parentWorkspaceId),
-      // RLM family messaging: gate on the flags persisted on the task record at
-      // spawn — NOT the live send-options experiments — so a child spawned under RLM
-      // keeps task_message_parent/task_message_sibling across app restarts and
-      // frontend experiment toggles. Uses the full RLM predicate (rlm AND a PTC
-      // parent) rather than the bare rlm bit: the hidden sub-flag can stay true
-      // after its parent is disabled, and such children run outside RLM. Workflow-
-      // owned workers are excluded: they hand results to WorkflowRunner through the
+      // Workflow-owned workers are excluded: they hand results to WorkflowRunner through the
       // journal path.
       enableFamilyMessaging:
         Boolean(metadata.parentWorkspaceId) &&
         metadata.workflowTask == null &&
-        isRlmModeEnabled(
-          findWorkspaceEntry(cfg, workspaceId)?.workspace.taskExperiments,
-          undefined
-        ),
+        isRlmModeEnabled(experiments, isExperimentEnabled),
       workflowAgentOutputSchema: metadata.workflowTask?.outputSchema,
       allowLegacyInvalidWorkflowAgentOutputSchema,
       recordFileState,

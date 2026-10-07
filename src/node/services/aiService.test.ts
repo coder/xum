@@ -1652,6 +1652,29 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   );
 
+  it("gates a sub-agent's family messaging on the experiments service", async () => {
+    using xumHome = new DisposableTempDir("ai-service-child-family-messaging");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-child-family-messaging";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath, {
+      parentWorkspaceId: "parent-workspace",
+    });
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(xumHome.path),
+      xumHome: xumHome.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.RLM || id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING
+    );
+    const harness = createHarness(xumHome.path, metadata, { experimentsService });
+
+    await startAdvisorStream(harness, workspaceId);
+
+    expect(getToolConfigFromHarness(harness).enableFamilyMessaging).toBe(true);
+  });
+
   it("prepares fallback system context with the fallback model's hot memories", async () => {
     using xumHome = new DisposableTempDir("ai-service-fallback-hot-memories");
     const projectPath = path.join(xumHome.path, "project");

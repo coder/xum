@@ -255,38 +255,6 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "Send id of the launch send that carries taskPrompt, written before that send. The history row that accepts the prompt carries the same id, so a reawakening sends a kept taskPrompt again only while no row does. Meaningful only while taskPrompt is set; absent on entries written before brief send ids.",
   }),
-  taskExperiments: z
-    .preprocess(
-      // Legacy alias: tasks stamped by builds where "PTC Exclusive Mode" was a
-      // separate experiment may carry only programmaticToolCallingExclusive.
-      // The merged PTC experiment activates exactly that posture, so the flag
-      // must map onto programmaticToolCalling on resumption instead of being
-      // stripped (which would silently drop PTC and make rlm inert). `true`
-      // wins over an explicit programmaticToolCalling: false because the old
-      // exclusive flag activated the posture regardless of the supplement flag.
-      (value) =>
-        typeof value === "object" &&
-        value !== null &&
-        (value as Record<string, unknown>).programmaticToolCallingExclusive === true
-          ? { ...value, programmaticToolCalling: true }
-          : value,
-      z.object({
-        programmaticToolCalling: z.boolean().optional(),
-        // Downgrade-compat mirror (see toPersistedTaskExperiments): retained
-        // through parsing and stamped alongside programmaticToolCalling so a
-        // downgraded build resumes the task in its exclusive posture instead
-        // of reading bare PTC as the removed (~2x cost) supplement mode.
-        programmaticToolCallingExclusive: z.boolean().optional(),
-        // RLM mode is stamped at spawn so child sessions keep RLM-gated features
-        // (persistent sandbox kernel, family messaging tools) across app restarts
-        // without depending on live frontend experiment state.
-        rlm: z.boolean().optional(),
-      })
-    )
-    .optional()
-    .meta({
-      description: "Experiments inherited from parent for restart-safe resumptions.",
-    }),
   taskBaseCommitSha: z.string().optional().meta({
     description:
       "Git commit SHA this agent task workspace started from (used for generating git-format-patch artifacts).",
