@@ -121,8 +121,11 @@ export const MessageWindow: React.FC<MessageWindowProps> = ({
               />
             )}
           </div>
+          {/* flex-auto, not flex-1: with a zero basis this block shrank beside the action buttons
+              (44px each on touch phones) and wrapped the model and time onto two lines that sat off
+              the buttons' line. A content basis lets the row wrap the whole block below instead. */}
           <div
-            className="text-muted flex min-w-0 flex-1 flex-wrap items-center gap-2 text-xs"
+            className="text-muted flex min-w-0 flex-auto flex-wrap items-center gap-2 text-xs"
             data-message-meta-right
           >
             {rightLabel}

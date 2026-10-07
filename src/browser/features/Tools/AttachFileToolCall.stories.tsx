@@ -1,9 +1,10 @@
 import type { ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { fireEvent, waitFor, within } from "@storybook/test";
+import { expect, fireEvent, waitFor, within } from "@storybook/test";
 import { createDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import { AttachFileToolCall } from "@/browser/features/Tools/AttachFileToolCall";
 import { lightweightMeta } from "@/browser/stories/meta.js";
+import { applyTouchPointerRules } from "@/browser/stories/helpers/touchPointer";
 
 const meta = {
   ...lightweightMeta,
@@ -226,6 +227,19 @@ export const LongMetadataPhone: Story = {
         }
       }
     });
+
+    // Touch phones give buttons a 44px minimum width, which replaced the Download button's
+    // content-based flex minimum and shrank it below its label beside the long description.
+    const removeTouchRules = applyTouchPointerRules(canvasElement.ownerDocument);
+    try {
+      const downloads = canvas.getAllByRole("button", { name: "Download" });
+      await expect(downloads.length).toBeGreaterThan(0);
+      for (const download of downloads) {
+        await expect(download.scrollWidth).toBeLessThanOrEqual(download.clientWidth);
+      }
+    } finally {
+      removeTouchRules();
+    }
   },
 };
 
