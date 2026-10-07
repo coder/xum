@@ -170,9 +170,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
         workspaceId: slashWorkspaceId,
         disableWorkspaceAgents: disableWorkspaceAgents || undefined,
       })
-      .then((skills) => {
+      .then(({ skills, unavailableSources }) => {
         if (cancelled) return;
-        agentSkillsCacheRef.current.set(cacheKey, skills);
+        // A partial list (e.g. SSH host unreachable) is not cached, so the next open asks again.
+        if (unavailableSources.length === 0) agentSkillsCacheRef.current.set(cacheKey, skills);
         setAgentSkills(skills);
       })
       .catch(() => {

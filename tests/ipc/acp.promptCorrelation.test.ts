@@ -1,6 +1,7 @@
 import { AgentSideConnection, PROTOCOL_VERSION, ndJsonStream } from "@agentclientprotocol/sdk";
 import { STOP_UNRECORDED_MESSAGE } from "../../src/common/constants/workspace";
 import type { OnChatMode, WorkspaceChatMessage } from "../../src/common/orpc/types";
+import type { AgentSkillListResult } from "../../src/common/types/agentSkill";
 import { MuxAgent } from "../../src/node/acp/agent";
 import type { ORPCClient, ServerConnection } from "../../src/node/acp/serverConnection";
 
@@ -291,6 +292,7 @@ interface HarnessOptions {
   sendHeldInput?: (
     input: Record<string, unknown>
   ) => Promise<{ success: boolean; data?: unknown; error?: unknown }>;
+  listSkills?: () => Promise<AgentSkillListResult>;
   /** Custom output WritableStream for simulating stdout backpressure. */
   acpOutputStream?: WritableStream<Uint8Array>;
   agentOptions?: ConstructorParameters<typeof MuxAgent>[2];
@@ -338,10 +340,12 @@ function createHarness(options?: HarnessOptions): Harness {
       list: async () => [],
     },
     agentSkills: {
-      list: async () => [],
-      listDiagnostics: async () => {
-        throw new Error("createHarness: listDiagnostics not implemented for this test");
-      },
+      list: async () =>
+        (await options?.listSkills?.()) ?? {
+          skills: [],
+          invalidSkills: [],
+          unavailableSources: [],
+        },
       get: async () => {
         throw new Error("createHarness: get not implemented for this test");
       },
@@ -1754,6 +1758,59 @@ describe("ACP prompt stream correlation", () => {
     harness.closeConnection();
     await harness.connectionClosed;
   }, 15_000);
+});
+
+describe("ACP slash commands after a partial skill list", () => {
+  it("sends the client the complete list once a slash prompt reads it", async () => {
+    const partial: AgentSkillListResult = {
+      skills: [],
+      invalidSkills: [],
+      unavailableSources: [
+        { scope: "project", displayPath: "/remote/.xum/skills", message: "host unreachable" },
+      ],
+    };
+    const complete: AgentSkillListResult = {
+      skills: [{ name: "deploy", description: "Deploy the app", scope: "project" }],
+      invalidSkills: [],
+      unavailableSources: [],
+    };
+    // The session's first read waits out an SSH timeout; the host recovers meanwhile.
+    let finishFirstRead = (_result: AgentSkillListResult) => undefined as void;
+    const firstRead = new Promise<AgentSkillListResult>((resolve) => {
+      finishFirstRead = resolve;
+    });
+    let listCount = 0;
+    const harness = createHarness({
+      listSkills: () => (listCount++ === 0 ? firstRead : Promise.resolve(complete)),
+    });
+    const advertised = () =>
+      harness.sessionUpdates
+        .filter(({ update }) => update.sessionUpdate === "available_commands_update")
+        .map(({ update }) => (update.availableCommands as { name: string }[]).map((c) => c.name));
+
+    await initializeDefaultAgent(harness);
+    const { sessionId } = await createDefaultSession(harness);
+    await waitForCondition(() => listCount === 1);
+
+    const { promptPromise, promptCorrelationId } = await startPromptTurn(
+      harness,
+      sessionId,
+      "/deploy now"
+    );
+    harness.pushChatEvent(
+      streamStart(sessionId, "assistant-deploy", { acpPromptId: promptCorrelationId })
+    );
+    harness.pushChatEvent(streamEnd(sessionId, "assistant-deploy"));
+    await expect(promptPromise).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(advertised().at(-1)).toContain("deploy");
+
+    // The overtaken first read must not replace the newer list.
+    finishFirstRead(partial);
+    await sleep(0);
+    expect(advertised().at(-1)).toContain("deploy");
+    harness.closeConnection();
+    await harness.connectionClosed;
+  });
 });
 
 describe("ACP held inputs (#4944)", () => {

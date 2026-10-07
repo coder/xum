@@ -256,7 +256,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     }
     api.agentSkills
       .list(discovery)
-      .then((skills) => {
+      .then(({ skills }) => {
         if (mounted && skillRequestId.current === requestId) setAgentSkills(skills);
       })
       .catch((error: unknown) => {

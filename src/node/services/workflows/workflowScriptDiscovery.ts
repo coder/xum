@@ -73,7 +73,7 @@ export async function discoverWorkflowScripts(
               },
             }
       )
-    ).forEach(addSkill);
+    ).skills.forEach(addSkill);
   } catch (error) {
     log.warn(`Workflow script discovery: failed to enumerate skills: ${getErrorMessage(error)}`);
   }

@@ -1,5 +1,5 @@
 import React from "react";
-import { AlertTriangle, Check, EyeOff, XCircle } from "lucide-react";
+import { AlertTriangle, Check, CloudOff, EyeOff, XCircle } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { SkillIcon } from "@/browser/components/icons/SkillIcon/SkillIcon";
 import { HoverClickPopover } from "@/browser/components/HoverClickPopover/HoverClickPopover";
@@ -11,6 +11,7 @@ import type {
   AgentSkillDescriptor,
   AgentSkillIssue,
   AgentSkillScope,
+  AgentSkillUnavailableSource,
 } from "@/common/types/agentSkill";
 
 interface SkillIndicatorProps {
@@ -20,6 +21,8 @@ interface SkillIndicatorProps {
   availableSkills: AgentSkillDescriptor[];
   /** Skills that were discovered but couldn't be loaded (SKILL.md parse errors, etc.) */
   invalidSkills?: AgentSkillIssue[];
+  /** Skills roots that could not be read (e.g. the SSH host did not answer) */
+  unavailableSources?: AgentSkillUnavailableSource[];
   /** Runtime skill load failures (agent_skill_read returned an error) */
   skillLoadErrors?: SkillLoadError[];
   className?: string;
@@ -36,6 +39,7 @@ interface SkillsPopoverContentProps {
   loadedSkills: LoadedSkill[];
   availableSkills: AgentSkillDescriptor[];
   invalidSkills: AgentSkillIssue[];
+  unavailableSources: AgentSkillUnavailableSource[];
   skillLoadErrors: SkillLoadError[];
 }
 
@@ -147,6 +151,29 @@ const SkillsPopoverContent: React.FC<SkillsPopoverContentProps> = (props) => {
           </div>
         </div>
       )}
+      {props.unavailableSources.length > 0 && (
+        <div className="border-separator-light border-t pt-2">
+          <div className="text-danger-soft flex items-center gap-1 text-[10px] font-medium tracking-wider uppercase">
+            <CloudOff className="h-3 w-3" />
+            Unavailable sources
+          </div>
+          <div className="mt-1.5 flex flex-col gap-1">
+            {props.unavailableSources.map((source) => (
+              <div key={source.displayPath} className="flex items-start gap-1.5">
+                <div className="bg-muted-foreground/30 mt-1.5 h-1 w-1 shrink-0 rounded-full" />
+                <div className="flex min-w-0 flex-col gap-0.5">
+                  <span className="text-muted-foreground line-clamp-1 font-mono text-[10px]">
+                    {source.displayPath}
+                  </span>
+                  <span className="text-muted-foreground line-clamp-2 text-[11px] leading-snug">
+                    {source.message}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       {props.skillLoadErrors.length > 0 && (
         <div className="border-separator-light border-t pt-2">
           <div className="text-danger-soft flex items-center gap-1 text-[10px] font-medium tracking-wider uppercase">
@@ -181,8 +208,9 @@ export const SkillIndicator: React.FC<SkillIndicatorProps> = (props) => {
   const loadedCount = props.loadedSkills.length;
   const totalCount = props.availableSkills.length;
   const invalidCount = props.invalidSkills?.length ?? 0;
+  const unavailableCount = props.unavailableSources?.length ?? 0;
   const loadErrorCount = props.skillLoadErrors?.length ?? 0;
-  const errorCount = invalidCount + loadErrorCount;
+  const errorCount = invalidCount + unavailableCount + loadErrorCount;
   const badgeCount = errorCount > 0 ? errorCount : loadedCount;
 
   // Don't render if there's nothing to show.
@@ -199,6 +227,11 @@ export const SkillIndicator: React.FC<SkillIndicatorProps> = (props) => {
   if (invalidCount > 0) {
     ariaLabelParts.push(`${invalidCount} invalid`);
   }
+  if (unavailableCount > 0) {
+    ariaLabelParts.push(
+      `${unavailableCount} unavailable source${unavailableCount === 1 ? "" : "s"}`
+    );
+  }
   if (loadErrorCount > 0) {
     ariaLabelParts.push(`${loadErrorCount} load error${loadErrorCount === 1 ? "" : "s"}`);
   }
@@ -212,6 +245,7 @@ export const SkillIndicator: React.FC<SkillIndicatorProps> = (props) => {
           loadedSkills={props.loadedSkills}
           availableSkills={props.availableSkills}
           invalidSkills={props.invalidSkills ?? []}
+          unavailableSources={props.unavailableSources ?? []}
           skillLoadErrors={props.skillLoadErrors ?? []}
         />
       }

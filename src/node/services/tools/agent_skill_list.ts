@@ -20,6 +20,7 @@ import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry
 import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
 import {
   discoverAgentSkills,
+  requireReachableSkills,
   getDefaultAgentSkillsRoots,
   getProjectSkillRoots,
 } from "@/node/services/agentSkills/agentSkillsService";
@@ -189,11 +190,13 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               includeClaudeSkills,
             });
 
-          const discovered = await discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
-            roots,
-            containment: skillCtx.containment,
-            dedupeByName: false,
-          });
+          const discovered = requireReachableSkills(
+            await discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
+              roots,
+              containment: skillCtx.containment,
+              dedupeByName: false,
+            })
+          );
           const seenByScope = new Set<string>();
           const skills = discovered
             .filter((skill) => skill.scope !== "built-in")

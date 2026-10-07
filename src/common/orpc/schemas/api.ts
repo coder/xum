@@ -153,12 +153,7 @@ import {
   WorkspaceHeartbeatSettingsSchema,
 } from "./workspace";
 import { WorkspaceAISettingsSchema } from "./workspaceAiSettings";
-import {
-  AgentSkillDescriptorSchema,
-  AgentSkillIssueSchema,
-  AgentSkillPackageSchema,
-  SkillNameSchema,
-} from "./agentSkill";
+import { AgentSkillListResultSchema, AgentSkillPackageSchema, SkillNameSchema } from "./agentSkill";
 import {
   AvailableWorkflowSchema,
   WorkflowRunIdSchema,
@@ -2739,14 +2734,7 @@ export const agents = {
 export const agentSkills = {
   list: {
     input: AgentDiscoveryInputSchema,
-    output: z.array(AgentSkillDescriptorSchema),
-  },
-  listDiagnostics: {
-    input: AgentDiscoveryInputSchema,
-    output: z.object({
-      skills: z.array(AgentSkillDescriptorSchema),
-      invalidSkills: z.array(AgentSkillIssueSchema),
-    }),
+    output: AgentSkillListResultSchema,
   },
   get: {
     input: AgentDiscoveryInputSchema.and(z.object({ skillName: SkillNameSchema })),

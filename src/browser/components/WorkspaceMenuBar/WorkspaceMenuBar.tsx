@@ -74,7 +74,11 @@ import { StatsDialog } from "@/browser/features/RightSidebar/StatsDialog";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
 import type { TabType } from "@/browser/types/rightSidebar";
-import type { AgentSkillDescriptor, AgentSkillIssue } from "@/common/types/agentSkill";
+import type {
+  AgentSkillDescriptor,
+  AgentSkillIssue,
+  AgentSkillUnavailableSource,
+} from "@/common/types/agentSkill";
 
 interface WorkspaceMenuBarProps {
   workspaceId: string;
@@ -193,6 +197,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const unrelatedMessagingModalOpen = unrelatedMessagingWorkspaceId === workspaceId;
   const [availableSkills, setAvailableSkills] = useState<AgentSkillDescriptor[]>([]);
   const [invalidSkills, setInvalidSkills] = useState<AgentSkillIssue[]>([]);
+  const [unavailableSkillSources, setUnavailableSkillSources] = useState<
+    AgentSkillUnavailableSource[]
+  >([]);
   const isSkillsMountedRef = useRef(true);
   const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuBarRef = useRef<HTMLDivElement | null>(null);
@@ -534,22 +541,25 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       if (!isSkillsMountedRef.current || requestId !== skillsRequestIdRef.current) return;
       setAvailableSkills([]);
       setInvalidSkills([]);
+      setUnavailableSkillSources([]);
       return;
     }
 
     try {
-      const diagnostics = await api.agentSkills.listDiagnostics({
+      const result = await api.agentSkills.list({
         workspaceId,
         disableWorkspaceAgents: disableWorkspaceAgents || undefined,
       });
       if (!isSkillsMountedRef.current || requestId !== skillsRequestIdRef.current) return;
-      setAvailableSkills(Array.isArray(diagnostics.skills) ? diagnostics.skills : []);
-      setInvalidSkills(Array.isArray(diagnostics.invalidSkills) ? diagnostics.invalidSkills : []);
+      setAvailableSkills(result.skills);
+      setInvalidSkills(result.invalidSkills);
+      setUnavailableSkillSources(result.unavailableSources);
     } catch (error) {
       console.error("Failed to load available skills:", error);
       if (isSkillsMountedRef.current && requestId === skillsRequestIdRef.current) {
         setAvailableSkills([]);
         setInvalidSkills([]);
+        setUnavailableSkillSources([]);
       }
     }
   }, [api, workspaceId, disableWorkspaceAgents]);
@@ -857,6 +867,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           loadedSkills={loadedSkills}
           availableSkills={availableSkills}
           invalidSkills={invalidSkills}
+          unavailableSources={unavailableSkillSources}
           skillLoadErrors={skillLoadErrors}
         />
         {editorError && <span className="text-danger-soft text-xs">{editorError}</span>}

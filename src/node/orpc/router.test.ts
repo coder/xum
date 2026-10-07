@@ -251,7 +251,7 @@ describe("router agent skill routes", () => {
       } as unknown as ORPCContext;
       const client = createRouterClient(router(), { context });
 
-      const skills = await client.agentSkills.list({ workspaceId: "workspace-1" });
+      const { skills } = await client.agentSkills.list({ workspaceId: "workspace-1" });
       expect(skills.find((skill) => skill.name === "parent-only")).toMatchObject({
         description: "from checkout",
         scope: "project",
@@ -322,7 +322,9 @@ describe("router agent skill routes", () => {
       } as unknown as ORPCContext;
       const client = createRouterClient(router(), { context });
 
-      await expect(client.agentSkills.list({ workspaceId: "workspace-1" })).resolves.toContainEqual(
+      await expect(
+        client.agentSkills.list({ workspaceId: "workspace-1" }).then((result) => result.skills)
+      ).resolves.toContainEqual(
         expect.objectContaining({
           name: "parent-only",
           description: "Parent skill",
@@ -368,7 +370,7 @@ describe("router agent skill routes", () => {
       const client = createRouterClient(router(), { context });
 
       await expect(
-        client.agentSkills.list({ projectPath: subProjectPath })
+        client.agentSkills.list({ projectPath: subProjectPath }).then((result) => result.skills)
       ).resolves.toContainEqual(
         expect.objectContaining({
           name: "parent-only",
