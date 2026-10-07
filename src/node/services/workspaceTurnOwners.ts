@@ -3,26 +3,28 @@ import type { ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/c
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 
 /**
- * Which owner directories can hold a target's workspace-turn records (#5569).
+ * Which owner directory can hold a target's workspace-turn records (#5569).
  *
- * Without it, the active-turn lookup scans every owner's task-handle directory on a map miss.
- * Records are stored under their owner, and createWorkspaceTurn's owner rule limits the owners:
- *
- * - ROOT target (no `parentWorkspaceId`): only the owner holding the target's creating
- *   (`createdWorkspace`) record, so every record lives in its creator's directory. This module
- *   names the claimed creator: the creator's own `delegatedCreation` mark, else the
- *   `mux.taskOwnerWorkspaceId` tag (the startup resolver's precedence). Tags are caller-editable,
- *   so the claim is only a hint: the caller must confirm it by finding the creating record in that
- *   same owner's listing. An unconfirmed claim (wrong tag, creation in flight) falls back.
- * - AGENT-TASK target: only its ancestors (isDescendantAgentTaskInConfig on the reawaken path). No
- *   code rewrites `parentWorkspaceId`, so the config ancestors now are those at admission. This
- *   assumes only `mode: "new"` writes creating records, and it creates roots only. A missing or
- *   duplicated row on the chain, or more than MAX_ANCESTOR_LEVELS levels (a cycle), falls back.
+ * Without it, the active-turn lookup scans every owner's task-handle directory on a map miss. For a
+ * ROOT target (no `parentWorkspaceId`) createWorkspaceTurn's owner rule allows a record only for
+ * the owner holding the target's creating (`createdWorkspace`) record, so every record of that
+ * root lives in its creator's directory. This module names the claimed creator: the creator's own
+ * `delegatedCreation` mark, else the `mux.taskOwnerWorkspaceId` tag (the startup resolver's
+ * precedence). Tags are caller-editable, so the claim is only a hint: the caller must confirm it by
+ * finding the creating record in that same owner's listing before answering from that directory.
+ * An unconfirmed claim (wrong tag, creation still in flight) falls back to the global scan.
  *
  * Non-guarantee: the narrowed lookup relies only on the owner rule. A record that breaks it (for
- * example one for an agent task owned by a non-ancestor) is missed, while the global scan returns
- * it. So is a record under a symlinked `sessions/<owner>`, which the global scan skips. Only
- * fixtures or hand edits create these states. Changing the owner rule must update this module.
+ * example a running record for a claimed root owned by someone other than its creator) is missed,
+ * while the global scan returns it. Only fixtures or hand edits create such records. Changing the
+ * owner rule in createWorkspaceTurn must update this module. A symlinked `sessions/<owner>` is
+ * missed the same way: the global scan skips it, the owner listing follows it.
+ *
+ * An AGENT-TASK target (a row with `parentWorkspaceId`) admits only its ancestors (the reawaken
+ * path's isDescendantAgentTaskInConfig), so its records live in its config ancestors' directories.
+ * No code rewrites `parentWorkspaceId`, so the ancestors now are the ancestors at admission. This
+ * assumes only `mode: "new"` writes creating records and creates roots only. A missing or
+ * duplicated row on the chain, or more than MAX_ANCESTOR_LEVELS levels (a cycle), falls back.
  */
 export type WorkspaceTurnOwners =
   | { kind: "creator"; ownerWorkspaceId: string }
