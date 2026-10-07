@@ -12,7 +12,12 @@ import { act, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { DraftStore, getDraftStore } from "@/browser/stores/DraftStore";
-import { WorkspaceStore, workspaceStore } from "@/browser/stores/WorkspaceStore";
+import {
+  WorkspaceStore,
+  useWorkspaceStoreRaw,
+  workspaceStore,
+  type WorkspaceState,
+} from "@/browser/stores/WorkspaceStore";
 import { createTestApiClient } from "@/browser/testUtils";
 import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
@@ -268,6 +273,73 @@ describe("Completing an edit of an older message", () => {
       await waitFor(() => expect(editTextarea(app)).toBeNull(), LOAD_TOLERANT_WAIT);
       await expectEditKeptAsDraft(app, scope);
     } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // Back from another workspace, a windowed replay (#4961) can load only the newest rows: the
+  // kept edit's row is then older history, not gone, and the edit stays open (#5808). The store
+  // view below plays that replay: caught up, the row outside the window, older history left.
+  test("a kept edit whose row is outside the replayed window stays open on return", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-switch-row-windowed" });
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- called below with the store as `this`
+    const realGetState = WorkspaceStore.prototype.getWorkspaceState;
+    const windowed = new WeakMap<WorkspaceState, WorkspaceState>();
+    let stateSpy: jest.SpyInstance | null = null;
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      typeIntoEdit(textarea, "edited before switch");
+      await waitFor(() => expect(textarea.value).toBe("edited before switch"));
+      const editedRow = useWorkspaceStoreRaw()
+        .getWorkspaceState(app.workspaceId)
+        .messages.find((row) => row.type === "user" && row.content === "first message");
+      const editedRowId = editedRow?.type === "user" ? editedRow.historyId : undefined;
+      expect(editedRowId).toBeDefined();
+      const created = await app.env.orpc.workspace.create({
+        projectPath: app.repoPath,
+        branchName: generateBranchName("edit-switch-row-windowed-other"),
+        trunkBranch: await detectDefaultTrunkBranch(app.repoPath),
+      });
+      if (!created.success) throw new Error(created.error);
+      workspaceStore.addWorkspace(created.metadata);
+      await showWorkspace(app, created.metadata.id, created.metadata.name);
+
+      stateSpy = jest
+        .spyOn(WorkspaceStore.prototype, "getWorkspaceState")
+        .mockImplementation(function (this: WorkspaceStore, workspaceId: string) {
+          const state = realGetState.call(this, workspaceId);
+          if (workspaceId !== app.workspaceId) return state;
+          // One view object per store state: useSyncExternalStore needs a stable snapshot.
+          let view = windowed.get(state);
+          if (!view) {
+            view = {
+              ...state,
+              hasOlderHistory: true,
+              messages: state.messages.filter(
+                (row) => !("historyId" in row) || row.historyId !== editedRowId
+              ),
+            };
+            windowed.set(state, view);
+          }
+          return view;
+        });
+      await showWorkspace(app, app.workspaceId, app.metadata.name);
+      await waitFor(
+        () =>
+          expect(
+            useWorkspaceStoreRaw().getWorkspaceState(app.workspaceId).isTranscriptCaughtUp
+          ).toBe(true),
+        LOAD_TOLERANT_WAIT
+      );
+      // Let the caught-up render run ChatPane's row check; the edit stays.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      });
+      expect(editTextarea(app)?.value).toBe("edited before switch");
+      expect(getDraftStore().getText(scope)).toBe("unsent draft");
+    } finally {
+      stateSpy?.mockRestore();
       await app.dispose();
     }
   }, 120_000);

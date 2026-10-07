@@ -1410,6 +1410,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     )?.historyId;
 
     if (!editCutoffHistoryId) {
+      // A windowed replay can leave a kept edit's row in older history, unloaded: that is not
+      // a deletion, so the edit stays (#5808). Its send still checks the rows (precondition).
+      if (workspaceState.hasOlderHistory) return;
       // Message was replaced or deleted - clear editing state
       setEditingMessage(undefined);
     }
