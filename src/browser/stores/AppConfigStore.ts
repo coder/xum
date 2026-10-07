@@ -7,7 +7,6 @@ import {
 } from "@/common/config/schemas/userPreferences";
 import { applyMergePatch, type MergePatch } from "@/common/utils/applyMergePatch";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import type { BashCollapsedSummaryMode, TranscriptDensity } from "@/common/constants/storage";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ExperimentId } from "@/common/constants/experiments";
 import { showFeedbackToast } from "@/browser/utils/feedbackToast";
@@ -26,10 +25,8 @@ export interface AppConfigSnapshot {
   proposePlanImplementReplacesChatHistory?: boolean;
   /**
    * Read only by the VS Code webview to seed its local preference cache (#4972, #4962). Desktop
-   * hydrates these through UserPreferencesContext / WorkspaceContext instead.
+   * hydrates it through WorkspaceContext instead.
    */
-  bashCollapsedSummaryMode?: BashCollapsedSummaryMode;
-  transcriptDensity?: TranscriptDensity;
   agentAiDefaults?: AgentAiDefaults;
   /** Read by the command palette to show the toggle's current state (#5791). */
   keepScreenAwake?: boolean;
@@ -194,9 +191,6 @@ export class AppConfigStore {
           minThinkingLevelByModel: config.minThinkingLevelByModel,
           proposePlanImplementReplacesChatHistory:
             taskSettings?.proposePlanImplementReplacesChatHistory === true,
-          // The webview projection may omit these (see redactWebviewOrpcResult).
-          bashCollapsedSummaryMode: config.userPreferences?.appearance?.bashCollapsedSummaryMode,
-          transcriptDensity: config.userPreferences?.appearance?.transcriptDensity,
           agentAiDefaults: config.agentAiDefaults,
           keepScreenAwake: config.keepScreenAwake === true,
           experiments: config.experiments ?? {},

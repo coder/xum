@@ -7,7 +7,6 @@ import { Profiler } from "react";
 import { installDom } from "../../../tests/ui/dom";
 import { readPersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import {
-  BASH_COLLAPSED_SUMMARY_MODE_KEY,
   GLOBAL_SCOPE_ID,
   getAgentIdKey,
   getThinkingLevelKey,
@@ -1066,8 +1065,7 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     cleanup();
     // The store is an app-wide singleton; drop what a test loaded so later tests start clean.
     getAppConfigStore().updateOptimistically({
-      bashCollapsedSummaryMode: undefined,
-      transcriptDensity: undefined,
+      userPreferences: undefined,
       agentAiDefaults: undefined,
     });
     cleanupDom?.();
@@ -1076,8 +1074,6 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
 
   test("bash headers follow the user's collapsed-summary mode once config arrives", async () => {
     const script = "ls -la && git log --oneline -3";
-    // Left over from an earlier webview session; it must not apply before this server's config.
-    updatePersistedState(BASH_COLLAPSED_SUMMARY_MODE_KEY, "intent");
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, [

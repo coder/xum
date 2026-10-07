@@ -9,11 +9,8 @@ import {
 import {
   GLOBAL_SCOPE_ID,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
-  TERMINAL_FONT_CONFIG_KEY,
   getAgentIdKey,
 } from "@/common/constants/storage";
-import type { UserPreferences } from "@/common/config/schemas/userPreferences";
-import { removeStoredUserPreference } from "@/common/preferences/userPreferencesStorage";
 
 class MemoryStorage implements Storage {
   private values = new Map<string, string>();
@@ -63,18 +60,9 @@ describe("UserPreferencesProvider bridge helpers", () => {
   });
 
   test("removing the last known value of a section deletes only that stored value", () => {
-    const remove = (before: UserPreferences, key: string) =>
-      createMergePatch(before, removeStoredUserPreference(before, key) ?? {});
-
     expect(createMergePatch({ appearance: { theme: "dark" } }, {})).toEqual({
       appearance: { theme: null },
     });
-    expect(
-      remove(
-        { appearance: { terminalFontConfig: { fontFamily: "Menlo", fontSize: 13 } } },
-        TERMINAL_FONT_CONFIG_KEY
-      )
-    ).toEqual({ appearance: { terminalFontConfig: null } });
   });
 
   test("only prunes scoped preferences after successful project and workspace loads", () => {

@@ -7,17 +7,10 @@ import {
   AUTO_COMPACTION_THRESHOLD_STORAGE_MAX,
 } from "@/common/constants/ui";
 import {
-  BASH_COLLAPSED_SUMMARY_MODE_KEY,
-  BASH_COLLAPSED_SUMMARY_MODES,
-  EDITOR_CONFIG_KEY,
   GLOBAL_SCOPE_ID,
   PROVIDER_OPTIONS_ANTHROPIC_KEY,
   PROVIDER_OPTIONS_GOOGLE_KEY,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
-  TERMINAL_BADGE_CONFIG_KEY,
-  TERMINAL_FONT_CONFIG_KEY,
-  TRANSCRIPT_DENSITIES,
-  TRANSCRIPT_DENSITY_KEY,
   getAgentIdKey,
   getAutoCompactionThresholdKey,
   getLastRuntimeConfigKey,
@@ -28,18 +21,11 @@ import {
   getReviewDefaultBaseKey,
   getThinkingLevelKey,
   getTrunkBranchKey,
-  normalizeEditorConfig,
-  normalizeTerminalBadgeConfig,
-  normalizeTerminalFontConfig,
-  type BashCollapsedSummaryMode,
-  type TranscriptDensity,
 } from "@/common/constants/storage";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
 import {
-  isRecord,
   parseAgentId,
   parseBoolean,
-  parseEnum,
   parseModelString,
   parseNonEmptyString,
   parseRecord,
@@ -59,11 +45,6 @@ export interface StoredUserPreferenceEntry {
 
 const PROJECT_SCOPE_PREFIX = "__project__/";
 const STATIC_USER_PREFERENCE_KEYS = new Set<string>([
-  TRANSCRIPT_DENSITY_KEY,
-  BASH_COLLAPSED_SUMMARY_MODE_KEY,
-  TERMINAL_BADGE_CONFIG_KEY,
-  TERMINAL_FONT_CONFIG_KEY,
-  EDITOR_CONFIG_KEY,
   PROVIDER_OPTIONS_ANTHROPIC_KEY,
   PROVIDER_OPTIONS_GOOGLE_KEY,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
@@ -140,13 +121,6 @@ export function isUserPreferenceStorageKey(key: string): boolean {
   return getPreferenceKind(key) !== undefined;
 }
 
-function ensureAppearance(
-  preferences: UserPreferences
-): NonNullable<UserPreferences["appearance"]> {
-  preferences.appearance ??= {};
-  return preferences.appearance;
-}
-
 function ensureAi(preferences: UserPreferences): NonNullable<UserPreferences["ai"]> {
   preferences.ai ??= {};
   return preferences.ai;
@@ -206,48 +180,6 @@ export function applyStoredUserPreference(
   value: unknown
 ): UserPreferences | undefined {
   const next = cloneUserPreferences(preferences);
-
-  if (key === TRANSCRIPT_DENSITY_KEY) {
-    const parsed = parseEnum<TranscriptDensity>(TRANSCRIPT_DENSITIES, value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureAppearance(next).transcriptDensity = parsed;
-    return pruneUserPreferences(next);
-  }
-
-  if (key === BASH_COLLAPSED_SUMMARY_MODE_KEY) {
-    const parsed = parseEnum<BashCollapsedSummaryMode>(BASH_COLLAPSED_SUMMARY_MODES, value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureAppearance(next).bashCollapsedSummaryMode = parsed;
-    return pruneUserPreferences(next);
-  }
-
-  if (key === TERMINAL_FONT_CONFIG_KEY) {
-    if (!isRecord(value)) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureAppearance(next).terminalFontConfig = normalizeTerminalFontConfig(value);
-    return pruneUserPreferences(next);
-  }
-
-  if (key === TERMINAL_BADGE_CONFIG_KEY) {
-    if (!isRecord(value)) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureAppearance(next).terminalBadgeConfig = normalizeTerminalBadgeConfig(value);
-    return pruneUserPreferences(next);
-  }
-
-  if (key === EDITOR_CONFIG_KEY) {
-    if (!isRecord(value)) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureAppearance(next).editorConfig = normalizeEditorConfig(value);
-    return pruneUserPreferences(next);
-  }
 
   if (key === getAgentIdKey(GLOBAL_SCOPE_ID)) {
     const parsed = parseAgentId(value);
@@ -399,13 +331,7 @@ export function removeStoredUserPreference(
 ): UserPreferences | undefined {
   const next = cloneUserPreferences(preferences);
 
-  if (key === TRANSCRIPT_DENSITY_KEY) delete next.appearance?.transcriptDensity;
-  else if (key === BASH_COLLAPSED_SUMMARY_MODE_KEY)
-    delete next.appearance?.bashCollapsedSummaryMode;
-  else if (key === TERMINAL_FONT_CONFIG_KEY) delete next.appearance?.terminalFontConfig;
-  else if (key === TERMINAL_BADGE_CONFIG_KEY) delete next.appearance?.terminalBadgeConfig;
-  else if (key === EDITOR_CONFIG_KEY) delete next.appearance?.editorConfig;
-  else if (key === getAgentIdKey(GLOBAL_SCOPE_ID)) delete next.ai?.globalDefaults?.agentId;
+  if (key === getAgentIdKey(GLOBAL_SCOPE_ID)) delete next.ai?.globalDefaults?.agentId;
   else if (key === getThinkingLevelKey(GLOBAL_SCOPE_ID))
     delete next.ai?.globalDefaults?.thinkingLevel;
   else if (key === PROVIDER_OPTIONS_ANTHROPIC_KEY) delete next.ai?.providerOptions?.anthropic;
@@ -449,21 +375,6 @@ export function entriesFromUserPreferences(
   if (!preferences) {
     return entries;
   }
-
-  const appearance = preferences.appearance;
-  if (appearance?.transcriptDensity !== undefined)
-    entries.push({ key: TRANSCRIPT_DENSITY_KEY, value: appearance.transcriptDensity });
-  if (appearance?.bashCollapsedSummaryMode !== undefined)
-    entries.push({
-      key: BASH_COLLAPSED_SUMMARY_MODE_KEY,
-      value: appearance.bashCollapsedSummaryMode,
-    });
-  if (appearance?.terminalFontConfig !== undefined)
-    entries.push({ key: TERMINAL_FONT_CONFIG_KEY, value: appearance.terminalFontConfig });
-  if (appearance?.terminalBadgeConfig !== undefined)
-    entries.push({ key: TERMINAL_BADGE_CONFIG_KEY, value: appearance.terminalBadgeConfig });
-  if (appearance?.editorConfig !== undefined)
-    entries.push({ key: EDITOR_CONFIG_KEY, value: appearance.editorConfig });
 
   const ai = preferences.ai;
   if (ai?.globalDefaults?.agentId !== undefined)
