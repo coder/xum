@@ -19,6 +19,7 @@ import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { resolveAutoCompactionThreshold } from "@/common/utils/compaction/autoCompactionThreshold";
 
 interface ServiceContainerPrivates {
@@ -207,13 +208,24 @@ describe("Compaction UI (mock AI router)", () => {
       await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
 
       const sendMessage = jest.spyOn(app.env.services.workspaceService, "sendMessage");
-      const saveUserConfig = jest
-        .spyOn(app.env.config, "saveUserConfig")
-        .mockRejectedValue(new Error("disk full"));
+      let failSave: (error: Error) => void = () => undefined;
+      const updateUserPreferences = jest
+        .spyOn(app.env.config, "updateUserPreferences")
+        .mockImplementation(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              failSave = reject;
+            })
+        );
+      const flush = jest.spyOn(getAppConfigStore(), "flushUserPreferences");
       const draft = "Draft that must survive a failed settings save";
       moveThresholdSlider(FORCE_THRESHOLD_PERCENT);
-      await waitFor(() => expect(saveUserConfig).toHaveBeenCalled(), { timeout: 10_000 });
+      await waitFor(() => expect(updateUserPreferences).toHaveBeenCalled(), { timeout: 10_000 });
       await app.chat.send(draft);
+      // Fail the save only once the send waits on it.
+      await waitFor(() => expect(flush).toHaveBeenCalled(), { timeout: 10_000 });
+      failSave(new Error("disk full"));
+      flush.mockRestore();
 
       // The composer refuses the send visibly rather than streaming with a stale threshold.
       await waitFor(
