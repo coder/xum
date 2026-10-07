@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 
 // Exact-step repros may run on the host (no model picks an action there), and the host pause
@@ -25,15 +26,32 @@ test("the rule catches a suite that drives flows with agent.act", () => {
   );
 });
 
-test("no repro lets a model pick actions", () => {
-  // Recursive, like the runner's repros/**/*.e2e.ts.
+// Every model-driven test file under `dir`. Recursive, like the runner's tests glob
+// (e2e.config.ts).
+function modelDrivenFiles(dir: string): string[] {
   const files = fs
-    .readdirSync(REPROS, { recursive: true, encoding: "utf8" })
+    .readdirSync(dir, { recursive: true, encoding: "utf8" })
     .filter((name) => name.endsWith(".e2e.ts"));
   expect(files.length).toBeGreaterThan(0);
-  const found = files.flatMap((name) => {
-    const why = modelDriven(fs.readFileSync(path.join(REPROS, name), "utf8"));
+  return files.flatMap((name) => {
+    const why = modelDriven(fs.readFileSync(path.join(dir, name), "utf8"));
     return why == null ? [] : [`${name}: ${why}`];
   });
-  expect(found).toEqual([]);
+}
+
+test("the scan finds a model-driven repro in a nested folder", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-repro-rules-"));
+  try {
+    fs.mkdirSync(path.join(dir, "group"));
+    fs.writeFileSync(path.join(dir, "group/x.e2e.ts"), "test('x', async ({ agent }) => {})");
+    expect(modelDrivenFiles(dir)).toEqual([
+      `${path.join("group", "x.e2e.ts")}: takes the agent fixture`,
+    ]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("no repro lets a model pick actions", () => {
+  expect(modelDrivenFiles(REPROS)).toEqual([]);
 });
