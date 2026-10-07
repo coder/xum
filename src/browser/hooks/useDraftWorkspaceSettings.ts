@@ -22,14 +22,11 @@ import {
 import {
   DEFAULT_MODEL_KEY,
   DEFAULT_RUNTIME_KEY,
-  getAgentIdKey,
-  getModelKey,
   getRuntimeKey,
   getTrunkBranchKey,
   getLastRuntimeConfigKey,
-  getProjectScopeId,
-  GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -231,18 +228,15 @@ export function useDraftWorkspaceSettings(
   const [thinkingLevel] = useThinkingLevel();
   const [reasoningMode] = useReasoningMode();
 
-  const projectScopeId = getProjectScopeId(projectPath);
   const { userProjects } = useProjectContext();
   const projectConfig = userProjects.get(projectPath);
 
-  const [globalDefaultAgentId] = usePersistedState<string>(
-    getAgentIdKey(GLOBAL_SCOPE_ID),
-    WORKSPACE_DEFAULTS.agentId,
-    { listener: true }
+  const globalDefaultAgentId =
+    useUserPreferences((preferences) => preferences.ai?.globalDefaults?.agentId) ??
+    WORKSPACE_DEFAULTS.agentId;
+  const projectAgentId = useUserPreferences(
+    (preferences) => preferences.ai?.projectDefaults?.[projectPath]?.agentId
   );
-  const [projectAgentId] = usePersistedState<string | null>(getAgentIdKey(projectScopeId), null, {
-    listener: true,
-  });
   const agentId =
     typeof projectAgentId === "string" && projectAgentId.trim().length > 0
       ? coerceAgentId(projectAgentId)
@@ -261,9 +255,9 @@ export function useDraftWorkspaceSettings(
 
   // Project-scoped model preference (persisted per project). If unset, fall back to the global
   // default model preference.
-  const [modelOverride] = usePersistedState<string | null>(getModelKey(projectScopeId), null, {
-    listener: true,
-  });
+  const modelOverride = useUserPreferences(
+    (preferences) => preferences.ai?.projectDefaults?.[projectPath]?.model
+  );
   const model = normalizeSelectedModel(
     typeof modelOverride === "string" && modelOverride.trim().length > 0
       ? modelOverride.trim()

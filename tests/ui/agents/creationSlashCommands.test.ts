@@ -24,11 +24,11 @@ import {
 import { ChatHarness } from "../harness";
 
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
   getDraftScopeId,
-  getModelKey,
   getProjectScopeId,
 } from "@/common/constants/storage";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -100,10 +100,11 @@ describeIntegration("Creation slash commands", () => {
         { timeout: 5_000 }
       );
 
-      const modelKey = getModelKey(getProjectScopeId(projectPath));
       await waitFor(
         () => {
-          expect(readPersistedState(modelKey, "")).toBe(expectedModel);
+          expect(getUserPreferences().ai?.projectDefaults?.[projectPath]?.model).toBe(
+            expectedModel
+          );
         },
         { timeout: 5_000 }
       );

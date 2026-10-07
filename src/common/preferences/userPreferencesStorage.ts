@@ -3,25 +3,17 @@ import {
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
 import {
-  GLOBAL_SCOPE_ID,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
-  getAgentIdKey,
   getLastRuntimeConfigKey,
-  getModelKey,
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
-  getProjectScopeId,
   getReviewDefaultBaseKey,
-  getThinkingLevelKey,
   getTrunkBranchKey,
 } from "@/common/constants/storage";
 import {
-  parseAgentId,
   parseBoolean,
-  parseModelString,
   parseNonEmptyString,
   parseRecord,
-  parseThinkingLevel,
 } from "@/common/preferences/userPreferenceParsing";
 
 export interface UserPreferenceStorageArea {
@@ -35,17 +27,9 @@ export interface StoredUserPreferenceEntry {
   value: unknown;
 }
 
-const PROJECT_SCOPE_PREFIX = "__project__/";
-const STATIC_USER_PREFERENCE_KEYS = new Set<string>([
-  REVIEW_INCLUDE_UNCOMMITTED_KEY,
-  getAgentIdKey(GLOBAL_SCOPE_ID),
-  getThinkingLevelKey(GLOBAL_SCOPE_ID),
-]);
+const STATIC_USER_PREFERENCE_KEYS = new Set<string>([REVIEW_INCLUDE_UNCOMMITTED_KEY]);
 
 const DYNAMIC_USER_PREFERENCE_PREFIXES = [
-  getAgentIdKey(PROJECT_SCOPE_PREFIX),
-  getModelKey(PROJECT_SCOPE_PREFIX),
-  getThinkingLevelKey(PROJECT_SCOPE_PREFIX),
   getTrunkBranchKey(""),
   getLastRuntimeConfigKey(""),
   getNotifyOnResponseAutoEnableKey(""),
@@ -69,17 +53,6 @@ function parseStoredValue(raw: string | null): unknown {
   }
 }
 
-function parseProjectScope(key: string, prefix: string): string | undefined {
-  if (!key.startsWith(prefix)) {
-    return undefined;
-  }
-
-  const scopeId = key.slice(prefix.length);
-  return scopeId.startsWith(PROJECT_SCOPE_PREFIX) && scopeId.length > PROJECT_SCOPE_PREFIX.length
-    ? scopeId.slice(PROJECT_SCOPE_PREFIX.length)
-    : undefined;
-}
-
 function readSuffix(key: string, prefix: string): string | undefined {
   if (!key.startsWith(prefix)) {
     return undefined;
@@ -99,29 +72,6 @@ function getPreferenceKind(key: string): string | undefined {
 
 export function isUserPreferenceStorageKey(key: string): boolean {
   return getPreferenceKind(key) !== undefined;
-}
-
-function ensureAi(preferences: UserPreferences): NonNullable<UserPreferences["ai"]> {
-  preferences.ai ??= {};
-  return preferences.ai;
-}
-
-function ensureGlobalAiDefaults(
-  preferences: UserPreferences
-): NonNullable<NonNullable<UserPreferences["ai"]>["globalDefaults"]> {
-  const ai = ensureAi(preferences);
-  ai.globalDefaults ??= {};
-  return ai.globalDefaults;
-}
-
-function ensureProjectAiDefaults(
-  preferences: UserPreferences,
-  projectPath: string
-): NonNullable<NonNullable<UserPreferences["ai"]>["projectDefaults"]>[string] {
-  const ai = ensureAi(preferences);
-  ai.projectDefaults ??= {};
-  ai.projectDefaults[projectPath] ??= {};
-  return ai.projectDefaults[projectPath];
 }
 
 function ensureWorkspaceCreationProject(
@@ -152,54 +102,6 @@ export function applyStoredUserPreference(
   value: unknown
 ): UserPreferences | undefined {
   const next = cloneUserPreferences(preferences);
-
-  if (key === getAgentIdKey(GLOBAL_SCOPE_ID)) {
-    const parsed = parseAgentId(value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureGlobalAiDefaults(next).agentId = parsed;
-    return pruneUserPreferences(next);
-  }
-
-  if (key === getThinkingLevelKey(GLOBAL_SCOPE_ID)) {
-    const parsed = parseThinkingLevel(value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureGlobalAiDefaults(next).thinkingLevel = parsed;
-    return pruneUserPreferences(next);
-  }
-
-  const projectAgentPath = parseProjectScope(key, "agentId:");
-  if (projectAgentPath) {
-    const parsed = parseAgentId(value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureProjectAiDefaults(next, projectAgentPath).agentId = parsed;
-    return pruneUserPreferences(next);
-  }
-
-  const projectModelPath = parseProjectScope(key, "model:");
-  if (projectModelPath) {
-    const parsed = parseModelString(value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureProjectAiDefaults(next, projectModelPath).model = parsed;
-    return pruneUserPreferences(next);
-  }
-
-  const projectThinkingPath = parseProjectScope(key, "thinkingLevel:");
-  if (projectThinkingPath) {
-    const parsed = parseThinkingLevel(value);
-    if (!parsed) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureProjectAiDefaults(next, projectThinkingPath).thinkingLevel = parsed;
-    return pruneUserPreferences(next);
-  }
 
   const trunkProjectPath = readSuffix(key, getTrunkBranchKey(""));
   if (trunkProjectPath) {
@@ -273,26 +175,15 @@ export function removeStoredUserPreference(
 ): UserPreferences | undefined {
   const next = cloneUserPreferences(preferences);
 
-  if (key === getAgentIdKey(GLOBAL_SCOPE_ID)) delete next.ai?.globalDefaults?.agentId;
-  else if (key === getThinkingLevelKey(GLOBAL_SCOPE_ID))
-    delete next.ai?.globalDefaults?.thinkingLevel;
-  else if (key === REVIEW_INCLUDE_UNCOMMITTED_KEY) delete next.review?.includeUncommitted;
+  if (key === REVIEW_INCLUDE_UNCOMMITTED_KEY) delete next.review?.includeUncommitted;
   else {
-    const projectAgentPath = parseProjectScope(key, "agentId:");
-    const projectModelPath = parseProjectScope(key, "model:");
-    const projectThinkingPath = parseProjectScope(key, "thinkingLevel:");
     const trunkProjectPath = readSuffix(key, getTrunkBranchKey(""));
     const runtimeProjectPath = readSuffix(key, getLastRuntimeConfigKey(""));
     const autoNotifyProjectPath = readSuffix(key, getNotifyOnResponseAutoEnableKey(""));
     const notifyWorkspaceId = readSuffix(key, getNotifyOnResponseKey(""));
     const reviewDefaultProjectPath = readSuffix(key, getReviewDefaultBaseKey(""));
 
-    if (projectAgentPath) delete next.ai?.projectDefaults?.[projectAgentPath]?.agentId;
-    else if (projectModelPath) delete next.ai?.projectDefaults?.[projectModelPath]?.model;
-    else if (projectThinkingPath)
-      delete next.ai?.projectDefaults?.[projectThinkingPath]?.thinkingLevel;
-    else if (trunkProjectPath)
-      delete next.workspaceCreation?.byProject?.[trunkProjectPath]?.trunkBranch;
+    if (trunkProjectPath) delete next.workspaceCreation?.byProject?.[trunkProjectPath]?.trunkBranch;
     else if (runtimeProjectPath)
       delete next.workspaceCreation?.byProject?.[runtimeProjectPath]?.lastRuntimeConfig;
     else if (autoNotifyProjectPath)
@@ -312,25 +203,6 @@ export function entriesFromUserPreferences(
   const entries: StoredUserPreferenceEntry[] = [];
   if (!preferences) {
     return entries;
-  }
-
-  const ai = preferences.ai;
-  if (ai?.globalDefaults?.agentId !== undefined)
-    entries.push({ key: getAgentIdKey(GLOBAL_SCOPE_ID), value: ai.globalDefaults.agentId });
-  if (ai?.globalDefaults?.thinkingLevel !== undefined)
-    entries.push({
-      key: getThinkingLevelKey(GLOBAL_SCOPE_ID),
-      value: ai.globalDefaults.thinkingLevel,
-    });
-
-  for (const [projectPath, defaults] of Object.entries(ai?.projectDefaults ?? {})) {
-    const scopeId = getProjectScopeId(projectPath);
-    if (defaults.agentId !== undefined)
-      entries.push({ key: getAgentIdKey(scopeId), value: defaults.agentId });
-    if (defaults.model !== undefined)
-      entries.push({ key: getModelKey(scopeId), value: defaults.model });
-    if (defaults.thinkingLevel !== undefined)
-      entries.push({ key: getThinkingLevelKey(scopeId), value: defaults.thinkingLevel });
   }
 
   for (const [projectPath, defaults] of Object.entries(

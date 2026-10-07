@@ -9,18 +9,16 @@ import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePer
 import {
   DEFAULT_MODEL_KEY,
   DEFAULT_RUNTIME_KEY,
-  GLOBAL_SCOPE_ID,
-  getAgentIdKey,
   getLastRuntimeConfigKey,
-  getModelKey,
-  getProjectScopeId,
   getRuntimeKey,
 } from "@/common/constants/storage";
 import { CODER_RUNTIME_PLACEHOLDER } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "./useDraftWorkspaceSettings";
-import { createTestApiClient } from "@/browser/testUtils";
+import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 
-function createStubApiClient(): APIClient {
+function createStubApiClient(preferences?: UserPreferences): APIClient {
   // useModelLRU() only needs providers.getConfig + providers.onConfigChanged.
   // Provide a minimal stub so tests can run without spinning up a real oRPC client.
   async function* empty() {
@@ -28,6 +26,7 @@ function createStubApiClient(): APIClient {
   }
 
   return createTestApiClient({
+    config: createTestPreferencesConfig(preferences),
     providers: {
       getConfig: () => Promise.resolve({}),
       onConfigChanged: () => Promise.resolve(empty()),
@@ -39,9 +38,13 @@ function createStubApiClient(): APIClient {
   });
 }
 
-function createWrapper(projectPath: string): React.FC<{ children: React.ReactNode }> {
+function createWrapper(
+  projectPath: string,
+  preferences?: UserPreferences
+): React.FC<{ children: React.ReactNode }> {
+  const client = createStubApiClient(preferences);
   const Wrapper: React.FC<{ children: React.ReactNode }> = (props) => (
-    <APIProvider client={createStubApiClient()}>
+    <APIProvider client={client}>
       <ProjectProvider>
         <ThinkingProvider projectPath={projectPath}>{props.children}</ThinkingProvider>
       </ProjectProvider>
@@ -70,6 +73,7 @@ describe("useDraftWorkspaceSettings", () => {
 
   afterEach(() => {
     cleanup();
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     mock.restore();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
@@ -79,9 +83,7 @@ describe("useDraftWorkspaceSettings", () => {
   test("uses global default agent when project preference is unset", async () => {
     const projectPath = "/tmp/project";
 
-    updatePersistedState(getAgentIdKey(GLOBAL_SCOPE_ID), "ask");
-
-    const wrapper = createWrapper(projectPath);
+    const wrapper = createWrapper(projectPath, { ai: { globalDefaults: { agentId: "ask" } } });
 
     const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
       wrapper,
@@ -95,10 +97,12 @@ describe("useDraftWorkspaceSettings", () => {
   test("prefers project agent over global default", async () => {
     const projectPath = "/tmp/project";
 
-    updatePersistedState(getAgentIdKey(GLOBAL_SCOPE_ID), "ask");
-    updatePersistedState(getAgentIdKey(getProjectScopeId(projectPath)), "plan");
-
-    const wrapper = createWrapper(projectPath);
+    const wrapper = createWrapper(projectPath, {
+      ai: {
+        globalDefaults: { agentId: "ask" },
+        projectDefaults: { [projectPath]: { agentId: "plan" } },
+      },
+    });
 
     const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
       wrapper,
@@ -112,9 +116,9 @@ describe("useDraftWorkspaceSettings", () => {
   test("preserves explicit gateway model in the project preference", async () => {
     const projectPath = "/tmp/project";
 
-    updatePersistedState(getModelKey(getProjectScopeId(projectPath)), "openrouter:openai/gpt-5");
-
-    const wrapper = createWrapper(projectPath);
+    const wrapper = createWrapper(projectPath, {
+      ai: { projectDefaults: { [projectPath]: { model: "openrouter:openai/gpt-5" } } },
+    });
 
     const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
       wrapper,

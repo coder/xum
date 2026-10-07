@@ -24,12 +24,11 @@ import {
 } from "@/browser/hooks/usePersistedState";
 import {
   ARCHIVED_WORKSPACES_CACHE_MAX_CHARS,
-  getAgentIdKey,
   getAgentsInitNudgeKey,
   getArchivedWorkspacesKey,
   getArchivedWorkspacesExpandedKey,
-  getProjectScopeId,
 } from "@/common/constants/storage";
+import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
 import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
@@ -266,7 +265,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
 
   const handleRunAgentsInit = useCallback(() => {
     // Switch project-scope mode to exec.
-    updatePersistedState(getAgentIdKey(getProjectScopeId(projectPath)), "exec");
+    updateUserPreferences({ ai: { projectDefaults: { [projectPath]: { agentId: "exec" } } } });
 
     // Run the /init skill and start the creation chat.
     if (chatInputRef.current) {

@@ -28,7 +28,6 @@ import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions"
 import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
-  getModelKey,
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
   getReasoningModeKey,
@@ -40,8 +39,8 @@ import {
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
   getWorkspaceNameStateKey,
-  GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { SendMessageError } from "@/common/types/errors";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -130,18 +129,17 @@ function syncCreationPreferences(
   autoRoutingEnabled: boolean
 ): void {
   const projectScopeId = getProjectScopeId(projectPath);
+  const aiPreferences = getUserPreferences().ai;
+  const projectDefaults = aiPreferences?.projectDefaults?.[projectPath];
 
   // Sync model from project scope to workspace scope
   // This ensures the model used for creation is persisted for future resumes
-  const projectModel = readPersistedState<string | null>(getModelKey(projectScopeId), null);
+  const projectModel = projectDefaults?.model;
   if (projectModel) {
     setWorkspaceModelWithOrigin(workspaceId, projectModel, "sync");
   }
-  const projectAgentId = readPersistedState<string | null>(getAgentIdKey(projectScopeId), null);
-  const globalDefaultAgentId = readPersistedState<string>(
-    getAgentIdKey(GLOBAL_SCOPE_ID),
-    WORKSPACE_DEFAULTS.agentId
-  );
+  const projectAgentId = projectDefaults?.agentId;
+  const globalDefaultAgentId = aiPreferences?.globalDefaults?.agentId ?? WORKSPACE_DEFAULTS.agentId;
   const effectiveAgentId =
     typeof projectAgentId === "string" && projectAgentId.trim().length > 0
       ? normalizeAgentId(projectAgentId, WORKSPACE_DEFAULTS.agentId)
@@ -174,11 +172,8 @@ function syncCreationPreferences(
     recordAutoRoutingChoiceForAgent(workspaceId, effectiveAgentId, routingChoice);
   }
 
-  const projectThinkingLevel = readPersistedState<ThinkingLevel | null>(
-    getThinkingLevelKey(projectScopeId),
-    null
-  );
-  if (projectThinkingLevel !== null) {
+  const projectThinkingLevel = projectDefaults?.thinkingLevel;
+  if (projectThinkingLevel !== undefined) {
     updatePersistedState(getThinkingLevelKey(workspaceId), projectThinkingLevel);
   }
 
