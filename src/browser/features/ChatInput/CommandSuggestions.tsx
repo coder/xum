@@ -6,6 +6,13 @@ import { FileIcon } from "@/browser/components/FileIcon/FileIcon";
 
 export const COMMAND_SUGGESTION_KEYS = ["Tab", "Enter", "ArrowUp", "ArrowDown", "Escape"];
 
+const MENU_MAX_HEIGHT_PX = 200;
+
+// floating-ui's engine check for WebKit.
+function isWebKit(): boolean {
+  return window.CSS.supports("-webkit-backdrop-filter", "none");
+}
+
 function HighlightedText({
   text,
   query,
@@ -88,10 +95,12 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
     if (!isSelectionControlled) setUncontrolledSelectedIndex(resolved);
     onSelectedIndexChange?.(resolved);
   };
-  const [position, setPosition] = useState<{ top: number; left: number; width: number } | null>(
-    null
-  );
-  const menuRef = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState<{
+    bottomEdge: number;
+    left: number;
+    width: number;
+    maxHeight: number;
+  } | null>(null);
   const selectedRef = useRef<HTMLDivElement>(null);
   const previousSuggestionsRef = useRef<SlashSuggestion[]>(suggestions);
   const wasVisibleRef = useRef(isVisible);
@@ -125,17 +134,28 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
       return;
     }
 
+    const viewport = window.visualViewport;
+    // WebKit reports client rects relative to the visual viewport, but `position: fixed` resolves
+    // against the layout viewport. They diverge while the iOS keyboard is open, so convert like
+    // floating-ui does (WebKit bug 257375).
+    const webKitViewport = viewport != null && isWebKit() ? viewport : null;
+
     const updatePosition = () => {
       const anchor = anchorRef.current;
       if (!anchor) return;
 
       const rect = anchor.getBoundingClientRect();
-      const menuHeight = menuRef.current?.offsetHeight ?? 200;
+      const bottomEdge = rect.top + (webKitViewport?.offsetTop ?? 0) - 8; // 8px gap above anchor
 
       setPosition({
-        top: rect.top - menuHeight - 8, // 8px gap above anchor
-        left: rect.left,
+        bottomEdge,
+        left: rect.left + (webKitViewport?.offsetLeft ?? 0),
         width: rect.width,
+        // Fit the menu between the top of the visible area and the input.
+        maxHeight: Math.max(
+          0,
+          Math.min(MENU_MAX_HEIGHT_PX, bottomEdge - (viewport?.offsetTop ?? 0))
+        ),
       });
     };
 
@@ -143,9 +163,13 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
 
     window.addEventListener("resize", updatePosition);
     window.addEventListener("scroll", updatePosition, true);
+    viewport?.addEventListener("resize", updatePosition);
+    viewport?.addEventListener("scroll", updatePosition);
     return () => {
       window.removeEventListener("resize", updatePosition);
       window.removeEventListener("scroll", updatePosition, true);
+      viewport?.removeEventListener("resize", updatePosition);
+      viewport?.removeEventListener("scroll", updatePosition);
     };
   }, [anchorRef, isVisible, suggestions]);
 
@@ -195,7 +219,6 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
 
   const content = (
     <div
-      ref={menuRef}
       id={resolvedListId}
       role="listbox"
       aria-label={ariaLabel}
@@ -204,18 +227,20 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
       }
       data-command-suggestions
       className={cn(
-        "bg-separator border-border-light z-[1010] flex max-h-[200px] flex-col overflow-y-auto rounded border shadow-[0_-4px_12px_rgba(0,0,0,0.4)]",
+        "bg-separator border-border-light z-[1010] flex flex-col overflow-y-auto rounded border shadow-[0_-4px_12px_rgba(0,0,0,0.4)]",
         !anchorRef && "absolute right-0 bottom-full left-0 mb-2"
       )}
       style={
         anchorRef && position
           ? {
               position: "fixed",
-              top: position.top,
+              // Pinning the bottom edge lets the menu grow upward without measuring its height.
+              bottom: `calc(100% - ${position.bottomEdge}px)`,
               left: position.left,
               width: position.width,
+              maxHeight: position.maxHeight,
             }
-          : undefined
+          : { maxHeight: MENU_MAX_HEIGHT_PX }
       }
     >
       {suggestions.map((suggestion, index) => (

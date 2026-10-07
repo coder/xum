@@ -2,7 +2,7 @@ import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import type { SlashSuggestion } from "@/browser/utils/slashCommands/types";
 import { CommandSuggestions } from "./CommandSuggestions";
 
@@ -112,6 +112,52 @@ describe("CommandSuggestions", () => {
     fireEvent.keyDown(document, { key: "Enter", shiftKey: true });
     expect(selected).toBeNull();
   });
+
+  it.each([
+    { engine: "WebKit", webKit: true },
+    { engine: "Chromium", webKit: false },
+  ])(
+    "keeps the anchored menu above the input when the visual viewport pans ($engine)",
+    ({ webKit }) => {
+      Object.defineProperty(window, "CSS", {
+        configurable: true,
+        value: { supports: () => webKit },
+      });
+      const viewport = Object.assign(new window.EventTarget(), { offsetLeft: 0, offsetTop: 0 });
+      Object.defineProperty(window, "visualViewport", { configurable: true, value: viewport });
+      // The input sits at (16, 243) in the layout viewport.
+      const clientRect = { left: 16, top: 243 };
+      const anchor = document.createElement("textarea");
+      anchor.getBoundingClientRect = () =>
+        new window.DOMRect(clientRect.left, clientRect.top, 360, 40);
+      render(
+        <CommandSuggestions
+          suggestions={suggestions}
+          onSelectSuggestion={() => undefined}
+          onDismiss={() => undefined}
+          isVisible
+          anchorRef={{ current: anchor }}
+        />
+      );
+      const menu = document.querySelector<HTMLElement>("[data-command-suggestions]");
+      expect(menu?.style.bottom).toBe("calc(100% - 235px)");
+      expect(menu?.style.maxHeight).toBe("200px");
+
+      // Only WebKit moves client rects with the visual viewport.
+      viewport.offsetLeft = 12;
+      viewport.offsetTop = 77;
+      if (webKit) {
+        clientRect.left -= 12;
+        clientRect.top -= 77;
+      }
+      act(() => {
+        viewport.dispatchEvent(new window.Event("scroll"));
+      });
+      expect(menu?.style.bottom).toBe("calc(100% - 235px)");
+      expect(menu?.style.left).toBe("16px");
+      expect(menu?.style.maxHeight).toBe("158px");
+    }
+  );
 
   it("dismisses on Escape without propagation", () => {
     let dismissed = false;
