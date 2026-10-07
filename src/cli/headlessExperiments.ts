@@ -1,6 +1,5 @@
 import {
   EXPERIMENT_IDS,
-  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
   PROMOTED_EXPERIMENT_IDS,
   type ExperimentId,
 } from "@/common/constants/experiments";
@@ -22,14 +21,9 @@ export function collectHeadlessExperiments(
   value: string,
   previous: ExperimentId[]
 ): ExperimentId[] {
-  let experimentId = value.trim().toLowerCase();
+  const experimentId = value.trim().toLowerCase();
   if (PROMOTED_EXPERIMENT_IDS.has(experimentId)) {
     return previous;
-  }
-  // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
-  // flag activates exactly the old exclusive posture.
-  if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
-    experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
   }
   const id = HEADLESS_EXPERIMENT_IDS.find((candidate) => candidate === experimentId);
   if (id === undefined) {
