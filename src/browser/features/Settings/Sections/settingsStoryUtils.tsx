@@ -14,11 +14,7 @@ import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/moc
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
-import {
-  getExperimentKey,
-  getExperimentList,
-  type ExperimentId,
-} from "@/common/constants/experiments";
+import type { ExperimentId } from "@/common/constants/experiments";
 import {
   LAST_CUSTOM_MODEL_PROVIDER_KEY,
   SELECTED_WORKSPACE_KEY,
@@ -43,13 +39,6 @@ export function resetStorybookPersistedStateForStory(): void {
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
     localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
-
-    // Storybook reuses one browser origin across stories, so experiment
-    // localStorage overrides from one story must not decide another story's
-    // switch positions. Each story can opt back in through setupSettingsStory().
-    for (const experiment of getExperimentList()) {
-      localStorage.removeItem(getExperimentKey(experiment.id));
-    }
 
     // Sidebar stories can write sidebarAgeGrouping=false into the shared
     // origin; clear it so the GeneralSection switch snapshots its default.

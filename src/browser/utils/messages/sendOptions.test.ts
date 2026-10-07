@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   getAutoModelRoutingKey,
@@ -22,6 +23,7 @@ describe("getSendOptionsFromStorage", () => {
   });
 
   afterEach(() => {
+    resetTestExperiments();
     window.localStorage.clear();
     cleanupDom?.();
     cleanupDom = null;
@@ -34,7 +36,7 @@ describe("getSendOptionsFromStorage", () => {
   ])(
     "carries the Auto flag only while the experiment is on and Auto is selected (%j)",
     ({ experiment, selected, expected }) => {
-      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), experiment);
+      setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, experiment);
       updatePersistedState(getAutoModelRoutingKey("ws-auto"), selected);
       const options = getSendOptionsFromStorage("ws-auto");
       expect(options.autoModelRouting).toBe(expected);
@@ -49,7 +51,7 @@ describe("getSendOptionsFromStorage", () => {
     { experiment: true, model: false, thinking: true },
     { experiment: false, model: true, thinking: true },
   ])("routes the model and thinking dimensions independently (%j)", (input) => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), input.experiment);
+    setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, input.experiment);
     updatePersistedState(getAutoModelRoutingKey("ws-dims"), input.model);
     updatePersistedState(getAutoThinkingLevelKey("ws-dims"), input.thinking);
     const options = getSendOptionsFromStorage("ws-dims");

@@ -14,7 +14,7 @@ import * as ReviewTypesModule from "@/common/types/review";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
@@ -25,7 +25,13 @@ import {
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
+import {
+  createTestApiClient,
+  createTestConfig,
+  type TestClientConfig,
+  resetTestExperiments,
+  setTestExperiment,
+} from "@/browser/testUtils";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 
@@ -353,6 +359,7 @@ describe("ProposePlanToolCall", () => {
   });
 
   afterEach(async () => {
+    resetTestExperiments();
     cleanup();
     await restoreProposePlanModuleMocks();
     barrierSpy?.mockRestore();
@@ -596,7 +603,7 @@ describe("ProposePlanToolCall", () => {
     const execModel = "openai:gpt-5.2";
     startInPlanMode(WORKSPACE_ID, execModel, "high");
     updatePersistedState(AGENT_AI_DEFAULTS_KEY, { exec: { modelString: execModel } });
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
+    setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
     updatePersistedState(getAutoModelRoutingKey(WORKSPACE_ID), true);
 
     const sendMessageCalls: SendMessageArgs[] = [];
@@ -616,7 +623,7 @@ describe("ProposePlanToolCall", () => {
     updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
       exec: { modelString: execModel, autoModelRouting: true, autoThinkingLevel: true },
     });
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
+    setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
 
     const sendMessageCalls: SendMessageArgs[] = [];
     mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });

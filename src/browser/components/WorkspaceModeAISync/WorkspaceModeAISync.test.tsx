@@ -6,7 +6,8 @@ import { installDom } from "../../../../tests/ui/dom";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { consumeWorkspaceModelChange, setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
 import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
@@ -64,6 +65,7 @@ describe("WorkspaceModeAISync", () => {
   });
 
   afterEach(() => {
+    resetTestExperiments();
     cleanup();
     cleanupDom?.();
     cleanupDom = null;
@@ -324,7 +326,7 @@ describe("WorkspaceModeAISync", () => {
 
   describe("Auto routing agent defaults", () => {
     beforeEach(() => {
-      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
+      setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
     });
 
     const readAuto = (workspaceId: string) => ({
