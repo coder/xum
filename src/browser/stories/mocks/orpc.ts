@@ -6,6 +6,7 @@
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from "@/constants/goals";
 import type { GoalBoardSnapshot } from "@/common/types/goal";
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
+import type { ExperimentId } from "@/common/constants/experiments";
 import type {
   MemoryConsolidationRecordPayload,
   MemoryConsolidationStatusPayload,
@@ -182,6 +183,8 @@ export interface MockORPCClientOptions {
   worktreeArchiveBehavior?: WorktreeArchiveBehavior;
   /** Initial full-width transcript toggle for config.getConfig */
   chatTranscriptFullWidth?: boolean;
+  /** Initial backend experiment values for config.getConfig; experiments.set updates them. */
+  experiments?: Partial<Record<ExperimentId, boolean>>;
   /** Initial keep-screen-awake toggle for config.getConfig */
   keepScreenAwake?: boolean;
   /** Initial runtime enablement for config.getConfig */
@@ -453,6 +456,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     coderWorkspaceArchiveBehavior: initialCoderWorkspaceArchiveBehavior = "stop",
     worktreeArchiveBehavior: initialWorktreeArchiveBehavior = "keep",
     chatTranscriptFullWidth: initialChatTranscriptFullWidth = false,
+    experiments: initialExperiments = {},
     keepScreenAwake: initialKeepScreenAwake = false,
     runtimeEnablement: initialRuntimeEnablement,
     defaultRuntime: initialDefaultRuntime,
@@ -605,6 +609,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let coderWorkspaceArchiveBehavior = initialCoderWorkspaceArchiveBehavior;
   let worktreeArchiveBehavior = initialWorktreeArchiveBehavior;
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
+  let experiments = initialExperiments;
   let keepScreenAwake = initialKeepScreenAwake;
   let toolSearchEnabled = true;
   let bashAiProxyEnabled = false;
@@ -835,7 +840,14 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve(undefined);
       },
     },
-    experiments: { set: () => Promise.resolve(undefined) },
+    experiments: {
+      getOverrides: () => Promise.resolve({ ...experiments }),
+      set: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => {
+        experiments = { ...experiments, [input.experimentId]: input.enabled === true };
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+    },
     config: {
       getConfig: () =>
         Promise.resolve({
@@ -861,6 +873,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           toolSearchEnabled,
           bashAiProxyEnabled,
           agentHeartbeatsEnabled,
+          experiments,
         }),
       saveConfig: (input: {
         taskSettings?: unknown;

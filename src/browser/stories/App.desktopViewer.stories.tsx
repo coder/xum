@@ -29,6 +29,7 @@ function setupDesktopStory(state: DesktopStoryState, sidebarWidth = 640) {
     workspaceId: WORKSPACE_ID,
     workspaceName: "desktop-viewer",
     messages: [],
+    experiments: { [EXPERIMENT_IDS.PORTABLE_DESKTOP]: true },
   });
   updatePersistedState(getExperimentKey(EXPERIMENT_IDS.PORTABLE_DESKTOP), true);
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);

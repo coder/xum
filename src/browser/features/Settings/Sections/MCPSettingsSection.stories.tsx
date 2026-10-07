@@ -1,6 +1,7 @@
 import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { wrapAsyncIterator } from "@orpc/shared";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { CLAUDE_DESIGN_URL } from "@/common/constants/claudeDesign";
 import type { ClaudeDesignStatus } from "@/common/orpc/schemas/claudeDesign";
 import { useEffect, useRef } from "react";
@@ -59,6 +60,7 @@ interface MCPSectionStoryOptions {
   testResults?: Record<string, string[]>;
   secrets?: Secret[];
   preCacheTools?: boolean;
+  experiments?: Partial<Record<ExperimentId, boolean>>;
 }
 
 function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): APIClient {
@@ -97,6 +99,7 @@ function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): API
     globalSecrets: options.secrets ?? [],
     mcpTestResults,
     mcpOauthAuthStatus: options.mcpOauthAuthStatus,
+    experiments: options.experiments,
   });
 }
 
@@ -109,6 +112,7 @@ const MCPSettingsSectionStoryShell: FC<{ setup: () => APIClient; children: React
   if (clientRef.current === null || setupRef.current !== setup) {
     setupRef.current = setup;
     clientRef.current = setup();
+    getAppConfigStore().setClient(clientRef.current);
   }
 
   return (
@@ -555,8 +559,8 @@ function setupDesignStory(
   const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
   let revision = 0;
   updates.push({ enabled, revision });
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP), enabled);
   const client = setupMCPSettingsSectionStory({
+    experiments: { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled },
     servers: enabled
       ? {
           claude_design: {

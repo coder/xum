@@ -2,6 +2,7 @@ import type { APIClient } from "@/browser/contexts/API";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { BashCollapsedSummaryMode, TranscriptDensity } from "@/common/constants/storage";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import type { ExperimentId } from "@/common/constants/experiments";
 
 /**
  * Slices of the app config consumed by per-model hooks (useRouting,
@@ -23,6 +24,8 @@ export interface AppConfigSnapshot {
   agentAiDefaults?: AgentAiDefaults;
   /** Read by the command palette to show the toggle's current state (#5791). */
   keepScreenAwake?: boolean;
+  /** Backend experiment values; the only experiment state the renderer reads. */
+  experiments?: Partial<Record<ExperimentId, boolean>>;
 }
 
 /**
@@ -99,6 +102,7 @@ export class AppConfigStore {
           transcriptDensity: config.userPreferences?.appearance?.transcriptDensity,
           agentAiDefaults: config.agentAiDefaults,
           keepScreenAwake: config.keepScreenAwake === true,
+          experiments: config.experiments ?? {},
         };
         this.notify();
       }

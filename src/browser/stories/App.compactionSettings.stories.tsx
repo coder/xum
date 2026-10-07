@@ -5,18 +5,15 @@ import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 export default { ...appMeta, title: "App/CompactionSettings" };
 
-const set = fn<APIClient["experiments"]["set"]>(() => Promise.resolve());
-const getOverrides = fn<APIClient["experiments"]["getOverrides"]>(() => Promise.resolve({}));
+const set = fn<APIClient["experiments"]["set"]>();
 
 function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "legacy") {
   expandLeftSidebar();
-  set.mockClear();
-  getOverrides.mockClear();
   const client = setupSettingsStory({
     experiments: {
       ...(mode === "defaults"
@@ -30,9 +27,11 @@ function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "leg
       [EXPERIMENT_IDS.RLM]: mode === "conflict",
     },
   });
+  set.mockReset();
+  set.mockImplementation(client.experiments.set);
   client.experiments = {
     set,
-    getOverrides,
+    getOverrides: client.experiments.getOverrides,
     onDesignChange: () =>
       Promise.resolve(
         wrapAsyncIterator(
@@ -60,18 +59,14 @@ async function openCompactionSettings(canvasElement: HTMLElement) {
   const canvas = within(await openSettingsDialog(canvasElement));
   const trigger = await canvas.findByRole("combobox", { name: "Compaction strategy" });
   trigger.scrollIntoView({ block: "center" });
-  await waitFor(async () => expect(getOverrides).toHaveBeenCalled());
   return trigger;
 }
 
 async function expectPersistedStrategy(continuous: boolean, budget: boolean) {
   await waitFor(async () => {
-    await expect(
-      readPersistedState(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION), undefined)
-    ).toBe(continuous);
-    await expect(readPersistedState(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET), undefined)).toBe(
-      budget
-    );
+    const experiments = getAppConfigStore().getSnapshot()?.experiments;
+    await expect(experiments?.[EXPERIMENT_IDS.CONTINUOUS_COMPACTION] === true).toBe(continuous);
+    await expect(experiments?.[EXPERIMENT_IDS.TOKEN_BUDGET] === true).toBe(budget);
   });
 }
 
@@ -106,7 +101,7 @@ async function selectStrategy(trigger: HTMLElement, name: string) {
 
 async function exerciseCompactionSettings(canvasElement: HTMLElement) {
   const trigger = await openCompactionSettings(canvasElement);
-  await expect(trigger).toHaveTextContent("Continuous");
+  await waitFor(() => expect(trigger).toHaveTextContent("Continuous"));
   await expectPersistedStrategy(true, true);
   await dismissWithoutChoosing(trigger);
 
@@ -168,9 +163,7 @@ export const ExplicitSummarize: AppStory = {
   play: async ({ canvasElement }) => {
     const trigger = await openCompactionSettings(canvasElement);
     await expect(trigger).toHaveTextContent("Summarize");
-    for (const id of [EXPERIMENT_IDS.CONTINUOUS_COMPACTION, EXPERIMENT_IDS.TOKEN_BUDGET]) {
-      await expect(readPersistedState(getExperimentKey(id), undefined)).toBeUndefined();
-    }
+    await expectPersistedStrategy(false, false);
     await dismissWithoutChoosing(trigger);
     // Keyboard activation must commit the current default just like a pointer selection.
     await userEvent.click(trigger);
@@ -188,7 +181,7 @@ export const TokenBudgetConflict: AppStory = {
   play: async ({ canvasElement }) => {
     const trigger = await openCompactionSettings(canvasElement);
     const canvas = within(getSettingsDialog());
-    await expect(trigger).toHaveTextContent("Token Budget");
+    await waitFor(() => expect(trigger).toHaveTextContent("Token Budget"));
     const warning = canvas.getByRole("status");
     await expect(warning).toBeVisible();
     await expect(trigger).toHaveAttribute("aria-describedby", warning.id);

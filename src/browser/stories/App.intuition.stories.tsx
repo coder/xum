@@ -14,8 +14,7 @@ import { collapseLeftSidebar } from "./helpers/uiState";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { createMockORPCClient } from "./mocks/orpc";
 import { FALLBACK_AGENTS } from "@/browser/features/Settings/Sections/TasksSection.agents";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 export default {
   ...appMeta,
@@ -164,9 +163,11 @@ export const ReasoningSettings: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY), true);
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY_INTUITION), true);
         return createMockORPCClient({
+          experiments: {
+            [EXPERIMENT_IDS.MEMORY]: true,
+            [EXPERIMENT_IDS.MEMORY_INTUITION]: true,
+          },
           agentDefinitions: FALLBACK_AGENTS,
           agentAiDefaults: {
             intuition: {

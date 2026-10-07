@@ -48,6 +48,7 @@ function setupDesktopStory(phone = false): APIClient {
     projectName: "desktop-demo",
     messages: [],
     additionalWorkspaces: [isolatedWorkspace],
+    experiments: { [EXPERIMENT_IDS.PORTABLE_DESKTOP]: true },
   });
   // Only bootstrap carries the binding; a capability probe must not determine the viewer's label.
   client.desktop = {

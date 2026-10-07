@@ -8,7 +8,7 @@ import {
   getModelKey,
   getReasoningModeKey,
 } from "@/common/constants/storage";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createFileReadTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
@@ -1055,11 +1055,11 @@ export const AutoModelRoutingActive: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
         updatePersistedState(getModelKey("ws-auto-routing"), "openai:gpt-5.6-sol");
         updatePersistedState(getAutoModelRoutingKey("ws-auto-routing"), true);
         return setupSimpleChatStory({
           workspaceId: "ws-auto-routing",
+          experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
           providersConfig: {
             openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
           },
@@ -1105,10 +1105,10 @@ export const AutoModelRoutingKeyboard: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
         updatePersistedState(getModelKey("ws-auto-routing-keyboard"), "openai:gpt-5.6-sol");
         return setupSimpleChatStory({
           workspaceId: "ws-auto-routing-keyboard",
+          experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
           providersConfig: {
             openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
           },
