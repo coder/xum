@@ -43,8 +43,10 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 // laptop in dark + light; the file was already counted).
 // +4 snapshots / +1 file: the skills hat with unreachable SSH skill sources
 // (SkillIndicator.stories.tsx, phone + laptop in dark + light).
-const MAX_SNAPSHOTS = 685;
-const MAX_SNAPSHOT_ENABLED_FILES = 119;
+// +1 snapshot / +1 file: the phone-width Providers layout (ProvidersSection.stories.tsx,
+// phone in dark; the rest of the file stays excluded).
+const MAX_SNAPSHOTS = 686;
+const MAX_SNAPSHOT_ENABLED_FILES = 120;
 
 const { values } = parseArgs({
   options: {

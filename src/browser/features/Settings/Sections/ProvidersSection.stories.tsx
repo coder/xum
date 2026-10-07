@@ -114,9 +114,8 @@ export const ProvidersPhoneViewport: Story = {
   },
   parameters: {
     layout: "fullscreen",
-    // No Pixel snapshot: the suite sits at its snapshot budget. The play's
-    // geometry assertions guard the regression in the Storybook test-runner instead.
-    pixel: PIXEL_DISABLED,
+    // The meta disables Pixel; parameters deep-merge, so re-enable explicitly.
+    pixel: { exclude: false, matrix: { themes: ["dark"], viewports: ["phone"] } },
   },
   render: () => (
     <SettingsSectionStory
@@ -136,8 +135,9 @@ export const ProvidersPhoneViewport: Story = {
       }
     >
       {/* Fixed phone width so the play's overflow assertions hold in the CI
-          test-runner too, which ignores viewport globals (AGENTS.md). */}
-      <div data-testid="phone-frame" style={{ width: 390 }}>
+          test-runner too, which ignores viewport globals (AGENTS.md). 375px matches
+          the `mobile1` viewport global; maxWidth keeps the frame inside narrower views. */}
+      <div data-testid="phone-frame" style={{ width: 375, maxWidth: "100%" }}>
         <ProvidersSection />
       </div>
     </SettingsSectionStory>
