@@ -44,7 +44,7 @@ export const LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID = "programmatic-tool-calling-exc
 
 /**
  * Read-side alias for persisted experiment-flag objects (camelCase form used
- * by taskExperiments snapshots and startup-retry send options): a legacy
+ * by startup-retry send options): a legacy
  * exclusive `true` opted into exactly the posture merged PTC activates, so it
  * wins even over an explicit `programmaticToolCalling: false`.
  */

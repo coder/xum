@@ -127,12 +127,6 @@ export interface TaskCreateArgs {
    * Defaults to blocking when omitted.
    */
   attentionPolicy?: BackgroundWorkAttentionPolicy;
-  /** Experiments to inherit to subagent */
-  experiments?: {
-    programmaticToolCalling?: boolean;
-    /** RLM mode: persisted on the task record so RLM-gated child features survive restarts. */
-    rlm?: boolean;
-  };
 }
 
 export function formatSubagentReportUserMessage(params: {

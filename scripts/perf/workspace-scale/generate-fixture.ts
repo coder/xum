@@ -61,10 +61,6 @@ export function buildFixture(root: string, options: FixtureOptions) {
         );
       }
       if (task < 0.35) {
-        workspace.taskExperiments = {
-          programmaticToolCalling: true,
-          rlm: true,
-        };
         workspace.taskTrunkBranch = "main";
         workspace.taskModelString = "anthropic:claude-sonnet-4-5";
       }
