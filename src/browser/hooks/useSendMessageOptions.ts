@@ -10,7 +10,7 @@ import {
 import { DEFAULT_MODEL_KEY, getModelKey } from "@/common/constants/storage";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { useProviderOptions } from "./useProviderOptions";
-import { useExperimentOverrideValue, useExperimentValue } from "./useExperiments";
+import { useExperimentValue } from "./useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
@@ -74,15 +74,6 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
     listener: true,
   });
 
-  // Subscribe to local override state so toggles apply immediately.
-  const programmaticToolCalling = useExperimentOverrideValue(
-    EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING
-  );
-  const rlm = useExperimentOverrideValue(EXPERIMENT_IDS.RLM);
-  const memory = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY);
-  const memoryIntuition = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY_INTUITION);
-  const continuousCompaction = useExperimentOverrideValue(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
-  const tokenBudget = useExperimentOverrideValue(EXPERIMENT_IDS.TOKEN_BUDGET);
   const [autoModelRouting] = useAutoRoutingSelection(workspaceId, "model");
   const [autoThinkingLevel] = useAutoRoutingSelection(workspaceId, "thinkingLevel");
 
@@ -100,14 +91,6 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
     reasoningMode,
     model: baseModel,
     providerOptions,
-    experiments: {
-      programmaticToolCalling,
-      rlm,
-      memory,
-      memoryIntuition,
-      continuousCompaction,
-      tokenBudget,
-    },
     disableWorkspaceAgents,
     autoModelRouting,
     autoThinkingLevel,
