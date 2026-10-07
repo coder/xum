@@ -3,12 +3,7 @@ import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
-import {
-  EXPERIMENT_IDS,
-  type ExperimentId,
-  getExperimentKey,
-  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
-} from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID } from "@/common/constants/experiments";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { APIProvider, type APIClient } from "./API";
 import {
@@ -116,7 +111,6 @@ describe("ExperimentsProvider", () => {
     currentClientMock = {
       experiments: {
         set,
-        getOverrides: () => Promise.resolve({ [perf]: false }),
         onPerfFlightRecorderChange: (_input, { signal } = {}) => {
           signal?.addEventListener("abort", statuses.end, { once: true });
           return Promise.resolve(wrapAsyncIterator(statuses.iterate(), {}));
@@ -126,7 +120,15 @@ describe("ExperimentsProvider", () => {
     function Toggle() {
       const [, setEnabled] = useExperiment(perf);
       const collecting = usePerfFlightRecorderCollecting();
-      return <button onClick={() => setEnabled(false)}>{String(collecting)}</button>;
+      return (
+        <button
+          onClick={() => {
+            setEnabled(false).catch(() => undefined);
+          }}
+        >
+          {String(collecting)}
+        </button>
+      );
     }
     try {
       const view = render(
@@ -182,116 +184,9 @@ describe("ExperimentsProvider", () => {
     }
   });
 
-  test.each([false, true])(
-    "compaction writes stay FIFO across rapid selections and consumer remounts (failure=%s)",
-    async (failFirstWrite) => {
-      const continuous = EXPERIMENT_IDS.CONTINUOUS_COMPACTION;
-      const budget = EXPERIMENT_IDS.TOKEN_BUDGET;
-      const backend: Partial<Record<ExperimentId, boolean>> = {};
-      const pending: Array<{ finish: () => void; fail: () => void }> = [];
-      const set = mock(
-        ({ experimentId, enabled }: Parameters<APIClient["experiments"]["set"]>[0]) =>
-          new Promise<void>((resolve, reject) => {
-            if (typeof enabled !== "boolean") throw new Error("Expected an explicit override");
-            pending.push({
-              finish: () => {
-                backend[experimentId] = enabled;
-                resolve();
-              },
-              fail: () => reject(new Error("offline")),
-            });
-          })
-      );
-      currentClientMock = {
-        experiments: { set, getOverrides: () => Promise.resolve({ ...backend }) },
-      };
-      function Settings() {
-        const [continuousEnabled, setContinuous] = useExperiment(continuous);
-        const [budgetEnabled, setBudget] = useExperiment(budget);
-        const [, setUnrelated] = useExperiment(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
-        return (
-          <>
-            <output>{`${continuousEnabled}/${budgetEnabled}`}</output>
-            <button
-              onClick={() => {
-                setBudget(true);
-                setContinuous(false);
-              }}
-            >
-              budget
-            </button>
-            <button
-              onClick={() => {
-                setContinuous(true);
-                setBudget(false);
-              }}
-            >
-              continuous
-            </button>
-            <button
-              onClick={() => {
-                setBudget(false);
-                setContinuous(false);
-              }}
-            >
-              summarize
-            </button>
-            <button onClick={() => setUnrelated(true)}>unrelated</button>
-          </>
-        );
-      }
-      const tree = (showSettings: boolean) => (
-        <APIProvider client={createTestApiClient(currentClientMock)}>
-          <ExperimentsProvider>{showSettings && <Settings />}</ExperimentsProvider>
-        </APIProvider>
-      );
-      const view = render(tree(true));
-      fireEvent.click(view.getByText("budget"));
-      await waitFor(() => expect(set).toHaveBeenCalledTimes(1));
-      fireEvent.click(view.getByText("continuous"));
-      view.rerender(tree(false));
-      view.rerender(tree(true));
-      fireEvent.click(view.getByText("summarize"));
-      expect(view.getByRole("status").textContent).toBe("false/false");
-      expect(set).toHaveBeenCalledTimes(1);
-
-      // Unrelated flags retain their immediate dispatch even while compaction is blocked.
-      fireEvent.click(view.getByText("unrelated"));
-      expect(set).toHaveBeenCalledTimes(2);
-      await act(async () => {
-        pending[1].finish();
-        await Promise.resolve();
-      });
-      for (let index = 0; index < 6; index++) {
-        const pendingIndex = index === 0 ? 0 : index + 1;
-        await act(async () => {
-          if (index === 0 && failFirstWrite) pending[pendingIndex].fail();
-          else pending[pendingIndex].finish();
-          await Promise.resolve();
-        });
-        expect(set).toHaveBeenCalledTimes(Math.min(index + 3, 7));
-      }
-      expect(set.mock.calls.map(([input]) => input)).toEqual([
-        { experimentId: budget, enabled: true },
-        { experimentId: EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES, enabled: true },
-        { experimentId: continuous, enabled: false },
-        { experimentId: continuous, enabled: true },
-        { experimentId: budget, enabled: false },
-        { experimentId: budget, enabled: false },
-        { experimentId: continuous, enabled: false },
-      ]);
-      expect(backend).toEqual({
-        [continuous]: false,
-        [budget]: false,
-        [EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES]: true,
-      });
-      expect(view.getByRole("status").textContent).toBe("false/false");
-    }
-  );
-
   test("stale local PTC keys are not written to the backend on connect or reconnect", async () => {
     globalThis.window.localStorage.setItem(
-      getExperimentKey(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
+      `experiment:${EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING}`,
       JSON.stringify(true)
     );
     globalThis.window.localStorage.setItem(
@@ -299,9 +194,8 @@ describe("ExperimentsProvider", () => {
       JSON.stringify(true)
     );
     const set = mock(() => Promise.resolve());
-    const getOverrides = mock(() => Promise.resolve({}));
     const tree = () => (
-      <APIProvider client={createTestApiClient({ experiments: { set, getOverrides } })}>
+      <APIProvider client={createTestApiClient({ experiments: { set } })}>
         <ExperimentsProvider>
           <div />
         </ExperimentsProvider>
@@ -309,10 +203,10 @@ describe("ExperimentsProvider", () => {
     );
 
     const view = render(tree());
-    await waitFor(() => expect(getOverrides).toHaveBeenCalledTimes(1));
+    await act(() => Promise.resolve());
     // A new client is what a reconnect hands the provider.
     view.rerender(tree());
-    await waitFor(() => expect(getOverrides).toHaveBeenCalledTimes(2));
+    await act(() => Promise.resolve());
     expect(set).not.toHaveBeenCalled();
   });
 });

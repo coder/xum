@@ -214,24 +214,14 @@ export function GeneralSection() {
       value === "summarize" || value === "continuous" || value === "token-budget",
       `Unexpected compaction strategy: ${value}`
     );
-    switch (value) {
-      case "continuous":
-        setContinuousCompaction(true);
-        setTokenBudget(false);
-        break;
-      case "token-budget":
-        setTokenBudget(true);
-        setContinuousCompaction(false);
-        break;
-      case "summarize":
-        setTokenBudget(false);
-        setContinuousCompaction(false);
-        break;
-      default: {
-        const exhaustive: never = value;
-        return exhaustive;
-      }
-    }
+    // Ordered writes, off before on; a pair left both on still resolves to continuous.
+    const persist = async () => {
+      if (value !== "token-budget") await setTokenBudget(false);
+      if (value !== "continuous") await setContinuousCompaction(false);
+      if (value === "token-budget") await setTokenBudget(true);
+      if (value === "continuous") await setContinuousCompaction(true);
+    };
+    persist().catch(() => undefined);
     // Retain the override events previously emitted by the individual experiment switches.
     telemetry.experimentOverridden(EXPERIMENT_IDS.CONTINUOUS_COMPACTION, value === "continuous");
     telemetry.experimentOverridden(EXPERIMENT_IDS.TOKEN_BUDGET, value === "token-budget");

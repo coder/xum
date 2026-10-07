@@ -61,7 +61,7 @@ function ExperimentRow(props: ExperimentRowProps) {
         return;
       }
 
-      setEnabled(value);
+      setEnabled(value).catch(() => undefined);
       // Track the override for analytics
       telemetry.experimentOverridden(experimentId, value);
       onToggle?.(value);

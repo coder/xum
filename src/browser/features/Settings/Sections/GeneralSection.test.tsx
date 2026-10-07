@@ -543,8 +543,20 @@ describe("GeneralSection", () => {
       const [rlm, setRlm] = useExperiment(EXPERIMENT_IDS.RLM);
       return (
         <>
-          <button onClick={() => setPtc(!ptc)}>Toggle PTC fixture</button>
-          <button onClick={() => setRlm(!rlm)}>Toggle RLM fixture</button>
+          <button
+            onClick={() => {
+              setPtc(!ptc).catch(() => undefined);
+            }}
+          >
+            Toggle PTC fixture
+          </button>
+          <button
+            onClick={() => {
+              setRlm(!rlm).catch(() => undefined);
+            }}
+          >
+            Toggle RLM fixture
+          </button>
         </>
       );
     }

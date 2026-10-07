@@ -4,7 +4,7 @@ export const EXPERIMENTS_WRITE_TIMEOUT_MS = 10_000;
  * Experiments System
  *
  * Global feature flags for experimental features.
- * State is persisted in localStorage as `experiment:${experimentId}`.
+ * State is persisted by the backend ExperimentsService in `feature_flags.json`.
  */
 
 export const EXPERIMENT_IDS = {
@@ -331,14 +331,6 @@ export function getExperimentPlatformRestrictionLabel(
 
   const lastPlatform = platformLabels[platformLabels.length - 1];
   return `Only available on ${platformLabels.slice(0, -1).join(", ")}, and ${lastPlatform}`;
-}
-
-/**
- * Get localStorage key for an experiment.
- * Format: "experiment:{experimentId}"
- */
-export function getExperimentKey(experimentId: ExperimentId): string {
-  return `experiment:${experimentId}`;
 }
 
 /**
