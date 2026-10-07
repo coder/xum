@@ -3,16 +3,9 @@ import {
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
 import {
-  AUTO_COMPACTION_THRESHOLD_MIN,
-  AUTO_COMPACTION_THRESHOLD_STORAGE_MAX,
-} from "@/common/constants/ui";
-import {
   GLOBAL_SCOPE_ID,
-  PROVIDER_OPTIONS_ANTHROPIC_KEY,
-  PROVIDER_OPTIONS_GOOGLE_KEY,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
   getAgentIdKey,
-  getAutoCompactionThresholdKey,
   getLastRuntimeConfigKey,
   getModelKey,
   getNotifyOnResponseAutoEnableKey,
@@ -22,7 +15,6 @@ import {
   getThinkingLevelKey,
   getTrunkBranchKey,
 } from "@/common/constants/storage";
-import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
 import {
   parseAgentId,
   parseBoolean,
@@ -45,8 +37,6 @@ export interface StoredUserPreferenceEntry {
 
 const PROJECT_SCOPE_PREFIX = "__project__/";
 const STATIC_USER_PREFERENCE_KEYS = new Set<string>([
-  PROVIDER_OPTIONS_ANTHROPIC_KEY,
-  PROVIDER_OPTIONS_GOOGLE_KEY,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
   getAgentIdKey(GLOBAL_SCOPE_ID),
   getThinkingLevelKey(GLOBAL_SCOPE_ID),
@@ -56,7 +46,6 @@ const DYNAMIC_USER_PREFERENCE_PREFIXES = [
   getAgentIdKey(PROJECT_SCOPE_PREFIX),
   getModelKey(PROJECT_SCOPE_PREFIX),
   getThinkingLevelKey(PROJECT_SCOPE_PREFIX),
-  getAutoCompactionThresholdKey(""),
   getTrunkBranchKey(""),
   getLastRuntimeConfigKey(""),
   getNotifyOnResponseAutoEnableKey(""),
@@ -78,15 +67,6 @@ function parseStoredValue(raw: string | null): unknown {
   } catch {
     return raw;
   }
-}
-
-function parseThreshold(value: unknown): number | undefined {
-  return typeof value === "number" &&
-    Number.isFinite(value) &&
-    value >= AUTO_COMPACTION_THRESHOLD_MIN &&
-    value <= AUTO_COMPACTION_THRESHOLD_STORAGE_MAX
-    ? value
-    : undefined;
 }
 
 function parseProjectScope(key: string, prefix: string): string | undefined {
@@ -142,14 +122,6 @@ function ensureProjectAiDefaults(
   ai.projectDefaults ??= {};
   ai.projectDefaults[projectPath] ??= {};
   return ai.projectDefaults[projectPath];
-}
-
-function ensureProviderOptions(
-  preferences: UserPreferences
-): NonNullable<NonNullable<UserPreferences["ai"]>["providerOptions"]> {
-  const ai = ensureAi(preferences);
-  ai.providerOptions ??= {};
-  return ai.providerOptions;
 }
 
 function ensureWorkspaceCreationProject(
@@ -229,36 +201,6 @@ export function applyStoredUserPreference(
     return pruneUserPreferences(next);
   }
 
-  if (key === PROVIDER_OPTIONS_ANTHROPIC_KEY) {
-    const parsed = MuxProviderOptionsSchema.shape.anthropic.safeParse(value);
-    if (!parsed.success || !parsed.data || Object.keys(parsed.data).length === 0) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureProviderOptions(next).anthropic = parsed.data;
-    return pruneUserPreferences(next);
-  }
-
-  if (key === PROVIDER_OPTIONS_GOOGLE_KEY) {
-    const parsed = MuxProviderOptionsSchema.shape.google.safeParse(value);
-    if (!parsed.success || !parsed.data || Object.keys(parsed.data).length === 0) {
-      return removeStoredUserPreference(next, key);
-    }
-    ensureProviderOptions(next).google = parsed.data;
-    return pruneUserPreferences(next);
-  }
-
-  const thresholdModel = readSuffix(key, getAutoCompactionThresholdKey(""));
-  if (thresholdModel) {
-    const parsed = parseThreshold(value);
-    if (parsed === undefined) {
-      return removeStoredUserPreference(next, key);
-    }
-    const ai = ensureAi(next);
-    ai.autoCompactionThresholdByModel ??= {};
-    ai.autoCompactionThresholdByModel[thresholdModel] = parsed;
-    return pruneUserPreferences(next);
-  }
-
   const trunkProjectPath = readSuffix(key, getTrunkBranchKey(""));
   if (trunkProjectPath) {
     const parsed = parseNonEmptyString(value);
@@ -334,14 +276,11 @@ export function removeStoredUserPreference(
   if (key === getAgentIdKey(GLOBAL_SCOPE_ID)) delete next.ai?.globalDefaults?.agentId;
   else if (key === getThinkingLevelKey(GLOBAL_SCOPE_ID))
     delete next.ai?.globalDefaults?.thinkingLevel;
-  else if (key === PROVIDER_OPTIONS_ANTHROPIC_KEY) delete next.ai?.providerOptions?.anthropic;
-  else if (key === PROVIDER_OPTIONS_GOOGLE_KEY) delete next.ai?.providerOptions?.google;
   else if (key === REVIEW_INCLUDE_UNCOMMITTED_KEY) delete next.review?.includeUncommitted;
   else {
     const projectAgentPath = parseProjectScope(key, "agentId:");
     const projectModelPath = parseProjectScope(key, "model:");
     const projectThinkingPath = parseProjectScope(key, "thinkingLevel:");
-    const thresholdModel = readSuffix(key, getAutoCompactionThresholdKey(""));
     const trunkProjectPath = readSuffix(key, getTrunkBranchKey(""));
     const runtimeProjectPath = readSuffix(key, getLastRuntimeConfigKey(""));
     const autoNotifyProjectPath = readSuffix(key, getNotifyOnResponseAutoEnableKey(""));
@@ -352,7 +291,6 @@ export function removeStoredUserPreference(
     else if (projectModelPath) delete next.ai?.projectDefaults?.[projectModelPath]?.model;
     else if (projectThinkingPath)
       delete next.ai?.projectDefaults?.[projectThinkingPath]?.thinkingLevel;
-    else if (thresholdModel) delete next.ai?.autoCompactionThresholdByModel?.[thresholdModel];
     else if (trunkProjectPath)
       delete next.workspaceCreation?.byProject?.[trunkProjectPath]?.trunkBranch;
     else if (runtimeProjectPath)
@@ -393,15 +331,6 @@ export function entriesFromUserPreferences(
       entries.push({ key: getModelKey(scopeId), value: defaults.model });
     if (defaults.thinkingLevel !== undefined)
       entries.push({ key: getThinkingLevelKey(scopeId), value: defaults.thinkingLevel });
-  }
-
-  if (ai?.providerOptions?.anthropic !== undefined)
-    entries.push({ key: PROVIDER_OPTIONS_ANTHROPIC_KEY, value: ai.providerOptions.anthropic });
-  if (ai?.providerOptions?.google !== undefined)
-    entries.push({ key: PROVIDER_OPTIONS_GOOGLE_KEY, value: ai.providerOptions.google });
-
-  for (const [model, threshold] of Object.entries(ai?.autoCompactionThresholdByModel ?? {})) {
-    entries.push({ key: getAutoCompactionThresholdKey(model), value: threshold });
   }
 
   for (const [projectPath, defaults] of Object.entries(

@@ -22,22 +22,15 @@ import {
 } from "@/common/types/thinking";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { migrateGlobalToPerModel } from "@/browser/contexts/ProviderOptionsContext";
 
-/**
- * Read provider options from localStorage
- */
 function getProviderOptions(): MuxProviderOptions {
-  const anthropic = readPersistedState<MuxProviderOptions["anthropic"]>(
-    "provider_options_anthropic",
-    {}
-  );
-  const google = readPersistedState<MuxProviderOptions["google"]>("provider_options_google", {});
-
+  const providerOptions = getUserPreferences().ai?.providerOptions;
   return {
-    anthropic,
-    google,
+    anthropic: migrateGlobalToPerModel(providerOptions?.anthropic),
+    google: providerOptions?.google,
   };
 }
 

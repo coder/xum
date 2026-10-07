@@ -1,7 +1,6 @@
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "./useExperiments";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT } from "@/common/constants/ui";
 
 export interface AutoCompactionSettings {
@@ -26,13 +25,13 @@ export function useAutoCompactionSettings(
   _workspaceId: string,
   model: string | null
 ): AutoCompactionSettings {
-  // Use model for threshold key, fall back to "default" if no model
-  const thresholdKey = getAutoCompactionThresholdKey(model ?? "default");
-  const [threshold, setThreshold] = usePersistedState<number>(
-    thresholdKey,
-    DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT,
-    { listener: true }
-  );
+  const thresholdModel = model ?? "default";
+  const threshold =
+    useUserPreferences(
+      (preferences) => preferences.ai?.autoCompactionThresholdByModel?.[thresholdModel]
+    ) ?? DEFAULT_AUTO_COMPACTION_THRESHOLD_PERCENT;
+  const setThreshold = (value: number) =>
+    updateUserPreferences({ ai: { autoCompactionThresholdByModel: { [thresholdModel]: value } } });
 
   const tokenBudget = useExperimentValue(EXPERIMENT_IDS.TOKEN_BUDGET);
   const continuousCompaction = useExperimentValue(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);

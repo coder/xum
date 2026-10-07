@@ -8,10 +8,8 @@ import {
   removeStoredUserPreference,
 } from "./userPreferencesStorage";
 import {
-  PROVIDER_OPTIONS_ANTHROPIC_KEY,
   REVIEW_INCLUDE_UNCOMMITTED_KEY,
   getAgentIdKey,
-  getAutoCompactionThresholdKey,
   getLastRuntimeConfigKey,
   getModelKey,
   getNotifyOnResponseAutoEnableKey,
@@ -61,8 +59,6 @@ describe("user preference localStorage registry", () => {
     storage.setJSON(getAgentIdKey(projectScope), "plan");
     storage.setJSON(getModelKey(projectScope), "openai:gpt-4.1");
     storage.setJSON(getThinkingLevelKey(projectScope), "high");
-    storage.setJSON(PROVIDER_OPTIONS_ANTHROPIC_KEY, { disableBetaFeatures: true });
-    storage.setJSON(getAutoCompactionThresholdKey("openai:gpt-4.1"), 80);
     storage.setJSON(getTrunkBranchKey("/repo"), "origin/main");
     storage.setJSON(getLastRuntimeConfigKey("/repo"), { ssh: { host: "devbox" } });
     storage.setJSON(getNotifyOnResponseAutoEnableKey("/repo"), true);
@@ -78,12 +74,6 @@ describe("user preference localStorage registry", () => {
             model: "openai:gpt-4.1",
             thinkingLevel: "high",
           },
-        },
-        providerOptions: {
-          anthropic: { disableBetaFeatures: true },
-        },
-        autoCompactionThresholdByModel: {
-          "openai:gpt-4.1": 80,
         },
       },
       workspaceCreation: {
@@ -116,11 +106,6 @@ describe("user preference localStorage registry", () => {
             thinkingLevel: "high",
           },
         },
-        providerOptions: {
-          anthropic: { disableBetaFeatures: true },
-          google: { safety: "off" },
-        },
-        autoCompactionThresholdByModel: { "openai:gpt-4.1": 100 },
       },
       workspaceCreation: {
         byProject: {
@@ -177,7 +162,7 @@ describe("user preference localStorage registry", () => {
   test("returns only valid entries for backfill", () => {
     const storage = new MemoryStorage();
     storage.setJSON(REVIEW_INCLUDE_UNCOMMITTED_KEY, true);
-    storage.setJSON(getAutoCompactionThresholdKey("bad"), 200);
+    storage.setJSON(getTrunkBranchKey("/repo"), "  ");
 
     expect(getStoredUserPreferenceEntries(storage)).toEqual([
       { key: REVIEW_INCLUDE_UNCOMMITTED_KEY, value: true },

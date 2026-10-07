@@ -1,9 +1,5 @@
-import React, { createContext, useContext, useRef } from "react";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  PROVIDER_OPTIONS_ANTHROPIC_KEY,
-  PROVIDER_OPTIONS_GOOGLE_KEY,
-} from "@/common/constants/storage";
+import React, { createContext, useContext } from "react";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { supports1MContext } from "@/common/utils/ai/models";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -11,8 +7,6 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 
 interface ProviderOptionsContextType {
   options: MuxProviderOptions;
-  setAnthropicOptions: (options: MuxProviderOptions["anthropic"]) => void;
-  setGoogleOptions: (options: MuxProviderOptions["google"]) => void;
   /** Check if a specific model has 1M context enabled */
   has1MContext: (modelId: string) => boolean;
   /** Toggle 1M context for a specific model */
@@ -30,7 +24,7 @@ const ProviderOptionsContext = createContext<ProviderOptionsContextType | undefi
  * migration targets. In that case, keep the legacy boolean untouched so we don't silently erase
  * a user's old beta preference for custom Sonnet 4 / 4.5 entries.
  */
-function migrateGlobalToPerModel(
+export function migrateGlobalToPerModel(
   options: MuxProviderOptions["anthropic"]
 ): MuxProviderOptions["anthropic"] {
   if (
@@ -56,24 +50,12 @@ function migrateGlobalToPerModel(
 
 export function ProviderOptionsProvider({ children }: { children: React.ReactNode }) {
   const { config: providersConfig } = useProvidersConfig();
-  const [anthropicOptions, setAnthropicOptions] = usePersistedState<
-    MuxProviderOptions["anthropic"]
-  >(PROVIDER_OPTIONS_ANTHROPIC_KEY, {}, { listener: true });
-
-  // One-time migration from global boolean to per-model set
-  const didMigrate = useRef(false);
-  if (!didMigrate.current) {
-    didMigrate.current = true;
-    const migrated = migrateGlobalToPerModel(anthropicOptions);
-    if (migrated !== anthropicOptions) {
-      setAnthropicOptions(migrated);
-    }
-  }
-
-  const [googleOptions, setGoogleOptions] = usePersistedState<MuxProviderOptions["google"]>(
-    PROVIDER_OPTIONS_GOOGLE_KEY,
-    {},
-    { listener: true }
+  // The legacy global 1M boolean migrates on read, so mounting never writes a preference.
+  const anthropicOptions = migrateGlobalToPerModel(
+    useUserPreferences((preferences) => preferences.ai?.providerOptions?.anthropic)
+  );
+  const googleOptions = useUserPreferences(
+    (preferences) => preferences.ai?.providerOptions?.google
   );
 
   const models1M = anthropicOptions?.use1MContextModels ?? [];
@@ -90,12 +72,17 @@ export function ProviderOptionsProvider({ children }: { children: React.ReactNod
     const next = has1MContext(modelId)
       ? models1M.filter((id) => id !== modelId)
       : [...models1M, modelId];
-    setAnthropicOptions({
-      ...anthropicOptions,
-      // Once a user interacts with a per-model toggle, prefer the explicit list over the
-      // deprecated global boolean so native-1M models never inherit stale beta state.
-      use1MContext: false,
-      use1MContextModels: next,
+    updateUserPreferences({
+      ai: {
+        providerOptions: {
+          anthropic: {
+            // Once a user interacts with a per-model toggle, prefer the explicit list over the
+            // deprecated global boolean so native-1M models never inherit stale beta state.
+            use1MContext: false,
+            use1MContextModels: next,
+          },
+        },
+      },
     });
   };
 
@@ -104,8 +91,6 @@ export function ProviderOptionsProvider({ children }: { children: React.ReactNod
       anthropic: anthropicOptions,
       google: googleOptions,
     },
-    setAnthropicOptions,
-    setGoogleOptions,
     has1MContext,
     toggle1MContext,
   };
