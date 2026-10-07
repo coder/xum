@@ -1,8 +1,6 @@
-import { useClaudeDesignRevision } from "@/browser/contexts/ExperimentsContext";
+import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
 import { getOwn } from "@/common/utils/getOwn";
 import { ClaudeDesignCard } from "./ClaudeDesignCard";
-import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
@@ -851,8 +849,7 @@ function ToolSearchSetting() {
 }
 
 export const MCPSettingsSection: React.FC = () => {
-  const designEnabled = useExperimentValue(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
-  const designRevision = useClaudeDesignRevision();
+  const design = useClaudeDesign();
   const refreshRequest = useRef({ id: 0 });
   const { api } = useAPI();
   const [servers, setServers] = useState<Record<string, MCPServerInfo>>({});
@@ -955,7 +952,7 @@ export const MCPSettingsSection: React.FC = () => {
     return () => {
       requests.id++;
     };
-  }, [refresh, designEnabled, designRevision]);
+  }, [refresh, design.enabled, design.revision]);
 
   // Clear new-server test result when transport/value/headers change
   useEffect(() => {
@@ -1334,7 +1331,7 @@ export const MCPSettingsSection: React.FC = () => {
 
       <ToolSearchSetting />
 
-      {designEnabled && (
+      {design.enabled && (
         <ClaudeDesignCard
           onChange={refresh}
           conflict={Boolean(

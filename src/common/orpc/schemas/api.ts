@@ -251,10 +251,6 @@ export const experiments = {
     input: z.void(),
     output: eventIterator(FlightRecorderStatusSchema),
   },
-  getOverrides: {
-    input: z.void(),
-    output: z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean()),
-  },
   set: {
     input: z.object({
       experimentId: z.enum(EXPERIMENT_IDS),

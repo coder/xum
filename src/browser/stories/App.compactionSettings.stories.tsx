@@ -31,7 +31,6 @@ function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "leg
   set.mockImplementation(client.experiments.set);
   client.experiments = {
     set,
-    getOverrides: client.experiments.getOverrides,
     onDesignChange: () =>
       Promise.resolve(
         wrapAsyncIterator(

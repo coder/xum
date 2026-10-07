@@ -22,7 +22,7 @@ import {
 } from "@/common/types/thinking";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { isExperimentEnabled } from "@/browser/hooks/useExperiments";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 /**
@@ -88,7 +88,8 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
 
   // Same gate as useAutoRoutingSelection: a stale persisted true must not
   // reach the backend once the experiment is off.
-  const autoRoutingEnabled = isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  const autoRoutingEnabled =
+    getAppConfigStore().getSnapshot()?.experiments?.[EXPERIMENT_IDS.AUTO_MODEL_ROUTING] === true;
   const autoModelRouting =
     autoRoutingEnabled &&
     readPersistedState<boolean>(getAutoModelRoutingKey(workspaceId), false) === true;

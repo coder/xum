@@ -841,7 +841,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
     experiments: {
-      getOverrides: () => Promise.resolve({ ...experiments }),
       set: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => {
         experiments = { ...experiments, [input.experimentId]: input.enabled === true };
         notifyConfigChanged();

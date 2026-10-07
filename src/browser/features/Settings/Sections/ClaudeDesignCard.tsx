@@ -1,4 +1,4 @@
-import { useClaudeDesignRevision } from "@/browser/contexts/ExperimentsContext";
+import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
 import { useEffect, useState, useRef } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { Button } from "@/browser/components/Button/Button";
@@ -31,7 +31,7 @@ const messages: Record<ClaudeDesignState, string> = {
 
 export function ClaudeDesignCard(props: { onChange: () => Promise<void>; conflict: boolean }) {
   const { api } = useAPI();
-  const designRevision = useClaudeDesignRevision();
+  const designRevision = useClaudeDesign().revision;
   const [loadedRevision, setLoadedRevision] = useState<number | null>(null);
   const statusRead = useRef({ id: 0, revision: designRevision });
   const [status, setStatus] = useState<ClaudeDesignStatus | null>(null);
