@@ -1194,6 +1194,22 @@ describe("Config", () => {
     expect(workspace != null && Object.hasOwn(workspace, "taskExperiments")).toBe(false);
   });
 
+  it("drops notify-on-response entries of removed workspaces at load time", () => {
+    fs.writeFileSync(
+      path.join(tempDir, "config.json"),
+      JSON.stringify({
+        projects: [["/repo", { workspaces: [{ path: "/repo/ws", id: "ws-kept", name: "ws" }] }]],
+        userPreferences: {
+          notifications: { notifyOnResponseByWorkspace: { "ws-kept": true, "ws-removed": true } },
+        },
+      })
+    );
+
+    expect(config.loadConfigOrDefault().userPreferences).toEqual({
+      notifications: { notifyOnResponseByWorkspace: { "ws-kept": true } },
+    });
+  });
+
   describe("deferred change notifications", () => {
     it("flushes slow sequential edits and unrelated edits once", async () => {
       let notifications = 0;
@@ -2131,13 +2147,13 @@ describe("Config", () => {
           projects: [],
           userPreferences: {
             appearance: { theme: "legacy-light", transcriptDensity: "wide" },
-            notifications: { notifyOnResponseByWorkspace: { "ws-1": true, "ws-2": "yes" } },
+            review: { defaultBaseByProject: { "/repo/a": "main", "/repo/b": 42 } },
           },
         })
       );
 
       expect(config.loadConfigOrDefault().userPreferences).toEqual({
-        notifications: { notifyOnResponseByWorkspace: { "ws-1": true } },
+        review: { defaultBaseByProject: { "/repo/a": "main" } },
       });
     });
   });

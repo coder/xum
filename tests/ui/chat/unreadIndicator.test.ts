@@ -20,7 +20,8 @@ import { createAppHarness, type AppHarness } from "../harness";
 import { openAnalyticsDialog, openSettingsDialog } from "../helpers";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
-import { getNotifyOnResponseKey, getWorkspaceLastReadKey } from "@/common/constants/storage";
+import { getWorkspaceLastReadKey } from "@/common/constants/storage";
+import { flushUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { detectDefaultTrunkBranch } from "@/node/git";
 
 /**
@@ -285,7 +286,10 @@ describe("Unread indicator (mock AI router)", () => {
       async (modal, openModal) => {
         // Regression: the modal covers the chat without changing the route's workspace, so a
         // completion must neither mark it read nor be suppressed as "already viewing".
-        updatePersistedState(getNotifyOnResponseKey(app.workspaceId), true);
+        updateUserPreferences({
+          notifications: { notifyOnResponseByWorkspace: { [app.workspaceId]: true } },
+        });
+        await flushUserPreferences();
         const notifications = captureBrowserNotifications();
         try {
           await sendGatedMessageUnderModal(app, `completion while in ${modal}`, openModal);

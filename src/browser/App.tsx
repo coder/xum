@@ -34,7 +34,7 @@ import {
 import { getVisibleWorkspaceIds } from "./utils/ui/workspaceDomNav";
 import { useUnreadTracking } from "./hooks/useUnreadTracking";
 import { useWorkspaceStoreRaw, useWorkspaceRecency } from "./stores/WorkspaceStore";
-import { getAppConfigStore } from "./stores/AppConfigStore";
+import { getAppConfigStore, getUserPreferences } from "./stores/AppConfigStore";
 import {
   getResponseCompleteNotificationBody,
   shouldNotifyOnResponseComplete,
@@ -73,7 +73,6 @@ import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
   getAgentIdKey,
   getAgentsInitNudgeKey,
-  getNotifyOnResponseKey,
   getProjectScopeId,
   getThinkingLevelByModelKey,
   getReasoningModeKey,
@@ -1443,7 +1442,9 @@ function AppInner() {
       }
 
       // Check if notifications are enabled for this workspace.
-      const notifyEnabled = readPersistedState(getNotifyOnResponseKey(event.workspaceId), false);
+      const notifyEnabled =
+        getUserPreferences().notifications?.notifyOnResponseByWorkspace?.[event.workspaceId] ===
+        true;
       if (!notifyEnabled) {
         return;
       }
