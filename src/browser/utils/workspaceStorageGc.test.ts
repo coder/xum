@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
+import { act, cleanup, renderHook } from "@testing-library/react";
 
-import { subscribePersistedStateWrites } from "@/browser/hooks/usePersistedState";
+import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   collectOrphanedWorkspaceStorage,
   resetWorkspaceStorageGcForTests,
@@ -54,6 +55,7 @@ describe("collectOrphanedWorkspaceStorage", () => {
   });
 
   afterEach(() => {
+    cleanup();
     restoreDomGlobals();
   });
 
@@ -99,22 +101,22 @@ describe("collectOrphanedWorkspaceStorage", () => {
 
   // Mounted usePersistedState consumers must observe the removal, or they would keep showing
   // (and could write back) the deleted value.
-  test("notifies persisted-state write listeners for every removed key", async () => {
+  test("mounted persisted-state hooks fall back to their defaults for removed keys", async () => {
     seed([getModelKey(ORPHAN_ID), getModelKey(KNOWN_ID)]);
-    const removedKeys: string[] = [];
-    const unsubscribe = subscribePersistedStateWrites((event) => {
-      if (event.newValue == null) removedKeys.push(event.key);
-    });
+    const mount = (key: string) =>
+      renderHook(() => usePersistedState(key, "default", { listener: true }));
+    const orphan = mount(getModelKey(ORPHAN_ID));
+    const known = mount(getModelKey(KNOWN_ID));
+    expect(orphan.result.current[0]).toBe("value");
 
-    try {
-      await collectOrphanedWorkspaceStorage({
+    await act(() =>
+      collectOrphanedWorkspaceStorage({
         listKnownWorkspaceIds: () => Promise.resolve([KNOWN_ID]),
-      });
-    } finally {
-      unsubscribe();
-    }
+      })
+    );
 
-    expect(removedKeys).toEqual([getModelKey(ORPHAN_ID)]);
+    expect(orphan.result.current[0]).toBe("default");
+    expect(known.result.current[0]).toBe("value");
   });
 
   test.each([
