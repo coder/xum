@@ -9,11 +9,7 @@ import * as path from "node:path";
 
 import { Command } from "commander";
 
-import {
-  EXPERIMENT_IDS,
-  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
-  PROMOTED_EXPERIMENT_IDS,
-} from "@/common/constants/experiments";
+import type { ExperimentId } from "@/common/constants/experiments";
 import { parseRuntimeModeAndHost, RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import {
   DEFAULT_THINKING_LEVEL,
@@ -34,6 +30,10 @@ import { CodexOauthService } from "@/node/services/codexOauthService";
 import { CoderOauthService } from "@/node/services/coderOauthService";
 import { ProviderService } from "@/node/services/providerService";
 import { createCoreServices } from "@/node/services/coreServicesRoot";
+import {
+  collectHeadlessExperiments,
+  createHeadlessExperimentsService,
+} from "./headlessExperiments";
 import { closeScopeBounded, disposeAppRuntime } from "@/node/services/di/appRuntime";
 import { log, type LogLevel } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -52,7 +52,6 @@ import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
 import { replaceRunConfig, resolveProjectDir, resolveProjectTrusted } from "./trust";
 
-const VALID_EXPERIMENT_IDS = new Set<string>(Object.values(EXPERIMENT_IDS));
 const THINKING_LABELS_LIST = [...new Set(Object.values(THINKING_DISPLAY_LABELS))].join(", ");
 
 export interface ParseWorkflowArgsInput {
@@ -77,7 +76,7 @@ interface WorkflowCLIOptions {
   argsJson?: string;
   argsFile?: string;
   argsStdin?: boolean;
-  experiment: string[];
+  experiment: ExperimentId[];
 }
 
 type WorkflowServices = ReturnType<typeof createCoreServices>;
@@ -171,25 +170,6 @@ async function gatherStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf-8");
 }
 
-function collectExperiments(value: string, previous: string[]): string[] {
-  let experimentId = value.trim().toLowerCase();
-  if (PROMOTED_EXPERIMENT_IDS.has(experimentId)) {
-    return previous;
-  }
-  // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
-  // flag activates exactly the old exclusive posture — keep existing
-  // automation that passes the removed ID working instead of erroring.
-  if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
-    experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
-  }
-  if (!VALID_EXPERIMENT_IDS.has(experimentId)) {
-    throw new Error(
-      `Unknown experiment "${value}". Valid experiments: ${[...VALID_EXPERIMENT_IDS].join(", ")}`
-    );
-  }
-  return previous.includes(experimentId) ? previous : [...previous, experimentId];
-}
-
 function parseRuntimeConfig(value: string | undefined): RuntimeConfig {
   if (!value) return { type: "local" };
   const parsed = parseRuntimeModeAndHost(value);
@@ -237,20 +217,6 @@ async function copyPersistentConfig(
   }
 
   await replaceRunConfig(realConfig, config);
-}
-
-function buildExperimentsObject(experimentIds: readonly string[]) {
-  return {
-    // RLM implies the PTC parent flag: tool assembly only builds
-    // code_execution when the PTC flag is set, so rlm-mode alone would be inert
-    // (the desktop can't express that state — Settings nests RLM under PTC).
-    programmaticToolCalling:
-      experimentIds.includes(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) ||
-      experimentIds.includes(EXPERIMENT_IDS.RLM),
-    // RLM rides the PTC parent; without this passthrough `-e rlm-mode` was
-    // silently dropped and workflow sends ran the non-kernel PTC toolset.
-    rlm: experimentIds.includes(EXPERIMENT_IDS.RLM),
-  };
 }
 
 async function disposeWorkflowResources(input: {
@@ -354,6 +320,10 @@ async function createWorkflowContext(options: {
       ...runStores,
       extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
       mcpConfig: realConfig,
+      experimentsService: await createHeadlessExperimentsService(
+        tempDir.path,
+        options.opts.experiment
+      ),
     });
     codexOauthService = new CodexOauthService(runProvidersStore, services.providerService);
     services.turnRequestBuilderBindings.codexOauthService = codexOauthService;
@@ -442,7 +412,6 @@ function createWorkflowService(input: {
   model: string;
   thinkingLevel: ParsedThinkingInput;
 }): WorkflowService {
-  const experiments = buildExperimentsObject(input.opts.experiment);
   const runtime = createRuntime(input.ctx.runtimeConfig, {
     projectPath: input.ctx.projectDir,
     workspaceName: input.ctx.workspaceId,
@@ -473,7 +442,6 @@ function createWorkflowService(input: {
         parentWorkspaceId: input.ctx.workspaceId,
         workflowRunId: runId,
         defaultAgentId: DEFAULT_WORKFLOW_AGENT_ID,
-        experiments,
         modelString: input.model,
         thinkingLevel: input.thinkingLevel,
         getProjectTrusted: () => input.ctx.projectTrusted,
@@ -629,7 +597,7 @@ export async function main(): Promise<number> {
     .option(
       "-e, --experiment <id>",
       "enable an additional experiment for workflow-owned child agents (can be repeated)",
-      collectExperiments,
+      collectHeadlessExperiments,
       []
     )
     .option("-v, --verbose", "show info-level logs")
