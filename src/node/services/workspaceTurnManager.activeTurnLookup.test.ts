@@ -342,7 +342,8 @@ describe("active workspace-turn lookup without a live registration (#5569)", () 
   });
 
   test("T8c: a claim that is not one path segment is never listed", async () => {
-    const claims = ["../x", ".", "..", "own\0er", " "];
+    // The last claim is a hand-edited non-string tag: config loading keeps tag values as written.
+    const claims = ["../x", ".", "..", "own\0er", " ", 42 as unknown as string];
     const targets = claims.map((_, index) => `target${index}`);
     const backendA = createWorkspaceTurnManagerHarness(
       await seedOnDisk(

@@ -38,11 +38,13 @@ export function resolveWorkspaceTurnOwners(
   const row = rows[0];
   if (row.parentWorkspaceId != null) return { kind: "fallback", reason: "agent task" };
 
-  const claim =
+  // Config loading keeps tag values as written, so a hand-edited tag can be a non-string.
+  const claim: unknown =
     row.delegatedCreation?.ownerWorkspaceId ??
-    row.tags?.[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId] ??
-    "";
-  if (claim.trim() === "") return { kind: "fallback", reason: "no creator claim" };
+    row.tags?.[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId];
+  if (typeof claim !== "string" || claim.trim() === "") {
+    return { kind: "fallback", reason: "no creator claim" };
+  }
   // The claim becomes a sessions/<owner> path segment; refuse anything that could leave it.
   if (path.basename(claim) !== claim || claim === "." || claim === ".." || claim.includes("\0")) {
     return { kind: "fallback", reason: "creator claim is not a path segment" };
