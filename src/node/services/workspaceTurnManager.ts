@@ -1432,6 +1432,8 @@ export class WorkspaceTurnManager {
       }
       const targetEntry = findWorkspaceEntry(cfg, existingWorkspaceId);
 
+      // The owner rule. The active-turn lookup reads only the owners it admits
+      // (workspaceTurnOwners.ts), so changing it must update that module.
       const ownsExistingWorkspaceTurn = ownerWorkspaceTurns.some(
         (record) => record.createdWorkspace && record.workspaceId === existingWorkspaceId
       );
