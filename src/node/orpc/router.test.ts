@@ -6,6 +6,9 @@ import * as os from "os";
 import * as path from "path";
 import { Context, Effect } from "effect";
 import { Config } from "@/node/config";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { ExperimentsService } from "@/node/services/experimentsService";
+import type { TelemetryService } from "@/node/services/telemetryService";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
 import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
@@ -398,9 +401,35 @@ describe("router config transcript mutation", () => {
   });
 
   function createContext(): ORPCContext {
-    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- Only Config is used by this route.
-    return { config } as ORPCContext;
+    const telemetryService = {
+      setFeatureFlagVariant: () => undefined,
+    } as unknown as TelemetryService;
+    return {
+      config,
+      experimentsService: new ExperimentsService({ telemetryService, xumHome: tempDir }),
+      perfFlightRecorder: {
+        beginRpcCall: () => null,
+        openRpcSubscription: () => null,
+        setEnabled: () => undefined,
+      },
+      perfCaptures: { setEnabled: () => undefined },
+    } as unknown as ORPCContext;
   }
+
+  test("experiments.set signals onConfigChanged and the next getConfig carries the value", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    const ptc = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(false);
+
+    const controller = new AbortController();
+    const changes = await client.config.onConfigChanged(undefined, { signal: controller.signal });
+    const changed = changes.next();
+    await client.experiments.set({ experimentId: ptc, enabled: true });
+    expect((await changed).done).toBe(false);
+    controller.abort();
+
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(true);
+  });
 
   test("persists the full-width chat transcript config flag", async () => {
     const client = createRouterClient(router(), { context: createContext() });

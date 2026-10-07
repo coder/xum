@@ -363,7 +363,10 @@ export const router = (authToken?: string) => {
         .output(schemas.config.getConfig.output)
         .handler(
           handlerGen(function* ({ context }) {
-            return yield* Effect.sync(() => context.config.getClientConfig());
+            return yield* Effect.sync(() => ({
+              ...context.config.getClientConfig(),
+              experiments: context.experimentsService.getEnabledStates(),
+            }));
           })
         ),
       // Event-iterator subscription: stays on the plain handler until the Effect

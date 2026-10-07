@@ -126,6 +126,7 @@ export class ExperimentsService {
 
   private initialized = false;
   private initialization: Promise<void> | undefined;
+  private readonly changeListeners = new Set<() => void>();
 
   constructor(options: {
     telemetryService: TelemetryService;
@@ -204,6 +205,14 @@ export class ExperimentsService {
       // A successful acknowledgement means the change survives a restart.
       this.adoptOverrides(next);
     });
+    for (const listener of this.changeListeners) listener();
+  }
+
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
   }
 
   private async withOverridesLock<T>(
@@ -231,6 +240,14 @@ export class ExperimentsService {
     }
 
     return this.overrides.get(experimentId) === true;
+  }
+
+  getEnabledStates(): Partial<Record<ExperimentId, boolean>> {
+    const states: Partial<Record<ExperimentId, boolean>> = {};
+    for (const experimentId of Object.values(EXPERIMENT_IDS)) {
+      states[experimentId] = this.isExperimentEnabled(experimentId);
+    }
+    return states;
   }
 
   private async ensureInitialized(): Promise<void> {
