@@ -8,10 +8,8 @@ import {
 
 import {
   EXPANDED_SECTIONS_KEY,
-  LAST_CUSTOM_MODEL_PROVIDER_KEY,
   LAST_VISITED_ROUTE_KEY,
   MAX_PERSISTED_KEY_CHARS,
-  UI_THEME_KEY,
   getPersistedKeyRegistration,
   getTimelineFilterKey,
 } from "@/common/constants/storage";
@@ -20,12 +18,9 @@ import {
   readPersistedRawString,
   readPersistedState,
   readPersistedString,
-  subscribePersistedStateWrites,
-  syncPersistedStateFromBackend,
   updatePersistedState,
   usePersistedState,
   writePersistedRawString,
-  type PersistedStateWriteEvent,
 } from "./usePersistedState";
 
 const QUOTA_FULL_KEY = EXPANDED_SECTIONS_KEY;
@@ -60,48 +55,6 @@ describe("raw persisted strings when storage access is denied", () => {
   });
 });
 
-describe("usePersistedState backend sync", () => {
-  let cleanupDom: (() => void) | null = null;
-
-  beforeEach(() => {
-    cleanupDom = installDom();
-  });
-
-  afterEach(() => {
-    cleanup();
-    cleanupDom?.();
-    cleanupDom = null;
-  });
-
-  test("backend cache hydration updates subscribers that did not opt into storage listening", () => {
-    const { result } = renderHook(() => usePersistedState(UI_THEME_KEY, "initial"));
-
-    expect(result.current[0]).toBe("initial");
-
-    act(() => {
-      syncPersistedStateFromBackend(UI_THEME_KEY, "from-backend");
-    });
-
-    expect(result.current[0]).toBe("from-backend");
-  });
-
-  test("write observers receive local and backend source labels", () => {
-    const events: PersistedStateWriteEvent[] = [];
-    const unsubscribe = subscribePersistedStateWrites((event) => {
-      events.push(event);
-    });
-
-    updatePersistedState(LAST_CUSTOM_MODEL_PROVIDER_KEY, "local-value");
-    syncPersistedStateFromBackend(LAST_CUSTOM_MODEL_PROVIDER_KEY, "backend-value");
-    unsubscribe();
-
-    expect(events).toEqual([
-      { key: LAST_CUSTOM_MODEL_PROVIDER_KEY, newValue: "local-value", source: "local" },
-      { key: LAST_CUSTOM_MODEL_PROVIDER_KEY, newValue: "backend-value", source: "backend" },
-    ]);
-  });
-});
-
 describe("persisted state writes under storage quota pressure", () => {
   let cleanupDom: (() => void) | null = null;
   let storage: QuotaLimitedStorage;
@@ -124,7 +77,7 @@ describe("persisted state writes under storage quota pressure", () => {
   });
 
   // Every public write path shares the quota handling: draft text goes through the hook setter,
-  // attachments/LRU caches through updatePersistedState, and backend preferences through sync.
+  // attachments/LRU caches through updatePersistedState.
   const writePaths: Array<[string, (key: string, value: string) => void]> = [
     [
       "updatePersistedState",
@@ -139,7 +92,6 @@ describe("persisted state writes under storage quota pressure", () => {
         act(() => result.current[1](value));
       },
     ],
-    ["syncPersistedStateFromBackend", (key, value) => syncPersistedStateFromBackend(key, value)],
   ];
 
   test.each(writePaths)(
@@ -173,11 +125,8 @@ describe("persisted state writes under storage quota pressure", () => {
     installStorage(1_000);
     storage.seed("session-cost:bbbbbbbbbb", "x".repeat(100));
     storage.seed("review-state:bbbbbbbbbb", "y".repeat(800));
-    const events: PersistedStateWriteEvent[] = [];
-    const unsubscribe = subscribePersistedStateWrites((event) => events.push(event));
 
     const results = [1, 2, 3].map(() => updatePersistedState(QUOTA_FULL_KEY, "z".repeat(400)));
-    unsubscribe();
 
     expect(results).toEqual([false, false, false]);
     expect(storage.getItem(QUOTA_FULL_KEY)).toBeNull();
@@ -191,8 +140,6 @@ describe("persisted state writes under storage quota pressure", () => {
       QUOTA_FULL_KEY,
       QUOTA_FULL_KEY,
     ]);
-    // Nothing changed on disk, so no write observer hears about it.
-    expect(events).toEqual([]);
     // One warning per key per session instead of one per keystroke.
     expect(warn).toHaveBeenCalledTimes(1);
   });
@@ -270,7 +217,7 @@ describe("persisted state key budgets", () => {
     const overlongKey = getTimelineFilterKey("w".repeat(MAX_PERSISTED_KEY_CHARS));
 
     expect(updatePersistedState(unregistered, true)).toBe(false);
-    syncPersistedStateFromBackend(overlongKey, "all");
+    expect(updatePersistedState(overlongKey, "all")).toBe(false);
     // Unlike over-budget values, these are not kept in memory either.
     expect(readPersistedState(unregistered, null)).toBeNull();
     expect(readPersistedState(overlongKey, null)).toBeNull();
