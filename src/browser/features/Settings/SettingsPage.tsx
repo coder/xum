@@ -296,12 +296,15 @@ export function SettingsPage() {
           </div>
         </div>
 
-        {/* One close button for both layouts: it sits in the top-right header row either way. */}
+        {/* One close button for both layouts: it sits in the top-right header row either way.
+            Touch phones force buttons to a 44px minimum (globals.css), so a 24px box offset by
+            0.75rem grew downward and sat below the "Settings" title. Phones therefore get an
+            explicit 44px box centered in the 48px header row (same as the Analytics sheet). */}
         <Button
           variant="ghost"
           size="icon"
           onClick={close}
-          className="absolute top-[calc(env(safe-area-inset-top)+0.75rem)] right-4 h-6 w-6 md:right-6"
+          className="absolute top-[calc(env(safe-area-inset-top)+0.125rem)] right-1 h-11 w-11 md:top-[calc(env(safe-area-inset-top)+0.75rem)] md:right-6 md:h-6 md:w-6"
           aria-label="Close settings"
         >
           <X className="h-4 w-4" />

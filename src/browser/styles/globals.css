@@ -865,6 +865,25 @@ body,
     min-width: 44px;
   }
 
+  /* Radix checkboxes draw their box on the <button> itself, so the 44px minimum above turned the
+     box into a 44px square and pushed it off its label's line. Keep the drawn size and give the
+     tap area to a centered pseudo-element, which does not take part in layout. */
+  button[role="checkbox"] {
+    position: relative;
+    min-height: 0;
+    min-width: 0;
+  }
+
+  button[role="checkbox"]::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 44px;
+    height: 44px;
+    transform: translate(-50%, -50%);
+  }
+
   /* Full-width rows above the composer (TODO, sub-agents, background bash) read as a list;
      44px each made a short stack taller than the composer. */
   .mobile-touch-row {
