@@ -893,12 +893,39 @@ describe("exact-append chain (#5286)", () => {
     });
   };
 
-  async function runTurn(mode: "exact" | "thinking" | "fallback"): Promise<SettledStepBudget[]> {
+  async function runTurn(
+    mode: "exact" | "thinking" | "fallback" | "settle-full-count" | "pre-stream-fold"
+  ): Promise<SettledStepBudget[]> {
     const h = await createTestHistoryService();
     const workspaceId = `exact-append-${mode}`;
     const messageId = `assistant-${mode}`;
     const settled: SettledStepBudget[] = [];
-    const thinkingOverrideState: { pending?: "high" } = {};
+    // TurnRequestBuilder.start()'s pre-stream thinking fold writes `applied` before startStream.
+    const thinkingOverrideState: { pending?: "high"; applied?: "high" } =
+      mode === "pre-stream-fold" ? { applied: "high" } : {};
+    // The first settle estimate falls back to a full count (no delta) while the next step's
+    // prepareStep still classifies its request as an exact append of the same anchor. The
+    // preflight check counts through the same function, so only a call outside it is a settle.
+    const realCheck = budgetCounting.checkAssembledRequestBudgetForModel;
+    const realAnchoredEstimate = budgetCounting.estimateAnchoredRequestTokensForModel;
+    let inPreflight = false;
+    let settleFullCounts = mode === "settle-full-count" ? 1 : 0;
+    const preflights = spyOn(budgetCounting, "checkAssembledRequestBudgetForModel");
+    preflights.mockImplementation(async (...args) => {
+      inPreflight = true;
+      try {
+        return await realCheck(...args);
+      } finally {
+        inPreflight = false;
+      }
+    });
+    const anchoredEstimates = spyOn(budgetCounting, "estimateAnchoredRequestTokensForModel");
+    anchoredEstimates.mockImplementation(async (...args) => {
+      const counted = await realAnchoredEstimate(...args);
+      if (inPreflight || settleFullCounts === 0 || counted == null) return counted;
+      settleFullCounts -= 1;
+      return { estimate: counted.estimate, hardCeiling: counted.hardCeiling };
+    });
     const tools = {
       read: tool({
         inputSchema: z.object({}),
@@ -939,6 +966,7 @@ describe("exact-append chain (#5286)", () => {
         providedRuntimeTempDir: runtimeDir,
         tools,
         contextBudgetLimit: 100_000,
+        ...(mode === "pre-stream-fold" ? { thinkingOverrideState } : {}),
         ...(mode === "thinking"
           ? {
               thinkingOverrideState,
@@ -977,6 +1005,8 @@ describe("exact-append chain (#5286)", () => {
       expect(completion.status).toBe("completed");
       return settled;
     } finally {
+      anchoredEstimates.mockRestore();
+      preflights.mockRestore();
       await manager.stopStream(workspaceId);
       await h.cleanup();
     }
@@ -1005,6 +1035,24 @@ describe("exact-append chain (#5286)", () => {
     const settled = await runTurn("fallback");
     expect(settled).toHaveLength(1);
     expect(settled[0].model).toBe("openai:gpt-4o-mini");
+    expect(settled[0].nextRequestDeltaTokens).toBeDefined();
+    expect(settled[0].exactAppendChain).toBe(false);
+  });
+
+  test("a full count at settle breaks the chain even when the next step is an exact append", async () => {
+    const settled = await runTurn("settle-full-count");
+    expect(settled).toHaveLength(2);
+    expect(settled[0].nextRequestDeltaTokens).toBeUndefined();
+    expect(settled[0].exactAppendChain).toBe(false);
+    // The second step's own settle estimate is an exact append again; the earlier full count
+    // still means its delta is not a chain of exact appends since the turn's first request.
+    expect(settled[1].nextRequestDeltaTokens).toBeDefined();
+    expect(settled[1].exactAppendChain).toBe(false);
+  });
+
+  test("a pre-stream thinking fold breaks the chain from the turn's first step", async () => {
+    const settled = await runTurn("pre-stream-fold");
+    expect(settled).toHaveLength(2);
     expect(settled[0].nextRequestDeltaTokens).toBeDefined();
     expect(settled[0].exactAppendChain).toBe(false);
   });
