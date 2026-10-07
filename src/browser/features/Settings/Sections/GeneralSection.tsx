@@ -9,8 +9,12 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
-import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
-import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  getAppConfigStore,
+  updateUserPreferences,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useAPI } from "@/browser/contexts/API";
@@ -23,7 +27,6 @@ import {
   DEFAULT_TERMINAL_FONT_CONFIG,
   TERMINAL_BADGE_POSITIONS,
   BASH_COLLAPSED_SUMMARY_MODES,
-  CHAT_TRANSCRIPT_FULL_WIDTH_KEY,
   SIDEBAR_AGE_GROUPING_KEY,
   SIDEBAR_FLAT_MODE_KEY,
   SIDEBAR_HIDE_SUBAGENTS_KEY,
@@ -354,12 +357,7 @@ export function GeneralSection() {
 
         // Use independent nonces so appearance/debug toggles do not discard archive updates.
         if (chatTranscriptFullWidthNonce === chatTranscriptFullWidthLoadNonceRef.current) {
-          const enabled = cfg.chatTranscriptFullWidth === true;
-          setChatTranscriptFullWidth(enabled);
-          updatePersistedState<boolean | undefined>(
-            CHAT_TRANSCRIPT_FULL_WIDTH_KEY,
-            enabled ? true : undefined
-          );
+          setChatTranscriptFullWidth(cfg.chatTranscriptFullWidth === true);
         }
 
         if (llmDebugLogsNonce === llmDebugLogsLoadNonceRef.current) {
@@ -457,10 +455,7 @@ export function GeneralSection() {
     // Invalidate any in-flight config load so it does not overwrite the user's selection.
     chatTranscriptFullWidthLoadNonceRef.current++;
     setChatTranscriptFullWidth(checked);
-    updatePersistedState<boolean | undefined>(
-      CHAT_TRANSCRIPT_FULL_WIDTH_KEY,
-      checked ? true : undefined
-    );
+    getAppConfigStore().updateOptimistically({ chatTranscriptFullWidth: checked });
 
     if (!api?.config?.updateChatTranscriptFullWidth) {
       return;
