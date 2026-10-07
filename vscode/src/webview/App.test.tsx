@@ -5,15 +5,11 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { Profiler } from "react";
 
 import { installDom } from "../../../tests/ui/dom";
-import { readPersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
-import {
-  GLOBAL_SCOPE_ID,
-  getAgentIdKey,
-  getThinkingLevelKey,
-} from "xum/common/constants/storage";
+import { updatePersistedState } from "xum/browser/hooks/usePersistedState";
+import { getAgentIdKey, getThinkingLevelKey } from "xum/common/constants/storage";
 import { resetAiSelectionIntentForTests } from "xum/browser/utils/aiSelectionIntent";
 import { formatModelDisplayName } from "xum/common/utils/ai/modelDisplay";
-import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
+import { getAppConfigStore, getUserPreferences } from "xum/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
 import { CHAT_VIEW_DATA_READY_TIMEOUT_MS } from "xum/browser/components/ChatPane/useChatViewDataReady";
 import { createMuxMessage, type MuxMetadata } from "xum/common/types/message";
@@ -1589,7 +1585,7 @@ describe("vscode webview agent lookup", () => {
     });
     // The click must not open the picker: an unscoped pick would write the webview's global agent key.
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    expect(readPersistedState(getAgentIdKey(GLOBAL_SCOPE_ID), null)).toBeNull();
+    expect(getUserPreferences().ai?.globalDefaults).toBeUndefined();
   });
 
   test("looks up agents again when the connection recovers from file mode (#4797)", async () => {

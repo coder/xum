@@ -1,6 +1,8 @@
 import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as RouterContextModule from "@/browser/contexts/RouterContext";
 import type { DraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
@@ -9,13 +11,11 @@ import * as DraftWorkspaceSettingsModule from "@/browser/hooks/useDraftWorkspace
 import * as ChatCommandsModule from "@/browser/utils/chatCommands";
 import type { ProjectConfig } from "@/common/types/project";
 import {
-  GLOBAL_SCOPE_ID,
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
   getAutoThinkingLevelKey,
-  getModelKey,
   getPendingDraftSkillDiscoveryKey,
   getPendingScopeId,
   getPendingWorkspaceSendErrorKey,
@@ -86,6 +86,10 @@ const draftBackend = createTestApiClient({
 
 const readPersistedStateCalls: Array<[string, unknown]> = [];
 let persistedPreferences: Record<string, unknown> = {};
+
+function setPreferences(userPreferences: UserPreferences | undefined): void {
+  getAppConfigStore().updateOptimistically({ userPreferences });
+}
 const readPersistedStateMock = mock((key: string, defaultValue: unknown) => {
   readPersistedStateCalls.push([key, defaultValue]);
   if (Object.prototype.hasOwnProperty.call(persistedPreferences, key)) {
@@ -678,6 +682,7 @@ describe("useCreationWorkspace", () => {
     restorePersistedStateMocks = installPersistedStateMocks();
     mockProjectConfigMap = new Map([[TEST_PROJECT_PATH, { workspaces: [], trusted: true }]]);
     persistedPreferences = {};
+    setPreferences(undefined);
     readPersistedStateCalls.length = 0;
     updatePersistedStateCalls.length = 0;
     draftSettingsInvocations = [];
@@ -887,9 +892,10 @@ describe("useCreationWorkspace", () => {
       nameGeneration: nameGenerationMock,
     });
 
-    persistedPreferences[getAgentIdKey(getProjectScopeId(TEST_PROJECT_PATH))] = "plan";
-    // Set model preference for the project scope (read by getSendOptionsFromStorage)
-    persistedPreferences[getModelKey(getProjectScopeId(TEST_PROJECT_PATH))] = "gpt-4";
+    // Project defaults are read by getSendOptionsFromStorage.
+    setPreferences({
+      ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "plan", model: "gpt-4" } } },
+    });
 
     draftSettingsState = createDraftSettingsHarness({
       selectedRuntime: { mode: "ssh", host: "example.com" },
@@ -1934,8 +1940,12 @@ describe("useCreationWorkspace", () => {
       nameGeneration: nameGenerationMock,
     });
 
-    persistedPreferences[getAgentIdKey(GLOBAL_SCOPE_ID)] = "ask";
-    persistedPreferences[getModelKey(getProjectScopeId(TEST_PROJECT_PATH))] = "gpt-4";
+    setPreferences({
+      ai: {
+        globalDefaults: { agentId: "ask" },
+        projectDefaults: { [TEST_PROJECT_PATH]: { model: "gpt-4" } },
+      },
+    });
 
     draftSettingsState = createDraftSettingsHarness({
       selectedRuntime: { mode: "ssh", host: "example.com" },
@@ -1992,9 +2002,9 @@ describe("useCreationWorkspace", () => {
       ),
     });
 
-    const projectScopeId = getProjectScopeId(TEST_PROJECT_PATH);
-    persistedPreferences[getAgentIdKey(projectScopeId)] = "mux";
-    persistedPreferences[getModelKey(projectScopeId)] = "gpt-4";
+    setPreferences({
+      ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "mux", model: "gpt-4" } } },
+    });
     draftSettingsState = createDraftSettingsHarness({ agentId: "mux" });
 
     const getHook = renderUseCreationWorkspace({
@@ -2041,8 +2051,9 @@ describe("useCreationWorkspace", () => {
 
       const projectScopeId = getProjectScopeId(TEST_PROJECT_PATH);
       persistedPreferences[AGENT_AI_DEFAULTS_KEY] = { exec: { autoModelRouting: true } };
-      persistedPreferences[getAgentIdKey(projectScopeId)] = "exec";
-      persistedPreferences[getModelKey(projectScopeId)] = "gpt-4";
+      setPreferences({
+        ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "exec", model: "gpt-4" } } },
+      });
       // Model Auto came from the default; thinking Auto was picked in the creation composer.
       persistedPreferences[getAutoModelRoutingKey(projectScopeId)] = true;
       persistedPreferences[getAutoThinkingLevelKey(projectScopeId)] = true;
