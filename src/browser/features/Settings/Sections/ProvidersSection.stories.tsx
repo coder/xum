@@ -103,6 +103,65 @@ export const ProvidersEnvSourced: Story = {
   },
 };
 
+/**
+ * Pinned phone viewport for the rows that overflowed at narrow widths: the OpenAI
+ * default-auth toggle must wrap inside the card, and the custom-provider "Add provider"
+ * button must keep its label width (AGENTS.md Storybook responsive rule).
+ */
+export const ProvidersPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    // The meta disables Pixel; parameters deep-merge, so re-enable explicitly.
+    pixel: { exclude: false, matrix: { themes: ["dark"], viewports: ["phone"] } },
+  },
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            openai: {
+              apiKeySet: false,
+              apiKeySource: "env",
+              isEnabled: true,
+              isConfigured: true,
+              baseUrlSource: "env",
+              baseUrlResolved: "https://env.openai.test/v1",
+            },
+          },
+        })
+      }
+    >
+      {/* Fixed phone width so the play's overflow assertions hold in the CI
+          test-runner too, which ignores viewport globals (AGENTS.md). */}
+      <div data-testid="phone-frame" style={{ width: 390 }}>
+        <ProvidersSection />
+      </div>
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = canvas.getByTestId("phone-frame").getBoundingClientRect();
+
+    await userEvent.click(await canvas.findByRole("button", { name: /openai/i }));
+    const apiKeyOption = await canvas.findByText("Use OpenAI API key by default");
+    const toggle = apiKeyOption.closest("[role='group']");
+    if (!(toggle instanceof HTMLElement)) {
+      throw new Error("Expected the default-auth toggle group");
+    }
+    await expect(toggle.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right);
+
+    const addProvider = await canvas.findByRole("button", { name: "Add provider" });
+    await expect(addProvider.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right);
+    await expect(addProvider.scrollWidth).toBeLessThanOrEqual(addProvider.clientWidth);
+    // Chromium never shrinks a nowrap button below its label, but iOS Safari did:
+    // the button must opt out of flex shrinking for the label to stay inside it.
+    await expect(getComputedStyle(addProvider).flexShrink).toBe("0");
+  },
+};
+
 export const XAIProcessingMode: Story = {
   render: () => (
     <SettingsSectionStory
