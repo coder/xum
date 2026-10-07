@@ -20,10 +20,7 @@ import { ProjectProvider, useProjectContext } from "../../contexts/ProjectContex
 import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
 import { WorkspaceProvider, useWorkspaceContext } from "../../contexts/WorkspaceContext";
 import { RouterProvider } from "../../contexts/RouterContext";
-import {
-  mirrorUserPreferencesLocalCache,
-  UserPreferencesProvider,
-} from "@/browser/contexts/UserPreferencesContext";
+import { UserPreferencesProvider } from "@/browser/contexts/UserPreferencesContext";
 import { TerminalRouterProvider } from "../../terminal/TerminalRouterContext";
 import { UpdateRestartOverlay } from "@/browser/components/UpdateRestartOverlay/UpdateRestartOverlay";
 
@@ -59,8 +56,8 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
     }).finally(() => unsubscribeAppConfig?.());
 
     const startup = Promise.race([appConfigPromise, timeoutPromise]);
-    // The local preference copies must hold the first snapshot before RouterProvider reads launch
-    // behavior, but a slow backend must not trap users on the boot screen.
+    // RouterProvider reads launch behavior from the first snapshot, but a slow backend must not
+    // trap users on the boot screen.
     void startup
       .then((result) => {
         if (result === "timeout") {
@@ -68,9 +65,6 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
         }
         if (abortController.signal.aborted && result !== "timeout") {
           return;
-        }
-        if (result !== "timeout") {
-          mirrorUserPreferencesLocalCache();
         }
 
         bootstrappedRef.current = true;

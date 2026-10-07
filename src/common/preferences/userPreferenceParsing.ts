@@ -18,25 +18,6 @@ export function parseEnum<T extends string>(values: readonly T[], value: unknown
   return typeof value === "string" && values.includes(value as T) ? (value as T) : undefined;
 }
 
-export function parseStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const item of value) {
-    const parsed = parseNonEmptyString(item);
-    if (!parsed || seen.has(parsed)) {
-      continue;
-    }
-    seen.add(parsed);
-    out.push(parsed);
-  }
-
-  return out.length > 0 ? out : undefined;
-}
-
 export function parseAgentId(value: unknown): string | undefined {
   if (typeof value !== "string" || value.trim().length === 0) {
     return undefined;
