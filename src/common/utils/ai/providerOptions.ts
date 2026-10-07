@@ -36,7 +36,7 @@ import {
   isKimiK3Model,
   openaiSupportsProMode,
   OPENROUTER_REASONING_EFFORT,
-  stripModelProviderPrefixes,
+  anthropicThinksUnlessDisabled,
 } from "@/common/types/thinking";
 import {
   isGeminiFlashMinimalRejectingModelName,
@@ -189,14 +189,6 @@ type ProviderOptions =
 interface BedrockProviderOptions {
   [key: string]: JSONValue | undefined;
   additionalModelRequestFields?: Record<string, JSONValue>;
-}
-
-/**
- * Claude Haiku 5+ on Bedrock. Haiku 5.5 thinks adaptively when the request omits
- * `thinking`, unlike Haiku 4.5, which does not think unless asked.
- */
-function isBedrockAdaptiveDefaultHaiku(capabilityModel: string): boolean {
-  return /(?:^|\.)claude-haiku-(?:[5-9]|\d{2,})/.test(stripModelProviderPrefixes(capabilityModel));
 }
 
 function resolveAnthropic1MCapabilityModel(
@@ -927,7 +919,7 @@ export function buildProviderOptions(
     formatProvider === "bedrock" &&
     origin === "anthropic" &&
     effectiveThinking === "off" &&
-    isBedrockAdaptiveDefaultHaiku(capabilityModel)
+    anthropicThinksUnlessDisabled(capabilityModel)
   ) {
     const options = {
       bedrock: {

@@ -419,6 +419,18 @@ export function anthropicRejectsDisabledThinking(modelString: string): boolean {
 }
 
 /**
+ * Whether the given Anthropic model thinks (adaptively) when the request omits
+ * `thinking`, while still accepting `{ type: "disabled" }`. Callers that want a
+ * thinking-free request must send `disabled` explicitly for these models.
+ *
+ * Claude Haiku 5.5 (and any future Haiku 5+) does this; Haiku 4.5 does not think
+ * unless asked. See https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide
+ */
+export function anthropicThinksUnlessDisabled(modelString: string): boolean {
+  return /(?:^|\.)claude-haiku-(?:[5-9]|\d{2,})/.test(stripModelProviderPrefixes(modelString));
+}
+
+/**
  * Whether the given Anthropic model accepts `thinking: { type: "between_tools" }`,
  * which turns off up-front thinking; the model still writes short progress notes
  * between tool calls. Xum maps the "off" level to it (#5086). Only Claude Sonnet
