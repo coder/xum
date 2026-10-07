@@ -9,8 +9,8 @@ import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { BackupSection } from "@/browser/features/Settings/Sections/BackupSection";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { BACKUP_CONTENT_DEFAULTS } from "@/common/config/schemas/settingsBackup";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
 
 type MockOptions = Parameters<typeof createMockORPCClient>[0];
 type MockClient = ReturnType<typeof createMockORPCClient>;
@@ -92,6 +92,7 @@ async function confirmRestore(canvas: BoundFunctions<typeof queries>): Promise<v
 
 describe("BackupSection", () => {
   afterEach(() => {
+    resetTestExperiments();
     cleanup();
   });
 
@@ -1214,7 +1215,7 @@ describe("BackupSection", () => {
       ).toBe(true);
       off.view.unmount();
 
-      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), true);
+      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
       const on = renderBackupSection();
       const onCanvas = within(on.view.container);
       const toggle = await onCanvas.findByRole("checkbox", { name: "Pinned global artifacts" });
@@ -1222,7 +1223,7 @@ describe("BackupSection", () => {
       fireEvent.keyDown(window, shortcut);
       await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
     } finally {
-      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), null);
+      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, null);
     }
   });
 });

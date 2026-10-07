@@ -34,12 +34,12 @@ import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
 import * as TimelineDialogModule from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 import * as ArtifactsDialogModule from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
 import * as StatsDialogModule from "@/browser/features/RightSidebar/StatsDialog";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
 import { focusRightSidebarTab, readRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { collectAllTabs } from "@/browser/utils/rightSidebarLayout";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CODER_RUNTIME_PLACEHOLDER, type RuntimeConfig } from "@/common/types/runtime";
@@ -437,6 +437,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   afterEach(() => {
+    resetTestExperiments();
     cleanup();
     mock.restore();
     cleanupDom?.();
@@ -614,7 +615,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
   it("narrow Ctrl+Shift+K opens the Artifacts dialog, but not from a terminal", () => {
     stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
-    window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), "true");
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
     const dialogSpy = spyOn(ArtifactsDialogModule, "ArtifactsDialog").mockImplementation(
       (() => null) as unknown as typeof ArtifactsDialogModule.ArtifactsDialog
     );
@@ -778,7 +779,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     const media = stubMatchMedia(
       (query) => isNarrow && query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`
     );
-    window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), "true");
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
     const artifactsSpy = spyOn(ArtifactsDialogModule, "ArtifactsDialog").mockImplementation(
       (() => null) as unknown as typeof ArtifactsDialogModule.ArtifactsDialog
     );
@@ -829,7 +830,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     };
 
     it("Timeline and Artifacts select their tab once the sidebar shows again", () => {
-      window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), "true");
+      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
       for (const [tab, open] of [
         ["timeline", { key: "T", shiftKey: true }],
         ["artifacts", { key: "K", ctrlKey: true, shiftKey: true }],
@@ -849,7 +850,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     });
 
     it("does not add the Artifacts tab once its experiment is off", () => {
-      window.localStorage.setItem(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), "true");
+      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
       const widen = widenable();
       focusRightSidebarTab(workspaceId, "review");
       const before = allTabs();
@@ -860,7 +861,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       });
       // The experiment turns off while the dialog is open (e.g. from another window).
       act(() => {
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), false);
+        setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, false);
       });
       widen();
       expect(allTabs()).toEqual(before);

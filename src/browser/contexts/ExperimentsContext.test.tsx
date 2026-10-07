@@ -87,7 +87,7 @@ describe("ExperimentsProvider", () => {
     currentClientMock = {};
   });
 
-  test("renderer flight recording follows the backend status stream, not stale storage", async () => {
+  test("renderer flight recording follows the backend status stream", async () => {
     // A CLI toggle or reload must not leave this page diverged from the backend.
     const perf = EXPERIMENT_IDS.PERF_FLIGHT_RECORDER;
     // happy-dom has no long-animation-frame support: record what the renderer observes.
@@ -110,7 +110,6 @@ describe("ExperimentsProvider", () => {
     globalThis.PerformanceObserver =
       FakePerformanceObserver as unknown as typeof PerformanceObserver;
     const connectedCount = () => observers.filter((observer) => observer.connected).length;
-    window.localStorage.setItem(getExperimentKey(perf), "false");
     const statuses = createAsyncMessageQueue<FlightRecorderStatus>();
     statuses.push({ enabled: true, state: "collecting" });
     const set = mock(() => Promise.resolve());
@@ -125,13 +124,9 @@ describe("ExperimentsProvider", () => {
       },
     };
     function Toggle() {
-      const [enabled, setEnabled] = useExperiment(perf);
+      const [, setEnabled] = useExperiment(perf);
       const collecting = usePerfFlightRecorderCollecting();
-      return (
-        <button
-          onClick={() => setEnabled(false)}
-        >{`${String(enabled)}/${String(collecting)}`}</button>
-      );
+      return <button onClick={() => setEnabled(false)}>{String(collecting)}</button>;
     }
     try {
       const view = render(
@@ -142,7 +137,7 @@ describe("ExperimentsProvider", () => {
           </ExperimentsProvider>
         </APIProvider>
       );
-      await waitFor(() => expect(view.getByRole("button").textContent).toBe("true/true"));
+      await waitFor(() => expect(view.getByRole("button").textContent).toBe("true"));
       expect(set).not.toHaveBeenCalled();
       // Only new entries: no `buffered` import of frames recorded while the experiment was off.
       await waitFor(() => expect(connectedCount()).toBe(2));
@@ -154,12 +149,12 @@ describe("ExperimentsProvider", () => {
       // A Settings toggle requests the change; the streamed status publishes it.
       fireEvent.click(view.getByRole("button"));
       expect(set).toHaveBeenCalledWith({ experimentId: perf, enabled: false });
-      expect(view.getByRole("button").textContent).toBe("true/true");
+      expect(view.getByRole("button").textContent).toBe("true");
       await act(async () => {
         statuses.push({ enabled: false, state: "off" });
         await Promise.resolve();
       });
-      await waitFor(() => expect(view.getByRole("button").textContent).toBe("false/false"));
+      await waitFor(() => expect(view.getByRole("button").textContent).toBe("false"));
       expect(connectedCount()).toBe(0);
 
       // A failed backend recorder stays enabled but stops renderer collection.
@@ -167,7 +162,7 @@ describe("ExperimentsProvider", () => {
         statuses.push({ enabled: true, state: "failed" });
         await Promise.resolve();
       });
-      await waitFor(() => expect(view.getByRole("button").textContent).toBe("true/false"));
+      await waitFor(() => expect(view.getByRole("button").textContent).toBe("false"));
       expect(observers).toHaveLength(2);
 
       // A dropped status stream (e.g. backend restart) stops collection until it reconnects.
@@ -180,7 +175,7 @@ describe("ExperimentsProvider", () => {
         statuses.end();
         await Promise.resolve();
       });
-      await waitFor(() => expect(view.getByRole("button").textContent).toBe("true/false"));
+      await waitFor(() => expect(view.getByRole("button").textContent).toBe("false"));
       expect(connectedCount()).toBe(0);
     } finally {
       globalThis.PerformanceObserver = originalPerformanceObserver;

@@ -12,7 +12,7 @@ import { AppLoader } from "../components/AppLoader/AppLoader";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   SELECTED_WORKSPACE_KEY,
@@ -99,12 +99,9 @@ function resetStorybookPersistedStateForStory(): void {
     // Terminal badge stories seed an enabled badge config; clear it so other
     // stories with terminals don't render order-dependent badge overlays.
     localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
-    // Stories seed experiments in the mock config, which a local value left by an earlier
-    // story would override.
-    for (const id of Object.values(EXPERIMENT_IDS)) {
-      updatePersistedState(getExperimentKey(id), undefined);
-    }
   }
+  // Startup waits for this story's own experiments instead of the previous story's snapshot.
+  getAppConfigStore().updateOptimistically({ experiments: undefined });
 }
 function getStorybookRenderKey(): string | null {
   if (typeof window === "undefined") {

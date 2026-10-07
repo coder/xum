@@ -1,7 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent, within } from "@storybook/test";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { APIProvider } from "@/browser/contexts/API";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { blurActiveElement } from "@/browser/stories/storyPlayHelpers.js";
@@ -10,7 +9,8 @@ import type {
   MemoryFileInfo,
 } from "@/common/orpc/schemas/memory";
 
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { MemoryTab } from "./MemoryTab";
 
 const meta: Meta<typeof MemoryTab> = {
@@ -96,7 +96,9 @@ const CONSOLIDATION_RECORD: MemoryConsolidationRecordPayload = {
 // The Memory tab lives in the narrow right sidebar, so pin the story to a
 // sidebar-like width (also exercises the ~375px mobile layout contract).
 function renderTab(width: string) {
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY_CONSOLIDATION), true);
+  getAppConfigStore().setClient(
+    createMockORPCClient({ experiments: { [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true } })
+  );
   return (
     <APIProvider
       client={createMockORPCClient({

@@ -1,9 +1,10 @@
 import type { ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, within } from "@storybook/test";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { lightweightMeta } from "@/browser/stories/meta.js";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import type { ArtifactKind } from "@/common/utils/artifactKind";
 import { ArtifactToolCall } from "./ArtifactToolCall";
 import { AttachFileToolCall } from "./AttachFileToolCall";
@@ -61,7 +62,9 @@ function Section(props: { label: string; children: ReactNode }) {
 
 /** Every card state in one chat-width column: published kinds, a failed publish, attach_file. */
 function renderGallery() {
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), true);
+  getAppConfigStore().setClient(
+    createMockORPCClient({ experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true } })
+  );
   return (
     <div className="bg-background p-4">
       <div className="flex w-full max-w-2xl flex-col gap-4">

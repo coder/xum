@@ -10,33 +10,12 @@ import React, {
 import {
   type ExperimentId,
   EXPERIMENT_IDS,
-  EXPERIMENTS,
   getExperimentKey,
   isExperimentSupportedOnPlatform,
 } from "@/common/constants/experiments";
-import { getStorageChangeEvent } from "@/common/constants/events";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useAPI } from "@/browser/contexts/API";
-
-/**
- * Subscribe to experiment changes for a specific experiment ID.
- * Uses localStorage + custom events for cross-component sync.
- */
-function subscribeToExperiment(experimentId: ExperimentId, callback: () => void): () => void {
-  const key = getExperimentKey(experimentId);
-  const storageChangeEvent = getStorageChangeEvent(key);
-
-  const handleChange = () => callback();
-
-  // Listen to both storage events (cross-tab) and custom events (same-tab)
-  window.addEventListener("storage", handleChange);
-  window.addEventListener(storageChangeEvent, handleChange);
-
-  return () => {
-    window.removeEventListener("storage", handleChange);
-    window.removeEventListener(storageChangeEvent, handleChange);
-  };
-}
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 function isCompactionExperiment(experimentId: ExperimentId): boolean {
   return (
@@ -51,27 +30,6 @@ function getCurrentDesktopPlatform(): NodeJS.Platform | undefined {
 
 function isExperimentSupported(experimentId: ExperimentId): boolean {
   return isExperimentSupportedOnPlatform(experimentId, getCurrentDesktopPlatform());
-}
-
-/**
- * Get explicit localStorage override for an experiment.
- * Returns undefined if no value is set or parsing fails.
- */
-function getExperimentOverrideSnapshot(experimentId: ExperimentId): boolean | undefined {
-  const parsed = readPersistedState<unknown>(getExperimentKey(experimentId), undefined);
-  return typeof parsed === "boolean" ? parsed : undefined;
-}
-
-/**
- * Experiments whose value only an ordered backend stream sets. Browser storage
- * is origin-scoped and can be stale (another origin, the CLI, or another process
- * changed the backend), so these are never read from it.
- */
-function isStreamOwnedExperiment(experimentId: ExperimentId): boolean {
-  return (
-    experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP ||
-    experimentId === EXPERIMENT_IDS.PERF_FLIGHT_RECORDER
-  );
 }
 
 /** Keeps the stream-owned values across reads that must not overwrite them. */
@@ -302,97 +260,32 @@ export function useClaudeDesignRevision(): number {
   return useContext(ExperimentsContext)?.designRevision ?? 0;
 }
 
-/**
- * Hook to get a single experiment's enabled state with reactive updates.
- * Uses useSyncExternalStore for efficient, selective re-renders.
- * Only re-renders when THIS specific experiment changes.
- *
- * @param experimentId - The experiment to subscribe to
- * @returns Whether the experiment is enabled
- */
+/** The backend value of one experiment from the AppConfigStore snapshot (off until it loads). */
 export function useExperimentValue(experimentId: ExperimentId): boolean {
-  const subscribe = useCallback(
-    (callback: () => void) => subscribeToExperiment(experimentId, callback),
-    [experimentId]
+  const store = getAppConfigStore();
+  const designEnabled =
+    useContext(ExperimentsContext)?.backendOverrides?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP] === true;
+  const enabled = useSyncExternalStore(
+    store.subscribe,
+    () => store.getSnapshot()?.experiments?.[experimentId] === true
   );
-
-  const getSnapshot = useCallback(
-    () => getExperimentOverrideSnapshot(experimentId),
-    [experimentId]
-  );
-
-  const localOverride = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-  const context = useContext(ExperimentsContext);
-
-  if (!isExperimentSupported(experimentId)) {
-    return false;
-  }
-
-  // Design consent is backend-authoritative: stale browser storage must never
-  // re-enable it on reconnect or override a confirmed backend disable.
-  if (experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP)
-    return context?.backendOverrides?.[experimentId] ?? false;
-
-  // The flight recorder follows the backend status stream; stale browser storage
-  // must not show a state the backend does not have.
-  if (experimentId === EXPERIMENT_IDS.PERF_FLIGHT_RECORDER)
-    return context?.backendOverrides?.[experimentId] ?? EXPERIMENTS[experimentId].enabledByDefault;
-
-  // An explicit local toggle wins, which also settles the race against an in-flight
-  // backend read: a toggle made while it loads is not overwritten when it resolves.
-  if (localOverride !== undefined) {
-    return localOverride;
-  }
-
-  return context?.backendOverrides?.[experimentId] ?? EXPERIMENTS[experimentId].enabledByDefault;
+  // Credential controls may hide only after the backend retired affected clients, which the
+  // ordered Design stream reports; the config snapshot can arrive first.
+  return experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP ? designEnabled : enabled;
 }
 
 /**
- * useExperimentValue, or null while that value is still provisional: no explicit local override
- * decides it and the backend overrides have not loaded (first render, offline, or a failed read).
- * Code that rewrites persisted state from a flag (the right-sidebar tab sync) must wait on null:
- * acting on the provisional default and then on the loaded value removed a saved Artifacts tab
- * and re-added it at the end without its selection on every reload.
+ * useExperimentValue, or null until the first config snapshot with experiments arrives. Code that
+ * rewrites persisted state from a flag (the right-sidebar tab sync) must wait on null: acting on
+ * the provisional default and then on the loaded value removed a saved Artifacts tab and re-added
+ * it at the end without its selection on every reload.
  */
 export function useSettledExperimentValue(experimentId: ExperimentId): boolean | null {
-  const value = useExperimentValue(experimentId);
-  const localOverride = useExperimentOverrideValue(experimentId);
-  const context = useContext(ExperimentsContext);
-  // Without a provider there is no backend to wait for, and unsupported experiments are always off.
-  if (context == null || !isExperimentSupported(experimentId)) {
-    return value;
-  }
-  // useExperimentValue lets an explicit local toggle win, except for stream-owned experiments.
-  if (localOverride !== undefined && !isStreamOwnedExperiment(experimentId)) {
-    return value;
-  }
-  return context.backendOverridesLoaded ? value : null;
-}
-
-/**
- * Hook to read only an explicit local override for an experiment.
- *
- * Returns `undefined` when the user has not explicitly set a value in localStorage,
- * which lets send options distinguish "user chose off" from "user never chose".
- */
-export function useExperimentOverrideValue(experimentId: ExperimentId): boolean | undefined {
-  const isSupported = isExperimentSupported(experimentId);
-  const subscribe = useCallback(
-    (callback: () => void) => subscribeToExperiment(experimentId, callback),
-    [experimentId]
-  );
-
-  const getSnapshot = useCallback(
-    () => getExperimentOverrideSnapshot(experimentId),
-    [experimentId]
-  );
-
-  const override = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-  if (!isSupported) {
-    return undefined;
-  }
-
-  return override;
+  const store = getAppConfigStore();
+  return useSyncExternalStore(store.subscribe, () => {
+    const experiments = store.getSnapshot()?.experiments;
+    return experiments ? experiments[experimentId] === true : null;
+  });
 }
 
 /**
