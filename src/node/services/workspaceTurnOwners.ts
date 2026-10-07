@@ -34,43 +34,17 @@ export type WorkspaceTurnOwners =
 // Admission walks at most 32 levels (isDescendantAgentTaskUsingParentById), so 64 covers it.
 const MAX_ANCESTOR_LEVELS = 64;
 
-// An owner ID becomes a sessions/<owner> path segment; refuse anything that could leave it.
-const isPathSegment = (id: string) =>
-  id.trim() !== "" && path.basename(id) === id && id !== "." && id !== ".." && !id.includes("\0");
-
 export function resolveWorkspaceTurnOwners(
   config: ProjectsConfig,
   workspaceId: string
 ): WorkspaceTurnOwners {
-  // Every row by ID, a duplicated ID as null: findWorkspaceEntry returns the first match and would
-  // hide a duplicate.
-  const rowsById = new Map<string, WorkspaceConfigEntry | null>();
-  for (const project of config.projects.values()) {
-    for (const row of project.workspaces) {
-      if (row.id != null) rowsById.set(row.id, rowsById.has(row.id) ? null : row);
-    }
-  }
-  const row = rowsById.get(workspaceId);
-  if (row == null) return { kind: "fallback", reason: row === null ? "duplicate row" : "no row" };
-  if (row.parentWorkspaceId != null) {
-    const ownerWorkspaceIds: string[] = [];
-    for (let current = row; current.parentWorkspaceId != null; ) {
-      const parentId = current.parentWorkspaceId;
-      if (ownerWorkspaceIds.length === MAX_ANCESTOR_LEVELS) {
-        return { kind: "fallback", reason: `more than ${MAX_ANCESTOR_LEVELS} ancestor levels` };
-      }
-      const parent = rowsById.get(parentId);
-      if (parent == null || !isPathSegment(parentId)) {
-        return {
-          kind: "fallback",
-          reason: `ancestor ${parentId}: missing, duplicate or unsafe row`,
-        };
-      }
-      ownerWorkspaceIds.push(parentId);
-      current = parent;
-    }
-    return { kind: "ancestors", ownerWorkspaceIds };
-  }
+  // Scan every row: findWorkspaceEntry returns the first match and would hide a duplicate ID.
+  const rows = [...config.projects.values()].flatMap((project) =>
+    project.workspaces.filter((workspace) => workspace.id === workspaceId)
+  );
+  if (rows.length !== 1) return { kind: "fallback", reason: `${rows.length} config rows` };
+  const row = rows[0];
+  if (row.parentWorkspaceId != null) return resolveAncestors(config, row);
 
   // Config loading keeps tag values as written, so a hand-edited tag can be a non-string.
   const claim: unknown =
@@ -79,8 +53,36 @@ export function resolveWorkspaceTurnOwners(
   if (typeof claim !== "string" || claim.trim() === "") {
     return { kind: "fallback", reason: "no creator claim" };
   }
-  if (!isPathSegment(claim)) {
+  // The claim becomes a sessions/<owner> path segment; refuse anything that could leave it.
+  if (path.basename(claim) !== claim || claim === "." || claim === ".." || claim.includes("\0")) {
     return { kind: "fallback", reason: "creator claim is not a path segment" };
   }
   return { kind: "creator", ownerWorkspaceId: claim };
+}
+
+// Only agent tasks build the row map; root targets keep the single filter above (#5569).
+function resolveAncestors(config: ProjectsConfig, row: WorkspaceConfigEntry): WorkspaceTurnOwners {
+  // Every row by ID, a duplicated ID as null, so a duplicate ancestor cannot hide behind the first.
+  const rowsById = new Map<string, WorkspaceConfigEntry | null>();
+  for (const project of config.projects.values()) {
+    for (const entry of project.workspaces) {
+      if (entry.id != null) rowsById.set(entry.id, rowsById.has(entry.id) ? null : entry);
+    }
+  }
+  const ownerWorkspaceIds: string[] = [];
+  for (let current = row; current.parentWorkspaceId != null; ) {
+    const parentId = current.parentWorkspaceId;
+    if (ownerWorkspaceIds.length === MAX_ANCESTOR_LEVELS) {
+      return { kind: "fallback", reason: `more than ${MAX_ANCESTOR_LEVELS} ancestor levels` };
+    }
+    const parent = rowsById.get(parentId);
+    // The ID becomes a sessions/<owner> path segment, as a creator claim does.
+    const segment = path.basename(parentId) === parentId && parentId !== "." && parentId !== "..";
+    if (parent == null || !segment || parentId.trim() === "" || parentId.includes("\0")) {
+      return { kind: "fallback", reason: `ancestor ${parentId}: missing, duplicate or unsafe row` };
+    }
+    ownerWorkspaceIds.push(parentId);
+    current = parent;
+  }
+  return { kind: "ancestors", ownerWorkspaceIds };
 }
