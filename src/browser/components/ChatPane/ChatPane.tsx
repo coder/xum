@@ -42,6 +42,7 @@ import {
 import { getRetryBarrierDerivation } from "./retryBarrierDerivation";
 import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { ChatInput, type ChatInputAPI } from "@/browser/features/ChatInput/index";
+import { keepUnsettledEditInDraft } from "@/browser/features/ChatInput/useComposerDraft";
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import {
   mergeConsecutiveStreamErrors,
@@ -331,10 +332,15 @@ function setEditingByWorkspace(
     previous: Readonly<Record<string, EditingMessageState>>
   ) => Readonly<Record<string, EditingMessageState>>
 ) {
-  const next = update(editTargets);
-  if (next === editTargets) return;
+  const previous = editTargets;
+  const next = update(previous);
+  if (next === previous) return;
   editTargets = next;
   for (const listener of editTargetListeners) listener();
+  // Every cleared or replaced target goes through here, so its unsettled contents are kept.
+  for (const [workspaceId, edit] of Object.entries(previous)) {
+    if (next[workspaceId]?.id !== edit.id) keepUnsettledEditInDraft(workspaceId, edit.id);
+  }
 }
 
 /** `edits` with this workspace's edit set or removed; the same object when nothing changes. */

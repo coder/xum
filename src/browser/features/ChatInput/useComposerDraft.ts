@@ -9,6 +9,7 @@ import type { ReviewNoteDataForDisplay } from "@/common/types/message";
 import type { Review } from "@/common/types/review";
 import assert from "@/common/utils/assert";
 import { DRAFT_ID_PATTERN } from "@/constants/drafts";
+import { joinDraftText } from "@/common/utils/composerDraftText";
 import type { ChatAttachment } from "./ChatAttachments";
 import type { Toast } from "./ChatInputToast";
 
@@ -72,6 +73,26 @@ function subscribeEditDraft(key: string, listener: () => void) {
     listeners.delete(listener);
     if (listeners.size === 0) editDraftListeners.delete(key);
   };
+}
+
+/**
+ * The one rule for an edit that loses its target without a settle (cancel and accepted sends
+ * settle first and leave no buffer): ChatPane calls this whenever a workspace's edit target is
+ * cleared or replaced (transcript-only, a second Edit, a deleted row, a refresh that finds no
+ * target). The edit's text and files stay in the workspace's normal draft, after the unsent
+ * draft, never over it. Taking the buffer first makes it exactly once.
+ */
+export function keepUnsettledEditInDraft(workspaceId: string, editId: string) {
+  const edit = editDrafts.get(workspaceId);
+  if (edit?.editId !== editId) return;
+  writeStoredEditDraft(workspaceId, null);
+  const scope: DraftStoreScope = { kind: "workspace", workspaceId };
+  if (edit.text.trim().length > 0) {
+    getDraftStore().setText(scope, (current) => joinDraftText(current, edit.text));
+  }
+  if (edit.attachments.length > 0) {
+    getDraftStore().setAttachments(scope, (current) => [...current, ...edit.attachments]);
+  }
 }
 
 type Update<T> = T | ((previous: T) => T);
