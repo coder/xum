@@ -29,8 +29,7 @@ import {
   canEditDisplayedUserMessage,
   type EditingMessageState,
 } from "@/browser/utils/chatEditing";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   Bot,
   ChevronLeft,
@@ -103,7 +102,9 @@ export const UserMessage: React.FC<UserMessageProps> = ({
         ...(structuredOutputJson ? [`Structured output:\n${structuredOutputJson}`] : []),
       ].join("\n\n")
     : visibleContent;
-  const [vimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, { listener: true });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const isMobileTouch =
     typeof window !== "undefined" &&
     window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;

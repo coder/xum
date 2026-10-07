@@ -2,8 +2,9 @@ import React from "react";
 import { StreamingBarrierView } from "./StreamingBarrierView";
 import { getModelName } from "@/common/utils/ai/models";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
-import { AGENT_AI_DEFAULTS_KEY, VIM_ENABLED_KEY, getModelKey } from "@/common/constants/storage";
+import { AGENT_AI_DEFAULTS_KEY, getModelKey } from "@/common/constants/storage";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import {
   useWorkspaceState,
@@ -296,7 +297,7 @@ export const StreamingBarrierContent: React.FC<StreamingBarrierContentProps> = (
   const modelName = model ? getModelName(model) : null;
 
   // Prefer parent vim state (subscribed in ChatPane) so the hint updates immediately.
-  const vimEnabled = vimEnabledFromParent ?? readPersistedState(VIM_ENABLED_KEY, false);
+  const vimEnabled = vimEnabledFromParent ?? getUserPreferences().appearance?.vimEnabled === true;
   const interruptKeybind = formatKeybind(
     vimEnabled ? KEYBINDS.INTERRUPT_STREAM_VIM : KEYBINDS.INTERRUPT_STREAM_NORMAL
   ).replace("Escape", "Esc");

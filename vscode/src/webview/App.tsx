@@ -55,10 +55,8 @@ import {
   matchesKeybind,
   KEYBINDS,
 } from "xum/browser/utils/ui/keybinds";
-import { readPersistedState } from "xum/browser/hooks/usePersistedState";
-import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
+import { getAppConfigStore, getUserPreferences } from "xum/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
-import { VIM_ENABLED_KEY } from "xum/common/constants/storage";
 import { useAutoScroll } from "xum/browser/hooks/useAutoScroll";
 import { useTranscriptDensity } from "xum/browser/hooks/useTranscriptDensity";
 import {
@@ -859,7 +857,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
         return;
       }
 
-      const vimEnabled = readPersistedState(VIM_ENABLED_KEY, false);
+      const vimEnabled = getUserPreferences().appearance?.vimEnabled === true;
       const interruptKeybind = vimEnabled
         ? KEYBINDS.INTERRUPT_STREAM_VIM
         : KEYBINDS.INTERRUPT_STREAM_NORMAL;

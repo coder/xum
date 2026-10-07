@@ -61,7 +61,6 @@ import {
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   AGENT_AI_DEFAULTS_KEY,
-  VIM_ENABLED_KEY,
   RUNTIME_ENABLEMENT_KEY,
   getProjectScopeId,
   getPendingDraftSkillDiscoveryKey,
@@ -103,7 +102,12 @@ import {
   useWorkspaceStoreRaw,
   useWorkspaceUsage,
 } from "@/browser/stores/WorkspaceStore";
-import { flushUserPreferences } from "@/browser/stores/AppConfigStore";
+import {
+  flushUserPreferences,
+  getUserPreferences,
+  updateUserPreferences,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { getPlaceholderTip } from "./placeholderTips";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
@@ -627,9 +631,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
   );
   const telemetry = useTelemetry();
-  const [vimEnabled, setVimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, {
-    listener: true,
-  });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const { startSequence: startTutorial } = useTutorial();
 
   // Track transcription provider prerequisites from Settings → Providers.
@@ -2080,7 +2084,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             setPreferredModel(action.model);
             break;
           case "toggle-vim":
-            setVimEnabled((enabled) => !enabled);
+            updateUserPreferences({
+              appearance: { vimEnabled: getUserPreferences().appearance?.vimEnabled !== true },
+            });
             break;
           case "set-sending":
             setSendingCount((count) => count + (action.sending ? 1 : -1));

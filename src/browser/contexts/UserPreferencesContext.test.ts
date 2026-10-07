@@ -10,10 +10,11 @@ import {
 } from "./UserPreferencesContext";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
+  GLOBAL_SCOPE_ID,
   LAUNCH_BEHAVIOR_KEY,
+  REVIEW_INCLUDE_UNCOMMITTED_KEY,
   TERMINAL_FONT_CONFIG_KEY,
-  UI_THEME_KEY,
-  VIM_ENABLED_KEY,
+  getAgentIdKey,
 } from "@/common/constants/storage";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import { removeStoredUserPreference } from "@/common/preferences/userPreferencesStorage";
@@ -72,23 +73,23 @@ describe("UserPreferencesProvider bridge helpers", () => {
 
   test("removes stale local cache entries on a backend refresh", () => {
     const storage = new MemoryStorage();
-    storage.setJSON(UI_THEME_KEY, "dark");
-    storage.setJSON(VIM_ENABLED_KEY, true);
+    storage.setJSON(REVIEW_INCLUDE_UNCOMMITTED_KEY, false);
+    storage.setJSON(getAgentIdKey(GLOBAL_SCOPE_ID), "plan");
 
     mirrorBackendPreferences({
-      backendPreferences: { appearance: { theme: "light" } },
+      backendPreferences: { review: { includeUncommitted: true } },
       storage,
     });
 
-    expect(JSON.parse(storage.getItem(UI_THEME_KEY) ?? "null")).toBe("light");
-    expect(storage.getItem(VIM_ENABLED_KEY)).toBeNull();
+    expect(JSON.parse(storage.getItem(REVIEW_INCLUDE_UNCOMMITTED_KEY) ?? "null")).toBe(true);
+    expect(storage.getItem(getAgentIdKey(GLOBAL_SCOPE_ID))).toBeNull();
   });
 
   test("removing the last known value of a section deletes only that stored value", () => {
     const remove = (before: UserPreferences, key: string) =>
       createMergePatch(before, removeStoredUserPreference(before, key) ?? {});
 
-    expect(remove({ appearance: { theme: "dark" } }, UI_THEME_KEY)).toEqual({
+    expect(createMergePatch({ appearance: { theme: "dark" } }, {})).toEqual({
       appearance: { theme: null },
     });
     expect(

@@ -15,6 +15,7 @@ import type { WorkspaceAISettingsCache } from "xum/browser/utils/workspaceModeAi
 import { normalizeAgentId } from "xum/common/utils/agentIds";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
 import { usePersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
+import { useUserPreferences } from "xum/browser/stores/AppConfigStore";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
 import { normalizeSelectedModel } from "xum/common/utils/ai/models";
 import {
@@ -42,7 +43,6 @@ import {
   COMPOSER_WORKSPACE_ICON_ONLY_HIDE_CLASS,
 } from "xum/constants/layout";
 import {
-  VIM_ENABLED_KEY,
   getInputKey,
   getModelKey,
   getWorkspaceAISettingsByAgentKey,
@@ -140,9 +140,9 @@ function ChatComposerInner(props: {
   const inputKey = getInputKey(props.workspaceId);
   const [input, setInput] = usePersistedState<string>(inputKey, "", { listener: true });
 
-  const [vimEnabled, setVimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, {
-    listener: true,
-  });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const [isSending, setIsSending] = useState(false);
 
   const aggregator = props.aggregator;
@@ -248,10 +248,12 @@ function ChatComposerInner(props: {
     }
 
     if (trimmed === "/vim") {
-      const next = !vimEnabled;
-      setVimEnabled(next);
+      // Vim mode lives in Xum's config, which the webview cannot write.
       setInput("");
-      props.onNotice({ level: "info", message: `Vim mode ${next ? "enabled" : "disabled"}.` });
+      props.onNotice({
+        level: "info",
+        message: `Vim mode is ${vimEnabled ? "enabled" : "disabled"}. Change it in Xum.`,
+      });
       return;
     }
 
