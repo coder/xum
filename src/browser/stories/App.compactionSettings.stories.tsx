@@ -10,12 +10,12 @@ import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments
 
 export default { ...appMeta, title: "App/CompactionSettings" };
 
-const setOverride = fn<APIClient["experiments"]["setOverride"]>(() => Promise.resolve());
+const set = fn<APIClient["experiments"]["set"]>(() => Promise.resolve());
 const getOverrides = fn<APIClient["experiments"]["getOverrides"]>(() => Promise.resolve({}));
 
 function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "legacy") {
   expandLeftSidebar();
-  setOverride.mockClear();
+  set.mockClear();
   getOverrides.mockClear();
   const client = setupSettingsStory({
     experiments: {
@@ -31,7 +31,7 @@ function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "leg
     },
   });
   client.experiments = {
-    setOverride,
+    set,
     getOverrides,
     onDesignChange: () =>
       Promise.resolve(
@@ -60,9 +60,7 @@ async function openCompactionSettings(canvasElement: HTMLElement) {
   const canvas = within(await openSettingsDialog(canvasElement));
   const trigger = await canvas.findByRole("combobox", { name: "Compaction strategy" });
   trigger.scrollIntoView({ block: "center" });
-  // Initial local-override uploads belong to provider reconciliation, not a dropdown choice.
   await waitFor(async () => expect(getOverrides).toHaveBeenCalled());
-  setOverride.mockClear();
   return trigger;
 }
 
@@ -78,12 +76,12 @@ async function expectPersistedStrategy(continuous: boolean, budget: boolean) {
 }
 
 async function expectStrategyWrites(continuous: boolean, budget: boolean) {
-  await waitFor(async () => expect(setOverride).toHaveBeenCalledTimes(2));
-  await expect(setOverride).toHaveBeenCalledWith({
+  await waitFor(async () => expect(set).toHaveBeenCalledTimes(2));
+  await expect(set).toHaveBeenCalledWith({
     experimentId: EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
     enabled: continuous,
   });
-  await expect(setOverride).toHaveBeenCalledWith({
+  await expect(set).toHaveBeenCalledWith({
     experimentId: EXPERIMENT_IDS.TOKEN_BUDGET,
     enabled: budget,
   });
@@ -93,11 +91,11 @@ async function dismissWithoutChoosing(trigger: HTMLElement) {
   await userEvent.click(trigger);
   await userEvent.keyboard("{Escape}");
   await expect(trigger).toHaveAttribute("aria-expanded", "false");
-  await expect(setOverride).not.toHaveBeenCalled();
+  await expect(set).not.toHaveBeenCalled();
 }
 
 async function selectStrategy(trigger: HTMLElement, name: string) {
-  setOverride.mockClear();
+  set.mockClear();
   await userEvent.click(trigger);
   const body = within(trigger.ownerDocument.body);
   await userEvent.click(await body.findByRole("option", { name }));

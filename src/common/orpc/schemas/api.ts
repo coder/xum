@@ -255,7 +255,7 @@ export const experiments = {
     input: z.void(),
     output: z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean()),
   },
-  setOverride: {
+  set: {
     input: z.object({
       experimentId: z.enum(EXPERIMENT_IDS),
       enabled: z.boolean().nullish(),

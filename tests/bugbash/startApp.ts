@@ -225,7 +225,7 @@ async function seed(
   fakeProviderOrigin: string | undefined
 ): Promise<string> {
   await api(base, "splashScreens/markSplashScreenViewed", { splashId: "onboarding-wizard-v1" });
-  await api(base, "experiments/setOverride", { experimentId: "artifacts", enabled: true });
+  await api(base, "experiments/set", { experimentId: "artifacts", enabled: true });
   if (ai.mode === "real") {
     await api(base, "providers/setProviderConfig", {
       provider: ai.provider,

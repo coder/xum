@@ -835,6 +835,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve(undefined);
       },
     },
+    experiments: { set: () => Promise.resolve(undefined) },
     config: {
       getConfig: () =>
         Promise.resolve({
