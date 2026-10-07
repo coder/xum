@@ -4401,6 +4401,31 @@ describe("AgentSession token-budget lifecycle", () => {
       }
     );
 
+    // Claims come from history: a claimed final prompt closes the window's stages even when no
+    // handoff row precedes it, so a later send past H gets no handoff.
+    test("a claimed final prompt without a handoff row suppresses a due handoff", async () => {
+      const h = await setup();
+      expect(
+        (
+          await h.historyService.appendManyToHistory(workspaceId, [
+            rolloverMessages.createContextBudgetWarning({
+              contextTokens: 110_000,
+              maxTokens: 128_000,
+              budgetTokens: ceiling,
+              sessionHistoryAvailable: true,
+              final: true,
+              newContextAvailable: true,
+            }),
+          ])
+        ).success
+      ).toBe(true);
+      await seedHistory(h, 95_000);
+      h.turnStart.estimate = () => 100_000;
+      expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+      expect(warningRows(await allRows(h)).map(isFinalFlushRow)).toEqual([true]);
+      expect(handoffClaimed(h)).toBe(false);
+    });
+
     // The builder drops a stage once its abort signal fires. The session's publish fence covers a
     // Stop that is already in progress when the warning would be published.
     test("a Stop that lands before the turn-start warning is published writes no warning", async () => {
