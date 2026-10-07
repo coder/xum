@@ -378,33 +378,12 @@ export function getRuntimeKey(projectPath: string): string {
 }
 
 /**
- * Get the localStorage key for trunk branch preference for a project
- * Stores the last used trunk branch when creating a workspace
- * Format: "trunkBranch:{projectPath}"
- */
-export function getTrunkBranchKey(projectPath: string): string {
-  return `trunkBranch:${projectPath}`;
-}
-
-/**
  * Get the localStorage key for whether to show the "Initialize with AGENTS.md" nudge for a project.
  * Set to true when a project is first added; cleared when user dismisses or runs /init.
  * Format: "agentsInitNudge:{projectPath}"
  */
 export function getAgentsInitNudgeKey(projectPath: string): string {
   return `agentsInitNudge:${projectPath}`;
-}
-
-/**
- * Get the localStorage key for the last runtime config used per provider for a project.
- *
- * Value shape is a provider-keyed object (e.g. { ssh: { host }, docker: { image } }) so we can
- * add new options without adding more storage keys.
- *
- * Format: "lastRuntimeConfig:{projectPath}"
- */
-export function getLastRuntimeConfigKey(projectPath: string): string {
-  return `lastRuntimeConfig:${projectPath}`;
 }
 
 /**
@@ -1214,9 +1193,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(EXPANDED_TASK_GROUPS_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
 
   // Project-scoped families ("{prefix}{projectPath}").
-  globalPrefix(projectPrefix(getTrunkBranchKey), "synced", 256, "project"),
-  // Provider-keyed last runtime options (e.g. { ssh: { host }, docker: { image } }).
-  globalPrefix(projectPrefix(getLastRuntimeConfigKey), "synced", 1024, "project"),
   globalPrefix(projectPrefix(getRuntimeKey), "ui", 256, "project"),
   globalPrefix(projectPrefix(getAgentsInitNudgeKey), "ui", 16, "project"),
   globalPrefix(projectPrefix(getReviewDefaultBaseKey), "synced", 256, "project"),

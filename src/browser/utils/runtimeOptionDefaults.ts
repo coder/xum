@@ -1,7 +1,50 @@
+import {
+  getUserPreferences,
+  updateUserPreferences,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { CoderWorkspaceConfig } from "@/common/orpc/schemas/coder";
 import { CODER_RUNTIME_PLACEHOLDER, RUNTIME_MODE, type RuntimeMode } from "@/common/types/runtime";
 
 export type RuntimeOptionDefaults = Partial<Record<RuntimeMode, unknown>>;
+
+const NO_RUNTIME_OPTION_DEFAULTS: RuntimeOptionDefaults = {};
+
+function selectRuntimeOptionDefaults(
+  preferences: UserPreferences,
+  projectPath: string
+): RuntimeOptionDefaults | undefined {
+  return preferences.workspaceCreation?.byProject?.[projectPath]?.lastRuntimeConfig;
+}
+
+/** The project's remembered runtime options; creation and Settings edit the same value. */
+export function useRuntimeOptionDefaults(projectPath: string | null): RuntimeOptionDefaults {
+  return (
+    useUserPreferences((preferences) =>
+      projectPath === null ? undefined : selectRuntimeOptionDefaults(preferences, projectPath)
+    ) ?? NO_RUNTIME_OPTION_DEFAULTS
+  );
+}
+
+export function readRuntimeOptionDefaults(projectPath: string): RuntimeOptionDefaults {
+  return (
+    selectRuntimeOptionDefaults(getUserPreferences(), projectPath) ?? NO_RUNTIME_OPTION_DEFAULTS
+  );
+}
+
+export function updateRuntimeOptionDefaults(
+  projectPath: string,
+  update: (prev: RuntimeOptionDefaults) => RuntimeOptionDefaults
+): void {
+  updateUserPreferences({
+    workspaceCreation: {
+      byProject: {
+        [projectPath]: { lastRuntimeConfig: update(readRuntimeOptionDefaults(projectPath)) },
+      },
+    },
+  });
+}
 
 export interface SshOptionDefaults {
   host: string;

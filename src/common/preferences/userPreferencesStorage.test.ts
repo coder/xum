@@ -8,12 +8,8 @@ import {
   removeStoredUserPreference,
 } from "./userPreferencesStorage";
 import {
-  REVIEW_INCLUDE_UNCOMMITTED_KEY,
-  getLastRuntimeConfigKey,
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
-  getReviewDefaultBaseKey,
-  getTrunkBranchKey,
 } from "@/common/constants/storage";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 
@@ -51,46 +47,19 @@ function entryKeys(preferences: UserPreferences | undefined): string[] {
 describe("user preference localStorage registry", () => {
   test("collects semantic preferences from legacy localStorage keys", () => {
     const storage = new MemoryStorage();
-    storage.setJSON(getTrunkBranchKey("/repo"), "origin/main");
-    storage.setJSON(getLastRuntimeConfigKey("/repo"), { ssh: { host: "devbox" } });
     storage.setJSON(getNotifyOnResponseAutoEnableKey("/repo"), true);
     storage.setJSON(getNotifyOnResponseKey("ws-1"), true);
-    storage.setJSON(REVIEW_INCLUDE_UNCOMMITTED_KEY, true);
-    storage.setJSON(getReviewDefaultBaseKey("/repo"), "origin/main");
 
     expect(collectForTest(storage)).toEqual({
-      workspaceCreation: {
-        byProject: {
-          "/repo": {
-            trunkBranch: "origin/main",
-            lastRuntimeConfig: { ssh: { host: "devbox" } },
-            notifyOnResponseAutoEnable: true,
-          },
-        },
-      },
-      notifications: {
-        notifyOnResponseByWorkspace: { "ws-1": true },
-      },
-      review: {
-        includeUncommitted: true,
-        defaultBaseByProject: { "/repo": "origin/main" },
-      },
+      workspaceCreation: { byProject: { "/repo": { notifyOnResponseAutoEnable: true } } },
+      notifications: { notifyOnResponseByWorkspace: { "ws-1": true } },
     });
   });
 
   test("all flattened preference entries are recognized, applied, and removable", () => {
     const preferences: UserPreferences = {
-      workspaceCreation: {
-        byProject: {
-          "/repo": {
-            trunkBranch: "origin/main",
-            lastRuntimeConfig: { ssh: { host: "devbox" } },
-            notifyOnResponseAutoEnable: true,
-          },
-        },
-      },
+      workspaceCreation: { byProject: { "/repo": { notifyOnResponseAutoEnable: true } } },
       notifications: { notifyOnResponseByWorkspace: { "ws-1": false } },
-      review: { includeUncommitted: true, defaultBaseByProject: { "/repo": "origin/main" } },
     };
 
     const entries = entriesFromUserPreferences(preferences);
@@ -104,34 +73,23 @@ describe("user preference localStorage registry", () => {
     }
   });
 
-  test("round trips backend preferences to localStorage entries", () => {
-    const preferences = {
-      review: { includeUncommitted: true },
-      notifications: { notifyOnResponseByWorkspace: { "ws-1": false } },
-    };
-
-    expect(entriesFromUserPreferences(preferences)).toEqual([
-      { key: getNotifyOnResponseKey("ws-1"), value: false },
-      { key: REVIEW_INCLUDE_UNCOMMITTED_KEY, value: true },
-    ]);
-  });
-
   test("removes a single localStorage preference without dropping siblings", () => {
-    let preferences = applyStoredUserPreference(undefined, REVIEW_INCLUDE_UNCOMMITTED_KEY, true);
-    preferences = applyStoredUserPreference(preferences, getReviewDefaultBaseKey("/repo"), "main");
-    preferences = removeStoredUserPreference(preferences, REVIEW_INCLUDE_UNCOMMITTED_KEY);
+    let preferences = applyStoredUserPreference(undefined, getNotifyOnResponseKey("ws-1"), true);
+    preferences = applyStoredUserPreference(preferences, getNotifyOnResponseKey("ws-2"), false);
+    preferences = removeStoredUserPreference(preferences, getNotifyOnResponseKey("ws-1"));
 
-    expect(preferences).toEqual({ review: { defaultBaseByProject: { "/repo": "main" } } });
-    expect(entryKeys(preferences)).not.toContain(REVIEW_INCLUDE_UNCOMMITTED_KEY);
+    expect(preferences).toEqual({
+      notifications: { notifyOnResponseByWorkspace: { "ws-2": false } },
+    });
   });
 
   test("returns only valid entries for backfill", () => {
     const storage = new MemoryStorage();
-    storage.setJSON(REVIEW_INCLUDE_UNCOMMITTED_KEY, true);
-    storage.setJSON(getTrunkBranchKey("/repo"), "  ");
+    storage.setJSON(getNotifyOnResponseKey("ws-1"), true);
+    storage.setJSON(getNotifyOnResponseAutoEnableKey("/repo"), "  ");
 
     expect(getStoredUserPreferenceEntries(storage)).toEqual([
-      { key: REVIEW_INCLUDE_UNCOMMITTED_KEY, value: true },
+      { key: getNotifyOnResponseKey("ws-1"), value: true },
     ]);
   });
 });
