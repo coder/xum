@@ -3,22 +3,22 @@ import { installDom } from "../../../tests/ui/dom";
 
 import {
   canPrunePreferenceScopes,
+  createMergePatch,
   createUserPreferenceSaveQueue,
   mirrorBackendPreferences,
   mirrorUserPreferencesLocalCache,
-  overlayDirtyLocalValues,
   prunePreferenceScopes,
 } from "./UserPreferencesContext";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
-import { getPersistedStateStorage, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   LAUNCH_BEHAVIOR_KEY,
-  PROJECT_ORDER_KEY,
+  TERMINAL_FONT_CONFIG_KEY,
   UI_THEME_KEY,
   VIM_ENABLED_KEY,
   getAutoCompactionThresholdKey,
 } from "@/common/constants/storage";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
+import { removeStoredUserPreference } from "@/common/preferences/userPreferencesStorage";
 
 class MemoryStorage implements Storage {
   private values = new Map<string, string>();
@@ -137,7 +137,6 @@ describe("UserPreferencesProvider bridge helpers", () => {
 
     mirrorBackendPreferences({
       backendPreferences: { appearance: { theme: "light" } },
-      dirtyKeys: new Set(),
       storage,
     });
 
@@ -145,69 +144,19 @@ describe("UserPreferencesProvider bridge helpers", () => {
     expect(storage.getItem(VIM_ENABLED_KEY)).toBeNull();
   });
 
-  test("does not overwrite dirty local cache entries with backend values", () => {
-    const storage = new MemoryStorage();
-    storage.setJSON(UI_THEME_KEY, "flexoki-dark");
+  test("removing the last known value of a section deletes only that stored value", () => {
+    const remove = (before: UserPreferences, key: string) =>
+      createMergePatch(before, removeStoredUserPreference(before, key) ?? {});
 
-    mirrorBackendPreferences({
-      backendPreferences: { appearance: { theme: "light" } },
-      dirtyKeys: new Set([UI_THEME_KEY]),
-      storage,
+    expect(remove({ appearance: { theme: "dark" } }, UI_THEME_KEY)).toEqual({
+      appearance: { theme: null },
     });
-
-    expect(JSON.parse(storage.getItem(UI_THEME_KEY) ?? "null")).toBe("flexoki-dark");
-  });
-
-  test("keeps dirty local cache entries on a backend refresh", () => {
-    const storage = new MemoryStorage();
-    storage.setJSON(UI_THEME_KEY, "dark");
-    storage.setJSON(VIM_ENABLED_KEY, true);
-
-    mirrorBackendPreferences({
-      backendPreferences: { appearance: { theme: "light" } },
-      dirtyKeys: new Set([VIM_ENABLED_KEY]),
-      storage,
-    });
-
-    expect(JSON.parse(storage.getItem(UI_THEME_KEY) ?? "null")).toBe("light");
-    expect(JSON.parse(storage.getItem(VIM_ENABLED_KEY) ?? "null")).toBe(true);
-  });
-
-  test("overlays dirty local values over a backend refresh", () => {
-    const storage = new MemoryStorage();
-    storage.setJSON(UI_THEME_KEY, "flexoki-dark");
-
     expect(
-      overlayDirtyLocalValues(
-        {
-          appearance: { theme: "light", vimEnabled: true },
-        },
-        [UI_THEME_KEY, VIM_ENABLED_KEY],
-        storage
+      remove(
+        { appearance: { terminalFontConfig: { fontFamily: "Menlo", fontSize: 13 } } },
+        TERMINAL_FONT_CONFIG_KEY
       )
-    ).toEqual({
-      appearance: { theme: "flexoki-dark" },
-    });
-  });
-
-  // A value over its key budget lives only in memory for the session; reading the raw on-disk value
-  // here would overlay (and save) the user's previous value instead of the one just set.
-  test("overlays a dirty value that is over its budget from the session copy", () => {
-    const cleanupDom = installDom();
-    try {
-      const order = Array.from(
-        { length: 1200 },
-        (_, index) => `/Users/someone/src/project-${index}`
-      );
-      expect(updatePersistedState(PROJECT_ORDER_KEY, order)).toBe(true);
-      expect(window.localStorage.getItem(PROJECT_ORDER_KEY)).toBeNull();
-
-      const next = overlayDirtyLocalValues({}, [PROJECT_ORDER_KEY], getPersistedStateStorage()!);
-
-      expect(JSON.stringify(next)).toContain("/Users/someone/src/project-1199");
-    } finally {
-      cleanupDom();
-    }
+    ).toEqual({ appearance: { terminalFontConfig: null } });
   });
 
   test("only prunes scoped preferences after successful project and workspace loads", () => {

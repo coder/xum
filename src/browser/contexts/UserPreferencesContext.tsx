@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import { useAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -12,18 +12,22 @@ import {
   normalizeUserPreferences,
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
-import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
+import {
+  getAppConfigStore,
+  getUserPreferences,
+  updateUserPreferences,
+  type UserPreferencesPatch,
+} from "@/browser/stores/AppConfigStore";
 import {
   applyStoredUserPreference,
   entriesFromUserPreferences,
   getStoredUserPreferenceKeys,
   isUserPreferenceStorageKey,
-  readStoredUserPreferenceValue,
   removeStoredUserPreference,
 } from "@/common/preferences/userPreferencesStorage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import { assert } from "@/common/utils/assert";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import { normalizeOrder } from "@/common/utils/projectOrdering";
 import { stableStringify } from "@/common/utils/stableStringify";
 
@@ -49,39 +53,19 @@ function removeBackendEntryFromLocalStorage(key: string, storage: Storage) {
   storage.removeItem(key);
 }
 
-export function overlayDirtyLocalValues(
-  preferences: UserPreferences | undefined,
-  dirtyKeys: Iterable<string>,
-  storage: Storage
-): UserPreferences | undefined {
-  let next = preferences;
-  for (const key of dirtyKeys) {
-    const value = readStoredUserPreferenceValue(storage, key);
-    next =
-      value === undefined
-        ? removeStoredUserPreference(next, key)
-        : applyStoredUserPreference(next, key, value);
-  }
-
-  return next;
-}
-
 export function mirrorBackendPreferences(params: {
   backendPreferences: UserPreferences | undefined;
-  dirtyKeys: ReadonlySet<string>;
   storage: Storage;
 }) {
   const backendEntries = entriesFromUserPreferences(params.backendPreferences);
   const backendKeys = new Set(backendEntries.map((entry) => entry.key));
 
   for (const entry of backendEntries) {
-    if (!params.dirtyKeys.has(entry.key)) {
-      writeBackendEntryToLocalStorage(entry, params.storage);
-    }
+    writeBackendEntryToLocalStorage(entry, params.storage);
   }
 
   for (const key of getStoredUserPreferenceKeys(params.storage)) {
-    if (!backendKeys.has(key) && !params.dirtyKeys.has(key)) {
+    if (!backendKeys.has(key)) {
       removeBackendEntryFromLocalStorage(key, params.storage);
     }
   }
@@ -93,7 +77,6 @@ export function mirrorUserPreferencesLocalCache(): void {
   if (storage) {
     mirrorBackendPreferences({
       backendPreferences: getUserPreferences(),
-      dirtyKeys: new Set(),
       storage,
     });
   }
@@ -423,98 +406,59 @@ export function createUserPreferenceSaveQueue(params: {
   return { enqueue, reserve, settle, waitForPersisted };
 }
 
-/** Preference entries the backend reads at request time, so senders can wait on them. */
-export interface UserPreferencePersistenceEntry {
-  kind: "autoCompactionThreshold";
-  model: string;
-}
-
-export interface UserPreferencesPersistenceContextValue {
-  /**
-   * Resolve once the backend has acknowledged the latest local write for `entry`.
-   * Rejects with a user-readable Error when that write's save failed, or with the abort
-   * reason when `signal` aborts (distinguish via `signal.aborted`).
-   */
-  waitForPreferencePersisted: (
-    entry: UserPreferencePersistenceEntry,
-    signal: AbortSignal
-  ) => Promise<void>;
-}
-
-function getPersistenceEntryStorageKey(entry: UserPreferencePersistenceEntry): string {
-  switch (entry.kind) {
-    case "autoCompactionThreshold":
-      return getAutoCompactionThresholdKey(entry.model);
-  }
-}
-
-// Without a provider (unit tests, stories) nothing is pending toward a backend.
-export const UserPreferencesPersistenceContext =
-  createContext<UserPreferencesPersistenceContextValue>({
-    waitForPreferencePersisted: () => Promise.resolve(),
-  });
-
-export function useUserPreferencePersistence(): UserPreferencesPersistenceContextValue {
-  return useContext(UserPreferencesPersistenceContext);
+/**
+ * Builds the merge patch that turns `before` into `after`. Temporary: only this provider's
+ * key-based writes need it until callers patch typed preferences directly.
+ */
+export function createMergePatch(
+  before: UserPreferences,
+  after: UserPreferences
+): UserPreferencesPatch {
+  // Null only stored values, never an emptied ancestor: that would also erase a sibling another
+  // client added since this snapshot. Entries hold the stored objects themselves, so identity works.
+  const storedValues = new Set(entriesFromUserPreferences(before).map((entry) => entry.value));
+  const deletion = (value: unknown): unknown =>
+    isPlainObject(value) && !storedValues.has(value)
+      ? Object.fromEntries(Object.entries(value).map(([key, child]) => [key, deletion(child)]))
+      : null;
+  const diff = (from: unknown, to: unknown): unknown => {
+    if (!isPlainObject(from) || !isPlainObject(to)) {
+      return to;
+    }
+    const patch: Record<string, unknown> = {};
+    for (const key of Object.keys(from)) {
+      if (to[key] === undefined) {
+        patch[key] = deletion(from[key]);
+      }
+    }
+    for (const [key, value] of Object.entries(to)) {
+      if (value !== undefined && stableStringify(value) !== stableStringify(from[key])) {
+        patch[key] = diff(from[key], value);
+      }
+    }
+    return patch;
+  };
+  return diff(before, after) as UserPreferencesPatch;
 }
 
 export function UserPreferencesProvider(props: { children: ReactNode }) {
   const { api } = useAPI();
   const projectContext = useProjectContext();
   const workspaceContext = useWorkspaceContext();
-  const currentPreferencesRef = useRef<UserPreferences | undefined>(undefined);
-  const dirtyKeysRef = useRef<Set<string>>(new Set());
-  const saveQueueRef = useRef<UserPreferenceSaveQueue | null>(null);
-  const hydratedRef = useRef(false);
   const [hydrated, setHydrated] = useState(false);
-
-  const persistence: UserPreferencesPersistenceContextValue = {
-    waitForPreferencePersisted: (entry, signal) => {
-      // Without an API client nothing is pending toward the backend; before hydration the
-      // queue holds reserved versions for local writes the hydration save will carry.
-      const queue = saveQueueRef.current;
-      if (!queue) {
-        return Promise.resolve();
-      }
-      return queue.waitForPersisted(getPersistenceEntryStorageKey(entry), signal);
-    },
-  };
 
   useEffect(() => {
     if (!api) {
-      saveQueueRef.current = null;
-      hydratedRef.current = false;
       setHydrated(false);
       return;
     }
 
-    // Treat every concrete API client identity as a fresh backend source.
-    currentPreferencesRef.current = undefined;
-    dirtyKeysRef.current.clear();
-    hydratedRef.current = false;
     setHydrated(false);
 
     const storage = getLocalStorage();
     if (!storage) {
       return;
     }
-
-    const abortController = new AbortController();
-    const { signal } = abortController;
-
-    const saveQueue = createUserPreferenceSaveQueue({
-      configClient: api.config,
-      signal,
-      getCurrentPreferences: () => currentPreferencesRef.current,
-      clearDirtyKeys: () => {
-        dirtyKeysRef.current.clear();
-      },
-      onError: (message, error) => {
-        console.warn(message, error);
-      },
-    });
-
-    saveQueueRef.current = saveQueue;
 
     const appConfigStore = getAppConfigStore();
     let mirroredPreferences: UserPreferences | undefined;
@@ -525,31 +469,11 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
         return;
       }
       mirroredPreferences = snapshotPreferences;
-      // Empty preferences normalize to undefined, so pruning them finds nothing to save.
-      const backendPreferences = normalizeUserPreferences(snapshotPreferences);
-
-      mirrorBackendPreferences({ backendPreferences, dirtyKeys: dirtyKeysRef.current, storage });
-      const nextPreferences = overlayDirtyLocalValues(
-        backendPreferences,
-        dirtyKeysRef.current,
-        storage
-      );
-
-      currentPreferencesRef.current = nextPreferences;
-      hydratedRef.current = true;
+      mirrorBackendPreferences({
+        backendPreferences: normalizeUserPreferences(snapshotPreferences),
+        storage,
+      });
       setHydrated(true);
-
-      if (
-        dirtyKeysRef.current.size > 0 &&
-        stableStringify(nextPreferences) !== stableStringify(backendPreferences)
-      ) {
-        // Dirty keys written before hydration were reserved, not enqueued; this save carries
-        // them, so it owns their requested versions and its acknowledgement releases waiters.
-        saveQueue.enqueue(nextPreferences, dirtyKeysRef.current);
-      } else {
-        // Nothing to save: the backend already holds every dirty value, so their waiters can go.
-        saveQueue.settle(dirtyKeysRef.current);
-      }
     };
 
     const unsubscribeWrites = subscribePersistedStateWrites((event) => {
@@ -557,30 +481,20 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
         return;
       }
 
-      dirtyKeysRef.current.add(event.key);
-      currentPreferencesRef.current =
+      const before = getUserPreferences();
+      const after =
         event.newValue === undefined || event.newValue === null
-          ? removeStoredUserPreference(currentPreferencesRef.current, event.key)
-          : applyStoredUserPreference(currentPreferencesRef.current, event.key, event.newValue);
-
-      if (!hydratedRef.current) {
-        // Not saved yet (hydration will carry it), but a sender waiting on this key must not
-        // be released before that save is acknowledged.
-        saveQueue.reserve([event.key]);
-        return;
-      }
-
-      saveQueue.enqueue(currentPreferencesRef.current, [event.key]);
+          ? removeStoredUserPreference(before, event.key)
+          : applyStoredUserPreference(before, event.key, event.newValue);
+      updateUserPreferences(createMergePatch(before, after ?? {}));
     });
 
     const unsubscribeStore = appConfigStore.subscribe(applyBackendPreferences);
     applyBackendPreferences();
 
     return () => {
-      abortController.abort();
       unsubscribeWrites();
       unsubscribeStore();
-      saveQueueRef.current = null;
     };
   }, [api]);
 
@@ -601,35 +515,17 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
 
     const projectPaths = new Set(projectContext.userProjects.keys());
     const workspaceIds = new Set(workspaceContext.workspaceMetadata.keys());
+    const current = getUserPreferences();
     const pruned = prunePreferenceScopes({
-      preferences: currentPreferencesRef.current,
+      preferences: current,
       projectPaths,
       workspaceIds,
       userProjects: projectContext.userProjects,
     });
 
-    if (stableStringify(pruned) === stableStringify(currentPreferencesRef.current)) {
-      return;
+    if (stableStringify(pruned) !== stableStringify(normalizeUserPreferences(current))) {
+      updateUserPreferences(createMergePatch(current, pruned ?? {}));
     }
-
-    currentPreferencesRef.current = pruned;
-    const storage = getLocalStorage();
-    if (storage) {
-      for (const entry of entriesFromUserPreferences(pruned)) {
-        writeBackendEntryToLocalStorage(entry, storage);
-      }
-    }
-
-    const prunedKeys = new Set(entriesFromUserPreferences(pruned).map((entry) => entry.key));
-    if (storage) {
-      for (const key of getStoredUserPreferenceKeys(storage)) {
-        if (!prunedKeys.has(key)) {
-          removeBackendEntryFromLocalStorage(key, storage);
-        }
-      }
-    }
-
-    saveQueueRef.current?.enqueue(pruned);
   }, [
     hydrated,
     projectContext.loading,
@@ -642,9 +538,5 @@ export function UserPreferencesProvider(props: { children: ReactNode }) {
     workspaceContext.workspaceMetadata,
   ]);
 
-  return (
-    <UserPreferencesPersistenceContext.Provider value={persistence}>
-      {props.children}
-    </UserPreferencesPersistenceContext.Provider>
-  );
+  return props.children;
 }

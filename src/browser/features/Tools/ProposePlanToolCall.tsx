@@ -36,7 +36,6 @@ import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { TranscriptQuoteRoot } from "../Messages/TranscriptQuoteBoundary";
 import { cn } from "@/common/lib/utils";
 import { useAPI } from "@/browser/contexts/API";
-import { useUserPreferencePersistence } from "@/browser/contexts/UserPreferencesContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
@@ -62,7 +61,7 @@ import {
   useHostTranscriptMutationCheck,
 } from "@/browser/utils/transcriptBarrier";
 import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
-import { useAppConfig } from "@/browser/stores/AppConfigStore";
+import { flushUserPreferences, useAppConfig } from "@/browser/stores/AppConfigStore";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import {
   resolveAutoRoutingForAgent,
@@ -241,7 +240,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   // also implicitly scopes lookups away from neighbouring tool calls/transcripts.
   const planContentRef = useRef<HTMLDivElement>(null);
   const { api } = useAPI();
-  const { waitForPreferencePersisted } = useUserPreferencePersistence();
   const { agentId: currentAgentId, agents } = useAgent();
   const autoRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const isAutoMode = currentAgentId === "auto";
@@ -642,10 +640,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     // Same barrier as the composer: the backend reads the send model's auto-compaction
     // threshold from persisted preferences, so a slider move right before this click must
     // reach config.json first. A failed save lands in the handlers' best-effort catch.
-    await waitForPreferencePersisted(
-      { kind: "autoCompactionThreshold", model: settings.resolvedModel },
-      new AbortController().signal
-    );
+    await flushUserPreferences();
 
     // Final re-check after every await; nothing has been changed yet.
     if (!isTranscriptMutationAllowed(workspaceId)) return null;
