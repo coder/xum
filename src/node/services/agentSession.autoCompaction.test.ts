@@ -9,6 +9,7 @@ import type {
   WorkspaceChatMessage,
 } from "@/common/orpc/types";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -239,13 +240,17 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
             )
           ).success
         ).toBe(true);
+        const flags: ExperimentId[] =
+          strategy === "tokenBudget"
+            ? [EXPERIMENT_IDS.TOKEN_BUDGET, EXPERIMENT_IDS.MEMORY]
+            : [EXPERIMENT_IDS.CONTINUOUS_COMPACTION];
+        spyOn(h.aiService, "isExperimentEnabled").mockImplementation((id) => flags.includes(id));
         const stream = spyOn(h.aiService, "streamMessage");
         expect(
           (
             await h.session.sendMessage("Summarize the idle workspace", {
               model,
               agentId: "compact",
-              experiments: { [strategy]: true, memory: strategy === "tokenBudget" },
               muxMetadata: {
                 type: "compaction-request",
                 rawCommand: "/compact",
@@ -357,14 +362,14 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   });
 
   test("stamps on-send auto-compaction requests with the RLM keep-recent tail only when RLM is on", async () => {
-    const runCase = async (args: {
-      workspaceId: string;
-      experiments?: SendMessageOptions["experiments"];
-    }) => {
+    const runCase = async (args: { workspaceId: string; enabled?: ExperimentId[] }) => {
       stubOverThreshold({ usagePercentage: 99, thresholdPercentage: 85 });
-      const { session, historyService } = await createSessionHarness({
+      const { session, historyService, aiService } = await createSessionHarness({
         workspaceId: args.workspaceId,
       });
+      spyOn(aiService, "isExperimentEnabled").mockImplementation(
+        (id) => args.enabled?.includes(id) === true
+      );
 
       // Seed a prior turn so the keep-recent selector has a safe user boundary
       // (u1 @ seq 2) with a provider-eligible head (u0, a0) before it.
@@ -381,7 +386,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       const result = await session.sendMessage("next question", {
         model: "openai:gpt-4o",
         agentId: "exec",
-        ...(args.experiments ? { experiments: args.experiments } : {}),
       });
       expect(result.success).toBe(true);
 
@@ -400,7 +404,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     // RLM on (sub-experiment of PTC): stamped with u1's historySequence.
     const stamped = await runCase({
       workspaceId: "ws-auto-compaction-rlm-stamp-on",
-      experiments: { programmaticToolCalling: true, rlm: true },
+      enabled: [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING, EXPERIMENT_IDS.RLM],
     });
     expect(stamped).toEqual({ startHistorySequence: 2 });
     await historyCleanup?.();
@@ -408,7 +412,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     // RLM flag without a PTC parent flag stays inert.
     const inert = await runCase({
       workspaceId: "ws-auto-compaction-rlm-stamp-inert",
-      experiments: { rlm: true },
+      enabled: [EXPERIMENT_IDS.RLM],
     });
     expect(inert).toBeUndefined();
     await historyCleanup?.();

@@ -206,7 +206,7 @@ describe("AgentSession disposal race conditions", () => {
           createMuxMessage("bs-u", "user", filler, { timestamp: 1 }),
           createMuxMessage("bs-a", "assistant", filler, { timestamp: 2 }),
         ],
-        experiments: { rlm: true, programmaticToolCalling: true },
+        isExperimentEnabled: () => true,
         guardTailMessageId: "bs-a",
       });
 

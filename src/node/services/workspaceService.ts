@@ -14350,10 +14350,8 @@ export class WorkspaceService
         // config registration: a rollback can no longer race the writer, and
         // once the workspace is in config, removal can always cancel + drain
         // the registration. Also keeps the summary's recorded usage from
-        // being wiped by resetForkedSessionUsage above. Fork IPC carries no
-        // send-option experiments, so gating falls back to the persisted
-        // machine overrides. Best-effort — never fails the fork (the promise
-        // never rejects). Awaited so the cross-process pending marker is
+        // being wiped by resetForkedSessionUsage above. Best-effort — never
+        // fails the fork (the promise never rejects). Awaited so the cross-process pending marker is
         // stat-visible before the fork IPC returns (r55): an immediate first
         // send handled by another backend must find it; generation itself
         // still runs in the background.
