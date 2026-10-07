@@ -142,10 +142,7 @@ export interface ProjectsConfig {
   /** Difficulty tiers for the auto-model-routing experiment; always normalized on load. */
   autoModelRouting?: AutoModelRoutingConfig;
 
-  /**
-   * Default model used for new workspaces (shared via ~/.xum/config.json).
-   * Mirrors the browser localStorage cache (DEFAULT_MODEL_KEY).
-   */
+  /** Default model used for new workspaces (shared via ~/.xum/config.json). */
   defaultModel?: string;
   /** Global advisor model override for the experimental advisor tool. */
   advisorModelString?: string;
@@ -157,10 +154,7 @@ export interface ProjectsConfig {
   advisorMaxUsesPerTurn?: number | null;
   /** Positive max-output-tokens cap for advisor responses; null/undefined means unlimited. */
   advisorMaxOutputTokens?: number | null;
-  /**
-   * Hidden model IDs (shared via ~/.xum/config.json).
-   * Mirrors the browser localStorage cache (HIDDEN_MODELS_KEY).
-   */
+  /** Hidden model IDs (shared via ~/.xum/config.json). */
   hiddenModels?: string[];
   /**
    * Default model/thinking/reasoning overrides per agentId. Base fields are the
