@@ -114,8 +114,9 @@ export const ProvidersPhoneViewport: Story = {
   },
   parameters: {
     layout: "fullscreen",
-    // The meta disables Pixel; parameters deep-merge, so re-enable explicitly.
-    pixel: { exclude: false, matrix: { themes: ["dark"], viewports: ["phone"] } },
+    // No Pixel snapshot: the suite sits at its snapshot budget. The play's
+    // geometry assertions guard the regression in the Storybook test-runner instead.
+    pixel: PIXEL_DISABLED,
   },
   render: () => (
     <SettingsSectionStory
