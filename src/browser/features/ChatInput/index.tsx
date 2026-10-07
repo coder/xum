@@ -34,7 +34,6 @@ import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { ThinkingSelector } from "@/browser/components/ThinkingSelector/ThinkingSelector";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
-import { useUserPreferencePersistence } from "@/browser/contexts/UserPreferencesContext";
 import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
 import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
@@ -104,6 +103,7 @@ import {
   useWorkspaceStoreRaw,
   useWorkspaceUsage,
 } from "@/browser/stores/WorkspaceStore";
+import { flushUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { getPlaceholderTip } from "./placeholderTips";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
@@ -321,7 +321,6 @@ interface EditSession {
 
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
-  const { waitForPreferencePersisted } = useUserPreferencePersistence();
   const { variant } = props;
   const { userProjects } = useProjectContext();
   const creationScope =
@@ -2809,10 +2808,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // acceptance also means the preference landed.)
         const preferencePersisted = await runWithCatch(
           async () => {
-            await waitForPreferencePersisted(
-              { kind: "autoCompactionThreshold", model: effectiveModel },
-              resolutionSignal
-            );
+            await flushUserPreferences();
             return true;
           },
           (error) => {
