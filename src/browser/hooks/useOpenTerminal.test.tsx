@@ -117,6 +117,30 @@ describe("useOpenTerminal in browser mode (#5684)", () => {
       expect(dialog.result.current).toEqual({ workspaceId: "ws-1", sessionId: "session-1" });
     });
 
+    // A session runs its initial command when it is created, so a second one would run it unseen.
+    test("a repeated open while the first session is being created creates no second session", async () => {
+      const { result, create, close } = renderOpenTerminal();
+      const dialog = renderHook(() => useTerminalDialogSession());
+      let finishCreate: () => void = () => undefined;
+      create.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishCreate = () =>
+              resolve({ sessionId: "session-1", workspaceId: "ws-1", cols: 80, rows: 24 });
+          })
+      );
+
+      const firstOpen = result.current("ws-1", undefined, { initialCommand: "echo once" });
+      await act(() => result.current("ws-1", undefined, { initialCommand: "echo once" }));
+      finishCreate();
+      await act(() => firstOpen);
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(close).not.toHaveBeenCalled();
+      expect(toasts).toHaveLength(0);
+      expect(dialog.result.current?.sessionId).toBe("session-1");
+    });
+
     // A toast would render behind the dialog, so it only showed up, stale, after closing it.
     test("a second terminal while the dialog shows one closes only the new session, without a toast", async () => {
       const { result, create, close } = renderOpenTerminal();

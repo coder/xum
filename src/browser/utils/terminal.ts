@@ -35,6 +35,11 @@ export class TerminalDialogBusyError extends TerminalPopupBlockedError {
   }
 }
 
+/** True where openTerminalPopout shows the in-app TerminalDialog instead of opening a window. */
+export function opensTerminalPopoutInDialog(): boolean {
+  return !window.api && isIosStandaloneWebApp();
+}
+
 /** Default terminal size used when creating sessions before the terminal is mounted */
 
 export interface TerminalSessionCreateOptions {
@@ -72,7 +77,7 @@ export function openTerminalPopout(
 ): Promise<void> {
   const isBrowser = !window.api;
 
-  if (isBrowser && isIosStandaloneWebApp()) {
+  if (opensTerminalPopoutInDialog()) {
     // A Home Screen web app has a single window: window.open showed terminal.html in place of
     // the app, with no way back to it.
     if (!showTerminalDialog({ workspaceId, sessionId, initialTitle })) {
