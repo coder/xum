@@ -5,7 +5,8 @@
  * Pixel snapshots both light and dark themes at the phone viewport.
  */
 
-import { expect, userEvent, within, waitFor } from "@storybook/test";
+import { wrapAsyncIterator } from "@orpc/shared";
+import { expect, fn, userEvent, within, waitFor } from "@storybook/test";
 import type { ComponentType } from "react";
 
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -698,6 +699,121 @@ export const IPhone16eStatsDialog: AppStory = {
       },
       { timeout: 10_000 }
     );
+
+    blurActiveElement();
+  },
+};
+
+function createHomeScreenTerminalProbe() {
+  return {
+    windowOpen: fn(),
+    createdSessionIds: [] as string[],
+    closedSessionIds: [] as string[],
+    exitShell: new Map<string, () => void>(),
+  };
+}
+
+// Shared by the story's mock client and its play; beforeEach starts each run with a fresh one.
+let homeScreenTerminal = createHomeScreenTerminalProbe();
+
+/**
+ * An iOS Home Screen web app has a single window: a pop-out terminal replaced the app with
+ * terminal.html, which had no way back. It opens in an in-app dialog instead.
+ */
+export const IPhone16eHomeScreenTerminal: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const client = setupSimpleChatStory({
+          workspaceId: "ws-iphone-16e-home-screen-terminal",
+          workspaceName: "mobile-terminal",
+          projectName: "mux",
+          messages: [...MESSAGES],
+        });
+        const { create, close } = client.terminal;
+        client.terminal.create = async (input) => {
+          const session = await create(input);
+          homeScreenTerminal.createdSessionIds.push(session.sessionId);
+          return session;
+        };
+        client.terminal.close = (input) => {
+          homeScreenTerminal.closedSessionIds.push(input.sessionId);
+          return close(input);
+        };
+        client.terminal.onExit = (input, options) => {
+          async function* untilShellExits() {
+            const exited = await new Promise<boolean>((resolve) => {
+              homeScreenTerminal.exitShell.set(input.sessionId, () => resolve(true));
+              options?.signal?.addEventListener("abort", () => resolve(false), { once: true });
+            });
+            if (exited) yield 0;
+          }
+          return Promise.resolve(wrapAsyncIterator(untilShellExits(), {}));
+        };
+        return client;
+      }}
+    />
+  ),
+  decorators: [IPhone16eDecorator],
+  // No Pixel capture: the snapshot budget is full, and the play asserts the behavior.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    homeScreenTerminal = createHomeScreenTerminalProbe();
+    const standalone = Object.getOwnPropertyDescriptor(navigator, "standalone");
+    const windowOpen = window.open;
+    Object.defineProperty(navigator, "standalone", { configurable: true, value: true });
+    window.open = homeScreenTerminal.windowOpen;
+    return () => {
+      window.open = windowOpen;
+      if (standalone) Object.defineProperty(navigator, "standalone", standalone);
+      else Reflect.deleteProperty(navigator, "standalone");
+    };
+  },
+  play: async ({ canvasElement }) => {
+    await stabilizePhoneViewportStory(canvasElement);
+    const canvas = within(canvasElement);
+    const body = within(document.body);
+    const isDialogGone = () =>
+      expect(document.querySelector('[data-testid="terminal-dialog"]')).toBeNull();
+
+    // The fixed-width decorator hides the right sidebar, so New terminal takes the pop-out path.
+    await userEvent.click(await canvas.findByRole("button", { name: "New terminal" }));
+    const dialog = await body.findByTestId("terminal-dialog");
+    await expect(homeScreenTerminal.windowOpen).not.toHaveBeenCalled();
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Close terminal" }));
+    await waitFor(isDialogGone);
+    await expect(homeScreenTerminal.closedSessionIds).toEqual(homeScreenTerminal.createdSessionIds);
+    // Back in the app: the composer takes input again.
+    const composer = canvas.getByRole("textbox");
+    await userEvent.type(composer, "back in the chat");
+    await expect(composer).toHaveValue("back in the chat");
+
+    // The close-tab shortcut also works from the shell, which stops the keys it handles.
+    await userEvent.click(canvas.getByRole("button", { name: "New terminal" }));
+    const [shell] = await within(await body.findByTestId("terminal-dialog")).findAllByRole(
+      "textbox",
+      { name: "Terminal input" }
+    );
+    shell.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "w",
+        code: "KeyW",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      })
+    );
+    await waitFor(isDialogGone);
+    await expect(homeScreenTerminal.closedSessionIds).toEqual(homeScreenTerminal.createdSessionIds);
+
+    // The shell exiting closes the dialog too.
+    await userEvent.click(canvas.getByRole("button", { name: "New terminal" }));
+    await body.findByTestId("terminal-dialog");
+    const exitingSessionId = homeScreenTerminal.createdSessionIds[2];
+    await waitFor(() => expect(homeScreenTerminal.exitShell.has(exitingSessionId)).toBe(true));
+    homeScreenTerminal.exitShell.get(exitingSessionId)?.();
+    await waitFor(isDialogGone);
 
     blurActiveElement();
   },

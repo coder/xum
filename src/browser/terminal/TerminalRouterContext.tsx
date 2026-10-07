@@ -13,7 +13,7 @@ const TerminalRouterContext = createContext<TerminalSessionRouter | null>(null);
 
 interface TerminalRouterProviderProps {
   children: React.ReactNode;
-  /** Set in pop-out terminal windows (terminal-window.tsx). */
+  /** Set in pop-out terminal windows (terminal-window.tsx) and TerminalDialog. */
   popout?: boolean;
 }
 

@@ -6,6 +6,7 @@ import { GlobalWindow } from "happy-dom";
 import type { ReactNode } from "react";
 import { APIProvider } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
+import { hideTerminalDialog, useTerminalDialogSession } from "@/browser/utils/terminalDialogStore";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
 import { useOpenTerminal } from "./useOpenTerminal";
 
@@ -75,5 +76,85 @@ describe("useOpenTerminal in browser mode (#5684)", () => {
     expect(toasts).toHaveLength(0);
     expect(close).not.toHaveBeenCalled();
     expect(openWindow).toHaveBeenCalledTimes(1);
+  });
+
+  describe("in an iOS Home Screen web app", () => {
+    let standaloneDescriptor: PropertyDescriptor | undefined;
+    let windowOpen: ReturnType<typeof mock>;
+
+    beforeEach(() => {
+      standaloneDescriptor = Object.getOwnPropertyDescriptor(globalThis.navigator, "standalone");
+      Object.defineProperty(globalThis.navigator, "standalone", {
+        configurable: true,
+        value: true,
+      });
+      windowOpen = mock(() => null);
+      window.open = windowOpen as unknown as typeof window.open;
+    });
+
+    afterEach(() => {
+      // Unmount the dialog hook first, so hiding the session does not re-render it outside act.
+      cleanup();
+      hideTerminalDialog("session-1");
+      if (standaloneDescriptor) {
+        Object.defineProperty(globalThis.navigator, "standalone", standaloneDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis.navigator, "standalone");
+      }
+    });
+
+    // iOS showed terminal.html in place of the app, with no way back to it.
+    test("shows the terminal in the in-app dialog instead of opening a window", async () => {
+      const { result, close, openWindow } = renderOpenTerminal();
+      const dialog = renderHook(() => useTerminalDialogSession());
+
+      await act(() => result.current("ws-1"));
+
+      expect(windowOpen).not.toHaveBeenCalled();
+      expect(openWindow).not.toHaveBeenCalled();
+      expect(close).not.toHaveBeenCalled();
+      expect(toasts).toHaveLength(0);
+      expect(dialog.result.current).toEqual({ workspaceId: "ws-1", sessionId: "session-1" });
+    });
+
+    // A session runs its initial command when it is created, so a second one would run it unseen.
+    test("a repeated open while the first session is being created creates no second session", async () => {
+      const { result, create, close } = renderOpenTerminal();
+      const dialog = renderHook(() => useTerminalDialogSession());
+      let finishCreate: () => void = () => undefined;
+      create.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishCreate = () =>
+              resolve({ sessionId: "session-1", workspaceId: "ws-1", cols: 80, rows: 24 });
+          })
+      );
+
+      const firstOpen = result.current("ws-1", undefined, { initialCommand: "echo once" });
+      await act(() => result.current("ws-1", undefined, { initialCommand: "echo once" }));
+      finishCreate();
+      await act(() => firstOpen);
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(close).not.toHaveBeenCalled();
+      expect(toasts).toHaveLength(0);
+      expect(dialog.result.current?.sessionId).toBe("session-1");
+    });
+
+    // A toast would render behind the dialog, so it only showed up, stale, after closing it.
+    test("a second terminal while the dialog shows one closes only the new session, without a toast", async () => {
+      const { result, create, close } = renderOpenTerminal();
+      const dialog = renderHook(() => useTerminalDialogSession());
+      await act(() => result.current("ws-1"));
+      create.mockImplementationOnce(() =>
+        Promise.resolve({ sessionId: "session-2", workspaceId: "ws-1", cols: 80, rows: 24 })
+      );
+
+      await act(() => result.current("ws-1"));
+
+      expect(dialog.result.current?.sessionId).toBe("session-1");
+      expect(close.mock.calls).toEqual([[{ sessionId: "session-2" }]]);
+      expect(toasts).toHaveLength(0);
+    });
   });
 });
