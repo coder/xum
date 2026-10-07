@@ -12,7 +12,7 @@ import { act, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { DraftStore, getDraftStore } from "@/browser/stores/DraftStore";
-import { WorkspaceStore } from "@/browser/stores/WorkspaceStore";
+import { WorkspaceStore, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { createTestApiClient } from "@/browser/testUtils";
 import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
@@ -20,6 +20,8 @@ import type { ReviewNoteData } from "@/common/types/review";
 import { EDIT_HISTORY_CHANGED_MESSAGE } from "@/constants/transcriptBarrier";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { Err } from "@/common/types/result";
+import { detectDefaultTrunkBranch } from "@/node/git";
+import { generateBranchName } from "../../ipc/helpers";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
 
@@ -98,6 +100,23 @@ async function expectEditKeptAsDraft(app: AppHarness, scope: DraftScope) {
   ).toEqual(["file-unsent"]);
 }
 
+/** Show a workspace the way the sidebar does, and wait until its composer is mounted. */
+async function showWorkspace(app: AppHarness, workspaceId: string, name: string) {
+  const row = await waitFor(() => {
+    const element = app.view.container.querySelector(`[data-workspace-id="${workspaceId}"]`);
+    if (!element || element.getAttribute("aria-disabled") === "true") {
+      throw new Error("Workspace row not selectable yet");
+    }
+    return element as HTMLElement;
+  }, LOAD_TOLERANT_WAIT);
+  fireEvent.click(row);
+  workspaceStore.setActiveWorkspaceId(workspaceId);
+  await waitFor(() => {
+    expect(document.title.startsWith(name)).toBe(true);
+    expect(app.view.container.querySelector('[data-testid="message-window"]')).not.toBe(null);
+  }, LOAD_TOLERANT_WAIT);
+}
+
 /** Another renderer on the same backend: a reload of this window, or a second window. */
 async function otherRenderer(app: AppHarness): Promise<DraftStore> {
   const store = new DraftStore();
@@ -144,6 +163,80 @@ describe("Completing an edit of an older message", () => {
       expect(saved.attachments.map(({ id }) => id)).toEqual(["file-unsent"]);
     } finally {
       reloaded?.setClient(null);
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // A workspace switch remounts the composer while ChatPane keeps the edit open: the edit's
+  // typed text and attachment changes must survive it, in memory only (#5808). An edit cannot
+  // add attachments, so its attachment change is removing one of the message's files.
+  test("an open edit keeps its typed text and attachments across a workspace switch", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-survives-switch" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const fileInput = await waitFor(() => {
+        const element = app.view.container.querySelector<HTMLInputElement>(
+          '[data-component="ChatInputSection"] input[type="file"]'
+        );
+        if (!element) throw new Error("File input not found");
+        return element;
+      }, LOAD_TOLERANT_WAIT);
+      fireEvent.change(fileInput, {
+        target: {
+          files: [
+            new File(["# kept"], "edit-kept.md", { type: "text/markdown" }),
+            new File(["# removed"], "edit-removed.md", { type: "text/markdown" }),
+          ],
+        },
+      });
+      await waitFor(() => {
+        expect(composerText(app)).toContain("edit-kept.md");
+        expect(composerText(app)).toContain("edit-removed.md");
+      }, LOAD_TOLERANT_WAIT);
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      await waitFor(() => expect(composerText(app)).toContain("edit-removed.md"), LOAD_TOLERANT_WAIT);
+      typeIntoEdit(textarea, "edited before switch");
+      await waitFor(() => expect(textarea.value).toBe("edited before switch"));
+      const removeButton = [
+        ...app.view.container.querySelectorAll<HTMLButtonElement>(
+          '[data-component="ChatInputSection"] button[aria-label="Remove attachment"]'
+        ),
+      ].find((button) => button.parentElement?.textContent?.includes("edit-removed.md"));
+      if (!removeButton) throw new Error("Remove button of edit-removed.md not found");
+      fireEvent.click(removeButton);
+      await waitFor(
+        () => expect(composerText(app)).not.toContain("edit-removed.md"),
+        LOAD_TOLERANT_WAIT
+      );
+
+      const created = await app.env.orpc.workspace.create({
+        projectPath: app.repoPath,
+        branchName: generateBranchName("edit-survives-switch-other"),
+        trunkBranch: await detectDefaultTrunkBranch(app.repoPath),
+      });
+      if (!created.success) throw new Error(created.error);
+      workspaceStore.addWorkspace(created.metadata);
+      await showWorkspace(app, created.metadata.id, created.metadata.name);
+      await showWorkspace(app, app.workspaceId, app.metadata.name);
+
+      await waitFor(
+        () => expect(editTextarea(app)?.value).toBe("edited before switch"),
+        LOAD_TOLERANT_WAIT
+      );
+      expect(composerText(app)).toContain("edit-kept.md");
+      expect(composerText(app)).not.toContain("edit-removed.md");
+      // The unsent draft never took the edit's text or files, in memory or on the backend.
+      expect(getDraftStore().getText(scope)).toBe("unsent draft");
+      expect(
+        getDraftStore()
+          .getView(scope)
+          .attachments.map(({ id }) => id)
+      ).toEqual(["file-unsent"]);
+      await getDraftStore().flush(scope);
+      const saved = await app.env.services.draftService.get(scope);
+      expect(saved.text).toBe("unsent draft");
+      expect(saved.attachments.map(({ id }) => id)).toEqual(["file-unsent"]);
+    } finally {
       await app.dispose();
     }
   }, 120_000);
