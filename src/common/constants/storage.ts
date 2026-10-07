@@ -428,12 +428,6 @@ export const HIDDEN_MODELS_KEY = "hidden-models";
 export const AGENT_AI_DEFAULTS_KEY = "agentAiDefaults";
 
 /**
- * Provider-specific AI options, synced through userPreferences.
- */
-export const PROVIDER_OPTIONS_ANTHROPIC_KEY = "provider_options_anthropic";
-export const PROVIDER_OPTIONS_GOOGLE_KEY = "provider_options_google";
-
-/**
  * Git status indicator display mode (global)
  * Stores: "line-delta" | "divergence"
  */
@@ -890,15 +884,6 @@ export function getAutoCompactionEnabledKey(workspaceId: string): string {
   return `autoCompaction:enabled:${workspaceId}`;
 }
 
-/**
- * Get the localStorage key for auto-compaction threshold percentage per model
- * Format: "autoCompaction:threshold:{model}"
- * Stored per-model because different models have different context windows
- */
-export function getAutoCompactionThresholdKey(model: string): string {
-  return `autoCompaction:threshold:${model}`;
-}
-
 /** localStorage-backed LRU caches (see src/browser/utils/lruCache.ts). */
 export const SESSION_COST_CACHE_ENTRY_PREFIX = "session-cost:";
 export const SESSION_COST_CACHE_INDEX_KEY = "session-cost-index";
@@ -1186,8 +1171,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // string[] of model ids; Record<agentId, defaults>.
   globalKey(HIDDEN_MODELS_KEY, "synced", 32 * 1024),
   globalKey(AGENT_AI_DEFAULTS_KEY, "synced", 32 * 1024),
-  globalKey(PROVIDER_OPTIONS_ANTHROPIC_KEY, "synced", 4096),
-  globalKey(PROVIDER_OPTIONS_GOOGLE_KEY, "synced", 4096),
   globalKey(GIT_STATUS_INDICATOR_MODE_KEY, "ui", 32),
   globalKey(TUTORIAL_STATE_KEY, "ui", 256),
   globalKey(REVIEW_INCLUDE_UNCOMMITTED_KEY, "synced", 16),
@@ -1229,9 +1212,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(EXPANDED_SECTIONS_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
   globalKey(EXPANDED_COMPLETED_SUB_AGENTS_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
   globalKey(EXPANDED_TASK_GROUPS_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
-
-  // Per-model auto-compaction threshold percentage (synced).
-  globalPrefix(getAutoCompactionThresholdKey(""), "synced", 16, "model"),
 
   // Project-scoped families ("{prefix}{projectPath}").
   globalPrefix(projectPrefix(getTrunkBranchKey), "synced", 256, "project"),
