@@ -543,6 +543,15 @@ export const router = (authToken?: string) => {
           })
         ),
 
+      updateUserPreferences: t
+        .input(schemas.config.updateUserPreferences.input)
+        .output(schemas.config.updateUserPreferences.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () => context.config.updateUserPreferences(input.patches));
+          })
+        ),
+
       updateChatTranscriptFullWidth: t
         .input(schemas.config.updateChatTranscriptFullWidth.input)
         .output(schemas.config.updateChatTranscriptFullWidth.output)

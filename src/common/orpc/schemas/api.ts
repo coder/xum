@@ -3149,6 +3149,13 @@ export const config = {
     }),
     output: z.void(),
   },
+  updateUserPreferences: {
+    input: z.object({
+      // RFC 7386 merge patches against the stored userPreferences, applied in order.
+      patches: z.array(z.record(z.string(), z.unknown())),
+    }),
+    output: z.void(),
+  },
   onConfigChanged: {
     input: z.void(),
     output: eventIterator(z.void()),

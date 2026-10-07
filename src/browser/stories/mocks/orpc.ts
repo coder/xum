@@ -94,6 +94,7 @@ import {
   normalizeUserPreferences,
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 import {
@@ -892,6 +893,16 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           agentAiDefaults = normalizeAgentAiDefaults(input.agentAiDefaults);
         }
 
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateUserPreferences: (input: { patches: unknown[] }) => {
+        userPreferences = normalizeUserPreferences(
+          input.patches.reduce<unknown>(
+            (prefs, patch) => applyMergePatch(prefs, patch),
+            userPreferences
+          )
+        );
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
