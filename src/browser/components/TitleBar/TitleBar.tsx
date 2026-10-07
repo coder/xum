@@ -26,7 +26,8 @@ import {
   DESKTOP_TITLEBAR_HEIGHT_CLASS,
 } from "@/browser/hooks/useDesktopTitlebar";
 
-import { DEFAULT_MODEL_KEY, getModelKey } from "@/common/constants/storage";
+import { getModelKey } from "@/common/constants/storage";
+import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { PROVIDER_DISPLAY_NAMES } from "@/common/constants/providers";
 import {
   getExplicitGatewayPrefix,
@@ -75,9 +76,7 @@ export function TitleBar(props: TitleBarProps) {
   const { isAnalyticsOpen, navigateToAnalytics, navigateFromAnalytics, currentWorkspaceId } =
     useRouter();
   const routing = useRouting();
-  const [defaultModel] = usePersistedState<string>(DEFAULT_MODEL_KEY, WORKSPACE_DEFAULTS.model, {
-    listener: true,
-  });
+  const defaultModel = useAppConfig((config) => config.defaultModel) ?? WORKSPACE_DEFAULTS.model;
   const workspaceModelKey = getModelKey(currentWorkspaceId ?? "__titlebar__");
   const [workspaceModelOverride] = usePersistedState<string | null>(workspaceModelKey, null, {
     listener: true,
