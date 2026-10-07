@@ -1,5 +1,12 @@
 import { isPlainObject } from "@/common/utils/isPlainObject";
 
+/** A typed RFC 7386 merge patch of `T`: every field optional, `null` deletes it. */
+export type MergePatch<T> = T extends readonly unknown[]
+  ? T
+  : T extends object
+    ? { [K in keyof T]?: MergePatch<T[K]> | null }
+    : T;
+
 /** RFC 7386 JSON merge patch: objects merge recursively, `null` deletes, anything else replaces. */
 export function applyMergePatch(target: unknown, patch: unknown): unknown {
   if (!isPlainObject(patch)) {

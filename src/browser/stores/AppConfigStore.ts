@@ -1,11 +1,17 @@
 import { useSyncExternalStore } from "react";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { APIClient } from "@/browser/contexts/API";
-import type { UserPreferences } from "@/common/config/schemas/userPreferences";
+import {
+  normalizeUserPreferences,
+  type UserPreferences,
+} from "@/common/config/schemas/userPreferences";
+import { applyMergePatch, type MergePatch } from "@/common/utils/applyMergePatch";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { BashCollapsedSummaryMode, TranscriptDensity } from "@/common/constants/storage";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ExperimentId } from "@/common/constants/experiments";
+import { showFeedbackToast } from "@/browser/utils/feedbackToast";
+import { isAbortError } from "@/browser/utils/isAbortError";
 
 /**
  * Slices of the app config consumed by per-model hooks (useRouting,
@@ -32,8 +38,13 @@ export interface AppConfigSnapshot {
   userPreferences?: UserPreferences;
 }
 
+export type UserPreferencesPatch = MergePatch<UserPreferences>;
+
 const EMPTY_SNAPSHOT: AppConfigSnapshot = {};
 const EMPTY_USER_PREFERENCES: UserPreferences = {};
+const USER_PREFERENCE_SAVE_FAILED_MESSAGE = "Settings could not be saved";
+const USER_PREFERENCE_SAVE_UNCONFIRMED_MESSAGE =
+  "Connection lost: settings may not have been saved";
 
 /**
  * Returns `previous` when it deep-equals `next`, else `next` rebuilt around the unchanged children
@@ -79,11 +90,20 @@ function reuseUnchanged(previous: unknown, next: unknown): unknown {
  */
 export class AppConfigStore {
   private client: APIClient | null = null;
+  private serverSnapshot: AppConfigSnapshot | null = null;
+  // serverSnapshot with the in-flight, then queued, preference patches applied.
   private snapshot: AppConfigSnapshot | null = null;
+  private inFlightPatches: UserPreferencesPatch[] = [];
+  private queuedPatches: UserPreferencesPatch[] = [];
+  // Settles when no preference write is pending; rejects when one of its writes failed.
+  private pendingWrite: Promise<void> | null = null;
+  // Aborted when the client changes: a request to a replaced connection may never settle.
+  private clientController: AbortController | null = null;
   private listeners = new Set<() => void>();
-  // Version counter to ignore stale responses from out-of-order fetches
+  // Version counters to ignore responses older than the applied data from out-of-order fetches
   // (and to invalidate in-flight fetches when an optimistic update lands).
   private fetchVersion = 0;
+  private appliedVersion = 0;
   private subscriptionController: AbortController | null = null;
   // Live onConfigChanged iterator, kept on the instance so setClient can
   // force-close it (see ProvidersConfigStore for the leak rationale).
@@ -93,13 +113,15 @@ export class AppConfigStore {
     // Reconnecting the current client (stories wire it beside APIProvider) keeps its subscription.
     if (client === this.client) return;
     this.client = client;
+    this.clientController?.abort();
+    this.clientController = client ? new AbortController() : null;
 
     this.subscriptionController?.abort();
     this.subscriptionController = null;
     void this.subscriptionIterator?.return?.();
     this.subscriptionIterator = null;
     // Invalidate in-flight fetches from the previous client.
-    this.fetchVersion++;
+    this.appliedVersion = ++this.fetchVersion;
 
     if (!client) {
       return;
@@ -121,17 +143,18 @@ export class AppConfigStore {
   refresh = async (): Promise<void> => {
     const client = this.client;
     if (!client) return;
+    const signal = this.clientController?.signal;
     const myVersion = ++this.fetchVersion;
     try {
-      const config = await client.config.getConfig();
-      // Only update if this is the latest fetch (ignore stale responses).
-      if (myVersion === this.fetchVersion) {
+      const config = await client.config.getConfig(undefined, { signal });
+      if (myVersion > this.appliedVersion) {
+        this.appliedVersion = myVersion;
         // The VS Code webview host projects the config and forwards taskSettings only with
         // this one flag, or not at all (#4942), so read it defensively.
         const taskSettings = config.taskSettings as
           | { proposePlanImplementReplacesChatHistory?: boolean }
           | undefined;
-        const next = reuseUnchanged(this.snapshot, {
+        this.serverSnapshot = {
           routePriority: config.routePriority,
           routeOverrides: config.routeOverrides,
           minThinkingLevelByModel: config.minThinkingLevelByModel,
@@ -144,11 +167,8 @@ export class AppConfigStore {
           keepScreenAwake: config.keepScreenAwake === true,
           experiments: config.experiments ?? {},
           userPreferences: config.userPreferences ?? EMPTY_USER_PREFERENCES,
-        });
-        if (next !== this.snapshot) {
-          this.snapshot = next;
-          this.notify();
-        }
+        };
+        this.publish();
       }
     } catch {
       // Best-effort only; consumers degrade to defaults.
@@ -161,10 +181,89 @@ export class AppConfigStore {
    * this optimistic state with stale data.
    */
   updateOptimistically = (updates: Partial<AppConfigSnapshot>): void => {
-    this.fetchVersion++;
-    this.snapshot = { ...this.snapshot, ...updates };
-    this.notify();
+    this.appliedVersion = ++this.fetchVersion;
+    this.serverSnapshot = { ...this.serverSnapshot, ...updates };
+    this.publish();
   };
+
+  /** Shows `patch` at once and sends it with the next write; never throws. */
+  updateUserPreferences = (patch: UserPreferencesPatch): void => {
+    if (!this.client) {
+      showFeedbackToast({ type: "error", message: USER_PREFERENCE_SAVE_FAILED_MESSAGE });
+      return;
+    }
+    this.queuedPatches.push(patch);
+    this.publish();
+    if (!this.pendingWrite) {
+      const write = this.writeUserPreferences();
+      write.catch(() => undefined);
+      this.pendingWrite = write;
+    }
+  };
+
+  /** Resolves when no preference write is pending; rejects when a pending write failed. */
+  flushUserPreferences = (): Promise<void> => this.pendingWrite ?? Promise.resolve();
+
+  private async writeUserPreferences(): Promise<void> {
+    let failure: string | null = null;
+    try {
+      while (this.queuedPatches.length > 0) {
+        this.inFlightPatches = this.queuedPatches;
+        this.queuedPatches = [];
+        const signal = this.clientController?.signal;
+        try {
+          // Read per batch: a reconnect can replace the client while patches wait.
+          const client = this.client;
+          if (!client) throw new Error("Not connected");
+          await client.config.updateUserPreferences({ patches: this.inFlightPatches }, { signal });
+          // Keep the patches applied until a fetch started after the write lands.
+          await this.refresh();
+        } catch (error) {
+          console.warn("Failed to save user preferences:", error);
+          if (signal?.aborted || isAbortError(error)) {
+            // The connection was lost or replaced mid-request. The server may still apply it (a
+            // frozen backend does when it resumes), so do not claim it failed; drop the edits
+            // queued behind it, and let the next connection's snapshot show what was saved.
+            failure = USER_PREFERENCE_SAVE_UNCONFIRMED_MESSAGE;
+            this.queuedPatches = [];
+          } else {
+            failure ??= USER_PREFERENCE_SAVE_FAILED_MESSAGE;
+          }
+        }
+        this.inFlightPatches = [];
+        this.publish();
+      }
+    } finally {
+      this.pendingWrite = null;
+    }
+    if (failure) {
+      showFeedbackToast({ type: "error", message: failure });
+      throw new Error(failure);
+    }
+  }
+
+  private publish(): void {
+    const server = this.serverSnapshot;
+    const patches = [...this.inFlightPatches, ...this.queuedPatches];
+    const view =
+      server && patches.length > 0
+        ? {
+            ...server,
+            userPreferences:
+              normalizeUserPreferences(
+                patches.reduce<unknown>(
+                  (preferences, patch) => applyMergePatch(preferences, patch),
+                  server.userPreferences
+                )
+              ) ?? EMPTY_USER_PREFERENCES,
+          }
+        : server;
+    const next = reuseUnchanged(this.snapshot, view);
+    if (next !== this.snapshot) {
+      this.snapshot = next;
+      this.notify();
+    }
+  }
 
   private notify(): void {
     for (const listener of this.listeners) {
@@ -224,6 +323,14 @@ export function useAppConfig<T>(select: (config: AppConfigSnapshot) => T): T {
 
 export function getUserPreferences(): UserPreferences {
   return getAppConfigStore().getSnapshot()?.userPreferences ?? EMPTY_USER_PREFERENCES;
+}
+
+export function updateUserPreferences(patch: UserPreferencesPatch): void {
+  getAppConfigStore().updateUserPreferences(patch);
+}
+
+export function flushUserPreferences(): Promise<void> {
+  return getAppConfigStore().flushUserPreferences();
 }
 
 export function useUserPreferences<T>(select: (preferences: UserPreferences) => T): T {
