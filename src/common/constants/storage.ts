@@ -663,24 +663,6 @@ export const REVIEW_FILE_TREE_VIEW_MODE_KEY = "reviewFileTreeViewMode";
  * Format: "statusState:{workspaceId}"
  */
 
-/**
- * Get the localStorage key for "notify on response" toggle per workspace.
- * When true, a browser notification is shown when assistant responses complete.
- * Format: "notifyOnResponse:{workspaceId}"
- */
-export function getNotifyOnResponseKey(workspaceId: string): string {
-  return `notifyOnResponse:${workspaceId}`;
-}
-
-/**
- * Get the localStorage key for "auto-enable notifications" toggle per project.
- * When true, new workspaces in this project automatically have notifications enabled.
- * Format: "notifyOnResponseAutoEnable:{projectPath}"
- */
-export function getNotifyOnResponseAutoEnableKey(projectPath: string): string {
-  return `notifyOnResponseAutoEnable:${projectPath}`;
-}
-
 export function getStatusStateKey(workspaceId: string): string {
   return `statusState:${workspaceId}`;
 }
@@ -1100,8 +1082,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // SendMessageError; transient (shown as a toast after navigation, then removed).
   workspaceKey(getPendingWorkspaceSendErrorKey, "workspace-scoped", false, 768),
   workspaceKey(getPendingDraftSkillDiscoveryKey, "workspace-scoped", false, 16),
-  // Synced: UserPreferencesContext mirrors notifyOnResponseByWorkspace from the backend.
-  workspaceKey(getNotifyOnResponseKey, "synced", false, 16),
 
   // Per-workspace keys that deleteWorkspaceStorage used to miss, leaving orphans behind.
   workspaceKey(getReasoningModeKey, "ui", false, 32),
@@ -1180,7 +1160,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Project-scoped families ("{prefix}{projectPath}").
   globalPrefix(projectPrefix(getRuntimeKey), "ui", 256, "project"),
   globalPrefix(projectPrefix(getAgentsInitNudgeKey), "ui", 16, "project"),
-  globalPrefix(projectPrefix(getNotifyOnResponseAutoEnableKey), "synced", 16, "project"),
   globalPrefix(projectPrefix(getArchivedWorkspacesExpandedKey), "ui", 16, "project"),
   globalPrefix(projectPrefix(getBrowserSelectedSessionKey), "ui", 256, "project"),
 
