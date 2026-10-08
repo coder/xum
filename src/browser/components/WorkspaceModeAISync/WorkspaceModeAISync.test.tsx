@@ -16,7 +16,6 @@ import {
   getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
-  getModelKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
@@ -130,7 +129,6 @@ describe("WorkspaceModeAISync", () => {
       exec: { modelString: "openai:gpt-5.2", thinkingLevel: "high" },
       plan: { modelString: "openai:gpt-5.2", thinkingLevel: "high" },
     });
-    updatePersistedState(getModelKey(workspaceId), "openai:gpt-5.2");
     updatePersistedState(getThinkingLevelKey(workspaceId), "high");
     updatePersistedState(getAutoModelRoutingKey(workspaceId), true);
     updatePersistedState(getAutoThinkingLevelKey(workspaceId), true);
@@ -163,13 +161,11 @@ describe("WorkspaceModeAISync", () => {
       exec: { model: workspaceModel, thinkingLevel: workspaceThinking },
     });
 
-    updatePersistedState(getModelKey(workspaceId), "some-legacy-model");
     updatePersistedState(getThinkingLevelKey(workspaceId), "medium");
 
     renderSync({ workspaceId, agentId: "exec" });
 
     await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe("some-legacy-model");
       expect(readPersistedState(getThinkingLevelKey(workspaceId), "high")).toBe("medium");
     });
   });
@@ -177,7 +173,6 @@ describe("WorkspaceModeAISync", () => {
   test("ignores workspace-by-agent values when settings are inherit", async () => {
     const workspaceId = nextWorkspaceId();
 
-    const existingModel = "some-legacy-model";
     const existingThinking = "off";
 
     // Inherit in Settings removes explicit per-agent defaults from agentAiDefaults.
@@ -186,13 +181,11 @@ describe("WorkspaceModeAISync", () => {
       exec: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
     });
 
-    updatePersistedState(getModelKey(workspaceId), existingModel);
     updatePersistedState(getThinkingLevelKey(workspaceId), existingThinking);
 
     renderSync({ workspaceId, agentId: "exec" });
 
     await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(existingModel);
       expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe(existingThinking);
     });
   });
@@ -228,7 +221,6 @@ describe("WorkspaceModeAISync", () => {
   test("ignores same-agent workspace overrides when agent defaults are missing", async () => {
     const workspaceId = nextWorkspaceId();
 
-    const existingModel = "some-legacy-model";
     const existingThinking = "high";
 
     setTestAgentAiDefaults({
@@ -238,55 +230,13 @@ describe("WorkspaceModeAISync", () => {
       custom: { model: "openai:gpt-5.2-pro", thinkingLevel: "medium" },
     });
 
-    updatePersistedState(getModelKey(workspaceId), existingModel);
     updatePersistedState(getThinkingLevelKey(workspaceId), existingThinking);
 
     renderSync({ workspaceId, agentId: "custom" });
 
     await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(existingModel);
       expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe(existingThinking);
     });
-  });
-
-  test("keeps the user's model when per-agent settings change without an agent switch", async () => {
-    const workspaceId = nextWorkspaceId();
-
-    const configuredModel = "anthropic:claude-haiku-4-5";
-    const userModel = "anthropic:claude-sonnet-4-5";
-
-    setTestAgentAiDefaults({
-      exec: { modelString: configuredModel },
-    });
-    updatePersistedState(getModelKey(workspaceId), configuredModel);
-    updatePersistedState(getThinkingLevelKey(workspaceId), "off");
-
-    renderSync({ workspaceId, agentId: "exec" });
-
-    await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(configuredModel);
-    });
-
-    // Picking a model writes both the model key and the per-agent settings cache.
-    act(() => {
-      updatePersistedState(getModelKey(workspaceId), userModel);
-      updatePersistedState(getWorkspaceAISettingsByAgentKey(workspaceId), {
-        exec: { model: userModel, thinkingLevel: "off" },
-      });
-    });
-
-    expect(readPersistedState(getModelKey(workspaceId), "")).toBe(userModel);
-
-    // Changing the thinking level rewrites the same per-agent cache entry.
-    act(() => {
-      updatePersistedState(getThinkingLevelKey(workspaceId), "high");
-      updatePersistedState(getWorkspaceAISettingsByAgentKey(workspaceId), {
-        exec: { model: userModel, thinkingLevel: "high" },
-      });
-    });
-
-    expect(readPersistedState(getModelKey(workspaceId), "")).toBe(userModel);
-    expect(readPersistedState(getThinkingLevelKey(workspaceId), "")).toBe("high");
   });
 
   test("does not inherit base defaults when selected agent has its own partial settings entry", async () => {
