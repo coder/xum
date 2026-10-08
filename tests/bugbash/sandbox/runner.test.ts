@@ -39,6 +39,8 @@ case "$1" in
   run|create) p=""; for a in "$@"; do case "$p" in --name) n=$a ;; --label) l="\${l-} \${a#*=}" ;; esac; p=$a; done
     if [ "\${CREATE-}" = die ]; then kill -9 $$; fi
     if [ "\${CREATE-}" = fail ]; then echo "create failed" >&2; exit 1; fi
+    if [ "\${CREATE-}" = accepted ]; then echo "ctr $n$l" >> "$bin/containers"; echo "connection reset" >&2; exit 1; fi
+    if [ "\${CREATE-}" = accepted-late ]; then setsid sh -c "sleep 0.5; echo 'ctr $n$l' >> '$bin/containers'" </dev/null >/dev/null 2>&1 & echo "connection reset" >&2; exit 1; fi
     if [ "\${CREATE-}" = late ]; then setsid sh -c "sleep 0.5; echo 'ctr $n$l' >> '$bin/containers'" </dev/null >/dev/null 2>&1 & sleep 1
     else echo "ctr $n$l" >> "$bin/containers"; fi
     if [ "$1" = create ]; then echo ctr; exit 0; fi
@@ -566,9 +568,35 @@ test("a create whose CLI died is an unknown outcome when no container has the na
 
 test("a signal during cleanup after a failed run still ends with Stopped", async () => {
   const stop = new AbortController();
-  const pending = launchIn({ CREATE: "fail", INSPECT_SLOW: "1" }, stop);
+  const pending = launchIn({ CREATE: "accepted", INSPECT_SLOW: "1" }, stop);
   while (!calls().includes("container inspect ")) await Bun.sleep(20);
   stop.abort("SIGINT");
   expect(await failure(pending)).toThrow(Stopped);
   expectNothingLeft();
 }, 15_000);
+
+// A create that exits nonzero without an ID does not prove that nothing was created: the daemon
+// can accept the request and the CLI lose its connection before the ID comes back.
+test("a failed create whose container lands later is unknown, never removed (exit 3)", async () => {
+  expect(await launchIn({ CREATE: "accepted-late" })).toBe(3);
+  await Bun.sleep(700); // the daemon's create lands by now
+  expect(fs.existsSync(path.join(bin, "started"))).toBe(false);
+  expect(calls()).not.toMatch(/^start /m);
+});
+
+test("a failed create whose container exists: cleanup finds it by exact name and removes it once", async () => {
+  const real = fs.realpathSync(root);
+  const checkout = crypto.createHash("sha256").update(real).digest("hex").slice(0, 12);
+  const sameCheckout = `c5 xbb-7 other:1 ${checkout}`; // same checkout, another owner
+  const pending = launchIn({ CREATE: "accepted" });
+  fs.appendFileSync(path.join(bin, "containers"), `${sameCheckout}\n`);
+  expect(await failure(pending)).toThrow(/docker create/);
+  expect(fs.existsSync(path.join(bin, "started"))).toBe(false);
+  expect(calls().match(/^rm -f ctr /gm)).toHaveLength(1);
+  expectNothingLeft([...FOREIGN, sameCheckout]);
+});
+
+test("a create that failed with no container under its name is unknown (exit 3)", async () => {
+  expect(await launchIn({ CREATE: "fail" })).toBe(3);
+  expect(calls()).not.toMatch(/^start /m);
+});

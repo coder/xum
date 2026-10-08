@@ -79,7 +79,7 @@ export class Session {
   #clientDir: string | null = null;
   #cleanup: Promise<CleanupState> | null = null;
   #owned: Job | null = null;
-  /** The ID that `docker create` returned, and whether its outcome is unknown (a killed CLI). */
+  /** The ID that `docker create` returned, and whether its outcome is unknown (a failed create). */
   #createdId: string | null = null;
   #createUnknown = false;
   /** Groups that a stop must not signal: a create that must run to its end. */
@@ -167,7 +167,10 @@ export class Session {
     const create = ["create", "--name", job.name, "--label", `xum.bugbash.owner=${job.owner}`,
       "--label", `xum.bugbash.checkout=${job.checkout}`, ...args];
     const created = await this.#spawn("docker", create, this.#client!, 60_000, undefined, true);
-    if (!created.ok && created.code > 128) this.#createUnknown = true;
+    // A create that failed without an ID does not prove that nothing was created: the daemon can
+    // accept the request after which the CLI loses its connection. Cleanup then reconciles by
+    // the exact name and both labels, and reports "unknown" when it cannot find the container.
+    if (!created.ok) this.#createUnknown = true;
     if (this.#stopped != null) throw new Stopped(this.#stopped);
     if (!created.ok) throw new Error(`docker create: ${created.error}`);
     this.#createdId = created.stdout;
