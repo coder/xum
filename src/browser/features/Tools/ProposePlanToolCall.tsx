@@ -44,6 +44,10 @@ import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { getAgentIdKey, getAutoRoutingChoiceByAgentKey } from "@/common/constants/storage";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
+import {
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSendOptions,
+} from "@/browser/utils/aiSelectionIntent";
 import { applyAutoRoutingOutcome } from "@/browser/utils/modelChange";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -578,20 +582,30 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     persistTargetAgentSettings({ workspaceId, targetAgentId: args.targetAgentId, autoRouting });
     // The target agent's resolved model and thinking level (its saved or configured settings).
     const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
+    const options = {
+      ...sendMessageOptions,
+      agentId: args.targetAgentId,
+      // The target agent's model and thinking level are explicit; classifying
+      // "Implement the plan" would reroute them based on a prompt that says nothing
+      // about the plan's difficulty.
+      autoModelRouting: false,
+      autoThinkingLevel: false,
+    };
+    // Picks the send carries, consumed like a composer send's.
+    const { attachedTokens } = getAiSelectionIntentForSendOptions(
+      workspaceId,
+      args.targetAgentId,
+      options
+    );
     const sendResult = await api.workspace.sendMessage({
       workspaceId,
       message: "Implement the plan",
-      options: {
-        ...sendMessageOptions,
-        agentId: args.targetAgentId,
-        // The target agent's model and thinking level are explicit; classifying
-        // "Implement the plan" would reroute them based on a prompt that says nothing
-        // about the plan's difficulty.
-        autoModelRouting: false,
-        autoThinkingLevel: false,
-      },
+      options,
     });
-    if (sendResult.success) return null;
+    if (sendResult.success) {
+      consumeAiSelectionIntent(workspaceId, args.targetAgentId, attachedTokens);
+      return null;
+    }
     const formatted = formatSendMessageError(sendResult.error);
     return formatted.resolutionHint
       ? `${formatted.message} ${formatted.resolutionHint}`

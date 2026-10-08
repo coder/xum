@@ -3,7 +3,7 @@ import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals"
 import { GlobalWindow } from "happy-dom";
 
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
+import { getPendingAiSelection, markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import {
   consumeWorkspaceModelChange,
   recordAutoRoutingChoiceForAgent,
@@ -51,6 +51,12 @@ describe("modelChange", () => {
     updatePersistedState(autoKey, true);
     setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "user");
     expect(readPersistedState(autoKey, false)).toBe(false);
+  });
+
+  test("a legacy workspace id that starts with __ records the pick as unsent", () => {
+    const legacyId = "__proj-main";
+    setWorkspaceModelWithOrigin(legacyId, "openai:gpt-5.2-codex", "user");
+    expect(getPendingAiSelection(legacyId, "exec", "model")).toBe("openai:gpt-5.2-codex");
   });
 
   test("records workspace routing picks per agent without a local experiment override", () => {
