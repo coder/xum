@@ -16,7 +16,10 @@ import { neutralizeAgentEnvelopeLookalikesForProvider } from "@/node/utils/messa
 import { extractToolMediaAsUserMessages } from "@/node/utils/messages/extractToolMediaAsUserMessages";
 import { sanitizeAnthropicPdfFilenames } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import { convertDataUriFilePartsForSdk } from "@/node/utils/messages/convertDataUriFilePartsForSdk";
-import { attachReasoningReplayMetadata } from "@/node/utils/messages/reasoningProviderOptions";
+import {
+  attachReasoningReplayMetadata,
+  stripReasoningReplay,
+} from "@/node/utils/messages/reasoningProviderOptions";
 import type { MuxMessage } from "@/common/types/message";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -33,6 +36,7 @@ import {
   normalizeLegacyToolSearchMessages,
 } from "@/common/utils/tools/toolCatalog";
 import { applyCacheControl, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
+import { findLatestContextBoundaryIndex } from "@/common/utils/messages/compactionBoundary";
 import { log } from "./log";
 
 /** Options for the full message preparation pipeline. */
@@ -216,9 +220,20 @@ export async function prepareMessagesForProvider(
       anthropicBindsThinkingToPrefix(resolveModelForMetadata(modelString, providersConfig ?? null)),
   });
 
+  // Preserved thinking: a repaired signature rejection removed every Anthropic thinking
+  // block from that request (MuxMetadata.anthropicThinkingReplay). Removed blocks must never
+  // come back: putting them back invalidates every block produced while they were gone, so
+  // the next turn would 400 and pay the repair again. Keep them out for the rest of the
+  // context segment. Same strip as the one-request repair (stripReasoningReplay), which also
+  // covers adaptive thinking, where transformModelMessages ignores anthropicStripReasoning.
+  const segmentMessages =
+    providerForMessages === "anthropic" && hasAnthropicReplayReceipt(messagesWithSentinel)
+      ? stripReasoningReplay(transformedMessages, "anthropic")
+      : transformedMessages;
+
   // Apply cache control for Anthropic models AFTER transformation
   const finalMessages = applyCacheControl(
-    transformedMessages,
+    segmentMessages,
     modelString,
     anthropicCacheTtl,
     providersConfig
@@ -236,6 +251,23 @@ export async function prepareMessagesForProvider(
   }
 
   return finalMessages;
+}
+
+/**
+ * True when an assistant row after the latest compaction or reset boundary carries the
+ * Anthropic thinking-repair receipt. The main caller already slices from that boundary;
+ * finding it again here keeps other callers correct too. The boundary row itself is not
+ * checked: a new segment starts replay again, and compaction tail copies
+ * (rlmPreservedTailCopy) do not copy the receipt for the same reason.
+ */
+function hasAnthropicReplayReceipt(messages: MuxMessage[]): boolean {
+  const segmentStart = findLatestContextBoundaryIndex(messages) + 1;
+  return messages
+    .slice(segmentStart)
+    .some(
+      (message) =>
+        message.role === "assistant" && message.metadata?.anthropicThinkingReplay === "off"
+    );
 }
 
 type AssistantContentArray = Exclude<AssistantModelMessage["content"], string>;

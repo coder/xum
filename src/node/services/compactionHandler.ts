@@ -56,6 +56,7 @@ import {
   getKeepRecentTailStartHistorySequence,
 } from "@/common/utils/messages/keepRecentTail";
 import { createPreservedTailCopyMessageId } from "@/node/services/utils/messageIds";
+import { stripAnthropicThinkingFromTailCopy } from "@/common/utils/compaction/tailCopyThinking";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import {
   mergeLoadedSkillSnapshots,
@@ -867,9 +868,7 @@ export class CompactionHandler {
         },
       }
     );
-    const idMap = new Map(params.tail.map((row) => [row.id, createPreservedTailCopyMessageId()]));
-    const copies = params.tail.map((row) => {
-      const copy = this.buildPreservedTailCopy(row, idMap);
+    const copies = this.buildTailCopies(params.tail).map((copy) => {
       // Continuous compaction prunes the just-finished answer too. Keep recent pages
       // visible below the boundary while retaining RLM's usage/snapshot sanitizer.
       copy.metadata = { ...copy.metadata, uiVisible: true };
@@ -1241,6 +1240,11 @@ export class CompactionHandler {
       return [];
     }
 
+    return this.buildTailCopies(tailRows);
+  }
+
+  /** Copies for regular RLM keep-tail and continuous compaction tails. */
+  private buildTailCopies(tailRows: MuxMessage[]): MuxMessage[] {
     // Preassign copy IDs for ALL tail rows before building any copy: MCP
     // snapshot rows precede the user row they expand, so a build-time map
     // would not yet contain the invoking row's copy ID when the snapshot row
@@ -1282,7 +1286,9 @@ export class CompactionHandler {
           }
         : source?.mcpPromptSnapshot;
 
-    return {
+    // Preserved thinking: the tail's Anthropic thinking is bound to the pre-summary
+    // prefix, so the copy drops its replay data (see stripAnthropicThinkingFromTailCopy).
+    return stripAnthropicThinkingFromTailCopy({
       ...row,
       id: copyId,
       metadata: {
@@ -1309,7 +1315,7 @@ export class CompactionHandler {
           : {}),
         ...(mcpPromptSnapshot !== undefined ? { mcpPromptSnapshot } : {}),
       },
-    };
+    });
   }
 
   /**

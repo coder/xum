@@ -454,6 +454,12 @@ interface StepMessageTracker {
   exactAppendChainBroken?: boolean;
   /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
   autoThinkingEscalation?: AutoThinkingEscalationState;
+  /**
+   * Set when an in-turn prefix change made prepareStep strip earlier Anthropic thinking.
+   * The finish-step handler then writes the replay receipt, so the next turn does not
+   * put the removed blocks back (preserved thinking).
+   */
+  anthropicThinkingStripped?: boolean;
 }
 interface StreamRequestConfig {
   stopCause?: StreamStopCause;
@@ -962,6 +968,11 @@ interface WorkspaceStreamInfo {
   historySequence: number;
   // Track accumulated parts for partial message (includes reasoning, text, and tools)
   parts: CompletedMessagePart[];
+  // The reasoning block opened by the latest reasoning-start, and the last part
+  // created for it (undefined until the block has a part). Anthropic replays each
+  // thinking block with its own signature, so a metadata-only signature delta may
+  // only attach to a part of the SAME block; otherwise it is its own (empty) block.
+  currentReasoningBlock?: { lastPart?: CompletedMessagePart };
   // Reasoning parts before this index belong to refused fallback attempts whose
   // usage was already attributed separately; stream-end backfill must not bill
   // them again under the answering model.
@@ -3135,11 +3146,13 @@ export class StreamManager {
             });
           }
         }
-        // #5086: `between_tools` cannot carry blockBinding, so a replayed in-turn
-        // thinking block stays valid only while everything before it is unchanged.
-        // A consumed prefix swap or a change to the advertised tool set edits that
-        // prefix, so rows sent up to that step never replay reasoning again. Blocks
-        // produced after it are bound to the new prefix and keep replaying (#5279).
+        // #5086, preserved thinking: a replayed in-turn thinking block stays valid only
+        // while everything before it is unchanged. A consumed prefix swap or a change to
+        // the advertised tool set edits that prefix, so rows sent up to that step never
+        // replay reasoning again. Blocks produced after it are bound to the new prefix and
+        // keep replaying (#5279). This applies to every Anthropic Messages thinking mode,
+        // not only `between_tools` (which cannot carry blockBinding): only the direct API
+        // route sends `drop_block`, so adaptive/enabled thinking on other routes would 400.
         const toolSetKey = activeTools === undefined ? "" : [...activeTools].sort().join("\n");
         const consumedSwap = stepTracker?.consumedPrefixSwap;
         const outgoing = rebuiltFirstStepMessages ?? effectiveMessages;
@@ -3154,7 +3167,8 @@ export class StreamManager {
         seenPrefixSwap = consumedSwap;
         previousToolSetKey = toolSetKey;
         if (
-          sendsBetweenToolsThinking(request.providerOptions) &&
+          (sendsBetweenToolsThinking(request.providerOptions) ||
+            isAnthropicMessagesModel(request.model)) &&
           outgoing.some(
             (message, index) =>
               index < reasoningReplayBoundary &&
@@ -3171,6 +3185,9 @@ export class StreamManager {
             rebuiltFirstStepMessages = stripped;
           } else {
             effectiveMessages = stripped;
+          }
+          if (stepTracker && isAnthropicMessagesModel(request.model)) {
+            stepTracker.anthropicThinkingStripped = true;
           }
         }
         // Taken before this step records its own request; step zero has no settled step.
@@ -4500,7 +4517,20 @@ export class StreamManager {
                 const startOptions = reasoningProviderOptionsFromMetadata(
                   lifecyclePart.providerMetadata
                 );
-                if (startOptions) {
+                const block: { lastPart?: CompletedMessagePart } = {};
+                streamInfo.currentReasoningBlock = block;
+                if (startOptions?.anthropic?.redactedData != null) {
+                  // An Anthropic redacted_thinking block is complete at start and
+                  // replays as its own block: never merge it into earlier reasoning.
+                  const redactedPart = {
+                    type: "reasoning" as const,
+                    text: "",
+                    timestamp: nextPartTimestamp(streamInfo),
+                    providerOptions: startOptions,
+                  };
+                  await this.appendPartAndEmit(workspaceId, streamInfo, redactedPart, true);
+                  block.lastPart = redactedPart;
+                } else if (startOptions) {
                   const lastPart = streamInfo.parts.at(-1);
                   if (lastPart?.type === "reasoning") {
                     lastPart.providerOptions = mergeReasoningProviderOptions(
@@ -4521,6 +4551,7 @@ export class StreamManager {
                       true
                     );
                   }
+                  block.lastPart = streamInfo.parts.at(-1);
                 }
                 break;
               }
@@ -4538,6 +4569,26 @@ export class StreamManager {
                 // the latest reasoning part without creating a new empty text part.
                 if (!delta && (signature || deltaOptions)) {
                   const lastPart = streamInfo.parts.at(-1);
+                  const block = streamInfo.currentReasoningBlock;
+                  // Without a reasoning-start (some normalized streams) the last
+                  // reasoning part is the only block we know of.
+                  const lastPartInBlock = block == null || block.lastPart === lastPart;
+                  if (signature && !(lastPart?.type === "reasoning" && lastPartInBlock)) {
+                    // The block has no part yet (empty thinking, only a signature) or
+                    // the last part belongs to an earlier block: the signature is a
+                    // block of its own. Attaching it elsewhere would drop this block
+                    // and overwrite the earlier block's signature.
+                    const signedPart = {
+                      type: "reasoning" as const,
+                      text: "",
+                      timestamp: nextPartTimestamp(streamInfo),
+                      signature,
+                      providerOptions: deltaOptions,
+                    };
+                    await this.appendPartAndEmit(workspaceId, streamInfo, signedPart, true);
+                    if (block) block.lastPart = signedPart;
+                    break;
+                  }
                   if (lastPart?.type === "reasoning") {
                     if (signature) {
                       lastPart.signature = signature;
@@ -4573,6 +4624,9 @@ export class StreamManager {
                   providerOptions: deltaOptions,
                 };
                 await this.appendPartAndEmit(workspaceId, streamInfo, newPart, true);
+                if (streamInfo.currentReasoningBlock) {
+                  streamInfo.currentReasoningBlock.lastPart = newPart;
+                }
                 break;
               }
 
@@ -4864,6 +4918,21 @@ export class StreamManager {
                   finishStepPart.providerMetadata,
                   finishStepPart.usage
                 );
+
+                // Preserved thinking: prepareStep stripped earlier Anthropic thinking after
+                // an in-turn prefix change. Write the same receipt as the signature repair,
+                // or the next turn replays the removed blocks and gets a 400. Persisted with
+                // the next partial write; a crash before it only costs one repair (fail-safe).
+                if (
+                  streamInfo.stepTracker.anthropicThinkingStripped === true &&
+                  streamInfo.initialMetadata?.anthropicThinkingReplay !== "off"
+                ) {
+                  streamInfo.initialMetadata = {
+                    ...streamInfo.initialMetadata,
+                    anthropicThinkingReplay: "off",
+                  };
+                  await this.schedulePartialWrite(workspaceId, streamInfo);
+                }
 
                 // Update cumulative totals for this stream.
                 //
@@ -5587,6 +5656,8 @@ export class StreamManager {
     if (!preserveParts) {
       streamInfo.reasoningBackfillStartIndex = undefined;
     }
+    // A retried attempt starts with no open reasoning block.
+    streamInfo.currentReasoningBlock = undefined;
     this.recordStepStart(streamInfo);
     streamInfo.receivedTerminalEvent = false;
     streamInfo.terminalFinishReason = undefined;
@@ -5820,6 +5891,21 @@ export class StreamManager {
       preserveUsage: hasParts,
       workspaceLog,
     });
+
+    if (rejectedNamespace === "anthropic") {
+      // Preserved thinking: once thinking is removed, putting it back invalidates every
+      // later block, so the next turns must keep it out (messagePipeline reads this
+      // receipt). initialMetadata feeds the partial, error partial and final row alike
+      // (as the model-fallback record does). Persist before the retry request goes out so
+      // a crash mid-retry cannot forget the strip. A step-0 repair has no parts yet, and
+      // commitPartial drops an empty partial, so a crash or a second rejection before any
+      // output loses the receipt: the next turn then pays one more retry (fail-safe).
+      streamInfo.initialMetadata = {
+        ...streamInfo.initialMetadata,
+        anthropicThinkingReplay: "off",
+      };
+      await this.flushPartialWrite(workspaceId, streamInfo);
+    }
 
     streamInfo.request = { ...streamInfo.request, messages };
     streamInfo.streamResult = this.createStreamResult(

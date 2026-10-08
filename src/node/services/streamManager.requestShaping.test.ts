@@ -363,9 +363,10 @@ describe("StreamManager - tool search activeTools scoping", () => {
     expect(await prepareStep({ messages })).toBeUndefined();
   });
 
-  test("a tool-set change ends in-turn reasoning replay on between_tools requests (#5086)", async () => {
-    // between_tools cannot carry blockBinding: a thinking block replayed after the
-    // advertised tools changed would fail the prefix check on enforced accounts.
+  test("a tool-set change ends in-turn reasoning replay on Anthropic requests (#5086)", async () => {
+    // Preserved thinking: a thinking block replayed after the advertised tools changed
+    // would fail the prefix check on enforced accounts. between_tools cannot carry
+    // blockBinding, and only the direct API route sends drop_block for adaptive.
     const inTurn: ModelMessage[] = [
       { role: "user", content: "hello" },
       {
@@ -418,10 +419,87 @@ describe("StreamManager - tool search activeTools scoping", () => {
     };
 
     expect(await run({ type: "between_tools" })).toEqual([true, false, false]);
-    // Adaptive requests carry blockBinding (drop_block), so they keep replaying.
-    expect(await run({ type: "adaptive" })).toEqual([true, true, true]);
+    expect(await run({ type: "adaptive" })).toEqual([true, false, false]);
     // Native tool search (#5262) keeps the tool set, so the blocks stay valid.
     expect(await run({ type: "between_tools" }, true)).toEqual([true, true, true]);
+  });
+
+  test("an in-turn Anthropic thinking strip leaves a replay receipt on the turn's row", async () => {
+    // Preserved thinking: once prepareStep stripped earlier blocks, the next turn must not
+    // put them back. The row carries the same receipt the signature repair writes.
+    const inTurn: ModelMessage[] = [
+      { role: "user", content: "hello" },
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "note", providerOptions: { anthropic: { signature: "s" } } },
+          { type: "tool-call", toolCallId: "c1", toolName: "bash", input: {} },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "c1",
+            toolName: "bash",
+            output: { type: "text", value: "ok" },
+          },
+        ],
+      },
+    ];
+    const run = async (changeToolSet: boolean) => {
+      const toolSearchState: ToolSearchStreamState = {
+        catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
+        deferredToolNames: new Set(["slack_send_message"]),
+        allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
+        activatedToolNames: new Set(),
+        native: false,
+      };
+      // Drive prepareStep from inside the stream, as the SDK does between steps.
+      const streamText = mock((options: Parameters<typeof aiSdk.streamText>[0]) =>
+        createStreamResultForTests(
+          (async function* () {
+            await prepareStepForTests(options, inTurn, 1);
+            if (changeToolSet) toolSearchState.activatedToolNames.add("slack_send_message");
+            await prepareStepForTests(options, inTurn, 2);
+            yield { type: "text-delta", text: "ok" };
+            yield {
+              type: "finish-step",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+            yield { type: "finish", finishReason: "stop" };
+          })()
+        )
+      );
+      const streamManager = createStreamManagerForTests(historyService, {
+        streamText: fakeStreamText(streamText),
+      });
+      capturedStreamCounter += 1;
+      const workspaceId = `receipt-stream-${capturedStreamCounter}`;
+      const messageId = `${workspaceId}-message`;
+      await appendPartialAssistantForTests(workspaceId, messageId, 1);
+      const result = await streamManager.startStream(
+        testStartOptions({
+          workspaceId,
+          messageId,
+          providedRuntimeTempDir: "",
+          model,
+          messages,
+          toolSearchState,
+          providerOptions: { anthropic: { thinking: { type: "adaptive" }, effort: "low" } },
+        })
+      );
+      if (!result.success) throw new Error("Expected stream to start");
+      await result.data.completion;
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      return history.data.find((message) => message.id === messageId)?.metadata
+        ?.anthropicThinkingReplay;
+    };
+
+    expect(await run(true)).toBe("off");
+    expect(await run(false)).toBeUndefined();
   });
 
   test("after a tool-set change, between_tools still replays reasoning created after it (#5279)", async () => {

@@ -561,12 +561,14 @@ describe("continuous prefix prepareStep and journal", () => {
 
   it.each([
     [{ type: "between_tools" }, false],
-    [{ type: "adaptive" }, true],
+    [{ type: "adaptive" }, false],
   ] as const)(
     "after a prefix swap, thinking=%o replays in-turn reasoning: %p (#5086)",
     async (thinking, replayed) => {
-      // between_tools cannot carry blockBinding: a thinking block replayed after the
-      // swap edited everything before it would fail the prefix check on enforced accounts.
+      // Preserved thinking: a thinking block replayed after the swap edited everything
+      // before it would fail the prefix check on enforced accounts, for every thinking
+      // mode (between_tools cannot carry blockBinding; only the direct route sends
+      // drop_block for adaptive).
       const withReasoning = originalMessages.map((message, index) =>
         index === 3 && Array.isArray(message.content)
           ? {
