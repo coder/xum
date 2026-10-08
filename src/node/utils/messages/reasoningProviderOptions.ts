@@ -2,27 +2,9 @@ import type { ModelMessage } from "ai";
 
 import type { MuxMessage, MuxReasoningPart } from "@/common/types/message";
 
-export interface ReasoningProviderMetadata {
-  anthropic?: {
-    signature?: string;
-    redactedData?: string;
-  };
-  // OpenAI/xAI Responses attach itemId + encrypted content so subsequent turns
-  // can restore reasoning without server-side response storage. OpenAI is
-  // replayed by encrypted content only (see attachReasoningReplayMetadata).
-  openai?: {
-    itemId?: string;
-    reasoningEncryptedContent?: string | null;
-  };
-  xai?: {
-    itemId?: string;
-    reasoningEncryptedContent?: string | null;
-  };
-  // Google attaches thought signatures that must be replayed on later turns.
-  google?: {
-    thoughtSignature?: string;
-  };
-}
+// The persisted replay shape (MuxReasoningPart.providerOptions), also read from SDK
+// providerMetadata.
+export type ReasoningProviderMetadata = NonNullable<MuxReasoningPart["providerOptions"]>;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null
@@ -43,15 +25,22 @@ function nonEmptyString(value: unknown): string | undefined {
  */
 export function sanitizeReasoningReplayMetadata(
   value: unknown
-): MuxReasoningPart["providerOptions"] | undefined {
+): ReasoningProviderMetadata | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
 
-  const options: NonNullable<MuxReasoningPart["providerOptions"]> = {};
+  const options: ReasoningProviderMetadata = {};
 
-  const anthropicSignature = nonEmptyString(asRecord(record.anthropic)?.signature);
+  const anthropic = asRecord(record.anthropic);
+  const anthropicSignature = nonEmptyString(anthropic?.signature);
+  const anthropicRedactedData = nonEmptyString(anthropic?.redactedData);
   if (anthropicSignature) {
     options.anthropic = { signature: anthropicSignature };
+  } else if (anthropicRedactedData) {
+    // A `redacted_thinking` block: the SDK replays it from redactedData, and only
+    // when no signature is present. Dropping it would shift every later block off
+    // the prefix it was signed against.
+    options.anthropic = { redactedData: anthropicRedactedData };
   }
 
   const googleThoughtSignature = nonEmptyString(asRecord(record.google)?.thoughtSignature);
@@ -88,18 +77,18 @@ export function sanitizeReasoningReplayMetadata(
  */
 export function reasoningProviderOptionsFromMetadata(
   providerMetadata: ReasoningProviderMetadata | undefined
-): MuxReasoningPart["providerOptions"] | undefined {
+): ReasoningProviderMetadata | undefined {
   return sanitizeReasoningReplayMetadata(providerMetadata);
 }
 
 export function mergeReasoningProviderOptions(
-  existing: MuxReasoningPart["providerOptions"] | undefined,
-  incoming: MuxReasoningPart["providerOptions"] | undefined
-): MuxReasoningPart["providerOptions"] | undefined {
+  existing: ReasoningProviderMetadata | undefined,
+  incoming: ReasoningProviderMetadata | undefined
+): ReasoningProviderMetadata | undefined {
   if (!existing) return incoming;
   if (!incoming) return existing;
 
-  const merged: NonNullable<MuxReasoningPart["providerOptions"]> = { ...existing };
+  const merged: ReasoningProviderMetadata = { ...existing };
 
   if (incoming.anthropic) {
     merged.anthropic = { ...existing.anthropic, ...incoming.anthropic };
@@ -121,7 +110,7 @@ export function mergeReasoningProviderOptions(
  * `providerOptions` field on the input part. Never persisted to history.
  */
 type ReasoningPartWithReplayMetadata = MuxReasoningPart & {
-  providerMetadata?: MuxReasoningPart["providerOptions"];
+  providerMetadata?: ReasoningProviderMetadata;
 };
 
 /**

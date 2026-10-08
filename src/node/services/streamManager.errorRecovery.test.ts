@@ -1206,7 +1206,7 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
   ];
 
   /** A real Anthropic Messages model whose HTTP responses are scripted; request bodies are captured. */
-  function scriptedAnthropicModel(responses: Array<() => Response>) {
+  function scriptedAnthropicModel(responses: Array<() => Response | Promise<Response>>) {
     const requestBlockTypes: string[][] = [];
     const model = createAnthropic({
       apiKey: "test-key",
@@ -1278,7 +1278,7 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
     const harness = createRecoveryHarness();
     const { model, requestBlockTypes } = scriptedAnthropicModel([rejection, success]);
 
-    const { calls } = await harness.run({
+    const { calls, messageId } = await harness.run({
       workspaceId: "anthropic-binding-repair",
       model,
       modelString: "coder:claude-aws-us-east-2/claude-opus-5-5",
@@ -1293,6 +1293,79 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
     expect(requestBlockTypes[1]).toContain("tool_result");
     expect(harness.errors()).toEqual([]);
     expect(harness.streamEnds()).toHaveLength(1);
+    // The committed row carries the receipt, so later turns keep thinking out.
+    const history = await historyService.getHistoryFromLatestBoundary("anthropic-binding-repair");
+    if (!history.success) throw new Error(history.error);
+    expect(
+      history.data.find((message) => message.id === messageId)?.metadata?.anthropicThinkingReplay
+    ).toBe("off");
+  });
+
+  test("persists the receipt before the retry request goes out", async () => {
+    const workspaceId = "anthropic-binding-receipt-first";
+    const harness = createRecoveryHarness();
+    const receiptsAtRetry: Array<MuxMetadata["anthropicThinkingReplay"]> = [];
+    const { model } = scriptedAnthropicModel([
+      rejection,
+      async () => {
+        const partial = await historyService.readPartial(workspaceId);
+        receiptsAtRetry.push(partial?.metadata?.anthropicThinkingReplay);
+        return success();
+      },
+    ]);
+
+    await harness.run({
+      workspaceId,
+      model,
+      messages: messages(),
+      attempts: [realSdkAttempt, realSdkAttempt],
+    });
+
+    expect(harness.streamEnds()).toHaveLength(1);
+    expect(receiptsAtRetry).toEqual(["off"]);
+  });
+
+  test("an OpenAI replay repair writes no Anthropic receipt", async () => {
+    const workspaceId = "openai-replay-no-receipt";
+    const harness = createRecoveryHarness();
+    const { messageId } = await harness.run({
+      workspaceId,
+      model: createTestLanguageModel("gpt-5.2-codex", "openai.responses"),
+      modelString: "openai:gpt-5.2-codex",
+      messages: [
+        { role: "user", content: "earlier" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "stale",
+              providerOptions: { openai: { reasoningEncryptedContent: "gAAA-stale" } },
+            },
+            { type: "text", text: "earlier answer" },
+          ],
+        },
+        { role: "user", content: "now" },
+      ],
+      attempts: [
+        failingAttempt(
+          createApiCallErrorForTests({
+            message: "Item with id 'rs_1' not found.",
+            statusCode: 400,
+            responseBody: "Item with id 'rs_1' not found.",
+            isRetryable: false,
+          })
+        ),
+        textAttempt("repaired answer"),
+      ],
+    });
+
+    expect(harness.streamEnds()).toHaveLength(1);
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const row = history.data.find((message) => message.id === messageId);
+    expect(row).toBeDefined();
+    expect(row?.metadata?.anthropicThinkingReplay).toBeUndefined();
   });
 
   test("a repeated rejection is terminal instead of retrying forever", async () => {
@@ -1310,9 +1383,10 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
     expect(calls).toHaveLength(2);
     expect(harness.errors()).toHaveLength(1);
     expect(harness.errors()[0]).toMatchObject({ messageId, errorType: "reasoning_rejected" });
-    expect((await historyService.readPartial(workspaceId))?.metadata?.errorType).toBe(
-      "reasoning_rejected"
-    );
+    const errorPartial = await historyService.readPartial(workspaceId);
+    expect(errorPartial?.metadata?.errorType).toBe("reasoning_rejected");
+    // The failed retry already ran without thinking: the stored row keeps the receipt.
+    expect(errorPartial?.metadata?.anthropicThinkingReplay).toBe("off");
   });
 
   test("leaves an unrelated Anthropic 400 to ordinary error handling", async () => {
