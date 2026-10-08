@@ -363,6 +363,48 @@ describe("StreamManager - tool search activeTools scoping", () => {
     expect(await prepareStep({ messages })).toBeUndefined();
   });
 
+  test("per-step transform drops a native tool_reference an earlier result already sent", async () => {
+    const searchResult = (toolCallId: string, referencedTools: string[]): ModelMessage => {
+      const raw: unknown = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId,
+            toolName: "tool_catalog_search",
+            output: {
+              type: "content",
+              value: referencedTools.map((toolName) => ({
+                type: "custom",
+                providerOptions: { anthropic: { type: "tool-reference", toolName } },
+              })),
+            },
+          },
+        ],
+      };
+      return raw as ModelMessage;
+    };
+    const inTurn: ModelMessage[] = [
+      { role: "user", content: "hello" },
+      searchResult("call-1", ["slack_send_message"]),
+      searchResult("call-2", ["slack_send_message", "slack_list_channels"]),
+    ];
+    const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
+      model,
+      messages,
+    });
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    const step = await prepareStep({ messages: inTurn });
+    const stepMessages = step?.messages;
+    if (stepMessages == null) throw new Error("Expected prepareStep to rewrite the messages");
+    // The first reference is untouched; the repeat is dropped from the second result.
+    expect(stepMessages[1]).toBe(inTurn[1]);
+    expect(JSON.stringify(stepMessages[2])).toBe(
+      JSON.stringify(searchResult("call-2", ["slack_list_channels"]))
+    );
+  });
+
   test("a tool-set change ends in-turn reasoning replay on Anthropic requests (#5086)", async () => {
     // Preserved thinking: a thinking block replayed after the advertised tools changed
     // would fail the prefix check on enforced accounts. between_tools cannot carry

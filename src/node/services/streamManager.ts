@@ -112,6 +112,7 @@ import {
   collectDeferLoadingToolNames,
   computeActiveToolNames,
   computeContextLoadedToolNames,
+  dedupeNativeToolReferences,
   computeLoadedToolNames,
   type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
@@ -407,7 +408,9 @@ function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
 }
 
 /**
- * Same-turn message transforms applied before every provider step: strip workflow run records
+ * Same-turn message transforms applied before every provider step: drop repeated native
+ * tool_reference blocks (a same-turn search can re-match tools an earlier result already
+ * loaded; messagePipeline's dedupe only sees persisted history), strip workflow run records
  * from same-turn tool results (history-level redaction in applyToolOutputRedaction can't see
  * these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
  * (messagePipeline's neutralizer only sees persisted history), then extract supported
@@ -418,7 +421,7 @@ function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
 function transformStepMessages(messages: ModelMessage[]): Promise<ModelMessage[]> {
   return extractToolMediaAsUserMessagesFromModelMessages(
     neutralizeAgentEnvelopeLookalikesInModelToolParts(
-      stripWorkflowRunRecordsFromModelMessages(messages)
+      stripWorkflowRunRecordsFromModelMessages(dedupeNativeToolReferences(messages))
     )
   );
 }

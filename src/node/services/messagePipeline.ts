@@ -33,6 +33,7 @@ import {
 } from "@/browser/utils/messages/modelMessageTransform";
 import {
   applyNativeToolSearchReplay,
+  dedupeNativeToolReferences,
   normalizeLegacyToolSearchMessages,
 } from "@/common/utils/tools/toolCatalog";
 import { applyCacheControl, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
@@ -195,11 +196,13 @@ export async function prepareMessagesForProvider(
 
   // --- ModelMessage-level transforms ---
 
-  const modelMessages = applyNativeToolSearchReplay(
-    normalizeLegacyToolSearchMessages(
-      sanitizeAssistantModelMessages(rawModelMessages, workspaceId)
-    ),
-    deferLoadingToolNames ?? new Set()
+  const modelMessages = dedupeNativeToolReferences(
+    applyNativeToolSearchReplay(
+      normalizeLegacyToolSearchMessages(
+        sanitizeAssistantModelMessages(rawModelMessages, workspaceId)
+      ),
+      deferLoadingToolNames ?? new Set()
+    )
   );
 
   log.debug_obj(`${workspaceId}/2_model_messages.json`, modelMessages);

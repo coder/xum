@@ -978,18 +978,87 @@ export function countToolReferences(messages: readonly unknown[]): Map<string, n
         continue;
       }
       for (const item of output.value as unknown[]) {
-        const providerOptions =
-          isPlainRecord(item) && item.type === "custom" ? item.providerOptions : undefined;
-        const anthropic = isPlainRecord(providerOptions) ? providerOptions.anthropic : undefined;
-        if (
-          isPlainRecord(anthropic) &&
-          anthropic.type === "tool-reference" &&
-          typeof anthropic.toolName === "string"
-        ) {
-          counts.set(anthropic.toolName, (counts.get(anthropic.toolName) ?? 0) + 1);
+        const name = nativeToolReferenceName(item);
+        if (name !== undefined) {
+          counts.set(name, (counts.get(name) ?? 0) + 1);
         }
       }
     }
   }
   return counts;
+}
+
+/** Tool name of a native `tool_reference` content item, undefined for anything else. */
+function nativeToolReferenceName(item: unknown): string | undefined {
+  const providerOptions =
+    isPlainRecord(item) && item.type === "custom" ? item.providerOptions : undefined;
+  const anthropic = isPlainRecord(providerOptions) ? providerOptions.anthropic : undefined;
+  return isPlainRecord(anthropic) &&
+    anthropic.type === "tool-reference" &&
+    typeof anthropic.toolName === "string"
+    ? anthropic.toolName
+    : undefined;
+}
+
+/**
+ * Request-only projection that drops a native `tool_reference` whose tool an
+ * earlier result in the same request already references: Anthropic expands
+ * every occurrence into the full definition, repeats included (#5413), so a
+ * repeat only re-pays the schema. Decided purely from the references present
+ * in `messages`, in transcript order — persisted results keep their raw
+ * matches, and a compacted prefix that dropped the first referencing result
+ * lets a later result reference the tool again. A result left with no
+ * references becomes a deterministic text result (Anthropic rejects an empty
+ * content list). Untouched messages keep their identity, and appending
+ * messages never changes the projection of an earlier prefix, so exact-append
+ * budget anchors and the cached transcript prefix stay intact. Applied
+ * wherever final per-request messages are produced (history pipeline and
+ * per-step transforms), keeping live and replayed requests byte-identical.
+ */
+export function dedupeNativeToolReferences(messages: ModelMessage[]): ModelMessage[] {
+  const seen = new Set<string>();
+  let anyChanged = false;
+  const deduped = messages.map((message) => {
+    if (message.role !== "tool") {
+      return message;
+    }
+    let changed = false;
+    const content: ToolModelMessage["content"] = message.content.map((part) => {
+      if (
+        part.type !== "tool-result" ||
+        !isMuxToolSearchName(part.toolName) ||
+        part.output.type !== "content"
+      ) {
+        return part;
+      }
+      const kept: typeof part.output.value = [];
+      const dropped: string[] = [];
+      for (const item of part.output.value) {
+        const name = nativeToolReferenceName(item);
+        if (name !== undefined && seen.has(name)) {
+          dropped.push(name);
+          continue;
+        }
+        if (name !== undefined) {
+          seen.add(name);
+        }
+        kept.push(item);
+      }
+      if (dropped.length === 0) {
+        return part;
+      }
+      changed = true;
+      const output: ToolResultOutput =
+        kept.length > 0
+          ? { type: "content", value: kept }
+          : { type: "text", value: `All matched tools are already loaded: ${dropped.join(", ")}` };
+      return { ...part, output };
+    });
+    if (!changed) {
+      return message;
+    }
+    anyChanged = true;
+    return { ...message, content };
+  });
+  return anyChanged ? deduped : messages;
 }
