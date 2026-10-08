@@ -35,7 +35,7 @@ type ExperimentOverrides = Partial<Record<ExperimentId, boolean>>;
 interface MockAPIClient {
   experiments: {
     getOverrides: () => Promise<ExperimentOverrides>;
-    setOverride: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => Promise<void>;
+    set: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => Promise<void>;
   };
   config: {
     getConfig: () => Promise<MockConfig>;
@@ -213,7 +213,7 @@ interface RenderGeneralSectionOptions {
 interface MockAPISetup {
   api: MockAPIClient;
   backendOverrides: ExperimentOverrides;
-  setOverrideMock: ReturnType<typeof mock<MockAPIClient["experiments"]["setOverride"]>>;
+  setMock: ReturnType<typeof mock<MockAPIClient["experiments"]["set"]>>;
   getOverridesMock: ReturnType<typeof mock<MockAPIClient["experiments"]["getOverrides"]>>;
   getConfigMock: ReturnType<typeof mock<() => Promise<MockConfig>>>;
   updateCoderPrefsMock: ReturnType<
@@ -244,7 +244,7 @@ function createMockAPI(
 ): MockAPISetup {
   const backendOverrides = { ...experimentOverrides };
   const getOverridesMock = mock(() => Promise.resolve({ ...backendOverrides }));
-  const setOverrideMock = mock(
+  const setMock = mock(
     ({ experimentId, enabled }: { experimentId: ExperimentId; enabled?: boolean | null }) => {
       // Like the backend, a null/omitted value clears the override.
       if (enabled == null) {
@@ -326,7 +326,7 @@ function createMockAPI(
 
   return {
     api: {
-      experiments: { getOverrides: getOverridesMock, setOverride: setOverrideMock },
+      experiments: { getOverrides: getOverridesMock, set: setMock },
       config: {
         getConfig: getConfigMock,
         updateCoderPrefs: updateCoderPrefsMock,
@@ -349,7 +349,7 @@ function createMockAPI(
       },
     },
     backendOverrides,
-    setOverrideMock,
+    setMock,
     getOverridesMock,
     getConfigMock,
     updateCoderPrefsMock,
@@ -484,17 +484,9 @@ describe("GeneralSection", () => {
         expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
           label
         );
-        expect(setup.backendOverrides).toEqual(overrides);
+        expect(setup.backendOverrides).toEqual(source === "backendOverrides" ? overrides : {});
         expect(experimentOverriddenMock).not.toHaveBeenCalled();
-        // The provider uploads explicit local values; mounting the dropdown must add no writes.
-        if (source === "localOverrides") {
-          for (const [experimentId, enabled] of Object.entries(overrides)) {
-            expect(setup.setOverrideMock).toHaveBeenCalledWith({ experimentId, enabled });
-          }
-        }
-        expect(setup.setOverrideMock).toHaveBeenCalledTimes(
-          source === "localOverrides" ? Object.keys(overrides).length : 0
-        );
+        expect(setup.setMock).not.toHaveBeenCalled();
         for (const [id, enabled] of Object.entries(overrides)) {
           expect(window.localStorage.getItem(getExperimentKey(id as ExperimentId))).toBe(
             source === "localOverrides" ? JSON.stringify(enabled) : null
@@ -510,7 +502,7 @@ describe("GeneralSection", () => {
     expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
       "Summarize"
     );
-    expect(setup.setOverrideMock).not.toHaveBeenCalled();
+    expect(setup.setMock).not.toHaveBeenCalled();
     expect(setup.backendOverrides).toEqual({});
     expect(
       window.localStorage.getItem(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION))
@@ -546,8 +538,8 @@ describe("GeneralSection", () => {
       expect(setup.view.getByRole("combobox", { name: "Compaction strategy" }).textContent).toBe(
         label
       );
-      expect(setup.backendOverrides).toEqual({ ...backend, ...local });
-      expect(setup.setOverrideMock).toHaveBeenCalledTimes(Object.keys(local).length);
+      expect(setup.backendOverrides).toEqual(backend);
+      expect(setup.setMock).not.toHaveBeenCalled();
     }
   );
 
@@ -576,7 +568,7 @@ describe("GeneralSection", () => {
             [EXPERIMENT_IDS.TOKEN_BUDGET]: budget,
           })
         );
-        expect(setup.setOverrideMock).toHaveBeenCalledTimes(2);
+        expect(setup.setMock).toHaveBeenCalledTimes(2);
         expect(experimentOverriddenMock).toHaveBeenCalledTimes(2);
         expect(experimentOverriddenMock).toHaveBeenCalledWith(
           EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
@@ -600,8 +592,12 @@ describe("GeneralSection", () => {
       const [rlm, setRlm] = useExperiment(EXPERIMENT_IDS.RLM);
       return (
         <>
-          <button onClick={() => setPtc(!ptc)}>Toggle PTC fixture</button>
-          <button onClick={() => setRlm(!rlm)}>Toggle RLM fixture</button>
+          <button data-enabled={ptc} onClick={() => setPtc(!ptc)}>
+            Toggle PTC fixture
+          </button>
+          <button data-enabled={rlm} onClick={() => setRlm(!rlm)}>
+            Toggle RLM fixture
+          </button>
         </>
       );
     }
@@ -613,17 +609,21 @@ describe("GeneralSection", () => {
     await chooseSelectOption(setup.view, "Compaction strategy", "Token Budget");
     const trigger = setup.view.getByRole("combobox", { name: "Compaction strategy" });
     expect(setup.view.queryByRole("status")).toBeNull();
-    fireEvent.click(setup.view.getByRole("button", { name: "Toggle RLM fixture" }));
-    expect(setup.view.queryByRole("status")).toBeNull();
-    fireEvent.click(setup.view.getByRole("button", { name: "Toggle PTC fixture" }));
-    const warning = setup.view.getByRole("status");
-    expect(trigger.getAttribute("aria-describedby")).toBe(warning.id);
-    fireEvent.click(setup.view.getByRole("button", { name: "Toggle RLM fixture" }));
-    expect(setup.view.queryByRole("status")).toBeNull();
-    fireEvent.click(setup.view.getByRole("button", { name: "Toggle RLM fixture" }));
-    expect(setup.view.getByRole("status")).toBeTruthy();
-    fireEvent.click(setup.view.getByRole("button", { name: "Toggle PTC fixture" }));
-    expect(setup.view.queryByRole("status")).toBeNull();
+    // Toggles show only acknowledged writes, so each step waits for the new value.
+    const toggle = async (name: string, enabled: boolean, warns: boolean) => {
+      const button = setup.view.getByRole("button", { name });
+      fireEvent.click(button);
+      await waitFor(() => {
+        expect(button.getAttribute("data-enabled")).toBe(String(enabled));
+        expect(Boolean(setup.view.queryByRole("status"))).toBe(warns);
+      });
+    };
+    await toggle("Toggle RLM fixture", true, false);
+    await toggle("Toggle PTC fixture", true, true);
+    expect(trigger.getAttribute("aria-describedby")).toBe(setup.view.getByRole("status").id);
+    await toggle("Toggle RLM fixture", false, false);
+    await toggle("Toggle RLM fixture", true, true);
+    await toggle("Toggle PTC fixture", false, false);
     expect(trigger.textContent).toBe("Token Budget");
     await waitFor(() =>
       expect(setup.backendOverrides).toEqual({
@@ -650,7 +650,7 @@ describe("GeneralSection", () => {
     );
     expect(within(portalRoot).queryAllByText("Token Budget")).toHaveLength(0);
     expect(setup.backendOverrides).toEqual({ [EXPERIMENT_IDS.TOKEN_BUDGET]: true });
-    expect(setup.setOverrideMock).not.toHaveBeenCalled();
+    expect(setup.setMock).not.toHaveBeenCalled();
   });
 
   test("persists flat chat list mode from the Sidebar group", () => {

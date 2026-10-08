@@ -2675,9 +2675,9 @@ export const router = (authToken?: string) => {
           syncPerfFlightRecorder(context);
           return overrides;
         }),
-      setOverride: t
-        .input(schemas.experiments.setOverride.input)
-        .output(schemas.experiments.setOverride.output)
+      set: t
+        .input(schemas.experiments.set.input)
+        .output(schemas.experiments.set.output)
         .handler(async ({ context, input }) => {
           await context.experimentsService.setOverride(input.experimentId, input.enabled);
           // Any override write adopts the merged disk state, which can flip this flag too.
