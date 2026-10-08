@@ -1769,6 +1769,12 @@ export class Config {
     project: ProjectConfig;
     workspace: Workspace;
   }> = [];
+  /**
+   * The indexed snapshot holds an id-less row or a "" project key. The full build resolves
+   * id-less rows through session files and skips "" keys, so its first row with an id can differ
+   * from the index entry; findWorkspaceMetadata then runs the full build (#5727 F1b).
+   */
+  private workspaceIndexNeedsFullBuild = false;
 
   private configStatKey(stat: fs.Stats): string {
     return [stat.ino, stat.mtimeMs, stat.size].join(":");
@@ -3679,10 +3685,13 @@ export class Config {
     this.workspaceIndexConfig = config;
     this.workspaceIndex = new Map();
     this.legacyWorkspaceEntries = [];
+    this.workspaceIndexNeedsFullBuild = false;
     for (const [projectPath, project] of config.projects) {
+      if (!projectPath) this.workspaceIndexNeedsFullBuild = true;
       for (const workspace of project.workspaces) {
         const entry = { projectPath, project, workspace };
         if (!workspace.id) {
+          this.workspaceIndexNeedsFullBuild = true;
           this.legacyWorkspaceEntries.push(entry);
         } else if (!this.workspaceIndex.has(workspace.id)) {
           this.workspaceIndex.set(workspace.id, entry);
@@ -3973,6 +3982,26 @@ export class Config {
     // Fresh array, shared entries (see the probeCheckouts CONTRACT): the copy keeps one
     // caller's in-place filter/sort from leaking into another.
     return metadata.slice();
+  }
+
+  /**
+   * The row `(await getAllWorkspaceMetadata()).find((m) => m.id === workspaceId)` gives, built
+   * from that one row (one checkout probe) unless the snapshot needs the full build (see
+   * workspaceIndexNeedsFullBuild). No await before the build, so both paths read one snapshot.
+   * Other rows' read-time migrations wait for their next full build (#5727 F1b).
+   */
+  async findWorkspaceMetadata(workspaceId: string): Promise<FrontendWorkspaceMetadata | null> {
+    const config = this.loadConfigOrDefault();
+    this.ensureWorkspaceIndex(config);
+    let projects: Iterable<[string, ProjectConfig]> = config.projects;
+    if (!this.workspaceIndexNeedsFullBuild) {
+      const entry = this.workspaceIndex.get(workspaceId);
+      if (!entry) return null;
+      assert(entry.workspace.id === workspaceId, "index entry must match its key");
+      projects = [[entry.projectPath, { ...entry.project, workspaces: [entry.workspace] }]];
+    }
+    const metadata = await this.buildWorkspaceMetadata(config, projects);
+    return metadata.find((candidate) => candidate.id === workspaceId) ?? null;
   }
 
   async getWorkspaceMetadataById(

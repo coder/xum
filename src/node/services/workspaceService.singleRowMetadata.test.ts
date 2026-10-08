@@ -125,8 +125,9 @@ const cases: Case[] = [
     expected: { name: "slash" },
   },
   {
-    // 32 stalled checkouts hold the probe concurrency past the build's shared 2 s deadline, so X
-    // (missing, last) answers its last-known state: present.
+    // 32 stalled checkouts hold the full build's probe concurrency past its shared 2 s deadline,
+    // where X (missing, last) would answer its last-known state, present. The one-row read probes
+    // X alone and reports it missing (F1b decision rule 2).
     name: "P1",
     projects: () =>
       inRepo(
@@ -135,17 +136,18 @@ const cases: Case[] = [
       )(),
     noCheckouts: true,
     id: "X",
-    expected: { transcriptOnly: undefined },
-    oracle: "full",
+    expected: { transcriptOnly: true },
+    oracle: "byId",
   },
   {
-    // The full build behind the X read at T1 assigns and saves Y's createdAt.
+    // A full build behind the X read at T1 would assign and save Y's createdAt. The one-row read
+    // leaves Y to its own read at T2 (F1b decision rule 2).
     name: "T1",
     projects: () => inRepo(row("X"), row("Y", { createdAt: undefined }))(),
     warmup: "X",
     id: "Y",
-    expected: { createdAt: T1 },
-    oracle: "full",
+    expected: { createdAt: T2 },
+    oracle: "byId",
   },
   {
     name: "D1",
@@ -408,4 +410,40 @@ describe("single-row metadata reads at callers 1-3 (#5727 F1b)", () => {
       test(`${c.name} at ${caller.name}`, () => run(c, caller), { timeout: 15_000 });
     }
   }
+
+  test("S2: the full-build fallback ends with the snapshot that needed it", async () => {
+    const { config, service } = ctx.harness;
+    const createdAt = (id: string) =>
+      [...config.loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((workspace) => workspace.id === id)?.createdAt;
+    await writeFixture(config, {
+      name: "S2",
+      projects: inRepo(row("X"), row("Y", { createdAt: undefined }), { path: ws("legacy") }),
+      id: "X",
+      expected: null,
+    });
+    // The id-less row turns the fallback on: the full build assigns and saves Y's createdAt.
+    expect((await service.getInfo("X"))?.id).toBe("X");
+    expect(createdAt("Y")).toBe(T0);
+
+    await config.editConfig((snapshot) => {
+      const project = snapshot.projects.get(repo())!;
+      project.workspaces = project.workspaces.filter(
+        (workspace) => workspace.path !== ws("legacy")
+      );
+      project.workspaces.push({
+        id: "Z",
+        name: "Z",
+        path: ws("Z"),
+        runtimeConfig: { type: "local" },
+      });
+      return snapshot;
+    });
+    await fs.mkdir(ws("Z"), { recursive: true });
+    setSystemTime(new Date(T1));
+    expect((await service.getInfo("X"))?.id).toBe("X");
+    setSystemTime(new Date(T2));
+    expect((await service.getInfo("Z"))?.createdAt).toBe(T2);
+  });
 });
