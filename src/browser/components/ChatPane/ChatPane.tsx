@@ -873,7 +873,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const chatInputAPI = useRef<ChatInputAPI | null>(null);
 
   const handleQuoteText = useCallback((quotedText: string) => {
-    chatInputAPI.current?.appendText(quotedText);
+    chatInputAPI.current?.appendToVisibleInput(quotedText);
     chatInputAPI.current?.focus();
   }, []);
 
@@ -939,6 +939,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     async (queuedMessage: QueuedMessageData) => {
       const inputApi = chatInputAPI.current;
       if (!inputApi) return;
+      // A visible edit would hide the restored message behind it: keep it queued instead.
+      if (inputApi.isEditVisible()) return;
 
       await api?.workspace.clearQueue({ workspaceId });
       inputApi.restoreDraft(normalizeQueuedMessage(queuedMessage), {

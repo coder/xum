@@ -7,6 +7,7 @@ import {
 } from "@/browser/stores/DraftStore";
 import type { ReviewNoteDataForDisplay } from "@/common/types/message";
 import type { Review } from "@/common/types/review";
+import { joinDraftText } from "@/common/utils/composerDraftText";
 import { DRAFT_ID_PATTERN } from "@/constants/drafts";
 import type { ChatAttachment } from "./ChatAttachments";
 import type { Toast } from "./ChatInputToast";
@@ -43,6 +44,25 @@ export function getComposerDraftScope(options: {
     : defaultCreationDraftScope(options.creationProjectPath);
 }
 
+/** An open edit's text and files. They live only in the composer that opened the edit. */
+export interface EditDraft {
+  id: string;
+  text: string;
+  attachments: ChatAttachment[];
+}
+
+/** Appends an edit's text after the draft in `scope`, and its files whose ids are missing. */
+function appendToStoredDraft(scope: DraftStoreScope, snapshot: Omit<EditDraft, "id">) {
+  const store = getDraftStore();
+  if (snapshot.text.trim())
+    store.setText(scope, (current) => joinDraftText(current, snapshot.text));
+  if (snapshot.attachments.length === 0) return;
+  store.setAttachments(scope, (current) => {
+    const ids = new Set(current.map(({ id }) => id));
+    return [...current, ...snapshot.attachments.filter(({ id }) => !ids.has(id))];
+  });
+}
+
 export function useComposerDraft(options: UseComposerDraftOptions) {
   const { attachedReviews, pushToast } = options;
   const draftStore = getDraftStore();
@@ -61,6 +81,17 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   const setAttachments = (
     value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
   ) => draftStore.setAttachments(draftScope, value);
+  // The open edit's buffer: an edit never reaches the shared, persisted draft, so a reload or a
+  // second window keeps the unsent draft (#5672, #5571). The ref is the live value.
+  const [editDraft, setEditDraftState] = useState<EditDraft | null>(null);
+  const editDraftRef = useRef<EditDraft | null>(null);
+  const writeEditDraft = (next: EditDraft | null) => {
+    editDraftRef.current = next;
+    setEditDraftState(next);
+  };
+  const updateEditDraft = (update: (current: EditDraft) => EditDraft) => {
+    if (editDraftRef.current) writeEditDraft(update(editDraftRef.current));
+  };
   const pushToastRef = useRef(pushToast);
   pushToastRef.current = pushToast;
   const { variant, workspaceId, creationProjectPath, pendingDraftId } = options;
@@ -86,6 +117,9 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     });
     return () => {
       unsubscribeSaveErrors();
+      // A switch or transcript-only unmounts the composer with its edit open: no text is lost.
+      if (editDraftRef.current) appendToStoredDraft(scope, editDraftRef.current);
+      editDraftRef.current = null;
       // Leaving this draft (workspace switch, route change, unmount): write it now rather than
       // after the debounce. A failure keeps the change in the store, which retries it.
       getDraftStore()
@@ -140,8 +174,32 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     setInput(next.text);
     setAttachments(next.attachments);
   };
+  // The only edit operations that write the normal draft: after it, once.
+  const consumeEditDraftIntoDraft = () => {
+    if (editDraftRef.current) appendToStoredDraft(draftScope, editDraftRef.current);
+    writeEditDraft(null);
+  };
   return {
     draftScope,
+    editDraft,
+    getEditDraft: () => editDraftRef.current,
+    beginEditDraft: writeEditDraft,
+    setEditText: (value: string | ((previous: string) => string)) =>
+      updateEditDraft((current) => ({
+        ...current,
+        text: typeof value === "function" ? value(current.text) : value,
+      })),
+    setEditAttachments: (
+      value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
+    ) =>
+      updateEditDraft((current) => ({
+        ...current,
+        attachments: typeof value === "function" ? value(current.attachments) : value,
+      })),
+    dropEditDraft: () => writeEditDraft(null),
+    consumeEditDraftIntoDraft,
+    appendSnapshotToDraft: (snapshot: Omit<EditDraft, "id">) =>
+      appendToStoredDraft(draftScope, snapshot),
     input,
     setInput,
     payloadsLoaded: draft.payloadsLoaded,

@@ -315,6 +315,8 @@ describe("useAIViewKeybinds", () => {
         restoreDraft: () => undefined,
         appendText: () => undefined,
         prependText: () => undefined,
+        appendToVisibleInput: () => undefined,
+        isEditVisible: () => false,
       },
     };
     renderUseAIViewKeybinds({

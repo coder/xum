@@ -21,6 +21,8 @@ interface UseComposerAttachmentsOptions {
     value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
   ) => void;
   editingMessage: boolean;
+  /** Live check, read when a file lands: the composer may show an edit by then. */
+  isEditVisible: () => boolean;
   pushToast: PushToast;
 }
 function getBaseMediaType(mediaType: string): string {
@@ -98,7 +100,9 @@ export function useComposerAttachments(options: UseComposerAttachmentsOptions) {
       )
     ).then((outcomes) => {
       const successes = outcomes.flatMap((outcome) => (outcome.ok ? outcome.attachments : []));
-      if (successes.length > 0) {
+      // An add that started before an edit opened lands in neither the edit nor the draft.
+      if (successes.length > 0 && options.isEditVisible()) rejectEditAttachment();
+      else if (successes.length > 0) {
         setAttachments((previous) => [...previous, ...successes]);
         showResizeToast(successes);
       }

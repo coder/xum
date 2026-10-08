@@ -24,6 +24,10 @@ export interface ChatInputAPI {
   restoreDraft: (pending: PendingUserMessage, options?: { retainedSendIds?: string[] }) => void;
   appendText: (text: string) => void;
   prependText: (text: string) => void;
+  /** Append where the composer shows it: the visible edit, else the draft (quotes, inserts). */
+  appendToVisibleInput: (text: string) => void;
+  /** Whether the composer shows an open edit; inserts that cannot join it are refused then. */
+  isEditVisible: () => boolean;
 }
 
 export interface WorkspaceCreatedOptions {
