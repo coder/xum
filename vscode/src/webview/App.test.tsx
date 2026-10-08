@@ -1846,6 +1846,37 @@ describe("vscode webview explicit AI-setting persistence", () => {
     expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
   });
 
+  test("drops an unsent pick on a server switch but keeps it across a reconnect", async () => {
+    // The host posts the server's workspaces, and the chat catches up again, after each connection.
+    async function reconnect(bridge: TestBridge, baseUrl: string) {
+      await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl } });
+      await bridge.emit({ type: "workspaces", workspaces: [mainWorkspace(TERRA_HIGH)] });
+      await bridge.emit({
+        type: "chatEvent",
+        workspaceId: WORKSPACE.id,
+        event: { type: "caught-up" },
+      });
+      await emitBackgroundBashes(bridge, WORKSPACE.id);
+    }
+    const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
+    await pickModel(view, "Opus 5.5");
+
+    await bridge.emit({ type: "connectionStatus", status: { mode: "file" } });
+    await reconnect(bridge, "http://x");
+    expect(await send(bridge, view)).toMatchObject({
+      model: "anthropic:claude-opus-5-5",
+      aiSelectionIntent: { model: true },
+    });
+    await reply(bridge, OK);
+
+    // Another server with a workspace of the same ID saves another model.
+    await reconnect(bridge, "http://y");
+    const options = await send(bridge, view);
+    expect(options.model).toBe(TERRA_HIGH.model);
+    expect(options.aiSelectionIntent).toBeUndefined();
+    await reply(bridge, OK);
+  });
+
   test("persists only the last of several rapid picks", async () => {
     const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
     await pickModel(view, "Sonnet 5.5");
