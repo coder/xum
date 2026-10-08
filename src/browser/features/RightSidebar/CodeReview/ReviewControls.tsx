@@ -109,7 +109,7 @@ export const ReviewControls: React.FC<ReviewControlsProps> = ({
     if (filters.assistedOnly) {
       onFiltersChange((prev) => ({ ...prev, assistedShowReadHunks: checked }));
     } else {
-      onFiltersChange((prev) => ({ ...prev, showReadHunks: checked }));
+      updateUserPreferences({ review: { showRead: checked } });
     }
   };
 
@@ -120,7 +120,7 @@ export const ReviewControls: React.FC<ReviewControlsProps> = ({
 
   const handleSortChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const sortOrder = e.target.value as ReviewSortOrder;
-    onFiltersChange((prev) => ({ ...prev, sortOrder }));
+    updateUserPreferences({ review: { sortOrder } });
   };
 
   const handleSetDefault = () => {

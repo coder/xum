@@ -2,9 +2,7 @@ import React, { useEffect } from "react";
 import { ArrowLeftRight, Github, MessageCircle } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { GIT_STATUS_INDICATOR_MODE_KEY } from "@/common/constants/storage";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import type { GitStatusIndicatorMode } from "../GitStatusIndicatorView/GitStatusIndicatorView";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { getDevcontainerStatusChip } from "@/browser/utils/runtimeUi";
 import { formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
@@ -84,15 +82,16 @@ function WorkspaceDriftIndicator(props: {
   );
 }
 
-/** Shares the divergence dialog's persisted mode key so both surfaces stay in sync. */
+/** Shares the divergence dialog's mode preference so both surfaces stay in sync. */
 function DriftModeToggle() {
-  const [mode, setMode] = usePersistedState<GitStatusIndicatorMode>(
-    GIT_STATUS_INDICATOR_MODE_KEY,
-    "line-delta",
-    { listener: true }
-  );
+  const mode =
+    useUserPreferences((preferences) => preferences.appearance?.gitStatusIndicatorMode) ??
+    "line-delta";
   const isLineDelta = mode === "line-delta";
-  const toggleMode = () => setMode((prev) => (prev === "line-delta" ? "divergence" : "line-delta"));
+  const toggleMode = () =>
+    updateUserPreferences({
+      appearance: { gitStatusIndicatorMode: isLineDelta ? "divergence" : "line-delta" },
+    });
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {

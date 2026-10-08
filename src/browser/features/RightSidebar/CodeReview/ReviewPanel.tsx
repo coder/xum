@@ -80,8 +80,6 @@ import {
   getReviewSelectedHunkKey,
   getReviewSearchStateKey,
   REVIEW_SEARCH_STATE_MAX_CHARS,
-  REVIEW_SORT_ORDER_KEY,
-  REVIEW_SHOW_READ_KEY,
 } from "@/common/constants/storage";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { parseNumstat, buildFileTree, extractNewPath } from "@/common/utils/git/numstatParser";
@@ -92,7 +90,6 @@ import type {
   DiffHunk,
   ReviewFilters as ReviewFiltersType,
   ReviewNoteData,
-  ReviewSortOrder,
 } from "@/common/types/review";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -860,18 +857,12 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   // Persist diff base per workspace (falls back to project default); syncs with GitStatusIndicator.
   const [diffBase, setDiffBase] = useWorkspaceDiffBase(workspaceId, projectPath);
 
-  // ReviewControls writes this global preference; filters always show its current value.
+  // ReviewControls writes these global preferences; filters always show their current values.
   const includeUncommitted =
     useUserPreferences((preferences) => preferences.review?.includeUncommitted) ?? false;
-
-  // Persist showReadHunks flag globally
-  const [showReadHunks, setShowReadHunks] = usePersistedState(REVIEW_SHOW_READ_KEY, true);
-
-  // Persist sort order globally
-  const [sortOrder, setSortOrder] = usePersistedState<ReviewSortOrder>(
-    REVIEW_SORT_ORDER_KEY,
-    "last-edit"
-  );
+  const showReadHunks = useUserPreferences((preferences) => preferences.review?.showRead) ?? true;
+  const sortOrder =
+    useUserPreferences((preferences) => preferences.review?.sortOrder) ?? "last-edit";
 
   // Auto-detect trunk for new review base keys so repos using master/develop
   // don't start on the hard-coded fallback. Existing user selections are preserved.
@@ -1097,7 +1088,12 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     sortOrder: sortOrder,
     assistedOnly: false,
   });
-  const filters: ReviewFiltersType = { ...filterState, includeUncommitted };
+  const filters: ReviewFiltersType = {
+    ...filterState,
+    includeUncommitted,
+    showReadHunks,
+    sortOrder,
+  };
 
   // Subscribe to the agent's Assisted Review hunks for this workspace. The
   // aggregator returns a stable reference (only changes when review_pane_update
@@ -1689,16 +1685,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     isCreating,
     isImmersive,
   ]);
-
-  // Persist showReadHunks when it changes
-  useEffect(() => {
-    setShowReadHunks(filters.showReadHunks);
-  }, [filters.showReadHunks, setShowReadHunks]);
-
-  // Persist sortOrder when it changes
-  useEffect(() => {
-    setSortOrder(filters.sortOrder);
-  }, [filters.sortOrder, setSortOrder]);
 
   // Record first-seen timestamps for new hunks
   useEffect(() => {

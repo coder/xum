@@ -244,6 +244,9 @@ describe("backup payload", () => {
         review: {
           includeUncommitted: true,
           defaultBaseByProject: { "/private/project": "main" },
+          sortOrder: "file-order",
+          fileTreeViewMode: "flat",
+          showRead: false,
         },
       },
     });
@@ -269,7 +272,12 @@ describe("backup payload", () => {
         globalDefaults: { agentId: "exec" },
         autoCompactionThresholdByModel: { "openai/gpt": 75 },
       },
-      review: { includeUncommitted: true },
+      review: {
+        includeUncommitted: true,
+        sortOrder: "file-order",
+        fileTreeViewMode: "flat",
+        showRead: false,
+      },
     });
   });
 

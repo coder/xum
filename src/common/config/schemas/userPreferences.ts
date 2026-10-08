@@ -7,12 +7,14 @@ import {
 import {
   BASH_COLLAPSED_SUMMARY_MODES,
   EDITOR_TYPES,
+  GIT_STATUS_INDICATOR_MODES,
   TERMINAL_BADGE_POSITIONS,
   TRANSCRIPT_DENSITIES,
   normalizeEditorConfig,
   normalizeTerminalBadgeConfig,
 } from "@/common/constants/storage";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
+import { REVIEW_FILE_TREE_VIEW_MODES, REVIEW_SORT_ORDERS } from "@/common/types/review";
 import { ThinkingLevelSchema, coerceThinkingLevel } from "@/common/types/thinking";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { isValidModelFormat, normalizeSelectedModel } from "@/common/utils/ai/models";
@@ -94,6 +96,8 @@ export const UserPreferencesSchema = z.object({
         (value) => (isPlainObject(value) ? normalizeEditorConfig(value) : undefined)
       ).optional(),
       vimEnabled: z.boolean().optional(),
+      powerModeEnabled: z.boolean().optional(),
+      gitStatusIndicatorMode: z.enum(GIT_STATUS_INDICATOR_MODES).optional(),
     })
     .optional(),
   navigation: z
@@ -160,6 +164,9 @@ export const UserPreferencesSchema = z.object({
     .object({
       includeUncommitted: z.boolean().optional(),
       defaultBaseByProject: z.record(z.string(), BranchSchema).optional(),
+      sortOrder: z.enum(REVIEW_SORT_ORDERS).optional(),
+      fileTreeViewMode: z.enum(REVIEW_FILE_TREE_VIEW_MODES).optional(),
+      showRead: z.boolean().optional(),
     })
     .optional(),
 });

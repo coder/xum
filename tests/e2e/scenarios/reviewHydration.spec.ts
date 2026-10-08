@@ -1,12 +1,12 @@
 import { type Page } from "@playwright/test";
 import { electronExpect as expect, electronTest as test } from "../electronTest";
-import { REVIEW_SORT_ORDER_KEY } from "../../../src/common/constants/storage";
 import { STORAGE_KEYS } from "../../../src/constants/workspaceDefaults";
 import {
   disableReviewTutorial,
   seedLargeReviewSingleFileDiff,
   seedReviewHydrationJumpDiff,
   seedReviewMarkReadIterationDiff,
+  setReviewPreferences,
 } from "../utils/reviewPerfFixture";
 
 test.skip(
@@ -41,18 +41,13 @@ async function primeReviewForHeadDiff(
 ): Promise<void> {
   const reviewDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspaceId);
 
-  await page.evaluate(
-    ({ diffBaseKey, sortOrderKey, showReadHunks }) => {
-      window.localStorage.setItem(diffBaseKey, JSON.stringify("HEAD"));
-      window.localStorage.setItem("review-show-read", JSON.stringify(showReadHunks));
-      window.localStorage.setItem(sortOrderKey, JSON.stringify("file-order"));
-    },
-    {
-      diffBaseKey: reviewDiffBaseKey,
-      sortOrderKey: REVIEW_SORT_ORDER_KEY,
-      showReadHunks: options.showReadHunks ?? true,
-    }
-  );
+  await page.evaluate((diffBaseKey) => {
+    window.localStorage.setItem(diffBaseKey, JSON.stringify("HEAD"));
+  }, reviewDiffBaseKey);
+  await setReviewPreferences(page, {
+    showRead: options.showReadHunks ?? true,
+    sortOrder: "file-order",
+  });
 }
 
 async function startHydrationSampler(

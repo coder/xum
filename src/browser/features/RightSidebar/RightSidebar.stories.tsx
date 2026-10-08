@@ -32,7 +32,7 @@ import { createAssistantMessage, createUserMessage } from "@/browser/stories/moc
 import type { MockSessionUsage } from "@/browser/stories/mocks/orpc";
 import { blurActiveElement } from "@/browser/stories/storyPlayHelpers";
 import { setupSimpleChatStory, setupStreamingChatStory } from "@/browser/stories/helpers/chatSetup";
-import { setHunkFirstSeen, setReviewSortOrder } from "@/browser/stories/helpers/reviews";
+import { setHunkFirstSeen } from "@/browser/stories/helpers/reviews";
 import { expandRightSidebar } from "@/browser/stories/helpers/uiState";
 import {
   RIGHT_SIDEBAR_TAB_KEY,
@@ -645,12 +645,10 @@ export const ReviewTabSortByLastEdit: Story = {
           [HUNK_IDS.client]: now - 5 * 60 * 1000,
         });
 
-        // Set sort order to "last-edit"
-        setReviewSortOrder("last-edit");
-
         const client = setupSimpleChatStory({
           workspaceId,
           workspaceName: "feature/sorting",
+          userPreferences: { review: { sortOrder: "last-edit" } },
           projectName: "my-app",
           messages: [
             createUserMessage("msg-1", "Add utilities and refactor button", { historySequence: 1 }),
@@ -721,12 +719,10 @@ export const ReviewTabSortByFileOrder: Story = {
         const workspaceId = "ws-review-file-order";
         localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
 
-        // Set sort order to "file-order" (default)
-        setReviewSortOrder("file-order");
-
         const client = setupSimpleChatStory({
           workspaceId,
           workspaceName: "feature/file-order",
+          userPreferences: { review: { sortOrder: "file-order" } },
           projectName: "my-app",
           messages: [
             createUserMessage("msg-1", "Make some changes", { historySequence: 1 }),

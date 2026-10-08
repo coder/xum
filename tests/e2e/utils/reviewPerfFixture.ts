@@ -3,6 +3,7 @@ import path from "path";
 import { spawnSync } from "child_process";
 import { type Page } from "@playwright/test";
 import { TUTORIAL_STATE_KEY } from "../../../src/common/constants/storage";
+import type { UserPreferences } from "../../../src/common/config/schemas/userPreferences";
 
 export const LARGE_CHANGE_ROOT = "src/review/perf-large-change";
 const LARGE_CHANGE_GROUP_COUNT = 20;
@@ -121,6 +122,19 @@ function buildLargeReviewSingleFileSource(
 
 function countGitDiffHunks(diffOutput: string): number {
   return diffOutput.split("\n").filter((line) => line.startsWith("@@ ")).length;
+}
+
+/** Writes review preferences through the backend into the test root's config.json. */
+export async function setReviewPreferences(
+  page: Page,
+  review: NonNullable<UserPreferences["review"]>
+): Promise<void> {
+  await page.waitForFunction(() => Boolean(window.__ORPC_CLIENT__));
+  await page.evaluate(async (patch) => {
+    const api = window.__ORPC_CLIENT__;
+    if (!api) throw new Error("E2E API client not initialized");
+    await api.config.updateUserPreferences({ patches: [{ review: patch }] });
+  }, review);
 }
 
 export async function disableReviewTutorial(page: Page): Promise<void> {
