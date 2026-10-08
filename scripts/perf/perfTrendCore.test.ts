@@ -153,6 +153,8 @@ describe("evaluateTrend", () => {
       all.push(reportNight(info, [[TYPING, "expected", 1]], [summary(0, 0.1)]));
     }
     expect(statusOf(all, "scriptMs")).toBe("no-baseline");
+    // Their summaries were usable: the values are contract gaps, not a broken night.
+    expect(all.at(-1)?.issue).toBeUndefined();
   });
 
   test("report-only metrics get a baseline but never regress or watch", () => {
@@ -170,13 +172,20 @@ describe("evaluateTrend", () => {
   });
 
   test("malformed nights fail loudly instead of reading as ok or empty", () => {
-    expect(() => evaluate(nights({ scriptMs: [NaN, 100, 100, 100, 100, 100, 100, 100] }))).toThrow(
-      "values must be finite"
-    );
+    for (const bad of [NaN, -5]) {
+      expect(() => evaluate(nights({ scriptMs: [bad, 100, 100, 100, 100, 100, 100] }))).toThrow(
+        "values must be finite and non-negative"
+      );
+    }
     const report = buildReport({ perfResult: "success", artifactFound: true, reads: [] });
-    expect(() => nightFromReport(run(0, { createdAt: "bad" }), report)).toThrow(
-      "invalid createdAt"
-    );
+    for (const createdAt of ["bad", "0", "2099-13-01T04:00:00Z"]) {
+      expect(() => nightFromReport(run(0, { createdAt }), report)).toThrow("invalid createdAt");
+    }
+    for (const repeated of [1, 0]) {
+      const all = nights({ scriptMs: [100, 100, 100] });
+      all[2].run.databaseId = all[repeated].run.databaseId;
+      expect(() => evaluate(all)).toThrow("a run fills two slots");
+    }
   });
 });
 
@@ -192,9 +201,12 @@ describe("selectHistory", () => {
       run(0, { databaseId: 3, status: "in_progress", createdAt: half }),
       run(0, { databaseId: 4 }),
       run(-1),
+      // Copies of slot 1's run: ineligible, older, and repeated. Only the newest eligible counts.
+      run(1, { status: "in_progress" }),
+      run(1, { createdAt: new Date(BASE - 25 * DAY).toISOString() }),
       run(1),
     ];
-    const selected = selectHistory(run(0), [...others, ...valid].reverse());
+    const selected = selectHistory(run(0), [...others, ...[...valid].reverse()]);
     expect(ids(selected)).toEqual(ids(valid.slice(0, 16)));
   });
 

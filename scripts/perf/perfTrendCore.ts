@@ -19,6 +19,14 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(`perfTrendCore: ${message}`);
 }
 
+/** `gh` prints UTC ISO times. Date.parse alone also accepts strings such as "0". */
+function timeOf(createdAt: string): number {
+  const time = Date.parse(createdAt);
+  const iso = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/.test(createdAt);
+  assert(iso && Number.isFinite(time), "invalid createdAt");
+  return time;
+}
+
 export type TrendMetricId = MetricId | MilestoneId;
 export type TrendMetric = { id: TrendMetricId; label: string; decimals: number };
 export type Values = Partial<Record<TrendMetricId, number>>;
@@ -93,14 +101,14 @@ export interface Night {
  * history; a dispatch current run is compared like a nightly (and rendered as a preview).
  */
 export function selectHistory(current: RunInfo, runs: readonly RunInfo[]): RunInfo[] {
-  const now = Date.parse(current.createdAt);
-  assert(Number.isFinite(now), "current run has an invalid createdAt");
-  const time = (run: RunInfo) => Date.parse(run.createdAt);
-  // Overlapping listing pages can repeat a run; one run must never fill two slots.
+  const now = timeOf(current.createdAt);
+  const time = (run: RunInfo) => timeOf(run.createdAt);
+  // Overlapping listing pages can repeat a run; one run must never fill two slots. Dedupe after
+  // filtering and sorting, so the newest eligible copy wins.
+  const seen = new Set<number>();
   return runs
     .filter(
-      (run, index) =>
-        runs.findIndex((other) => other.databaseId === run.databaseId) === index &&
+      (run) =>
         run.event === "schedule" &&
         run.headBranch === "main" &&
         run.status === "completed" &&
@@ -109,19 +117,22 @@ export function selectHistory(current: RunInfo, runs: readonly RunInfo[]): RunIn
         time(run) >= EARLIEST_START
     )
     .sort((a, b) => time(b) - time(a))
+    .filter((run) => !seen.has(run.databaseId) && seen.add(run.databaseId))
     .slice(0, HISTORY_NIGHTS);
 }
 
 /** Uses only `buildReport` rows, so every value comes from its test's final attempt. */
 export function nightFromReport(run: RunInfo, report: Report): Night {
-  const created = Date.parse(run.createdAt);
-  assert(Number.isFinite(created), "run has an invalid createdAt");
+  const created = timeOf(run.createdAt);
   const scenarios: Night["scenarios"] = {};
+  // A usable summary from before a metric's contract start is a gap, not "no usable summary".
+  let usable = false;
   // Chat-switch rows carry labels only; their per-leg metrics are deferred (#4442).
   for (const row of report.rows.filter((entry) => !entry.chatSwitch)) {
     for (const scenario of row.scenarios) {
       const all: Values = { ...scenario.values, ...scenario.milestones?.values };
       const kept: Values = {};
+      usable ||= Object.keys(all).length > 0;
       for (const { id } of TREND_METRICS) {
         if (all[id] !== undefined && created >= Date.parse(CONTRACT_START[id])) kept[id] = all[id];
       }
@@ -129,10 +140,9 @@ export function nightFromReport(run: RunInfo, report: Report): Night {
     }
   }
   const keys = report.problems.map((problem) => problem.key);
-  const hasValues = Object.values(scenarios).some((values) => Object.keys(values).length > 0);
   const issue: NightIssue | undefined = keys.includes("artifact:missing")
     ? "artifact missing or expired"
-    : !hasValues
+    : !usable
       ? "no usable summary"
       : keys.some((key) => key.startsWith("summary-invalid:"))
         ? "unusable summary"
@@ -189,14 +199,16 @@ function evaluateSeries(
 export function evaluateTrend(current: Night, history: readonly Night[]): SeriesTrend[] {
   const nights = [current, ...history];
   assert(history.length <= HISTORY_NIGHTS, "too many history nights");
+  const ids = new Set(nights.map((night) => night.run.databaseId));
+  assert(ids.size === nights.length, "a run fills two slots");
   nights.forEach((night, slot) => {
     assert(Number.isSafeInteger(night.run.databaseId), "invalid run id");
-    const time = Date.parse(night.run.createdAt);
-    const newer = slot === 0 ? Infinity : Date.parse(nights[slot - 1].run.createdAt);
-    assert(Number.isFinite(time) && time < newer, "nights must be valid and newest first");
+    const newer = slot === 0 ? Infinity : timeOf(nights[slot - 1].run.createdAt);
+    assert(timeOf(night.run.createdAt) < newer, "nights must be newest first");
     for (const values of Object.values(night.scenarios)) {
-      const finite = (value?: number) => value === undefined || Number.isFinite(value);
-      assert(Object.values(values).every(finite), "values must be finite");
+      const valid = (value?: number) =>
+        value === undefined || (Number.isFinite(value) && value >= 0);
+      assert(Object.values(values).every(valid), "values must be finite and non-negative");
     }
   });
   const labels = [...new Set(nights.flatMap((night) => Object.keys(night.scenarios)))].sort();
