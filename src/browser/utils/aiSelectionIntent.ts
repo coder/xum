@@ -409,8 +409,8 @@ export function copyPendingAiSelection(sourceWorkspaceId: string, destWorkspaceI
   notify();
 }
 
-/** Test-only: forget all pending picks and metadata. */
-export function resetAiSelectionIntentForTests(): void {
+/** Forgets all pending picks and metadata: another server can reuse a workspace ID. */
+export function clearAiSelectionState(): void {
   pendingByScope.clear();
   pendingAgentByWorkspace.clear();
   pendingAutoRoutingByScope.clear();
@@ -418,3 +418,5 @@ export function resetAiSelectionIntentForTests(): void {
   agentBasesByScope.clear();
   notify();
 }
+
+export const resetAiSelectionIntentForTests = clearAiSelectionState;
