@@ -8,6 +8,7 @@ import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
+  setAgentBases,
   setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
 import {
@@ -124,6 +125,24 @@ describe("getWorkspaceAiSelection", () => {
         reasoningMode: testCase.reasoning,
       });
     }
+  });
+
+  test("a custom agent resolves its base agent's defaults from the loaded agent list", () => {
+    getAppConfigStore().updateOptimistically({
+      defaultModel: "openai:global",
+      agentAiDefaults: { exec: { modelString: "openai:configured", thinkingLevel: "high" } },
+    });
+    setWorkspaceAiMetadata(WS, {
+      projectPath: PROJECT,
+      aiSettings: undefined,
+      aiSettingsByAgent: undefined,
+    });
+    setAgentBases(WS, [{ id: "exec" }, { id: "reviewer", base: "exec" }]);
+
+    expect(getWorkspaceAiSelection(WS, "reviewer")).toMatchObject({
+      model: "openai:configured",
+      thinkingLevel: "high",
+    });
   });
 
   test("the hook follows a default model that loads after it rendered", () => {

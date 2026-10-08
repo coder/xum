@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { normalizeModelPreference } from "@/browser/utils/messages/buildSendMessageOptions";
 import {
+  getAgentBases,
   getAiSelectionVersion,
   getPendingAiSelection,
   getWorkspaceAiMetadata,
@@ -59,7 +60,7 @@ function resolveWorkspaceAiSelection(input: WorkspaceAiSelectionInput): Workspac
   const configured = resolveConfiguredAiDefaults(
     agentId,
     input.agentAiDefaults,
-    input.agentBaseById
+    input.agentBaseById ?? getAgentBases(input.workspaceId)
   );
   const project =
     metadata?.projectPath != null ? input.ai?.projectDefaults?.[metadata.projectPath] : undefined;

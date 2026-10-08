@@ -34,6 +34,7 @@ export type WorkspaceAiMetadata = Pick<
 
 const pendingByScope = new Map<string, Partial<Record<AiSelectionField, PendingSelection>>>();
 const metadataByWorkspace = new Map<string, WorkspaceAiMetadata>();
+const agentBasesByScope = new Map<string, ReadonlyMap<string, string | undefined>>();
 const listeners = new Set<() => void>();
 let nextToken = 1;
 let version = 0;
@@ -61,6 +62,27 @@ export function setWorkspaceAiMetadata(workspaceId: string, metadata: WorkspaceA
 
 export function getWorkspaceAiMetadata(workspaceId: string): WorkspaceAiMetadata | undefined {
   return metadataByWorkspace.get(workspaceId);
+}
+
+/**
+ * Agent id -> base id of the agents loaded for a workspace or creation scope, so readers outside
+ * the agent context still resolve a custom agent's inherited defaults.
+ */
+export function setAgentBases(
+  scopeId: string,
+  agents: ReadonlyArray<{ id: string; base?: string }>
+): void {
+  const bases = new Map(agents.map((agent) => [agent.id, agent.base]));
+  const previous = agentBasesByScope.get(scopeId);
+  if (previous != null && JSON.stringify([...previous]) === JSON.stringify([...bases])) return;
+  agentBasesByScope.set(scopeId, bases);
+  notify();
+}
+
+export function getAgentBases(
+  scopeId: string
+): ReadonlyMap<string, string | undefined> | undefined {
+  return agentBasesByScope.get(scopeId);
 }
 
 function normalizeAgent(agentId: string): string {
@@ -215,5 +237,6 @@ export function dropPendingModelPicks(shouldDrop: (model: string) => boolean): v
 export function resetAiSelectionIntentForTests(): void {
   pendingByScope.clear();
   metadataByWorkspace.clear();
+  agentBasesByScope.clear();
   notify();
 }
