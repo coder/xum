@@ -499,6 +499,65 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     });
   });
 
+  const saveWithAutoChoices = () =>
+    saveWorkspaces(harness.config, projectPath, [
+      {
+        id: "ws",
+        path: workspacePath,
+        name: "ws",
+        aiSettingsByAgent: {
+          exec: {
+            model: "openai:gpt-4o-mini",
+            thinkingLevel: "off",
+            autoModelRouting: true,
+            autoThinkingLevel: true,
+          },
+        },
+      },
+    ]);
+
+  test.each([
+    [{}, {}],
+    // A plan handoff runs its send without Auto but keeps the agent's Auto choices.
+    [{ savedAutoRouting: { model: true, thinkingLevel: false } }, { autoModelRouting: true }],
+    [{ autoModelRouting: true, savedAutoRouting: { model: false, thinkingLevel: false } }, {}],
+  ])("a send saves the Auto choices it carries: %j", async (sendFlags, savedFlags) => {
+    await saveWithAutoChoices();
+    const svc = workspaceService as unknown as {
+      maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
+    };
+
+    await svc.maybePersistAISettingsFromOptions("ws", {
+      agentId: "exec",
+      model: "openai:gpt-4o-mini",
+      thinkingLevel: "off",
+      ...sendFlags,
+    });
+
+    expect(readEntry()?.aiSettingsByAgent?.exec).toEqual({
+      model: "openai:gpt-4o-mini",
+      thinkingLevel: "off",
+      ...savedFlags,
+    });
+  });
+
+  test("a picker update keeps the saved Auto choices", async () => {
+    await saveWithAutoChoices();
+
+    const result = await workspaceService.updateAgentAISettings("ws", "exec", {
+      model: "openai:gpt-5.2",
+      thinkingLevel: "high",
+    });
+
+    expect(result.success).toBe(true);
+    expect(readEntry()?.aiSettingsByAgent?.exec).toEqual({
+      model: "openai:gpt-5.2",
+      thinkingLevel: "high",
+      autoModelRouting: true,
+      autoThinkingLevel: true,
+    });
+  });
+
   test("persists AI settings for sub-agent workspaces so auto-resume can use latest model", async () => {
     interface WorkspaceServiceTestAccess {
       maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
