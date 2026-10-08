@@ -11,6 +11,7 @@ import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import type { ProviderName } from "@/common/constants/providers";
 import { WORDS_TO_TOKENS_RATIO } from "@/common/constants/ui";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
@@ -90,6 +91,7 @@ function fakeAiService(
   model: MockLanguageModelV3 | null,
   opts?: {
     onCreateModel?: (modelString: string) => void;
+    routeProvider?: ProviderName;
     workspaceModel?: string | null;
     /** Full metadata override for getWorkspaceMetadata (wins over workspaceModel). */
     metadata?: SideChannelMetadata;
@@ -101,13 +103,24 @@ function fakeAiService(
   const workspaceModel =
     opts?.workspaceModel === undefined ? "anthropic:claude-haiku-4-5" : opts.workspaceModel;
   return {
-    createModelWithPinnedMetadata: ((modelString: string) => {
+    createModelWithPinnedOptions: ((modelString: string) => {
       opts?.onCreateModel?.(modelString);
       if (!model) {
         return Promise.resolve(Err({ type: "api_key_not_found" as const, provider: "anthropic" }));
       }
-      return Promise.resolve(Ok({ model, metadataModel: modelString }));
-    }) as BranchSummaryAiService["createModelWithPinnedMetadata"],
+      return Promise.resolve(
+        Ok({
+          model,
+          metadataModel: modelString,
+          effectiveModelString: modelString,
+          wireProviderName: opts?.routeProvider ?? modelString.split(":", 1)[0],
+          optionsModelString: modelString,
+          optionsProvidersConfig: {},
+          optionsMuxProviderOptions: {},
+          optionsRouteProvider: opts?.routeProvider,
+        })
+      );
+    }) as BranchSummaryAiService["createModelWithPinnedOptions"],
     getWorkspaceMetadata: (() =>
       Promise.resolve(
         opts?.metadata !== undefined
@@ -617,6 +630,58 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     }
   });
 
+  // Bedrock and OpenRouter ignore the anthropic namespace, so disabled thinking must
+  // be serialized for the route the candidate was created on.
+  test.each([
+    [
+      "bedrock",
+      {
+        bedrock: {
+          additionalModelRequestFields: {
+            thinking: { type: "disabled" },
+            output_config: { effort: "low" },
+          },
+        },
+      },
+    ],
+    ["openrouter", { openrouter: { reasoning: { effort: "none" } } }],
+  ] as const)(
+    "Haiku 5.5 gets disabled thinking on the %s route",
+    async (routeProvider, expected) => {
+      const { historyService, cleanup } = await createTestHistoryService();
+      try {
+        const sentProviderOptions: unknown[] = [];
+        const model = new MockLanguageModelV3({
+          doStream: (options: LanguageModelV3CallOptions) => {
+            sentProviderOptions.push(options.providerOptions);
+            return Promise.resolve({
+              stream: simulateReadableStream({
+                chunks: [
+                  { type: "text-start", id: "t1" },
+                  { type: "text-delta", id: "t1", delta: "Summarized the branch." },
+                  { type: "text-end", id: "t1" },
+                  finishChunk(),
+                ] satisfies LanguageModelV3StreamPart[],
+              }),
+            });
+          },
+        });
+        const workspaceModel = "anthropic:claude-haiku-5-5";
+        const appended = await maybeAppendAbandonedBranchSummary({
+          historyService,
+          aiService: fakeAiService(model, { workspaceModel, routeProvider }),
+          workspaceId: `ws-${routeProvider}`,
+          abandonedMessages: meatyExchange(workspaceModel),
+          isExperimentEnabled: RLM_ON,
+        });
+        expect(appended).not.toBeNull();
+        expect(sentProviderOptions).toEqual([expected]);
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+
   test("explicit caller-resolved candidates bypass the target workspace's empty metadata", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
@@ -943,7 +1008,7 @@ describe("maybeAppendAbandonedBranchSummary", () => {
       // and workspace removal waits forever on the background drain.
       const base = fakeAiService(null);
       const wedgedCreation: BranchSummaryAiService = {
-        createModelWithPinnedMetadata: () => new Promise<never>(() => undefined),
+        createModelWithPinnedOptions: () => new Promise<never>(() => undefined),
         getWorkspaceMetadata: base.getWorkspaceMetadata,
       };
       const startedAt = Date.now();
@@ -1486,10 +1551,10 @@ describe("branch summary placement on fork/truncate flows", () => {
       });
       const model = summaryModel("The abandoned branch context both requests need.");
       const gatedAiService: BranchSummaryAiService = {
-        createModelWithPinnedMetadata: (async (...createArgs) => {
+        createModelWithPinnedOptions: (async (...createArgs) => {
           await modelGate;
-          return fakeAiService(model).createModelWithPinnedMetadata(...createArgs);
-        }) as BranchSummaryAiService["createModelWithPinnedMetadata"],
+          return fakeAiService(model).createModelWithPinnedOptions(...createArgs);
+        }) as BranchSummaryAiService["createModelWithPinnedOptions"],
         getWorkspaceMetadata: fakeAiService(model).getWorkspaceMetadata,
       };
       await startAbandonedBranchSummaryInBackground({
@@ -1634,10 +1699,10 @@ describe("branch summary placement on fork/truncate flows", () => {
       });
       const model = summaryModel("A summary that must never land after removal.");
       const gatedAiService: BranchSummaryAiService = {
-        createModelWithPinnedMetadata: (async (...createArgs) => {
+        createModelWithPinnedOptions: (async (...createArgs) => {
           await modelGate;
-          return fakeAiService(model).createModelWithPinnedMetadata(...createArgs);
-        }) as BranchSummaryAiService["createModelWithPinnedMetadata"],
+          return fakeAiService(model).createModelWithPinnedOptions(...createArgs);
+        }) as BranchSummaryAiService["createModelWithPinnedOptions"],
         getWorkspaceMetadata: fakeAiService(model).getWorkspaceMetadata,
       };
 
