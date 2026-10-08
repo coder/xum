@@ -25,17 +25,32 @@ import type { ReviewNoteData } from "@/common/types/review";
 import { EDIT_HISTORY_CHANGED_MESSAGE } from "@/constants/transcriptBarrier";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { Err } from "@/common/types/result";
+import { joinDraftText } from "@/common/utils/composerDraftText";
 import { detectDefaultTrunkBranch } from "@/node/git";
 import { generateBranchName } from "../../ipc/helpers";
 import { preloadTestModules } from "../../ipc/setup";
-import { createAppHarness, type AppHarness } from "../harness";
+import { ChatHarness, createAppHarness, type AppHarness } from "../harness";
 
 const LOAD_TOLERANT_WAIT = { timeout: 30_000 };
 
-async function startEditWithUnsentDraft(app: AppHarness, scope: DraftScope) {
+/**
+ * The mock's reply to `text`. It echoes the sent text, with its one note formatted in front,
+ * so a reply to a message with a note is matched within that one reply.
+ */
+const mockReply = (text: string, withNote: boolean) =>
+  withNote
+    ? new RegExp(`Mock response: <review>[^<]*</review>\\s*${text}`)
+    : `Mock response: ${text}`;
+
+/** `rowNote`: a review note sent with the edited row, so the edit opens with it. */
+async function startEditWithUnsentDraft(app: AppHarness, scope: DraftScope, rowNote?: string) {
+  if (rowNote) {
+    await attachStoreReview(app, "review-row", rowNote);
+    await waitFor(() => expect(composerText(app)).toContain(rowNote), LOAD_TOLERANT_WAIT);
+  }
   await app.chat.send("first message");
   await app.chat.expectTranscriptContains(
-    "Mock response: first message",
+    mockReply("first message", rowNote !== undefined),
     LOAD_TOLERANT_WAIT.timeout
   );
   await app.chat.expectStreamComplete();
@@ -188,8 +203,11 @@ describe("Completing an edit of an older message", () => {
       // Typing in the edit writes only the memory buffer, never the persisted draft store.
       const setText = jest.spyOn(getDraftStore(), "setText");
       const setAttachments = jest.spyOn(getDraftStore(), "setAttachments");
-      typeIntoEdit(textarea, "edited before reload");
-      await waitFor(() => expect(textarea.value).toBe("edited before reload"));
+      // Several keystrokes, as a user types: none of them reaches the draft store.
+      for (const typed of ["e", "ed", "edi", "edit", "edited before reload"]) {
+        typeIntoEdit(textarea, typed);
+        await waitFor(() => expect(textarea.value).toBe(typed));
+      }
       expect(setText).not.toHaveBeenCalled();
       expect(setAttachments).not.toHaveBeenCalled();
       setText.mockRestore();
@@ -202,178 +220,6 @@ describe("Completing an edit of an older message", () => {
       expect(saved.attachments.map(({ id }) => id)).toEqual(["file-unsent"]);
     } finally {
       reloaded?.setClient(null);
-      await app.dispose();
-    }
-  }, 120_000);
-
-  // A workspace switch remounts the composer while ChatPane keeps the edit open: the edit's
-  // typed text and attachment changes must survive it, in memory only (#5808). An edit cannot
-  // add attachments, so its attachment change is removing one of the message's files.
-  test("an open edit keeps its typed text and attachments across a workspace switch", async () => {
-    const app = await createAppHarness({ branchPrefix: "edit-survives-switch" });
-    try {
-      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
-      const fileInput = await waitFor(() => {
-        const element = app.view.container.querySelector<HTMLInputElement>(
-          '[data-component="ChatInputSection"] input[type="file"]'
-        );
-        if (!element) throw new Error("File input not found");
-        return element;
-      }, LOAD_TOLERANT_WAIT);
-      fireEvent.change(fileInput, {
-        target: {
-          files: [
-            new File(["# kept"], "edit-kept.md", { type: "text/markdown" }),
-            new File(["# removed"], "edit-removed.md", { type: "text/markdown" }),
-          ],
-        },
-      });
-      await waitFor(() => {
-        expect(composerText(app)).toContain("edit-kept.md");
-        expect(composerText(app)).toContain("edit-removed.md");
-      }, LOAD_TOLERANT_WAIT);
-      const textarea = await startEditWithUnsentDraft(app, scope);
-      await waitFor(
-        () => expect(composerText(app)).toContain("edit-removed.md"),
-        LOAD_TOLERANT_WAIT
-      );
-      typeIntoEdit(textarea, "edited before switch");
-      await waitFor(() => expect(textarea.value).toBe("edited before switch"));
-      const removeButton = [
-        ...app.view.container.querySelectorAll<HTMLButtonElement>(
-          '[data-component="ChatInputSection"] button[aria-label="Remove attachment"]'
-        ),
-      ].find((button) => button.parentElement?.textContent?.includes("edit-removed.md"));
-      if (!removeButton) throw new Error("Remove button of edit-removed.md not found");
-      fireEvent.click(removeButton);
-      await waitFor(
-        () => expect(composerText(app)).not.toContain("edit-removed.md"),
-        LOAD_TOLERANT_WAIT
-      );
-
-      const created = await app.env.orpc.workspace.create({
-        projectPath: app.repoPath,
-        branchName: generateBranchName("edit-survives-switch-other"),
-        trunkBranch: await detectDefaultTrunkBranch(app.repoPath),
-      });
-      if (!created.success) throw new Error(created.error);
-      workspaceStore.addWorkspace(created.metadata);
-      await showWorkspace(app, created.metadata.id, created.metadata.name);
-      await showWorkspace(app, app.workspaceId, app.metadata.name);
-
-      await waitFor(
-        () => expect(editTextarea(app)?.value).toBe("edited before switch"),
-        LOAD_TOLERANT_WAIT
-      );
-      expect(composerText(app)).toContain("edit-kept.md");
-      expect(composerText(app)).not.toContain("edit-removed.md");
-      // The unsent draft never took the edit's text or files, in memory or on the backend.
-      expect(getDraftStore().getText(scope)).toBe("unsent draft");
-      expect(
-        getDraftStore()
-          .getView(scope)
-          .attachments.map(({ id }) => id)
-      ).toEqual(["file-unsent"]);
-      await getDraftStore().flush(scope);
-      const saved = await app.env.services.draftService.get(scope);
-      expect(saved.text).toBe("unsent draft");
-      expect(saved.attachments.map(({ id }) => id)).toEqual(["file-unsent"]);
-    } finally {
-      await app.dispose();
-    }
-  }, 120_000);
-
-  // A kept edit whose row goes while another workspace is shown ends on return, like any edit
-  // whose row is deleted: its text stays as a normal draft after the unsent draft.
-  test("a kept edit whose row is deleted while another workspace is shown ends on return", async () => {
-    const app = await createAppHarness({ branchPrefix: "edit-switch-row-deleted" });
-    try {
-      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
-      const textarea = await startEditWithUnsentDraft(app, scope);
-      typeIntoEdit(textarea, "edited message");
-      await waitFor(() => expect(textarea.value).toBe("edited message"));
-      const created = await app.env.orpc.workspace.create({
-        projectPath: app.repoPath,
-        branchName: generateBranchName("edit-switch-row-deleted-other"),
-        trunkBranch: await detectDefaultTrunkBranch(app.repoPath),
-      });
-      if (!created.success) throw new Error(created.error);
-      workspaceStore.addWorkspace(created.metadata);
-      await showWorkspace(app, created.metadata.id, created.metadata.name);
-
-      const cleared = await app.env.services.workspaceService.truncateHistory(app.workspaceId);
-      expect(cleared.success).toBe(true);
-      await showWorkspace(app, app.workspaceId, app.metadata.name);
-      await waitFor(() => expect(editTextarea(app)).toBeNull(), LOAD_TOLERANT_WAIT);
-      await expectEditKeptAsDraft(app, scope);
-    } finally {
-      await app.dispose();
-    }
-  }, 120_000);
-
-  // Back from another workspace, a windowed replay (#4961) can load only the newest rows: the
-  // kept edit's row is then older history, not gone, and the edit stays open (#5808). The store
-  // view below plays that replay: caught up, the row outside the window, older history left.
-  test("a kept edit whose row is outside the replayed window stays open on return", async () => {
-    const app = await createAppHarness({ branchPrefix: "edit-switch-row-windowed" });
-    // eslint-disable-next-line @typescript-eslint/unbound-method -- called below with the store as `this`
-    const realGetState = WorkspaceStore.prototype.getWorkspaceState;
-    const windowed = new WeakMap<WorkspaceState, WorkspaceState>();
-    let stateSpy: jest.SpyInstance | null = null;
-    try {
-      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
-      const textarea = await startEditWithUnsentDraft(app, scope);
-      typeIntoEdit(textarea, "edited before switch");
-      await waitFor(() => expect(textarea.value).toBe("edited before switch"));
-      const editedRow = useWorkspaceStoreRaw()
-        .getWorkspaceState(app.workspaceId)
-        .messages.find((row) => row.type === "user" && row.content === "first message");
-      const editedRowId = editedRow?.type === "user" ? editedRow.historyId : undefined;
-      expect(editedRowId).toBeDefined();
-      const created = await app.env.orpc.workspace.create({
-        projectPath: app.repoPath,
-        branchName: generateBranchName("edit-switch-row-windowed-other"),
-        trunkBranch: await detectDefaultTrunkBranch(app.repoPath),
-      });
-      if (!created.success) throw new Error(created.error);
-      workspaceStore.addWorkspace(created.metadata);
-      await showWorkspace(app, created.metadata.id, created.metadata.name);
-
-      stateSpy = jest
-        .spyOn(WorkspaceStore.prototype, "getWorkspaceState")
-        .mockImplementation(function (this: WorkspaceStore, workspaceId: string) {
-          const state = realGetState.call(this, workspaceId);
-          if (workspaceId !== app.workspaceId) return state;
-          // One view object per store state: useSyncExternalStore needs a stable snapshot.
-          let view = windowed.get(state);
-          if (!view) {
-            view = {
-              ...state,
-              hasOlderHistory: true,
-              messages: state.messages.filter(
-                (row) => !("historyId" in row) || row.historyId !== editedRowId
-              ),
-            };
-            windowed.set(state, view);
-          }
-          return view;
-        });
-      await showWorkspace(app, app.workspaceId, app.metadata.name);
-      await waitFor(
-        () =>
-          expect(
-            useWorkspaceStoreRaw().getWorkspaceState(app.workspaceId).isTranscriptCaughtUp
-          ).toBe(true),
-        LOAD_TOLERANT_WAIT
-      );
-      // Let the caught-up render run ChatPane's row check; the edit stays.
-      await act(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      });
-      expect(editTextarea(app)?.value).toBe("edited before switch");
-      expect(getDraftStore().getText(scope)).toBe("unsent draft");
-    } finally {
-      stateSpy?.mockRestore();
       await app.dispose();
     }
   }, 120_000);
@@ -1099,6 +945,750 @@ describe("Edit refused because history changed (B8)", () => {
       );
       sendSpy.mockRestore();
     } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+});
+
+/** A second workspace of the same project, known to the sidebar. */
+async function addOtherWorkspace(app: AppHarness, prefix: string) {
+  const created = await app.env.orpc.workspace.create({
+    projectPath: app.repoPath,
+    branchName: generateBranchName(prefix),
+    trunkBranch: await detectDefaultTrunkBranch(app.repoPath),
+  });
+  if (!created.success) throw new Error(created.error);
+  workspaceStore.addWorkspace(created.metadata);
+  return created.metadata;
+}
+
+/** Show `other`, then the harness workspace again: the composer of A unmounts and remounts. */
+async function switchAwayAndBack(app: AppHarness, other: { id: string; name: string }) {
+  await showWorkspace(app, other.id, other.name);
+  await showWorkspace(app, app.workspaceId, app.metadata.name);
+}
+
+/** The history id of the user row that shows `content`. */
+function userRowId(workspaceId: string, content: string) {
+  const row = useWorkspaceStoreRaw()
+    .getWorkspaceState(workspaceId)
+    .messages.find((message) => message.type === "user" && message.content === content);
+  const id = row?.type === "user" ? row.historyId : undefined;
+  if (!id) throw new Error(`No user row "${content}"`);
+  return id;
+}
+
+type SendSpy = jest.SpyInstance<
+  ReturnType<AppHarness["env"]["services"]["workspaceService"]["sendMessage"]>,
+  Parameters<AppHarness["env"]["services"]["workspaceService"]["sendMessage"]>
+>;
+
+/**
+ * Hold edit sends (requests with an `editMessageId`) before the backend sees them, until
+ * released; other sends go through. `refuse`: the held edit is then refused with this error.
+ * `replyOnly`: the backend takes the edit at once (its row is replaced) and only the reply waits.
+ */
+function holdEditSends(
+  app: AppHarness,
+  refuse?: { type: "history-changed" | "unknown" },
+  replyOnly = false
+) {
+  const workspaceService = app.env.services.workspaceService;
+  const realSend = workspaceService.sendMessage.bind(workspaceService);
+  let release: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const spy: SendSpy = jest
+    .spyOn(workspaceService, "sendMessage")
+    .mockImplementation(async (...args: Parameters<typeof realSend>) => {
+      if (args[2].editMessageId === undefined) return realSend(...args);
+      const reply = replyOnly ? await realSend(...args) : null;
+      await gate;
+      if (reply) return reply;
+      if (!refuse) return realSend(...args);
+      return refuse.type === "unknown"
+        ? Err({ type: "unknown", raw: "refused" })
+        : Err({ type: "history-changed" });
+    });
+  return { release, spy };
+}
+
+const editRequests = (spy: SendSpy, editId: string) =>
+  spy.mock.calls.filter(([, , options]) => options.editMessageId === editId).length;
+
+/** How many times `needle` occurs in `text`. */
+const occurrences = (text: string, needle: string) => text.split(needle).length - 1;
+
+/** How many notes in the composer's review panel show `note`. */
+const notesShowing = (app: AppHarness, note: string) =>
+  reviewPanelNotes(app).filter((text) => text.includes(note)).length;
+
+/** Send `text` with one attached note, and wait until its reply is complete. */
+async function sendWithNote(app: AppHarness, text: string, id: string, note: string) {
+  await attachStoreReview(app, id, note);
+  await waitFor(() => expect(composerText(app)).toContain(note), LOAD_TOLERANT_WAIT);
+  await app.chat.send(text);
+  await app.chat.expectTranscriptContains(mockReply(text, true), LOAD_TOLERANT_WAIT.timeout);
+  await app.chat.expectStreamComplete();
+}
+
+/**
+ * While an edit send is in flight, put a queued message (`text` with `note`) back into the
+ * composer with its Edit action: the note joins the composer's own note list during the send.
+ * The review panel hides while an edit send is in flight, so the restored text is the signal.
+ * `holdBusy`: the workspace is idle, so a held stream keeps it busy while `text` queues.
+ */
+async function restoreQueuedNoteDuringEditSend(
+  app: AppHarness,
+  text: string,
+  note: string,
+  holdBusy: boolean
+) {
+  const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+  const options = { model: "openai:gpt-5.2", agentId: "exec" } as const;
+  const holding = holdBusy
+    ? app.env.orpc.workspace.sendMessage({
+        workspaceId: app.workspaceId,
+        message: "[mock:wait-start] hold the workspace busy",
+        options,
+      })
+    : null;
+  await waitFor(() => expect(session.isBusy()).toBe(true), LOAD_TOLERANT_WAIT);
+  await app.env.orpc.workspace.sendMessage({
+    workspaceId: app.workspaceId,
+    message: text,
+    options: { ...options, muxMetadata: { type: "normal", reviews: [review(note)] } },
+  });
+  await waitFor(() => expect(session.hasQueuedMessages()).toBe(true), LOAD_TOLERANT_WAIT);
+  await editQueuedMessage(app);
+  await waitFor(() => {
+    const values = [
+      ...app.view.container.querySelectorAll<HTMLTextAreaElement>(
+        '[data-component="ChatInputSection"] textarea'
+      ),
+    ].map((textarea) => textarea.value);
+    expect(values.some((value) => value.includes(text))).toBe(true);
+  }, LOAD_TOLERANT_WAIT);
+  if (holding) {
+    app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+    await holding;
+    await app.chat.expectStreamComplete();
+  }
+}
+
+/** The composer's Send button. */
+const sendButton = (app: AppHarness) =>
+  app.view.container.querySelector<HTMLButtonElement>(
+    '[data-component="ChatInputSection"] button[aria-label="Send message"]'
+  );
+
+/**
+ * Serve the workspace's state through `view` (one view object per store state, as
+ * useSyncExternalStore needs a stable snapshot): a replay as the transcript shows it.
+ */
+function replayView(app: AppHarness, view: (state: WorkspaceState) => WorkspaceState) {
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called below with the store as `this`
+  const realGetState = WorkspaceStore.prototype.getWorkspaceState;
+  const views = new WeakMap<WorkspaceState, WorkspaceState>();
+  return jest.spyOn(WorkspaceStore.prototype, "getWorkspaceState").mockImplementation(function (
+    this: WorkspaceStore,
+    workspaceId: string
+  ) {
+    const state = realGetState.call(this, workspaceId);
+    if (workspaceId !== app.workspaceId) return state;
+    let shown = views.get(state);
+    if (!shown) {
+      shown = view(state);
+      views.set(state, shown);
+    }
+    return shown;
+  });
+}
+
+/** Re-render ChatPane with the store's current view, and let its effects run. */
+async function rerenderTranscript(app: AppHarness) {
+  await act(async () => {
+    useWorkspaceStoreRaw().bumpState(app.workspaceId);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  });
+}
+
+// A workspace switch remounts the composer (ChatPane keys it by workspace). The switch ends the
+// open edit, as on main, and the edit's text, files and notes move once into that workspace's
+// draft, after the unsent draft (#5808). No edit state survives a composer remount.
+describe("A workspace switch ends an open edit (#5808)", () => {
+  beforeAll(async () => {
+    await preloadTestModules();
+  });
+
+  test("an edit sent before a workspace switch is closed on return and is sent only once", async () => {
+    const app = await createAppHarness({ branchPrefix: "switch-edit-sent-once" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const other = await addOtherWorkspace(app, "switch-edit-sent-once-other");
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      const editId = userRowId(app.workspaceId, "first message");
+      const sends = holdEditSends(app);
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await waitFor(() => expect(editRequests(sends.spy, editId)).toBe(1), LOAD_TOLERANT_WAIT);
+
+      await switchAwayAndBack(app, other);
+      // No edit is open on return, so nothing can send the edit a second time.
+      expect(editTextarea(app)).toBeNull();
+      await app.chat.expectInputValue("unsent draft", LOAD_TOLERANT_WAIT.timeout);
+
+      sends.release();
+      await app.chat.expectTranscriptContains("edited message", LOAD_TOLERANT_WAIT.timeout);
+      await app.chat.expectStreamComplete();
+      expect(editRequests(sends.spy, editId)).toBe(1);
+      expect(editTextarea(app)).toBeNull();
+      await expectUnsentDraftKept(app, scope);
+      sends.spy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("an edit accepted after a workspace switch brings back only the pre-edit notes", async () => {
+    const app = await createAppHarness({ branchPrefix: "switch-edit-accepted-notes" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const other = await addOtherWorkspace(app, "switch-edit-accepted-notes-other");
+      await sendWithNote(app, "first message", "review-row", "row note");
+      // The pre-edit draft has its own note list (P).
+      await restoreQueuedMessageWithNote(app, scope, "pre-edit note");
+      await editRow(app, "first message");
+      await waitFor(() => expect(notesShowing(app, "row note")).toBe(1), LOAD_TOLERANT_WAIT);
+
+      const replies = holdEditSends(app, undefined, true);
+      await sendEdit(app, "[mock:wait-start] edited message", "first message");
+      // During the send a queued message with note R goes back into the composer.
+      await restoreQueuedNoteDuringEditSend(app, "second follow-up", "restored note", false);
+
+      // The edit is accepted after its composer unmounted.
+      await switchAwayAndBack(app, other);
+      replies.release();
+      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+      await app.chat.expectStreamComplete();
+      await waitFor(() => {
+        expect(notesShowing(app, "pre-edit note")).toBe(1);
+        expect(notesShowing(app, "restored note")).toBe(1);
+      }, LOAD_TOLERANT_WAIT);
+
+      // The next message carries P and R once each, and never the edit's own note.
+      await app.chat.send("final follow-up");
+      const sent = await waitFor(() => {
+        const call = replies.spy.mock.calls.find(([, message]) =>
+          message.endsWith("final follow-up")
+        );
+        if (!call) throw new Error("final follow-up not sent");
+        return call[1];
+      }, LOAD_TOLERANT_WAIT);
+      expect(occurrences(sent, "pre-edit note")).toBe(1);
+      expect(occurrences(sent, "restored note")).toBe(1);
+      expect(occurrences(sent, "row note")).toBe(0);
+      await app.chat.expectStreamComplete();
+      replies.spy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("an edit whose history-changed refresh failed ends on a switch, with its text after the unsent draft", async () => {
+    const app = await createAppHarness({ branchPrefix: "switch-edit-refresh-failed" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const other = await addOtherWorkspace(app, "switch-edit-refresh-failed-other");
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      const sendSpy = jest
+        .spyOn(app.env.services.workspaceService, "sendMessage")
+        .mockResolvedValueOnce(Err({ type: "history-changed" }));
+      const refreshSpy = jest
+        .spyOn(WorkspaceStore.prototype, "requestTranscriptRefresh")
+        .mockResolvedValue({ kind: "failed", error: "refresh unavailable" });
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await waitFor(
+        () => expect(composerText(app)).toContain("transcript refresh failed"),
+        LOAD_TOLERANT_WAIT
+      );
+
+      await switchAwayAndBack(app, other);
+      expect(editTextarea(app)).toBeNull();
+      expect(composerText(app)).not.toContain("refreshing transcript");
+      expect(composerText(app)).not.toContain("transcript refresh failed");
+      await waitFor(
+        () =>
+          expect(messageTextarea(app).value).toBe(joinDraftText("unsent draft", "edited message")),
+        LOAD_TOLERANT_WAIT
+      );
+      expect(getDraftStore().getText(scope)).toBe(messageTextarea(app).value);
+      await waitFor(() => expect(sendButton(app)?.disabled).toBe(false), LOAD_TOLERANT_WAIT);
+      refreshSpy.mockRestore();
+      sendSpy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // An edit cannot add files, so its file change is removing one of the message's files.
+  test("a workspace switch ends an open edit and keeps its text and files after the unsent draft, once", async () => {
+    const app = await createAppHarness({ branchPrefix: "switch-edit-moves-contents" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const other = await addOtherWorkspace(app, "switch-edit-moves-contents-other");
+      const fileInput = await waitFor(() => {
+        const element = app.view.container.querySelector<HTMLInputElement>(
+          '[data-component="ChatInputSection"] input[type="file"]'
+        );
+        if (!element) throw new Error("File input not found");
+        return element;
+      }, LOAD_TOLERANT_WAIT);
+      fireEvent.change(fileInput, {
+        target: {
+          files: [
+            new File(["# kept"], "edit-kept.md", { type: "text/markdown" }),
+            new File(["# removed"], "edit-removed.md", { type: "text/markdown" }),
+          ],
+        },
+      });
+      await waitFor(() => {
+        expect(composerText(app)).toContain("edit-kept.md");
+        expect(composerText(app)).toContain("edit-removed.md");
+      }, LOAD_TOLERANT_WAIT);
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      await waitFor(
+        () => expect(composerText(app)).toContain("edit-removed.md"),
+        LOAD_TOLERANT_WAIT
+      );
+      typeIntoEdit(textarea, "edited before switch");
+      await waitFor(() => expect(textarea.value).toBe("edited before switch"));
+      const removeButton = [
+        ...app.view.container.querySelectorAll<HTMLButtonElement>(
+          '[data-component="ChatInputSection"] button[aria-label="Remove attachment"]'
+        ),
+      ].find((button) => button.parentElement?.textContent?.includes("edit-removed.md"));
+      if (!removeButton) throw new Error("Remove button of edit-removed.md not found");
+      fireEvent.click(removeButton);
+      await waitFor(
+        () => expect(composerText(app)).not.toContain("edit-removed.md"),
+        LOAD_TOLERANT_WAIT
+      );
+
+      await switchAwayAndBack(app, other);
+      await switchAwayAndBack(app, other);
+      expect(editTextarea(app)).toBeNull();
+      const expected = joinDraftText("unsent draft", "edited before switch");
+      await waitFor(() => expect(messageTextarea(app).value).toBe(expected), LOAD_TOLERANT_WAIT);
+      const names = (attachments: { filename?: string; id: string }[]) =>
+        attachments.map((attachment) => attachment.filename ?? attachment.id);
+      expect(getDraftStore().getText(scope)).toBe(expected);
+      expect(names(getDraftStore().getView(scope).attachments)).toEqual([
+        "unsent.txt",
+        "edit-kept.md",
+      ]);
+      await getDraftStore().flush(scope);
+      const saved = await app.env.services.draftService.get(scope);
+      expect(saved.text).toBe(expected);
+      expect(saved.attachments).toHaveLength(2);
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("an edit refused after a workspace switch keeps its text, files and notes in that workspace's draft, once", async () => {
+    const app = await createAppHarness({ branchPrefix: "switch-edit-refused" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const other = await addOtherWorkspace(app, "switch-edit-refused-other");
+      const otherScope: DraftScope = { kind: "workspace", workspaceId: other.id };
+      await attachComposerFile(app, "edit-file.md");
+      const textarea = await startEditWithUnsentDraft(app, scope, "row note");
+      const sends = holdEditSends(app, { type: "history-changed" });
+      const refreshSpy = jest.spyOn(WorkspaceStore.prototype, "requestTranscriptRefresh");
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await waitFor(
+        () => expect(sends.spy.mock.calls.some(([, , o]) => o.editMessageId)).toBe(true),
+        LOAD_TOLERANT_WAIT
+      );
+      await restoreQueuedNoteDuringEditSend(app, "queued with note", "restored note", true);
+
+      // The refusal arrives while the other workspace is shown.
+      await showWorkspace(app, other.id, other.name);
+      sends.release();
+      await waitFor(
+        () => expect(getDraftStore().getText(scope)).toContain("edited message"),
+        LOAD_TOLERANT_WAIT
+      );
+      await showWorkspace(app, app.workspaceId, app.metadata.name);
+
+      expect(editTextarea(app)).toBeNull();
+      const expected = joinDraftText("unsent draft", "edited message", "queued with note");
+      await waitFor(() => expect(messageTextarea(app).value).toBe(expected), LOAD_TOLERANT_WAIT);
+      expect(getDraftStore().getText(scope)).toBe(expected);
+      const names = (attachments: { filename?: string; id: string }[]) =>
+        attachments.map((attachment) => attachment.filename ?? attachment.id);
+      expect(names(getDraftStore().getView(scope).attachments)).toEqual([
+        "unsent.txt",
+        "edit-file.md",
+      ]);
+      await waitFor(() => {
+        expect(notesShowing(app, "row note")).toBe(1);
+        expect(notesShowing(app, "restored note")).toBe(1);
+      }, LOAD_TOLERANT_WAIT);
+      expect(getDraftStore().getText(otherScope)).toBe("");
+      // The unmounted composer starts no transcript refresh for its dead edit.
+      expect(refreshSpy.mock.calls.filter(([id]) => id === app.workspaceId)).toHaveLength(0);
+      refreshSpy.mockRestore();
+      sends.spy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("a workspace switch moves an idle edit's notes to the attached notes, once", async () => {
+    const app = await createAppHarness({ branchPrefix: "switch-edit-moves-notes" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const other = await addOtherWorkspace(app, "switch-edit-moves-notes-other");
+      const textarea = await startEditWithUnsentDraft(app, scope, "row note");
+      await waitFor(() => expect(notesShowing(app, "row note")).toBe(1), LOAD_TOLERANT_WAIT);
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+
+      await switchAwayAndBack(app, other);
+      await switchAwayAndBack(app, other);
+      expect(editTextarea(app)).toBeNull();
+      await waitFor(() => expect(notesShowing(app, "row note")).toBe(1), LOAD_TOLERANT_WAIT);
+      expect(getDraftStore().getText(scope)).toBe(joinDraftText("unsent draft", "edited message"));
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // Main keeps one edit slot in ChatPane: a late cancel from A's unmounted composer would
+  // close the edit the user opened in B meanwhile.
+  test("an edit accepted after a switch does not close an edit opened in the other workspace", async () => {
+    const app = await createAppHarness({ branchPrefix: "switch-edit-keeps-other-edit" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const other = await addOtherWorkspace(app, "switch-edit-keeps-other-edit-other");
+      // Visit B first: it keeps cached rows, so ChatPane stays mounted across the switches.
+      await showWorkspace(app, other.id, other.name);
+      const otherChat = new ChatHarness(app.view.container, other.id);
+      await otherChat.send("other message");
+      await otherChat.expectTranscriptContains(
+        "Mock response: other message",
+        LOAD_TOLERANT_WAIT.timeout
+      );
+      await otherChat.expectStreamComplete();
+      await showWorkspace(app, app.workspaceId, app.metadata.name);
+
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      const editId = userRowId(app.workspaceId, "first message");
+      const sends = holdEditSends(app);
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await waitFor(() => expect(editRequests(sends.spy, editId)).toBe(1), LOAD_TOLERANT_WAIT);
+
+      await showWorkspace(app, other.id, other.name);
+      await editRow(app, "other message");
+      typeIntoEdit(editTextarea(app)!, "edited other message");
+      await waitFor(() => expect(editTextarea(app)?.value).toBe("edited other message"));
+
+      sends.release();
+      // Wait for A's held edit send to return, then for its completion to run.
+      await Promise.all(sends.spy.mock.results.map((result) => result.value as Promise<unknown>));
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      });
+      expect(editTextarea(app)?.value).toBe("edited other message");
+      sends.spy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("an editing /compact accepted after a switch never shows its command text in the draft", async () => {
+    const app = await createAppHarness({ branchPrefix: "switch-edit-compact" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const other = await addOtherWorkspace(app, "switch-edit-compact-other");
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      // Hold the compaction request: the command keeps its text in the edit until accepted.
+      const workspaceService = app.env.services.workspaceService;
+      const realSend = workspaceService.sendMessage.bind(workspaceService);
+      let releaseSend: () => void = () => undefined;
+      const sendGate = new Promise<void>((resolve) => {
+        releaseSend = resolve;
+      });
+      const sendSpy = jest
+        .spyOn(workspaceService, "sendMessage")
+        .mockImplementation(async (...args: Parameters<typeof realSend>) => {
+          await sendGate;
+          return realSend(...args);
+        });
+      typeIntoEdit(textarea, "/compact -t 500");
+      await waitFor(() => expect(textarea.value).toBe("/compact -t 500"));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await waitFor(() => expect(sendSpy).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
+
+      await switchAwayAndBack(app, other);
+      expect(editTextarea(app)).toBeNull();
+      expect(getDraftStore().getText(scope)).toBe("unsent draft");
+      releaseSend();
+      await app.chat.expectStreamComplete(60_000);
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      });
+      await expectUnsentDraftKept(app, scope);
+      sendSpy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("under StrictMode an accepted edit closes, and a switch moves an idle edit once", async () => {
+    const app = await createAppHarness({ branchPrefix: "switch-edit-strict", strictMode: true });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const other = await addOtherWorkspace(app, "switch-edit-strict-other");
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await app.chat.expectTranscriptContains("edited message", LOAD_TOLERANT_WAIT.timeout);
+      await app.chat.expectStreamComplete();
+      await waitFor(() => expect(editTextarea(app)).toBeNull(), LOAD_TOLERANT_WAIT);
+      await expectUnsentDraftKept(app, scope);
+
+      await editRow(app, "edited message");
+      typeIntoEdit(editTextarea(app)!, "edited again");
+      await waitFor(() => expect(editTextarea(app)?.value).toBe("edited again"));
+      await switchAwayAndBack(app, other);
+      expect(editTextarea(app)).toBeNull();
+      const expected = joinDraftText("unsent draft", "edited again");
+      await waitFor(() => expect(messageTextarea(app).value).toBe(expected), LOAD_TOLERANT_WAIT);
+      expect(getDraftStore().getText(scope)).toBe(expected);
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("an edit refused after its row was deleted keeps its text after the unsent draft, once", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-refused-row-deleted" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      const sends = holdEditSends(app, { type: "unknown" });
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await waitFor(
+        () => expect(sends.spy.mock.calls.some(([, , o]) => o.editMessageId)).toBe(true),
+        LOAD_TOLERANT_WAIT
+      );
+      const cleared = await app.env.services.workspaceService.truncateHistory(app.workspaceId);
+      expect(cleared.success).toBe(true);
+      await waitFor(() => expect(editTextarea(app)).toBeNull(), LOAD_TOLERANT_WAIT);
+
+      sends.release();
+      await expectEditKeptAsDraft(app, scope);
+      expect(getDraftStore().getText(scope)).toBe(joinDraftText("unsent draft", "edited message"));
+      sends.spy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("an edit whose row is deleted keeps its notes as attached notes after a switch", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-row-deleted-notes" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const other = await addOtherWorkspace(app, "edit-row-deleted-notes-other");
+      const textarea = await startEditWithUnsentDraft(app, scope, "row note");
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      const cleared = await app.env.services.workspaceService.truncateHistory(app.workspaceId);
+      expect(cleared.success).toBe(true);
+      await waitFor(() => expect(editTextarea(app)).toBeNull(), LOAD_TOLERANT_WAIT);
+      await expectEditKeptAsDraft(app, scope);
+
+      await switchAwayAndBack(app, other);
+      await switchAwayAndBack(app, other);
+      await waitFor(() => expect(notesShowing(app, "row note")).toBe(1), LOAD_TOLERANT_WAIT);
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("a second Edit with notes, then Cancel, shows the first edit's notes once", async () => {
+    const app = await createAppHarness({ branchPrefix: "second-edit-notes-cancel" });
+    try {
+      await sendWithNote(app, "earlier message", "review-earlier", "second row note");
+      await sendWithNote(app, "first message", "review-first", "first row note");
+      await editRow(app, "first message");
+      typeIntoEdit(editTextarea(app)!, "edited message");
+      await waitFor(() => expect(editTextarea(app)?.value).toBe("edited message"));
+
+      await editRow(app, "earlier message");
+      await waitFor(() => expect(notesShowing(app, "second row note")).toBe(1), LOAD_TOLERANT_WAIT);
+      fireEvent.keyDown(editTextarea(app)!, { key: "Escape" });
+      await waitFor(() => expect(editTextarea(app)).toBeNull(), LOAD_TOLERANT_WAIT);
+      await waitFor(() => expect(notesShowing(app, "first row note")).toBe(1), LOAD_TOLERANT_WAIT);
+      expect(notesShowing(app, "second row note")).toBe(0);
+
+      // The note is sent once, and then it is done: it does not stay attached.
+      const sendSpy = jest.spyOn(app.env.services.workspaceService, "sendMessage");
+      await app.chat.send("follow-up");
+      const sent = await waitFor(() => {
+        const call = sendSpy.mock.calls.find(([, message]) => message.endsWith("follow-up"));
+        if (!call) throw new Error("follow-up not sent");
+        return call[1];
+      }, LOAD_TOLERANT_WAIT);
+      expect(occurrences(sent, "first row note")).toBe(1);
+      await app.chat.expectStreamComplete();
+      await waitFor(() => expect(notesShowing(app, "first row note")).toBe(0), LOAD_TOLERANT_WAIT);
+      sendSpy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("an edit cancelled while its send is still preparing sends nothing", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-cancel-preparing" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      const sendSpy: SendSpy = jest.spyOn(app.env.services.workspaceService, "sendMessage");
+      const save = await holdNextSendBeforeClear(app);
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      const composer = app.view.container.querySelector<HTMLElement>(
+        '[data-component="ChatInputSection"]'
+      )!;
+      fireEvent.click(within(composer).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(editTextarea(app)).toBeNull(), LOAD_TOLERANT_WAIT);
+
+      save.release();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      });
+      expect(sendSpy.mock.calls.filter(([, , o]) => o.editMessageId)).toHaveLength(0);
+      // The send settled: Edit works again.
+      await waitFor(
+        () => expect(rowEditButton(app, "first message")?.disabled).toBe(false),
+        LOAD_TOLERANT_WAIT
+      );
+      await expectUnsentDraftKept(app, scope);
+      save.spy.mockRestore();
+      sendSpy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // A replay of the shown workspace can empty its rows while ChatPane stays mounted: an open
+  // edit must not close because its row is briefly missing.
+  test("an open edit stays open while its workspace replays and has not caught up", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-replay-not-caught-up" });
+    let stateSpy: jest.SpyInstance | null = null;
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      stateSpy = replayView(app, (state) => ({
+        ...state,
+        isTranscriptCaughtUp: false,
+        messages: [],
+      }));
+      await rerenderTranscript(app);
+      expect(editTextarea(app)?.value).toBe("edited message");
+      expect(getDraftStore().getText(scope)).toBe("unsent draft");
+    } finally {
+      stateSpy?.mockRestore();
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // A windowed replay (#4961) can load only the newest rows: the edit's row is then older
+  // history, not gone.
+  test("an open edit stays open when a replay leaves its row outside the window", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-replay-windowed" });
+    let stateSpy: jest.SpyInstance | null = null;
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      const editId = userRowId(app.workspaceId, "first message");
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      stateSpy = replayView(app, (state) => ({
+        ...state,
+        hasOlderHistory: true,
+        messages: state.messages.filter((row) => !("historyId" in row) || row.historyId !== editId),
+      }));
+      await rerenderTranscript(app);
+      expect(editTextarea(app)?.value).toBe("edited message");
+      expect(getDraftStore().getText(scope)).toBe("unsent draft");
+    } finally {
+      stateSpy?.mockRestore();
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // The switch, not the replay, decides: the edit ends even though the returning replay keeps
+  // its row in older history, and its text joins the draft once.
+  test("a workspace switch ends an open edit whose row a replay leaves outside the window", async () => {
+    const app = await createAppHarness({ branchPrefix: "switch-edit-row-windowed" });
+    let stateSpy: jest.SpyInstance | null = null;
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const other = await addOtherWorkspace(app, "switch-edit-row-windowed-other");
+      // Visit B first: ChatPane then stays mounted across the switches, and only the switch
+      // itself ends the edit.
+      await switchAwayAndBack(app, other);
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      const editId = userRowId(app.workspaceId, "first message");
+      typeIntoEdit(textarea, "edited before switch");
+      await waitFor(() => expect(textarea.value).toBe("edited before switch"));
+      await showWorkspace(app, other.id, other.name);
+      stateSpy = replayView(app, (state) => ({
+        ...state,
+        hasOlderHistory: true,
+        messages: state.messages.filter((row) => !("historyId" in row) || row.historyId !== editId),
+      }));
+      await showWorkspace(app, app.workspaceId, app.metadata.name);
+      await waitFor(
+        () =>
+          expect(
+            useWorkspaceStoreRaw().getWorkspaceState(app.workspaceId).isTranscriptCaughtUp
+          ).toBe(true),
+        LOAD_TOLERANT_WAIT
+      );
+      await rerenderTranscript(app);
+      expect(editTextarea(app)).toBeNull();
+      const expected = joinDraftText("unsent draft", "edited before switch");
+      await waitFor(() => expect(messageTextarea(app).value).toBe(expected), LOAD_TOLERANT_WAIT);
+      await switchAwayAndBack(app, other);
+      await rerenderTranscript(app);
+      expect(editTextarea(app)).toBeNull();
+      expect(getDraftStore().getText(scope)).toBe(expected);
+      expect(
+        getDraftStore()
+          .getView(scope)
+          .attachments.map(({ id }) => id)
+      ).toEqual(["file-unsent"]);
+    } finally {
+      stateSpy?.mockRestore();
       await app.dispose();
     }
   }, 120_000);
