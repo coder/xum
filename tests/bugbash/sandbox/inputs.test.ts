@@ -101,7 +101,9 @@ test("the container env passes only allowlisted names, and never a credential", 
     E2E_TELEMETRY_DISABLED: "1",
     BUGBASH_CONTAINER: "1",
   });
-  for (const name of ["OPENAI_BASE_URL", "API_KEY", "token", "GH_AUTH_TOKEN", "SECRET"])
+  // prettier-ignore
+  for (const name of ["OPENAI_BASE_URL", "API_KEY", "token", "GH_AUTH_TOKEN", "SECRET",
+    "AWS_SECRET_ACCESS_KEY", "GITHUB_PAT", "PRIVATE_KEY", "GOOGLE_APPLICATION_CREDENTIALS"])
     expect(() => containerEnv({}, { [name]: "x" })).toThrow("no credential");
   expect(containerEnv({}, { BUGBASH_CONTAINER: "0" }).BUGBASH_CONTAINER).toBe("1");
 });
