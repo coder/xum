@@ -127,7 +127,7 @@ describe("evaluateTrend", () => {
     const all = nights({ scriptMs: [200, undefined, 200, 200, 100, 100, 100, 100, 100] });
     const missing = buildReport({ perfResult: "failure", artifactFound: false, reads: [] });
     all[1] = nightFromReport(run(1), missing);
-    expect(all[1]).toMatchObject({ scenarios: {}, issue: "artifact missing or expired" });
+    expect(all[1]).toEqual({ run: run(1), scenarios: {}, issue: "artifact missing or expired" });
     expect(trendOf(all, "scriptMs")).toMatchObject({ status: "watch", above: 2 });
   });
 
@@ -139,11 +139,10 @@ describe("evaluateTrend", () => {
     ]);
   });
 
-  test("values come from each test's final attempt only", () => {
-    const flaky = reportNight(run(0), [[TYPING, "flaky", 2]], [summary(0, 0.9), summary(1, 0.4)]);
-    expect(flaky.scenarios["chat-typing"]?.scriptMs).toBe(400);
+  test("a final attempt without a summary is a gap, never an earlier attempt's values", () => {
+    // Which attempt buildReport keeps is owned by perfReport.test.ts; this pins the night it maps to.
     const failed = reportNight(run(0), [[TYPING, "unexpected", 2]], [summary(0, 0.9)]);
-    expect(failed).toMatchObject({ scenarios: {}, issue: "no usable summary" });
+    expect(failed).toEqual({ run: run(0), scenarios: {}, issue: "no usable summary" });
   });
 
   test("values from nights before the contract start never count", () => {
