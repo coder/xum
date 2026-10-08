@@ -15,13 +15,30 @@ export type { BaseTabType };
  * Extended tab type that supports multiple terminal instances.
  * - Terminal tabs: "terminal" (placeholder for new) or "terminal:<sessionId>" for real sessions
  */
-export type TabType = BaseTabType | `terminal:${string}` | "terminal";
+export type TabType =
+  | BaseTabType
+  | `terminal:${string}`
+  | "terminal"
+  /** A /side chat of this workspace: "side:<sideChatWorkspaceId>". */
+  | `side:${string}`;
 
-/** Check if a value is a valid tab type (base tab or terminal instance). */
+const SIDE_CHAT_TAB_PREFIX = "side:";
+
+/** Check if a value is a valid tab type (base tab, terminal instance, or side chat). */
 export function isTabType(value: unknown): value is TabType {
   if (typeof value !== "string") return false;
   if (isBaseTabId(value)) return true;
+  if (value.startsWith(SIDE_CHAT_TAB_PREFIX)) return value.length > SIDE_CHAT_TAB_PREFIX.length;
   return value === "terminal" || value.startsWith("terminal:");
+}
+
+/** The side chat workspace a "side:<id>" tab shows, or undefined for other tabs. */
+export function getSideChatTabWorkspaceId(tab: TabType): string | undefined {
+  return tab.startsWith(SIDE_CHAT_TAB_PREFIX) ? tab.slice(SIDE_CHAT_TAB_PREFIX.length) : undefined;
+}
+
+export function makeSideChatTabType(sideChatWorkspaceId: string): TabType {
+  return `${SIDE_CHAT_TAB_PREFIX}${sideChatWorkspaceId}`;
 }
 
 /** Check if a tab type represents a terminal (either base "terminal" or "terminal:<sessionId>"). */

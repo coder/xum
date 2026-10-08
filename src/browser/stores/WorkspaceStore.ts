@@ -844,19 +844,23 @@ export class WorkspaceStore {
 
   // Supporting data structures
   private aggregators = new Map<string, StreamingMessageAggregator>();
-  // Active onChat subscription cleanup handlers (must stay size <= 1).
-  private ipcUnsubscribers = new Map<string, () => void>();
+  // Live onChat subscription loops keyed by workspace. Keys are always a subset of
+  // {activeWorkspaceId, pinnedWorkspaceId} (so size <= 2); membership is THE "has a live
+  // subscription" check. The controller's signal is the loop signal, so a refresh request can
+  // bind to the loop it was made under.
+  private onChatControllers = new Map<string, AbortController>();
 
   // Workspace selected in the UI (set from WorkspaceContext routing state).
   private activeWorkspaceId: string | null = null;
+  // Secondary visible chat (the /side chat tab in the right sidebar) that renders a second live
+  // transcript next to the routed chat, so it needs its own onChat subscription. A single slot:
+  // keeping every background workspace subscribed is exactly what the one-subscription design
+  // avoids, and only one side chat pane can be on screen at a time.
+  private pinnedWorkspaceId: string | null = null;
 
-  // Workspace currently owning the live onChat subscription.
-  private activeOnChatWorkspaceId: string | null = null;
   // Workspaces whose first onChat replay since activation has not settled yet (#4662).
   // Kept outside chatTransientState because full-replay resets replace transient objects.
   private chatReplayPendingWorkspaces = new Set<string>();
-  // Loop signal of that subscription, so a refresh request can bind to the loop it was made under.
-  private activeOnChatSignal: AbortSignal | null = null;
   // The in-flight onChat attempt per workspace (set in subscribe, cleared when the attempt finishes).
   private currentOnChatAttempts = new Map<string, OnChatAttemptContext>();
   // At most one pending transcript refresh request per workspace (see requestTranscriptRefresh).
@@ -1588,10 +1592,7 @@ export class WorkspaceStore {
     }
 
     for (const workspaceId of this.workspaceMetadata.keys()) {
-      if (
-        this.activeWorkspaceId === workspaceId ||
-        this.usageStore.hasKeySubscribers(workspaceId)
-      ) {
+      if (this.isWorkspaceOnScreen(workspaceId) || this.usageStore.hasKeySubscribers(workspaceId)) {
         this.refreshSessionUsage(workspaceId);
       }
     }
@@ -1604,7 +1605,7 @@ export class WorkspaceStore {
       this.subscribeToTimeline(workspaceId);
     }
 
-    this.ensureActiveOnChatSubscription();
+    this.ensureOnChatSubscriptions();
     void this.refreshProvidersConfig(client);
     this.subscribeToProvidersConfig(client);
   }
@@ -1625,7 +1626,7 @@ export class WorkspaceStore {
       // Chat-switch User Timing origin (#4504): every switch milestone is measured from here.
       markChatSwitchStart(workspaceId);
     }
-    this.ensureActiveOnChatSubscription();
+    this.ensureOnChatSubscriptions();
 
     // Re-hydrate persisted session usage so cost totals reflect any
     // session-usage-delta events that arrived while this workspace was inactive.
@@ -1634,7 +1635,7 @@ export class WorkspaceStore {
     }
 
     // Invalidate cached workspace state for both the old and new active
-    // workspaces. getWorkspaceState() uses activeOnChatWorkspaceId to decide
+    // workspaces. getWorkspaceState() uses the live onChat subscription set to decide
     // whether to trust aggregator data or activity snapshots, so a switch
     // requires recomputation even if no new events arrived.
     if (previousActiveId) {
@@ -1645,13 +1646,60 @@ export class WorkspaceStore {
     }
   }
 
+  /**
+   * Keep a second workspace's onChat subscription live alongside the active one. The /side
+   * chat tab calls this on mount/unmount (via {@link usePinnedWorkspaceChat}) so its pane gets
+   * a caught-up transcript and live stream events while the routed chat stays subscribed too.
+   */
+  setPinnedWorkspaceId(workspaceId: string | null): void {
+    assert(
+      workspaceId === null || (typeof workspaceId === "string" && workspaceId.length > 0),
+      "setPinnedWorkspaceId requires a non-empty workspaceId or null"
+    );
+
+    if (this.pinnedWorkspaceId === workspaceId) {
+      return;
+    }
+
+    const previousPinnedId = this.pinnedWorkspaceId;
+    this.pinnedWorkspaceId = workspaceId;
+    this.ensureOnChatSubscriptions();
+
+    // Same as activation: usage deltas that arrived while unsubscribed are only on disk.
+    if (workspaceId && this.isWorkspaceRegistered(workspaceId)) {
+      this.refreshSessionUsage(workspaceId);
+    }
+
+    // Subscription membership feeds getWorkspaceState()/getWorkspaceShellStatus(), so both
+    // the unpinned and newly pinned workspaces must recompute.
+    if (previousPinnedId && this.aggregators.has(previousPinnedId)) {
+      this.states.bump(previousPinnedId);
+    }
+    if (workspaceId && this.aggregators.has(workspaceId)) {
+      this.states.bump(workspaceId);
+    }
+  }
+
+  getPinnedWorkspaceId(): string | null {
+    return this.pinnedWorkspaceId;
+  }
+
   isOnChatSubscriptionActive(workspaceId: string): boolean {
     assert(
       typeof workspaceId === "string" && workspaceId.length > 0,
       "isOnChatSubscriptionActive requires a non-empty workspaceId"
     );
 
-    return this.activeOnChatWorkspaceId === workspaceId;
+    return this.onChatControllers.has(workspaceId);
+  }
+
+  /**
+   * Whether the workspace's chat is rendered on screen: the routed chat or the pinned side
+   * chat. Background-only behavior (activity-driven completion notifications, stale stream
+   * cleanup) must skip these because their live onChat subscription is authoritative.
+   */
+  private isWorkspaceOnScreen(workspaceId: string): boolean {
+    return workspaceId === this.activeWorkspaceId || workspaceId === this.pinnedWorkspaceId;
   }
 
   private ensureActivitySubscription(): void {
@@ -1680,24 +1728,32 @@ export class WorkspaceStore {
     }
   }
 
-  private assertSingleActiveOnChatSubscription(): void {
-    assert(
-      this.ipcUnsubscribers.size <= 1,
-      `[WorkspaceStore] Expected at most one active onChat subscription, found ${this.ipcUnsubscribers.size}`
-    );
-
-    if (this.activeOnChatWorkspaceId === null) {
-      assert(
-        this.ipcUnsubscribers.size === 0,
-        "[WorkspaceStore] onChat unsubscribe map must be empty when no active workspace is subscribed"
-      );
-      return;
+  /** Registered workspaces that should own a live onChat subscription right now. */
+  private getDesiredOnChatWorkspaceIds(): Set<string> {
+    const desired = new Set<string>();
+    for (const workspaceId of [this.activeWorkspaceId, this.pinnedWorkspaceId]) {
+      if (workspaceId && this.isWorkspaceRegistered(workspaceId)) {
+        desired.add(workspaceId);
+      }
     }
+    return desired;
+  }
 
+  private assertOnChatSubscriptionsMatch(desired: ReadonlySet<string>): void {
     assert(
-      this.ipcUnsubscribers.has(this.activeOnChatWorkspaceId),
-      `[WorkspaceStore] Missing onChat unsubscribe handler for ${this.activeOnChatWorkspaceId}`
+      this.onChatControllers.size <= 2,
+      `[WorkspaceStore] Expected at most two live onChat subscriptions (active + pinned), found ${this.onChatControllers.size}`
     );
+    assert(
+      this.onChatControllers.size === desired.size,
+      `[WorkspaceStore] Expected ${desired.size} live onChat subscriptions, found ${this.onChatControllers.size}`
+    );
+    for (const workspaceId of this.onChatControllers.keys()) {
+      assert(
+        desired.has(workspaceId),
+        `[WorkspaceStore] onChat subscription for ${workspaceId} is neither active nor pinned`
+      );
+    }
   }
 
   private clearReplayBuffers(workspaceId: string): void {
@@ -1760,76 +1816,77 @@ export class WorkspaceStore {
     }
   }
 
-  private ensureActiveOnChatSubscription(): void {
-    const targetWorkspaceId =
-      this.activeWorkspaceId && this.isWorkspaceRegistered(this.activeWorkspaceId)
-        ? this.activeWorkspaceId
-        : null;
+  /**
+   * Reconcile live onChat subscriptions with {active, pinned}: stop loops for workspaces that
+   * left the set, start loops for ones that joined. A workspace that is both active and pinned
+   * keeps one loop, and switching the active workspace never disturbs the pinned loop.
+   */
+  private ensureOnChatSubscriptions(): void {
+    const desired = this.getDesiredOnChatWorkspaceIds();
 
-    if (this.activeOnChatWorkspaceId === targetWorkspaceId) {
-      this.assertSingleActiveOnChatSubscription();
-      return;
+    // Teardown first so the live set never transiently exceeds its bound.
+    for (const workspaceId of Array.from(this.onChatControllers.keys())) {
+      if (!desired.has(workspaceId)) {
+        this.stopOnChatSubscription(workspaceId);
+      }
+    }
+    for (const workspaceId of desired) {
+      if (!this.onChatControllers.has(workspaceId)) {
+        this.startOnChatSubscription(workspaceId);
+      }
     }
 
-    if (this.activeOnChatWorkspaceId) {
-      const previousActiveWorkspaceId = this.activeOnChatWorkspaceId;
-      const previousTransient = this.chatTransientState.get(previousActiveWorkspaceId);
-      if (previousTransient) {
-        previousTransient.isHydratingTranscript = false;
-        // Leaving mid-hydration or mid-stream leaves the cached rows incomplete: stream
-        // deltas are never delivered to an unsubscribed aggregator, and an activity
-        // snapshot carrying the same streamingGeneration cannot reveal that afterwards.
-        // The aggregator, not the activity snapshot, decides "mid-stream" here: while
-        // subscribed it saw stream-end over onChat, whereas the streaming=false activity
-        // update is published asynchronously after it and can still lag at this point.
-        // Read caughtUp before clearReplayBuffers resets it below.
-        const previousAggregator = this.aggregators.get(previousActiveWorkspaceId);
-        if (
-          !previousTransient.caughtUp ||
-          previousAggregator?.hasInterruptibleActiveStream() === true
-        ) {
-          previousTransient.cachedTranscriptStale = true;
-        }
-        this.resetStaleSkeletonDeadline(previousActiveWorkspaceId);
-      }
+    this.assertOnChatSubscriptionsMatch(desired);
+  }
 
-      // Clear replay buffers before aborting so a fast workspace switch/reopen
-      // cannot replay stale buffered rows from the previous subscription attempt.
-      this.clearReplayBuffers(previousActiveWorkspaceId);
-      // Navigation settles a pending refresh synchronously; the composer that asked is gone.
-      this.settleTranscriptRefresh(previousActiveWorkspaceId, { kind: "cancelled" });
-
-      const unsubscribe = this.ipcUnsubscribers.get(previousActiveWorkspaceId);
-      if (unsubscribe) {
-        unsubscribe();
+  private stopOnChatSubscription(workspaceId: string): void {
+    const previousTransient = this.chatTransientState.get(workspaceId);
+    if (previousTransient) {
+      previousTransient.isHydratingTranscript = false;
+      // Leaving mid-hydration or mid-stream leaves the cached rows incomplete: stream
+      // deltas are never delivered to an unsubscribed aggregator, and an activity
+      // snapshot carrying the same streamingGeneration cannot reveal that afterwards.
+      // The aggregator, not the activity snapshot, decides "mid-stream" here: while
+      // subscribed it saw stream-end over onChat, whereas the streaming=false activity
+      // update is published asynchronously after it and can still lag at this point.
+      // Read caughtUp before clearReplayBuffers resets it below.
+      const previousAggregator = this.aggregators.get(workspaceId);
+      if (
+        !previousTransient.caughtUp ||
+        previousAggregator?.hasInterruptibleActiveStream() === true
+      ) {
+        previousTransient.cachedTranscriptStale = true;
       }
-      this.ipcUnsubscribers.delete(previousActiveWorkspaceId);
-      this.chatReplayPendingWorkspaces.delete(previousActiveWorkspaceId);
-      this.activeOnChatWorkspaceId = null;
-      this.activeOnChatSignal = null;
+      this.resetStaleSkeletonDeadline(workspaceId);
     }
 
-    if (targetWorkspaceId) {
-      const transient = this.chatTransientState.get(targetWorkspaceId);
-      if (transient) {
-        transient.caughtUp = false;
-        transient.historyVerified = false;
-        // Only show transcript hydration once we can actually establish onChat.
-        // When the ORPC client is unavailable, avoid pinning the pane in loading.
-        transient.isHydratingTranscript = this.client !== null;
-      }
+    // Clear replay buffers before aborting so a fast workspace switch/reopen
+    // cannot replay stale buffered rows from the previous subscription attempt.
+    this.clearReplayBuffers(workspaceId);
+    // Navigation settles a pending refresh synchronously; the composer that asked is gone.
+    this.settleTranscriptRefresh(workspaceId, { kind: "cancelled" });
 
-      const controller = new AbortController();
-      this.ipcUnsubscribers.set(targetWorkspaceId, () => controller.abort());
-      // Set even without a client: probes cannot run without one either, and the replay
-      // starts once the client arrives.
-      this.chatReplayPendingWorkspaces.add(targetWorkspaceId);
-      this.activeOnChatWorkspaceId = targetWorkspaceId;
-      this.activeOnChatSignal = controller.signal;
-      void this.runOnChatSubscription(targetWorkspaceId, controller.signal);
+    this.onChatControllers.get(workspaceId)?.abort();
+    this.onChatControllers.delete(workspaceId);
+    this.chatReplayPendingWorkspaces.delete(workspaceId);
+  }
+
+  private startOnChatSubscription(workspaceId: string): void {
+    const transient = this.chatTransientState.get(workspaceId);
+    if (transient) {
+      transient.caughtUp = false;
+      transient.historyVerified = false;
+      // Only show transcript hydration once we can actually establish onChat.
+      // When the ORPC client is unavailable, avoid pinning the pane in loading.
+      transient.isHydratingTranscript = this.client !== null;
     }
 
-    this.assertSingleActiveOnChatSubscription();
+    const controller = new AbortController();
+    this.onChatControllers.set(workspaceId, controller);
+    // Set even without a client: probes cannot run without one either, and the replay
+    // starts once the client arrives.
+    this.chatReplayPendingWorkspaces.add(workspaceId);
+    void this.runOnChatSubscription(workspaceId, controller.signal);
   }
 
   /**
@@ -2447,7 +2504,8 @@ export class WorkspaceStore {
         this.historyPagination.get(workspaceId) ?? createInitialHistoryPaginationState();
       const hasInterruptibleActiveStream = aggregator.hasInterruptibleActiveStream();
       const activity = this.workspaceActivity.get(workspaceId);
-      const isActiveWorkspace = this.activeOnChatWorkspaceId === workspaceId;
+      // "Active" here means "has a live onChat subscription" (routed or pinned side chat).
+      const isActiveWorkspace = this.onChatControllers.has(workspaceId);
       const messages = aggregator.getAllMessages();
       const metadata = this.workspaceMetadata.get(workspaceId);
       const pendingStreamStartTime = aggregator.getPendingStreamStartTime();
@@ -2605,7 +2663,7 @@ export class WorkspaceStore {
     const aggregator = this.assertGet(workspaceId);
     const transient = this.assertChatTransientState(workspaceId);
     const hasMessages = aggregator.hasMessages();
-    const isActiveWorkspace = this.activeOnChatWorkspaceId === workspaceId;
+    const isActiveWorkspace = this.onChatControllers.has(workspaceId);
 
     // Keep this selector lighter than getWorkspaceState(): the shell only needs enough
     // state to decide placeholder vs mounted chat. Avoid rebuilding the full displayed
@@ -3104,8 +3162,7 @@ export class WorkspaceStore {
     );
 
     const { promise, resolve } = Promise.withResolvers<TranscriptRefreshOutcome>();
-    const loopSignal =
-      this.activeOnChatWorkspaceId === workspaceId ? this.activeOnChatSignal : null;
+    const loopSignal = this.onChatControllers.get(workspaceId)?.signal ?? null;
     if (!loopSignal) {
       // Not subscribed: the composer that asked is no longer looking at this workspace.
       resolve({ kind: "cancelled" });
@@ -3297,8 +3354,7 @@ export class WorkspaceStore {
    */
   isWorkspaceChatReplayPending(workspaceId: string): boolean {
     return (
-      this.activeOnChatWorkspaceId === workspaceId &&
-      this.chatReplayPendingWorkspaces.has(workspaceId)
+      this.onChatControllers.has(workspaceId) && this.chatReplayPendingWorkspaces.has(workspaceId)
     );
   }
 
@@ -3907,7 +3963,7 @@ export class WorkspaceStore {
     }
 
     const didBackgroundStreamingGenerationAdvance =
-      workspaceId !== this.activeWorkspaceId &&
+      !this.isWorkspaceOnScreen(workspaceId) &&
       previous?.streaming === true &&
       snapshot?.streaming === true &&
       previous.streamingGeneration !== undefined &&
@@ -3928,8 +3984,10 @@ export class WorkspaceStore {
     if (stoppedStreamingSnapshot && !this.isOnChatSubscriptionActive(workspaceId)) {
       collapsePinnedTodoOnStreamStop(workspaceId, stoppedStreamingSnapshot.hasTodos === true);
     }
+    // The pinned side chat is on screen with a live onChat loop, so like the routed chat it
+    // gets completion from onChat stream-end, never an activity-driven background notification.
     const isBackgroundStreamingStop =
-      stoppedStreamingSnapshot !== null && workspaceId !== this.activeWorkspaceId;
+      stoppedStreamingSnapshot !== null && !this.isWorkspaceOnScreen(workspaceId);
     const streamStartRecency = this.activityStreamingStartRecency.get(workspaceId);
     const recencyAdvancedSinceStreamStart =
       stoppedStreamingSnapshot !== null &&
@@ -4608,7 +4666,7 @@ export class WorkspaceStore {
     aggregator.clearActiveStreams();
 
     // Registration must not fetch usage for every workspace in the sidebar.
-    if (this.activeWorkspaceId === workspaceId || this.usageStore.hasKeySubscribers(workspaceId)) {
+    if (this.isWorkspaceOnScreen(workspaceId) || this.usageStore.hasKeySubscribers(workspaceId)) {
       this.refreshSessionUsage(workspaceId);
     }
 
@@ -4616,7 +4674,7 @@ export class WorkspaceStore {
     this.subscribeToStats(workspaceId);
     this.subscribeToTimeline(workspaceId);
 
-    this.ensureActiveOnChatSubscription();
+    this.ensureOnChatSubscriptions();
 
     if (!this.client) {
       console.warn(`[WorkspaceStore] No ORPC client available for workspace ${workspaceId}`);
@@ -4700,6 +4758,9 @@ export class WorkspaceStore {
     if (this.activeWorkspaceId === workspaceId) {
       this.activeWorkspaceId = null;
     }
+    if (this.pinnedWorkspaceId === workspaceId) {
+      this.pinnedWorkspaceId = null;
+    }
 
     const statsUnsubscribe = this.statsUnsubscribers.get(workspaceId);
     if (statsUnsubscribe) {
@@ -4712,15 +4773,8 @@ export class WorkspaceStore {
       this.timelineUnsubscribers.delete(workspaceId);
     }
 
-    const unsubscribe = this.ipcUnsubscribers.get(workspaceId);
-    if (unsubscribe) {
-      unsubscribe();
-      this.ipcUnsubscribers.delete(workspaceId);
-    }
-    if (this.activeOnChatWorkspaceId === workspaceId) {
-      this.activeOnChatWorkspaceId = null;
-      this.activeOnChatSignal = null;
-    }
+    this.onChatControllers.get(workspaceId)?.abort();
+    this.onChatControllers.delete(workspaceId);
     this.chatReplayPendingWorkspaces.delete(workspaceId);
     this.currentOnChatAttempts.delete(workspaceId);
     // A pending refresh can never get its baseline from a removed workspace.
@@ -4762,7 +4816,7 @@ export class WorkspaceStore {
     this.sessionUsage.delete(workspaceId);
     this.sessionUsageRequestVersion.delete(workspaceId);
 
-    this.ensureActiveOnChatSubscription();
+    this.ensureOnChatSubscriptions();
     this.derived.bump("recency");
   }
 
@@ -4791,13 +4845,13 @@ export class WorkspaceStore {
       }
     }
 
-    // Re-evaluate the active subscription after additions/removals.
-    // removeWorkspace can null activeWorkspaceId when the removed workspace
-    // was active (e.g., stale singleton state between integration tests),
-    // leaving addWorkspace's ensureActiveOnChatSubscription targeting the
-    // old workspace. This final call reconciles the subscription with the
-    // current activeWorkspaceId + registration state.
-    this.ensureActiveOnChatSubscription();
+    // Re-evaluate live subscriptions after additions/removals.
+    // removeWorkspace can null activeWorkspaceId/pinnedWorkspaceId when the removed
+    // workspace was active/pinned (e.g., stale singleton state between integration tests),
+    // leaving addWorkspace's ensureOnChatSubscriptions targeting the old workspace.
+    // This final call reconciles the subscriptions with the current active/pinned ids
+    // + registration state.
+    this.ensureOnChatSubscriptions();
   }
 
   /**
@@ -4822,10 +4876,10 @@ export class WorkspaceStore {
     }
     this.currentOnChatAttempts.clear();
 
-    for (const unsubscribe of this.ipcUnsubscribers.values()) {
-      unsubscribe();
+    for (const controller of this.onChatControllers.values()) {
+      controller.abort();
     }
-    this.ipcUnsubscribers.clear();
+    this.onChatControllers.clear();
 
     if (this.activityAbortController) {
       this.activityAbortController.abort();
@@ -4842,8 +4896,7 @@ export class WorkspaceStore {
     this.clientChangeController.abort();
 
     this.activeWorkspaceId = null;
-    this.activeOnChatWorkspaceId = null;
-    this.activeOnChatSignal = null;
+    this.pinnedWorkspaceId = null;
     this.chatReplayPendingWorkspaces.clear();
     this.pendingReplayReset.clear();
     this.states.clear();
@@ -5673,6 +5726,29 @@ export function useWorkspaceShellStatus(workspaceId: string): WorkspaceShellStat
     (listener) => store.subscribeKey(workspaceId, listener),
     () => store.getWorkspaceShellStatus(workspaceId)
   );
+}
+
+/**
+ * Keep `workspaceId`'s onChat subscription live while the calling component is mounted (the
+ * /side chat tab pane renders a second transcript next to the routed chat). Pass null to opt
+ * out without unmounting.
+ */
+export function usePinnedWorkspaceChat(workspaceId: string | null): void {
+  // Syncing an external store with the mount lifecycle is what effects are for.
+  useEffect(() => {
+    if (!workspaceId) {
+      return;
+    }
+    const store = getStoreInstance();
+    store.setPinnedWorkspaceId(workspaceId);
+    return () => {
+      // A newer pane may already have pinned another workspace (mount/unmount ordering
+      // across tab switches); only release the slot if it is still ours.
+      if (store.getPinnedWorkspaceId() === workspaceId) {
+        store.setPinnedWorkspaceId(null);
+      }
+    };
+  }, [workspaceId]);
 }
 
 /**

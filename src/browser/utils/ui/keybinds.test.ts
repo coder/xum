@@ -1,5 +1,13 @@
-import { afterEach, describe, it, expect, test } from "bun:test";
-import { isMac, matchesKeybind, isKeybindDeprecated, KEYBINDS } from "./keybinds";
+import { afterEach, beforeEach, describe, it, expect, test } from "bun:test";
+import { GlobalWindow } from "happy-dom";
+import {
+  isMac,
+  matchesKeybind,
+  isKeybindDeprecated,
+  KEYBINDS,
+  paneHandlesKeyEvent,
+  SIDE_CHAT_PANE_ATTR,
+} from "./keybinds";
 import type { Keybind } from "@/common/types/keybind";
 
 // Many tests below swap in a stub `window` ({ api: { platform } }) without restoring it.
@@ -458,4 +466,51 @@ describe("global keybind collisions", () => {
       ).toEqual(["lower <-> upper"]);
     });
   }
+});
+
+describe("paneHandlesKeyEvent", () => {
+  // Same DOM-global save/restore as workspaceDomNav.test.ts: later files in this bun process may
+  // depend on whatever window/document/HTMLElement were installed before.
+  const globals = globalThis as unknown as Record<"window" | "document" | "HTMLElement", unknown>;
+  let previous: Pick<typeof globals, "window" | "document" | "HTMLElement">;
+
+  beforeEach(() => {
+    previous = {
+      window: globals.window,
+      document: globals.document,
+      HTMLElement: globals.HTMLElement,
+    };
+    const happyWindow = new GlobalWindow();
+    globals.window = happyWindow;
+    globals.document = happyWindow.document;
+    globals.HTMLElement = happyWindow.HTMLElement;
+  });
+
+  afterEach(() => {
+    globals.window = previous.window;
+    globals.document = previous.document;
+    globals.HTMLElement = previous.HTMLElement;
+  });
+
+  test("exactly one pane handles each target", () => {
+    const sidePane = document.createElement("div");
+    sidePane.setAttribute(SIDE_CHAT_PANE_ATTR, "");
+    const sideInput = document.createElement("textarea");
+    sidePane.appendChild(sideInput);
+    const mainInput = document.createElement("textarea");
+    document.body.append(sidePane, mainInput);
+
+    const targets: Array<[EventTarget | null, "main" | "side"]> = [
+      [sideInput, "side"],
+      [sidePane, "side"],
+      [mainInput, "main"],
+      [document.body, "main"],
+      // Nothing focused (or a non-element target) belongs to the main pane.
+      [null, "main"],
+    ];
+    for (const [target, owner] of targets) {
+      expect(paneHandlesKeyEvent("side", target)).toBe(owner === "side");
+      expect(paneHandlesKeyEvent("main", target)).toBe(owner === "main");
+    }
+  });
 });

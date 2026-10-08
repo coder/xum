@@ -1240,9 +1240,10 @@ function handleClearCommand(
 }
 
 /**
- * /side (Codex's side conversation): open an ephemeral fork of this chat in place of it. The
- * main chat keeps running in the background; leaving the side chat discards it
- * (useDiscardSideChatOnLeave).
+ * /side (Codex's side conversation): open an ephemeral fork of this chat. It opens as a tab in
+ * this workspace's right sidebar so both chats stay visible (closing the tab discards it). Where
+ * the sidebar is hidden (narrow viewports) it takes over the chat view instead, like Codex, and
+ * leaving it discards it (useDiscardSideChatOnLeave).
  */
 function handleSideCommand(
   parsed: Extract<ParsedCommand, { type: "side" }>,
@@ -1264,7 +1265,14 @@ function handleSideCommand(
       const sideWorkspaceId = result.metadata.id;
       // Same model/agent/thinking settings as the main chat, like a fork.
       copyWorkspaceStorage(env.workspaceId, sideWorkspaceId);
-      dispatchWorkspaceSwitch(result.metadata);
+      const openTab = new CustomEvent(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, {
+        detail: { workspaceId: env.workspaceId, sideChatWorkspaceId: sideWorkspaceId },
+        cancelable: true,
+      });
+      // dispatchEvent returns false once the sidebar claimed the event (showed the tab).
+      if (window.dispatchEvent(openTab)) {
+        dispatchWorkspaceSwitch(result.metadata);
+      }
       const question = parsed.question;
       if (question != null) {
         // Deferred like forkWorkspace's start message, so the switch lands and the store

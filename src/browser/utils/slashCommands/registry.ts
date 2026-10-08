@@ -355,7 +355,7 @@ const parseSideCommand = ({ rawInput }: { rawInput: string }): ParsedCommand => 
 const sideCommandDefinition: SlashCommandDefinition = {
   key: "side",
   description:
-    "Ask a side question in a temporary fork of this chat. Esc returns to the main chat and discards it.",
+    "Ask a side question in a temporary fork of this chat, opened next to it. Closing it discards it.",
   inputHint: SLASH_COMMAND_HINTS.side,
   handler: parseSideCommand,
 };

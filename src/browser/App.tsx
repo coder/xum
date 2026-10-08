@@ -1364,6 +1364,12 @@ function AppInner() {
       if (isWorkspaceFocused) {
         return;
       }
+      // /side chats are short-lived questions answered next to (or in place of) their main chat,
+      // which already has the user's attention; they never notify (they inherit the main chat's
+      // notify setting through copied storage, and a click would open the side chat full-screen).
+      if (workspaceMetadataRef.current.get(event.workspaceId)?.sideChatParentWorkspaceId != null) {
+        return;
+      }
 
       // Check if notifications are enabled for this workspace.
       const notifyEnabled =

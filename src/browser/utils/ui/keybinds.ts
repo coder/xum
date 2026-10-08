@@ -217,6 +217,25 @@ export function isTerminalFocused(target: EventTarget | null): boolean {
 }
 
 /**
+ * Marks the /side chat pane in the right sidebar. A second chat pane is mounted there next to
+ * the main one, and both register the same window-level chat shortcuts; this attribute tells
+ * them apart (see paneHandlesKeyEvent).
+ */
+export const SIDE_CHAT_PANE_ATTR = "data-side-chat-pane";
+
+/** Which chat pane a set of window-level shortcuts belongs to. */
+export type ChatPaneScope = "main" | "side";
+
+/**
+ * Whether a chat pane's window-level shortcut should act on this event: the side pane acts only
+ * while focus is inside it, the main pane everywhere else (including when nothing is focused).
+ */
+export function paneHandlesKeyEvent(scope: ChatPaneScope, target: EventTarget | null): boolean {
+  const inSidePane = hasClosestWithAttr(target, SIDE_CHAT_PANE_ATTR);
+  return scope === "side" ? inSidePane : !inSidePane;
+}
+
+/**
  * Check if the event target is inside a browser viewport container.
  * Used by global keyboard handlers to avoid stealing keystrokes from live browser sessions.
  */

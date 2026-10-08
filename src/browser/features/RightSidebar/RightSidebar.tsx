@@ -8,7 +8,7 @@ import {
   getTerminalTitlesKey,
 } from "@/common/constants/storage";
 import { trimRecordToChars } from "@/browser/utils/boundedPersistedValue";
-import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
@@ -67,7 +67,9 @@ import { shouldAutoActivateWorkflowsTab } from "@/browser/features/RightSidebar/
 import {
   isTabType,
   isTerminalTab,
+  getSideChatTabWorkspaceId,
   getTerminalSessionId,
+  makeSideChatTabType,
   getTerminalTabFallbackName,
   makeTerminalTabType,
   type TabType,
@@ -105,6 +107,7 @@ import {
 } from "@/browser/utils/terminal";
 import { ReviewAssistedStatsReporter } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
 import {
+  SideChatTabLabel,
   TAB_REGISTRY,
   TerminalTabLabel,
   getTabContentClassName,
@@ -125,6 +128,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
+import { SideChatPanel } from "./SideChatPanel";
 import { useExperimentGatedTab } from "./useExperimentGatedTab";
 
 interface SidebarContainerProps {
@@ -306,6 +310,8 @@ interface RightSidebarTabsetNodeProps {
   onAddTerminal: () => void;
   /** Handler to close a terminal tab */
   onCloseTerminal: (tab: TabType) => void;
+  /** Handler to close a /side chat tab (discards the side chat) */
+  onCloseSideChat: (tab: TabType) => void;
   /** Handler to remove a terminal tab after the session exits */
   onTerminalExit: (tab: TabType) => void;
   /** Map of terminal tab types to their current titles (from OSC sequences) */
@@ -407,6 +413,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
 
   // Count terminal tabs in this tabset for numbering (Terminal, Terminal 2, etc.)
   const terminalTabs = props.node.tabs.filter(isTerminalTab);
+  const activeSideChatWorkspaceId = getSideChatTabWorkspaceId(props.node.activeTab);
 
   const items = props.node.tabs.flatMap((tab) => {
     const tabId = `${tabsetBaseId}-tab-${tab}`;
@@ -451,6 +458,8 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           onClose={() => props.onCloseTerminal(tab)}
         />
       );
+    } else if (getSideChatTabWorkspaceId(tab) != null) {
+      label = <SideChatTabLabel onClose={() => props.onCloseSideChat(tab)} />;
     } else {
       label = tab;
     }
@@ -464,8 +473,12 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
         label,
         tooltip,
         tab,
-        // Terminal tabs are closeable
-        onClose: isTerminal ? () => props.onCloseTerminal(tab) : undefined,
+        // Terminal and side chat tabs are closeable
+        onClose: isTerminal
+          ? () => props.onCloseTerminal(tab)
+          : getSideChatTabWorkspaceId(tab) != null
+            ? () => props.onCloseSideChat(tab)
+            : undefined,
       },
     ];
   });
@@ -581,6 +594,22 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
             tabsetBaseId={tabsetBaseId}
             context={panelContext}
           />
+        )}
+
+        {/* The active side chat tab: a second live chat pane next to the main chat. Mounted only
+            while active, so at most one side chat holds the store's pinned subscription. */}
+        {activeSideChatWorkspaceId != null && (
+          <div
+            role="tabpanel"
+            id={`${tabsetBaseId}-panel-${props.node.activeTab}`}
+            aria-labelledby={`${tabsetBaseId}-tab-${props.node.activeTab}`}
+            className="flex h-full min-h-0 flex-col"
+          >
+            <SideChatPanel
+              key={activeSideChatWorkspaceId}
+              sideChatWorkspaceId={activeSideChatWorkspaceId}
+            />
+          </div>
         )}
 
         {/* Render all terminal tabs (keep-alive: hidden but mounted) */}
@@ -1158,6 +1187,31 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   const sidebarContainerRef = React.useRef<HTMLDivElement>(null);
 
+  // /side chat tabs. Side chats this sidebar just opened whose metadata has not arrived yet, so
+  // the stale-tab cleanup below does not strip them in the meantime.
+  const pendingSideChatIdsRef = React.useRef(new Set<string>());
+  React.useEffect(() => {
+    const handleOpenSideChatTab = (event: Event) => {
+      const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB>).detail;
+      if (detail?.workspaceId !== workspaceId) return;
+      // A hidden sidebar (narrow viewport) cannot show the tab: leave the event unhandled so the
+      // sender opens the side chat full-screen instead.
+      const container = sidebarContainerRef.current;
+      if (container != null && isRightSidebarResponsivelyHidden(container)) return;
+      event.preventDefault();
+      pendingSideChatIdsRef.current.add(detail.sideChatWorkspaceId);
+      setCollapsed(false);
+      // One side chat per workspace (like Codex): the backend already discarded the previous
+      // one, so its tab is replaced rather than kept.
+      setLayout((prev) =>
+        selectOrAddTab(removeSideChatTabs(prev), makeSideChatTabType(detail.sideChatWorkspaceId))
+      );
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, handleOpenSideChatTab);
+    return () =>
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, handleOpenSideChatTab);
+  }, [setCollapsed, setLayout, workspaceId]);
+
   // "Open in Artifacts" on an MCP Apps tool card and openArtifact() (chat cards, file cards,
   // Review, palette) persist their selection, then ask for the tab like OPEN_GOAL_TAB. On small
   // viewports WorkspaceMenuBar opens the Artifacts dialog instead; this handler then stays out,
@@ -1417,6 +1471,46 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     [focusActiveTerminal, getBaseLayout, setLayout, terminalTitlesKey]
   );
 
+  // Closing a side chat's tab discards the side chat: side chats are ephemeral (Codex form
+  // factor), and the tab is their only way back in. Removal is forced and only deletes the side
+  // chat's own row and session; it shares this workspace's checkout, which removal never touches.
+  const handleCloseSideChat = React.useCallback(
+    (tab: TabType) => {
+      const sideChatWorkspaceId = getSideChatTabWorkspaceId(tab);
+      if (sideChatWorkspaceId == null) return;
+      setLayout((prev) => removeTabEverywhere(prev, tab));
+      api?.workspace
+        .remove({ workspaceId: sideChatWorkspaceId, options: { force: true } })
+        .then((result) => {
+          if (!result.success)
+            console.warn("[RightSidebar] Failed to discard side chat:", result.error);
+        })
+        .catch((error: unknown) => {
+          // The backend sweeps leftover side chats at startup.
+          console.warn("[RightSidebar] Failed to discard side chat:", error);
+        });
+    },
+    [api, setLayout]
+  );
+
+  // Drop tabs of side chats that no longer exist: discarded by a newer /side, removed with
+  // their workspace, or swept at startup (side chats never survive a restart).
+  const { workspaceMetadata: allWorkspaceMetadata, loaded: workspaceMetadataLoaded } =
+    workspaceMetadataContext;
+  React.useEffect(() => {
+    if (!workspaceMetadataLoaded) return;
+    const pending = pendingSideChatIdsRef.current;
+    for (const id of pending) {
+      if (allWorkspaceMetadata.has(id)) pending.delete(id);
+    }
+    const staleTabs = collectAllTabs(layout.root).filter((tab) => {
+      const id = getSideChatTabWorkspaceId(tab);
+      return id != null && !allWorkspaceMetadata.has(id) && !pending.has(id);
+    });
+    if (staleTabs.length === 0) return;
+    setLayout((prev) => staleTabs.reduce((acc, tab) => removeTabEverywhere(acc, tab), prev));
+  }, [allWorkspaceMetadata, layout, setLayout, workspaceMetadataLoaded]);
+
   // Keyboard shortcut for closing active terminal tab (Ctrl/Cmd+W)
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -1430,6 +1524,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       if (focusedTabset?.type !== "tabset") return;
 
       const activeTab = focusedTabset.activeTab;
+
+      if (getSideChatTabWorkspaceId(activeTab) != null) {
+        handleCloseSideChat(activeTab);
+        return;
+      }
 
       // Handle terminal tabs
       if (isTerminalTab(activeTab)) {
@@ -1450,7 +1549,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
     window.addEventListener("keydown", handleKeyDown, { capture: true });
     return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
-  }, [api, focusActiveTerminal, layout, removeTerminalTab, setLayout]);
+  }, [api, focusActiveTerminal, handleCloseSideChat, layout, removeTerminalTab, setLayout]);
 
   // Sync terminal tabs with backend sessions on workspace mount.
   // - Adds tabs for backend sessions that don't have tabs (restore after reload)
@@ -1782,6 +1881,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         onPopOutTerminal={handlePopOutTerminal}
         onAddTerminal={handleAddTerminal}
         onCloseTerminal={handleCloseTerminal}
+        onCloseSideChat={handleCloseSideChat}
         onTerminalExit={removeTerminalTab}
         terminalTitles={terminalTitles}
         terminalTabOrder={terminalTabOrder}
@@ -1878,3 +1978,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 // Memoize to prevent re-renders when parent (AIView) re-renders during streaming
 // Only re-renders when workspaceId or chatAreaRef changes, or internal state updates
 export const RightSidebar = React.memo(RightSidebarComponent);
+
+/** Remove every /side chat tab from the layout. */
+function removeSideChatTabs(layout: RightSidebarLayoutState): RightSidebarLayoutState {
+  return collectAllTabs(layout.root)
+    .filter((tab) => getSideChatTabWorkspaceId(tab) != null)
+    .reduce((acc, tab) => removeTabEverywhere(acc, tab), layout);
+}

@@ -17,6 +17,7 @@ import {
   Sparkles,
   Target,
   ListTree,
+  MessagesSquare,
   Terminal as TerminalIcon,
   Workflow,
   X,
@@ -337,6 +338,34 @@ export const InstructionsTabLabel: React.FC<InstructionsTabLabelProps> = ({ work
         </span>
       )}
     </>
+  );
+};
+
+/** /side chat tab label: closing the tab discards the side chat. */
+export const SideChatTabLabel: React.FC<{ onClose: () => void }> = (props) => {
+  return (
+    <span className="inline-flex items-center gap-1">
+      <MessagesSquare className="h-3 w-3 shrink-0" />
+      <span>Side chat</span>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            className="text-muted hover:text-destructive -my-0.5 rounded p-0.5 transition-colors"
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onClose();
+            }}
+            aria-label="Close side chat"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">
+          Close and discard side chat ({formatKeybind(KEYBINDS.CLOSE_TAB)})
+        </TooltipContent>
+      </Tooltip>
+    </span>
   );
 };
 

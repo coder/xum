@@ -12,11 +12,11 @@ import { getRuntimeType } from "@/node/runtime/initHook";
  * still be working in the same checkout, and side-chat writes would interfere with it.
  */
 export const SIDE_CHAT_SYSTEM_INSTRUCTIONS = [
-  "You are in a side chat: a temporary conversation forked from the user's main chat so they can ask questions without disturbing it. It is discarded when the user returns to the main chat.",
+  "You are in a side chat: a temporary conversation forked from the user's main chat so they can ask questions without disturbing it. The main chat may keep working while you answer, and this side chat is discarded when the user closes it.",
   "The conversation history before this side chat was inherited from the main chat. Treat it as reference-only context: do not continue, resume, or finish the main chat's in-progress work here.",
   "Side chats are for interactive dialogue aimed at understanding: answer questions, explain code and decisions, discuss options, and read files or run read-only commands when that helps you answer.",
   "Do not write, edit, create, move, or delete files, and do not perform other operations that change state or could interfere with the main chat, which may still be working in the same checkout. This includes git operations that change the repository, installing dependencies, starting or stopping processes, editing plans, goals, or todos, and spawning sub-agents or workflows.",
-  "If the user asks for such a change, describe what you would do and suggest making the change from the main chat instead (Esc returns there).",
+  "If the user asks for such a change, describe what you would do and suggest making the change from the main chat instead.",
 ].join("\n\n");
 
 /** Appends the side-chat guardrails to a turn's additional instructions; other chats pass through. */

@@ -27,7 +27,9 @@ import {
   KEYBINDS,
   matchNumberedKeybind,
   isDesktopViewportFocused,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { sortAgentsStable } from "@/browser/utils/agents";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { COMPOSER_CONTROL_HEIGHT_CLASS, COMPOSER_ICON_ONLY_HIDE_CLASS } from "@/constants/layout";
@@ -211,15 +213,20 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
   }, [onComplete]);
 
   // Hotkey integration (open via AgentContext).
+  // The event carries no target and both the main and /side chat composers mount a picker, so it
+  // is routed by focus: the side picker opens only while focus is inside the side pane (its
+  // TOGGLE_AGENT keybind), the main picker otherwise (main keybind, command palette).
+  const paneScope = useChatPaneScope();
   useEffect(() => {
     const handleOpen = () => {
+      if (!paneHandlesKeyEvent(paneScope, document.activeElement)) return;
       openPicker({ highlightAgentId: normalizedAgentId });
     };
 
     window.addEventListener(CUSTOM_EVENTS.OPEN_AGENT_PICKER, handleOpen as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.OPEN_AGENT_PICKER, handleOpen as EventListener);
-  }, [normalizedAgentId, openPicker]);
+  }, [normalizedAgentId, openPicker, paneScope]);
 
   useEffect(() => {
     const handleClose = () => {

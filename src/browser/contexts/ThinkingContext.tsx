@@ -18,7 +18,8 @@ import {
   useWorkspaceAiSelection,
 } from "@/browser/utils/workspaceAiSettingsSync";
 import { useOptionalAgent } from "@/browser/contexts/AgentContext";
-import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import { KEYBINDS, matchesKeybind, paneHandlesKeyEvent } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { useScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
@@ -99,8 +100,12 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   // Global keybinds for adjusting the thinking level.
   // Implemented at the ThinkingProvider level so they work in both the workspace view
   // and the "New Workspace" creation screen (which doesn't mount AIView).
+  // The /side chat tab mounts its own ThinkingProvider next to the main one; only the pane that
+  // owns the focused element steps its level, so one keystroke never changes both chats.
+  const paneScope = useChatPaneScope();
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (!paneHandlesKeyEvent(paneScope, e.target)) return;
       const isIncrease = matchesKeybind(e, KEYBINDS.INCREASE_THINKING);
       const isDecrease = matchesKeybind(e, KEYBINDS.DECREASE_THINKING);
       // TOGGLE_THINKING is deprecated but still honored for muscle memory.
@@ -140,7 +145,7 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [getMinimum, model, providersConfig, thinkingLevel, setThinkingLevel]);
+  }, [getMinimum, model, providersConfig, thinkingLevel, setThinkingLevel, paneScope]);
 
   return (
     <ThinkingContext.Provider

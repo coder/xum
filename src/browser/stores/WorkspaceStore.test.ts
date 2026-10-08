@@ -1994,6 +1994,106 @@ describe("WorkspaceStore", () => {
     expect(store.isOnChatSubscriptionActive("workspace-2")).toBe(false);
   });
 
+  // The /side chat tab renders a second live transcript next to the routed chat.
+  describe("pinned workspace subscription", () => {
+    const onChatSignals = (workspaceId: string) =>
+      mockOnChat.mock.calls
+        .filter(([input]) => input?.workspaceId === workspaceId)
+        .map(([, options]) => options?.signal);
+
+    beforeEach(() => {
+      mockChatScript([], { keepOpen: true });
+    });
+
+    it("adds a second live subscription without disturbing the active one", async () => {
+      createAndAddWorkspace(store, "main");
+      createAndAddWorkspace(store, "side", {}, false);
+      await tick(0);
+      expect(onChatSignals("main")).toHaveLength(1);
+      expect(onChatSignals("side")).toHaveLength(0);
+
+      store.setPinnedWorkspaceId("side");
+      await tick(0);
+      expect(store.isOnChatSubscriptionActive("main")).toBe(true);
+      expect(store.isOnChatSubscriptionActive("side")).toBe(true);
+      expect(onChatSignals("main")).toHaveLength(1);
+      expect(onChatSignals("main")[0]?.aborted).toBe(false);
+      expect(onChatSignals("side")).toHaveLength(1);
+
+      // Switching the routed chat must not restart the side chat's replay.
+      createAndAddWorkspace(store, "other");
+      await tick(0);
+      expect(onChatSignals("main")[0]?.aborted).toBe(true);
+      expect(onChatSignals("side")).toHaveLength(1);
+      expect(onChatSignals("side")[0]?.aborted).toBe(false);
+
+      store.setPinnedWorkspaceId(null);
+      await tick(0);
+      expect(onChatSignals("side")[0]?.aborted).toBe(true);
+      expect(store.isOnChatSubscriptionActive("side")).toBe(false);
+      expect(store.isOnChatSubscriptionActive("other")).toBe(true);
+      expect(onChatSignals("other")[0]?.aborted).toBe(false);
+    });
+
+    it("subscribes once when the pinned workspace is also active", async () => {
+      createAndAddWorkspace(store, "main");
+      store.setPinnedWorkspaceId("main");
+      await tick(0);
+      expect(onChatSignals("main")).toHaveLength(1);
+
+      // Unpinning keeps the routed chat's loop; deactivating while pinned keeps it too.
+      store.setPinnedWorkspaceId(null);
+      store.setPinnedWorkspaceId("main");
+      store.setActiveWorkspaceId(null);
+      await tick(0);
+      expect(onChatSignals("main")).toHaveLength(1);
+      expect(onChatSignals("main")[0]?.aborted).toBe(false);
+      expect(store.isOnChatSubscriptionActive("main")).toBe(true);
+    });
+
+    it("starts the pinned subscription once the workspace registers, and drops it on removal", async () => {
+      store.setPinnedWorkspaceId("late-side");
+      await tick(0);
+      expect(onChatSignals("late-side")).toHaveLength(0);
+
+      createAndAddWorkspace(store, "late-side", {}, false);
+      await tick(0);
+      expect(onChatSignals("late-side")).toHaveLength(1);
+
+      store.removeWorkspace("late-side");
+      expect(onChatSignals("late-side")[0]?.aborted).toBe(true);
+      expect(store.getPinnedWorkspaceId()).toBeNull();
+
+      // A re-registered workspace with the same id is not silently re-pinned.
+      createAndAddWorkspace(store, "late-side", {}, false);
+      await tick(0);
+      expect(onChatSignals("late-side")).toHaveLength(1);
+    });
+
+    it("trusts the caught-up aggregator over activity snapshots for the pinned workspace", async () => {
+      mockActivityList.mockResolvedValue({ side: createActivitySnapshot(10, { streaming: true }) });
+      mockActivitySubscribe.mockImplementation(idleActivitySubscription);
+      mockChatStreamFor("side", () => [
+        createHistoryMessageEvent("history-1", 1),
+        fullCaughtUpEvent(),
+      ]);
+      recreateStore();
+      createAndAddWorkspace(store, "main");
+      createAndAddWorkspace(store, "side", {}, false);
+
+      // Unsubscribed: the activity snapshot's streaming flag is the only signal.
+      expect(await waitUntil(() => store.getWorkspaceState("side").canInterrupt)).toBe(true);
+
+      store.setPinnedWorkspaceId("side");
+      expect(await waitUntil(() => store.getWorkspaceState("side").isTranscriptCaughtUp)).toBe(
+        true
+      );
+      const state = store.getWorkspaceState("side");
+      expect(state.messages).toHaveLength(1);
+      expect(state.canInterrupt).toBe(false);
+    });
+  });
+
   describe("stale cached transcript", () => {
     const workspaceId = "stale-transcript-workspace";
     const otherWorkspaceId = "stale-transcript-other";
@@ -5922,6 +6022,29 @@ describe("WorkspaceStore", () => {
         isFinal: true,
         completedAt: initialRecency + 1,
       });
+    });
+
+    it("does not fire activity-driven completion for the pinned side chat", async () => {
+      const activeWorkspaceId = "active-workspace-pinned-stop";
+      const pinnedWorkspaceId = "pinned-workspace-stop";
+      const initialRecency = new Date("2024-01-05T00:00:00.000Z").getTime();
+      const initialSnapshot = createActivitySnapshot(initialRecency);
+      const releaseCompletion = mockBackgroundActivityTransition(
+        pinnedWorkspaceId,
+        initialSnapshot,
+        [{ ...initialSnapshot, recency: initialRecency + 1, streaming: false }]
+      );
+      const onResponseComplete = createResponseCompleteSpy();
+
+      recreateStore(onResponseComplete);
+      createAndAddWorkspace(store, activeWorkspaceId);
+      createAndAddWorkspace(store, pinnedWorkspaceId, {}, false);
+      store.setPinnedWorkspaceId(pinnedWorkspaceId);
+      releaseCompletion();
+      await tick(0);
+
+      // The side chat is on screen with a live onChat loop; its stream-end is authoritative.
+      expect(onResponseComplete).not.toHaveBeenCalled();
     });
 
     it("marks background compaction stops from activity snapshots as non-notifying completions", async () => {

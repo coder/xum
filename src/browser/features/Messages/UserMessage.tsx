@@ -9,6 +9,7 @@ import {
 } from "@/browser/features/ChatInput/stagedAttachments";
 import type { ButtonConfig } from "./MessageWindow";
 import { MessageWindow } from "./MessageWindow";
+import { useOptionalMessageListContext } from "./MessageListContext";
 import { UserMessageContent } from "./UserMessageContent";
 import { GoalSyntheticMessageContent } from "./GoalSyntheticMessageContent";
 import {
@@ -112,7 +113,12 @@ export const UserMessage: React.FC<UserMessageProps> = ({
   const apiState = React.useContext(APIContext);
   const api = apiState?.api ?? null;
   const workspaceContext = useOptionalWorkspaceContext();
-  const workspaceId = workspaceContext?.selectedWorkspace?.workspaceId ?? null;
+  // Prefer the transcript's own workspace: a /side chat transcript renders next to the routed
+  // (selected) workspace, so the selection would download, cache-key, and guard against the wrong
+  // workspace. The selection remains the fallback outside a chat transcript.
+  const messageListContext = useOptionalMessageListContext();
+  const workspaceId =
+    messageListContext?.workspaceId ?? workspaceContext?.selectedWorkspace?.workspaceId ?? null;
 
   // Tracks the workspace this message currently renders for (null once
   // unmounted), so an in-flight download fetch can detect that the user

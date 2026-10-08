@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
 import {
+  getSideChatTabWorkspaceId,
+  isTabType,
+  makeSideChatTabType,
+} from "@/browser/types/rightSidebar";
+import {
   addTabToFocusedTabset,
   addToolToFocusedTabset,
   dockTabToEdge,
@@ -281,6 +286,32 @@ test("parseRightSidebarLayoutState strips removed static tabs from persisted lay
   expect(result.root.tabs).not.toContain("stats");
   expect(result.root.tabs).not.toContain("explorer");
   expect(result.root.activeTab).toBe("costs");
+});
+
+test("parseRightSidebarLayoutState keeps an open /side chat tab and the rest of the layout", () => {
+  const raw = {
+    version: 1,
+    nextId: 2,
+    focusedTabsetId: "tabset-1",
+    root: {
+      type: "tabset",
+      id: "tabset-1",
+      tabs: ["costs", "terminal:abc", "side:side-ws"],
+      activeTab: "side:side-ws",
+    },
+  };
+
+  const result = parseRightSidebarLayoutState(raw, "costs");
+
+  if (result.root.type !== "tabset") throw new Error("expected tabset");
+  expect(result.root.tabs).toContain("terminal:abc");
+  expect(result.root.activeTab).toBe("side:side-ws");
+  expect(getSideChatTabWorkspaceId(result.root.activeTab)).toBe("side-ws");
+});
+
+test("a bare side: prefix is not a valid tab", () => {
+  expect(isTabType("side:")).toBe(false);
+  expect(isTabType(makeSideChatTabType("side-ws"))).toBe(true);
 });
 
 test("parseRightSidebarLayoutState falls back activeTab when stats was active", () => {

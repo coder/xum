@@ -28,7 +28,9 @@ import {
   isEditableElement,
   KEYBINDS,
   matchesKeybind,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { useStartHere } from "@/browser/hooks/useStartHere";
 import { useReviews } from "@/browser/hooks/useReviews";
 import { createMuxMessage } from "@/common/types/message";
@@ -404,6 +406,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     setAnnotateMode(false);
   }, [canAnnotate]);
 
+  // The latest plan in the main chat and in the /side chat tab can both be mounted; only the pane
+  // owning the focused element toggles its plan's annotate mode.
+  const paneScope = useChatPaneScope();
   useEffect(() => {
     // Scope the global annotate shortcut to the latest non-ephemeral plan tool call.
     // Ephemeral previews can still use the button, but should not all toggle together.
@@ -415,7 +420,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || isEditableElement(event.target)) {
+      if (
+        event.defaultPrevented ||
+        isEditableElement(event.target) ||
+        !paneHandlesKeyEvent(paneScope, event.target)
+      ) {
         return;
       }
 
@@ -435,7 +444,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canAnnotate, isPlanVisible, isLatest, isEphemeralPreviewMode]);
+  }, [canAnnotate, isPlanVisible, isLatest, isEphemeralPreviewMode, paneScope]);
 
   // When using "Start Here" (replace chat history), the plan is already included in the
   // conversation *only* when the Propose Plan tool result includes full plan text.
@@ -754,9 +763,18 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       if (!matchesKeybind(event, KEYBINDS.RUN_LATEST_PLAN_ACTION)) return;
       // A focused control already handled it (the agent picker treats Alt+Enter as Enter).
       if (event.defaultPrevented) return;
+      // The /side chat tab's transcript is never the selected workspace, so it is gated by focus
+      // instead: it runs its plan only while focus is inside the side pane, the main one otherwise.
+      if (!paneHandlesKeyEvent(paneScope, event.target)) return;
       // Only the selected workspace's transcript (a sub-agent transcript may show its own plan).
       // Hosts without a workspace context (the webview) show one transcript.
-      if (selectedWorkspaceId !== undefined && selectedWorkspaceId !== workspaceId) return;
+      if (
+        paneScope === "main" &&
+        selectedWorkspaceId !== undefined &&
+        selectedWorkspaceId !== workspaceId
+      ) {
+        return;
+      }
       if (isTypingInNonEmptyField(document.activeElement)) return;
       event.preventDefault();
       if (event.repeat) return;
