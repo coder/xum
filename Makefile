@@ -91,7 +91,7 @@ include fmt.mk
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck static-check static-check-full
-.PHONY: test-bugbash-repros test-bugbash-known-failures
+.PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish
 .PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
@@ -223,6 +223,17 @@ dev-server-sandbox: ## Start an isolated dev-server instance (fresh XUM_ROOT + f
 # picks their actions. Their recipes refuse at once, so they build nothing first.
 bug-bash: ## Agent bug bash: e2e explore charters x models (paused on the host until the sandbox lands, #5714)
 	@bun tests/bugbash/run.ts $(BUGBASH_ARGS)
+
+# The bug-bash sandbox image (tests/bugbash/sandbox/build.sh, #5714). Each prints one value on
+# stdout. Publishing runs only in the manual "Bug-bash sandbox image" workflow on main.
+bugbash-sandbox-key: ## Print the inputs key of the bug-bash sandbox image for this checkout
+	@./tests/bugbash/sandbox/build.sh --key
+
+bugbash-sandbox-image: ## Build the bug-bash sandbox image locally (linux/amd64) and print its image ID
+	@./tests/bugbash/sandbox/build.sh
+
+bugbash-sandbox-publish: ## Workflow only: build and push the bug-bash sandbox image, print its image.json record
+	@./tests/bugbash/sandbox/build.sh --push
 
 # Bug-bash repro tests (tests/bugbash/repros/*.e2e.ts): exact UI steps, no model calls, against a
 # seeded `xum server` (tests/bugbash/startApp.ts). e2e needs Node.js 22.22.3+ or 24.8+ (E2E_NODE)
