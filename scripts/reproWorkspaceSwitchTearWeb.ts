@@ -428,16 +428,6 @@ async function main() {
     try {
       const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
       await page.goto(`http://127.0.0.1:${vitePort}`, { waitUntil: "domcontentloaded" });
-      await page.evaluate(() => {
-        localStorage.setItem(
-          "tutorialState",
-          JSON.stringify({
-            disabled: false,
-            completed: { settings: true, creation: true, workspace: true },
-          })
-        );
-      });
-      await page.reload({ waitUntil: "domcontentloaded" });
 
       await waitForProjectPage(page);
       const trunkBranch = readTrunkBranch(demoProject.projectPath);

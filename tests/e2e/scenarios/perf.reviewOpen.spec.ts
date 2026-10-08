@@ -8,11 +8,7 @@ import {
   withChromeProfiles,
   writePerfArtifacts,
 } from "../utils/perfProfile";
-import {
-  disableReviewTutorial,
-  seedLargeReviewDiff,
-  setReviewPreferences,
-} from "../utils/reviewPerfFixture";
+import { seedLargeReviewDiff, setReviewPreferences } from "../utils/reviewPerfFixture";
 
 const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 
@@ -39,8 +35,6 @@ test.describe("regular review performance profiling", () => {
     ui,
     workspace,
   }, testInfo) => {
-    await disableReviewTutorial(page);
-
     const diffSummary = seedLargeReviewDiff(workspace.demoProject.workspacePath);
     const reviewDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspace.demoProject.workspaceId);
 

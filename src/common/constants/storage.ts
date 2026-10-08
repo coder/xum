@@ -518,24 +518,6 @@ export function normalizeTerminalBadgeConfig(value: unknown): TerminalBadgeConfi
 }
 
 /**
- * Tutorial state storage key (global)
- * Stores: { disabled: boolean, completed: { creation?: true, workspace?: true, review?: true } }
- */
-export const TUTORIAL_STATE_KEY = "tutorialState";
-
-export type TutorialSequence = "creation" | "workspace" | "review";
-
-export interface TutorialState {
-  disabled: boolean;
-  completed: Partial<Record<TutorialSequence, true>>;
-}
-
-export const DEFAULT_TUTORIAL_STATE: TutorialState = {
-  disabled: false,
-  completed: {},
-};
-
-/**
  * Get the localStorage key for review (hunk read) state per workspace
  * Stores which hunks have been marked as read during code review
  * Legacy: migrated to the backend review-state.json; read once for import, then removed.
@@ -1041,7 +1023,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Legacy creation draft list, now in the backend drafts/list.json (imported once by DraftStore,
   // then removed, #5225). Never written again, so no budget (0).
   globalKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, "draft", 0),
-  globalKey(TUTORIAL_STATE_KEY, "ui", 256),
   globalKey(LEFT_SIDEBAR_COLLAPSED_KEY, "ui", 16),
   globalKey(SIDEBAR_AGE_GROUPING_KEY, "ui", 16),
   globalKey(SIDEBAR_FLAT_MODE_KEY, "ui", 16),

@@ -8,11 +8,7 @@ import {
   withChromeProfiles,
   writePerfArtifacts,
 } from "../utils/perfProfile";
-import {
-  disableReviewTutorial,
-  seedLargeReviewSingleFileDiff,
-  setReviewPreferences,
-} from "../utils/reviewPerfFixture";
+import { seedLargeReviewSingleFileDiff, setReviewPreferences } from "../utils/reviewPerfFixture";
 
 const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 const HUNK_ITERATION_COUNT = 60;
@@ -121,8 +117,6 @@ test.describe("immersive review hunk iteration performance profiling", () => {
     ui,
     workspace,
   }, testInfo) => {
-    await disableReviewTutorial(page);
-
     const diffSummary = seedLargeReviewSingleFileDiff(workspace.demoProject.workspacePath);
     const expectedOverlayLineCount = diffSummary.lineCount + diffSummary.deletedLines;
     expect(diffSummary.hunkCount).toBeGreaterThan(HUNK_ITERATION_COUNT);

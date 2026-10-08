@@ -248,6 +248,7 @@ describe("backup payload", () => {
           fileTreeViewMode: "flat",
           showRead: false,
         },
+        ui: { tutorialState: { disabled: true } },
       },
     });
 
@@ -278,6 +279,7 @@ describe("backup payload", () => {
         fileTreeViewMode: "flat",
         showRead: false,
       },
+      ui: { tutorialState: { disabled: true } },
     });
   });
 
@@ -871,6 +873,14 @@ describe("backup payload", () => {
     expect(merged.appearance?.theme).toBe("dark");
     expect(merged.appearance?.vimEnabled).toBe(true);
     expect(merged.appearance?.editorConfig).toEqual({ editor: "vscode" });
+  });
+
+  it("restores the backed-up tutorial state", () => {
+    const merged = mergeBackupPreferences(
+      { ui: { tutorialState: { completed: { creation: true } } } },
+      { ui: { tutorialState: { disabled: true } } }
+    );
+    expect(merged.ui).toEqual({ tutorialState: { disabled: true } });
   });
 
   it("refuses an oversized file and an oversized payload on both sides", async () => {

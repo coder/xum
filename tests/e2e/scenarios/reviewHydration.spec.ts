@@ -2,7 +2,6 @@ import { type Page } from "@playwright/test";
 import { electronExpect as expect, electronTest as test } from "../electronTest";
 import { STORAGE_KEYS } from "../../../src/constants/workspaceDefaults";
 import {
-  disableReviewTutorial,
   seedLargeReviewSingleFileDiff,
   seedReviewHydrationJumpDiff,
   seedReviewMarkReadIterationDiff,
@@ -175,7 +174,6 @@ test.describe("immersive review hydration stability", () => {
     ui,
     workspace,
   }) => {
-    await disableReviewTutorial(page);
     const diffSummary = seedReviewMarkReadIterationDiff(workspace.demoProject.workspacePath);
 
     await primeReviewForHeadDiff(page, workspace.demoProject.workspaceId);
@@ -268,7 +266,6 @@ test.describe("immersive review hydration stability", () => {
     ui,
     workspace,
   }) => {
-    await disableReviewTutorial(page);
     const diffSummary = seedReviewMarkReadIterationDiff(workspace.demoProject.workspacePath);
 
     await primeReviewForHeadDiff(page, workspace.demoProject.workspaceId, { showReadHunks: false });
@@ -355,7 +352,6 @@ test.describe("immersive review hydration stability", () => {
     ui,
     workspace,
   }) => {
-    await disableReviewTutorial(page);
     const diffSummary = seedReviewHydrationJumpDiff(workspace.demoProject.workspacePath);
     const expectedFullOverlayLineCount = diffSummary.lineCount + diffSummary.deletedLines;
 
@@ -428,7 +424,6 @@ test.describe("immersive review hydration stability", () => {
     ui,
     workspace,
   }) => {
-    await disableReviewTutorial(page);
     const diffSummary = seedLargeReviewSingleFileDiff(workspace.demoProject.workspacePath, {
       hunkCount: 24,
       hunkSpacing: 20,
@@ -546,7 +541,6 @@ test.describe("immersive review hydration stability", () => {
     ui,
     workspace,
   }) => {
-    await disableReviewTutorial(page);
     const diffSummary = seedLargeReviewSingleFileDiff(workspace.demoProject.workspacePath, {
       hunkCount: 24,
       hunkSpacing: 20,

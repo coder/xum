@@ -600,8 +600,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     ] satisfies AgentDefinitionDescriptor[]);
 
   // Stories paint dark by default, so the theme preference shown in Settings matches.
+  // Tutorials are off so their overlays cannot cover a story.
   let userPreferences = normalizeUserPreferences(
-    applyMergePatch({ appearance: { theme: "dark" } }, initialUserPreferences ?? {})
+    applyMergePatch(
+      { appearance: { theme: "dark" }, ui: { tutorialState: { disabled: true } } },
+      initialUserPreferences ?? {}
+    )
   );
   let taskSettings = normalizeTaskSettings(initialTaskSettings ?? DEFAULT_TASK_SETTINGS);
 

@@ -169,6 +169,22 @@ export const UserPreferencesSchema = z.object({
       showRead: z.boolean().optional(),
     })
     .optional(),
+  ui: z
+    .object({
+      tutorialState: z
+        .object({
+          disabled: z.boolean().optional(),
+          completed: z
+            .object({
+              creation: z.literal(true).optional(),
+              workspace: z.literal(true).optional(),
+              review: z.literal(true).optional(),
+            })
+            .optional(),
+        })
+        .optional(),
+    })
+    .optional(),
 });
 
 export type UserPreferences = z.infer<typeof UserPreferencesSchema>;
