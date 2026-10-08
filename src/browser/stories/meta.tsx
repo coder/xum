@@ -99,12 +99,9 @@ function resetStorybookPersistedStateForStory(): void {
     // Terminal badge stories seed an enabled badge config; clear it so other
     // stories with terminals don't render order-dependent badge overlays.
     localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
-    // Context-policy stories must not change subsequent stories' automatic behavior.
-    for (const id of [
-      EXPERIMENT_IDS.TOKEN_BUDGET,
-      EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
-      EXPERIMENT_IDS.RLM,
-    ]) {
+    // Stories seed experiments in the mock config, which a local value left by an earlier
+    // story would override.
+    for (const id of Object.values(EXPERIMENT_IDS)) {
       updatePersistedState(getExperimentKey(id), undefined);
     }
   }

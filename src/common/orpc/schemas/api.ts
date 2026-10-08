@@ -3143,6 +3143,7 @@ export const config = {
       heartbeatDefaultIntervalMs: z.number().optional(),
       goalDefaults: GoalDefaultsConfigSchema,
       evaluationDefaults: EvaluationDefaultsSchema.optional(),
+      experiments: z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean()),
     }),
   },
   saveConfig: {

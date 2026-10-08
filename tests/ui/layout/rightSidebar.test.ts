@@ -36,7 +36,7 @@ import {
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
 } from "@/common/constants/storage";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 // RightSidebarLayoutState used for initial setup via persisted-state helpers - acceptable for test fixtures
 import {
@@ -136,8 +136,11 @@ describeIntegration("RightSidebar (UI)", () => {
     // Reset all right-sidebar persisted state so each test starts clean.
     updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
     updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AGENT_BROWSER), null);
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.PORTABLE_DESKTOP), null);
+    await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.AGENT_BROWSER, enabled: null });
+    await env.orpc.experiments.set({
+      experimentId: EXPERIMENT_IDS.PORTABLE_DESKTOP,
+      enabled: null,
+    });
     updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, null);
     updatePersistedState(getRightSidebarLayoutKey(workspaceId), null);
     updatePersistedState(getTerminalTitlesKey(workspaceId), null);
@@ -281,8 +284,8 @@ describeIntegration("RightSidebar (UI)", () => {
   }, 60_000);
 
   test("adds the browser tab when the experiment is enabled", async () => {
+    await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.AGENT_BROWSER, enabled: true });
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
-      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AGENT_BROWSER), true);
       updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
       updatePersistedState(getRightSidebarLayoutKey(workspaceId), null);
     });
@@ -295,7 +298,7 @@ describeIntegration("RightSidebar (UI)", () => {
         }
       });
     } finally {
-      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AGENT_BROWSER), null);
+      await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.AGENT_BROWSER, enabled: null });
       await cleanup();
     }
   }, 60_000);

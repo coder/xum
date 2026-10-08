@@ -363,7 +363,14 @@ export const router = (authToken?: string) => {
         .output(schemas.config.getConfig.output)
         .handler(
           handlerGen(function* ({ context }) {
-            return yield* Effect.sync(() => context.config.getClientConfig());
+            const experiments = yield* Effect.promise(() =>
+              context.experimentsService.getEnabledStates()
+            );
+            return yield* Effect.sync(() => {
+              // The disk reread can adopt another backend's recorder toggle.
+              syncPerfFlightRecorder(context);
+              return { ...context.config.getClientConfig(), experiments };
+            });
           })
         ),
       // Event-iterator subscription: stays on the plain handler until the Effect

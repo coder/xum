@@ -34,6 +34,12 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
   const bootstrappedRef = useRef(false);
 
+  // Connected here so startup can wait for the first config snapshot (experiments); the gate
+  // stays mounted, so this also follows reconnects.
+  useEffect(() => {
+    getAppConfigStore().setClient(apiState.api ?? null);
+  }, [apiState.api]);
+
   useEffect(() => {
     if (bootstrappedRef.current || !apiState.api) {
       return;
@@ -52,7 +58,18 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
       return undefined;
     });
 
-    const startup = Promise.race([hydratePromise, timeoutPromise]);
+    const appConfigStore = getAppConfigStore();
+    let unsubscribeAppConfig: (() => void) | undefined;
+    const appConfigPromise = new Promise<void>((resolve) => {
+      const resolveWhenLoaded = () => {
+        if (appConfigStore.getSnapshot()?.experiments) resolve();
+      };
+      unsubscribeAppConfig = appConfigStore.subscribe(resolveWhenLoaded);
+      abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+      resolveWhenLoaded();
+    }).finally(() => unsubscribeAppConfig?.());
+
+    const startup = Promise.race([Promise.all([hydratePromise, appConfigPromise]), timeoutPromise]);
     // User preference hydration must happen before RouterProvider reads launch behavior, but
     // startup still needs a hard fallback so a slow backend cannot trap users on the boot screen.
     void startup
@@ -193,7 +210,6 @@ function AppLoaderInner() {
     backgroundBashStore.setClient(api ?? null);
     getPRStatusStoreInstance().setClient(api ?? null);
     getProvidersConfigStore().setClient(api ?? null);
-    getAppConfigStore().setClient(api ?? null);
     getReviewStateStore().setClient(api ?? null);
     getDraftStore().setClient(api ?? null);
     getAgentSkillsStore().setClient(api ?? null);

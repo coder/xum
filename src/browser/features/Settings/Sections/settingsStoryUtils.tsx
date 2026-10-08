@@ -145,8 +145,8 @@ interface SetupSettingsStoryOptions {
   goalDefaults?: GoalDefaults;
   /** Sessions shown in Settings → Server Access. */
   serverAuthSessions?: ServerAuthSession[];
-  /** Pre-set experiment states in localStorage before render */
-  experiments?: Partial<Record<string, boolean>>;
+  /** Initial backend experiment values for config.getConfig */
+  experiments?: Partial<Record<ExperimentId, boolean>>;
 }
 
 /** Setup basic workspace for settings stories. */
@@ -154,13 +154,6 @@ export function setupSettingsStory(options: SetupSettingsStoryOptions): APIClien
   const workspaces = [createWorkspace({ id: "ws-1", name: "main", projectName: "my-app" })];
 
   selectWorkspace(workspaces[0]);
-
-  if (options.experiments) {
-    for (const [experimentId, enabled] of Object.entries(options.experiments)) {
-      const key = getExperimentKey(experimentId as ExperimentId);
-      window.localStorage.setItem(key, JSON.stringify(enabled));
-    }
-  }
 
   return createMockORPCClient({
     projects: groupWorkspacesByProject(workspaces),
@@ -173,6 +166,7 @@ export function setupSettingsStory(options: SetupSettingsStoryOptions): APIClien
     goalDefaults: options.goalDefaults,
     taskSettings: options.taskSettings,
     serverAuthSessions: options.serverAuthSessions,
+    experiments: options.experiments,
     layoutPresets: options.layoutPresets,
   });
 }

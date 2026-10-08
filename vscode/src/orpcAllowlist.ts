@@ -124,7 +124,12 @@ export function redactWebviewOrpcResult(path: string[], value: unknown): unknown
   return value;
 }
 
-const WEBVIEW_APP_CONFIG_FIELDS = ["routePriority", "routeOverrides", "minThinkingLevelByModel"];
+const WEBVIEW_APP_CONFIG_FIELDS = [
+  "routePriority",
+  "routeOverrides",
+  "minThinkingLevelByModel",
+  "experiments",
+];
 const REDACTED_PROVIDER_CONFIG_FIELDS = new Set([
   "baseUrl",
   "baseUrlResolved",
