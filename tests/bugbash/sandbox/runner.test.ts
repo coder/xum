@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { launch } from "./launch";
 import { readImageLock, Refusal, Session, Stopped } from "./runner";
 
 // Each test runs the real build.sh in a throwaway git repo and a fake `docker` on PATH. The
@@ -22,7 +23,8 @@ case "$1" in
     # A grandchild that holds no pipe: only a signal to the whole group reaches it.
     # The leader ends on SIGTERM, but its grandchild ignores it and holds no pipe (#5878 review).
     if [ "$PULL" = orphan ]; then (trap '' TERM; exec sleep 60) >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; sleep 30; fi
-    if [ "$PULL" = group ]; then sleep 60 >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; trap '' TERM; wait $!; fi ;;
+    if [ "$PULL" = group ]; then sleep 60 >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; trap '' TERM; wait $!; fi
+    if [ "$PULL" = swap ]; then rm -r "$SWAP"; ln -s / "$SWAP"; fi ;;
   image) echo "{\\"org.xum.bugbash.inputs\\":\\"$LABEL\\"}" ;;
   # Lines of bin/containers: id name owner checkout. ps prints the ids that match every filter.
   ps) [ "$PS_RC" = 0 ] || exit 1
@@ -33,6 +35,11 @@ case "$1" in
       label=xum.bugbash.checkout=*) c=\${a#label=xum.bugbash.checkout=} ;;
     esac; done
     awk -v n="$n" -v o="$o" -v c="$c" '$2==n && $3==o && $4==c {print $1}' "$bin/containers" ;;
+  # launch.ts: the container registers itself, and only cleanup removes it.
+  run) p=""; for a in "$@"; do case "$p" in --name) n=$a ;; --label) l="\${l-} \${a#*=}" ;; esac; p=$a; done
+    echo "ctr $n$l" >> "$bin/containers"
+    if [ "$RUN" = hang ]; then exec sleep 30; fi
+    printf '{"p":"app.log","n":2}\nok'; [ "$RUN" = cut ] || printf '{"end":true}\n'; exit 7 ;;
   rm) shift 2; for id in "$@"; do awk -v id="$id" '$1!=id' "$bin/containers" > "$bin/c.tmp"; mv "$bin/c.tmp" "$bin/containers"; done ;;
   *) exit 9 ;;
 esac
@@ -101,6 +108,7 @@ function fake(over: Record<string, string> = {}) {
     PULL: "ok",
     LABEL: key,
     PS_RC: "0",
+    RUN: "ok",
     ...over,
   };
   fs.writeFileSync(
@@ -311,3 +319,135 @@ test("#5877 item 4: a stop during the endpoint lookup leaves no private client f
   expect(await s.cleanup()).toBe("none");
   expect(fs.readdirSync(tmp)).toEqual([]);
 }, 15_000);
+
+// launch.ts, with the same fake docker: a checkout with a repro config and both mount sources.
+const ARGS = ["run", "--config", "e2e.config.ts", "--output", ".e2e/r"];
+const HOST_ENV = { BUGBASH_AI: "mock", ANTHROPIC_API_KEY: "sk-secret", BUGBASH_APP_LOG: "/x.log" };
+function launchIn(
+  over: Record<string, string> = {},
+  stop = new AbortController(),
+  env: Record<string, string> = HOST_ENV
+) {
+  const real = fs.realpathSync(root);
+  fs.mkdirSync(path.join(real, "tests/bugbash"), { recursive: true });
+  fs.writeFileSync(path.join(real, "tests/bugbash/e2e.config.ts"), "export default {}");
+  for (const dir of ["dist", "node_modules"])
+    fs.mkdirSync(path.join(real, dir), { recursive: true });
+  fs.writeFileSync(path.join(bin, "containers"), FOREIGN.join("\n") + "\n");
+  fake({ IMAGES: "sha256:abc", SWAP: path.join(real, "node_modules"), ...over });
+  const cwd = path.join(real, "tests/bugbash");
+  return launch(ARGS, { root: real, cwd, env, stop: stop.signal });
+}
+/** Nothing of a job stays: no container, no job folder, no private client folder, no image rm. */
+function expectNothingLeft() {
+  expect(fs.readFileSync(path.join(bin, "containers"), "utf8").trim().split("\n")).toEqual(FOREIGN);
+  const left = fs.readdirSync(tmp, { recursive: true }).map(String);
+  expect(left.filter((p) => /xbb-|xum-bugbash-docker/.test(p))).toEqual([]);
+  expect(calls()).not.toMatch(/^(rmi|image rm|image prune|system prune)/m);
+}
+
+test("a repro job runs in the locked-down container; the export comes back; cleanup removes it", async () => {
+  expect(await launchIn()).toBe(7);
+  expect(fs.readFileSync(path.join(root, "tests/bugbash/.e2e/r/app.log"), "utf8")).toBe("ok");
+  const run = calls()
+    .split("\n")
+    .find((line) => line.startsWith("run "))!;
+  for (const flag of ["--network none", "--read-only", "--cap-drop ALL", "-i --init"])
+    expect(run).toContain(flag);
+  const real = fs.realpathSync(root);
+  expect(run).toContain(
+    `--mount type=bind,src=${real}/node_modules,dst=/repo/node_modules,readonly`
+  );
+  // The app log stays in the export folder; no host credential and no host log path pass.
+  expect(run).toContain("-e BUGBASH_APP_LOG=.e2e/r/app.log");
+  expect(run).toContain("-e BUGBASH_CONTAINER=1");
+  expect(run).toContain("-e BUGBASH_AI_RESOLVED=mock");
+  expect(run).not.toMatch(/sk-secret|\/x\.log/);
+  expectNothingLeft();
+});
+
+test("an export without its end frame is incomplete evidence (exit 4)", async () => {
+  expect(await launchIn({ RUN: "cut" })).toBe(4);
+  expectNothingLeft();
+});
+
+test("an unknown container state after cleanup outranks the job's result (exit 3)", async () => {
+  expect(await launchIn({ PS_RC: "1" })).toBe(3);
+});
+
+test.each([
+  ["before the launch", {}, null],
+  ["during the endpoint lookup", { CONTEXT: "hang" }, "context "],
+  ["during the pull", { IMAGES: "", PULL: "hang" }, "pull "],
+  ["while the job runs", { RUN: "hang" }, "run "],
+])(
+  "a stop %s leaves nothing behind",
+  async (_name, over, marker) => {
+    const stop = new AbortController();
+    if (marker == null) stop.abort("SIGTERM");
+    const pending = launchIn(over, stop);
+    while (marker != null && !calls().includes(marker)) await Bun.sleep(20);
+    stop.abort("SIGTERM");
+    expect(await failure(pending)).toThrow(Stopped);
+    if (marker !== "run ") expect(calls()).not.toContain("run ");
+    expectNothingLeft();
+  },
+  15_000
+);
+
+test("a mount source that becomes a symlink before `docker run` refuses; nothing starts", async () => {
+  expect(await failure(launchIn({ IMAGES: "", PULL: "swap" }))).toThrow(/not a symlink/);
+  expect(calls()).not.toContain("run ");
+  expectNothingLeft();
+});
+
+test.each([
+  ["`e2e explore`", ["explore", "--config", "e2e.config.ts"], /not `e2e run`/],
+  ["an existing output folder", ARGS, /exists: remove it first/],
+])("%s refuses before any docker command", async (_name, args, message) => {
+  fs.mkdirSync(path.join(root, "tests/bugbash/.e2e/r"), { recursive: true });
+  const real = fs.realpathSync(root);
+  const o = { root: real, cwd: path.join(real, "tests/bugbash"), env: { BUGBASH_AI: "mock" } };
+  fs.writeFileSync(path.join(real, "tests/bugbash/e2e.config.ts"), "export default {}");
+  expect(await failure(launch(args, { ...o, stop: new AbortController().signal }))).toThrow(
+    message
+  );
+  expect(calls()).toBe("");
+});
+
+// Every non-mock mode refuses before any docker command, so before the container env exists and
+// before a job starts. Real mode waits for the provider proxy (#5714): no key enters the sandbox.
+const NOT_MOCK = [
+  {},
+  { BUGBASH_AI: "auto" },
+  { BUGBASH_AI: "real" },
+  { BUGBASH_AI: "mock", BUGBASH_AI_RESOLVED: "real" },
+  { BUGBASH_AI: "real", BUGBASH_AI_RESOLVED: "mock" },
+  { BUGBASH_AI_RESOLVED: "real" },
+  { BUGBASH_AI_RESOLVED: "" },
+];
+test.each(NOT_MOCK)("the mode %j refuses before any docker command", async (mode) => {
+  const env = { ...HOST_ENV, BUGBASH_AI: "", ...mode } as Record<string, string>;
+  if (env.BUGBASH_AI === "") delete env.BUGBASH_AI;
+  expect(await failure(launchIn({}, new AbortController(), env))).toThrow(/only the mock app AI/);
+  expect(calls()).toBe("");
+  expectNothingLeft();
+});
+
+test("the command line refuses an ambient BUGBASH_AI_RESOLVED=real before any docker command", () => {
+  const dir = path.join(import.meta.dir, "..");
+  const output = `.e2e/xbb-test-${process.pid}`;
+  const cli = spawnSync(
+    process.execPath,
+    ["sandbox/launch.ts", "--", ...ARGS.slice(0, 3), "--output", output],
+    {
+      cwd: dir,
+      encoding: "utf8",
+      env: { PATH: process.env.PATH, TMPDIR: tmp, BUGBASH_AI: "mock", BUGBASH_AI_RESOLVED: "real" },
+    }
+  );
+  expect(cli.stderr).toContain("only the mock app AI");
+  expect(cli.status).toBe(2);
+  expect(calls()).toBe("");
+  expect(fs.existsSync(path.join(dir, output))).toBe(false);
+});

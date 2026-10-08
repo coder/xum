@@ -21,8 +21,9 @@ export const INPUTS = ["src", "tests/bugbash", "tsconfig.json", "package.json"];
 // Not BUGBASH_AI_REASON: after a failed probe it holds the provider URL and response text.
 const PASS_ENV = ["BUGBASH_AI", "BUGBASH_AI_RESOLVED", "BUGBASH_APP_MODEL", "BUGBASH_MODEL",
   "BUGBASH_EFFORT", "BUGBASH_SCENARIO", "E2E_TELEMETRY_DISABLED"]; // prettier-ignore
-// A bare name (API_KEY, TOKEN) or a suffix after "_" (ANTHROPIC_API_KEY, GH_TOKEN).
-const CREDENTIAL = /(^|_)(API_KEY|TOKEN|BASE_URL|SECRET|PASSWORD)$/i;
+// Any name that looks like a credential, anywhere in it (AWS_SECRET_ACCESS_KEY, GH_TOKEN), or a
+// PAT: a backstop behind the allowlist, so it may also refuse a harmless name.
+const CREDENTIAL = /SECRET|PASSWORD|TOKEN|KEY|CREDENTIAL|BASE_URL|(^|_)PAT$/i;
 
 /**
  * Checks each folder of `rel` under `base` without following a symlink; with `create`, it makes

@@ -1,7 +1,7 @@
 /**
  * The runner library of the bug-bash sandbox (#5714). It finds a local Docker daemon, gets the
- * pinned image, runs commands as tracked async children, and cleans up after a job. It has no
- * entry point and starts no job container: the launch command comes in a later step.
+ * pinned image, runs commands as tracked async children, runs the job container, and cleans up
+ * after a job. launch.ts is its entry point.
  *
  * The trust anchor is the digest in image.json, which a reviewed pull request sets. The runner
  * pulls only `name@digest` and never builds. It refuses when the inputs key of this checkout
@@ -9,6 +9,7 @@
  * person must publish a new one (workflow "Bug-bash sandbox image") and update image.json.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import type { Readable } from "node:stream";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -49,6 +50,8 @@ export function readImageLock(root = ROOT): ImageLock {
 
 interface Result {
   ok: boolean;
+  /** The shell convention: the exit code, or 128 + the number of the signal that ended it. */
+  code: number;
   stdout: string;
   error: string;
 }
@@ -123,6 +126,29 @@ export class Session {
       throw new Refusal(`bad container name ${JSON.stringify(job.name)}`);
     // A frozen copy: a later change to the caller's object cannot change what cleanup removes.
     this.#owned = Object.freeze({ name: job.name, owner: job.owner, checkout: job.checkout });
+  }
+
+  /**
+   * Runs the owned job's container: `docker run --name <job> --label …` and then `args`. Its
+   * stdin is the lifeline: entry.ts stops the job on EOF, so it ends when this process dies. Its
+   * stdout goes to `receive`, its stderr to ours. A stop or the timeout ends the docker client,
+   * and cleanup() removes the container.
+   */
+  async runJob<T>(args: string[], receive: (out: Readable) => Promise<T>, timeoutMs: number) {
+    const job = this.#owned;
+    if (job == null) throw new Error("runJob() needs own() first");
+    if (this.#stopped != null) throw new Stopped(this.#stopped);
+    // prettier-ignore
+    const named = ["run", "--name", job.name, "--label", `xum.bugbash.owner=${job.owner}`,
+      "--label", `xum.bugbash.checkout=${job.checkout}`, ...args];
+    const received: Promise<T>[] = [];
+    const r = await this.#spawn("docker", named, this.#client!, timeoutMs, (child) => {
+      child.stdin?.on("error", () => undefined); // EPIPE once the container is gone
+      const p = receive(child.stdout!);
+      p.catch(() => undefined); // handled: the await below rethrows it
+      received.push(p);
+    });
+    return { code: r.code, received: await received[0] };
   }
 
   /**
@@ -263,37 +289,45 @@ export class Session {
     return r;
   }
 
+  /** With `stream`, the child gets a stdin pipe and our stderr, and `stream` reads its stdout. */
   #spawn(
     cmd: string,
     args: string[],
     env: Record<string, string>,
-    timeoutMs: number
+    timeoutMs: number,
+    stream?: (child: ChildProcess) => void
   ): Promise<Result> {
     // detached: its own process group, so a stop or a timeout reaches its children too.
-    const child = spawn(cmd, args, { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+    const stdio =
+      stream == null
+        ? (["ignore", "pipe", "pipe"] as const)
+        : (["pipe", "pipe", "inherit"] as const);
+    const child = spawn(cmd, args, { env, stdio: [...stdio], detached: true });
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
-    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+    if (stream != null) stream(child);
+    else child.stdout?.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+    child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
     const group = child.pid;
     if (group != null) this.#groups.add(group);
     const timer = setTimeout(() => {
       if (group != null) this.#signal(group, "SIGKILL");
     }, timeoutMs);
     const result = new Promise<Result>((resolve) => {
-      const done = (code: number | null, why: string) => {
+      const done = (code: number | null, signal: NodeJS.Signals | null, why: string) => {
         clearTimeout(timer);
         this.#children.delete(child);
         // An empty group is done. A group with members left stays tracked until cleanup.
         if (group != null && !groupAlive(group)) this.#groups.delete(group);
         resolve({
           ok: code === 0,
+          code: code ?? (signal != null ? 128 + os.constants.signals[signal] : 1),
           stdout: stdout.trim(),
           error: code === 0 ? "" : stderr.trim() || why,
         });
       };
-      child.once("error", (error) => done(null, error.message));
-      child.once("close", (code, signal) => done(code, `exit ${code ?? signal}`));
+      child.once("error", (error) => done(null, null, error.message));
+      child.once("close", (code, signal) => done(code, signal, `exit ${code ?? signal}`));
     });
     this.#children.set(child, result);
     return result;
