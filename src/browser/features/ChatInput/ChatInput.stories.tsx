@@ -578,8 +578,9 @@ export const ThinkingSelectorUltrafast: AppStory = {
   ),
   parameters: {
     ...appMeta.parameters,
+    // One snapshot pins the new indicator glyph; the play covers fit and state on every run.
     pixel: {
-      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
+      matrix: { themes: ["dark"], viewports: ["phone"] },
     },
     docs: {
       description: {
