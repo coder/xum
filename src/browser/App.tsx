@@ -704,7 +704,8 @@ function AppInner() {
     return provider != null && isFastModeActive(provider, providersConfig[provider]);
   }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
 
-  const getUltrafastModeActive = useCallback(() => {
+  // Plain function: React Compiler handles memoization.
+  const getUltrafastModeActive = () => {
     const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
     if (!scopeId || providersConfig == null) return false;
 
@@ -715,7 +716,7 @@ function AppInner() {
         resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
       }) && isUltrafastModeActive(providersConfig.openai)
     );
-  }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
+  };
 
   const fastModeToggleInFlightRef = useRef(false);
   // Native host computer use belongs to the selected workspace. Offer it only where the backend
@@ -803,14 +804,6 @@ function AppInner() {
       selectedWorkspace,
       updateOptimistically,
     ]
-  );
-  const toggleFastMode = useCallback(
-    () => togglePremiumServiceTier("priority"),
-    [togglePremiumServiceTier]
-  );
-  const toggleUltrafastMode = useCallback(
-    () => togglePremiumServiceTier("ultrafast"),
-    [togglePremiumServiceTier]
   );
 
   const registerParamsRef = useRef<BuildSourcesParams | null>(null);
@@ -1082,9 +1075,9 @@ function AppInner() {
     getReasoningMode: getReasoningModeForWorkspace,
     onToggleReasoningMode: toggleReasoningModeFromPalette,
     getFastMode: getFastModeActive,
-    onToggleFastMode: toggleFastMode,
+    onToggleFastMode: () => togglePremiumServiceTier("priority"),
     getUltrafastMode: getUltrafastModeActive,
-    onToggleUltrafastMode: toggleUltrafastMode,
+    onToggleUltrafastMode: () => togglePremiumServiceTier("ultrafast"),
     // Read when the palette opens, from the shared cache (one fetch + one config subscription
     // per session), so showing the state costs no IPC call (#5791).
     getKeepScreenAwake: () => getAppConfigStore().getSnapshot()?.keepScreenAwake,
@@ -1216,10 +1209,10 @@ function AppInner() {
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_FAST_MODE)) {
         e.preventDefault();
         // Modals trap focus and hide the page behind them; don't change hidden page UI.
-        if (!isDialogOpen()) toggleFastMode().catch(() => undefined);
+        if (!isDialogOpen()) togglePremiumServiceTier("priority").catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ULTRAFAST_MODE)) {
         e.preventDefault();
-        if (!isDialogOpen()) toggleUltrafastMode().catch(() => undefined);
+        if (!isDialogOpen()) togglePremiumServiceTier("ultrafast").catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_COMPUTER_USE) && computerUseAvailable) {
         e.preventDefault();
         // A held shortcut would race enable and disable requests and leave either state behind.
@@ -1290,8 +1283,7 @@ function AppInner() {
     isCommandPaletteOpen,
     closeCommandPalette,
     openCommandPalette,
-    toggleFastMode,
-    toggleUltrafastMode,
+    togglePremiumServiceTier,
     computerUseAvailable,
     computerUse,
     openSettings,
