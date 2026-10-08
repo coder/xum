@@ -10,7 +10,6 @@ import {
 import { normalizeAgentId as normalizeWorkspaceAgentId } from "@/common/utils/agentIds";
 import { collectDeclaredAncestorLayers } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
-import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
 
 export type WorkspaceAISettingsCache = Partial<
   Record<
@@ -84,11 +83,6 @@ export function resolveConfiguredAiDefaults(
     autoThinkingLevel: resolveConfiguredAuto("autoThinkingLevel", resolved.sources.thinkingLevel),
   };
 }
-
-/** Explicit composer picks per agent: true = Auto, false = a concrete value. */
-export type AutoRoutingChoiceByAgent = Partial<
-  Record<string, Partial<Record<AutoRoutingDimension, boolean>>>
->;
 
 // Keep agent -> model/thinking precedence in one place so mode switches that send immediately
 // (like propose_plan Implement / Continue in Auto) resolve the same settings as sync effects.

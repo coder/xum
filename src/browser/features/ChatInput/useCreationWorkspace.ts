@@ -10,9 +10,6 @@ import type {
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
-import { getAutoRoutingKey, recordAutoRoutingChoiceForAgent } from "@/browser/utils/modelChange";
-import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
-import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
@@ -23,11 +20,7 @@ import {
   getProjectScopeId,
   getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
-import {
-  getAppConfigStore,
-  getUserPreferences,
-  updateUserPreferences,
-} from "@/browser/stores/AppConfigStore";
+import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { SendMessageError } from "@/common/types/errors";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -80,9 +73,8 @@ import {
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { resolveDevcontainerSelection } from "@/browser/utils/devcontainerSelection";
 import { getErrorMessage } from "@/common/utils/errors";
-import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
+import { resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 export type CreationSendResult = { success: true } | { success: false; error?: SendMessageError };
 export type CreationInitialSlashCommand = Extract<ParsedCommand, { type: "goal-set" }> & {
@@ -106,7 +98,6 @@ interface UseCreationWorkspaceOptions {
   /** User's currently selected model (for name generation fallback) */
   userModel?: string;
   agentBaseById?: ReadonlyMap<string, string | undefined>;
-  autoRoutingEnabled?: boolean;
 }
 
 // Project defaults can still name a removed built-in agent, and only user actions write
@@ -121,51 +112,7 @@ function resolveCreationAgentId(
     : agentId;
 }
 
-function syncCreationPreferences(
-  projectPath: string,
-  workspaceId: string,
-  agentBaseById: ReadonlyMap<string, string | undefined> | undefined,
-  autoRoutingEnabled: boolean
-): void {
-  const projectScopeId = getProjectScopeId(projectPath);
-  const aiPreferences = getUserPreferences().ai;
-  const projectDefaults = aiPreferences?.projectDefaults?.[projectPath];
-
-  const projectAgentId = projectDefaults?.agentId;
-  const globalDefaultAgentId = aiPreferences?.globalDefaults?.agentId ?? WORKSPACE_DEFAULTS.agentId;
-  const effectiveAgentId = resolveCreationAgentId(
-    typeof projectAgentId === "string" && projectAgentId.trim().length > 0
-      ? normalizeAgentId(projectAgentId, WORKSPACE_DEFAULTS.agentId)
-      : normalizeAgentId(globalDefaultAgentId, WORKSPACE_DEFAULTS.agentId),
-    agentBaseById
-  );
-
-  // Preserve only creation choices that differ from configured defaults; recording
-  // defaults would prevent later Settings changes from taking effect.
-  const configuredDefaults = resolveConfiguredAiDefaults(
-    effectiveAgentId,
-    getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {},
-    agentBaseById
-  );
-  const routingChoice: Partial<Record<AutoRoutingDimension, boolean>> = {};
-  for (const [dimension, configuredAuto] of [
-    ["model", configuredDefaults.autoModelRouting === true],
-    ["thinkingLevel", configuredDefaults.autoThinkingLevel === true],
-  ] as const) {
-    const creationAuto =
-      readPersistedState<boolean>(getAutoRoutingKey(projectScopeId, dimension), false) === true;
-    if (creationAuto) {
-      updatePersistedState(getAutoRoutingKey(workspaceId, dimension), true);
-    }
-    if (creationAuto !== configuredAuto) {
-      routingChoice[dimension] = creationAuto;
-    }
-  }
-  // Without the experiment the composer offers no Auto, so a mismatch is not a pick.
-  if (autoRoutingEnabled && Object.keys(routingChoice).length > 0) {
-    recordAutoRoutingChoiceForAgent(workspaceId, effectiveAgentId, routingChoice);
-  }
-
+function syncCreationPreferences(projectPath: string, workspaceId: string): void {
   // Auto-enable notifications if the project-level preference is set
   if (
     getUserPreferences().workspaceCreation?.byProject?.[projectPath]?.notifyOnResponseAutoEnable
@@ -292,7 +239,6 @@ export function useCreationWorkspace({
   draftId,
   userModel,
   agentBaseById,
-  autoRoutingEnabled = false,
 }: UseCreationWorkspaceOptions): UseCreationWorkspaceReturn {
   const workspaceContext = useOptionalWorkspaceContext();
   const promoteWorkspaceDraft = workspaceContext?.promoteWorkspaceDraft;
@@ -310,9 +256,6 @@ export function useCreationWorkspace({
 
   // Keep router state fresh synchronously so auto-navigation checks don't lag behind route changes.
   latestRouteRef.current = { currentWorkspaceId, currentProjectId, pendingDraftId };
-  // Read through a ref so a per-render agent map does not destabilize handleSend.
-  const agentBaseByIdRef = useRef(agentBaseById);
-  agentBaseByIdRef.current = agentBaseById;
   const { api } = useAPI();
   const { getProjectConfig, refreshProjects, loading: projectsLoading } = useProjectContext();
   const { config: providersConfig } = useProvidersConfig();
@@ -681,12 +624,7 @@ export function useCreationWorkspace({
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).
-        syncCreationPreferences(
-          projectPath,
-          metadata.id,
-          agentBaseByIdRef.current,
-          autoRoutingEnabled
-        );
+        syncCreationPreferences(projectPath, metadata.id);
 
         // Switch to the workspace immediately after creation unless the user navigated away
         // from the draft that initiated the creation (avoid yanking focus to the new workspace).
@@ -998,7 +936,6 @@ export function useCreationWorkspace({
       workspaceNameState.autoGenerate,
       message,
       subProjectPath,
-      autoRoutingEnabled,
       draftId,
       promoteWorkspaceDraft,
       deleteWorkspaceDraft,

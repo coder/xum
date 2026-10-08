@@ -1,11 +1,4 @@
-import {
-  AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS,
-  getAutoModelRoutingKey,
-  getAutoRoutingChoiceByAgentKey,
-  getAutoThinkingLevelKey,
-} from "@/common/constants/storage";
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import {
   markAiSelectionIntent,
@@ -13,8 +6,6 @@ import {
   type AutoRoutingDimension,
 } from "@/browser/utils/aiSelectionIntent";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
-import type { AutoRoutingChoiceByAgent } from "@/browser/utils/workspaceModeAi";
-import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 export type ModelChangeOrigin = "user" | "agent" | "sync";
@@ -104,39 +95,6 @@ export function setWorkspaceModelWithOrigin(
   if (origin === "user") {
     setAutoRoutingChoice(workspaceId, "model", false);
   }
-}
-
-const AUTO_ROUTING_KEY_BY_DIMENSION: Record<AutoRoutingDimension, (scopeId: string) => string> = {
-  model: getAutoModelRoutingKey,
-  thinkingLevel: getAutoThinkingLevelKey,
-};
-
-export function getAutoRoutingKey(scopeId: string, dimension: AutoRoutingDimension): string {
-  return AUTO_ROUTING_KEY_BY_DIMENSION[dimension](scopeId);
-}
-
-export function recordAutoRoutingChoiceForAgent(
-  workspaceId: string,
-  agentId: string,
-  choice: Partial<Record<AutoRoutingDimension, boolean>>
-): void {
-  updatePersistedState<AutoRoutingChoiceByAgent>(
-    getAutoRoutingChoiceByAgentKey(workspaceId),
-    (prev) => {
-      const record: AutoRoutingChoiceByAgent = prev && typeof prev === "object" ? prev : {};
-      const choices: Record<string, Partial<Record<AutoRoutingDimension, boolean>>> = {};
-      for (const [id, value] of Object.entries(record)) if (value) choices[id] = value;
-      // One entry per agent ever chosen: keep the most recently chosen agents inside the key
-      // budget so the newest choices always persist (an over-budget value would not survive reload).
-      return withRecordEntry(
-        choices,
-        agentId,
-        { ...record[agentId], ...choice },
-        AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS
-      );
-    },
-    {}
-  );
 }
 
 /** Records an unsent Auto pick for the scope's selected agent. */

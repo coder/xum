@@ -15,8 +15,6 @@ import * as storageModule from "@/common/constants/storage";
 import {
   GLOBAL_SCOPE_ID,
   PERSISTED_KEY_REGISTRY,
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
   getDisableWorkspaceAgentsKey,
   getDraftScopeId,
   getModelKey,
@@ -58,8 +56,6 @@ const PROJECT_SCOPED_WORKSPACE_KEYS = [
   getThinkingLevelKey,
   getReasoningModeKey,
   getDisableWorkspaceAgentsKey,
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
 ];
 
 function projectPath(index: number): string {

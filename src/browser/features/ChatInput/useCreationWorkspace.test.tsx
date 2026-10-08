@@ -2,6 +2,11 @@ import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/Draft
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import {
+  resetAiSelectionIntentForTests,
+  setAutoRoutingPick,
+} from "@/browser/utils/aiSelectionIntent";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as RouterContextModule from "@/browser/contexts/RouterContext";
@@ -11,9 +16,6 @@ import * as DraftWorkspaceSettingsModule from "@/browser/hooks/useDraftWorkspace
 import * as ChatCommandsModule from "@/browser/utils/chatCommands";
 import type { ProjectConfig } from "@/common/types/project";
 import {
-  getAutoModelRoutingKey,
-  getAutoRoutingChoiceByAgentKey,
-  getAutoThinkingLevelKey,
   getPendingDraftSkillDiscoveryKey,
   getPendingScopeId,
   getPendingWorkspaceSendErrorKey,
@@ -698,6 +700,8 @@ describe("useCreationWorkspace", () => {
   });
 
   afterEach(async () => {
+    resetAiSelectionIntentForTests();
+    getAppConfigStore().updateOptimistically({ experiments: undefined });
     getDraftStore().setClient(null);
     cleanup();
     restorePersistedStateMocks?.();
@@ -2022,64 +2026,49 @@ describe("useCreationWorkspace", () => {
     expect(sendMessageMock.mock.calls[0]?.[0]?.options?.agentId).toBe("exec");
   });
 
-  test.each([true, false])(
-    "records only creation routing picks that differ from the agent's Auto default (experiment %p)",
-    async (autoRoutingEnabled) => {
-      setupWindow({
-        listBranches: mock(
-          (): Promise<BranchListResult> =>
-            Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
-        ),
-        sendMessage: mock(
-          (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
-            Promise.resolve({ success: true as const, data: {} })
-        ),
-        create: mock(
-          (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
-            Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
-        ),
-      });
+  test("the first send carries the creation composer's Auto picks to the new workspace", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({ success: true as const, data: {} })
+    );
+    setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+      sendMessage: sendMessageMock,
+      create: mock(
+        (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+          Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+      ),
+    });
 
-      const projectScopeId = getProjectScopeId(TEST_PROJECT_PATH);
-      getAppConfigStore().updateOptimistically({
-        agentAiDefaults: { exec: { autoModelRouting: true } },
-      });
-      setPreferences({
-        ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "exec", model: "gpt-4" } } },
-      });
-      // Model Auto came from the default; thinking Auto was picked in the creation composer.
-      persistedPreferences[getAutoModelRoutingKey(projectScopeId)] = true;
-      persistedPreferences[getAutoThinkingLevelKey(projectScopeId)] = true;
-      draftSettingsState = createDraftSettingsHarness({ agentId: "exec" });
+    getAppConfigStore().updateOptimistically({
+      agentAiDefaults: { exec: { autoModelRouting: true } },
+      experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
+    });
+    setPreferences({
+      ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "exec", model: "gpt-4" } } },
+    });
+    // Model Auto comes from the default; thinking Auto was picked in the creation composer.
+    setAutoRoutingPick(getProjectScopeId(TEST_PROJECT_PATH), "exec", "thinkingLevel", true);
+    draftSettingsState = createDraftSettingsHarness({ agentId: "exec" });
 
-      const getHook = renderUseCreationWorkspace({
-        projectPath: TEST_PROJECT_PATH,
-        onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
-        message: "launch workspace",
-        autoRoutingEnabled,
-      });
-      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
 
-      await act(async () => {
-        await getHook().handleSend("launch workspace");
-      });
+    await act(async () => {
+      await getHook().handleSend("launch workspace");
+    });
 
-      expect(updatePersistedStateCalls).toContainEqual([
-        getAutoModelRoutingKey(TEST_WORKSPACE_ID),
-        true,
-      ]);
-      expect(updatePersistedStateCalls).toContainEqual([
-        getAutoThinkingLevelKey(TEST_WORKSPACE_ID),
-        true,
-      ]);
-      const recordedChoices = updatePersistedStateCalls
-        .filter(([key]) => key === getAutoRoutingChoiceByAgentKey(TEST_WORKSPACE_ID))
-        .map(([, updater]) => (updater as (prev: unknown) => unknown)({}));
-      expect(recordedChoices).toEqual(
-        autoRoutingEnabled ? [{ exec: { thinkingLevel: true } }] : []
-      );
-    }
-  );
+    const options = sendMessageMock.mock.calls[0]?.[0]?.options;
+    expect(options?.autoModelRouting).toBe(true);
+    expect(options?.autoThinkingLevel).toBe(true);
+  });
 
   test("handleSend returns failure when sendMessage fails and clears draft", async () => {
     const listBranchesMock = mock(
@@ -2563,7 +2552,6 @@ interface HookOptions {
     }
   ) => void;
   agentBaseById?: ReadonlyMap<string, string | undefined>;
-  autoRoutingEnabled?: boolean;
   message?: string;
   draftId?: string | null;
 }

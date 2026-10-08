@@ -189,32 +189,6 @@ export function getModelKey(workspaceId: string): string {
 }
 
 /**
- * Get the localStorage key for the composer's Auto selection (auto-model-routing
- * experiment). Kept separate from the model key so the concrete model survives
- * as the routing fallback.
- */
-export function getAutoModelRoutingKey(workspaceId: string): string {
-  return `autoModelRouting:${workspaceId}`;
-}
-
-/**
- * Get the localStorage key for the composer's Auto thinking-level selection
- * (auto-model-routing experiment). Independent of the model Auto key: either
- * dimension can be routed while the other stays concrete.
- */
-export function getAutoThinkingLevelKey(workspaceId: string): string {
-  return `autoThinkingLevel:${workspaceId}`;
-}
-
-/**
- * Explicit routing picks stay separate from the metadata-hydrated per-agent AI settings
- * cache, which carries no routing state.
- */
-export function getAutoRoutingChoiceByAgentKey(workspaceId: string): string {
-  return `autoRoutingChoiceByAgent:${workspaceId}`;
-}
-
-/**
  * Get the localStorage key for the input text for a workspace.
  * Only the VS Code webview composer still writes it; the desktop/web composer keeps drafts on the
  * backend and reads this key once for the legacy draft import.
@@ -747,8 +721,6 @@ export const EXPANDED_TASK_GROUPS_KEY = "expandedTaskGroups";
 export const FILE_TREE_EXPAND_STATE_MAX_CHARS = 512;
 /** auto-expand:{workspaceId}: the per-tool map keeps the most recently toggled tools that fit. */
 export const AUTO_EXPAND_PREFS_MAX_CHARS = 512;
-/** autoRoutingChoiceByAgent:{workspaceId}: one entry per agent ever chosen; the owner keeps the newest. */
-export const AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS = 384;
 /** reviewSearchState:{workspaceId}: longer searches still work but are not restored on reload. */
 export const REVIEW_SEARCH_STATE_MAX_CHARS = 256;
 /**
@@ -899,9 +871,6 @@ function projectPrefix(getKey: (projectPath: string) => string): string {
 export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Copied on fork.
   workspaceKey(getModelKey, "ui", true, MODEL_KEY_MAX_CHARS),
-  workspaceKey(getAutoModelRoutingKey, "ui", true, 16),
-  workspaceKey(getAutoThinkingLevelKey, "ui", true, 16),
-  workspaceKey(getAutoRoutingChoiceByAgentKey, "ui", true, AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS),
   // { thinking?, tools?: Record<toolName, boolean> }: one entry per tool the user toggled.
   workspaceKey(getAutoExpandPrefsKey, "ui", true, AUTO_EXPAND_PREFS_MAX_CHARS),
   // Creation-draft scopes only. ~80 skeleton + generatedIdentity <= ~410 (propose_name: name <= 20
