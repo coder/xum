@@ -6,7 +6,6 @@ import React, {
   useRef,
   useDeferredValue,
   useMemo,
-  useSyncExternalStore,
 } from "react";
 import { Lightbulb } from "lucide-react";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
@@ -42,7 +41,6 @@ import {
 import { getRetryBarrierDerivation } from "./retryBarrierDerivation";
 import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { ChatInput, type ChatInputAPI } from "@/browser/features/ChatInput/index";
-import { keepUnsettledEditInDraft } from "@/browser/features/ChatInput/useComposerDraft";
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import {
   mergeConsecutiveStreamErrors,
@@ -313,49 +311,6 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   );
 };
 
-// The open edit per workspace, in module memory: a workspace switch keeps it, so switching back
-// shows the edit with its typed changes, whose buffer the composer keeps (#5808). Not React
-// state: the shell unmounts this pane while a workspace loads. Memory only, so a reload drops
-// it. An entry goes when its edit ends; one left by a workspace removed mid-edit is small and
-// stays until reload.
-let editTargets: Readonly<Record<string, EditingMessageState>> = {};
-const editTargetListeners = new Set<() => void>();
-const readEditTargets = () => editTargets;
-function subscribeEditTargets(listener: () => void) {
-  editTargetListeners.add(listener);
-  return () => {
-    editTargetListeners.delete(listener);
-  };
-}
-function setEditingByWorkspace(
-  update: (
-    previous: Readonly<Record<string, EditingMessageState>>
-  ) => Readonly<Record<string, EditingMessageState>>
-) {
-  const previous = editTargets;
-  const next = update(previous);
-  if (next === previous) return;
-  editTargets = next;
-  for (const listener of editTargetListeners) listener();
-  // Every cleared or replaced target goes through here, so its unsettled contents are kept.
-  for (const [workspaceId, edit] of Object.entries(previous)) {
-    if (next[workspaceId]?.id !== edit.id) keepUnsettledEditInDraft(workspaceId, edit.id);
-  }
-}
-
-/** `edits` with this workspace's edit set or removed; the same object when nothing changes. */
-function withWorkspaceEdit(
-  edits: Readonly<Record<string, EditingMessageState>>,
-  workspaceId: string,
-  edit: EditingMessageState | undefined
-): Readonly<Record<string, EditingMessageState>> {
-  if (edits[workspaceId] === edit) return edits;
-  if (edit) return { ...edits, [workspaceId]: edit };
-  if (!(workspaceId in edits)) return edits;
-  const { [workspaceId]: _removed, ...rest } = edits;
-  return rest;
-}
-
 const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const {
     workspaceId,
@@ -423,24 +378,30 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       ? queuedActionErrorState.error
       : null;
 
-  const editingByWorkspace = useSyncExternalStore(subscribeEditTargets, readEditTargets);
-  const editingMessage = editingByWorkspace[workspaceId];
+  const [editingState, setEditingState] = useState(() => ({
+    workspaceId,
+    message: undefined as EditingMessageState | undefined,
+  }));
+  const editingMessage =
+    editingState.workspaceId === workspaceId ? editingState.message : undefined;
   const setEditingMessage = useCallback(
     (message: EditingMessageState | undefined) => {
       // Any change of edit target ends the conflict recovery of the previous edit (no-op
       // when none is pending); only the composer's own updater keeps a request alive.
       storeRaw.cancelTranscriptRefresh(workspaceId);
-      setEditingByWorkspace((previous) =>
-        withWorkspaceEdit(previous, workspaceId, transcriptOnly ? undefined : message)
-      );
+      setEditingState({
+        workspaceId,
+        message: transcriptOnly ? undefined : message,
+      });
     },
     [storeRaw, workspaceId, transcriptOnly]
   );
   const updateEditingMessage = (update: (current: EditingMessageState) => EditingMessageState) => {
-    setEditingByWorkspace((previous) => {
-      const current = previous[workspaceId];
-      return current ? withWorkspaceEdit(previous, workspaceId, update(current)) : previous;
-    });
+    setEditingState((previous) =>
+      previous.workspaceId === workspaceId && previous.message
+        ? { ...previous, message: update(previous.message) }
+        : previous
+    );
   };
   // The workspace with an unresolved edit send: no edit starts there meanwhile (#5226).
   const [editSendPendingIn, setEditSendPendingIn] = useState<string | null>(null);
@@ -473,7 +434,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // stale edit state instead of leaving the transcript stuck at an edit cutoff.
   useEffect(() => {
     if (transcriptOnly && editingMessage) {
-      setEditingByWorkspace((previous) => withWorkspaceEdit(previous, workspaceId, undefined));
+      setEditingState({ workspaceId, message: undefined });
     }
   }, [editingMessage, transcriptOnly, workspaceId]);
 
@@ -929,8 +890,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     clearBackgroundBashError();
   }, [clearBackgroundBashError, workspaceId]);
 
-  // A switch keeps each workspace's open edit (editingByWorkspace).
   useEffect(() => {
+    setEditingState({ workspaceId, message: undefined });
     setPendingTimelineReveal(null);
   }, [workspaceId]);
 
@@ -1393,8 +1354,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Must be before early return to satisfy React Hooks rules
   useEffect(() => {
     if (!workspaceState || !editingMessage) return;
-    // Back from another workspace, a kept edit's rows replay first: only a caught-up
-    // transcript can show that its row is gone (#5808).
+    // A replay of this workspace empties its rows first, while ChatPane stays mounted: only a
+    // caught-up transcript can show that the edited row is gone (#5808).
     if (!workspaceState.isTranscriptCaughtUp) return;
     // Conflict recovery re-reads the transcript (a full replay empties the aggregator first,
     // a pre-window range discards cached pages); the refresh outcome decides whether the
@@ -1416,8 +1377,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     )?.historyId;
 
     if (!editCutoffHistoryId) {
-      // A windowed replay can leave a kept edit's row in older history, unloaded: that is not
-      // a deletion, so the edit stays (#5808). Its send still checks the rows (precondition).
+      // A windowed replay can leave the edited row in older history, unloaded: that is not a
+      // deletion, so the edit stays (#5808). Its send still checks the rows (precondition).
       if (workspaceState.hasOlderHistory) return;
       // Message was replaced or deleted - clear editing state
       setEditingMessage(undefined);

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   defaultCreationDraftScope,
   getDraftStore,
@@ -7,9 +7,7 @@ import {
 } from "@/browser/stores/DraftStore";
 import type { ReviewNoteDataForDisplay } from "@/common/types/message";
 import type { Review } from "@/common/types/review";
-import assert from "@/common/utils/assert";
 import { DRAFT_ID_PATTERN } from "@/constants/drafts";
-import { joinDraftText } from "@/common/utils/composerDraftText";
 import type { ChatAttachment } from "./ChatAttachments";
 import type { Toast } from "./ChatInputToast";
 
@@ -53,47 +51,7 @@ interface EditDraft {
   text: string;
   attachments: ChatAttachment[];
 }
-
-// The open edit's buffer per workspace, in module memory. A workspace switch remounts the
-// composer (ChatPane keys it by workspace) while ChatPane keeps the edit open, so the buffer
-// must outlive the composer (#5808). Module memory, not the draft store: a reload still drops
-// the edit, and another window never sees it (#5672, #5571).
-const editDrafts = new Map<string, EditDraft>();
-const editDraftListeners = new Map<string, Set<() => void>>();
-function writeStoredEditDraft(key: string, next: EditDraft | null) {
-  if (next) editDrafts.set(key, next);
-  else editDrafts.delete(key);
-  for (const listener of editDraftListeners.get(key) ?? []) listener();
-}
-function subscribeEditDraft(key: string, listener: () => void) {
-  const listeners = editDraftListeners.get(key) ?? new Set<() => void>();
-  editDraftListeners.set(key, listeners);
-  listeners.add(listener);
-  return () => {
-    listeners.delete(listener);
-    if (listeners.size === 0) editDraftListeners.delete(key);
-  };
-}
-
-/**
- * The one rule for an edit that loses its target without a settle (cancel and accepted sends
- * settle first and leave no buffer): ChatPane calls this whenever a workspace's edit target is
- * cleared or replaced (transcript-only, a second Edit, a deleted row, a refresh that finds no
- * target). The edit's text and files stay in the workspace's normal draft, after the unsent
- * draft, never over it. Taking the buffer first makes it exactly once.
- */
-export function keepUnsettledEditInDraft(workspaceId: string, editId: string) {
-  const edit = editDrafts.get(workspaceId);
-  if (edit?.editId !== editId) return;
-  writeStoredEditDraft(workspaceId, null);
-  const scope: DraftStoreScope = { kind: "workspace", workspaceId };
-  if (edit.text.trim().length > 0) {
-    getDraftStore().setText(scope, (current) => joinDraftText(current, edit.text));
-  }
-  if (edit.attachments.length > 0) {
-    getDraftStore().setAttachments(scope, (current) => [...current, ...edit.attachments]);
-  }
-}
+type EditPatch = Partial<Pick<EditDraft, "text" | "attachments">>;
 
 type Update<T> = T | ((previous: T) => T);
 const applyUpdate = <T>(value: Update<T>, previous: T): T =>
@@ -109,28 +67,21 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   // While a message is edited, the composer edits this buffer instead of the draft: the edit
   // text stays in this window's memory, so a reload keeps the unsent draft (#5672) and another
   // window never shows the edit (#5571). A reload drops the edit; that is the chosen tradeoff.
-  // Edits exist only in a workspace composer, so the workspace keys the buffer (editDrafts).
-  const editKey = options.variant === "workspace" ? options.workspaceId : null;
-  const readEditDraft = () => (editKey ? (editDrafts.get(editKey) ?? null) : null);
-  const editDraft = useSyncExternalStore(
-    (listener) => (editKey ? subscribeEditDraft(editKey, listener) : () => undefined),
-    readEditDraft
-  );
+  // The ref is the live copy for writes that run after an await; renders read the state.
+  const [editDraft, setEditDraftState] = useState<EditDraft | null>(null);
+  const editDraftRef = useRef<EditDraft | null>(null);
   const editIdRef = useRef(options.editMessageId);
   useLayoutEffect(() => {
     editIdRef.current = options.editMessageId;
   });
   const writeEditDraft = (next: EditDraft | null) => {
-    if (!editKey) {
-      assert(next === null, "An edit buffer needs a workspace composer");
-      return;
-    }
-    writeStoredEditDraft(editKey, next);
+    editDraftRef.current = next;
+    setEditDraftState(next);
   };
   // Only the open edit's buffer counts. One left behind by an edit that ended without settling
-  // (its row was replaced) is ignored until the composer releases it.
+  // (its row was replaced) is ignored until the composer moves it to the draft.
   const liveEditDraft = () => {
-    const current = readEditDraft();
+    const current = editDraftRef.current;
     return current !== null && current.editId === editIdRef.current ? current : null;
   };
   const editActive = editDraft !== null && editDraft.editId === options.editMessageId;
@@ -182,7 +133,14 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
         .catch(() => undefined);
     };
   }, [variant, workspaceId, creationProjectPath, pendingDraftId]);
-  const [draftReviews, setDraftReviews] = useState<ReviewNoteDataForDisplay[] | null>(null);
+  const [draftReviews, setDraftReviewsState] = useState<ReviewNoteDataForDisplay[] | null>(null);
+  // Written with the state, so an edit send that completes after its composer unmounted still
+  // reads (and moves) the notes it put back (#5808). Never written on an edit keystroke.
+  const draftReviewsRef = useRef(draftReviews);
+  const setDraftReviews = (value: Update<ReviewNoteDataForDisplay[] | null>) => {
+    draftReviewsRef.current = applyUpdate(value, draftReviewsRef.current);
+    setDraftReviewsState(draftReviewsRef.current);
+  };
   const draftReviewIdsRef = useRef(new WeakMap<ReviewNoteDataForDisplay, string>());
   const nextDraftReviewIdRef = useRef(0);
   const isDraftReviewData = (value: unknown): value is ReviewNoteDataForDisplay =>
@@ -235,25 +193,19 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     setInput,
     /** The live composer text (the open edit's, else the draft's), for code after an await. */
     getLiveText: () => liveEditDraft()?.text ?? draftStore.getText(draftScope),
-    /**
-     * Fill the edit buffer; from now on the composer edits it, not the draft. A buffer this edit
-     * already has (it outlived a workspace switch) is kept with its typed changes.
-     */
-    beginEditDraft: (editId: string, next: { text: string; attachments: ChatAttachment[] }) => {
-      if (readEditDraft()?.editId === editId) return;
-      writeEditDraft({ editId, ...next });
-    },
-    /**
-     * Change this edit's buffer, whether or not ChatPane still shows the edit (an accepted edit
-     * command replaces its row before it clears the composer). Never the shared draft.
-     */
-    updateEditDraft: (editId: string, patch: Partial<Pick<EditDraft, "text" | "attachments">>) => {
-      const edit = readEditDraft();
-      if (edit?.editId === editId) writeEditDraft({ ...edit, ...patch });
+    /** Fill the edit buffer; from now on the composer edits it, not the draft. */
+    beginEditDraft: (editId: string, next: { text: string; attachments: ChatAttachment[] }) =>
+      writeEditDraft({ editId, ...next }),
+    /** Change this edit's buffer, shown or not; never the draft. False if it is not this edit's. */
+    updateEditDraft: (editId: string, update: EditPatch | ((edit: EditDraft) => EditPatch)) => {
+      const edit = editDraftRef.current;
+      if (edit?.editId !== editId) return false;
+      writeEditDraft({ ...edit, ...(typeof update === "function" ? update(edit) : update) });
+      return true;
     },
     /** Drop the edit buffer and return what it held (text typed during an edit send). */
     endEditDraft: () => {
-      const edit = readEditDraft();
+      const edit = editDraftRef.current;
       writeEditDraft(null);
       return edit;
     },
@@ -264,6 +216,7 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     attachments,
     setAttachments,
     draftReviews,
+    draftReviewsRef,
     setDraftReviews,
     getDraft,
     setDraft,
