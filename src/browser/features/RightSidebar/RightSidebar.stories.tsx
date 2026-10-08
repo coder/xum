@@ -30,6 +30,7 @@ import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import type { MockSessionUsage } from "@/browser/stories/mocks/orpc";
+import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { blurActiveElement } from "@/browser/stories/storyPlayHelpers";
 import { setupSimpleChatStory, setupStreamingChatStory } from "@/browser/stories/helpers/chatSetup";
 import { setHunkFirstSeen } from "@/browser/stories/helpers/reviews";
@@ -1496,6 +1497,9 @@ export const OutputTabErrorsOnly: Story = {
  * open (Codex-style empty tab) instead of showing every tool as an idle tab.
  */
 export const NewTabLauncher: Story = {
+  // Play-only: NewTabLauncherNarrow captures the launcher (and the strip overflow) for Pixel,
+  // which keeps this PR within the snapshot budget.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
@@ -1525,8 +1529,9 @@ export const NewTabLauncher: Story = {
 };
 
 /**
- * The New tab launcher at the sidebar's minimum width (300px): rows wrap their descriptions
- * instead of overflowing.
+ * The New tab launcher at the sidebar's minimum width (300px), next to more open tabs than fit:
+ * launcher rows wrap their descriptions instead of overflowing, and the strip stays one row
+ * that scrolls sideways (hidden scrollbar, faded edges) with "+" pinned at the end.
  */
 export const NewTabLauncherNarrow: Story = {
   render: () => (
@@ -1534,7 +1539,11 @@ export const NewTabLauncherNarrow: Story = {
       setup={() => {
         localStorage.removeItem(RIGHT_SIDEBAR_TAB_KEY);
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "300");
-        seedSidebarLayout("ws-new-tab-narrow", ["costs", "review", "new"], "new");
+        seedSidebarLayout(
+          "ws-new-tab-narrow",
+          ["costs", "review", "instructions", "goal", "workflows", "new"],
+          "new"
+        );
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-new-tab-narrow",
@@ -1554,18 +1563,19 @@ export const NewTabLauncherNarrow: Story = {
     const canvas = within(canvasElement);
     await canvas.findByRole("tab", { name: /^new tab/i, selected: true });
     await canvas.findByRole("button", { name: "Terminal" });
-    // Stats, Review and the New tab overflow a 300px strip: the selected New tab must still
-    // show in full.
+    // The open tabs overflow a 300px strip: the selected New tab must still show in full.
     await canvas.findByRole("tab", { name: /stats.*\$0\.12/i });
     await expectSelectedTabVisible(canvasElement);
   },
 };
 
 /**
- * Many open tabs in a narrow sidebar: the strip stays one row and scrolls sideways (hidden
- * scrollbar, faded edges) with "+" pinned at the end, instead of wrapping onto a second line.
+ * Many open tabs in a narrow sidebar with a middle tab selected: the strip scrolls that tab
+ * fully into view instead of wrapping onto a second line.
  */
 export const ManyTabsSingleRow: Story = {
+  // Play-only: NewTabLauncherNarrow already captures the overflowing strip for Pixel.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <RightSidebarStoryShell
       setup={() => {

@@ -47,7 +47,10 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 // phone in dark; the rest of the file stays excluded).
 // +1 snapshot: the Ultrafast closed-state indicator (ChatInput.stories.tsx ThinkingSelectorUltrafast,
 // phone in dark; the file was already counted).
-const MAX_SNAPSHOTS = 687;
+// +2 snapshots: the right-sidebar New tab launcher with an overflowing single-row tab strip
+// (RightSidebar.stories.tsx NewTabLauncherNarrow, desktop in dark + light; the fresh-workspace
+// and many-tabs stories stay play-only).
+const MAX_SNAPSHOTS = 689;
 const MAX_SNAPSHOT_ENABLED_FILES = 120;
 
 const { values } = parseArgs({
