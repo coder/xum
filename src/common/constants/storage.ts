@@ -47,6 +47,19 @@ const DRAFT_SCOPE_ID_PREFIX = "__draft__/";
 export const GLOBAL_SCOPE_ID = "__global__";
 
 /**
+ * Global, project, pending and draft composer scopes. Every other id is a workspace id,
+ * including legacy `<project basename>-<branch>` ids that start with "__".
+ */
+export function isNonWorkspaceScopeId(scopeId: string): boolean {
+  return (
+    scopeId === GLOBAL_SCOPE_ID ||
+    scopeId.startsWith(getProjectScopeId("")) ||
+    scopeId.startsWith(getPendingScopeId("")) ||
+    scopeId.startsWith(DRAFT_SCOPE_ID_PREFIX)
+  );
+}
+
+/**
  * Get the localStorage key for the UI theme preference (global)
  * Format: "uiTheme"
  */

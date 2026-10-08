@@ -10,6 +10,8 @@ import type {
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
+import { setAutoRoutingPick } from "@/browser/utils/aiSelectionIntent";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
@@ -20,7 +22,12 @@ import {
   getProjectScopeId,
   getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
-import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
+import {
+  getAppConfigStore,
+  getUserPreferences,
+  updateUserPreferences,
+} from "@/browser/stores/AppConfigStore";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { SendMessageError } from "@/common/types/errors";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -112,7 +119,17 @@ function resolveCreationAgentId(
     : agentId;
 }
 
-function syncCreationPreferences(projectPath: string, workspaceId: string): void {
+function syncCreationPreferences(projectPath: string, workspaceId: string, agentId: string): void {
+  // Without the experiment the composer offers no Auto, so the creation scope has no choice.
+  const experiments = getAppConfigStore().getSnapshot()?.experiments;
+  if (experiments?.[EXPERIMENT_IDS.AUTO_MODEL_ROUTING] === true) {
+    for (const dimension of ["model", "thinkingLevel"] as const) {
+      // The workspace shows the creation choice until a send saves it.
+      const creationAuto = getAutoRouting(getProjectScopeId(projectPath), dimension, agentId);
+      setAutoRoutingPick(workspaceId, agentId, dimension, creationAuto);
+    }
+  }
+
   // Auto-enable notifications if the project-level preference is set
   if (
     getUserPreferences().workspaceCreation?.byProject?.[projectPath]?.notifyOnResponseAutoEnable
@@ -624,7 +641,7 @@ export function useCreationWorkspace({
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).
-        syncCreationPreferences(projectPath, metadata.id);
+        syncCreationPreferences(projectPath, metadata.id, creationAgentId);
 
         // Switch to the workspace immediately after creation unless the user navigated away
         // from the draft that initiated the creation (avoid yanking focus to the new workspace).

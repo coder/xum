@@ -3,6 +3,7 @@ import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
+  getAutoRoutingPick,
   resetAiSelectionIntentForTests,
   setAutoRoutingPick,
 } from "@/browser/utils/aiSelectionIntent";
@@ -2068,6 +2069,9 @@ describe("useCreationWorkspace", () => {
     const options = sendMessageMock.mock.calls[0]?.[0]?.options;
     expect(options?.autoModelRouting).toBe(true);
     expect(options?.autoThinkingLevel).toBe(true);
+    // The workspace shows both creation choices until a send saves them.
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "model")).toBe(true);
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "thinkingLevel")).toBe(true);
   });
 
   test("handleSend returns failure when sendMessage fails and clears draft", async () => {

@@ -6,15 +6,21 @@ import {
   getAiSelectionVersion,
   getAutoRoutingPick,
   getPendingAiSelection,
+  getSavedAiSettings,
   getWorkspaceAiMetadata,
   subscribeAiSelection,
   type AutoRoutingDimension,
 } from "@/browser/utils/aiSelectionIntent";
 import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
-import { readScopedAiDefault, useScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import {
+  readScopeAgentId,
+  readScopedAiDefault,
+  useScopeAgentId,
+  useScopedAiDefault,
+} from "@/browser/utils/scopedAiDefaults";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { readPersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
-import { getReasoningModeKey } from "@/common/constants/storage";
+import { getReasoningModeKey, isNonWorkspaceScopeId } from "@/common/constants/storage";
 import {
   getAppConfigStore,
   getUserPreferences,
@@ -58,7 +64,7 @@ function resolveWorkspaceAiSelection(input: WorkspaceAiSelectionInput): Workspac
   const pick = (field: keyof WorkspaceAiSelection) =>
     getPendingAiSelection(input.workspaceId, agentId, field);
   const metadata = getWorkspaceAiMetadata(input.workspaceId);
-  const saved = metadata?.aiSettingsByAgent?.[agentId] ?? metadata?.aiSettings;
+  const saved = getSavedAiSettings(input.workspaceId, agentId);
   const configured = resolveConfiguredAiDefaults(
     agentId,
     input.agentAiDefaults,
@@ -88,10 +94,6 @@ function resolveWorkspaceAiSelection(input: WorkspaceAiSelectionInput): Workspac
   };
 }
 
-function isCreationScope(scopeId: string): boolean {
-  return scopeId.startsWith("__");
-}
-
 function resolveCreationScopeSelection(
   scoped: {
     model: string | undefined;
@@ -110,14 +112,14 @@ function resolveCreationScopeSelection(
 
 /**
  * Non-React reader; agentId defaults to the workspace's selected agent. Creation composers
- * pass their project, global or draft scope (workspace ids never start with "__").
+ * pass their project, global or draft scope.
  */
 export function getWorkspaceAiSelection(
   workspaceId: string,
   agentId = readScopedAiDefault(workspaceId, "agentId") ?? WORKSPACE_DEFAULTS.agentId,
   agentBaseById?: ReadonlyMap<string, string | undefined>
 ): WorkspaceAiSelection {
-  if (isCreationScope(workspaceId)) {
+  if (isNonWorkspaceScopeId(workspaceId)) {
     return resolveCreationScopeSelection(
       {
         model: readScopedAiDefault(workspaceId, "model"),
@@ -161,7 +163,7 @@ export function useWorkspaceAiSelection(
     useAppConfig((config) => config.defaultModel),
     WORKSPACE_DEFAULTS.model
   );
-  if (isCreationScope(workspaceId)) {
+  if (isNonWorkspaceScopeId(workspaceId)) {
     return resolveCreationScopeSelection(
       {
         model: scopedModel,
@@ -191,7 +193,7 @@ function resolveAutoRouting(input: {
 }): boolean {
   const agentId = normalizeAgentId(input.agentId, WORKSPACE_DEFAULTS.agentId);
   const flag = AUTO_ROUTING_FLAG[input.dimension];
-  const saved = getWorkspaceAiMetadata(input.scopeId)?.aiSettingsByAgent?.[agentId];
+  const saved = getSavedAiSettings(input.scopeId, agentId);
   return (
     getAutoRoutingPick(input.scopeId, agentId, input.dimension) ??
     (saved != null
@@ -207,7 +209,7 @@ function resolveAutoRouting(input: {
 export function getAutoRouting(
   scopeId: string,
   dimension: AutoRoutingDimension,
-  agentId = readScopedAiDefault(scopeId, "agentId") ?? WORKSPACE_DEFAULTS.agentId,
+  agentId = readScopeAgentId(scopeId),
   agentBaseById?: ReadonlyMap<string, string | undefined>
 ): boolean {
   return resolveAutoRouting({
@@ -225,12 +227,12 @@ export function useAutoRouting(
   agentBaseById?: ReadonlyMap<string, string | undefined>
 ): boolean {
   useSyncExternalStore(subscribeAiSelection, getAiSelectionVersion);
-  const agentId = useScopedAiDefault(scopeId, "agentId");
+  const agentId = useScopeAgentId(scopeId);
   const agentAiDefaults = useAgentAiDefaults();
   return resolveAutoRouting({
     scopeId,
     dimension,
-    agentId: agentId ?? WORKSPACE_DEFAULTS.agentId,
+    agentId,
     agentAiDefaults,
     agentBaseById,
   });
