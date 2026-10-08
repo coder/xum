@@ -139,10 +139,23 @@ describe("evaluateTrend", () => {
     ]);
   });
 
-  test("a final attempt without a summary is a gap, never an earlier attempt's values", () => {
-    // Which attempt buildReport keeps is owned by perfReport.test.ts; this pins the night it maps to.
+  test("values come from each test's final attempt only", () => {
+    const flaky = reportNight(run(0), [[TYPING, "flaky", 2]], [summary(0, 0.9), summary(1, 0.4)]);
+    expect(flaky.scenarios["chat-typing"]?.scriptMs).toBe(400);
     const failed = reportNight(run(0), [[TYPING, "unexpected", 2]], [summary(0, 0.9)]);
     expect(failed).toEqual({ run: run(0), scenarios: {}, issue: "no usable summary" });
+  });
+
+  test("a night merges page milestones and skips chat-switch rows", () => {
+    const test = { key: "k", spec: "s", title: "t", status: "expected", attempts: 1 } as const;
+    const milestones = { values: { firstMessageMs: 3 }, gaps: [] };
+    const open = { label: "open", values: { wallMs: 9 }, milestones };
+    const rows = [
+      { test, chatSwitch: false, scenarios: [open] },
+      { test, chatSwitch: true, scenarios: [{ label: "switch", values: { scriptMs: 1 } }] },
+    ];
+    const night = nightFromReport(run(0), { rows, problems: [], warnings: [] });
+    expect(night.scenarios).toEqual({ open: { wallMs: 9, firstMessageMs: 3 } });
   });
 
   test("values from nights before the contract start never count", () => {
