@@ -72,23 +72,44 @@ test("the version comes only from the @e2e-dev/web copy, and must be unique", ()
   expect(key().err).toContain("found 0");
 });
 
-test("--push for an existing tag reports the digest of its manifest bytes, and builds nothing", () => {
+test("--push always builds fresh and reports the name and digest of its own build", () => {
   setup();
-  // A fake docker: `imagetools inspect --raw` prints a manifest, any other command fails.
+  // A fake docker: `buildx build` writes build metadata to --metadata-file, and every call is
+  // logged. A registry lookup (imagetools) would be a reuse path.
   const bin = path.join(repo, "bin");
   fs.mkdirSync(bin);
-  const manifest = '{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}\n';
-  fs.writeFileSync(path.join(bin, "manifest.json"), manifest);
+  const calls = path.join(bin, "calls.log");
+  const digest = `sha256:${"ab".repeat(32)}`;
   fs.writeFileSync(
     path.join(bin, "docker"),
-    `#!/bin/sh\n[ "$1 $2 $3 $4" = "buildx imagetools inspect --raw" ] || exit 9\ncat "${bin}/manifest.json"\n`,
+    `#!/bin/sh
+echo "$*" >> "${calls}"
+[ "$1 $2" = "buildx build" ] || exit 9
+tag=""; meta=""
+while [ $# -gt 0 ]; do
+  case "$1" in --tag) tag=$2 ;; --metadata-file) meta=$2 ;; esac
+  shift
+done
+printf '{"containerimage.digest":"${digest}","image.name":"%s"}' "$tag" > "$meta"
+`,
     { mode: 0o755 }
   );
-  const r = spawnSync(path.join(repo, SANDBOX, "build.sh"), ["--push"], {
-    encoding: "utf8",
-    env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
-  });
+  const push = () =>
+    spawnSync(path.join(repo, SANDBOX, "build.sh"), ["--push"], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+    });
+  const r = push();
   expect(r.status).toBe(0);
-  const digest = `sha256:${new Bun.CryptoHasher("sha256").update(manifest).digest("hex")}`;
-  expect(JSON.parse(r.stdout)).toMatchObject({ digest, playwrightCore: "1.63.0" });
+  expect(JSON.parse(r.stdout)).toMatchObject({
+    image: "ghcr.io/coder/xum-bugbash-sandbox",
+    digest,
+    inputsKey: key().out,
+    playwrightCore: "1.63.0",
+  });
+  // A second publish of the same inputs builds again. Every call was a push build.
+  expect(push().status).toBe(0);
+  const log = fs.readFileSync(calls, "utf8").trim().split("\n");
+  expect(log).toHaveLength(2);
+  for (const line of log) expect(line).toMatch(/^buildx build .*--no-cache .*--push /);
 });

@@ -3,7 +3,7 @@
 #
 #   build.sh --key    print the inputs key of this checkout
 #   build.sh          build for linux/amd64 into the local Docker, print the image ID
-#   build.sh --push   main publish job only: push to GHCR, print the image.json record
+#   build.sh --push   the manual publish job only: build, push to GHCR, print the image.json record
 #
 # The inputs key is the sha256 of three lines: the sha256 of the Dockerfile, the sha256 of this
 # script, and the playwright-core version of @e2e-dev/web in bun.lock. The image carries it as
@@ -11,8 +11,10 @@
 # The script reads these files from the working tree and refuses when they differ from HEAD, so
 # the key always names committed source.
 #
-# The build gets an empty context, no cache and no build args from the env. --push skips the
-# build when the registry already has the tag inputs-<key>: one key, one published digest.
+# The build gets an empty context, no cache and no build args from the env. --push always builds
+# fresh: it never checks the registry and never reuses an image. It pushes a new tag, so it
+# overwrites no tag, and it reports the name and digest from its own build output. Two publishes
+# of one inputs key give two digests; the reviewed digest in image.json is what runners trust.
 # Nothing here deletes an image.
 set -euo pipefail
 
@@ -64,7 +66,7 @@ case "$mode" in
 esac
 
 context=$(mktemp -d)
-trap 'rm -rf "$context" "$context.json" "$context.raw"' EXIT
+trap 'rm -rf "$context" "$context.json"' EXIT
 build() {
   docker buildx build --platform linux/amd64 --no-cache --pull --provenance=false --sbom=false \
     --build-arg "PLAYWRIGHT_CORE_VERSION=$PLAYWRIGHT" --build-arg "INPUTS_SHA256=$KEY" \
@@ -77,18 +79,13 @@ if [ "$mode" = local ]; then
   exit 0
 fi
 
-# --push
-TAG="$IMAGE:inputs-$KEY"
-# The digest of a manifest is the sha256 of its raw bytes. Hash the file, not a --format value:
-# some buildx versions ignore --format here and print a table (docker/buildx#4006).
-if docker buildx imagetools inspect --raw "$TAG" >"$context.raw" 2>/dev/null; then
-  digest="sha256:$(sha "$context.raw")"
-  echo "build.sh: $TAG exists, no build" >&2
-else
-  build --push --tag "$TAG"
-  digest=$(jq -r '."containerimage.digest"' "$context.json")
-fi
-[[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || die "bad digest: $digest"
-jq -n --arg image "$IMAGE" --arg digest "$digest" --arg key "$KEY" --arg pw "$PLAYWRIGHT" \
+# --push. One new tag per publish (inputs key, commit, UTC time), so a publish overwrites no tag.
+build --push --tag "$IMAGE:inputs-${KEY:0:16}-$(git rev-parse --short=12 HEAD)-$(date -u +%Y%m%d%H%M%S)"
+# The name and digest come from this build's own metadata, not from a registry lookup.
+digest=$(jq -r '."containerimage.digest"' "$context.json")
+pushed=$(jq -r '."image.name"' "$context.json")
+[[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || die "bad digest in the build metadata: $digest"
+[[ $pushed == "$IMAGE:"* && $pushed != *,* ]] || die "unexpected image name in the build metadata: $pushed"
+jq -n --arg image "${pushed%:*}" --arg digest "$digest" --arg key "$KEY" --arg pw "$PLAYWRIGHT" \
   --arg from "$(git rev-parse HEAD)" \
   '{image: $image, digest: $digest, inputsKey: $key, playwrightCore: $pw, publishedFrom: $from}'

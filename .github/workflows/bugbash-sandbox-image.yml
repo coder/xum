@@ -1,24 +1,22 @@
 # The bug-bash sandbox image (#5714): tests/bugbash/sandbox/Dockerfile, built by build.sh.
 #
-# Pull requests build it with a read-only token and push nothing. Only a push to main (or a
-# manual run on main) publishes, from that exact commit, with no cache and no artifact from any
-# other run. A person then copies the digest from the job summary into image.json in a pull
+# Pull requests build it with a read-only token and push nothing. Publishing is manual: only a
+# workflow_dispatch run on main publishes, from that run's exact commit, with no cache and no
+# artifact from any other run. Each publish builds fresh, and the attestation names that build's
+# own output. A person then copies the digest from the job summary into image.json in a pull
 # request: no workflow writes to the repo. Nothing here deletes an image.
+#
+# Until a new image is published and its digest PR merges, runners refuse a checkout whose image
+# inputs changed (stale inputs key).
 name: Bug-bash sandbox image
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - tests/bugbash/sandbox/Dockerfile
-      - tests/bugbash/sandbox/build.sh
-      - bun.lock
-      - .github/workflows/bugbash-sandbox-image.yml
   pull_request:
     paths:
       - tests/bugbash/sandbox/Dockerfile
       - tests/bugbash/sandbox/build.sh
       - bun.lock
+      - Makefile
       - .github/workflows/bugbash-sandbox-image.yml
   workflow_dispatch: {}
 
@@ -42,17 +40,17 @@ jobs:
           persist-credentials: false
       - name: Build
         run: |
-          id=$(./tests/bugbash/sandbox/build.sh)
+          id=$(make -s bugbash-sandbox-image)
           size=$(docker image inspect --format '{{.Size}}' "$id")
-          echo "Image $id: $size bytes (inputs key $(./tests/bugbash/sandbox/build.sh --key))" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Image $id: $size bytes (inputs key $(make -s bugbash-sandbox-key))" | tee -a "$GITHUB_STEP_SUMMARY"
 
   publish:
     name: Publish
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Push ghcr.io/coder/xum-bugbash-sandbox. Only this job, only on main.
+      # Push ghcr.io/coder/xum-bugbash-sandbox. Only this job, only a manual run on main.
       packages: write
       # Build provenance for audit (the runner trusts the digest in image.json).
       id-token: write
@@ -71,8 +69,10 @@ jobs:
       - name: Build and push
         id: push
         run: |
-          ./tests/bugbash/sandbox/build.sh --push > image.json
-          echo "digest=$(jq -r .digest image.json)" >> "$GITHUB_OUTPUT"
+          make -s bugbash-sandbox-publish > image.json
+          # The subject of the attestation is this build's own output (image.json).
+          echo "image=$(jq -er .image image.json)" >> "$GITHUB_OUTPUT"
+          echo "digest=$(jq -er .digest image.json)" >> "$GITHUB_OUTPUT"
           {
             echo '### tests/bugbash/sandbox/image.json'
             echo
@@ -83,6 +83,6 @@ jobs:
       - name: Attest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-name: ghcr.io/coder/xum-bugbash-sandbox
+          subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
