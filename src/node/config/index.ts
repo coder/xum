@@ -4438,24 +4438,6 @@ export class Config {
       }
     }
 
-    // Filtered rows still inherit family identity from archived ancestors in the registry.
-    this.ensureWorkspaceIndex(config);
-    const parentById = new Map(workspaceMetadata.map((meta) => [meta.id, meta.parentWorkspaceId]));
-    const parentOf = (id: string) =>
-      parentById.has(id)
-        ? parentById.get(id)
-        : this.workspaceIndex.get(id)?.workspace.parentWorkspaceId;
-    for (const metadata of workspaceMetadata) {
-      const chain: string[] = [];
-      let root = metadata.id;
-      while (parentOf(root) && !chain.includes(root)) {
-        chain.push(root);
-        root = parentOf(root)!;
-      }
-      // A malformed cycle gets one representative, even for descendants entering it.
-      const cycle = chain.indexOf(root);
-      metadata.rootWorkspaceId = cycle < 0 ? root : chain.slice(cycle).sort()[0];
-    }
     const filtered = workspaceMetadata.filter((metadata) => {
       if (options?.archived == null || options.archived === "all") return true;
       return (

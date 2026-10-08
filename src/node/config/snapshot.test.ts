@@ -508,7 +508,7 @@ describe("Config snapshots", () => {
     }
   });
 
-  it("filters archive timestamps before checkout probes and retains archived ancestors", async () => {
+  it("filters archive timestamps before checkout probes and keeps parents of filtered rows", async () => {
     await saveWorkspaces([
       workspace("root", { archivedAt: older }),
       workspace("active", { parentWorkspaceId: "root" }),
@@ -528,7 +528,7 @@ describe("Config snapshots", () => {
     try {
       const active = await config.getAllWorkspaceMetadata({ archived: "active" });
       expect(active.map((metadata) => metadata.id)).toEqual(["active", "restored", "equal"]);
-      expect(active[0].rootWorkspaceId).toBe("root");
+      expect(active[0].parentWorkspaceId).toBe("root");
       delete stored[0].title;
       expect(access.mock.calls.map(([file]) => file)).toEqual(
         active.map((metadata) => metadata.namedWorkspacePath)
