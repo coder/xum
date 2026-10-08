@@ -1978,7 +1978,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       aiService: summaryAiService,
       workspaceId,
       abandonedMessages,
-      experiments: { rlm: true, programmaticToolCalling: true },
+      isExperimentEnabled: () => true,
       guardTailMessageId: "m2",
     });
     // Wait for the background generation to append + settle WITHOUT

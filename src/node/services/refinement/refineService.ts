@@ -48,11 +48,7 @@ import {
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import {
-  buildAbandonedBranchTranscript,
-  isRlmModeEnabled,
-  type RlmExperimentFlags,
-} from "@/node/services/branchSummary";
+import { buildAbandonedBranchTranscript, isRlmModeEnabled } from "@/node/services/branchSummary";
 import {
   findLatestContextBoundaryIndex,
   isDurableContextResetBoundaryMarker,
@@ -335,21 +331,12 @@ export class RefineService {
     private readonly options: RefineServiceOptions = {}
   ) {}
 
-  private enabled(experiments?: RlmExperimentFlags): boolean {
-    // RLM is a sub-experiment of Programmatic Tool Calling; both machine
-    // overrides must be on. Explicit renderer flags ride the request with the
-    // same authority as send options.experiments (r32): persisting overrides
-    // to the backend is asynchronous/best-effort, so a backend-only predicate
-    // could refuse /refine while the same workspace is already running with
-    // the RLM kernel the renderer sees.
-    return isRlmModeEnabled(experiments, (id) => this.experiments.isExperimentEnabled(id));
+  private enabled(): boolean {
+    return isRlmModeEnabled((id) => this.experiments.isExperimentEnabled(id));
   }
 
-  async run(
-    workspaceId: string,
-    experiments?: RlmExperimentFlags
-  ): Promise<Result<RefineRecord, string>> {
-    if (!this.enabled(experiments)) {
+  async run(workspaceId: string): Promise<Result<RefineRecord, string>> {
+    if (!this.enabled()) {
       return Err("rlm-mode experiment is disabled (enable Programmatic Tool Calling + RLM Mode)");
     }
     if (this.inFlight.has(workspaceId)) {
@@ -409,10 +396,9 @@ export class RefineService {
      * that only its own renderer displayed, so binding approval to the
      * newest transcript row would apply edits this user never audited.
      */
-    approvedProposalHash: string,
-    experiments?: RlmExperimentFlags
+    approvedProposalHash: string
   ): Promise<Result<RefineRecord, string>> {
-    if (!this.enabled(experiments)) {
+    if (!this.enabled()) {
       return Err("rlm-mode experiment is disabled (enable Programmatic Tool Calling + RLM Mode)");
     }
     if (this.inFlight.has(workspaceId)) {

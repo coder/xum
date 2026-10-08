@@ -1,4 +1,4 @@
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import * as budgetCounting from "./contextBudgetCounting";
 import type { MCPServerManager } from "./mcpServerManager";
 import { eventSpine } from "./events/eventSpine";
@@ -48,12 +48,7 @@ const model = "openai:gpt-4o";
 /** Persist the slider value (percent) for the test model, as the UI would. */
 const seedThreshold = (h: AgentSessionHarness, fraction: number) =>
   seedAutoCompactionThreshold(h.config, model, Math.round(fraction * 100));
-const options: SendMessageOptions = {
-  model,
-  agentId: "exec",
-  // Token budget requires the Memory experiment; the harness has no backend experiment service.
-  experiments: { tokenBudget: true, memory: true },
-};
+const options: SendMessageOptions = { model, agentId: "exec" };
 const correlation = {
   type: "workspace-turn-task",
   taskHandleId: "wst_budget",
@@ -166,6 +161,7 @@ async function seedHistory(h: AgentSessionHarness, inputTokens: number, toolResu
 describe("AgentSession token-budget lifecycle", () => {
   const harnesses: AgentSessionHarness[] = [];
   const storageCleanups: Array<() => Promise<void>> = [];
+  const enabledExperiments = new Set<ExperimentId>();
   afterEach(async () => {
     for (const h of harnesses.reverse()) {
       await h.session.dispose();
@@ -257,6 +253,12 @@ describe("AgentSession token-budget lifecycle", () => {
       },
     });
     harnesses.push(h);
+    enabledExperiments.clear();
+    enabledExperiments.add(EXPERIMENT_IDS.TOKEN_BUDGET);
+    enabledExperiments.add(EXPERIMENT_IDS.MEMORY);
+    spyOn(h.aiService, "isExperimentEnabled").mockImplementation((id) =>
+      enabledExperiments.has(id)
+    );
     spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(
       Ok({
         id: workspaceId,
@@ -313,9 +315,6 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("manual compaction publishes a summary and clears globally enabled token-budget state", async () => {
     const h = await setup();
-    spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
-    );
     await seedHistory(h, 20_000);
     const state = budgetOf(h);
     state.contextBudgetHandoffClaimed = true;
@@ -797,7 +796,7 @@ describe("AgentSession token-budget lifecycle", () => {
         message = "Read @large.txt";
       } else if (kind === "skill") {
         spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-          (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT
+          (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT || enabledExperiments.has(id)
         );
         const skillDir = path.join(h.config.rootDir, ".xum", "skills", "large-prelude");
         await fs.mkdir(skillDir, { recursive: true });
@@ -2322,11 +2321,10 @@ describe("AgentSession token-budget lifecycle", () => {
       const h = await setup();
       expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
       const nextOptions: SendMessageOptions =
-        change === "larger-model"
-          ? { ...options, model: "openai:gpt-4.1" }
-          : { ...options, experiments: { tokenBudget: false } };
+        change === "larger-model" ? { ...options, model: "openai:gpt-4.1" } : options;
       expect(h.session.queueMessage("Next request", nextOptions)).not.toBeNull();
       expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+      if (change === "mode-inactive") enabledExperiments.delete(EXPERIMENT_IDS.TOKEN_BUDGET);
       h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
       await h.waitForRequest(2);
       const rows = await allRows(h);
@@ -2744,7 +2742,7 @@ describe("AgentSession token-budget lifecycle", () => {
           },
         };
         spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-          (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT
+          (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT || enabledExperiments.has(id)
         );
         if (kind === "deduped-skill") {
           expect(
@@ -2753,7 +2751,7 @@ describe("AgentSession token-budget lifecycle", () => {
           await h.session.dispose();
           h = await setup({ previous: h, failure });
           spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
-            (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT
+            (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT || enabledExperiments.has(id)
           );
         }
       }
@@ -3227,9 +3225,9 @@ describe("AgentSession token-budget lifecycle", () => {
     const h = await setup();
     await seedHistory(h, 20_000);
     if (mode === "auto-off" || mode === "assembled") await seedThreshold(h, 1);
+    if (mode === "experiment-off") enabledExperiments.delete(EXPERIMENT_IDS.TOKEN_BUDGET);
     const sendOptions: SendMessageOptions = {
       ...options,
-      ...(mode === "experiment-off" ? { experiments: { tokenBudget: false } } : {}),
       ...(mode === "history-disabled"
         ? { toolPolicy: [{ regex_match: "session_.*", action: "disable" as const }] }
         : {}),
@@ -4078,16 +4076,16 @@ describe("AgentSession token-budget lifecycle", () => {
   });
 
   test.each([
-    { tokenBudget: false },
-    { tokenBudget: true, continuousCompaction: true },
-    { tokenBudget: true, rlm: true, programmaticToolCalling: true },
-  ])(
+    { off: [EXPERIMENT_IDS.TOKEN_BUDGET], on: [] },
+    { off: [], on: [EXPERIMENT_IDS.CONTINUOUS_COMPACTION] },
+    { off: [], on: [EXPERIMENT_IDS.RLM, EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING] },
+  ] satisfies Array<{ off: ExperimentId[]; on: ExperimentId[] }>)(
     "off or competing experiment %j does not install a settled budget callback",
-    async (experiments) => {
+    async ({ off, on }) => {
       const h = await setup();
-      expect(
-        (await h.session.sendMessage("No budget rollover", { ...options, experiments })).success
-      ).toBe(true);
+      for (const id of off) enabledExperiments.delete(id);
+      for (const id of on) enabledExperiments.add(id);
+      expect((await h.session.sendMessage("No budget rollover", options)).success).toBe(true);
       expect(h.requests[0].onStepSettled).toBeUndefined();
       expect(rolloverRows(await allRows(h))).toHaveLength(0);
     }

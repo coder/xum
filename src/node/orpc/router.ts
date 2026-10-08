@@ -1766,20 +1766,14 @@ export const router = (authToken?: string) => {
       run: t
         .input(schemas.refinements.run.input)
         .output(schemas.refinements.run.output)
-        .handler(({ context, input }) =>
-          context.refineService.run(input.workspaceId, input.experiments)
-        ),
+        .handler(({ context, input }) => context.refineService.run(input.workspaceId)),
       // Explicit approval step: applies the staged edits from the last run
       // through the same journaled tool paths (rollback keeps working).
       apply: t
         .input(schemas.refinements.apply.input)
         .output(schemas.refinements.apply.output)
         .handler(({ context, input }) =>
-          context.refineService.apply(
-            input.workspaceId,
-            input.approvedProposalHash,
-            input.experiments
-          )
+          context.refineService.apply(input.workspaceId, input.approvedProposalHash)
         ),
     },
     workspace: {

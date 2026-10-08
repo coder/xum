@@ -5013,7 +5013,6 @@ export class AgentSession {
           aiService: this.aiService,
           workspaceId: this.workspaceId,
           abandonedMessages: truncateResult.data.removedMessages,
-          experiments: options?.experiments,
           isExperimentEnabled: (experimentId) => this.aiService.isExperimentEnabled(experimentId),
           // Side-channel spend must reach session usage / the cost UI.
           ...(this.sessionUsageService ? { sessionUsageService: this.sessionUsageService } : {}),
@@ -5106,8 +5105,7 @@ export class AgentSession {
                   cancelSignal,
                   attempt
                 )
-              : typedMuxMetadata,
-            optionsForStream
+              : typedMuxMetadata
           )
         : typedMuxMetadata;
 
@@ -6993,15 +6991,9 @@ export class AgentSession {
     };
   }
 
-  /**
-   * True when RLM-mode history behaviors (keep-recent compaction floor,
-   * abandoned-branch summaries) apply. Frontend sends carry experiments in
-   * send options; backend-initiated compaction sends (idle loop) do not, so
-   * the shared gate falls back to the persisted machine overrides the
-   * renderer syncs into Settings.
-   */
-  private isRlmCompactionEnabled(options: SendMessageOptions | undefined): boolean {
-    return isRlmModeEnabled(options?.experiments, (experimentId: ExperimentId) =>
+  /** True when RLM-mode history behaviors (keep-recent compaction floor) apply. */
+  private isRlmCompactionEnabled(): boolean {
+    return isRlmModeEnabled((experimentId: ExperimentId) =>
       this.aiService.isExperimentEnabled(experimentId)
     );
   }
@@ -7015,13 +7007,11 @@ export class AgentSession {
    * when history cannot be read (self-healing: compaction proceeds without a
    * tail), or when the tail clamps away entirely.
    */
-  private computeKeepRecentTailStamp(
-    options: SendMessageOptions | undefined
-  ): Promise<{ startHistorySequence: number } | undefined> {
+  private computeKeepRecentTailStamp(): Promise<{ startHistorySequence: number } | undefined> {
     return computeKeepRecentTailStamp(
       this.historyService,
       this.workspaceId,
-      this.isRlmCompactionEnabled(options)
+      this.isRlmCompactionEnabled()
     );
   }
 
@@ -7075,10 +7065,9 @@ export class AgentSession {
 
   /** Stamp a compaction-request metadata payload with the keep-recent tail (no-op when RLM is off). */
   private async withKeepRecentTailStamp(
-    metadata: Extract<MuxMessageMetadata, { type: "compaction-request" }>,
-    options: SendMessageOptions | undefined
+    metadata: Extract<MuxMessageMetadata, { type: "compaction-request" }>
   ): Promise<MuxMessageMetadata> {
-    const stamp = await this.computeKeepRecentTailStamp(options);
+    const stamp = await this.computeKeepRecentTailStamp();
     return stamp === undefined ? metadata : { ...metadata, keepRecentTail: stamp };
   }
 
@@ -8391,7 +8380,7 @@ export class AgentSession {
       const postCompactionAttachments =
         disablePostCompactionAttachments === true || preparedRequest != null || leaseRefusal != null
           ? null
-          : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
+          : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled());
       if (isStreamStartAborted()) {
         return Ok(undefined);
       }

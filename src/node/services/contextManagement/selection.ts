@@ -27,7 +27,7 @@ export function resolveContextStrategy(input: {
   // Keep precedence and suppression separate: saved token-budget settings can be inactive,
   // and consumed continuous work must not disappear when the configured strategy changes.
   if (continuous) return { configured, tokenBudgetSuppressedBy: "continuous" };
-  if (isRlmModeEnabled(input.experiments, input.isEnabled)) {
+  if (isRlmModeEnabled(input.isEnabled)) {
     return { configured, tokenBudgetSuppressedBy: "rlm" };
   }
   if (input.isCompactionRequest) {
