@@ -123,6 +123,7 @@ describe("perfTrend CLI", () => {
   const failures: Array<[string, string, Replies[string]]> = [
     ["a runs listing that exits 1", RUNS, { err: HOSTILE, code: 1 }],
     ["a failed current-run fetch", "repos/o/r/actions/runs/100", { err: HOSTILE, code: 1 }],
+    ["a failed artifact listing", "repos/o/r/actions/runs/99/artifacts", { err: HOSTILE, code: 1 }],
     ["a truncated listing", RUNS, { out: { total_count: 101, workflow_runs: [] } }],
     // Input the core rejects. Bun's Date.parse would roll 02-30 over to March.
     ["an impossible date", RUNS, broken({ created_at: "2099-02-30T08:30:00Z" })],
@@ -144,11 +145,12 @@ describe("perfTrend CLI", () => {
 
   test("in Actions, stdout stays empty and API text reaches only the summary, sanitized", () => {
     const summary = join(root, "summary.md");
-    for (const fixture of [
-      replies(HISTORY),
-      { ...replies([]), [RUNS]: { err: HOSTILE, code: 1 } },
-    ]) {
-      const result = run(fixture, { GITHUB_ACTIONS: "true", GITHUB_STEP_SUMMARY: summary });
+    // The first run has no summary path, so only the GITHUB_ACTIONS check keeps stdout empty.
+    for (const [fixture, path] of [
+      [replies(HISTORY), ""],
+      [{ ...replies([]), [RUNS]: { err: HOSTILE, code: 1 } }, summary],
+    ] as const) {
+      const result = run(fixture, { GITHUB_ACTIONS: "true", GITHUB_STEP_SUMMARY: path });
       expect([result.code, result.out]).toEqual([0, ""]);
       expect(result.err).toMatch(/^perf trend: [a-z0-9 ,;]+\n$/);
     }

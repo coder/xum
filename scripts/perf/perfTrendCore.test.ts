@@ -146,10 +146,7 @@ describe("evaluateTrend", () => {
       ["scriptMs", "no-data", true],
       ["layouts", "no-data", true],
     ]);
-    const warnings = render(all)
-      .split("\n")
-      .filter((line) => line.startsWith("- "));
-    expect(warnings).toEqual([
+    expect(render(all).match(/^- .*/gm)).toEqual([
       "- `s` has no value tonight for script ms, layouts, but earlier nights do",
     ]);
   });
