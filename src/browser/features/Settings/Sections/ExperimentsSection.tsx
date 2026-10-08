@@ -61,10 +61,12 @@ function ExperimentRow(props: ExperimentRowProps) {
         return;
       }
 
-      setEnabled(value);
+      // Dependent settings (the LAN bind reset) change only once the write is saved.
+      setEnabled(value)
+        .then(() => onToggle?.(value))
+        .catch(() => undefined);
       // Track the override for analytics
       telemetry.experimentOverridden(experimentId, value);
-      onToggle?.(value);
     },
     [disabled, setEnabled, telemetry, experimentId, onToggle]
   );

@@ -11,7 +11,6 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { installDom } from "../../../tests/ui/dom";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { EXPERIMENTS, getExperimentKey, type ExperimentId } from "@/common/constants/experiments";
 import * as storageModule from "@/common/constants/storage";
 import {
   GLOBAL_SCOPE_ID,
@@ -80,7 +79,6 @@ const draftScopeIds = Array.from({ length: DRAFT_SCOPE_COUNT }, (_, index) =>
   getDraftScopeId(projectPaths[index % PROJECT_COUNT], `${index}`.padStart(36, "d"))
 );
 const projectScopeIds = [...projectPaths.map(getProjectScopeId), GLOBAL_SCOPE_ID];
-const experimentKeys = (Object.keys(EXPERIMENTS) as ExperimentId[]).map(getExperimentKey);
 
 /** Every concrete key the worst-case model writes for one registration. */
 function modelledKeys(entry: PersistedKeyRegistration): string[] {
@@ -113,8 +111,6 @@ function modelledKeys(entry: PersistedKeyRegistration): string[] {
         { length: MODEL_COUNT },
         (_, index) => `${entry.key}provider:model-${index}`
       );
-    case "experiment":
-      return experimentKeys.filter((key) => key.startsWith(entry.key));
     default:
       // LRU caches key their entries by workspace id; model every entry maxEntries allows, which
       // can be more than WORKSPACE_COUNT (session costs outlive deleted workspaces).
@@ -223,9 +219,6 @@ describe("localStorage budget", () => {
         key = (value as (scope: string) => string)("0123456789");
       }
       if (key !== null && getPersistedKeyRegistration(key) === undefined) unregistered.push(name);
-    }
-    for (const key of experimentKeys) {
-      if (getPersistedKeyRegistration(key) === undefined) unregistered.push(key);
     }
     expect(unregistered).toEqual([]);
   });

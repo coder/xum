@@ -419,11 +419,11 @@ describe("GeneralSection", () => {
     return trigger;
   }
 
-  async function chooseSelectOption(
+  async function clickSelectOption(
     view: ReturnType<typeof render>,
     label: string,
     optionText: string
-  ): Promise<void> {
+  ): Promise<HTMLElement> {
     const trigger = getSelectTrigger(view, label);
     fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     const portalRoot = view.baseElement.ownerDocument.body;
@@ -439,6 +439,15 @@ describe("GeneralSection", () => {
       return button;
     });
     fireEvent.click(option);
+    return trigger;
+  }
+
+  async function chooseSelectOption(
+    view: ReturnType<typeof render>,
+    label: string,
+    optionText: string
+  ): Promise<void> {
+    const trigger = await clickSelectOption(view, label, optionText);
     await waitFor(() => {
       expect(trigger.textContent).toContain(optionText);
     });
@@ -541,16 +550,48 @@ describe("GeneralSection", () => {
     );
   }
 
+  test("rapid strategy choices on a slow backend persist the last choice", async () => {
+    const setup = renderGeneralSection({ backendOverrides: { [EXPERIMENT_IDS.MEMORY]: true } });
+    await hydrateExperiments();
+    const pending: Array<() => void> = [];
+    setup.setMock.mockImplementation(({ experimentId, enabled }) => {
+      setup.backendOverrides[experimentId] = enabled === true;
+      setup.emitConfigChanged();
+      return new Promise<void>((resolve) => pending.push(resolve));
+    });
+
+    await clickSelectOption(setup.view, "Compaction strategy", "Continuous");
+    await clickSelectOption(setup.view, "Compaction strategy", "Token Budget");
+    while (setup.setMock.mock.calls.length < 4 || pending.length > 0) {
+      await waitFor(() => expect(pending.length).toBeGreaterThan(0));
+      act(() => pending.shift()?.());
+    }
+
+    expect(setup.backendOverrides).toEqual({
+      [EXPERIMENT_IDS.MEMORY]: true,
+      [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: false,
+      [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
+    });
+  });
+
   test("keeps Token Budget selectable and tracks live PTC/RLM conflicts without changing the strategy", async () => {
     function ConflictToggles() {
       const [ptc, setPtc] = useExperiment(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
       const [rlm, setRlm] = useExperiment(EXPERIMENT_IDS.RLM);
       return (
         <>
-          <button data-enabled={ptc} onClick={() => setPtc(!ptc)}>
+          <button
+            onClick={() => {
+              setPtc(!ptc).catch(() => undefined);
+            }}
+          >
             Toggle PTC fixture
           </button>
-          <button data-enabled={rlm} onClick={() => setRlm(!rlm)}>
+          <button
+            onClick={() => {
+              setRlm(!rlm).catch(() => undefined);
+            }}
+          >
             Toggle RLM fixture
           </button>
         </>
