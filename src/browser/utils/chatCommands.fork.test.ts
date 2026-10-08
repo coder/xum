@@ -3,10 +3,17 @@ import { getDraftStore } from "@/browser/stores/DraftStore";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
 import { toDraftAttachmentMetadata } from "@/common/utils/drafts";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+} from "@/browser/utils/aiSelectionIntent";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { installDom } from "../../../tests/ui/dom";
 import { forkWorkspace } from "./chatCommands";
 
 const SOURCE_ID = "fork-source-ws";
+const FORK_ID = "fork-child-ws";
 
 let cleanupDom: (() => void) | undefined;
 
@@ -16,6 +23,7 @@ beforeEach(() => {
 
 afterEach(() => {
   getDraftStore().setClient(null);
+  resetAiSelectionIntentForTests();
   cleanupDom?.();
 });
 
@@ -61,5 +69,39 @@ describe("forkWorkspace", () => {
     await forkWorkspace({ client, sourceWorkspaceId: SOURCE_ID });
 
     expect(textSeenByFork).toBe("typed just before forking");
+  });
+
+  test("the fork keeps the source's unsent AI picks", async () => {
+    const forkMetadata: FrontendWorkspaceMetadata = {
+      id: FORK_ID,
+      name: "fork",
+      projectName: "project",
+      projectPath: "/tmp/project",
+      namedWorkspacePath: "/tmp/project/fork",
+      runtimeConfig: { type: "local" },
+    };
+    const client = createTestApiClient({
+      workspace: {
+        fork: () =>
+          Promise.resolve({
+            success: true as const,
+            metadata: forkMetadata,
+            projectPath: forkMetadata.projectPath,
+          }),
+        getInfo: () => Promise.resolve(forkMetadata),
+      },
+    });
+    markAiSelectionIntent(SOURCE_ID, "model", "openai:gpt-5.2");
+    markAiSelectionIntent(SOURCE_ID, "thinkingLevel", "high");
+    markAiSelectionIntent(SOURCE_ID, "reasoningMode", "pro");
+
+    const result = await forkWorkspace({ client, sourceWorkspaceId: SOURCE_ID });
+
+    expect(result.success).toBe(true);
+    expect(getWorkspaceAiSelection(FORK_ID, "exec")).toEqual({
+      model: "openai:gpt-5.2",
+      thinkingLevel: "high",
+      reasoningMode: "pro",
+    });
   });
 });
