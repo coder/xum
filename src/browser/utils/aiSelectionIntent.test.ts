@@ -7,15 +7,21 @@ import {
   consumeAiSelectionIntent,
   getAiSelectionIntentForSend,
   getAiSelectionIntentForSendOptions,
+  getPendingAiSelection,
   hasPendingAiSelectionIntent,
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
+  setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
 import { getAgentIdKey } from "@/common/constants/storage";
 
 const WS = "intent-ws";
 const MODEL_A = "openai:gpt-5.2";
 const MODEL_B = "anthropic:claude-sonnet-4-5";
+
+function saveExecModel(model: string): void {
+  setWorkspaceAiMetadata(WS, { aiSettingsByAgent: { exec: { model, thinkingLevel: "off" } } });
+}
 
 describe("aiSelectionIntent", () => {
   beforeEach(() => {
@@ -68,8 +74,27 @@ describe("aiSelectionIntent", () => {
     markAiSelectionIntent(WS, "model", MODEL_A);
     const latest = getAiSelectionIntentForSend(WS, "exec", { model: MODEL_A });
     expect(latest.attachedTokens.model).not.toBe(staleTokens.model);
+    saveExecModel(MODEL_A);
     consumeAiSelectionIntent(WS, "exec", latest.attachedTokens);
     expect(getAiSelectionIntentForSend(WS, "exec", { model: MODEL_A }).intent).toBeUndefined();
+  });
+
+  test("a sent pick lasts until the saved bucket holds it; an unsent pick outlasts it", () => {
+    saveExecModel(MODEL_A);
+    markAiSelectionIntent(WS, "model", MODEL_B);
+    consumeAiSelectionIntent(
+      WS,
+      "exec",
+      getAiSelectionIntentForSend(WS, "exec", { model: MODEL_B }).attachedTokens
+    );
+    // The save is in flight or failed: the composer keeps the sent pick.
+    expect(getPendingAiSelection(WS, "exec", "model")).toBe(MODEL_B);
+    saveExecModel(MODEL_B);
+    expect(getPendingAiSelection(WS, "exec", "model")).toBeUndefined();
+
+    markAiSelectionIntent(WS, "model", MODEL_A);
+    saveExecModel(MODEL_A);
+    expect(getPendingAiSelection(WS, "exec", "model")).toBe(MODEL_A);
   });
 
   test("a pick scoped to Plan does not apply to Exec", () => {
@@ -97,6 +122,9 @@ describe("aiSelectionIntent", () => {
     });
     expect(autoModel.intent).toEqual({ thinkingLevel: true });
     // Only attached fields are consumed; the model pick stays pending.
+    setWorkspaceAiMetadata(WS, {
+      aiSettingsByAgent: { exec: { model: MODEL_B, thinkingLevel: "high" } },
+    });
     consumeAiSelectionIntent(WS, "exec", autoModel.attachedTokens);
     expect(getAiSelectionIntentForSend(WS, "exec", sent).intent).toEqual({ model: true });
 

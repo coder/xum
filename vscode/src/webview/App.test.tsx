@@ -1813,7 +1813,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
     await reply(bridge, OK);
   });
 
-  test("persists an explicit model pick once, at the next send", async () => {
+  test("persists an explicit model pick until the host's metadata holds it", async () => {
     // "low" is below Opus 5.5's built-in minimum (MED): the companion thinking level must be sent
     // (and so persisted) as stored, not raised to a client-side floor.
     const { bridge, view } = await open([
@@ -1821,19 +1821,27 @@ describe("vscode webview explicit AI-setting persistence", () => {
     ]);
     await pickModel(view, "Opus 5.5");
 
-    const first = await send(bridge, view);
-    expect(first).toMatchObject({
+    const picked = {
       agentId: "plan",
       model: "anthropic:claude-opus-5-5",
       thinkingLevel: "low",
       skipAiSettingsPersistence: false,
       aiSelectionIntent: { model: true },
-    });
+    };
+    expect(await send(bridge, view)).toMatchObject(picked);
+    await reply(bridge, OK);
+    // The metadata pump has not delivered the saved model yet, so the pick still applies.
+    expect(await send(bridge, view)).toMatchObject(picked);
     await reply(bridge, OK);
 
-    const second = await send(bridge, view);
-    expect(second.skipAiSettingsPersistence).toBe(true);
-    expect(second.aiSelectionIntent).toBeUndefined();
+    await bridge.emit({
+      type: "workspaces",
+      workspaces: [mainWorkspace({ model: "anthropic:claude-opus-5-5", thinkingLevel: "low" })],
+    });
+    const saved = await send(bridge, view);
+    expect(saved.model).toBe("anthropic:claude-opus-5-5");
+    expect(saved.skipAiSettingsPersistence).toBe(true);
+    expect(saved.aiSelectionIntent).toBeUndefined();
     await reply(bridge, OK);
     expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
   });
