@@ -54,6 +54,7 @@ import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentI
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
   hasPendingAiSelectionIntent,
+  setWorkspaceAiMetadata,
   type AiSelectionField,
 } from "@/browser/utils/aiSelectionIntent";
 import type { APIClient } from "@/browser/contexts/API";
@@ -73,20 +74,25 @@ import {
 import { createDraftId } from "@/common/utils/drafts";
 
 /**
- * Seed per-workspace localStorage from backend workspace metadata.
- *
- * This keeps a workspace's model/thinking consistent across devices/browsers.
+ * Record backend workspace AI metadata for the AI selection resolver and seed
+ * per-workspace localStorage from it.
  */
 /** The metadata fields the seeding reads; the VS Code webview only receives these (#4738). */
 export type WorkspaceAiSeedSource = Pick<
   FrontendWorkspaceMetadata,
   "id" | "agentId" | "agentType" | "parentWorkspaceId" | "aiSettings" | "aiSettingsByAgent"
->;
+> &
+  Partial<Pick<FrontendWorkspaceMetadata, "projectPath">>;
 
 export function seedWorkspaceLocalStorageFromBackend(
   metadata: WorkspaceAiSeedSource,
   previous?: WorkspaceAiSeedSource
 ): void {
+  setWorkspaceAiMetadata(metadata.id, {
+    projectPath: metadata.projectPath,
+    aiSettings: metadata.aiSettings,
+    aiSettingsByAgent: metadata.aiSettingsByAgent,
+  });
   // Snapshot all main-workspace choices on client load, not on navigation.
   // Later metadata must not overwrite unsent choices; reload to restore backend settings.
   if (metadata.parentWorkspaceId == null && previous != null) {

@@ -544,7 +544,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
             if (!workspace.ai) continue;
             const previousAi = workspacesRef.current.find((w) => w.id === workspace.id)?.ai;
             seedWorkspaceLocalStorageFromBackend(
-              { id: workspace.id, ...workspace.ai },
+              { id: workspace.id, projectPath: workspace.projectPath, ...workspace.ai },
               previousAi ? { id: workspace.id, ...previousAi } : undefined
             );
           }

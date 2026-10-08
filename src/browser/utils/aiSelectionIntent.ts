@@ -11,6 +11,7 @@
  * a re-pick made while an earlier send is outstanding survives that send's consume.
  */
 import type { AiSelectionIntent } from "@/common/types/agentAiSettings";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { getAgentIdKey } from "@/common/constants/storage";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import assert from "@/common/utils/assert";
@@ -25,8 +26,42 @@ interface PendingSelection {
   token: number;
 }
 
+export type WorkspaceAiMetadata = Pick<
+  FrontendWorkspaceMetadata,
+  "aiSettings" | "aiSettingsByAgent"
+> &
+  Partial<Pick<FrontendWorkspaceMetadata, "projectPath">>;
+
 const pendingByScope = new Map<string, Partial<Record<AiSelectionField, PendingSelection>>>();
+const metadataByWorkspace = new Map<string, WorkspaceAiMetadata>();
+const listeners = new Set<() => void>();
 let nextToken = 1;
+let version = 0;
+
+function notify(): void {
+  version++;
+  for (const listener of listeners) listener();
+}
+
+export function subscribeAiSelection(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+export function getAiSelectionVersion(): number {
+  return version;
+}
+
+export function setWorkspaceAiMetadata(workspaceId: string, metadata: WorkspaceAiMetadata): void {
+  const previous = metadataByWorkspace.get(workspaceId);
+  if (JSON.stringify(previous) === JSON.stringify(metadata)) return;
+  metadataByWorkspace.set(workspaceId, metadata);
+  notify();
+}
+
+export function getWorkspaceAiMetadata(workspaceId: string): WorkspaceAiMetadata | undefined {
+  return metadataByWorkspace.get(workspaceId);
+}
 
 function normalizeAgent(agentId: string): string {
   return agentId.trim().toLowerCase() || WORKSPACE_DEFAULTS.agentId;
@@ -62,6 +97,15 @@ export function markAiSelectionIntent(
   assert(normalized != null, "markAiSelectionIntent: value must be non-empty");
   const token = nextToken++;
   pendingByScope.set(key, { ...pendingByScope.get(key), [field]: { value: normalized, token } });
+  notify();
+}
+
+export function getPendingAiSelection(
+  workspaceId: string,
+  agentId: string,
+  field: AiSelectionField
+): string | undefined {
+  return pendingByScope.get(`${workspaceId}\u0000${normalizeAgent(agentId)}`)?.[field]?.value;
 }
 
 /**
@@ -145,6 +189,7 @@ export function consumeAiSelectionIntent(
   } else {
     pendingByScope.set(key, next);
   }
+  notify();
 }
 
 /** Whether a local field value still reflects an unsent deliberate pick (reseed guard). */
@@ -158,7 +203,17 @@ export function hasPendingAiSelectionIntent(
   return selection != null && comparable(field, localValue) === selection.value;
 }
 
-/** Test-only: forget all pending picks. */
+/** A removed provider's pending model picks would otherwise outrank the repaired settings. */
+export function dropPendingModelPicks(shouldDrop: (model: string) => boolean): void {
+  for (const pending of pendingByScope.values()) {
+    if (pending.model != null && shouldDrop(pending.model.value)) delete pending.model;
+  }
+  notify();
+}
+
+/** Test-only: forget all pending picks and metadata. */
 export function resetAiSelectionIntentForTests(): void {
   pendingByScope.clear();
+  metadataByWorkspace.clear();
+  notify();
 }

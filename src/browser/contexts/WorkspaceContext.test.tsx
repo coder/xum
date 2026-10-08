@@ -28,6 +28,7 @@ import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils"
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import {
+  getWorkspaceAiMetadata,
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
 } from "@/browser/utils/aiSelectionIntent";
@@ -538,6 +539,9 @@ describe("WorkspaceContext", () => {
       });
       await setup();
       await waitFor(() => expect(processed).toBe(true));
+      expect(getWorkspaceAiMetadata(workspaceId)?.aiSettings?.model).toBe(
+        archived ? undefined : "openai:gpt-5.2"
+      );
       expect(readPersistedState<string | null>(getModelKey(workspaceId), null)).toBe(
         archived ? null : "openai:gpt-5.2"
       );

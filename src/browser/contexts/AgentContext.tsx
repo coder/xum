@@ -367,6 +367,10 @@ function AgentProviderWithState(props: {
   return <AgentContext.Provider value={agentContextValue}>{props.children}</AgentContext.Provider>;
 }
 
+export function useOptionalAgent(): AgentContextValue | undefined {
+  return useContext(AgentContext);
+}
+
 export function useAgent(): AgentContextValue {
   const ctx = useContext(AgentContext);
   if (!ctx) {
