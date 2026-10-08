@@ -806,6 +806,62 @@ describe("Config", () => {
       expect(projectPaths).not.toContain("/home/user/project/");
       expect(projectPaths).not.toContain("/home/user/another//");
     });
+
+    // #5917: the root has no trailing slash to strip. Normalizing "/" to "" made the next save
+    // write a "" key, which the following load rejected together with every workspace row.
+    it("keeps a project at / and its workspace rows through a save and a reload", async () => {
+      const workspacePath = path.join(config.srcDir, "root", "feature");
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["/", { workspaces: [{ path: workspacePath, id: "ws-root", name: "feature" }] }],
+          ],
+        })
+      );
+
+      // A settings edit on the workspace: load, mutate, save. Find the row by id, so the edit
+      // does not depend on which key the loader chose for the project.
+      await config.editConfig((cfg) => {
+        const row = [...cfg.projects.values()]
+          .flatMap((project) => project.workspaces)
+          .find((workspace) => workspace.id === "ws-root");
+        if (!row) throw new Error("expected the workspace row after load");
+        row.title = "edited";
+        return cfg;
+      });
+
+      // The save keeps the key as "/". It used to write "", which the next load rejects.
+      const saved = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        projects: Array<[string, unknown]>;
+      };
+      expect(saved.projects.map(([projectPath]) => projectPath)).toEqual(["/"]);
+
+      const reloaded = new Config(tempDir).loadConfigOrDefault();
+      expect(Array.from(reloaded.projects.keys())).toEqual(["/"]);
+      expect(reloaded.projects.get("/")?.workspaces).toMatchObject([
+        { id: "ws-root", path: workspacePath, title: "edited" },
+      ]);
+    });
+
+    // Self-healing for configs that an earlier save already wrote with the root as "".
+    it("loads a project stored under an empty key as / with its workspace rows", () => {
+      const workspacePath = path.join(config.srcDir, "root", "feature");
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["", { workspaces: [{ path: workspacePath, id: "ws-root", name: "feature" }] }],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(Array.from(loaded.projects.keys())).toEqual(["/"]);
+      expect(loaded.projects.get("/")?.workspaces).toMatchObject([
+        { id: "ws-root", path: workspacePath },
+      ]);
+    });
   });
 
   describe("loadConfigOrDefault customInstructions sanitizing", () => {

@@ -1,7 +1,12 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { expandTilde, validateProjectPath, isGitRepository } from "./pathUtils";
+import {
+  expandTilde,
+  validateProjectPath,
+  isGitRepository,
+  stripTrailingSlashes,
+} from "./pathUtils";
 
 describe("pathUtils", () => {
   describe("expandTilde", () => {
@@ -37,6 +42,23 @@ describe("pathUtils", () => {
     it("should handle empty string", () => {
       const result = expandTilde("");
       expect(result).toBe("");
+    });
+  });
+
+  describe("stripTrailingSlashes", () => {
+    it("strips trailing separators from ordinary paths as before", () => {
+      expect(stripTrailingSlashes("/home/user/project/")).toBe("/home/user/project");
+      expect(stripTrailingSlashes("/home/user/project//")).toBe("/home/user/project");
+      expect(stripTrailingSlashes("/home/user/project")).toBe("/home/user/project");
+      expect(stripTrailingSlashes("C:\\Users\\project\\")).toBe("C:\\Users\\project");
+      expect(stripTrailingSlashes("")).toBe("");
+    });
+
+    // #5917: "/" normalized to "", an invalid project key that the next config load dropped.
+    it("keeps the filesystem root, which has no trailing slash to strip", () => {
+      expect(stripTrailingSlashes("/")).toBe("/");
+      expect(stripTrailingSlashes("//")).toBe("/");
+      expect(stripTrailingSlashes("\\")).toBe("\\");
     });
   });
 
