@@ -58,7 +58,10 @@ export interface Job {
   owner: string;
   checkout: string;
 }
-export type CleanupState = "removed" | `unknown: ${string}`;
+/** "none": the session owned no job, so no container can exist. */
+export type CleanupState = "none" | "removed" | `unknown: ${string}`;
+/** The container name goes into a `name=^/…$` filter, which is a regex: no dots, no specials. */
+const CONTAINER_NAME = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
 export class Session {
   readonly #root: string;
@@ -67,6 +70,7 @@ export class Session {
   #client: Record<string, string> | null = null;
   #clientDir: string | null = null;
   #cleanup: Promise<CleanupState> | null = null;
+  #owned: Job | null = null;
 
   /** The entry point aborts `stop` from its SIGINT and SIGTERM handlers. */
   constructor(stop: AbortSignal, options: { root?: string } = {}) {
@@ -101,20 +105,35 @@ export class Session {
   }
 
   /**
+   * Registers the one job container of this session. The launcher calls it before `docker run`,
+   * so cleanup always knows the container it must remove. After a stop it refuses: cleanup may
+   * already be done, and the container must then never start.
+   */
+  own(job: Job): void {
+    if (this.#stopped != null) throw new Stopped(this.#stopped);
+    if (this.#owned != null) throw new Error("a session owns one job only");
+    if (this.#client == null)
+      throw new Error("own() needs a connected session: ensureImage() first");
+    if (!CONTAINER_NAME.test(job.name))
+      throw new Refusal(`bad container name ${JSON.stringify(job.name)}`);
+    this.#owned = job;
+  }
+
+  /**
    * One cleanup for success, error and stop: later calls get the same promise. It stops the
-   * session, waits for every child, and removes the job's container. It reports an unknown
+   * session, waits for every child, and removes the owned job's container. It reports an unknown
    * container state instead of success, and it never removes an image.
    */
-  cleanup(job?: Job): Promise<CleanupState> {
-    this.#cleanup ??= this.#runCleanup(job);
+  cleanup(): Promise<CleanupState> {
+    this.#cleanup ??= this.#runCleanup();
     return this.#cleanup;
   }
 
-  async #runCleanup(job?: Job): Promise<CleanupState> {
+  async #runCleanup(): Promise<CleanupState> {
     this.#stop("cleanup");
     await Promise.all(this.#children.values());
-    const state =
-      job == null || this.#client == null ? "removed" : await this.#removeContainer(job);
+    // own() needs a client, so an owned job always has one.
+    const state = this.#owned == null ? "none" : await this.#removeContainer(this.#owned);
     if (this.#clientDir != null) fs.rmSync(this.#clientDir, { recursive: true, force: true });
     return state;
   }
@@ -139,9 +158,9 @@ export class Session {
     this.#stopped ??= reason;
     // Only the children of this moment: cleanup commands start later and must finish.
     const victims = [...this.#children.keys()];
-    for (const child of victims) child.kill("SIGTERM");
+    for (const child of victims) signalGroup(child, "SIGTERM");
     setTimeout(() => {
-      for (const child of victims) if (this.#children.has(child)) child.kill("SIGKILL");
+      for (const child of victims) if (this.#children.has(child)) signalGroup(child, "SIGKILL");
     }, KILL_AFTER_MS).unref();
   }
 
@@ -176,6 +195,9 @@ export class Session {
     // Fail closed: a remote, ssh or relative endpoint is refused, never swapped for the default.
     if (!/^unix:\/\/\/./.test(context.stdout))
       throw new Refusal(`docker endpoint ${JSON.stringify(context.stdout)}: not a local socket`);
+    // #job() already throws after a stop. This check keeps it so if code moves in between: a
+    // folder made after cleanup would never be removed (#5877).
+    if (this.#stopped != null) throw new Stopped(this.#stopped);
     this.#clientDir = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-docker-"));
     const client = {
       PATH: user.PATH ?? "",
@@ -218,12 +240,13 @@ export class Session {
     env: Record<string, string>,
     timeoutMs: number
   ): Promise<Result> {
-    const child = spawn(cmd, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+    // detached: its own process group, so a stop or a timeout reaches its children too.
+    const child = spawn(cmd, args, { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
     child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    const timer = setTimeout(() => signalGroup(child, "SIGKILL"), timeoutMs);
     const result = new Promise<Result>((resolve) => {
       const done = (code: number | null, why: string) => {
         clearTimeout(timer);
@@ -239,5 +262,15 @@ export class Session {
     });
     this.#children.set(child, result);
     return result;
+  }
+}
+
+/** Signals the process group that `child` leads (#5877). A group that is gone is no error. */
+function signalGroup(child: ChildProcess, signal: NodeJS.Signals) {
+  if (child.pid == null) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
   }
 }

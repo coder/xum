@@ -14,13 +14,24 @@ const FAKE = `#!/bin/sh
 bin=$(dirname "$0"); . "$bin/fake.env"
 echo "$* [home=\${HOME-} cfg=\${DOCKER_CONFIG-}]" >> "$bin/calls.log"
 case "$1" in
-  context) echo "$HOST" ;;
+  context) if [ "\${CONTEXT-}" = hang ]; then trap '' TERM; exec sleep 30; fi; echo "$HOST" ;;
   info) echo "$INFO" ;;
   images) [ "$IMAGES_RC" = 0 ] || { echo "daemon down" >&2; exit 1; }; echo "$IMAGES" ;;
-  pull) if [ "$PULL" = hang ]; then trap '' TERM; exec sleep 30; fi ;;
+  pull)
+    if [ "$PULL" = hang ]; then trap '' TERM; exec sleep 30; fi
+    # A grandchild that holds no pipe: only a signal to the whole group reaches it.
+    if [ "$PULL" = group ]; then sleep 60 >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; trap '' TERM; wait $!; fi ;;
   image) echo "{\\"org.xum.bugbash.inputs\\":\\"$LABEL\\"}" ;;
-  ps) [ "$PS_RC" = 0 ] || exit 1; cat "$bin/containers" ;;
-  rm) : > "$bin/containers" ;;
+  # Lines of bin/containers: id name owner checkout. ps prints the ids that match every filter.
+  ps) [ "$PS_RC" = 0 ] || exit 1
+    n=""; o=""; c=""
+    for a in "$@"; do case "$a" in
+      name=*) n=\${a#name=^/}; n=\${n%"$"} ;;
+      label=xum.bugbash.owner=*) o=\${a#label=xum.bugbash.owner=} ;;
+      label=xum.bugbash.checkout=*) c=\${a#label=xum.bugbash.checkout=} ;;
+    esac; done
+    awk -v n="$n" -v o="$o" -v c="$c" '$2==n && $3==o && $4==c {print $1}' "$bin/containers" ;;
+  rm) shift 2; for id in "$@"; do awk -v id="$id" '$1!=id' "$bin/containers" > "$bin/c.tmp"; mv "$bin/c.tmp" "$bin/containers"; done ;;
   *) exit 9 ;;
 esac
 `;
@@ -29,6 +40,8 @@ let root = "";
 let bin = "";
 let key = "";
 const savedPath = process.env.PATH;
+const savedTmp = process.env.TMPDIR;
+let tmp = "";
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-runner-"));
   fs.mkdirSync(path.join(root, SANDBOX), { recursive: true });
@@ -55,10 +68,15 @@ beforeEach(() => {
   fs.writeFileSync(path.join(bin, "containers"), "");
   fake();
   process.env.PATH = `${bin}:${savedPath ?? ""}`;
+  // The private client folders of this test go here, so a leak shows.
+  tmp = path.join(root, "tmp");
+  fs.mkdirSync(tmp);
+  process.env.TMPDIR = tmp;
 });
 afterEach(async () => {
   await Promise.all(sessions.splice(0).map((s) => s.cleanup()));
   process.env.PATH = savedPath;
+  process.env.TMPDIR = savedTmp;
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -133,7 +151,7 @@ test("a missing image is pulled by digest, with a private client config", async 
   const cfg = /cfg=(\S+)\]/.exec(lines[2])![1];
   expect(lines[2]).toContain("[home= ");
   expect(fs.readdirSync(cfg)).toEqual([]);
-  expect(await s.cleanup()).toBe("removed");
+  expect(await s.cleanup()).toBe("none");
   expect(fs.existsSync(cfg)).toBe(false);
 });
 
@@ -169,36 +187,103 @@ test.each([
   expect(calls()).not.toContain("pull");
 });
 
-test("a stop ends a running pull; cleanup still runs and removes only the job's container", async () => {
+const JOB = { name: "xbb-1", owner: "boot:pid", checkout: "abc" };
+const FOREIGN = ["c2 xbb-1 other:pid abc", "c3 xbb-1 boot:pid other", "c4 xbb-2 boot:pid abc"];
+
+test("a stop ends a running pull; cleanup removes only the owned container, no image", async () => {
   fake({ PULL: "hang" });
-  fs.writeFileSync(path.join(bin, "containers"), "c1\n");
+  fs.writeFileSync(
+    path.join(bin, "containers"),
+    ["c1 xbb-1 boot:pid abc", ...FOREIGN].join("\n") + "\n"
+  );
   const stop = new AbortController();
   const s = session(stop);
   const pending = s.ensureImage();
   while (!calls().includes("pull ")) await Bun.sleep(20);
+  s.own(JOB);
   const stoppedAt = Date.now();
   stop.abort("SIGTERM");
   // The fake pull ignores SIGTERM, so it ends only by SIGKILL after the grace period.
   expect(await pending.catch((e: unknown) => e)).toEqual(new Stopped("SIGTERM"));
   expect(Date.now() - stoppedAt).toBeGreaterThanOrEqual(4_500);
   expect(await failure(s.ensureImage())).toThrow(Stopped);
-
-  const job = { name: "xbb-1", owner: "boot:pid", checkout: "abc" };
-  const first = s.cleanup(job);
-  expect(s.cleanup(job)).toBe(first);
-  expect(await first).toBe("removed");
-  const ps = calls()
-    .split("\n")
-    .find((l) => l.startsWith("ps "))!;
-  expect(ps).toContain(
-    "--filter name=^/xbb-1$ --filter label=xum.bugbash.owner=boot:pid --filter label=xum.bugbash.checkout=abc"
-  );
-  expect(calls()).toContain("rm -f c1 ");
+  expect(await s.cleanup()).toBe("removed");
+  expect(fs.readFileSync(path.join(bin, "containers"), "utf8").trim().split("\n")).toEqual(FOREIGN);
+  expect(calls()).not.toMatch(/^(rmi|image rm|image prune|system prune)/m);
+  expect(fs.readdirSync(tmp)).toEqual([]);
 }, 15_000);
 
 test("cleanup reports an unknown container state, never success", async () => {
   fake({ IMAGES: "sha256:abc", PS_RC: "1" });
   const s = session();
   await s.ensureImage();
-  expect(await s.cleanup({ name: "xbb-1", owner: "o", checkout: "c" })).toStartWith("unknown: ");
+  s.own(JOB);
+  expect(await s.cleanup()).toStartWith("unknown: ");
 });
+
+const alive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+test("#5877 item 1: a stop also ends the grandchildren of a running command", async () => {
+  fake({ PULL: "group" });
+  const stop = new AbortController();
+  const s = session(stop);
+  const pending = s.ensureImage();
+  const pidFile = path.join(bin, "grandchild.pid");
+  while (!fs.existsSync(pidFile) || fs.readFileSync(pidFile, "utf8").trim() === "")
+    await Bun.sleep(20);
+  const grandchild = Number(fs.readFileSync(pidFile, "utf8"));
+  expect(alive(grandchild)).toBe(true);
+  stop.abort("SIGTERM");
+  expect(await failure(pending)).toThrow(Stopped);
+  await s.cleanup();
+  for (let i = 0; i < 50 && alive(grandchild); i++) await Bun.sleep(20);
+  const survived = alive(grandchild);
+  if (survived) process.kill(grandchild, "SIGKILL");
+  expect(survived).toBe(false);
+}, 15_000);
+
+test("#5877 item 2: cleanup handles the owned job exactly once; own() after a stop refuses", async () => {
+  fake({ IMAGES: "sha256:abc" });
+  fs.writeFileSync(path.join(bin, "containers"), "c1 xbb-1 boot:pid abc\n");
+  const s = session();
+  await s.ensureImage();
+  s.own(JOB);
+  expect(() => s.own(JOB)).toThrow("one job only");
+  const first = s.cleanup();
+  expect(s.cleanup()).toBe(first);
+  expect(await first).toBe("removed");
+  expect(calls().match(/^rm -f /gm)).toHaveLength(1);
+
+  const late = session();
+  await late.ensureImage();
+  void late.cleanup();
+  expect(() => late.own(JOB)).toThrow(Stopped);
+});
+
+test("#5877 items 3 and 5: no owned job is 'none'; a regex-like name refuses", async () => {
+  expect(await session().cleanup()).toBe("none");
+  fake({ IMAGES: "sha256:abc" });
+  const s = session();
+  await s.ensureImage();
+  expect(() => s.own({ ...JOB, name: "xbb.1" })).toThrow(Refusal);
+  expect(() => session().own(JOB)).toThrow("ensureImage() first");
+});
+
+test("#5877 item 4: a stop during the endpoint lookup leaves no private client folder", async () => {
+  fake({ CONTEXT: "hang" });
+  const stop = new AbortController();
+  const s = session(stop);
+  const pending = s.ensureImage();
+  while (!calls().includes("context ")) await Bun.sleep(20);
+  stop.abort("SIGINT");
+  expect(await failure(pending)).toThrow(Stopped);
+  expect(await s.cleanup()).toBe("none");
+  expect(fs.readdirSync(tmp)).toEqual([]);
+}, 15_000);
