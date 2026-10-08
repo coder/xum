@@ -852,6 +852,17 @@ function holdEditSends(
 const editRequests = (spy: SendSpy) =>
   spy.mock.calls.filter(([, , options]) => options.editMessageId !== undefined).length;
 
+/** Send the open edit as `text`, held before the backend sees it: its target still shows. */
+async function startHeldEditSend(app: AppHarness, text: string, mode: "accept" | "refuse") {
+  const sends = holdEditSends(app, mode);
+  const textarea = editTextarea(app)!;
+  typeIntoEdit(textarea, text);
+  await waitFor(() => expect(textarea.value).toBe(text));
+  fireEvent.keyDown(textarea, { key: "Enter" });
+  await waitFor(() => expect(editRequests(sends.spy)).toBe(1), LOAD_TOLERANT_WAIT);
+  return sends;
+}
+
 /** Let pending promise continuations (a late send reply, a refresh outcome) run. */
 async function settleAsyncWork() {
   await act(async () => {
@@ -1605,14 +1616,10 @@ describe("Edit sends, restores and inserts while the unsent draft waits", () => 
     const app = await createAppHarness({ branchPrefix: "edit-queued-card-during-send" });
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
-      const textarea = await startEditWithUnsentDraft(app, scope);
-      // Held before the backend sees it: the edit's target still shows (section 3, step 11).
-      // The busy stream below changes the history, so the backend would refuse the edit anyway.
-      const sends = holdEditSends(app, "refuse");
-      typeIntoEdit(textarea, "edited message");
-      await waitFor(() => expect(textarea.value).toBe("edited message"));
-      fireEvent.keyDown(textarea, { key: "Enter" });
-      await waitFor(() => expect(editRequests(sends.spy)).toBe(1), LOAD_TOLERANT_WAIT);
+      await startEditWithUnsentDraft(app, scope);
+      // The edit's target still shows (section 3, step 11). The busy stream below changes the
+      // history, so the backend would refuse the edit anyway.
+      const sends = await startHeldEditSend(app, "edited message", "refuse");
       await queueBehindHeldStream(app, "queued Q", "queued note");
       await editQueuedMessage(app);
       await waitFor(
@@ -1806,8 +1813,8 @@ describe("Edit sends, restores and inserts while the unsent draft waits", () => 
       }
       await typeUnsentDraft(app, scope);
       await editRow(app, "second message");
-      const sends = holdEditSends(app, "reply-only");
-      await sendEdit(app, "[mock:wait-start] edited message", "Mock response: second message");
+      // Held before the backend: the edit's own buffer still exists behind the shown draft.
+      const sends = await startHeldEditSend(app, "edited message", "accept");
       await quoteTranscriptText(app, "Mock response: first message");
       await waitFor(() => {
         const text = getDraftStore().getText(scope);
@@ -1816,7 +1823,10 @@ describe("Edit sends, restores and inserts while the unsent draft waits", () => 
       }, LOAD_TOLERANT_WAIT);
       expect(messageTextarea(app).value).toBe(getDraftStore().getText(scope));
       sends.release();
-      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+      await app.chat.expectTranscriptContains(
+        "Mock response: edited message",
+        LOAD_TOLERANT_WAIT.timeout
+      );
       await app.chat.expectStreamComplete();
       sends.spy.mockRestore();
     } finally {
