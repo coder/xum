@@ -44,16 +44,9 @@ import {
   useAutoRoutingSelection,
   useSendMessageOptions,
 } from "@/browser/hooks/useSendMessageOptions";
-import {
-  applyAutoRoutingOutcome,
-  setWorkspaceModelWithOrigin,
-  setWorkspaceThinkingLevelWithOrigin,
-} from "@/browser/utils/modelChange";
-import { readScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
-import {
-  resolveAutoRoutingForAgent,
-  resolveWorkspaceAiSettingsForAgent,
-} from "@/browser/utils/workspaceModeAi";
+import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
 import {
   getReasoningModeKey,
   getProjectScopeId,
@@ -1078,41 +1071,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       existingReasoningMode: existingReasoning,
       agentBaseById,
     });
-    // Agent resolution in creation scopes uses configured defaults because they keep no
-    // per-agent routing choices or settings buckets.
-    const autoRoutingOutcome = resolveAutoRoutingForAgent({
-      agentId: normalizedAgentId,
-      agentAiDefaults,
-      agentBaseById,
-      explicitSwitch: isExplicitAgentSwitch,
-      experimentEnabled: autoModelRoutingEnabled,
-    });
     if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(scopeId, resolvedModel, isExplicitAgentSwitch ? "agent" : "sync");
     }
 
     if (existingThinking !== resolvedThinking) {
-      setWorkspaceThinkingLevelWithOrigin(
-        scopeId,
-        resolvedThinking,
-        isExplicitAgentSwitch ? "agent" : "sync"
-      );
+      writeScopedAiDefault(scopeId, "thinkingLevel", resolvedThinking);
     }
 
     if (existingReasoning !== resolvedReasoning) {
       updatePersistedState(reasoningKey, resolvedReasoning);
     }
-
-    applyAutoRoutingOutcome(scopeId, autoRoutingOutcome);
-  }, [
-    agentAiDefaults,
-    agentId,
-    agents,
-    autoModelRoutingEnabled,
-    creationParentProjectPath,
-    defaultModel,
-    variant,
-  ]);
+  }, [agentAiDefaults, agentId, agents, creationParentProjectPath, defaultModel, variant]);
 
   const chatDockColumnWidthClass = useChatDockColumnWidthClass();
 

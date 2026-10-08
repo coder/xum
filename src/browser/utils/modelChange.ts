@@ -5,7 +5,6 @@ import {
   getAutoThinkingLevelKey,
 } from "@/common/constants/storage";
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
-import type { ThinkingLevel } from "@/common/types/thinking";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import {
@@ -14,7 +13,7 @@ import {
   type AutoRoutingDimension,
 } from "@/browser/utils/aiSelectionIntent";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
-import type { AutoRoutingChoiceByAgent, AutoRoutingOutcome } from "@/browser/utils/workspaceModeAi";
+import type { AutoRoutingChoiceByAgent } from "@/browser/utils/workspaceModeAi";
 import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
@@ -148,26 +147,4 @@ export function setAutoRoutingChoice(
 ): void {
   const agentId = readScopedAiDefault(scopeId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
   setAutoRoutingPick(scopeId, agentId, dimension, active);
-}
-
-/** Apply after agent-origin writes clear Auto so the target agent's resolved choice wins. */
-export function applyAutoRoutingOutcome(scopeId: string, outcome: AutoRoutingOutcome): void {
-  for (const dimension of ["model", "thinkingLevel"] as const) {
-    const active = outcome[dimension];
-    if (active !== undefined) {
-      updatePersistedState(getAutoRoutingKey(scopeId, dimension), active);
-    }
-  }
-}
-
-/** Agent switches clear Auto before the resolved routing outcome is applied; sync preserves it. */
-export function setWorkspaceThinkingLevelWithOrigin(
-  workspaceId: string,
-  level: ThinkingLevel,
-  origin: ModelChangeOrigin
-): void {
-  writeScopedAiDefault(workspaceId, "thinkingLevel", level);
-  if (origin !== "sync") {
-    updatePersistedState(getAutoThinkingLevelKey(workspaceId), false);
-  }
 }

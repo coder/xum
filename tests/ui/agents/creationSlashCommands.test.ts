@@ -23,14 +23,10 @@ import {
 } from "../helpers";
 import { ChatHarness } from "../harness";
 
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { getUserPreferences } from "@/browser/stores/AppConfigStore";
-import {
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
-  getDraftScopeId,
-  getProjectScopeId,
-} from "@/common/constants/storage";
+import { resetAiSelectionIntentForTests } from "@/browser/utils/aiSelectionIntent";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
+import { getDraftScopeId, getProjectScopeId } from "@/common/constants/storage";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 
@@ -138,6 +134,8 @@ describeIntegration("Creation slash commands", () => {
   }, 30_000);
 
   test("a configured Auto default turns Auto on in the creation composer", async () => {
+    // The /model test above left an unsent concrete pick for this shared project.
+    resetAiSelectionIntentForTests();
     const env = getSharedEnv();
     await env.orpc.config.updateAgentAiDefaults({
       agentAiDefaults: { exec: { autoModelRouting: true } },
@@ -152,11 +150,11 @@ describeIntegration("Creation slash commands", () => {
       const projectScopeId = getProjectScopeId(projectPath);
       await waitFor(
         () => {
-          expect(readPersistedState(getAutoModelRoutingKey(projectScopeId), false)).toBe(true);
+          expect(getAutoRouting(projectScopeId, "model")).toBe(true);
         },
         { timeout: 5_000 }
       );
-      expect(readPersistedState(getAutoThinkingLevelKey(projectScopeId), false)).toBe(false);
+      expect(getAutoRouting(projectScopeId, "thinkingLevel")).toBe(false);
     } finally {
       await cleanupView(view, cleanupDom);
       await env.orpc.config.updateAgentAiDefaults({ agentAiDefaults: {} });

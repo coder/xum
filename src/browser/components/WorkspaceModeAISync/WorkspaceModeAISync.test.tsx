@@ -1,19 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { ReactElement } from "react";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { consumeWorkspaceModelChange } from "@/browser/utils/modelChange";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import {
-  resetTestExperiments,
-  setTestAgentAiDefaults,
-  setTestExperiment,
-} from "@/browser/testUtils";
-import { getAutoModelRoutingKey, getAutoThinkingLevelKey } from "@/common/constants/storage";
-import { setWorkspaceAgentPick, setWorkspaceAiMetadata } from "@/browser/utils/aiSelectionIntent";
+import { setTestAgentAiDefaults } from "@/browser/testUtils";
 
 import { WorkspaceModeAISync } from "../WorkspaceModeAISync/WorkspaceModeAISync";
 
@@ -62,7 +53,6 @@ describe("WorkspaceModeAISync", () => {
   });
 
   afterEach(() => {
-    resetTestExperiments();
     setTestAgentAiDefaults(undefined);
     cleanup();
     cleanupDom?.();
@@ -89,84 +79,6 @@ describe("WorkspaceModeAISync", () => {
 
     await waitFor(() => {
       expect(consumeWorkspaceModelChange(workspaceId, planModel)).toBe("agent");
-    });
-  });
-
-  test("an explicit agent switch leaves Auto", async () => {
-    const workspaceId = nextWorkspaceId();
-    updatePersistedState(getAutoModelRoutingKey(workspaceId), true);
-    updatePersistedState(getAutoThinkingLevelKey(workspaceId), true);
-
-    const { rerender } = renderSync({ workspaceId, agentId: "exec" });
-    // Mount sync is not a switch: the user's routing choice survives.
-    expect(readPersistedState(getAutoModelRoutingKey(workspaceId), false)).toBe(true);
-    expect(readPersistedState(getAutoThinkingLevelKey(workspaceId), false)).toBe(true);
-
-    rerender(<SyncHarness workspaceId={workspaceId} agentId="plan" />);
-    await waitFor(() => {
-      expect(readPersistedState(getAutoThinkingLevelKey(workspaceId), true)).toBe(false);
-    });
-    expect(readPersistedState(getAutoModelRoutingKey(workspaceId), true)).toBe(false);
-  });
-
-  describe("Auto routing agent defaults", () => {
-    beforeEach(() => {
-      setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
-    });
-
-    const readAuto = (workspaceId: string) => ({
-      model: readPersistedState(getAutoModelRoutingKey(workspaceId), false),
-      thinkingLevel: readPersistedState(getAutoThinkingLevelKey(workspaceId), false),
-    });
-
-    function renderAt(workspaceId: string, agentId: string) {
-      setWorkspaceAgentPick(workspaceId, agentId);
-      return renderSync({ workspaceId, agentId });
-    }
-
-    function switchTo(rerender: (ui: ReactElement) => void, workspaceId: string, agentId: string) {
-      setWorkspaceAgentPick(workspaceId, agentId);
-      rerender(<SyncHarness workspaceId={workspaceId} agentId={agentId} />);
-    }
-
-    test("agent switches turn Auto on for a configured-Auto agent and off for others", async () => {
-      const workspaceId = nextWorkspaceId();
-      setTestAgentAiDefaults({
-        exec: { modelString: "openai:gpt-5.2", autoModelRouting: true, autoThinkingLevel: true },
-        plan: { modelString: "openai:gpt-5.2" },
-      });
-
-      const { rerender } = renderAt(workspaceId, "plan");
-      expect(readAuto(workspaceId)).toEqual({ model: false, thinkingLevel: false });
-
-      switchTo(rerender, workspaceId, "exec");
-      await waitFor(() => {
-        expect(readAuto(workspaceId)).toEqual({ model: true, thinkingLevel: true });
-      });
-
-      switchTo(rerender, workspaceId, "plan");
-      await waitFor(() => {
-        expect(readAuto(workspaceId)).toEqual({ model: false, thinkingLevel: false });
-      });
-    });
-
-    test("mount sync applies configured Auto only when the agent has no workspace bucket", async () => {
-      const autoExec = { exec: { autoModelRouting: true, autoThinkingLevel: true } };
-      setTestAgentAiDefaults(autoExec);
-
-      const fresh = nextWorkspaceId();
-      renderAt(fresh, "exec");
-      await waitFor(() => {
-        expect(readAuto(fresh)).toEqual({ model: true, thinkingLevel: true });
-      });
-      cleanup();
-
-      const legacy = nextWorkspaceId();
-      setWorkspaceAiMetadata(legacy, {
-        aiSettingsByAgent: { exec: { model: "openai:gpt-5.2", thinkingLevel: "low" } },
-      });
-      renderAt(legacy, "exec");
-      expect(readAuto(legacy)).toEqual({ model: false, thinkingLevel: false });
     });
   });
 });

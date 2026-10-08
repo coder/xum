@@ -90,63 +90,6 @@ export type AutoRoutingChoiceByAgent = Partial<
   Record<string, Partial<Record<AutoRoutingDimension, boolean>>>
 >;
 
-/** undefined leaves the scope's Auto flag unchanged. */
-export type AutoRoutingOutcome = Record<AutoRoutingDimension, boolean | undefined>;
-
-/**
- * Explicit switches prefer workspace picks over configured defaults. Background sync only
- * enables configured Auto when no pick or per-agent bucket exists, and never disables existing Auto.
- */
-export function resolveAutoRoutingForAgent(args: {
-  agentId: string;
-  agentAiDefaults: AgentAiDefaults;
-  agentBaseById?: ReadonlyMap<string, string | undefined>;
-  explicitSwitch: boolean;
-  experimentEnabled: boolean;
-  routingChoices?: AutoRoutingChoiceByAgent;
-  workspaceByAgent?: WorkspaceAISettingsCache;
-}): AutoRoutingOutcome {
-  if (!args.experimentEnabled) {
-    // Keep per-agent choices stored but inactive while the experiment is off.
-    const outcome = args.explicitSwitch ? false : undefined;
-    return { model: outcome, thinkingLevel: outcome };
-  }
-
-  const normalizedAgentId = normalizeAgentId(args.agentId);
-  const configured = resolveConfiguredAiDefaults(
-    normalizedAgentId,
-    args.agentAiDefaults,
-    args.agentBaseById
-  );
-  const choices = args.routingChoices?.[normalizedAgentId];
-  const bucket = args.workspaceByAgent?.[normalizedAgentId];
-  const bucketModel = typeof bucket?.model === "string" ? bucket.model.trim() : "";
-
-  const resolveDimension = (
-    choice: boolean | undefined,
-    configuredAuto: boolean,
-    hasBucketValue: boolean
-  ): boolean | undefined => {
-    if (args.explicitSwitch) {
-      return choice ?? configuredAuto;
-    }
-    return configuredAuto && choice === undefined && !hasBucketValue ? true : undefined;
-  };
-
-  return {
-    model: resolveDimension(
-      choices?.model,
-      configured.autoModelRouting === true,
-      isValidModelFormat(bucketModel)
-    ),
-    thinkingLevel: resolveDimension(
-      choices?.thinkingLevel,
-      configured.autoThinkingLevel === true,
-      coerceThinkingLevel(bucket?.thinkingLevel) != null
-    ),
-  };
-}
-
 // Keep agent -> model/thinking precedence in one place so mode switches that send immediately
 // (like propose_plan Implement / Continue in Auto) resolve the same settings as sync effects.
 export function resolveWorkspaceAiSettingsForAgent(args: {
