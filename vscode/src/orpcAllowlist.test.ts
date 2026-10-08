@@ -175,6 +175,26 @@ describe("webview preferences (#4972, #4962)", () => {
     ).toEqual({ userPreferences: { appearance: { bashCollapsedSummaryMode: "intent" } } });
   });
 
+  test("forwards the numeric per-model compaction thresholds and no other AI preference", () => {
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        userPreferences: {
+          ai: {
+            projectDefaults: { "/home/alice/secret-project": { model: "openai:gpt-5" } },
+            autoCompactionThresholdByModel: {
+              "anthropic:claude-opus-5-5": 60,
+              "openai:gpt-5": "70",
+            },
+          },
+        },
+      })
+    ).toEqual({
+      userPreferences: {
+        ai: { autoCompactionThresholdByModel: { "anthropic:claude-opus-5-5": 60 } },
+      },
+    });
+  });
+
   test("forwards agentAiDefaults rebuilt from named fields, without invalid agents", () => {
     expect(
       redactWebviewOrpcResult(["config", "getConfig"], {

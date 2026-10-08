@@ -461,7 +461,12 @@ function ChatComposerInner(props: {
 
               <ContextUsageIndicatorButton
                 data={contextUsageData}
-                autoCompaction={autoCompactionSettings}
+                // No setter: the host blocks every config write from the webview, so the
+                // threshold is shown read-only.
+                autoCompaction={{
+                  threshold: autoCompactionSettings.threshold,
+                  rolloverEnabled: autoCompactionSettings.rolloverEnabled,
+                }}
               />
             </div>
 

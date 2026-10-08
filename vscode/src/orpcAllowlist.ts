@@ -103,9 +103,9 @@ export function isAllowedOrpcPath(path: string[]): boolean {
  * later stay in the host).
  * Of the task settings, only proposePlanImplementReplacesChatHistory (a boolean) is forwarded (#4942).
  * Of the user preferences, only appearance.bashCollapsedSummaryMode (a valid mode),
- * appearance.transcriptDensity (a valid density) and appearance.vimEnabled (a boolean) are
- * forwarded, and agentAiDefaults is forwarded rebuilt by normalizeAgentAiDefaults (#4972, #4979,
- * #4962).
+ * appearance.transcriptDensity (a valid density), appearance.vimEnabled (a boolean) and the numeric
+ * entries of ai.autoCompactionThresholdByModel are forwarded, and agentAiDefaults is forwarded
+ * rebuilt by normalizeAgentAiDefaults (#4972, #4979, #4962).
  *
  * providers.getConfig (#4766): it carries no keys (only apiKeySet-style booleans), but base URLs and
  * the deployment URL can embed credentials and apiKeyFile is a local path; no webview code reads
@@ -188,8 +188,28 @@ function projectAppConfig(value: unknown): Record<string, unknown> {
   if (typeof vimEnabled === "boolean") {
     projectedAppearance.vimEnabled = vimEnabled;
   }
+  const projectedPreferences: Record<string, unknown> = {};
   if (Object.keys(projectedAppearance).length > 0) {
-    projected.userPreferences = { appearance: projectedAppearance };
+    projectedPreferences.appearance = projectedAppearance;
+  }
+  // The composer's context meter shows the per-model compaction threshold; only the numbers cross.
+  const ai =
+    typeof userPreferences === "object" && userPreferences !== null
+      ? (userPreferences.ai as Record<string, unknown> | null | undefined)
+      : undefined;
+  const thresholds = ai?.autoCompactionThresholdByModel;
+  if (typeof thresholds === "object" && thresholds !== null) {
+    const projectedThresholds = Object.fromEntries(
+      Object.entries(thresholds).filter(
+        ([, percent]) => typeof percent === "number" && Number.isFinite(percent)
+      )
+    );
+    if (Object.keys(projectedThresholds).length > 0) {
+      projectedPreferences.ai = { autoCompactionThresholdByModel: projectedThresholds };
+    }
+  }
+  if (Object.keys(projectedPreferences).length > 0) {
+    projected.userPreferences = projectedPreferences;
   }
   // Agent switches and plan actions fall back to the per-agent defaults (Settings > Tasks) when the
   // workspace has no settings for the target agent (#4962). normalizeAgentAiDefaults rebuilds each

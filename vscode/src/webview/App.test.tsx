@@ -1248,6 +1248,40 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
       options: { agentId: "exec", model: "anthropic:claude-opus-5-5", thinkingLevel: "low" },
     });
   });
+
+  test("shows the saved compaction threshold read-only", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      userMessage("Summarize the repo"),
+      {
+        type: "message",
+        id: "a1",
+        role: "assistant",
+        parts: [{ type: "text", text: "Done." }],
+        metadata: {
+          historySequence: 2,
+          timestamp: 2,
+          model: "anthropic:claude-opus-5-5",
+          contextUsage: { inputTokens: 50_000, outputTokens: 1_000, totalTokens: undefined },
+        },
+      },
+    ]);
+    await bridge.answer("config.getConfig", {
+      userPreferences: {
+        ai: { autoCompactionThresholdByModel: { "anthropic:claude-opus-5-5": 60 } },
+      },
+    });
+
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: /^Context usage/ }));
+      await Promise.resolve();
+    });
+    const dialog = document.body.querySelector('[role="dialog"]');
+    expect(dialog?.textContent).toContain("Auto-compact at 60%");
+    // A drag would call config.updateUserPreferences, which the host blocks.
+    expect(dialog?.querySelector('[style*="ew-resize"]')).toBeNull();
+  });
 });
 
 describe("vscode webview AI settings persistence", () => {

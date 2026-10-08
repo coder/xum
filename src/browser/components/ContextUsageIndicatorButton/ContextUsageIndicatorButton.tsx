@@ -64,6 +64,15 @@ const PercentTickMarks: React.FC = () => {
   );
 };
 
+function getUsageSliderHint(config: AutoCompactionConfig): string {
+  if (!config.setThreshold) {
+    return getAutoCompactionLabel(config);
+  }
+  return config.rolloverEnabled
+    ? `${getAutoCompactionLabel(config)} · Drag blue slider to adjust`
+    : "Drag blue slider to adjust usage-based auto-compaction";
+}
+
 /** Unified auto-compact settings panel */
 const AutoCompactSettings: React.FC<{
   data: TokenMeterData;
@@ -113,11 +122,9 @@ const AutoCompactSettings: React.FC<{
             {percentageDisplay}
           </span>
         </div>
-        {showUsageSlider && (
+        {showUsageSlider && usageConfig && (
           <div className="text-muted counter-nums mt-1 text-[10px]">
-            {usageConfig?.rolloverEnabled
-              ? `${getAutoCompactionLabel(usageConfig)} · Drag blue slider to adjust`
-              : "Drag blue slider to adjust usage-based auto-compaction"}
+            {getUsageSliderHint(usageConfig)}
           </div>
         )}
       </div>
