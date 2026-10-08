@@ -2,8 +2,9 @@
  * Cross-run perf trends (#4442 phase 2b): pure policy. Slot 0 is the current run,
  * slots 1-16 are earlier scheduled main nights, newest first. A series (one metric of one
  * scenario) regresses when slots 0-2 all exceed the threshold over the median of slots 3-16. A
- * missing artifact, failed test or unusable summary is a gap, never a dropped night, so a streak
- * can never skip a bad night. Imports only `./perfReportCore` (the job has no `bun install`).
+ * missing artifact, a test without a final-attempt summary or an unusable summary is a gap, never
+ * a dropped night, so a streak can never skip a bad night. A failed test whose final attempt wrote
+ * a summary keeps its values. Imports only `./perfReportCore` (the job has no `bun install`).
  * The log line holds counts only. The Markdown renderer lands with the CLI (PR 2b-2).
  */
 import {
@@ -95,9 +96,11 @@ export function selectHistory(current: RunInfo, runs: readonly RunInfo[]): RunIn
   const now = Date.parse(current.createdAt);
   assert(Number.isFinite(now), "current run has an invalid createdAt");
   const time = (run: RunInfo) => Date.parse(run.createdAt);
+  // Overlapping listing pages can repeat a run; one run must never fill two slots.
   return runs
     .filter(
-      (run) =>
+      (run, index) =>
+        runs.findIndex((other) => other.databaseId === run.databaseId) === index &&
         run.event === "schedule" &&
         run.headBranch === "main" &&
         run.status === "completed" &&
@@ -112,6 +115,7 @@ export function selectHistory(current: RunInfo, runs: readonly RunInfo[]): RunIn
 /** Uses only `buildReport` rows, so every value comes from its test's final attempt. */
 export function nightFromReport(run: RunInfo, report: Report): Night {
   const created = Date.parse(run.createdAt);
+  assert(Number.isFinite(created), "run has an invalid createdAt");
   const scenarios: Night["scenarios"] = {};
   // Chat-switch rows carry labels only; their per-leg metrics are deferred (#4442).
   for (const row of report.rows.filter((entry) => !entry.chatSwitch)) {
@@ -190,6 +194,10 @@ export function evaluateTrend(current: Night, history: readonly Night[]): Series
     const time = Date.parse(night.run.createdAt);
     const newer = slot === 0 ? Infinity : Date.parse(nights[slot - 1].run.createdAt);
     assert(Number.isFinite(time) && time < newer, "nights must be valid and newest first");
+    for (const values of Object.values(night.scenarios)) {
+      const finite = (value?: number) => value === undefined || Number.isFinite(value);
+      assert(Object.values(values).every(finite), "values must be finite");
+    }
   });
   const labels = [...new Set(nights.flatMap((night) => Object.keys(night.scenarios)))].sort();
   const trends: SeriesTrend[] = [];

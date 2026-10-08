@@ -168,6 +168,16 @@ describe("evaluateTrend", () => {
       ["ok", true],
     ]);
   });
+
+  test("malformed nights fail loudly instead of reading as ok or empty", () => {
+    expect(() => evaluate(nights({ scriptMs: [NaN, 100, 100, 100, 100, 100, 100, 100] }))).toThrow(
+      "values must be finite"
+    );
+    const report = buildReport({ perfResult: "success", artifactFound: true, reads: [] });
+    expect(() => nightFromReport(run(0, { createdAt: "bad" }), report)).toThrow(
+      "invalid createdAt"
+    );
+  });
 });
 
 describe("selectHistory", () => {
@@ -182,6 +192,7 @@ describe("selectHistory", () => {
       run(0, { databaseId: 3, status: "in_progress", createdAt: half }),
       run(0, { databaseId: 4 }),
       run(-1),
+      run(1),
     ];
     const selected = selectHistory(run(0), [...others, ...valid].reverse());
     expect(ids(selected)).toEqual(ids(valid.slice(0, 16)));
