@@ -551,6 +551,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const onAcceptRestoredHeldInputs =
     variant === "workspace" ? props.onAcceptRestoredHeldInputs : undefined;
 
+  // The latest edit's session. Settled explicitly: the edit target also leaves the live
+  // transcript when the accepted edit replaces it (possibly before the send returns), and that
+  // is not a cancel.
+  const editSessionRef = useRef<EditSession | null>(null);
+  // The edit target the entry effect last applied (see the edit-entry effect).
+  const appliedEditIdRef = useRef<string | null>(null);
   // Creation sends can resolve after navigation; guard draft clears on unmounted inputs.
   const isMountedRef = useRef(true);
   useEffect(() => {
@@ -1272,10 +1278,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     ]
   );
 
-  // The latest edit's session. Settled explicitly: the edit target also leaves the live
-  // transcript when the accepted edit replaces it (possibly before the send returns), and that
-  // is not a cancel.
-  const editSessionRef = useRef<EditSession | null>(null);
   // Still this composer's open, unsettled edit and ChatPane's target (none after an unmount).
   const isLiveEdit = useCallback(
     (session: EditSession | null) =>
@@ -1452,7 +1454,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Runs once per edit target: the draft callbacks change identity as the user types, and
   // re-applying would clobber the in-progress edit text. The applied-id ref makes that
   // explicit instead of hiding the callbacks from the dependency list.
-  const appliedEditIdRef = useRef<string | null>(null);
   const draftPayloadsLoaded = draft.payloadsLoaded;
   useEffect(() => {
     // An edit that ended without a send or Cancel (second Edit, deleted row, target not found)
