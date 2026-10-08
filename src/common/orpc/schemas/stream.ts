@@ -1082,6 +1082,11 @@ export const SendMessageOptionsSchema = z.object({
    */
   autoThinkingLevel: z.boolean().optional(),
   /**
+   * Auto choices to save for the agent instead of this send's own flags: a plan handoff sends
+   * with routing off but keeps the target agent's Auto choices for its later sends.
+   */
+  savedAutoRouting: z.object({ model: z.boolean(), thinkingLevel: z.boolean() }).optional(),
+  /**
    * When true, workspace-specific agent definitions are disabled.
    * Only built-in and global agents are loaded. Useful for "unbricking" when
    * iterating on agent files - a broken agent in the worktree won't affect message sending.
