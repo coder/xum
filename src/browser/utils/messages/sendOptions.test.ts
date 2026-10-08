@@ -11,6 +11,10 @@ import {
   getThinkingLevelByModelKey,
   getThinkingLevelKey,
 } from "@/common/constants/storage";
+import {
+  resetAiSelectionIntentForTests,
+  setWorkspaceAiMetadata,
+} from "@/browser/utils/aiSelectionIntent";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { installDom } from "../../../../tests/ui/dom";
 import { getSendOptionsFromStorage } from "./sendOptions";
@@ -28,6 +32,7 @@ describe("getSendOptionsFromStorage", () => {
 
   afterEach(() => {
     resetTestExperiments();
+    resetAiSelectionIntentForTests();
     getAppConfigStore().updateOptimistically({
       userPreferences: undefined,
       defaultModel: undefined,
@@ -70,11 +75,14 @@ describe("getSendOptionsFromStorage", () => {
     );
   });
 
-  test("preserves explicit gateway-scoped stored model preferences", () => {
+  test("preserves explicit gateway-scoped saved workspace models", () => {
     const workspaceId = "ws-1";
     const rawModel = "mux-gateway:anthropic/claude-haiku-4-5";
 
     window.localStorage.setItem(getModelKey(workspaceId), JSON.stringify(rawModel));
+    setWorkspaceAiMetadata(workspaceId, {
+      aiSettingsByAgent: { exec: { model: rawModel, thinkingLevel: "off" } },
+    });
 
     const options = getSendOptionsFromStorage(workspaceId);
 

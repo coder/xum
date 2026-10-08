@@ -9,6 +9,10 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { GlobalWindow } from "happy-dom";
 import { getModelKey } from "@/common/constants/storage";
+import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+} from "@/browser/utils/aiSelectionIntent";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import { applyMergePatch } from "@/common/utils/applyMergePatch";
@@ -1162,6 +1166,7 @@ test("goal set objective prompt blocks budgeted goals on unpriced selected model
   globalThis.window = testWindow as unknown as Window & typeof globalThis;
   globalThis.document = testWindow.document as unknown as Document;
   window.localStorage.setItem(getModelKey("w1"), JSON.stringify("custom:unpriced-model"));
+  markAiSelectionIntent("w1", "model", "custom:unpriced-model");
 
   try {
     const getGoal = mock(() => Promise.resolve({ goal: null }));
@@ -1187,6 +1192,7 @@ test("goal set objective prompt blocks budgeted goals on unpriced selected model
 
     expect(setGoal).not.toHaveBeenCalled();
   } finally {
+    resetAiSelectionIntentForTests();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
   }

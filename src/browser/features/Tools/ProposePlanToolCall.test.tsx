@@ -23,6 +23,11 @@ import {
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
+import {
+  resetAiSelectionIntentForTests,
+  setWorkspaceAiMetadata,
+} from "@/browser/utils/aiSelectionIntent";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import {
   createTestApiClient,
@@ -319,9 +324,18 @@ function renderCompletedPlan(props: Partial<ProposePlanProps> = {}) {
   });
 }
 
-function startInPlanMode(workspaceId = WORKSPACE_ID, model?: string, thinkingLevel?: string) {
+function startInPlanMode(
+  workspaceId = WORKSPACE_ID,
+  model?: string,
+  thinkingLevel?: ThinkingLevel
+) {
   window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("plan"));
   if (model) updatePersistedState(getModelKey(workspaceId), model);
+  if (model) {
+    setWorkspaceAiMetadata(workspaceId, {
+      aiSettingsByAgent: { plan: { model, thinkingLevel: thinkingLevel ?? "off" } },
+    });
+  }
   if (thinkingLevel) updatePersistedState(getThinkingLevelKey(workspaceId), thinkingLevel);
 }
 
@@ -370,6 +384,7 @@ describe("ProposePlanToolCall", () => {
 
   afterEach(async () => {
     resetTestExperiments();
+    resetAiSelectionIntentForTests();
     setTestAgentAiDefaults(undefined);
     cleanup();
     await restoreProposePlanModuleMocks();
@@ -656,9 +671,15 @@ describe("ProposePlanToolCall", () => {
 
     startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
     setTestAgentAiDefaults({});
-    updatePersistedState(getWorkspaceAISettingsByAgentKey(WORKSPACE_ID), {
-      exec: { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking },
+    const exec = { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking } as const;
+    setWorkspaceAiMetadata(WORKSPACE_ID, {
+      aiSettingsByAgent: {
+        plan: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "high" },
+        exec,
+      },
     });
+    // Thinking still restores from the seeded per-agent cache.
+    updatePersistedState(getWorkspaceAISettingsByAgentKey(WORKSPACE_ID), { exec });
 
     const sendMessageCalls: SendMessageArgs[] = [];
     mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });

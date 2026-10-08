@@ -3,6 +3,7 @@ import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals"
 import { GlobalWindow } from "happy-dom";
 
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import {
   consumeWorkspaceModelChange,
   recordAutoRoutingChoiceForAgent,
@@ -70,6 +71,7 @@ describe("modelChange", () => {
     const otherModel = "anthropic:claude-sonnet-4-5";
 
     setWorkspaceModelWithOrigin(workspaceId, model, "sync");
+    markAiSelectionIntent(workspaceId, "model", model);
 
     // Simulate user selecting the already-active model.
     setWorkspaceModelWithOrigin(workspaceId, model, "user");

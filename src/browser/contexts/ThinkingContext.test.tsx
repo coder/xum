@@ -33,6 +33,11 @@ import {
 } from "@/browser/testUtils";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
+import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+  setWorkspaceAiMetadata,
+} from "@/browser/utils/aiSelectionIntent";
 
 let currentClientMock: TestApiOverrides<APIClient> = {};
 let metadataMap = new Map<string, FrontendWorkspaceMetadata>();
@@ -148,6 +153,7 @@ function createWorkspaceMetadata(
 
 function setWorkspaceMetadata(metadata: FrontendWorkspaceMetadata) {
   metadataMap = new Map([[metadata.id, metadata]]);
+  setWorkspaceAiMetadata(metadata.id, metadata);
 }
 
 function createEmptyAsyncIterable<T>(): AsyncIterable<T> {
@@ -168,12 +174,12 @@ function applyWorkspaceStorageOverrides(props: {
   modelOverride?: string | null;
   thinkingOverride?: "off" | null;
 }) {
-  if (props.modelOverride !== undefined) {
-    if (props.modelOverride == null) {
-      window.localStorage.removeItem(getModelKey(props.workspaceId));
-    } else {
-      updatePersistedState(getModelKey(props.workspaceId), props.modelOverride);
-    }
+  if (props.modelOverride === null) {
+    window.localStorage.removeItem(getModelKey(props.workspaceId));
+  }
+  if (props.modelOverride != null) {
+    updatePersistedState(getModelKey(props.workspaceId), props.modelOverride);
+    markAiSelectionIntent(props.workspaceId, "model", props.modelOverride);
   }
 
   if (props.thinkingOverride !== undefined) {
@@ -315,6 +321,7 @@ describe("ThinkingContext", () => {
       defaultModel: undefined,
     });
     metadataMap = new Map();
+    resetAiSelectionIntentForTests();
     currentClientMock = {};
   });
 
@@ -563,6 +570,7 @@ describe("ThinkingContext", () => {
     const workspaceId = "ws-1";
 
     updatePersistedState(getModelKey(workspaceId), "openai:gpt-5.2");
+    markAiSelectionIntent(workspaceId, "model", "openai:gpt-5.2");
     updatePersistedState(getThinkingLevelKey(workspaceId), "high");
 
     let unmounts = 0;
@@ -590,6 +598,7 @@ describe("ThinkingContext", () => {
 
     act(() => {
       updatePersistedState(getModelKey(workspaceId), "anthropic:claude-3.5");
+      markAiSelectionIntent(workspaceId, "model", "anthropic:claude-3.5");
     });
 
     // Thinking is workspace-scoped (not per-model), so switching models should not change it.
@@ -603,6 +612,7 @@ describe("ThinkingContext", () => {
     const workspaceId = "ws-1";
 
     updatePersistedState(getModelKey(workspaceId), "openai:gpt-5.2");
+    markAiSelectionIntent(workspaceId, "model", "openai:gpt-5.2");
     updatePersistedState(getThinkingLevelByModelKey("openai:gpt-5.2"), "low");
 
     const view = renderWithAPI(
@@ -623,6 +633,7 @@ describe("ThinkingContext", () => {
     // Switching models should not change the workspace-scoped value.
     act(() => {
       updatePersistedState(getModelKey(workspaceId), "anthropic:claude-3.5");
+      markAiSelectionIntent(workspaceId, "model", "anthropic:claude-3.5");
     });
 
     await waitFor(() => {

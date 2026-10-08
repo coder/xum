@@ -22,6 +22,10 @@ import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getModelKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+} from "@/browser/utils/aiSelectionIntent";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { FALLBACK_AGENTS } from "./TasksSection.agents";
@@ -168,8 +172,10 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
   // Discovery only runs for a selected workspace's project.
   selectedWorkspaceMock =
     options.agents || options.workspaceModel ? { projectPath: "/proj", workspaceId: "ws-1" } : null;
+  resetAiSelectionIntentForTests();
   if (options.workspaceModel) {
     updatePersistedState(getModelKey("ws-1"), options.workspaceModel);
+    markAiSelectionIntent("ws-1", "model", options.workspaceModel);
   }
 
   // Inject the per-test client through the real provider; mocking the API module leaks into
