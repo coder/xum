@@ -311,6 +311,32 @@ describe("AgentContext", () => {
     });
   });
 
+  test("a workspace without a saved agent follows project default agent changes", async () => {
+    const workspaceId = "ws-project-default-agent";
+    mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT, REVIEW_PROJECT_AGENT];
+    mockWorkspaceMetadata = new Map([[workspaceId, {}]]);
+    let contextValue: AgentContextValue | undefined;
+
+    renderAgentHarness({
+      projectPath: "/tmp/project",
+      workspaceId,
+      preferences: { ai: { projectDefaults: { "/tmp/project": { agentId: "plan" } } } },
+      onChange: (value) => (contextValue = value),
+    });
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("plan");
+    });
+
+    act(() => {
+      getAppConfigStore().updateOptimistically({
+        userPreferences: { ai: { projectDefaults: { "/tmp/project": { agentId: "review" } } } },
+      });
+    });
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("review");
+    });
+  });
+
   test("cycle shortcut advances to next agent", async () => {
     const projectPath = "/tmp/project";
     mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT];

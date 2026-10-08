@@ -4,6 +4,7 @@ import {
   getAgentBases,
   getAiSelectionVersion,
   getPendingAiSelection,
+  getSavedAiSettings,
   getWorkspaceAiMetadata,
   subscribeAiSelection,
 } from "@/browser/utils/aiSelectionIntent";
@@ -55,7 +56,7 @@ function resolveWorkspaceAiSelection(input: WorkspaceAiSelectionInput): Workspac
   const pick = (field: keyof WorkspaceAiSelection) =>
     getPendingAiSelection(input.workspaceId, agentId, field);
   const metadata = getWorkspaceAiMetadata(input.workspaceId);
-  const saved = metadata?.aiSettingsByAgent?.[agentId] ?? metadata?.aiSettings;
+  const saved = getSavedAiSettings(input.workspaceId, agentId);
   const configured = resolveConfiguredAiDefaults(
     agentId,
     input.agentAiDefaults,

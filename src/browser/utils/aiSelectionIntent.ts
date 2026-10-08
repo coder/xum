@@ -10,8 +10,8 @@
  * pick never applies to Exec after a plan→exec handoff. Each pick gets a fresh token so
  * a re-pick made while an earlier send is outstanding survives that send's consume.
  * Pending picks are also the composer's unsent values (see resolveWorkspaceAiSelection),
- * next to the latest workspace AI metadata, so a reload drops an unsent pick. An unsent
- * agent pick lasts until the metadata's agent matches it.
+ * next to the latest workspace AI metadata, so a reload drops an unsent pick. The agent pick
+ * follows the same token lifecycle as the field picks.
  */
 import type { AiSelectionIntent } from "@/common/types/agentAiSettings";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -22,7 +22,7 @@ import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 
 export type AiSelectionField = keyof AiSelectionIntent;
-export type AiSelectionTokens = Partial<Record<AiSelectionField, number>>;
+export type AiSelectionTokens = Partial<Record<AiSelectionField | "agentId", number>>;
 
 interface PendingSelection {
   value: string;
@@ -40,7 +40,7 @@ export type WorkspaceAiMetadata = Pick<
   >;
 
 const pendingByScope = new Map<string, Partial<Record<AiSelectionField, PendingSelection>>>();
-const pendingAgentByWorkspace = new Map<string, string>();
+const pendingAgentByWorkspace = new Map<string, PendingSelection>();
 const metadataByWorkspace = new Map<string, WorkspaceAiMetadata>();
 const agentBasesByScope = new Map<string, ReadonlyMap<string, string | undefined>>();
 const listeners = new Set<() => void>();
@@ -73,7 +73,8 @@ export function setWorkspaceAiMetadata(workspaceId: string, source: WorkspaceAiM
   const previous = metadataByWorkspace.get(workspaceId);
   if (JSON.stringify(previous) === JSON.stringify(metadata)) return;
   metadataByWorkspace.set(workspaceId, metadata);
-  if (pendingAgentByWorkspace.get(workspaceId) === resolvePersistedAgentId(metadata, "")) {
+  const agentPick = pendingAgentByWorkspace.get(workspaceId);
+  if (agentPick?.sent === true && agentPick.value === resolvePersistedAgentId(metadata, "")) {
     pendingAgentByWorkspace.delete(workspaceId);
   }
   for (const agentId of Object.keys(metadata.aiSettingsByAgent ?? {})) {
@@ -137,18 +138,26 @@ function getSavedWorkspaceAgentId(workspaceId: string): string {
 }
 
 export function getWorkspaceAgentId(workspaceId: string): string {
-  return pendingAgentByWorkspace.get(workspaceId) ?? getSavedWorkspaceAgentId(workspaceId);
+  return pendingAgentByWorkspace.get(workspaceId)?.value ?? getSavedWorkspaceAgentId(workspaceId);
 }
 
-/** Records an unsent agent pick; picking the saved agent drops the pick. */
+/**
+ * Records an unsent agent pick. Picking the saved agent still records one: while a send of
+ * another agent is in flight, the saved agent is stale.
+ */
 export function setWorkspaceAgentPick(workspaceId: string, agentId: string): void {
-  const normalized = normalizeAgentId(agentId, WORKSPACE_DEFAULTS.agentId);
-  if (normalized === getSavedWorkspaceAgentId(workspaceId)) {
-    pendingAgentByWorkspace.delete(workspaceId);
-  } else {
-    pendingAgentByWorkspace.set(workspaceId, normalized);
-  }
+  const value = normalizeAgentId(agentId, WORKSPACE_DEFAULTS.agentId);
+  pendingAgentByWorkspace.set(workspaceId, { value, token: nextToken++ });
   notify();
+}
+
+/** The workspace's saved settings for an agent; a legacy workspace has only `aiSettings`. */
+export function getSavedAiSettings(
+  workspaceId: string,
+  agentId: string
+): WorkspaceAiMetadata["aiSettings"] {
+  const metadata = metadataByWorkspace.get(workspaceId);
+  return metadata?.aiSettingsByAgent?.[normalizeAgent(agentId)] ?? metadata?.aiSettings;
 }
 
 function isSavedPick(
@@ -210,6 +219,10 @@ export function getAiSelectionIntentForSend(
   const pending = pendingByScope.get(scopeKey(workspaceId, agentId));
   const intent: AiSelectionIntent = {};
   const attachedTokens: AiSelectionTokens = {};
+  const agentPick = pendingAgentByWorkspace.get(workspaceId);
+  if (agentPick?.value === normalizeAgentId(agentId, WORKSPACE_DEFAULTS.agentId)) {
+    attachedTokens.agentId = agentPick.token;
+  }
   if (pending != null) {
     for (const field of ["model", "thinkingLevel", "reasoningMode"] as const) {
       const selection = pending[field];
@@ -246,7 +259,7 @@ export function getAiSelectionIntentForSendOptions(
   }
   const candidate = getAiSelectionIntentForSend(workspaceId, agentId, options);
   const intent: AiSelectionIntent = {};
-  const attachedTokens: AiSelectionTokens = {};
+  const attachedTokens: AiSelectionTokens = { agentId: candidate.attachedTokens.agentId };
   const keep = (field: AiSelectionField, allowed: boolean) => {
     if (!allowed || candidate.intent?.[field] !== true) return;
     intent[field] = true;
@@ -262,19 +275,31 @@ export function getAiSelectionIntentForSendOptions(
 }
 
 /**
- * After a successful send: an attached pick ends once the saved bucket holds it, so a save
- * still in flight or failed keeps it. A re-pick made meanwhile has a new token and survives.
+ * After a successful send: an attached pick ends once the saved bucket (or agent) holds it, so
+ * a save still in flight or failed keeps it. A re-pick made meanwhile has a new token and survives.
  */
 export function consumeAiSelectionIntent(
   workspaceId: string,
   agentId: string,
   attachedTokens: AiSelectionTokens
 ): void {
+  const agentPick = pendingAgentByWorkspace.get(workspaceId);
+  if (agentPick != null && agentPick.token === attachedTokens.agentId) {
+    const savedAgentId = resolvePersistedAgentId(metadataByWorkspace.get(workspaceId), "");
+    if (agentPick.value === savedAgentId) {
+      pendingAgentByWorkspace.delete(workspaceId);
+    } else {
+      pendingAgentByWorkspace.set(workspaceId, { ...agentPick, sent: true });
+    }
+  }
   const key = scopeKey(workspaceId, agentId);
   const pending = pendingByScope.get(key);
-  if (pending == null) return;
+  if (pending == null) {
+    notify();
+    return;
+  }
   const next = { ...pending };
-  for (const field of Object.keys(attachedTokens) as AiSelectionField[]) {
+  for (const field of ["model", "thinkingLevel", "reasoningMode"] as const) {
     const selection = next[field];
     if (selection == null || selection.token !== attachedTokens[field]) continue;
     if (isSavedPick(workspaceId, agentId, field, selection.value)) {

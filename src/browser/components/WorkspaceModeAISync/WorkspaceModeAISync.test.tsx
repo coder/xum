@@ -161,9 +161,18 @@ describe("WorkspaceModeAISync", () => {
       });
       cleanup();
 
+      const saved = nextWorkspaceId();
+      setWorkspaceAiMetadata(saved, {
+        aiSettingsByAgent: { exec: { model: "openai:gpt-5.2", thinkingLevel: "low" } },
+      });
+      renderAt(saved, "exec");
+      expect(readAuto(saved)).toEqual({ model: false, thinkingLevel: false });
+      cleanup();
+
+      // A legacy workspace's single settings bucket applies to every agent.
       const legacy = nextWorkspaceId();
       setWorkspaceAiMetadata(legacy, {
-        aiSettingsByAgent: { exec: { model: "openai:gpt-5.2", thinkingLevel: "low" } },
+        aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "low" },
       });
       renderAt(legacy, "exec");
       expect(readAuto(legacy)).toEqual({ model: false, thinkingLevel: false });

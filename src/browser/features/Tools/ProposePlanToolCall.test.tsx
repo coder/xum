@@ -618,6 +618,9 @@ describe("ProposePlanToolCall", () => {
     await waitFor(() =>
       expect(getPendingAiSelection(WORKSPACE_ID, "exec", "model")).toBeUndefined()
     );
+    // The handoff's agent pick ended with the save too, so a later agent change applies.
+    setWorkspaceAiMetadata(WORKSPACE_ID, { agentId: "plan" });
+    expect(getWorkspaceAgentId(WORKSPACE_ID)).toBe("plan");
   });
 
   test("Implement keeps the exec model when the composer has Auto routing selected", async () => {

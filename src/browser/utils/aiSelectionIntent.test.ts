@@ -55,14 +55,45 @@ describe("aiSelectionIntent", () => {
     expect(getWorkspaceAgentId(WS)).toBe("exec");
   });
 
-  test("an unsent agent pick lasts until the saved agent matches it", () => {
+  test("a sent agent pick lasts until the saved agent matches it; an unsent one outlasts it", () => {
     setWorkspaceAiMetadata(WS, { agentId: "plan" });
     setWorkspaceAgentPick(WS, "exec");
-    setWorkspaceAiMetadata(WS, { agentId: "plan", projectPath: "/repo" });
+    setWorkspaceAiMetadata(WS, { agentId: "exec" });
+    setWorkspaceAiMetadata(WS, { agentId: "plan" });
+    expect(getWorkspaceAgentId(WS)).toBe("exec");
+
+    consumeAiSelectionIntent(
+      WS,
+      "exec",
+      getAiSelectionIntentForSend(WS, "exec", {}).attachedTokens
+    );
     expect(getWorkspaceAgentId(WS)).toBe("exec");
     setWorkspaceAiMetadata(WS, { agentId: "exec" });
     setWorkspaceAiMetadata(WS, { agentId: "plan" });
     expect(getWorkspaceAgentId(WS)).toBe("plan");
+  });
+
+  test("re-picking the saved agent while a send is outstanding survives that send", () => {
+    setWorkspaceAiMetadata(WS, { agentId: "plan" });
+    setWorkspaceAgentPick(WS, "exec");
+    const first = getAiSelectionIntentForSend(WS, "exec", {});
+    setWorkspaceAgentPick(WS, "plan");
+    consumeAiSelectionIntent(WS, "exec", first.attachedTokens);
+    setWorkspaceAiMetadata(WS, { agentId: "exec" });
+    expect(getWorkspaceAgentId(WS)).toBe("plan");
+  });
+
+  test("a sent agent pick the saved agent already holds ends at once", () => {
+    setWorkspaceAiMetadata(WS, { agentId: "plan" });
+    setWorkspaceAgentPick(WS, "plan");
+    consumeAiSelectionIntent(
+      WS,
+      "plan",
+      getAiSelectionIntentForSend(WS, "plan", {}).attachedTokens
+    );
+    // A no-op save emits no metadata; another window's later change still applies.
+    setWorkspaceAiMetadata(WS, { agentId: "exec" });
+    expect(getWorkspaceAgentId(WS)).toBe("exec");
   });
 
   test("attaches only fields whose sent value still equals the pick", () => {
