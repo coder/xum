@@ -1354,6 +1354,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Must be before early return to satisfy React Hooks rules
   useEffect(() => {
     if (!workspaceState || !editingMessage) return;
+    // A replay of this workspace empties its rows first, while ChatPane stays mounted: only a
+    // caught-up transcript can show that the edited row is gone (#5808).
+    if (!workspaceState.isTranscriptCaughtUp) return;
     // Conflict recovery re-reads the transcript (a full replay empties the aggregator first,
     // a pre-window range discards cached pages); the refresh outcome decides whether the
     // edited row is gone, not the transient absence of its row.
@@ -1374,6 +1377,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     )?.historyId;
 
     if (!editCutoffHistoryId) {
+      // A windowed replay can leave the edited row in older history, unloaded: that is not a
+      // deletion, so the edit stays (#5808). Its send still checks the rows (precondition).
+      if (workspaceState.hasOlderHistory) return;
       // Message was replaced or deleted - clear editing state
       setEditingMessage(undefined);
     }

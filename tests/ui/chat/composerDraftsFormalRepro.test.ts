@@ -26,7 +26,8 @@ import { fireEvent, waitFor } from "@testing-library/react";
 import * as fs from "fs/promises";
 import * as path from "path";
 
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { DraftStore, getDraftStore } from "@/browser/stores/DraftStore";
+import { createTestApiClient } from "@/browser/testUtils";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
@@ -201,15 +202,16 @@ describe("formal/composer-drafts: composer text across a failed send", () => {
 
 /**
  * #5501: an edit send (the one send kind without a pending-send entry) still clears the composer
- * and puts what it took back when it fails. Edits write the shared workspace draft (#5571), so
- * another window that still holds the edit can save it again while the send is in flight.
+ * and puts what it took back when it fails. Since #5571 the edit text lives in this window's
+ * memory, so no other window can hold it or save it again: the put-back goes into the edit, and
+ * what another window saves meanwhile stays in the shared draft.
  */
 describe("formal/composer-drafts: a failed edit's put-back", () => {
   beforeAll(async () => {
     await preloadTestModules();
   });
 
-  async function startEdit(app: AppHarness, scope: DraftScope) {
+  async function startEdit(app: AppHarness) {
     await app.chat.send("first message");
     await app.chat.expectTranscriptContains("Mock response: first message", WAIT.timeout);
     await app.chat.expectStreamComplete();
@@ -227,7 +229,7 @@ describe("formal/composer-drafts: a failed edit's put-back", () => {
       expect(element.value).toBe("first message");
       return element;
     }, WAIT);
-    getDraftStore().setText(scope, "edited message");
+    fireEvent.change(textarea, { target: { value: "edited message" } });
     await waitFor(() => expect(textarea.value).toBe("edited message"), WAIT);
     return textarea;
   }
@@ -239,10 +241,10 @@ describe("formal/composer-drafts: a failed edit's put-back", () => {
     );
   }
 
-  test("does not show the edit's text twice when another window saved it meanwhile", async () => {
+  test("puts the edit's text back into the edit once, apart from another window's draft", async () => {
     const app = await createAppHarness({ branchPrefix: "formal-edit-restore-dup" });
     const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
-    const textarea = await startEdit(app, scope).catch(async (error: unknown) => {
+    const textarea = await startEdit(app).catch(async (error: unknown) => {
       await app.dispose();
       throw error;
     });
@@ -250,18 +252,23 @@ describe("formal/composer-drafts: a failed edit's put-back", () => {
     try {
       fireEvent.keyDown(textarea, { key: "Enter" });
       await waitFor(() => expect(held.spy).toHaveBeenCalledTimes(1), WAIT);
-      await waitFor(() => expect(getDraftStore().getView(scope).text).toBe(""), WAIT);
-      await getDraftStore().flush(scope);
+      await waitFor(() => expect(textarea.value).toBe(""), WAIT);
 
-      // A second window that still held the edit saves it again, with text typed after it.
-      const saved = "edited message\n\ntyped in another window";
+      // A second window saves its own draft while the edit send is in flight.
+      const saved = "typed in another window";
       await app.env.services.draftService.update({ scope, text: saved });
       await waitFor(() => expect(getDraftStore().getView(scope).text).toBe(saved), WAIT);
 
       held.release();
       await expectRefused(app);
-      // Target assertion: the text the composer already holds is not put back a second time,
-      // and the other window's text stays.
+      // Target assertion: the edit gets its text back once, and the shared draft holds only the
+      // other window's text.
+      await waitFor(() => {
+        const edit = app.view.container.querySelector<HTMLTextAreaElement>(
+          'textarea[aria-label="Edit message"]'
+        );
+        expect(edit?.value).toBe("edited message");
+      }, WAIT);
       expect(getDraftStore().getView(scope).text).toBe(saved);
       await getDraftStore().flush(scope);
       expect((await app.env.services.draftService.get(scope)).text).toBe(saved);
@@ -272,68 +279,89 @@ describe("formal/composer-drafts: a failed edit's put-back", () => {
     }
   }, 120_000);
 
-  test("keeps the staged copy of an attachment another window saved again as pending", async () => {
+  // Replaces the pre-#5571 "another window saved the staged copy again" case: no other window
+  // holds an edit now, but a failed edit send must still neither lose nor duplicate a staged file.
+  test("keeps a staged attachment in the edit once across a refused send, out of the shared draft", async () => {
     const app = await createAppHarness({ branchPrefix: "formal-edit-restore-staged" });
     const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
-    const textarea = await startEdit(app, scope).catch(async (error: unknown) => {
-      await app.dispose();
-      throw error;
-    });
-    const held = holdSendReplies(app, () => refused());
+    const secondWindow = new DraftStore();
+    secondWindow.setClient(createTestApiClient(app.env.orpc));
+    const stageSpy = jest.spyOn(app.env.services.workspaceService, "stageAttachment");
+    const chips = () =>
+      (
+        app.view.container.querySelector('[data-component="ChatInputSection"]')?.textContent ?? ""
+      ).split("notes.md").length - 1;
+    const unsent = {
+      kind: "provider" as const,
+      id: "file-unsent",
+      url: "data:text/plain;base64,dW5zZW50",
+      mediaType: "text/plain",
+      filename: "unsent.txt",
+    };
+    let held: ReturnType<typeof holdSendReplies> | null = null;
     try {
-      const pendingFile = {
-        kind: "pending-file" as const,
-        id: "file-1",
-        mediaType: "text/plain",
-        filename: "notes.txt",
-        sizeBytes: 2,
-        dataBase64: "aGk=",
-      };
-      getDraftStore().setAttachments(scope, [pendingFile]);
-      await waitFor(() => expect(getDraftStore().getView(scope).attachments).toHaveLength(1), WAIT);
-      fireEvent.keyDown(textarea, { key: "Enter" });
-      await waitFor(() => expect(held.spy).toHaveBeenCalledTimes(1), WAIT);
-      // The send staged the file under the same id, then took it out of the composer.
-      await waitFor(() => expect(getDraftStore().getView(scope).attachments).toEqual([]), WAIT);
-      await getDraftStore().flush(scope);
-
-      // A second window that still held the pending version saves it again, with a new file.
-      const newFile = {
-        kind: "provider" as const,
-        id: "file-2",
-        url: "data:text/plain;base64,bmV3",
-        mediaType: "text/plain",
-        filename: "new.txt",
-      };
-      await app.env.services.draftService.update({ scope, attachments: [pendingFile, newFile] });
-      await waitFor(
-        () =>
-          expect(
-            getDraftStore()
-              .getView(scope)
-              .attachments.map(({ kind }) => kind)
-          ).toEqual(["pending-file", "provider"]),
-        WAIT
+      await secondWindow.whenReady();
+      // The message to edit carries a file staged into the workspace.
+      const input = await waitFor(() => {
+        const element = app.view.container.querySelector<HTMLInputElement>(
+          '[data-component="ChatInputSection"] input[type="file"]'
+        );
+        if (!element) throw new Error("File input not found");
+        return element;
+      }, WAIT);
+      fireEvent.change(input, {
+        target: { files: [new File(["# notes"], "notes.md", { type: "text/markdown" })] },
+      });
+      await waitFor(() => expect(chips()).toBe(1), WAIT);
+      await app.chat.send("first message");
+      await app.chat.expectTranscriptContains("Mock response: first message", WAIT.timeout);
+      await app.chat.expectStreamComplete();
+      expect(stageSpy).toHaveBeenCalledTimes(1);
+      // An unsent draft with its own file, then the edit: the edit shows the message's file.
+      getDraftStore().setText(scope, "unsent draft");
+      getDraftStore().setAttachments(scope, [unsent]);
+      await waitFor(() => expect(secondWindow.getText(scope)).toBe("unsent draft"), WAIT);
+      fireEvent.click(
+        await waitFor(() => {
+          const button = app.view.container.querySelector<HTMLElement>('button[aria-label="Edit"]');
+          if (!button) throw new Error("Edit button not found");
+          return button;
+        }, WAIT)
       );
+      const textarea = await waitFor(() => {
+        const element = app.view.container.querySelector<HTMLTextAreaElement>(
+          'textarea[aria-label="Edit message"]'
+        );
+        if (!element) throw new Error("Edit textarea not found");
+        return element;
+      }, WAIT);
+      fireEvent.change(textarea, { target: { value: "edited message" } });
+      await waitFor(() => expect(chips()).toBe(1), WAIT);
 
+      held = holdSendReplies(app, () => refused());
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await waitFor(() => expect(held?.spy).toHaveBeenCalledTimes(1), WAIT);
       held.release();
       await expectRefused(app);
-      // Target assertion: the refused send puts back what it sent (the staged file), so a retry
-      // does not stage the file again and orphan the first copy. The new file stays.
-      const restored = getDraftStore().getView(scope).attachments;
-      expect(restored.map(({ id, kind }) => `${id}:${kind}`)).toEqual([
-        "file-1:staged",
-        "file-2:provider",
-      ]);
+      // Target assertion: the refused edit keeps its text and the staged file, once, without
+      // staging it again; the shared draft and the other window keep only the unsent draft.
+      await waitFor(() => expect(textarea.value).toBe("edited message"), WAIT);
+      expect(chips()).toBe(1);
+      expect(stageSpy).toHaveBeenCalledTimes(1);
+      const sharedIds = (view: { attachments: { id: string }[] }) =>
+        view.attachments.map(({ id }) => id);
+      expect(sharedIds(getDraftStore().getView(scope))).toEqual(["file-unsent"]);
       await getDraftStore().flush(scope);
-      const savedAttachments = (await app.env.services.draftService.get(scope)).attachments;
-      expect(savedAttachments.map(({ id, kind }) => `${id}:${kind}`)).toEqual([
-        "file-1:staged",
-        "file-2:provider",
-      ]);
+      expect(sharedIds(await app.env.services.draftService.get(scope))).toEqual(["file-unsent"]);
+      // Another window loads attachment payloads only for a draft it shows.
+      await secondWindow.ensurePayloads(scope);
+      expect(sharedIds(secondWindow.getView(scope))).toEqual(["file-unsent"]);
+      expect(secondWindow.getText(scope)).toBe("unsent draft");
     } finally {
-      await held.settle();
-      held.spy.mockRestore();
+      await held?.settle();
+      held?.spy.mockRestore();
+      stageSpy.mockRestore();
+      secondWindow.setClient(null);
       await app.dispose();
     }
   }, 120_000);

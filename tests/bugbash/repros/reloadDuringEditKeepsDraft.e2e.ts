@@ -1,5 +1,5 @@
-// Known failure, open issue #5672: a reload during a message edit leaves the edit text in the
-// composer as the new-message draft, and the unsent draft is lost. Fails until #5672 is fixed.
+// #5672: a reload during a message edit must keep the unsent draft. The edit text lives in the
+// window's memory only, so the reload drops the edit and the composer shows the unsent draft.
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { openPlayground, sendMessageForEdit, WORKSPACE_TITLE } from "./helpers";
@@ -9,7 +9,7 @@ const messageText = () => `5672 message to edit ${Date.now()}`;
 
 test(
   "a reload during an edit keeps the unsent draft",
-  { tags: ["bugbash", "known-failure", "5672"] },
+  { tags: ["bugbash", "5672"] },
   async ({ app, screen, browser }) => {
     await openPlayground(app, screen, browser);
     const MESSAGE = messageText();

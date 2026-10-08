@@ -54,6 +54,8 @@ export async function createAppHarness(options?: {
    * workspace-scoped persisted state (e.g. draft attachments).
    */
   beforeRender?: (workspaceId: string) => void;
+  /** Render the app under React StrictMode (dev builds do). */
+  strictMode?: boolean;
 }): Promise<AppHarness> {
   const repoPath = await createTempGitRepo();
   const env = await createTestEnvironment();
@@ -92,7 +94,7 @@ export async function createAppHarness(options?: {
 
     cleanupDom = installDom();
     options?.beforeRender?.(workspaceId);
-    view = renderApp({ apiClient: env.orpc, metadata });
+    view = renderApp({ apiClient: env.orpc, metadata, strictMode: options?.strictMode });
 
     await setupWorkspaceView(view, metadata, workspaceId);
     await waitForWorkspaceChatToRender(view.container);
