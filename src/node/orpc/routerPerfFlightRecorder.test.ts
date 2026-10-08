@@ -78,7 +78,6 @@ function createClient(
     perfCaptures,
     perfReports,
     experimentsService: {
-      getOverrides: () => Promise.resolve(Object.fromEntries(overrides)),
       setOverride: (experimentId: ExperimentId, enabled: boolean | null | undefined) => {
         if (enabled == null) overrides.delete(experimentId);
         else overrides.set(experimentId, enabled);
@@ -87,7 +86,7 @@ function createClient(
       isExperimentEnabled: (experimentId: ExperimentId) => overrides.get(experimentId) === true,
     },
   } as unknown as ORPCContext;
-  return { client: createRouterClient(router(), { context }), overrides };
+  return { client: createRouterClient(router(), { context }) };
 }
 
 function batch(loafCount: number): RendererBatch {
@@ -126,7 +125,7 @@ describe("perf flight recorder procedures", () => {
   });
 
   test("experiment overrides start and stop collection without a restart", async () => {
-    const { client, overrides } = createClient();
+    const { client } = createClient();
     await client.experiments.set({
       experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
       enabled: true,
@@ -141,9 +140,10 @@ describe("perf flight recorder procedures", () => {
       { kind: "long-animation-frame", atMs: 1, durationMs: 250, rendererId: "r-test" },
     ]);
 
-    // Another process turned it off on disk; the next overrides read adopts that state.
-    overrides.delete(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER);
-    await client.experiments.getOverrides();
+    await client.experiments.set({
+      experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
+      enabled: false,
+    });
     expect((await client.perf.getFlightRecorderSnapshot()).state).toBe("off");
   });
 
@@ -191,16 +191,17 @@ describe("perf flight recorder procedures", () => {
       experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
       enabled: true,
     });
-    await client.experiments.getOverrides();
+    await client.experiments.set({
+      experimentId: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
+      enabled: true,
+    });
     const controller = new AbortController();
     const stream = await client.experiments.onPerfFlightRecorderChange(undefined, {
       signal: controller.signal,
     });
     expect((await stream.next()).value).toEqual({ enabled: true, state: "collecting" });
     const live = (await client.perf.getFlightRecorderSnapshot()).rpc;
-    expect(live.procedures).toMatchObject([
-      { path: "experiments.getOverrides", count: 1, errorCount: 0 },
-    ]);
+    expect(live.procedures).toMatchObject([{ path: "experiments.set", count: 1, errorCount: 0 }]);
     expect(live.subscriptions).toMatchObject([
       { path: "experiments.onPerfFlightRecorderChange", live: 1, opened: 1, events: 1 },
     ]);
@@ -210,7 +211,7 @@ describe("perf flight recorder procedures", () => {
     const closed = (await client.perf.getFlightRecorderSnapshot()).rpc;
     expect(closed.subscriptions).toMatchObject([{ live: 0, events: 1 }]);
     expect(closed.procedures.map((p) => [p.path, p.count])).toEqual([
-      ["experiments.getOverrides", 1],
+      ["experiments.set", 1],
       ["perf.getFlightRecorderSnapshot", 1],
     ]);
   });

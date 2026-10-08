@@ -1,6 +1,7 @@
 import React from "react";
 import type { ExperimentId } from "@/common/constants/experiments";
-import { useSettledExperimentValue } from "@/browser/contexts/ExperimentsContext";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import type { TabType } from "@/browser/types/rightSidebar";
 import {
   addTabToFocusedTabset,
@@ -23,10 +24,15 @@ export function useExperimentGatedTab(args: {
   setLayoutRaw: React.Dispatch<React.SetStateAction<RightSidebarLayoutState>>;
 }): void {
   const { tab, initialActiveTab, setLayoutRaw } = args;
-  const enabled = useSettledExperimentValue(args.experimentId);
+  const enabled = useExperimentValue(args.experimentId);
+  const store = getAppConfigStore();
+  const loaded = React.useSyncExternalStore(
+    store.subscribe,
+    () => store.getSnapshot()?.experiments != null
+  );
 
   React.useEffect(() => {
-    if (enabled == null) {
+    if (!loaded) {
       return;
     }
 
@@ -44,5 +50,5 @@ export function useExperimentGatedTab(args: {
 
       return prev;
     });
-  }, [enabled, initialActiveTab, setLayoutRaw, tab]);
+  }, [enabled, loaded, initialActiveTab, setLayoutRaw, tab]);
 }

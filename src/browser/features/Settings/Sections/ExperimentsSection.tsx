@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Info } from "lucide-react";
-import { useExperiment, useExperimentValue } from "@/browser/contexts/ExperimentsContext";
+import { useExperiment, useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
   getExperimentList,
   getExperimentPlatformRestrictionLabel,

@@ -14,7 +14,8 @@ import {
   type TestClientConfig,
 } from "@/browser/testUtils";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
-import { ExperimentsProvider, useExperiment } from "@/browser/contexts/ExperimentsContext";
+import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
+import { useExperiment } from "@/browser/hooks/useExperiments";
 import * as RealSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as RealTelemetryModule from "@/browser/hooks/useTelemetry";
 import { GeneralSection } from "./GeneralSection";
@@ -36,7 +37,6 @@ type ExperimentOverrides = Partial<Record<ExperimentId, boolean>>;
 
 interface MockAPIClient {
   experiments: {
-    getOverrides: () => Promise<ExperimentOverrides>;
     set: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => Promise<void>;
   };
   config: {
@@ -328,7 +328,7 @@ function createMockAPI(
 
   return {
     api: {
-      experiments: { set: setMock, getOverrides: () => Promise.resolve({ ...backendOverrides }) },
+      experiments: { set: setMock },
       config: {
         getConfig: getConfigMock,
         updateCoderPrefs: updateCoderPrefsMock,

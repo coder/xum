@@ -22,11 +22,11 @@ import {
   TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
 } from "@/constants/transcriptBarrier";
 
-// Simple mock for localStorage to satisfy resolveCompactionModel and experiment gating.
+// Simple mock for localStorage to satisfy resolveCompactionModel.
 // Note: command helpers read from window.localStorage, so we set both globalThis.localStorage
 // and window.localStorage for test isolation.
 beforeEach(() => {
-  // Ensure `window` exists for browser-environment functions like isExperimentEnabled.
+  // Ensure `window` exists for browser-environment functions.
   if (typeof globalThis.window === "undefined") {
     (globalThis as unknown as { window: typeof globalThis }).window = globalThis;
   }
