@@ -554,13 +554,20 @@ export const ProjectSettingsOAuthLoggedIn: Story = {
 function setupDesignStory(
   enabled = true,
   reuseEnabled = false,
-  sibling?: { disconnect: () => void }
+  sibling?: { disconnect: () => void },
+  pendingDisable?: { finish: () => void }
 ): APIClient {
-  const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+  // One stream per subscription, like the backend: the section and its card both subscribe.
+  const subscribers: Array<(update: { enabled: boolean; revision: number }) => void> = [];
   let revision = 0;
-  updates.push({ enabled, revision });
+  let streamEnabled = enabled;
+  const publish = () => {
+    revision++;
+    for (const push of subscribers) push({ enabled: streamEnabled, revision });
+  };
   const client = setupMCPSettingsSectionStory({
-    experiments: { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled },
+    // A pending disable: the config snapshot already reads off while the stream still reports on.
+    experiments: { [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: enabled && !pendingDisable },
     servers: enabled
       ? {
           claude_design: {
@@ -584,6 +591,9 @@ function setupDesignStory(
   };
   client.experiments = {
     onDesignChange: (_input, { signal } = {}) => {
+      const updates = createAsyncMessageQueue<{ enabled: boolean; revision: number }>();
+      updates.push({ enabled: streamEnabled, revision });
+      subscribers.push(updates.push);
       signal?.addEventListener("abort", updates.end, { once: true });
       return Promise.resolve(wrapAsyncIterator(updates.iterate(), {}));
     },
@@ -607,7 +617,7 @@ function setupDesignStory(
       settings: { ...status.settings, ...settings },
       state: settings.reuseEnabled ? "not_configured" : "disabled",
     };
-    updates.push({ enabled, revision: ++revision });
+    publish();
     return Promise.resolve(status);
   };
   if (sibling) {
@@ -626,7 +636,15 @@ function setupDesignStory(
         state: "disabled",
         settings: { ...status.settings, reuseEnabled: false, serverEnabled: false },
       };
-      updates.push({ enabled, revision: ++revision });
+      publish();
+    };
+  }
+  if (pendingDisable) {
+    pendingDisable.finish = () => {
+      streamEnabled = false;
+      publish();
+      // An update from before the disable that arrives late.
+      for (const push of subscribers) push({ enabled: true, revision: revision - 1 });
     };
   }
   client.mcp.test = () => {
@@ -734,5 +752,28 @@ export const ClaudeDesignSiblingDisconnect: Story = {
     await expect(
       canvas.getByRole("switch", { name: "Toggle claude_design enabled" })
     ).not.toBeChecked();
+  },
+};
+
+const pendingDesignDisable: { finish: () => void } = { finish: () => undefined };
+
+export const ClaudeDesignHidesAfterRetirement: Story = {
+  tags: ["claude-design"],
+  parameters: { pixel: { exclude: true } },
+  render: () => (
+    <MCPSettingsSectionStoryShell
+      setup={() => setupDesignStory(true, false, undefined, pendingDesignDisable)}
+    >
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    // The Design stream reports a disable only after the backend retired affected clients.
+    await canvas.findByRole("region", { name: "Claude Design" });
+    // A direct call, not a click, so React renders the disable and the late older update
+    // together: the card hides only if the older update is ignored.
+    pendingDesignDisable.finish();
+    await waitFor(() => expect(canvas.queryByRole("region", { name: "Claude Design" })).toBeNull());
   },
 };
