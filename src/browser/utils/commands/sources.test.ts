@@ -1321,6 +1321,27 @@ test("toggle keep screen awake command is only offered in the desktop app", () =
   }
 });
 
+test("Fast and Ultrafast palette actions agree on the one current tier", () => {
+  const subtitles = (fast: boolean, ultrafast: boolean) => {
+    const actions = getActions({
+      getEffectiveComposerModel: () => "openai:gpt-6.1-sol",
+      providersConfig: { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },
+      getRouteForModel: () => "direct",
+      getFastMode: () => fast,
+      getUltrafastMode: () => ultrafast,
+    });
+    const subtitle = (id: string) => actions.find((a) => a.id === id)?.subtitle;
+    return [subtitle("thinking:toggle-fast-mode"), subtitle("thinking:toggle-ultrafast-mode")];
+  };
+  // The tiers are mutually exclusive; neither action may call the other's active tier Standard.
+  const [fastWhileUltra, ultraWhileUltra] = subtitles(false, true);
+  expect(fastWhileUltra).toBe(ultraWhileUltra);
+  expect(fastWhileUltra).toContain("Ultrafast");
+  const [fastWhileFast, ultraWhileFast] = subtitles(true, false);
+  expect(fastWhileFast).toBe(ultraWhileFast);
+  expect(ultraWhileFast).not.toContain("Ultrafast");
+});
+
 // #5791: config-backed toggles showed no current state, unlike the local-state toggles.
 test("toggle keep screen awake shows the loaded config value", () => {
   const originalWindow = globalThis.window;

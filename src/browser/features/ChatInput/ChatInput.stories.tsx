@@ -553,8 +553,13 @@ export const ThinkingSelectorCyberOpen: AppStory = {
  */
 export const ThinkingSelectorUltrafast: AppStory = {
   tags: ["thinking-selector"],
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
   render: () => (
-    <div data-testid="composer-width-wrapper" style={{ width: 400, height: 700 }}>
+    // min() keeps the test-runner's desktop window at the tightest row while Pixel's
+    // phone viewport (narrower than 400px) still sets the real width.
+    <div data-testid="composer-width-wrapper" style={{ width: "min(400px, 100%)", height: 700 }}>
       <AppWithMocks
         setup={() => {
           collapseLeftSidebar();

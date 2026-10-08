@@ -1489,6 +1489,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     const providerOptionRoute = providerOptionGateModel
       ? p.getRouteForModel?.(normalizeToCanonical(providerOptionGateModel))
       : undefined;
+    // Fast and Ultrafast are one mutually exclusive tier preference, so both actions report the
+    // same current tier instead of each calling the other's active tier "Standard".
+    const premiumTierLabel = p.getFastMode()
+      ? "Fast — faster responses at higher cost"
+      : p.getUltrafastMode()
+        ? "Ultrafast — fastest responses, highest cost"
+        : "Standard";
     const fastModeAction: CommandAction | null =
       p.providersConfig != null &&
       getFastModeProvider(providerOptionGateModel ?? "", {
@@ -1498,7 +1505,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         ? {
             id: CommandIds.toggleFastMode(),
             title: "Toggle Fast Mode",
-            subtitle: `Current: ${p.getFastMode() ? "Fast — faster responses at higher cost" : "Standard"}`,
+            subtitle: `Current: ${premiumTierLabel}`,
             section: section.mode,
             shortcutHint: formatKeybind(KEYBINDS.TOGGLE_FAST_MODE),
             run: p.onToggleFastMode,
@@ -1513,7 +1520,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         ? {
             id: CommandIds.toggleUltrafastMode(),
             title: "Toggle Ultrafast Mode",
-            subtitle: `Current: ${p.getUltrafastMode() ? "Ultrafast — fastest responses, highest cost" : "Off"}`,
+            subtitle: `Current: ${premiumTierLabel}`,
             section: section.mode,
             shortcutHint: formatKeybind(KEYBINDS.TOGGLE_ULTRAFAST_MODE),
             run: p.onToggleUltrafastMode,
