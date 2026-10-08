@@ -54,6 +54,7 @@ import {
   CODER_OAUTH_SERVER_CALLBACK_PATH,
   CODER_OAUTH_SERVER_START_PATH,
 } from "@/common/constants/coderOAuth";
+import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { assert } from "@/common/utils/assert";
 import { getAppProxyBasePathFromPathname, stripAppProxyBasePath } from "@/common/appProxyBasePath";
 
@@ -1227,7 +1228,7 @@ export async function createOrpcServer({
     <meta name="color-scheme" content="dark light" />
     <meta name="theme-color" content="#0e0e0e" />
     <title>${title}</title>
-    <link rel="stylesheet" href="https://gateway.mux.coder.com/static/css/site.css" />
+    <link rel="stylesheet" href="${MUX_GATEWAY_ORIGIN}/static/css/site.css" />
   </head>
   <body>
     <div class="page">

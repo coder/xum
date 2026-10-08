@@ -120,6 +120,7 @@ import {
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { isDeferLoadingTool } from "@/common/utils/tools/toolCatalog";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import { MUX_GATEWAY_AI_BASE_URL } from "@/common/constants/muxGatewayOAuth";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import {
@@ -2464,8 +2465,7 @@ export class ProviderModelFactory {
           );
           const providerFetch = fetchWithAutoLogout;
           // Use configured baseURL or fall back to default gateway URL
-          const gatewayBaseURL =
-            providerConfig.baseURL ?? "https://gateway.mux.coder.com/api/v1/ai-gateway/v1/ai";
+          const gatewayBaseURL = providerConfig.baseURL ?? MUX_GATEWAY_AI_BASE_URL;
 
           // 1M context beta header is injected per-request via buildRequestHeaders() →
           // streamText({ headers }), not at provider creation time.
