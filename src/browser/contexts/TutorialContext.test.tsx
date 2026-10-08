@@ -1,11 +1,7 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
-import {
-  DEFAULT_TUTORIAL_STATE,
-  TUTORIAL_STATE_KEY,
-  type TutorialState,
-} from "@/common/constants/storage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import * as RealTutorialTooltipModule from "@/browser/components/TutorialTooltip/TutorialTooltip";
 import * as RealSplashScreenProviderModule from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { restoreModulesAfterSuite } from "../../../tests/ui/moduleMocks";
@@ -38,15 +34,6 @@ function TutorialHarness() {
       <span data-testid="tutorial-disabled">{String(tutorial.isTutorialDisabled())}</span>
     </div>
   );
-}
-
-function readStoredTutorialState(): TutorialState | null {
-  const raw = window.localStorage.getItem(TUTORIAL_STATE_KEY);
-  if (!raw) {
-    return null;
-  }
-
-  return JSON.parse(raw) as TutorialState;
 }
 
 describe("TutorialContext", () => {
@@ -87,6 +74,7 @@ describe("TutorialContext", () => {
 
   afterEach(() => {
     cleanup();
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     mock.restore();
     globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = undefined;
     globalThis.getComputedStyle = originalGetComputedStyle;
@@ -140,8 +128,9 @@ describe("TutorialContext", () => {
     });
   });
 
-  test("browser sandbox default blocks tutorials without persisting a forced disable", async () => {
+  test("browser sandbox default blocks tutorials without persisting a forced disable", () => {
     globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = false;
+    const updateUserPreferences = spyOn(getAppConfigStore(), "updateUserPreferences");
 
     const view = render(
       <TutorialProvider>
@@ -152,10 +141,8 @@ describe("TutorialContext", () => {
     expect(view.getByTestId("tutorial-disabled").textContent).toBe("true");
     fireEvent.click(view.getByTestId("start-creation"));
 
-    await waitFor(() => {
-      expect(readStoredTutorialState()).toEqual(DEFAULT_TUTORIAL_STATE);
-    });
     expect(view.queryByTestId("tutorial-tooltip")).toBeNull();
+    expect(updateUserPreferences).not.toHaveBeenCalled();
   });
 
   test("browser sandbox opt-in restores the tutorial flow", async () => {
@@ -196,13 +183,9 @@ describe("TutorialContext", () => {
 
   test("persisted tutorial disables still win over sandbox opt-in", () => {
     globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = true;
-    window.localStorage.setItem(
-      TUTORIAL_STATE_KEY,
-      JSON.stringify({
-        disabled: true,
-        completed: {},
-      } satisfies TutorialState)
-    );
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { ui: { tutorialState: { disabled: true } } },
+    });
 
     const view = render(
       <TutorialProvider>

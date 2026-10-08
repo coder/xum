@@ -13,11 +13,7 @@ import {
   withChromeProfiles,
   writePerfArtifacts,
 } from "../utils/perfProfile";
-import {
-  disableReviewTutorial,
-  seedLargeReviewDiff,
-  setReviewPreferences,
-} from "../utils/reviewPerfFixture";
+import { seedLargeReviewDiff, setReviewPreferences } from "../utils/reviewPerfFixture";
 
 const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 const REVIEW_CHANGED_LINES_PER_FILE = 50;
@@ -67,8 +63,6 @@ test.describe("chat open with review sidebar performance profiling", () => {
     ui,
     workspace,
   }, testInfo) => {
-    await disableReviewTutorial(page);
-
     const historySummary = await seedWorkspaceHistoryProfile({
       demoProject: workspace.demoProject,
       profile: "large",

@@ -2,7 +2,6 @@ import fs from "fs";
 import path from "path";
 import { spawnSync } from "child_process";
 import { type Page } from "@playwright/test";
-import { TUTORIAL_STATE_KEY } from "../../../src/common/constants/storage";
 import type { UserPreferences } from "../../../src/common/config/schemas/userPreferences";
 
 export const LARGE_CHANGE_ROOT = "src/review/perf-large-change";
@@ -135,28 +134,6 @@ export async function setReviewPreferences(
     if (!api) throw new Error("E2E API client not initialized");
     await api.config.updateUserPreferences({ patches: [{ review: patch }] });
   }, review);
-}
-
-export async function disableReviewTutorial(page: Page): Promise<void> {
-  await page.evaluate((tutorialStateKey) => {
-    const raw = window.localStorage.getItem(tutorialStateKey);
-    const parsed = raw
-      ? (JSON.parse(raw) as { disabled?: boolean; completed?: Record<string, boolean> })
-      : null;
-    window.localStorage.setItem(
-      tutorialStateKey,
-      JSON.stringify({
-        disabled: parsed?.disabled ?? false,
-        completed: {
-          ...(parsed?.completed ?? {}),
-          review: true,
-        },
-      })
-    );
-  }, TUTORIAL_STATE_KEY);
-
-  await page.reload();
-  await page.waitForLoadState("domcontentloaded");
 }
 
 export function seedLargeReviewDiff(

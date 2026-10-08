@@ -7,19 +7,25 @@
 import type { Browser } from "@e2e-dev/web";
 import type { Locator, Screen } from "e2e";
 import { expect } from "e2e";
-import { TUTORIAL_STATE_KEY } from "../../../src/common/constants/storage";
+import { createORPCClient } from "@orpc/client";
+import { RPCLink } from "@orpc/client/fetch";
+import type { RouterClient } from "@orpc/server";
+import type { AppRouter } from "../../../src/node/orpc/router";
 
 export const WORKSPACE_TITLE = "Bug bash playground";
 
 /**
- * Switches tutorials off from the next page load on (a fresh context would show one over the
- * workspace). Tutorial repros skip this helper.
+ * Switches tutorials off on the server before the page loads (one would show over the
+ * workspace). The preference follows the user, so it stays off for the rest of the run.
  */
-export async function disableTutorials(browser: Browser): Promise<void> {
-  await browser.addInitScript(
-    (key: string) => localStorage.setItem(key, JSON.stringify({ disabled: true, completed: {} })),
-    TUTORIAL_STATE_KEY
+export async function disableTutorials(app: { baseUrl: string | undefined }): Promise<void> {
+  if (app.baseUrl === undefined) throw new Error("The bug-bash target declares no app URL");
+  const client: RouterClient<AppRouter> = createORPCClient(
+    new RPCLink({ origin: new URL(app.baseUrl).origin, url: "/orpc" })
   );
+  await client.config.updateUserPreferences({
+    patches: [{ ui: { tutorialState: { disabled: true } } }],
+  });
 }
 
 /**
@@ -208,11 +214,11 @@ export async function waitForLayerEscapeReady(browser: Browser): Promise<void> {
 
 /** Opens the app with tutorials off and selects the seeded workspace. */
 export async function openPlayground(
-  app: { open(path?: string): Promise<void> },
+  app: { baseUrl: string | undefined; open(path?: string): Promise<void> },
   screen: Screen,
   browser: Browser
 ): Promise<void> {
-  await disableTutorials(browser);
+  await disableTutorials(app);
   await browser.addInitScript(layerProbeInit);
   await app.open();
   // A fresh context starts with the project collapsed in the sidebar.

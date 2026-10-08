@@ -81,6 +81,15 @@ export function prepareDemoProject(
 
   const configPayload = {
     projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+    // Delayed tutorial backdrops race with Playwright clicks in unrelated scenarios.
+    userPreferences: {
+      ui: {
+        tutorialState: {
+          disabled: true,
+          completed: { creation: true, workspace: true, review: true },
+        },
+      },
+    },
   } as const;
 
   fs.writeFileSync(configPath, JSON.stringify(configPayload, null, 2));
