@@ -46,6 +46,7 @@ const pendingByScope = new Map<string, Partial<Record<AiSelectionField, PendingS
 const pendingAgentByWorkspace = new Map<string, string>();
 const pendingAutoRoutingByScope = new Map<string, Partial<Record<AutoRoutingDimension, boolean>>>();
 const metadataByWorkspace = new Map<string, WorkspaceAiMetadata>();
+const agentBasesByScope = new Map<string, ReadonlyMap<string, string | undefined>>();
 const listeners = new Set<() => void>();
 let nextToken = 1;
 let version = 0;
@@ -93,6 +94,27 @@ export function setWorkspaceAiMetadata(workspaceId: string, source: WorkspaceAiM
 
 export function getWorkspaceAiMetadata(workspaceId: string): WorkspaceAiMetadata | undefined {
   return metadataByWorkspace.get(workspaceId);
+}
+
+/**
+ * Agent id -> base id of the agents loaded for a workspace or creation scope, so readers outside
+ * the agent context still resolve a custom agent's inherited defaults.
+ */
+export function setAgentBases(
+  scopeId: string,
+  agents: ReadonlyArray<{ id: string; base?: string }>
+): void {
+  const bases = new Map(agents.map((agent) => [agent.id, agent.base]));
+  const previous = agentBasesByScope.get(scopeId);
+  if (previous != null && JSON.stringify([...previous]) === JSON.stringify([...bases])) return;
+  agentBasesByScope.set(scopeId, bases);
+  notify();
+}
+
+export function getAgentBases(
+  scopeId: string
+): ReadonlyMap<string, string | undefined> | undefined {
+  return agentBasesByScope.get(scopeId);
 }
 
 function normalizeAgent(agentId: string): string {
@@ -281,11 +303,29 @@ export function dropPendingModelPicks(shouldDrop: (model: string) => boolean): v
   notify();
 }
 
+/** A fork starts from what the source composer shows, including its unsent picks. */
+export function copyPendingAiSelection(sourceWorkspaceId: string, destWorkspaceId: string): void {
+  const sourcePrefix = `${sourceWorkspaceId}\u0000`;
+  for (const [key, pending] of [...pendingByScope]) {
+    if (!key.startsWith(sourcePrefix)) continue;
+    pendingByScope.set(scopeKey(destWorkspaceId, key.slice(sourcePrefix.length)), { ...pending });
+  }
+  for (const [key, picks] of [...pendingAutoRoutingByScope]) {
+    if (!key.startsWith(sourcePrefix)) continue;
+    const destKey = scopeKey(destWorkspaceId, key.slice(sourcePrefix.length));
+    pendingAutoRoutingByScope.set(destKey, { ...picks });
+  }
+  const agentPick = pendingAgentByWorkspace.get(sourceWorkspaceId);
+  if (agentPick != null) pendingAgentByWorkspace.set(destWorkspaceId, agentPick);
+  notify();
+}
+
 /** Test-only: forget all pending picks and metadata. */
 export function resetAiSelectionIntentForTests(): void {
   pendingByScope.clear();
   pendingAgentByWorkspace.clear();
   pendingAutoRoutingByScope.clear();
   metadataByWorkspace.clear();
+  agentBasesByScope.clear();
   notify();
 }

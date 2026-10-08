@@ -22,7 +22,7 @@ import {
  * transforms workspace defaults. Both initial sends and stream resumption
  * use this function to ensure consistent behavior.
  *
- * @param baseOptions - Workspace default options (from localStorage or useSendMessageOptions)
+ * @param baseOptions - Workspace default options (from getSendOptionsFromStorage or useSendMessageOptions)
  * @param compactData - Compaction request metadata from /compact command
  * @returns Final SendMessageOptions with compaction overrides applied
  */

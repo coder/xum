@@ -96,6 +96,16 @@ describe("computeReawakenInputsKey", () => {
     }
     expect(key(makeConfig(), "other-context")).not.toBe(base);
   });
+
+  it("ignores Auto flags, which planning does not read", () => {
+    const bucket = { model: MODEL_A, thinkingLevel: "medium" as const };
+    const flagged = { ...bucket, autoModelRouting: true, autoThinkingLevel: true };
+    for (const side of ["child", "parent"] as const) {
+      expect(key(makeConfig({ [side]: { aiSettingsByAgent: { exec: flagged } } }))).toBe(
+        key(makeConfig({ [side]: { aiSettingsByAgent: { exec: bucket } } }))
+      );
+    }
+  });
 });
 
 describe("planReawakenAi", () => {
@@ -219,5 +229,29 @@ describe("applyAgentTaskTurnAiSnapshot", () => {
     });
     expect(workspace.taskModelString).toBe(MODEL_B);
     expect(workspace.taskThinkingLevel).toBe("high");
+  });
+
+  it("keeps the child's saved Auto choices", () => {
+    const workspace: Workspace = {
+      id: "child",
+      name: "child",
+      path: "/repo/child",
+      aiSettingsByAgent: {
+        exec: { model: MODEL_C, thinkingLevel: "low", autoModelRouting: true },
+      },
+    };
+    applyAgentTaskTurnAiSnapshot(workspace, {
+      agentId: "exec",
+      taskModelString: MODEL_B,
+      canonicalModel: MODEL_B,
+      thinkingLevel: "high",
+      reasoningMode: "standard",
+    });
+    expect(workspace.aiSettingsByAgent?.exec).toEqual({
+      model: MODEL_B,
+      thinkingLevel: "high",
+      reasoningMode: "standard",
+      autoModelRouting: true,
+    });
   });
 });

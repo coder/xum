@@ -23,6 +23,7 @@ import {
   useScopedAiDefault,
   writeScopedAiDefault,
 } from "@/browser/utils/scopedAiDefaults";
+import { setAgentBases } from "@/browser/utils/aiSelectionIntent";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { sortAgentsStable } from "@/browser/utils/agents";
 import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
@@ -158,6 +159,7 @@ function AgentProviderWithState(props: {
           isMountedRef.current
         ) {
           setAgents(result);
+          setAgentBases(getScopeId(workspaceId, projectPath), result);
           setLoadFailed(false);
           setLoaded(true);
         }

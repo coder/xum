@@ -15,7 +15,6 @@ import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
-import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   getWorkspaceAgentId,
   resetAiSelectionIntentForTests,
@@ -275,13 +274,15 @@ function createMockApi(
   } = {}
 ): MockApi {
   return {
-    // APIProvider connects AppConfigStore, whose fetch must keep the agent defaults a test seeded.
+    // APIProvider connects AppConfigStore, whose fetch must keep the agent defaults and
+    // experiments a test seeded.
     config: {
       getConfig: () =>
         Promise.resolve(
           overrides.config ?? {
             ...DEFAULT_CONFIG,
             agentAiDefaults: getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {},
+            experiments: getAppConfigStore().getSnapshot()?.experiments ?? {},
           }
         ),
     },
@@ -614,7 +615,7 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.autoModelRouting).not.toBe(true);
   });
 
-  test("Implement sends unrouted, then leaves the composer on exec's Auto default", async () => {
+  test("Implement sends unrouted but saves exec's Auto default for its later sends", async () => {
     const execModel = "openai:gpt-5.2";
     startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
     setTestAgentAiDefaults({
@@ -632,8 +633,10 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.model).toBe(execModel);
     expect(sendMessageCalls[0]?.options.autoModelRouting).toBe(false);
     expect(sendMessageCalls[0]?.options.autoThinkingLevel).toBe(false);
-    expect(getAutoRouting(WORKSPACE_ID, "model", "exec")).toBe(true);
-    expect(getAutoRouting(WORKSPACE_ID, "thinkingLevel", "exec")).toBe(true);
+    expect(sendMessageCalls[0]?.options.savedAutoRouting).toEqual({
+      model: true,
+      thinkingLevel: true,
+    });
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {
