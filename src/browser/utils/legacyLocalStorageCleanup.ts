@@ -7,7 +7,20 @@ import {
 // duplicated backend-owned data (plan text, post-compaction state) and now live in memory;
 // leaving them in localStorage wastes quota (QuotaExceededError blocked draft persistence).
 // Experiment values live only on the backend; an older build would re-upload stale local copies.
-const DROPPED_CACHE_KEY_PREFIXES = ["planContent:", "postCompactionState:", "experiment:"] as const;
+// Workspace AI picks live in workspace metadata or, until sent, in memory.
+const DROPPED_CACHE_KEY_PREFIXES = [
+  "planContent:",
+  "postCompactionState:",
+  "experiment:",
+  "agentId:",
+  "workspaceAiSettingsByAgent:",
+  "autoModelRouting:",
+  "autoThinkingLevel:",
+  "autoRoutingChoiceByAgent:",
+  "model:",
+  "thinkingLevel:",
+  "reasoningMode:",
+] as const;
 
 /**
  * Remove localStorage keys written by caches that no longer persist. Runs on every startup

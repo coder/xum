@@ -41,13 +41,8 @@ import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
-import {
-  setAutoRoutingPick,
-  setWorkspaceAgentPick,
-  type AutoRoutingDimension,
-} from "@/browser/utils/aiSelectionIntent";
+import { setWorkspaceAgentPick } from "@/browser/utils/aiSelectionIntent";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
-import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   useHostTranscriptMutationAllowed,
   useHostTranscriptMutationCheck,
@@ -212,7 +207,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   // also implicitly scopes lookups away from neighbouring tool calls/transcripts.
   const planContentRef = useRef<HTMLDivElement>(null);
   const { api } = useAPI();
-  const { agentId: currentAgentId, agents } = useAgent();
+  const { agentId: currentAgentId } = useAgent();
   const isAutoMode = currentAgentId === "auto";
   const openInEditor = useOpenInEditor();
   const workspaceContext = useOptionalWorkspaceContext();
@@ -493,45 +488,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   };
 
   /**
-   * The target agent's Auto choices. Pure read: nothing is persisted until
-   * `persistTargetAgentSettings` runs, so the handlers can await their preconditions
-   * (preference persistence, the transcript barrier) before any side effect.
-   */
-  const resolveTargetAgentRouting = (args: {
-    workspaceId: string;
-    targetAgentId: "auto" | "exec";
-  }): Record<AutoRoutingDimension, boolean> => {
-    const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
-    return {
-      model: getAutoRouting(args.workspaceId, "model", args.targetAgentId, agentBaseById),
-      thinkingLevel: getAutoRouting(
-        args.workspaceId,
-        "thinkingLevel",
-        args.targetAgentId,
-        agentBaseById
-      ),
-    };
-  };
-
-  /** Switch the workspace to the target agent (synchronous, right before the send). */
-  const persistTargetAgentSettings = (args: {
-    workspaceId: string;
-    targetAgentId: "auto" | "exec";
-    autoRouting: Record<AutoRoutingDimension, boolean>;
-  }): void => {
-    setWorkspaceAgentPick(args.workspaceId, args.targetAgentId);
-    // The send below disables routing and saves that, so keep the choice for later composer sends.
-    for (const dimension of ["model", "thinkingLevel"] as const) {
-      setAutoRoutingPick(
-        args.workspaceId,
-        args.targetAgentId,
-        dimension,
-        args.autoRouting[dimension]
-      );
-    }
-  };
-
-  /**
    * One plan action ("Implement the plan" as exec, or Continue in Auto). Ordering matters:
    * every await and the final barrier check come BEFORE the irreversible steps (the optional
    * history replacement, the workspace mode switch, the send), so a barrier that closes during
@@ -556,10 +512,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
     if (shouldReplaceChatHistory && !canReplaceChatHistory) return null;
 
-    const autoRouting = resolveTargetAgentRouting({
-      workspaceId,
-      targetAgentId: args.targetAgentId,
-    });
     // Same barrier as the composer: the backend reads the send model's auto-compaction
     // threshold from persisted preferences, so a slider move right before this click must
     // reach config.json first. A failed save lands in the handlers' best-effort catch.
@@ -573,8 +525,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         errorContext: args.replacementErrorContext,
       });
     }
-    persistTargetAgentSettings({ workspaceId, targetAgentId: args.targetAgentId, autoRouting });
-    // The target agent's resolved model and thinking level (its saved or configured settings).
+    setWorkspaceAgentPick(workspaceId, args.targetAgentId);
+    // The target agent's resolved model, thinking level and Auto choices.
     const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
     const sendResult = await api.workspace.sendMessage({
       workspaceId,
@@ -587,6 +539,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         // about the plan's difficulty.
         autoModelRouting: false,
         autoThinkingLevel: false,
+        // The agent's later composer sends keep its Auto choices.
+        savedAutoRouting: {
+          model: sendMessageOptions.autoModelRouting === true,
+          thinkingLevel: sendMessageOptions.autoThinkingLevel === true,
+        },
       },
     });
     if (sendResult.success) return null;

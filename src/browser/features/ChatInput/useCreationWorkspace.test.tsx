@@ -1905,7 +1905,7 @@ describe("useCreationWorkspace", () => {
     expect(workspaceApi.create.mock.calls.length).toBe(0);
   });
 
-  test("syncs global default agent to workspace when project agent is unset", async () => {
+  test("sends the global default agent when the project agent is unset", async () => {
     const listBranchesMock = mock(
       (): Promise<BranchListResult> =>
         Promise.resolve({
