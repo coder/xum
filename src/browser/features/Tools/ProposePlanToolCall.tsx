@@ -41,29 +41,20 @@ import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
-import { getAutoRoutingChoiceByAgentKey } from "@/common/constants/storage";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import { setWorkspaceAgentPick } from "@/browser/utils/aiSelectionIntent";
+import {
+  setAutoRoutingPick,
+  setWorkspaceAgentPick,
+  type AutoRoutingDimension,
+} from "@/browser/utils/aiSelectionIntent";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
-import { applyAutoRoutingOutcome } from "@/browser/utils/modelChange";
-import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   useHostTranscriptMutationAllowed,
   useHostTranscriptMutationCheck,
 } from "@/browser/utils/transcriptBarrier";
 import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
-import {
-  flushUserPreferences,
-  getAppConfigStore,
-  useAppConfig,
-} from "@/browser/stores/AppConfigStore";
+import { flushUserPreferences, useAppConfig } from "@/browser/stores/AppConfigStore";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
-import {
-  resolveAutoRoutingForAgent,
-  type AutoRoutingChoiceByAgent,
-  type AutoRoutingOutcome,
-} from "@/browser/utils/workspaceModeAi";
 import type { ReviewActionCallbacks } from "../Shared/InlineReviewNote";
 import { isPlanFilePath, normalizePlanFilePath } from "@/common/types/review";
 import {
@@ -222,7 +213,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const planContentRef = useRef<HTMLDivElement>(null);
   const { api } = useAPI();
   const { agentId: currentAgentId, agents } = useAgent();
-  const autoRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const isAutoMode = currentAgentId === "auto";
   const openInEditor = useOpenInEditor();
   const workspaceContext = useOptionalWorkspaceContext();
@@ -503,35 +493,42 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   };
 
   /**
-   * The target agent's auto-routing outcome. Pure read: nothing is persisted until
+   * The target agent's Auto choices. Pure read: nothing is persisted until
    * `persistTargetAgentSettings` runs, so the handlers can await their preconditions
    * (preference persistence, the transcript barrier) before any side effect.
    */
   const resolveTargetAgentRouting = (args: {
     workspaceId: string;
     targetAgentId: "auto" | "exec";
-  }): AutoRoutingOutcome =>
-    resolveAutoRoutingForAgent({
-      agentId: args.targetAgentId,
-      agentAiDefaults: getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {},
-      agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
-      explicitSwitch: true,
-      experimentEnabled: autoRoutingEnabled,
-      routingChoices: readPersistedState<AutoRoutingChoiceByAgent>(
-        getAutoRoutingChoiceByAgentKey(args.workspaceId),
-        {}
+  }): Record<AutoRoutingDimension, boolean> => {
+    const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
+    return {
+      model: getAutoRouting(args.workspaceId, "model", args.targetAgentId, agentBaseById),
+      thinkingLevel: getAutoRouting(
+        args.workspaceId,
+        "thinkingLevel",
+        args.targetAgentId,
+        agentBaseById
       ),
-    });
+    };
+  };
 
   /** Switch the workspace to the target agent (synchronous, right before the send). */
   const persistTargetAgentSettings = (args: {
     workspaceId: string;
     targetAgentId: "auto" | "exec";
-    autoRouting: AutoRoutingOutcome;
+    autoRouting: Record<AutoRoutingDimension, boolean>;
   }): void => {
     setWorkspaceAgentPick(args.workspaceId, args.targetAgentId);
-    // Persist routing for later composer sends; the immediate action below disables routing.
-    applyAutoRoutingOutcome(args.workspaceId, args.autoRouting);
+    // The send below disables routing and saves that, so keep the choice for later composer sends.
+    for (const dimension of ["model", "thinkingLevel"] as const) {
+      setAutoRoutingPick(
+        args.workspaceId,
+        args.targetAgentId,
+        dimension,
+        args.autoRouting[dimension]
+      );
+    }
   };
 
   /**

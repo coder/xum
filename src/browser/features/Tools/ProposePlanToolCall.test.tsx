@@ -13,9 +13,9 @@ import * as DiffRendererModule from "@/browser/features/Shared/DiffRenderer";
 import * as ReviewTypesModule from "@/common/types/review";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { getAutoModelRoutingKey, getAutoThinkingLevelKey } from "@/common/constants/storage";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   getWorkspaceAgentId,
   resetAiSelectionIntentForTests,
@@ -603,7 +603,7 @@ describe("ProposePlanToolCall", () => {
     startInPlanMode(WORKSPACE_ID, execModel, "high");
     setTestAgentAiDefaults({ exec: { modelString: execModel } });
     setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
-    updatePersistedState(getAutoModelRoutingKey(WORKSPACE_ID), true);
+    setAutoRoutingChoice(WORKSPACE_ID, "model", true);
 
     const sendMessageCalls: SendMessageArgs[] = [];
     mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
@@ -634,8 +634,8 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.model).toBe(execModel);
     expect(sendMessageCalls[0]?.options.autoModelRouting).toBe(false);
     expect(sendMessageCalls[0]?.options.autoThinkingLevel).toBe(false);
-    expect(readPersistedState(getAutoModelRoutingKey(WORKSPACE_ID), false)).toBe(true);
-    expect(readPersistedState(getAutoThinkingLevelKey(WORKSPACE_ID), false)).toBe(true);
+    expect(getAutoRouting(WORKSPACE_ID, "model", "exec")).toBe(true);
+    expect(getAutoRouting(WORKSPACE_ID, "thinkingLevel", "exec")).toBe(true);
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {

@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ReactElement } from "react";
-import { act, cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 
 import { AgentProvider } from "@/browser/contexts/AgentContext";
-import { consumeWorkspaceModelChange, setAutoRoutingChoice } from "@/browser/utils/modelChange";
+import { consumeWorkspaceModelChange } from "@/browser/utils/modelChange";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
@@ -167,47 +167,6 @@ describe("WorkspaceModeAISync", () => {
       });
       renderAt(legacy, "exec");
       expect(readAuto(legacy)).toEqual({ model: false, thinkingLevel: false });
-    });
-
-    test("an explicit concrete pick survives an agent round trip over an Auto default", async () => {
-      const workspaceId = nextWorkspaceId();
-      setTestAgentAiDefaults({
-        exec: { autoModelRouting: true, autoThinkingLevel: true },
-      });
-
-      const { rerender } = renderAt(workspaceId, "exec");
-      await waitFor(() => {
-        expect(readAuto(workspaceId)).toEqual({ model: true, thinkingLevel: true });
-      });
-      act(() => setAutoRoutingChoice(workspaceId, "model", false));
-
-      switchTo(rerender, workspaceId, "plan");
-      await waitFor(() => {
-        expect(readAuto(workspaceId)).toEqual({ model: false, thinkingLevel: false });
-      });
-      switchTo(rerender, workspaceId, "exec");
-      await waitFor(() => {
-        expect(readAuto(workspaceId)).toEqual({ model: false, thinkingLevel: true });
-      });
-    });
-
-    test("an explicit Auto pick survives an agent round trip over a concrete default", async () => {
-      const workspaceId = nextWorkspaceId();
-      setTestAgentAiDefaults({
-        exec: { modelString: "openai:gpt-5.2", thinkingLevel: "low" },
-      });
-
-      const { rerender } = renderAt(workspaceId, "exec");
-      act(() => setAutoRoutingChoice(workspaceId, "thinkingLevel", true));
-
-      switchTo(rerender, workspaceId, "plan");
-      await waitFor(() => {
-        expect(readAuto(workspaceId).thinkingLevel).toBe(false);
-      });
-      switchTo(rerender, workspaceId, "exec");
-      await waitFor(() => {
-        expect(readAuto(workspaceId)).toEqual({ model: false, thinkingLevel: true });
-      });
     });
   });
 });

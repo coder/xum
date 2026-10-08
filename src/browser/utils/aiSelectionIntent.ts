@@ -22,6 +22,11 @@ import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 
 export type AiSelectionField = keyof AiSelectionIntent;
+export type AutoRoutingDimension = "model" | "thinkingLevel";
+export const AUTO_ROUTING_FLAG = {
+  model: "autoModelRouting",
+  thinkingLevel: "autoThinkingLevel",
+} as const satisfies Record<AutoRoutingDimension, string>;
 export type AiSelectionTokens = Partial<Record<AiSelectionField, number>>;
 
 interface PendingSelection {
@@ -39,6 +44,7 @@ export type WorkspaceAiMetadata = Pick<
 
 const pendingByScope = new Map<string, Partial<Record<AiSelectionField, PendingSelection>>>();
 const pendingAgentByWorkspace = new Map<string, string>();
+const pendingAutoRoutingByScope = new Map<string, Partial<Record<AutoRoutingDimension, boolean>>>();
 const metadataByWorkspace = new Map<string, WorkspaceAiMetadata>();
 const listeners = new Set<() => void>();
 let nextToken = 1;
@@ -72,6 +78,15 @@ export function setWorkspaceAiMetadata(workspaceId: string, source: WorkspaceAiM
   metadataByWorkspace.set(workspaceId, metadata);
   if (pendingAgentByWorkspace.get(workspaceId) === resolvePersistedAgentId(metadata, "")) {
     pendingAgentByWorkspace.delete(workspaceId);
+  }
+  for (const [agentId, settings] of Object.entries(metadata.aiSettingsByAgent ?? {})) {
+    const picks = pendingAutoRoutingByScope.get(scopeKey(workspaceId, agentId));
+    if (picks == null) continue;
+    for (const dimension of ["model", "thinkingLevel"] as const) {
+      if (picks[dimension] === (settings[AUTO_ROUTING_FLAG[dimension]] === true)) {
+        delete picks[dimension];
+      }
+    }
   }
   notify();
 }
@@ -111,6 +126,29 @@ export function setWorkspaceAgentPick(workspaceId: string, agentId: string): voi
   } else {
     pendingAgentByWorkspace.set(workspaceId, normalized);
   }
+  notify();
+}
+
+/** An unsent Auto pick lasts until the agent's saved flag matches it. */
+export function getAutoRoutingPick(
+  scopeId: string,
+  agentId: string,
+  dimension: AutoRoutingDimension
+): boolean | undefined {
+  return pendingAutoRoutingByScope.get(scopeKey(scopeId, agentId))?.[dimension];
+}
+
+export function setAutoRoutingPick(
+  scopeId: string,
+  agentId: string,
+  dimension: AutoRoutingDimension,
+  active: boolean
+): void {
+  const key = scopeKey(scopeId, agentId);
+  pendingAutoRoutingByScope.set(key, {
+    ...pendingAutoRoutingByScope.get(key),
+    [dimension]: active,
+  });
   notify();
 }
 
@@ -247,6 +285,7 @@ export function dropPendingModelPicks(shouldDrop: (model: string) => boolean): v
 export function resetAiSelectionIntentForTests(): void {
   pendingByScope.clear();
   pendingAgentByWorkspace.clear();
+  pendingAutoRoutingByScope.clear();
   metadataByWorkspace.clear();
   notify();
 }

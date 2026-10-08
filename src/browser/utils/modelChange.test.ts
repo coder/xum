@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { markAiSelectionIntent, setWorkspaceAgentPick } from "@/browser/utils/aiSelectionIntent";
 import {
   consumeWorkspaceModelChange,
@@ -12,9 +11,9 @@ import {
 } from "@/browser/utils/modelChange";
 import {
   AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS,
-  getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
 } from "@/common/constants/storage";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 
 let workspaceCounter = 0;
 
@@ -36,32 +35,28 @@ describe("modelChange", () => {
     restoreDomGlobals();
   });
 
-  test("explicit user and agent picks turn Auto off; sync keeps it", () => {
+  test("an explicit user pick turns Auto off; sync keeps it", () => {
     const workspaceId = nextWorkspaceId();
-    const autoKey = getAutoModelRoutingKey(workspaceId);
 
-    updatePersistedState(autoKey, true);
+    setAutoRoutingChoice(workspaceId, "model", true);
     setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "sync");
-    expect(readPersistedState(autoKey, false)).toBe(true);
+    expect(getAutoRouting(workspaceId, "model")).toBe(true);
 
-    setWorkspaceModelWithOrigin(workspaceId, "anthropic:claude-sonnet-4-5", "agent");
-    expect(readPersistedState(autoKey, false)).toBe(false);
-
-    updatePersistedState(autoKey, true);
-    setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "user");
-    expect(readPersistedState(autoKey, false)).toBe(false);
+    setWorkspaceModelWithOrigin(workspaceId, "anthropic:claude-sonnet-4-5", "user");
+    expect(getAutoRouting(workspaceId, "model")).toBe(false);
   });
 
-  test("records workspace routing picks per agent without a local experiment override", () => {
+  test("records routing picks for the selected agent only", () => {
     const workspaceId = nextWorkspaceId();
     setWorkspaceAgentPick(workspaceId, "plan");
 
     setAutoRoutingChoice(workspaceId, "thinkingLevel", true);
+    setAutoRoutingChoice(workspaceId, "model", true);
     setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "user");
 
-    expect(readPersistedState(getAutoRoutingChoiceByAgentKey(workspaceId), {})).toEqual({
-      plan: { thinkingLevel: true, model: false },
-    });
+    expect(getAutoRouting(workspaceId, "thinkingLevel", "plan")).toBe(true);
+    expect(getAutoRouting(workspaceId, "model", "plan")).toBe(false);
+    expect(getAutoRouting(workspaceId, "thinkingLevel", "exec")).toBe(false);
   });
 
   test("does not record explicit entries for no-op model changes", () => {

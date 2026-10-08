@@ -10,11 +10,8 @@ import type {
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
-import {
-  getAutoRoutingKey,
-  recordAutoRoutingChoiceForAgent,
-  type AutoRoutingDimension,
-} from "@/browser/utils/modelChange";
+import { getAutoRoutingKey, recordAutoRoutingChoiceForAgent } from "@/browser/utils/modelChange";
+import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
 import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";

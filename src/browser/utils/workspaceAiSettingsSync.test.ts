@@ -8,9 +8,11 @@ import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
+  setAutoRoutingPick,
   setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
 import {
+  getAutoRouting,
   getWorkspaceAiSelection,
   useWorkspaceAiSelection,
   type WorkspaceAiSelection,
@@ -147,5 +149,28 @@ describe("getWorkspaceAiSelection", () => {
     const { result } = renderHook(() => useWorkspaceAiSelection(scopeId));
     expect(result.current).toEqual(expected);
     expect(getWorkspaceAiSelection(scopeId)).toEqual(expected);
+  });
+
+  test("Auto routing falls through the unsent pick, the saved flag and configured Auto", () => {
+    getAppConfigStore().updateOptimistically({
+      agentAiDefaults: { exec: { autoModelRouting: true, autoThinkingLevel: true } },
+    });
+    const save = (flags: { autoModelRouting?: boolean }) =>
+      setWorkspaceAiMetadata(WS, {
+        aiSettingsByAgent: { exec: { model: "openai:saved", thinkingLevel: "low", ...flags } },
+      });
+    expect(getAutoRouting(WS, "model", "exec")).toBe(true);
+    expect(getAutoRouting(WS, "model", "plan")).toBe(false);
+
+    // A saved bucket owns the flag: its absent flag means off.
+    save({});
+    expect(getAutoRouting(WS, "thinkingLevel", "exec")).toBe(false);
+
+    setAutoRoutingPick(WS, "exec", "model", true);
+    expect(getAutoRouting(WS, "model", "exec")).toBe(true);
+    // Saving the picked value drops the pick, so a later saved change shows through.
+    save({ autoModelRouting: true });
+    save({});
+    expect(getAutoRouting(WS, "model", "exec")).toBe(false);
   });
 });

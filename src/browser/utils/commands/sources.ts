@@ -7,7 +7,7 @@ import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedb
 import { showFeedbackToast as showCommandFeedbackToast } from "@/browser/utils/feedbackToast";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
-import type { AutoRoutingDimension } from "@/browser/utils/modelChange";
+import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
 import {
   THINKING_LEVELS,
   type OpenAIReasoningMode,

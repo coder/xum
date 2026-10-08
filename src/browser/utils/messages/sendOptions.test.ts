@@ -2,10 +2,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getAutoModelRoutingKey, getAutoThinkingLevelKey } from "@/common/constants/storage";
 import {
   resetAiSelectionIntentForTests,
+  setAutoRoutingPick,
   setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -43,7 +42,7 @@ describe("getSendOptionsFromStorage", () => {
     "carries the Auto flag only while the experiment is on and Auto is selected (%j)",
     ({ experiment, selected, expected }) => {
       setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, experiment);
-      updatePersistedState(getAutoModelRoutingKey("ws-auto"), selected);
+      setAutoRoutingPick("ws-auto", "exec", "model", selected);
       const options = getSendOptionsFromStorage("ws-auto");
       expect(options.autoModelRouting).toBe(expected);
       expect(SendMessageOptionsSchema.parse(JSON.parse(JSON.stringify(options))).model).toBe(
@@ -58,8 +57,8 @@ describe("getSendOptionsFromStorage", () => {
     { experiment: false, model: true, thinking: true },
   ])("routes the model and thinking dimensions independently (%j)", (input) => {
     setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, input.experiment);
-    updatePersistedState(getAutoModelRoutingKey("ws-dims"), input.model);
-    updatePersistedState(getAutoThinkingLevelKey("ws-dims"), input.thinking);
+    setAutoRoutingPick("ws-dims", "exec", "model", input.model);
+    setAutoRoutingPick("ws-dims", "exec", "thinkingLevel", input.thinking);
     const options = getSendOptionsFromStorage("ws-dims");
     expect(options.autoModelRouting).toBe(input.experiment && input.model ? true : undefined);
     expect(options.autoThinkingLevel).toBe(input.experiment && input.thinking ? true : undefined);

@@ -10,11 +10,7 @@ import { ProjectCreateModal } from "./components/ProjectCreateModal/ProjectCreat
 import { MultiProjectWorkspaceCreateModal } from "./components/MultiProjectWorkspaceCreateModal/MultiProjectWorkspaceCreateModal";
 import { AIView } from "./components/AIView/AIView";
 import { ErrorBoundary } from "./components/ErrorBoundary/ErrorBoundary";
-import {
-  usePersistedState,
-  updatePersistedState,
-  readPersistedState,
-} from "./hooks/usePersistedState";
+import { usePersistedState, updatePersistedState } from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { useComputerUse } from "./hooks/useComputerUse";
 import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
@@ -85,7 +81,7 @@ import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useStartWorkspaceCreation } from "./hooks/useStartWorkspaceCreation";
 import { useAPI } from "@/browser/contexts/API";
 import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
-import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { getAutoRouting, getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
 import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
@@ -117,7 +113,7 @@ import { WindowsToolchainBanner } from "./components/WindowsToolchainBanner/Wind
 import { RosettaBanner } from "./components/RosettaBanner/RosettaBanner";
 
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { getAutoRoutingKey, setAutoRoutingChoice } from "@/browser/utils/modelChange";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -919,10 +915,9 @@ function AppInner() {
       ? { enabled: computerUse.enabledHere, onToggle: computerUse.toggle }
       : null,
     autoModelRoutingEnabled,
-    // The composer's useAutoRoutingSelection listens on the same keys, so a palette write lands
+    // The composer's useAutoRoutingSelection reads the same picks, so a palette write lands
     // in the picker rows the way a row click does.
-    getAutoRouting: (scopeId, dimension) =>
-      readPersistedState<boolean>(getAutoRoutingKey(scopeId, dimension), false) === true,
+    getAutoRouting: (scopeId, dimension) => getAutoRouting(scopeId, dimension),
     onSetAutoRouting: (scopeId, dimension, active) =>
       setAutoRoutingChoice(scopeId, dimension, active),
     getEffectiveComposerModel: getModelForWorkspace,

@@ -10,7 +10,7 @@ import {
 import { normalizeAgentId as normalizeWorkspaceAgentId } from "@/common/utils/agentIds";
 import { collectDeclaredAncestorLayers } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
-import type { AutoRoutingDimension } from "@/browser/utils/modelChange";
+import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
 
 export type WorkspaceAISettingsCache = Partial<
   Record<

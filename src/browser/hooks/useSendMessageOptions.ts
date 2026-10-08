@@ -1,18 +1,14 @@
 import { useReasoningMode } from "./useReasoningMode";
 import { useThinkingLevel } from "./useThinkingLevel";
-import { useAgent } from "@/browser/contexts/AgentContext";
-import { usePersistedState } from "./usePersistedState";
+import { useAgent, useOptionalAgent } from "@/browser/contexts/AgentContext";
 import { buildSendMessageOptions } from "@/browser/utils/messages/buildSendMessageOptions";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { useProviderOptions } from "./useProviderOptions";
 import { useExperimentValue } from "./useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
-import {
-  getAutoRoutingKey,
-  setAutoRoutingChoice,
-  type AutoRoutingDimension,
-} from "@/browser/utils/modelChange";
+import { useAutoRouting, useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
+import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
 
 /**
  * Extended send options that includes both the canonical model used for backend routing
@@ -23,21 +19,21 @@ export interface SendMessageOptionsWithBase extends SendMessageOptions {
   baseModel: string;
 }
 
-/**
- * Ignores persisted Auto while the experiment is disabled. In workspace scopes, user
- * updates also record the active agent's routing choice.
- */
+/** Ignores saved Auto while the experiment is disabled. */
 export function useAutoRoutingSelection(
   workspaceId: string,
   dimension: AutoRoutingDimension
 ): [active: boolean, setActive: (active: boolean) => void] {
   const experimentEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
-  const [persisted] = usePersistedState<boolean>(getAutoRoutingKey(workspaceId, dimension), false, {
-    listener: true,
-  });
+  const agents = useOptionalAgent()?.agents ?? [];
+  const active = useAutoRouting(
+    workspaceId,
+    dimension,
+    new Map(agents.map((agent) => [agent.id, agent.base]))
+  );
   return [
-    experimentEnabled && persisted === true,
-    (active) => setAutoRoutingChoice(workspaceId, dimension, active),
+    experimentEnabled && active,
+    (next) => setAutoRoutingChoice(workspaceId, dimension, next),
   ];
 }
 

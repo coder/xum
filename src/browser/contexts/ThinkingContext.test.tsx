@@ -8,10 +8,11 @@ import { AgentProvider, type AgentContextValue } from "@/browser/contexts/AgentC
 import { ProviderOptionsProvider } from "@/browser/contexts/ProviderOptionsContext";
 import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
-import { getAutoThinkingLevelKey, getProjectScopeId } from "@/common/constants/storage";
+import { getProjectScopeId } from "@/common/constants/storage";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
 import {
   createTestApiClient,
@@ -400,7 +401,7 @@ describe("ThinkingContext", () => {
   test("a concrete pick via setter or keybind leaves Auto thinking routing", async () => {
     const projectPath = "/Users/dev/auto-thinking";
     const scopeId = getProjectScopeId(projectPath);
-    updatePersistedState(getAutoThinkingLevelKey(scopeId), true);
+    setAutoRoutingChoice(scopeId, "thinkingLevel", true);
 
     const view = renderWithAPI(
       <ThinkingProvider projectPath={projectPath}>
@@ -414,17 +415,17 @@ describe("ThinkingContext", () => {
       button.click();
     });
     await waitFor(() => {
-      expect(readPersistedState<boolean>(getAutoThinkingLevelKey(scopeId), true)).toBe(false);
+      expect(getAutoRouting(scopeId, "thinkingLevel")).toBe(false);
     }, METADATA_WAIT_OPTIONS);
 
-    updatePersistedState(getAutoThinkingLevelKey(scopeId), true);
+    setAutoRoutingChoice(scopeId, "thinkingLevel", true);
     act(() => {
       window.dispatchEvent(
         new window.KeyboardEvent("keydown", { key: "T", ctrlKey: true, shiftKey: true })
       );
     });
     await waitFor(() => {
-      expect(readPersistedState<boolean>(getAutoThinkingLevelKey(scopeId), true)).toBe(false);
+      expect(getAutoRouting(scopeId, "thinkingLevel")).toBe(false);
     }, METADATA_WAIT_OPTIONS);
   });
 });

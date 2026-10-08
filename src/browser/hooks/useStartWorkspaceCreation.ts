@@ -1,10 +1,10 @@
 import { useCallback, useEffect } from "react";
 import type { ProjectConfig } from "@/common/types/project";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
-import { getAutoModelRoutingKey, getProjectScopeId } from "@/common/constants/storage";
+import { getProjectScopeId } from "@/common/constants/storage";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import {
   getFirstTopLevelProjectPath,
   resolveWorkspaceCreationScope,
@@ -13,12 +13,9 @@ import {
 export type StartWorkspaceCreationDetail =
   CustomEventPayloads[typeof CUSTOM_EVENTS.START_WORKSPACE_CREATION];
 
-type PersistFn = typeof updatePersistedState;
-
 export function persistWorkspaceCreationPrefill(
   projectPath: string,
-  detail: StartWorkspaceCreationDetail | undefined,
-  persist: PersistFn = updatePersistedState
+  detail: StartWorkspaceCreationDetail | undefined
 ): void {
   if (!detail) {
     return;
@@ -31,11 +28,10 @@ export function persistWorkspaceCreationPrefill(
   }
 
   if (detail.model !== undefined) {
-    const projectScopeId = getProjectScopeId(projectPath);
     updateUserPreferences({ ai: { projectDefaults: { [projectPath]: { model: detail.model } } } });
     // A prefilled model is an explicit pick, so it leaves Auto (see setWorkspaceModelWithOrigin);
     // otherwise the creation send would treat it as the routing fallback.
-    persist(getAutoModelRoutingKey(projectScopeId), false);
+    setAutoRoutingChoice(getProjectScopeId(projectPath), "model", false);
   }
 
   if (detail.trunkBranch !== undefined) {

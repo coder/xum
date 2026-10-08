@@ -1,10 +1,13 @@
 import { useSyncExternalStore } from "react";
 import { normalizeModelPreference } from "@/browser/utils/messages/buildSendMessageOptions";
 import {
+  AUTO_ROUTING_FLAG,
   getAiSelectionVersion,
+  getAutoRoutingPick,
   getPendingAiSelection,
   getWorkspaceAiMetadata,
   subscribeAiSelection,
+  type AutoRoutingDimension,
 } from "@/browser/utils/aiSelectionIntent";
 import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
 import { readScopedAiDefault, useScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
@@ -172,6 +175,58 @@ export function useWorkspaceAiSelection(
     agentId: agentId ?? selectedAgentId ?? WORKSPACE_DEFAULTS.agentId,
     ai,
     defaultModel,
+    agentAiDefaults,
+    agentBaseById,
+  });
+}
+
+/** The unsent pick, then the agent's saved flag (a saved bucket owns it), then configured Auto. */
+function resolveAutoRouting(input: {
+  scopeId: string;
+  dimension: AutoRoutingDimension;
+  agentId: string;
+  agentAiDefaults: AgentAiDefaults;
+  agentBaseById?: ReadonlyMap<string, string | undefined>;
+}): boolean {
+  const agentId = normalizeAgentId(input.agentId, WORKSPACE_DEFAULTS.agentId);
+  const flag = AUTO_ROUTING_FLAG[input.dimension];
+  const saved = getWorkspaceAiMetadata(input.scopeId)?.aiSettingsByAgent?.[agentId];
+  return (
+    getAutoRoutingPick(input.scopeId, agentId, input.dimension) ??
+    (saved != null
+      ? saved[flag] === true
+      : resolveConfiguredAiDefaults(agentId, input.agentAiDefaults, input.agentBaseById)[flag] ===
+        true)
+  );
+}
+
+export function getAutoRouting(
+  scopeId: string,
+  dimension: AutoRoutingDimension,
+  agentId = readScopedAiDefault(scopeId, "agentId") ?? WORKSPACE_DEFAULTS.agentId,
+  agentBaseById?: ReadonlyMap<string, string | undefined>
+): boolean {
+  return resolveAutoRouting({
+    scopeId,
+    dimension,
+    agentId,
+    agentAiDefaults: getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {},
+    agentBaseById,
+  });
+}
+
+export function useAutoRouting(
+  scopeId: string,
+  dimension: AutoRoutingDimension,
+  agentBaseById?: ReadonlyMap<string, string | undefined>
+): boolean {
+  useSyncExternalStore(subscribeAiSelection, getAiSelectionVersion);
+  const agentId = useScopedAiDefault(scopeId, "agentId");
+  const agentAiDefaults = useAgentAiDefaults();
+  return resolveAutoRouting({
+    scopeId,
+    dimension,
+    agentId: agentId ?? WORKSPACE_DEFAULTS.agentId,
     agentAiDefaults,
     agentBaseById,
   });

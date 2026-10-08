@@ -8,10 +8,15 @@ import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
-import { getWorkspaceAgentId, markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
+import {
+  markAiSelectionIntent,
+  setAutoRoutingPick,
+  type AutoRoutingDimension,
+} from "@/browser/utils/aiSelectionIntent";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import type { AutoRoutingChoiceByAgent, AutoRoutingOutcome } from "@/browser/utils/workspaceModeAi";
 import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
+import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 export type ModelChangeOrigin = "user" | "agent" | "sync";
 
@@ -99,13 +104,8 @@ export function setWorkspaceModelWithOrigin(
   }
   if (origin === "user") {
     setAutoRoutingChoice(workspaceId, "model", false);
-  } else if (origin === "agent") {
-    // Clear the previous flag until the caller applies the target agent's resolved routing.
-    updatePersistedState(getAutoModelRoutingKey(workspaceId), false);
   }
 }
-
-export type AutoRoutingDimension = "model" | "thinkingLevel";
 
 const AUTO_ROUTING_KEY_BY_DIMENSION: Record<AutoRoutingDimension, (scopeId: string) => string> = {
   model: getAutoModelRoutingKey,
@@ -114,16 +114,6 @@ const AUTO_ROUTING_KEY_BY_DIMENSION: Record<AutoRoutingDimension, (scopeId: stri
 
 export function getAutoRoutingKey(scopeId: string, dimension: AutoRoutingDimension): string {
   return AUTO_ROUTING_KEY_BY_DIMENSION[dimension](scopeId);
-}
-
-/** Records workspace routing picks per agent; non-workspace scopes keep only scope-wide Auto. */
-function recordAutoRoutingChoice(
-  scopeId: string,
-  dimension: AutoRoutingDimension,
-  auto: boolean
-): void {
-  if (scopeId.length === 0 || scopeId.startsWith("__")) return;
-  recordAutoRoutingChoiceForAgent(scopeId, getWorkspaceAgentId(scopeId), { [dimension]: auto });
 }
 
 export function recordAutoRoutingChoiceForAgent(
@@ -150,13 +140,14 @@ export function recordAutoRoutingChoiceForAgent(
   );
 }
 
+/** Records an unsent Auto pick for the scope's selected agent. */
 export function setAutoRoutingChoice(
   scopeId: string,
   dimension: AutoRoutingDimension,
   active: boolean
 ): void {
-  updatePersistedState(getAutoRoutingKey(scopeId, dimension), active);
-  recordAutoRoutingChoice(scopeId, dimension, active);
+  const agentId = readScopedAiDefault(scopeId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
+  setAutoRoutingPick(scopeId, agentId, dimension, active);
 }
 
 /** Apply after agent-origin writes clear Auto so the target agent's resolved choice wins. */

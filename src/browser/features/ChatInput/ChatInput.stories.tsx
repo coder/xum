@@ -2,8 +2,7 @@ import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { collapseLeftSidebar, setWorkspaceInput } from "@/browser/stories/helpers/uiState";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getAutoModelRoutingKey } from "@/common/constants/storage";
+import { setAutoRoutingPick } from "@/browser/utils/aiSelectionIntent";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createFileReadTool } from "@/browser/stories/mocks/tools";
@@ -1048,7 +1047,7 @@ export const AutoModelRoutingActive: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        updatePersistedState(getAutoModelRoutingKey("ws-auto-routing"), true);
+        setAutoRoutingPick("ws-auto-routing", "exec", "model", true);
         return setupSimpleChatStory({
           workspaceId: "ws-auto-routing",
           aiSettings: { model: "openai:gpt-5.6-sol", thinkingLevel: "off" },
