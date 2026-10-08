@@ -66,6 +66,16 @@ export function isFilesystemRoot(inputPath: string): boolean {
 }
 
 /**
+ * Like isFilesystemRoot, but also follows symlinks (a link to "/" is the root). Costs one
+ * realpath, so only flows that register a new project use it; a missing path is checked as text.
+ */
+export async function resolvesToFilesystemRoot(inputPath: string): Promise<boolean> {
+  if (isFilesystemRoot(inputPath)) return true;
+  const realPath = await fs.realpath(inputPath).catch(() => null);
+  return realPath != null && isFilesystemRoot(realPath);
+}
+
+/**
  * Validate that a project path exists and is a directory.
  * Git repository status is checked separately - non-git repos are valid
  * but will be restricted to local runtime only.
@@ -85,13 +95,14 @@ export async function validateProjectPath(inputPath: string): Promise<PathValida
   // Expand tilde if present
   const expandedPath = expandTilde(inputPath);
 
-  // Normalize to resolve any .. or . in the path, then strip trailing slashes
-  const normalizedPath = stripTrailingSlashes(path.normalize(expandedPath));
-
-  // Before #5917 the root normalized to "" and failed the stat below; keep refusing it.
-  if (isFilesystemRoot(normalizedPath)) {
+  // Before #5917 the root normalized to "" and failed the stat below; keep refusing it. Check
+  // before stripping: a Windows drive root "C:\\" strips to the drive-relative "C:".
+  if (isFilesystemRoot(path.normalize(expandedPath))) {
     return { valid: false, error: PROJECT_AT_FILESYSTEM_ROOT_ERROR };
   }
+
+  // Normalize to resolve any .. or . in the path, then strip trailing slashes
+  const normalizedPath = stripTrailingSlashes(path.normalize(expandedPath));
 
   // Check if path exists
   try {

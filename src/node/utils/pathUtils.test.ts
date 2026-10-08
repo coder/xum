@@ -65,7 +65,8 @@ describe("pathUtils", () => {
   describe("validateProjectPath", () => {
     // #5917: "/" used to fail only by accident ("" did not exist). Refuse it explicitly.
     it("refuses the filesystem root", async () => {
-      for (const root of ["/", "//", "/tmp/.."]) {
+      // path.parse(cwd).root is "/" on POSIX and a drive root such as "C:\\" on Windows.
+      for (const root of ["/", "//", "/tmp/..", path.parse(process.cwd()).root]) {
         expect(await validateProjectPath(root)).toEqual({
           valid: false,
           error: "A project cannot be the filesystem root",

@@ -862,6 +862,34 @@ describe("Config", () => {
         { id: "ws-root", path: workspacePath },
       ]);
     });
+
+    // The restored root must not become every other project's parent: the load-time hierarchy
+    // merge would move their workspace rows into the root's bucket.
+    it("keeps other projects and their rows separate from a restored root project", async () => {
+      const rootWorkspace = path.join(config.srcDir, "root", "feature");
+      const repoWorkspace = path.join(config.srcDir, "repo", "main");
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["", { workspaces: [{ path: rootWorkspace, id: "ws-root", name: "feature" }] }],
+            [
+              "/home/user/repo",
+              { workspaces: [{ path: repoWorkspace, id: "ws-repo", name: "main" }] },
+            ],
+          ],
+        })
+      );
+
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).loadConfigOrDefault();
+      const repo = reloaded.projects.get("/home/user/repo");
+      expect(repo?.parentProjectPath).toBeUndefined();
+      expect(repo?.workspaces.map((workspace) => workspace.id)).toEqual(["ws-repo"]);
+      expect(reloaded.projects.get("/")?.workspaces.map((workspace) => workspace.id)).toEqual([
+        "ws-root",
+      ]);
+    });
   });
 
   describe("loadConfigOrDefault customInstructions sanitizing", () => {

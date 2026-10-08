@@ -21,6 +21,20 @@ describe("subProjects", () => {
     expect(isPathDescendant("/repo", "/repo")).toBe(false);
   });
 
+  // #5917: a root project restored from an older config must not adopt every project.
+  test("never treats the filesystem root as a parent project", () => {
+    expect(isPathDescendant("/", "/repo")).toBe(false);
+    expect(isPathDescendant("//", "/repo/packages/api")).toBe(false);
+    expect(
+      deriveProjectHierarchy(
+        new Map<string, ProjectConfig>([
+          ["/", project()],
+          ["/repo", project()],
+        ])
+      ).get("/repo")?.parentProjectPath
+    ).toBeUndefined();
+  });
+
   test("treats Windows drive-letter paths as case-insensitive", () => {
     expect(isPathDescendant("C:\\Repo", "c:\\repo\\packages\\api")).toBe(true);
   });

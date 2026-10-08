@@ -180,6 +180,20 @@ describe("ProjectService", () => {
       expect(config.loadConfigOrDefault().projects.size).toBe(0);
     });
 
+    // Windows needs extra privileges for symlinks.
+    it.skipIf(process.platform === "win32")(
+      "refuses a symlink that resolves to the filesystem root",
+      async () => {
+        const link = path.join(tempDir, "root-link");
+        await fs.symlink("/", link);
+        expect(await service.create(link)).toEqual({
+          success: false,
+          error: "A project cannot be the filesystem root",
+        });
+        expect(config.loadConfigOrDefault().projects.size).toBe(0);
+      }
+    );
+
     it("creates and registers a git project at a new path", async () => {
       const projectPath = path.join(tempDir, "new-git-project");
 

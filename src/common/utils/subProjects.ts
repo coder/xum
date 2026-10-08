@@ -14,6 +14,9 @@ export function normalizeForDescendantComparison(value: string): string {
 
 export function isPathDescendant(parentPath: string, candidatePath: string): boolean {
   const parent = normalizeForDescendantComparison(parentPath);
+  // The POSIX root normalizes to "". A root project restored from an older config (#5917) is
+  // never a parent: it would adopt every project and the hierarchy merge would move their rows.
+  if (parent === "") return false;
   const candidate = normalizeForDescendantComparison(candidatePath);
   return candidate.startsWith(`${parent}/`) && candidate.length > parent.length + 1;
 }
