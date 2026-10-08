@@ -1915,4 +1915,143 @@ describe("Edit sends, restores and inserts while the unsent draft waits", () => 
       await app.dispose();
     }
   }, 120_000);
+
+  // T25 (#5893 review evidence): a held, scripted command shows where the parts of an edit that
+  // the command did not clear go, once, for each disposition and edit state.
+  type HeldCommandEnd = "edit open" | "new text typed" | "edit ended by a switch";
+  const scriptedCommand = (
+    actions: chatCommands.CommandAction[],
+    inputDisposition: "consume" | "restore-if-empty"
+  ) => {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const spy = jest.spyOn(chatCommands, "processSlashCommand").mockImplementation(() =>
+      Promise.resolve({
+        kind: "phase",
+        actions,
+        continue: () => gate.then(() => ({ kind: "complete", actions: [], inputDisposition })),
+      })
+    );
+    return { spy, release: () => release() };
+  };
+  async function runHeldCommand(
+    prefix: string,
+    actions: chatCommands.CommandAction[],
+    inputDisposition: "consume" | "restore-if-empty",
+    end: HeldCommandEnd,
+    expectAfter: (app: AppHarness, scope: DraftScope) => Promise<void>
+  ) {
+    const app = await createAppHarness({ branchPrefix: prefix });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      const other =
+        end === "edit ended by a switch" ? await addOtherWorkspace(app, `${prefix}-o`) : null;
+      getDraftStore().setAttachments(scope, [
+        {
+          kind: "provider",
+          id: "file-edit",
+          url: "data:text/plain;base64,ZWRpdA==",
+          mediaType: "text/plain",
+          filename: "edit.txt",
+        },
+      ]);
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      const command = scriptedCommand(actions, inputDisposition);
+      typeIntoEdit(textarea, "/vim ");
+      await waitFor(() => expect(textarea.value).toBe("/vim "));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await waitFor(() => expect(command.spy).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
+      // The command took the edit's text and files when it started.
+      await waitFor(() => expect(editTextarea(app)?.value).toBe(""), LOAD_TOLERANT_WAIT);
+      expect(occurrences(composerText(app), "edit.txt")).toBe(0);
+      if (end === "new text typed") {
+        typeIntoEdit(editTextarea(app)!, "new words");
+        await waitFor(() => expect(editTextarea(app)?.value).toBe("new words"));
+      }
+      if (other) {
+        await switchAwayAndBack(app, other);
+        expect(editTextarea(app)).toBeNull();
+      }
+      command.release();
+      await settleAsyncWork();
+      await expectAfter(app, scope);
+      command.spy.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }
+  const expectEdit = async (app: AppHarness, text: string, files: number) => {
+    await waitFor(() => expect(editTextarea(app)?.value).toBe(text), LOAD_TOLERANT_WAIT);
+    expect(occurrences(composerText(app), "edit.txt")).toBe(files);
+  };
+  const clearsText: chatCommands.CommandAction[] = [{ type: "clear-input" }];
+  const cases: {
+    disposition: "consume" | "restore-if-empty";
+    end: HeldCommandEnd;
+    expectAfter: (app: AppHarness, scope: DraftScope) => Promise<void>;
+  }[] = [
+    {
+      disposition: "consume",
+      end: "new text typed",
+      expectAfter: async (app, scope) => {
+        await expectEdit(app, "new words", 1);
+        await expectDraft(app, scope, "unsent draft", ["unsent.txt"]);
+      },
+    },
+    {
+      disposition: "consume",
+      end: "edit ended by a switch",
+      expectAfter: (app, scope) =>
+        expectDraft(app, scope, "unsent draft", ["unsent.txt", "edit.txt"]),
+    },
+    {
+      disposition: "restore-if-empty",
+      end: "edit open",
+      expectAfter: async (app, scope) => {
+        await expectEdit(app, "/vim ", 1);
+        await expectDraft(app, scope, "unsent draft", ["unsent.txt"]);
+      },
+    },
+    {
+      disposition: "restore-if-empty",
+      end: "new text typed",
+      expectAfter: async (app, scope) => {
+        await expectEdit(app, "new words", 1);
+        await expectDraft(app, scope, "unsent draft", ["unsent.txt"]);
+      },
+    },
+    {
+      disposition: "restore-if-empty",
+      end: "edit ended by a switch",
+      expectAfter: (app, scope) =>
+        expectDraft(app, scope, joinDraftText("unsent draft", "/vim "), ["unsent.txt", "edit.txt"]),
+    },
+  ];
+  for (const testCase of cases) {
+    test(`a held text-only command (${testCase.disposition}, ${testCase.end}) returns the edit's file once`, async () => {
+      await runHeldCommand(
+        `held-${testCase.disposition === "consume" ? "c" : "r"}-${testCase.end.split(" ")[0]}-${testCase.end.split(" ")[1]}`,
+        clearsText,
+        testCase.disposition,
+        testCase.end,
+        testCase.expectAfter
+      );
+    }, 120_000);
+  }
+
+  // T26 (#5893 review evidence): a command that clears the files keeps them cleared.
+  for (const end of ["edit open", "edit ended by a switch"] as const) {
+    test(`a held command that clears attachments (${end}) brings no file back`, async () => {
+      await runHeldCommand(
+        `held-clr-${end.split(" ")[1]}`,
+        [{ type: "clear-input" }, { type: "clear-attachments" }],
+        "consume",
+        end,
+        async (app, scope) => {
+          if (end === "edit open") await expectEdit(app, "", 0);
+          await expectDraft(app, scope, "unsent draft", ["unsent.txt"]);
+        }
+      );
+    }, 120_000);
+  }
 });
