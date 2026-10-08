@@ -2,7 +2,6 @@ import { type Page } from "@playwright/test";
 import { electronTest as test, electronExpect as expect } from "../electronTest";
 import { getXumE2EEnv } from "../env";
 import {
-  REVIEW_SORT_ORDER_KEY,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_TAB_KEY,
 } from "../../../src/common/constants/storage";
@@ -14,7 +13,11 @@ import {
   withChromeProfiles,
   writePerfArtifacts,
 } from "../utils/perfProfile";
-import { disableReviewTutorial, seedLargeReviewDiff } from "../utils/reviewPerfFixture";
+import {
+  disableReviewTutorial,
+  seedLargeReviewDiff,
+  setReviewPreferences,
+} from "../utils/reviewPerfFixture";
 
 const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 const REVIEW_CHANGED_LINES_PER_FILE = 50;
@@ -25,21 +28,19 @@ async function primeReviewSidebarForWorkspace(page: Page, workspaceId: string): 
   const reviewDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspaceId);
 
   await page.evaluate(
-    ({ collapsedKey, diffBaseKey, sidebarTabKey, sortOrderKey }) => {
+    ({ collapsedKey, diffBaseKey, sidebarTabKey }) => {
       // The cold-open scenario should mount the Review tab next to the transcript immediately.
       window.localStorage.setItem(sidebarTabKey, JSON.stringify("review"));
       window.localStorage.setItem(collapsedKey, JSON.stringify(false));
       window.localStorage.setItem(diffBaseKey, JSON.stringify("HEAD"));
-      window.localStorage.setItem("review-show-read", JSON.stringify(true));
-      window.localStorage.setItem(sortOrderKey, JSON.stringify("file-order"));
     },
     {
       collapsedKey: RIGHT_SIDEBAR_COLLAPSED_KEY,
       diffBaseKey: reviewDiffBaseKey,
       sidebarTabKey: RIGHT_SIDEBAR_TAB_KEY,
-      sortOrderKey: REVIEW_SORT_ORDER_KEY,
     }
   );
+  await setReviewPreferences(page, { showRead: true, sortOrder: "file-order" });
 }
 
 async function waitForChatAndReviewReady(page: Page): Promise<void> {

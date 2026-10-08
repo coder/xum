@@ -1,14 +1,12 @@
 import React, { useState, useCallback } from "react";
 import type { GitStatus } from "@/common/types/workspace";
-import { GIT_STATUS_INDICATOR_MODE_KEY } from "@/common/constants/storage";
+import type { GitStatusIndicatorMode } from "@/common/constants/storage";
 import { STORAGE_KEYS } from "@/constants/workspaceDefaults";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useReviewDefaultBase } from "@/browser/utils/reviewDefaultBase";
 import { invalidateGitStatus, useGitStatusRefreshing } from "@/browser/stores/GitStatusStore";
-import {
-  GitStatusIndicatorView,
-  type GitStatusIndicatorMode,
-} from "../GitStatusIndicatorView/GitStatusIndicatorView";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { GitStatusIndicatorView } from "../GitStatusIndicatorView/GitStatusIndicatorView";
 import { useGitBranchDetails } from "@/browser/features/Hooks/useGitBranchDetails";
 
 interface GitStatusIndicatorProps {
@@ -36,11 +34,9 @@ export const GitStatusIndicator: React.FC<GitStatusIndicatorProps> = ({
   const trimmedWorkspaceId = workspaceId.trim();
   const isRefreshing = useGitStatusRefreshing(trimmedWorkspaceId);
 
-  const [mode, setMode] = usePersistedState<GitStatusIndicatorMode>(
-    GIT_STATUS_INDICATOR_MODE_KEY,
-    "line-delta",
-    { listener: true }
-  );
+  const mode =
+    useUserPreferences((preferences) => preferences.appearance?.gitStatusIndicatorMode) ??
+    "line-delta";
 
   // Per-project default base (fallback for new workspaces)
   const projectDefaultBase = useReviewDefaultBase(projectPath);
@@ -60,12 +56,9 @@ export const GitStatusIndicator: React.FC<GitStatusIndicatorProps> = ({
     [setBaseRef, trimmedWorkspaceId]
   );
 
-  const handleModeChange = useCallback(
-    (nextMode: GitStatusIndicatorMode) => {
-      setMode(nextMode);
-    },
-    [setMode]
-  );
+  const handleModeChange = useCallback((nextMode: GitStatusIndicatorMode) => {
+    updateUserPreferences({ appearance: { gitStatusIndicatorMode: nextMode } });
+  }, []);
 
   console.assert(
     trimmedWorkspaceId.length > 0,

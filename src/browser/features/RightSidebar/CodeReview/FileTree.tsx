@@ -4,8 +4,9 @@
 
 import React from "react";
 import { extractNewPath, type FileTreeNode } from "@/common/utils/git/numstatParser";
-import type { FileChangeType } from "@/common/types/review";
+import type { FileChangeType, ReviewFileTreeViewMode } from "@/common/types/review";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   createSessionValueStore,
   trimRecordToChars,
@@ -13,7 +14,6 @@ import {
 } from "@/browser/utils/boundedPersistedValue";
 import {
   getFileTreeExpandStateKey,
-  REVIEW_FILE_TREE_VIEW_MODE_KEY,
   FILE_TREE_EXPAND_STATE_MAX_CHARS,
 } from "@/common/constants/storage";
 import { cn } from "@/common/lib/utils";
@@ -100,11 +100,9 @@ function getFileChangeBadge(
   }
 }
 
-type FileTreeViewMode = "structured" | "flat";
-
 type FileLabelMode = "name" | "path";
 
-const FILE_TREE_VIEW_MODE_OPTIONS: Array<ToggleOption<FileTreeViewMode>> = [
+const FILE_TREE_VIEW_MODE_OPTIONS: Array<ToggleOption<ReviewFileTreeViewMode>> = [
   { value: "structured", label: "Structured" },
   { value: "flat", label: "Flat" },
 ];
@@ -423,11 +421,8 @@ export const FileTree: React.FC<FileTreeExternalProps> = ({
     setPersistedExpandStateMap(persisted);
   };
 
-  const [viewMode, setViewMode] = usePersistedState<FileTreeViewMode>(
-    REVIEW_FILE_TREE_VIEW_MODE_KEY,
-    "structured",
-    { listener: true }
-  );
+  const viewMode =
+    useUserPreferences((preferences) => preferences.review?.fileTreeViewMode) ?? "structured";
 
   // Extract display name for filter indicator
   const filterDisplayName = selectedPath ? (selectedPath.split("/").pop() ?? selectedPath) : null;
@@ -441,7 +436,7 @@ export const FileTree: React.FC<FileTreeExternalProps> = ({
             <ToggleGroup
               options={FILE_TREE_VIEW_MODE_OPTIONS}
               value={viewMode}
-              onChange={(mode) => setViewMode(mode)}
+              onChange={(mode) => updateUserPreferences({ review: { fileTreeViewMode: mode } })}
             />
           </div>
           {selectedPath && (

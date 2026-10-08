@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
-import { POWER_MODE_ENABLED_KEY } from "@/common/constants/storage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { PowerModeEngine } from "@/browser/utils/powerMode/PowerModeEngine";
 import * as RealPowerModeOverlayModule from "@/browser/features/PowerMode/PowerModeOverlay";
 import { restoreModulesAfterSuite } from "../../../tests/ui/moduleMocks";
@@ -92,11 +92,14 @@ describe("PowerModeContext", () => {
     domGlobals.StorageEvent = dom.StorageEvent;
     domGlobals.CustomEvent = dom.CustomEvent;
 
-    window.localStorage.setItem(POWER_MODE_ENABLED_KEY, JSON.stringify(true));
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { appearance: { powerModeEnabled: true } },
+    });
   });
 
   afterEach(() => {
     cleanup();
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     mock.restore();
     globalThis.getComputedStyle = originalGetComputedStyle;
     globalThis.window = originalWindow;

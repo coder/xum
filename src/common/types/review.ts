@@ -78,7 +78,11 @@ export interface ReviewState {
 /**
  * Sort order options for review panel hunks
  */
-export type ReviewSortOrder = "file-order" | "last-edit";
+export const REVIEW_SORT_ORDERS = ["file-order", "last-edit"] as const;
+export type ReviewSortOrder = (typeof REVIEW_SORT_ORDERS)[number];
+
+export const REVIEW_FILE_TREE_VIEW_MODES = ["structured", "flat"] as const;
+export type ReviewFileTreeViewMode = (typeof REVIEW_FILE_TREE_VIEW_MODES)[number];
 
 /**
  * Filter options for review panel

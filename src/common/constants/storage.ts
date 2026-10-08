@@ -53,11 +53,6 @@ export const GLOBAL_SCOPE_ID = "__global__";
 export const UI_THEME_KEY = "uiTheme";
 
 /**
- * LocalStorage key for the hidden Power Mode UI easter egg (global).
- */
-export const POWER_MODE_ENABLED_KEY = "powerModeEnabled";
-
-/**
  * Get the localStorage key for the last selected provider when adding custom models (global)
  * Format: "lastCustomModelProvider"
  */
@@ -362,12 +357,9 @@ export function getAgentsInitNudgeKey(projectPath: string): string {
   return `agentsInitNudge:${projectPath}`;
 }
 
-/**
- * Git status indicator display mode (global)
- * Stores: "line-delta" | "divergence"
- */
+export const GIT_STATUS_INDICATOR_MODES = ["divergence", "line-delta"] as const;
 
-export const GIT_STATUS_INDICATOR_MODE_KEY = "gitStatusIndicatorMode";
+export type GitStatusIndicatorMode = (typeof GIT_STATUS_INDICATOR_MODES)[number];
 
 export type EditorType = "vscode" | "cursor" | "zed" | "custom";
 
@@ -572,12 +564,6 @@ export function getHunkFirstSeenKey(workspaceId: string): string {
 }
 
 /**
- * Get the localStorage key for review sort order preference (global)
- * Format: "review-sort-order"
- */
-export const REVIEW_SORT_ORDER_KEY = "review-sort-order";
-
-/**
  * Get the localStorage key for hunk expand/collapse state in Review tab
  * Stores user's manual expand/collapse preferences per hunk
  * Legacy: migrated to the backend review-state.json; read once for import, then removed.
@@ -605,12 +591,6 @@ export function getReviewReadMoreKey(workspaceId: string): string {
 export function getFileTreeExpandStateKey(workspaceId: string): string {
   return `fileTreeExpandState:${workspaceId}`;
 }
-
-/**
- * LocalStorage key for file tree view mode in the Review tab (global).
- * Format: "reviewFileTreeViewMode"
- */
-export const REVIEW_FILE_TREE_VIEW_MODE_KEY = "reviewFileTreeViewMode";
 
 /**
  * Get the localStorage key for persisted legacy agent status for a workspace.
@@ -815,7 +795,6 @@ export const STATS_TAB_VIEW_MODE_KEY = "statsTab:viewMode";
 export const STATS_TAB_SHOW_MODE_BREAKDOWN_KEY = "statsTab:showModeBreakdown";
 export const COSTS_TAB_VIEW_MODE_KEY = "costsTab:viewMode";
 export const OUTPUT_TAB_LEVEL_KEY = "output-tab-level";
-export const REVIEW_SHOW_READ_KEY = "review-show-read";
 export const MERMAID_DIAGRAM_ZOOM_KEY = "mermaid-diagram-zoom";
 export const ANALYTICS_TIME_RANGE_KEY = "analytics:timeRange";
 export const ANALYTICS_TIMING_METRIC_KEY = "analytics:timingMetric";
@@ -1053,7 +1032,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Global UI state.
   // Paint cache of appearance.theme for index.html, written by ThemeProvider.
   globalKey(UI_THEME_KEY, "cache", 64),
-  globalKey(POWER_MODE_ENABLED_KEY, "ui", 16),
   globalKey(ARTIFACTS_SELECTION_KEY, "ui", ARTIFACTS_SELECTION_MAX_CHARS),
   globalKey(LAST_CUSTOM_MODEL_PROVIDER_KEY, "ui", 128),
   // { workspaceId } (older builds also stored paths; readers use only the id).
@@ -1063,10 +1041,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Legacy creation draft list, now in the backend drafts/list.json (imported once by DraftStore,
   // then removed, #5225). Never written again, so no budget (0).
   globalKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, "draft", 0),
-  globalKey(GIT_STATUS_INDICATOR_MODE_KEY, "ui", 32),
   globalKey(TUTORIAL_STATE_KEY, "ui", 256),
-  globalKey(REVIEW_SORT_ORDER_KEY, "ui", 32),
-  globalKey(REVIEW_FILE_TREE_VIEW_MODE_KEY, "ui", 32),
   globalKey(LEFT_SIDEBAR_COLLAPSED_KEY, "ui", 16),
   globalKey(SIDEBAR_AGE_GROUPING_KEY, "ui", 16),
   globalKey(SIDEBAR_FLAT_MODE_KEY, "ui", 16),
@@ -1094,7 +1069,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(STATS_TAB_SHOW_MODE_BREAKDOWN_KEY, "ui", 16),
   globalKey(COSTS_TAB_VIEW_MODE_KEY, "ui", 32),
   globalKey(OUTPUT_TAB_LEVEL_KEY, "ui", 32),
-  globalKey(REVIEW_SHOW_READ_KEY, "ui", 16),
   globalKey(MERMAID_DIAGRAM_ZOOM_KEY, "ui", 32),
   globalKey(ANALYTICS_TIME_RANGE_KEY, "ui", 32),
   globalKey(ANALYTICS_TIMING_METRIC_KEY, "ui", 32),

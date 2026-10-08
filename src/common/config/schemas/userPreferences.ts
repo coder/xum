@@ -7,10 +7,12 @@ import {
 import {
   BASH_COLLAPSED_SUMMARY_MODES,
   EDITOR_TYPES,
+  GIT_STATUS_INDICATOR_MODES,
   TERMINAL_BADGE_POSITIONS,
   TRANSCRIPT_DENSITIES,
 } from "@/common/constants/storage";
 import { MuxProviderOptionsSchema } from "@/common/schemas/providerOptions";
+import { REVIEW_FILE_TREE_VIEW_MODES, REVIEW_SORT_ORDERS } from "@/common/types/review";
 import { ThinkingLevelSchema } from "@/common/types/thinking";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 
@@ -54,6 +56,8 @@ export const UserPreferencesSchema = z.object({
         })
         .optional(),
       vimEnabled: z.boolean().optional(),
+      powerModeEnabled: z.boolean().optional(),
+      gitStatusIndicatorMode: z.enum(GIT_STATUS_INDICATOR_MODES).optional(),
     })
     .optional(),
   navigation: z
@@ -117,6 +121,9 @@ export const UserPreferencesSchema = z.object({
     .object({
       includeUncommitted: z.boolean().optional(),
       defaultBaseByProject: z.record(z.string(), z.string().min(1)).optional(),
+      sortOrder: z.enum(REVIEW_SORT_ORDERS).optional(),
+      fileTreeViewMode: z.enum(REVIEW_FILE_TREE_VIEW_MODES).optional(),
+      showRead: z.boolean().optional(),
     })
     .optional(),
 });

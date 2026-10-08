@@ -1,7 +1,6 @@
 import "../dom";
 import { fireEvent, waitFor, within } from "@testing-library/react";
 
-import { REVIEW_SORT_ORDER_KEY } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { STORAGE_KEYS } from "@/constants/workspaceDefaults";
 import type { APIClient } from "@/browser/contexts/API";
@@ -24,10 +23,8 @@ async function renderReviewPanelForUndoTests(params: {
 }): Promise<RenderedApp> {
   updatePersistedState(STORAGE_KEYS.reviewDiffBase(params.workspaceId), "HEAD");
   await params.apiClient.config.updateUserPreferences({
-    patches: [{ review: { includeUncommitted: true } }],
+    patches: [{ review: { includeUncommitted: true, showRead: false, sortOrder: "file-order" } }],
   });
-  updatePersistedState("review-show-read", false);
-  updatePersistedState(REVIEW_SORT_ORDER_KEY, "file-order");
 
   return renderReviewPanel({
     apiClient: params.apiClient,

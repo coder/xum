@@ -4,7 +4,8 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { cleanup, render } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import type { GitStatus } from "@/common/types/workspace";
-import { GitStatusIndicatorView, type GitStatusIndicatorMode } from "./GitStatusIndicatorView";
+import type { GitStatusIndicatorMode } from "@/common/constants/storage";
+import { GitStatusIndicatorView } from "./GitStatusIndicatorView";
 
 let cleanupDom: (() => void) | null = null;
 
