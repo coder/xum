@@ -181,11 +181,10 @@ export async function captureLanguageModelPrompt(params: {
       // Same per-step transforms as StreamManager.createStreamResult's
       // prepareStep — they run on step 0 too, so the recorded prompt
       // includes them.
-      const withoutWorkflowRunRecords = stripWorkflowRunRecordsFromModelMessages(
-        dedupeNativeToolReferences(stepMessages)
+      const withoutWorkflowRunRecords = stripWorkflowRunRecordsFromModelMessages(stepMessages);
+      const rewritten = dedupeNativeToolReferences(
+        await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords)
       );
-      const rewritten =
-        await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords);
       return rewritten === stepMessages ? undefined : { messages: rewritten };
     },
   });

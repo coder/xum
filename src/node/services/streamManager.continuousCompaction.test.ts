@@ -559,6 +559,53 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(latestMessages()).toEqual(result.messages);
   });
 
+  it("dedupes native tool_references against the swapped prefix, not the dropped one", async () => {
+    // The only earlier reference to the tool lives in the dropped prefix; the
+    // retained tail repeats it. Deduping before the swap would project the tail
+    // against the dropped prefix and lose the turn's only surviving reference.
+    const searchResult = (toolCallId: string): ai.ModelMessage => {
+      const raw: unknown = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId,
+            toolName: "tool_catalog_search",
+            output: {
+              type: "content",
+              value: [
+                {
+                  type: "custom",
+                  providerOptions: {
+                    anthropic: { type: "tool-reference", toolName: "zulip_send_message" },
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      };
+      return raw as ai.ModelMessage;
+    };
+    const withRepeatedReference: ai.ModelMessage[] = [
+      ...originalMessages.slice(0, 3),
+      {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: "old-search", toolName: "bash", input: {} }],
+      },
+      searchResult("old-search"),
+      ...originalMessages.slice(3),
+      searchResult("keep"),
+    ];
+    const { run, swapState } = await setupLiveSwap();
+    const result = await run(withRepeatedReference);
+    assert(result?.messages, "Expected swapped messages");
+    expect(swapState()).toBe("consumed");
+    const references = JSON.stringify(result.messages).match(/"tool-reference"/g);
+    expect(references).toHaveLength(1);
+    expect(JSON.stringify(result.messages)).not.toContain("old-search");
+  });
+
   it.each([
     [{ type: "between_tools" }, false],
     [{ type: "adaptive" }, false],

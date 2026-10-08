@@ -408,20 +408,20 @@ function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
 }
 
 /**
- * Same-turn message transforms applied before every provider step: drop repeated native
- * tool_reference blocks (a same-turn search can re-match tools an earlier result already
- * loaded; messagePipeline's dedupe only sees persisted history), strip workflow run records
+ * Same-turn message transforms applied before every provider step: strip workflow run records
  * from same-turn tool results (history-level redaction in applyToolOutputRedaction can't see
  * these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
  * (messagePipeline's neutralizer only sees persisted history), then extract supported
  * attachments out of tool-result JSON so providers don't treat them as text. Idempotent on an
  * already-transformed prefix. The settled-step budget floor reuses it so it measures exactly the
- * request the next step's preflight will check.
+ * request the next step's preflight will check. Native tool_reference dedupe is NOT part of
+ * this transform: it must run after a prefix swap (see prepareStep), which replaces the prefix
+ * the projection is decided against.
  */
 function transformStepMessages(messages: ModelMessage[]): Promise<ModelMessage[]> {
   return extractToolMediaAsUserMessagesFromModelMessages(
     neutralizeAgentEnvelopeLookalikesInModelToolParts(
-      stripWorkflowRunRecordsFromModelMessages(dedupeNativeToolReferences(messages))
+      stripWorkflowRunRecordsFromModelMessages(messages)
     )
   );
 }
@@ -2749,13 +2749,15 @@ export class StreamManager {
           const nextMessages =
             request.contextBudgetLimit == null
               ? undefined
-              : await transformStepMessages([
-                  ...(stepTracker?.latestMessages ?? [
-                    ...request.messages,
-                    ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
-                  ]),
-                  ...step.response.messages,
-                ]);
+              : dedupeNativeToolReferences(
+                  await transformStepMessages([
+                    ...(stepTracker?.latestMessages ?? [
+                      ...request.messages,
+                      ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
+                    ]),
+                    ...step.response.messages,
+                  ])
+                );
           const nextRequest =
             nextMessages == null
               ? undefined
@@ -3064,6 +3066,11 @@ export class StreamManager {
           }
           if (stepTracker.pendingPrefixSwap === swap) stepTracker.pendingPrefixSwap = undefined;
         }
+        // Dedupe after the swap, never before: the swap replaces the prefix this
+        // projection is decided against, and the SDK accumulates the next step's
+        // input from these returned messages, so a reference dropped against a
+        // swapped-out prefix would stay lost for the rest of the turn.
+        effectiveMessages = dedupeNativeToolReferences(effectiveMessages);
         if (stepTracker) {
           stepTracker.latestMessages = effectiveMessages;
         }
@@ -3134,7 +3141,9 @@ export class StreamManager {
               thinkingOverride
             );
             // Same per-step transforms the construction-time messages receive.
-            rebuiltFirstStepMessages = await transformStepMessages(rebuilt);
+            rebuiltFirstStepMessages = dedupeNativeToolReferences(
+              await transformStepMessages(rebuilt)
+            );
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
             }
