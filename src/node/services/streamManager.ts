@@ -125,6 +125,7 @@ import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
 import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
+import { countAnthropicInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
 import { stripAnthropicReasoning } from "@/browser/utils/messages/modelMessageTransform";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
@@ -4918,6 +4919,26 @@ export class StreamManager {
                   finishStepPart.providerMetadata,
                   finishStepPart.usage
                 );
+
+                // Preserved thinking: report thinking blocks Anthropic dropped for this
+                // step. A prefix-binding drop means Xum edited the prompt prefix, which is
+                // worth seeing at info; model/account drops and older-account
+                // "mismatch allowed" flags are expected noise.
+                const inputTransformations =
+                  countAnthropicInputTransformations(stepProviderMetadata);
+                if (inputTransformations != null) {
+                  const fields = {
+                    messageId: streamInfo.messageId,
+                    model: streamInfo.model,
+                    ...inputTransformations,
+                  };
+                  const message = "Anthropic dropped or flagged replayed thinking blocks";
+                  if (inputTransformations.dropped.prefix_binding_mismatch > 0) {
+                    workspaceLog.info(message, fields);
+                  } else {
+                    workspaceLog.debug(message, fields);
+                  }
+                }
 
                 // Preserved thinking: prepareStep stripped earlier Anthropic thinking after
                 // an in-turn prefix change. Write the same receipt as the signature repair,

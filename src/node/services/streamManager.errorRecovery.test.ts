@@ -13,6 +13,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import { OPENAI_RESPONSES_BASE_URL_HINT } from "./utils/openAIResponsesBaseUrlHint";
 import type { MuxMetadata } from "@/common/types/message";
+import { log } from "./log";
 import {
   installStreamManagerTestHistory,
   historyService,
@@ -1387,6 +1388,75 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
     expect(errorPartial?.metadata?.errorType).toBe("reasoning_rejected");
     // The failed retry already ran without thinking: the stored row keeps the receipt.
     expect(errorPartial?.metadata?.anthropicThinkingReplay).toBe("off");
+  });
+
+  test("logs prefix-binding thinking drops for the step at info, without paths", async () => {
+    const harness = createRecoveryHarness();
+    const [messageStart, ...rest] = successEvents;
+    const droppedEvents = [
+      {
+        ...messageStart,
+        message: {
+          ...messageStart.message,
+          input_transformations: [
+            {
+              type: "thinking_dropped",
+              path: "messages.1.content.0",
+              reason: "prefix_binding_mismatch",
+            },
+            {
+              type: "thinking_dropped",
+              path: "messages.3.content.0",
+              reason: "model_binding_mismatch",
+            },
+          ],
+        },
+      },
+      ...rest,
+    ];
+    const { model } = scriptedAnthropicModel([
+      () =>
+        new Response(droppedEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+          headers: { "content-type": "text/event-stream" },
+        }),
+    ]);
+    const infoLines: unknown[][] = [];
+    const realWithFields = log.withFields;
+    const withFields = spyOn(log, "withFields").mockImplementation((fields) => {
+      const child = realWithFields(fields);
+      return {
+        ...child,
+        info: (...args: unknown[]) => {
+          infoLines.push(args);
+          child.info(...args);
+        },
+      };
+    });
+    try {
+      await harness.run({
+        workspaceId: "anthropic-input-transformations",
+        model,
+        messages: messages(),
+        attempts: [realSdkAttempt],
+      });
+    } finally {
+      withFields.mockRestore();
+    }
+
+    expect(harness.streamEnds()).toHaveLength(1);
+    const dropLines = infoLines.filter(([message]) =>
+      String(message).includes("replayed thinking blocks")
+    );
+    expect(dropLines).toHaveLength(1);
+    expect(dropLines[0]?.[1]).toMatchObject({
+      dropped: {
+        prefix_binding_mismatch: 1,
+        model_binding_mismatch: 1,
+        organization_binding_mismatch: 0,
+      },
+      mismatchAllowed: 0,
+    });
+    expect(JSON.stringify(dropLines)).not.toContain("messages.1.content.0");
   });
 
   test("leaves an unrelated Anthropic 400 to ordinary error handling", async () => {

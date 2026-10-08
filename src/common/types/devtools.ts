@@ -35,6 +35,26 @@ export interface DevToolsStep {
   responseHeaders: Record<string, string> | null;
   rawResponse: unknown;
   rawChunks: unknown;
+  /**
+   * Anthropic `input_transformations` for this step (beta
+   * `thinking-binding-controls-2026-08-01`): replayed thinking blocks the API
+   * dropped or let through despite a failed binding check. Null when the response
+   * did not report the field (other providers, header not sent, older rows).
+   */
+  inputTransformations: AnthropicInputTransformation[] | null;
+}
+
+/**
+ * One Anthropic `input_transformations` entry. Known types are `thinking_dropped`
+ * (reason `prefix_binding_mismatch`, `model_binding_mismatch` or
+ * `organization_binding_mismatch`) and `thinking_mismatch_allowed`. Anthropic adds
+ * new types and reasons over time, so both stay open strings. `path` names the
+ * block, e.g. `messages.3.content.0`. Entries carry no signatures.
+ */
+export interface AnthropicInputTransformation {
+  type: string;
+  path: string;
+  reason?: string;
 }
 
 export interface DevToolsStepInput {
