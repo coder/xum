@@ -130,6 +130,7 @@ describe("perfTrend CLI", () => {
     ["a negative run id", RUNS, broken({ id: -5 })],
     ["two nights at one time", RUNS, broken({ created_at: apiRun(1).created_at })],
     ["a malformed createdAt", RUNS, broken({ created_at: "yesterday" })],
+    ["a run without an event", RUNS, broken({ event: null })],
   ];
   for (const [name, key, reply] of failures) {
     test(`${name} is a history error with no table`, () => {

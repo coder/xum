@@ -297,7 +297,8 @@ export function renderTrendSummary(input: TrendInput): string {
   const warnings = trends
     .filter((trend) => trend.status === "watch")
     .map((trend) => `watch: ${describe(trend)}`);
-  for (const night of history) {
+  // Tonight first: a missing current artifact must name its cause, not only lost series.
+  for (const night of [input.current, ...history]) {
     if (night.issue !== undefined) warnings.push(`run ${night.run.databaseId}: ${night.issue}`);
   }
   for (const label of labels) {

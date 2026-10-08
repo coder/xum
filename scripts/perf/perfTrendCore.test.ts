@@ -138,6 +138,8 @@ describe("evaluateTrend", () => {
     expect(all[1]).toEqual({ run: run(1), scenarios: {}, issue: "artifact missing or expired" });
     expect(trendOf(all, "scriptMs")).toMatchObject({ status: "watch", above: 2 });
     expect(render(all)).toContain(`- run ${all[1].run.databaseId}: artifact missing or expired`);
+    all[0] = { ...all[1], run: run(0) };
+    expect(render(all)).toContain(`- run ${all[0].run.databaseId}: artifact missing or expired`);
   });
 
   test("a series with earlier values but none tonight is lost, not dropped", () => {

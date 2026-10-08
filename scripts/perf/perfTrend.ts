@@ -46,10 +46,13 @@ async function api(path: string, fields: string[] = []): Promise<Record<string, 
 function toRun(raw: unknown): Run {
   const run = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
   if (!Number.isSafeInteger(run.id) || Number(run.id) <= 0) throw new Error("invalid run id");
+  // selectHistory would silently drop a run without these and shift the slots. The current run is
+  // still in progress, so only its conclusion may be null.
   const keys = ["event", "head_branch", "status", "created_at", "conclusion"];
-  const [event, headBranch, status, createdAt, conclusion] = keys.map((key) =>
-    typeof run[key] === "string" ? run[key] : ""
-  );
+  const [event, headBranch, status, createdAt, conclusion] = keys.map((key) => {
+    if (typeof run[key] === "string" || key === "conclusion") return String(run[key] ?? "");
+    throw new Error(`run without ${key}`);
+  });
   return { databaseId: Number(run.id), event, headBranch, status, createdAt, conclusion };
 }
 
