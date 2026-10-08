@@ -32,17 +32,6 @@ export const EXPERIMENT_IDS = {
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
 
 /**
- * Pre-merge experiment ID: "PTC Exclusive Mode" was a separate experiment
- * before Programmatic Tool Calling became exclusive-only. The backend
- * (feature_flags.json and persisted flag objects) aliases a stored `true`
- * onto the merged PTC key on read and mirror the merged PTC value back onto
- * this key on write, so upgrades keep the user's exclusive posture and a
- * downgraded build runs exclusive mode instead of the removed (~2x cost)
- * supplement mode.
- */
-export const LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID = "programmatic-tool-calling-exclusive";
-
-/**
  * Former experiment IDs whose features are now always on. CLI `-e` parsing
  * accepts them as no-ops so existing automation (for example terminal-bench)
  * keeps working instead of failing on an unknown experiment.
