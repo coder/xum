@@ -28,11 +28,9 @@ import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
   RIGHT_SIDEBAR_COLLAPSED_KEY,
-  SIDEBAR_HIDE_SUBAGENTS_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
   normalizeTerminalBadgeConfig,
 } from "@/common/constants/storage";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { CommandIds } from "@/browser/utils/commandIds";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
@@ -797,21 +795,23 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       {
         id: CommandIds.navToggleHideSubAgents(),
         title: "Toggle Hide Sub-Agents in Sidebar",
-        subtitle: `Current: ${readPersistedState(SIDEBAR_HIDE_SUBAGENTS_KEY, false) ? "Hidden" : "Shown"}`,
+        subtitle: `Current: ${getUserPreferences().ui?.sidebarHideSubAgents ? "Hidden" : "Shown"}`,
         section: section.navigation,
         keywords: ["sub-agents", "subagents", "hide", "show", "sidebar"],
         run: () => {
-          updatePersistedState<boolean>(SIDEBAR_HIDE_SUBAGENTS_KEY, (prev) => !prev, false);
+          const hidden = getUserPreferences().ui?.sidebarHideSubAgents ?? false;
+          updateUserPreferences({ ui: { sidebarHideSubAgents: !hidden } });
         },
       },
       {
         id: CommandIds.navToggleFlatChatList(),
         title: "Toggle Flat Chat List",
-        subtitle: `Current: ${readPersistedState(SIDEBAR_FLAT_MODE_KEY, false) ? "Flat" : "Grouped"}`,
+        subtitle: `Current: ${getUserPreferences().ui?.sidebarFlatMode ? "Flat" : "Grouped"}`,
         section: section.navigation,
         keywords: ["flat", "chat", "list", "projects", "folders", "sidebar"],
         run: () => {
-          updatePersistedState<boolean>(SIDEBAR_FLAT_MODE_KEY, (prev) => !prev, false);
+          const flat = getUserPreferences().ui?.sidebarFlatMode ?? false;
+          updateUserPreferences({ ui: { sidebarFlatMode: !flat } });
         },
       },
       {

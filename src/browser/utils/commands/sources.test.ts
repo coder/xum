@@ -8,11 +8,10 @@ import type { ProjectConfig } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { GlobalWindow } from "happy-dom";
-import {
-  getModelKey,
-  SIDEBAR_FLAT_MODE_KEY,
-  SIDEBAR_HIDE_SUBAGENTS_KEY,
-} from "@/common/constants/storage";
+import { getModelKey } from "@/common/constants/storage";
+import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { APIClient } from "@/browser/contexts/API";
@@ -1686,12 +1685,27 @@ test("workspace generate title command dispatches a title-generation request eve
   }
 });
 
+/** Applies preference writes to the store snapshot so commands see their own toggles. */
+function applyPreferenceWritesLocally() {
+  const store = getAppConfigStore();
+  const spy = spyOn(store, "updateUserPreferences").mockImplementation((patch) => {
+    store.updateOptimistically({
+      userPreferences: normalizeUserPreferences(applyMergePatch(getUserPreferences(), patch)),
+    });
+  });
+  return () => {
+    spy.mockRestore();
+    store.updateOptimistically({ userPreferences: undefined });
+  };
+}
+
 test("toggle flat chat list command flips the persisted sidebar setting", () => {
   const testWindow = new GlobalWindow();
   const originalWindow = globalThis.window;
   const originalDocument = globalThis.document;
   globalThis.window = testWindow as unknown as Window & typeof globalThis;
   globalThis.document = testWindow.document as unknown as Document;
+  const restorePreferences = applyPreferenceWritesLocally();
 
   try {
     const toggle = () => {
@@ -1701,13 +1715,14 @@ test("toggle flat chat list command flips the persisted sidebar setting", () => 
     };
 
     toggle();
-    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("true");
+    expect(getUserPreferences().ui?.sidebarFlatMode).toBe(true);
     expect(getActions().find((a) => a.id === "nav:toggle-flat-chat-list")?.subtitle).toContain(
       "Flat"
     );
     toggle();
-    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("false");
+    expect(getUserPreferences().ui?.sidebarFlatMode).toBe(false);
   } finally {
+    restorePreferences();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
   }
@@ -1719,6 +1734,7 @@ test("toggle hide sub-agents command flips the persisted sidebar setting", () =>
   const originalDocument = globalThis.document;
   globalThis.window = testWindow as unknown as Window & typeof globalThis;
   globalThis.document = testWindow.document as unknown as Document;
+  const restorePreferences = applyPreferenceWritesLocally();
 
   try {
     const toggle = () => {
@@ -1728,13 +1744,14 @@ test("toggle hide sub-agents command flips the persisted sidebar setting", () =>
     };
 
     toggle();
-    expect(window.localStorage.getItem(SIDEBAR_HIDE_SUBAGENTS_KEY)).toBe("true");
+    expect(getUserPreferences().ui?.sidebarHideSubAgents).toBe(true);
 
     const rebuilt = getActions().find((a) => a.id === "nav:toggle-hide-subagents");
     expect(rebuilt?.subtitle).toContain("Hidden");
     toggle();
-    expect(window.localStorage.getItem(SIDEBAR_HIDE_SUBAGENTS_KEY)).toBe("false");
+    expect(getUserPreferences().ui?.sidebarHideSubAgents).toBe(false);
   } finally {
+    restorePreferences();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
   }

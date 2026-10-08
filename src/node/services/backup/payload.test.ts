@@ -875,12 +875,16 @@ describe("backup payload", () => {
     expect(merged.appearance?.editorConfig).toEqual({ editor: "vscode" });
   });
 
-  it("restores the backed-up tutorial state", () => {
+  it("restores the backed-up ui fields and keeps the ones the backup lacks", () => {
     const merged = mergeBackupPreferences(
-      { ui: { tutorialState: { completed: { creation: true } } } },
-      { ui: { tutorialState: { disabled: true } } }
+      { ui: { tutorialState: { completed: { creation: true } }, outputTabLevel: "debug" } },
+      { ui: { tutorialState: { disabled: true }, sidebarFlatMode: true } }
     );
-    expect(merged.ui).toEqual({ tutorialState: { disabled: true } });
+    expect(merged.ui).toEqual({
+      tutorialState: { disabled: true },
+      outputTabLevel: "debug",
+      sidebarFlatMode: true,
+    });
   });
 
   it("refuses an oversized file and an oversized payload on both sides", async () => {

@@ -14,11 +14,7 @@ import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import type { ExperimentId } from "@/common/constants/experiments";
-import {
-  LAST_CUSTOM_MODEL_PROVIDER_KEY,
-  SELECTED_WORKSPACE_KEY,
-  SIDEBAR_AGE_GROUPING_KEY,
-} from "@/common/constants/storage";
+import { LAST_CUSTOM_MODEL_PROVIDER_KEY, SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { ProvidersConfigMap, ServerAuthSession } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -36,10 +32,6 @@ interface SettingsSectionStoryProps {
 export function resetStorybookPersistedStateForStory(): void {
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
-
-    // Sidebar stories can write sidebarAgeGrouping=false into the shared
-    // origin; clear it so the GeneralSection switch snapshots its default.
-    localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
 
     // The Coder catalog ModelsSection stories seed the add row's provider;
     // clear it so the other ModelsSection stories snapshot their default.

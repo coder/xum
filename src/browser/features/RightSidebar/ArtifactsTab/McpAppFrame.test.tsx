@@ -7,6 +7,7 @@ import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
@@ -27,6 +28,7 @@ const VIEW: McpAppViewRef = {
 };
 
 let invocation: McpAppView["invocation"] = null;
+let viewCsp: McpAppView["csp"] = {};
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -42,7 +44,7 @@ function Wrapper(props: { children: ReactNode }) {
           success: true as const,
           data: {
             html: "<p>view</p>",
-            csp: {},
+            csp: viewCsp,
             prefersBorder: null,
             resultAvailable: true,
             result: { content: [] },
@@ -128,6 +130,7 @@ describe("McpAppFrame", () => {
     cleanupDom = installDom();
     window.localStorage.clear();
     invocation = null;
+    viewCsp = {};
     toolCalls = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -137,6 +140,13 @@ describe("McpAppFrame", () => {
     cleanup();
     cleanupDom?.();
     cleanupDom = null;
+  });
+
+  test("grants no CDN source until the saved preferences load", async () => {
+    getAppConfigStore().clearCachedState();
+    viewCsp = { resourceDomains: ["https://cdn.tailwindcss.com"] };
+    const { frame } = await renderFrame();
+    expect(frame.getAttribute("srcdoc")).not.toContain("https://cdn.tailwindcss.com");
   });
 
   test("the view is bound to the recorded tool call, not the card", async () => {
@@ -431,6 +441,7 @@ describe("McpAppFrame host strips", () => {
     cleanupDom = installDom();
     window.localStorage.clear();
     invocation = null;
+    viewCsp = {};
     toolCalls = [];
     // Desktop mode: the preload bridge exists (isDesktopMode).
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;

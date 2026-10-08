@@ -1,17 +1,11 @@
 import { Switch } from "@/browser/components/Switch/Switch";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY } from "@/common/constants/storage";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 
 /** Per-user settings for the Artifacts experiment, shown under its row in Experiments. */
 export function ArtifactsExperimentConfig() {
-  // Same key and default as SandboxedArtifactFrame, which listens for changes.
-  const [allowCdn, setAllowCdn] = usePersistedState<boolean>(
-    ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY,
-    true,
-    {
-      listener: true,
-    }
-  );
+  // Same default as SandboxedArtifactFrame and McpAppFrame.
+  const allowCdn =
+    useUserPreferences((preferences) => preferences.ui?.artifactsAllowCdnScripts) ?? true;
   return (
     <div className="bg-background-secondary flex items-center justify-between gap-4 px-4 py-3">
       <div className="flex-1">
@@ -26,7 +20,9 @@ export function ArtifactsExperimentConfig() {
       </div>
       <Switch
         checked={allowCdn}
-        onCheckedChange={setAllowCdn}
+        onCheckedChange={(checked) =>
+          updateUserPreferences({ ui: { artifactsAllowCdnScripts: checked } })
+        }
         aria-label="Toggle CDN scripts in artifacts"
       />
     </div>

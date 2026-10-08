@@ -9,16 +9,14 @@ import {
 import { formatModelStringForDisplay } from "@/common/utils/ai/models";
 import { normalizeUsageModelKey } from "@/common/utils/providers/modelEntries";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { TOKEN_COMPONENT_COLORS, formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
 
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
-import { COSTS_TAB_VIEW_MODE_KEY } from "@/common/constants/storage";
+import type { UsageViewMode } from "@/common/config/schemas/userPreferences";
 
-type ViewMode = "last-request" | "session";
-
-const VIEW_MODE_OPTIONS: Array<ToggleOption<ViewMode>> = [
+const VIEW_MODE_OPTIONS: Array<ToggleOption<UsageViewMode>> = [
   { value: "session", label: "Session" },
   { value: "last-request", label: "Last Request" },
 ];
@@ -30,9 +28,8 @@ interface CostsTabProps {
 const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   const usage = useWorkspaceUsage(workspaceId);
   const { config: providersConfig } = useProvidersConfig();
-  const [viewMode, setViewMode] = usePersistedState<ViewMode>(COSTS_TAB_VIEW_MODE_KEY, "session", {
-    listener: true,
-  });
+  const viewMode =
+    useUserPreferences((preferences) => preferences.ui?.costsTabViewMode) ?? "session";
 
   // Session usage for cost calculation
   // Uses sessionTotal (pre-computed) + liveCostUsage (cumulative during streaming)
@@ -188,7 +185,9 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
                   <ToggleGroup
                     options={VIEW_MODE_OPTIONS}
                     value={viewMode}
-                    onChange={setViewMode}
+                    onChange={(costsTabViewMode) =>
+                      updateUserPreferences({ ui: { costsTabViewMode } })
+                    }
                   />
                 </div>
                 <span className="text-muted flex items-center gap-1 text-xs tabular-nums">

@@ -230,7 +230,6 @@ export const CostsTab: Story = {
     <RightSidebarStoryShell
       setup={() => {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-costs"));
@@ -274,7 +273,6 @@ export const CostsTabWithCacheCreate: Story = {
     <RightSidebarStoryShell
       setup={() => {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "350");
         const modelUsage = {
@@ -345,7 +343,6 @@ export const CostsTabMultiModel: Story = {
     <RightSidebarStoryShell
       setup={() => {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-multi-model"));
@@ -1253,7 +1250,6 @@ export const CompactionModelWarning: Story = {
     <RightSidebarStoryShell
       setup={() => {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-compact-warning"));
@@ -1391,7 +1387,6 @@ export const OutputTabEmpty: Story = {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("output"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-output-empty"));
-        localStorage.removeItem("output-tab-level");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-output-empty",
@@ -1419,7 +1414,6 @@ export const OutputTabWithLogs: Story = {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("output"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-output-logs"));
-        localStorage.removeItem("output-tab-level");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-output-logs",
@@ -1447,12 +1441,12 @@ export const OutputTabErrorsOnly: Story = {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("output"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-output-errors"));
-        // Persist the level filter to "error" so only error entries display.
-        localStorage.setItem("output-tab-level", JSON.stringify("error"));
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-output-errors",
           workspaceName: "feature/logging",
+          // Only error entries display.
+          userPreferences: { ui: { outputTabLevel: "error" } },
           projectName: "my-app",
           messages: [createUserMessage("msg-1", "Check errors", { historySequence: 1 })],
           logEntries: createOutputLogEntries(),

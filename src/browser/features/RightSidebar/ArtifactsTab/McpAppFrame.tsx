@@ -5,10 +5,8 @@ import { cn } from "@/common/lib/utils";
 import { useAPI } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY } from "@/common/constants/storage";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
@@ -24,7 +22,7 @@ import { closeMcpAppView, type McpAppViewRef } from "./mcpAppViewsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
-import { ARTIFACT_IFRAME_SANDBOX } from "./SandboxedArtifactFrame";
+import { ARTIFACT_IFRAME_SANDBOX, useArtifactsAllowCdnScripts } from "./SandboxedArtifactFrame";
 import { Notice, NoteBar } from "./SourceText";
 
 // Spec style variable -> the app's CSS variable it is read from (globals.css). Values are
@@ -157,9 +155,7 @@ export function McpAppFrame(props: {
 }) {
   const inline = props.variant === "inline";
   const { api } = useAPI();
-  const [allowCdn] = usePersistedState<boolean>(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true, {
-    listener: true,
-  });
+  const allowCdn = useArtifactsAllowCdnScripts();
   const { theme: themeMode } = useTheme();
   const theme: "light" | "dark" = isLightThemeMode(themeMode) ? "light" : "dark";
   const [loaded, setLoaded] = useState<Loaded | null>(null);

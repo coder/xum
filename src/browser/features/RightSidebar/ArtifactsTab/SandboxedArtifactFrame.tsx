@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useTheme } from "@/browser/contexts/ThemeContext";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
-import { ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY } from "@/common/constants/storage";
+import { useAppConfig, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createArtifactAssetLoader } from "./artifactAssets";
 import {
@@ -46,6 +45,13 @@ interface BuiltDocument {
   error: string | null;
 }
 
+/** Denied until the saved preferences load, so a user who turned CDN scripts off never runs one. */
+export function useArtifactsAllowCdnScripts(): boolean {
+  const loaded = useAppConfig((config) => config.userPreferences !== undefined);
+  const allowed = useUserPreferences((preferences) => preferences.ui?.artifactsAllowCdnScripts);
+  return loaded && (allowed ?? true);
+}
+
 /**
  * HTML and SVG artifacts in a sandboxed iframe (srcdoc + CSP + postMessage bridge).
  * This is the app's only iframe for agent-written content; see artifactCsp.ts,
@@ -64,9 +70,7 @@ export function SandboxedArtifactFrame(props: {
   onAnnotate?: (pick: ArtifactAnnotationPick) => void;
 }) {
   const read = useArtifactAssetReader(props.workspaceId);
-  const [allowCdn] = usePersistedState<boolean>(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true, {
-    listener: true,
-  });
+  const allowCdn = useArtifactsAllowCdnScripts();
   const { theme: themeMode } = useTheme();
   const theme: ArtifactTheme = isLightThemeMode(themeMode) ? "light" : "dark";
   // Only the theme at mount is baked into the document; later changes travel over the bridge
