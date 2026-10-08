@@ -161,6 +161,35 @@ describe("TutorialContext", () => {
     }
   );
 
+  test("closes a tutorial that another window completes and lets the next one start", () => {
+    function StartButtons() {
+      const { startSequence } = useTutorial();
+      return (
+        <>
+          <button data-testid="start-creation" onClick={() => startSequence("creation")} />
+          <button data-testid="start-workspace" onClick={() => startSequence("workspace")} />
+        </>
+      );
+    }
+    const view = render(
+      <TutorialProvider>
+        <StartButtons />
+      </TutorialProvider>
+    );
+    fireEvent.click(view.getByTestId("start-creation"));
+    expect(view.getByTestId("tutorial-tooltip")).toBeTruthy();
+
+    act(() =>
+      getAppConfigStore().updateOptimistically({
+        userPreferences: { ui: { tutorialState: { completed: { creation: true } } } },
+      })
+    );
+    expect(view.queryByTestId("tutorial-tooltip")).toBeNull();
+
+    fireEvent.click(view.getByTestId("start-workspace"));
+    expect(view.getByTestId("tutorial-tooltip")).toBeTruthy();
+  });
+
   test("starts no tutorial before the saved preferences load", async () => {
     getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     const view = render(

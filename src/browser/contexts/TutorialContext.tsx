@@ -127,6 +127,9 @@ export function TutorialProvider({ children }: TutorialProviderProps) {
   // Keep sandbox suppression runtime-only so a default sandbox launch cannot poison
   // later opt-in runs that reuse the same browser origin or Electron userData profile.
   const effectiveTutorialsDisabled = tutorialDisabled || sandboxTutorialOptIn === false;
+  // Another window can finish the open tutorial; its synced completion closes it here too.
+  const shownSequence =
+    activeSequence !== null && completed?.[activeSequence] !== true ? activeSequence : null;
 
   const isSequenceCompleted = useCallback(
     (sequence: TutorialSequence): boolean => {
@@ -152,13 +155,13 @@ export function TutorialProvider({ children }: TutorialProviderProps) {
         return;
       }
       // Don't start if another sequence is active
-      if (activeSequence !== null) {
+      if (shownSequence !== null) {
         return;
       }
       setActiveSequence(sequence);
       setCurrentStepIndex(0);
     },
-    [preferencesLoaded, effectiveTutorialsDisabled, completed, activeSequence]
+    [preferencesLoaded, effectiveTutorialsDisabled, completed, shownSequence]
   );
 
   const completeSequence = useCallback((sequence: TutorialSequence) => {
@@ -169,22 +172,22 @@ export function TutorialProvider({ children }: TutorialProviderProps) {
   }, []);
 
   const handleNext = useCallback(() => {
-    if (activeSequence === null) return;
+    if (shownSequence === null) return;
 
-    const steps = TUTORIAL_SEQUENCES[activeSequence];
+    const steps = TUTORIAL_SEQUENCES[shownSequence];
     if (currentStepIndex < steps.length - 1) {
       setCurrentStepIndex((prev) => prev + 1);
     } else {
-      completeSequence(activeSequence);
+      completeSequence(shownSequence);
     }
-  }, [activeSequence, completeSequence, currentStepIndex]);
+  }, [shownSequence, completeSequence, currentStepIndex]);
 
   const handleDismiss = useCallback(() => {
-    if (activeSequence === null) return;
+    if (shownSequence === null) return;
 
     // Mark as completed when dismissed
-    completeSequence(activeSequence);
-  }, [activeSequence, completeSequence]);
+    completeSequence(shownSequence);
+  }, [shownSequence, completeSequence]);
 
   const handleDisableTutorial = useCallback(() => {
     sessionDisabledRef.current = true;
@@ -199,7 +202,7 @@ export function TutorialProvider({ children }: TutorialProviderProps) {
     isTutorialDisabled,
   };
 
-  const activeSteps = activeSequence ? TUTORIAL_SEQUENCES[activeSequence] : null;
+  const activeSteps = shownSequence ? TUTORIAL_SEQUENCES[shownSequence] : null;
   const currentStep = activeSteps?.[currentStepIndex];
 
   return (
