@@ -16,7 +16,7 @@ import {
   useSavedQueries,
 } from "@/browser/hooks/useAnalytics";
 import { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { ToggleGroup } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { Button } from "@/browser/components/Button/Button";
 import { AgentCostChart } from "./AgentCostChart";
@@ -31,32 +31,7 @@ import { TimingChart } from "./TimingChart";
 import { TokensByModelChart } from "./TokensByModelChart";
 import { formatProjectDisplayName } from "./analyticsUtils";
 import { buildTimeFilterPredicate } from "./sqlTimeFilter";
-import {
-  ANALYTICS_TIME_RANGE_KEY,
-  ANALYTICS_TIMING_METRIC_KEY,
-  ANALYTICS_TIME_ZONE_MODE_KEY,
-} from "@/common/constants/storage";
-
-type TimeRange = "7d" | "30d" | "90d" | "all";
-type TimingMetric = "ttft" | "duration" | "tps";
-type TimeZoneMode = "local" | "utc";
-
-const VALID_TIME_RANGES = new Set<string>(["7d", "30d", "90d", "all"]);
-const VALID_TIMING_METRICS = new Set<string>(["ttft", "duration", "tps"]);
-
-const VALID_TIME_ZONE_MODES = new Set<string>(["local", "utc"]);
-
-/** Coerce a persisted value to a known TimeRange, falling back to "30d" if stale/corrupted. */
-function normalizeTimeRange(value: unknown): TimeRange {
-  return typeof value === "string" && VALID_TIME_RANGES.has(value) ? (value as TimeRange) : "30d";
-}
-
-/** Coerce a persisted value to a known TimingMetric, falling back to "duration" if stale/corrupted. */
-function normalizeTimingMetric(value: unknown): TimingMetric {
-  return typeof value === "string" && VALID_TIMING_METRICS.has(value)
-    ? (value as TimingMetric)
-    : "duration";
-}
+import type { AnalyticsTimeRange } from "@/common/config/schemas/userPreferences";
 
 /** Build a calendar-date boundary for the selected timezone. */
 function getDateKeyInTimeZone(date: Date, timeZone: string): string {
@@ -90,7 +65,7 @@ function daysAgoInTimeZone(days: number, timeZone: string): Date {
 }
 
 function computeDateRange(
-  timeRange: TimeRange,
+  timeRange: AnalyticsTimeRange,
   timeZone: string
 ): {
   from: Date | null;
@@ -110,13 +85,6 @@ function computeDateRange(
       // Self-heal: unknown persisted value → safe default.
       return { from: daysAgoInTimeZone(29, timeZone), to: null, granularity: "day" };
   }
-}
-
-/** Coerce a persisted value to a supported timezone mode. */
-function normalizeTimeZoneMode(value: unknown): TimeZoneMode {
-  return typeof value === "string" && VALID_TIME_ZONE_MODES.has(value)
-    ? (value as TimeZoneMode)
-    : "local";
 }
 
 function getBrowserTimeZone(): string {
@@ -170,24 +138,12 @@ function AnalyticsDashboardContent() {
   const { userProjects } = useProjectContext();
 
   const [projectPath, setProjectPath] = useState<string | null>(null);
-  const [rawTimeRange, setTimeRange] = usePersistedState<TimeRange>(
-    ANALYTICS_TIME_RANGE_KEY,
-    "30d"
-  );
-  const [rawTimingMetric, setTimingMetric] = usePersistedState<TimingMetric>(
-    ANALYTICS_TIMING_METRIC_KEY,
-    "duration"
-  );
-  const [rawTimeZoneMode, setTimeZoneMode] = usePersistedState<TimeZoneMode>(
-    ANALYTICS_TIME_ZONE_MODE_KEY,
-    "local"
-  );
-
-  // Coerce persisted values to known enums — stale/corrupted localStorage
-  // entries self-heal to defaults instead of crashing the dashboard.
-  const timeRange = normalizeTimeRange(rawTimeRange);
-  const timingMetric = normalizeTimingMetric(rawTimingMetric);
-  const timeZoneMode = normalizeTimeZoneMode(rawTimeZoneMode);
+  const timeRange =
+    useUserPreferences((preferences) => preferences.ui?.analyticsTimeRange) ?? "30d";
+  const timingMetric =
+    useUserPreferences((preferences) => preferences.ui?.analyticsTimingMetric) ?? "duration";
+  const timeZoneMode =
+    useUserPreferences((preferences) => preferences.ui?.analyticsTimeZoneMode) ?? "local";
   const timeZone = timeZoneMode === "utc" ? "UTC" : getBrowserTimeZone();
 
   const dateRange = computeDateRange(timeRange, "UTC");
@@ -294,7 +250,9 @@ function AnalyticsDashboardContent() {
                 { value: "utc", label: "UTC" },
               ]}
               value={timeZoneMode}
-              onChange={setTimeZoneMode}
+              onChange={(analyticsTimeZoneMode) =>
+                updateUserPreferences({ ui: { analyticsTimeZoneMode } })
+              }
             />
           </div>
 
@@ -312,7 +270,7 @@ function AnalyticsDashboardContent() {
                 variant={timeRange === range ? "secondary" : "ghost"}
                 size="sm"
                 className="h-6 px-2 text-xs"
-                onClick={() => setTimeRange(range)}
+                onClick={() => updateUserPreferences({ ui: { analyticsTimeRange: range } })}
               >
                 {label}
               </Button>
@@ -342,7 +300,9 @@ function AnalyticsDashboardContent() {
             loading={timingDistribution.loading}
             error={timingDistribution.error}
             metric={timingMetric}
-            onMetricChange={setTimingMetric}
+            onMetricChange={(analyticsTimingMetric) =>
+              updateUserPreferences({ ui: { analyticsTimingMetric } })
+            }
           />
           <ProviderCacheHitChart
             data={providerCacheHitRatios.data}

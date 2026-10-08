@@ -21,7 +21,7 @@ import * as RealTelemetryModule from "@/browser/hooks/useTelemetry";
 import { GeneralSection } from "./GeneralSection";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import { DEFAULT_TERMINAL_FONT_CONFIG, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
+import { DEFAULT_TERMINAL_FONT_CONFIG } from "@/common/constants/storage";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
   type CoderWorkspaceArchiveBehavior,
@@ -657,16 +657,17 @@ describe("GeneralSection", () => {
     expect(setup.setMock).not.toHaveBeenCalled();
   });
 
-  test("persists flat chat list mode from the Sidebar group", () => {
-    const { view } = renderGeneralSection();
-    const sidebarHeading = view.getByRole("heading", { name: "Sidebar" });
+  test("persists flat chat list mode from the Sidebar group", async () => {
+    const setup = renderGeneralSection();
+    const sidebarHeading = setup.view.getByRole("heading", { name: "Sidebar" });
     const sidebarGroup = sidebarHeading.parentElement;
     expect(sidebarGroup).not.toBeNull();
     const toggle = within(sidebarGroup!).getByLabelText("Toggle flat chat list");
 
     fireEvent.click(toggle);
 
-    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("true");
+    await act(() => flushUserPreferences());
+    expect(setup.config.userPreferences?.ui?.sidebarFlatMode).toBe(true);
   });
 
   test("persists the collapsed bash summaries display mode", async () => {

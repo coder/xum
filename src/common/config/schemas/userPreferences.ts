@@ -27,6 +27,17 @@ export type ThemePreferenceConfig = z.infer<typeof ThemePreferenceSchema>;
 
 export const LaunchBehaviorSchema = z.enum(["dashboard", "new-chat", "last-workspace"]);
 
+export const USAGE_VIEW_MODES = ["session", "last-request"] as const;
+export type UsageViewMode = (typeof USAGE_VIEW_MODES)[number];
+export const OUTPUT_LOG_LEVELS = ["error", "warn", "info", "debug"] as const;
+export type OutputLogLevel = (typeof OUTPUT_LOG_LEVELS)[number];
+export const ANALYTICS_TIME_RANGES = ["7d", "30d", "90d", "all"] as const;
+export type AnalyticsTimeRange = (typeof ANALYTICS_TIME_RANGES)[number];
+export const ANALYTICS_TIMING_METRICS = ["ttft", "duration", "tps"] as const;
+export type AnalyticsTimingMetric = (typeof ANALYTICS_TIMING_METRICS)[number];
+export const ANALYTICS_TIME_ZONE_MODES = ["local", "utc"] as const;
+export type AnalyticsTimeZoneMode = (typeof ANALYTICS_TIME_ZONE_MODES)[number];
+
 export const UserPreferencesSchema = z.object({
   appearance: z
     .object({
@@ -140,6 +151,18 @@ export const UserPreferencesSchema = z.object({
             .optional(),
         })
         .optional(),
+      sidebarAgeGrouping: z.boolean().optional(),
+      sidebarFlatMode: z.boolean().optional(),
+      sidebarHideSubAgents: z.boolean().optional(),
+      artifactsAllowCdnScripts: z.boolean().optional(),
+      statsTabViewMode: z.enum(USAGE_VIEW_MODES).optional(),
+      statsTabShowModeBreakdown: z.boolean().optional(),
+      costsTabViewMode: z.enum(USAGE_VIEW_MODES).optional(),
+      outputTabLevel: z.enum(OUTPUT_LOG_LEVELS).optional(),
+      analyticsTimeRange: z.enum(ANALYTICS_TIME_RANGES).optional(),
+      analyticsTimingMetric: z.enum(ANALYTICS_TIMING_METRICS).optional(),
+      // "local" means the viewing client's time zone, resolved at render time.
+      analyticsTimeZoneMode: z.enum(ANALYTICS_TIME_ZONE_MODES).optional(),
     })
     .optional(),
 });

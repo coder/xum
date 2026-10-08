@@ -1,16 +1,13 @@
 import React from "react";
 
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { useWorkspaceStatsSnapshot } from "@/browser/stores/WorkspaceStore";
 import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { computeTimingPercentages } from "@/browser/utils/timingPercentages";
 import { calculateAverageTPS } from "@/browser/utils/messages/StreamingTPSCalculator";
 import { formatDuration } from "@/common/utils/formatDuration";
-import {
-  STATS_TAB_VIEW_MODE_KEY,
-  STATS_TAB_SHOW_MODE_BREAKDOWN_KEY,
-} from "@/common/constants/storage";
+import type { UsageViewMode } from "@/common/config/schemas/userPreferences";
 
 // Colors for timing components (matching TOKEN_COMPONENT_COLORS style)
 const TIMING_COLORS = {
@@ -24,9 +21,7 @@ function formatTokens(tokens: number): string {
   return `${(tokens / 1000).toFixed(1)}k`;
 }
 
-type ViewMode = "session" | "last-request";
-
-const VIEW_MODE_OPTIONS: Array<ToggleOption<ViewMode>> = [
+const VIEW_MODE_OPTIONS: Array<ToggleOption<UsageViewMode>> = [
   { value: "session", label: "Session" },
   { value: "last-request", label: "Last Request" },
 ];
@@ -66,14 +61,14 @@ function computeAverageTtft(totalTtftMs: number, ttftCount: number): number | nu
 function useStatsData(workspaceId: string) {
   const snapshot = useWorkspaceStatsSnapshot(workspaceId);
   const telemetry = useTelemetry();
-  const [viewMode, setViewMode] = usePersistedState<ViewMode>(STATS_TAB_VIEW_MODE_KEY, "session", {
-    listener: true,
-  });
-  const [showModeBreakdown, setShowModeBreakdown] = usePersistedState<boolean>(
-    STATS_TAB_SHOW_MODE_BREAKDOWN_KEY,
-    false,
-    { listener: true }
-  );
+  const viewMode =
+    useUserPreferences((preferences) => preferences.ui?.statsTabViewMode) ?? "session";
+  const setViewMode = (statsTabViewMode: UsageViewMode) =>
+    updateUserPreferences({ ui: { statsTabViewMode } });
+  const showModeBreakdown =
+    useUserPreferences((preferences) => preferences.ui?.statsTabShowModeBreakdown) ?? false;
+  const setShowModeBreakdown = (statsTabShowModeBreakdown: boolean) =>
+    updateUserPreferences({ ui: { statsTabShowModeBreakdown } });
 
   const [isClearing, setIsClearing] = React.useState(false);
   const [clearError, setClearError] = React.useState<string | null>(null);

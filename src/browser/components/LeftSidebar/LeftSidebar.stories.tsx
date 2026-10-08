@@ -33,7 +33,6 @@ import { buildSortedWorkspacesByProject } from "@/browser/utils/ui/workspaceFilt
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   SELECTED_WORKSPACE_KEY,
-  SIDEBAR_AGE_GROUPING_KEY,
   getWorkspaceLastReadKey,
   EXPANDED_OLD_WORKSPACES_KEY,
 } from "@/common/constants/storage";
@@ -106,9 +105,6 @@ function LeftSidebarStoryScene(props: { leftSidebarProps?: LeftSidebarStoryOverr
 function resetStorybookPersistedStateForStory(): void {
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
-    // FlatListWhenAgeGroupingDisabled writes this key; clear it so later
-    // stories are not affected by story execution order.
-    localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
   }
 }
 
@@ -860,12 +856,12 @@ export const FlatListWhenAgeGroupingDisabled: AppStory = {
         const workspaces = [oldWorkspace, activeSubAgent, completedSubAgent];
 
         expandProjects([projectPath]);
-        updatePersistedState(SIDEBAR_AGE_GROUPING_KEY, false);
         // Grouping is off, so no tier should need expansion for rows to show.
         localStorage.setItem(EXPANDED_OLD_WORKSPACES_KEY, JSON.stringify({}));
         return createMockORPCClient({
           projects: groupWorkspacesByProject(workspaces),
           workspaces,
+          userPreferences: { ui: { sidebarAgeGrouping: false } },
         });
       }}
     />

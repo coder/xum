@@ -7,9 +7,8 @@ import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
-import { ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY } from "@/common/constants/storage";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ARTIFACT_ASSET_LIMITS } from "./artifactAssets";
@@ -130,6 +129,7 @@ describe("ArtifactViewer renderers", () => {
 
   afterEach(() => {
     cleanup();
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     cleanupDom?.();
     cleanupDom = null;
   });
@@ -211,7 +211,9 @@ describe("ArtifactViewer renderers", () => {
   });
 
   test("renders HTML in a scripts-only sandbox with the CSP meta first", async () => {
-    updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, false);
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { ui: { artifactsAllowCdnScripts: false } },
+    });
     const html = '<script>alert(1)</script><img src="https://tracker.example/p.gif"><p>hi</p>';
     const view = renderArtifact("page.html", { "page.html": ok("page.html", html) });
     const frame = await view.findByTestId("artifact-frame");

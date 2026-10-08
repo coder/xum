@@ -82,7 +82,6 @@ import {
   EXPANDED_PROJECTS_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_WIDTH_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
 } from "@/common/constants/storage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
@@ -1006,7 +1005,7 @@ function AppInner() {
         direction,
         sortedWorkspacesByProject,
         userProjects,
-        readPersistedState(SIDEBAR_FLAT_MODE_KEY, false)
+        getUserPreferences().ui?.sidebarFlatMode
           ? { multiProjectEnabled: multiProjectWorkspacesEnabled }
           : false
       );

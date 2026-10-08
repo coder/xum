@@ -600,27 +600,6 @@ export function getWorkspaceLastReadKey(workspaceId: string): string {
 export const LEFT_SIDEBAR_COLLAPSED_KEY = "sidebarCollapsed";
 
 /**
- * Whether the sidebar groups older workspaces under collapsible
- * "Older than X days" age tiers (boolean, default true).
- * When false, all workspaces render as one flat recency-sorted list.
- * Format: "sidebarAgeGrouping"
- */
-export const SIDEBAR_AGE_GROUPING_KEY = "sidebarAgeGrouping";
-
-/**
- * When true, show all sidebar chats in one list instead of project folders.
- * Format: "sidebarFlatMode" (boolean, default false)
- */
-export const SIDEBAR_FLAT_MODE_KEY = "sidebarFlatMode";
-
-/**
- * Hide sub-agent rows in the left sidebar and summarize their activity on
- * parent rows instead.
- * Format: "sidebarHideSubAgents" (boolean, default false)
- */
-export const SIDEBAR_HIDE_SUBAGENTS_KEY = "sidebarHideSubAgents";
-
-/**
  * Left sidebar width
  * Format: "left-sidebar:width"
  */
@@ -672,13 +651,6 @@ export const ARTIFACTS_SELECTION_KEY = "artifacts:selection";
 export const ARTIFACTS_SELECTION_MAX_WORKSPACES = 16;
 /** Room for 16 entries with paths of about 1,000 chars; older workspaces drop first. */
 export const ARTIFACTS_SELECTION_MAX_CHARS = 20_000;
-
-/**
- * Whether sandboxed HTML/SVG artifacts may load scripts and fonts from the CDN allowlist
- * (Settings -> Experiments -> Artifacts). Global, default true.
- * Format: "artifacts:allowCdnScripts" (boolean)
- */
-export const ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY = "artifacts:allowCdnScripts";
 
 /**
  * Get the localStorage key for terminal titles per workspace.
@@ -773,14 +745,7 @@ export function getReviewDiffBaseKey(workspaceId: string): string {
 export const POST_COMPACTION_COLLAPSED_KEY = "postCompaction:collapsed";
 export const POST_COMPACTION_FILES_EXPANDED_KEY = "postCompaction:filesExpanded";
 export const STATS_CONTAINER_SUB_TAB_KEY = "statsContainer:subTab";
-export const STATS_TAB_VIEW_MODE_KEY = "statsTab:viewMode";
-export const STATS_TAB_SHOW_MODE_BREAKDOWN_KEY = "statsTab:showModeBreakdown";
-export const COSTS_TAB_VIEW_MODE_KEY = "costsTab:viewMode";
-export const OUTPUT_TAB_LEVEL_KEY = "output-tab-level";
 export const MERMAID_DIAGRAM_ZOOM_KEY = "mermaid-diagram-zoom";
-export const ANALYTICS_TIME_RANGE_KEY = "analytics:timeRange";
-export const ANALYTICS_TIMING_METRIC_KEY = "analytics:timingMetric";
-export const ANALYTICS_TIME_ZONE_MODE_KEY = "analytics:timeZoneMode";
 export const ROSETTA_BANNER_DISMISSED_KEY = "rosettaBannerDismissedAt";
 export const WINDOWS_TOOLCHAIN_BANNER_DISMISSED_KEY = "windowsToolchainBannerDismissedAt";
 export const REMOTE_CONNECTION_URL_KEY = "remoteConnectionUrl";
@@ -1024,10 +989,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // then removed, #5225). Never written again, so no budget (0).
   globalKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, "draft", 0),
   globalKey(LEFT_SIDEBAR_COLLAPSED_KEY, "ui", 16),
-  globalKey(SIDEBAR_AGE_GROUPING_KEY, "ui", 16),
-  globalKey(SIDEBAR_FLAT_MODE_KEY, "ui", 16),
-  globalKey(SIDEBAR_HIDE_SUBAGENTS_KEY, "ui", 16),
-  globalKey(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, "ui", 16),
   globalKey(LEFT_SIDEBAR_WIDTH_KEY, "ui", 16),
   globalKey(MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY, "ui", 32),
   // Legacy global tab; still read as a fallback for the per-workspace layout.
@@ -1046,14 +1007,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(POST_COMPACTION_COLLAPSED_KEY, "ui", 16),
   globalKey(POST_COMPACTION_FILES_EXPANDED_KEY, "ui", 16),
   globalKey(STATS_CONTAINER_SUB_TAB_KEY, "ui", 32),
-  globalKey(STATS_TAB_VIEW_MODE_KEY, "ui", 32),
-  globalKey(STATS_TAB_SHOW_MODE_BREAKDOWN_KEY, "ui", 16),
-  globalKey(COSTS_TAB_VIEW_MODE_KEY, "ui", 32),
-  globalKey(OUTPUT_TAB_LEVEL_KEY, "ui", 32),
   globalKey(MERMAID_DIAGRAM_ZOOM_KEY, "ui", 32),
-  globalKey(ANALYTICS_TIME_RANGE_KEY, "ui", 32),
-  globalKey(ANALYTICS_TIMING_METRIC_KEY, "ui", 32),
-  globalKey(ANALYTICS_TIME_ZONE_MODE_KEY, "ui", 32),
   globalKey(EXPANDED_OLD_WORKSPACES_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
   globalKey(EXPANDED_SECTIONS_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
   globalKey(EXPANDED_COMPLETED_SUB_AGENTS_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),

@@ -5,10 +5,9 @@ import { cn } from "@/common/lib/utils";
 import { useAPI } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY } from "@/common/constants/storage";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
@@ -157,9 +156,8 @@ export function McpAppFrame(props: {
 }) {
   const inline = props.variant === "inline";
   const { api } = useAPI();
-  const [allowCdn] = usePersistedState<boolean>(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true, {
-    listener: true,
-  });
+  const allowCdn =
+    useUserPreferences((preferences) => preferences.ui?.artifactsAllowCdnScripts) ?? true;
   const { theme: themeMode } = useTheme();
   const theme: "light" | "dark" = isLightThemeMode(themeMode) ? "light" : "dark";
   const [loaded, setLoaded] = useState<Loaded | null>(null);

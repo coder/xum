@@ -988,6 +988,7 @@ export function projectBackupPreferences(value: unknown): UserPreferences {
   }
   const review = projectFields(parsed.review, BACKED_UP_REVIEW_FIELDS);
   if (review !== undefined) projected.review = review;
+  if (parsed.ui !== undefined) projected.ui = copyJson(parsed.ui);
 
   return projected;
 }
@@ -1022,6 +1023,7 @@ export function mergeBackupPreferences(
       : {}),
     ...(projected.ai ? { ai: mergeAiPreferences(current?.ai, projected.ai) } : {}),
     ...(projected.review ? { review: { ...current?.review, ...projected.review } } : {}),
+    ...(projected.ui ? { ui: { ...current?.ui, ...projected.ui } } : {}),
   });
 }
 

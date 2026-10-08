@@ -16,9 +16,6 @@ import { useWorkspaceStoreRaw, type WorkspaceStore } from "@/browser/stores/Work
 import {
   EXPANDED_PROJECTS_KEY,
   MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY,
-  SIDEBAR_AGE_GROUPING_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
-  SIDEBAR_HIDE_SUBAGENTS_KEY,
   getDraftScopeId,
   getWorkspaceLastReadKey,
   getWorkspaceNameStateKey,
@@ -904,19 +901,16 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   >(EXPANDED_OLD_WORKSPACES_KEY, {});
 
   // Whether workspaces are grouped under collapsible "Older than X days" tiers.
-  // Toggled from Settings → General; listener keeps the sidebar live-updated.
-  const [ageGroupingEnabled] = usePersistedState<boolean>(SIDEBAR_AGE_GROUPING_KEY, true, {
-    listener: true,
-  });
+  // Toggled from Settings → General.
+  const ageGroupingEnabled =
+    useUserPreferences((preferences) => preferences.ui?.sidebarAgeGrouping) ?? true;
 
-  const [flatSidebarEnabled] = usePersistedState<boolean>(SIDEBAR_FLAT_MODE_KEY, false, {
-    listener: true,
-  });
+  const flatSidebarEnabled =
+    useUserPreferences((preferences) => preferences.ui?.sidebarFlatMode) ?? false;
 
   // Opt-in: hide sub-agent rows and summarize them on parent rows instead.
-  const [hideSubAgentRows] = usePersistedState<boolean>(SIDEBAR_HIDE_SUBAGENTS_KEY, false, {
-    listener: true,
-  });
+  const hideSubAgentRows =
+    useUserPreferences((preferences) => preferences.ui?.sidebarHideSubAgents) ?? false;
 
   // Track which sections are expanded
   const [expandedSections, setExpandedSections] = usePersistedState<Record<string, boolean>>(

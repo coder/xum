@@ -863,7 +863,6 @@ export const PlanMermaidWithCosts: AppStory = {
         });
 
         window.localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        window.localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         window.localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "500");
         window.localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
 
@@ -974,7 +973,6 @@ export const CostsTabRich: AppStory = {
         });
 
         window.localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        window.localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         window.localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "500");
         window.localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
 

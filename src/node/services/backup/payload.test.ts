@@ -248,6 +248,7 @@ describe("backup payload", () => {
           fileTreeViewMode: "flat",
           showRead: false,
         },
+        ui: { sidebarFlatMode: true, analyticsTimeRange: "7d" },
       },
     });
 
@@ -278,6 +279,7 @@ describe("backup payload", () => {
         fileTreeViewMode: "flat",
         showRead: false,
       },
+      ui: { sidebarFlatMode: true, analyticsTimeRange: "7d" },
     });
   });
 

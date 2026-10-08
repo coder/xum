@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useTheme } from "@/browser/contexts/ThemeContext";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
-import { ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY } from "@/common/constants/storage";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createArtifactAssetLoader } from "./artifactAssets";
 import {
@@ -64,9 +63,8 @@ export function SandboxedArtifactFrame(props: {
   onAnnotate?: (pick: ArtifactAnnotationPick) => void;
 }) {
   const read = useArtifactAssetReader(props.workspaceId);
-  const [allowCdn] = usePersistedState<boolean>(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true, {
-    listener: true,
-  });
+  const allowCdn =
+    useUserPreferences((preferences) => preferences.ui?.artifactsAllowCdnScripts) ?? true;
   const { theme: themeMode } = useTheme();
   const theme: ArtifactTheme = isLightThemeMode(themeMode) ? "light" : "dark";
   // Only the theme at mount is baked into the document; later changes travel over the bridge

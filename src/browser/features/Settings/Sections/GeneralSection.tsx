@@ -9,7 +9,6 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   getAppConfigStore,
   updateUserPreferences,
@@ -27,9 +26,6 @@ import {
   DEFAULT_TERMINAL_FONT_CONFIG,
   TERMINAL_BADGE_POSITIONS,
   BASH_COLLAPSED_SUMMARY_MODES,
-  SIDEBAR_AGE_GROUPING_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
-  SIDEBAR_HIDE_SUBAGENTS_KEY,
   TRANSCRIPT_DENSITIES,
   normalizeBashCollapsedSummaryMode,
   normalizeEditorConfig,
@@ -233,22 +229,12 @@ export function GeneralSection() {
   const bashCollapsedSummaryMode = useUserPreferences((preferences) =>
     normalizeBashCollapsedSummaryMode(preferences.appearance?.bashCollapsedSummaryMode)
   );
-  const [sidebarAgeGrouping, setSidebarAgeGrouping] = usePersistedState<boolean>(
-    SIDEBAR_AGE_GROUPING_KEY,
-    true
-  );
-  const [sidebarFlatMode, setSidebarFlatMode] = usePersistedState<boolean>(
-    SIDEBAR_FLAT_MODE_KEY,
-    false,
-    { listener: true }
-  );
-  // The command palette also toggles this key, so stay subscribed to
-  // external updates while Settings is mounted.
-  const [sidebarHideSubAgents, setSidebarHideSubAgents] = usePersistedState<boolean>(
-    SIDEBAR_HIDE_SUBAGENTS_KEY,
-    false,
-    { listener: true }
-  );
+  const sidebarAgeGrouping =
+    useUserPreferences((preferences) => preferences.ui?.sidebarAgeGrouping) ?? true;
+  const sidebarFlatMode =
+    useUserPreferences((preferences) => preferences.ui?.sidebarFlatMode) ?? false;
+  const sidebarHideSubAgents =
+    useUserPreferences((preferences) => preferences.ui?.sidebarHideSubAgents) ?? false;
   const [transcriptDensity, setTranscriptDensity] = useTranscriptDensity();
   const rawTerminalFontConfig = useUserPreferences(
     (preferences) => preferences.appearance?.terminalFontConfig
@@ -812,7 +798,9 @@ export function GeneralSection() {
             </div>
             <Switch
               checked={sidebarFlatMode}
-              onCheckedChange={setSidebarFlatMode}
+              onCheckedChange={(checked) =>
+                updateUserPreferences({ ui: { sidebarFlatMode: checked } })
+              }
               aria-label="Toggle flat chat list"
             />
           </div>
@@ -827,7 +815,9 @@ export function GeneralSection() {
             </div>
             <Switch
               checked={sidebarAgeGrouping}
-              onCheckedChange={setSidebarAgeGrouping}
+              onCheckedChange={(checked) =>
+                updateUserPreferences({ ui: { sidebarAgeGrouping: checked } })
+              }
               aria-label="Toggle sidebar workspace age grouping"
             />
           </div>
@@ -842,7 +832,9 @@ export function GeneralSection() {
             </div>
             <Switch
               checked={sidebarHideSubAgents}
-              onCheckedChange={setSidebarHideSubAgents}
+              onCheckedChange={(checked) =>
+                updateUserPreferences({ ui: { sidebarHideSubAgents: checked } })
+              }
               aria-label="Toggle hiding sub-agents in the sidebar"
             />
           </div>
