@@ -82,12 +82,11 @@ import { createRuntime, runFullInit } from "../node/runtime/runtimeFactory";
 import type { Runtime } from "../node/runtime/Runtime";
 import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
+import type { ExperimentId } from "../common/constants/experiments";
 import {
-  EXPERIMENT_IDS,
-  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
-  PROMOTED_EXPERIMENT_IDS,
-  type ExperimentId,
-} from "../common/constants/experiments";
+  collectHeadlessExperiments,
+  createHeadlessExperimentsService,
+} from "./headlessExperiments";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   createRunConfig,
@@ -278,81 +277,6 @@ function renderUnknown(value: unknown): string {
   }
 }
 
-/**
- * Experiment IDs `xum run` can actually forward, each mapped to its
- * SendMessageOptions.experiments field. A single table (instead of ad-hoc
- * `includes` checks) guarantees an ID accepted by `-e` cannot be silently
- * dropped here — that previously swallowed `rlm-mode`, so PTC+RLM CLI runs
- * degraded to the flat non-kernel PTC toolset while desktop honored the flag.
- */
-const SEND_MESSAGE_EXPERIMENT_FIELDS = {
-  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: "programmaticToolCalling",
-  [EXPERIMENT_IDS.RLM]: "rlm",
-  // Deliberately absent: MEMORY. MemoryService derives its storage from the
-  // CLI's ephemeral tempDir config root, so persistent memories under the
-  // user's Xum home would be invisible and new writes deleted on process exit.
-} as const satisfies Partial<
-  Record<ExperimentId, keyof NonNullable<SendMessageOptions["experiments"]>>
->;
-
-function isSendMessageExperimentId(
-  value: string
-): value is keyof typeof SEND_MESSAGE_EXPERIMENT_FIELDS {
-  // Own-property check: `in` would also accept Object.prototype names like
-  // "constructor" or "toString", which have no mapping and would silently
-  // produce a garbage experiments field.
-  return Object.hasOwn(SEND_MESSAGE_EXPERIMENT_FIELDS, value);
-}
-
-function collectExperiments(value: string, previous: string[]): string[] {
-  let experimentId = value.trim().toLowerCase();
-  if (PROMOTED_EXPERIMENT_IDS.has(experimentId)) {
-    return previous;
-  }
-  // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
-  // flag activates exactly the old exclusive posture — keep existing
-  // automation that passes the removed ID working instead of erroring.
-  if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
-    experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
-  }
-  // App-level experiments (e.g. agent-browser) have no send-options field and
-  // would be silent no-ops in a headless run, so reject them loudly.
-  if (!isSendMessageExperimentId(experimentId)) {
-    throw new Error(
-      `Unknown or unsupported experiment "${value}". Valid experiments: ${Object.keys(
-        SEND_MESSAGE_EXPERIMENT_FIELDS
-      ).join(", ")}`
-    );
-  }
-  if (previous.includes(experimentId)) {
-    return previous; // Dedupe
-  }
-  return [...previous, experimentId];
-}
-
-/**
- * Convert experiment ID array to the experiments object expected by SendMessageOptions.
- * Only requested experiments are set (to true); unspecified flags stay undefined so
- * backend fallbacks apply, mirroring how the desktop renderer sends them.
- */
-function buildExperimentsObject(experimentIds: string[]): SendMessageOptions["experiments"] {
-  if (experimentIds.length === 0) return undefined;
-
-  const experiments: NonNullable<SendMessageOptions["experiments"]> = {};
-  for (const experimentId of experimentIds) {
-    assert(isSendMessageExperimentId(experimentId), `Unmapped experiment id: ${experimentId}`);
-    experiments[SEND_MESSAGE_EXPERIMENT_FIELDS[experimentId]] = true;
-  }
-  // RLM is a sub-experiment of PTC: tool assembly only builds code_execution
-  // when the PTC flag is set, so rlm-mode alone would be silently inert. Imply
-  // the parent flag, mirroring the desktop where Settings nests RLM under the
-  // PTC toggle (PTC is exclusive-only, so RLM then runs the kernel posture).
-  if (experiments.rlm) {
-    experiments.programmaticToolCalling = true;
-  }
-  return experiments;
-}
-
 interface MCPServerEntry {
   name: string;
   command: string;
@@ -400,7 +324,12 @@ program
   .option("-q, --quiet", "only output final result")
   .option("--mcp <server>", "MCP server as name=command (can be repeated)", collectMcpServers, [])
   .option("--no-mcp-config", "ignore global + repo MCP config files (use only --mcp servers)")
-  .option("-e, --experiment <id>", "enable experiment (can be repeated)", collectExperiments, [])
+  .option(
+    "-e, --experiment <id>",
+    "enable experiment (can be repeated)",
+    collectHeadlessExperiments,
+    []
+  )
   .option("-b, --budget <usd>", "stop when session cost exceeds budget (USD)", parseFloat)
   .option("--goal <objective>", "drive an ephemeral CLI Goal Run until complete")
   .option("--goal-budget <budget>", "goal budget, e.g. $5, 5.00, or 500c")
@@ -450,7 +379,7 @@ interface CLIOptions {
   quiet?: boolean;
   mcp: MCPServerEntry[];
   mcpConfig: boolean;
-  experiment: string[];
+  experiment: ExperimentId[];
   budget?: number;
   goal?: string;
   goalBudget?: string;
@@ -660,6 +589,7 @@ async function main(): Promise<number> {
     // Session config lives in tempDir (deleted on exit) — disable workspace.*
     // host actions so workflows can't create worktrees whose tags evaporate.
     mcpConfig: realConfig,
+    experimentsService: await createHeadlessExperimentsService(config.rootDir, opts.experiment),
     mcpServerManagerOptions: {
       inlineServers,
       ignoreConfigFile: !opts.mcpConfig,
@@ -883,13 +813,10 @@ async function main(): Promise<number> {
   // Calling initialize() on a fresh config is a no-op, but skipping it makes the intent
   // clear and avoids any risk of cross-workspace side effects if config were ever shared.
 
-  const experiments = buildExperimentsObject(opts.experiment);
-
   const buildSendOptions = (cliMode: CLIMode): SendMessageOptions => ({
     model,
     thinkingLevel,
     agentId: cliMode,
-    experiments,
     providerOptions: {
       ...(opts.use1m && { anthropic: { use1MContext: true } }),
       ...(opts.serviceTier != null && { openai: { serviceTier: opts.serviceTier } }),
