@@ -5,11 +5,14 @@
  * missing artifact, a test without a final-attempt summary or an unusable summary is a gap, never
  * a dropped night, so a streak can never skip a bad night. A failed test whose final attempt wrote
  * a summary keeps its values. Imports only `./perfReportCore` (the job has no `bun install`).
- * The log line holds counts only. The Markdown renderer lands with the CLI (PR 2b-2).
+ * Untrusted text reaches the Markdown only through `code()`; the log line holds counts only.
  */
 import {
+  code,
+  formatValue,
   METRICS,
   MILESTONES,
+  tableHeader,
   type MetricId,
   type MilestoneId,
   type Report,
@@ -23,7 +26,9 @@ function assert(condition: unknown, message: string): asserts condition {
 function timeOf(createdAt: string): number {
   const time = Date.parse(createdAt);
   const iso = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/.test(createdAt);
-  assert(iso && Number.isFinite(time), "invalid createdAt");
+  // Bun rolls impossible dates forward (2026-02-30 reads as March 2), so require a round trip.
+  const exact = Number.isFinite(time) && new Date(time).toISOString().slice(0, 19);
+  assert(iso && exact === createdAt.slice(0, 19), "invalid createdAt");
   return time;
 }
 
@@ -100,9 +105,9 @@ export interface Night {
  * current run, not the wall clock, so any past night can be replayed. Dispatch runs never enter
  * history; a dispatch current run is compared like a nightly (and rendered as a preview).
  */
-export function selectHistory(current: RunInfo, runs: readonly RunInfo[]): RunInfo[] {
+export function selectHistory<R extends RunInfo>(current: RunInfo, runs: readonly R[]): R[] {
   const now = timeOf(current.createdAt);
-  const time = (run: RunInfo) => timeOf(run.createdAt);
+  const time = (run: R) => timeOf(run.createdAt);
   // Overlapping listing pages can repeat a run; one run must never fill two slots. Dedupe after
   // filtering and sorting, so the newest eligible copy wins.
   const seen = new Set<number>();
@@ -228,6 +233,82 @@ export interface TrendInput {
   history: readonly Night[];
   /** Listing or fetching history failed (first line of the error, unsanitized). */
   historyError?: string;
+}
+
+function valueText(trend: SeriesTrend): string {
+  const value = formatValue(trend.value, trend.metric.decimals);
+  if (trend.baseline === undefined) return `${value} (no baseline)`;
+  // A zero baseline (React renders) has no meaningful percent.
+  if (trend.baseline === 0 || trend.value === undefined) return value;
+  const percent = Math.round(((trend.value - trend.baseline) / trend.baseline) * 100);
+  return `${value} (${percent >= 0 ? "+" : ""}${percent}%)`;
+}
+
+function describe(trend: SeriesTrend): string {
+  return `${code(trend.label)} ${trend.metric.label.toLowerCase()} ${valueText(trend)}, ${trend.above} of ${STREAK_NIGHTS} nights above`;
+}
+
+function cell(trend: SeriesTrend | undefined): string {
+  if (trend === undefined) return "—";
+  if (trend.value === undefined) return "no data";
+  const marker =
+    trend.status === "regressed" ? " **regressed**" : trend.status === "watch" ? " watch" : "";
+  return `${valueText(trend)}${marker}`;
+}
+
+/** Job summary Markdown. Labels and error text pass through `code()`; numbers are formatted. */
+export function renderTrendSummary(input: TrendInput): string {
+  const lines = ["## Perf trend", ""];
+  const { run } = input.current;
+  if (run.event !== "schedule" || run.headBranch !== "main") {
+    lines.push("Preview: not a scheduled-main result.", "");
+  }
+  if (input.historyError !== undefined) {
+    // No table: an auth or API error must never look like a cold start.
+    const first = input.historyError.split(/[\r\n]/).find((line) => line.trim()) ?? "";
+    lines.push("### Problems", "", `- history fetch failed: ${code(first)}`, "");
+    return lines.join("\n");
+  }
+  const { history } = input;
+  const trends = evaluateTrend(input.current, history);
+  const day = (night: Night) => night.run.createdAt.slice(0, 10);
+  lines.push(
+    history.length === 0
+      ? "No earlier scheduled main nights to compare with."
+      : `Compared with ${history.length} scheduled main nights (${day(history[history.length - 1])} to ${day(history[0])}).`,
+    ""
+  );
+  const regressed = trends.filter((trend) => trend.status === "regressed");
+  if (regressed.length > 0) {
+    lines.push("### Problems", "", ...regressed.map((trend) => `- regressed: ${describe(trend)}`));
+    lines.push("");
+  }
+  const labels = [...new Set(trends.map((trend) => trend.label))];
+  if (labels.length > 0) {
+    lines.push(...tableHeader(["Scenario", ...TREND_METRICS.map((metric) => metric.label)], 1));
+    for (const label of labels) {
+      const cells = TREND_METRICS.map((metric) =>
+        cell(trends.find((trend) => trend.label === label && trend.metric.id === metric.id))
+      );
+      lines.push(`| ${code(label)} | ${cells.join(" | ")} |`);
+    }
+    lines.push("");
+  }
+  const warnings = trends
+    .filter((trend) => trend.status === "watch")
+    .map((trend) => `watch: ${describe(trend)}`);
+  for (const night of history) {
+    if (night.issue !== undefined) warnings.push(`run ${night.run.databaseId}: ${night.issue}`);
+  }
+  for (const label of labels) {
+    const lost = trends.filter((trend) => trend.label === label && trend.lost);
+    const metrics = lost.map((trend) => trend.metric.label.toLowerCase()).join(", ");
+    if (lost.length > 0)
+      warnings.push(`${code(label)} has no value tonight for ${metrics}, but earlier nights do`);
+  }
+  if (warnings.length > 0)
+    lines.push("### Warnings", "", ...warnings.map((text) => `- ${text}`), "");
+  return lines.join("\n");
 }
 
 /** The only trend line for the job log: counts only, never labels, keys or error text. */

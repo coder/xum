@@ -4,6 +4,7 @@ import {
   evaluateTrend,
   formatTrendLogLine,
   nightFromReport,
+  renderTrendSummary,
   selectHistory,
   type Night,
   type RunInfo,
@@ -37,6 +38,8 @@ const evaluate = (all: Night[]) => evaluateTrend(all[0], all.slice(1));
 const trendOf = (all: Night[], metric: TrendMetricId) =>
   evaluate(all).find((trend) => trend.metric.id === metric);
 const statusOf = (all: Night[], metric: TrendMetricId) => trendOf(all, metric)?.status;
+const render = (all: Night[], historyError?: string) =>
+  renderTrendSummary({ current: all[0], history: all.slice(1), historyError });
 
 const TYPING = { file: "tests/e2e/scenarios/perf.chatTyping.spec.ts", title: "typing" };
 const SWITCH = { file: "tests/e2e/scenarios/perf.chatSwitch.spec.ts", title: "switch" };
@@ -89,6 +92,9 @@ describe("evaluateTrend", () => {
     ] as const) {
       const trend = trendOf(nights({ scriptMs: [...streak, ...BASELINE] }), "scriptMs");
       expect(trend).toMatchObject({ status: "watch", above });
+      expect(render(nights({ scriptMs: [...streak, ...BASELINE] }))).toContain(
+        `### Warnings\n\n- watch: \`s\` script ms 160 (+60%), ${above} of 3 nights above\n`
+      );
     }
     expect(statusOf(nights({ scriptMs: [90, 160, 160, ...BASELINE] }), "scriptMs")).toBe("ok");
   });
@@ -98,6 +104,8 @@ describe("evaluateTrend", () => {
     expect(statusOf(nights({ reactRenders: [4, 4, 4, 0, 0, 0, 0, 0] }), "reactRenders")).toBe("ok");
     const zero = nights({ reactRenders: [6, 6, 6, 0, 0, 0, 0, 0] });
     expect(trendOf(zero, "reactRenders")).toMatchObject({ status: "regressed", baseline: 0 });
+    expect(render(zero)).toContain("| 6 **regressed** |");
+    expect(render(zero)).not.toContain("%");
   });
 
   test("a baseline needs five values of that metric, not five nights", () => {
@@ -129,6 +137,7 @@ describe("evaluateTrend", () => {
     all[1] = nightFromReport(run(1), missing);
     expect(all[1]).toEqual({ run: run(1), scenarios: {}, issue: "artifact missing or expired" });
     expect(trendOf(all, "scriptMs")).toMatchObject({ status: "watch", above: 2 });
+    expect(render(all)).toContain(`- run ${all[1].run.databaseId}: artifact missing or expired`);
   });
 
   test("a series with earlier values but none tonight is lost, not dropped", () => {
@@ -136,6 +145,12 @@ describe("evaluateTrend", () => {
     expect(evaluate(all).map((trend) => [trend.metric.id, trend.status, trend.lost])).toEqual([
       ["scriptMs", "no-data", true],
       ["layouts", "no-data", true],
+    ]);
+    const warnings = render(all)
+      .split("\n")
+      .filter((line) => line.startsWith("- "));
+    expect(warnings).toEqual([
+      "- `s` has no value tonight for script ms, layouts, but earlier nights do",
     ]);
   });
 
@@ -181,6 +196,9 @@ describe("evaluateTrend", () => {
       ["ok", true],
       ["ok", true],
     ]);
+    const markdown = render(all);
+    expect(markdown.match(/\(\+100%\)/g)).toHaveLength(3);
+    expect(markdown).not.toMatch(/regressed|watch/);
   });
 
   test("malformed nights fail loudly instead of reading as ok or empty", () => {
@@ -190,7 +208,7 @@ describe("evaluateTrend", () => {
       );
     }
     const report = buildReport({ perfResult: "success", artifactFound: true, reads: [] });
-    for (const createdAt of ["bad", "0", "2099-13-01T04:00:00Z"]) {
+    for (const createdAt of ["bad", "0", "2099-13-01T04:00:00Z", "2026-02-30T04:00:00Z"]) {
       expect(() => nightFromReport(run(0, { createdAt }), report)).toThrow("invalid createdAt");
     }
     for (const repeated of [1, 0]) {
@@ -246,5 +264,41 @@ describe("formatTrendLogLine", () => {
     expect(lines[0]).toContain("1 regressed, 0 watch, 1 lost series over 7 nights");
     expect(lines[1]).toContain("history fetch failed");
     for (const line of lines) expect(line).toMatch(/^perf trend: [a-z0-9 ,;]+$/);
+  });
+});
+
+describe("renderTrendSummary", () => {
+  test("a history error is one problem, never an empty-history table", () => {
+    const markdown = render(nights({ scriptMs: [100, 100] }), "\nHTTP 401: Bad credentials\nmore");
+    expect(markdown).toContain(
+      "### Problems\n\n- history fetch failed: `HTTP 401: Bad credentials`\n"
+    );
+    expect(markdown).not.toMatch(/^\||no baseline|No earlier|more/m);
+  });
+
+  test("a dispatch run is labeled as a preview", () => {
+    const all = nights({ scriptMs: [100, 100] });
+    expect(render(all)).not.toContain("Preview");
+    all[0] = { ...all[0], run: run(0, { event: "workflow_dispatch" }) };
+    expect(render(all)).toContain("## Perf trend\n\nPreview: not a scheduled-main result.\n");
+  });
+
+  test("untrusted labels and errors cannot break the Markdown", () => {
+    const evil = "x\u001b[31m`|<script>alert(1)</script>\u2028y\u001b]8;;https://e.test\u0007|z";
+    const all = nights(
+      { scriptMs: [200, 200, 200, 100, 100, 100, 100, 100], layouts: [undefined, 10] },
+      evil
+    );
+    for (const historyError of [undefined, evil]) {
+      const lines = render(all, historyError).split("\n");
+      expect(lines.join("")).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029<>]/);
+      const table = lines.filter((line) => line.startsWith("|"));
+      expect(table.length).toBe(historyError === undefined ? 3 : 0);
+      for (const line of table) expect(line.split("|").length).toBe(table[0].split("|").length);
+      for (const line of lines) expect((line.match(/`/g)?.length ?? 0) % 2).toBe(0);
+    }
+    expect(render(all)).toMatch(
+      /^\| `x[^`|]*` \| — \| 200 \(\+100%\) \*\*regressed\*\* \| — \| no data \|/m
+    );
   });
 });
