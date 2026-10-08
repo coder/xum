@@ -760,21 +760,8 @@ function normalizePersistedWorkspace(
     };
   const hasLegacyWorkflowSchedule = Object.hasOwn(persisted, "workflowSchedule");
   const hasBestOf = Object.hasOwn(persisted, "bestOf");
-  // Legacy alias: tasks stamped by builds where "PTC Exclusive Mode" was a
-  // separate experiment may carry only programmaticToolCallingExclusive. The
-  // merged PTC experiment activates exactly that posture, so resumed tasks
-  // must read it as programmaticToolCalling (`true` wins over an explicit
-  // false, matching the schema preprocess and backend feature-flag alias).
-  // This is the runtime path: loadConfigOrDefault does not parse workspaces
-  // through WorkspaceConfigSchema, so the schema-level alias alone never runs
-  // here. The legacy key is retained for downgrade compatibility.
-  const taskExperiments =
-    typeof persisted.taskExperiments === "object" && persisted.taskExperiments !== null
-      ? (persisted.taskExperiments as Record<string, unknown>)
-      : undefined;
-  const hasLegacyPtcExclusive =
-    taskExperiments?.programmaticToolCallingExclusive === true &&
-    taskExperiments.programmaticToolCalling !== true;
+  // Children read experiments from ExperimentsService; a spawn-time snapshot must not linger.
+  const hasLegacyTaskExperiments = Object.hasOwn(persisted, "taskExperiments");
   const hasMalformedTaskAttemptId =
     persisted.taskAttemptId !== undefined && !isTaskAttemptId(persisted.taskAttemptId);
   // A malformed removal marker (hand edit, corruption) is dropped rather than kept: every task
@@ -813,7 +800,7 @@ function normalizePersistedWorkspace(
   if (
     !hasLegacyWorkflowSchedule &&
     !hasBestOf &&
-    !hasLegacyPtcExclusive &&
+    !hasLegacyTaskExperiments &&
     !hasMalformedTaskAttemptId &&
     !hasMalformedPendingRemoval &&
     !hasMalformedPendingArchive &&
@@ -827,6 +814,7 @@ function normalizePersistedWorkspace(
 
   const nextWorkspace = { ...persisted };
   delete nextWorkspace.workflowSchedule;
+  delete nextWorkspace.taskExperiments;
   if (hasMalformedPendingRemoval) delete nextWorkspace.pendingRemoval;
   if (hasMalformedPendingArchive) delete nextWorkspace.pendingArchive;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
@@ -839,15 +827,6 @@ function normalizePersistedWorkspace(
       : [];
     if (ids.length > 0) nextWorkspace.taskReservationTombstones = ids;
     else delete nextWorkspace.taskReservationTombstones;
-  }
-
-  if (hasLegacyPtcExclusive) {
-    // Spreading the typed field copies ALL persisted keys at runtime —
-    // including the legacy one, which stays for downgrade compatibility.
-    nextWorkspace.taskExperiments = {
-      ...persisted.taskExperiments,
-      programmaticToolCalling: true,
-    };
   }
 
   if (hasBestOf) {

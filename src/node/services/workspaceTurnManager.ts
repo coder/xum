@@ -21,7 +21,6 @@ import {
   type BackgroundableForegroundWaiter,
   type QueueCutAttributionSnapshot,
   type ResolvedWorkspaceAiSettings,
-  type TaskCreateArgs,
   type WorkspaceHost,
   type WorkspaceLifecycleResult,
   type WorkspaceTurnHost,
@@ -328,7 +327,6 @@ export interface WorkspaceTurnCreateArgs {
     queueDispatchMode?: WorkspaceTurnQueueDispatchMode;
     disposable?: boolean;
   };
-  experiments?: TaskCreateArgs["experiments"];
   /**
    * How the owner's stream-end treats this workspace turn while active. Derived
    * from `run_in_background`: background -> "notify_on_terminal"; foreground/default
@@ -1384,7 +1382,6 @@ export class WorkspaceTurnManager {
     let targetAiSettings: ResolvedWorkspaceAiSettings | undefined;
     let targetTaskModelString: string | undefined;
     let targetTaskThinkingLevel: ThinkingLevel | undefined;
-    let targetTaskExperiments: TaskCreateArgs["experiments"];
     let targetIsAgentWorkspace = false;
     let createdWorkspace = false;
     let createdTargetBranch = false;
@@ -1457,7 +1454,6 @@ export class WorkspaceTurnManager {
         workspaceTurnAgentId = resolveTaskAgentIdForResume(targetEntry.workspace);
         targetTaskModelString = coerceNonEmptyString(targetEntry.workspace.taskModelString);
         targetTaskThinkingLevel = targetEntry.workspace.taskThinkingLevel;
-        targetTaskExperiments = targetEntry.workspace.taskExperiments;
       }
       if (requestedAgentId != null) {
         // Persistent agent-task children are pinned to their persisted identity:
@@ -2093,7 +2089,6 @@ export class WorkspaceTurnManager {
         ...(thinkingLevel != null ? { thinkingLevel } : {}),
         ...(reasoningMode != null ? { reasoningMode } : {}),
         muxMetadata: this.buildWorkspaceTurnMuxMetadata(record),
-        experiments: args.experiments ?? targetTaskExperiments,
         ...(mode === "existing" ? { queueDispatchMode } : {}),
         // A per-turn agent override on an existing workspace must not overwrite the target's
         // saved agent/settings (maybePersistAISettingsFromOptions persists them on every

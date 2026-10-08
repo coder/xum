@@ -799,43 +799,6 @@ describe("TaskService", () => {
     expect(tasks.map((task) => task.taskSticky)).toEqual([undefined, undefined]);
   });
 
-  test("createMany stamps the rlm experiment on admitted and queued task records", async () => {
-    const config = await createTestConfig(rootDir);
-    stubStableIds(config, ["rlma000001", "rlmq000002"], "rlmfb00003");
-
-    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    await config.editConfig((cfg) => {
-      cfg.taskSettings = { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 };
-      return cfg;
-    });
-
-    const sendMessage = mock(() => new Promise<Result<void>>(() => undefined));
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    const result = await taskService.createMany(
-      ["one", "two"].map((prompt, index) => ({
-        parentWorkspaceId: parentId,
-        kind: "agent" as const,
-        agentId: "explore",
-        prompt,
-        title: `Task ${index + 1}`,
-        // RLM children must keep family messaging across restarts even when the
-        // frontend experiment toggles off, so the spawn stamp is the durable gate.
-        experiments: { rlm: true, programmaticToolCalling: true },
-      }))
-    );
-
-    expect(result.success).toBe(true);
-    if (!result.success) return;
-    expect(result.data.map((task) => task.status)).toEqual(["starting", "queued"]);
-
-    const tasks = Array.from(config.loadConfigOrDefault().projects.values())
-      .flatMap((project) => project.workspaces)
-      .filter((workspace) => workspace.parentWorkspaceId === parentId);
-    expect(tasks.map((task) => task.taskExperiments?.rlm)).toEqual([true, true]);
-  });
-
   test("resolveWorkspaceModelFallbackChain honors taskOnRefusal opt-out", async () => {
     const config = await createTestConfig(rootDir);
 

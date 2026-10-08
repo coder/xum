@@ -15,9 +15,6 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-// Persisted task snapshots stamp the legacy exclusive mirror so downgraded
-// builds resume tasks in the exclusive posture (see withLegacyPtcExclusiveMirror).
-import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -731,7 +728,6 @@ interface TaskLaunchPlan {
   preferredTrunkBranch?: string;
   workflowTask?: TaskCreateArgs["workflowTask"];
   bestOf?: TaskCreateArgs["bestOf"];
-  experiments?: TaskCreateArgs["experiments"];
   onRefusal?: TaskCreateArgs["onRefusal"];
   attentionPolicy?: TaskCreateArgs["attentionPolicy"];
   taskDesktopOwnerWorkspaceId?: string;
@@ -1334,16 +1330,12 @@ function rowSupersedes(
  */
 function buildTaskTurnSendOptions(
   workspace: WorkspaceConfigEntry
-): Pick<
-  SendMessageOptions,
-  "model" | "agentId" | "thinkingLevel" | "reasoningMode" | "experiments"
-> {
+): Pick<SendMessageOptions, "model" | "agentId" | "thinkingLevel" | "reasoningMode"> {
   return {
     model: workspace.taskModelString ?? defaultModel,
     agentId: resolveTaskAgentIdForResume(workspace),
     thinkingLevel: workspace.taskThinkingLevel,
     reasoningMode: coerceOpenAIReasoningMode(workspace.aiSettings?.reasoningMode),
-    experiments: workspace.taskExperiments,
   };
 }
 
@@ -5853,7 +5845,6 @@ export class TaskService implements AgentTaskIntegration {
         agentId,
         thinkingLevel: task.taskThinkingLevel,
         reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
-        experiments: task.taskExperiments,
       };
       if (pendingGuidance.length > 0) {
         let sendResult: Result<void, SendMessageError> = Ok(undefined);
@@ -6916,7 +6907,6 @@ export class TaskService implements AgentTaskIntegration {
         skipInitHook: plan.skipInitHook,
         workflowTask: plan.args.workflowTask,
         bestOf: plan.normalizedBestOf,
-        experiments: plan.args.experiments,
         onRefusal: plan.args.onRefusal,
         attentionPolicy: plan.args.attentionPolicy,
         taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
@@ -7221,7 +7211,6 @@ export class TaskService implements AgentTaskIntegration {
           taskThinkingLevel: plan.effectiveThinkingLevel,
           taskAiPins: plan.taskAiPins ?? {},
           taskOnRefusal: plan.onRefusal,
-          taskExperiments: withLegacyPtcExclusiveMirror(plan.experiments),
           taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
           taskAttentionPolicy: plan.attentionPolicy,
           taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
@@ -8278,7 +8267,6 @@ export class TaskService implements AgentTaskIntegration {
       // Inherited pro mode: the send path re-gates per model/route, so this is
       // inert for non-GPT-5.6 task models.
       reasoningMode: plan.effectiveReasoningMode,
-      experiments: plan.experiments,
     };
     // Linearization point: cancellation observed here guarantees "never launched"; past the
     // admission below only a Stop (Layer 2) ends the execution.
@@ -8784,7 +8772,6 @@ export class TaskService implements AgentTaskIntegration {
               taskThinkingLevel: effectiveThinkingLevel,
               taskAiPins,
               taskOnRefusal: args.onRefusal,
-              taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
               taskIsolation: useSharedWorkspace ? "none" : undefined,
               taskAttentionPolicy: args.attentionPolicy,
               taskDesktopOwnerWorkspaceId,
@@ -9145,7 +9132,6 @@ export class TaskService implements AgentTaskIntegration {
           taskThinkingLevel: effectiveThinkingLevel,
           taskAiPins,
           taskOnRefusal: args.onRefusal,
-          taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
           taskIsolation: useSharedWorkspace ? "none" : undefined,
           taskAttentionPolicy: args.attentionPolicy,
           taskDesktopOwnerWorkspaceId,
@@ -9281,7 +9267,6 @@ export class TaskService implements AgentTaskIntegration {
                 agentId,
                 thinkingLevel: effectiveThinkingLevel,
                 reasoningMode: effectiveReasoningMode,
-                experiments: args.experiments,
               },
               {
                 acceptanceOrigin: "automatic",
@@ -10013,7 +9998,6 @@ export class TaskService implements AgentTaskIntegration {
             agentId: activeAgentId,
             thinkingLevel: activeAiSettings?.thinkingLevel ?? entry.workspace.taskThinkingLevel,
             reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
-            experiments: entry.workspace.taskExperiments,
             queueDispatchMode,
             ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
           },
@@ -10884,7 +10868,6 @@ export class TaskService implements AgentTaskIntegration {
           agentId: activeAgentId,
           thinkingLevel: activeAiSettings?.thinkingLevel ?? targetEntry.workspace.taskThinkingLevel,
           reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
-          experiments: targetEntry.workspace.taskExperiments,
           muxMetadata: triggerMuxMetadata,
         };
       }
@@ -14437,7 +14420,6 @@ export class TaskService implements AgentTaskIntegration {
         agentId,
         thinkingLevel: freshEntry.workspace.taskThinkingLevel,
         reasoningMode: coerceOpenAIReasoningMode(freshEntry.workspace.aiSettings?.reasoningMode),
-        experiments: freshEntry.workspace.taskExperiments,
         ...(completionKind === "propose_plan"
           ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
           : {}),
@@ -16957,7 +16939,6 @@ export class TaskService implements AgentTaskIntegration {
           preferredTrunkBranch: task.taskTrunkBranch,
           workflowTask: task.workflowTask,
           bestOf: this.getEffectiveTaskGroup(taskId, task),
-          experiments: task.taskExperiments,
           attemptId: launch.attemptId,
           launchLease,
           // A reservation this process owns keeps its cancellation across the queue.
@@ -17750,7 +17731,6 @@ export class TaskService implements AgentTaskIntegration {
         agentId,
         thinkingLevel: entry.workspace.taskThinkingLevel,
         reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
-        experiments: entry.workspace.taskExperiments,
       },
       {
         acceptanceOrigin: "automatic",
@@ -19994,7 +19974,6 @@ export class TaskService implements AgentTaskIntegration {
             agentId: targetAgentId,
             thinkingLevel: effectiveThinkingLevel,
             ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
-            experiments: args.entry.workspace.taskExperiments,
           },
           {
             acceptanceOrigin: "automatic",
