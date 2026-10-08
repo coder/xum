@@ -20,6 +20,8 @@ case "$1" in
   pull)
     if [ "$PULL" = hang ]; then trap '' TERM; exec sleep 30; fi
     # A grandchild that holds no pipe: only a signal to the whole group reaches it.
+    # The leader ends on SIGTERM, but its grandchild ignores it and holds no pipe (#5878 review).
+    if [ "$PULL" = orphan ]; then (trap '' TERM; exec sleep 60) >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; sleep 30; fi
     if [ "$PULL" = group ]; then sleep 60 >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; trap '' TERM; wait $!; fi ;;
   image) echo "{\\"org.xum.bugbash.inputs\\":\\"$LABEL\\"}" ;;
   # Lines of bin/containers: id name owner checkout. ps prints the ids that match every filter.
@@ -230,24 +232,31 @@ const alive = (pid: number) => {
   }
 };
 
-test("#5877 item 1: a stop also ends the grandchildren of a running command", async () => {
-  fake({ PULL: "group" });
-  const stop = new AbortController();
-  const s = session(stop);
-  const pending = s.ensureImage();
-  const pidFile = path.join(bin, "grandchild.pid");
-  while (!fs.existsSync(pidFile) || fs.readFileSync(pidFile, "utf8").trim() === "")
-    await Bun.sleep(20);
-  const grandchild = Number(fs.readFileSync(pidFile, "utf8"));
-  expect(alive(grandchild)).toBe(true);
-  stop.abort("SIGTERM");
-  expect(await failure(pending)).toThrow(Stopped);
-  await s.cleanup();
-  for (let i = 0; i < 50 && alive(grandchild); i++) await Bun.sleep(20);
-  const survived = alive(grandchild);
-  if (survived) process.kill(grandchild, "SIGKILL");
-  expect(survived).toBe(false);
-}, 15_000);
+test.each([
+  ["the leader also ignores SIGTERM", "group"],
+  ["the leader exits on SIGTERM and leaves an orphan", "orphan"],
+])(
+  "#5877 item 1: a stop also ends the grandchildren (%s)",
+  async (_name, shape) => {
+    fake({ PULL: shape });
+    const stop = new AbortController();
+    const s = session(stop);
+    const pending = s.ensureImage();
+    const pidFile = path.join(bin, "grandchild.pid");
+    while (!fs.existsSync(pidFile) || fs.readFileSync(pidFile, "utf8").trim() === "")
+      await Bun.sleep(20);
+    const grandchild = Number(fs.readFileSync(pidFile, "utf8"));
+    expect(alive(grandchild)).toBe(true);
+    stop.abort("SIGTERM");
+    expect(await failure(pending)).toThrow(Stopped);
+    // cleanup() returns only once the whole group is gone.
+    expect(await s.cleanup()).toBe("none");
+    const survived = alive(grandchild);
+    if (survived) process.kill(grandchild, "SIGKILL");
+    expect(survived).toBe(false);
+  },
+  20_000
+);
 
 test("#5877 item 2: cleanup handles the owned job exactly once; own() after a stop refuses", async () => {
   fake({ IMAGES: "sha256:abc" });
@@ -263,8 +272,23 @@ test("#5877 item 2: cleanup handles the owned job exactly once; own() after a st
 
   const late = session();
   await late.ensureImage();
-  void late.cleanup();
+  expect(await late.cleanup()).toBe("none");
   expect(() => late.own(JOB)).toThrow(Stopped);
+});
+
+test("own() keeps a copy: a later change to the caller's job object changes nothing", async () => {
+  fake({ IMAGES: "sha256:abc" });
+  fs.writeFileSync(
+    path.join(bin, "containers"),
+    ["c1 xbb-1 boot:pid abc", ...FOREIGN].join("\n") + "\n"
+  );
+  const s = session();
+  await s.ensureImage();
+  const job = { ...JOB };
+  s.own(job);
+  job.name = "xbb-2";
+  expect(await s.cleanup()).toBe("removed");
+  expect(fs.readFileSync(path.join(bin, "containers"), "utf8").trim().split("\n")).toEqual(FOREIGN);
 });
 
 test("#5877 items 3 and 5: no owned job is 'none'; a regex-like name refuses", async () => {

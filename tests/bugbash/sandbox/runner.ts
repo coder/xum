@@ -54,9 +54,9 @@ interface Result {
 }
 /** A job container, matched by its name and both labels, never by the name alone. */
 export interface Job {
-  name: string;
-  owner: string;
-  checkout: string;
+  readonly name: string;
+  readonly owner: string;
+  readonly checkout: string;
 }
 /** "none": the session owned no job, so no container can exist. */
 export type CleanupState = "none" | "removed" | `unknown: ${string}`;
@@ -66,6 +66,11 @@ const CONTAINER_NAME = /^[a-z0-9][a-z0-9-]{0,62}$/;
 export class Session {
   readonly #root: string;
   readonly #children = new Map<ChildProcess, Promise<Result>>();
+  /**
+   * The process groups of all commands, by leader PID, until they are empty. A group outlives its
+   * leader when a member ignores SIGTERM, so a stop signals groups, not children (#5877).
+   */
+  readonly #groups = new Set<number>();
   #stopped: string | null = null;
   #client: Record<string, string> | null = null;
   #clientDir: string | null = null;
@@ -116,7 +121,8 @@ export class Session {
       throw new Error("own() needs a connected session: ensureImage() first");
     if (!CONTAINER_NAME.test(job.name))
       throw new Refusal(`bad container name ${JSON.stringify(job.name)}`);
-    this.#owned = job;
+    // A frozen copy: a later change to the caller's object cannot change what cleanup removes.
+    this.#owned = Object.freeze({ name: job.name, owner: job.owner, checkout: job.checkout });
   }
 
   /**
@@ -132,9 +138,12 @@ export class Session {
   async #runCleanup(): Promise<CleanupState> {
     this.#stop("cleanup");
     await Promise.all(this.#children.values());
+    // The SIGKILL of #stop() comes after KILL_AFTER_MS, so the groups end by then.
+    const left = await this.#groupsGone(KILL_AFTER_MS + 2_000);
     // own() needs a client, so an owned job always has one.
     const state = this.#owned == null ? "none" : await this.#removeContainer(this.#owned);
     if (this.#clientDir != null) fs.rmSync(this.#clientDir, { recursive: true, force: true });
+    if (left.length > 0) return `unknown: process groups ${left.join(" ")} still run`;
     return state;
   }
 
@@ -156,12 +165,32 @@ export class Session {
 
   #stop(reason: string) {
     this.#stopped ??= reason;
-    // Only the children of this moment: cleanup commands start later and must finish.
-    const victims = [...this.#children.keys()];
-    for (const child of victims) signalGroup(child, "SIGTERM");
+    // Only the groups of this moment: cleanup commands start later and must finish.
+    const victims = [...this.#groups];
+    for (const group of victims) this.#signal(group, "SIGTERM");
     setTimeout(() => {
-      for (const child of victims) if (this.#children.has(child)) signalGroup(child, "SIGKILL");
+      for (const group of victims) this.#signal(group, "SIGKILL");
     }, KILL_AFTER_MS).unref();
+  }
+
+  /**
+   * Signals a tracked group that still has a member. A group ID stays reserved while any member
+   * lives, so a signal right after a live probe cannot reach a new group with a reused ID.
+   */
+  #signal(group: number, signal: NodeJS.Signals) {
+    if (!this.#groups.has(group)) return;
+    if (!groupAlive(group)) this.#groups.delete(group);
+    else killGroup(group, signal);
+  }
+
+  /** Waits until every tracked group is empty, or `ms` ends. Returns the groups left. */
+  async #groupsGone(ms: number): Promise<number[]> {
+    const end = Date.now() + ms;
+    for (;;) {
+      for (const group of this.#groups) if (!groupAlive(group)) this.#groups.delete(group);
+      if (this.#groups.size === 0 || Date.now() >= end) return [...this.#groups];
+      await Bun.sleep(50);
+    }
   }
 
   async #checkoutKey(): Promise<string> {
@@ -246,11 +275,17 @@ export class Session {
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
     child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-    const timer = setTimeout(() => signalGroup(child, "SIGKILL"), timeoutMs);
+    const group = child.pid;
+    if (group != null) this.#groups.add(group);
+    const timer = setTimeout(() => {
+      if (group != null) this.#signal(group, "SIGKILL");
+    }, timeoutMs);
     const result = new Promise<Result>((resolve) => {
       const done = (code: number | null, why: string) => {
         clearTimeout(timer);
         this.#children.delete(child);
+        // An empty group is done. A group with members left stays tracked until cleanup.
+        if (group != null && !groupAlive(group)) this.#groups.delete(group);
         resolve({
           ok: code === 0,
           stdout: stdout.trim(),
@@ -265,12 +300,27 @@ export class Session {
   }
 }
 
-/** Signals the process group that `child` leads (#5877). A group that is gone is no error. */
-function signalGroup(child: ChildProcess, signal: NodeJS.Signals) {
-  if (child.pid == null) return;
+// ESRCH: the group is empty. EPERM: its members belong to another user, so it is not a group
+// that this session started (every command runs as this user). Neither is an error here: these
+// run from timers, where a throw would end the launcher before cleanup.
+const GONE = new Set(["ESRCH", "EPERM"]);
+
+/** Signals a process group. A group that just emptied is no error. */
+function killGroup(group: number, signal: NodeJS.Signals) {
   try {
-    process.kill(-child.pid, signal);
+    process.kill(-group, signal);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    if (!GONE.has((error as NodeJS.ErrnoException).code ?? "")) throw error;
+  }
+}
+
+/** Whether a process group of this user has a member: signal 0 tests it without a signal. */
+function groupAlive(group: number): boolean {
+  try {
+    process.kill(-group, 0);
+    return true;
+  } catch (error) {
+    if (GONE.has((error as NodeJS.ErrnoException).code ?? "")) return false;
+    throw error;
   }
 }
