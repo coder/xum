@@ -1477,9 +1477,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const handleCloseSideChat = React.useCallback(
     (tab: TabType) => {
       const sideChatWorkspaceId = getSideChatTabWorkspaceId(tab);
-      if (sideChatWorkspaceId == null) return;
+      // Without a client the side chat cannot be discarded: keep its tab so closing can be
+      // retried, instead of hiding a side chat that lives on.
+      if (sideChatWorkspaceId == null || api == null) return;
       setLayout((prev) => removeTabEverywhere(prev, tab));
-      api?.workspace
+      api.workspace
         .remove({ workspaceId: sideChatWorkspaceId, options: { force: true } })
         .then((result) => {
           if (!result.success)

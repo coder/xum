@@ -18,6 +18,8 @@ export function useDiscardSideChatOnLeave(
   // The side chat being viewed, if any. Updated whenever metadata arrives, so a side chat whose
   // metadata lands after the switch still counts.
   const viewedSideChatIdRef = useRef<string | null>(null);
+  // Side chats left while disconnected: kept until a client exists to discard them.
+  const pendingDiscardIdsRef = useRef(new Set<string>());
 
   useEffect(() => {
     const previousSideChatId = viewedSideChatIdRef.current;
@@ -26,19 +28,26 @@ export function useDiscardSideChatOnLeave(
       currentId != null && workspaceMetadata.get(currentId)?.sideChatParentWorkspaceId != null;
     viewedSideChatIdRef.current = currentIsSideChat ? currentId : null;
 
-    if (previousSideChatId == null || previousSideChatId === currentId || api == null) {
-      return;
+    const pending = pendingDiscardIdsRef.current;
+    if (previousSideChatId != null && previousSideChatId !== currentId) {
+      pending.add(previousSideChatId);
     }
-    api.workspace
-      .remove({ workspaceId: previousSideChatId, options: { force: true } })
-      .then((result) => {
-        if (!result.success) {
-          console.warn("Failed to discard side chat:", result.error);
-        }
-      })
-      .catch((error: unknown) => {
-        // The backend sweeps leftover side chats at startup.
-        console.warn("Failed to discard side chat:", error);
-      });
+    if (api == null) return;
+    for (const sideChatId of pending) {
+      // Returned to it before the discard could run: it is being viewed again.
+      if (sideChatId === currentId) continue;
+      pending.delete(sideChatId);
+      api.workspace
+        .remove({ workspaceId: sideChatId, options: { force: true } })
+        .then((result) => {
+          if (!result.success) {
+            console.warn("Failed to discard side chat:", result.error);
+          }
+        })
+        .catch((error: unknown) => {
+          // The backend sweeps leftover side chats at startup.
+          console.warn("Failed to discard side chat:", error);
+        });
+    }
   }, [api, currentWorkspaceId, workspaceMetadata]);
 }

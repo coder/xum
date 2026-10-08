@@ -9,7 +9,12 @@ import {
 type ProjectsConfig = ReturnType<Config["loadConfigOrDefault"]>;
 
 function topology(
-  workspaces: Array<{ id: string; parentWorkspaceId?: string; memoryOwnerWorkspaceId?: string }>
+  workspaces: Array<{
+    id: string;
+    parentWorkspaceId?: string;
+    memoryOwnerWorkspaceId?: string;
+    sideChatParentWorkspaceId?: string;
+  }>
 ): ProjectsConfig {
   return {
     projects: new Map([
@@ -31,6 +36,17 @@ describe("resolveWorkspaceMemoryOwnerId", () => {
     expect(resolveWorkspaceMemoryOwnerId(cfg, "ws-grandchild")).toBe("ws-owner");
     expect(resolveWorkspaceMemoryOwnerId(cfg, "ws-solo")).toBe("ws-solo");
     expect(resolveWorkspaceMemoryOwnerId(cfg, "ws-unregistered")).toBe("ws-unregistered");
+  });
+
+  it("gives a /side chat its main chat's notebook, including a sub-agent main chat's root", () => {
+    const cfg = topology([
+      { id: "ws-owner" },
+      { id: "ws-child", parentWorkspaceId: "ws-owner" },
+      { id: "ws-side", sideChatParentWorkspaceId: "ws-owner" },
+      { id: "ws-child-side", sideChatParentWorkspaceId: "ws-child" },
+    ]);
+    expect(resolveWorkspaceMemoryOwnerId(cfg, "ws-side")).toBe("ws-owner");
+    expect(resolveWorkspaceMemoryOwnerId(cfg, "ws-child-side")).toBe("ws-owner");
   });
 
   it("falls back to the acting workspace on a dangling parent, a cycle, or an over-deep chain", () => {
