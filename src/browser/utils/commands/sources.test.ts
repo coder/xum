@@ -68,6 +68,8 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
     onToggleReasoningMode: () => undefined,
     getFastMode: () => false,
     onToggleFastMode: () => undefined,
+    getUltrafastMode: () => false,
+    onToggleUltrafastMode: () => undefined,
     getEffectiveComposerModel: () => "anthropic:claude-sonnet-4-5",
     onStartWorkspaceCreation: () => undefined,
     onStartScratchCreation: () => undefined,

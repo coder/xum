@@ -9,9 +9,12 @@ import {
   getFastModeServiceTierChange,
   getFastModeUnavailableReason,
   isFastModeActive,
+  ultrafastModeAvailable,
 } from "./fastModeServiceTier";
 
 type ProviderConfigWriter = Pick<APIClient["providers"], "setProviderConfig">;
+
+const OPENAI_CONFIG = { apiKeySet: true, isEnabled: true, isConfigured: true };
 
 function createWriter() {
   const setProviderConfig = mock((_input: unknown) =>
@@ -256,6 +259,99 @@ describe("fast mode service tier", () => {
   test("uses provider-valid fallbacks for legacy priority config without a restore tier", () => {
     expect(getFastModeServiceTierChange("openai", "priority").serviceTier).toBe("auto");
     expect(getFastModeServiceTierChange("xai", "priority").serviceTier).toBe("default");
+  });
+
+  test("offers Ultrafast only where the request path would send it", () => {
+    const openai = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    const config = (extra: object = {}): ProvidersConfigMap => ({
+      openai: { ...openai, ...extra },
+    });
+    expect(ultrafastModeAvailable("openai:gpt-6.1-sol", { providersConfig: config() })).toBe(true);
+    expect(ultrafastModeAvailable("openai:gpt-6-astra", { providersConfig: config() })).toBe(true);
+    // Fast-capable but not Ultrafast-capable model.
+    expect(ultrafastModeAvailable("openai:gpt-6-luna", { providersConfig: config() })).toBe(false);
+    // Chat Completions rejects the tier.
+    expect(
+      ultrafastModeAvailable("openai:gpt-6.1-sol", {
+        providersConfig: config({ wireFormat: "chatCompletions" }),
+      })
+    ).toBe(false);
+    // Non-OpenAI Fast modes have no Ultrafast tier.
+    expect(ultrafastModeAvailable("xai:grok-4.7", { providersConfig: null })).toBe(false);
+  });
+
+  test.each([
+    // [current, stored restore target, toggled tier] -> [new tier, new restore target]
+    [
+      "enables Ultrafast and remembers the base tier",
+      "flex",
+      undefined,
+      "ultrafast",
+      "ultrafast",
+      "flex",
+    ],
+    [
+      "turns Ultrafast off back to the base tier",
+      "ultrafast",
+      "flex",
+      "ultrafast",
+      "flex",
+      undefined,
+    ],
+    [
+      "switches Fast to Ultrafast keeping the base tier",
+      "priority",
+      "flex",
+      "ultrafast",
+      "ultrafast",
+      "flex",
+    ],
+    [
+      "switches Ultrafast to Fast keeping the base tier",
+      "ultrafast",
+      "unset",
+      "priority",
+      "priority",
+      "unset",
+    ],
+    // Ultrafast chosen in Settings is itself the base tier Fast mode returns to.
+    [
+      "keeps a Settings Ultrafast as Fast mode's restore target",
+      "ultrafast",
+      undefined,
+      "priority",
+      "priority",
+      "ultrafast",
+    ],
+    [
+      "returns to a Settings Ultrafast from Fast",
+      "priority",
+      "ultrafast",
+      "ultrafast",
+      "ultrafast",
+      undefined,
+    ],
+  ] as const)("%s", (_name, current, previous, target, serviceTier, previousServiceTier) => {
+    const change = getFastModeServiceTierChange("openai", current, previous, target);
+    expect(change.serviceTier).toBe(serviceTier);
+    expect(change.previousServiceTier).toBe(previousServiceTier);
+  });
+
+  test("persists Ultrafast's restore target before raising the tier", async () => {
+    const { providers, setProviderConfig } = createWriter();
+
+    const patch = await applyFastModeToggle(
+      providers,
+      "openai",
+      { ...OPENAI_CONFIG, serviceTier: "auto" },
+      "ultrafast"
+    );
+
+    expect(patch).toEqual({ serviceTier: "ultrafast", fastModePreviousServiceTier: "auto" });
+    expect(setProviderConfig.mock.calls.map(([input]) => input)).toEqual([
+      { provider: "openai", keyPath: ["fastModePreviousServiceTier"], value: "auto" },
+      { provider: "openai", keyPath: ["serviceTier"], value: "ultrafast" },
+    ]);
   });
 
   test("writes xAI fast mode to the xAI provider config", async () => {

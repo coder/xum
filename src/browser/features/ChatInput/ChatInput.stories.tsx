@@ -478,7 +478,7 @@ export const ThinkingSelectorOpen: AppStory = {
       if (!within(menu).getByRole("button", { name: /Pro mode/i })) {
         throw new Error("Pro mode row missing");
       }
-      if (!within(menu).getByRole("button", { name: /Fast mode/i })) {
+      if (!within(menu).getByRole("button", { name: /^Fast mode/i })) {
         throw new Error("Fast mode row missing");
       }
       if (!within(menu).getByRole("button", { name: /Cyber/ })) {
@@ -540,6 +540,86 @@ export const ThinkingSelectorCyberOpen: AppStory = {
       "true"
     );
     await expect(within(menu).getByRole("button", { name: /Pro mode/i })).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
+  },
+};
+
+/**
+ * Ultrafast's closed-state indicator is Fast's bolt plus speed trails, so it is wider than the
+ * Fast bolt. The fixed-width wrapper pins the tightest composer row (the test-runner ignores
+ * viewport globals) to prove the wider indicator stays visible without overflowing the row.
+ */
+export const ThinkingSelectorUltrafast: AppStory = {
+  tags: ["thinking-selector"],
+  render: () => (
+    <div data-testid="composer-width-wrapper" style={{ width: 400, height: 700 }}>
+      <AppWithMocks
+        setup={() => {
+          collapseLeftSidebar();
+          updatePersistedState(getModelKey("ws-thinking-selector-ultrafast"), "openai:gpt-6.1-sol");
+          return setupSimpleChatStory({
+            workspaceId: "ws-thinking-selector-ultrafast",
+            providersConfig: {
+              openai: {
+                apiKeySet: true,
+                isEnabled: true,
+                isConfigured: true,
+                serviceTier: "ultrafast",
+                fastModePreviousServiceTier: "unset",
+              },
+            },
+            messages: [],
+          });
+        }}
+      />
+    </div>
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
+    },
+    docs: {
+      description: {
+        story:
+          "Ultrafast mode active on GPT-6.1 Sol: the closed selector shows the bolt-with-trails indicator and the open menu marks Ultrafast, not Fast.",
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitForChatInputAutofocusDone(storyRoot);
+    blurActiveElement();
+
+    const trigger = within(storyRoot).getByRole("button", { name: /Thinking:/i });
+    await expect(trigger).toHaveAccessibleName(/ultrafast mode/);
+    const indicator = storyRoot.querySelector<HTMLElement>("[data-ultrafast-mode-indicator]");
+    if (!indicator || indicator.getBoundingClientRect().width === 0) {
+      throw new Error("Ultrafast indicator should be visible on the tightest composer row");
+    }
+    if (storyRoot.querySelector("[data-fast-mode-indicator]")) {
+      throw new Error("Fast indicator must not render while Ultrafast is the active tier");
+    }
+    assertComposerPillGeometry(storyRoot);
+    const row = storyRoot.querySelector<HTMLElement>('[data-component="ComposerControlRow"]');
+    if (!row) throw new Error("Composer control row not rendered");
+    if (row.scrollWidth > row.clientWidth) {
+      throw new Error(`Row overflows by ${row.scrollWidth - row.clientWidth}px with Ultrafast`);
+    }
+
+    await userEvent.click(trigger);
+    const menu = await waitFor(() => {
+      const match = storyRoot.querySelector<HTMLElement>('[data-component="ThinkingSelectorMenu"]');
+      if (!match) throw new Error("Thinking selector menu did not open");
+      return match;
+    });
+    await expect(within(menu).getByRole("button", { name: /^Ultrafast mode/i })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    await expect(within(menu).getByRole("button", { name: /^Fast mode/i })).toHaveAttribute(
       "aria-pressed",
       "false"
     );

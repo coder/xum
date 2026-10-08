@@ -4618,7 +4618,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "### OpenAI Ultrafast",
       "",
-      "To use OpenAI's fastest processing tier, choose **ultrafast** as the service tier in **Settings → Providers → OpenAI**. Xum sends it only to models that OpenAI serves Ultrafast for: GPT-6.1 Sol and GPT-6 Astra, on the default Responses API route (Chat Completions does not accept it). Other models and routes run without a service tier instead of falling back to Fast. Ultrafast costs 6× the Standard price, and Xum's cost tracking uses that rate.",
+      "To use OpenAI's fastest processing tier, turn on the thinking selector's **Ultrafast mode** row (it sits next to **Fast mode**), run **Toggle Ultrafast Mode** from the command palette, or use its keyboard shortcut. You can also choose **ultrafast** as the service tier in **Settings → Providers → OpenAI**. Fast and Ultrafast are mutually exclusive, and turning either off restores the tier you had before. Xum sends it only to models that OpenAI serves Ultrafast for: GPT-6.1 Sol and GPT-6 Astra, on the default Responses API route (Chat Completions does not accept it). Other models and routes run without a service tier instead of falling back to Fast. Ultrafast costs 6× the Standard price, and Xum's cost tracking uses that rate.",
       "",
       "### Pro reasoning mode (GPT-6)",
       "",
