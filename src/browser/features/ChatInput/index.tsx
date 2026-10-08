@@ -1340,6 +1340,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (session) session.sendInFlight = inFlight;
   };
   // After every commit: the edit's end arrives as a prop change, and settled sessions no-op.
+  // PERF: this runs on every ChatInputInner commit, stream updates included. Keep it O(1) with
+  // no I/O: releaseEndedEdit reads only refs and returns before any store read when no edit
+  // session exists (or it is settled, in flight, or still open).
   useEffect(() => {
     releaseEndedEditRef.current = releaseEndedEdit;
     releaseEndedEdit();
