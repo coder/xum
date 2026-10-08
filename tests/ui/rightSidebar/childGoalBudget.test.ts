@@ -22,13 +22,10 @@ import {
 } from "../../ipc/helpers";
 
 import { detectDefaultTrunkBranch } from "@/node/git";
-import {
-  RIGHT_SIDEBAR_TAB_KEY,
-  getModelKey,
-  getRightSidebarLayoutKey,
-} from "@/common/constants/storage";
+import { RIGHT_SIDEBAR_TAB_KEY, getRightSidebarLayoutKey } from "@/common/constants/storage";
 import { UNPRICED_CURRENT_MODEL_GOAL_MESSAGE } from "@/common/utils/goals/budgetPricing";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 
 import { installDom } from "../dom";
@@ -100,7 +97,7 @@ describe("RightSidebar child goal budget (UI)", () => {
         cleanupDom = installDom();
         updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "goal");
         updatePersistedState(getRightSidebarLayoutKey(target.id), null);
-        updatePersistedState(getModelKey(target.id), UNPRICED_COMPOSER_MODEL);
+        markAiSelectionIntent(target.id, "model", UNPRICED_COMPOSER_MODEL);
         view = renderApp({ apiClient: env.orpc, metadata: target });
         await setupWorkspaceView(view, target, target.id);
         const rendered = view;

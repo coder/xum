@@ -8,7 +8,6 @@ import type { ProjectConfig } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { GlobalWindow } from "happy-dom";
-import { getModelKey } from "@/common/constants/storage";
 import {
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
@@ -1165,7 +1164,6 @@ test("goal set objective prompt blocks budgeted goals on unpriced selected model
   const originalDocument = globalThis.document;
   globalThis.window = testWindow as unknown as Window & typeof globalThis;
   globalThis.document = testWindow.document as unknown as Document;
-  window.localStorage.setItem(getModelKey("w1"), JSON.stringify("custom:unpriced-model"));
   markAiSelectionIntent("w1", "model", "custom:unpriced-model");
 
   try {

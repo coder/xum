@@ -70,7 +70,6 @@ describe("modelChange", () => {
     const model = "openai:gpt-5.2-codex";
     const otherModel = "anthropic:claude-sonnet-4-5";
 
-    setWorkspaceModelWithOrigin(workspaceId, model, "sync");
     markAiSelectionIntent(workspaceId, "model", model);
 
     // Simulate user selecting the already-active model.

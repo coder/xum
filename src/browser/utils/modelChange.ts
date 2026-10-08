@@ -11,6 +11,8 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import type { AutoRoutingChoiceByAgent, AutoRoutingOutcome } from "@/browser/utils/workspaceModeAi";
 import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 
@@ -30,15 +32,20 @@ const pendingExplicitChanges = new Map<string, ExplicitModelChange>();
 // aliases (mux-gateway:openai/x) still collapse so persisted rewrites keep matching.
 const normalizeExplicitModel = (model: string): string => modelSelectionEqualityKey(model);
 
+/** Workspace ids never start with "__"; project, global and draft scopes do. */
+const isWorkspaceScope = (scopeId: string): boolean => !scopeId.startsWith("__");
+
 export function recordWorkspaceModelChange(
   workspaceId: string,
   model: string,
-  origin: ModelChangeOrigin
+  origin: ModelChangeOrigin,
+  current = isWorkspaceScope(workspaceId)
+    ? getWorkspaceAiSelection(workspaceId).model
+    : readScopedAiDefault(workspaceId, "model")
 ): void {
   if (origin === "sync") return;
 
   const normalized = normalizeExplicitModel(model);
-  const current = readScopedAiDefault(workspaceId, "model");
   const normalizedCurrent = current ? normalizeExplicitModel(current) : null;
 
   // Avoid leaving stale explicit-change entries when the effective model doesn't change
@@ -87,7 +94,12 @@ export function setWorkspaceModelWithOrigin(
   origin: ModelChangeOrigin
 ): void {
   recordWorkspaceModelChange(workspaceId, model, origin);
-  writeScopedAiDefault(workspaceId, "model", model);
+  // A workspace pick stays in memory until a send persists it into workspace metadata.
+  if (!isWorkspaceScope(workspaceId)) {
+    writeScopedAiDefault(workspaceId, "model", model);
+  } else if (origin === "user") {
+    markAiSelectionIntent(workspaceId, "model", model);
+  }
   if (origin === "user") {
     setAutoRoutingChoice(workspaceId, "model", false);
   } else if (origin === "agent") {

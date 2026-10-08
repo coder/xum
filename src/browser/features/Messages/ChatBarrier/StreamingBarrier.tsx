@@ -2,8 +2,7 @@ import React from "react";
 import { StreamingBarrierView } from "./StreamingBarrierView";
 import { getModelName } from "@/common/utils/ai/models";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
-import { getModelKey } from "@/common/constants/storage";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   useWorkspaceState,
@@ -11,7 +10,6 @@ import {
   useWorkspaceStoreRaw,
   useWorkspaceStreamingStats,
 } from "@/browser/stores/WorkspaceStore";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useAPI } from "@/browser/contexts/API";
 import { stopStream } from "@/browser/utils/stopStream";
@@ -285,13 +283,11 @@ export const StreamingBarrierContent: React.FC<StreamingBarrierContentProps> = (
   const tps = showTokenCount ? streamingStats?.tps : undefined;
 
   // Model to display:
-  // - "starting" phase: prefer pendingStreamModel (from muxMetadata), then localStorage
+  // - "starting" phase: prefer pendingStreamModel (from muxMetadata), then the composer model
   // - Otherwise: use currentModel from active stream
   const model =
     phase === "starting"
-      ? (pendingStreamModel ??
-        readPersistedState<string | null>(getModelKey(workspaceId), null) ??
-        getDefaultModel())
+      ? (pendingStreamModel ?? getWorkspaceAiSelection(workspaceId).model)
       : currentModel;
   const modelName = model ? getModelName(model) : null;
 

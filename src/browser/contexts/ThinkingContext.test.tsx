@@ -15,7 +15,6 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import {
   getAutoThinkingLevelKey,
-  getModelKey,
   getProjectScopeId,
   getReasoningModeKey,
   getThinkingLevelByModelKey,
@@ -174,11 +173,7 @@ function applyWorkspaceStorageOverrides(props: {
   modelOverride?: string | null;
   thinkingOverride?: "off" | null;
 }) {
-  if (props.modelOverride === null) {
-    window.localStorage.removeItem(getModelKey(props.workspaceId));
-  }
   if (props.modelOverride != null) {
-    updatePersistedState(getModelKey(props.workspaceId), props.modelOverride);
     markAiSelectionIntent(props.workspaceId, "model", props.modelOverride);
   }
 
@@ -569,7 +564,6 @@ describe("ThinkingContext", () => {
   test("switching models does not remount children", async () => {
     const workspaceId = "ws-1";
 
-    updatePersistedState(getModelKey(workspaceId), "openai:gpt-5.2");
     markAiSelectionIntent(workspaceId, "model", "openai:gpt-5.2");
     updatePersistedState(getThinkingLevelKey(workspaceId), "high");
 
@@ -597,7 +591,6 @@ describe("ThinkingContext", () => {
     });
 
     act(() => {
-      updatePersistedState(getModelKey(workspaceId), "anthropic:claude-3.5");
       markAiSelectionIntent(workspaceId, "model", "anthropic:claude-3.5");
     });
 
@@ -611,7 +604,6 @@ describe("ThinkingContext", () => {
   test("migrates legacy per-model thinking to the workspace-scoped key", async () => {
     const workspaceId = "ws-1";
 
-    updatePersistedState(getModelKey(workspaceId), "openai:gpt-5.2");
     markAiSelectionIntent(workspaceId, "model", "openai:gpt-5.2");
     updatePersistedState(getThinkingLevelByModelKey("openai:gpt-5.2"), "low");
 
@@ -632,7 +624,6 @@ describe("ThinkingContext", () => {
 
     // Switching models should not change the workspace-scoped value.
     act(() => {
-      updatePersistedState(getModelKey(workspaceId), "anthropic:claude-3.5");
       markAiSelectionIntent(workspaceId, "model", "anthropic:claude-3.5");
     });
 

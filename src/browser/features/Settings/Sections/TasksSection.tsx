@@ -17,10 +17,9 @@ import {
 import { copyToClipboard } from "@/browser/utils/clipboard";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { getDefaultModel, useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { resolveAdvisorEnabledForAgent } from "@/common/constants/advisor";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { getModelKey } from "@/common/constants/storage";
+import { useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   getAppConfigStore,
   updateUserPreferences,
@@ -449,15 +448,8 @@ export function TasksSection() {
   // "Inherit", we show thinking levels for the workspace model (falling back to
   // the global default). This mirrors the workspace model resolution chain used when sending messages.
   const selectedWorkspaceId = selectedWorkspace?.workspaceId ?? null;
-  const defaultModel = getDefaultModel();
-  const workspaceModelStorageKey = selectedWorkspaceId
-    ? getModelKey(selectedWorkspaceId)
-    : "__tasks_workspace_model_fallback__";
-  const [workspaceModelRaw] = usePersistedState<unknown>(workspaceModelStorageKey, defaultModel, {
-    listener: true,
-  });
-  const inheritedEffectiveModel =
-    (typeof workspaceModelRaw === "string" ? workspaceModelRaw.trim() : "") || defaultModel;
+  const workspaceModel = useWorkspaceAiSelection(selectedWorkspaceId ?? "").model;
+  const inheritedEffectiveModel = selectedWorkspaceId ? workspaceModel : getDefaultModel();
 
   const lastSyncedTaskSettingsRef = useRef<TaskSettings | null>(null);
   const lastSyncedAgentAiDefaultsRef = useRef<AgentAiDefaults | null>(null);

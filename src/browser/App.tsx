@@ -84,7 +84,6 @@ import {
   LEFT_SIDEBAR_WIDTH_KEY,
 } from "@/common/constants/storage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { UpdateChannel } from "@/common/types/project";
 import { useTelemetry } from "./hooks/useTelemetry";
@@ -92,7 +91,7 @@ import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useStartWorkspaceCreation } from "./hooks/useStartWorkspaceCreation";
 import { useAPI } from "@/browser/contexts/API";
 import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
-import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
 import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
@@ -125,7 +124,6 @@ import { RosettaBanner } from "./components/RosettaBanner/RosettaBanner";
 
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { getAutoRoutingKey, setAutoRoutingChoice } from "@/browser/utils/modelChange";
-import { readScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -498,24 +496,22 @@ function AppInner() {
   } = useCommandRegistry();
 
   /**
-   * Get the selected model for a workspace, preserving explicit gateway prefixes.
+   * The workspace's effective AI selection, preserving explicit gateway prefixes. A sub-agent
+   * resolves for its own agent.
    */
-  const getModelForWorkspace = useCallback(
-    (workspaceId: string): string => {
-      const defaultModel = getDefaultModel();
-      const preferredModel = readScopedAiDefault(workspaceId, "model") ?? null;
+  const getAiSelectionForWorkspace = useCallback(
+    (workspaceId: string) => {
       const metadata = workspaceMetadata.get(workspaceId);
-      const persistedAgentId =
-        (readScopedAiDefault(workspaceId, "agentId") ?? WORKSPACE_DEFAULTS.agentId)
-          .trim()
-          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
-      const agentId =
-        metadata?.parentWorkspaceId != null && metadata.agentId
-          ? metadata.agentId
-          : persistedAgentId;
-      return resolveEffectiveComposerModel(preferredModel, metadata, agentId, defaultModel);
+      return getWorkspaceAiSelection(
+        workspaceId,
+        metadata?.parentWorkspaceId != null && metadata.agentId ? metadata.agentId : undefined
+      );
     },
     [workspaceMetadata]
+  );
+  const getModelForWorkspace = useCallback(
+    (workspaceId: string): string => getAiSelectionForWorkspace(workspaceId).model,
+    [getAiSelectionForWorkspace]
   );
 
   const getThinkingLevelForWorkspace = useCallback(

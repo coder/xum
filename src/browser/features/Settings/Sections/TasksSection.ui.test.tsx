@@ -20,8 +20,6 @@ import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { getModelKey } from "@/common/constants/storage";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
@@ -174,7 +172,6 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
     options.agents || options.workspaceModel ? { projectPath: "/proj", workspaceId: "ws-1" } : null;
   resetAiSelectionIntentForTests();
   if (options.workspaceModel) {
-    updatePersistedState(getModelKey("ws-1"), options.workspaceModel);
     markAiSelectionIntent("ws-1", "model", options.workspaceModel);
   }
 

@@ -6,7 +6,6 @@ import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
-  getModelKey,
   getProjectScopeId,
   getThinkingLevelByModelKey,
   getThinkingLevelKey,
@@ -79,7 +78,6 @@ describe("getSendOptionsFromStorage", () => {
     const workspaceId = "ws-1";
     const rawModel = "mux-gateway:anthropic/claude-haiku-4-5";
 
-    window.localStorage.setItem(getModelKey(workspaceId), JSON.stringify(rawModel));
     setWorkspaceAiMetadata(workspaceId, {
       aiSettingsByAgent: { exec: { model: rawModel, thinkingLevel: "off" } },
     });

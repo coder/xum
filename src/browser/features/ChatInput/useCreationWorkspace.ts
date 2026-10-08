@@ -18,7 +18,6 @@ import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSett
 import {
   getAutoRoutingKey,
   recordAutoRoutingChoiceForAgent,
-  setWorkspaceModelWithOrigin,
   type AutoRoutingDimension,
 } from "@/browser/utils/modelChange";
 import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
@@ -144,12 +143,6 @@ function syncCreationPreferences(
   const aiPreferences = getUserPreferences().ai;
   const projectDefaults = aiPreferences?.projectDefaults?.[projectPath];
 
-  // Sync model from project scope to workspace scope
-  // This ensures the model used for creation is persisted for future resumes
-  const projectModel = projectDefaults?.model;
-  if (projectModel) {
-    setWorkspaceModelWithOrigin(workspaceId, projectModel, "sync");
-  }
   const projectAgentId = projectDefaults?.agentId;
   const globalDefaultAgentId = aiPreferences?.globalDefaults?.agentId ?? WORKSPACE_DEFAULTS.agentId;
   const effectiveAgentId = resolveCreationAgentId(
@@ -201,6 +194,7 @@ function syncCreationPreferences(
     updatePersistedState(getReasoningModeKey(workspaceId), projectReasoningMode);
   }
 
+  const projectModel = projectDefaults?.model;
   if (projectModel) {
     const effectiveThinking: ThinkingLevel = projectThinkingLevel ?? "off";
 

@@ -7,11 +7,7 @@ import {
   getDisableWorkspaceAgentsKey,
 } from "@/common/constants/storage";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
-import {
-  buildSendMessageOptions,
-  normalizeModelPreference,
-} from "@/browser/utils/messages/buildSendMessageOptions";
+import { buildSendMessageOptions } from "@/browser/utils/messages/buildSendMessageOptions";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import {
   coerceOpenAIReasoningMode,
@@ -22,6 +18,7 @@ import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getServerScope, readScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { migrateGlobalToPerModel } from "@/browser/contexts/ProviderOptionsContext";
 
@@ -38,9 +35,8 @@ function getProviderOptions(): MuxProviderOptions {
  * Used by compaction, resume, idle-compaction, and plan execution outside React context.
  */
 export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptions {
-  const defaultModel = getDefaultModel();
-  const rawModel = readScopedAiDefault(workspaceId, "model") ?? defaultModel;
-  const baseModel = normalizeModelPreference(rawModel, defaultModel);
+  const agentId = readScopedAiDefault(workspaceId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
+  const baseModel = getWorkspaceAiSelection(workspaceId, agentId).model;
 
   // Read thinking level (workspace-scoped).
   // Migration: if the workspace-scoped value is missing, fall back to legacy per-model storage
@@ -62,8 +58,6 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
     // Best-effort: avoid losing a user's existing per-model preference.
     updatePersistedState<ThinkingLevel>(scopedKey, thinkingLevel);
   }
-
-  const agentId = readScopedAiDefault(workspaceId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
 
   // OpenAI pro reasoning mode (workspace-scoped); absent = standard.
   // Coerce untrusted persisted values so corrupt entries self-heal to "standard"

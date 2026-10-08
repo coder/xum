@@ -12,6 +12,11 @@ import {
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import {
+  getPendingAiSelection,
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+} from "@/browser/utils/aiSelectionIntent";
 import { repairLocalModelPreferencesForRemovedProvider } from "./modelPreferenceRepair";
 
 const REMOVED_PROVIDER = "removed-provider";
@@ -57,6 +62,7 @@ describe("repairLocalModelPreferencesForRemovedProvider", () => {
       updatePersistedState<undefined>(key, undefined);
     }
     touchedKeys.clear();
+    resetAiSelectionIntentForTests();
     cleanupDom?.();
     cleanupDom = null;
   });
@@ -79,6 +85,17 @@ describe("repairLocalModelPreferencesForRemovedProvider", () => {
 
     expect(readString(affectedKey)).toBe(WORKSPACE_DEFAULTS.model);
     expect(readString(unaffectedKey)).toBe(unaffectedModel);
+  });
+
+  test("drops unsent model picks only when they belong to the removed provider", () => {
+    const unaffectedModel = `${OTHER_PROVIDER}:workspace-model`;
+    markAiSelectionIntent("affected", "model", `${REMOVED_PROVIDER}:workspace-model`);
+    markAiSelectionIntent("unaffected", "model", unaffectedModel);
+
+    repairLocalModelPreferencesForRemovedProvider(REMOVED_PROVIDER, []);
+
+    expect(getPendingAiSelection("affected", "exec", "model")).toBeUndefined();
+    expect(getPendingAiSelection("unaffected", "exec", "model")).toBe(unaffectedModel);
   });
 
   test("clears last custom model provider only when it matches the removed provider", () => {

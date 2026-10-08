@@ -200,36 +200,29 @@ describe("WorkspaceModeAISync", () => {
   test("restores workspace-by-agent override on explicit agent switch when defaults inherit", async () => {
     const workspaceId = nextWorkspaceId();
 
-    const planModel = "anthropic:claude-sonnet-4-5";
     const planThinking = "high";
-    const execWorkspaceModel = "openai:gpt-5.2-pro";
     const execWorkspaceThinking = "medium";
 
     setTestAgentAiDefaults({});
     updatePersistedState(getWorkspaceAISettingsByAgentKey(workspaceId), {
-      exec: { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking },
+      exec: { model: "openai:gpt-5.2-pro", thinkingLevel: execWorkspaceThinking },
     });
 
-    updatePersistedState(getModelKey(workspaceId), planModel);
     updatePersistedState(getThinkingLevelKey(workspaceId), planThinking);
 
     const { rerender } = renderSync({ workspaceId, agentId: "plan" });
 
     await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(planModel);
       expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe(planThinking);
     });
 
     rerender(<SyncHarness workspaceId={workspaceId} agentId="exec" />);
 
     await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(execWorkspaceModel);
       expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe(
         execWorkspaceThinking
       );
     });
-
-    expect(consumeWorkspaceModelChange(workspaceId, execWorkspaceModel)).toBe("agent");
   });
 
   test("ignores same-agent workspace overrides when agent defaults are missing", async () => {
@@ -307,7 +300,6 @@ describe("WorkspaceModeAISync", () => {
       exec: { thinkingLevel: baseConfiguredThinking },
     });
 
-    updatePersistedState(getModelKey(workspaceId), "some-legacy-model");
     updatePersistedState(getThinkingLevelKey(workspaceId), "high");
 
     // Unknown non-plan agent IDs still use exec as fallback agent; this verifies
@@ -315,7 +307,6 @@ describe("WorkspaceModeAISync", () => {
     renderSync({ workspaceId, agentId: "custom" });
 
     await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(customConfiguredModel);
       expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe("high");
     });
   });
@@ -354,7 +345,6 @@ describe("WorkspaceModeAISync", () => {
       await waitFor(() => {
         expect(readAuto(workspaceId)).toEqual({ model: true, thinkingLevel: true });
       });
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe("openai:gpt-5.2");
 
       switchTo(rerender, workspaceId, "plan");
       await waitFor(() => {

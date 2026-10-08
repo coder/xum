@@ -766,10 +766,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     ensureModelInSettings(selectedModel); // Ensure model exists in Settings
     // A concrete pick (selector, /model, or the cycle shortcut) always leaves Auto.
     setAutoModelRoutingActive(false);
-    // Deliberate pick: pins the model on a sub-agent once a message sends it.
-    if (variant === "workspace" && workspaceId) {
-      markAiSelectionIntent(workspaceId, "model", selectedModel);
-    }
 
     if (onModelChange) {
       // Notify parent of model change (for context switch warning + persisted model metadata).
@@ -786,6 +782,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (variant !== "workspace" || !workspaceId) {
       return;
     }
+    // Marked after onModelChange so its explicit-switch record still sees the previous model;
+    // this also pins a same-model pick on a sub-agent once a message sends it.
+    markAiSelectionIntent(workspaceId, "model", selectedModel);
 
     const normalizedAgentId = normalizeAgentId(agentId, "exec");
 

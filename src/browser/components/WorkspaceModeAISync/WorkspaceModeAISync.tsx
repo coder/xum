@@ -4,7 +4,6 @@ import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePer
 import { useAgentAiDefaults } from "@/browser/stores/AppConfigStore";
 import {
   getAutoRoutingChoiceByAgentKey,
-  getModelKey,
   getReasoningModeKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
@@ -12,7 +11,7 @@ import {
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import {
   applyAutoRoutingOutcome,
-  setWorkspaceModelWithOrigin,
+  recordWorkspaceModelChange,
   setWorkspaceThinkingLevelWithOrigin,
 } from "@/browser/utils/modelChange";
 import {
@@ -21,6 +20,7 @@ import {
   type AutoRoutingChoiceByAgent,
   type WorkspaceAISettingsCache,
 } from "@/browser/utils/workspaceModeAi";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
@@ -41,15 +41,15 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
 
   useEffect(() => {
     const fallbackModel = getDefaultModel();
-    const modelKey = getModelKey(workspaceId);
     const thinkingKey = getThinkingLevelKey(workspaceId);
 
     const normalizedAgentId = normalizeAgentId(agentId, "exec");
+    const previousAgentId = prevAgentIdRef.current;
 
     const isExplicitAgentSwitch =
-      prevAgentIdRef.current !== null &&
+      previousAgentId !== null &&
       prevWorkspaceIdRef.current === workspaceId &&
-      prevAgentIdRef.current !== normalizedAgentId;
+      previousAgentId !== normalizedAgentId;
 
     // Update refs for the next run (even if no model changes).
     prevAgentIdRef.current = normalizedAgentId;
@@ -63,27 +63,41 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
       {}
     );
 
-    const existingModel = readPersistedState<string>(modelKey, fallbackModel);
     const existingThinking = readPersistedState<ThinkingLevel>(thinkingKey, "off");
     const reasoningKey = getReasoningModeKey(workspaceId);
     const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
 
     const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
-    const { resolvedModel, resolvedThinking, resolvedReasoningMode } =
-      resolveWorkspaceAiSettingsForAgent({
-        agentId: normalizedAgentId,
-        agentAiDefaults,
-        // Keep deterministic handoff behavior: background sync should trust the
-        // currently active workspace model, but explicit mode switches should
-        // restore the selected agent's per-workspace override (if any).
-        workspaceByAgent,
-        useWorkspaceByAgentFallback: isExplicitAgentSwitch,
-        fallbackModel,
-        existingModel,
-        existingThinking,
-        existingReasoningMode: existingReasoning,
-        agentBaseById,
-      });
+    const resolvedModel = getWorkspaceAiSelection(
+      workspaceId,
+      normalizedAgentId,
+      agentBaseById
+    ).model;
+    if (isExplicitAgentSwitch) {
+      // Each agent resolves its own model, so the switch itself is the explicit model change.
+      recordWorkspaceModelChange(
+        workspaceId,
+        resolvedModel,
+        "agent",
+        getWorkspaceAiSelection(workspaceId, previousAgentId, agentBaseById).model
+      );
+    }
+
+    // The resolver owns the model; only thinking and reasoning come from here.
+    const { resolvedThinking, resolvedReasoningMode } = resolveWorkspaceAiSettingsForAgent({
+      agentId: normalizedAgentId,
+      agentAiDefaults,
+      // Keep deterministic handoff behavior: background sync should trust the
+      // currently active workspace settings, but explicit mode switches should
+      // restore the selected agent's per-workspace override (if any).
+      workspaceByAgent,
+      useWorkspaceByAgentFallback: isExplicitAgentSwitch,
+      fallbackModel,
+      existingModel: resolvedModel,
+      existingThinking,
+      existingReasoningMode: existingReasoning,
+      agentBaseById,
+    });
     const autoRoutingOutcome = resolveAutoRoutingForAgent({
       agentId: normalizedAgentId,
       agentAiDefaults,
@@ -96,14 +110,6 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
       ),
       workspaceByAgent,
     });
-
-    if (existingModel !== resolvedModel) {
-      setWorkspaceModelWithOrigin(
-        workspaceId,
-        resolvedModel,
-        isExplicitAgentSwitch ? "agent" : "sync"
-      );
-    }
 
     if (existingThinking !== resolvedThinking) {
       setWorkspaceThinkingLevelWithOrigin(

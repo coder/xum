@@ -1,20 +1,13 @@
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { useReasoningMode } from "./useReasoningMode";
 import { useThinkingLevel } from "./useThinkingLevel";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { usePersistedState } from "./usePersistedState";
-import {
-  buildSendMessageOptions,
-  normalizeModelPreference,
-} from "@/browser/utils/messages/buildSendMessageOptions";
-import { useScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import { buildSendMessageOptions } from "@/browser/utils/messages/buildSendMessageOptions";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { useProviderOptions } from "./useProviderOptions";
 import { useExperimentValue } from "./useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
-import { useAppConfig } from "@/browser/stores/AppConfigStore";
-import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
+import { useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   getAutoRoutingKey,
   setAutoRoutingChoice,
@@ -55,26 +48,17 @@ export function useAutoRoutingSelection(
 export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWithBase {
   const [thinkingLevel] = useThinkingLevel();
   const [reasoningMode] = useReasoningMode();
-  const { agentId, disableWorkspaceAgents } = useAgent();
-  const { workspaceMetadata } = useWorkspaceContext();
+  const { agentId, agents, disableWorkspaceAgents } = useAgent();
   const { options: providerOptions } = useProviderOptions();
 
-  const defaultModelPref = useAppConfig((config) => config.defaultModel);
-  const defaultModel = normalizeModelPreference(defaultModelPref, WORKSPACE_DEFAULTS.model);
-
-  // Workspace-scoped model preference. If unset, fall back to metadata, then global default.
-  const preferredModel = useScopedAiDefault(workspaceId, "model") ?? null;
+  const baseModel = useWorkspaceAiSelection(
+    workspaceId,
+    agentId,
+    new Map(agents.map((agent) => [agent.id, agent.base]))
+  ).model;
 
   const [autoModelRouting] = useAutoRoutingSelection(workspaceId, "model");
   const [autoThinkingLevel] = useAutoRoutingSelection(workspaceId, "thinkingLevel");
-
-  // Prefer metadata over the global default until workspace localStorage seeding catches up.
-  const baseModel = resolveEffectiveComposerModel(
-    preferredModel,
-    workspaceMetadata.get(workspaceId),
-    agentId,
-    defaultModel
-  );
 
   const options = buildSendMessageOptions({
     agentId,

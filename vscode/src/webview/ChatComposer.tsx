@@ -13,6 +13,7 @@ import { useThinkingLevel } from "xum/browser/hooks/useThinkingLevel";
 import { useReasoningMode } from "xum/browser/hooks/useReasoningMode";
 import type { WorkspaceAISettingsCache } from "xum/browser/utils/workspaceModeAi";
 import { normalizeAgentId } from "xum/common/utils/agentIds";
+import { useWorkspaceAiSelection } from "xum/browser/utils/workspaceAiSettingsSync";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
 import { usePersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useUserPreferences } from "xum/browser/stores/AppConfigStore";
@@ -42,11 +43,7 @@ import {
   COMPOSER_CONTROL_HEIGHT_CLASS,
   COMPOSER_WORKSPACE_ICON_ONLY_HIDE_CLASS,
 } from "xum/constants/layout";
-import {
-  getInputKey,
-  getModelKey,
-  getWorkspaceAISettingsByAgentKey,
-} from "xum/common/constants/storage";
+import { getInputKey, getWorkspaceAISettingsByAgentKey } from "xum/common/constants/storage";
 
 const SEND_MESSAGE_TIMEOUT_MS = 30_000;
 
@@ -128,16 +125,9 @@ function ChatComposerInner(props: {
     setDefaultModel,
   } = useModelsFromSettings();
 
-  const modelKey = getModelKey(props.workspaceId);
-  // Not defaultModel as the initial value: it is sticky, and the default arrives with the config,
-  // which can load after the composer mounts. Sends read the live default too.
-  const [preferredModel, setPreferredModel] = usePersistedState<string | null>(modelKey, null, {
-    listener: true,
-  });
-
   // Gateway-preserving, like the desktop composer: an explicit gateway pick (e.g.
   // openrouter:openai/gpt-5) stays selected instead of showing as its direct-provider model.
-  const storedModel = normalizeSelectedModel(preferredModel ?? defaultModel);
+  const storedModel = useWorkspaceAiSelection(props.workspaceId, agentId).model;
 
   const inputKey = getInputKey(props.workspaceId);
   const [input, setInput] = usePersistedState<string>(inputKey, "", { listener: true });
@@ -202,10 +192,9 @@ function ChatComposerInner(props: {
     const selectedModel = normalizeSelectedModel(model);
     ensureModelInSettings(selectedModel);
     markAiSelectionIntent(props.workspaceId, "model", selectedModel);
-    setPreferredModel(selectedModel);
 
-    // Like the desktop composer, record the pick in the active agent's cache so
-    // WorkspaceModeAISync restores it (not the seeded model) after switching agents and back.
+    // Like the desktop composer, keep the active agent's cache current: WorkspaceModeAISync
+    // still restores thinking and reasoning from it after switching agents and back.
     updatePersistedState<WorkspaceAISettingsCache>(
       getWorkspaceAISettingsByAgentKey(props.workspaceId),
       (prev) => ({

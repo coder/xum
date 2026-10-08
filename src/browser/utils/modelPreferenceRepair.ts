@@ -11,6 +11,7 @@ import {
 } from "@/common/constants/storage";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { modelStringStartsWithProvider } from "@/common/utils/providers/modelString";
+import { dropPendingModelPicks } from "@/browser/utils/aiSelectionIntent";
 
 // Browser repair only: removing a custom provider updates config on the backend,
 // but per-origin persisted browser preferences can still reference provider-owned models.
@@ -83,4 +84,5 @@ export function repairLocalModelPreferencesForRemovedProvider(
     repairPersistedModelString(getModelKey(workspaceId), provider, WORKSPACE_DEFAULTS.model);
     repairWorkspaceAISettingsByAgent(workspaceId, provider);
   }
+  dropPendingModelPicks((model) => modelStringStartsWithProvider(model, provider));
 }

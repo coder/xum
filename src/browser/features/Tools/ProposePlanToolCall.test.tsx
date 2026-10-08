@@ -19,7 +19,6 @@ import {
   getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
-  getModelKey,
   getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
@@ -330,7 +329,6 @@ function startInPlanMode(
   thinkingLevel?: ThinkingLevel
 ) {
   window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("plan"));
-  if (model) updatePersistedState(getModelKey(workspaceId), model);
   if (model) {
     setWorkspaceAiMetadata(workspaceId, {
       aiSettingsByAgent: { plan: { model, thinkingLevel: thinkingLevel ?? "off" } },
@@ -607,18 +605,15 @@ describe("ProposePlanToolCall", () => {
     // Note: some tests in this repo mock the `usePersistedState` module globally. In that case,
     // `updatePersistedState` won't actually write to localStorage here, so we assert the call.
     const agentKey = getAgentIdKey(WORKSPACE_ID);
-    const modelKey = getModelKey(WORKSPACE_ID);
     const thinkingKey = getThinkingLevelKey(WORKSPACE_ID);
     const updatePersistedStateMaybeMock = updatePersistedState as unknown as {
       mock?: { calls: unknown[][] };
     };
     if (updatePersistedStateMaybeMock.mock) {
       expect(updatePersistedState).toHaveBeenCalledWith(agentKey, "exec");
-      expect(updatePersistedState).toHaveBeenCalledWith(modelKey, execModel);
       expect(updatePersistedState).toHaveBeenCalledWith(thinkingKey, execThinking);
     } else {
       expect(JSON.parse(window.localStorage.getItem(agentKey)!)).toBe("exec");
-      expect(JSON.parse(window.localStorage.getItem(modelKey)!)).toBe(execModel);
       expect(JSON.parse(window.localStorage.getItem(thinkingKey)!)).toBe(execThinking);
     }
   });

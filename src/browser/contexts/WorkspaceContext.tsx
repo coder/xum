@@ -34,7 +34,6 @@ import { deleteWorkspaceStorage, migrateWorkspaceStorage } from "@/browser/utils
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { useAPI } from "@/browser/contexts/API";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
@@ -180,7 +179,7 @@ export function seedWorkspaceLocalStorageFromBackend(
   const modelKey = getModelKey(workspaceId);
   const existingModel = readPersistedState<string | undefined>(modelKey, undefined);
   if (existingModel !== active.model && !keepsUnsentPick("model", existingModel)) {
-    setWorkspaceModelWithOrigin(workspaceId, active.model, "sync");
+    updatePersistedState(modelKey, active.model);
   }
 
   const thinkingKey = getThinkingLevelKey(workspaceId);
