@@ -397,6 +397,54 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-5-5", "off")).toBe("low");
   });
 
+  test("offers all 6 levels for Haiku 5.5 but keeps Haiku 4.5 on the default ladder", () => {
+    // Haiku 5.5 supports every effort level and still accepts disabled thinking at
+    // effort high or below, so "off" survives while xhigh/max become available.
+    const allLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
+    for (const model of [
+      "anthropic:claude-haiku-5-5",
+      "mux-gateway:anthropic/claude-haiku-5-5",
+      "bedrock:anthropic.claude-haiku-5-5",
+    ]) {
+      expect({ model, policy: getThinkingPolicyForModel(model) }).toEqual({
+        model,
+        policy: allLevels,
+      });
+      expect(enforceThinkingPolicy(model, "off")).toBe("off");
+    }
+    // Haiku stays the cheap tier: its default floor stays "off" (as for Haiku 4.5), so
+    // `/haiku+0` and a stored "off" still disable thinking, and an explicit floor still wins.
+    const mapped: ProvidersConfigMap = {
+      anthropic: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "team-haiku", mappedToModel: "anthropic:claude-haiku-5-5" }],
+      },
+    };
+    for (const [model, config] of [
+      ["anthropic:claude-haiku-5-5", null],
+      ["mux-gateway:anthropic/claude-haiku-5-5", null],
+      ["bedrock:anthropic.claude-haiku-5-5", null],
+      ["anthropic:team-haiku", mapped],
+    ] as const) {
+      const floor = resolveMinimumThinkingLevel(model, null, config);
+      expect({ model, floor }).toEqual({ model, floor: "off" });
+      expect(resolveThinkingInput(0, model, config)).toBe("off");
+      expect(enforceThinkingPolicy(model, "off", floor, config)).toBe("off");
+      expect(enforceThinkingPolicy(model, "off", "medium", config)).toBe("medium");
+      expect(getAvailableThinkingLevels(model, floor, config)).toEqual(allLevels);
+    }
+    // Haiku 4.5 (budget_tokens thinking, no effort) keeps the 4-level default.
+    expect(getThinkingPolicyForModel("anthropic:claude-haiku-4-5")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+    ]);
+    expect(getDefaultMinimumThinkingLevel("anthropic:claude-haiku-4-5")).toBe("off");
+  });
+
   test("returns 5 levels including xhigh for Sonnet 4.6", () => {
     expect(getThinkingPolicyForModel("anthropic:claude-sonnet-4-6")).toEqual([
       "off",

@@ -1034,7 +1034,15 @@ export async function getToolsForModel(
         // - Not bridgeable in the PTC sandbox because provider-native tools have no execute().
         // - Tool hooks (.xum/tool_pre/.xum/tool_post) are skipped because withHooks() returns
         //   early when execute() is absent — same limitation as web_search (provider-native).
-        if (supportsAnthropicNativeWebFetch(capabilityModelId)) {
+        //
+        // Claude Haiku keeps the client fetcher even on 4.6+ (Haiku 5.5): moving the
+        // `haiku` alias from 4.5 to 5.5 must not silently drop tool_pre/tool_post
+        // enforcement (e.g. egress checks) on web_fetch for users of that alias. Remove
+        // this carve-out once native tools honor hooks (#5840).
+        if (
+          supportsAnthropicNativeWebFetch(capabilityModelId) &&
+          !/(?:^|\.)claude-haiku-/.test(capabilityModelId.toLowerCase())
+        ) {
           allTools = {
             ...baseTools,
             ...(mcpTools ?? {}),

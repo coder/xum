@@ -22,7 +22,10 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { buildCompactionPrompt } from "@/common/constants/ui";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
-import { anthropicRejectsDisabledThinking } from "@/common/types/thinking";
+import {
+  anthropicRejectsDisabledThinking,
+  anthropicThinksUnlessDisabled,
+} from "@/common/types/thinking";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -400,7 +403,10 @@ async function generateAbandonedBranchSummaryText(input: {
       // No thinking provider options are passed, so the call stays thinking-free
       // on top of the thinking-stripped transcript, except on models that cannot
       // disable thinking: those get low effort and thinking headroom instead.
+      // Models that think unless told not to (Haiku 5.5) get explicit disabled
+      // thinking, or their thinking could use up the small summary budget.
       const alwaysThinks = anthropicRejectsDisabledThinking(modelResult.data.metadataModel);
+      const thinksUnlessDisabled = anthropicThinksUnlessDisabled(modelResult.data.metadataModel);
       const stream = streamText({
         model: modelResult.data.model,
         system: input.system,
@@ -409,6 +415,9 @@ async function generateAbandonedBranchSummaryText(input: {
           ? BRANCH_SUMMARY_MAX_OUTPUT_TOKENS + BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS
           : BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
         ...(alwaysThinks && { providerOptions: { anthropic: { effort: "low" } } }),
+        ...(thinksUnlessDisabled && {
+          providerOptions: { anthropic: { thinking: { type: "disabled" }, effort: "low" } },
+        }),
         abortSignal,
       });
       // Consume deltas incrementally (not stream.text) so a deadline that

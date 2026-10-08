@@ -213,6 +213,11 @@ function thinkingLevelIndex(level: ThinkingLevel): number {
   return THINKING_LEVELS.indexOf(level);
 }
 
+/** Claude Haiku of any generation, tolerating provider prefixes and Bedrock's `anthropic.` prefix. */
+function isClaudeHaikuModel(modelString: string): boolean {
+  return /(?:^|\.)claude-haiku-/.test(stripModelProviderPrefixes(modelString));
+}
+
 /**
  * Default *minimum* thinking level (floor) for a model.
  *
@@ -235,6 +240,15 @@ export function getDefaultMinimumThinkingLevel(
   // A binary model must retain its off option unless the user explicitly raises the floor.
   const policy = getThinkingPolicyForModel(modelString, providersConfig);
   if (policy.length === 2 && policy[0] === "off") return THINKING_LEVEL_OFF;
+  // Haiku is the cheap, fast tier: `/haiku+0` and stored "off" must keep thinking off.
+  // Haiku 4.5 got that from the default policy; Haiku 5.5 matches an explicit policy
+  // (native xhigh), which would otherwise raise the default floor to medium.
+  if (
+    policy[0] === "off" &&
+    isClaudeHaikuModel(resolveModelForMetadata(modelString, providersConfig ?? null))
+  ) {
+    return THINKING_LEVEL_OFF;
+  }
   return hasExplicitThinkingPolicy(modelString, providersConfig)
     ? DEFAULT_THINKING_LEVEL
     : THINKING_LEVEL_OFF;

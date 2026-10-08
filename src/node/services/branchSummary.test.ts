@@ -555,15 +555,16 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     }
   });
 
-  test("candidates that cannot disable thinking get low effort and thinking headroom", async () => {
+  test("candidates that cannot disable thinking get headroom, and Haiku 5.5 gets disabled thinking", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {
-      const calls: Array<{ maxOutputTokens?: number; effort?: unknown }> = [];
+      const calls: Array<{ maxOutputTokens?: number; effort?: unknown; thinking?: unknown }> = [];
       const model = new MockLanguageModelV3({
         doStream: (options: LanguageModelV3CallOptions) => {
           calls.push({
             maxOutputTokens: options.maxOutputTokens,
             effort: options.providerOptions?.anthropic?.effort,
+            thinking: options.providerOptions?.anthropic?.thinking,
           });
           return Promise.resolve({
             stream: simulateReadableStream({
@@ -577,7 +578,13 @@ describe("maybeAppendAbandonedBranchSummary", () => {
           });
         },
       });
-      for (const workspaceModel of ["anthropic:claude-opus-5-5", "anthropic:claude-haiku-4-5"]) {
+      // Haiku 5.5 thinks unless told not to, so it gets explicit disabled thinking
+      // within the plain summary budget; Haiku 4.5 needs no options.
+      for (const workspaceModel of [
+        "anthropic:claude-opus-5-5",
+        "anthropic:claude-haiku-4-5",
+        "anthropic:claude-haiku-5-5",
+      ]) {
         const appended = await maybeAppendAbandonedBranchSummary({
           historyService,
           aiService: fakeAiService(model, { workspaceModel }),
@@ -592,8 +599,18 @@ describe("maybeAppendAbandonedBranchSummary", () => {
           maxOutputTokens:
             BRANCH_SUMMARY_MAX_OUTPUT_TOKENS + BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS,
           effort: "low",
+          thinking: undefined,
         },
-        { maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS, effort: undefined },
+        {
+          maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
+          effort: undefined,
+          thinking: undefined,
+        },
+        {
+          maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
+          effort: "low",
+          thinking: { type: "disabled" },
+        },
       ]);
     } finally {
       await cleanup();
