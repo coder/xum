@@ -212,6 +212,7 @@ function AgentProviderWithState(props: {
           isMountedRef.current
         ) {
           setAgents([]);
+          setAgentBases(getScopeId(workspaceId, projectPath), []);
           setLoadFailed(true);
           setLoaded(true);
         }
