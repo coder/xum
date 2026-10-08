@@ -21,6 +21,7 @@ import {
 } from "@/browser/stores/WorkspaceStore";
 import { createTestApiClient } from "@/browser/testUtils";
 import * as chatCommands from "@/browser/utils/chatCommands";
+import * as controlFlow from "@/browser/utils/compilerSafeControlFlow";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
@@ -914,6 +915,8 @@ async function quoteTranscriptText(app: AppHarness, text: string) {
     if (!element) throw new Error(`Transcript text "${text}" not found`);
     return element;
   }, LOAD_TOLERANT_WAIT);
+  // PositionedMenu anchors its popover with DOMRect, which tests/ui/dom.ts does not install.
+  if (typeof DOMRect === "undefined") Object.assign(globalThis, { DOMRect: window.DOMRect });
   fireEvent.contextMenu(target);
   const quote = await waitFor(() => {
     const item = [...document.body.querySelectorAll("button")].find((button) =>
@@ -1316,10 +1319,12 @@ describe("An edit send that settles after its composer unmounted", () => {
           await app.chat.expectTranscriptNotContains("first message", LOAD_TOLERANT_WAIT.timeout);
         }
 
-        // Back in this workspace while the send is pending: Edit stays refused (#5226).
-        await switchAwayAndBack(app, other);
+        // An edit in the other workspace; back here while the send is pending, Edit stays
+        // refused (#5226); then the other workspace's edit again. ChatPane stays mounted.
+        await showWorkspace(app, other.id, other.name);
+        await editRow(app, "other message");
+        await showWorkspace(app, app.workspaceId, app.metadata.name);
         await expectEditRefused(app, targetShown ? "first message" : "edited message");
-
         await showWorkspace(app, other.id, other.name);
         await editRow(app, "other message");
         typeIntoEdit(editTextarea(app)!, "edited other message");
@@ -1331,6 +1336,7 @@ describe("An edit send that settles after its composer unmounted", () => {
 
         fireEvent.keyDown(editTextarea(app)!, { key: "Escape" });
         await showWorkspace(app, app.workspaceId, app.metadata.name);
+        await app.chat.expectTranscriptNotContains("first message", LOAD_TOLERANT_WAIT.timeout);
         await app.chat.expectStreamComplete();
         const editedRows = useWorkspaceStoreRaw()
           .getWorkspaceState(app.workspaceId)
@@ -1599,9 +1605,14 @@ describe("Edit sends, restores and inserts while the unsent draft waits", () => 
     const app = await createAppHarness({ branchPrefix: "edit-queued-card-during-send" });
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
-      await startEditWithUnsentDraft(app, scope);
-      const sends = holdEditSends(app, "reply-only");
-      await sendEdit(app, "[mock:wait-start] edited message", "first message");
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      // Held before the backend sees it: the edit's target still shows (section 3, step 11).
+      // The busy stream below changes the history, so the backend would refuse the edit anyway.
+      const sends = holdEditSends(app, "refuse");
+      typeIntoEdit(textarea, "edited message");
+      await waitFor(() => expect(textarea.value).toBe("edited message"));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await waitFor(() => expect(editRequests(sends.spy)).toBe(1), LOAD_TOLERANT_WAIT);
       await queueBehindHeldStream(app, "queued Q", "queued note");
       await editQueuedMessage(app);
       await waitFor(
@@ -1619,9 +1630,14 @@ describe("Edit sends, restores and inserts while the unsent draft waits", () => 
         ).toHaveLength(1)
       );
 
-      sends.release();
+      // The refused edit opens again with its text, and "Q, U" waits behind it.
       app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
       await app.chat.expectStreamComplete();
+      sends.release();
+      await waitFor(
+        () => expect(editTextarea(app)?.value).toBe("edited message"),
+        LOAD_TOLERANT_WAIT
+      );
       await settleAsyncWork();
       await expectDraft(app, scope, joinDraftText("queued Q", "unsent draft"), ["unsent.txt"]);
       sends.spy.mockRestore();
@@ -1718,11 +1734,30 @@ describe("Edit sends, restores and inserts while the unsent draft waits", () => 
               }
             : result;
         });
+      // The rejection still leaves the composer's send unhandled (`void handleSend()`), as on
+      // main. Only the restore is under test, so the send's outer wrapper stops it there.
+      const realFinally = controlFlow.runWithFinally;
+      const rejections: unknown[] = [];
+      const finallySpy = jest.spyOn(controlFlow, "runWithFinally").mockImplementation((async (
+        body: () => Promise<unknown>,
+        cleanup: () => void
+      ) => {
+        try {
+          return await realFinally(body, cleanup);
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== "compaction request rejected") {
+            throw error;
+          }
+          rejections.push(error);
+          return undefined;
+        }
+      }) as typeof realFinally);
       typeIntoEdit(textarea, "/compact -t 500");
       await waitFor(() => expect(textarea.value).toBe("/compact -t 500"));
       fireEvent.keyDown(textarea, { key: "Enter" });
       await waitFor(() => expect(commandSpy).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
       await settleAsyncWork();
+      expect(rejections).toHaveLength(1);
       await waitFor(
         () => expect(editTextarea(app)?.value).toBe("/compact -t 500"),
         LOAD_TOLERANT_WAIT
@@ -1730,6 +1765,7 @@ describe("Edit sends, restores and inserts while the unsent draft waits", () => 
       expect(occurrences(composerText(app), "edit-file.md")).toBe(1);
       await expectDraft(app, scope, "unsent draft", ["unsent.txt"]);
       commandSpy.mockRestore();
+      finallySpy.mockRestore();
     } finally {
       await app.dispose();
     }
