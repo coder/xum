@@ -1070,7 +1070,7 @@ describe("StreamManager - stream error classification", () => {
       name: "classifies 402 payment required as quota (avoid auto-retry)",
       error: createApiCallErrorForTests({
         message: "Insufficient balance. Please add credits to continue.",
-        url: "https://gateway.mux.coder.com/api/v1/ai-gateway/v1/ai/language-model",
+        url: "https://gateway.xum.cdr.dev/api/v1/ai-gateway/v1/ai/language-model",
         statusCode: 402,
         responseBody:
           '{"error":{"message":"Insufficient balance. Please add credits to continue.","type":"invalid_request_error"}}',
