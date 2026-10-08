@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -394,6 +394,24 @@ test.each([
   },
   15_000
 );
+
+test("a signal during the synchronous staging starts no container", async () => {
+  const stop = new AbortController();
+  // containerEnv reads BUGBASH_EFFORT right after staging, still synchronously. A real signal
+  // there runs its handler at the next turn of the event loop, as this setImmediate does.
+  const env = new Proxy(HOST_ENV as Record<string, string>, {
+    get(target, key) {
+      if (key === "BUGBASH_EFFORT") setImmediate(() => stop.abort("SIGTERM"));
+      return target[key as string];
+    },
+  });
+  // A spy, not the fake's log: a SIGTERM can end the fake before it writes its log line.
+  const runJob = spyOn(Session.prototype, "runJob"); // calls through
+  expect(await failure(launchIn({}, stop, env))).toThrow(Stopped);
+  expect(runJob).not.toHaveBeenCalled();
+  runJob.mockRestore();
+  expectNothingLeft();
+});
 
 test("a mount source that becomes a symlink before `docker run` refuses; nothing starts", async () => {
   expect(await failure(launchIn({ IMAGES: "", PULL: "swap" }))).toThrow(/not a symlink/);

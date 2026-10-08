@@ -117,7 +117,9 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
       ...Object.entries(env).flatMap(([key, value]) => ["-e", `${key}=${value}`]),
       "-w", "/repo/tests/bugbash", "--entrypoint", "bun", image, "sandbox/entry.ts",
       "--export", output, "--", "node", "../../node_modules/e2e/dist/cli/bin.js", ...args];
-    // After a signal during the synchronous staging, own() throws Stopped: nothing starts.
+    // A signal during the synchronous staging runs its handler only at the next turn of the
+    // event loop. This yield lets it run, so own() throws and no container starts (measured).
+    await new Promise((resolve) => setImmediate(resolve));
     session.own({ name, owner: ownerLabel(), checkout });
     log(`${name} starts: --network none, mock app AI`);
     const job = await session.runJob(flags, (out) => receiveExport(out, dest), DEADLINE_MS);
