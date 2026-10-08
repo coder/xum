@@ -1,9 +1,8 @@
 import { buildSendMessageOptions } from "@/browser/utils/messages/buildSendMessageOptions";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
-import { readScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import { readScopeAgentId } from "@/browser/utils/scopedAiDefaults";
 import { getAutoRouting, getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { migrateGlobalToPerModel } from "@/browser/contexts/ProviderOptionsContext";
@@ -21,7 +20,7 @@ function getProviderOptions(): MuxProviderOptions {
  * Used by compaction, resume, idle-compaction, and plan execution outside React context.
  */
 export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptions {
-  const agentId = readScopedAiDefault(workspaceId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
+  const agentId = readScopeAgentId(workspaceId);
   const selection = getWorkspaceAiSelection(workspaceId, agentId);
 
   const providerOptions = getProviderOptions();

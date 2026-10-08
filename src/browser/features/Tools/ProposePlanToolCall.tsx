@@ -41,7 +41,11 @@ import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
-import { setWorkspaceAgentPick } from "@/browser/utils/aiSelectionIntent";
+import {
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSendOptions,
+  setWorkspaceAgentPick,
+} from "@/browser/utils/aiSelectionIntent";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
   useHostTranscriptMutationAllowed,
@@ -528,25 +532,35 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     setWorkspaceAgentPick(workspaceId, args.targetAgentId);
     // The target agent's resolved model, thinking level and Auto choices.
     const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
+    const options = {
+      ...sendMessageOptions,
+      agentId: args.targetAgentId,
+      // The target agent's model and thinking level are explicit; classifying
+      // "Implement the plan" would reroute them based on a prompt that says nothing
+      // about the plan's difficulty.
+      autoModelRouting: false,
+      autoThinkingLevel: false,
+      // The agent's later composer sends keep its Auto choices.
+      savedAutoRouting: {
+        model: sendMessageOptions.autoModelRouting === true,
+        thinkingLevel: sendMessageOptions.autoThinkingLevel === true,
+      },
+    };
+    // Picks the send carries, consumed like a composer send's.
+    const { attachedTokens } = getAiSelectionIntentForSendOptions(
+      workspaceId,
+      args.targetAgentId,
+      options
+    );
     const sendResult = await api.workspace.sendMessage({
       workspaceId,
       message: "Implement the plan",
-      options: {
-        ...sendMessageOptions,
-        agentId: args.targetAgentId,
-        // The target agent's model and thinking level are explicit; classifying
-        // "Implement the plan" would reroute them based on a prompt that says nothing
-        // about the plan's difficulty.
-        autoModelRouting: false,
-        autoThinkingLevel: false,
-        // The agent's later composer sends keep its Auto choices.
-        savedAutoRouting: {
-          model: sendMessageOptions.autoModelRouting === true,
-          thinkingLevel: sendMessageOptions.autoThinkingLevel === true,
-        },
-      },
+      options,
     });
-    if (sendResult.success) return null;
+    if (sendResult.success) {
+      consumeAiSelectionIntent(workspaceId, args.targetAgentId, attachedTokens);
+      return null;
+    }
     const formatted = formatSendMessageError(sendResult.error);
     return formatted.resolutionHint
       ? `${formatted.message} ${formatted.resolutionHint}`
