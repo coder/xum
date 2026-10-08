@@ -36,6 +36,7 @@ import {
   readRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
 import { isTabType, makeTerminalTabType, type TabType } from "@/browser/types/rightSidebar";
+import { isBaseTabId } from "@/browser/features/RightSidebar/Tabs/tabConfig";
 import { createTerminalSession } from "@/browser/utils/terminal";
 import type { APIClient } from "@/browser/contexts/API";
 
@@ -131,11 +132,14 @@ function toPresetTab(
     return createTerminalPlaceholder(ctx.terminalCounter);
   }
 
-  // Base tabs are already compatible.
-  if (tab === "costs" || tab === "review") {
-    return tab;
+  // Tool tabs and the New tab keep their id. Typed so a tab id missing from
+  // RIGHT_SIDEBAR_PRESET_BASE_TABS fails to compile instead of being dropped from presets.
+  if (isBaseTabId(tab) || tab === "new") {
+    const presetTab: RightSidebarPresetTabType = tab;
+    return presetTab;
   }
 
+  // Side chats are ephemeral (discarded on restart), so presets leave them out.
   return null;
 }
 
@@ -212,9 +216,8 @@ function convertLayoutStateToPreset(state: RightSidebarLayoutState): RightSideba
   const root = convertNodeToPreset(state.root, ctx);
 
   if (!root) {
-    // Presets store only Stats/Review/terminals (the New tab and other tools are dropped), and a
-    // preset needs at least one tab, so a layout with none of those saves as a Stats tab.
-    const fallback = getDefaultRightSidebarLayoutState("costs");
+    // Only side chats were open (presets leave them out): save the New tab in their place.
+    const fallback = getDefaultRightSidebarLayoutState();
     const fallbackRoot = convertNodeToPreset(fallback.root, { terminalCounter: 0 });
     assert(fallbackRoot !== null, "default right sidebar layout must convert");
     return {
@@ -395,7 +398,8 @@ function resolvePresetLayoutToLayoutState(
     findTabset(root, preset.focusedTabsetId)?.id ?? findFirstTabsetId(root) ?? "tabset-1";
 
   return {
-    version: 2,
+    version: 1,
+    openTabsOnly: true,
     nextId: preset.nextId,
     focusedTabsetId,
     root,

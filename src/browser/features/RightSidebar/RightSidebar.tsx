@@ -1720,7 +1720,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     [createTerminalTab]
   );
 
-  // From a New tab launcher the terminal takes the New tab's place in that tabset.
+  // From a New tab launcher the terminal takes the New tab's place in that tabset (or opens in
+  // the focused pane if that tabset closed while the session was being created).
   const handleOpenTerminalFromNewTab = React.useCallback(
     (tabsetId: string): void =>
       createTerminalTab((prev, tab) => openToolFromNewTab(prev, tabsetId, tab)),

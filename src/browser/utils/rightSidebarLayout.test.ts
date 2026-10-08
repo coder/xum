@@ -32,7 +32,8 @@ function tabset(id: string, tabs: TabType[], activeTab: TabType = tabs[0]): Tabs
 
 function single(tabs: TabType[], activeTab: TabType = tabs[0]): RightSidebarLayoutState {
   return {
-    version: 2,
+    version: 1,
+    openTabsOnly: true,
     nextId: 2,
     focusedTabsetId: "tabset-1",
     root: tabset("tabset-1", tabs, activeTab),
@@ -41,7 +42,8 @@ function single(tabs: TabType[], activeTab: TabType = tabs[0]): RightSidebarLayo
 
 function split(left: Tabset, right: Tabset, focusedTabsetId = left.id): RightSidebarLayoutState {
   return {
-    version: 2,
+    version: 1,
+    openTabsOnly: true,
     nextId: 3,
     focusedTabsetId,
     root: {
@@ -311,7 +313,7 @@ test("dockTabToEdge removes an empty source tabset when docking into another tab
 
 // --- Persisted layouts ---
 
-test("version 1 layouts keep terminals, side chats, and the active tab; other tools go", () => {
+test("unmarked (legacy) layouts drop auto-added tools but keep the active tab, Output, terminals, side chats", () => {
   const raw = {
     version: 1,
     nextId: 3,
@@ -325,7 +327,7 @@ test("version 1 layouts keep terminals, side chats, and the active tab; other to
         {
           type: "tabset",
           id: "tabset-1",
-          tabs: ["costs", "review", "instructions", "terminal:abc", "goal", "side:sc"],
+          tabs: ["costs", "review", "output", "instructions", "terminal:abc", "goal", "side:sc"],
           activeTab: "review",
         },
         {
@@ -339,16 +341,18 @@ test("version 1 layouts keep terminals, side chats, and the active tab; other to
   };
 
   const result = parseRightSidebarLayoutState(raw);
-  expect(result.version).toBe(2);
+  // Still version 1 (readable by older builds), marked as migrated.
+  expect(result).toMatchObject({ version: 1, openTabsOnly: true });
   const [left, right] = children(result);
   expect(left).toMatchObject({
-    tabs: ["review", "terminal:abc", "side:sc"],
+    // Output was never auto-added, so the user opened it: it stays.
+    tabs: ["review", "output", "terminal:abc", "side:sc"],
     activeTab: "review",
   });
   expect(right).toMatchObject({ tabs: ["timeline"], activeTab: "timeline" });
 });
 
-test("a version 1 tabset whose active tab is missing becomes a New tab when nothing is kept", () => {
+test("a legacy tabset whose active tab is missing becomes a New tab when nothing is kept", () => {
   const raw = {
     version: 1,
     nextId: 2,
@@ -366,7 +370,7 @@ test("a version 1 tabset whose active tab is missing becomes a New tab when noth
   });
 });
 
-test("version 1 migration is idempotent", () => {
+test("the legacy migration is idempotent", () => {
   const raw = {
     version: 1,
     nextId: 2,
@@ -384,14 +388,15 @@ test("version 1 migration is idempotent", () => {
   expect(rootTabset(once).tabs).toEqual(["costs", "terminal:abc"]);
 });
 
-test("version 2 layouts are used as-is: no tools are re-added", () => {
+test("marked layouts are used as-is: no tools are re-added", () => {
   const raw = single(["goal"]);
   expect(parseRightSidebarLayoutState(raw)).toBe(raw);
 });
 
 test("parseRightSidebarLayoutState strips removed static tabs", () => {
   const raw = {
-    version: 2,
+    version: 1,
+    openTabsOnly: true,
     nextId: 2,
     focusedTabsetId: "tabset-1",
     root: {
@@ -410,7 +415,8 @@ test("parseRightSidebarLayoutState strips removed static tabs", () => {
 
 test("a tabset holding only removed tabs becomes a New tab", () => {
   const raw = {
-    version: 2,
+    version: 1,
+    openTabsOnly: true,
     nextId: 2,
     focusedTabsetId: "tabset-1",
     root: {
@@ -437,4 +443,35 @@ test("tab type validation accepts the New tab and rejects a bare side: prefix", 
   expect(isTabType("new")).toBe(true);
   expect(isTabType("side:")).toBe(false);
   expect(isTabType(makeSideChatTabType("side-ws"))).toBe(true);
+});
+
+test("marked layouts written by this build still validate as version 1 for older builds", () => {
+  // Older builds accept only version 1 and ignore unknown keys; a version bump would make
+  // them reset the layout (losing splits and tab order) after a downgrade.
+  const written = parseRightSidebarLayoutState(null);
+  expect(written.version).toBe(1);
+  expect(written.openTabsOnly).toBe(true);
+});
+
+test("openToolFromNewTab prefers the tool already in its own pane over an earlier pane's copy", () => {
+  // Both panes hold Stats (possible after drags); the launcher in pane 2 must select pane 2's.
+  const s = openToolFromNewTab(
+    split(tabset("tabset-1", ["costs"]), tabset("tabset-2", ["costs", "new"], "new"), "tabset-2"),
+    "tabset-2",
+    "costs"
+  );
+  const [left, right] = children(s);
+  expect(left.tabs).toEqual(["costs"]);
+  expect(right).toMatchObject({ tabs: ["costs"], activeTab: "costs" });
+  expect(s.focusedTabsetId).toBe("tabset-2");
+});
+
+test("openToolFromNewTab opens in the focused pane when the launcher's pane is gone", () => {
+  // A terminal arrives only after its session is created; by then the launcher pane may have
+  // been closed. The session must still get a tab.
+  const s = openToolFromNewTab(single(["costs", "review"]), "tabset-gone", "terminal:s1");
+  expect(rootTabset(s)).toMatchObject({
+    tabs: ["costs", "review", "terminal:s1"],
+    activeTab: "terminal:s1",
+  });
 });

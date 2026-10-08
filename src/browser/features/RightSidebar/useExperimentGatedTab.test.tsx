@@ -17,7 +17,8 @@ import { useExperimentGatedTab } from "./useExperimentGatedTab";
 // The user's saved layout [costs, review, artifacts, goal] with Artifacts selected.
 function savedLayout(): RightSidebarLayoutState {
   return {
-    version: 2,
+    version: 1,
+    openTabsOnly: true,
     nextId: 2,
     focusedTabsetId: "tabset-1",
     root: {

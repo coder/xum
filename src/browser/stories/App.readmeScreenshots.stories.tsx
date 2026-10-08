@@ -269,7 +269,8 @@ function createReadmeGitDivergenceExecutor(gitStatus: Map<string, GitStatusFixtu
 function seedReadmeSidebarTabs(workspaceId: string, activeTab: TabType): void {
   const tabs: TabType[] = ["costs", "review", "instructions", "workflows", "timeline", "goal"];
   const layout: RightSidebarLayoutState = {
-    version: 2,
+    version: 1,
+    openTabsOnly: true,
     nextId: 2,
     focusedTabsetId: "tabset-1",
     root: { type: "tabset", id: "tabset-1", tabs, activeTab },

@@ -191,7 +191,8 @@ function RightSidebarStoryShell(props: { setup: () => APIClient; children: React
 /** Seed one pane holding exactly these open tabs (the strip shows only opened tabs). */
 function seedSidebarLayout(workspaceId: string, tabs: TabType[], activeTab: TabType = tabs[0]) {
   const layout: RightSidebarLayoutState = {
-    version: 2,
+    version: 1,
+    openTabsOnly: true,
     nextId: 2,
     focusedTabsetId: "tabset-1",
     root: { type: "tabset", id: "tabset-1", tabs, activeTab },

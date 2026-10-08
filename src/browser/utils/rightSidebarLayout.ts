@@ -1,11 +1,4 @@
-import {
-  getSideChatTabWorkspaceId,
-  isNewTab,
-  isTabType,
-  isTerminalTab,
-  NEW_TAB,
-  type TabType,
-} from "@/browser/types/rightSidebar";
+import { isNewTab, isTabType, NEW_TAB, type TabType } from "@/browser/types/rightSidebar";
 
 export type RightSidebarLayoutNode =
   | {
@@ -49,18 +42,17 @@ function isLayoutNode(value: unknown): value is RightSidebarLayoutNode {
   return false;
 }
 
-/** A persisted layout of any supported version (parse migrates it to the current one). */
-type PersistedRightSidebarLayoutState = Omit<RightSidebarLayoutState, "version"> & {
-  version: 1 | 2;
+/** A persisted layout: legacy ones lack the `openTabsOnly` marker (parse migrates them). */
+type PersistedRightSidebarLayoutState = Omit<RightSidebarLayoutState, "openTabsOnly"> & {
+  openTabsOnly?: unknown;
 };
 
-/** Accepts version 1 (pre "New tab") and version 2 layouts; parse always emits version 2. */
 export function isRightSidebarLayoutState(
   value: unknown
 ): value is PersistedRightSidebarLayoutState {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
-  if (v.version !== 1 && v.version !== 2) return false;
+  if (v.version !== 1) return false;
   if (typeof v.nextId !== "number") return false;
   if (typeof v.focusedTabsetId !== "string") return false;
   if (!isLayoutNode(v.root)) return false;
@@ -68,11 +60,18 @@ export function isRightSidebarLayoutState(
 }
 
 /**
- * Version 2: the strip holds only tabs that were opened (by the user or a real event), plus
- * at most one "New tab" per tabset. Version 1 re-injected every default tool on each parse.
+ * `openTabsOnly`: the strip holds only tabs that were opened (by the user or a real event),
+ * plus at most one "New tab" per tabset. Layouts without it come from builds that re-injected
+ * every default tool on each parse, and get migrated once.
+ *
+ * Still `version: 1` with a marker field instead of a version bump, so a downgraded build
+ * keeps reading the layout (its validator requires version 1 and ignores unknown keys) instead
+ * of resetting the user's splits and tab order. Older builds do reject a layout that contains
+ * the "new" tab type (their isTabType does not know it) and fall back to their default.
  */
 export interface RightSidebarLayoutState {
-  version: 2;
+  version: 1;
+  openTabsOnly: true;
   nextId: number;
   focusedTabsetId: string;
   root: RightSidebarLayoutNode;
@@ -85,7 +84,8 @@ export interface RightSidebarLayoutState {
 export function getDefaultRightSidebarLayoutState(activeTab?: TabType): RightSidebarLayoutState {
   const tab = activeTab ?? NEW_TAB;
   return {
-    version: 2,
+    version: 1,
+    openTabsOnly: true,
     nextId: 2,
     focusedTabsetId: "tabset-1",
     root: {
@@ -114,30 +114,46 @@ export function parseRightSidebarLayoutState(
     return getDefaultRightSidebarLayoutState(activeTabFallback);
   }
 
-  if (raw.version === 1) {
+  if (raw.openTabsOnly !== true) {
     return {
       ...raw,
-      version: 2,
-      root: mapTabsets(raw.root, migrateVersion1Tabset),
+      openTabsOnly: true,
+      root: mapTabsets(raw.root, migrateLegacyTabset),
     };
   }
 
-  // Version 2 is used as-is; only repair invalid tabsets (empty, duplicate New tabs, a stale
-  // activeTab). Returns the same object when nothing changed so the persist-back effect in
-  // RightSidebar settles instead of rewriting storage on every render.
-  const root = mapTabsets(raw.root, normalizeTabset);
-  return root === raw.root ? (raw as RightSidebarLayoutState) : { ...raw, version: 2, root };
+  // Marked layouts are used as-is; only repair invalid tabsets (empty, duplicate New tabs, a
+  // stale activeTab). Returns the same object when nothing changed so the persist-back effect
+  // in RightSidebar settles instead of rewriting storage on every render.
+  const marked = raw as RightSidebarLayoutState;
+  const root = mapTabsets(marked.root, normalizeTabset);
+  return root === marked.root ? marked : { ...marked, root };
 }
 
 /**
- * Version 1 parsing re-added every default tool (Stats, Review, Instructions, Workflows,
- * Timeline) and the app auto-added Goal/Debug/Desktop/etc., so most static tabs in a v1
- * layout were never opened by the user. Keep what reflects real use: terminals, side chats,
- * and the tab the user was looking at.
+ * Tabs the legacy runtime added by itself: parse re-injected the default tools (Stats, Review,
+ * Instructions, Workflows, Timeline) and the sidebar auto-added Goal and the setting- or
+ * experiment-gated tools. In a legacy layout these say nothing about what the user opened.
+ * Anything else (Output, terminals, side chats) was opened on purpose and is kept.
  */
-function migrateVersion1Tabset(node: TabsetNode): TabsetNode {
+const LEGACY_AUTO_ADDED_TABS: ReadonlySet<TabType> = new Set<TabType>([
+  "costs",
+  "review",
+  "instructions",
+  "workflows",
+  "timeline",
+  "goal",
+  "debug",
+  "desktop",
+  "browser",
+  "memory",
+  "artifacts",
+]);
+
+/** Drop auto-added tabs, except the one the user was looking at. */
+function migrateLegacyTabset(node: TabsetNode): TabsetNode {
   const kept = node.tabs.filter(
-    (tab) => isTerminalTab(tab) || getSideChatTabWorkspaceId(tab) != null || tab === node.activeTab
+    (tab) => !LEGACY_AUTO_ADDED_TABS.has(tab) || tab === node.activeTab
   );
   return normalizeTabset({ ...node, tabs: kept });
 }
@@ -608,18 +624,32 @@ export function addNewTabToTabset(
 
 /**
  * Open a tool from a tabset's New tab (the launcher). The tool replaces the New tab in place
- * and is selected; a tool already open elsewhere is selected there and the New tab goes away,
- * since a layout holds each tool once.
+ * and is selected; a tool already open is selected where it is (this tabset first) and the
+ * New tab goes away. If the tabset no longer exists, the tool opens in the focused pane.
  */
 export function openToolFromNewTab(
   state: RightSidebarLayoutState,
   tabsetId: string,
   tool: TabType
 ): RightSidebarLayoutState {
+  if (isNewTab(tool)) return state;
   const target = findTabset(state.root, tabsetId);
-  if (target?.type !== "tabset" || isNewTab(tool)) return state;
+  if (target?.type !== "tabset") {
+    // The launcher's pane closed before the tool arrived (a terminal opens only once its
+    // session exists): open it in the focused (or first) pane rather than dropping it, which
+    // would leave a live session with no tab.
+    const fallbackId =
+      findTabset(state.root, state.focusedTabsetId) !== null
+        ? state.focusedTabsetId
+        : findFirstTabsetId(state.root);
+    return fallbackId == null ? state : selectOrAddTab(setFocusedTabset(state, fallbackId), tool);
+  }
 
-  const existing = collectAllTabsWithTabset(state.root).find((t) => t.tab === tool);
+  // A copy in this tabset wins over one elsewhere (a tool can sit in several panes, e.g. after
+  // a drag); a depth-first search alone could pick an earlier pane and move focus away.
+  const existing = target.tabs.includes(tool)
+    ? { tab: tool, tabsetId }
+    : collectAllTabsWithTabset(state.root).find((t) => t.tab === tool);
   if (existing) {
     // In another tabset, closing the New tab may collapse its (now pointless) pane.
     const next =

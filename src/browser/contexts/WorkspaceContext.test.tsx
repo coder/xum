@@ -990,7 +990,8 @@ describe("WorkspaceContext", () => {
       const layoutKey = getRightSidebarLayoutKey(workspaceId);
       const terminalTitlesKey = getTerminalTitlesKey(workspaceId);
       const persistedLayout: RightSidebarLayoutState = {
-        version: 2,
+        version: 1,
+        openTabsOnly: true,
         nextId: 2,
         focusedTabsetId: "tabset-1",
         root: {
@@ -1036,7 +1037,8 @@ describe("WorkspaceContext", () => {
       const layoutKey = getRightSidebarLayoutKey(workspaceId);
       const terminalTitlesKey = getTerminalTitlesKey(workspaceId);
       const persistedLayout: RightSidebarLayoutState = {
-        version: 2,
+        version: 1,
+        openTabsOnly: true,
         nextId: 2,
         focusedTabsetId: "tabset-1",
         root: {
@@ -1185,7 +1187,8 @@ describe("WorkspaceContext", () => {
     const layoutKey = getRightSidebarLayoutKey(workspaceId);
     const terminalTitlesKey = getTerminalTitlesKey(workspaceId);
     const persistedLayout: RightSidebarLayoutState = {
-      version: 2,
+      version: 1,
+      openTabsOnly: true,
       nextId: 2,
       focusedTabsetId: "tabset-1",
       root: {

@@ -1,6 +1,7 @@
-import type {
-  RightSidebarLayoutPresetNode,
-  RightSidebarPresetTabType,
+import {
+  RIGHT_SIDEBAR_PRESET_BASE_TABS,
+  type RightSidebarLayoutPresetNode,
+  type RightSidebarPresetTabType,
 } from "@/common/types/uiLayouts";
 import { z } from "zod";
 
@@ -19,7 +20,7 @@ export const KeybindSchema = z
   })
   .strict();
 
-const RightSidebarPresetBaseTabSchema = z.enum(["costs", "review", "stats"]);
+const RightSidebarPresetBaseTabSchema = z.enum(RIGHT_SIDEBAR_PRESET_BASE_TABS);
 
 export const RightSidebarPresetTabSchema: z.ZodType<RightSidebarPresetTabType> = z.union([
   RightSidebarPresetBaseTabSchema,

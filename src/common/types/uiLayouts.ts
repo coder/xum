@@ -18,7 +18,33 @@ export interface LayoutSlot {
   keybindOverride?: Keybind;
 }
 
-export type RightSidebarPresetBaseTabType = "costs" | "review" | "stats";
+/**
+ * Static right-sidebar tabs a preset can hold: every tool tab, the "new" launcher tab, and the
+ * legacy "stats" (read as Stats). Mirrors the browser's tab ids (common code cannot import the
+ * browser tab config); `toPresetTab` in src/browser/utils/uiLayouts.ts fails to compile when a
+ * browser tab is missing here.
+ *
+ * Builds that only knew costs/review/stats ignore a preset holding any other value (their
+ * normalizer drops the preset, not the whole config); presets made of Stats, Review and
+ * terminals keep the old encoding and stay readable there.
+ */
+export const RIGHT_SIDEBAR_PRESET_BASE_TABS = [
+  "costs",
+  "review",
+  "stats",
+  "instructions",
+  "goal",
+  "workflows",
+  "timeline",
+  "artifacts",
+  "memory",
+  "desktop",
+  "browser",
+  "output",
+  "debug",
+  "new",
+] as const;
+export type RightSidebarPresetBaseTabType = (typeof RIGHT_SIDEBAR_PRESET_BASE_TABS)[number];
 export type RightSidebarPresetTabType = RightSidebarPresetBaseTabType | `terminal_new:${string}`;
 
 export type RightSidebarLayoutPresetNode =
@@ -113,7 +139,7 @@ function normalizeRightSidebarWidthPreset(raw: unknown): RightSidebarWidthPreset
 
 function isPresetTabType(value: unknown): value is RightSidebarPresetTabType {
   if (typeof value !== "string") return false;
-  if (value === "costs" || value === "review" || value === "stats") {
+  if ((RIGHT_SIDEBAR_PRESET_BASE_TABS as readonly string[]).includes(value)) {
     return true;
   }
   return value.startsWith("terminal_new:") && value.length > "terminal_new:".length;

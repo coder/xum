@@ -199,7 +199,8 @@ describeIntegration("RightSidebar (UI)", () => {
   /** Persist a single-pane layout holding exactly these (open) tabs. */
   function seedLayout(tabs: TabType[], activeTab: TabType = tabs[0]) {
     const layout: RightSidebarLayoutState = {
-      version: 2,
+      version: 1,
+      openTabsOnly: true,
       nextId: 2,
       focusedTabsetId: "tabset-1",
       root: { type: "tabset", id: "tabset-1", tabs, activeTab },
@@ -423,7 +424,8 @@ describeIntegration("RightSidebar (UI)", () => {
   test("tab selection persists across workspace navigation", async () => {
     // Start with Review tab selected
     const initialLayout: RightSidebarLayoutState = {
-      version: 2,
+      version: 1,
+      openTabsOnly: true,
       nextId: 2,
       focusedTabsetId: "tabset-1",
       root: {
@@ -724,7 +726,8 @@ describeIntegration("RightSidebar (UI)", () => {
   test("split layout renders multiple panes with separate tablists", async () => {
     // Set up a split layout with two panes (top: costs, bottom: review)
     const splitLayout: RightSidebarLayoutState = {
-      version: 2,
+      version: 1,
+      openTabsOnly: true,
       nextId: 10,
       root: {
         type: "split",

@@ -168,7 +168,8 @@ test.describe("sidebar drag and drop", () => {
     await page.evaluate(
       ({ wsId }) => {
         const splitLayout = {
-          version: 2,
+          version: 1,
+          openTabsOnly: true,
           nextId: 3,
           focusedTabsetId: "tabset-1",
           root: {
