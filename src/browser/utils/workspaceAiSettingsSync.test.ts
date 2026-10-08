@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 
@@ -49,6 +49,7 @@ function seed(tiers: readonly Tier[]): void {
   if (has("pick")) {
     markAiSelectionIntent(WS, "model", "openai:picked");
     markAiSelectionIntent(WS, "thinkingLevel", "max");
+    markAiSelectionIntent(WS, "reasoningMode", "pro");
   }
 }
 
@@ -83,13 +84,13 @@ describe("getWorkspaceAiSelection", () => {
         tiers: ["pick", "saved", "legacy", "configured", "project"],
         model: "openai:picked",
         thinkingLevel: "max",
-        // A saved bucket owns reasoning: its absent mode means standard.
-        reasoning: "standard",
+        reasoning: "pro",
       },
       {
         tiers: ["saved", "legacy", "configured", "project"],
         model: "openai:saved",
         thinkingLevel: "xhigh",
+        // A saved bucket owns reasoning: its absent mode means standard.
         reasoning: "standard",
       },
       {
@@ -123,6 +124,19 @@ describe("getWorkspaceAiSelection", () => {
         reasoningMode: testCase.reasoning,
       });
     }
+  });
+
+  test("the hook follows a default model that loads after it rendered", () => {
+    setWorkspaceAiMetadata(WS, {
+      projectPath: PROJECT,
+      aiSettings: undefined,
+      aiSettingsByAgent: undefined,
+    });
+    const { result } = renderHook(() => useWorkspaceAiSelection(WS, "exec"));
+
+    act(() => getAppConfigStore().updateOptimistically({ defaultModel: "openai:loaded-later" }));
+
+    expect(result.current.model).toBe("openai:loaded-later");
   });
 
   test("a creation scope resolves its own defaults in the hook and the plain reader", () => {
