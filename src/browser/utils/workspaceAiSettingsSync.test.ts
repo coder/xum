@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, renderHook } from "@testing-library/react";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 
@@ -8,6 +8,7 @@ import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
+  setAgentBases,
   setAutoRoutingPick,
   setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
@@ -51,6 +52,7 @@ function seed(tiers: readonly Tier[]): void {
   if (has("pick")) {
     markAiSelectionIntent(WS, "model", "openai:picked");
     markAiSelectionIntent(WS, "thinkingLevel", "max");
+    markAiSelectionIntent(WS, "reasoningMode", "pro");
   }
 }
 
@@ -85,13 +87,13 @@ describe("getWorkspaceAiSelection", () => {
         tiers: ["pick", "saved", "legacy", "configured", "project"],
         model: "openai:picked",
         thinkingLevel: "max",
-        // A saved bucket owns reasoning: its absent mode means standard.
-        reasoning: "standard",
+        reasoning: "pro",
       },
       {
         tiers: ["saved", "legacy", "configured", "project"],
         model: "openai:saved",
         thinkingLevel: "xhigh",
+        // A saved bucket owns reasoning: its absent mode means standard.
         reasoning: "standard",
       },
       {
@@ -125,6 +127,37 @@ describe("getWorkspaceAiSelection", () => {
         reasoningMode: testCase.reasoning,
       });
     }
+  });
+
+  test("a custom agent resolves its base agent's defaults from the loaded agent list", () => {
+    getAppConfigStore().updateOptimistically({
+      defaultModel: "openai:global",
+      agentAiDefaults: { exec: { modelString: "openai:configured", thinkingLevel: "high" } },
+    });
+    setWorkspaceAiMetadata(WS, {
+      projectPath: PROJECT,
+      aiSettings: undefined,
+      aiSettingsByAgent: undefined,
+    });
+    setAgentBases(WS, [{ id: "exec" }, { id: "reviewer", base: "exec" }]);
+
+    expect(getWorkspaceAiSelection(WS, "reviewer")).toMatchObject({
+      model: "openai:configured",
+      thinkingLevel: "high",
+    });
+  });
+
+  test("the hook follows a default model that loads after it rendered", () => {
+    setWorkspaceAiMetadata(WS, {
+      projectPath: PROJECT,
+      aiSettings: undefined,
+      aiSettingsByAgent: undefined,
+    });
+    const { result } = renderHook(() => useWorkspaceAiSelection(WS, "exec"));
+
+    act(() => getAppConfigStore().updateOptimistically({ defaultModel: "openai:loaded-later" }));
+
+    expect(result.current.model).toBe("openai:loaded-later");
   });
 
   test("a creation scope resolves its own defaults in the hook and the plain reader", () => {
@@ -161,6 +194,10 @@ describe("getWorkspaceAiSelection", () => {
       });
     expect(getAutoRouting(WS, "model", "exec")).toBe(true);
     expect(getAutoRouting(WS, "model", "plan")).toBe(false);
+    setAgentBases(WS, [{ id: "reviewer", base: "exec" }]);
+    expect(getAutoRouting(WS, "model", "reviewer")).toBe(true);
+    setAutoRoutingPick(WS, "exec", "model", false);
+    expect(getAutoRouting(WS, "model", "exec")).toBe(false);
 
     // A saved bucket owns the flag: its absent flag means off.
     save({});

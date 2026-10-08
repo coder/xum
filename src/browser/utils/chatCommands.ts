@@ -65,6 +65,7 @@ import type { ChatAttachment } from "../features/ChatInput/ChatAttachments";
 import { dispatchWorkspaceSwitch } from "./workspaceEvents";
 import { getRuntimeKey } from "@/common/constants/storage";
 import { copyWorkspaceStorage } from "@/browser/utils/workspaceStorage";
+import { copyPendingAiSelection } from "@/browser/utils/aiSelectionIntent";
 import { readPersistedRawString } from "@/browser/hooks/usePersistedState";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
@@ -146,6 +147,7 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   }
 
   copyWorkspaceStorage(options.sourceWorkspaceId, result.metadata.id);
+  copyPendingAiSelection(options.sourceWorkspaceId, result.metadata.id);
 
   // Get workspace info for switching
   const workspaceInfo = await client.workspace.getInfo({ workspaceId: result.metadata.id });
