@@ -5,7 +5,6 @@ import { userEvent, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
 import type { AgentPluginListItem } from "@/common/orpc/schemas/agentPlugins";
@@ -106,9 +105,7 @@ const PluginsSectionStoryShell: FC<{ options: MockORPCClientOptions; children: R
   return (
     <ThemeProvider>
       <TooltipProvider>
-        <APIProvider client={clientRef.current}>
-          <ExperimentsProvider>{props.children}</ExperimentsProvider>
-        </APIProvider>
+        <APIProvider client={clientRef.current}>{props.children}</APIProvider>
       </TooltipProvider>
     </ThemeProvider>
   );

@@ -2,7 +2,6 @@ import type { ReactNode } from "react";
 import { useRef } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ConfirmDialogProvider } from "@/browser/contexts/ConfirmDialogContext";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { ProviderOptionsProvider } from "@/browser/contexts/ProviderOptionsContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
@@ -104,15 +103,13 @@ export function SettingsSectionStory(props: SettingsSectionStoryProps) {
       <RouterProvider>
         <ProjectProvider>
           <WorkspaceProvider>
-            <ExperimentsProvider>
-              <UILayoutsProvider>
-                <SettingsProvider>
-                  <ProviderOptionsProvider>
-                    <ConfirmDialogProvider>{props.children}</ConfirmDialogProvider>
-                  </ProviderOptionsProvider>
-                </SettingsProvider>
-              </UILayoutsProvider>
-            </ExperimentsProvider>
+            <UILayoutsProvider>
+              <SettingsProvider>
+                <ProviderOptionsProvider>
+                  <ConfirmDialogProvider>{props.children}</ConfirmDialogProvider>
+                </ProviderOptionsProvider>
+              </SettingsProvider>
+            </UILayoutsProvider>
           </WorkspaceProvider>
         </ProjectProvider>
       </RouterProvider>

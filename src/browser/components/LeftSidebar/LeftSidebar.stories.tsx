@@ -26,7 +26,6 @@ import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectCo
 import { WorkspaceProvider, useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { ConfirmDialogProvider } from "@/browser/contexts/ConfirmDialogContext";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { AboutDialogProvider } from "@/browser/contexts/AboutDialogContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { useWorkspaceRecency } from "@/browser/stores/WorkspaceStore";
@@ -164,21 +163,19 @@ function LeftSidebarStoryShell(props: LeftSidebarStoryShellProps) {
     <ThemeProvider key={providerTreeKey}>
       <APIProvider client={clientRef.current}>
         <RouterProvider>
-          <ExperimentsProvider>
-            <TooltipProvider delayDuration={200}>
-              <SettingsProvider>
-                <AboutDialogProvider>
-                  <ConfirmDialogProvider>
-                    <ProjectProvider>
-                      <WorkspaceProvider>
-                        <LeftSidebarStoryScene leftSidebarProps={props.leftSidebarProps} />
-                      </WorkspaceProvider>
-                    </ProjectProvider>
-                  </ConfirmDialogProvider>
-                </AboutDialogProvider>
-              </SettingsProvider>
-            </TooltipProvider>
-          </ExperimentsProvider>
+          <TooltipProvider delayDuration={200}>
+            <SettingsProvider>
+              <AboutDialogProvider>
+                <ConfirmDialogProvider>
+                  <ProjectProvider>
+                    <WorkspaceProvider>
+                      <LeftSidebarStoryScene leftSidebarProps={props.leftSidebarProps} />
+                    </WorkspaceProvider>
+                  </ProjectProvider>
+                </ConfirmDialogProvider>
+              </AboutDialogProvider>
+            </SettingsProvider>
+          </TooltipProvider>
         </RouterProvider>
       </APIProvider>
     </ThemeProvider>
