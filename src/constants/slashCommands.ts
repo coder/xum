@@ -13,6 +13,8 @@ export const WORKSPACE_ONLY_COMMAND_KEYS: ReadonlySet<string> = new Set([
   "refine",
   "fork",
   "new",
+  "side",
+  "btw",
   "plan",
   "heartbeat",
 ]);
@@ -29,6 +31,7 @@ export const WORKSPACE_ONLY_COMMAND_TYPE_LIST = [
   "refine",
   "fork",
   "new",
+  "side",
   "plan-show",
   "plan-open",
   "heartbeat-set",

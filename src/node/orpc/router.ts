@@ -92,6 +92,7 @@ import {
   clearWorkspaceGoal,
   createMultiProjectWorkspace,
   createScratchWorkspace,
+  createSideChat,
   createWorkspace,
   forkWorkspace,
   getBackgroundBashOutput,
@@ -2000,6 +2001,10 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.fork.input)
         .output(schemas.workspace.fork.output)
         .handler(({ context, input }) => forkWorkspace(context, input)),
+      createSideChat: t
+        .input(schemas.workspace.createSideChat.input)
+        .output(schemas.workspace.createSideChat.output)
+        .handler(({ context, input }) => createSideChat(context, input)),
       stageAttachment: t
         .input(schemas.workspace.stageAttachment.input)
         .output(schemas.workspace.stageAttachment.output)

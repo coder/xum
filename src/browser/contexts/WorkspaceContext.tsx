@@ -59,6 +59,7 @@ import {
   type WorkspaceDraft,
 } from "@/browser/stores/DraftStore";
 import { createDraftId } from "@/common/utils/drafts";
+import { useDiscardSideChatOnLeave } from "@/browser/hooks/useDiscardSideChatOnLeave";
 
 export function toWorkspaceSelection(metadata: FrontendWorkspaceMetadata): WorkspaceSelection {
   return {
@@ -463,6 +464,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     },
     [workspaceStore]
   );
+  useDiscardSideChatOnLeave(api, currentWorkspaceId, workspaceMetadata);
   // The routed creation draft id, for the startup creation-draft storage GC (never collected).
   const routedDraftIdRef = useRef<string | null>(null);
   const [loading, setLoading] = useState(true);

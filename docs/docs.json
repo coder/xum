@@ -48,6 +48,7 @@
               "workspaces/scratch-chats",
               "workspaces/artifacts",
               "workspaces/fork",
+              "workspaces/side-chats",
               "workspaces/xumignore",
               {
                 "group": "Compaction",

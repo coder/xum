@@ -250,6 +250,16 @@ export async function forkWorkspace(context: ORPCContext, input: ForkWorkspaceIn
     : { success: false as const, error: result.error };
 }
 
+export async function createSideChat(
+  context: ORPCContext,
+  input: z.infer<typeof schemas.workspace.createSideChat.input>
+) {
+  const result = await context.workspaceService.createSideChat(input.parentWorkspaceId);
+  return result.success
+    ? { success: true as const, metadata: result.data.metadata }
+    : { success: false as const, error: result.error };
+}
+
 export async function sendWorkspaceMessage(
   context: ORPCContext,
   input: z.infer<typeof schemas.workspace.sendMessage.input>

@@ -8,6 +8,7 @@ export const SLASH_COMMAND_HINTS = {
   model: "<abbreviation|full-id>",
   fork: "[start message]",
   new: "[start message]",
+  side: "[question]",
   idle: "<hours>|off",
   heartbeat: "<minutes>|off",
   goal: "[-b <amount>] [--turns <n>] <objective>|budget <amount>|clear",

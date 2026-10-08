@@ -561,6 +561,46 @@ describe("processSlashCommand model and gating results", () => {
     });
   });
 
+  test("side chats refuse workspace commands, including a nested /side", async () => {
+    const createSideChat = mock(() => Promise.resolve({ success: false, error: "unused" }));
+    const env = createEnv({
+      isSideChat: true,
+      api: { workspace: { createSideChat } } as unknown as SlashCommandEnv["api"],
+    });
+    for (const parsed of [
+      parseCommand("/side why?"),
+      parseCommand("/fork"),
+      parseCommand("/new"),
+    ]) {
+      const result = await processSlashCommand(parsed, env);
+      if (result.kind !== "complete") throw new Error("expected complete result");
+      expectDisposition(result, "restore");
+      expect(result.actions.some((action) => action.type === "show-toast")).toBe(true);
+    }
+    expect(createSideChat).not.toHaveBeenCalled();
+
+    // Conversation-local commands still work in a side chat.
+    const vim = await processSlashCommand({ type: "vim-toggle" }, env);
+    if (vim.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(vim, "consume");
+  });
+
+  test("/side starts a side chat of the current workspace and restores input on failure", async () => {
+    const createSideChat = mock((_input: { parentWorkspaceId: string }) =>
+      Promise.resolve({ success: false as const, error: "Side chats cannot be nested." })
+    );
+    const { batches, result } = await finishCommand(
+      await processSlashCommand(
+        { type: "side", question: "why?" },
+        createEnv({ api: { workspace: { createSideChat } } as unknown as SlashCommandEnv["api"] })
+      )
+    );
+    expect(createSideChat).toHaveBeenCalledWith({ parentWorkspaceId: "test-ws" });
+    expect(batches[0]).toContainEqual({ type: "clear-input" });
+    expectDisposition(result, "restore");
+    expectToast(result.actions, { type: "error", message: "Side chats cannot be nested." });
+  });
+
   test("returns idle-compaction and debug actions", async () => {
     const setIdleCompaction = mock(() => Promise.resolve({ success: true, data: undefined }));
     const idle = await processSlashCommand(

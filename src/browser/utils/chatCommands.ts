@@ -242,6 +242,8 @@ export interface SlashCommandEnv {
   resetContext?: () => Promise<"reset" | "noop">;
   truncateHistory?: (percentage?: number) => Promise<void>;
   isCurrent?: () => boolean;
+  /** The composer belongs to an ephemeral /side chat (see handleSideCommand). */
+  isSideChat?: boolean;
 }
 
 interface WorkspaceCommandEnv extends SlashCommandEnv {
@@ -757,6 +759,18 @@ export async function processSlashCommand(
       }),
     ]);
   }
+  // Like Codex, side chats only allow commands that cannot change the conversation or the
+  // workspace (model, vim, ...): workspace commands like /fork, /compact, /goal or a nested
+  // /side would outlive or disturb a chat that is discarded on return.
+  if (isWorkspaceOnlyCommand && env.isSideChat === true) {
+    return complete("restore", [
+      showToast({
+        id: Date.now().toString(),
+        type: "error",
+        message: "Command not available in side chats. Press Esc to return to the main chat.",
+      }),
+    ]);
+  }
 
   if (isWorkspaceCommandType) {
     switch (parsed.type) {
@@ -878,6 +892,10 @@ export async function processSlashCommand(
       case "fork":
         if (!client) return notConnected();
         return handleForkCommand(parsed, { ...env, api: client });
+      case "side":
+        if (!env.workspaceId) throw new Error("Workspace ID required");
+        if (!client) return notConnected();
+        return handleSideCommand(parsed, { ...env, api: client, workspaceId: env.workspaceId });
       case "new":
         if (!env.workspaceId) throw new Error("Workspace ID required");
         if (!client) return notConnected();
@@ -1217,6 +1235,56 @@ function handleClearCommand(
       return complete("restore", [
         showToast({ id: Date.now().toString(), type: "error", message: normalized.message }),
       ]);
+    }
+  });
+}
+
+/**
+ * /side (Codex's side conversation): open an ephemeral fork of this chat in place of it. The
+ * main chat keeps running in the background; leaving the side chat discards it
+ * (useDiscardSideChatOnLeave).
+ */
+function handleSideCommand(
+  parsed: Extract<ParsedCommand, { type: "side" }>,
+  env: WorkspaceCommandEnv
+): CommandResult {
+  return phase([{ type: "clear-input" }, { type: "set-sending", sending: true }], async () => {
+    const failed = (message: string) =>
+      complete("restore", [
+        showToast({ id: Date.now().toString(), type: "error", title: "Side Chat Failed", message }),
+        { type: "set-sending", sending: false },
+      ]);
+    try {
+      const result = await env.api.workspace.createSideChat({
+        parentWorkspaceId: env.workspaceId,
+      });
+      if (!result.success) {
+        return failed(result.error);
+      }
+      const sideWorkspaceId = result.metadata.id;
+      // Same model/agent/thinking settings as the main chat, like a fork.
+      copyWorkspaceStorage(env.workspaceId, sideWorkspaceId);
+      dispatchWorkspaceSwitch(result.metadata);
+      const question = parsed.question;
+      if (question != null) {
+        // Deferred like forkWorkspace's start message, so the switch lands and the store
+        // subscribes to the side chat before its first turn streams.
+        requestAnimationFrame(() => {
+          env.api.workspace
+            .sendMessage({
+              workspaceId: sideWorkspaceId,
+              message: question,
+              options: env.sendMessageOptions,
+            })
+            .catch(() => {
+              // Best-effort: the user can resend the question from the side chat.
+            });
+        });
+      }
+      trackCommandUsed("side");
+      return complete("consume", [{ type: "set-sending", sending: false }]);
+    } catch (error) {
+      return failed(error instanceof Error ? error.message : "Failed to start side chat");
     }
   });
 }

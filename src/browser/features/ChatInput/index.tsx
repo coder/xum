@@ -590,7 +590,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
 
   const { open } = useSettings();
-  const { selectedWorkspace, beginWorkspaceCreation } = useWorkspaceContext();
+  const { selectedWorkspace, beginWorkspaceCreation, workspaceMetadata } = useWorkspaceContext();
   const { agentId, currentAgent, agents } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
@@ -1965,6 +1965,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       attachments,
       fileParts: commandFileParts.length > 0 ? commandFileParts : undefined,
       attachedReviewIds: options?.reviews ? options.reviews.ids : reviewIdsForCheck,
+      isSideChat:
+        commandWorkspaceId != null &&
+        workspaceMetadata.get(commandWorkspaceId)?.sideChatParentWorkspaceId != null,
       isCurrent: () => {
         const scope = asyncCommandScopeRef.current;
         return (

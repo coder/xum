@@ -345,6 +345,28 @@ const newCommandDefinition: SlashCommandDefinition = {
   },
 };
 
+// /side mirrors Codex's side conversations: everything after the command is a question sent
+// straight into the new side chat. /btw is Codex's alias for the same command.
+const parseSideCommand = ({ rawInput }: { rawInput: string }): ParsedCommand => {
+  const question = rawInput.trim();
+  return question.length === 0 ? { type: "side" } : { type: "side", question };
+};
+
+const sideCommandDefinition: SlashCommandDefinition = {
+  key: "side",
+  description:
+    "Ask a side question in a temporary fork of this chat. Esc returns to the main chat and discards it.",
+  inputHint: SLASH_COMMAND_HINTS.side,
+  handler: parseSideCommand,
+};
+
+const btwCommandDefinition: SlashCommandDefinition = {
+  key: "btw",
+  description: "Alias for /side.",
+  inputHint: SLASH_COMMAND_HINTS.side,
+  handler: parseSideCommand,
+};
+
 const IDLE_USAGE = `/idle ${SLASH_COMMAND_HINTS.idle}`;
 const HEARTBEAT_USAGE = `/heartbeat ${SLASH_COMMAND_HINTS.heartbeat}`;
 const HEARTBEAT_INTERVAL_GRANULARITY_MS = 60_000;
@@ -696,6 +718,8 @@ export const SLASH_COMMAND_DEFINITIONS: readonly SlashCommandDefinition[] = [
 
   forkCommandDefinition,
   newCommandDefinition,
+  sideCommandDefinition,
+  btwCommandDefinition,
   vimCommandDefinition,
   idleCommandDefinition,
   heartbeatCommandDefinition,

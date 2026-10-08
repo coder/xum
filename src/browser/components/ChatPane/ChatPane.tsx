@@ -8,6 +8,7 @@ import React, {
   useMemo,
 } from "react";
 import { Lightbulb } from "lucide-react";
+import { SideChatBanner } from "@/browser/components/SideChatBanner/SideChatBanner";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
@@ -288,6 +289,14 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
               onOpenTerminal={props.onOpenTerminal}
             />
           </PerfRenderMarker>
+
+          {meta?.sideChatParentWorkspaceId != null && (
+            <SideChatBanner
+              key={workspaceId}
+              workspaceId={workspaceId}
+              parentWorkspaceId={meta.sideChatParentWorkspaceId}
+            />
+          )}
 
           <ChatPaneContent
             workspaceId={workspaceId}

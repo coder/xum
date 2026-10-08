@@ -114,6 +114,7 @@ import {
 } from "./additionalSystemContext";
 import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
+import { withSideChatInstructions } from "./sideChat";
 import type { EvaluationService } from "./evaluation/evaluationService";
 import type { InstructionSources } from "@/common/types/instructions";
 import { extractToolInstructionsFromSources } from "./systemMessage";
@@ -1739,9 +1740,14 @@ export class TurnRequestBuilder {
         workspaceAdditionalSystemContext = "";
       }
     }
-    const scratchpadAdditionalSystemInstructions = mergeAdditionalSystemInstructions(
-      workspaceAdditionalSystemContext,
-      additionalSystemInstructions
+    // Side chats get their guardrails on every turn (including retries and resumes), so they do
+    // not depend on the renderer remembering to send them.
+    const scratchpadAdditionalSystemInstructions = withSideChatInstructions(
+      metadata,
+      mergeAdditionalSystemInstructions(
+        workspaceAdditionalSystemContext,
+        additionalSystemInstructions
+      )
     );
     recordStartupPhaseTiming("loadAdditionalSystemContextMs", loadAdditionalSystemContextStartedAt);
 
