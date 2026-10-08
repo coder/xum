@@ -1883,4 +1883,36 @@ describe("Edit sends, restores and inserts while the unsent draft waits", () => 
       await app.dispose();
     }
   }, 120_000);
+
+  // T24 (#5893 review): /vim consumes its input with clear-input only. As on main, the edit
+  // keeps its files: only what a command clears belongs to it.
+  test("a text-only command typed into an edit keeps the edit's file", async () => {
+    const app = await createAppHarness({ branchPrefix: "edit-command-keeps-file" });
+    try {
+      const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
+      // A provider file: commands other than /compact refuse staged files before they run.
+      getDraftStore().setAttachments(scope, [
+        {
+          kind: "provider",
+          id: "file-edit",
+          url: "data:text/plain;base64,ZWRpdA==",
+          mediaType: "text/plain",
+          filename: "edit.txt",
+        },
+      ]);
+      const textarea = await startEditWithUnsentDraft(app, scope);
+      expect(occurrences(composerText(app), "edit.txt")).toBe(1);
+      // The trailing space closes the command suggestions, so Enter sends.
+      typeIntoEdit(textarea, "/vim ");
+      await waitFor(() => expect(textarea.value).toBe("/vim "));
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await waitFor(() => expect(editTextarea(app)?.value).toBe(""), LOAD_TOLERANT_WAIT);
+      await settleAsyncWork();
+      expect(editTextarea(app)).not.toBeNull();
+      expect(occurrences(composerText(app), "edit.txt")).toBe(1);
+      await expectDraft(app, scope, "unsent draft", ["unsent.txt"]);
+    } finally {
+      await app.dispose();
+    }
+  }, 120_000);
 });

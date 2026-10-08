@@ -2144,12 +2144,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       setEditText((current) => joinDraftText(snapshot.text, current));
       setEditAttachments((current) => [...snapshot.attachments, ...current]);
     };
+    // A command consumes only what it clears: /vim clears the text, and the edit keeps its files.
+    let clearedText = false;
+    let clearedFiles = false;
+    const putBackUncleared = () => {
+      if (!commandSnapshot) return;
+      if (clearedText) commandSnapshot = { ...commandSnapshot, text: "" };
+      if (clearedFiles) commandSnapshot = { ...commandSnapshot, attachments: [] };
+      putBackCommandSnapshot();
+    };
     // Command actions stop at the caller's UI boundary; creation mode intentionally has its own applier.
     const applyCommandActions = (actions: CommandAction[]) => {
       for (const action of actions) {
         switch (action.type) {
           case "clear-input":
             if (!commandEditSession) setInput("");
+            else clearedText = true;
             break;
           case "reset-input-height":
             if (inputRef.current) inputRef.current.style.height = "";
@@ -2168,6 +2178,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             break;
           case "clear-attachments":
             if (!commandEditSession) setAttachments([]);
+            else clearedFiles = true;
             break;
           case "detach-reviews":
             if (variant === "workspace") props.onDetachAllReviews?.();
@@ -2214,6 +2225,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       case "consume":
         // Commands clear the composer through their own clear-input actions;
         // clearing again here would wipe a draft typed while phases ran.
+        putBackUncleared();
         if (!restoredPreEditDraft) setDraftReviews(null);
         break;
       case "restore":
@@ -2228,6 +2240,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         else if (!commandEditSession && getDraftStore().getText(draftScope).trim().length === 0) {
           setInput(restoreInput);
         } else {
+          putBackUncleared();
           setDraftReviews(null);
         }
         break;
