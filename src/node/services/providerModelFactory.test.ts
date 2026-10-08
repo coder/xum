@@ -1490,9 +1490,10 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
 
   it.each([
     ["gpt-6-astra", "ultrafast"],
+    ["gpt-6.1-sol", "ultrafast"],
     // Ultrafast is model-gated: other models drop the tier instead of sending one
     // OpenAI rejects (and never fall back to the separately billed Fast tier).
-    ["gpt-6.1-sol", undefined],
+    ["gpt-6-luna", undefined],
     ["gpt-6-sol", undefined],
   ] as const)(
     "sends the configured Ultrafast tier for %s only when supported",

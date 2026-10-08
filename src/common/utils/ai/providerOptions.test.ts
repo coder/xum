@@ -1414,11 +1414,13 @@ describe("buildProviderOptions - OpenAI", () => {
 
     test.each([
       ["openai:gpt-6-astra", "ultrafast"],
+      ["openai:gpt-6.1-sol", "ultrafast"],
+      ["openai:gpt-6.1-sol-2026-09-29", "ultrafast"],
       // GPT-5.6 Sol preview access is no longer supported, so the tier is dropped.
       ["openai:gpt-5.6-sol", undefined],
       ["openai:gpt-5.6", undefined],
-      // Announced but not yet served in the API; must not fall back to Fast either.
-      ["openai:gpt-6.1-sol", undefined],
+      // Unsupported models must not fall back to Fast either.
+      ["openai:gpt-6-luna", undefined],
       ["openai:gpt-6-sol", undefined],
       ["openai:gpt-5.6-terra", undefined],
     ] as const)("gates the Ultrafast tier by model: %s -> %s", (model, expected) => {

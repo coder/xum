@@ -12,7 +12,7 @@ import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
-import { isGpt6AstraModel } from "@/common/types/thinking";
+import { isGpt61SolModel, isGpt6AstraModel } from "@/common/types/thinking";
 
 export interface OpenAIDirectProviderOptionsAvailability {
   /** Settings-resolved route for the canonical model ("direct" = no gateway). */
@@ -67,11 +67,10 @@ export function resolveProviderOptionsRoute(
  *
  * Ultrafast (`service_tier: "ultrafast"`, launched at DevDay 2026-09-29, billed
  * at 6x Standard) is model-gated: among the supported models OpenAI serves it
- * only for GPT-6 Astra (GPT-5.6 Sol preview access is no longer supported). GPT-6.1
- * Sol Ultrafast was announced for "the coming days" and is not in the API yet;
- * add it here once the Ultrafast guide lists it. Callers drop the tier for other
- * models (Standard or the project default) instead of switching to Fast, which
- * is a different paid tier.
+ * for GPT-6 Astra and, since 2026-10-08, GPT-6.1 Sol (GPT-5.6 Sol preview access
+ * is no longer supported). Callers drop the tier for other models (Standard or
+ * the project default) instead of switching to Fast, which is a different paid
+ * tier.
  * https://developers.openai.com/api/docs/guides/ultrafast-mode
  */
 export function openaiModelSupportsServiceTier(
@@ -82,7 +81,7 @@ export function openaiModelSupportsServiceTier(
   if (serviceTier !== "ultrafast") return true;
   // Resolve mapped aliases and Coder gateway identities to the upstream model.
   const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
-  return isGpt6AstraModel(capabilityModel);
+  return isGpt6AstraModel(capabilityModel) || isGpt61SolModel(capabilityModel);
 }
 
 /** Fast shares OpenAI's preference across gateways that forward its service tier. */
