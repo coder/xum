@@ -13289,8 +13289,9 @@ export class WorkspaceService
       thinkingLevel,
       ...(reasoningMode != null ? { reasoningMode } : {}),
       // Clients send the auto-routing flags only when on, so an absent flag means off.
-      autoModelRouting: options?.autoModelRouting === true,
-      autoThinkingLevel: options?.autoThinkingLevel === true,
+      autoModelRouting: options?.savedAutoRouting?.model ?? options?.autoModelRouting === true,
+      autoThinkingLevel:
+        options?.savedAutoRouting?.thinkingLevel ?? options?.autoThinkingLevel === true,
     };
   }
 

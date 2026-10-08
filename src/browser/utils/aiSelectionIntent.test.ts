@@ -1,15 +1,18 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 import {
   consumeAiSelectionIntent,
   getAiSelectionIntentForSend,
   getAiSelectionIntentForSendOptions,
   getPendingAiSelection,
+  getWorkspaceAgentId,
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
   setWorkspaceAgentPick,
+  setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
 
 const WS = "intent-ws";
@@ -27,7 +30,35 @@ describe("aiSelectionIntent", () => {
   });
 
   afterEach(() => {
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     restoreDomGlobals();
+  });
+
+  test("the workspace agent falls back to the project, then the global default agent", () => {
+    getAppConfigStore().updateOptimistically({
+      userPreferences: {
+        ai: {
+          globalDefaults: { agentId: "ask" },
+          projectDefaults: { "/repo": { agentId: "plan" } },
+        },
+      },
+    });
+    setWorkspaceAiMetadata(WS, { projectPath: "/repo" });
+    expect(getWorkspaceAgentId(WS)).toBe("plan");
+    setWorkspaceAiMetadata(WS, { projectPath: "/other" });
+    expect(getWorkspaceAgentId(WS)).toBe("ask");
+    setWorkspaceAiMetadata(WS, { projectPath: "/repo", agentId: "exec" });
+    expect(getWorkspaceAgentId(WS)).toBe("exec");
+  });
+
+  test("an unsent agent pick lasts until the saved agent matches it", () => {
+    setWorkspaceAiMetadata(WS, { agentId: "plan" });
+    setWorkspaceAgentPick(WS, "exec");
+    setWorkspaceAiMetadata(WS, { agentId: "plan", projectPath: "/repo" });
+    expect(getWorkspaceAgentId(WS)).toBe("exec");
+    setWorkspaceAiMetadata(WS, { agentId: "exec" });
+    setWorkspaceAiMetadata(WS, { agentId: "plan" });
+    expect(getWorkspaceAgentId(WS)).toBe("plan");
   });
 
   test("attaches only fields whose sent value still equals the pick", () => {

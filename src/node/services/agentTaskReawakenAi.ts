@@ -41,6 +41,14 @@ import {
 } from "@/node/services/taskWorkspaceSeam";
 
 type LoadedConfig = ReturnType<Config["loadConfigOrDefault"]>;
+type AgentSettingsBucket = NonNullable<WorkspaceConfigEntry["aiSettingsByAgent"]>[string];
+
+/** Planning never reads the composer's Auto flags, so a flag-only change must not refuse a commit. */
+function withoutAutoRoutingFlags(bucket: AgentSettingsBucket | undefined) {
+  if (bucket == null) return null;
+  const { autoModelRouting, autoThinkingLevel, ...settings } = bucket;
+  return settings;
+}
 
 /** AI settings one reawakened execution runs with; mirrors creation's conventions. */
 export interface AgentTaskTurnAiSnapshot {
@@ -131,7 +139,7 @@ export function computeReawakenInputsKey(
       agentId,
       parentWorkspaceId: child.parentWorkspaceId ?? null,
       taskAiPins: child.taskAiPins ?? null,
-      bucket: child.aiSettingsByAgent?.[agentId] ?? null,
+      bucket: withoutAutoRoutingFlags(child.aiSettingsByAgent?.[agentId]),
       aiSettings: child.aiSettings ?? null,
       taskModelString: child.taskModelString ?? null,
       taskThinkingLevel: child.taskThinkingLevel ?? null,
@@ -141,7 +149,15 @@ export function computeReawakenInputsKey(
         ? {
             agentId: parent.agentId ?? null,
             agentType: parent.agentType ?? null,
-            aiSettingsByAgent: parent.aiSettingsByAgent ?? null,
+            aiSettingsByAgent:
+              parent.aiSettingsByAgent != null
+                ? Object.fromEntries(
+                    Object.entries(parent.aiSettingsByAgent).map(([id, bucket]) => [
+                      id,
+                      withoutAutoRoutingFlags(bucket),
+                    ])
+                  )
+                : null,
             aiSettings: parent.aiSettings ?? null,
           }
         : null,
@@ -310,12 +326,16 @@ export function applyAgentTaskTurnAiSnapshot(
     thinkingLevel: snapshot.thinkingLevel,
     reasoningMode: snapshot.reasoningMode,
   };
+  const previous = workspace.aiSettingsByAgent?.[snapshot.agentId];
   workspace.aiSettingsByAgent = {
     ...(workspace.aiSettingsByAgent ?? {}),
     [snapshot.agentId]: {
       model: bucketModel,
       thinkingLevel: snapshot.thinkingLevel,
       reasoningMode: snapshot.reasoningMode,
+      // The snapshot has no Auto choices; the child's composer keeps them for its next sends.
+      ...(previous?.autoModelRouting === true ? { autoModelRouting: true } : {}),
+      ...(previous?.autoThinkingLevel === true ? { autoThinkingLevel: true } : {}),
     },
   };
   workspace.taskModelString = snapshot.taskModelString;
