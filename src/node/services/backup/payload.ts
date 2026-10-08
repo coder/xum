@@ -988,7 +988,12 @@ export function projectBackupPreferences(value: unknown): UserPreferences {
   }
   const review = projectFields(parsed.review, BACKED_UP_REVIEW_FIELDS);
   if (review !== undefined) projected.review = review;
-  if (parsed.ui !== undefined) projected.ui = copyJson(parsed.ui);
+  if (parsed.ui !== undefined) {
+    // The artifact CDN choice is a security setting: a repository that could turn it back on
+    // would reopen the CDN request channel to hostile artifacts.
+    const { artifactsAllowCdnScripts, ...ui } = parsed.ui;
+    if (Object.keys(ui).length > 0) projected.ui = copyJson(ui);
+  }
 
   return projected;
 }

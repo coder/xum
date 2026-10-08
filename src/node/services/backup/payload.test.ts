@@ -887,6 +887,16 @@ describe("backup payload", () => {
     });
   });
 
+  it("keeps the artifact CDN choice out of both the backup and the restore", () => {
+    const local = { ui: { artifactsAllowCdnScripts: false } };
+    expect(serializeBackupPreferences(local).toString("utf-8")).not.toContain("Cdn");
+
+    const merged = mergeBackupPreferences(local, {
+      ui: { artifactsAllowCdnScripts: true, sidebarFlatMode: true },
+    });
+    expect(merged.ui).toEqual({ artifactsAllowCdnScripts: false, sidebarFlatMode: true });
+  });
+
   it("refuses an oversized file and an oversized payload on both sides", async () => {
     // Sparse, so the size is real to stat while nothing is ever read or written.
     async function sparseFile(root: string, relativePath: string, size: number): Promise<void> {
