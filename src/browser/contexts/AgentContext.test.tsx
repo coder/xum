@@ -1,6 +1,6 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
@@ -25,6 +25,7 @@ import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync
 
 let mockAgentDefinitions: AgentDefinitionDescriptor[] = [];
 let mockWorkspaceMetadata = new Map<string, { parentWorkspaceId?: string; agentId?: string }>();
+let mockAgentListFails = false;
 
 const EXEC_AGENT: AgentDefinitionDescriptor = {
   id: "exec",
@@ -128,7 +129,10 @@ function createApiClient(
         : {}),
     },
     agents: {
-      list: () => Promise.resolve(mockAgentDefinitions),
+      list: () =>
+        mockAgentListFails
+          ? Promise.reject(new Error("agents unavailable"))
+          : Promise.resolve(mockAgentDefinitions),
     },
     workspace: {
       list: () => Promise.resolve(workspaceMetadata),
@@ -196,6 +200,7 @@ describe("AgentContext", () => {
   beforeEach(() => {
     mockAgentDefinitions = [];
     mockWorkspaceMetadata = new Map();
+    mockAgentListFails = false;
 
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
@@ -258,6 +263,31 @@ describe("AgentContext", () => {
     await waitFor(() => {
       expect(getWorkspaceAiSelection(workspaceId, "review").model).toBe("openai:gpt-5.2");
     });
+  });
+
+  test("a failed agent refresh drops the inherited defaults it loaded before", async () => {
+    const workspaceId = "ws-custom-agent";
+    mockAgentDefinitions = [EXEC_AGENT, { ...REVIEW_PROJECT_AGENT, base: "exec" }];
+    mockWorkspaceMetadata = new Map([[workspaceId, { agentId: "review" }]]);
+    let contextValue: AgentContextValue | undefined;
+
+    renderAgentHarness({
+      projectPath: "/tmp/project",
+      workspaceId,
+      agentAiDefaults: { exec: { modelString: "openai:gpt-5.2" } },
+      onChange: (value) => (contextValue = value),
+    });
+    await waitFor(() => {
+      expect(getWorkspaceAiSelection(workspaceId, "review").model).toBe("openai:gpt-5.2");
+    });
+
+    mockAgentListFails = true;
+    await act(async () => {
+      await contextValue?.refresh();
+    });
+
+    expect(contextValue?.loadFailed).toBe(true);
+    expect(getWorkspaceAiSelection(workspaceId, "review").model).not.toBe("openai:gpt-5.2");
   });
 
   test("project-scoped preference takes precedence over global default", async () => {

@@ -3,6 +3,7 @@ import {
   getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
   getAutoThinkingLevelKey,
+  isNonWorkspaceScopeId,
 } from "@/common/constants/storage";
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
 import type { ThinkingLevel } from "@/common/types/thinking";
@@ -29,8 +30,7 @@ const pendingExplicitChanges = new Map<string, ExplicitModelChange>();
 // aliases (mux-gateway:openai/x) still collapse so persisted rewrites keep matching.
 const normalizeExplicitModel = (model: string): string => modelSelectionEqualityKey(model);
 
-/** Workspace ids never start with "__"; project, global and draft scopes do. */
-const isWorkspaceScope = (scopeId: string): boolean => !scopeId.startsWith("__");
+const isWorkspaceScope = (scopeId: string): boolean => !isNonWorkspaceScopeId(scopeId);
 
 export function recordWorkspaceModelChange(
   workspaceId: string,
