@@ -88,7 +88,7 @@ export function ultrafastModeAvailable(
 ): boolean {
   return (
     getFastModeProvider(modelString, options) === "openai" &&
-    openaiModelSupportsServiceTier(modelString, "ultrafast", options?.providersConfig)
+    openaiModelSupportsServiceTier(modelString, "ultrafast", options)
   );
 }
 

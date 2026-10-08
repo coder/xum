@@ -276,6 +276,23 @@ describe("fast mode service tier", () => {
         providersConfig: config({ wireFormat: "chatCompletions" }),
       })
     ).toBe(false);
+    // Coder pins each instance's wire; the direct OpenAI wire setting must not override it.
+    const viaCoder = (type: string) =>
+      ultrafastModeAvailable("coder:prod/gpt-6.1-sol", {
+        resolvedRouteProvider: "coder",
+        providersConfig: {
+          openai: { ...openai, wireFormat: "responses" },
+          coder: {
+            apiKeySet: false,
+            isEnabled: true,
+            isConfigured: true,
+            discoveredProviders: [{ name: "prod", type }],
+            models: [{ id: "prod/gpt-6.1-sol", mappedToModel: "openai:gpt-6.1-sol" }],
+          },
+        },
+      });
+    expect(viaCoder("openai")).toBe(true);
+    expect(viaCoder("openai-compat")).toBe(false);
     // Non-OpenAI Fast modes have no Ultrafast tier.
     expect(ultrafastModeAvailable("xai:grok-4.7", { providersConfig: null })).toBe(false);
   });

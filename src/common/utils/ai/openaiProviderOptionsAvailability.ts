@@ -71,22 +71,52 @@ export function resolveProviderOptionsRoute(
  * is no longer supported). Callers drop the tier for other models (Standard or
  * the project default) instead of switching to Fast, which is a different paid
  * tier. Ultrafast is also Responses-only: the Chat Completions service_tier enum
- * has no "ultrafast" and rejects it with a 400.
+ * has no "ultrafast" and rejects it with a 400 (see ultrafastWireAccepted).
  * https://developers.openai.com/api/docs/guides/ultrafast-mode
  */
 export function openaiModelSupportsServiceTier(
   modelString: string,
   serviceTier: string,
-  providersConfig?: ProvidersConfigMap | null,
-  openaiWireFormat?: OpenAIWireFormat | null
+  options?: OpenAIDirectProviderOptionsAvailability
 ): boolean {
   if (serviceTier !== "ultrafast") return true;
-  // The stored wire format wins over the request-level one, as in the factory.
-  const wireFormat = providersConfig?.openai?.wireFormat ?? openaiWireFormat ?? "responses";
-  if (wireFormat === "chatCompletions") return false;
+  if (!ultrafastWireAccepted(modelString, options)) return false;
   // Resolve mapped aliases and Coder gateway identities to the upstream model.
-  const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
+  const capabilityModel = resolveModelForMetadata(modelString, options?.providersConfig ?? null);
   return isGpt6AstraModel(capabilityModel) || isGpt61SolModel(capabilityModel);
+}
+
+/**
+ * Whether the wire this route actually speaks accepts Ultrafast. Each route pins its own
+ * wire, so the direct OpenAI wireFormat setting must not decide for other routes.
+ */
+function ultrafastWireAccepted(
+  modelString: string,
+  options?: OpenAIDirectProviderOptionsAvailability
+): boolean {
+  const providersConfig = options?.providersConfig;
+  const custom = providersConfig?.[modelString.split(":", 1)[0]];
+  // Only openai-responses custom providers carry tiers (openaiServiceTierAvailable), and
+  // they always speak Responses.
+  if (isCustomProviderConfig(custom)) return custom.providerType === "openai-responses";
+
+  const route = resolveProviderOptionsRoute(modelString, options);
+  if (route === "coder") {
+    // The factory pins a Coder route's wire from the instance type: only "openai"
+    // instances speak Responses; "openai-compat" instances use Chat Completions.
+    const gatewayModelId = resolveCoderRouteGatewayModelId(modelString, providersConfig ?? null);
+    const wire =
+      gatewayModelId == null
+        ? null
+        : resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder);
+    return wire?.providerType === "openai";
+  }
+  // Other gateways (OpenRouter, Xum Gateway, Copilot) keep forwarding the tier as before.
+  if (route !== "direct") return true;
+  // Direct OpenAI: the stored wire format wins over the request-level one, as in the factory.
+  const wireFormat =
+    providersConfig?.openai?.wireFormat ?? options?.openaiWireFormat ?? "responses";
+  return wireFormat !== "chatCompletions";
 }
 
 /** Fast shares OpenAI's preference across gateways that forward its service tier. */
