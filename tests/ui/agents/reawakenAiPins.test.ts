@@ -10,9 +10,7 @@ import "../dom";
 import { waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
-import { getThinkingLevelKey } from "@/common/constants/storage";
 import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { shouldRunIntegrationTests } from "../../testUtils";
@@ -91,7 +89,6 @@ describeIntegration("Reawakened sub-agent pins from the renderer", () => {
         workspace.taskAiPins = {};
       });
       const selection = () => getWorkspaceAiSelection(app.workspaceId);
-      const thinkingKey = getThinkingLevelKey(app.workspaceId);
 
       // 1. A plain send records no pins.
       await sendAndSettle(app, "plain follow-up");
@@ -121,7 +118,7 @@ describeIntegration("Reawakened sub-agent pins from the renderer", () => {
       await editChild(app, (workspace) => {
         workspace.aiSettingsByAgent = { exec: { model: BACKEND_MODEL, thinkingLevel: "low" } };
       });
-      await waitFor(() => expect(readPersistedState(thinkingKey, "")).toBe("low"), {
+      await waitFor(() => expect(selection().thinkingLevel).toBe("low"), {
         timeout: 10_000,
       });
       expect(selection().model).toBe(picked);

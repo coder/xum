@@ -74,9 +74,7 @@ import {
   getAgentIdKey,
   getAgentsInitNudgeKey,
   getProjectScopeId,
-  getThinkingLevelByModelKey,
   getReasoningModeKey,
-  getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   getWorkspaceLastReadKey,
   EXPANDED_PROJECTS_KEY,
@@ -515,43 +513,9 @@ function AppInner() {
   );
 
   const getThinkingLevelForWorkspace = useCallback(
-    (workspaceId: string): ThinkingLevel => {
-      if (!workspaceId) {
-        return "off";
-      }
-
-      const scopedKey = getThinkingLevelKey(workspaceId);
-      const scoped = readPersistedState<ThinkingLevel | undefined>(scopedKey, undefined);
-      if (scoped !== undefined) {
-        return THINKING_LEVELS.includes(scoped) ? scoped : "off";
-      }
-
-      // Keep this render-time palette lookup pure. ThinkingProvider owns migration to the
-      // workspace-scoped key, while the palette can read legacy values as a fallback.
-      const model = getModelForWorkspace(workspaceId);
-      const legacy = readPersistedState<ThinkingLevel | undefined>(
-        getThinkingLevelByModelKey(model),
-        undefined
-      );
-      if (legacy !== undefined && THINKING_LEVELS.includes(legacy)) {
-        return legacy;
-      }
-
-      // Fallback: check canonical key for legacy entries stored before gateway-aware normalization.
-      const canonicalModel = normalizeToCanonical(model);
-      if (canonicalModel !== model) {
-        const canonicalLegacy = readPersistedState<ThinkingLevel | undefined>(
-          getThinkingLevelByModelKey(canonicalModel),
-          undefined
-        );
-        if (canonicalLegacy !== undefined && THINKING_LEVELS.includes(canonicalLegacy)) {
-          return canonicalLegacy;
-        }
-      }
-
-      return "off";
-    },
-    [getModelForWorkspace]
+    (workspaceId: string): ThinkingLevel =>
+      workspaceId ? getAiSelectionForWorkspace(workspaceId).thinkingLevel : "off",
+    [getAiSelectionForWorkspace]
   );
 
   // Pro mode is Responses-only; the palette command hides under chatCompletions
@@ -579,6 +543,7 @@ function AppInner() {
     return coerceOpenAIReasoningMode(stored) ?? "standard";
   }, []);
 
+  // Palette picks stay in memory until a user message sends them.
   const setThinkingLevelFromPalette = useCallback(
     (workspaceId: string, level: ThinkingLevel) => {
       if (!workspaceId) {
@@ -587,12 +552,8 @@ function AppInner() {
 
       const normalized = THINKING_LEVELS.includes(level) ? level : "off";
       const model = getModelForWorkspace(workspaceId);
-      const key = getThinkingLevelKey(workspaceId);
       const reasoningMode = getReasoningModeForWorkspace(workspaceId);
 
-      // Use the utility function which handles localStorage and event dispatch
-      // ThinkingProvider will pick this up via its listener
-      updatePersistedState(key, normalized);
       markAiSelectionIntent(workspaceId, "thinkingLevel", normalized);
       // The palette bypasses ThinkingProvider.setThinkingLevel, so leave Auto here too.
       setAutoRoutingChoice(workspaceId, "thinkingLevel", false);

@@ -30,7 +30,7 @@ const STORAGE_KEYS: Record<ScopedAiField, (scopeId: string) => string> = {
 const PROJECT_SCOPE_PREFIX = getProjectScopeId("");
 
 /** Project and global scopes are config.json preferences; workspace and draft scopes stay local. */
-export function getServerScope(scopeId: string): { projectPath?: string } | undefined {
+function getServerScope(scopeId: string): { projectPath?: string } | undefined {
   if (scopeId === GLOBAL_SCOPE_ID) return {};
   return scopeId.startsWith(PROJECT_SCOPE_PREFIX)
     ? { projectPath: scopeId.slice(PROJECT_SCOPE_PREFIX.length) }

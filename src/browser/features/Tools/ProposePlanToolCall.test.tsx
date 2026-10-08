@@ -19,8 +19,6 @@ import {
   getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
 import {
   resetAiSelectionIntentForTests,
@@ -326,15 +324,12 @@ function renderCompletedPlan(props: Partial<ProposePlanProps> = {}) {
 function startInPlanMode(
   workspaceId = WORKSPACE_ID,
   model?: string,
-  thinkingLevel?: ThinkingLevel
+  thinkingLevel: ThinkingLevel = "off"
 ) {
   window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("plan"));
   if (model) {
-    setWorkspaceAiMetadata(workspaceId, {
-      aiSettingsByAgent: { plan: { model, thinkingLevel: thinkingLevel ?? "off" } },
-    });
+    setWorkspaceAiMetadata(workspaceId, { aiSettingsByAgent: { plan: { model, thinkingLevel } } });
   }
-  if (thinkingLevel) updatePersistedState(getThinkingLevelKey(workspaceId), thinkingLevel);
 }
 
 function recordSendMessage(calls: SendMessageArgs[]): MockApi["workspace"]["sendMessage"] {
@@ -605,16 +600,13 @@ describe("ProposePlanToolCall", () => {
     // Note: some tests in this repo mock the `usePersistedState` module globally. In that case,
     // `updatePersistedState` won't actually write to localStorage here, so we assert the call.
     const agentKey = getAgentIdKey(WORKSPACE_ID);
-    const thinkingKey = getThinkingLevelKey(WORKSPACE_ID);
     const updatePersistedStateMaybeMock = updatePersistedState as unknown as {
       mock?: { calls: unknown[][] };
     };
     if (updatePersistedStateMaybeMock.mock) {
       expect(updatePersistedState).toHaveBeenCalledWith(agentKey, "exec");
-      expect(updatePersistedState).toHaveBeenCalledWith(thinkingKey, execThinking);
     } else {
       expect(JSON.parse(window.localStorage.getItem(agentKey)!)).toBe("exec");
-      expect(JSON.parse(window.localStorage.getItem(thinkingKey)!)).toBe(execThinking);
     }
   });
 
@@ -664,17 +656,14 @@ describe("ProposePlanToolCall", () => {
     const execWorkspaceModel = "openai:gpt-5.2-pro";
     const execWorkspaceThinking = "medium";
 
-    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+    window.localStorage.setItem(getAgentIdKey(WORKSPACE_ID), JSON.stringify("plan"));
     setTestAgentAiDefaults({});
-    const exec = { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking } as const;
     setWorkspaceAiMetadata(WORKSPACE_ID, {
       aiSettingsByAgent: {
         plan: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "high" },
-        exec,
+        exec: { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking },
       },
     });
-    // Thinking still restores from the seeded per-agent cache.
-    updatePersistedState(getWorkspaceAISettingsByAgentKey(WORKSPACE_ID), { exec });
 
     const sendMessageCalls: SendMessageArgs[] = [];
     mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });

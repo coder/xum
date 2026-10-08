@@ -26,7 +26,6 @@ import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions"
 import {
   getAgentIdKey,
   getReasoningModeKey,
-  getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   getPendingScopeId,
   getDraftScopeId,
@@ -179,13 +178,8 @@ function syncCreationPreferences(
     recordAutoRoutingChoiceForAgent(workspaceId, effectiveAgentId, routingChoice);
   }
 
-  const projectThinkingLevel = projectDefaults?.thinkingLevel;
-  if (projectThinkingLevel !== undefined) {
-    updatePersistedState(getThinkingLevelKey(workspaceId), projectThinkingLevel);
-  }
-
-  // Mirror thinkingLevel: carry the creation-time pro reasoning-mode choice into
-  // the new workspace's scope so it survives the project→workspace transition.
+  // Carry the creation-time pro reasoning-mode choice into the new workspace's
+  // scope so it survives the project→workspace transition.
   // Coerced so a corrupt persisted value is dropped instead of copied forward.
   const projectReasoningMode = coerceOpenAIReasoningMode(
     readPersistedState<OpenAIReasoningMode | null>(getReasoningModeKey(projectScopeId), null)
@@ -196,7 +190,7 @@ function syncCreationPreferences(
 
   const projectModel = projectDefaults?.model;
   if (projectModel) {
-    const effectiveThinking: ThinkingLevel = projectThinkingLevel ?? "off";
+    const effectiveThinking: ThinkingLevel = projectDefaults?.thinkingLevel ?? "off";
 
     type AgentSettingsCache = Partial<
       Record<

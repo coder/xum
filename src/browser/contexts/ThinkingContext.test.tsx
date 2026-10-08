@@ -17,8 +17,6 @@ import {
   getAutoThinkingLevelKey,
   getProjectScopeId,
   getReasoningModeKey,
-  getThinkingLevelByModelKey,
-  getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
 import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
@@ -177,12 +175,8 @@ function applyWorkspaceStorageOverrides(props: {
     markAiSelectionIntent(props.workspaceId, "model", props.modelOverride);
   }
 
-  if (props.thinkingOverride !== undefined) {
-    if (props.thinkingOverride == null) {
-      window.localStorage.removeItem(getThinkingLevelKey(props.workspaceId));
-    } else {
-      updatePersistedState(getThinkingLevelKey(props.workspaceId), props.thinkingOverride);
-    }
+  if (props.thinkingOverride != null) {
+    markAiSelectionIntent(props.workspaceId, "thinkingLevel", props.thinkingOverride);
   }
 }
 
@@ -565,7 +559,7 @@ describe("ThinkingContext", () => {
     const workspaceId = "ws-1";
 
     markAiSelectionIntent(workspaceId, "model", "openai:gpt-5.2");
-    updatePersistedState(getThinkingLevelKey(workspaceId), "high");
+    markAiSelectionIntent(workspaceId, "thinkingLevel", "high");
 
     let unmounts = 0;
 
@@ -600,36 +594,6 @@ describe("ThinkingContext", () => {
     });
 
     expect(unmounts).toBe(0);
-  });
-  test("migrates legacy per-model thinking to the workspace-scoped key", async () => {
-    const workspaceId = "ws-1";
-
-    markAiSelectionIntent(workspaceId, "model", "openai:gpt-5.2");
-    updatePersistedState(getThinkingLevelByModelKey("openai:gpt-5.2"), "low");
-
-    const view = renderWithAPI(
-      <ThinkingProvider workspaceId={workspaceId}>
-        <TestComponent workspaceId={workspaceId} />
-      </ThinkingProvider>
-    );
-
-    await waitFor(() => {
-      expect(view.getByTestId("thinking").textContent).toBe("low:ws-1");
-    });
-
-    // Migration should have populated the new workspace-scoped key.
-    const persisted = window.localStorage.getItem(getThinkingLevelKey(workspaceId));
-    expect(persisted).toBeTruthy();
-    expect(JSON.parse(persisted!)).toBe("low");
-
-    // Switching models should not change the workspace-scoped value.
-    act(() => {
-      markAiSelectionIntent(workspaceId, "model", "anthropic:claude-3.5");
-    });
-
-    await waitFor(() => {
-      expect(view.getByTestId("thinking").textContent).toBe("low:ws-1");
-    });
   });
 
   test("cycles thinking with metadata model before global default", async () => {

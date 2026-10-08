@@ -2,22 +2,16 @@ import {
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
   getReasoningModeKey,
-  getThinkingLevelByModelKey,
-  getThinkingLevelKey,
   getDisableWorkspaceAgentsKey,
 } from "@/common/constants/storage";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { buildSendMessageOptions } from "@/browser/utils/messages/buildSendMessageOptions";
 import type { SendMessageOptions } from "@/common/orpc/types";
-import {
-  coerceOpenAIReasoningMode,
-  type OpenAIReasoningMode,
-  type ThinkingLevel,
-} from "@/common/types/thinking";
+import { coerceOpenAIReasoningMode, type OpenAIReasoningMode } from "@/common/types/thinking";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
-import { getServerScope, readScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import { readScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { migrateGlobalToPerModel } from "@/browser/contexts/ProviderOptionsContext";
@@ -36,28 +30,7 @@ function getProviderOptions(): MuxProviderOptions {
  */
 export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptions {
   const agentId = readScopedAiDefault(workspaceId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
-  const baseModel = getWorkspaceAiSelection(workspaceId, agentId).model;
-
-  // Read thinking level (workspace-scoped).
-  // Migration: if the workspace-scoped value is missing, fall back to legacy per-model storage
-  // once, then persist into the workspace-scoped key.
-  const scopedKey = getThinkingLevelKey(workspaceId);
-  const existingScoped = readScopedAiDefault(workspaceId, "thinkingLevel");
-  // Project and global scopes are typed preferences, so only workspace scopes migrate.
-  const migratesLegacyLevel =
-    existingScoped === undefined && getServerScope(workspaceId) === undefined;
-  const thinkingLevel =
-    existingScoped ??
-    (migratesLegacyLevel
-      ? readPersistedState<ThinkingLevel>(
-          getThinkingLevelByModelKey(baseModel),
-          WORKSPACE_DEFAULTS.thinkingLevel
-        )
-      : WORKSPACE_DEFAULTS.thinkingLevel);
-  if (migratesLegacyLevel) {
-    // Best-effort: avoid losing a user's existing per-model preference.
-    updatePersistedState<ThinkingLevel>(scopedKey, thinkingLevel);
-  }
+  const selection = getWorkspaceAiSelection(workspaceId, agentId);
 
   // OpenAI pro reasoning mode (workspace-scoped); absent = standard.
   // Coerce untrusted persisted values so corrupt entries self-heal to "standard"
@@ -86,9 +59,9 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
     readPersistedState<boolean>(getAutoThinkingLevelKey(workspaceId), false) === true;
 
   return buildSendMessageOptions({
-    model: baseModel,
+    model: selection.model,
     agentId,
-    thinkingLevel,
+    thinkingLevel: selection.thinkingLevel,
     reasoningMode,
     providerOptions,
     disableWorkspaceAgents,

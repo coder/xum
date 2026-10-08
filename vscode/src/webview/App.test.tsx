@@ -6,8 +6,11 @@ import { Profiler } from "react";
 
 import { installDom } from "../../../tests/ui/dom";
 import { updatePersistedState } from "xum/browser/hooks/usePersistedState";
-import { getAgentIdKey, getThinkingLevelKey } from "xum/common/constants/storage";
-import { resetAiSelectionIntentForTests } from "xum/browser/utils/aiSelectionIntent";
+import { getAgentIdKey } from "xum/common/constants/storage";
+import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+} from "xum/browser/utils/aiSelectionIntent";
 import { formatModelDisplayName } from "xum/common/utils/ai/modelDisplay";
 import { getAppConfigStore, getUserPreferences } from "xum/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
@@ -1253,6 +1256,7 @@ describe("vscode webview AI settings persistence", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    resetAiSelectionIntentForTests();
   });
 
   afterEach(() => {
@@ -1304,7 +1308,7 @@ describe("vscode webview AI settings persistence", () => {
     // not clamp; the backend applies the authoritative floor to the turn.
     // "low" is below the default model's built-in minimum (medium), so a client-side clamp would
     // raise it; it is also not the default, so the test proves the stored choice is what is sent.
-    updatePersistedState(getThinkingLevelKey(WORKSPACE.id), "low");
+    markAiSelectionIntent(WORKSPACE.id, "thinkingLevel", "low");
     const { bridge, view } = await renderSelected();
     const options = await sendMessage(bridge, view);
     expect(options.thinkingLevel).toBe("low");
@@ -1615,6 +1619,7 @@ describe("vscode webview app and providers config", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    resetAiSelectionIntentForTests();
   });
 
   afterEach(() => {
@@ -1630,7 +1635,7 @@ describe("vscode webview app and providers config", () => {
 
   test("shows the thinking level raised to the user's configured minimum", async () => {
     // "low" is below both the built-in minimum (MED) and the configured one (HIGH).
-    updatePersistedState(getThinkingLevelKey(WORKSPACE.id), "low");
+    markAiSelectionIntent(WORKSPACE.id, "thinkingLevel", "low");
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge);
