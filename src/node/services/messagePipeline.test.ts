@@ -226,9 +226,9 @@ describe("reasoning replay in built provider requests", () => {
     expect(JSON.stringify(result)).not.toContain("orphan thoughts");
   });
 
-  it("strips replayed Anthropic reasoning for Sonnet 5.5 between_tools (edited history)", async () => {
-    // #5086: between_tools cannot carry block_binding, so a history block whose prefix
-    // changed (an edit, or a system/tools change) must not be replayed.
+  it("strips replayed Anthropic reasoning at off for prefix-bound models (edited history)", async () => {
+    // #5086: between_tools and disabled thinking cannot carry block_binding, so a history
+    // block whose prefix changed (an edit, or a system/tools change) must not be replayed.
     const history = historyWith([
       {
         type: "reasoning",
@@ -244,8 +244,10 @@ describe("reasoning replay in built provider requests", () => {
     expect(
       JSON.stringify(await buildRequest("anthropic", "off", history, "anthropic:claude-sonnet-5-5"))
     ).toContain("earlier answer");
-    // Adaptive Sonnet 5.5 and Sonnet 5 "off" (disabled) keep replaying it.
+    expect(await replayed("anthropic:claude-haiku-5-5", "off")).toBe(0);
+    // Adaptive thinking and models that do not bind blocks (Sonnet 5 "off") keep replaying it.
     expect(await replayed("anthropic:claude-sonnet-5-5", "low")).toBe(1);
+    expect(await replayed("anthropic:claude-haiku-5-5", "low")).toBe(1);
     expect(await replayed("anthropic:claude-sonnet-5", "off")).toBe(1);
   });
 
