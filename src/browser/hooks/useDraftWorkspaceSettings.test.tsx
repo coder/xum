@@ -5,8 +5,6 @@ import React from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getRuntimeKey } from "@/common/constants/storage";
 import { CODER_RUNTIME_PLACEHOLDER } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "./useDraftWorkspaceSettings";
 import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
@@ -252,7 +250,6 @@ describe("useDraftWorkspaceSettings", () => {
     const projectPath = "/tmp/project";
 
     getAppConfigStore().updateOptimistically({ defaultRuntime: "coder" });
-    updatePersistedState(getRuntimeKey(projectPath), "ssh dev@host");
     const lastRuntimeConfig = {
       ssh: {
         host: "dev@host",
@@ -275,42 +272,6 @@ describe("useDraftWorkspaceSettings", () => {
         coder: { existingWorkspace: false },
       });
     });
-  });
-
-  test("persists Coder default string when toggling default", async () => {
-    const projectPath = "/tmp/project";
-
-    const lastRuntimeConfig = {
-      ssh: {
-        host: "dev@host",
-        coderEnabled: false,
-        coderConfig: { existingWorkspace: false },
-      },
-    };
-
-    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, lastRuntimeConfig));
-
-    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
-      wrapper,
-    });
-
-    act(() => {
-      result.current.setDefaultRuntimeChoice("coder");
-    });
-
-    await waitFor(() => {
-      expect(result.current.settings.selectedRuntime).toEqual({
-        mode: "ssh",
-        host: CODER_RUNTIME_PLACEHOLDER,
-        coder: { existingWorkspace: false },
-      });
-    });
-
-    const defaultRuntimeString = readPersistedState<string | undefined>(
-      getRuntimeKey(projectPath),
-      undefined
-    );
-    expect(defaultRuntimeString).toBe(`ssh ${CODER_RUNTIME_PLACEHOLDER}`);
   });
 
   test("exposes persisted Coder config as fallback when re-selecting Coder", async () => {

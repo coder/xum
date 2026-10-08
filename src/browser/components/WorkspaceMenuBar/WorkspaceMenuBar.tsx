@@ -56,7 +56,6 @@ import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
 import { useAPI } from "@/browser/contexts/API";
-import { useAgent } from "@/browser/contexts/AgentContext";
 
 import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -154,7 +153,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   onOpenTerminal,
 }) => {
   const { api } = useAPI();
-  const { disableWorkspaceAgents } = useAgent();
   const { preflightArchiveWorkspace, archiveWorkspace, archivingWorkspaceIds, setWorkspacePinned } =
     useWorkspaceActions();
   const isArchiving = archivingWorkspaceIds.has(workspaceId);
@@ -198,7 +196,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     setUnrelatedMessagingWorkspaceId(null);
   }
   const unrelatedMessagingModalOpen = unrelatedMessagingWorkspaceId === workspaceId;
-  const skillList = useAgentSkills({ workspaceId, disableWorkspaceAgents });
+  const skillList = useAgentSkills({ workspaceId, disableWorkspaceAgents: false });
   const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuBarRef = useRef<HTMLDivElement | null>(null);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);

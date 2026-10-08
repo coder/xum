@@ -63,9 +63,8 @@ import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/a
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import type { ChatAttachment } from "../features/ChatInput/ChatAttachments";
 import { dispatchWorkspaceSwitch } from "./workspaceEvents";
-import { getRuntimeKey } from "@/common/constants/storage";
 import { copyWorkspaceStorage } from "@/browser/utils/workspaceStorage";
-import { readPersistedRawString } from "@/browser/hooks/usePersistedState";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
@@ -1379,18 +1378,12 @@ export async function createNewWorkspace(
     effectiveTrunk = recommendedTrunk ?? "main";
   }
 
-  // Use saved default runtime preference if not explicitly provided
-  let effectiveRuntime = options.runtime;
-  if (effectiveRuntime === undefined) {
-    const runtimeKey = getRuntimeKey(options.projectPath);
-    const savedRuntime = readPersistedRawString(runtimeKey);
-    if (savedRuntime) {
-      effectiveRuntime = savedRuntime;
-    }
-  }
-
-  // Parse runtime config if provided.
-  const runtimeConfig = parseRuntimeString(effectiveRuntime);
+  // /new cannot ask for the host, image or config path the other runtimes need, so only a
+  // configured local default applies; anything else gets the backend's worktree default.
+  const defaultRuntime = getAppConfigStore().getSnapshot()?.defaultRuntime;
+  const runtimeConfig = parseRuntimeString(
+    options.runtime ?? (defaultRuntime === RUNTIME_MODE.LOCAL ? defaultRuntime : undefined)
+  );
 
   const result = await options.client.workspace.create({
     projectPath: options.projectPath,

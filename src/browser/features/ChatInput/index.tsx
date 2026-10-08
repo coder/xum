@@ -668,7 +668,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     variant,
     workspaceId,
     projectPath: atMentionProjectPath,
-    disableWorkspaceAgents: sendMessageOptions.disableWorkspaceAgents === true,
   });
   const { agentSkillDescriptors, handleInputCaretChange, mcpPromptDescriptors } =
     composerSuggestions;
@@ -883,7 +882,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           sshHostFallback: creationState.sshHostFallback,
           defaultRuntimeMode: creationState.defaultRuntimeMode,
           onSelectedRuntimeChange: creationState.setSelectedRuntime,
-          onSetDefaultRuntime: creationState.setDefaultRuntimeChoice,
           disabled: isSendInFlight,
           projectPath: creationParentProjectPath,
           // Surface the actually-targeted project (possibly a sub-project) to
@@ -2238,9 +2236,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           ? {
               kind: "workspace",
               workspaceId,
-              disableWorkspaceAgents:
-                sendMessageOptions.disableWorkspaceAgents === true ||
-                transferredDraftProjectDiscovery,
+              disableWorkspaceAgents: transferredDraftProjectDiscovery,
             }
           : null;
     // Captured before command resolution so the row the new workspace opens with shows what was

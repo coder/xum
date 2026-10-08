@@ -13,13 +13,10 @@ import { installDom } from "../../../tests/ui/dom";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import * as storageModule from "@/common/constants/storage";
 import {
-  GLOBAL_SCOPE_ID,
   PERSISTED_KEY_REGISTRY,
-  getDisableWorkspaceAgentsKey,
   getDraftScopeId,
   getPersistedKeyKind,
   getPersistedKeyRegistration,
-  getProjectScopeId,
   type PersistedKeyRegistration,
 } from "@/common/constants/storage";
 
@@ -44,12 +41,6 @@ const MODEL_COUNT = 50;
 const NON_EVICTABLE_CEILING_CHARS = 2.5 * 1024 * 1024;
 const LOCAL_STORAGE_BUDGET_CEILING_CHARS = 3.5 * 1024 * 1024;
 
-/**
- * Workspace keys that creation flows also write under project and global scope ids (creation
- * defaults), so they are counted once per project plus once for the global scope.
- */
-const PROJECT_SCOPED_WORKSPACE_KEYS = [getDisableWorkspaceAgentsKey];
-
 function projectPath(index: number): string {
   const prefix = `/Users/someone/src/github.com/org/project-${index}/`;
   return prefix + "p".repeat(PROJECT_PATH_CHARS - prefix.length);
@@ -64,7 +55,6 @@ const workspaceIds = Array.from({ length: WORKSPACE_COUNT }, (_, index) => works
 const draftScopeIds = Array.from({ length: DRAFT_SCOPE_COUNT }, (_, index) =>
   getDraftScopeId(projectPaths[index % PROJECT_COUNT], `${index}`.padStart(36, "d"))
 );
-const projectScopeIds = [...projectPaths.map(getProjectScopeId), GLOBAL_SCOPE_ID];
 
 /** Every concrete key the worst-case model writes for one registration. */
 function modelledKeys(entry: PersistedKeyRegistration): string[] {
@@ -75,11 +65,7 @@ function modelledKeys(entry: PersistedKeyRegistration): string[] {
         : entry.scopes === "webview"
           ? workspaceIds
           : [...workspaceIds, ...draftScopeIds];
-    const keys = scopeIds.map(entry.getKey);
-    if (PROJECT_SCOPED_WORKSPACE_KEYS.includes(entry.getKey)) {
-      keys.push(...projectScopeIds.map(entry.getKey));
-    }
-    return keys;
+    return scopeIds.map(entry.getKey);
   }
   if (entry.match === "exact") return [entry.key];
   switch (entry.instances) {

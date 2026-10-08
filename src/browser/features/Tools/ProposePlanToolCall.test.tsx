@@ -231,8 +231,6 @@ function wrapToolCall(content: JSX.Element, agentId = "plan") {
         loadFailed: false,
         refresh: () => Promise.resolve(),
         refreshing: false,
-        disableWorkspaceAgents: false,
-        setDisableWorkspaceAgents: noop,
       }}
     >
       <TooltipProvider>{content}</TooltipProvider>

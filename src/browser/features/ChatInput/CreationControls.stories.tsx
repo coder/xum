@@ -90,7 +90,6 @@ const BASE_ARGS = {
   value: RUNTIME_MODE.WORKTREE,
   defaultMode: RUNTIME_MODE.WORKTREE,
   onChange: fn(),
-  onSetDefault: fn(),
   runtimeAvailabilityState: getLoadedRuntimeAvailability({ available: true }),
 } satisfies RuntimeButtonGroupProps;
 
@@ -124,7 +123,6 @@ const DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS: Omit<
   coderConfigFallback: {},
   sshHostFallback: "devbox.internal",
   defaultRuntimeMode: RUNTIME_MODE.WORKTREE,
-  onSetDefaultRuntime: fn(),
   disabled: false,
   projectPath: "/home/user/projects/my-app",
   userProjects: new Map(),
@@ -340,7 +338,6 @@ const CREATION_ERROR_BASE_CONTROLS_PROPS = {
   sshHostFallback: "devbox",
   defaultRuntimeMode: RUNTIME_MODE.WORKTREE,
   onSelectedRuntimeChange: fn(),
-  onSetDefaultRuntime: fn(),
   disabled: false,
   projectPath: CREATION_PROJECT_PATH,
   userProjects: new Map(),

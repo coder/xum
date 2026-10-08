@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import { Command } from "cmdk";
 import { useCommandRegistry } from "@/browser/contexts/CommandRegistryContext";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getAgentSkillsStore, useAgentSkills } from "@/browser/stores/AgentSkillsStore";
 import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import {
@@ -17,7 +16,6 @@ import { resolveSlashCommandExperimentValue } from "@/browser/utils/slashCommand
 import { getSlashCommandSuggestions } from "@/browser/utils/slashCommands/suggestions";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { getDisableWorkspaceAgentsKey, GLOBAL_SCOPE_ID } from "@/common/constants/storage";
 import { filterCommandsByPrefix } from "@/browser/utils/commandPaletteFiltering";
 import { rankByPaletteQuery } from "@/browser/utils/commandPaletteRanking";
 
@@ -67,17 +65,13 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   const slashContext = getSlashContext?.();
   const slashWorkspaceId = slashContext?.workspaceId;
 
-  const [disableWorkspaceAgents] = usePersistedState<boolean>(
-    getDisableWorkspaceAgentsKey(slashWorkspaceId ?? GLOBAL_SCOPE_ID),
-    false,
-    { listener: true }
-  );
-
   const commandPanelRef = useRef<HTMLDivElement | null>(null);
   const paletteOpenOriginRef = useRef<HTMLElement | null>(null);
   const { isOpen, initialQuery, close, getActions, addRecent, recent } = useCommandRegistry();
   const agentSkills = useAgentSkills(
-    isOpen && slashWorkspaceId ? { workspaceId: slashWorkspaceId, disableWorkspaceAgents } : null
+    isOpen && slashWorkspaceId
+      ? { workspaceId: slashWorkspaceId, disableWorkspaceAgents: false }
+      : null
   ).skills;
   const [query, setQuery] = useState("");
   const [activePrompt, setActivePrompt] = useState<null | {
@@ -233,7 +227,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
       if (slashWorkspaceId && value.trim().startsWith("/") && !query.trim().startsWith("/")) {
         getAgentSkillsStore().ensureFresh({
           workspaceId: slashWorkspaceId,
-          disableWorkspaceAgents,
+          disableWorkspaceAgents: false,
         });
       }
       setQuery(value);
@@ -241,7 +235,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
         setPromptError(null);
       }
     },
-    [activePrompt, query, slashWorkspaceId, disableWorkspaceAgents]
+    [activePrompt, query, slashWorkspaceId]
   );
 
   const generalResults = useMemo(() => {

@@ -15,7 +15,6 @@ import {
   getPersistedKeyRegistration,
   getWorkspaceNameStateKey,
   getDesktopPopoutKey,
-  getDisableWorkspaceAgentsKey,
   getMCPTestResultsKey,
   getPinnedTodoExpandedKey,
   getReviewFileFilterKey,
@@ -43,7 +42,6 @@ describe("deleteWorkspaceStorage", () => {
     const workspaceId = "ws-delete-missing";
     const otherWorkspaceKey = getPinnedTodoExpandedKey("ws-other");
     const keys = [
-      getDisableWorkspaceAgentsKey,
       getPinnedTodoExpandedKey,
       getSubAgentTasksExpandedKey,
       getRightSidebarLayoutKey,

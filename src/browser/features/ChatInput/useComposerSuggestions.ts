@@ -157,12 +157,10 @@ interface UseComposerSuggestionsOptions {
   variant: "creation" | "workspace";
   workspaceId: string | null;
   projectPath: string | null;
-  disableWorkspaceAgents: boolean;
 }
 
 export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
-  const { disableWorkspaceAgents, input, inputRef, projectPath, setInput, variant, workspaceId } =
-    options;
+  const { input, inputRef, projectPath, setInput, variant, workspaceId } = options;
   const { api } = useAPI();
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
@@ -212,10 +210,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   const listId = useId();
   const skillDiscovery: AgentSkillsDiscovery | null =
     variant === "workspace" && workspaceId
-      ? {
-          workspaceId,
-          disableWorkspaceAgents: disableWorkspaceAgents || transferredDraftProjectDiscovery,
-        }
+      ? { workspaceId, disableWorkspaceAgents: transferredDraftProjectDiscovery }
       : variant === "creation" && projectPath
         ? { projectPath }
         : null;

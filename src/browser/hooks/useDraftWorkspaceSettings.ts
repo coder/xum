@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { usePersistedState } from "./usePersistedState";
 import { useReasoningMode } from "./useReasoningMode";
 import { useThinkingLevel } from "./useThinkingLevel";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
@@ -15,14 +14,12 @@ import {
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import {
   readOptionField,
-  readRuntimeOptionDefaults,
   readSshOptionDefaults,
   type RuntimeOptionDefaults,
   updateRuntimeOptionDefaults,
   useRuntimeOptionDefaults,
   writeSshOptionDefaults,
 } from "@/browser/utils/runtimeOptionDefaults";
-import { getRuntimeKey } from "@/common/constants/storage";
 import {
   updateUserPreferences,
   useAppConfig,
@@ -220,8 +217,6 @@ export function useDraftWorkspaceSettings(
   sshHostFallback: string;
   /** Set the currently selected runtime (discriminated union) */
   setSelectedRuntime: (runtime: ParsedRuntime) => void;
-  /** Set the default runtime choice for this project (persists via checkbox) */
-  setDefaultRuntimeChoice: (choice: RuntimeChoice) => void;
   setTrunkBranch: (branch: string) => void;
   getRuntimeString: () => string | undefined;
 } {
@@ -262,15 +257,6 @@ export function useDraftWorkspaceSettings(
   const rawGlobalDefaultRuntime = useAppConfig((config) => config.defaultRuntime);
   const globalDefaultRuntime = normalizeRuntimeChoice(rawGlobalDefaultRuntime);
 
-  // Project-scoped default runtime (persisted when the creation tooltip checkbox is used).
-  // Legacy per-project default (only write-side used by setDefaultRuntimeChoice; reads
-  // now come from settingsDefaultRuntime above).
-  const [, setDefaultRuntimeString] = usePersistedState<string | undefined>(
-    getRuntimeKey(projectPath),
-    undefined,
-    { listener: true }
-  );
-
   const hasProjectRuntimeOverrides =
     projectConfig?.runtimeOverridesEnabled === true ||
     Boolean(projectConfig?.runtimeEnablement) ||
@@ -279,9 +265,6 @@ export function useDraftWorkspaceSettings(
     ? (projectConfig?.defaultRuntime ?? globalDefaultRuntime ?? RUNTIME_MODE.WORKTREE)
     : (globalDefaultRuntime ?? RUNTIME_MODE.WORKTREE);
 
-  // Always use the Settings-configured default as the canonical source of truth.
-  // The old per-project localStorage key (getRuntimeKey) is now stale since the creation
-  // tooltip default toggle was removed; new defaults come from the Runtimes settings panel.
   const parsedDefault = buildRuntimeFromChoice(settingsDefaultRuntime);
   const defaultRuntimeMode: RuntimeMode = parsedDefault?.mode ?? RUNTIME_MODE.WORKTREE;
 
@@ -512,38 +495,6 @@ export function useDraftWorkspaceSettings(
     }
   };
 
-  // Setter for default runtime choice (persists via checkbox in tooltip)
-  const setDefaultRuntimeChoice = (choice: RuntimeChoice) => {
-    // Defaults should only change when the checkbox is toggled, not when last-used SSH flips.
-    const freshRuntimeConfigs = readRuntimeOptionDefaults(projectPath);
-    const freshSshState = readSshRuntimeState(freshRuntimeConfigs);
-
-    const newMode = choice === "coder" ? RUNTIME_MODE.SSH : choice;
-    const sshConfig: SshRuntimeConfig =
-      choice === "coder"
-        ? {
-            host: CODER_RUNTIME_PLACEHOLDER,
-            coder: freshSshState.coderConfig ?? DEFAULT_CODER_CONFIG,
-          }
-        : {
-            host: freshSshState.host,
-            coder: undefined,
-          };
-
-    const newRuntime = buildRuntimeForMode(
-      newMode,
-      sshConfig,
-      lastDockerImage,
-      lastShareCredentials,
-      defaultDevcontainerConfigPath,
-      lastDevcontainerShareCredentials
-    );
-    const newRuntimeString = buildRuntimeString(newRuntime);
-    setDefaultRuntimeString(newRuntimeString);
-    // Also update selection to match new default
-    setSelectedRuntimeState(newRuntime);
-  };
-
   // Helper to get runtime string for IPC calls
   const getRuntimeString = (): string | undefined => {
     return buildRuntimeString(selectedRuntime);
@@ -562,7 +513,6 @@ export function useDraftWorkspaceSettings(
     coderConfigFallback,
     sshHostFallback,
     setSelectedRuntime,
-    setDefaultRuntimeChoice,
     setTrunkBranch,
     getRuntimeString,
   };

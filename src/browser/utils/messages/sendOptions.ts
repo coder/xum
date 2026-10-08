@@ -1,5 +1,3 @@
-import { getDisableWorkspaceAgentsKey } from "@/common/constants/storage";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { buildSendMessageOptions } from "@/browser/utils/messages/buildSendMessageOptions";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -19,7 +17,7 @@ function getProviderOptions(): MuxProviderOptions {
 }
 
 /**
- * Non-hook equivalent of useSendMessageOptions — reads current preferences from localStorage.
+ * Non-hook equivalent of useSendMessageOptions: resolves the current picks and preferences.
  * Used by compaction, resume, idle-compaction, and plan execution outside React context.
  */
 export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptions {
@@ -27,11 +25,6 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
   const selection = getWorkspaceAiSelection(workspaceId, agentId);
 
   const providerOptions = getProviderOptions();
-
-  const disableWorkspaceAgents = readPersistedState<boolean>(
-    getDisableWorkspaceAgentsKey(workspaceId),
-    false
-  );
 
   // Same gate as useAutoRoutingSelection: a saved true must not reach the backend
   // once the experiment is off.
@@ -45,7 +38,6 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
     ...selection,
     agentId,
     providerOptions,
-    disableWorkspaceAgents,
     autoModelRouting,
     autoThinkingLevel,
   });

@@ -158,8 +158,6 @@ interface UseCreationWorkspaceReturn {
   defaultRuntimeMode: RuntimeChoice;
   /** Set the currently selected runtime (discriminated union) */
   setSelectedRuntime: (runtime: ParsedRuntime) => void;
-  /** Set the default runtime choice for this project (persists via checkbox) */
-  setDefaultRuntimeChoice: (choice: RuntimeChoice) => void;
   toast: Toast | null;
   setToast: (toast: Toast | null) => void;
   isSending: boolean;
@@ -274,14 +272,8 @@ export function useCreationWorkspace({
     useState<RuntimeAvailabilityState>({ status: "loading" });
 
   // Centralized draft workspace settings with automatic persistence
-  const {
-    settings,
-    coderConfigFallback,
-    sshHostFallback,
-    setSelectedRuntime,
-    setDefaultRuntimeChoice,
-    setTrunkBranch,
-  } = useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk);
+  const { settings, coderConfigFallback, sshHostFallback, setSelectedRuntime, setTrunkBranch } =
+    useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk);
   const creationAgentId = resolveCreationAgentId(settings.agentId, agentBaseById);
 
   // Persist draft workspace name generation state per draft (so multiple drafts don't share a
@@ -465,9 +457,8 @@ export function useCreationWorkspace({
         const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
         const createTitle = normalizedTitle || undefined;
 
-        // Read send options fresh from localStorage at send time to avoid
-        // race conditions with React state updates (requestAnimationFrame batching
-        // in usePersistedState can delay state updates after model selection).
+        // Read send options at send time: render state can lag a pick made just
+        // before sending.
         // Override agentId from current draft settings so first-send uses the same
         // project/global/default resolution chain as the creation UI.
         const sendMessageOptions = {
@@ -995,7 +986,6 @@ export function useCreationWorkspace({
     sshHostFallback,
     defaultRuntimeMode: settings.defaultRuntimeMode,
     setSelectedRuntime,
-    setDefaultRuntimeChoice,
     toast,
     setToast,
     isSending,

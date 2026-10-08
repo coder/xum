@@ -249,31 +249,6 @@ export function getAutoRetryKey(workspaceId: string): string {
 }
 
 /**
- * Get the localStorage key for the pinned third agent id for a scope.
- * Format: "pinnedAgentId:{scopeId}"
- */
-export function getPinnedAgentIdKey(scopeId: string): string {
-  return `pinnedAgentId:${scopeId}`;
-}
-/**
- * Get the localStorage key for "disable workspace agents" toggle per scope.
- * When true, workspace-specific agents are disabled - only built-in and global agents are loaded.
- * Useful for "unbricking" when iterating on agent files in a workspace worktree.
- * Format: "disableWorkspaceAgents:{scopeId}"
- */
-export function getDisableWorkspaceAgentsKey(scopeId: string): string {
-  return `disableWorkspaceAgents:${scopeId}`;
-}
-/**
- * Get the localStorage key for the default runtime for a project
- * Defaults to worktree if not set; can only be changed via the "Default for project" checkbox.
- * Format: "runtime:{projectPath}"
- */
-export function getRuntimeKey(projectPath: string): string {
-  return `runtime:${projectPath}`;
-}
-
-/**
  * Get the localStorage key for whether to show the "Initialize with AGENTS.md" nudge for a project.
  * Set to true when a project is first added; cleared when user dismisses or runs /init.
  * Format: "agentsInitNudge:{projectPath}"
@@ -638,14 +613,6 @@ export function getDesktopPopoutKey(workspaceId: string): string {
   return `desktop-popout:${workspaceId}`;
 }
 
-/**
- * Get the localStorage key for auto-compaction enabled preference per workspace
- * Format: "autoCompaction:enabled:{workspaceId}"
- */
-export function getAutoCompactionEnabledKey(workspaceId: string): string {
-  return `autoCompaction:enabled:${workspaceId}`;
-}
-
 /** localStorage-backed LRU caches (see src/browser/utils/lruCache.ts). */
 export const SESSION_COST_CACHE_ENTRY_PREFIX = "session-cost:";
 export const SESSION_COST_CACHE_INDEX_KEY = "session-cost-index";
@@ -845,7 +812,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // The VS Code webview composer's unsent text. Longer drafts still work for the session (kept in
   // memory); the webview then persists only the last text that fit.
   workspaceKey(getInputKey, "draft", false, 8192, "webview"),
-  workspaceKey(getPinnedAgentIdKey, "ui", true, 128),
   workspaceKey(getReviewSelectedHunkKey, "workspace-scoped", true, 256),
   workspaceKey(
     getFileTreeExpandStateKey,
@@ -855,7 +821,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   ),
   workspaceKey(getReviewSearchStateKey, "workspace-scoped", true, REVIEW_SEARCH_STATE_MAX_CHARS),
   workspaceKey(getReviewImmersiveKey, "workspace-scoped", true, 16),
-  workspaceKey(getAutoCompactionEnabledKey, "ui", true, 16),
   workspaceKey(getWorkspaceLastReadKey, "workspace-scoped", true, 32),
   // Not a cache: a status_set result compacted out of history cannot be re-derived after reload
   // (see StreamingMessageAggregator.loadPersistedAgentStatus), so it must never be evicted.
@@ -879,7 +844,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getPendingDraftSkillDiscoveryKey, "workspace-scoped", false, 16),
 
   // Per-workspace keys that deleteWorkspaceStorage used to miss, leaving orphans behind.
-  workspaceKey(getDisableWorkspaceAgentsKey, "ui", false, 16),
   workspaceKey(getPinnedTodoExpandedKey, "ui", false, 16),
   workspaceKey(getSubAgentTasksExpandedKey, "ui", false, 16),
   workspaceKey(getRightSidebarLayoutKey, "ui", false, RIGHT_SIDEBAR_LAYOUT_MAX_CHARS),
@@ -928,7 +892,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(EXPANDED_TASK_GROUPS_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
 
   // Project-scoped families ("{prefix}{projectPath}").
-  globalPrefix(projectPrefix(getRuntimeKey), "ui", 256, "project"),
   globalPrefix(projectPrefix(getAgentsInitNudgeKey), "ui", 16, "project"),
   globalPrefix(projectPrefix(getArchivedWorkspacesExpandedKey), "ui", 16, "project"),
   globalPrefix(projectPrefix(getBrowserSelectedSessionKey), "ui", 256, "project"),

@@ -83,8 +83,6 @@ const agentContextValue: AgentContextValue = {
   loadFailed: false,
   refresh: () => Promise.resolve(),
   refreshing: false,
-  disableWorkspaceAgents: false,
-  setDisableWorkspaceAgents: () => undefined,
 };
 
 const ThinkingSetterComponent: React.FC = () => {

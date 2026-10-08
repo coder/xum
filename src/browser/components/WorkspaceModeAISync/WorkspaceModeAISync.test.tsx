@@ -33,8 +33,6 @@ function SyncHarness(props: { workspaceId: string; agentId: string }) {
         loadFailed: false,
         refresh: () => Promise.resolve(),
         refreshing: false,
-        disableWorkspaceAgents: false,
-        setDisableWorkspaceAgents: noop,
       }}
     >
       <WorkspaceModeAISync workspaceId={props.workspaceId} />

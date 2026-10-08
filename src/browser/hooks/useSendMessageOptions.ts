@@ -44,7 +44,7 @@ export function useAutoRoutingSelection(
 export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWithBase {
   const [thinkingLevel] = useThinkingLevel();
   const [reasoningMode] = useReasoningMode();
-  const { agentId, agents, disableWorkspaceAgents } = useAgent();
+  const { agentId, agents } = useAgent();
   const { options: providerOptions } = useProviderOptions();
 
   const baseModel = useWorkspaceAiSelection(
@@ -62,7 +62,6 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
     reasoningMode,
     model: baseModel,
     providerOptions,
-    disableWorkspaceAgents,
     autoModelRouting,
     autoThinkingLevel,
   });
