@@ -3,10 +3,12 @@ import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals"
 import { GlobalWindow } from "happy-dom";
 
 import {
+  getAutoRoutingPick,
   getPendingAiSelection,
   markAiSelectionIntent,
   setWorkspaceAgentPick,
 } from "@/browser/utils/aiSelectionIntent";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   consumeWorkspaceModelChange,
   recordAutoRoutingChoiceForAgent,
@@ -16,6 +18,7 @@ import {
 import {
   AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS,
   getAutoRoutingChoiceByAgentKey,
+  getProjectScopeId,
 } from "@/common/constants/storage";
 import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 
@@ -54,6 +57,16 @@ describe("modelChange", () => {
     const legacyId = "__proj-main";
     setWorkspaceModelWithOrigin(legacyId, "openai:gpt-5.2-codex", "user");
     expect(getPendingAiSelection(legacyId, "exec", "model")).toBe("openai:gpt-5.2-codex");
+  });
+
+  test("a project without its own agent records Auto picks for the inherited global agent", () => {
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { ai: { globalDefaults: { agentId: "plan" } } },
+    });
+    const scopeId = getProjectScopeId("/model-change-project");
+    setAutoRoutingChoice(scopeId, "model", true);
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+    expect(getAutoRoutingPick(scopeId, "plan", "model")).toBe(true);
   });
 
   test("records routing picks for the selected agent only", () => {

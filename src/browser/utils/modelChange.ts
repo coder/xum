@@ -8,7 +8,11 @@ import {
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import {
+  readScopeAgentId,
+  readScopedAiDefault,
+  writeScopedAiDefault,
+} from "@/browser/utils/scopedAiDefaults";
 import {
   markAiSelectionIntent,
   setAutoRoutingPick,
@@ -17,7 +21,6 @@ import {
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import type { AutoRoutingChoiceByAgent, AutoRoutingOutcome } from "@/browser/utils/workspaceModeAi";
 import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 export type ModelChangeOrigin = "user" | "agent" | "sync";
 
@@ -146,8 +149,7 @@ export function setAutoRoutingChoice(
   dimension: AutoRoutingDimension,
   active: boolean
 ): void {
-  const agentId = readScopedAiDefault(scopeId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
-  setAutoRoutingPick(scopeId, agentId, dimension, active);
+  setAutoRoutingPick(scopeId, readScopeAgentId(scopeId), dimension, active);
 }
 
 /** Apply after agent-origin writes clear Auto so the target agent's resolved choice wins. */

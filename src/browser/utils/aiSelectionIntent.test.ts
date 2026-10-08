@@ -7,10 +7,12 @@ import {
   consumeAiSelectionIntent,
   getAiSelectionIntentForSend,
   getAiSelectionIntentForSendOptions,
+  getAutoRoutingPick,
   getPendingAiSelection,
   getWorkspaceAgentId,
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
+  setAutoRoutingPick,
   setWorkspaceAgentPick,
   setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
@@ -153,6 +155,30 @@ describe("aiSelectionIntent", () => {
     markAiSelectionIntent(WS, "model", MODEL_A);
     saveExecModel(MODEL_A);
     expect(getPendingAiSelection(WS, "exec", "model")).toBe(MODEL_A);
+  });
+
+  test("a sent Auto pick ends once the saved flag holds it, even when the save is a no-op", () => {
+    const saveAuto = (autoModelRouting: boolean) =>
+      setWorkspaceAiMetadata(WS, {
+        aiSettingsByAgent: { exec: { model: MODEL_A, thinkingLevel: "off", autoModelRouting } },
+      });
+    const send = () =>
+      consumeAiSelectionIntent(
+        WS,
+        "exec",
+        getAiSelectionIntentForSendOptions(WS, "exec", { model: MODEL_A, autoModelRouting: true })
+          .attachedTokens
+      );
+    saveAuto(false);
+    setAutoRoutingPick(WS, "exec", "model", true);
+    send();
+    // The save is in flight or failed.
+    expect(getAutoRoutingPick(WS, "exec", "model")).toBe(true);
+
+    saveAuto(true);
+    setAutoRoutingPick(WS, "exec", "model", true);
+    send();
+    expect(getAutoRoutingPick(WS, "exec", "model")).toBeUndefined();
   });
 
   test("a pick scoped to Plan does not apply to Exec", () => {

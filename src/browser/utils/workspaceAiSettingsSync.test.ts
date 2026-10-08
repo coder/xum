@@ -15,6 +15,7 @@ import {
 import {
   getAutoRouting,
   getWorkspaceAiSelection,
+  useAutoRouting,
   useWorkspaceAiSelection,
   type WorkspaceAiSelection,
 } from "@/browser/utils/workspaceAiSettingsSync";
@@ -222,5 +223,21 @@ describe("getWorkspaceAiSelection", () => {
     save({ autoModelRouting: true });
     save({});
     expect(getAutoRouting(WS, "model", "exec")).toBe(false);
+
+    // A legacy workspace's single bucket owns the flag too.
+    const legacy = "resolver-legacy";
+    setWorkspaceAiMetadata(legacy, { aiSettings: { model: "openai:saved", thinkingLevel: "low" } });
+    expect(getAutoRouting(legacy, "model", "exec")).toBe(false);
+  });
+
+  test("a project without its own agent routes Auto for the inherited global agent", () => {
+    getAppConfigStore().updateOptimistically({
+      agentAiDefaults: { plan: { autoModelRouting: true } },
+      userPreferences: { ai: { globalDefaults: { agentId: "plan" } } },
+    });
+    const scopeId = getProjectScopeId(PROJECT);
+    expect(getAutoRouting(scopeId, "model")).toBe(true);
+    const { result } = renderHook(() => useAutoRouting(scopeId, "model"));
+    expect(result.current).toBe(true);
   });
 });

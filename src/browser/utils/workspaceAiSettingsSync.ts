@@ -12,7 +12,12 @@ import {
   type AutoRoutingDimension,
 } from "@/browser/utils/aiSelectionIntent";
 import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
-import { readScopedAiDefault, useScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import {
+  readScopeAgentId,
+  readScopedAiDefault,
+  useScopeAgentId,
+  useScopedAiDefault,
+} from "@/browser/utils/scopedAiDefaults";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { readPersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getReasoningModeKey, isNonWorkspaceScopeId } from "@/common/constants/storage";
@@ -188,7 +193,7 @@ function resolveAutoRouting(input: {
 }): boolean {
   const agentId = normalizeAgentId(input.agentId, WORKSPACE_DEFAULTS.agentId);
   const flag = AUTO_ROUTING_FLAG[input.dimension];
-  const saved = getWorkspaceAiMetadata(input.scopeId)?.aiSettingsByAgent?.[agentId];
+  const saved = getSavedAiSettings(input.scopeId, agentId);
   return (
     getAutoRoutingPick(input.scopeId, agentId, input.dimension) ??
     (saved != null
@@ -204,7 +209,7 @@ function resolveAutoRouting(input: {
 export function getAutoRouting(
   scopeId: string,
   dimension: AutoRoutingDimension,
-  agentId = readScopedAiDefault(scopeId, "agentId") ?? WORKSPACE_DEFAULTS.agentId,
+  agentId = readScopeAgentId(scopeId),
   agentBaseById?: ReadonlyMap<string, string | undefined>
 ): boolean {
   return resolveAutoRouting({
@@ -222,12 +227,12 @@ export function useAutoRouting(
   agentBaseById?: ReadonlyMap<string, string | undefined>
 ): boolean {
   useSyncExternalStore(subscribeAiSelection, getAiSelectionVersion);
-  const agentId = useScopedAiDefault(scopeId, "agentId");
+  const agentId = useScopeAgentId(scopeId);
   const agentAiDefaults = useAgentAiDefaults();
   return resolveAutoRouting({
     scopeId,
     dimension,
-    agentId: agentId ?? WORKSPACE_DEFAULTS.agentId,
+    agentId,
     agentAiDefaults,
     agentBaseById,
   });

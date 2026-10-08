@@ -2,6 +2,11 @@ import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/Draft
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import {
+  getAutoRoutingPick,
+  resetAiSelectionIntentForTests,
+  setAutoRoutingPick,
+} from "@/browser/utils/aiSelectionIntent";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as RouterContextModule from "@/browser/contexts/RouterContext";
@@ -11,9 +16,7 @@ import * as DraftWorkspaceSettingsModule from "@/browser/hooks/useDraftWorkspace
 import * as ChatCommandsModule from "@/browser/utils/chatCommands";
 import type { ProjectConfig } from "@/common/types/project";
 import {
-  getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
-  getAutoThinkingLevelKey,
   getPendingDraftSkillDiscoveryKey,
   getPendingScopeId,
   getPendingWorkspaceSendErrorKey,
@@ -700,6 +703,7 @@ describe("useCreationWorkspace", () => {
   afterEach(async () => {
     getDraftStore().setClient(null);
     cleanup();
+    resetAiSelectionIntentForTests();
     restorePersistedStateMocks?.();
     restorePersistedStateMocks = null;
     await restoreUseCreationWorkspaceModuleMocks();
@@ -2048,8 +2052,7 @@ describe("useCreationWorkspace", () => {
         ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "exec", model: "gpt-4" } } },
       });
       // Model Auto came from the default; thinking Auto was picked in the creation composer.
-      persistedPreferences[getAutoModelRoutingKey(projectScopeId)] = true;
-      persistedPreferences[getAutoThinkingLevelKey(projectScopeId)] = true;
+      setAutoRoutingPick(projectScopeId, "exec", "thinkingLevel", true);
       draftSettingsState = createDraftSettingsHarness({ agentId: "exec" });
 
       const getHook = renderUseCreationWorkspace({
@@ -2064,14 +2067,12 @@ describe("useCreationWorkspace", () => {
         await getHook().handleSend("launch workspace");
       });
 
-      expect(updatePersistedStateCalls).toContainEqual([
-        getAutoModelRoutingKey(TEST_WORKSPACE_ID),
-        true,
-      ]);
-      expect(updatePersistedStateCalls).toContainEqual([
-        getAutoThinkingLevelKey(TEST_WORKSPACE_ID),
-        true,
-      ]);
+      // The workspace shows both creation choices until a send saves them.
+      const workspaceAuto = (dimension: "model" | "thinkingLevel") =>
+        getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", dimension);
+      expect([workspaceAuto("model"), workspaceAuto("thinkingLevel")]).toEqual(
+        autoRoutingEnabled ? [true, true] : [undefined, undefined]
+      );
       const recordedChoices = updatePersistedStateCalls
         .filter(([key]) => key === getAutoRoutingChoiceByAgentKey(TEST_WORKSPACE_ID))
         .map(([, updater]) => (updater as (prev: unknown) => unknown)({}));
