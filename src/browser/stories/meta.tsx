@@ -13,6 +13,7 @@ import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { resetAiSelectionIntentForTests } from "@/browser/utils/aiSelectionIntent";
 import { SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -84,6 +85,8 @@ function resetStorybookPersistedStateForStory(): void {
   }
   // Startup waits for this story's own snapshot instead of the previous story's.
   getAppConfigStore().updateOptimistically({ experiments: undefined, userPreferences: undefined });
+  // Unsent AI picks live in memory, and the test-runner renders all stories of a file in one page.
+  resetAiSelectionIntentForTests();
 }
 function getStorybookRenderKey(): string | null {
   if (typeof window === "undefined") {
