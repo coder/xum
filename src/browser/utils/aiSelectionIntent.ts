@@ -233,6 +233,16 @@ export function dropPendingModelPicks(shouldDrop: (model: string) => boolean): v
   notify();
 }
 
+/** A fork starts from what the source composer shows, including its unsent picks. */
+export function copyPendingAiSelection(sourceWorkspaceId: string, destWorkspaceId: string): void {
+  const sourcePrefix = `${sourceWorkspaceId}\u0000`;
+  for (const [key, pending] of [...pendingByScope]) {
+    if (!key.startsWith(sourcePrefix)) continue;
+    pendingByScope.set(scopeKey(destWorkspaceId, key.slice(sourcePrefix.length)), { ...pending });
+  }
+  notify();
+}
+
 /** Test-only: forget all pending picks and metadata. */
 export function resetAiSelectionIntentForTests(): void {
   pendingByScope.clear();
