@@ -139,6 +139,19 @@ describe("getWorkspaceAiSelection", () => {
     expect(result.current.model).toBe("openai:loaded-later");
   });
 
+  test("a legacy workspace id that starts with __ resolves its saved settings", () => {
+    const legacyId = "__proj-main";
+    setWorkspaceAiMetadata(legacyId, {
+      projectPath: PROJECT,
+      aiSettings: undefined,
+      aiSettingsByAgent: { exec: { model: "openai:saved", thinkingLevel: "high" } },
+    });
+
+    const { result } = renderHook(() => useWorkspaceAiSelection(legacyId, "exec"));
+    expect(result.current.model).toBe("openai:saved");
+    expect(getWorkspaceAiSelection(legacyId, "exec").model).toBe("openai:saved");
+  });
+
   test("a creation scope resolves its own defaults in the hook and the plain reader", () => {
     const scopeId = getProjectScopeId(PROJECT);
     // Workspace resolution would apply the configured Exec model here instead.
