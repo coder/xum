@@ -1,6 +1,7 @@
 import type { TurnStreamHandle } from "./streamManager";
 import type { StreamEndEvent } from "@/common/types/stream";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { EventEmitter } from "events";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -141,6 +142,9 @@ describe("AgentSession goal safety hooks", () => {
       const workspaceId = `budget-rejection-goal-${synthetic}`;
       const { session, goalService, aiService, cleanup } = await createSessionHarness(workspaceId);
       cleanups.push(cleanup);
+      spyOn(aiService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+      );
       const stream = spyOn(aiService, "streamMessage");
       const candidates = registerBusyKickoffConsumer(goalService);
       await setGoalOk(goalService, { workspaceId, objective: "Keep working until interrupted" });
@@ -148,10 +152,7 @@ describe("AgentSession goal safety hooks", () => {
       expect(candidates.has(workspaceId)).toBe(true);
       const result = await session.sendMessage(
         "Oversized intervention ".repeat(40_000),
-        {
-          ...SEND_OPTIONS,
-          experiments: { tokenBudget: true, memory: true },
-        },
+        SEND_OPTIONS,
         synthetic ? { synthetic: true, agentInitiated: true } : undefined
       );
       expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
@@ -167,18 +168,14 @@ describe("AgentSession goal safety hooks", () => {
 
   test("blank token-budget sends do not acknowledge or pause an active goal", async () => {
     const workspaceId = "blank-budget-rejection-goal";
-    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    const { session, goalService, aiService, cleanup } = await createSessionHarness(workspaceId);
     cleanups.push(cleanup);
+    spyOn(aiService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+    );
     await setGoalOk(goalService, { workspaceId, objective: "Continue working" });
     await goalService.requireUserAcknowledgment(workspaceId, 55_000);
-    expect(
-      (
-        await session.sendMessage(" ", {
-          ...SEND_OPTIONS,
-          experiments: { tokenBudget: true, memory: true },
-        })
-      ).success
-    ).toBe(false);
+    expect((await session.sendMessage(" ", SEND_OPTIONS)).success).toBe(false);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({
       status: "active",
       requireUserAcknowledgmentSinceMs: 55_000,

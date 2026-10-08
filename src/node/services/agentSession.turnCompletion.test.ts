@@ -1,5 +1,6 @@
 import type { TurnCoordinator } from "./turnCoordinator";
 import { createMuxMessage } from "@/common/types/message";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import { Exit, Scope } from "effect";
 import { defaultEffectRunner as runner } from "./di/effectRunner";
@@ -929,8 +930,9 @@ describe("AgentSession turn completion", () => {
         workspaceId,
         createMuxMessage("prior", "assistant", "Earlier completed work")
       );
-      const options = { ...sendOptions, experiments: { tokenBudget: true, memory: true } };
-      expect((await h.session.sendMessage("original request", options)).success).toBe(true);
+      const enabled = new Set<string>([EXPERIMENT_IDS.TOKEN_BUDGET, EXPERIMENT_IDS.MEMORY]);
+      spyOn(h.aiService, "isExperimentEnabled").mockImplementation((id) => enabled.has(id));
+      expect((await h.session.sendMessage("original request", sendOptions)).success).toBe(true);
       oldPolicy = policyPromise(consumer);
       const read = h.historyService.getHistoryFromLatestBoundary.bind(h.historyService);
       spyOn(h.historyService, "getHistoryFromLatestBoundary").mockImplementationOnce(async (id) => {
@@ -950,7 +952,7 @@ describe("AgentSession turn completion", () => {
       const coordinator = internal(h.session).coordinator;
       const originalOperation = coordinator.operationId;
       coordinator.finishTurn(coordinator.turnId);
-      expect((await h.session.sendMessage("replacement request", options)).success).toBe(true);
+      expect((await h.session.sendMessage("replacement request", sendOptions)).success).toBe(true);
       const replacementOperation = coordinator.operationId;
       expect(replacementOperation).toBeDefined();
       expect(replacementOperation).not.toBe(originalOperation);

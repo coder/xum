@@ -33,8 +33,12 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
     aiEmitter: continuous.aiEmitter,
   });
   harnesses.push(budget);
+  let continuousOn = true;
   spyOn(continuous.aiService, "isExperimentEnabled").mockImplementation(
-    (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+    (id) =>
+      id === EXPERIMENT_IDS.TOKEN_BUDGET ||
+      id === EXPERIMENT_IDS.MEMORY ||
+      (continuousOn && id === EXPERIMENT_IDS.CONTINUOUS_COMPACTION)
   );
   // The default single-session harness closes handles with its first session's signal.
   // Shared AI dependencies must instead retain each workspace's physical stream lifetime.
@@ -66,16 +70,15 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
       await continuous.session.sendMessage("Continuous workspace task", {
         model,
         agentId: "exec",
-        experiments: { continuousCompaction: true },
       })
     ).success
   ).toBe(true);
+  continuousOn = false;
   expect(
     (
       await budget.session.sendMessage("Budget workspace task", {
         model,
         agentId: "exec",
-        experiments: { continuousCompaction: false },
       })
     ).success
   ).toBe(true);

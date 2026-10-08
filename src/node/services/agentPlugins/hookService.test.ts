@@ -7,6 +7,7 @@ import { prepareWorkspaceRequestHooks } from "./requestHooks";
 import { attachLanguageModelCleanup } from "../languageModelCleanup";
 import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 /**
  * QuickJS-heavy integration tests for Tier-1 sandboxed plugin hooks: real
@@ -571,6 +572,9 @@ describe("AgentPluginHookService", () => {
       (args) => harness.service.ensureWorkspaceHooks(args)
     );
     spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(Ok(metadata));
+    spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+    );
     try {
       await h.historyService.appendManyToHistory(WORKSPACE_ID, [
         createMuxMessage("old-user", "user", "old request"),
@@ -586,7 +590,6 @@ describe("AgentPluginHookService", () => {
           await h.session.sendMessage("New request", {
             model: "openai:gpt-4o",
             agentId: "exec",
-            experiments: { tokenBudget: true, memory: true },
           })
         ).success
       ).toBe(true);
