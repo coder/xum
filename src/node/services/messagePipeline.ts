@@ -20,7 +20,7 @@ import { attachReasoningReplayMetadata } from "@/node/utils/messages/reasoningPr
 import type { MuxMessage } from "@/common/types/message";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { anthropicSupportsBetweenToolsThinking, type ThinkingLevel } from "@/common/types/thinking";
+import { anthropicBindsThinkingToPrefix, type ThinkingLevel } from "@/common/types/thinking";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import {
   transformModelMessages,
@@ -204,17 +204,16 @@ export async function prepareMessagesForProvider(
   const transformedMessages = transformModelMessages(modelMessages, providerForMessages, {
     anthropicThinkingEnabled:
       providerForMessages === "anthropic" && effectiveThinkingLevel !== "off",
-    // `between_tools` cannot carry blockBinding, and this replay is not append-only
-    // (see buildProviderOptions), so a history block with a changed prefix would 400 on
-    // enforced accounts. Strip history-side blocks: #5086's "strip from the edited turn
-    // onward", applied to every turn, since a system prompt or tools change edits every
-    // block's prefix. Blocks the current turn produces between steps still replay.
+    // At "off", neither `between_tools` (Sonnet 5.5) nor `disabled` (Haiku 5.5) carries
+    // blockBinding, and this replay is not append-only (see buildProviderOptions), so a
+    // history block with a changed prefix would 400 on enforced accounts. Strip
+    // history-side blocks: #5086's "strip from the edited turn onward", applied to every
+    // turn, since a system prompt or tools change edits every block's prefix. Blocks the
+    // current turn produces between steps still replay.
     anthropicStripReasoning:
       providerForMessages === "anthropic" &&
       effectiveThinkingLevel === "off" &&
-      anthropicSupportsBetweenToolsThinking(
-        resolveModelForMetadata(modelString, providersConfig ?? null)
-      ),
+      anthropicBindsThinkingToPrefix(resolveModelForMetadata(modelString, providersConfig ?? null)),
   });
 
   // Apply cache control for Anthropic models AFTER transformation

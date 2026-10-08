@@ -3170,6 +3170,83 @@ describe("buildProviderOptions - OpenRouter", () => {
 
     expect(buildProviderOptions("openrouter:z-ai/glm-4.6", "off")).toEqual({});
   });
+
+  // Haiku 5.5 reasons adaptively when `reasoning` is omitted (a live OpenRouter call
+  // spent ~200 reasoning tokens on a short prompt), so "off" must disable it.
+  test.each([
+    ["the canonical alias routed to OpenRouter", "anthropic:claude-haiku-5-5"],
+    ["an explicit OpenRouter model", "openrouter:anthropic/claude-haiku-5.5"],
+  ])("Haiku 5.5 off disables reasoning for %s", async (_label, modelString) => {
+    const capturedBodies: Array<Record<string, unknown>> = [];
+    const captureFetch: typeof fetch = Object.assign(
+      (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (typeof init?.body !== "string") {
+          throw new Error("Expected a JSON request body");
+        }
+        capturedBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: "chat_test",
+              object: "chat.completion",
+              created: 0,
+              model: "anthropic/claude-haiku-5.5",
+              choices: [
+                { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+              ],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }),
+            { headers: { "content-type": "application/json" } }
+          )
+        );
+      },
+      { preconnect: fetch.preconnect.bind(fetch) }
+    );
+    const options = buildProviderOptions(
+      modelString,
+      "off",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "openrouter"
+    );
+
+    await generateText({
+      model: createOpenRouter({ apiKey: "test", fetch: captureFetch })(
+        "anthropic/claude-haiku-5.5"
+      ),
+      prompt: "Return ok.",
+      providerOptions: options as Parameters<typeof generateText>[0]["providerOptions"],
+      maxRetries: 0,
+    });
+
+    expect(capturedBodies).toHaveLength(1);
+    expect(capturedBodies[0].reasoning).toEqual({ effort: "none" });
+  });
+
+  test("leaves other levels and older Claude models on the OpenRouter defaults", () => {
+    const openRouterOptions = (model: string, level: Parameters<typeof buildProviderOptions>[1]) =>
+      buildProviderOptions(
+        model,
+        level,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        "openrouter"
+      );
+
+    expect(openRouterOptions("anthropic:claude-haiku-5-5", "low")).toEqual({
+      openrouter: { reasoning: { enabled: true, effort: "low", exclude: false } },
+    });
+    // Haiku 4.5 does not reason unless asked, so omitting `reasoning` already means "off".
+    expect(openRouterOptions("anthropic:claude-haiku-4-5", "off")).toEqual({});
+  });
 });
 
 describe("buildProviderOptions - xAI", () => {

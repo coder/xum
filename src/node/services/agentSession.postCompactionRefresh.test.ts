@@ -190,7 +190,6 @@ describe("AgentSession post-compaction refresh trigger", () => {
         return undefined;
       },
       createModelWithPinnedOptions: mock(modelUnavailable),
-      createModelWithPinnedMetadata: mock(modelUnavailable),
       getWorkspaceMetadata: mock((workspaceId: string) =>
         Promise.resolve(Err(`Workspace ${workspaceId} not found`))
       ),

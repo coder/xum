@@ -1311,7 +1311,7 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
             workspaceId === sourceId ? Ok(sourceMetadata) : Err("workspace not found")
           )
         ),
-        createModelWithPinnedMetadata: mock((modelString: string) =>
+        createModelWithPinnedOptions: mock((modelString: string) =>
           Promise.resolve(
             Ok({
               model: new MockLanguageModelV3({
@@ -1319,6 +1319,11 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
                   Promise.resolve({ stream: simulateReadableStream({ chunks: summaryChunks }) }),
               }),
               metadataModel: modelString,
+              effectiveModelString: modelString,
+              wireProviderName: "anthropic",
+              optionsModelString: modelString,
+              optionsProvidersConfig: {},
+              optionsMuxProviderOptions: {},
             })
           )
         ),
