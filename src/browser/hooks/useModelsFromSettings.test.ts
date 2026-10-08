@@ -1,6 +1,6 @@
 // Bootstrap DOM before API imports can initialize Radix layout effects.
 import { installDom } from "../../../tests/ui/dom";
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import * as APIModule from "@/browser/contexts/API";
 import * as ProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
@@ -243,6 +243,18 @@ describe("useModelsFromSettings selected model preservation", () => {
     expect(updateModelPreferences).toHaveBeenCalledWith({
       defaultModel: "openrouter:openai/gpt-5",
     });
+  });
+
+  test("refuses a default model change visibly while disconnected", () => {
+    const alert = spyOn(window, "alert").mockImplementation(() => undefined);
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    act(() => {
+      result.current.setDefaultModel("openrouter:openai/gpt-5");
+    });
+
+    expect(getAppConfigStore().getSnapshot()?.defaultModel).toBeUndefined();
+    expect(alert).toHaveBeenCalledTimes(1);
   });
 
   test("ensureModelInSettings skips syncing explicit gateway-scoped selections", () => {
@@ -796,6 +808,7 @@ describe("useModelsFromSettings hidden-model gateway identity", () => {
   afterEach(cleanupUseModelsHookTest);
 
   test("hiding an explicit Coder gateway model hides that entry, not the direct model", async () => {
+    apiMock = { config: { updateModelPreferences: mock(() => Promise.resolve(undefined)) } };
     // Cross-typed instance: name "openai", type "anthropic". Name-only
     // canonicalization would persist openai:claude-opus-4-1, leaving the
     // Coder entry visible and hiding the distinct direct OpenAI model.

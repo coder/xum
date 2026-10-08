@@ -43,7 +43,7 @@ const INITIAL_READ_RETRY_MS = 250;
 const MAX_INITIAL_READ_RETRY_MS = 5_000;
 const EMPTY_USER_PREFERENCES: UserPreferences = {};
 const EMPTY_AGENT_AI_DEFAULTS: AgentAiDefaults = {};
-const USER_PREFERENCE_SAVE_FAILED_MESSAGE = "Settings could not be saved";
+export const USER_PREFERENCE_SAVE_FAILED_MESSAGE = "Settings could not be saved";
 const USER_PREFERENCE_SAVE_UNCONFIRMED_MESSAGE =
   "Connection lost: settings may not have been saved";
 
