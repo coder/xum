@@ -809,7 +809,6 @@ export async function processSlashCommand(
             }),
           ]);
         }
-        const experiments = env.sendMessageOptions.experiments;
         return complete("consume", [{ type: "clear-input" }], async () => {
           try {
             const result =
@@ -817,9 +816,8 @@ export async function processSlashCommand(
                 ? await client.refinements.apply({
                     workspaceId,
                     approvedProposalHash: displayedProposalHash,
-                    experiments,
                   })
-                : await client.refinements.run({ workspaceId, experiments });
+                : await client.refinements.run({ workspaceId });
             const appliedCount = result.success
               ? result.data.applied.length + (result.data.untrackedApplied ?? 0)
               : 0;
