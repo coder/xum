@@ -21,7 +21,8 @@ export const INPUTS = ["src", "tests/bugbash", "tsconfig.json", "package.json"];
 // Not BUGBASH_AI_REASON: after a failed probe it holds the provider URL and response text.
 const PASS_ENV = ["BUGBASH_AI", "BUGBASH_AI_RESOLVED", "BUGBASH_APP_MODEL", "BUGBASH_MODEL",
   "BUGBASH_EFFORT", "BUGBASH_SCENARIO", "E2E_TELEMETRY_DISABLED"]; // prettier-ignore
-const CREDENTIAL = /(_API_KEY|_AUTH_TOKEN|_TOKEN|_BASE_URL|_SECRET|_PASSWORD)$/i;
+// A bare name (API_KEY, TOKEN) or a suffix after "_" (ANTHROPIC_API_KEY, GH_TOKEN).
+const CREDENTIAL = /(^|_)(API_KEY|TOKEN|BASE_URL|SECRET|PASSWORD)$/i;
 
 /**
  * Checks each folder of `rel` under `base` without following a symlink; with `create`, it makes
@@ -108,10 +109,12 @@ export function jobEnv(output: string): Record<string, string> {
 }
 
 // The `e2e run` options that a repro run may use: selection and output only. Not allowed, among
-// others: a second --config, positional files, "--", --agent and the cache and trace switches.
+// others: a second --config, positional files, "--", --agent and the cache and trace switches,
+// and --workers and --retries: e2e.config.ts fixes one worker (the tests share one seeded app)
+// and no retry (a retry can hide a flaky failure).
 // e2e reads no env var that picks a config or an agent (e2e 0.17).
 const RUN_VALUE_OPTIONS = ["--config", "--output", "--tag", "--exclude-tag", "--tag-mode",
-  "--grep", "--grep-invert", "--target", "--shard", "--workers", "--retries", "--max-failures",
+  "--grep", "--grep-invert", "--target", "--shard", "--max-failures",
   "--reporter"]; // prettier-ignore
 const RUN_FLAGS = ["--pass-with-no-tests", "--last-failed", "--debug"];
 

@@ -101,7 +101,8 @@ test("the container env passes only allowlisted names, and never a credential", 
     E2E_TELEMETRY_DISABLED: "1",
     BUGBASH_CONTAINER: "1",
   });
-  expect(() => containerEnv({}, { OPENAI_BASE_URL: "x" })).toThrow("no credential");
+  for (const name of ["OPENAI_BASE_URL", "API_KEY", "token", "GH_AUTH_TOKEN", "SECRET"])
+    expect(() => containerEnv({}, { [name]: "x" })).toThrow("no credential");
   expect(containerEnv({}, { BUGBASH_CONTAINER: "0" }).BUGBASH_CONTAINER).toBe("1");
 });
 
@@ -136,6 +137,8 @@ test("only an exact-step `e2e run` with the repro config passes", () => {
     ["run", "--config", "e2e.config.ts", "repros/x.e2e.ts"],
     ["run", "--config", "e2e.config.ts", "--agent", "x"],
     ["run", "--config", "e2e.config.ts", "--tag"],
+    ["run", "--config", "e2e.config.ts", "--workers", "4"],
+    ["run", "--config", "e2e.config.ts", "--retries=2"],
   ])
     expect(exactStepRefusal(args, dir, dir)).not.toBeNull();
   expect(exactStepRefusal(ok, root, dir)).toContain("the cwd must be");
