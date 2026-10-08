@@ -79,12 +79,26 @@ export class Session {
   #clientDir: string | null = null;
   #cleanup: Promise<CleanupState> | null = null;
   #owned: Job | null = null;
+  /** The ID that `docker create` returned, and whether its outcome is unknown (a killed CLI). */
+  #createdId: string | null = null;
+  #createUnknown = false;
+  /** Groups that a stop must not signal: a create that must run to its end. */
+  readonly #protected = new Set<number>();
+  /** Set once cleanup has stopped the job: a later signal must not end cleanup's commands. */
+  #cleaning = false;
 
   /** The entry point aborts `stop` from its SIGINT and SIGTERM handlers. */
   constructor(stop: AbortSignal, options: { root?: string } = {}) {
     this.#root = options.root ?? ROOT;
     if (stop.aborted) this.#stop(String(stop.reason));
-    else stop.addEventListener("abort", () => this.#stop(String(stop.reason)), { once: true });
+    else
+      stop.addEventListener(
+        "abort",
+        () => {
+          if (!this.#cleaning) this.#stop(String(stop.reason));
+        },
+        { once: true }
+      );
   }
 
   /** The pinned image, pulled when missing, as `name@digest`. */
@@ -138,14 +152,31 @@ export class Session {
     const job = this.#owned;
     if (job == null) throw new Error("runJob() needs own() first");
     if (this.#stopped != null) throw new Stopped(this.#stopped);
+    // The name and both labels are what cleanup matches, so no caller arg may set them: docker
+    // takes the last --name, and an extra label would not matter, but a label file could.
+    const setsName = args.find((a) => /^(--name|--label|--label-file|-l)(=|$)/.test(a));
+    if (setsName != null) throw new Error(`runJob() sets the name and labels itself: ${setsName}`);
+    // Create, then start: a stop in between starts nothing. The create runs to its end even
+    // after a stop, because killing its CLI does not cancel the daemon's create, and only a
+    // finished create tells cleanup whether a container exists.
     // prettier-ignore
-    const named = ["run", "--name", job.name, "--label", `xum.bugbash.owner=${job.owner}`,
+    const create = ["create", "--name", job.name, "--label", `xum.bugbash.owner=${job.owner}`,
       "--label", `xum.bugbash.checkout=${job.checkout}`, ...args];
+    const created = await this.#spawn("docker", create, this.#client!, 60_000, undefined, true);
+    if (!created.ok && created.code > 128) this.#createUnknown = true;
+    if (this.#stopped != null) throw new Stopped(this.#stopped);
+    if (!created.ok) throw new Error(`docker create: ${created.error}`);
+    this.#createdId = created.stdout;
     const received: Promise<T>[] = [];
-    const r = await this.#spawn("docker", named, this.#client!, timeoutMs, (child) => {
+    const start = ["start", "--attach", "--interactive", this.#createdId];
+    const r = await this.#spawn("docker", start, this.#client!, timeoutMs, (child) => {
       child.stdin?.on("error", () => undefined); // EPIPE once the container is gone
       const p = receive(child.stdout!);
-      p.catch(() => undefined); // handled: the await below rethrows it
+      // A receiver that gives up reads no more output, so the job would only end at the
+      // timeout. End the docker client now: the lifeline then stops the job.
+      p.catch(() => {
+        if (child.pid != null) this.#terminate([child.pid]);
+      });
       received.push(p);
     });
     return { code: r.code, received: await received[0] };
@@ -163,6 +194,7 @@ export class Session {
 
   async #runCleanup(): Promise<CleanupState> {
     this.#stop("cleanup");
+    this.#cleaning = true;
     await Promise.all(this.#children.values());
     // The SIGKILL of #stop() comes after KILL_AFTER_MS, so the groups end by then.
     const left = await this.#groupsGone(KILL_AFTER_MS + 2_000);
@@ -173,26 +205,48 @@ export class Session {
     return state;
   }
 
+  /**
+   * Finds the job's container by its exact name, also when create never returned an ID, and
+   * removes it only after its name, both labels and the created ID match.
+   */
   async #removeContainer(job: Job): Promise<CleanupState> {
-    // prettier-ignore
-    const filters = ["--filter", `name=^/${job.name}$`, "--filter", `label=xum.bugbash.owner=${job.owner}`,
-      "--filter", `label=xum.bugbash.checkout=${job.checkout}`];
+    const found = await this.#inspect(job.name);
+    if (found === "absent")
+      return this.#createUnknown ? "unknown: the create's outcome is unknown" : "removed";
+    if ("error" in found) return `unknown: ${found.error}`;
+    const ours =
+      found.name === `/${job.name}` &&
+      found.owner === job.owner &&
+      found.checkout === job.checkout &&
+      (this.#createdId == null || found.id === this.#createdId);
+    if (!ours) return `unknown: ${job.name} is not this job's container, so it stays`;
     // Cleanup commands still run after a stop, so they bypass #job().
-    const find = () =>
-      this.#spawn("docker", ["ps", "-aq", "--no-trunc", ...filters], this.#client!, 15_000);
-    const found = await find();
-    if (!found.ok) return `unknown: ${found.error}`;
-    if (found.stdout === "") return "removed";
-    await this.#spawn("docker", ["rm", "-f", ...found.stdout.split("\n")], this.#client!, 30_000);
-    const after = await find();
-    if (!after.ok) return `unknown: ${after.error}`;
-    return after.stdout === "" ? "removed" : `unknown: still present: ${after.stdout}`;
+    await this.#spawn("docker", ["rm", "-f", found.id], this.#client!, 30_000);
+    const after = await this.#inspect(found.id);
+    if (after === "absent") return "removed";
+    return "error" in after ? `unknown: ${after.error}` : `unknown: still present: ${found.id}`;
+  }
+
+  /** The container with this exact name or ID, "absent", or the error of the lookup. */
+  async #inspect(ref: string) {
+    // prettier-ignore
+    const format = ["{{.Id}}", "{{.Name}}", '{{index .Config.Labels "xum.bugbash.owner"}}',
+      '{{index .Config.Labels "xum.bugbash.checkout"}}'].join(" ");
+    const args = ["container", "inspect", "--format", format, "--", ref];
+    const r = await this.#spawn("docker", args, this.#client!, 15_000);
+    if (!r.ok) return /No such (container|object)/.test(r.error) ? "absent" : { error: r.error };
+    const [id = "", name = "", owner = "", checkout = ""] = r.stdout.split(" ");
+    return { id, name, owner, checkout };
   }
 
   #stop(reason: string) {
     this.#stopped ??= reason;
     // Only the groups of this moment: cleanup commands start later and must finish.
-    const victims = [...this.#groups];
+    this.#terminate([...this.#groups].filter((group) => !this.#protected.has(group)));
+  }
+
+  /** SIGTERM to each group now, SIGKILL to the ones left after the grace period. */
+  #terminate(victims: number[]) {
     for (const group of victims) this.#signal(group, "SIGTERM");
     setTimeout(() => {
       for (const group of victims) this.#signal(group, "SIGKILL");
@@ -295,7 +349,8 @@ export class Session {
     args: string[],
     env: Record<string, string>,
     timeoutMs: number,
-    stream?: (child: ChildProcess) => void
+    stream?: (child: ChildProcess) => void,
+    protect = false
   ): Promise<Result> {
     // detached: its own process group, so a stop or a timeout reaches its children too.
     const stdio =
@@ -310,6 +365,7 @@ export class Session {
     child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
     const group = child.pid;
     if (group != null) this.#groups.add(group);
+    if (group != null && protect) this.#protected.add(group);
     const timer = setTimeout(() => {
       if (group != null) this.#signal(group, "SIGKILL");
     }, timeoutMs);

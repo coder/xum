@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,6 +15,11 @@ const REF = `ghcr.io/coder/xum-bugbash-sandbox@${DIGEST}`;
 const FAKE = `#!/bin/sh
 bin=$(dirname "$0"); . "$bin/fake.env"
 echo "$* [home=\${HOME-} cfg=\${DOCKER_CONFIG-}]" >> "$bin/calls.log"
+# A started container's job: it writes the export stream on stdout.
+job() { touch "$bin/started"
+    if [ "$RUN" = hang ]; then exec sleep 30; fi
+    if [ "$RUN" = early ]; then echo "not a header"; exec sleep 30; fi
+    printf '{"p":"app.log","n":2}\nok'; [ "$RUN" = cut ] || printf '{"end":true}\n'; exit 7; }
 case "$1" in
   context) if [ "\${CONTEXT-}" = hang ]; then trap '' TERM; exec sleep 30; fi; echo "$HOST" ;;
   info) echo "$INFO" ;;
@@ -26,20 +32,22 @@ case "$1" in
     if [ "$PULL" = group ]; then sleep 60 >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; trap '' TERM; wait $!; fi
     if [ "$PULL" = swap ]; then rm -r "$SWAP"; ln -s / "$SWAP"; fi ;;
   image) echo "{\\"org.xum.bugbash.inputs\\":\\"$LABEL\\"}" ;;
-  # Lines of bin/containers: id name owner checkout. ps prints the ids that match every filter.
-  ps) [ "$PS_RC" = 0 ] || exit 1
-    n=""; o=""; c=""
-    for a in "$@"; do case "$a" in
-      name=*) n=\${a#name=^/}; n=\${n%"$"} ;;
-      label=xum.bugbash.owner=*) o=\${a#label=xum.bugbash.owner=} ;;
-      label=xum.bugbash.checkout=*) c=\${a#label=xum.bugbash.checkout=} ;;
-    esac; done
-    awk -v n="$n" -v o="$o" -v c="$c" '$2==n && $3==o && $4==c {print $1}' "$bin/containers" ;;
-  # launch.ts: the container registers itself, and only cleanup removes it.
-  run) p=""; for a in "$@"; do case "$p" in --name) n=$a ;; --label) l="\${l-} \${a#*=}" ;; esac; p=$a; done
-    echo "ctr $n$l" >> "$bin/containers"
-    if [ "$RUN" = hang ]; then exec sleep 30; fi
-    printf '{"p":"app.log","n":2}\nok'; [ "$RUN" = cut ] || printf '{"end":true}\n'; exit 7 ;;
+  # Lines of bin/containers: id name owner checkout.
+  # The fake daemon: create and run register "ctr <name> <owner> <checkout>", only rm removes
+  # it. CREATE=late: the daemon lands it 0.5 s after the request, outside the CLI's process
+  # group, and the CLI answers at 1 s. Killing that CLI does not cancel the daemon's create.
+  run|create) p=""; for a in "$@"; do case "$p" in --name) n=$a ;; --label) l="\${l-} \${a#*=}" ;; esac; p=$a; done
+    if [ "\${CREATE-}" = die ]; then kill -9 $$; fi
+    if [ "\${CREATE-}" = late ]; then setsid sh -c "sleep 0.5; echo 'ctr $n$l' >> '$bin/containers'" </dev/null >/dev/null 2>&1 & sleep 1
+    else echo "ctr $n$l" >> "$bin/containers"; fi
+    if [ "$1" = create ]; then echo ctr; exit 0; fi
+    job ;;
+  start) job ;;
+  container) [ "\${INSPECT_RC-0}" = 0 ] || { echo "daemon down" >&2; exit 1; }
+    if [ "\${INSPECT_SLOW-}" = 1 ]; then sleep 1; fi
+    for ref; do :; done
+    awk -v r="$ref" '$1==r || $2==r {print $1, "/" $2, $3, $4; f=1} END {exit !f}' "$bin/containers" ||
+      { echo "Error response from daemon: No such container: $ref" >&2; exit 1; } ;;
   rm) shift 2; for id in "$@"; do awk -v id="$id" '$1!=id' "$bin/containers" > "$bin/c.tmp"; mv "$bin/c.tmp" "$bin/containers"; done ;;
   *) exit 9 ;;
 esac
@@ -107,7 +115,6 @@ function fake(over: Record<string, string> = {}) {
     IMAGES: "",
     PULL: "ok",
     LABEL: key,
-    PS_RC: "0",
     RUN: "ok",
     ...over,
   };
@@ -198,7 +205,8 @@ test.each([
 });
 
 const JOB = { name: "xbb-1", owner: "boot:pid", checkout: "abc" };
-const FOREIGN = ["c2 xbb-1 other:pid abc", "c3 xbb-1 boot:pid other", "c4 xbb-2 boot:pid abc"];
+// Names are unique on a daemon, so a foreign container never has the job's name.
+const FOREIGN = ["c2 xbb-9 other:pid abc", "c3 xbb-8 boot:pid other", "c4 xbb-2 boot:pid abc"];
 
 test("a stop ends a running pull; cleanup removes only the owned container, no image", async () => {
   fake({ PULL: "hang" });
@@ -224,7 +232,7 @@ test("a stop ends a running pull; cleanup removes only the owned container, no i
 }, 15_000);
 
 test("cleanup reports an unknown container state, never success", async () => {
-  fake({ IMAGES: "sha256:abc", PS_RC: "1" });
+  fake({ IMAGES: "sha256:abc", INSPECT_RC: "1" });
   const s = session();
   await s.ensureImage();
   s.own(JOB);
@@ -339,30 +347,32 @@ function launchIn(
   return launch(ARGS, { root: real, cwd, env, stop: stop.signal });
 }
 /** Nothing of a job stays: no container, no job folder, no private client folder, no image rm. */
-function expectNothingLeft() {
-  expect(fs.readFileSync(path.join(bin, "containers"), "utf8").trim().split("\n")).toEqual(FOREIGN);
+function expectNothingLeft(survivors = FOREIGN) {
+  expect(fs.readFileSync(path.join(bin, "containers"), "utf8").trim().split("\n")).toEqual(
+    survivors
+  );
   const left = fs.readdirSync(tmp, { recursive: true }).map(String);
-  expect(left.filter((p) => /xbb-|xum-bugbash-docker/.test(p))).toEqual([]);
+  expect(left.filter((p) => /xbb-|xum-bugbash-(docker|sandbox)/.test(p))).toEqual([]);
   expect(calls()).not.toMatch(/^(rmi|image rm|image prune|system prune)/m);
 }
 
 test("a repro job runs in the locked-down container; the export comes back; cleanup removes it", async () => {
   expect(await launchIn()).toBe(7);
   expect(fs.readFileSync(path.join(root, "tests/bugbash/.e2e/r/app.log"), "utf8")).toBe("ok");
-  const run = calls()
+  const create = calls()
     .split("\n")
-    .find((line) => line.startsWith("run "))!;
+    .find((line) => line.startsWith("create "))!;
   for (const flag of ["--network none", "--read-only", "--cap-drop ALL", "-i --init"])
-    expect(run).toContain(flag);
+    expect(create).toContain(flag);
   const real = fs.realpathSync(root);
-  expect(run).toContain(
+  expect(create).toContain(
     `--mount type=bind,src=${real}/node_modules,dst=/repo/node_modules,readonly`
   );
   // The app log stays in the export folder; no host credential and no host log path pass.
-  expect(run).toContain("-e BUGBASH_APP_LOG=.e2e/r/app.log");
-  expect(run).toContain("-e BUGBASH_CONTAINER=1");
-  expect(run).toContain("-e BUGBASH_AI_RESOLVED=mock");
-  expect(run).not.toMatch(/sk-secret|\/x\.log/);
+  expect(create).toContain("-e BUGBASH_APP_LOG=.e2e/r/app.log");
+  expect(create).toContain("-e BUGBASH_CONTAINER=1");
+  expect(create).toContain("-e BUGBASH_AI_RESOLVED=mock");
+  expect(create).not.toMatch(/sk-secret|\/x\.log/);
   expectNothingLeft();
 });
 
@@ -372,14 +382,14 @@ test("an export without its end frame is incomplete evidence (exit 4)", async ()
 });
 
 test("an unknown container state after cleanup outranks the job's result (exit 3)", async () => {
-  expect(await launchIn({ PS_RC: "1" })).toBe(3);
+  expect(await launchIn({ INSPECT_RC: "1" })).toBe(3);
 });
 
 test.each([
   ["before the launch", {}, null],
   ["during the endpoint lookup", { CONTEXT: "hang" }, "context "],
   ["during the pull", { IMAGES: "", PULL: "hang" }, "pull "],
-  ["while the job runs", { RUN: "hang" }, "run "],
+  ["while the job runs", { RUN: "hang" }, "start "],
 ])(
   "a stop %s leaves nothing behind",
   async (_name, over, marker) => {
@@ -389,7 +399,7 @@ test.each([
     while (marker != null && !calls().includes(marker)) await Bun.sleep(20);
     stop.abort("SIGTERM");
     expect(await failure(pending)).toThrow(Stopped);
-    if (marker !== "run ") expect(calls()).not.toContain("run ");
+    if (marker !== "start ") expect(calls()).not.toContain("create ");
     expectNothingLeft();
   },
   15_000
@@ -415,7 +425,7 @@ test("a signal during the synchronous staging starts no container", async () => 
 
 test("a mount source that becomes a symlink before `docker run` refuses; nothing starts", async () => {
   expect(await failure(launchIn({ IMAGES: "", PULL: "swap" }))).toThrow(/not a symlink/);
-  expect(calls()).not.toContain("run ");
+  expect(calls()).not.toContain("create ");
   expectNothingLeft();
 });
 
@@ -468,4 +478,78 @@ test("the command line refuses an ambient BUGBASH_AI_RESOLVED=real before any do
   expect(cli.status).toBe(2);
   expect(calls()).toBe("");
   expect(fs.existsSync(path.join(dir, output))).toBe(false);
+});
+
+test("runJob() refuses caller args that set the name or a label", async () => {
+  fake({ IMAGES: "sha256:abc" });
+  const s = session();
+  await s.ensureImage();
+  s.own(JOB);
+  for (const arg of ["--name", "--name=x", "--label", "--label=a=b", "-l", "--label-file"])
+    expect(await failure(s.runJob([arg, "img"], () => Promise.resolve(0), 1_000))).toThrow(
+      /sets the name and labels itself/
+    );
+  expect(calls()).not.toContain("create ");
+});
+
+test("a receiver that gives up ends the job at once, not at the deadline (exit 4)", async () => {
+  const started = Date.now();
+  expect(await launchIn({ RUN: "early" })).toBe(4);
+  expect(Date.now() - started).toBeLessThan(10_000);
+  expectNothingLeft();
+}, 20_000);
+
+test("a signal during cleanup still ends with Stopped, and cleanup completes", async () => {
+  const stop = new AbortController();
+  const pending = launchIn({ INSPECT_SLOW: "1" }, stop);
+  while (!calls().includes("container inspect ")) await Bun.sleep(20);
+  stop.abort("SIGTERM");
+  expect(await failure(pending)).toThrow(Stopped);
+  expectNothingLeft();
+}, 15_000);
+
+// The window of a create: the stop lands while the daemon still creates the container, before
+// the CLI has returned its ID. Only a create whose outcome is known may count as removed.
+test.each([
+  ["while the create request is in flight", "sent"],
+  ["after the daemon created it, before its ID came back", "landed"],
+])(
+  "a stop %s: the job never starts, and cleanup removes it once",
+  async (_name, when) => {
+    const real = fs.realpathSync(root);
+    const checkout = crypto.createHash("sha256").update(real).digest("hex").slice(0, 12);
+    const sameCheckout = `c5 xbb-7 other:1 ${checkout}`; // same checkout, another owner
+    const stop = new AbortController();
+    const pending = launchIn({ CREATE: "late" }, stop);
+    const containers = path.join(bin, "containers");
+    fs.appendFileSync(containers, `${sameCheckout}\n`);
+    if (when === "sent") while (!/^(run|create) /m.test(calls())) await Bun.sleep(10);
+    else while (!fs.readFileSync(containers, "utf8").includes("ctr ")) await Bun.sleep(10);
+    stop.abort("SIGTERM");
+    expect(await failure(pending)).toThrow(Stopped);
+    await Bun.sleep(700); // a create that the daemon still finishes lands by now
+    expect(fs.existsSync(path.join(bin, "started"))).toBe(false);
+    expect(calls().match(/^rm -f ctr /gm)).toHaveLength(1);
+    expectNothingLeft([...FOREIGN, sameCheckout]);
+  },
+  20_000
+);
+
+test("a container with the job's name but other labels is not removed", async () => {
+  fake({ IMAGES: "sha256:abc" });
+  fs.writeFileSync(path.join(bin, "containers"), "c9 xbb-1 other:pid abc\n");
+  const s = session();
+  await s.ensureImage();
+  s.own(JOB);
+  expect(await s.cleanup()).toStartWith("unknown: xbb-1 is not this job's container");
+  expect(calls()).not.toMatch(/^rm /m);
+});
+
+test("a create whose CLI died is an unknown outcome when no container has the name", async () => {
+  fake({ IMAGES: "sha256:abc", CREATE: "die" });
+  const s = session();
+  await s.ensureImage();
+  s.own(JOB);
+  expect(await failure(s.runJob(["img"], () => Promise.resolve(0), 5_000))).toThrow(/create/);
+  expect(await s.cleanup()).toBe("unknown: the create's outcome is unknown");
 });

@@ -18,6 +18,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Readable } from "node:stream";
 import { receiveExport } from "./exportStream";
 // prettier-ignore
 import { checkMountSource, containerEnv, exactStepRefusal, jobEnv, outputDir, plainFolders, stage } from "./inputs";
@@ -53,6 +54,13 @@ function ownerLabel(): string {
   const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
   const start = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
   return `${bootId()}:${pidns}:${process.pid}:${start}`;
+}
+
+/** The receiver stopped before the end of the export, so the evidence is incomplete. */
+class IncompleteExport extends Error {
+  constructor(readonly result: { files: number; error?: string }) {
+    super(`incomplete: ${result.error}`);
+  }
 }
 
 export interface LaunchOptions {
@@ -92,9 +100,16 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
 
   const run = async (): Promise<number> => {
     const image = await session.ensureImage();
-    fs.mkdirSync(path.dirname(jobDir), { recursive: true, mode: 0o700 });
-    fs.mkdirSync(jobDir, { mode: 0o700 }); // EEXIST: not this job's folder, so cleanup keeps it
-    made = true;
+    // Another launcher's cleanup can remove the empty parents in between: then try again.
+    for (let tries = 3; !made; tries--) {
+      fs.mkdirSync(path.dirname(jobDir), { recursive: true, mode: 0o700 });
+      try {
+        fs.mkdirSync(jobDir, { mode: 0o700 }); // EEXIST: not this job's folder, so it stays
+        made = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT" || tries <= 1) throw error;
+      }
+    }
     const staged = path.join(jobDir, "stage");
     log(`${name} staged ${stage(o.root, staged)} files`);
     const nonce = crypto.randomUUID();
@@ -122,13 +137,23 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
     await new Promise((resolve) => setImmediate(resolve));
     session.own({ name, owner: ownerLabel(), checkout });
     log(`${name} starts: --network none, mock app AI`);
-    const job = await session.runJob(flags, (out) => receiveExport(out, dest), DEADLINE_MS);
-    const { complete, files, error } = job.received;
-    log(
-      `${name} exit ${job.code}, ${files} files, ${complete ? "complete" : `incomplete: ${error}`}`
-    );
-    if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
-    return complete ? job.code : 4;
+    // An incomplete export rejects, so runJob ends the job at once instead of at the deadline.
+    const receive = async (out: Readable) => {
+      const r = await receiveExport(out, dest);
+      if (!r.complete) throw new IncompleteExport(r);
+      return r;
+    };
+    try {
+      const job = await session.runJob(flags, receive, DEADLINE_MS);
+      log(`${name} exit ${job.code}, ${job.received.files} files, complete`);
+      if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
+      return job.code;
+    } catch (error) {
+      if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
+      if (!(error instanceof IncompleteExport)) throw error;
+      log(`${name} ${error.result.files} files, ${error.message}`);
+      return 4;
+    }
   };
 
   // One cleanup for every outcome. An unknown container state outranks the job's result.
@@ -139,9 +164,21 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
     result = { error };
   }
   const state = await session.cleanup();
-  if (made) fs.rmSync(jobDir, { recursive: true, force: true });
+  if (made) {
+    fs.rmSync(jobDir, { recursive: true, force: true });
+    // The checkout folder, then the sandbox folder, when no other job uses them.
+    for (const dir of [path.dirname(jobDir), path.dirname(path.dirname(jobDir))]) {
+      try {
+        fs.rmdirSync(dir); // never recursive: a folder in use is not empty and stays
+      } catch {
+        break; // ENOTEMPTY or ENOENT
+      }
+    }
+  }
   log(`${name} cleanup: ${state}`);
   if (state.startsWith("unknown")) return 3;
+  // A signal during cleanup still counts: the job did not end on its own terms.
+  if (o.stop.aborted && typeof result === "number") throw new Stopped(String(o.stop.reason));
   if (typeof result !== "number") throw result.error;
   return result;
 }

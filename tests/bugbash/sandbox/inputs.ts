@@ -48,6 +48,7 @@ export function plainFolders(base: string, rel: string, create: boolean, seen = 
  * old .e2e runs, app logs and local env files. Each must be a regular file under plain folders.
  */
 export function stage(root: string, into: string): number {
+  if (fs.realpathSync(root) !== root) throw new Refusal(`${root} is not a canonical path`);
   // prettier-ignore
   const listArgs = ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--deduplicate"];
   const listed = spawnSync("git", ["-C", root, ...listArgs, "--", ...INPUTS], {
@@ -64,13 +65,32 @@ export function stage(root: string, into: string): number {
     plainFolders(root, path.dirname(rel), false, seen); // lstat above follows symlinked folders
     if (!st.isFile()) throw new Refusal(`stage: ${rel} is not a regular file`);
     fs.mkdirSync(path.join(into, path.dirname(rel)), { recursive: true });
-    fs.copyFileSync(path.join(root, rel), path.join(into, rel), fs.constants.COPYFILE_EXCL);
+    copyRegular(path.join(root, rel), path.join(into, rel));
     count += 1;
   }
   // Mount points for the read-only build outputs and the job's tmpfs.
   for (const dir of ["dist", "node_modules", "tests/bugbash/.e2e"])
     fs.mkdirSync(path.join(into, dir), { recursive: true });
   return count;
+}
+
+/**
+ * Copies one regular file through its fd. The checks above use paths, so a file or folder
+ * swapped for a symlink after them could redirect a copy by path. Here the opened file must be
+ * a regular file whose real path (its /proc fd link) is `src` itself, so the bytes come from
+ * inside the checkout. Such a swap needs a host process, which is outside the threat model;
+ * this closes it anyway.
+ */
+function copyRegular(src: string, dst: string): void {
+  const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
+  const fd = fs.openSync(src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+  try {
+    if (!fs.fstatSync(fd).isFile() || fs.readlinkSync(`/proc/self/fd/${fd}`) !== src)
+      throw new Refusal(`stage: ${src} changed while it was copied`);
+    fs.writeFileSync(dst, fs.readFileSync(fd), { flag: "wx" });
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /**

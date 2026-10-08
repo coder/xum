@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -73,6 +73,37 @@ test.each([
   expect(() => stage(root, into())).toThrow(Refusal);
   const copied = spawnSync("grep", ["-r", "host secret", into()], { encoding: "utf8" });
   expect(copied.stdout).toBe("");
+});
+
+test("a folder swapped for a symlink after the checks copies no host file", () => {
+  fs.mkdirSync(path.join(outside, "repros"));
+  fs.writeFileSync(path.join(outside, "repros/x.e2e.ts"), "host secret\n");
+  // stage() makes the target folder right before each copy, after its checks: swap there.
+  const real = fs.mkdirSync;
+  const swap = spyOn(fs, "mkdirSync").mockImplementation(((dir: fs.PathLike, options) => {
+    if (String(dir).endsWith("-stage/tests/bugbash/repros")) {
+      fs.rmSync(path.join(root, "tests/bugbash/repros"), { recursive: true });
+      fs.symlinkSync(path.join(outside, "repros"), path.join(root, "tests/bugbash/repros"));
+    }
+    return real(dir, options);
+  }) as typeof fs.mkdirSync);
+  try {
+    expect(() => stage(root, into())).toThrow(/changed while it was copied/);
+  } finally {
+    swap.mockRestore();
+  }
+  const copied = spawnSync("grep", ["-r", "host secret", into()], { encoding: "utf8" });
+  expect(copied.stdout).toBe("");
+});
+
+test("stage refuses a checkout reached through a symlink", () => {
+  const linked = `${root}-link`;
+  fs.symlinkSync(root, linked);
+  try {
+    expect(() => stage(linked, into())).toThrow("not a canonical path");
+  } finally {
+    fs.rmSync(linked);
+  }
 });
 
 test("a mount source must be a plain folder of the checkout", () => {
