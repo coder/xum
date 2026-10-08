@@ -17,12 +17,9 @@ import {
   PERSISTED_KEY_REGISTRY,
   getDisableWorkspaceAgentsKey,
   getDraftScopeId,
-  getModelKey,
   getPersistedKeyKind,
   getPersistedKeyRegistration,
   getProjectScopeId,
-  getReasoningModeKey,
-  getThinkingLevelKey,
   type PersistedKeyRegistration,
 } from "@/common/constants/storage";
 
@@ -51,12 +48,7 @@ const LOCAL_STORAGE_BUDGET_CEILING_CHARS = 3.5 * 1024 * 1024;
  * Workspace keys that creation flows also write under project and global scope ids (creation
  * defaults), so they are counted once per project plus once for the global scope.
  */
-const PROJECT_SCOPED_WORKSPACE_KEYS = [
-  getModelKey,
-  getThinkingLevelKey,
-  getReasoningModeKey,
-  getDisableWorkspaceAgentsKey,
-];
+const PROJECT_SCOPED_WORKSPACE_KEYS = [getDisableWorkspaceAgentsKey];
 
 function projectPath(index: number): string {
   const prefix = `/Users/someone/src/github.com/org/project-${index}/`;

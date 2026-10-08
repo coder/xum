@@ -3,7 +3,6 @@ import { cleanup, renderHook } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   markAiSelectionIntent,
@@ -17,7 +16,7 @@ import {
   useWorkspaceAiSelection,
   type WorkspaceAiSelection,
 } from "@/browser/utils/workspaceAiSettingsSync";
-import { getProjectScopeId, getReasoningModeKey } from "@/common/constants/storage";
+import { getProjectScopeId } from "@/common/constants/storage";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 
 const WS = "resolver-ws";
@@ -139,7 +138,7 @@ describe("getWorkspaceAiSelection", () => {
         },
       },
     });
-    updatePersistedState(getReasoningModeKey(scopeId), "pro");
+    markAiSelectionIntent(scopeId, "reasoningMode", "pro");
 
     const expected: WorkspaceAiSelection = {
       model: "openai:project",

@@ -5,6 +5,7 @@ import {
   getAiSelectionVersion,
   getAutoRoutingPick,
   getPendingAiSelection,
+  getWorkspaceAgentId,
   getWorkspaceAiMetadata,
   subscribeAiSelection,
   type AutoRoutingDimension,
@@ -12,8 +13,6 @@ import {
 import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
 import { readScopedAiDefault, useScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
-import { readPersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
-import { getReasoningModeKey } from "@/common/constants/storage";
 import {
   getAppConfigStore,
   getUserPreferences,
@@ -92,18 +91,18 @@ function isCreationScope(scopeId: string): boolean {
 }
 
 function resolveCreationScopeSelection(
-  scoped: {
-    model: string | undefined;
-    thinkingLevel: ThinkingLevel | undefined;
-    reasoningMode: OpenAIReasoningMode | null;
-  },
+  scopeId: string,
+  scoped: { model: string | undefined; thinkingLevel: ThinkingLevel | undefined },
   defaultModel: string
 ): WorkspaceAiSelection {
   return {
     model: normalizeModelPreference(scoped.model, defaultModel),
     thinkingLevel: scoped.thinkingLevel ?? WORKSPACE_DEFAULTS.thinkingLevel,
-    // Coerce untrusted persisted values so corrupt entries self-heal to "standard".
-    reasoningMode: coerceOpenAIReasoningMode(scoped.reasoningMode) ?? "standard",
+    // A creation scope's reasoning mode is only an unsent pick.
+    reasoningMode:
+      coerceOpenAIReasoningMode(
+        getPendingAiSelection(scopeId, getWorkspaceAgentId(scopeId), "reasoningMode")
+      ) ?? "standard",
   };
 }
 
@@ -118,13 +117,10 @@ export function getWorkspaceAiSelection(
 ): WorkspaceAiSelection {
   if (isCreationScope(workspaceId)) {
     return resolveCreationScopeSelection(
+      workspaceId,
       {
         model: readScopedAiDefault(workspaceId, "model"),
         thinkingLevel: readScopedAiDefault(workspaceId, "thinkingLevel"),
-        reasoningMode: readPersistedState<OpenAIReasoningMode | null>(
-          getReasoningModeKey(workspaceId),
-          null
-        ),
       },
       getDefaultModel()
     );
@@ -149,11 +145,6 @@ export function useWorkspaceAiSelection(
   // Subscribed for creation scopes, which resolve like getWorkspaceAiSelection.
   const scopedModel = useScopedAiDefault(workspaceId, "model");
   const scopedThinkingLevel = useScopedAiDefault(workspaceId, "thinkingLevel");
-  const [scopedReasoningMode] = usePersistedState<OpenAIReasoningMode | null>(
-    getReasoningModeKey(workspaceId),
-    null,
-    { listener: true }
-  );
   const ai = useUserPreferences((preferences) => preferences.ai);
   const agentAiDefaults = useAgentAiDefaults();
   const defaultModel = normalizeModelPreference(
@@ -162,11 +153,8 @@ export function useWorkspaceAiSelection(
   );
   if (isCreationScope(workspaceId)) {
     return resolveCreationScopeSelection(
-      {
-        model: scopedModel,
-        thinkingLevel: scopedThinkingLevel,
-        reasoningMode: scopedReasoningMode,
-      },
+      workspaceId,
+      { model: scopedModel, thinkingLevel: scopedThinkingLevel },
       defaultModel
     );
   }

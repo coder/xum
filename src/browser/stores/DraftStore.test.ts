@@ -11,7 +11,7 @@ import {
   getDraftScopeId,
   getInputAttachmentsKey,
   getInputKey,
-  getModelKey,
+  getAutoExpandPrefsKey,
   getPendingScopeId,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
 } from "@/common/constants/storage";
@@ -203,7 +203,7 @@ describe("DraftStore", () => {
     seedLegacyKey(getInputAttachmentsKey(creationScopeId), [image]);
     seedLegacyKey(getInputKey(getPendingScopeId(projectPath)), "pending text");
     // Scope-bound settings of the pending composer follow its draft, like createWorkspaceDraft.
-    updatePersistedState(getModelKey(getPendingScopeId(projectPath)), "pending-model");
+    updatePersistedState(getAutoExpandPrefsKey(getPendingScopeId(projectPath)), "pending-model");
 
     // First start: every import fails, so every key must survive for the next start.
     control.failImports = 100;
@@ -234,12 +234,12 @@ describe("DraftStore", () => {
     expect(listPersistedKeys("input")).toEqual([]);
     expect(
       readPersistedState<string | null>(
-        getModelKey(getDraftScopeId(projectPath, listed[0].draftId)),
+        getAutoExpandPrefsKey(getDraftScopeId(projectPath, listed[0].draftId)),
         null
       )
     ).toBe("pending-model");
     expect(
-      readPersistedState<string | null>(getModelKey(getPendingScopeId(projectPath)), null)
+      readPersistedState<string | null>(getAutoExpandPrefsKey(getPendingScopeId(projectPath)), null)
     ).toBeNull();
   });
 

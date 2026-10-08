@@ -156,39 +156,6 @@ export function getBrowserSelectedSessionKey(projectPath: string): string {
 }
 
 /**
- * Get the localStorage key for thinking level preference per scope (workspace/project).
- * Format: "thinkingLevel:{scopeId}"
- */
-export function getThinkingLevelKey(scopeId: string): string {
-  return `thinkingLevel:${scopeId}`;
-}
-
-/**
- * Get the localStorage key for the OpenAI pro reasoning-mode toggle per scope
- * (workspace/project). Format: "reasoningMode:{scopeId}"
- */
-export function getReasoningModeKey(scopeId: string): string {
-  return `reasoningMode:${scopeId}`;
-}
-
-/**
- * LEGACY: Get the localStorage key for thinking level preference per model (global).
- * Format: "thinkingLevel:model:{modelName}"
- *
- * Kept for one-time migration to per-workspace thinking.
- */
-export function getThinkingLevelByModelKey(modelName: string): string {
-  return `thinkingLevel:model:${modelName}`;
-}
-
-/**
- * Get the localStorage key for the user's preferred model for a workspace
- */
-export function getModelKey(workspaceId: string): string {
-  return `model:${workspaceId}`;
-}
-
-/**
  * Get the localStorage key for the input text for a workspace.
  * Only the VS Code webview composer still writes it; the desktop/web composer keeps drafts on the
  * backend and reads this key once for the legacy draft import.
@@ -743,7 +710,7 @@ export const WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS = 2000;
  */
 export const WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS = 1024;
 /**
- * model:{workspaceId} holds a "provider:modelId" string. Custom model ids are checked against it
+ * Model preferences hold a "provider:modelId" string. Custom model ids are checked against it
  * where they are entered (getModelIdLengthError); built-in ids are far shorter.
  */
 export const MODEL_KEY_MAX_CHARS = 128;
@@ -870,7 +837,6 @@ function projectPrefix(getKey: (projectPath: string) => string): string {
 // exceed its budget is a bug in its owner.
 export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Copied on fork.
-  workspaceKey(getModelKey, "ui", true, MODEL_KEY_MAX_CHARS),
   // { thinking?, tools?: Record<toolName, boolean> }: one entry per tool the user toggled.
   workspaceKey(getAutoExpandPrefsKey, "ui", true, AUTO_EXPAND_PREFS_MAX_CHARS),
   // Creation-draft scopes only. ~80 skeleton + generatedIdentity <= ~410 (propose_name: name <= 20
@@ -880,7 +846,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // memory); the webview then persists only the last text that fit.
   workspaceKey(getInputKey, "draft", false, 8192, "webview"),
   workspaceKey(getPinnedAgentIdKey, "ui", true, 128),
-  workspaceKey(getThinkingLevelKey, "ui", true, 32),
   workspaceKey(getReviewSelectedHunkKey, "workspace-scoped", true, 256),
   workspaceKey(
     getFileTreeExpandStateKey,
@@ -914,7 +879,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getPendingDraftSkillDiscoveryKey, "workspace-scoped", false, 16),
 
   // Per-workspace keys that deleteWorkspaceStorage used to miss, leaving orphans behind.
-  workspaceKey(getReasoningModeKey, "ui", false, 32),
   workspaceKey(getDisableWorkspaceAgentsKey, "ui", false, 16),
   workspaceKey(getPinnedTodoExpandedKey, "ui", false, 16),
   workspaceKey(getSubAgentTasksExpandedKey, "ui", false, 16),
@@ -1054,7 +1018,7 @@ export function getPersistedKeyKind(key: string): PersistedKeyKind | undefined {
 /**
  * New workspaces get crypto.randomBytes(5) hex ids (Config.generateStableId). Orphan GC only
  * collects keys whose scope id has this shape, so legacy-format ids, creation-draft, pending,
- * project and global scopes and legacy keys that share a prefix (e.g. "thinkingLevel:model:{model}") are never collected.
+ * project and global scopes are never collected.
  * Failing closed here leaks a little space at worst; guessing wrong would delete user data.
  */
 const STABLE_WORKSPACE_ID_PATTERN = /^[0-9a-f]{10}$/;

@@ -4,7 +4,11 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
-import { getDraftScopeId, getModelKey, getWorkspaceNameStateKey } from "@/common/constants/storage";
+import {
+  getDraftScopeId,
+  getAutoExpandPrefsKey,
+  getWorkspaceNameStateKey,
+} from "@/common/constants/storage";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { APIProvider, type APIClient } from "./API";
 import { ProjectProvider, useProjectContext, type ProjectContext } from "./ProjectContext";
@@ -89,7 +93,7 @@ describe("ProjectContext", () => {
     await waitFor(() => expect(ctx().userProjects.size).toBe(1));
     // The draft list never hydrated in this renderer, so only the backend knows the draft ids.
     const scopeId = getDraftScopeId("/alpha", "d1");
-    const keys = [getModelKey(scopeId), getWorkspaceNameStateKey(scopeId)];
+    const keys = [getAutoExpandPrefsKey(scopeId), getWorkspaceNameStateKey(scopeId)];
     for (const key of keys) updatePersistedState(key, "value");
 
     await act(async () => {

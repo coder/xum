@@ -23,11 +23,7 @@ import { createErrorToast } from "@/browser/features/ChatInput/ChatInputToasts";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import { parseCommand } from "@/browser/utils/slashCommands/parser";
-import {
-  readPersistedState,
-  usePersistedState,
-  updatePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { usePersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -47,8 +43,8 @@ import {
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
-  getReasoningModeKey,
   getProjectScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
@@ -136,7 +132,7 @@ import {
   type PendingUserMessage,
 } from "@/browser/utils/chatEditing";
 
-import { type OpenAIReasoningMode, type ThinkingLevel } from "@/common/types/thinking";
+import { type ThinkingLevel } from "@/common/types/thinking";
 import { normalizeRuntimeEnablement } from "@/common/types/runtime";
 import {
   type MuxMessageMetadata,
@@ -1054,8 +1050,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // a custom agent inheriting model/thinking/pro from its base would
     // otherwise send the first prompt with the ambient model and Pro gated off
     // until WorkspaceModeAISync corrects the workspace.
-    const reasoningKey = getReasoningModeKey(scopeId);
-    const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
+    const existingReasoning = getWorkspaceAiSelection(scopeId).reasoningMode;
     const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
     const {
       resolvedModel,
@@ -1079,7 +1074,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     if (existingReasoning !== resolvedReasoning) {
-      updatePersistedState(reasoningKey, resolvedReasoning);
+      markAiSelectionIntent(scopeId, "reasoningMode", resolvedReasoning);
     }
   }, [agentAiDefaults, agentId, agents, creationParentProjectPath, defaultModel, variant]);
 

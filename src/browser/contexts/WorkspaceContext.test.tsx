@@ -15,7 +15,7 @@ import {
   LAST_VISITED_ROUTE_KEY,
   SELECTED_WORKSPACE_KEY,
   getDraftScopeId,
-  getModelKey,
+  getAutoExpandPrefsKey,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
   type LaunchBehavior,
@@ -2012,9 +2012,9 @@ describe("WorkspaceContext", () => {
       subProjectPath: null,
       createdAt: 1,
     });
-    const listedKey = getModelKey(getDraftScopeId(projectPath, "listed"));
+    const listedKey = getAutoExpandPrefsKey(getDraftScopeId(projectPath, "listed"));
     // Deleted in another window: only its settings are left in this origin.
-    const orphanKey = getModelKey(getDraftScopeId(projectPath, "deleted-elsewhere"));
+    const orphanKey = getAutoExpandPrefsKey(getDraftScopeId(projectPath, "deleted-elsewhere"));
     resetCreationDraftStorageGcForTests();
     createMockAPI({
       projects: {
@@ -2047,7 +2047,7 @@ describe("WorkspaceContext", () => {
       return current;
     });
     // Routed but unlisted (e.g. its list write never landed).
-    const routedKey = getModelKey(getDraftScopeId(projectPath, "routed"));
+    const routedKey = getAutoExpandPrefsKey(getDraftScopeId(projectPath, "routed"));
     resetCreationDraftStorageGcForTests();
     createMockAPI({
       projects: {
@@ -2281,15 +2281,17 @@ describe("WorkspaceContext", () => {
         },
         // Drafts live on the backend now; any registered workspace-scoped key shows the GC.
         localStorage: {
-          [getModelKey(ACTIVE_ID)]: JSON.stringify("live model"),
-          [getModelKey(ORPHAN_ID)]: JSON.stringify("orphan model"),
+          [getAutoExpandPrefsKey(ACTIVE_ID)]: JSON.stringify("live model"),
+          [getAutoExpandPrefsKey(ORPHAN_ID)]: JSON.stringify("orphan model"),
         },
       });
 
       await setup();
 
-      await waitFor(() => expect(localStorage.getItem(getModelKey(ORPHAN_ID))).toBeNull());
-      expect(localStorage.getItem(getModelKey(ACTIVE_ID))).not.toBeNull();
+      await waitFor(() =>
+        expect(localStorage.getItem(getAutoExpandPrefsKey(ORPHAN_ID))).toBeNull()
+      );
+      expect(localStorage.getItem(getAutoExpandPrefsKey(ACTIVE_ID))).not.toBeNull();
     });
 
     test("never runs after a failed startup load, even when a later refresh succeeds", async () => {
@@ -2303,7 +2305,7 @@ describe("WorkspaceContext", () => {
               : Promise.resolve([createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]),
           listKnownIdsForStorageGc: () => Promise.resolve({ workspaceIds: [ACTIVE_ID] }),
         },
-        localStorage: { [getModelKey(ORPHAN_ID)]: JSON.stringify("draft") },
+        localStorage: { [getAutoExpandPrefsKey(ORPHAN_ID)]: JSON.stringify("draft") },
       });
 
       const ctx = await setup();
@@ -2313,7 +2315,7 @@ describe("WorkspaceContext", () => {
       await waitFor(() => expect(ctx().workspaceMetadata.has(ACTIVE_ID)).toBe(true));
 
       expect(workspaceApi.listKnownIdsForStorageGc).not.toHaveBeenCalled();
-      expect(localStorage.getItem(getModelKey(ORPHAN_ID))).not.toBeNull();
+      expect(localStorage.getItem(getAutoExpandPrefsKey(ORPHAN_ID))).not.toBeNull();
     });
   });
 });

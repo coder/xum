@@ -2,16 +2,10 @@ import type { ReactNode } from "react";
 import React, { createContext, useCallback, useContext, useEffect } from "react";
 import {
   THINKING_LEVEL_OFF,
-  coerceOpenAIReasoningMode,
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  getProjectScopeId,
-  getReasoningModeKey,
-  GLOBAL_SCOPE_ID,
-} from "@/common/constants/storage";
+import { getProjectScopeId, GLOBAL_SCOPE_ID } from "@/common/constants/storage";
 import { useDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import { enforceThinkingPolicy, getAvailableThinkingLevels } from "@/common/utils/thinking/policy";
@@ -19,7 +13,10 @@ import { useMinThinkingLevels } from "@/browser/hooks/useMinThinkingLevels";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useAPI } from "@/browser/contexts/API";
 import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
-import { useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import {
+  getWorkspaceAiSelection,
+  useWorkspaceAiSelection,
+} from "@/browser/utils/workspaceAiSettingsSync";
 import { useOptionalAgent } from "@/browser/contexts/AgentContext";
 import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
@@ -64,10 +61,6 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   );
   const scopedModel = useScopedAiDefault(defaultsScopeId, "model");
   const scopedThinkingLevel = useScopedAiDefault(defaultsScopeId, "thinkingLevel");
-  const [scopedReasoningMode, setScopedReasoningMode] =
-    usePersistedState<OpenAIReasoningMode | null>(getReasoningModeKey(defaultsScopeId), null, {
-      listener: true,
-    });
 
   // normalizeSelectedModel (not normalizeToCanonical): explicit gateway identities must
   // survive; thinking policy lookups resolve gateway-scoped strings themselves.
@@ -75,11 +68,9 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
     workspaceId != null ? selection.model : normalizeSelectedModel(scopedModel ?? defaultModel);
   const thinkingLevel =
     workspaceId != null ? selection.thinkingLevel : (scopedThinkingLevel ?? THINKING_LEVEL_OFF);
-  // Coerce untrusted persisted values so bad state self-heals to "standard".
+  // useWorkspaceAiSelection re-renders this provider when a creation scope's pick changes.
   const reasoningMode =
-    workspaceId != null
-      ? selection.reasoningMode
-      : (coerceOpenAIReasoningMode(scopedReasoningMode) ?? "standard");
+    workspaceId != null ? selection.reasoningMode : getWorkspaceAiSelection(scopeId).reasoningMode;
 
   // A workspace pick stays in memory until a user message sends it.
   const setThinkingLevel = useCallback(
@@ -102,11 +93,7 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   );
 
   const setReasoningMode = (mode: OpenAIReasoningMode) => {
-    if (workspaceId != null) {
-      markAiSelectionIntent(workspaceId, "reasoningMode", mode);
-    } else {
-      setScopedReasoningMode(mode);
-    }
+    markAiSelectionIntent(scopeId, "reasoningMode", mode);
   };
 
   // Global keybinds for adjusting the thinking level.
