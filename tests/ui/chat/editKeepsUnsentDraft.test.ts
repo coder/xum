@@ -12,6 +12,7 @@ import { act, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { DraftStore, getDraftStore } from "@/browser/stores/DraftStore";
+import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import {
   WorkspaceStore,
   useWorkspaceStoreRaw,
@@ -968,6 +969,22 @@ async function switchAwayAndBack(app: AppHarness, other: { id: string; name: str
   await showWorkspace(app, app.workspaceId, app.metadata.name);
 }
 
+/**
+ * Visit `other` once and send a message there, then show the harness workspace again: with
+ * cached rows in both, ChatPane stays mounted across later switches (no loading placeholder).
+ */
+async function visitWithMessage(app: AppHarness, other: { id: string; name: string }) {
+  await showWorkspace(app, other.id, other.name);
+  const otherChat = new ChatHarness(app.view.container, other.id);
+  await otherChat.send("other message");
+  await otherChat.expectTranscriptContains(
+    "Mock response: other message",
+    LOAD_TOLERANT_WAIT.timeout
+  );
+  await otherChat.expectStreamComplete();
+  await showWorkspace(app, app.workspaceId, app.metadata.name);
+}
+
 /** The history id of the user row that shows `content`. */
 function userRowId(workspaceId: string, content: string) {
   const row = useWorkspaceStoreRaw()
@@ -1379,16 +1396,7 @@ describe("A workspace switch ends an open edit (#5808)", () => {
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
       const other = await addOtherWorkspace(app, "switch-edit-keeps-other-edit-other");
-      // Visit B first: it keeps cached rows, so ChatPane stays mounted across the switches.
-      await showWorkspace(app, other.id, other.name);
-      const otherChat = new ChatHarness(app.view.container, other.id);
-      await otherChat.send("other message");
-      await otherChat.expectTranscriptContains(
-        "Mock response: other message",
-        LOAD_TOLERANT_WAIT.timeout
-      );
-      await otherChat.expectStreamComplete();
-      await showWorkspace(app, app.workspaceId, app.metadata.name);
+      await visitWithMessage(app, other);
 
       const textarea = await startEditWithUnsentDraft(app, scope);
       const editId = userRowId(app.workspaceId, "first message");
@@ -1555,7 +1563,16 @@ describe("A workspace switch ends an open edit (#5808)", () => {
       }, LOAD_TOLERANT_WAIT);
       expect(occurrences(sent, "first row note")).toBe(1);
       await app.chat.expectStreamComplete();
-      await waitFor(() => expect(notesShowing(app, "first row note")).toBe(0), LOAD_TOLERANT_WAIT);
+      // Read the store, not the panel: the panel hides while the send is in flight.
+      await waitFor(
+        () =>
+          expect(
+            getReviewStateStore()
+              .getAttachedReviews(app.workspaceId)
+              .filter((attached) => attached.data.userNote === "first row note")
+          ).toHaveLength(0),
+        LOAD_TOLERANT_WAIT
+      );
       sendSpy.mockRestore();
     } finally {
       await app.dispose();
@@ -1653,9 +1670,8 @@ describe("A workspace switch ends an open edit (#5808)", () => {
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
       const other = await addOtherWorkspace(app, "switch-edit-row-windowed-other");
-      // Visit B first: ChatPane then stays mounted across the switches, and only the switch
-      // itself ends the edit.
-      await switchAwayAndBack(app, other);
+      // ChatPane stays mounted across the switches: the switch itself must end the edit.
+      await visitWithMessage(app, other);
       const textarea = await startEditWithUnsentDraft(app, scope);
       const editId = userRowId(app.workspaceId, "first message");
       typeIntoEdit(textarea, "edited before switch");
