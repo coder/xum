@@ -20,12 +20,9 @@ import type { DeepLinkPayload } from "@/common/types/deepLink";
 import {
   getAgentIdKey,
   getDraftScopeId,
-  getModelKey,
   getPendingScopeId,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
-  getReasoningModeKey,
-  getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
   getWorkspaceNameStateKey,
   SELECTED_WORKSPACE_KEY,
@@ -50,12 +47,7 @@ import { isAbortError } from "@/browser/utils/isAbortError";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import {
-  hasPendingAiSelectionIntent,
-  setWorkspaceAiMetadata,
-  type AiSelectionField,
-} from "@/browser/utils/aiSelectionIntent";
+import { setWorkspaceAiMetadata } from "@/browser/utils/aiSelectionIntent";
 import type { APIClient } from "@/browser/contexts/API";
 import { getErrorMessage } from "@/common/utils/errors";
 import { collectOrphanedWorkspaceStorage } from "@/browser/utils/workspaceStorageGc";
@@ -73,8 +65,8 @@ import {
 import { createDraftId } from "@/common/utils/drafts";
 
 /**
- * Record backend workspace AI metadata for the AI selection resolver and seed
- * per-workspace localStorage from it.
+ * Record backend workspace AI metadata for the AI selection resolver and seed the
+ * per-workspace agent localStorage from it.
  */
 /** The metadata fields the seeding reads; the VS Code webview only receives these (#4738). */
 export type WorkspaceAiSeedSource = Pick<
@@ -130,17 +122,6 @@ export function seedWorkspaceLocalStorageFromBackend(
     return;
   }
 
-  const activeAgentId = readPersistedState<string>(
-    getAgentIdKey(workspaceId),
-    WORKSPACE_DEFAULTS.agentId
-  );
-  // Sub-agent metadata can arrive (e.g. after a reawakening) between a deliberate pick and
-  // the send that pins it; keep the unsent pick instead of reseeding over it. Picks are
-  // scoped to the active agent, so a pending Plan pick never blocks Exec reseeding.
-  const keepsUnsentPick = (field: AiSelectionField, localValue: string | undefined) =>
-    metadata.parentWorkspaceId != null &&
-    hasPendingAiSelectionIntent(workspaceId, activeAgentId, field, localValue);
-
   // Merge backend values into a per-workspace per-agent cache.
   const byAgentKey = getWorkspaceAISettingsByAgentKey(workspaceId);
   const existingByAgent = readPersistedState<WorkspaceAISettingsByAgentCache>(byAgentKey, {});
@@ -149,59 +130,15 @@ export function seedWorkspaceLocalStorageFromBackend(
   for (const [agentKey, entry] of Object.entries(aiByAgent)) {
     if (!entry) continue;
     if (typeof entry.model !== "string" || entry.model.length === 0) continue;
-
-    const existing = agentKey === activeAgentId ? existingByAgent[agentKey] : undefined;
-    const reasoningMode =
-      existing != null && keepsUnsentPick("reasoningMode", existing.reasoningMode)
-        ? existing.reasoningMode
-        : entry.reasoningMode;
     nextByAgent[agentKey] = {
-      model:
-        existing != null && keepsUnsentPick("model", existing.model) ? existing.model : entry.model,
-      thinkingLevel:
-        existing != null && keepsUnsentPick("thinkingLevel", existing.thinkingLevel)
-          ? existing.thinkingLevel
-          : entry.thinkingLevel,
-      ...(reasoningMode != null ? { reasoningMode } : {}),
+      model: entry.model,
+      thinkingLevel: entry.thinkingLevel,
+      ...(entry.reasoningMode != null ? { reasoningMode: entry.reasoningMode } : {}),
     };
   }
 
   if (JSON.stringify(existingByAgent) !== JSON.stringify(nextByAgent)) {
     updatePersistedState(byAgentKey, nextByAgent);
-  }
-
-  // Seed the active agent into the existing keys to avoid UI flash.
-  const active = nextByAgent[activeAgentId] ?? nextByAgent.exec ?? nextByAgent.plan;
-  if (!active) {
-    return;
-  }
-
-  const modelKey = getModelKey(workspaceId);
-  const existingModel = readPersistedState<string | undefined>(modelKey, undefined);
-  if (existingModel !== active.model && !keepsUnsentPick("model", existingModel)) {
-    updatePersistedState(modelKey, active.model);
-  }
-
-  const thinkingKey = getThinkingLevelKey(workspaceId);
-  const existingThinking = readPersistedState<ThinkingLevel | undefined>(thinkingKey, undefined);
-  if (
-    existingThinking !== active.thinkingLevel &&
-    !keepsUnsentPick("thinkingLevel", existingThinking)
-  ) {
-    updatePersistedState(thinkingKey, active.thinkingLevel);
-  }
-
-  // Absent reasoningMode means "standard": seed it explicitly so switching to
-  // an agent whose settings never carried the field cannot inherit another
-  // agent's "pro" from the shared workspace-scoped key.
-  const reasoningKey = getReasoningModeKey(workspaceId);
-  const nextReasoning = active.reasoningMode ?? "standard";
-  const existingReasoning = readPersistedState<OpenAIReasoningMode | undefined>(
-    reasoningKey,
-    undefined
-  );
-  if (existingReasoning !== nextReasoning && !keepsUnsentPick("reasoningMode", existingReasoning)) {
-    updatePersistedState(reasoningKey, nextReasoning);
   }
 }
 

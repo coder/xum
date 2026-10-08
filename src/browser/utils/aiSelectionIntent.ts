@@ -9,6 +9,8 @@
  * Intentionally in memory only (per window) and scoped by workspace + agent: a Plan
  * pick never applies to Exec after a plan→exec handoff. Each pick gets a fresh token so
  * a re-pick made while an earlier send is outstanding survives that send's consume.
+ * Pending picks are also the composer's unsent values (see resolveWorkspaceAiSelection),
+ * next to the latest workspace AI metadata, so a reload drops an unsent pick.
  */
 import type { AiSelectionIntent } from "@/common/types/agentAiSettings";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -190,17 +192,6 @@ export function consumeAiSelectionIntent(
     pendingByScope.set(key, next);
   }
   notify();
-}
-
-/** Whether a local field value still reflects an unsent deliberate pick (reseed guard). */
-export function hasPendingAiSelectionIntent(
-  workspaceId: string,
-  agentId: string,
-  field: AiSelectionField,
-  localValue: string | undefined
-): boolean {
-  const selection = pendingByScope.get(scopeKey(workspaceId, agentId))?.[field];
-  return selection != null && comparable(field, localValue) === selection.value;
 }
 
 /** A removed provider's pending model picks would otherwise outrank the repaired settings. */

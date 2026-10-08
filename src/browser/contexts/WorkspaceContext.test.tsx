@@ -19,7 +19,6 @@ import {
   getModelKey,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
-  getThinkingLevelKey,
   type LaunchBehavior,
 } from "@/common/constants/storage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -27,11 +26,7 @@ import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
-import {
-  getWorkspaceAiMetadata,
-  markAiSelectionIntent,
-  resetAiSelectionIntentForTests,
-} from "@/browser/utils/aiSelectionIntent";
+import { getWorkspaceAiMetadata } from "@/browser/utils/aiSelectionIntent";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { resetWorkspaceStorageGcForTests } from "@/browser/utils/workspaceStorageGc";
 import { resetCreationDraftStorageGcForTests } from "@/browser/utils/creationDraftStorageGc";
@@ -542,45 +537,9 @@ describe("WorkspaceContext", () => {
       expect(getWorkspaceAiMetadata(workspaceId)?.aiSettings?.model).toBe(
         archived ? undefined : "openai:gpt-5.2"
       );
-      expect(readPersistedState<string | null>(getModelKey(workspaceId), null)).toBe(
-        archived ? null : "openai:gpt-5.2"
-      );
-      expect(readPersistedState<string | null>(getThinkingLevelKey(workspaceId), null)).toBe(
-        archived ? null : "xhigh"
-      );
     }
   );
 
-  test("seeds model + thinking localStorage from backend metadata", async () => {
-    const initialWorkspaces: FrontendWorkspaceMetadata[] = [
-      createWorkspaceMetadata({
-        id: "ws-ai",
-        aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "xhigh" },
-      }),
-    ];
-
-    createMockAPI({
-      workspace: {
-        list: () => Promise.resolve(initialWorkspaces),
-      },
-      localStorage: {
-        // Seed with different values; backend should win.
-        [getModelKey("ws-ai")]: JSON.stringify("anthropic:claude-3.5"),
-        [getThinkingLevelKey("ws-ai")]: JSON.stringify("low"),
-      },
-    });
-
-    const ctx = await setup();
-
-    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
-
-    expect(JSON.parse(globalThis.localStorage.getItem(getModelKey("ws-ai"))!)).toBe(
-      "openai:gpt-5.2"
-    );
-    expect(JSON.parse(globalThis.localStorage.getItem(getThinkingLevelKey("ws-ai"))!)).toBe(
-      "xhigh"
-    );
-  });
   test.each(["unchanged", "mode", "model"])("keeps local choices: %s", async (change) => {
     const changed = change !== "unchanged";
     const nextAgentId = change === "mode" ? "auto" : "plan";
@@ -620,11 +579,9 @@ describe("WorkspaceContext", () => {
     await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
     await waitFor(() => expect(emitMetadata).toBeTruthy());
     expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("plan");
-    expect(readPersistedState(getModelKey(workspaceId), "")).toBe("openai:gpt-5.2");
 
     act(() => {
       updatePersistedState(getAgentIdKey(workspaceId), "exec");
-      updatePersistedState(getModelKey(workspaceId), "anthropic:claude-opus-4-6");
       emitMetadata?.({
         workspaceId,
         metadata: {
@@ -646,7 +603,6 @@ describe("WorkspaceContext", () => {
       expect(ctx().workspaceMetadata.get(workspaceId)?.title).toBe("Updated title")
     );
     expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("exec");
-    expect(readPersistedState(getModelKey(workspaceId), "")).toBe("anthropic:claude-opus-4-6");
   });
 
   test("child workspace metadata still seeds the locked backend agent", async () => {
@@ -675,48 +631,6 @@ describe("WorkspaceContext", () => {
     expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
       "plan"
     );
-  });
-
-  test.each([
-    { name: "keeps a pending Exec pick", pickAgent: "exec", expectedModel: "openai:gpt-5.2" },
-    {
-      name: "reseeds over a Plan-scoped pick",
-      pickAgent: "plan",
-      expectedModel: "anthropic:claude-opus-4-6",
-    },
-  ])("child metadata reseed $name", async (row) => {
-    const workspaceId = "ws-pick-child";
-    createMockAPI({
-      workspace: {
-        list: () =>
-          Promise.resolve([
-            createWorkspaceMetadata({
-              id: workspaceId,
-              parentWorkspaceId: "ws-parent",
-              agentId: "exec",
-              aiSettingsByAgent: {
-                exec: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
-              },
-            }),
-          ]),
-      },
-      localStorage: {
-        [getAgentIdKey(workspaceId)]: JSON.stringify(row.pickAgent),
-        [getModelKey(workspaceId)]: JSON.stringify("openai:gpt-5.2"),
-        [getThinkingLevelKey(workspaceId)]: JSON.stringify("low"),
-      },
-    });
-    // A deliberate, not yet sent pick made while the child's active agent was row.pickAgent.
-    resetAiSelectionIntentForTests();
-    markAiSelectionIntent(workspaceId, "model", "openai:gpt-5.2");
-
-    const ctx = await setup();
-    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
-
-    expect(readPersistedState(getModelKey(workspaceId), "")).toBe(row.expectedModel);
-    // Fields without a pending pick always follow the backend.
-    expect(readPersistedState(getThinkingLevelKey(workspaceId), "")).toBe("high");
-    resetAiSelectionIntentForTests();
   });
 
   test("loads workspace metadata on mount", async () => {

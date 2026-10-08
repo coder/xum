@@ -7,7 +7,7 @@ import {
   consumeAiSelectionIntent,
   getAiSelectionIntentForSend,
   getAiSelectionIntentForSendOptions,
-  hasPendingAiSelectionIntent,
+  getPendingAiSelection,
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
 } from "@/browser/utils/aiSelectionIntent";
@@ -76,9 +76,8 @@ describe("aiSelectionIntent", () => {
     updatePersistedState(getAgentIdKey(WS), "plan");
     markAiSelectionIntent(WS, "model", MODEL_A);
     expect(getAiSelectionIntentForSend(WS, "exec", { model: MODEL_A }).intent).toBeUndefined();
-    expect(hasPendingAiSelectionIntent(WS, "exec", "model", MODEL_A)).toBe(false);
-    expect(hasPendingAiSelectionIntent(WS, "plan", "model", MODEL_A)).toBe(true);
-    expect(hasPendingAiSelectionIntent(WS, "plan", "model", MODEL_B)).toBe(false);
+    expect(getPendingAiSelection(WS, "exec", "model")).toBeUndefined();
+    expect(getPendingAiSelection(WS, "plan", "model")).toBe(MODEL_A);
   });
 
   test("send options: one-shot sends pin nothing and Auto drops the routed dimension", () => {
