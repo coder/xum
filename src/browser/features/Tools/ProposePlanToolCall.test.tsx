@@ -16,7 +16,9 @@ import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import {
+  getPendingAiSelection,
   getWorkspaceAgentId,
+  markAiSelectionIntent,
   resetAiSelectionIntentForTests,
   setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
@@ -595,6 +597,31 @@ describe("ProposePlanToolCall", () => {
 
     // Clicking Implement should switch the workspace agent to exec.
     expect(getWorkspaceAgentId(WORKSPACE_ID)).toBe("exec");
+  });
+
+  test("Implement sends the unsent Exec pick and ends it once it is saved", async () => {
+    const pickedModel = "openai:gpt-5.2-pro";
+    // Picked while Exec was the agent, then the workspace switched to Plan.
+    markAiSelectionIntent(WORKSPACE_ID, "model", pickedModel);
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    expect(sendMessageCalls[0]?.options.model).toBe(pickedModel);
+    setWorkspaceAiMetadata(WORKSPACE_ID, {
+      agentId: "exec",
+      aiSettingsByAgent: { exec: { model: pickedModel, thinkingLevel: "high" } },
+    });
+    await waitFor(() =>
+      expect(getPendingAiSelection(WORKSPACE_ID, "exec", "model")).toBeUndefined()
+    );
+    // The handoff's agent pick ended with the save too, so a later agent change applies.
+    setWorkspaceAiMetadata(WORKSPACE_ID, { agentId: "plan" });
+    expect(getWorkspaceAgentId(WORKSPACE_ID)).toBe("plan");
   });
 
   test("Implement keeps the exec model when the composer has Auto routing selected", async () => {

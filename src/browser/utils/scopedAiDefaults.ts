@@ -85,6 +85,8 @@ export function useScopedAiDefault<F extends ScopedAiField>(
   const serverValue = useUserPreferences((preferences) =>
     scope ? selectServerDefault(preferences, scope, field) : undefined
   );
+  // A workspace without a saved agent shows the project or global default agent.
+  useUserPreferences((preferences) => preferences.ai);
   const workspaceValue = useSyncExternalStore(subscribeAiSelection, () =>
     scope ? undefined : readWorkspaceDefault(scopeId, field)
   );

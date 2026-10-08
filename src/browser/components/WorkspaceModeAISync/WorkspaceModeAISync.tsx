@@ -3,7 +3,7 @@ import { useAgent } from "@/browser/contexts/AgentContext";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { useAgentAiDefaults } from "@/browser/stores/AppConfigStore";
 import { getAutoRoutingChoiceByAgentKey } from "@/common/constants/storage";
-import { getWorkspaceAiMetadata } from "@/browser/utils/aiSelectionIntent";
+import { getSavedAiSettings } from "@/browser/utils/aiSelectionIntent";
 import { applyAutoRoutingOutcome, recordWorkspaceModelChange } from "@/browser/utils/modelChange";
 import {
   resolveAutoRoutingForAgent,
@@ -61,7 +61,9 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
         getAutoRoutingChoiceByAgentKey(workspaceId),
         {}
       ),
-      workspaceByAgent: getWorkspaceAiMetadata(workspaceId)?.aiSettingsByAgent,
+      workspaceByAgent: {
+        [normalizedAgentId]: getSavedAiSettings(workspaceId, normalizedAgentId),
+      },
     });
     applyAutoRoutingOutcome(workspaceId, autoRoutingOutcome);
   }, [agentAiDefaults, agentId, agents, autoRoutingEnabled, workspaceId]);

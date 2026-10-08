@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 
-import { markAiSelectionIntent, setWorkspaceAgentPick } from "@/browser/utils/aiSelectionIntent";
+import {
+  getPendingAiSelection,
+  markAiSelectionIntent,
+  setWorkspaceAgentPick,
+} from "@/browser/utils/aiSelectionIntent";
 import {
   consumeWorkspaceModelChange,
   recordAutoRoutingChoiceForAgent,
@@ -44,6 +48,12 @@ describe("modelChange", () => {
 
     setWorkspaceModelWithOrigin(workspaceId, "anthropic:claude-sonnet-4-5", "user");
     expect(getAutoRouting(workspaceId, "model")).toBe(false);
+  });
+
+  test("a legacy workspace id that starts with __ records the pick as unsent", () => {
+    const legacyId = "__proj-main";
+    setWorkspaceModelWithOrigin(legacyId, "openai:gpt-5.2-codex", "user");
+    expect(getPendingAiSelection(legacyId, "exec", "model")).toBe("openai:gpt-5.2-codex");
   });
 
   test("records routing picks for the selected agent only", () => {
