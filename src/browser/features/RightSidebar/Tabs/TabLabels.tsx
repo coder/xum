@@ -18,6 +18,7 @@ import {
   Target,
   ListTree,
   MessagesSquare,
+  Plus,
   Terminal as TerminalIcon,
   Workflow,
   X,
@@ -346,6 +347,16 @@ export const InstructionsTabLabel: React.FC<InstructionsTabLabelProps> = ({ work
     </>
   );
 };
+
+/** Label of the New tab (the tool launcher). */
+export function NewTabLabel() {
+  return (
+    <span className="inline-flex min-w-0 items-center gap-1">
+      <Plus className="h-3 w-3 shrink-0" />
+      <span className="truncate">New tab</span>
+    </span>
+  );
+}
 
 /** /side chat tab label: closing the tab discards the side chat. */
 export const SideChatTabLabel: React.FC<{ onClose: () => void }> = (props) => {

@@ -44,6 +44,8 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { ComponentType, ReactNode } from "react";
 import { useEffect, useRef } from "react";
+import type { TabType } from "@/browser/types/rightSidebar";
+import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { RightSidebar } from "./RightSidebar.js";
 
 const meta: Meta = {
@@ -185,6 +187,56 @@ function RightSidebarStoryShell(props: { setup: () => APIClient; children: React
   );
 }
 
+/** Seed one pane holding exactly these open tabs (the strip shows only opened tabs). */
+function seedSidebarLayout(workspaceId: string, tabs: TabType[], activeTab: TabType = tabs[0]) {
+  const layout: RightSidebarLayoutState = {
+    version: 2,
+    nextId: 2,
+    focusedTabsetId: "tabset-1",
+    root: { type: "tabset", id: "tabset-1", tabs, activeTab },
+  };
+  localStorage.setItem(getRightSidebarLayoutKey(workspaceId), JSON.stringify(layout));
+}
+
+/**
+ * The selected tab lies fully inside its strip's scroll viewport (not cut off at an edge or
+ * hidden behind "+"). Retries because labels grow after mount (cost badge, counts) and the
+ * strip re-scrolls when they do. Stories using it fix the sidebar width themselves, so this
+ * holds at any test-runner viewport size.
+ */
+async function expectSelectedTabVisible(canvasElement: HTMLElement): Promise<void> {
+  await waitFor(() => {
+    const tab = canvasElement.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+    const row = tab?.closest<HTMLElement>("[data-tab-scroll-row]");
+    if (tab == null || row == null) throw new Error("selected tab not rendered");
+    const tabRect = tab.getBoundingClientRect();
+    const rowRect = row.getBoundingClientRect();
+    // Plain throws (not the instrumented expect) so waitFor retries synchronously.
+    if (tabRect.left < rowRect.left - 1 || tabRect.right > rowRect.right + 1) {
+      throw new Error(
+        `selected tab ${Math.round(tabRect.left)}-${Math.round(tabRect.right)} is outside ` +
+          `its strip ${Math.round(rowRect.left)}-${Math.round(rowRect.right)}`
+      );
+    }
+  });
+}
+
+/**
+ * Wait until a diff line's text renders. Matches the panel's whole text, not one element:
+ * syntax highlighting splits a line into token spans moments after it first renders, so
+ * getByText only matched while the plain line was still up (a race the play could lose).
+ */
+async function waitForDiffText(canvasElement: HTMLElement, text: RegExp): Promise<void> {
+  await waitFor(
+    () => {
+      const panel = canvasElement.querySelector('[role="tabpanel"]');
+      if (!text.test(panel?.textContent ?? ""))
+        throw new Error(`diff text ${text.source} not rendered`);
+    },
+    { timeout: 10_000 }
+  );
+}
+
 function RightSidebarStoryContent(props: { workspaceId: string }) {
   const width = readPersistedState<number>(RIGHT_SIDEBAR_WIDTH_KEY, 400);
 
@@ -229,10 +281,9 @@ export const CostsTab: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
         localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
-        localStorage.removeItem(getRightSidebarLayoutKey("ws-costs"));
+        seedSidebarLayout("ws-costs", ["costs", "review"], "costs");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-costs",
@@ -272,7 +323,6 @@ export const CostsTabWithCacheCreate: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
         localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "350");
         const modelUsage = {
@@ -285,7 +335,7 @@ export const CostsTabWithCacheCreate: Story = {
           model: "anthropic:claude-sonnet-4-20250514",
         };
 
-        localStorage.removeItem(getRightSidebarLayoutKey("ws-cache-create"));
+        seedSidebarLayout("ws-cache-create", ["costs", "review"], "costs");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-cache-create",
@@ -342,10 +392,9 @@ export const CostsTabMultiModel: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
         localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
-        localStorage.removeItem(getRightSidebarLayoutKey("ws-multi-model"));
+        seedSidebarLayout("ws-multi-model", ["costs", "review"], "costs");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-multi-model",
@@ -407,9 +456,8 @@ export const ReviewTab: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "700");
-        localStorage.removeItem(getRightSidebarLayoutKey("ws-review"));
+        seedSidebarLayout("ws-review", ["costs", "review"], "costs");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-review",
@@ -453,7 +501,7 @@ export const StatsTabIdle: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
+        seedSidebarLayout("ws-stats-idle", ["costs", "review"], "costs");
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         // Pre-select Timing sub-tab so it shows timing content
         localStorage.setItem("statsContainer:subTab", JSON.stringify("timing"));
@@ -496,7 +544,7 @@ export const StatsTabStreaming: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
+        seedSidebarLayout("ws-stats-streaming", ["costs", "review"], "costs");
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         // Pre-select Timing sub-tab so it shows timing content
         localStorage.setItem("statsContainer:subTab", JSON.stringify("timing"));
@@ -624,11 +672,10 @@ export const ReviewTabSortByLastEdit: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("review"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "700");
         // Clear persisted layout to ensure review tab appears in fresh default layout
         const workspaceId = "ws-review-sort";
-        localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
+        seedSidebarLayout(workspaceId, ["costs", "review"], "review");
         const now = Date.now();
 
         // Set up first-seen timestamps for hunks (oldest to newest: format -> button -> client)
@@ -711,10 +758,9 @@ export const ReviewTabSortByFileOrder: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("review"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "700");
         const workspaceId = "ws-review-file-order";
-        localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
+        seedSidebarLayout(workspaceId, ["costs", "review"], "review");
 
         const client = setupSimpleChatStory({
           workspaceId,
@@ -811,9 +857,8 @@ export const DiffPaddingAlignment: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("review"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "700");
-        localStorage.removeItem(getRightSidebarLayoutKey("ws-diff-alignment"));
+        seedSidebarLayout("ws-diff-alignment", ["costs", "review"], "review");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-diff-alignment",
@@ -850,10 +895,8 @@ export const DiffPaddingAlignment: Story = {
       { timeout: 10_000 }
     );
 
-    // Wait for diff content to render
-    await waitFor(() => {
-      canvas.getByText(/add\(a: number/i);
-    });
+    // Wait for diff content to render.
+    await waitForDiffText(canvasElement, /add\(a: number/i);
 
     // Visual verification: the padding strip should align with the diff gutter
   },
@@ -891,9 +934,8 @@ export const DiffPaddingAlignmentModification: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("review"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "700");
-        localStorage.removeItem(getRightSidebarLayoutKey("ws-diff-modification"));
+        seedSidebarLayout("ws-diff-modification", ["costs", "review"], "review");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-diff-modification",
@@ -923,12 +965,7 @@ export const DiffPaddingAlignmentModification: Story = {
     await userEvent.click(reviewTab);
 
     // Wait for diff content to render
-    await waitFor(
-      () => {
-        canvas.getByText(/export const config/i);
-      },
-      { timeout: 10_000 }
-    );
+    await waitForDiffText(canvasElement, /export const config/i);
 
     // Visual verification for mixed diff types
   },
@@ -1006,10 +1043,9 @@ export const ReviewTabReadMore: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("review"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "700");
         const workspaceId = "ws-read-more";
-        localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
+        seedSidebarLayout(workspaceId, ["costs", "review"], "review");
 
         const client = setupSimpleChatStory({
           workspaceId,
@@ -1067,7 +1103,7 @@ export const ReviewTabWithFileFilter: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("review"));
+        seedSidebarLayout("ws-review-file-filter", ["costs", "review"], "review");
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "700");
 
         const workspaceId = "ws-review-file-filter";
@@ -1132,10 +1168,9 @@ export const ReviewTabReadMoreBoundaries: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("review"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "700");
         const workspaceId = "ws-read-more-boundaries";
-        localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
+        seedSidebarLayout(workspaceId, ["costs", "review"], "review");
 
         const client = setupSimpleChatStory({
           workspaceId,
@@ -1171,10 +1206,9 @@ export const ReviewTabWithUntrackedFiles: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("review"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "700");
         const workspaceId = "ws-untracked";
-        localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
+        seedSidebarLayout(workspaceId, ["costs", "review"], "review");
 
         const client = setupSimpleChatStory({
           workspaceId,
@@ -1249,10 +1283,9 @@ export const CompactionModelWarning: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
         localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
-        localStorage.removeItem(getRightSidebarLayoutKey("ws-compact-warning"));
+        seedSidebarLayout("ws-compact-warning", ["costs", "review"], "costs");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-compact-warning",
@@ -1384,9 +1417,8 @@ export const OutputTabEmpty: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("output"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
-        localStorage.removeItem(getRightSidebarLayoutKey("ws-output-empty"));
+        seedSidebarLayout("ws-output-empty", ["costs", "review", "output"], "output");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-output-empty",
@@ -1411,9 +1443,8 @@ export const OutputTabWithLogs: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("output"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
-        localStorage.removeItem(getRightSidebarLayoutKey("ws-output-logs"));
+        seedSidebarLayout("ws-output-logs", ["costs", "review", "output"], "output");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-output-logs",
@@ -1438,9 +1469,9 @@ export const OutputTabErrorsOnly: Story = {
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("output"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
-        localStorage.removeItem(getRightSidebarLayoutKey("ws-output-errors"));
+        seedSidebarLayout("ws-output-errors", ["costs", "review", "output"], "output");
+        // Persist the level filter to "error" so only error entries display.
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-output-errors",
@@ -1458,4 +1489,114 @@ export const OutputTabErrorsOnly: Story = {
       <RightSidebarStoryContent workspaceId="ws-output-errors" />
     </RightSidebarStoryShell>
   ),
+};
+
+/**
+ * A fresh workspace: the strip holds only the New tab, whose launcher lists the tools a pane can
+ * open (Codex-style empty tab) instead of showing every tool as an idle tab.
+ */
+export const NewTabLauncher: Story = {
+  render: () => (
+    <RightSidebarStoryShell
+      setup={() => {
+        localStorage.removeItem(RIGHT_SIDEBAR_TAB_KEY);
+        localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
+        localStorage.removeItem(getRightSidebarLayoutKey("ws-new-tab"));
+
+        const client = setupSimpleChatStory({
+          workspaceId: "ws-new-tab",
+          workspaceName: "feature/new-tab",
+          projectName: "my-app",
+          messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
+        });
+        expandRightSidebar();
+        return client;
+      }}
+    >
+      <RightSidebarStoryContent workspaceId="ws-new-tab" />
+    </RightSidebarStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("tab", { name: /^new tab/i, selected: true });
+    await canvas.findByRole("button", { name: "Review" });
+    await expect(canvas.getAllByRole("tab")).toHaveLength(1);
+  },
+};
+
+/**
+ * The New tab launcher at the sidebar's minimum width (300px): rows wrap their descriptions
+ * instead of overflowing.
+ */
+export const NewTabLauncherNarrow: Story = {
+  render: () => (
+    <RightSidebarStoryShell
+      setup={() => {
+        localStorage.removeItem(RIGHT_SIDEBAR_TAB_KEY);
+        localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "300");
+        seedSidebarLayout("ws-new-tab-narrow", ["costs", "review", "new"], "new");
+
+        const client = setupSimpleChatStory({
+          workspaceId: "ws-new-tab-narrow",
+          workspaceName: "feature/new-tab",
+          projectName: "my-app",
+          messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
+          sessionUsage: createSessionUsage(0.12),
+        });
+        expandRightSidebar();
+        return client;
+      }}
+    >
+      <RightSidebarStoryContent workspaceId="ws-new-tab-narrow" />
+    </RightSidebarStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("tab", { name: /^new tab/i, selected: true });
+    await canvas.findByRole("button", { name: "Terminal" });
+    // Stats, Review and the New tab overflow a 300px strip: the selected New tab must still
+    // show in full.
+    await canvas.findByRole("tab", { name: /stats.*\$0\.12/i });
+    await expectSelectedTabVisible(canvasElement);
+  },
+};
+
+/**
+ * Many open tabs in a narrow sidebar: the strip stays one row and scrolls sideways (hidden
+ * scrollbar, faded edges) with "+" pinned at the end, instead of wrapping onto a second line.
+ */
+export const ManyTabsSingleRow: Story = {
+  render: () => (
+    <RightSidebarStoryShell
+      setup={() => {
+        localStorage.removeItem(RIGHT_SIDEBAR_TAB_KEY);
+        localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "320");
+        seedSidebarLayout(
+          "ws-many-tabs",
+          ["costs", "review", "instructions", "goal", "workflows", "timeline", "output"],
+          "timeline"
+        );
+
+        const client = setupSimpleChatStory({
+          workspaceId: "ws-many-tabs",
+          workspaceName: "feature/many-tabs",
+          projectName: "my-app",
+          messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
+          sessionUsage: createSessionUsage(0.34),
+        });
+        expandRightSidebar();
+        return client;
+      }}
+    >
+      <RightSidebarStoryContent workspaceId="ws-many-tabs" />
+    </RightSidebarStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("tab", { name: /^timeline/i, selected: true });
+    await canvas.findByRole("button", { name: "New tab" });
+    // Wait for the cost badge: it widens Stats after mount, pushing the selected tab right.
+    await canvas.findByRole("tab", { name: /stats.*\$0\.34/i });
+    await expectSelectedTabVisible(canvasElement);
+  },
 };

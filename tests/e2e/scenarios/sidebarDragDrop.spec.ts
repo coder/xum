@@ -19,6 +19,10 @@ test.describe("sidebar drag and drop", () => {
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
     await expect(sidebar).toBeVisible({ timeout: 5000 });
 
+    // A fresh workspace shows only the New tab: open Stats, then Review, from its launcher.
+    await ui.metaSidebar.selectTab("Stats");
+    await ui.metaSidebar.selectTab("Review");
+
     const tablist = sidebar.getByRole("tablist");
     await expect(tablist).toBeVisible({ timeout: 5000 });
 
@@ -27,7 +31,8 @@ test.describe("sidebar drag and drop", () => {
     await expect(costsTab).toBeVisible({ timeout: 5000 });
     await expect(reviewTab).toBeVisible({ timeout: 5000 });
 
-    // Stats tab should be selected (active) by default
+    // Make Stats the active tab being dragged
+    await costsTab.click();
     await expect(costsTab).toHaveAttribute("aria-selected", "true");
 
     // Verify initial order: Stats comes before Review
@@ -56,7 +61,9 @@ test.describe("sidebar drag and drop", () => {
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
     await expect(sidebar).toBeVisible({ timeout: 5000 });
 
-    // Add a terminal tab first (not present by default)
+    // Open Stats, Review, and a terminal (a fresh workspace shows only the New tab)
+    await ui.metaSidebar.selectTab("Stats");
+    await ui.metaSidebar.selectTab("Review");
     await ui.metaSidebar.addTerminal();
 
     const tablist = sidebar.getByRole("tablist");
@@ -112,7 +119,9 @@ test.describe("sidebar drag and drop", () => {
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
     await expect(sidebar).toBeVisible();
 
-    // Add a terminal tab first (not present by default)
+    // Open Stats, Review, and a terminal (a fresh workspace shows only the New tab)
+    await ui.metaSidebar.selectTab("Stats");
+    await ui.metaSidebar.selectTab("Review");
     await ui.metaSidebar.addTerminal();
 
     const tablist = sidebar.getByRole("tablist");
@@ -154,12 +163,12 @@ test.describe("sidebar drag and drop", () => {
     // Get workspaceId from context for per-workspace layout key
     const workspaceId = ui.context.workspaceId;
 
-    // Seed Goal so its asynchronous restoration cannot race the tab-count check.
+    // Seed Stats, Review, and Goal in the first pane; the count below proves none is re-added.
     // Layout key is per-workspace: "right-sidebar:layout:{workspaceId}"
     await page.evaluate(
       ({ wsId }) => {
         const splitLayout = {
-          version: 1,
+          version: 2,
           nextId: 3,
           focusedTabsetId: "tabset-1",
           root: {
@@ -201,9 +210,8 @@ test.describe("sidebar drag and drop", () => {
     const tablists = await sidebar.getByRole("tablist").all();
     expect(tablists.length).toBe(2);
 
-    // The migration adds Instructions, Workflows, and Timeline alongside the persisted
-    // Stats, Review, and Goal tabs.
-    await expect(tablists[0].getByRole("tab")).toHaveCount(6);
+    // Only the persisted tabs show: nothing is re-added on load.
+    await expect(tablists[0].getByRole("tab")).toHaveCount(3);
     await expect(tablists[1].getByRole("tab")).toHaveCount(1); // Stats (duplicate costs in split)
   });
 

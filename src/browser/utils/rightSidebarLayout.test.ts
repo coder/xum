@@ -3,372 +3,315 @@ import {
   getSideChatTabWorkspaceId,
   isTabType,
   makeSideChatTabType,
+  type TabType,
 } from "@/browser/types/rightSidebar";
 import {
+  addNewTabToTabset,
   addTabToFocusedTabset,
-  addToolToFocusedTabset,
+  closeTabInTabset,
+  collectAllTabsWithTabset,
   dockTabToEdge,
   getDefaultRightSidebarLayoutState,
   moveTabToTabset,
+  openToolFromNewTab,
   parseRightSidebarLayoutState,
   removeTabEverywhere,
   reorderTabInTabset,
+  selectOrAddTab,
   selectTabInFocusedTabset,
   splitFocusedTabset,
+  type RightSidebarLayoutNode,
   type RightSidebarLayoutState,
 } from "./rightSidebarLayout";
 
-test("default layout includes Instructions alongside Stats and Review", () => {
-  const state = getDefaultRightSidebarLayoutState("costs");
-  expect(state.root.type).toBe("tabset");
-  if (state.root.type !== "tabset") throw new Error("expected tabset");
+type Tabset = Extract<RightSidebarLayoutNode, { type: "tabset" }>;
 
-  expect(state.root.tabs).toContain("costs");
-  expect(state.root.tabs).toContain("review");
-  expect(state.root.tabs).toContain("instructions");
+function tabset(id: string, tabs: TabType[], activeTab: TabType = tabs[0]): Tabset {
+  return { type: "tabset", id, tabs, activeTab };
+}
+
+function single(tabs: TabType[], activeTab: TabType = tabs[0]): RightSidebarLayoutState {
+  return {
+    version: 2,
+    nextId: 2,
+    focusedTabsetId: "tabset-1",
+    root: tabset("tabset-1", tabs, activeTab),
+  };
+}
+
+function split(left: Tabset, right: Tabset, focusedTabsetId = left.id): RightSidebarLayoutState {
+  return {
+    version: 2,
+    nextId: 3,
+    focusedTabsetId,
+    root: {
+      type: "split",
+      id: "split-1",
+      direction: "horizontal",
+      sizes: [50, 50],
+      children: [left, right],
+    },
+  };
+}
+
+function rootTabset(state: RightSidebarLayoutState): Tabset {
+  if (state.root.type !== "tabset") throw new Error("expected tabset root");
+  return state.root;
+}
+
+function children(state: RightSidebarLayoutState): [Tabset, Tabset] {
+  if (state.root.type !== "split") throw new Error("expected split root");
+  const [left, right] = state.root.children;
+  if (left.type !== "tabset" || right.type !== "tabset") throw new Error("expected tabsets");
+  return [left, right];
+}
+
+test("a new layout holds just the New tab, or the one requested tool", () => {
+  expect(rootTabset(getDefaultRightSidebarLayoutState())).toMatchObject({
+    tabs: ["new"],
+    activeTab: "new",
+  });
+  expect(rootTabset(getDefaultRightSidebarLayoutState("review"))).toMatchObject({
+    tabs: ["review"],
+    activeTab: "review",
+  });
+});
+
+test("invalid persisted data falls back to the New tab layout", () => {
+  expect(rootTabset(parseRightSidebarLayoutState({ version: 3 })).tabs).toEqual(["new"]);
+  expect(rootTabset(parseRightSidebarLayoutState(null, "goal")).tabs).toEqual(["goal"]);
 });
 
 test("removeTabEverywhere preserves identity when the tab is absent", () => {
-  const state = getDefaultRightSidebarLayoutState("costs");
-  const withoutBrowser = removeTabEverywhere(state, "browser");
+  const state = single(["costs"]);
+  expect(removeTabEverywhere(state, "browser")).toBe(state);
+});
 
-  expect(withoutBrowser).toBe(state);
+test("removing the last tab leaves the New tab", () => {
+  const next = removeTabEverywhere(single(["costs"]), "costs");
+  expect(rootTabset(next)).toMatchObject({ tabs: ["new"], activeTab: "new" });
 });
 
 test("selectTabInFocusedTabset adds missing tool and makes it active", () => {
-  let s = getDefaultRightSidebarLayoutState("costs");
-  // Start with a layout that only has costs.
-  s = {
-    ...s,
-    root: { type: "tabset", id: "tabset-1", tabs: ["costs"], activeTab: "costs" },
-  };
-
-  s = selectTabInFocusedTabset(s, "terminal");
-  expect(s.root.type).toBe("tabset");
-  if (s.root.type !== "tabset") throw new Error("expected tabset");
-  expect(s.root.tabs).toEqual(["costs", "terminal"]);
-  expect(s.root.activeTab).toBe("terminal");
+  const s = selectTabInFocusedTabset(single(["costs"]), "terminal");
+  expect(rootTabset(s)).toMatchObject({
+    tabs: ["costs", "terminal"],
+    activeTab: "terminal",
+  });
 });
 
-test("splitFocusedTabset moves active tab when possible (no empty tabsets)", () => {
-  const s0 = getDefaultRightSidebarLayoutState("terminal");
-  const s1 = splitFocusedTabset(s0, "horizontal");
-  expect(s1.root.type).toBe("split");
-  if (s1.root.type !== "split") throw new Error("expected split");
-  expect(s1.root.children[0].type).toBe("tabset");
-  expect(s1.root.children[1].type).toBe("tabset");
+test("adding a tool where the New tab is the only tab replaces it, even without activating", () => {
+  const selected = selectOrAddTab(single(["new"]), "workflows");
+  expect(rootTabset(selected)).toMatchObject({
+    tabs: ["workflows"],
+    activeTab: "workflows",
+  });
 
-  const left = s1.root.children[0];
-  const right = s1.root.children[1];
-  if (left.type !== "tabset" || right.type !== "tabset") throw new Error("expected tabsets");
-
-  expect(left.tabs.length).toBeGreaterThan(0);
-  expect(right.tabs.length).toBeGreaterThan(0);
+  const background = addTabToFocusedTabset(single(["new"]), "terminal:s1", false);
+  expect(rootTabset(background)).toMatchObject({
+    tabs: ["terminal:s1"],
+    activeTab: "terminal:s1",
+  });
 });
 
-test("splitFocusedTabset avoids empty by spawning a neighbor tool for 1-tab tabsets", () => {
-  let s = getDefaultRightSidebarLayoutState("costs");
-  s = {
-    ...s,
-    root: { type: "tabset", id: "tabset-1", tabs: ["review"], activeTab: "review" },
-  };
-
-  const s1 = splitFocusedTabset(s, "vertical");
-  expect(s1.root.type).toBe("split");
-  if (s1.root.type !== "split") throw new Error("expected split");
-
-  const left = s1.root.children[0];
-  const right = s1.root.children[1];
-  if (left.type !== "tabset" || right.type !== "tabset") throw new Error("expected tabsets");
-
-  expect(left.tabs).toEqual(["review"]);
-  expect(right.tabs.length).toBe(1);
-  expect(right.tabs[0]).not.toBe("review");
+test("an activated tool replaces the New tab being viewed, at its position", () => {
+  const s = selectOrAddTab(single(["costs", "new", "review"], "new"), "goal");
+  expect(rootTabset(s)).toMatchObject({
+    tabs: ["costs", "goal", "review"],
+    activeTab: "goal",
+  });
 });
 
-test("addToolToFocusedTabset is an alias of selectTabInFocusedTabset", () => {
-  const s0 = getDefaultRightSidebarLayoutState("costs");
-  const s1 = addToolToFocusedTabset(s0, "review");
-  expect(JSON.stringify(s1)).toContain("review");
+test("a background add keeps a New tab the user is looking at beside other tabs", () => {
+  const s = addTabToFocusedTabset(single(["costs", "new"], "new"), "terminal:s1", false);
+  expect(rootTabset(s)).toMatchObject({
+    tabs: ["costs", "new", "terminal:s1"],
+    activeTab: "new",
+  });
 });
 
 test("addTabToFocusedTabset can add a tab without stealing focus", () => {
-  const s0: RightSidebarLayoutState = {
-    version: 1,
-    nextId: 2,
-    focusedTabsetId: "tabset-1",
-    root: { type: "tabset", id: "tabset-1", tabs: ["costs", "review"], activeTab: "costs" },
-  };
-
-  const s1 = addTabToFocusedTabset(s0, "output", false);
-
-  expect(s1.root.type).toBe("tabset");
-  if (s1.root.type !== "tabset") throw new Error("expected tabset");
-  expect(s1.root.tabs).toEqual(["costs", "review", "output"]);
-  expect(s1.root.activeTab).toBe("costs");
+  const s1 = addTabToFocusedTabset(single(["costs", "review"]), "output", false);
+  expect(rootTabset(s1)).toMatchObject({
+    tabs: ["costs", "review", "output"],
+    activeTab: "costs",
+  });
 });
 
-test("moveTabToTabset moves tab between tabsets", () => {
-  // Create a split layout with two tabsets
-  const s0 = getDefaultRightSidebarLayoutState("costs");
-  const s1 = splitFocusedTabset(s0, "horizontal");
-  expect(s1.root.type).toBe("split");
-  if (s1.root.type !== "split") throw new Error("expected split");
-
-  const left = s1.root.children[0];
-  const right = s1.root.children[1];
-  if (left.type !== "tabset" || right.type !== "tabset") throw new Error("expected tabsets");
-
-  // Move costs from left to right
-  const s2 = moveTabToTabset(s1, "costs", left.id, right.id);
-  expect(s2.root.type).toBe("split");
-  if (s2.root.type !== "split") throw new Error("expected split");
-
-  const newLeft = s2.root.children[0];
-  const newRight = s2.root.children[1];
-  if (newLeft.type !== "tabset" || newRight.type !== "tabset") throw new Error("expected tabsets");
-
-  expect(newRight.tabs).toContain("costs");
-  expect(newRight.activeTab).toBe("costs");
+test("openToolFromNewTab replaces the New tab in place and selects the tool", () => {
+  const s = openToolFromNewTab(single(["costs", "new", "review"], "new"), "tabset-1", "timeline");
+  expect(rootTabset(s)).toMatchObject({
+    tabs: ["costs", "timeline", "review"],
+    activeTab: "timeline",
+  });
 });
 
-test("moveTabToTabset removes empty source tabset", () => {
-  // Create a split where one tabset has only one tab
-  let s: RightSidebarLayoutState = {
-    version: 1,
-    nextId: 3,
-    focusedTabsetId: "tabset-1",
-    root: {
-      type: "split",
-      id: "split-1",
-      direction: "horizontal",
-      sizes: [50, 50],
-      children: [
-        { type: "tabset", id: "tabset-1", tabs: ["costs"], activeTab: "costs" },
-        { type: "tabset", id: "tabset-2", tabs: ["review", "terminal"], activeTab: "review" },
-      ],
-    },
-  };
-
-  // Move the only tab from tabset-1 to tabset-2
-  s = moveTabToTabset(s, "costs", "tabset-1", "tabset-2");
-
-  // The split should be replaced by the remaining tabset
-  expect(s.root.type).toBe("tabset");
-  if (s.root.type !== "tabset") throw new Error("expected tabset");
-  expect(s.root.tabs).toContain("costs");
-  expect(s.root.tabs).toContain("review");
-  expect(s.root.tabs).toContain("terminal");
+test("openToolFromNewTab selects a tool already open in the tabset and drops the New tab", () => {
+  const s = openToolFromNewTab(single(["costs", "new"], "new"), "tabset-1", "costs");
+  expect(rootTabset(s)).toMatchObject({ tabs: ["costs"], activeTab: "costs" });
 });
 
-test("reorderTabInTabset reorders tabs within a tabset", () => {
-  // Use an explicit minimal layout so this test exercises only reordering,
-  // independent of the registry's `inDefaultLayout` set.
-  const s0: RightSidebarLayoutState = {
-    version: 1,
-    nextId: 2,
-    focusedTabsetId: "tabset-1",
-    root: { type: "tabset", id: "tabset-1", tabs: ["costs", "review"], activeTab: "costs" },
-  };
-  const s1 = reorderTabInTabset(s0, "tabset-1", 0, 1);
-
-  expect(s1.root.type).toBe("tabset");
-  if (s1.root.type !== "tabset") throw new Error("expected tabset");
-
-  expect(s1.root.tabs).toEqual(["review", "costs"]);
-  expect(s1.root.activeTab).toBe("costs");
+test("openToolFromNewTab selects a tool open in another pane, closing the New tab's pane", () => {
+  const s = openToolFromNewTab(
+    split(tabset("tabset-1", ["review", "costs"]), tabset("tabset-2", ["new"]), "tabset-2"),
+    "tabset-2",
+    "costs"
+  );
+  expect(rootTabset(s)).toMatchObject({
+    id: "tabset-1",
+    tabs: ["review", "costs"],
+    activeTab: "costs",
+  });
+  expect(s.focusedTabsetId).toBe("tabset-1");
 });
 
-test("dockTabToEdge splits a tabset and moves the dragged tab into the new pane", () => {
-  // Default layout has ["costs", "review"]; drag review into a bottom split
-  const s0 = getDefaultRightSidebarLayoutState("costs");
+test("a tabset holds at most one New tab", () => {
+  const once = addNewTabToTabset(single(["costs"]), "tabset-1");
+  const twice = addNewTabToTabset(selectOrAddTab(once, "costs"), "tabset-1");
+  expect(rootTabset(twice)).toMatchObject({
+    tabs: ["costs", "new"],
+    activeTab: "new",
+  });
 
-  const s1 = dockTabToEdge(s0, "review", "tabset-1", "tabset-1", "bottom");
-
-  expect(s1.root.type).toBe("split");
-  if (s1.root.type !== "split") throw new Error("expected split");
-
-  expect(s1.root.direction).toBe("horizontal");
-
-  const top = s1.root.children[0];
-  const bottom = s1.root.children[1];
-  if (top.type !== "tabset" || bottom.type !== "tabset") throw new Error("expected tabsets");
-
-  expect(bottom.tabs).toEqual(["review"]);
-  expect(bottom.activeTab).toBe("review");
-  expect(top.tabs).not.toContain("review");
+  const parsed = parseRightSidebarLayoutState(single(["new", "costs", "new"], "costs"));
+  expect(rootTabset(parsed).tabs).toEqual(["new", "costs"]);
 });
 
-test("dockTabToEdge avoids empty tabsets when dragging out the last tab", () => {
-  const s0: RightSidebarLayoutState = {
-    version: 1,
-    nextId: 2,
-    focusedTabsetId: "tabset-1",
-    root: { type: "tabset", id: "tabset-1", tabs: ["costs"], activeTab: "costs" },
-  };
-
-  const s1 = dockTabToEdge(s0, "costs", "tabset-1", "tabset-1", "right");
-  expect(s1.root.type).toBe("split");
-  if (s1.root.type !== "split") throw new Error("expected split");
-
-  expect(s1.root.direction).toBe("vertical");
-
-  const left = s1.root.children[0];
-  const right = s1.root.children[1];
-  if (left.type !== "tabset" || right.type !== "tabset") throw new Error("expected tabsets");
-
-  // The dragged tab goes into the new right pane.
-  expect(right.tabs).toEqual(["costs"]);
-
-  // The original pane gets a fallback tool instead of going empty.
-  expect(left.tabs.length).toBe(1);
-  expect(left.tabs[0]).not.toBe("costs");
+test("each pane can have its own New tab, and Ctrl/Cmd+number slots skip them", () => {
+  const s = addNewTabToTabset(
+    split(tabset("tabset-1", ["costs", "new"]), tabset("tabset-2", ["review"])),
+    "tabset-2"
+  );
+  const [left, right] = children(s);
+  expect(left.tabs).toContain("new");
+  expect(right).toMatchObject({ tabs: ["review", "new"], activeTab: "new" });
+  expect(collectAllTabsWithTabset(s.root).map((t) => t.tab)).toEqual(["costs", "review"]);
 });
 
-test("dockTabToEdge removes an empty source tabset when docking into another tabset", () => {
-  const s0: RightSidebarLayoutState = {
-    version: 1,
-    nextId: 3,
-    focusedTabsetId: "tabset-1",
-    root: {
-      type: "split",
-      id: "split-1",
-      direction: "horizontal",
-      sizes: [50, 50],
-      children: [
-        { type: "tabset", id: "tabset-1", tabs: ["costs"], activeTab: "costs" },
-        { type: "tabset", id: "tabset-2", tabs: ["review"], activeTab: "review" },
-      ],
-    },
-  };
+test("closeTabInTabset closes one pane's New tab without touching another's", () => {
+  const s = closeTabInTabset(
+    split(tabset("tabset-1", ["costs", "new"]), tabset("tabset-2", ["review", "new"])),
+    "tabset-2",
+    "new"
+  );
+  const [left, right] = children(s);
+  expect(left.tabs).toEqual(["costs", "new"]);
+  expect(right.tabs).toEqual(["review"]);
+});
 
-  // Dock the costs tab to the left edge of tabset-2.
-  const s1 = dockTabToEdge(s0, "costs", "tabset-1", "tabset-2", "left");
+test("closing the last tab of the only pane leaves the New tab; closing that New tab is a no-op", () => {
+  const closed = closeTabInTabset(single(["review"]), "tabset-1", "review");
+  expect(rootTabset(closed)).toMatchObject({ tabs: ["new"], activeTab: "new" });
+  expect(closeTabInTabset(closed, "tabset-1", "new")).toBe(closed);
+});
 
-  // The original source tabset should be removed and the root should now be the new split.
-  expect(s1.root.type).toBe("split");
-  if (s1.root.type !== "split") throw new Error("expected split");
+test("closing the last tab of one pane collapses the split into the other pane", () => {
+  const s = closeTabInTabset(
+    split(tabset("tabset-1", ["costs"]), tabset("tabset-2", ["review"]), "tabset-1"),
+    "tabset-1",
+    "costs"
+  );
+  expect(rootTabset(s).id).toBe("tabset-2");
+  expect(s.focusedTabsetId).toBe("tabset-2");
+});
 
-  const left = s1.root.children[0];
-  const right = s1.root.children[1];
-  if (left.type !== "tabset" || right.type !== "tabset") throw new Error("expected tabsets");
+test("closing the active tab selects its neighbor", () => {
+  const s = closeTabInTabset(single(["costs", "review", "goal"], "review"), "tabset-1", "review");
+  expect(rootTabset(s)).toMatchObject({
+    tabs: ["costs", "goal"],
+    activeTab: "goal",
+  });
+});
 
+test("splitting a one-tab pane gives the new pane a New tab", () => {
+  const [left, right] = children(splitFocusedTabset(single(["review"]), "vertical"));
+  expect(left.tabs).toEqual(["review"]);
+  expect(right).toMatchObject({ tabs: ["new"], activeTab: "new" });
+});
+
+test("splitting a multi-tab pane moves the active tab into the new pane", () => {
+  const [left, right] = children(
+    splitFocusedTabset(single(["costs", "review"], "review"), "horizontal")
+  );
   expect(left.tabs).toEqual(["costs"]);
   expect(right.tabs).toEqual(["review"]);
 });
 
-test("parseRightSidebarLayoutState strips removed static tabs from persisted layouts", () => {
-  // Simulate a persisted layout that still contains removed tabs
-  const raw = {
-    version: 1,
-    nextId: 2,
-    focusedTabsetId: "tabset-1",
-    root: {
-      type: "tabset",
-      id: "tabset-1",
-      tabs: ["costs", "review", "stats", "explorer"],
-      activeTab: "costs",
-    },
-  };
-
-  const result = parseRightSidebarLayoutState(raw, "costs");
-
-  // Should parse successfully (not fall back to defaults)
-  expect(result.root.type).toBe("tabset");
-  if (result.root.type !== "tabset") throw new Error("expected tabset");
-
-  // Removed tabs ("stats", "explorer") are stripped. New default-layout tabs
-  // declared in the registry (`inDefaultLayout: true`) are auto-injected so
-  // upgrades flow through without the user having to add them by hand — see
-  // `ensureDefaultLayoutTabs` in rightSidebarLayout.ts.
-  expect(result.root.tabs).toContain("costs");
-  expect(result.root.tabs).toContain("review");
-  expect(result.root.tabs).not.toContain("stats");
-  expect(result.root.tabs).not.toContain("explorer");
-  expect(result.root.activeTab).toBe("costs");
+test("moveTabToTabset moves tab between tabsets", () => {
+  const s = moveTabToTabset(
+    split(tabset("tabset-1", ["costs", "goal"]), tabset("tabset-2", ["review"])),
+    "costs",
+    "tabset-1",
+    "tabset-2"
+  );
+  const [, right] = children(s);
+  expect(right).toMatchObject({
+    tabs: ["review", "costs"],
+    activeTab: "costs",
+  });
 });
 
-test("parseRightSidebarLayoutState keeps an open /side chat tab and the rest of the layout", () => {
-  const raw = {
-    version: 1,
-    nextId: 2,
-    focusedTabsetId: "tabset-1",
-    root: {
-      type: "tabset",
-      id: "tabset-1",
-      tabs: ["costs", "terminal:abc", "side:side-ws"],
-      activeTab: "side:side-ws",
-    },
-  };
-
-  const result = parseRightSidebarLayoutState(raw, "costs");
-
-  if (result.root.type !== "tabset") throw new Error("expected tabset");
-  expect(result.root.tabs).toContain("terminal:abc");
-  expect(result.root.activeTab).toBe("side:side-ws");
-  expect(getSideChatTabWorkspaceId(result.root.activeTab)).toBe("side-ws");
+test("moveTabToTabset into a pane holding only a New tab replaces it", () => {
+  const s = moveTabToTabset(
+    split(tabset("tabset-1", ["costs", "goal"]), tabset("tabset-2", ["new"])),
+    "costs",
+    "tabset-1",
+    "tabset-2"
+  );
+  const [, right] = children(s);
+  expect(right).toMatchObject({ tabs: ["costs"], activeTab: "costs" });
 });
 
-test("a bare side: prefix is not a valid tab", () => {
-  expect(isTabType("side:")).toBe(false);
-  expect(isTabType(makeSideChatTabType("side-ws"))).toBe(true);
+test("moveTabToTabset removes empty source tabset", () => {
+  const s = moveTabToTabset(
+    split(tabset("tabset-1", ["costs"]), tabset("tabset-2", ["review", "terminal"])),
+    "costs",
+    "tabset-1",
+    "tabset-2"
+  );
+  expect(rootTabset(s).tabs).toEqual(["review", "terminal", "costs"]);
 });
 
-test("parseRightSidebarLayoutState falls back activeTab when stats was active", () => {
-  const raw = {
-    version: 1,
-    nextId: 2,
-    focusedTabsetId: "tabset-1",
-    root: {
-      type: "tabset",
-      id: "tabset-1",
-      tabs: ["costs", "stats", "review", "explorer"],
-      activeTab: "stats",
-    },
-  };
-
-  const result = parseRightSidebarLayoutState(raw, "costs");
-
-  expect(result.root.type).toBe("tabset");
-  if (result.root.type !== "tabset") throw new Error("expected tabset");
-
-  // "stats" stripped; activeTab should fall back to the first remaining tab.
-  expect(result.root.tabs).toContain("costs");
-  expect(result.root.tabs).toContain("review");
-  expect(result.root.tabs).not.toContain("stats");
-  expect(result.root.activeTab).toBe("costs");
-});
-test("parseRightSidebarLayoutState maps stats activeTab to costs even when reordered", () => {
-  // Tabs reordered so "costs" is NOT first — activeTab should still map to "costs"
-  const raw = {
-    version: 1,
-    nextId: 2,
-    focusedTabsetId: "tabset-1",
-    root: {
-      type: "tabset",
-      id: "tabset-1",
-      tabs: ["review", "costs", "stats", "explorer"],
-      activeTab: "stats",
-    },
-  };
-
-  const result = parseRightSidebarLayoutState(raw, "costs");
-
-  expect(result.root.type).toBe("tabset");
-  if (result.root.type !== "tabset") throw new Error("expected tabset");
-
-  // "stats"/"explorer" stripped; activeTab should map to "costs" (semantic
-  // replacement), not "review". Default-layout tabs (`inDefaultLayout: true`)
-  // may be auto-injected by `ensureDefaultLayoutTabs`, so we assert presence
-  // of the original tabs rather than full-array equality.
-  expect(result.root.tabs).toContain("review");
-  expect(result.root.tabs).toContain("costs");
-  expect(result.root.tabs).not.toContain("stats");
-  expect(result.root.tabs).not.toContain("explorer");
-  expect(result.root.activeTab).toBe("costs");
+test("reorderTabInTabset reorders tabs within a tabset", () => {
+  const s1 = reorderTabInTabset(single(["costs", "review"]), "tabset-1", 0, 1);
+  expect(rootTabset(s1)).toMatchObject({
+    tabs: ["review", "costs"],
+    activeTab: "costs",
+  });
 });
 
-test("parseRightSidebarLayoutState handles split layouts with removed tabs", () => {
+test("dockTabToEdge splits a tabset and moves the dragged tab into the new pane", () => {
+  const s1 = dockTabToEdge(single(["costs", "review"]), "review", "tabset-1", "tabset-1", "bottom");
+  expect(s1.root.type === "split" && s1.root.direction).toBe("horizontal");
+  const [top, bottom] = children(s1);
+  expect(bottom).toMatchObject({ tabs: ["review"], activeTab: "review" });
+  expect(top.tabs).toEqual(["costs"]);
+});
+
+test("dragging out the last tab leaves a New tab in the original pane", () => {
+  const [left, right] = children(
+    dockTabToEdge(single(["costs"]), "costs", "tabset-1", "tabset-1", "right")
+  );
+  expect(right.tabs).toEqual(["costs"]);
+  expect(left).toMatchObject({ tabs: ["new"], activeTab: "new" });
+});
+
+test("dockTabToEdge removes an empty source tabset when docking into another tabset", () => {
+  const s1 = dockTabToEdge(
+    split(tabset("tabset-1", ["costs"]), tabset("tabset-2", ["review"])),
+    "costs",
+    "tabset-1",
+    "tabset-2",
+    "left"
+  );
+  const [left, right] = children(s1);
+  expect(left.tabs).toEqual(["costs"]);
+  expect(right.tabs).toEqual(["review"]);
+});
+
+// --- Persisted layouts ---
+
+test("version 1 layouts keep terminals, side chats, and the active tab; other tools go", () => {
   const raw = {
     version: 1,
     nextId: 3,
@@ -382,66 +325,116 @@ test("parseRightSidebarLayoutState handles split layouts with removed tabs", () 
         {
           type: "tabset",
           id: "tabset-1",
-          tabs: ["costs", "stats", "explorer"],
-          activeTab: "costs",
+          tabs: ["costs", "review", "instructions", "terminal:abc", "goal", "side:sc"],
+          activeTab: "review",
         },
         {
           type: "tabset",
           id: "tabset-2",
-          tabs: ["review", "stats"],
-          activeTab: "stats",
+          tabs: ["workflows", "timeline"],
+          activeTab: "timeline",
         },
       ],
     },
   };
 
-  const result = parseRightSidebarLayoutState(raw, "costs");
-
-  // Both tabsets should have removed tabs stripped
-  expect(result.root.type).toBe("split");
-  if (result.root.type !== "split") throw new Error("expected split");
-
-  const left = result.root.children[0];
-  const right = result.root.children[1];
-
-  expect(left.type).toBe("tabset");
-  expect(right.type).toBe("tabset");
-
-  if (left.type !== "tabset" || right.type !== "tabset") throw new Error("expected tabsets");
-
-  // The left tabset still contains "costs" (and only "costs" of the originals);
-  // any additional default-layout tabs are auto-appended by
-  // `ensureDefaultLayoutTabs`. The right tabset is unaffected (it doesn't host
-  // the first tabset, which is where defaults land).
-  expect(left.tabs).toContain("costs");
-  expect(left.tabs).not.toContain("stats");
-  expect(left.tabs).not.toContain("explorer");
-  expect(left.activeTab).toBe("costs");
-  expect(right.tabs).toEqual(["review"]);
-  expect(right.activeTab).toBe("review");
+  const result = parseRightSidebarLayoutState(raw);
+  expect(result.version).toBe(2);
+  const [left, right] = children(result);
+  expect(left).toMatchObject({
+    tabs: ["review", "terminal:abc", "side:sc"],
+    activeTab: "review",
+  });
+  expect(right).toMatchObject({ tabs: ["timeline"], activeTab: "timeline" });
 });
 
-test("parseRightSidebarLayoutState auto-adds missing default-layout tabs from the registry", () => {
-  // A minimal pre-existing layout that pre-dates the addition of new default
-  // tabs. The migration should add every `inDefaultLayout: true` tab from the
-  // registry to the first tabset, leaving the active tab untouched.
-  const raw: RightSidebarLayoutState = {
+test("a version 1 tabset whose active tab is missing becomes a New tab when nothing is kept", () => {
+  const raw = {
     version: 1,
     nextId: 2,
     focusedTabsetId: "tabset-1",
-    root: { type: "tabset", id: "tabset-1", tabs: ["costs"], activeTab: "costs" },
+    root: {
+      type: "tabset",
+      id: "tabset-1",
+      tabs: ["costs", "review"],
+      activeTab: "goal",
+    },
   };
+  expect(rootTabset(parseRightSidebarLayoutState(raw))).toMatchObject({
+    tabs: ["new"],
+    activeTab: "new",
+  });
+});
 
-  const result = parseRightSidebarLayoutState(raw, "costs");
+test("version 1 migration is idempotent", () => {
+  const raw = {
+    version: 1,
+    nextId: 2,
+    focusedTabsetId: "tabset-1",
+    root: {
+      type: "tabset",
+      id: "tabset-1",
+      tabs: ["costs", "terminal:abc", "review"],
+      activeTab: "costs",
+    },
+  };
+  const once = parseRightSidebarLayoutState(raw);
+  const twice = parseRightSidebarLayoutState(once);
+  expect(twice).toBe(once);
+  expect(rootTabset(once).tabs).toEqual(["costs", "terminal:abc"]);
+});
 
-  expect(result.root.type).toBe("tabset");
-  if (result.root.type !== "tabset") throw new Error("expected tabset");
+test("version 2 layouts are used as-is: no tools are re-added", () => {
+  const raw = single(["goal"]);
+  expect(parseRightSidebarLayoutState(raw)).toBe(raw);
+});
 
-  // Confirms the migration injects every default tab without re-ordering
-  // existing ones — pre-existing "costs" stays at index 0.
-  expect(result.root.tabs[0]).toBe("costs");
-  expect(result.root.tabs).toContain("costs");
-  expect(result.root.tabs).toContain("review");
-  expect(result.root.tabs).toContain("instructions");
-  expect(result.root.activeTab).toBe("costs");
+test("parseRightSidebarLayoutState strips removed static tabs", () => {
+  const raw = {
+    version: 2,
+    nextId: 2,
+    focusedTabsetId: "tabset-1",
+    root: {
+      type: "tabset",
+      id: "tabset-1",
+      tabs: ["review", "costs", "stats", "explorer", "file:a.ts"],
+      activeTab: "stats",
+    },
+  };
+  // "stats" maps to its replacement, "costs", rather than the first tab.
+  expect(rootTabset(parseRightSidebarLayoutState(raw))).toMatchObject({
+    tabs: ["review", "costs"],
+    activeTab: "costs",
+  });
+});
+
+test("a tabset holding only removed tabs becomes a New tab", () => {
+  const raw = {
+    version: 2,
+    nextId: 2,
+    focusedTabsetId: "tabset-1",
+    root: {
+      type: "tabset",
+      id: "tabset-1",
+      tabs: ["stats", "explorer"],
+      activeTab: "stats",
+    },
+  };
+  expect(rootTabset(parseRightSidebarLayoutState(raw))).toMatchObject({
+    tabs: ["new"],
+    activeTab: "new",
+  });
+});
+
+test("parseRightSidebarLayoutState keeps an open /side chat tab", () => {
+  const raw = single(["costs", "terminal:abc", "side:side-ws"], "side:side-ws");
+  const result = rootTabset(parseRightSidebarLayoutState(raw));
+  expect(result.tabs).toContain("terminal:abc");
+  expect(getSideChatTabWorkspaceId(result.activeTab)).toBe("side-ws");
+});
+
+test("tab type validation accepts the New tab and rejects a bare side: prefix", () => {
+  expect(isTabType("new")).toBe(true);
+  expect(isTabType("side:")).toBe(false);
+  expect(isTabType(makeSideChatTabType("side-ws"))).toBe(true);
 });

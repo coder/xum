@@ -18,4 +18,4 @@ export {
 export { getTabName, getTabContentClassName } from "./registry";
 
 // Still exported for legacy/test consumers.
-export { SideChatTabLabel, TerminalTabLabel } from "./TabLabels";
+export { NewTabLabel, SideChatTabLabel, TerminalTabLabel } from "./TabLabels";

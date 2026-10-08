@@ -35,7 +35,11 @@ export function updateRightSidebarLayout(
   );
 }
 
-export function getRightSidebarTabFallback(): TabType {
-  const raw = readPersistedState<string>(RIGHT_SIDEBAR_TAB_KEY, "costs");
-  return isTabType(raw) ? raw : "costs";
+/**
+ * A tool explicitly requested for new layouts, if any. Without one a new layout holds just the
+ * New tab (see getDefaultRightSidebarLayoutState).
+ */
+export function getRightSidebarTabFallback(): TabType | undefined {
+  const raw = readPersistedState<string | null>(RIGHT_SIDEBAR_TAB_KEY, null);
+  return isTabType(raw) ? raw : undefined;
 }

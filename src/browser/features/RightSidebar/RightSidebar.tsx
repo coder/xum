@@ -66,6 +66,8 @@ import {
 } from "@/browser/stores/WorkspaceStore";
 import { shouldAutoActivateWorkflowsTab } from "@/browser/features/RightSidebar/Workflows/workflowDisplay";
 import {
+  NEW_TAB,
+  isNewTab,
   isTabType,
   isTerminalTab,
   getSideChatTabWorkspaceId,
@@ -77,7 +79,9 @@ import {
 } from "@/browser/types/rightSidebar";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import {
+  addNewTabToTabset,
   addTabToFocusedTabset,
+  closeTabInTabset,
   collectAllTabs,
   collectAllTabsWithTabset,
   dockTabToEdge,
@@ -85,6 +89,7 @@ import {
   getDefaultRightSidebarLayoutState,
   getFocusedActiveTab,
   moveTabToTabset,
+  openToolFromNewTab,
   parseRightSidebarLayoutState,
   removeTabEverywhere,
   reorderTabInTabset,
@@ -108,6 +113,7 @@ import {
 } from "@/browser/utils/terminal";
 import { ReviewAssistedStatsReporter } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
 import {
+  NewTabLabel,
   SideChatTabLabel,
   TAB_REGISTRY,
   TerminalTabLabel,
@@ -130,6 +136,8 @@ import {
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
 import { SideChatPanel } from "./SideChatPanel";
+import { NewTabLauncher } from "./NewTabLauncher";
+import { getOrderedBaseTabIds } from "./Tabs/tabConfig";
 import { useExperimentGatedTab } from "./useExperimentGatedTab";
 
 interface SidebarContainerProps {
@@ -307,8 +315,21 @@ interface RightSidebarTabsetNodeProps {
   setLayout: (updater: (prev: RightSidebarLayoutState) => RightSidebarLayoutState) => void;
   /** Handler to pop out a terminal tab to a separate window */
   onPopOutTerminal: (tab: TabType) => void;
-  /** Handler to add a new terminal tab */
-  onAddTerminal: () => void;
+  /** Handler for the strip's "+" button: open (or show) this tabset's New tab */
+  onAddNewTab: (tabsetId: string) => void;
+  /** Open a tool from this tabset's New tab launcher (replaces the New tab) */
+  onOpenToolFromNewTab: (tabsetId: string, tool: BaseTabType) => void;
+  /** Create a terminal from this tabset's New tab launcher (replaces the New tab) */
+  onOpenTerminalFromNewTab: (tabsetId: string) => void;
+  /** Close a static or New tab of this tabset (terminal and side chat tabs have their own) */
+  onCloseTab: (tabsetId: string, tab: TabType) => void;
+  /** Whether this tabset is the whole layout (its lone New tab then cannot be closed) */
+  isOnlyTabset: boolean;
+  /** Tools the New tab launcher offers, in order (already filtered for availability) */
+  launcherTools: BaseTabType[];
+  /** Tabset whose New tab launcher should take focus once shown (after "+" or the shortcut) */
+  launcherAutoFocusTabsetId: string | null;
+  onLauncherAutoFocusConsumed: () => void;
   /** Handler to close a terminal tab */
   onCloseTerminal: (tab: TabType) => void;
   /** Handler to close a /side chat tab (discards the side chat) */
@@ -446,7 +467,9 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
     // with index + close/pop-out actions) — see `tabRegistry.tsx` for why
     // terminals stay outside the static registry.
     let label: React.ReactNode;
-    if (isBaseTabId(tab)) {
+    if (isNewTab(tab)) {
+      label = <NewTabLabel />;
+    } else if (isBaseTabId(tab)) {
       const Label = TAB_REGISTRY[tab].Label;
       label = <Label workspaceId={props.workspaceId} reviewStats={props.reviewStats} />;
     } else if (isTerminal) {
@@ -474,12 +497,20 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
         label,
         tooltip,
         tab,
-        // Terminal and side chat tabs are closeable
+        // Every tab is closeable; terminal and side chat labels render their own X (closing
+        // also ends the session / discards the side chat). Closing the layout's only tab when
+        // it is already the New tab would do nothing, so that tab offers no close.
         onClose: isTerminal
           ? () => props.onCloseTerminal(tab)
           : getSideChatTabWorkspaceId(tab) != null
             ? () => props.onCloseSideChat(tab)
-            : undefined,
+            : isNewTab(tab) && props.isOnlyTabset && props.node.tabs.length === 1
+              ? undefined
+              : () => props.onCloseTab(props.node.id, tab),
+        closeLabel:
+          isTerminal || getSideChatTabWorkspaceId(tab) != null
+            ? undefined
+            : `Close ${getTabName(tab)}`,
       },
     ];
   });
@@ -528,7 +559,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           ariaLabel="Sidebar views"
           items={items}
           tabsetId={props.node.id}
-          onAddTerminal={props.onAddTerminal}
+          onAddNewTab={() => props.onAddNewTab(props.node.id)}
         />
       </SortableContext>
       <div
@@ -595,6 +626,22 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
             tabsetBaseId={tabsetBaseId}
             context={panelContext}
           />
+        )}
+
+        {isNewTab(props.node.activeTab) && (
+          <div
+            role="tabpanel"
+            id={`${tabsetBaseId}-panel-${props.node.activeTab}`}
+            aria-labelledby={`${tabsetBaseId}-tab-${props.node.activeTab}`}
+          >
+            <NewTabLauncher
+              tools={props.launcherTools}
+              onOpenTool={(tool) => props.onOpenToolFromNewTab(props.node.id, tool)}
+              onOpenTerminal={() => props.onOpenTerminalFromNewTab(props.node.id)}
+              autoFocus={props.launcherAutoFocusTabsetId === props.node.id}
+              onAutoFocusConsumed={props.onLauncherAutoFocusConsumed}
+            />
+          </div>
         )}
 
         {/* Mount this pane's selected side chat; other split panes may show their own side chats. */}
@@ -716,6 +763,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     setReviewPanelStats(stats ? { total: stats.total, read: stats.read } : null);
   }, []);
 
+  // Tabset whose New tab launcher should focus its first row once shown ("+" or the shortcut).
+  const [launcherAutoFocusTabsetId, setLauncherAutoFocusTabsetId] = React.useState<string | null>(
+    null
+  );
+
   // Terminal session ID that should be auto-focused (new terminal or explicit tab focus).
   const [autoFocusTerminalSession, setAutoFocusTerminalSession] = React.useState<string | null>(
     null
@@ -744,6 +796,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const api = apiState.api;
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
+  const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   // Child task workspaces own a goal (pause/resume/complete), but goal-board and
   // creation actions stay parent-only (`WorkspaceGoalService.assertParentWorkspace`).
   const workspaceMetadataContext = useWorkspaceMetadata();
@@ -917,12 +971,15 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       window.removeEventListener(CUSTOM_EVENTS.LLM_DEBUG_LOGS_CHANGED, handleLlmDebugLogsChanged);
   }, []);
 
-  // Read last-used focused tab for better defaults when initializing a new layout.
-  const initialActiveTab = React.useMemo<TabType>(() => {
-    const raw = readPersistedState<string>(RIGHT_SIDEBAR_TAB_KEY, "costs");
-    if (!canReviewDiffs && raw === "review") return "costs";
-    return isTabType(raw) ? raw : "costs";
-  }, [canReviewDiffs]);
+  // A tool explicitly requested for new layouts (RIGHT_SIDEBAR_TAB_KEY). Without one, a
+  // workspace starts with just the New tab, which guides the user to the tools.
+  // Not gated on canReviewDiffs: that is false until workspace metadata loads, and a "review"
+  // request dropped then would persist a New-tab-only layout. Without a repository, `layout`
+  // below hides Review anyway (an emptied layout shows the New tab).
+  const initialActiveTab = React.useMemo<TabType | undefined>(() => {
+    const raw = readPersistedState<string | null>(RIGHT_SIDEBAR_TAB_KEY, null);
+    return isTabType(raw) ? raw : undefined;
+  }, []);
 
   const defaultLayout = React.useMemo(
     () => getDefaultRightSidebarLayoutState(initialActiveTab),
@@ -995,10 +1052,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     setIsReviewImmersive(false);
   }, [hasReviewPanelMounted, isReviewImmersive, setIsReviewImmersive]);
 
-  // Legacy "stats" tabs in persisted layouts are stripped during parsing
-  // (see stripLegacyStatsTab in rightSidebarLayout.ts).
-  // If LLM debug logs are enabled, ensure the Debug tab exists in the layout.
-  // If disabled, ensure it doesn't linger in persisted layouts.
+  // The Debug tab is offered by the New tab launcher while LLM debug logs are on; when they are
+  // off, drop it from persisted layouts. It is never added on its own: the strip shows only
+  // tabs the user (or a real event) opened.
   React.useEffect(() => {
     // Skip layout mutations until the config has been loaded. Using null
     // as the initial state prevents pruning debug tabs from persisted layouts
@@ -1011,11 +1067,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
       const hasDebug = collectAllTabs(prev.root).includes("debug");
 
-      if (llmDebugLogsEnabled && !hasDebug) {
-        // Add debug tab to the focused tabset without stealing focus.
-        return addTabToFocusedTabset(prev, "debug", false);
-      }
-
       if (!llmDebugLogsEnabled && hasDebug) {
         return removeTabEverywhere(prev, "debug");
       }
@@ -1023,7 +1074,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       return prev;
     });
   }, [initialActiveTab, layoutRaw, llmDebugLogsEnabled, setLayoutRaw]);
-  // Experiment-gated tabs follow their experiment once its value has loaded.
+  // Experiment-gated tabs are dropped once their experiment turns out to be off.
   useExperimentGatedTab({
     tab: "browser",
     experimentId: EXPERIMENT_IDS.AGENT_BROWSER,
@@ -1042,20 +1093,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     initialActiveTab,
     setLayoutRaw,
   });
-
-  React.useEffect(() => {
-    setLayoutRaw((prevRaw) => {
-      const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
-      const hasGoal = collectAllTabs(prev.root).includes("goal");
-      // Goal tab is always visible, sub-agents included: a child's goal is paused/resumed
-      // there (the panel hides the parent-only board and create form, see tabRegistry).
-      if (!hasGoal) {
-        return addTabToFocusedTabset(prev, "goal", false);
-      }
-
-      return prev;
-    });
-  }, [initialActiveTab, setLayoutRaw]);
 
   React.useEffect(() => {
     if (!desktopExperimentEnabled) {
@@ -1098,10 +1135,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       const prev = parseRightSidebarLayoutState(prevRaw, initialActiveTab);
       const hasDesktop = collectAllTabs(prev.root).includes("desktop");
 
-      if (desktopAvailable && !hasDesktop) {
-        return addTabToFocusedTabset(prev, "desktop", false);
-      }
-
+      // Offered by the New tab launcher while available; only removal happens here.
       if (!desktopAvailable && hasDesktop) {
         return removeTabEverywhere(prev, "desktop");
       }
@@ -1131,7 +1165,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   const focusActiveTerminal = React.useCallback(
     (state: RightSidebarLayoutState) => {
-      const activeTab = getFocusedActiveTab(state, initialActiveTab);
+      const activeTab = getFocusedActiveTab(state, NEW_TAB);
       if (!isTerminalTab(activeTab)) {
         return;
       }
@@ -1140,7 +1174,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         setAutoFocusTerminalSession(sessionId);
       }
     },
-    [initialActiveTab, setAutoFocusTerminalSession]
+    [setAutoFocusTerminalSession]
   );
 
   const setLayout = React.useCallback(
@@ -1524,7 +1558,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     setLayout((prev) => staleTabs.reduce((acc, tab) => removeTabEverywhere(acc, tab), prev));
   }, [allWorkspaceMetadata, layout, setLayout, workspaceId, workspaceMetadataLoaded]);
 
-  // Keyboard shortcut for closing active terminal tab (Ctrl/Cmd+W)
+  // Keyboard shortcut for closing the focused pane's active tab, whatever its type
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (isDesktopViewportFocused(e.target)) return;
@@ -1558,6 +1592,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         removeTerminalTab(activeTab);
         return;
       }
+
+      // Static and New tabs: closing the last tab leaves the New tab.
+      setLayout((prev) => closeTabInTabset(prev, focusedTabset.id, activeTab));
     };
 
     window.addEventListener("keydown", handleKeyDown, { capture: true });
@@ -1652,8 +1689,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // that leaves the sidebar half-expanded and looks like an app crash. The wrapper stays
   // non-async (`() => void`) so the existing `addTerminalRef` / `onAddTerminal` callsites
   // (typed as void-returning) don't trip `no-misused-promises`.
-  const handleAddTerminal = React.useCallback(
-    (options?: TerminalSessionCreateOptions): void => {
+  const createTerminalTab = React.useCallback(
+    (
+      place: (prev: RightSidebarLayoutState, tab: TabType) => RightSidebarLayoutState,
+      options?: TerminalSessionCreateOptions
+    ): void => {
       if (!api) return;
 
       // Also expand sidebar if collapsed
@@ -1662,7 +1702,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       void createTerminalSession(api, workspaceId, options)
         .then((session) => {
           const newTab = makeTerminalTabType(session.sessionId);
-          setLayout((prev) => addTabToFocusedTabset(prev, newTab));
+          setLayout((prev) => place(prev, newTab));
           // Schedule focus for this terminal (will be consumed when the tab mounts)
           setAutoFocusTerminalSession(session.sessionId);
         })
@@ -1673,6 +1713,89 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     },
     [api, workspaceId, setLayout, setCollapsed, terminalCreateError]
   );
+
+  const handleAddTerminal = React.useCallback(
+    (options?: TerminalSessionCreateOptions): void =>
+      createTerminalTab((prev, tab) => addTabToFocusedTabset(prev, tab), options),
+    [createTerminalTab]
+  );
+
+  // From a New tab launcher the terminal takes the New tab's place in that tabset.
+  const handleOpenTerminalFromNewTab = React.useCallback(
+    (tabsetId: string): void =>
+      createTerminalTab((prev, tab) => openToolFromNewTab(prev, tabsetId, tab)),
+    [createTerminalTab]
+  );
+
+  const handleOpenToolFromNewTab = React.useCallback(
+    (tabsetId: string, tool: BaseTabType) => {
+      // Same follow-ups as opening these tabs by shortcut: panels with keyboard navigation
+      // take focus because the user just picked them.
+      if (tool === "review") _setFocusTrigger((prev) => prev + 1);
+      if (tool === "artifacts") setAutoFocusArtifacts(true);
+      setLayout((prev) => openToolFromNewTab(prev, tabsetId, tool));
+    },
+    [setLayout]
+  );
+
+  const handleCloseTab = React.useCallback(
+    (tabsetId: string, tab: TabType) => {
+      setLayout((prev) => closeTabInTabset(prev, tabsetId, tab));
+    },
+    [setLayout]
+  );
+
+  // "+" in a strip (tabsetId) or the shortcut (focused tabset): show that tabset's New tab and
+  // move focus into its launcher.
+  const handleAddNewTab = React.useCallback(
+    (tabsetId?: string) => {
+      const targetId = tabsetId ?? getBaseLayout().focusedTabsetId;
+      setCollapsed(false);
+      setLayout((prev) => addNewTabToTabset(prev, targetId));
+      setLauncherAutoFocusTabsetId(targetId);
+    },
+    [getBaseLayout, setCollapsed, setLayout]
+  );
+
+  React.useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!matchesKeybind(e, KEYBINDS.NEW_SIDEBAR_TAB)) return;
+      const container = sidebarContainerRef.current;
+      if (
+        // The narrow layout hides the sidebar; there is no strip to add a tab to.
+        (container != null && isRightSidebarResponsivelyHidden(container)) ||
+        isDialogOpen() ||
+        // Remote desktops and terminals own their keystrokes.
+        isTerminalFocused(e.target) ||
+        isDesktopViewportFocused(e.target)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      handleAddNewTab();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [handleAddNewTab]);
+
+  // Tools the New tab launcher offers. Unavailable ones are left out rather than shown
+  // disabled; experiment tabs follow their experiment, Debug follows the LLM debug logs
+  // setting, and Desktop needs a desktop-capable runtime.
+  const toolAvailable: Record<BaseTabType, boolean> = {
+    costs: true,
+    review: canReviewDiffs,
+    instructions: true,
+    goal: true,
+    workflows: true,
+    timeline: true,
+    artifacts: artifactsExperimentEnabled,
+    memory: memoryExperimentEnabled,
+    desktop: desktopAvailable === true,
+    browser: browserExperimentEnabled,
+    output: true,
+    debug: llmDebugLogsEnabled === true,
+  };
+  const launcherTools = getOrderedBaseTabIds().filter((tool) => toolAvailable[tool]);
 
   // Expose handleAddTerminal to parent via ref (for Cmd/Ctrl+T keybind)
   React.useEffect(() => {
@@ -1892,7 +2015,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         activeDragData={activeDragData}
         setLayout={setLayout}
         onPopOutTerminal={handlePopOutTerminal}
-        onAddTerminal={handleAddTerminal}
+        onAddNewTab={handleAddNewTab}
+        onOpenToolFromNewTab={handleOpenToolFromNewTab}
+        onOpenTerminalFromNewTab={handleOpenTerminalFromNewTab}
+        onCloseTab={handleCloseTab}
+        isOnlyTabset={layout.root.type === "tabset"}
+        launcherTools={launcherTools}
+        launcherAutoFocusTabsetId={launcherAutoFocusTabsetId}
+        onLauncherAutoFocusConsumed={() => setLauncherAutoFocusTabsetId(null)}
         onCloseTerminal={handleCloseTerminal}
         onCloseSideChat={handleCloseSideChat}
         onTerminalExit={removeTerminalTab}

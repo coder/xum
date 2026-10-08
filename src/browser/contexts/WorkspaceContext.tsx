@@ -1490,7 +1490,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
             if (rawLayout != null) {
               // Use parseRightSidebarLayoutState to handle legacy migrations
               // (e.g. "stats" tab stripped) before cleaning terminal tabs.
-              const layout = parseRightSidebarLayoutState(rawLayout, "costs");
+              const layout = parseRightSidebarLayoutState(rawLayout);
               const terminalTabs = collectAllTabs(layout.root).filter(isTerminalTab);
               let cleanedLayout = layout;
               for (const tab of terminalTabs) {

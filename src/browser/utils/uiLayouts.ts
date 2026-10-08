@@ -212,8 +212,9 @@ function convertLayoutStateToPreset(state: RightSidebarLayoutState): RightSideba
   const root = convertNodeToPreset(state.root, ctx);
 
   if (!root) {
-    // Fallback to default layout without terminals.
-    const fallback = getDefaultRightSidebarLayoutState(getRightSidebarTabFallback());
+    // Presets store only Stats/Review/terminals (the New tab and other tools are dropped), and a
+    // preset needs at least one tab, so a layout with none of those saves as a Stats tab.
+    const fallback = getDefaultRightSidebarLayoutState("costs");
     const fallbackRoot = convertNodeToPreset(fallback.root, { terminalCounter: 0 });
     assert(fallbackRoot !== null, "default right sidebar layout must convert");
     return {
@@ -394,7 +395,7 @@ function resolvePresetLayoutToLayoutState(
     findTabset(root, preset.focusedTabsetId)?.id ?? findFirstTabsetId(root) ?? "tabset-1";
 
   return {
-    version: 1,
+    version: 2,
     nextId: preset.nextId,
     focusedTabsetId,
     root,

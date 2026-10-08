@@ -4,8 +4,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/To
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useDroppable, useDndContext } from "@dnd-kit/core";
-import { Plus } from "lucide-react";
+import { Plus, X } from "lucide-react";
 import type { TabType } from "@/browser/types/rightSidebar";
+import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   isDesktopMode,
   DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
@@ -31,8 +32,13 @@ export interface RightSidebarTabStripItem {
   disabled?: boolean;
   /** The tab type (used for drag identification) */
   tab: TabType;
-  /** Optional callback to close this tab (for closeable tabs like terminals) */
+  /** Closes this tab (X button, middle-click). Absent when closing would do nothing. */
   onClose?: () => void;
+  /**
+   * Accessible name of the strip-rendered X button. Unset for labels that render their own
+   * close button (terminal, side chat), so the tab never shows two.
+   */
+  closeLabel?: string;
 }
 
 interface RightSidebarTabStripProps {
@@ -40,8 +46,8 @@ interface RightSidebarTabStripProps {
   ariaLabel?: string;
   /** Unique ID of this tabset (for drag/drop) */
   tabsetId: string;
-  /** Called when user clicks the "+" button to add a new terminal */
-  onAddTerminal?: () => void;
+  /** Called when user clicks the "+" button to open (or show) this tabset's New tab */
+  onAddNewTab?: () => void;
 }
 
 /**
@@ -74,10 +80,7 @@ const SortableTab: React.FC<{
   const sortableOnKeyDown = listeners?.onKeyDown;
 
   return (
-    <div
-      className={cn("relative mr-1 mb-1 inline-flex align-middle", isDesktop && "titlebar-no-drag")}
-      style={style}
-    >
+    <div className={cn("relative shrink-0", isDesktop && "titlebar-no-drag")} style={style}>
       <Tooltip>
         <TooltipTrigger asChild>
           <div
@@ -85,8 +88,11 @@ const SortableTab: React.FC<{
             {...attributes}
             {...(listeners ?? {})}
             className={cn(
-              "flex min-w-0 max-w-[240px] items-baseline gap-1.5 whitespace-nowrap rounded-md px-3 py-1 text-xs font-medium transition-all duration-150",
+              "group relative flex min-w-0 max-w-[240px] items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1 text-xs font-medium transition-colors duration-150",
               "cursor-grab touch-none active:cursor-grabbing",
+              // Only the selected tab keeps room for its X; elsewhere the X overlays the label's
+              // end on hover/focus, so idle tabs stay as compact as their label.
+              item.selected && item.closeLabel != null && item.onClose && "pr-6",
               item.selected
                 ? "bg-hover text-foreground"
                 : "bg-transparent text-muted hover:bg-hover/50 hover:text-foreground",
@@ -125,7 +131,15 @@ const SortableTab: React.FC<{
             aria-disabled={item.disabled ? true : undefined}
             tabIndex={item.disabled ? -1 : (attributes.tabIndex ?? 0)}
           >
-            {item.label}
+            {/* Long labels truncate inside the tab instead of stretching the strip. */}
+            <span className="flex min-w-0 items-center gap-1.5 truncate">{item.label}</span>
+            {item.onClose && item.closeLabel != null && (
+              <TabCloseButton
+                label={item.closeLabel}
+                selected={item.selected}
+                onClose={item.onClose}
+              />
+            )}
           </div>
         </TooltipTrigger>
         <TooltipContent side="bottom" align="center">
@@ -136,11 +150,70 @@ const SortableTab: React.FC<{
   );
 };
 
+/**
+ * X button for tabs whose label has no close button of its own. Absolutely positioned so it
+ * takes no room: the selected tab reserves padding for it, other tabs show it over the end of
+ * the label on hover or keyboard focus (focus-within also covers the tab itself having focus,
+ * so Tab reaches the X next). `invisible` rather than transparent: a hidden X must not catch
+ * clicks (or taps) on the label.
+ */
+const TabCloseButton: React.FC<{
+  label: string;
+  selected: boolean;
+  onClose: () => void;
+}> = (props) => (
+  <button
+    type="button"
+    className={cn(
+      "text-muted hover:text-foreground absolute right-1 top-1/2 -translate-y-1/2 rounded p-0.5",
+      props.selected
+        ? "bg-hover"
+        : "bg-hover invisible group-focus-within:visible group-hover:visible"
+    )}
+    onClick={(e) => {
+      e.stopPropagation();
+      props.onClose();
+    }}
+    aria-label={props.label}
+  >
+    <X className="h-3 w-3" />
+  </button>
+);
+
+/** Width of the `.scroll-fade-x` edge fade (scrollbar-none.css): a tab under it looks cut off. */
+const SCROLL_FADE_PX = 24;
+
+/**
+ * Scroll the row (only as far as needed) so its selected tab is fully visible and clear of the
+ * edge fades. Computed against the row instead of `scrollIntoView`, which also scrolls
+ * overflow-hidden ancestors and ignores the fades.
+ */
+function revealSelectedTab(row: HTMLElement): void {
+  const tab = row.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+  if (tab == null) return;
+  const rowRect = row.getBoundingClientRect();
+  const tabRect = tab.getBoundingClientRect();
+  const tabStart = tabRect.left - rowRect.left + row.scrollLeft;
+  const tabEnd = tabStart + tabRect.width;
+  const maxScroll = row.scrollWidth - row.clientWidth;
+  let next = row.scrollLeft;
+  // A fade only shows on a side with more content past it, so the first and last tabs need
+  // no margin (the clamp below lets them reach the very edge).
+  if (tabEnd + SCROLL_FADE_PX > row.scrollLeft + row.clientWidth) {
+    next = tabEnd + SCROLL_FADE_PX - row.clientWidth;
+  }
+  if (tabStart - SCROLL_FADE_PX < next) {
+    next = tabStart - SCROLL_FADE_PX;
+  }
+  next = Math.max(0, Math.min(maxScroll, next));
+  if (Math.abs(next - row.scrollLeft) >= 1) row.scrollLeft = next;
+}
+
 export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
   items,
   ariaLabel = "Sidebar views",
   tabsetId,
-  onAddTerminal,
+  onAddNewTab,
 }) => {
   const { active } = useDndContext();
   const activeData = active?.data.current as TabDragData | undefined;
@@ -160,11 +233,31 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
   // In desktop mode, add right padding for Windows/Linux titlebar overlay buttons
   const isDesktop = isDesktopMode();
 
+  // The strip is a single scrolling row, so the selected tab can sit past the visible edge:
+  // selected by a shortcut, the launcher, or an event, or pushed out when tabs before it grow
+  // (Stats gains its cost badge, counts load) or the pane narrows. Keep it fully visible,
+  // clear of the edge fades, whenever the selection or any size in the row changes. An effect
+  // because it syncs with layout; the ResizeObserver supplies the size changes.
+  const scrollRowRef = React.useRef<HTMLDivElement>(null);
+  const selectedItemId = items.find((item) => item.selected)?.id;
+  const itemIdsKey = items.map((item) => item.id).join("|");
+  React.useEffect(() => {
+    const row = scrollRowRef.current;
+    if (row == null || selectedItemId == null) return;
+    const reveal = () => revealSelectedTab(row);
+    reveal();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(reveal);
+    observer.observe(row);
+    for (const child of Array.from(row.children)) observer.observe(child);
+    return () => observer.disconnect();
+  }, [selectedItemId, itemIdsKey]);
+
   return (
     <div
       ref={setNodeRef}
       className={cn(
-        "border-border-light titlebar-safe-right titlebar-safe-right-gutter-2 flex min-w-0 items-center border-b px-2 py-1.5 transition-colors",
+        "border-border-light titlebar-safe-right titlebar-safe-right-gutter-2 flex min-w-0 items-center gap-1 border-b px-2 py-1.5 transition-colors",
         isDesktop && DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
         showDropHighlight && "bg-accent/30",
         isDraggingFromHere && "bg-accent/10",
@@ -172,42 +265,49 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         isDesktop && "titlebar-drag"
       )}
     >
-      {/* The tablist owns only tabs (aria-required-children, #5951), so the "+" button is its
-          sibling. To keep "+" right after the last tab when the tabs wrap, the tabs and "+" flow
-          as inline boxes in one block. The tablist is a plain inline box, not `display: contents`,
-          because Safari has dropped the role of `display: contents` elements (#5962). Margins
-          on each item, offset by negative margins here, stand in for a 4 px flex gap. */}
-      <div className="-mr-1 -mb-1 min-w-0 flex-1">
-        <div className="inline" role="tablist" aria-label={ariaLabel}>
-          {items.map((item, index) => (
-            <SortableTab
-              key={item.id}
-              item={item}
-              index={index}
-              tabsetId={tabsetId}
-              isDesktop={isDesktop}
-            />
-          ))}
-        </div>
-        {onAddTerminal && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                className={cn(
-                  "text-muted hover:bg-hover hover:text-foreground mr-1 mb-1 shrink-0 rounded-md p-1 align-middle transition-colors",
-                  isDesktop && "titlebar-no-drag"
-                )}
-                onClick={onAddTerminal}
-                aria-label="New terminal"
-              >
-                <Plus className="h-3.5 w-3.5" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">New terminal</TooltipContent>
-          </Tooltip>
-        )}
+      {/* One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges). */}
+      <div
+        ref={scrollRowRef}
+        data-tab-scroll-row
+        role="tablist"
+        aria-label={ariaLabel}
+        className="scrollbar-none scroll-fade-x flex min-w-0 flex-1 flex-nowrap items-center gap-1 overflow-x-auto"
+      >
+        {items.map((item, index) => (
+          <SortableTab
+            key={item.id}
+            item={item}
+            index={index}
+            tabsetId={tabsetId}
+            isDesktop={isDesktop}
+          />
+        ))}
       </div>
+      {/* Outside the scrolling row so it stays visible however many tabs are open. */}
+      {onAddNewTab && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              className={cn(
+                "text-muted hover:bg-hover hover:text-foreground shrink-0 rounded-md p-1 transition-colors",
+                isDesktop && "titlebar-no-drag"
+              )}
+              onClick={onAddNewTab}
+              aria-label="New tab"
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">
+            New tab
+            <span className="mobile-hide-shortcut-hints">
+              {" "}
+              ({formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB)})
+            </span>
+          </TooltipContent>
+        </Tooltip>
+      )}
     </div>
   );
 };

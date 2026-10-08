@@ -2,6 +2,7 @@
  * Integration tests for RightSidebar dock-lite behavior.
  *
  * Tests cover:
+ * - The New tab launcher a fresh workspace starts with
  * - Tab switching (costs, review, terminal)
  * - Sidebar collapse/expand
  * - Tab persistence across navigation
@@ -11,7 +12,7 @@
  */
 
 import "../dom";
-import { fireEvent, waitFor } from "@testing-library/react";
+import { fireEvent, waitFor, within } from "@testing-library/react";
 
 import { getApiKey, shouldRunIntegrationTests } from "../../testUtils";
 import {
@@ -43,6 +44,7 @@ import {
   getDefaultRightSidebarLayoutState,
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
+import type { TabType } from "@/browser/types/rightSidebar";
 
 const RIGHT_SIDEBAR_SELECTOR = '[role="complementary"][aria-label="Workspace insights"]';
 
@@ -194,13 +196,31 @@ describeIntegration("RightSidebar (UI)", () => {
       timeout
     );
 
-  async function createTerminalTab(sidebar: HTMLElement): Promise<HTMLElement> {
-    const newTerminalButton = await findRequiredElement(
-      sidebar,
-      'button[aria-label="New terminal"]',
-      "New terminal button not found"
+  /** Persist a single-pane layout holding exactly these (open) tabs. */
+  function seedLayout(tabs: TabType[], activeTab: TabType = tabs[0]) {
+    const layout: RightSidebarLayoutState = {
+      version: 2,
+      nextId: 2,
+      focusedTabsetId: "tabset-1",
+      root: { type: "tabset", id: "tabset-1", tabs, activeTab },
+    };
+    updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
+  }
+
+  const getTabs = (sidebar: HTMLElement) =>
+    Array.from(sidebar.querySelectorAll<HTMLElement>('[role="tab"]'));
+
+  /** "+" opens the New tab; its launcher lists the tools. */
+  async function openLauncher(sidebar: HTMLElement): Promise<HTMLElement> {
+    fireEvent.click(
+      await findRequiredElement(sidebar, 'button[aria-label="New tab"]', "New tab button not found")
     );
-    fireEvent.click(newTerminalButton);
+    return findSidebarPanel(sidebar, "-panel-new");
+  }
+
+  async function createTerminalTab(sidebar: HTMLElement): Promise<HTMLElement> {
+    const launcher = await openLauncher(sidebar);
+    fireEvent.click(within(launcher).getByRole("button", { name: "Terminal" }));
     return findSidebarTab(sidebar, "terminal:", 10_000);
   }
 
@@ -222,68 +242,52 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
-  test("shows the Instructions tab by default", async () => {
+  test("a fresh workspace shows only the New tab, whose launcher lists the tools", async () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
       updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
       updatePersistedState(getRightSidebarLayoutKey(workspaceId), null);
     });
 
     try {
+      const launcher = await findSidebarPanel(sidebar, "-panel-new");
+      const tabs = getTabs(sidebar);
+      expect(tabs).toHaveLength(1);
+      expect(tabs[0].getAttribute("aria-selected")).toBe("true");
+      // Tools are offered in the launcher instead of as idle tabs.
+      for (const name of ["Stats", "Review", "Instructions", "Goal", "Terminal"]) {
+        expect(within(launcher).getByRole("button", { name })).toBeTruthy();
+      }
+      // The only tab is already the New tab, so it offers no close button.
+      expect(sidebar.querySelector('button[aria-label^="Close"]')).toBeNull();
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("opening a tool from the New tab replaces it with that tool", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() =>
+      seedLayout(["costs", "new"], "new")
+    );
+
+    try {
+      const launcher = await findSidebarPanel(sidebar, "-panel-new");
+      fireEvent.click(within(launcher).getByRole("button", { name: "Review" }));
+
+      await findSidebarPanel(sidebar, "review");
       await waitFor(() => {
-        const instructionsTab = sidebar.querySelector(
-          '[role="tab"][aria-controls*="instructions"]'
-        );
-        if (!instructionsTab) {
-          throw new Error("Instructions tab should be present by default");
-        }
+        const tabs = getTabs(sidebar);
+        expect(tabs.map((tab) => tab.getAttribute("aria-controls"))).toEqual([
+          expect.stringContaining("costs"),
+          expect.stringContaining("review"),
+        ]);
+        expect(tabs[1].getAttribute("aria-selected")).toBe("true");
       });
     } finally {
       await cleanup();
     }
   }, 60_000);
 
-  test("always shows the goal tab on top-level workspaces (even without an active goal)", async () => {
-    const cleanupDom = installDom();
-
-    updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
-    updatePersistedState(getRightSidebarLayoutKey(workspaceId), null);
-
-    const view = renderApp({
-      apiClient: env.orpc,
-      metadata,
-    });
-
-    try {
-      await setupWorkspaceView(view, metadata, workspaceId);
-
-      const sidebar = await waitFor(
-        () => {
-          const el = view.container.querySelector(
-            '[role="complementary"][aria-label="Workspace insights"]'
-          );
-          if (!el) throw new Error("RightSidebar not found");
-          return el as HTMLElement;
-        },
-        { timeout: 10_000 }
-      );
-
-      // Regression guard: the tab used to be gated on `goal != null ||
-      // goalHistory.length > 0`, so a brand-new workspace (no goal, no
-      // history) hid the tab entirely. Now that goals are GA the tab is
-      // always visible on top-level workspaces so it can surface the
-      // in-tab create form for new workspaces.
-      await waitFor(() => {
-        const goalTab = sidebar.querySelector('[role="tab"][aria-controls*="goal"]');
-        if (!goalTab) {
-          throw new Error("Goal tab should always be present on top-level workspaces");
-        }
-      });
-    } finally {
-      await cleanupView(view, cleanupDom);
-    }
-  }, 60_000);
-
-  test("adds the browser tab when the experiment is enabled", async () => {
+  test("offers the browser in the New tab when the experiment is enabled, without opening it", async () => {
     await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.AGENT_BROWSER, enabled: true });
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
       updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
@@ -291,12 +295,11 @@ describeIntegration("RightSidebar (UI)", () => {
     });
 
     try {
+      const launcher = await findSidebarPanel(sidebar, "-panel-new");
       await waitFor(() => {
-        const browserTab = sidebar.querySelector('[role="tab"][aria-controls*="browser"]');
-        if (!browserTab) {
-          throw new Error("Browser tab not found");
-        }
+        expect(within(launcher).getByRole("button", { name: "Browser" })).toBeTruthy();
       });
+      expect(sidebar.querySelector('[role="tab"][aria-controls*="browser"]')).toBeNull();
     } finally {
       await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.AGENT_BROWSER, enabled: null });
       await cleanup();
@@ -304,16 +307,12 @@ describeIntegration("RightSidebar (UI)", () => {
   }, 60_000);
 
   test("tab switching updates active tab and persists selection", async () => {
-    const { sidebar, cleanup } = await setupRightSidebarView(() => {
-      // Clear any persisted state
-      updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
-      updatePersistedState(getRightSidebarLayoutKey(workspaceId), null);
-    });
+    const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs", "review"]));
 
     try {
       const costsTab = await findSidebarTab(sidebar, "costs");
 
-      // Costs should be selected by default
+      // Costs is the seeded active tab
       expect(costsTab.getAttribute("aria-selected")).toBe("true");
 
       // Click Review tab
@@ -344,26 +343,32 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
-  // The standalone "stats" tab was absorbed into the "costs" tab as sub-tabs.
-  // Verify the unified "Stats" tab (internal key "costs") is selected by default.
-  test("stats tab is selected by default", async () => {
-    const { sidebar, cleanup } = await setupRightSidebarView(() => {
-      // Clear any persisted state
-      updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
-      updatePersistedState(getRightSidebarLayoutKey(workspaceId), null);
-    });
+  test("closing tabs: a static tab closes, and closing the last tab leaves the New tab", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs", "review"]));
 
     try {
-      // Verify the costs/stats tab is selected by default (no standalone "stats" tab exists).
+      fireEvent.click(
+        await findRequiredElement(
+          sidebar,
+          'button[aria-label="Close Review"]',
+          "Close Review not found"
+        )
+      );
       await waitFor(() => {
-        const costsTab = sidebar.querySelector('[role="tab"][aria-controls*="costs"]');
-        if (!costsTab) throw new Error("Stats tab (costs) not found");
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+      });
 
-        expect(costsTab.getAttribute("aria-selected")).toBe("true");
-
-        // Standalone "stats" tab should not exist
-        const statsTab = sidebar.querySelector('[role="tab"][aria-controls*="-stats"]');
-        expect(statsTab).toBeNull();
+      fireEvent.click(
+        await findRequiredElement(
+          sidebar,
+          'button[aria-label="Close Stats"]',
+          "Close Stats not found"
+        )
+      );
+      await findSidebarPanel(sidebar, "-panel-new");
+      await waitFor(() => {
+        expect(getTabs(sidebar)).toHaveLength(1);
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="costs"]')).toBeNull();
       });
     } finally {
       await cleanup();
@@ -418,7 +423,7 @@ describeIntegration("RightSidebar (UI)", () => {
   test("tab selection persists across workspace navigation", async () => {
     // Start with Review tab selected
     const initialLayout: RightSidebarLayoutState = {
-      version: 1,
+      version: 2,
       nextId: 2,
       focusedTabsetId: "tabset-1",
       root: {
@@ -482,7 +487,7 @@ describeIntegration("RightSidebar (UI)", () => {
   }, 60_000);
 
   test("correct tab content is displayed for each tab", async () => {
-    const { sidebar, cleanup } = await setupRightSidebarView();
+    const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs", "review"]));
 
     try {
       // Switch to Costs tab and verify content
@@ -495,7 +500,7 @@ describeIntegration("RightSidebar (UI)", () => {
       fireEvent.click(reviewTab);
       await findSidebarPanel(sidebar, "review");
 
-      // Create a terminal via the "+" button and verify its content
+      // Create a terminal via "+" (New tab) and its launcher, and verify its content
       const terminalTab = await createTerminalTab(sidebar);
 
       await waitFor(() => {
@@ -512,6 +517,7 @@ describeIntegration("RightSidebar (UI)", () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
       // Clear any persisted width state
       updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, null);
+      seedLayout(["costs", "review"]);
     });
 
     try {
@@ -526,7 +532,7 @@ describeIntegration("RightSidebar (UI)", () => {
       );
 
       // Simulate drag resize to 500px
-      // Start on Costs tab (default)
+      // Start on Costs tab (seeded)
       const costsTab = await waitFor(
         () => {
           const tab = sidebar.querySelector('[role="tab"][aria-controls*="costs"]');
@@ -582,6 +588,7 @@ describeIntegration("RightSidebar (UI)", () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
       // Clear any persisted state
       updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, null);
+      seedLayout(["costs", "review"]);
     });
 
     try {
@@ -717,7 +724,7 @@ describeIntegration("RightSidebar (UI)", () => {
   test("split layout renders multiple panes with separate tablists", async () => {
     // Set up a split layout with two panes (top: costs, bottom: review)
     const splitLayout: RightSidebarLayoutState = {
-      version: 1,
+      version: 2,
       nextId: 10,
       root: {
         type: "split",
@@ -785,20 +792,7 @@ describeIntegration("RightSidebar (UI)", () => {
     });
 
     try {
-      fireEvent.click(
-        await findRequiredElement(
-          sidebar,
-          'button[aria-label="New terminal"]',
-          "New terminal button not found"
-        )
-      );
-
-      await waitFor(
-        () => {
-          expect(sidebar.querySelector('[role="tab"][aria-controls*="terminal:"]')).toBeTruthy();
-        },
-        { timeout: 10_000 }
-      );
+      await createTerminalTab(sidebar);
       expect(await env.orpc.terminal.listSessions({ workspaceId })).toHaveLength(1);
       // The oversized layout lives in memory only; localStorage keeps the last layout that fit.
       expect(window.localStorage.getItem(layoutKey)).toContain(tabsetId);

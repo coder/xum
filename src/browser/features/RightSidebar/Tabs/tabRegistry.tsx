@@ -13,6 +13,21 @@
  */
 
 import React from "react";
+import {
+  AppWindow,
+  Brain,
+  BugPlay,
+  ChartColumn,
+  FileText,
+  GitCompare,
+  Globe,
+  ListTree,
+  Monitor,
+  ScrollText,
+  Target,
+  Workflow,
+  type LucideIcon,
+} from "lucide-react";
 import { ErrorBoundary } from "@/browser/components/ErrorBoundary/ErrorBoundary";
 import { InstructionsTab } from "@/browser/components/InstructionsTab/InstructionsTab";
 import { OutputTab } from "@/browser/components/OutputTab/OutputTab";
@@ -108,6 +123,8 @@ export interface TabPanelContext {
 
 /** Static description of one non-terminal tab, including UI renderers. */
 export interface TabRegistration extends TabConfig {
+  /** Icon for the New tab launcher row. */
+  Icon: LucideIcon;
   /** Workspace-scope label component (subscribes to per-workspace stores as needed). */
   Label: React.ComponentType<TabLabelContext>;
   /** Renders the panel body. Receives a workspace-scoped context bag. */
@@ -116,6 +133,7 @@ export interface TabRegistration extends TabConfig {
 
 const TAB_RENDERERS = {
   costs: {
+    Icon: ChartColumn,
     Label: ({ workspaceId }) => <StatsTabLabel workspaceId={workspaceId} />,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Stats tab">
@@ -124,6 +142,7 @@ const TAB_RENDERERS = {
     ),
   },
   review: {
+    Icon: GitCompare,
     Label: ({ reviewStats }) => <ReviewTabLabel reviewStats={reviewStats} />,
     renderPanel: (ctx) => (
       <ReviewPanel
@@ -143,10 +162,12 @@ const TAB_RENDERERS = {
     ),
   },
   instructions: {
+    Icon: FileText,
     Label: ({ workspaceId }) => <InstructionsTabLabel workspaceId={workspaceId} />,
     renderPanel: (ctx) => <InstructionsTab workspaceId={ctx.workspaceId} />,
   },
   goal: {
+    Icon: Target,
     Label: ({ workspaceId }) => <GoalTabLabel workspaceId={workspaceId} />,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Goal tab">
@@ -166,6 +187,7 @@ const TAB_RENDERERS = {
     ),
   },
   timeline: {
+    Icon: ListTree,
     Label: TimelineTabLabel,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Timeline tab">
@@ -174,6 +196,7 @@ const TAB_RENDERERS = {
     ),
   },
   artifacts: {
+    Icon: AppWindow,
     Label: ArtifactsTabLabel,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Artifacts tab">
@@ -186,10 +209,12 @@ const TAB_RENDERERS = {
     ),
   },
   memory: {
+    Icon: Brain,
     Label: MemoryTabLabel,
     renderPanel: (ctx) => <MemoryTab workspaceId={ctx.workspaceId} />,
   },
   workflows: {
+    Icon: Workflow,
     Label: ({ workspaceId }) => <WorkflowsTabLabel workspaceId={workspaceId} />,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Workflows tab">
@@ -198,6 +223,7 @@ const TAB_RENDERERS = {
     ),
   },
   desktop: {
+    Icon: Monitor,
     Label: DesktopTabLabel,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Desktop tab">
@@ -206,6 +232,7 @@ const TAB_RENDERERS = {
     ),
   },
   browser: {
+    Icon: Globe,
     Label: BrowserTabLabel,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Browser tab">
@@ -214,10 +241,12 @@ const TAB_RENDERERS = {
     ),
   },
   output: {
+    Icon: ScrollText,
     Label: OutputTabLabel,
     renderPanel: (ctx) => <OutputTab workspaceId={ctx.workspaceId} />,
   },
   debug: {
+    Icon: BugPlay,
     Label: DebugTabLabel,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Debug tab">
@@ -228,6 +257,7 @@ const TAB_RENDERERS = {
 } satisfies Record<
   BaseTabType,
   {
+    Icon: LucideIcon;
     Label: React.ComponentType<TabLabelContext>;
     renderPanel: (ctx: TabPanelContext) => React.ReactNode;
   }

@@ -4,6 +4,9 @@ import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
 import type { APIClient } from "@/browser/contexts/API";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 
+/** Row names in the right sidebar's New tab launcher. */
+const LAUNCHER_TOOL_NAMES = { costs: "Stats", review: "Review", terminal: "Terminal" } as const;
+
 interface RenderReviewPanelParams {
   apiClient: APIClient;
   /** Metadata for the workspace to select (optional - app can render without a workspace) */
@@ -79,10 +82,23 @@ export function renderApp(props: RenderReviewPanelParams): RenderedApp {
           const tabButton = result.container.querySelector<HTMLElement>(
             `[role="tab"][aria-controls*="${tab}"]`
           );
-          if (!tabButton) {
-            throw new Error(`Tab "${tab}" not found`);
+          if (tabButton) {
+            tabButton.click();
+            return;
           }
-          tabButton.click();
+          // The strip holds only opened tabs: open the tool from a New tab's launcher, adding
+          // a New tab with "+" first when none is showing. The retry then selects the tab.
+          const launcherRow = Array.from(
+            result.container.querySelectorAll<HTMLElement>(
+              '[role="tabpanel"][id*="-panel-new"] button'
+            )
+          ).find((row) => row.getAttribute("aria-label") === LAUNCHER_TOOL_NAMES[tab]);
+          if (launcherRow) {
+            launcherRow.click();
+          } else {
+            result.container.querySelector<HTMLElement>('button[aria-label="New tab"]')?.click();
+          }
+          throw new Error(`Tab "${tab}" not open yet`);
         },
         { timeout: 5000 }
       );

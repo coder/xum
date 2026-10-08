@@ -356,6 +356,7 @@ describe("global keybind collisions", () => {
     "FOCUS_BACKGROUND_PROCESSES",
     "FOCUS_CHAT",
     "CLOSE_TAB",
+    "NEW_SIDEBAR_TAB",
     "OPEN_TIMELINE_DIALOG",
     "OPEN_STATS_DIALOG",
     "OPEN_ARTIFACTS_TAB",

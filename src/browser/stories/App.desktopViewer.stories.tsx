@@ -35,7 +35,7 @@ function setupDesktopStory(state: DesktopStoryState, sidebarWidth = 640) {
   updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
   updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, sidebarWidth);
   updatePersistedState(getRightSidebarLayoutKey(WORKSPACE_ID), {
-    version: 1,
+    version: 2,
     nextId: 2,
     focusedTabsetId: "desktop-tabset",
     root: { type: "tabset", id: "desktop-tabset", tabs: ["desktop"], activeTab: "desktop" },

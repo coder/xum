@@ -20,14 +20,26 @@ export type TabType =
   | `terminal:${string}`
   | "terminal"
   /** A /side chat of this workspace: "side:<sideChatWorkspaceId>". */
-  | `side:${string}`;
+  | `side:${string}`
+  /**
+   * The empty "New tab" (Codex-style): a launcher listing the tools a tabset can open. It is
+   * not a tool, so it stays out of BaseTabType (palette tool lists, presets, Hide/Show).
+   */
+  | "new";
+
+/** The "New tab" launcher tab. A tabset holds at most one. */
+export const NEW_TAB: TabType = "new";
+
+export function isNewTab(tab: TabType): boolean {
+  return tab === NEW_TAB;
+}
 
 const SIDE_CHAT_TAB_PREFIX = "side:";
 
-/** Check if a value is a valid tab type (base tab, terminal instance, or side chat). */
+/** Check if a value is a valid tab type (base tab, terminal instance, side chat, or New tab). */
 export function isTabType(value: unknown): value is TabType {
   if (typeof value !== "string") return false;
-  if (isBaseTabId(value)) return true;
+  if (isBaseTabId(value) || value === NEW_TAB) return true;
   if (value.startsWith(SIDE_CHAT_TAB_PREFIX)) return value.length > SIDE_CHAT_TAB_PREFIX.length;
   return value === "terminal" || value.startsWith("terminal:");
 }
