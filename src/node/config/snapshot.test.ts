@@ -3,6 +3,7 @@ import nativeFs, * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from ".";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { log } from "@/node/services/log";
 import type { ProjectConfig, ProjectsConfig, Workspace } from "@/common/types/project";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -547,17 +548,61 @@ describe("Config snapshots", () => {
   });
 
   it("builds the same metadata for a single id with just one checkout probe", async () => {
+    // Single-row readers (getInfo, metadata emits) rely on the by-id build returning exactly the
+    // row that `getAllWorkspaceMetadata().find(id)` returns, so cover the shapes where the two
+    // builds resolve identity differently: ancestors outside the built row set, cycles, duplicate
+    // ids (first row wins, as with .find), id-less legacy rows and the multi-project bucket.
+    const legacyPath = path.join(root, "legacy");
+    const legacyId = config.generateLegacyId(projectPath, legacyPath);
     await saveWorkspaces([
       workspace("root", { archivedAt: older }),
-      workspace("child", { parentWorkspaceId: "root" }),
+      workspace("mid", { parentWorkspaceId: "root", archivedAt: older }),
+      // Missing worktree checkout: both builds must mark it transcript-only.
+      workspace("child", {
+        parentWorkspaceId: "mid",
+        runtimeConfig: { type: "worktree", srcBaseDir: root },
+      }),
+      workspace("cycle-a", { parentWorkspaceId: "cycle-b" }),
+      workspace("cycle-b", { parentWorkspaceId: "cycle-a" }),
+      workspace("cycle-child", { parentWorkspaceId: "cycle-b" }),
+      workspace("dup", { title: "first" }),
+      workspace("dup", { title: "second" }),
+      // createdAt keeps the unpersisted legacy fallback stable across the two builds.
+      { path: legacyPath, createdAt: older },
+      workspace("legacy-child", { parentWorkspaceId: legacyId }),
     ]);
-    const all = await config.getAllWorkspaceMetadata();
+    await config.editConfig((snapshot) => {
+      snapshot.projects.set(MULTI_PROJECT_CONFIG_KEY, {
+        workspaces: [
+          workspace("multi", {
+            projects: [
+              { projectPath, projectName: "project" },
+              { projectPath: path.join(root, "other"), projectName: "other" },
+            ],
+          }),
+        ],
+      });
+      return snapshot;
+    });
+    // Keep the legacy row id-less on disk for every read below.
+    const all = await config.getAllWorkspaceMetadata({ persistMigrations: false });
+    const ids = [...new Set(all.map((metadata) => metadata.id))];
+    expect(ids).toContain(legacyId);
+    expect(ids).toContain("multi");
+    expect(all.find((metadata) => metadata.id === "child")?.transcriptOnly).toBe(true);
     const access = spyOn(fs.promises, "access");
     const enumerate = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() => {
       throw new Error("Unexpected full metadata enumeration");
     });
     try {
-      expect(await config.getWorkspaceMetadataById("child")).toEqual(all[1]);
+      for (const id of ids) {
+        access.mockClear();
+        const byId = await config.getWorkspaceMetadataById(id, { persistMigrations: false });
+        expect({ id, row: byId }).toEqual({ id, row: all.find((metadata) => metadata.id === id)! });
+        expect(access).toHaveBeenCalledTimes(1);
+      }
+      access.mockClear();
+      expect(await config.getWorkspaceMetadataById("child")).toEqual(all[2]);
       expect(access.mock.calls.map(([file]) => file)).toEqual([path.join(root, "child")]);
       expect(await config.getWorkspaceMetadataById("missing")).toBeNull();
       expect(access).toHaveBeenCalledTimes(1);
@@ -646,5 +691,255 @@ describe("Config snapshots", () => {
       release();
       access.mockRestore();
     }
+  });
+
+  // #5727 F1b amendment A2: F1b changes ensureWorkspaceIndex, which these read paths share, so
+  // every call on them must keep the base's exact operation counts. The tables hold the base's
+  // counts for each call from a cold build through cache hits, a same-value edit by this instance
+  // and an external replacement. The instrumentation lives only in this test.
+  describe("operation counts on the read paths F1b leaves unchanged (#5727 F1b A2)", () => {
+    interface Counts {
+      /** Replacements of the by-id index (Config.workspaceIndex). */
+      indexBuilds: number;
+      /**
+       * Element reads of `workspaces` arrays: parsed config.json (validation and normalization),
+       * the normalized snapshot, and every project list handed to buildWorkspaceMetadata.
+       */
+      rowsVisited: number;
+      /** loadConfigOrDefault calls on the Config under test. */
+      configLoads: number;
+      /** config.json reads from disk, sync or async. */
+      configFileReads: number;
+    }
+    interface Internals {
+      normalizeParsedConfig(parsed: unknown): ProjectsConfig;
+      buildWorkspaceMetadata: BuildWorkspaceMetadata;
+    }
+    type Run = (subject: Config, lastId: string, fresh: () => Config) => unknown;
+    /** A reader between every await of the edit, like the startup tombstone heal sweep. */
+    async function editWithReader(subject: Config, read: () => unknown) {
+      let reading = true;
+      const reader = () => {
+        if (!reading) return;
+        read();
+        setImmediate(reader);
+      };
+      setImmediate(reader);
+      try {
+        await subject.editConfig((snapshot) => snapshot);
+      } finally {
+        reading = false;
+      }
+      // Publishes the saved file if no reader turn ran after the rename, so the count is fixed.
+      read();
+    }
+    const paths: Record<string, Run> = {
+      "loadConfigOrDefault, fresh Config": (_subject, _id, fresh) => fresh().loadConfigOrDefault(),
+      "loadConfigOrDefault, snapshot hit": (subject) => subject.loadConfigOrDefault(),
+      "findWorkspace(last id)": (subject, id) => subject.findWorkspace(id),
+      "getAllWorkspaceMetadata, full build": (subject) => subject.getAllWorkspaceMetadata(),
+      "getAllWorkspaceMetadata, last-known probes": (subject) =>
+        subject.getAllWorkspaceMetadata({ probeCheckouts: "last-known" }),
+      "getAllWorkspaceMetadata, registry memo": (subject) =>
+        subject.getAllWorkspaceMetadata({ probeCheckouts: false }),
+      "getWorkspaceMetadataById(last id)": (subject, id) => subject.getWorkspaceMetadataById(id),
+      "editConfig, same-value edit": (subject) => subject.editConfig((snapshot) => snapshot),
+      "editConfig, then loadConfigOrDefault": async (subject) => {
+        await subject.editConfig((snapshot) => snapshot);
+        return subject.loadConfigOrDefault();
+      },
+      // The reader's own loads are not counted (their number follows event-loop turns); its disk
+      // reads, index builds and row visits are.
+      "editConfig, reader on every event-loop turn": (subject) =>
+        editWithReader(subject, Config.prototype.loadConfigOrDefault.bind(subject)),
+    };
+    /** Uncounted step before each counted call. */
+    const steps: Array<[string, (subject: Config) => Promise<unknown> | undefined]> = [
+      ["cold", () => undefined],
+      ["hit", () => undefined],
+      ["hit", () => undefined],
+      ["after own edit", (subject) => subject.editConfig((snapshot) => snapshot)],
+      ["hit", () => undefined],
+      ["after external replacement", () => new Config(root).editConfig((snapshot) => snapshot)],
+      ["hit", () => undefined],
+    ];
+
+    /** Counts every call of `steps` on each path; `seed` rewrites the fixture before each path. */
+    async function countCalls(seed: () => Promise<void>, lastId: string) {
+      const configPath = path.join(root, "config.json");
+      const counts: Counts = { indexBuilds: 0, rowsVisited: 0, configLoads: 0, configFileReads: 0 };
+      let counting = false;
+      const count = (key: keyof Counts) => {
+        if (counting) counts[key]++;
+      };
+      const tracked = new WeakSet<object>();
+      const track = (rows: unknown): unknown => {
+        if (!Array.isArray(rows) || tracked.has(rows)) return rows;
+        const proxy = new Proxy(rows, {
+          get(target, key, receiver) {
+            if (typeof key === "string" && /^(0|[1-9]\d*)$/.test(key)) count("rowsVisited");
+            return Reflect.get(target, key, receiver) as unknown;
+          },
+        });
+        tracked.add(proxy);
+        return proxy;
+      };
+      const instrument = (subject: Config): Config => {
+        // The index is replaced exactly when it is rebuilt.
+        const own = Object.getOwnPropertyDescriptor(subject, "workspaceIndex");
+        expect(own && "value" in own).toBe(true);
+        let index: unknown = own!.value;
+        Object.defineProperty(subject, "workspaceIndex", {
+          configurable: true,
+          get: () => index,
+          set: (next: unknown) => {
+            count("indexBuilds");
+            index = next;
+          },
+        });
+        const internals = subject as unknown as Internals;
+        const normalize = internals.normalizeParsedConfig.bind(subject);
+        spyOn(internals, "normalizeParsedConfig").mockImplementation((parsed) => {
+          const snapshot = normalize(parsed);
+          for (const project of snapshot.projects.values()) {
+            project.workspaces = track(project.workspaces) as Workspace[];
+          }
+          return snapshot;
+        });
+        const build = internals.buildWorkspaceMetadata.bind(subject);
+        spyOn(internals, "buildWorkspaceMetadata").mockImplementation(
+          (snapshot, projects, opts) => {
+            const list = [...projects];
+            for (const [, project] of list) {
+              project.workspaces = track(project.workspaces) as Workspace[];
+            }
+            return build(snapshot, list, opts);
+          }
+        );
+        const load = subject.loadConfigOrDefault.bind(subject);
+        spyOn(subject, "loadConfigOrDefault").mockImplementation((options) => {
+          count("configLoads");
+          return load(options);
+        });
+        return subject;
+      };
+      // Parsed config.json, before validation and normalization read it.
+      const jsonParse = JSON.parse.bind(JSON);
+      const parse = spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+        const value: unknown = jsonParse(text, reviver);
+        const projects = (value as { projects?: unknown } | null)?.projects;
+        if (Array.isArray(projects)) {
+          for (const entry of projects) {
+            const project: unknown = Array.isArray(entry) ? entry[1] : undefined;
+            if (project && typeof project === "object" && "workspaces" in project) {
+              project.workspaces = track(project.workspaces);
+            }
+          }
+        }
+        return value;
+      });
+      const read = spyOn(fs, "readFileSync");
+      const asyncRead = spyOn(fs.promises, "readFile");
+      const reads = () =>
+        read.mock.calls.filter(([file]) => file === configPath).length +
+        asyncRead.mock.calls.filter(([file]) => file === configPath).length;
+      const result: Record<string, string> = {};
+      try {
+        for (const [name, run] of Object.entries(paths)) {
+          await seed();
+          const subject = instrument(new Config(root));
+          const calls: string[] = [];
+          for (const [, before] of steps) {
+            await before(subject);
+            const readsBefore = reads();
+            Object.assign(counts, { indexBuilds: 0, rowsVisited: 0, configLoads: 0 });
+            counting = true;
+            try {
+              await run(subject, lastId, () => instrument(new Config(root)));
+            } finally {
+              counting = false;
+            }
+            const c = { ...counts, configFileReads: reads() - readsBefore };
+            calls.push(`${c.indexBuilds} ${c.rowsVisited} ${c.configLoads} ${c.configFileReads}`);
+          }
+          result[name] = calls.join(" | ");
+        }
+      } finally {
+        parse.mockRestore();
+        read.mockRestore();
+        asyncRead.mockRestore();
+      }
+      return result;
+    }
+
+    const seedRows = (legacyRow: boolean) => () =>
+      config.editConfig((snapshot) => {
+        snapshot.projects.set(projectPath, {
+          workspaces: [workspace("a1"), workspace("a2", { archivedAt: older }), workspace("a3")],
+        });
+        snapshot.projects.set(path.join(root, "second"), {
+          workspaces: [
+            ...(legacyRow ? [{ path: path.join(root, "legacy"), createdAt: older }] : []),
+            workspace("b1"),
+            workspace("b2", { archivedAt: older }),
+            workspace("last"),
+          ],
+        });
+        return snapshot;
+      });
+
+    // Each entry: "indexBuilds rowsVisited configLoads configFileReads" per call, in `steps`
+    // order (cold | hit | hit | after own edit | hit | after external replacement | hit).
+    // getAllWorkspaceMetadata never reads the by-id index, on the base or with F1b.
+    it("keeps the base's counts with every row persisted", async () => {
+      expect(await countCalls(seedRows(false), "last")).toEqual({
+        "loadConfigOrDefault, fresh Config":
+          "0 24 1 1 | 0 24 1 1 | 0 24 1 1 | 0 24 1 1 | 0 24 1 1 | 0 24 1 1 | 0 24 1 1",
+        "loadConfigOrDefault, snapshot hit":
+          "0 24 1 1 | 0 0 1 0 | 0 0 1 0 | 0 24 1 1 | 0 0 1 0 | 0 24 1 1 | 0 0 1 0",
+        "findWorkspace(last id)":
+          "1 30 1 1 | 0 0 1 0 | 0 0 1 0 | 1 30 1 1 | 0 0 1 0 | 1 30 1 1 | 0 0 1 0",
+        "getAllWorkspaceMetadata, full build":
+          "0 30 1 1 | 0 6 1 0 | 0 6 1 0 | 0 30 1 1 | 0 6 1 0 | 0 30 1 1 | 0 6 1 0",
+        "getAllWorkspaceMetadata, last-known probes":
+          "0 30 1 1 | 0 6 1 0 | 0 6 1 0 | 0 30 1 1 | 0 6 1 0 | 0 30 1 1 | 0 6 1 0",
+        "getAllWorkspaceMetadata, registry memo":
+          "0 30 1 1 | 0 0 1 0 | 0 0 1 0 | 0 30 1 1 | 0 0 1 0 | 0 30 1 1 | 0 0 1 0",
+        "getWorkspaceMetadataById(last id)":
+          "1 31 1 1 | 0 1 1 0 | 0 1 1 0 | 1 31 1 1 | 0 1 1 0 | 1 31 1 1 | 0 1 1 0",
+        "editConfig, same-value edit":
+          "0 54 1 2 | 0 54 1 2 | 0 54 1 2 | 0 54 1 2 | 0 54 1 2 | 0 54 1 2 | 0 54 1 2",
+        "editConfig, then loadConfigOrDefault":
+          "0 78 2 3 | 0 54 2 2 | 0 54 2 2 | 0 78 2 3 | 0 54 2 2 | 0 78 2 3 | 0 54 2 2",
+        "editConfig, reader on every event-loop turn":
+          "0 78 1 3 | 0 54 1 2 | 0 54 1 2 | 0 78 1 3 | 0 54 1 2 | 0 78 1 3 | 0 54 1 2",
+      });
+    });
+
+    it("keeps the base's counts with an id-less legacy row", async () => {
+      // The first full build also saves the legacy row's id, so its next call reloads.
+      expect(await countCalls(seedRows(true), "last")).toEqual({
+        "loadConfigOrDefault, fresh Config":
+          "0 28 1 1 | 0 28 1 1 | 0 28 1 1 | 0 28 1 1 | 0 28 1 1 | 0 28 1 1 | 0 28 1 1",
+        "loadConfigOrDefault, snapshot hit":
+          "0 28 1 1 | 0 0 1 0 | 0 0 1 0 | 0 28 1 1 | 0 0 1 0 | 0 28 1 1 | 0 0 1 0",
+        "findWorkspace(last id)":
+          "1 35 1 1 | 0 0 1 0 | 0 0 1 0 | 1 35 1 1 | 0 0 1 0 | 1 35 1 1 | 0 0 1 0",
+        "getAllWorkspaceMetadata, full build":
+          "0 71 2 2 | 0 35 1 1 | 0 7 1 0 | 0 35 1 1 | 0 7 1 0 | 0 35 1 1 | 0 7 1 0",
+        "getAllWorkspaceMetadata, last-known probes":
+          "0 71 2 2 | 0 35 1 1 | 0 7 1 0 | 0 35 1 1 | 0 7 1 0 | 0 35 1 1 | 0 7 1 0",
+        "getAllWorkspaceMetadata, registry memo":
+          "0 71 2 2 | 0 35 1 1 | 0 0 1 0 | 0 35 1 1 | 0 0 1 0 | 0 35 1 1 | 0 0 1 0",
+        "getWorkspaceMetadataById(last id)":
+          "1 36 1 1 | 0 1 1 0 | 0 1 1 0 | 1 36 1 1 | 0 1 1 0 | 1 36 1 1 | 0 1 1 0",
+        "editConfig, same-value edit":
+          "0 63 1 2 | 0 63 1 2 | 0 63 1 2 | 0 63 1 2 | 0 63 1 2 | 0 63 1 2 | 0 63 1 2",
+        "editConfig, then loadConfigOrDefault":
+          "0 91 2 3 | 0 63 2 2 | 0 63 2 2 | 0 91 2 3 | 0 63 2 2 | 0 91 2 3 | 0 63 2 2",
+        "editConfig, reader on every event-loop turn":
+          "0 91 1 3 | 0 63 1 2 | 0 63 1 2 | 0 91 1 3 | 0 63 1 2 | 0 91 1 3 | 0 63 1 2",
+      });
+    });
   });
 });
