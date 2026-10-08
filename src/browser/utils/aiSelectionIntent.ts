@@ -24,6 +24,8 @@ export type AiSelectionTokens = Partial<Record<AiSelectionField, number>>;
 interface PendingSelection {
   value: string;
   token: number;
+  /** A successful send carried it: it ends once the agent's saved bucket holds it. */
+  sent?: true;
 }
 
 export type WorkspaceAiMetadata = Pick<
@@ -57,6 +59,19 @@ export function setWorkspaceAiMetadata(workspaceId: string, metadata: WorkspaceA
   const previous = metadataByWorkspace.get(workspaceId);
   if (JSON.stringify(previous) === JSON.stringify(metadata)) return;
   metadataByWorkspace.set(workspaceId, metadata);
+  for (const agentId of Object.keys(metadata.aiSettingsByAgent ?? {})) {
+    const key = scopeKey(workspaceId, agentId);
+    const pending = pendingByScope.get(key);
+    if (pending == null) continue;
+    for (const field of Object.keys(pending) as AiSelectionField[]) {
+      const selection = pending[field];
+      // An unsent pick stays the composer's value even when it equals the saved one.
+      if (selection?.sent === true && isSavedPick(workspaceId, agentId, field, selection.value)) {
+        delete pending[field];
+      }
+    }
+    if (Object.keys(pending).length === 0) pendingByScope.delete(key);
+  }
   notify();
 }
 
@@ -87,6 +102,16 @@ export function getAgentBases(
 
 function normalizeAgent(agentId: string): string {
   return agentId.trim().toLowerCase() || WORKSPACE_DEFAULTS.agentId;
+}
+
+function isSavedPick(
+  workspaceId: string,
+  agentId: string,
+  field: AiSelectionField,
+  value: string
+): boolean {
+  const saved = metadataByWorkspace.get(workspaceId)?.aiSettingsByAgent?.[normalizeAgent(agentId)];
+  return saved != null && comparable(field, saved[field]) === value;
 }
 
 function scopeKey(workspaceId: string, agentId: string): string {
@@ -193,7 +218,10 @@ export function getAiSelectionIntentForSendOptions(
   };
 }
 
-/** Clears attached picks after a successful send, unless the user re-picked meanwhile. */
+/**
+ * After a successful send: an attached pick ends once the saved bucket holds it, so a save
+ * still in flight or failed keeps it. A re-pick made meanwhile has a new token and survives.
+ */
 export function consumeAiSelectionIntent(
   workspaceId: string,
   agentId: string,
@@ -204,7 +232,13 @@ export function consumeAiSelectionIntent(
   if (pending == null) return;
   const next = { ...pending };
   for (const field of Object.keys(attachedTokens) as AiSelectionField[]) {
-    if (next[field]?.token === attachedTokens[field]) delete next[field];
+    const selection = next[field];
+    if (selection == null || selection.token !== attachedTokens[field]) continue;
+    if (isSavedPick(workspaceId, agentId, field, selection.value)) {
+      delete next[field];
+    } else {
+      next[field] = { ...selection, sent: true };
+    }
   }
   if (Object.keys(next).length === 0) {
     pendingByScope.delete(key);

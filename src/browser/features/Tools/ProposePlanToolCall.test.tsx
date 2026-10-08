@@ -21,6 +21,8 @@ import {
   getAutoThinkingLevelKey,
 } from "@/common/constants/storage";
 import {
+  getPendingAiSelection,
+  markAiSelectionIntent,
   resetAiSelectionIntentForTests,
   setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
@@ -608,6 +610,27 @@ describe("ProposePlanToolCall", () => {
     } else {
       expect(JSON.parse(window.localStorage.getItem(agentKey)!)).toBe("exec");
     }
+  });
+
+  test("Implement sends the unsent Exec pick and ends it once it is saved", async () => {
+    const pickedModel = "openai:gpt-5.2-pro";
+    window.localStorage.setItem(getAgentIdKey(WORKSPACE_ID), JSON.stringify("exec"));
+    markAiSelectionIntent(WORKSPACE_ID, "model", pickedModel);
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    expect(sendMessageCalls[0]?.options.model).toBe(pickedModel);
+    setWorkspaceAiMetadata(WORKSPACE_ID, {
+      aiSettingsByAgent: { exec: { model: pickedModel, thinkingLevel: "high" } },
+    });
+    await waitFor(() =>
+      expect(getPendingAiSelection(WORKSPACE_ID, "exec", "model")).toBeUndefined()
+    );
   });
 
   test("Implement keeps the exec model when the composer has Auto routing selected", async () => {
