@@ -146,7 +146,7 @@ interface OpenRouterReasoningOptions {
     exclude?: boolean;
     // "max" is not in OpenRouter's generic low/medium/high set; it is the only
     // effort Kimi K3 accepts (model metadata supported_efforts: ["max"]).
-    effort?: "low" | "medium" | "high" | "max";
+    effort?: "none" | "low" | "medium" | "high" | "max";
   };
 }
 
@@ -784,14 +784,22 @@ export function buildProviderOptions(
     const reasoningEffort = isKimiK3Model(capabilityModel)
       ? "max"
       : OPENROUTER_REASONING_EFFORT[effectiveThinking];
+    // Haiku 5.5 reasons adaptively when `reasoning` is omitted, so "off" must
+    // disable it explicitly, as on the direct and Bedrock routes. OpenRouter
+    // documents effort "none" as disabling reasoning entirely.
+    const disableReasoning =
+      !reasoningEffort &&
+      effectiveThinking === "off" &&
+      anthropicThinksUnlessDisabled(capabilityModel);
 
     log.debug("buildProviderOptions: OpenRouter config", {
       reasoningEffort,
+      disableReasoning,
       thinkingLevel: effectiveThinking,
     });
 
     // OpenRouter spreads this namespace directly into the HTTP body.
-    if (reasoningEffort || serviceTier != null) {
+    if (reasoningEffort || disableReasoning || serviceTier != null) {
       const options = {
         openrouter: {
           ...(serviceTier != null && { service_tier: serviceTier }),
@@ -803,6 +811,7 @@ export function buildProviderOptions(
               exclude: false,
             },
           }),
+          ...(disableReasoning && { reasoning: { effort: "none" } }),
         },
       } satisfies { openrouter: OpenRouterReasoningOptions };
       log.debug("buildProviderOptions: Returning OpenRouter options", options);
