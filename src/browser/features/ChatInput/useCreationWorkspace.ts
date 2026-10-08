@@ -9,11 +9,7 @@ import type {
 } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
-import {
-  coerceOpenAIReasoningMode,
-  type OpenAIReasoningMode,
-  type ThinkingLevel,
-} from "@/common/types/thinking";
+import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import {
   getAutoRoutingKey,
@@ -25,7 +21,6 @@ import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePer
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
   getAgentIdKey,
-  getReasoningModeKey,
   getWorkspaceAISettingsByAgentKey,
   getPendingScopeId,
   getDraftScopeId,
@@ -178,16 +173,6 @@ function syncCreationPreferences(
     recordAutoRoutingChoiceForAgent(workspaceId, effectiveAgentId, routingChoice);
   }
 
-  // Carry the creation-time pro reasoning-mode choice into the new workspace's
-  // scope so it survives the project→workspace transition.
-  // Coerced so a corrupt persisted value is dropped instead of copied forward.
-  const projectReasoningMode = coerceOpenAIReasoningMode(
-    readPersistedState<OpenAIReasoningMode | null>(getReasoningModeKey(projectScopeId), null)
-  );
-  if (projectReasoningMode != null) {
-    updatePersistedState(getReasoningModeKey(workspaceId), projectReasoningMode);
-  }
-
   const projectModel = projectDefaults?.model;
   if (projectModel) {
     const effectiveThinking: ThinkingLevel = projectDefaults?.thinkingLevel ?? "off";
@@ -207,7 +192,6 @@ function syncCreationPreferences(
           [effectiveAgentId]: {
             model: projectModel,
             thinkingLevel: effectiveThinking,
-            ...(projectReasoningMode != null ? { reasoningMode: projectReasoningMode } : {}),
           },
         };
       },

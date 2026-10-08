@@ -64,7 +64,6 @@ import {
 } from "@/common/utils/subProjects";
 import {
   THINKING_LEVELS,
-  coerceOpenAIReasoningMode,
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
@@ -74,7 +73,6 @@ import {
   getAgentIdKey,
   getAgentsInitNudgeKey,
   getProjectScopeId,
-  getReasoningModeKey,
   getWorkspaceAISettingsByAgentKey,
   getWorkspaceLastReadKey,
   EXPANDED_PROJECTS_KEY,
@@ -517,6 +515,11 @@ function AppInner() {
       workspaceId ? getAiSelectionForWorkspace(workspaceId).thinkingLevel : "off",
     [getAiSelectionForWorkspace]
   );
+  const getReasoningModeForWorkspace = useCallback(
+    (workspaceId: string): OpenAIReasoningMode =>
+      workspaceId ? getAiSelectionForWorkspace(workspaceId).reasoningMode : "standard",
+    [getAiSelectionForWorkspace]
+  );
 
   // Pro mode is Responses-only; the palette command hides under chatCompletions
   // and on non-passthrough routes (mirroring the send path's header gating).
@@ -530,18 +533,6 @@ function AppInner() {
     (canonicalModel: string) => routing.resolveRoute(canonicalModel).route,
     [routing]
   );
-
-  const getReasoningModeForWorkspace = useCallback((workspaceId: string): OpenAIReasoningMode => {
-    if (!workspaceId) {
-      return "standard";
-    }
-    const stored = readPersistedState<OpenAIReasoningMode | null>(
-      getReasoningModeKey(workspaceId),
-      null
-    );
-    // Coerce untrusted persisted values so corrupt entries self-heal to "standard".
-    return coerceOpenAIReasoningMode(stored) ?? "standard";
-  }, []);
 
   // Palette picks stay in memory until a user message sends them.
   const setThinkingLevelFromPalette = useCallback(
@@ -613,7 +604,6 @@ function AppInner() {
       const model = getModelForWorkspace(workspaceId);
       const thinkingLevel = getThinkingLevelForWorkspace(workspaceId);
 
-      updatePersistedState(getReasoningModeKey(workspaceId), next);
       markAiSelectionIntent(workspaceId, "reasoningMode", next);
 
       type WorkspaceAISettingsByAgentCache = Partial<

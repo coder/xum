@@ -41,17 +41,10 @@ import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
-import {
-  getAgentIdKey,
-  getReasoningModeKey,
-  getAutoRoutingChoiceByAgentKey,
-  getWorkspaceAISettingsByAgentKey,
-} from "@/common/constants/storage";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
+import { getAgentIdKey, getAutoRoutingChoiceByAgentKey } from "@/common/constants/storage";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyAutoRoutingOutcome } from "@/browser/utils/modelChange";
-import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
@@ -67,15 +60,11 @@ import {
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import {
   resolveAutoRoutingForAgent,
-  resolveWorkspaceAiSettingsForAgent,
   type AutoRoutingChoiceByAgent,
   type AutoRoutingOutcome,
-  type WorkspaceAISettingsCache,
 } from "@/browser/utils/workspaceModeAi";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ReviewActionCallbacks } from "../Shared/InlineReviewNote";
 import { isPlanFilePath, normalizePlanFilePath } from "@/common/types/review";
-import type { OpenAIReasoningMode } from "@/common/types/thinking";
 import {
   Check,
   Clipboard,
@@ -161,13 +150,6 @@ function isTypingInNonEmptyField(element: Element | null): boolean {
     return element.value.trim() !== "";
   }
   return (element.textContent ?? "").trim() !== "";
-}
-
-/** Resolved (not yet persisted) AI settings for a plan action's target agent. */
-interface TargetAgentSettings {
-  resolvedReasoningMode: OpenAIReasoningMode;
-  existingReasoning: OpenAIReasoningMode;
-  autoRouting: AutoRoutingOutcome;
 }
 
 interface ProposePlanToolCallProps {
@@ -519,49 +501,19 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
   };
 
-  // User request: propose_plan primary actions send immediately after agent switch.
-  // Resolve and persist reasoning synchronously here so the follow-up message
-  // uses the target agent defaults instead of stale planning-mode preferences.
   /**
-   * The AI settings a plan action switches the workspace to. Pure read: nothing is persisted
-   * until `persistTargetAgentSettings` runs, so the handlers can await their preconditions
+   * The target agent's auto-routing outcome. Pure read: nothing is persisted until
+   * `persistTargetAgentSettings` runs, so the handlers can await their preconditions
    * (preference persistence, the transcript barrier) before any side effect.
    */
-  const resolveTargetAgentSettings = (args: {
+  const resolveTargetAgentRouting = (args: {
     workspaceId: string;
     targetAgentId: "auto" | "exec";
-  }): TargetAgentSettings => {
-    const reasoningKey = getReasoningModeKey(args.workspaceId);
-    const fallbackModel = getDefaultModel();
-
-    const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
-    const agentAiDefaults: AgentAiDefaults =
-      getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {};
-    const workspaceByAgent = readPersistedState<WorkspaceAISettingsCache>(
-      getWorkspaceAISettingsByAgentKey(args.workspaceId),
-      {}
-    );
-
-    const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
-    const target = getWorkspaceAiSelection(args.workspaceId, args.targetAgentId, agentBaseById);
-    // The resolver owns model and thinking; only reasoning comes from here.
-    const { resolvedReasoningMode } = resolveWorkspaceAiSettingsForAgent({
+  }): AutoRoutingOutcome =>
+    resolveAutoRoutingForAgent({
       agentId: args.targetAgentId,
-      agentAiDefaults,
-      // Propose-plan actions are explicit mode switches; honor any per-agent
-      // workspace override before inheriting the previously active plan settings.
-      workspaceByAgent,
-      useWorkspaceByAgentFallback: true,
-      fallbackModel,
-      existingModel: target.model,
-      existingThinking: target.thinkingLevel,
-      existingReasoningMode: existingReasoning,
-      agentBaseById,
-    });
-    const autoRouting = resolveAutoRoutingForAgent({
-      agentId: args.targetAgentId,
-      agentAiDefaults,
-      agentBaseById,
+      agentAiDefaults: getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {},
+      agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
       explicitSwitch: true,
       experimentEnabled: autoRoutingEnabled,
       routingChoices: readPersistedState<AutoRoutingChoiceByAgent>(
@@ -570,23 +522,15 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       ),
     });
 
-    return { resolvedReasoningMode, existingReasoning, autoRouting };
-  };
-
-  /** Switch the workspace to the resolved agent settings (synchronous, right before the send). */
+  /** Switch the workspace to the target agent (synchronous, right before the send). */
   const persistTargetAgentSettings = (args: {
     workspaceId: string;
     targetAgentId: "auto" | "exec";
-    settings: TargetAgentSettings;
+    autoRouting: AutoRoutingOutcome;
   }): void => {
-    const { settings } = args;
     updatePersistedState(getAgentIdKey(args.workspaceId), args.targetAgentId);
-    // Persist before getSendOptionsFromStorage reads the key for the follow-up send.
-    if (settings.existingReasoning !== settings.resolvedReasoningMode) {
-      updatePersistedState(getReasoningModeKey(args.workspaceId), settings.resolvedReasoningMode);
-    }
     // Persist routing for later composer sends; the immediate action below disables routing.
-    applyAutoRoutingOutcome(args.workspaceId, settings.autoRouting);
+    applyAutoRoutingOutcome(args.workspaceId, args.autoRouting);
   };
 
   /**
@@ -614,7 +558,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
     if (shouldReplaceChatHistory && !canReplaceChatHistory) return null;
 
-    const settings = resolveTargetAgentSettings({
+    const autoRouting = resolveTargetAgentRouting({
       workspaceId,
       targetAgentId: args.targetAgentId,
     });
@@ -631,7 +575,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         errorContext: args.replacementErrorContext,
       });
     }
-    persistTargetAgentSettings({ workspaceId, targetAgentId: args.targetAgentId, settings });
+    persistTargetAgentSettings({ workspaceId, targetAgentId: args.targetAgentId, autoRouting });
     // The target agent's resolved model and thinking level (its saved or configured settings).
     const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
     const sendResult = await api.workspace.sendMessage({

@@ -6,11 +6,7 @@ import {
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
-import {
-  readPersistedState,
-  updatePersistedState,
-  usePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   getProjectScopeId,
   getReasoningModeKey,
@@ -24,12 +20,8 @@ import { useMinThinkingLevels } from "@/browser/hooks/useMinThinkingLevels";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useAPI } from "@/browser/contexts/API";
 import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
-import {
-  getWorkspaceAiSettingsFromMetadata,
-  useWorkspaceAiSelection,
-} from "@/browser/utils/workspaceAiSettingsSync";
+import { useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { useOptionalAgent } from "@/browser/contexts/AgentContext";
-import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
@@ -62,7 +54,6 @@ function getScopeId(workspaceId: string | undefined, projectPath: string | undef
 
 export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   const { api } = useAPI();
-  const workspaceContext = useOptionalWorkspaceContext();
   const { getMinimum } = useMinThinkingLevels();
   // Resolve mapped aliases so keybind stepping walks the target model's ladder.
   const { config: providersConfig } = useProvidersConfig();
@@ -79,30 +70,22 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   );
   const scopedModel = useScopedAiDefault(defaultsScopeId, "model");
   const scopedThinkingLevel = useScopedAiDefault(defaultsScopeId, "thinkingLevel");
+  const [scopedReasoningMode, setScopedReasoningMode] =
+    usePersistedState<OpenAIReasoningMode | null>(getReasoningModeKey(defaultsScopeId), null, {
+      listener: true,
+    });
+
   // normalizeSelectedModel (not normalizeToCanonical): explicit gateway identities must
   // survive; thinking policy lookups resolve gateway-scoped strings themselves.
   const model =
     workspaceId != null ? selection.model : normalizeSelectedModel(scopedModel ?? defaultModel);
   const thinkingLevel =
     workspaceId != null ? selection.thinkingLevel : (scopedThinkingLevel ?? THINKING_LEVEL_OFF);
-  const metadataAgentId = readScopedAiDefault(scopeId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
-  const metadataSettings = getWorkspaceAiSettingsFromMetadata(
-    props.workspaceId ? workspaceContext?.workspaceMetadata.get(props.workspaceId) : undefined,
-    metadataAgentId
-  );
-
-  // Workspace-scoped OpenAI pro reasoning mode. Null = no explicit user choice yet;
-  // absent everywhere means "standard" (the API default).
-  const reasoningKey = getReasoningModeKey(scopeId);
-  const [persistedReasoningMode, setReasoningModeInternal] =
-    usePersistedState<OpenAIReasoningMode | null>(reasoningKey, null, { listener: true });
-  // Coerce untrusted persisted values (corrupt entries or a future downgrade) so
-  // bad state self-heals to "standard" instead of failing SendMessageOptionsSchema
-  // validation and bricking sends until storage is cleared.
+  // Coerce untrusted persisted values so bad state self-heals to "standard".
   const reasoningMode =
-    coerceOpenAIReasoningMode(persistedReasoningMode) ??
-    coerceOpenAIReasoningMode(metadataSettings.reasoningMode) ??
-    "standard";
+    workspaceId != null
+      ? selection.reasoningMode
+      : (coerceOpenAIReasoningMode(scopedReasoningMode) ?? "standard");
 
   // Keep picker choices local until a user message sends the full settings.
   const persistAgentAiSettings = useCallback(
@@ -145,18 +128,6 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
     [props.workspaceId, scopeId]
   );
 
-  // Read the sibling setting at call time (not from the render closure) so
-  // rapid interleaved updates cannot persist a stale counterpart value.
-  const getCurrentReasoningMode = useCallback(
-    (): OpenAIReasoningMode =>
-      coerceOpenAIReasoningMode(
-        readPersistedState<OpenAIReasoningMode | null>(reasoningKey, null)
-      ) ??
-      coerceOpenAIReasoningMode(metadataSettings.reasoningMode) ??
-      "standard",
-    [metadataSettings.reasoningMode, reasoningKey]
-  );
-
   // A workspace pick stays in memory until a user message sends it.
   const setThinkingLevel = useCallback(
     (level: ThinkingLevel) => {
@@ -169,28 +140,25 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
       // A concrete pick (selector row or keybind step) leaves thinking Auto,
       // mirroring setWorkspaceModelWithOrigin for the model dimension.
       setAutoRoutingChoice(scopeId, "thinkingLevel", false);
-      persistAgentAiSettings({
-        model,
-        thinkingLevel: level,
-        reasoningMode: getCurrentReasoningMode(),
-      });
+      persistAgentAiSettings({ model, thinkingLevel: level, reasoningMode });
       // Mid-turn change: also request the new level for the active turn's next model step.
       if (workspaceId != null) {
         requestActiveTurnThinkingLevel(api, workspaceId, level);
       }
     },
-    [api, getCurrentReasoningMode, model, persistAgentAiSettings, scopeId, workspaceId]
+    [api, model, persistAgentAiSettings, reasoningMode, scopeId, workspaceId]
   );
 
   const setReasoningMode = useCallback(
     (mode: OpenAIReasoningMode) => {
-      setReasoningModeInternal(mode);
-      if (props.workspaceId) {
-        markAiSelectionIntent(props.workspaceId, "reasoningMode", mode);
+      if (workspaceId != null) {
+        markAiSelectionIntent(workspaceId, "reasoningMode", mode);
+      } else {
+        setScopedReasoningMode(mode);
       }
       persistAgentAiSettings({ model, thinkingLevel, reasoningMode: mode });
     },
-    [model, persistAgentAiSettings, props.workspaceId, setReasoningModeInternal, thinkingLevel]
+    [model, persistAgentAiSettings, setScopedReasoningMode, thinkingLevel, workspaceId]
   );
 
   // Global keybinds for adjusting the thinking level.

@@ -1,13 +1,11 @@
 import {
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
-  getReasoningModeKey,
   getDisableWorkspaceAgentsKey,
 } from "@/common/constants/storage";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { buildSendMessageOptions } from "@/browser/utils/messages/buildSendMessageOptions";
 import type { SendMessageOptions } from "@/common/orpc/types";
-import { coerceOpenAIReasoningMode, type OpenAIReasoningMode } from "@/common/types/thinking";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
@@ -32,14 +30,6 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
   const agentId = readScopedAiDefault(workspaceId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
   const selection = getWorkspaceAiSelection(workspaceId, agentId);
 
-  // OpenAI pro reasoning mode (workspace-scoped); absent = standard.
-  // Coerce untrusted persisted values so corrupt entries self-heal to "standard"
-  // instead of failing SendMessageOptionsSchema on retry/resume/creation flows.
-  const reasoningMode =
-    coerceOpenAIReasoningMode(
-      readPersistedState<OpenAIReasoningMode | null>(getReasoningModeKey(workspaceId), null)
-    ) ?? "standard";
-
   const providerOptions = getProviderOptions();
 
   const disableWorkspaceAgents = readPersistedState<boolean>(
@@ -59,10 +49,8 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
     readPersistedState<boolean>(getAutoThinkingLevelKey(workspaceId), false) === true;
 
   return buildSendMessageOptions({
-    model: selection.model,
+    ...selection,
     agentId,
-    thinkingLevel: selection.thinkingLevel,
-    reasoningMode,
     providerOptions,
     disableWorkspaceAgents,
     autoModelRouting,

@@ -3,8 +3,6 @@ import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar } from "./helpers/uiState";
 import { blurActiveElement, waitForChatInputAutofocusDone } from "./storyPlayHelpers";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import { getReasoningModeKey } from "@/common/constants/storage";
 
 export default { ...appMeta, title: "App/Astra Pro" };
 
@@ -60,7 +58,6 @@ export const CoderGateway: AppStory = {
     await expect(pro).toHaveAttribute("aria-pressed", "false");
     await userEvent.click(pro);
     await expect(pro).toHaveAttribute("aria-pressed", "true");
-    await expect(readPersistedState(getReasoningModeKey(workspaceId), "standard")).toBe("pro");
     await expect(trigger).toHaveAccessibleName("Thinking: high, pro mode");
     // Keyboard activation must also disable Pro without changing reasoning effort.
     pro.focus();

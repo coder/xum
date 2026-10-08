@@ -12,11 +12,10 @@ import {
 } from "@/browser/contexts/WorkspaceContext";
 import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import {
   getAutoThinkingLevelKey,
   getProjectScopeId,
-  getReasoningModeKey,
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
 import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
@@ -354,7 +353,7 @@ describe("ThinkingContext", () => {
 
   test("setting thinking uses metadata model before global default", async () => {
     const workspaceId = "ws-set-thinking-metadata-model";
-    updatePersistedState(getReasoningModeKey(workspaceId), "pro");
+    markAiSelectionIntent(workspaceId, "reasoningMode", "pro");
     const updateAgentAISettings = mock<
       (args: WorkspaceUpdateAgentAISettingsArgs) => Promise<WorkspaceUpdateAgentAISettingsResult>
     >(() =>
@@ -480,21 +479,24 @@ describe("ThinkingContext", () => {
     expect(updateAgentAISettings).not.toHaveBeenCalled();
   });
 
-  test("self-heals corrupt persisted reasoningMode to standard but keeps valid pro", async () => {
-    // Corrupt persisted values (e.g. from a future downgrade) must coerce to
+  test("self-heals a corrupt saved reasoningMode to standard but keeps valid pro", async () => {
+    // Corrupt saved values (e.g. from a future downgrade) must coerce to
     // "standard" instead of flowing into SendMessageOptionsSchema and bricking sends.
     const cases = [
-      { workspaceId: "ws-reasoning-corrupt", persisted: "ultra", expected: "standard" },
-      { workspaceId: "ws-reasoning-valid", persisted: "pro", expected: "pro" },
+      { workspaceId: "ws-reasoning-corrupt", saved: "ultra", expected: "standard" },
+      { workspaceId: "ws-reasoning-valid", saved: "pro", expected: "pro" },
     ];
 
     for (const testCase of cases) {
-      const metadata = createWorkspaceMetadata({ id: testCase.workspaceId });
+      const metadata = createWorkspaceMetadata({
+        id: testCase.workspaceId,
+        aiSettings: {
+          model: "openai:gpt-5.5",
+          thinkingLevel: "high",
+          reasoningMode: testCase.saved as OpenAIReasoningMode,
+        },
+      });
       setWorkspaceMetadata(metadata);
-      window.localStorage.setItem(
-        getReasoningModeKey(testCase.workspaceId),
-        JSON.stringify(testCase.persisted)
-      );
 
       const view = renderWithWorkspaceMetadata({
         workspaceId: testCase.workspaceId,
