@@ -26,6 +26,7 @@ import type {
   ToolResultPart,
 } from "ai";
 import type { ModelMessage, MuxMessage } from "@/common/types/message";
+import type { ToolSearchToolResult } from "@/common/types/tools";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 
@@ -55,6 +56,27 @@ export const TOOL_SEARCH_MAX_LIMIT = 25;
  */
 export const NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS = 24_000;
 
+/**
+ * Keyword-search auto-load cap on a single deferred tool definition
+ * (description + JSON input schema chars). A weak keyword match must not
+ * silently load an oversized definition: once loaded it is carried for the
+ * rest of the session (wire tokens on every request plus permanent
+ * context-window pressure), while an explicit exact-name lookup costs one
+ * extra search round trip (roughly one cached transcript re-read).
+ *
+ * Chosen from a real 178-tool deferred catalog (2026-10): P95 is ~6.7k chars
+ * and the 8-15k band holds frequently wanted tools (page/issue editors), so a
+ * lower cap taxes ordinary searches with spurious round trips. Only three
+ * pathological query tools exceed 16k (17k/22k/80k chars; the 80k one ranked
+ * first for an unrelated query and cost ~31k tokens for the session, #5413
+ * audit). At 16k the smallest guarded tool (~6.4k tokens) already costs more
+ * to carry over a median ~45-request session than the one re-search trip.
+ */
+export const TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS = 16_000;
+
+/** Wire chars per token for approximate model-facing size labels (same measurement as #5405). */
+const TOOL_SEARCH_WIRE_CHARS_PER_TOKEN = 2.7;
+
 /** Size proxy for a tool definition on the wire: description plus JSON input schema. */
 function toolDefinitionChars(tool: Tool): number {
   const description = typeof tool.description === "string" ? tool.description.length : 0;
@@ -70,6 +92,13 @@ export interface ToolCatalogEntry {
   paramText: string;
   /** MCP server that provides this tool, when known (used for the catalog overview + scoring). */
   serverName?: string;
+  /**
+   * Definition size (description + JSON input schema chars) for the keyword
+   * auto-load cap. Optional so hand-built test entries stay small;
+   * buildToolCatalog, the only production constructor, always sets it, and an
+   * absent value is treated as small (never guarded).
+   */
+  definitionChars?: number;
 }
 
 /**
@@ -203,6 +232,7 @@ export function buildToolCatalog(inputs: ToolCatalogInputs): ToolCatalogClassifi
       description: typeof tool.description === "string" ? tool.description : "",
       paramText: extractParamText(tool),
       serverName: inputs.mcpToolServers?.[name],
+      definitionChars: toolDefinitionChars(tool),
     });
   }
 
@@ -665,13 +695,72 @@ export function searchToolCatalog(
   }
 
   scored.sort((a, b) => b.score - a.score || a.entry.name.localeCompare(b.entry.name));
-  return scored.slice(0, effectiveLimit).map(({ entry }) => ({
+  return scored.slice(0, effectiveLimit).map(({ entry }) => toToolSearchMatch(entry));
+}
+
+function toToolSearchMatch(entry: ToolCatalogEntry): ToolSearchMatch {
+  return {
     name: entry.name,
     description: entry.description,
     // Display label, not the raw name: an unbounded server-map key repeated
     // across up to 25 matches could inflate the result past provider limits.
     ...(entry.serverName !== undefined ? { serverName: displayServerLabel(entry.serverName) } : {}),
-  }));
+  };
+}
+
+export const TOOL_SEARCH_DISCOVERY_NOTE =
+  "No tools were loaded: a matched definition exceeds the auto-load size cap. " +
+  "To load a tool (any size), search again with its exact name as the entire query; " +
+  "narrow the keywords to load only the smaller candidates.";
+
+/**
+ * Resolve one tool_catalog_search query against the deferred catalog.
+ *
+ * Two paths (documented in the tool description):
+ * - Exact lookup: a query that is exactly one catalog tool's name (trimmed,
+ *   case-insensitive) returns and loads just that tool, any size, skipping
+ *   fuzzy ranking. This is the escape hatch the discovery note points at; it
+ *   cannot be re-guarded, so a discovery result never loops.
+ * - Keyword search: ranking unchanged. When any ranked match's definition
+ *   exceeds TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS, nothing is loaded
+ *   (`matches` stays empty, so activation, native tool_reference output, and
+ *   restart replay all skip it by construction) and every ranked candidate is
+ *   listed with its approximate token size instead — explicit discovery, never
+ *   a silent skip or a partial load the model cannot see in native mode
+ *   (a tool_result cannot mix tool_reference blocks with text).
+ */
+export function resolveToolSearchQuery(
+  catalog: readonly ToolCatalogEntry[],
+  query: string,
+  limit?: number | null
+): { query: string; matches: ToolSearchMatch[]; discovery?: ToolSearchToolResult["discovery"] } {
+  const trimmed = query.trim().toLowerCase();
+  const exact = catalog.find((entry) => entry.name.toLowerCase() === trimmed);
+  if (exact !== undefined) {
+    return { query, matches: [toToolSearchMatch(exact)] };
+  }
+  const matches = searchToolCatalog(catalog, query, limit);
+  const definitionChars = new Map(catalog.map((entry) => [entry.name, entry.definitionChars ?? 0]));
+  const isOversized = (name: string) =>
+    (definitionChars.get(name) ?? 0) > TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS;
+  if (!matches.some((match) => isOversized(match.name))) {
+    return { query, matches };
+  }
+  return {
+    query,
+    matches: [],
+    discovery: {
+      candidates: matches.map((match) => ({
+        name: match.name,
+        ...(match.serverName !== undefined ? { serverName: match.serverName } : {}),
+        approxTokens: Math.round(
+          (definitionChars.get(match.name) ?? 0) / TOOL_SEARCH_WIRE_CHARS_PER_TOKEN
+        ),
+        ...(isOversized(match.name) ? { oversized: true as const } : {}),
+      })),
+      note: TOOL_SEARCH_DISCOVERY_NOTE,
+    },
+  };
 }
 
 /** Read `matches[].name` strings from a defensively-parsed tool_catalog_search result value. */

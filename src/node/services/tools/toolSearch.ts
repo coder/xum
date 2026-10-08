@@ -11,7 +11,10 @@ import { tool } from "ai";
 import type { ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolSearchToolResult } from "@/common/types/tools";
-import { buildToolSearchModelOutput, searchToolCatalog } from "@/common/utils/tools/toolCatalog";
+import {
+  buildToolSearchModelOutput,
+  resolveToolSearchQuery,
+} from "@/common/utils/tools/toolCatalog";
 
 export const createToolSearchTool: ToolFactory = (config) => {
   // Captured at creation; `state` is assigned later, after the post-policy
@@ -28,11 +31,12 @@ export const createToolSearchTool: ToolFactory = (config) => {
       if (state == null) {
         return { query, matches: [], totalDeferred: 0 };
       }
-      const matches = searchToolCatalog(state.catalog, query, limit);
-      for (const match of matches) {
+      const resolved = resolveToolSearchQuery(state.catalog, query, limit);
+      // A discovery result has no matches, so it activates nothing.
+      for (const match of resolved.matches) {
         state.activatedToolNames.add(match.name);
       }
-      return { query, matches, totalDeferred: state.catalog.length };
+      return { ...resolved, totalDeferred: state.catalog.length };
     },
     // Read at call time: a model fallback can switch the stream between native
     // and scoped mode. The persisted output (and the UI) stays the raw result.
