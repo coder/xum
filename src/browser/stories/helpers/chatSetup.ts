@@ -108,6 +108,7 @@ export interface SimpleChatSetupOptions {
   /** Render the chat workspace as transcript-only (worktree gone; no composer). */
   transcriptOnly?: boolean;
   aiSettings?: FrontendWorkspaceMetadata["aiSettings"];
+  agentId?: string;
 }
 
 /**
@@ -126,6 +127,7 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
       projectPath,
       transcriptOnly: opts.transcriptOnly,
       aiSettings: opts.aiSettings,
+      agentId: opts.agentId,
     }),
     ...(opts.additionalWorkspaces ?? []),
   ];

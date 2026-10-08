@@ -10,15 +10,16 @@
  * pick never applies to Exec after a plan→exec handoff. Each pick gets a fresh token so
  * a re-pick made while an earlier send is outstanding survives that send's consume.
  * Pending picks are also the composer's unsent values (see resolveWorkspaceAiSelection),
- * next to the latest workspace AI metadata, so a reload drops an unsent pick.
+ * next to the latest workspace AI metadata, so a reload drops an unsent pick. An unsent
+ * agent pick lasts until the metadata's agent matches it.
  */
 import type { AiSelectionIntent } from "@/common/types/agentAiSettings";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { getAgentIdKey } from "@/common/constants/storage";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
+import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
 import assert from "@/common/utils/assert";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 
 export type AiSelectionField = keyof AiSelectionIntent;
 export type AiSelectionTokens = Partial<Record<AiSelectionField, number>>;
@@ -32,9 +33,12 @@ export type WorkspaceAiMetadata = Pick<
   FrontendWorkspaceMetadata,
   "aiSettings" | "aiSettingsByAgent"
 > &
-  Partial<Pick<FrontendWorkspaceMetadata, "projectPath">>;
+  Partial<
+    Pick<FrontendWorkspaceMetadata, "projectPath" | "agentId" | "agentType" | "parentWorkspaceId">
+  >;
 
 const pendingByScope = new Map<string, Partial<Record<AiSelectionField, PendingSelection>>>();
+const pendingAgentByWorkspace = new Map<string, string>();
 const metadataByWorkspace = new Map<string, WorkspaceAiMetadata>();
 const listeners = new Set<() => void>();
 let nextToken = 1;
@@ -54,10 +58,21 @@ export function getAiSelectionVersion(): number {
   return version;
 }
 
-export function setWorkspaceAiMetadata(workspaceId: string, metadata: WorkspaceAiMetadata): void {
+export function setWorkspaceAiMetadata(workspaceId: string, source: WorkspaceAiMetadata): void {
+  const metadata: WorkspaceAiMetadata = {
+    projectPath: source.projectPath,
+    agentId: source.agentId,
+    agentType: source.agentType,
+    parentWorkspaceId: source.parentWorkspaceId,
+    aiSettings: source.aiSettings,
+    aiSettingsByAgent: source.aiSettingsByAgent,
+  };
   const previous = metadataByWorkspace.get(workspaceId);
   if (JSON.stringify(previous) === JSON.stringify(metadata)) return;
   metadataByWorkspace.set(workspaceId, metadata);
+  if (pendingAgentByWorkspace.get(workspaceId) === resolvePersistedAgentId(metadata, "")) {
+    pendingAgentByWorkspace.delete(workspaceId);
+  }
   notify();
 }
 
@@ -67,6 +82,36 @@ export function getWorkspaceAiMetadata(workspaceId: string): WorkspaceAiMetadata
 
 function normalizeAgent(agentId: string): string {
   return agentId.trim().toLowerCase() || WORKSPACE_DEFAULTS.agentId;
+}
+
+/** The workspace's agent without an unsent pick: metadata, then project and global defaults. */
+function getSavedWorkspaceAgentId(workspaceId: string): string {
+  const metadata = metadataByWorkspace.get(workspaceId);
+  const ai = getUserPreferences().ai;
+  const projectAgentId =
+    metadata?.projectPath != null
+      ? ai?.projectDefaults?.[metadata.projectPath]?.agentId
+      : undefined;
+  return (
+    resolvePersistedAgentId(metadata, "") ||
+    normalizeAgentId(projectAgentId, "") ||
+    normalizeAgentId(ai?.globalDefaults?.agentId, WORKSPACE_DEFAULTS.agentId)
+  );
+}
+
+export function getWorkspaceAgentId(workspaceId: string): string {
+  return pendingAgentByWorkspace.get(workspaceId) ?? getSavedWorkspaceAgentId(workspaceId);
+}
+
+/** Records an unsent agent pick; picking the saved agent drops the pick. */
+export function setWorkspaceAgentPick(workspaceId: string, agentId: string): void {
+  const normalized = normalizeAgentId(agentId, WORKSPACE_DEFAULTS.agentId);
+  if (normalized === getSavedWorkspaceAgentId(workspaceId)) {
+    pendingAgentByWorkspace.delete(workspaceId);
+  } else {
+    pendingAgentByWorkspace.set(workspaceId, normalized);
+  }
+  notify();
 }
 
 function scopeKey(workspaceId: string, agentId: string): string {
@@ -90,11 +135,7 @@ export function markAiSelectionIntent(
   field: AiSelectionField,
   value: string
 ): void {
-  const agentId = readPersistedState<string>(
-    getAgentIdKey(workspaceId),
-    WORKSPACE_DEFAULTS.agentId
-  );
-  const key = scopeKey(workspaceId, agentId);
+  const key = scopeKey(workspaceId, getWorkspaceAgentId(workspaceId));
   const normalized = comparable(field, value);
   assert(normalized != null, "markAiSelectionIntent: value must be non-empty");
   const token = nextToken++;
@@ -205,6 +246,7 @@ export function dropPendingModelPicks(shouldDrop: (model: string) => boolean): v
 /** Test-only: forget all pending picks and metadata. */
 export function resetAiSelectionIntentForTests(): void {
   pendingByScope.clear();
+  pendingAgentByWorkspace.clear();
   metadataByWorkspace.clear();
   notify();
 }

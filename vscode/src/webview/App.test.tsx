@@ -5,11 +5,10 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { Profiler } from "react";
 
 import { installDom } from "../../../tests/ui/dom";
-import { updatePersistedState } from "xum/browser/hooks/usePersistedState";
-import { getAgentIdKey } from "xum/common/constants/storage";
 import {
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
+  setWorkspaceAgentPick,
 } from "xum/browser/utils/aiSelectionIntent";
 import { formatModelDisplayName } from "xum/common/utils/ai/modelDisplay";
 import { getAppConfigStore, getUserPreferences } from "xum/browser/stores/AppConfigStore";
@@ -1394,7 +1393,7 @@ describe("vscode webview workspace AI settings", () => {
     });
     // A stale local pick must not change the agent a child task runs with.
     await act(async () => {
-      updatePersistedState(getAgentIdKey(WORKSPACE.id), "plan");
+      setWorkspaceAgentPick(WORKSPACE.id, "plan");
       await Promise.resolve();
     });
 
@@ -2484,7 +2483,7 @@ describe("vscode webview retry barrier (#5092)", () => {
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, failedTurn("network"), subAgent);
     await act(async () => {
-      updatePersistedState(getAgentIdKey(subAgent.id), "plan");
+      setWorkspaceAgentPick(subAgent.id, "plan");
       await Promise.resolve();
     });
 
@@ -2498,7 +2497,7 @@ describe("vscode webview retry barrier (#5092)", () => {
     await selectWorkspace(bridge, [userRow("u1", 1)], subAgent);
     await stopMidStream(bridge);
     await act(async () => {
-      updatePersistedState(getAgentIdKey(subAgent.id), "plan");
+      setWorkspaceAgentPick(subAgent.id, "plan");
       await Promise.resolve();
     });
 

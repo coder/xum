@@ -15,12 +15,9 @@ import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { getAutoModelRoutingKey, getAutoThinkingLevelKey } from "@/common/constants/storage";
 import {
-  getAgentIdKey,
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
-} from "@/common/constants/storage";
-import {
+  getWorkspaceAgentId,
   resetAiSelectionIntentForTests,
   setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
@@ -326,10 +323,10 @@ function startInPlanMode(
   model?: string,
   thinkingLevel: ThinkingLevel = "off"
 ) {
-  window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("plan"));
-  if (model) {
-    setWorkspaceAiMetadata(workspaceId, { aiSettingsByAgent: { plan: { model, thinkingLevel } } });
-  }
+  setWorkspaceAiMetadata(workspaceId, {
+    agentId: "plan",
+    ...(model ? { aiSettingsByAgent: { plan: { model, thinkingLevel } } } : {}),
+  });
 }
 
 function recordSendMessage(calls: SendMessageArgs[]): MockApi["workspace"]["sendMessage"] {
@@ -596,18 +593,7 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.autoThinkingLevel).toBe(false);
 
     // Clicking Implement should switch the workspace agent to exec.
-    //
-    // Note: some tests in this repo mock the `usePersistedState` module globally. In that case,
-    // `updatePersistedState` won't actually write to localStorage here, so we assert the call.
-    const agentKey = getAgentIdKey(WORKSPACE_ID);
-    const updatePersistedStateMaybeMock = updatePersistedState as unknown as {
-      mock?: { calls: unknown[][] };
-    };
-    if (updatePersistedStateMaybeMock.mock) {
-      expect(updatePersistedState).toHaveBeenCalledWith(agentKey, "exec");
-    } else {
-      expect(JSON.parse(window.localStorage.getItem(agentKey)!)).toBe("exec");
-    }
+    expect(getWorkspaceAgentId(WORKSPACE_ID)).toBe("exec");
   });
 
   test("Implement keeps the exec model when the composer has Auto routing selected", async () => {
@@ -656,9 +642,9 @@ describe("ProposePlanToolCall", () => {
     const execWorkspaceModel = "openai:gpt-5.2-pro";
     const execWorkspaceThinking = "medium";
 
-    window.localStorage.setItem(getAgentIdKey(WORKSPACE_ID), JSON.stringify("plan"));
     setTestAgentAiDefaults({});
     setWorkspaceAiMetadata(WORKSPACE_ID, {
+      agentId: "plan",
       aiSettingsByAgent: {
         plan: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "high" },
         exec: { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking },

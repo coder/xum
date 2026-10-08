@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   consumeAiSelectionIntent,
   getAiSelectionIntentForSend,
@@ -10,8 +9,8 @@ import {
   getPendingAiSelection,
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
+  setWorkspaceAgentPick,
 } from "@/browser/utils/aiSelectionIntent";
-import { getAgentIdKey } from "@/common/constants/storage";
 
 const WS = "intent-ws";
 const MODEL_A = "openai:gpt-5.2";
@@ -25,7 +24,6 @@ describe("aiSelectionIntent", () => {
     globalThis.localStorage = globalThis.window.localStorage;
     globalThis.localStorage.clear();
     resetAiSelectionIntentForTests();
-    updatePersistedState(getAgentIdKey(WS), "exec");
   });
 
   afterEach(() => {
@@ -73,7 +71,7 @@ describe("aiSelectionIntent", () => {
   });
 
   test("a pick scoped to Plan does not apply to Exec", () => {
-    updatePersistedState(getAgentIdKey(WS), "plan");
+    setWorkspaceAgentPick(WS, "plan");
     markAiSelectionIntent(WS, "model", MODEL_A);
     expect(getAiSelectionIntentForSend(WS, "exec", { model: MODEL_A }).intent).toBeUndefined();
     expect(getPendingAiSelection(WS, "exec", "model")).toBeUndefined();

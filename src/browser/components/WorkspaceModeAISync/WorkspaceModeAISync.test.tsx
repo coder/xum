@@ -12,12 +12,8 @@ import {
   setTestAgentAiDefaults,
   setTestExperiment,
 } from "@/browser/testUtils";
-import {
-  getAgentIdKey,
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
-} from "@/common/constants/storage";
+import { getAutoModelRoutingKey, getAutoThinkingLevelKey } from "@/common/constants/storage";
+import { setWorkspaceAgentPick, setWorkspaceAiMetadata } from "@/browser/utils/aiSelectionIntent";
 
 import { WorkspaceModeAISync } from "../WorkspaceModeAISync/WorkspaceModeAISync";
 
@@ -124,12 +120,12 @@ describe("WorkspaceModeAISync", () => {
     });
 
     function renderAt(workspaceId: string, agentId: string) {
-      updatePersistedState(getAgentIdKey(workspaceId), agentId);
+      setWorkspaceAgentPick(workspaceId, agentId);
       return renderSync({ workspaceId, agentId });
     }
 
     function switchTo(rerender: (ui: ReactElement) => void, workspaceId: string, agentId: string) {
-      updatePersistedState(getAgentIdKey(workspaceId), agentId);
+      setWorkspaceAgentPick(workspaceId, agentId);
       rerender(<SyncHarness workspaceId={workspaceId} agentId={agentId} />);
     }
 
@@ -166,8 +162,8 @@ describe("WorkspaceModeAISync", () => {
       cleanup();
 
       const legacy = nextWorkspaceId();
-      updatePersistedState(getWorkspaceAISettingsByAgentKey(legacy), {
-        exec: { model: "openai:gpt-5.2", thinkingLevel: "low" },
+      setWorkspaceAiMetadata(legacy, {
+        aiSettingsByAgent: { exec: { model: "openai:gpt-5.2", thinkingLevel: "low" } },
       });
       renderAt(legacy, "exec");
       expect(readAuto(legacy)).toEqual({ model: false, thinkingLevel: false });

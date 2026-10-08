@@ -3,7 +3,7 @@ import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals"
 import { GlobalWindow } from "happy-dom";
 
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
+import { markAiSelectionIntent, setWorkspaceAgentPick } from "@/browser/utils/aiSelectionIntent";
 import {
   consumeWorkspaceModelChange,
   recordAutoRoutingChoiceForAgent,
@@ -12,7 +12,6 @@ import {
 } from "@/browser/utils/modelChange";
 import {
   AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS,
-  getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
 } from "@/common/constants/storage";
@@ -55,7 +54,7 @@ describe("modelChange", () => {
 
   test("records workspace routing picks per agent without a local experiment override", () => {
     const workspaceId = nextWorkspaceId();
-    updatePersistedState(getAgentIdKey(workspaceId), "plan");
+    setWorkspaceAgentPick(workspaceId, "plan");
 
     setAutoRoutingChoice(workspaceId, "thinkingLevel", true);
     setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "user");

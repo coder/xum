@@ -14,7 +14,6 @@ import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/W
 import {
   LAST_VISITED_ROUTE_KEY,
   SELECTED_WORKSPACE_KEY,
-  getAgentIdKey,
   getDraftScopeId,
   getModelKey,
   getRightSidebarLayoutKey,
@@ -24,9 +23,13 @@ import {
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
-import { getWorkspaceAiMetadata } from "@/browser/utils/aiSelectionIntent";
+import {
+  getWorkspaceAgentId,
+  getWorkspaceAiMetadata,
+  setWorkspaceAgentPick,
+} from "@/browser/utils/aiSelectionIntent";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { resetWorkspaceStorageGcForTests } from "@/browser/utils/workspaceStorageGc";
 import { resetCreationDraftStorageGcForTests } from "@/browser/utils/creationDraftStorageGc";
@@ -540,10 +543,10 @@ describe("WorkspaceContext", () => {
     }
   );
 
-  test.each(["unchanged", "mode", "model"])("keeps local choices: %s", async (change) => {
+  test.each(["unchanged", "mode", "model"])("keeps an unsent agent pick: %s", async (change) => {
     const changed = change !== "unchanged";
     const nextAgentId = change === "mode" ? "auto" : "plan";
-    const workspaceId = "ws-agent-main";
+    const workspaceId = `ws-agent-main-${change}`;
     const saved = createWorkspaceMetadata({
       id: workspaceId,
       agentId: "plan",
@@ -569,19 +572,16 @@ describe("WorkspaceContext", () => {
             })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
           ),
       },
-      localStorage: {
-        [getAgentIdKey(workspaceId)]: JSON.stringify("exec"),
-      },
     });
 
     const ctx = await setup();
 
     await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
     await waitFor(() => expect(emitMetadata).toBeTruthy());
-    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("plan");
+    expect(getWorkspaceAgentId(workspaceId)).toBe("plan");
 
     act(() => {
-      updatePersistedState(getAgentIdKey(workspaceId), "exec");
+      setWorkspaceAgentPick(workspaceId, "exec");
       emitMetadata?.({
         workspaceId,
         metadata: {
@@ -602,10 +602,10 @@ describe("WorkspaceContext", () => {
     await waitFor(() =>
       expect(ctx().workspaceMetadata.get(workspaceId)?.title).toBe("Updated title")
     );
-    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("exec");
+    expect(getWorkspaceAgentId(workspaceId)).toBe("exec");
   });
 
-  test("child workspace metadata still seeds the locked backend agent", async () => {
+  test("child workspace metadata resolves the locked backend agent", async () => {
     const workspaceId = "ws-agent-child";
 
     createMockAPI({
@@ -615,12 +615,10 @@ describe("WorkspaceContext", () => {
             createWorkspaceMetadata({
               id: workspaceId,
               parentWorkspaceId: "ws-parent",
+              agentId: "exec",
               agentType: "plan",
             }),
           ]),
-      },
-      localStorage: {
-        [getAgentIdKey(workspaceId)]: JSON.stringify("exec"),
       },
     });
 
@@ -628,9 +626,7 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
 
-    expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
-      "plan"
-    );
+    expect(getWorkspaceAgentId(workspaceId)).toBe("plan");
   });
 
   test("loads workspace metadata on mount", async () => {

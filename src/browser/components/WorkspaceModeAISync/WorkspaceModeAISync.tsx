@@ -2,15 +2,12 @@ import { useEffect, useRef } from "react";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { useAgentAiDefaults } from "@/browser/stores/AppConfigStore";
-import {
-  getAutoRoutingChoiceByAgentKey,
-  getWorkspaceAISettingsByAgentKey,
-} from "@/common/constants/storage";
+import { getAutoRoutingChoiceByAgentKey } from "@/common/constants/storage";
+import { getWorkspaceAiMetadata } from "@/browser/utils/aiSelectionIntent";
 import { applyAutoRoutingOutcome, recordWorkspaceModelChange } from "@/browser/utils/modelChange";
 import {
   resolveAutoRoutingForAgent,
   type AutoRoutingChoiceByAgent,
-  type WorkspaceAISettingsCache,
 } from "@/browser/utils/workspaceModeAi";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
@@ -64,10 +61,7 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
         getAutoRoutingChoiceByAgentKey(workspaceId),
         {}
       ),
-      workspaceByAgent: readPersistedState<WorkspaceAISettingsCache>(
-        getWorkspaceAISettingsByAgentKey(workspaceId),
-        {}
-      ),
+      workspaceByAgent: getWorkspaceAiMetadata(workspaceId)?.aiSettingsByAgent,
     });
     applyAutoRoutingOutcome(workspaceId, autoRoutingOutcome);
   }, [agentAiDefaults, agentId, agents, autoRoutingEnabled, workspaceId]);

@@ -37,7 +37,7 @@ import {
 } from "xum/browser/stores/BackgroundBashStore";
 import { useChatViewDataReadyDeadline } from "xum/browser/components/ChatPane/useChatViewDataReady";
 import { mergeConsecutiveStreamErrors } from "xum/browser/utils/messages/messageUtils";
-import { seedWorkspaceLocalStorageFromBackend } from "xum/browser/contexts/WorkspaceContext";
+import { setWorkspaceAiMetadata } from "xum/browser/utils/aiSelectionIntent";
 import { WorkspaceModeAISync } from "xum/browser/components/WorkspaceModeAISync/WorkspaceModeAISync";
 import { resolvePersistedAgentId } from "xum/common/utils/agentIds";
 import {
@@ -127,7 +127,7 @@ function WebviewChatProviders(props: {
         props.workspaceAi
           ? {
               parentWorkspaceId: props.workspaceAi.parentWorkspaceId,
-              // Same identity resolution as the seeding: a child task's creation-time agentType
+              // Same identity resolution as the composer: a child task's creation-time agentType
               // wins over an agentId restamped by a recovery send.
               agentId: resolvePersistedAgentId(props.workspaceAi, "") || undefined,
             }
@@ -537,16 +537,13 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
           return;
         }
         case "workspaces":
-          // Seed each workspace's persisted agent/AI settings into the composer's storage, with the
-          // desktop's own rules (#4738): a main workspace is snapshotted once per webview load, a
-          // sub-agent workspace follows its backend settings.
+          // The composer resolves each workspace's agent and AI settings from them (#4738).
           for (const workspace of msg.workspaces) {
             if (!workspace.ai) continue;
-            const previousAi = workspacesRef.current.find((w) => w.id === workspace.id)?.ai;
-            seedWorkspaceLocalStorageFromBackend(
-              { id: workspace.id, projectPath: workspace.projectPath, ...workspace.ai },
-              previousAi ? { id: workspace.id, ...previousAi } : undefined
-            );
+            setWorkspaceAiMetadata(workspace.id, {
+              projectPath: workspace.projectPath,
+              ...workspace.ai,
+            });
           }
           workspacesRef.current = msg.workspaces;
           setWorkspaces(msg.workspaces);

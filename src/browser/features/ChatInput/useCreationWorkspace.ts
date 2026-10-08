@@ -19,7 +19,6 @@ import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
-  getAgentIdKey,
   getPendingScopeId,
   getDraftScopeId,
   getPendingDraftSkillDiscoveryKey,
@@ -143,7 +142,6 @@ function syncCreationPreferences(
       : normalizeAgentId(globalDefaultAgentId, WORKSPACE_DEFAULTS.agentId),
     agentBaseById
   );
-  updatePersistedState(getAgentIdKey(workspaceId), effectiveAgentId);
 
   // Preserve only creation choices that differ from configured defaults; recording
   // defaults would prevent later Settings changes from taking effect.

@@ -1,17 +1,14 @@
 import {
   AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS,
-  getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
   getAutoThinkingLevelKey,
 } from "@/common/constants/storage";
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
-import { normalizeAgentId } from "@/common/utils/agentIds";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
-import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
+import { getWorkspaceAgentId, markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import type { AutoRoutingChoiceByAgent, AutoRoutingOutcome } from "@/browser/utils/workspaceModeAi";
 import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
@@ -126,11 +123,7 @@ function recordAutoRoutingChoice(
   auto: boolean
 ): void {
   if (scopeId.length === 0 || scopeId.startsWith("__")) return;
-  const agentId = normalizeAgentId(
-    readPersistedState<string>(getAgentIdKey(scopeId), WORKSPACE_DEFAULTS.agentId),
-    WORKSPACE_DEFAULTS.agentId
-  );
-  recordAutoRoutingChoiceForAgent(scopeId, agentId, { [dimension]: auto });
+  recordAutoRoutingChoiceForAgent(scopeId, getWorkspaceAgentId(scopeId), { [dimension]: auto });
 }
 
 export function recordAutoRoutingChoiceForAgent(

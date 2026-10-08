@@ -99,10 +99,9 @@ export const ProposePlanInPlanMode: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        window.localStorage.setItem("agentId:ws-plan-mode", JSON.stringify("plan"));
-
         return setupSimpleChatStory({
           workspaceId: "ws-plan-mode",
+          agentId: "plan",
           messages: [
             createUserMessage("msg-1", "Help me refactor the authentication module", {
               historySequence: 1,

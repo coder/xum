@@ -11,8 +11,8 @@ import type { FrontendWorkspaceMetadata } from "xum/common/types/workspace";
 export type UiWorkspaceRuntimeType = "local" | "worktree" | "ssh";
 
 /**
- * The workspace's persisted agent and AI settings: exactly the fields the webview needs to seed its
- * composer (seedWorkspaceLocalStorageFromBackend) and apply the sub-agent agent lock (#4738).
+ * The workspace's persisted agent and AI settings: exactly the fields the webview needs to resolve
+ * its composer (setWorkspaceAiMetadata) and apply the sub-agent agent lock (#4738).
  * Deliberately narrow: no paths, prompts, runtime settings or other metadata.
  */
 export type UiWorkspaceAiState = Pick<

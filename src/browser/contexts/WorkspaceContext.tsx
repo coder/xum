@@ -13,17 +13,14 @@ import {
 import { useLocation } from "react-router-dom";
 import type { FrontendWorkspaceMetadata, WorkspaceRemoveResult } from "@/common/types/workspace";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
-import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { WorkspaceSelection } from "@/browser/components/ProjectSidebar/ProjectSidebar";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { DeepLinkPayload } from "@/common/types/deepLink";
 import {
-  getAgentIdKey,
   getDraftScopeId,
   getPendingScopeId,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
-  getWorkspaceAISettingsByAgentKey,
   getWorkspaceNameStateKey,
   SELECTED_WORKSPACE_KEY,
 } from "@/common/constants/storage";
@@ -46,7 +43,6 @@ import { appendPinnedTimestamp, reassignPinnedTimestamps } from "@/common/utils/
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
 import { useRouter } from "@/browser/contexts/RouterContext";
-import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
 import { setWorkspaceAiMetadata } from "@/browser/utils/aiSelectionIntent";
 import type { APIClient } from "@/browser/contexts/API";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -63,84 +59,6 @@ import {
   type WorkspaceDraft,
 } from "@/browser/stores/DraftStore";
 import { createDraftId } from "@/common/utils/drafts";
-
-/**
- * Record backend workspace AI metadata for the AI selection resolver and seed the
- * per-workspace agent localStorage from it.
- */
-/** The metadata fields the seeding reads; the VS Code webview only receives these (#4738). */
-export type WorkspaceAiSeedSource = Pick<
-  FrontendWorkspaceMetadata,
-  "id" | "agentId" | "agentType" | "parentWorkspaceId" | "aiSettings" | "aiSettingsByAgent"
-> &
-  Partial<Pick<FrontendWorkspaceMetadata, "projectPath">>;
-
-export function seedWorkspaceLocalStorageFromBackend(
-  metadata: WorkspaceAiSeedSource,
-  previous?: WorkspaceAiSeedSource
-): void {
-  setWorkspaceAiMetadata(metadata.id, {
-    projectPath: metadata.projectPath,
-    aiSettings: metadata.aiSettings,
-    aiSettingsByAgent: metadata.aiSettingsByAgent,
-  });
-  // Snapshot all main-workspace choices on client load, not on navigation.
-  // Later metadata must not overwrite unsent choices; reload to restore backend settings.
-  if (metadata.parentWorkspaceId == null && previous != null) {
-    return;
-  }
-  // Cache keyed by agentId (string) - includes exec, plan, and custom agents
-  type WorkspaceAISettingsByAgentCache = Partial<
-    Record<
-      string,
-      { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-    >
-  >;
-
-  const workspaceId = metadata.id;
-
-  const metadataAgentId = resolvePersistedAgentId(metadata, "");
-  if (metadataAgentId.length > 0) {
-    const key = getAgentIdKey(workspaceId);
-    const normalized = normalizeAgentId(metadataAgentId);
-    const existing = readPersistedState<string | undefined>(key, undefined);
-    if (existing !== normalized) {
-      updatePersistedState(key, normalized);
-    }
-  }
-
-  const aiByAgent =
-    metadata.aiSettingsByAgent ??
-    (metadata.aiSettings
-      ? {
-          plan: metadata.aiSettings,
-          exec: metadata.aiSettings,
-        }
-      : undefined);
-
-  if (!aiByAgent) {
-    return;
-  }
-
-  // Merge backend values into a per-workspace per-agent cache.
-  const byAgentKey = getWorkspaceAISettingsByAgentKey(workspaceId);
-  const existingByAgent = readPersistedState<WorkspaceAISettingsByAgentCache>(byAgentKey, {});
-  const nextByAgent: WorkspaceAISettingsByAgentCache = { ...existingByAgent };
-
-  for (const [agentKey, entry] of Object.entries(aiByAgent)) {
-    if (!entry) continue;
-    if (typeof entry.model !== "string" || entry.model.length === 0) continue;
-    nextByAgent[agentKey] = {
-      model: entry.model,
-      thinkingLevel: entry.thinkingLevel,
-      ...(entry.reasoningMode != null ? { reasoningMode: entry.reasoningMode } : {}),
-    };
-  }
-
-  if (JSON.stringify(existingByAgent) !== JSON.stringify(nextByAgent)) {
-    updatePersistedState(byAgentKey, nextByAgent);
-  }
-}
 
 export function toWorkspaceSelection(metadata: FrontendWorkspaceMetadata): WorkspaceSelection {
   return {
@@ -470,10 +388,9 @@ function getMostRecentVisibleWorkspaceScope(
     : null;
 }
 
-// Skips archived rows and seeds renderer settings; callers decide how the map is applied.
+// Skips archived rows and records AI metadata for the resolver; callers decide how the map is applied.
 function buildActiveWorkspaceMetadataMap(
-  metadataList: FrontendWorkspaceMetadata[],
-  previous: ReadonlyMap<string, FrontendWorkspaceMetadata>
+  metadataList: FrontendWorkspaceMetadata[]
 ): Map<string, FrontendWorkspaceMetadata> {
   const metadataMap = new Map<string, FrontendWorkspaceMetadata>();
   for (const metadata of metadataList) {
@@ -482,7 +399,7 @@ function buildActiveWorkspaceMetadataMap(
 
     ensureCreatedAt(metadata);
     // Use stable workspace ID as key (not path, which can change)
-    seedWorkspaceLocalStorageFromBackend(metadata, previous.get(metadata.id));
+    setWorkspaceAiMetadata(metadata.id, metadata);
     metadataMap.set(metadata.id, metadata);
   }
   return metadataMap;
@@ -1034,9 +951,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           if ("type" in event) {
             arrivals.lastSnapshot = arrivals.count;
             arrivals.lastByWorkspaceId.clear();
-            setWorkspaceMetadata(
-              buildActiveWorkspaceMetadataMap(event.workspaces, workspaceMetadataRef.current)
-            );
+            setWorkspaceMetadata(buildActiveWorkspaceMetadataMap(event.workspaces));
             setLoaded(true);
             setLoadError(null);
             if (!snapshotApplied) {
@@ -1058,7 +973,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           // Archived metadata never enters the active map or needs renderer settings.
           if (meta !== null && !isNowArchived) {
             ensureCreatedAt(meta);
-            seedWorkspaceLocalStorageFromBackend(meta, workspaceMetadataRef.current.get(meta.id));
+            setWorkspaceAiMetadata(meta.id, meta);
           }
 
           // If the currently-selected workspace is being archived, navigate away *before*
@@ -1210,10 +1125,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
         // Update metadata immediately to avoid race condition with validation effect
         ensureCreatedAt(result.metadata);
-        seedWorkspaceLocalStorageFromBackend(
-          result.metadata,
-          workspaceMetadataRef.current.get(result.metadata.id)
-        );
+        setWorkspaceAiMetadata(result.metadata.id, result.metadata);
         setWorkspaceMetadata((prev) => {
           const updated = new Map(prev);
           updated.set(result.metadata.id, result.metadata);
@@ -1643,8 +1555,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         if (arrivedAt > requestedAt) touchedIds.add(workspaceId);
       }
       const listed = buildActiveWorkspaceMetadataMap(
-        metadataList.filter((metadata) => !touchedIds.has(metadata.id)),
-        workspaceMetadataRef.current
+        metadataList.filter((metadata) => !touchedIds.has(metadata.id))
       );
       setWorkspaceMetadata((prev) => {
         const next = new Map(listed);
@@ -1669,10 +1580,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       const metadata = await api.workspace.getInfo({ workspaceId });
       if (metadata) {
         ensureCreatedAt(metadata);
-        seedWorkspaceLocalStorageFromBackend(
-          metadata,
-          workspaceMetadataRef.current.get(metadata.id)
-        );
+        setWorkspaceAiMetadata(metadata.id, metadata);
       }
       return metadata;
     },

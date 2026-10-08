@@ -172,14 +172,6 @@ export function getReasoningModeKey(scopeId: string): string {
 }
 
 /**
- * Get the localStorage key for per-agent workspace AI overrides cache.
- * Format: "workspaceAiSettingsByAgent:{workspaceId}"
- */
-export function getWorkspaceAISettingsByAgentKey(workspaceId: string): string {
-  return `workspaceAiSettingsByAgent:${workspaceId}`;
-}
-
-/**
  * LEGACY: Get the localStorage key for thinking level preference per model (global).
  * Format: "thinkingLevel:model:{modelName}"
  *
@@ -313,14 +305,6 @@ export function getPendingDraftSkillDiscoveryKey(workspaceId: string): string {
  */
 export function getAutoRetryKey(workspaceId: string): string {
   return `${workspaceId}-autoRetry`;
-}
-
-/**
- * Get the localStorage key for the selected agent definition id for a scope.
- * Format: "agentId:{scopeId}"
- */
-export function getAgentIdKey(scopeId: string): string {
-  return `agentId:${scopeId}`;
 }
 
 /**
@@ -914,8 +898,6 @@ function projectPrefix(getKey: (projectPath: string) => string): string {
 // exceed its budget is a bug in its owner.
 export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Copied on fork.
-  // Record<agentId, { model, thinkingLevel, reasoningMode? }>, hydrated from workspace metadata.
-  workspaceKey(getWorkspaceAISettingsByAgentKey, "ui", true, 1024),
   workspaceKey(getModelKey, "ui", true, MODEL_KEY_MAX_CHARS),
   workspaceKey(getAutoModelRoutingKey, "ui", true, 16),
   workspaceKey(getAutoThinkingLevelKey, "ui", true, 16),
@@ -928,7 +910,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // The VS Code webview composer's unsent text. Longer drafts still work for the session (kept in
   // memory); the webview then persists only the last text that fit.
   workspaceKey(getInputKey, "draft", false, 8192, "webview"),
-  workspaceKey(getAgentIdKey, "ui", true, 128),
   workspaceKey(getPinnedAgentIdKey, "ui", true, 128),
   workspaceKey(getThinkingLevelKey, "ui", true, 32),
   workspaceKey(getReviewSelectedHunkKey, "workspace-scoped", true, 256),

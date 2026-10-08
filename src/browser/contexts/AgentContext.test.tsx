@@ -5,7 +5,7 @@ import { GlobalWindow } from "happy-dom";
 
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import { getAgentIdKey } from "@/common/constants/storage";
+import { setWorkspaceAgentPick } from "@/browser/utils/aiSelectionIntent";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
@@ -309,7 +309,7 @@ describe("AgentContext", () => {
       parentWorkspaceId: "parent-workspace",
       agentId: "exec",
     });
-    window.localStorage.setItem(getAgentIdKey(lockedWorkspaceId), JSON.stringify("plan"));
+    setWorkspaceAgentPick(lockedWorkspaceId, "plan");
 
     let contextValue: AgentContextValue | undefined;
     let openPickerEvents = 0;
@@ -326,7 +326,7 @@ describe("AgentContext", () => {
       });
 
       await waitFor(() => {
-        // Backend-assigned agent overrides stale localStorage in locked workspaces.
+        // Backend-assigned agent overrides a stale agent pick in locked workspaces.
         expect(contextValue?.agentId).toBe("exec");
       });
 

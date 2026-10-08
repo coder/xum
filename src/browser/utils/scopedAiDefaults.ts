@@ -1,35 +1,27 @@
-import {
-  readPersistedState,
-  updatePersistedState,
-  usePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { useSyncExternalStore } from "react";
 import {
   getUserPreferences,
   updateUserPreferences,
   useUserPreferences,
 } from "@/browser/stores/AppConfigStore";
-import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import {
-  getAgentIdKey,
-  getModelKey,
-  getProjectScopeId,
-  getThinkingLevelKey,
-  GLOBAL_SCOPE_ID,
-} from "@/common/constants/storage";
+  getWorkspaceAgentId,
+  setWorkspaceAgentPick,
+  subscribeAiSelection,
+} from "@/browser/utils/aiSelectionIntent";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
+import { getProjectScopeId, GLOBAL_SCOPE_ID } from "@/common/constants/storage";
 
 // Global defaults have no model, so a global model read is always undefined.
 type AiDefaults = NonNullable<NonNullable<UserPreferences["ai"]>["projectDefaults"]>[string];
 type ScopedAiField = keyof AiDefaults;
 
-const STORAGE_KEYS: Record<ScopedAiField, (scopeId: string) => string> = {
-  agentId: getAgentIdKey,
-  model: getModelKey,
-  thinkingLevel: getThinkingLevelKey,
-};
-
 const PROJECT_SCOPE_PREFIX = getProjectScopeId("");
 
-/** Project and global scopes are config.json preferences; workspace and draft scopes stay local. */
+/**
+ * Project and global scopes are config.json preferences. A workspace scope resolves only its
+ * agent (unsent pick, then metadata); its model and thinking come from resolveWorkspaceAiSelection.
+ */
 function getServerScope(scopeId: string): { projectPath?: string } | undefined {
   if (scopeId === GLOBAL_SCOPE_ID) return {};
   return scopeId.startsWith(PROJECT_SCOPE_PREFIX)
@@ -57,7 +49,12 @@ export function readScopedAiDefault<F extends ScopedAiField>(
   if (scope) {
     return selectServerDefault(getUserPreferences(), scope, field);
   }
-  return readPersistedState<AiDefaults[F]>(STORAGE_KEYS[field](scopeId), undefined);
+  return readWorkspaceDefault(scopeId, field);
+}
+
+function readWorkspaceDefault<F extends ScopedAiField>(scopeId: string, field: F): AiDefaults[F] {
+  const value: AiDefaults = field === "agentId" ? { agentId: getWorkspaceAgentId(scopeId) } : {};
+  return value[field];
 }
 
 export function writeScopedAiDefault<F extends ScopedAiField>(
@@ -67,7 +64,8 @@ export function writeScopedAiDefault<F extends ScopedAiField>(
 ): void {
   const scope = getServerScope(scopeId);
   if (!scope) {
-    updatePersistedState(STORAGE_KEYS[field](scopeId), value);
+    // A workspace agent pick stays in memory until a send stores it in workspace metadata.
+    if (field === "agentId" && typeof value === "string") setWorkspaceAgentPick(scopeId, value);
     return;
   }
   const defaults = { [field]: value ?? null };
@@ -87,8 +85,8 @@ export function useScopedAiDefault<F extends ScopedAiField>(
   const serverValue = useUserPreferences((preferences) =>
     scope ? selectServerDefault(preferences, scope, field) : undefined
   );
-  const [localValue] = usePersistedState<AiDefaults[F]>(STORAGE_KEYS[field](scopeId), undefined, {
-    listener: true,
-  });
-  return scope ? serverValue : localValue;
+  const workspaceValue = useSyncExternalStore(subscribeAiSelection, () =>
+    scope ? undefined : readWorkspaceDefault(scopeId, field)
+  );
+  return scope ? serverValue : workspaceValue;
 }

@@ -41,8 +41,9 @@ import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
-import { getAgentIdKey, getAutoRoutingChoiceByAgentKey } from "@/common/constants/storage";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getAutoRoutingChoiceByAgentKey } from "@/common/constants/storage";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { setWorkspaceAgentPick } from "@/browser/utils/aiSelectionIntent";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyAutoRoutingOutcome } from "@/browser/utils/modelChange";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
@@ -528,7 +529,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     targetAgentId: "auto" | "exec";
     autoRouting: AutoRoutingOutcome;
   }): void => {
-    updatePersistedState(getAgentIdKey(args.workspaceId), args.targetAgentId);
+    setWorkspaceAgentPick(args.workspaceId, args.targetAgentId);
     // Persist routing for later composer sends; the immediate action below disables routing.
     applyAutoRoutingOutcome(args.workspaceId, args.autoRouting);
   };

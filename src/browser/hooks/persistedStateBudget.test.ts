@@ -15,7 +15,6 @@ import * as storageModule from "@/common/constants/storage";
 import {
   GLOBAL_SCOPE_ID,
   PERSISTED_KEY_REGISTRY,
-  getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
   getDisableWorkspaceAgentsKey,
@@ -56,7 +55,6 @@ const LOCAL_STORAGE_BUDGET_CEILING_CHARS = 3.5 * 1024 * 1024;
  */
 const PROJECT_SCOPED_WORKSPACE_KEYS = [
   getModelKey,
-  getAgentIdKey,
   getThinkingLevelKey,
   getReasoningModeKey,
   getDisableWorkspaceAgentsKey,

@@ -11,7 +11,6 @@ import * as DraftWorkspaceSettingsModule from "@/browser/hooks/useDraftWorkspace
 import * as ChatCommandsModule from "@/browser/utils/chatCommands";
 import type { ProjectConfig } from "@/common/types/project";
 import {
-  getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
   getAutoThinkingLevelKey,
@@ -19,7 +18,6 @@ import {
   getPendingScopeId,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
-  getThinkingLevelKey,
   getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
@@ -1969,7 +1967,6 @@ describe("useCreationWorkspace", () => {
     });
 
     expect(handleSendResult).toEqual({ success: true });
-    expect(updatePersistedStateCalls).toContainEqual([getAgentIdKey(TEST_WORKSPACE_ID), "ask"]);
 
     const sendCall = sendMessageMock.mock.calls[0];
     if (!sendCall) {
@@ -2021,7 +2018,6 @@ describe("useCreationWorkspace", () => {
       await getHook().handleSend("launch workspace");
     });
 
-    expect(updatePersistedStateCalls).toContainEqual([getAgentIdKey(TEST_WORKSPACE_ID), "exec"]);
     expect(updateAgentAISettingsMock.mock.calls[0]?.[0]?.agentId).toBe("exec");
     expect(sendMessageMock.mock.calls[0]?.[0]?.options?.agentId).toBe("exec");
   });
@@ -2437,12 +2433,7 @@ describe("useCreationWorkspace", () => {
     expect(onWorkspaceCreated.mock.calls.length).toBe(0);
     await waitFor(() => expect(getHook().toast?.message).toBe("backend exploded"));
     await waitFor(() => expect(getHook().isSending).toBe(false));
-
-    // Side effect: send-options reader may migrate thinking level into the project scope.
-    const thinkingKey = getThinkingLevelKey(getProjectScopeId(TEST_PROJECT_PATH));
-    if (updatePersistedStateCalls.length > 0) {
-      expect(updatePersistedStateCalls).toEqual([[thinkingKey, "off"]]);
-    }
+    expect(updatePersistedStateCalls).toEqual([]);
   });
 });
 
