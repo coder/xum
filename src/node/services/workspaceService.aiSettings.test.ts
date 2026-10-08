@@ -87,6 +87,8 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
             agentId,
             model: "openai:gpt-5.2",
             thinkingLevel: "high",
+            autoModelRouting: true,
+            autoThinkingLevel: true,
             ...(skip ? { skipAiSettingsPersistence: true } : {}),
           },
           synthetic ? { synthetic: true } : undefined
@@ -114,7 +116,12 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
                 aiSettings: remembered.aiSettings,
                 aiSettingsByAgent: {
                   ...remembered.aiSettingsByAgent,
-                  [agentId]: { model: "openai:gpt-5.2", thinkingLevel: "high" },
+                  [agentId]: {
+                    model: "openai:gpt-5.2",
+                    thinkingLevel: "high",
+                    autoModelRouting: true,
+                    autoThinkingLevel: true,
+                  },
                 },
               }
         );

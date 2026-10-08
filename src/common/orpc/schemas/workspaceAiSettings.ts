@@ -21,6 +21,16 @@ export const WorkspaceAISettingsSchema = z.object({
   }),
 });
 
+// Only sends persist the auto-routing flags, so the picker update routes keep the base schema.
+export const WorkspaceAgentAISettingsSchema = WorkspaceAISettingsSchema.extend({
+  autoModelRouting: z.boolean().optional().meta({
+    description: "Composer model set to Auto on the last send. Absent = off.",
+  }),
+  autoThinkingLevel: z.boolean().optional().meta({
+    description: "Composer thinking level set to Auto on the last send. Absent = off.",
+  }),
+});
+
 /**
  * Per-agent workspace AI overrides.
  *
@@ -29,5 +39,5 @@ export const WorkspaceAISettingsSchema = z.object({
  */
 export const WorkspaceAISettingsByAgentSchema = z.record(
   z.string().min(1),
-  WorkspaceAISettingsSchema
+  WorkspaceAgentAISettingsSchema
 );

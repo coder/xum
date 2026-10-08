@@ -1059,10 +1059,22 @@ describe("WorkspaceService fork", () => {
       generateStableIdSpy.mockRestore();
     }
   });
-  test("fork marks the new workspace as pending auto-title when a continue message is queued", async () => {
+  test("fork keeps the parent's AI selection and marks the new workspace as pending auto-title when a continue message is queued", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";
     const sourceProjectPath = path.join(tempDir, "project");
+    const sourceAISelection = {
+      agentId: "plan",
+      aiSettings: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "medium" as const },
+      aiSettingsByAgent: {
+        plan: {
+          model: "openai:gpt-5.2",
+          thinkingLevel: "high" as const,
+          autoModelRouting: true,
+          autoThinkingLevel: true,
+        },
+      },
+    };
     const sourceMetadata: FrontendWorkspaceMetadata = {
       id: sourceWorkspaceId,
       name: "source-branch",
@@ -1071,6 +1083,7 @@ describe("WorkspaceService fork", () => {
       projectName: "project",
       runtimeConfig: { type: "local" },
       namedWorkspacePath: path.join(sourceProjectPath, "source-branch"),
+      ...sourceAISelection,
     };
     const forkedWorkspacePath = path.join(sourceProjectPath, "source-branch-1");
 
@@ -1135,6 +1148,11 @@ describe("WorkspaceService fork", () => {
         (metadata) => metadata.id === newWorkspaceId
       );
       expect(persistedMetadata?.pendingAutoTitle).toBe(true);
+      expect({
+        agentId: persistedMetadata?.agentId,
+        aiSettings: persistedMetadata?.aiSettings,
+        aiSettingsByAgent: persistedMetadata?.aiSettingsByAgent,
+      }).toEqual(sourceAISelection);
     } finally {
       orchestrateForkSpy.mockRestore();
       copyPlanSpy.mockRestore();
