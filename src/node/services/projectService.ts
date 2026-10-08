@@ -5,6 +5,8 @@ import { spawn } from "child_process";
 import { createHash, randomBytes } from "crypto";
 import {
   validateProjectPath,
+  isFilesystemRoot,
+  PROJECT_AT_FILESYSTEM_ROOT_ERROR,
   isGitRepository,
   isInsideGitRepository,
   stripTrailingSlashes,
@@ -520,6 +522,10 @@ export class ProjectService {
         normalizedPath = path.resolve(expandTilde(projectPath));
       } else {
         normalizedPath = path.resolve(projectPath);
+      }
+      // File completions, git status and review scans would walk the whole disk (#5917).
+      if (isFilesystemRoot(normalizedPath)) {
+        return Err(PROJECT_AT_FILESYSTEM_ROOT_ERROR);
       }
 
       let existingStat: Stats | null = null;
@@ -2030,6 +2036,9 @@ export class ProjectService {
     await this.config.editConfig((config) => {
       let project = config.projects.get(normalizedPath);
       if (!project) {
+        // Trust can create a project entry, but never a new one at the root (#5917). An existing
+        // root project (from an older config) can still change its trust.
+        if (isFilesystemRoot(normalizedPath)) throw new Error(PROJECT_AT_FILESYSTEM_ROOT_ERROR);
         project = { workspaces: [] };
         config.projects.set(normalizedPath, project);
       }

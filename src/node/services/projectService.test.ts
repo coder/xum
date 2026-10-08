@@ -170,6 +170,16 @@ describe("ProjectService", () => {
   });
 
   describe("create", () => {
+    // #5917: a root project would make file completions, git status and review scans walk the
+    // whole disk.
+    it("refuses to register the filesystem root", async () => {
+      expect(await service.create("/")).toEqual({
+        success: false,
+        error: "A project cannot be the filesystem root",
+      });
+      expect(config.loadConfigOrDefault().projects.size).toBe(0);
+    });
+
     it("creates and registers a git project at a new path", async () => {
       const projectPath = path.join(tempDir, "new-git-project");
 
@@ -2334,6 +2344,26 @@ exit 1
   });
 
   describe("project settings mutations", () => {
+    it("setTrust never creates a project at the filesystem root, but updates an existing one", async () => {
+      let refusal: unknown;
+      try {
+        await service.setTrust("/", true);
+      } catch (error) {
+        refusal = error;
+      }
+      expect(refusal).toBeInstanceOf(Error);
+      expect((refusal as Error).message).toBe("A project cannot be the filesystem root");
+      expect(config.loadConfigOrDefault().projects.size).toBe(0);
+
+      // An older config can already hold the root project (#5917): its trust still changes.
+      await config.editConfig((current) => {
+        current.projects.set("/", { workspaces: [] });
+        return current;
+      });
+      await service.setTrust("/", true);
+      expect(new Config(tempDir).loadConfigOrDefault().projects.get("/")?.trusted).toBe(true);
+    });
+
     it("propagates parent trust to MCP state", async () => {
       const parentPath = path.join(tempDir, "project");
       const childPath = path.join(parentPath, "packages", "api");

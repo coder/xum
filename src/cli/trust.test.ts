@@ -240,6 +240,18 @@ describe("xum trust CLI", () => {
     expect(result.stdout.toString()).toBe("");
   }, 15_000);
 
+  test("refuses to trust the filesystem root as a new project", async () => {
+    using tmp = new DisposableTempDir("trust-cli-root");
+    const result = await Bun.$`${BUN_EXECUTABLE} ${TRUST_ENTRY} --dir / --json`
+      .env({ ...process.env, MUX_ROOT: tmp.path })
+      .nothrow()
+      .quiet();
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr.toString()).toContain("A project cannot be the filesystem root");
+    expect(new Config(tmp.path).loadConfigOrDefault().projects.size).toBe(0);
+  }, 15_000);
+
   test("trust from a linked worktree records trust for the main repository", async () => {
     using tmp = new DisposableTempDir("trust-cli-worktree");
     // realpath: git reports physical paths (macOS /var -> /private/var) and the trust

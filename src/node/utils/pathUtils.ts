@@ -37,9 +37,32 @@ export function expandTilde(inputPath: string): string {
  * @example
  * stripTrailingSlashes("/home/user/project/") // => "/home/user/project"
  * stripTrailingSlashes("/home/user/project//") // => "/home/user/project"
+ * stripTrailingSlashes("/") // => "/" (the root has no trailing slash to strip, #5917)
  */
 export function stripTrailingSlashes(inputPath: string): string {
-  return inputPath.replace(/[/\\]+$/, "");
+  // One backward scan, and no allocation when nothing is stripped: about 80 callers, some on
+  // lookup paths. A path made only of separators keeps one, so "/" never becomes "" (an
+  // invalid project key that the next config load dropped with its workspace rows, #5917).
+  let end = inputPath.length;
+  while (end > 0) {
+    const code = inputPath.charCodeAt(end - 1);
+    if (code !== 47 /* / */ && code !== 92 /* \ */) break;
+    end--;
+  }
+  if (end === inputPath.length) return inputPath;
+  return end === 0 ? inputPath.slice(0, 1) : inputPath.slice(0, end);
+}
+
+export const PROJECT_AT_FILESYSTEM_ROOT_ERROR = "A project cannot be the filesystem root";
+
+/**
+ * True when `inputPath` resolves to a filesystem root (`/` on POSIX, a drive root on Windows).
+ * Project add, create and trust flows refuse such paths: file completions, git status and
+ * review scans would walk the whole disk. Configs that already hold a root project still load.
+ */
+export function isFilesystemRoot(inputPath: string): boolean {
+  const resolved = path.resolve(inputPath);
+  return path.parse(resolved).root === resolved;
 }
 
 /**
@@ -64,6 +87,11 @@ export async function validateProjectPath(inputPath: string): Promise<PathValida
 
   // Normalize to resolve any .. or . in the path, then strip trailing slashes
   const normalizedPath = stripTrailingSlashes(path.normalize(expandedPath));
+
+  // Before #5917 the root normalized to "" and failed the stat below; keep refusing it.
+  if (isFilesystemRoot(normalizedPath)) {
+    return { valid: false, error: PROJECT_AT_FILESYSTEM_ROOT_ERROR };
+  }
 
   // Check if path exists
   try {

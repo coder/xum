@@ -63,6 +63,16 @@ describe("pathUtils", () => {
   });
 
   describe("validateProjectPath", () => {
+    // #5917: "/" used to fail only by accident ("" did not exist). Refuse it explicitly.
+    it("refuses the filesystem root", async () => {
+      for (const root of ["/", "//", "/tmp/.."]) {
+        expect(await validateProjectPath(root)).toEqual({
+          valid: false,
+          error: "A project cannot be the filesystem root",
+        });
+      }
+    });
+
     let tempDir: string;
 
     beforeEach(() => {
