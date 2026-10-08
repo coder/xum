@@ -2,6 +2,7 @@ import { useSyncExternalStore } from "react";
 import { normalizeModelPreference } from "@/browser/utils/messages/buildSendMessageOptions";
 import {
   AUTO_ROUTING_FLAG,
+  getAgentBases,
   getAiSelectionVersion,
   getAutoRoutingPick,
   getPendingAiSelection,
@@ -61,7 +62,7 @@ function resolveWorkspaceAiSelection(input: WorkspaceAiSelectionInput): Workspac
   const configured = resolveConfiguredAiDefaults(
     agentId,
     input.agentAiDefaults,
-    input.agentBaseById
+    input.agentBaseById ?? getAgentBases(input.workspaceId)
   );
   const project =
     metadata?.projectPath != null ? input.ai?.projectDefaults?.[metadata.projectPath] : undefined;
@@ -195,8 +196,11 @@ function resolveAutoRouting(input: {
     getAutoRoutingPick(input.scopeId, agentId, input.dimension) ??
     (saved != null
       ? saved[flag] === true
-      : resolveConfiguredAiDefaults(agentId, input.agentAiDefaults, input.agentBaseById)[flag] ===
-        true)
+      : resolveConfiguredAiDefaults(
+          agentId,
+          input.agentAiDefaults,
+          input.agentBaseById ?? getAgentBases(input.scopeId)
+        )[flag] === true)
   );
 }
 

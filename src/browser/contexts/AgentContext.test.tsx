@@ -15,7 +15,13 @@ import { APIProvider, type APIClient } from "./API";
 import { ProjectProvider } from "./ProjectContext";
 import { RouterProvider } from "./RouterContext";
 import { WorkspaceProvider } from "./WorkspaceContext";
-import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
+import {
+  createTestApiClient,
+  createTestConfig,
+  createTestPreferencesConfig,
+} from "@/browser/testUtils";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 
 let mockAgentDefinitions: AgentDefinitionDescriptor[] = [];
 let mockWorkspaceMetadata = new Map<string, { parentWorkspaceId?: string; agentId?: string }>();
@@ -100,14 +106,27 @@ function createEmptyAsyncIterable<T>(): AsyncIterable<T> {
   };
 }
 
-function createApiClient(preferences?: UserPreferences): APIClient {
+function createApiClient(
+  preferences?: UserPreferences,
+  agentAiDefaults?: AgentAiDefaults
+): APIClient {
   const workspaceMetadata = Array.from(
     mockWorkspaceMetadata.entries(),
     ([workspaceId, overrides]) => createWorkspaceMetadata(workspaceId, overrides)
   );
 
   return createTestApiClient({
-    config: createTestPreferencesConfig(preferences),
+    config: {
+      ...createTestPreferencesConfig(preferences),
+      ...(agentAiDefaults != null
+        ? {
+            getConfig: () =>
+              Promise.resolve(
+                createTestConfig({ userPreferences: preferences ?? {}, agentAiDefaults })
+              ),
+          }
+        : {}),
+    },
     agents: {
       list: () => Promise.resolve(mockAgentDefinitions),
     },
@@ -151,10 +170,11 @@ function renderAgentHarness(props: {
   projectPath: string;
   workspaceId?: string;
   preferences?: UserPreferences;
+  agentAiDefaults?: AgentAiDefaults;
   onChange: (value: AgentContextValue) => void;
 }) {
   return render(
-    <APIProvider client={createApiClient(props.preferences)}>
+    <APIProvider client={createApiClient(props.preferences, props.agentAiDefaults)}>
       <RouterProvider>
         <ProjectProvider>
           <WorkspaceProvider>
@@ -195,7 +215,10 @@ describe("AgentContext", () => {
 
   afterEach(() => {
     cleanup();
-    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+    getAppConfigStore().updateOptimistically({
+      userPreferences: undefined,
+      agentAiDefaults: undefined,
+    });
     getWorkspaceStoreRaw().dispose();
     mock.restore();
     globalThis.window = originalWindow;
@@ -218,6 +241,23 @@ describe("AgentContext", () => {
       expect(contextValue?.agentId).toBe("exec");
     });
     expect(getUserPreferences().ai?.projectDefaults).toBeUndefined();
+  });
+
+  test("readers outside the agent context resolve a custom agent's inherited defaults", async () => {
+    const workspaceId = "ws-custom-agent";
+    mockAgentDefinitions = [EXEC_AGENT, { ...REVIEW_PROJECT_AGENT, base: "exec" }];
+    mockWorkspaceMetadata = new Map([[workspaceId, { agentId: "review" }]]);
+
+    renderAgentHarness({
+      projectPath: "/tmp/project",
+      workspaceId,
+      agentAiDefaults: { exec: { modelString: "openai:gpt-5.2" } },
+      onChange: () => undefined,
+    });
+
+    await waitFor(() => {
+      expect(getWorkspaceAiSelection(workspaceId, "review").model).toBe("openai:gpt-5.2");
+    });
   });
 
   test("project-scoped preference takes precedence over global default", async () => {
