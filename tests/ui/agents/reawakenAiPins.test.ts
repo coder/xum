@@ -11,7 +11,8 @@ import { waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import { getModelKey, getThinkingLevelKey } from "@/common/constants/storage";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { getThinkingLevelKey } from "@/common/constants/storage";
 import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { shouldRunIntegrationTests } from "../../testUtils";
@@ -89,7 +90,7 @@ describeIntegration("Reawakened sub-agent pins from the renderer", () => {
         workspace.aiSettingsByAgent = { exec: { model: SPAWN_MODEL, thinkingLevel: "high" } };
         workspace.taskAiPins = {};
       });
-      const modelKey = getModelKey(app.workspaceId);
+      const selection = () => getWorkspaceAiSelection(app.workspaceId);
       const thinkingKey = getThinkingLevelKey(app.workspaceId);
 
       // 1. A plain send records no pins.
@@ -97,11 +98,11 @@ describeIntegration("Reawakened sub-agent pins from the renderer", () => {
       expect(readChild(app).taskAiPins).toEqual({});
 
       // 2. A backend bucket change reseeds the renderer (not a user pick): no pin.
-      expect(readPersistedState(modelKey, "")).not.toBe(BACKEND_MODEL);
+      expect(selection().model).not.toBe(BACKEND_MODEL);
       await editChild(app, (workspace) => {
         workspace.aiSettingsByAgent = { exec: { model: BACKEND_MODEL, thinkingLevel: "high" } };
       });
-      await waitFor(() => expect(readPersistedState(modelKey, "")).toBe(BACKEND_MODEL), {
+      await waitFor(() => expect(selection().model).toBe(BACKEND_MODEL), {
         timeout: 10_000,
       });
       await sendAndSettle(app, "after backend reseed");
@@ -114,7 +115,7 @@ describeIntegration("Reawakened sub-agent pins from the renderer", () => {
       const picked = MODEL_ABBREVIATIONS.sonnet;
       if (!picked) throw new Error("Missing sonnet abbreviation");
       await app.chat.send("/model sonnet");
-      await waitFor(() => expect(readPersistedState(modelKey, "")).toBe(picked), {
+      await waitFor(() => expect(selection().model).toBe(picked), {
         timeout: 10_000,
       });
       await editChild(app, (workspace) => {
@@ -123,7 +124,7 @@ describeIntegration("Reawakened sub-agent pins from the renderer", () => {
       await waitFor(() => expect(readPersistedState(thinkingKey, "")).toBe("low"), {
         timeout: 10_000,
       });
-      expect(readPersistedState(modelKey, "")).toBe(picked);
+      expect(selection().model).toBe(picked);
       await sendAndSettle(app, "send the pick");
       expect(readChild(app).taskAiPins).toEqual({ model: picked });
 
@@ -132,7 +133,7 @@ describeIntegration("Reawakened sub-agent pins from the renderer", () => {
       await editChild(app, (workspace) => {
         workspace.aiSettingsByAgent = { exec: { model: BACKEND_MODEL, thinkingLevel: "high" } };
       });
-      await waitFor(() => expect(readPersistedState(modelKey, "")).toBe(BACKEND_MODEL), {
+      await waitFor(() => expect(selection().model).toBe(BACKEND_MODEL), {
         timeout: 10_000,
       });
       await sendAndSettle(app, "plain after the pin");

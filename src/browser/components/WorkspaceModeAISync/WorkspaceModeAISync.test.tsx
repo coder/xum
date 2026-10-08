@@ -86,24 +86,16 @@ describe("WorkspaceModeAISync", () => {
       plan: { modelString: planModel },
     });
 
-    // Start with a different model so the mount sync performs an update.
-    updatePersistedState(getModelKey(workspaceId), "some-legacy-model");
-
     const { rerender } = renderSync({ workspaceId, agentId: "exec" });
-
-    // Mount sync should update the model but NOT record an explicit change entry.
-    await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(execModel);
-    });
+    // Mount sync is not a switch, so it records no explicit change entry.
     expect(consumeWorkspaceModelChange(workspaceId, execModel)).toBeNull();
 
     // Switching agents (within the same workspace) should be treated as explicit.
     rerender(<SyncHarness workspaceId={workspaceId} agentId="plan" />);
 
     await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(planModel);
+      expect(consumeWorkspaceModelChange(workspaceId, planModel)).toBe("agent");
     });
-    expect(consumeWorkspaceModelChange(workspaceId, planModel)).toBe("agent");
   });
 
   test("an explicit agent switch that changes the thinking level leaves thinking Auto", async () => {

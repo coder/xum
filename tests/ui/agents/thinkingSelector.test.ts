@@ -9,8 +9,7 @@ import userEvent from "@testing-library/user-event";
 
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { getModelKey } from "@/common/constants/storage";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 
 import { shouldRunIntegrationTests } from "../../testUtils";
@@ -56,7 +55,7 @@ async function selectModel(
   fireEvent.click(option);
 
   await waitFor(() => {
-    const persisted = readPersistedState(getModelKey(workspaceId), "");
+    const persisted = getWorkspaceAiSelection(workspaceId).model;
     if (persisted !== model) {
       throw new Error(`Expected model ${model} but got ${persisted}`);
     }
