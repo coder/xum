@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -94,6 +95,14 @@ test("a folder swapped for a symlink after the checks copies no host file", () =
   }
   const copied = spawnSync("grep", ["-r", "host secret", into()], { encoding: "utf8" });
   expect(copied.stdout).toBe("");
+});
+
+test("stage copies a file larger than its copy chunk byte for byte", () => {
+  const data = crypto.randomBytes((3 << 20) + 7);
+  write("src/big.bin", "");
+  fs.writeFileSync(path.join(root, "src/big.bin"), data);
+  stage(root, into());
+  expect(fs.readFileSync(path.join(into(), "src/big.bin")).equals(data)).toBe(true);
 });
 
 test("stage refuses a checkout reached through a symlink", () => {

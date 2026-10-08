@@ -38,6 +38,7 @@ case "$1" in
   # group, and the CLI answers at 1 s. Killing that CLI does not cancel the daemon's create.
   run|create) p=""; for a in "$@"; do case "$p" in --name) n=$a ;; --label) l="\${l-} \${a#*=}" ;; esac; p=$a; done
     if [ "\${CREATE-}" = die ]; then kill -9 $$; fi
+    if [ "\${CREATE-}" = fail ]; then echo "create failed" >&2; exit 1; fi
     if [ "\${CREATE-}" = late ]; then setsid sh -c "sleep 0.5; echo 'ctr $n$l' >> '$bin/containers'" </dev/null >/dev/null 2>&1 & sleep 1
     else echo "ctr $n$l" >> "$bin/containers"; fi
     if [ "$1" = create ]; then echo ctr; exit 0; fi
@@ -362,16 +363,16 @@ test("a repro job runs in the locked-down container; the export comes back; clea
   const create = calls()
     .split("\n")
     .find((line) => line.startsWith("create "))!;
-  for (const flag of ["--network none", "--read-only", "--cap-drop ALL", "-i --init"])
+  for (const flag of ["--network none", "--read-only", "--cap-drop ALL", "--interactive --init"])
     expect(create).toContain(flag);
   const real = fs.realpathSync(root);
   expect(create).toContain(
     `--mount type=bind,src=${real}/node_modules,dst=/repo/node_modules,readonly`
   );
   // The app log stays in the export folder; no host credential and no host log path pass.
-  expect(create).toContain("-e BUGBASH_APP_LOG=.e2e/r/app.log");
-  expect(create).toContain("-e BUGBASH_CONTAINER=1");
-  expect(create).toContain("-e BUGBASH_AI_RESOLVED=mock");
+  expect(create).toContain("--env BUGBASH_APP_LOG=.e2e/r/app.log");
+  expect(create).toContain("--env BUGBASH_CONTAINER=1");
+  expect(create).toContain("--env BUGBASH_AI_RESOLVED=mock");
   expect(create).not.toMatch(/sk-secret|\/x\.log/);
   expectNothingLeft();
 });
@@ -485,7 +486,16 @@ test("runJob() refuses caller args that set the name or a label", async () => {
   const s = session();
   await s.ensureImage();
   s.own(JOB);
-  for (const arg of ["--name", "--name=x", "--label", "--label=a=b", "-l", "--label-file"])
+  for (const arg of [
+    "--name",
+    "--name=x",
+    "--label",
+    "--label=a=b",
+    "-l",
+    "-lxum.bugbash.owner=x",
+    "-il",
+    "--label-file",
+  ])
     expect(await failure(s.runJob([arg, "img"], () => Promise.resolve(0), 1_000))).toThrow(
       /sets the name and labels itself/
     );
@@ -553,3 +563,12 @@ test("a create whose CLI died is an unknown outcome when no container has the na
   expect(await failure(s.runJob(["img"], () => Promise.resolve(0), 5_000))).toThrow(/create/);
   expect(await s.cleanup()).toBe("unknown: the create's outcome is unknown");
 });
+
+test("a signal during cleanup after a failed run still ends with Stopped", async () => {
+  const stop = new AbortController();
+  const pending = launchIn({ CREATE: "fail", INSPECT_SLOW: "1" }, stop);
+  while (!calls().includes("container inspect ")) await Bun.sleep(20);
+  stop.abort("SIGINT");
+  expect(await failure(pending)).toThrow(Stopped);
+  expectNothingLeft();
+}, 15_000);

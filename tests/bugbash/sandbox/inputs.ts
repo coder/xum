@@ -87,10 +87,21 @@ function copyRegular(src: string, dst: string): void {
   try {
     if (!fs.fstatSync(fd).isFile() || fs.readlinkSync(`/proc/self/fd/${fd}`) !== src)
       throw new Refusal(`stage: ${src} changed while it was copied`);
-    fs.writeFileSync(dst, fs.readFileSync(fd), { flag: "wx" });
+    // In bounded chunks: a large or sparse input must not be read into memory at once.
+    const out = fs.openSync(dst, "wx");
+    try {
+      const chunk = Buffer.alloc(1 << 20);
+      for (let n; (n = fs.readSync(fd, chunk)) > 0; ) writeAll(out, chunk.subarray(0, n));
+    } finally {
+      fs.closeSync(out);
+    }
   } finally {
     fs.closeSync(fd);
   }
+}
+
+function writeAll(fd: number, data: Buffer): void {
+  for (let done = 0; done < data.length; ) done += fs.writeSync(fd, data, done);
 }
 
 /**

@@ -122,15 +122,15 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
     const env = containerEnv(o.env, { ...jobEnv(output), ...host, ...MOCK });
     plainFolders(dir, path.dirname(output), true);
     // prettier-ignore
-    const flags = ["--rm", "-i", "--init", "--log-driver", "none", "--network", "none",
+    const flags = ["--rm", "--interactive", "--init", "--log-driver", "none", "--network", "none",
       "--user", `${uid}:${gid}`, "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
       "--read-only", "--pids-limit", "4096", "--memory", "4g", "--memory-swap", "4g",
       "--tmpfs", "/tmp:rw,nosuid,nodev,size=4g", "--tmpfs", "/home/bugbash:rw,nosuid,nodev,size=1g",
       "--tmpfs", `/repo/tests/bugbash/.e2e:rw,nosuid,nodev,size=1g,uid=${uid},gid=${gid}`,
       ...bind(staged, "/repo"), ...mounts(),
       ...bind(path.join(jobDir, "passwd"), "/etc/passwd"), ...bind(path.join(jobDir, "group"), "/etc/group"),
-      ...Object.entries(env).flatMap(([key, value]) => ["-e", `${key}=${value}`]),
-      "-w", "/repo/tests/bugbash", "--entrypoint", "bun", image, "sandbox/entry.ts",
+      ...Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
+      "--workdir", "/repo/tests/bugbash", "--entrypoint", "bun", image, "sandbox/entry.ts",
       "--export", output, "--", "node", "../../node_modules/e2e/dist/cli/bin.js", ...args];
     // A signal during the synchronous staging runs its handler only at the next turn of the
     // event loop. This yield lets it run, so own() throws and no container starts (measured).
@@ -177,8 +177,8 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
   }
   log(`${name} cleanup: ${state}`);
   if (state.startsWith("unknown")) return 3;
-  // A signal during cleanup still counts: the job did not end on its own terms.
-  if (o.stop.aborted && typeof result === "number") throw new Stopped(String(o.stop.reason));
+  // An observed stop outranks the job's result and its error: cleanup's state is known here.
+  if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
   if (typeof result !== "number") throw result.error;
   return result;
 }

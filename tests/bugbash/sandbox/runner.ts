@@ -153,9 +153,13 @@ export class Session {
     if (job == null) throw new Error("runJob() needs own() first");
     if (this.#stopped != null) throw new Stopped(this.#stopped);
     // The name and both labels are what cleanup matches, so no caller arg may set them: docker
-    // takes the last --name, and an extra label would not matter, but a label file could.
-    const setsName = args.find((a) => /^(--name|--label|--label-file|-l)(=|$)/.test(a));
-    if (setsName != null) throw new Error(`runJob() sets the name and labels itself: ${setsName}`);
+    // takes the last --name and the last value of a label key. Short options are refused too:
+    // pflag reads `-lkey=value` and clusters such as `-il key=value` as a label.
+    const setsName = args.find((a) => /^(--name|--label|--label-file)(=|$)|^-[^-]/.test(a));
+    if (setsName != null)
+      throw new Error(
+        `runJob() sets the name and labels itself, and takes long options only: ${setsName}`
+      );
     // Create, then start: a stop in between starts nothing. The create runs to its end even
     // after a stop, because killing its CLI does not cancel the daemon's create, and only a
     // finished create tells cleanup whether a container exists.
