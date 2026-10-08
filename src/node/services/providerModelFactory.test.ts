@@ -1489,21 +1489,24 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
   );
 
   it.each([
-    ["gpt-6-astra", "ultrafast"],
-    ["gpt-6.1-sol", "ultrafast"],
+    ["gpt-6-astra", "responses", "ultrafast"],
+    ["gpt-6.1-sol", "responses", "ultrafast"],
     // Ultrafast is model-gated: other models drop the tier instead of sending one
     // OpenAI rejects (and never fall back to the separately billed Fast tier).
-    ["gpt-6-luna", undefined],
-    ["gpt-6-sol", undefined],
+    ["gpt-6-luna", "responses", undefined],
+    ["gpt-6-sol", "responses", undefined],
+    // Chat Completions' service_tier enum has no "ultrafast", so the stored wire drops it.
+    ["gpt-6.1-sol", "chatCompletions", undefined],
   ] as const)(
-    "sends the configured Ultrafast tier for %s only when supported",
-    async (model, tier) => {
+    "sends the configured Ultrafast tier for %s over %s only when supported",
+    async (model, wireFormat, tier) => {
       await withTempConfig(async (_config, factory, _oauth, store) => {
         store.saveProvidersConfig({
           openai: {
             apiKey: "native-key",
             baseUrl: "https://native.example.com/v1",
             serviceTier: "ultrafast",
+            wireFormat,
           },
         });
         const { calls, fakeFetch } = createCapturingFetch();

@@ -406,7 +406,12 @@ export function buildProviderOptions(
       resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
       openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
     }) &&
-    openaiModelSupportsServiceTier(modelString, requestedServiceTier, providersConfig)
+    openaiModelSupportsServiceTier(
+      modelString,
+      requestedServiceTier,
+      providersConfig,
+      muxProviderOptions?.openai?.wireFormat
+    )
       ? requestedServiceTier
       : undefined;
 

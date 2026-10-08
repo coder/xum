@@ -1721,7 +1721,12 @@ export class ProviderModelFactory {
           serviceTier.success &&
           serviceTierAvailable &&
           // Ultrafast is model-gated: drop it rather than send a tier the model rejects.
-          openaiModelSupportsServiceTier(modelString, serviceTier.data, serviceTierProvidersConfig)
+          openaiModelSupportsServiceTier(
+            modelString,
+            serviceTier.data,
+            serviceTierProvidersConfig,
+            muxProviderOptions?.openai?.wireFormat
+          )
         ) {
           serviceTierDefault = {
             namespace: "openai",

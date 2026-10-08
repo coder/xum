@@ -1432,6 +1432,15 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(openai?.serviceTier).toBe(expected);
     });
 
+    test("drops Ultrafast on the Chat Completions wire, which rejects it", () => {
+      const openai = getOpenAIOptions(
+        buildProviderOptions("openai:gpt-6.1-sol", "medium", undefined, undefined, {
+          openai: { serviceTier: "ultrafast", wireFormat: "chatCompletions" },
+        })
+      );
+      expect(openai?.serviceTier).toBeUndefined();
+    });
+
     test("resolves Ultrafast support through a mapped alias", () => {
       const openai = getOpenAIOptions(
         buildProviderOptions(
