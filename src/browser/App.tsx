@@ -70,10 +70,8 @@ import {
 import { createCustomEvent, CUSTOM_EVENTS } from "@/common/constants/events";
 import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
-  getAgentIdKey,
   getAgentsInitNudgeKey,
   getProjectScopeId,
-  getWorkspaceAISettingsByAgentKey,
   getWorkspaceLastReadKey,
   EXPANDED_PROJECTS_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
@@ -127,7 +125,6 @@ import { getErrorMessage } from "@/common/utils/errors";
 import assert from "@/common/utils/assert";
 import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { prependInitialAppProxyBasePath } from "@/browser/utils/frontendBasePath";
@@ -509,17 +506,10 @@ function AppInner() {
     (workspaceId: string): string => getAiSelectionForWorkspace(workspaceId).model,
     [getAiSelectionForWorkspace]
   );
-
-  const getThinkingLevelForWorkspace = useCallback(
-    (workspaceId: string): ThinkingLevel =>
-      workspaceId ? getAiSelectionForWorkspace(workspaceId).thinkingLevel : "off",
-    [getAiSelectionForWorkspace]
-  );
-  const getReasoningModeForWorkspace = useCallback(
-    (workspaceId: string): OpenAIReasoningMode =>
-      workspaceId ? getAiSelectionForWorkspace(workspaceId).reasoningMode : "standard",
-    [getAiSelectionForWorkspace]
-  );
+  const getThinkingLevelForWorkspace = (workspaceId: string): ThinkingLevel =>
+    workspaceId ? getAiSelectionForWorkspace(workspaceId).thinkingLevel : "off";
+  const getReasoningModeForWorkspace = (workspaceId: string): OpenAIReasoningMode =>
+    workspaceId ? getAiSelectionForWorkspace(workspaceId).reasoningMode : "standard";
 
   // Pro mode is Responses-only; the palette command hides under chatCompletions
   // and on non-passthrough routes (mirroring the send path's header gating).
@@ -542,37 +532,9 @@ function AppInner() {
       }
 
       const normalized = THINKING_LEVELS.includes(level) ? level : "off";
-      const model = getModelForWorkspace(workspaceId);
-      const reasoningMode = getReasoningModeForWorkspace(workspaceId);
-
       markAiSelectionIntent(workspaceId, "thinkingLevel", normalized);
       // The palette bypasses ThinkingProvider.setThinkingLevel, so leave Auto here too.
       setAutoRoutingChoice(workspaceId, "thinkingLevel", false);
-
-      type WorkspaceAISettingsByAgentCache = Partial<
-        Record<
-          string,
-          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-        >
-      >;
-
-      const normalizedAgentId =
-        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
-          .trim()
-          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
-
-      updatePersistedState<WorkspaceAISettingsByAgentCache>(
-        getWorkspaceAISettingsByAgentKey(workspaceId),
-        (prev) => {
-          const record: WorkspaceAISettingsByAgentCache =
-            prev && typeof prev === "object" ? prev : {};
-          return {
-            ...record,
-            [normalizedAgentId]: { model, thinkingLevel: normalized, reasoningMode },
-          };
-        },
-        {}
-      );
 
       if (api) {
         // Mid-turn change: also apply to the active turn's next model step so
@@ -589,50 +551,20 @@ function AppInner() {
         );
       }
     },
-    [api, getModelForWorkspace, getReasoningModeForWorkspace]
+    [api]
   );
 
-  // Keep palette choices local until a user message sends the full settings.
-  const toggleReasoningModeFromPalette = useCallback(
-    (workspaceId: string, mode: Exclude<OpenAIReasoningMode, "standard">) => {
-      if (!workspaceId) {
-        return;
-      }
-
-      const next: OpenAIReasoningMode =
-        getReasoningModeForWorkspace(workspaceId) === mode ? "standard" : mode;
-      const model = getModelForWorkspace(workspaceId);
-      const thinkingLevel = getThinkingLevelForWorkspace(workspaceId);
-
-      markAiSelectionIntent(workspaceId, "reasoningMode", next);
-
-      type WorkspaceAISettingsByAgentCache = Partial<
-        Record<
-          string,
-          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-        >
-      >;
-
-      const normalizedAgentId =
-        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
-          .trim()
-          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
-
-      updatePersistedState<WorkspaceAISettingsByAgentCache>(
-        getWorkspaceAISettingsByAgentKey(workspaceId),
-        (prev) => {
-          const record: WorkspaceAISettingsByAgentCache =
-            prev && typeof prev === "object" ? prev : {};
-          return {
-            ...record,
-            [normalizedAgentId]: { model, thinkingLevel, reasoningMode: next },
-          };
-        },
-        {}
-      );
-    },
-    [getModelForWorkspace, getReasoningModeForWorkspace, getThinkingLevelForWorkspace]
-  );
+  const toggleReasoningModeFromPalette = (
+    workspaceId: string,
+    mode: Exclude<OpenAIReasoningMode, "standard">
+  ) => {
+    if (!workspaceId) {
+      return;
+    }
+    const next: OpenAIReasoningMode =
+      getReasoningModeForWorkspace(workspaceId) === mode ? "standard" : mode;
+    markAiSelectionIntent(workspaceId, "reasoningMode", next);
+  };
 
   const getFastModeActive = useCallback(() => {
     const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;

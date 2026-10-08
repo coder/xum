@@ -9,7 +9,6 @@ import type {
 } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
-import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import {
   getAutoRoutingKey,
@@ -21,7 +20,6 @@ import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePer
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
   getAgentIdKey,
-  getWorkspaceAISettingsByAgentKey,
   getPendingScopeId,
   getDraftScopeId,
   getPendingDraftSkillDiscoveryKey,
@@ -171,32 +169,6 @@ function syncCreationPreferences(
   // Without the experiment the composer offers no Auto, so a mismatch is not a pick.
   if (autoRoutingEnabled && Object.keys(routingChoice).length > 0) {
     recordAutoRoutingChoiceForAgent(workspaceId, effectiveAgentId, routingChoice);
-  }
-
-  const projectModel = projectDefaults?.model;
-  if (projectModel) {
-    const effectiveThinking: ThinkingLevel = projectDefaults?.thinkingLevel ?? "off";
-
-    type AgentSettingsCache = Partial<
-      Record<
-        string,
-        { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-      >
-    >;
-    updatePersistedState<AgentSettingsCache>(
-      getWorkspaceAISettingsByAgentKey(workspaceId),
-      (prev) => {
-        const record: AgentSettingsCache = prev && typeof prev === "object" ? prev : {};
-        return {
-          ...record,
-          [effectiveAgentId]: {
-            model: projectModel,
-            thinkingLevel: effectiveThinking,
-          },
-        };
-      },
-      {}
-    );
   }
 
   // Auto-enable notifications if the project-level preference is set

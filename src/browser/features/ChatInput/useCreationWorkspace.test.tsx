@@ -20,7 +20,6 @@ import {
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
   getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
   getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
@@ -2023,10 +2022,6 @@ describe("useCreationWorkspace", () => {
     });
 
     expect(updatePersistedStateCalls).toContainEqual([getAgentIdKey(TEST_WORKSPACE_ID), "exec"]);
-    const cachedAgentIds = updatePersistedStateCalls
-      .filter(([key]) => key === getWorkspaceAISettingsByAgentKey(TEST_WORKSPACE_ID))
-      .map(([, updater]) => Object.keys((updater as (prev: unknown) => object)({})));
-    expect(cachedAgentIds).toEqual([["exec"]]);
     expect(updateAgentAISettingsMock.mock.calls[0]?.[0]?.agentId).toBe("exec");
     expect(sendMessageMock.mock.calls[0]?.[0]?.options?.agentId).toBe("exec");
   });

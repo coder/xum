@@ -34,8 +34,6 @@ import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { ThinkingSelector } from "@/browser/components/ThinkingSelector/ThinkingSelector";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
-import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
-import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import {
@@ -58,7 +56,6 @@ import {
 } from "@/browser/utils/workspaceModeAi";
 import {
   getReasoningModeKey,
-  getWorkspaceAISettingsByAgentKey,
   getProjectScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
@@ -333,8 +330,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const creationSubProjectPath = creationScope?.subProjectPath ?? undefined;
   const creationProject =
     variant === "creation" ? userProjects.get(creationParentProjectPath) : undefined;
-  const [thinkingLevel] = useThinkingLevel();
-  const [reasoningMode] = useReasoningMode();
   const atMentionProjectPath =
     variant === "creation" && props.kind !== "scratch" ? props.projectPath : null;
   const asyncCommandScopeRef = useRef<{ variant: typeof variant; workspaceId: string | null }>({
@@ -742,13 +737,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   };
 
   const setPreferredModel = (model: string) => {
-    type WorkspaceAISettingsByAgentCache = Partial<
-      Record<
-        string,
-        { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-      >
-    >;
-
     const selectedModel = normalizeSelectedModel(model);
     if (
       variant === "workspace" &&
@@ -779,27 +767,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       }
     }
 
-    if (variant !== "workspace" || !workspaceId) {
-      return;
-    }
     // Marked after onModelChange so its explicit-switch record still sees the previous model;
     // this also pins a same-model pick on a sub-agent once a message sends it.
-    markAiSelectionIntent(workspaceId, "model", selectedModel);
-
-    const normalizedAgentId = normalizeAgentId(agentId, "exec");
-
-    updatePersistedState<WorkspaceAISettingsByAgentCache>(
-      getWorkspaceAISettingsByAgentKey(workspaceId),
-      (prev) => {
-        const record: WorkspaceAISettingsByAgentCache =
-          prev && typeof prev === "object" ? prev : {};
-        return {
-          ...record,
-          [normalizedAgentId]: { model: selectedModel, thinkingLevel, reasoningMode },
-        };
-      },
-      {}
-    );
+    if (variant === "workspace" && workspaceId) {
+      markAiSelectionIntent(workspaceId, "model", selectedModel);
+    }
   };
 
   // Model cycling candidates: all visible models (custom + built-in, minus hidden).

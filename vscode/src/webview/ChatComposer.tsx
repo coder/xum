@@ -9,13 +9,9 @@ import { matchesKeybind, formatKeybind, KEYBINDS } from "xum/browser/utils/ui/ke
 import { CUSTOM_EVENTS, createCustomEvent } from "xum/common/constants/events";
 import { useAPI } from "xum/browser/contexts/API";
 import { useAgent } from "xum/browser/contexts/AgentContext";
-import { useThinkingLevel } from "xum/browser/hooks/useThinkingLevel";
-import { useReasoningMode } from "xum/browser/hooks/useReasoningMode";
-import type { WorkspaceAISettingsCache } from "xum/browser/utils/workspaceModeAi";
-import { normalizeAgentId } from "xum/common/utils/agentIds";
 import { useWorkspaceAiSelection } from "xum/browser/utils/workspaceAiSettingsSync";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
-import { usePersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
+import { usePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useUserPreferences } from "xum/browser/stores/AppConfigStore";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
 import { normalizeSelectedModel } from "xum/common/utils/ai/models";
@@ -43,7 +39,7 @@ import {
   COMPOSER_CONTROL_HEIGHT_CLASS,
   COMPOSER_WORKSPACE_ICON_ONLY_HIDE_CLASS,
 } from "xum/constants/layout";
-import { getInputKey, getWorkspaceAISettingsByAgentKey } from "xum/common/constants/storage";
+import { getInputKey } from "xum/common/constants/storage";
 
 const SEND_MESSAGE_TIMEOUT_MS = 30_000;
 
@@ -108,8 +104,6 @@ function ChatComposerInner(props: {
   // #4820: without a workspace scope a pick would write the webview's global agent key.
   const agentPickerUsable = props.agentScoped && isAgentSelectionLocked !== true;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const [thinkingLevel] = useThinkingLevel();
-  const [reasoningMode] = useReasoningMode();
 
   const { options: providerOptions } = useProviderOptions();
   const use1M = providerOptions.anthropic?.use1MContext ?? false;
@@ -192,21 +186,6 @@ function ChatComposerInner(props: {
     const selectedModel = normalizeSelectedModel(model);
     ensureModelInSettings(selectedModel);
     markAiSelectionIntent(props.workspaceId, "model", selectedModel);
-
-    // Like the desktop composer, keep the active agent's cache current: WorkspaceModeAISync
-    // still restores thinking and reasoning from it after switching agents and back.
-    updatePersistedState<WorkspaceAISettingsCache>(
-      getWorkspaceAISettingsByAgentKey(props.workspaceId),
-      (prev) => ({
-        ...(prev && typeof prev === "object" ? prev : {}),
-        [normalizeAgentId(agentId, "exec")]: {
-          model: selectedModel,
-          thinkingLevel,
-          reasoningMode,
-        },
-      }),
-      {}
-    );
 
     // #4781: nothing is written here; the next send persists the pick (desktop parity).
   };
