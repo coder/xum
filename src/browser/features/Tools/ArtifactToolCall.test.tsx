@@ -5,16 +5,15 @@ import { cleanup, fireEvent, render as rtlRender } from "@testing-library/react"
 import type { ReactElement } from "react";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { installDom } from "../../../../tests/ui/dom";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { ChatHostContextProvider } from "@/browser/contexts/ChatHostContext";
 import { CHAT_UI_FEATURE_IDS } from "@/common/constants/chatUiFeatures";
 import { ArtifactToolCall } from "./ArtifactToolCall";
 import { AttachFileToolCall } from "./AttachFileToolCall";
 import { APIProvider } from "@/browser/contexts/API";
 import { OpenAsArtifactButton } from "@/browser/features/RightSidebar/ArtifactsTab/OpenAsArtifactButton";
-import { createTestApiClient } from "@/browser/testUtils";
+import { createTestApiClient, resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
 
 /** StatusIndicator needs the app's tooltip provider. */
 const render = (ui: ReactElement) => rtlRender(ui, { wrapper: TooltipProvider });
@@ -46,6 +45,7 @@ describe("artifact chat cards", () => {
   });
 
   afterEach(() => {
+    resetTestExperiments();
     window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onOpen);
     cleanup();
     cleanupDom?.();
@@ -53,7 +53,7 @@ describe("artifact chat cards", () => {
   });
 
   test("clicking a published card opens the Artifacts tab at that version", () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), true);
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
     const view = render(
       <ArtifactToolCall
         toolName="artifact"
@@ -82,7 +82,7 @@ describe("artifact chat cards", () => {
   });
 
   test("focus opens the tab once when the result arrives live, never on replay", () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), true);
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
     const live = render(
       <ArtifactToolCall
         toolName="artifact"
@@ -169,14 +169,14 @@ describe("artifact chat cards", () => {
     expect(hidden.queryByRole("button", { name: /Open in Artifacts/ })).toBeNull();
     hidden.unmount();
 
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), true);
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
     const view = render(card);
     fireEvent.click(view.getByRole("button", { name: /Open in Artifacts/ }));
     expect(opens).toEqual([{ workspaceId: WS, path: "report.md", versionId: 2 }]);
   });
 
   test("hosts without an Artifacts surface get no open buttons on attach_file or file cards", () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), true);
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
     const uiSupport = Object.fromEntries(
       CHAT_UI_FEATURE_IDS.map((id) => [id, id === "artifactsPanel" ? "unsupported" : "supported"])
     ) as Parameters<typeof ChatHostContextProvider>[0]["value"]["uiSupport"];

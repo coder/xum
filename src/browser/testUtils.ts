@@ -1,5 +1,7 @@
 import { createRequire } from "node:module";
 import type { APIClient } from "@/browser/contexts/API";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import type { ExperimentId } from "@/common/constants/experiments";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import { getDefaultAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
@@ -206,4 +208,17 @@ export function createTestBashResult(options: {
       ...truncated,
     },
   };
+}
+
+/** Sets one experiment in the shared AppConfigStore snapshot, as a backend config fetch would. */
+export function setTestExperiment(experimentId: ExperimentId, enabled: boolean | null): void {
+  const store = getAppConfigStore();
+  store.updateOptimistically({
+    experiments: { ...store.getSnapshot()?.experiments, [experimentId]: enabled === true },
+  });
+}
+
+/** Clears the experiments snapshot so the store singleton does not leak flags between tests. */
+export function resetTestExperiments(): void {
+  getAppConfigStore().updateOptimistically({ experiments: undefined });
 }

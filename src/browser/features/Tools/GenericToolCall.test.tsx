@@ -4,9 +4,8 @@ import { cleanup, fireEvent, render, within } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import { APIContext, APIProvider } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { createTestApiClient } from "@/browser/testUtils";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { createTestApiClient, resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import type { ToolStatus } from "./Shared/toolUtils";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
@@ -92,9 +91,10 @@ describe("GenericToolCall MCP Apps view", () => {
   beforeEach(() => {
     cleanupDom = installDom();
     getViewCalls = 0;
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), true);
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
   });
   afterEach(() => {
+    resetTestExperiments();
     cleanup();
     cleanupDom();
   });
@@ -226,7 +226,7 @@ describe("GenericToolCall MCP Apps view", () => {
   });
 
   test("with the experiment off, an app call renders like any other call", () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), false);
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, false);
     const view = renderAppCall("completed");
     expect(view.getByText("Arguments")).toBeTruthy();
     expect(view.queryByTestId("mcp-app-frame")).toBeNull();

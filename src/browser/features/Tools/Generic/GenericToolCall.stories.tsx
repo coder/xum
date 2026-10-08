@@ -2,10 +2,10 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { APIProvider } from "@/browser/contexts/API";
 import { GenericToolCall } from "@/browser/features/Tools/GenericToolCall";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 const meta = {
   ...lightweightMeta,
@@ -96,7 +96,9 @@ const DICE_RESULT = {
 };
 
 function renderMcpAppCall() {
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ARTIFACTS), true);
+  getAppConfigStore().setClient(
+    createMockORPCClient({ experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true } })
+  );
   return (
     <APIProvider
       client={createMockORPCClient({
