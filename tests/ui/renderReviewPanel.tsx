@@ -1,4 +1,5 @@
 import { render, type RenderResult, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
 import type { APIClient } from "@/browser/contexts/API";
@@ -8,6 +9,8 @@ interface RenderReviewPanelParams {
   apiClient: APIClient;
   /** Metadata for the workspace to select (optional - app can render without a workspace) */
   metadata?: FrontendWorkspaceMetadata;
+  /** Render under React StrictMode, as dev builds do (main.tsx). */
+  strictMode?: boolean;
 }
 
 export interface RenderedApp extends RenderResult {
@@ -34,7 +37,8 @@ export function renderReviewPanel(props: RenderReviewPanelParams): RenderedApp {
  * This exercises the real component tree, providers, and state management.
  */
 export function renderApp(props: RenderReviewPanelParams): RenderedApp {
-  const result = render(<AppLoader client={props.apiClient} />);
+  const app = <AppLoader client={props.apiClient} />;
+  const result = render(props.strictMode ? <StrictMode>{app}</StrictMode> : app);
 
   return {
     ...result,

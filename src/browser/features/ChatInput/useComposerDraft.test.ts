@@ -78,4 +78,32 @@ describe("useComposerDraft", () => {
 
     expect(result.current.attachments.map(({ id }) => id)).toEqual(["a", "b"]);
   });
+
+  // T18: an in-flight send or command owns a detached snapshot; it never touches the live edit.
+  test("a snapshot append leaves the edit buffer alone; consuming the buffer appends it once", () => {
+    const workspaceId = "ws-edit-buffer";
+    const { result } = renderDraft(workspaceId);
+    act(() => {
+      result.current.setInput("unsent");
+      result.current.setAttachments([attachment("unsent")]);
+      result.current.beginEditDraft({ id: "edit-1", text: "edit", attachments: [attachment("e")] });
+    });
+    act(() => {
+      result.current.appendSnapshotToDraft({ text: "snapshot", attachments: [attachment("s")] });
+    });
+
+    const view = () => getDraftStore().getView({ kind: "workspace", workspaceId });
+    expect(view().text).toBe("unsent\n\nsnapshot");
+    expect(view().attachments.map(({ id }) => id)).toEqual(["unsent", "s"]);
+    expect(result.current.editDraft?.text).toBe("edit");
+    expect(result.current.editDraft?.attachments.map(({ id }) => id)).toEqual(["e"]);
+
+    act(() => {
+      result.current.consumeEditDraftIntoDraft();
+      result.current.consumeEditDraftIntoDraft();
+    });
+    expect(view().text).toBe("unsent\n\nsnapshot\n\nedit");
+    expect(view().attachments.map(({ id }) => id)).toEqual(["unsent", "s", "e"]);
+    expect(result.current.editDraft).toBeNull();
+  });
 });
