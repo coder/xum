@@ -12,7 +12,6 @@ import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
-import { selectCopilotApiMode } from "@/common/utils/copilot/modelRouting";
 import { isGpt61SolModel, isGpt6AstraModel } from "@/common/types/thinking";
 
 export interface OpenAIDirectProviderOptionsAvailability {
@@ -88,8 +87,11 @@ export function openaiModelSupportsServiceTier(
 }
 
 /**
- * Whether the wire this route actually speaks accepts Ultrafast. Each route pins its own
- * wire, so the direct OpenAI wireFormat setting must not decide for other routes.
+ * Whether the wire this route actually speaks accepts Ultrafast. An allowlist that fails
+ * closed: only routes that send OpenAI's own Responses API keep the 6x tier. Gateways with
+ * their own adapters (OpenRouter's chat API, Xum Gateway, Copilot's Chat Completions) do not
+ * accept "ultrafast", and each route pins its own wire, so the direct OpenAI wireFormat
+ * setting must not decide for them.
  */
 function ultrafastWireAccepted(
   modelString: string,
@@ -112,13 +114,7 @@ function ultrafastWireAccepted(
         : resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder);
     return wire?.providerType === "openai";
   }
-  if (route === "github-copilot") {
-    // Copilot picks its wire per model and sends most GPT models over Chat Completions.
-    const [, modelId] = normalizeToCanonical(modelString).split(":", 2);
-    return selectCopilotApiMode(modelId ?? modelString) === "responses";
-  }
-  // Other gateways (OpenRouter, Xum Gateway) keep forwarding the tier as before.
-  if (route !== "direct") return true;
+  if (route !== "direct") return false;
   // Direct OpenAI: the stored wire format wins over the request-level one, as in the factory.
   const wireFormat =
     providersConfig?.openai?.wireFormat ?? options?.openaiWireFormat ?? "responses";

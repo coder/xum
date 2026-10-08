@@ -1212,7 +1212,10 @@ function AppInner() {
         if (!isDialogOpen()) togglePremiumServiceTier("priority").catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ULTRAFAST_MODE)) {
         e.preventDefault();
-        if (!isDialogOpen()) togglePremiumServiceTier("ultrafast").catch(() => undefined);
+        // A held chord would re-toggle once each write settles, leaving the tier timing-dependent.
+        if (!isDialogOpen() && !e.repeat) {
+          togglePremiumServiceTier("ultrafast").catch(() => undefined);
+        }
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_COMPUTER_USE) && computerUseAvailable) {
         e.preventDefault();
         // A held shortcut would race enable and disable requests and leave either state behind.

@@ -293,18 +293,17 @@ describe("fast mode service tier", () => {
       });
     expect(viaCoder("openai")).toBe(true);
     expect(viaCoder("openai-compat")).toBe(false);
-    // Copilot keeps GPT-6 models on Chat Completions, so Fast stays offered but Ultrafast does not.
-    const copilotOptions = {
-      resolvedRouteProvider: "github-copilot",
-      providersConfig: config({}),
-    };
-    copilotOptions.providersConfig["github-copilot"] = {
-      apiKeySet: true,
-      isEnabled: true,
-      isConfigured: true,
-    };
-    expect(getFastModeProvider("openai:gpt-6.1-sol", copilotOptions)).toBe("openai");
-    expect(ultrafastModeAvailable("openai:gpt-6.1-sol", copilotOptions)).toBe(false);
+    // Gateways with their own adapters forward Fast but not Ultrafast: the gate fails closed.
+    for (const route of ["github-copilot", "openrouter", "mux-gateway"]) {
+      const gatewayOptions = { resolvedRouteProvider: route, providersConfig: config({}) };
+      gatewayOptions.providersConfig[route] = {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+      };
+      expect(getFastModeProvider("openai:gpt-6.1-sol", gatewayOptions)).toBe("openai");
+      expect(ultrafastModeAvailable("openai:gpt-6.1-sol", gatewayOptions)).toBe(false);
+    }
     // Non-OpenAI Fast modes have no Ultrafast tier.
     expect(ultrafastModeAvailable("xai:grok-4.7", { providersConfig: null })).toBe(false);
   });
