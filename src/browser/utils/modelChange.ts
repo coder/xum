@@ -3,10 +3,15 @@ import {
   getAutoModelRoutingKey,
   getAutoRoutingChoiceByAgentKey,
   getAutoThinkingLevelKey,
+  isNonWorkspaceScopeId,
 } from "@/common/constants/storage";
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import {
+  readScopeAgentId,
+  readScopedAiDefault,
+  writeScopedAiDefault,
+} from "@/browser/utils/scopedAiDefaults";
 import {
   markAiSelectionIntent,
   setAutoRoutingPick,
@@ -15,7 +20,6 @@ import {
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import type { AutoRoutingChoiceByAgent } from "@/browser/utils/workspaceModeAi";
 import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 export type ModelChangeOrigin = "user" | "agent" | "sync";
 
@@ -33,8 +37,7 @@ const pendingExplicitChanges = new Map<string, ExplicitModelChange>();
 // aliases (mux-gateway:openai/x) still collapse so persisted rewrites keep matching.
 const normalizeExplicitModel = (model: string): string => modelSelectionEqualityKey(model);
 
-/** Workspace ids never start with "__"; project, global and draft scopes do. */
-const isWorkspaceScope = (scopeId: string): boolean => !scopeId.startsWith("__");
+const isWorkspaceScope = (scopeId: string): boolean => !isNonWorkspaceScopeId(scopeId);
 
 export function recordWorkspaceModelChange(
   workspaceId: string,
@@ -145,6 +148,5 @@ export function setAutoRoutingChoice(
   dimension: AutoRoutingDimension,
   active: boolean
 ): void {
-  const agentId = readScopedAiDefault(scopeId, "agentId") ?? WORKSPACE_DEFAULTS.agentId;
-  setAutoRoutingPick(scopeId, agentId, dimension, active);
+  setAutoRoutingPick(scopeId, readScopeAgentId(scopeId), dimension, active);
 }

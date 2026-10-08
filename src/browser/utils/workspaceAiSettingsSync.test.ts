@@ -15,6 +15,7 @@ import {
 import {
   getAutoRouting,
   getWorkspaceAiSelection,
+  useAutoRouting,
   useWorkspaceAiSelection,
   type WorkspaceAiSelection,
 } from "@/browser/utils/workspaceAiSettingsSync";
@@ -160,6 +161,19 @@ describe("getWorkspaceAiSelection", () => {
     expect(result.current.model).toBe("openai:loaded-later");
   });
 
+  test("a legacy workspace id that starts with __ resolves its saved settings", () => {
+    const legacyId = "__proj-main";
+    setWorkspaceAiMetadata(legacyId, {
+      projectPath: PROJECT,
+      aiSettings: undefined,
+      aiSettingsByAgent: { exec: { model: "openai:saved", thinkingLevel: "high" } },
+    });
+
+    const { result } = renderHook(() => useWorkspaceAiSelection(legacyId, "exec"));
+    expect(result.current.model).toBe("openai:saved");
+    expect(getWorkspaceAiSelection(legacyId, "exec").model).toBe("openai:saved");
+  });
+
   test("a creation scope resolves its own defaults in the hook and the plain reader", () => {
     const scopeId = getProjectScopeId(PROJECT);
     // Workspace resolution would apply the configured Exec model here instead.
@@ -209,5 +223,21 @@ describe("getWorkspaceAiSelection", () => {
     save({ autoModelRouting: true });
     save({});
     expect(getAutoRouting(WS, "model", "exec")).toBe(false);
+
+    // A legacy workspace's single bucket owns the flag too.
+    const legacy = "resolver-legacy";
+    setWorkspaceAiMetadata(legacy, { aiSettings: { model: "openai:saved", thinkingLevel: "low" } });
+    expect(getAutoRouting(legacy, "model", "exec")).toBe(false);
+  });
+
+  test("a project without its own agent routes Auto for the inherited global agent", () => {
+    getAppConfigStore().updateOptimistically({
+      agentAiDefaults: { plan: { autoModelRouting: true } },
+      userPreferences: { ai: { globalDefaults: { agentId: "plan" } } },
+    });
+    const scopeId = getProjectScopeId(PROJECT);
+    expect(getAutoRouting(scopeId, "model")).toBe(true);
+    const { result } = renderHook(() => useAutoRouting(scopeId, "model"));
+    expect(result.current).toBe(true);
   });
 });

@@ -10,8 +10,9 @@ import type {
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
-import { getAutoRoutingKey, recordAutoRoutingChoiceForAgent } from "@/browser/utils/modelChange";
-import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
+import { recordAutoRoutingChoiceForAgent } from "@/browser/utils/modelChange";
+import { setAutoRoutingPick, type AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
@@ -147,23 +148,28 @@ function syncCreationPreferences(
     getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {},
     agentBaseById
   );
-  const routingChoice: Partial<Record<AutoRoutingDimension, boolean>> = {};
-  for (const [dimension, configuredAuto] of [
-    ["model", configuredDefaults.autoModelRouting === true],
-    ["thinkingLevel", configuredDefaults.autoThinkingLevel === true],
-  ] as const) {
-    const creationAuto =
-      readPersistedState<boolean>(getAutoRoutingKey(projectScopeId, dimension), false) === true;
-    if (creationAuto) {
-      updatePersistedState(getAutoRoutingKey(workspaceId, dimension), true);
+  // Without the experiment the composer offers no Auto, so the creation scope has no choice.
+  if (autoRoutingEnabled) {
+    const routingChoice: Partial<Record<AutoRoutingDimension, boolean>> = {};
+    for (const [dimension, configuredAuto] of [
+      ["model", configuredDefaults.autoModelRouting === true],
+      ["thinkingLevel", configuredDefaults.autoThinkingLevel === true],
+    ] as const) {
+      const creationAuto = getAutoRouting(
+        projectScopeId,
+        dimension,
+        effectiveAgentId,
+        agentBaseById
+      );
+      // The workspace shows the creation choice until a send saves it.
+      setAutoRoutingPick(workspaceId, effectiveAgentId, dimension, creationAuto);
+      if (creationAuto !== configuredAuto) {
+        routingChoice[dimension] = creationAuto;
+      }
     }
-    if (creationAuto !== configuredAuto) {
-      routingChoice[dimension] = creationAuto;
+    if (Object.keys(routingChoice).length > 0) {
+      recordAutoRoutingChoiceForAgent(workspaceId, effectiveAgentId, routingChoice);
     }
-  }
-  // Without the experiment the composer offers no Auto, so a mismatch is not a pick.
-  if (autoRoutingEnabled && Object.keys(routingChoice).length > 0) {
-    recordAutoRoutingChoiceForAgent(workspaceId, effectiveAgentId, routingChoice);
   }
 
   // Auto-enable notifications if the project-level preference is set
