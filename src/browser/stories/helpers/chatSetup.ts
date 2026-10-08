@@ -107,6 +107,7 @@ export interface SimpleChatSetupOptions {
   timelineEvents?: TimelineEvent[];
   /** Render the chat workspace as transcript-only (worktree gone; no composer). */
   transcriptOnly?: boolean;
+  aiSettings?: FrontendWorkspaceMetadata["aiSettings"];
 }
 
 /**
@@ -124,6 +125,7 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
       projectName,
       projectPath,
       transcriptOnly: opts.transcriptOnly,
+      aiSettings: opts.aiSettings,
     }),
     ...(opts.additionalWorkspaces ?? []),
   ];

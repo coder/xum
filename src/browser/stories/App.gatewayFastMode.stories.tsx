@@ -1,10 +1,8 @@
 import { expect, userEvent, waitFor, within } from "@storybook/test";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   FastModePreviousServiceTierSchema,
   ServiceTierSchema,
 } from "@/common/config/schemas/providersConfig";
-import { getModelKey, getReasoningModeKey, getThinkingLevelKey } from "@/common/constants/storage";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import assert from "@/common/utils/assert";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
@@ -19,9 +17,6 @@ const phoneViewport = { name: "Phone", styles: { width: "390px", height: "844px"
 
 function setupGatewayFastMode() {
   collapseLeftSidebar();
-  updatePersistedState(getModelKey(workspaceId), "coder:openai/gpt-6-astra");
-  updatePersistedState(getThinkingLevelKey(workspaceId), "high");
-  updatePersistedState(getReasoningModeKey(workspaceId), "standard");
   // An unconfigured provider still exposes preferences.
   let providersConfig: ProvidersConfigMap = {
     coder: {
@@ -34,6 +29,7 @@ function setupGatewayFastMode() {
   };
   const client = setupSimpleChatStory({
     workspaceId,
+    aiSettings: { model: "coder:openai/gpt-6-astra", thinkingLevel: "high" },
     messages: [],
     routePriority: ["coder"],
     providersConfig,

@@ -3,8 +3,8 @@ import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar } from "./helpers/uiState";
 import { blurActiveElement, waitForChatInputAutofocusDone } from "./storyPlayHelpers";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getModelKey, getReasoningModeKey, getThinkingLevelKey } from "@/common/constants/storage";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { getReasoningModeKey } from "@/common/constants/storage";
 
 export default { ...appMeta, title: "App/Astra Pro" };
 
@@ -32,11 +32,9 @@ export const CoderGateway: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        updatePersistedState(getModelKey(workspaceId), "coder:openai/gpt-6-astra");
-        updatePersistedState(getThinkingLevelKey(workspaceId), "high");
-        updatePersistedState(getReasoningModeKey(workspaceId), "standard");
         return setupSimpleChatStory({
           workspaceId,
+          aiSettings: { model: "coder:openai/gpt-6-astra", thinkingLevel: "high" },
           messages: [],
           routePriority: ["coder"],
           providersConfig: {
