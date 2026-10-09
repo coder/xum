@@ -107,8 +107,8 @@ function main(argv: string[]): void {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--json") json = true;
-    else if (arg === "--forbid") patterns.push(argv[++i] || fail("--forbid needs a substring"));
-    else if (arg.startsWith("-") || distArg != null) fail(`unexpected argument ${arg}`);
+    else if (arg === "--forbid" && /^[^-]/.test(argv[i + 1] ?? "")) patterns.push(argv[++i]);
+    else if (arg.startsWith("-") || distArg != null) fail(`bad or incomplete argument ${arg}`);
     else distArg = arg;
   }
   const distDir = path.resolve(distArg ?? "dist");

@@ -65,9 +65,9 @@ describe("firstLoadJs", () => {
     expect(lazyOnly.exitCode, lazyOnly.stderr).toBe(0);
     const firstLoad = await runScript([dir, "--forbid", "node_modules/shared-dep/"]);
     expect(firstLoad.exitCode).toBe(1);
-    expect(firstLoad.stderr).toContain(
-      "shared-BBBBBBBB.js has ../node_modules/shared-dep/index.js"
-    );
+    expect(firstLoad.stderr).toContain("shared-BBBBBBBB.js has ../node_modules/shared-dep/");
+    // A flag is never a pattern, so `--json` cannot be swallowed silently.
+    expect((await runScript([dir, "--forbid", "--json"])).exitCode).toBe(2);
     // Skipping a chunk without a map would let a forbidden module back on unnoticed.
     await fs.rm(path.join(dir, "deep-EEEEEEEE.js.map"));
     const noMap = await runScript([dir, "--forbid", "node_modules/lazy-only/"]);
