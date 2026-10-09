@@ -101,7 +101,8 @@ function ProgressDots(props: { count: number; activeIndex: number }) {
 function WizardHeader(props: { stepIndex: number; totalSteps: number }) {
   return (
     <div className="flex items-center justify-end gap-2">
-      <span className="text-content-secondary text-xs">
+      {/* Hidden from screen readers: the progress dots already announce "Step N of M" (#5948). */}
+      <span className="text-content-secondary text-xs" aria-hidden="true">
         {props.stepIndex + 1} / {props.totalSteps}
       </span>
       <ProgressDots count={props.totalSteps} activeIndex={props.stepIndex} />
