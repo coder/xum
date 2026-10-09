@@ -114,6 +114,9 @@ import {
   computeContextLoadedToolNames,
   dedupeNativeToolReferences,
   computeLoadedToolNames,
+  recordNativeToolSearchResults,
+  restoreNativeToolSearchResults,
+  type NativeToolSearchResultPart,
   type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
 import { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
@@ -2980,6 +2983,10 @@ export class StreamManager {
     // #5086: see the `between_tools` replay guard in prepareStep.
     let previousToolSetKey: string | undefined;
     let seenPrefixSwap: ContinuousPrefixSwap | undefined;
+    // Raw tool-search results seen by this run's steps, keyed by toolCallId.
+    // The reference dedupe below projects repeats out of the returned messages
+    // the SDK carries forward, so a later prefix swap restores from here.
+    const rawToolSearchResults = new Map<string, NativeToolSearchResultPart>();
     // Outgoing rows before this index predate the latest in-turn prefix change.
     let reasoningReplayBoundary = 0;
     // XUM_DISABLE_AGENT_TOOLS=1 sends no tools at all (see isAgentToolsDisabled). Every chat
@@ -2998,6 +3005,7 @@ export class StreamManager {
         // streamText runs multiple internal LLM calls (steps) when tools are enabled.
         const rewritten = await transformStepMessages(stepMessages);
         let effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
+        recordNativeToolSearchResults(effectiveMessages, rawToolSearchResults);
         if (stepTracker?.prefixSwapInvalidated) {
           // Cross-family fallback must not send the old provider's cached prefix.
           // Release only on the session's stop, after fallback reset/locks have completed.
@@ -3035,7 +3043,13 @@ export class StreamManager {
         }
         const swap = stepTracker?.pendingPrefixSwap;
         if (swap && stepTracker?.workspaceId) {
-          const swapped = this.swapPrefix(effectiveMessages, swap);
+          // Swap from the raw results: the carried tail may hold a projected
+          // repeat whose first occurrence the swap is about to drop, and only
+          // the raw form lets the post-swap dedupe keep that tool loaded.
+          const swapped = this.swapPrefix(
+            restoreNativeToolSearchResults(effectiveMessages, rawToolSearchResults),
+            swap
+          );
           if (swapped) {
             const store = this.historyService.getContinuousCompactionJournal(
               stepTracker.workspaceId
