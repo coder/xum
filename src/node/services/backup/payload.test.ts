@@ -232,7 +232,12 @@ describe("backup payload", () => {
       sourceLabel: "test-host",
       exportedAt: "2026-07-30T00:00:00.000Z",
       preferences: {
-        appearance: { theme: "dark", vimEnabled: true },
+        appearance: {
+          theme: "dark",
+          vimEnabled: true,
+          powerModeEnabled: true,
+          gitStatusIndicatorMode: "line-delta",
+        },
         navigation: { launchBehavior: "dashboard", projectOrder: ["/private/project"] },
         ai: {
           globalDefaults: { agentId: "exec" },
@@ -267,7 +272,12 @@ describe("backup payload", () => {
       unknown
     >;
     expect(preferences).toEqual({
-      appearance: { theme: "dark", vimEnabled: true },
+      appearance: {
+        theme: "dark",
+        vimEnabled: true,
+        powerModeEnabled: true,
+        gitStatusIndicatorMode: "line-delta",
+      },
       navigation: { launchBehavior: "dashboard" },
       ai: {
         globalDefaults: { agentId: "exec" },

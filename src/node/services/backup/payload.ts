@@ -916,6 +916,8 @@ const BACKED_UP_APPEARANCE_FIELDS = [
   "terminalFontConfig",
   "terminalBadgeConfig",
   "vimEnabled",
+  "powerModeEnabled",
+  "gitStatusIndicatorMode",
 ] as const satisfies ReadonlyArray<keyof Appearance>;
 
 type Review = NonNullable<UserPreferences["review"]>;
