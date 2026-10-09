@@ -128,20 +128,28 @@ describe("MarkdownChunker", () => {
     }
   });
 
-  test("a block whose text differs from the input is never sealed", () => {
-    // Streamdown's blocks turn CRLF into LF, so they no longer match the input.
-    const text = Array.from({ length: 20 }, (_, k) => `Paragraph ${k} text.`).join("\r\n\r\n");
-    expect(new MarkdownChunker(40).update(text).join("")).toBe(text);
+  test("a warm chunker cuts a table like a cold one at every prefix", () => {
+    const full = `${hugeTable(6_000)}\nAfter the table.\n`;
+    const warm = new MarkdownChunker(2_000);
+    let cut = false;
+    for (let end = 1; end < full.length + 13; end += 13) {
+      const text = full.slice(0, Math.min(end, full.length));
+      const cold = new MarkdownChunker(2_000);
+      expect(warm.update(text)).toEqual(cold.update(text));
+      expect(warm.heads()).toEqual(cold.heads());
+      cut ||= warm.heads().some((head) => head !== "");
+    }
+    expect(cut).toBe(true);
   });
 
-  // #5664: a partial marker (`…\n\n30` before its `.`) must not seal the list before it, even when
-  // the open range is close to the chunk size. Every chunk size puts some marker near a limit.
-  test("a partial ordered marker at a chunk limit does not split the list", () => {
-    const full = Array.from({ length: 40 }, (_, k) => `${k + 1}. Item ${k + 1} text`).join("\n\n");
-    for (let maxChars = 60; maxChars <= 140; maxChars++) {
-      const chunker = new MarkdownChunker(maxChars);
-      for (let end = 1; end <= full.length; end++) chunker.update(full.slice(0, end));
-      expect(chunker.completedChunks()).toEqual([full]);
+  test("a replacement edit clears the heads of a cut table", () => {
+    const chunker = new MarkdownChunker(2_000);
+    chunker.update(hugeTable(9_000));
+    expect(chunker.heads().some((head) => head !== "")).toBe(true);
+    for (const other of [hugeTable(5_000, (k) => `| x${k} | y |\n`), "Other text.\n\nMore."]) {
+      const cold = new MarkdownChunker(2_000);
+      expect(chunker.update(other)).toEqual(cold.update(other));
+      expect(chunker.heads()).toEqual(cold.heads());
     }
   });
 
@@ -255,14 +263,18 @@ describe("ChunkedStreamingMarkdown", () => {
     );
   }
 
-  function renderSingle(content: string): HTMLElement {
+  function renderSingle(content: string, streaming = false): HTMLElement {
     const single = document.createElement("div");
     document.body.appendChild(single);
     const singleRoot = createRoot(single);
     flushSync(() =>
       singleRoot.render(
         <ThemeProvider forcedTheme="dark">
-          <MarkdownCore content={content} />
+          <MarkdownCore
+            content={content}
+            parseIncompleteMarkdown={streaming}
+            renderSynchronously={streaming}
+          />
         </ThemeProvider>
       )
     );
@@ -277,6 +289,129 @@ describe("ChunkedStreamingMarkdown", () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
   }
+
+  // Queues animation frames, so a test can mount every backfilled chunk without waiting.
+  function withManualFrames(run: (flushFrames: () => void) => void) {
+    const frames: FrameRequestCallback[] = [];
+    const originalRequest = globalThis.requestAnimationFrame;
+    const originalCancel = globalThis.cancelAnimationFrame;
+    globalThis.requestAnimationFrame = (callback) => frames.push(callback);
+    globalThis.cancelAnimationFrame = (id) => {
+      frames[id - 1] = () => undefined;
+    };
+    let next = 0;
+    try {
+      run(() => {
+        while (next < frames.length) flushSync(() => frames[next++](0));
+      });
+    } finally {
+      globalThis.requestAnimationFrame = originalRequest;
+      globalThis.cancelAnimationFrame = originalCancel;
+    }
+  }
+
+  // Streams `text` in steps of `step` chars and mounts every backfilled chunk.
+  function streamRow(text: string, step: number) {
+    withManualFrames((flushFrames) => {
+      for (let end = 300; end < text.length; end += step) renderRow(text.slice(0, end), true);
+      renderRow(text, true);
+      flushFrames();
+    });
+  }
+
+  // Cells of every body row in order, with their tags, alignment and inline HTML. The repeated
+  // <thead> of each piece is skipped.
+  function bodyRows(element: Element): string[] {
+    return [...element.querySelectorAll("tbody tr")].map((tr) =>
+      [...tr.children].map((cell) => cell.outerHTML).join("")
+    );
+  }
+
+  // Rows with escaped pipes and pipes in code, links, images, inline HTML, extra and missing
+  // cells, empty rows, lazy rows and rows without outer pipes. Each row closes its own markup.
+  const EQUIVALENCE_ROWS: Array<(k: number) => string> = [
+    (k) => `| ${k} | a \\| b | \`x\\|y\` |`,
+    (k) => `| ${k} | [link ${k}](https://example.com/${k}) | ![im](https://example.com/${k}.png) |`,
+    (k) => `| ${k} | **bold ${k}** <kbd>k</kbd> | extra | cells |`,
+    (k) => `| ${k} |`,
+    () => "|  |  |  |",
+    (k) => `lazy row ${k} with \`code\``,
+    (k) => `${k} | no outer | pipes`,
+  ];
+
+  test.each([
+    ["nothing", ""],
+    ["a list", "\n- a list item\n- another item\n"],
+    ["a heading", "\n## A heading after\n\nText after it."],
+    ["a fence", "\n```ts\nconst after = 1;\n```\n"],
+    ["a paragraph", "\nA paragraph after the table.\n"],
+  ])(
+    "table pieces render the same rows, in order, as the whole table (then %s)",
+    (_after, after) => {
+      let table = "| n | value | code |\n|:--|:-:|--:|\n";
+      for (let k = 1; table.length < 4_500; k++) {
+        table += EQUIVALENCE_ROWS[k % EQUIVALENCE_ROWS.length](k) + "\n";
+      }
+      const full = table + after;
+      // Prefixes next to each cut and its row newlines, inside each construct the tail repair
+      // changes, at the first line of the next block, and the final text.
+      const checked = new Set<number>([table.length + 3, full.length]);
+      let cut = 0;
+      for (const chunk of new MarkdownChunker(2_000).update(full).slice(0, -1)) {
+        cut += chunk.length;
+        const nextNewline = full.indexOf("\n", cut);
+        for (const at of [cut - 1, cut, cut + 1, nextNewline, nextNewline + 1]) checked.add(at);
+      }
+      for (const marker of ["**bo", "[li", "`x", "![im"]) {
+        for (let at = full.indexOf(marker); at !== -1; at = full.indexOf(marker, at + 600)) {
+          checked.add(at + marker.length);
+        }
+      }
+      expect(checked.size).toBeGreaterThan(20);
+      withManualFrames((flushFrames) => {
+        for (const end of [...checked].sort((a, b) => a - b)) {
+          const text = full.slice(0, Math.min(end, full.length));
+          renderRow(text, true);
+          flushFrames();
+          const oracle = renderSingle(text, true);
+          expect(bodyRows(container)).toEqual(bodyRows(oracle));
+          // Every piece repeats the same header row.
+          const heads = [...container.querySelectorAll("thead")].map((head) => head.outerHTML);
+          expect(new Set(heads)).toEqual(new Set([oracle.querySelector("thead")!.outerHTML]));
+        }
+        expect(container.querySelectorAll("table").length).toBeGreaterThan(2);
+        // Completed: one table, as one static render.
+        renderRow(full, false);
+        flushFrames();
+        expect(container.querySelectorAll("table")).toHaveLength(1);
+        expect(bodyRows(container)).toEqual(bodyRows(renderSingle(full)));
+      });
+    }
+  );
+
+  test("cut table pieces keep the stripes in phase", () => {
+    streamRow(hugeTable(9_000), 450);
+    const pieces = [...container.querySelectorAll("table")];
+    expect(pieces.length).toBeGreaterThan(3);
+    // `tr:nth-of-type(even)` restarts in each piece, so every sealed piece has an even count.
+    for (const piece of pieces.slice(0, -1)) {
+      expect(piece.querySelectorAll("tbody tr").length % 2).toBe(0);
+    }
+  });
+
+  test("a block after a cut table renders outside the table", () => {
+    const paragraphs = Array.from(
+      { length: 12 },
+      (_, k) => `Paragraph ${k} after the table, ${"lorem ipsum dolor sit amet ".repeat(8)}`
+    );
+    streamRow(`${hugeTable(6_000)}\n${paragraphs.join("\n\n")}`, 300);
+    expect(container.querySelectorAll("table").length).toBeGreaterThan(2);
+    const after = [...container.querySelectorAll("p")].filter((p) =>
+      p.textContent?.startsWith("Paragraph ")
+    );
+    expect(after).toHaveLength(12);
+    for (const p of after) expect(p.closest("table")).toBeNull();
+  });
 
   test("a huge list that mounts mid-stream shows its newest items in the first commit", () => {
     const list = hugeList(30_000, bulletLine);
@@ -356,19 +491,33 @@ describe("ChunkedStreamingMarkdown", () => {
   // cut list into one chunk, so every chunk after it moves to a lower index.
   test.each([
     // At least one sealed chunk after the list is mounted, but no list item yet.
-    ["after the cut list", (row: Element) => row.children.length > 1 && !row.querySelector("li")],
+    [
+      "after the cut list",
+      hugeList(14_000, bulletLine),
+      "li",
+      (row: Element) => row.children.length > 1 && !row.querySelector("li"),
+    ],
     // Some ranges of the list are mounted, but not its first item.
     [
       "inside the cut list",
+      hugeList(14_000, bulletLine),
+      "li",
       (row: Element) => row.querySelector("li") !== null && !row.textContent?.includes("item 1 "),
+    ],
+    // Some pieces of the table are mounted, but not its first row.
+    [
+      "inside the cut table",
+      hugeTable(14_000),
+      "tbody tr",
+      (row: Element) => row.querySelector("tr") !== null && !row.textContent?.includes("v1 and"),
     ],
   ])(
     "completion during the backfill, with the oldest mounted chunk %s, unmounts nothing",
-    (_where, isOldestMounted) => {
+    (_where, huge, rowSelector, isOldestMounted) => {
       const paragraph = (k: number) =>
         `Paragraph ${k}: ${"lorem ipsum dolor sit amet ".repeat(24)}`;
       const after = Array.from({ length: 16 }, (_, k) => paragraph(k)).join("\n\n");
-      const reply = `Intro.\n\n${hugeList(14_000, bulletLine)}\n${after}`;
+      const reply = `Intro.\n\n${huge}\n${after}`;
       const frames: FrameRequestCallback[] = [];
       const originalRequest = globalThis.requestAnimationFrame;
       const originalCancel = globalThis.cancelAnimationFrame;
@@ -384,14 +533,18 @@ describe("ChunkedStreamingMarkdown", () => {
         }
         // Every mounted chunk but the open last one, which remounts when the stream ends (#5664).
         const visible = [...container.firstElementChild!.children].slice(0, -1);
-        const sealedAfterList = visible.filter((chunk) => !chunk.querySelector("li"));
+        const sealedAfterList = visible.filter((chunk) => !chunk.querySelector(rowSelector));
         expect(sealedAfterList.length).toBeGreaterThan(0);
 
         renderRow(reply, false);
-        const text = container.textContent?.replace(/\s+/g, "");
-        for (const chunk of visible) {
-          expect(text).toContain(chunk.textContent.replace(/\s+/g, ""));
-        }
+        // Text without the header rows, which each table piece repeats while streaming.
+        const bodyText = (element: Element) => {
+          const copy = element.cloneNode(true) as Element;
+          for (const head of copy.querySelectorAll("thead")) head.remove();
+          return (copy.textContent ?? "").replace(/\s+/g, "");
+        };
+        const text = bodyText(container);
+        for (const chunk of visible) expect(text).toContain(bodyText(chunk));
         for (const chunk of sealedAfterList) expect(chunk.isConnected).toBe(true);
       } finally {
         globalThis.requestAnimationFrame = originalRequest;

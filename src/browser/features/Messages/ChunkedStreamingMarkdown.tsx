@@ -7,7 +7,7 @@ import {
 } from "@/constants/streaming";
 import { MarkdownCore } from "./MarkdownCore";
 import { normalizeMarkdown } from "./MarkdownStyles";
-import { listItemRanges } from "./streamingMarkdownBlocks";
+import { listItemRanges, tableRowRanges } from "./streamingMarkdownBlocks";
 
 // Blank lines, or the digits of an ordered list marker before its `.` or `)` arrives.
 const PARTIAL_LIST_MARKER = /^\d{0,9}$/;
@@ -22,6 +22,8 @@ const PARTIAL_LIST_MARKER = /^\d{0,9}$/;
  * A list longer than `maxChars` is cut at its top-level items into chunks of its own, so the open
  * chunk of a huge streaming list stays small enough for a synchronous render (#5666). Each cut
  * renders as a separate list while streaming; `completedChunks` joins the cut list back together.
+ * A huge table is cut the same way at its rows; each later piece renders with the table's head
+ * (header and delimiter rows) in front of it, see `heads`.
  */
 export class MarkdownChunker {
   private text = "";
@@ -29,6 +31,8 @@ export class MarkdownChunker {
   private sealed: string[] = [];
   // Per sealed chunk: true when the chunk after it continues the same cut list.
   private sealedContinues: boolean[] = [];
+  // Per sealed chunk: the head of the cut table that the chunk after it continues, else "".
+  private sealedHeads: string[] = [];
   private chunks: readonly string[] = [];
 
   constructor(private readonly maxChars: number) {}
@@ -36,41 +40,52 @@ export class MarkdownChunker {
   update(text: string): readonly string[] {
     if (text === this.text) return this.chunks;
     // Replaced or shortened text: the sealed prefix no longer holds, start over.
-    if (!text.startsWith(this.sealedText)) {
-      this.sealed = [];
-      this.sealedContinues = [];
-      this.sealedText = "";
+    if (!text.startsWith(this.sealedText)) this.reset();
+    // The rows after a sealed table piece lex as table rows only after the head.
+    let continuedHead = this.sealedHeads.at(-1) ?? "";
+    let blocks = parseMarkdownIntoBlocks(continuedHead + text.slice(this.sealedText.length));
+    if (!blocks[0]?.startsWith(continuedHead)) {
+      this.reset();
+      continuedHead = "";
+      blocks = parseMarkdownIntoBlocks(text);
     }
-    const groups: Array<{ text: string; continues: boolean }> = [];
+    const groups: Array<{ text: string; continues: boolean; head: string }> = [];
     let current = "";
     let currentContinues = false;
+    let currentHead = "";
     const pushCurrent = () => {
-      if (current.length > 0) groups.push({ text: current, continues: currentContinues });
+      if (current.length > 0) {
+        groups.push({ text: current, continues: currentContinues, head: currentHead });
+      }
       current = "";
       currentContinues = false;
+      currentHead = "";
     };
-    const blocks = parseMarkdownIntoBlocks(text.slice(this.sealedText.length));
     // A tail that is only a partial list marker (`…\n\n30` before its `.`) parses as a paragraph
     // after the list, but joins the list once the marker is complete (#5664). So that tail and
     // the blank lines before it never start a group: sealing the list there would make the next
     // item start a second list.
     let tailStart = blocks.length;
     while (tailStart > 0 && PARTIAL_LIST_MARKER.test(blocks[tailStart - 1].trim())) tailStart--;
-    for (const [index, block] of blocks.entries()) {
-      // Each range of a cut list is a chunk of its own. A partial marker in the tail still joins
-      // the last range below, like any other block.
-      const ranges =
-        index < tailStart && block.length > this.maxChars
-          ? listItemRanges(block, this.maxChars)
-          : null;
+    for (const [index, lexedBlock] of blocks.entries()) {
+      // Each range of a cut list or table is a chunk of its own. A partial marker in the tail
+      // still joins the last range below, like any other block.
+      const cut = index < tailStart && lexedBlock.length > this.maxChars;
+      const list = cut ? listItemRanges(lexedBlock, this.maxChars) : null;
+      const table = cut && list === null ? tableRowRanges(lexedBlock, this.maxChars) : null;
+      const ranges = list ?? table?.pieces ?? null;
+      // The source of the first block starts after the head that was put in front of it.
+      const strip = (range: string) => (index === 0 ? range.slice(continuedHead.length) : range);
       if (ranges !== null) {
         for (const [rangeIndex, range] of ranges.entries()) {
           pushCurrent();
-          current = range;
+          current = rangeIndex === 0 ? strip(range) : range;
           currentContinues = rangeIndex < ranges.length - 1;
+          currentHead = currentContinues ? (table?.head ?? "") : "";
         }
         continue;
       }
+      const block = strip(lexedBlock);
       if (
         index < tailStart &&
         current.length > 0 &&
@@ -88,6 +103,7 @@ export class MarkdownChunker {
       if (!text.startsWith(group.text, this.sealedText.length)) break;
       this.sealed.push(group.text);
       this.sealedContinues.push(group.continues);
+      this.sealedHeads.push(group.head);
       this.sealedText += group.text;
     }
     const open = text.slice(this.sealedText.length);
@@ -96,7 +112,19 @@ export class MarkdownChunker {
     return this.chunks;
   }
 
-  /** The chunks of the last update, with each cut list joined back into one chunk. */
+  /** Per chunk of the last update: the head of the cut table it continues, else "". */
+  heads(): readonly string[] {
+    return this.chunks.map((_, index) => (index > 0 ? this.sealedHeads[index - 1] : ""));
+  }
+
+  private reset() {
+    this.sealed = [];
+    this.sealedContinues = [];
+    this.sealedHeads = [];
+    this.sealedText = "";
+  }
+
+  /** The chunks of the last update, with each cut list or table joined back into one chunk. */
   completedChunks(): readonly string[] {
     const completed: string[] = [];
     let joinNext = false;
@@ -141,8 +169,11 @@ export const ChunkedStreamingMarkdown: React.FC<ChunkedStreamingMarkdownProps> =
   const chunkerRef = useRef<MarkdownChunker | null>(null);
   chunkerRef.current ??= new MarkdownChunker(CHUNKED_STREAMING_CHUNK_CHARS);
   const streamingChunks = chunkerRef.current.update(normalizeMarkdown(props.content));
-  // A completed row renders each cut list as one list again.
+  // A completed row renders each cut list or table as one list or table again.
   const chunks = props.isStreaming ? streamingChunks : chunkerRef.current.completedChunks();
+  // While streaming, each later piece of a cut table renders as its own table under the head.
+  const heads = props.isStreaming ? chunkerRef.current.heads() : null;
+  const contents = chunks.map((chunk, index) => (heads?.[index] ?? "") + chunk);
   const lastIndex = chunks.length - 1;
   // Streamdown memoizes each element by its source position, so an element whose position did
   // not change keeps a stale render: the first item of a list that turns loose keeps no <p>. A
@@ -178,15 +209,15 @@ export const ChunkedStreamingMarkdown: React.FC<ChunkedStreamingMarkdownProps> =
 
   return (
     <div className="space-y-2">
-      {chunks.slice(start).map((chunk, offset) => (
+      {contents.slice(start).map((content, offset) => (
         <MarkdownCore
           key={keys[start + offset]}
-          content={chunk}
+          content={content}
           // Only the open last chunk can hold incomplete markdown.
           parseIncompleteMarkdown={props.isStreaming && start + offset === lastIndex}
           // A single block above the cap (e.g. a huge code fence) cannot be split, and one
           // synchronous render of it would block too long: it keeps the deferred render.
-          renderSynchronously={chunk.length <= STATIC_STREAMING_MOUNT_MAX_CHARS}
+          renderSynchronously={content.length <= STATIC_STREAMING_MOUNT_MAX_CHARS}
           preserveLineBreaks={props.preserveLineBreaks}
         />
       ))}
