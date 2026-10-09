@@ -193,11 +193,12 @@ export interface BuildSourcesParams {
   // Layout slots
   layoutPresets?: LayoutPresetsConfig | null;
   onApplyLayoutSlot?: (workspaceId: string, slot: LayoutSlotNumber) => void;
+  /** Errs with a user-facing message when the layout cannot be saved. */
   onCaptureLayoutSlot?: (
     workspaceId: string,
     slot: LayoutSlotNumber,
     name: string
-  ) => Promise<void>;
+  ) => Promise<Result<void>>;
   onClearTimingStats?: (workspaceId: string) => void;
 }
 
@@ -1072,7 +1073,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               },
             ],
             onSubmit: async (vals) => {
-              await p.onCaptureLayoutSlot?.(selected.workspaceId, slot, vals.name.trim());
+              const result = await p.onCaptureLayoutSlot?.(
+                selected.workspaceId,
+                slot,
+                vals.name.trim()
+              );
+              // The palette has already closed and ignores the submit promise, so a toast is the
+              // only way the user learns the capture was refused.
+              if (result && !result.success) {
+                showCommandFeedbackToast({ type: "error", message: result.error });
+              }
             },
           },
         });

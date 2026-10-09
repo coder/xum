@@ -300,11 +300,16 @@ export function LayoutsSection() {
     }
 
     try {
-      const preset = await saveCurrentWorkspaceToSlot(
+      const result = await saveCurrentWorkspaceToSlot(
         workspaceId,
         nextSlotNumber,
         `Layout ${nextSlotNumber}`
       );
+      if (!result.success) {
+        setActionError(result.error);
+        return;
+      }
+      const preset = result.data;
       setEditingName({ slot: nextSlotNumber, value: preset.name, original: preset.name });
       setNameError(null);
     } catch {
@@ -411,9 +416,14 @@ export function LayoutsSection() {
                     return;
                   }
 
-                  void saveCurrentWorkspaceToSlot(workspaceId, slot).catch(() => {
-                    setActionError("Failed to update layout.");
-                  });
+                  void saveCurrentWorkspaceToSlot(workspaceId, slot).then(
+                    (result) => {
+                      if (!result.success) setActionError(result.error);
+                    },
+                    () => {
+                      setActionError("Failed to update layout.");
+                    }
+                  );
                 },
               },
               {

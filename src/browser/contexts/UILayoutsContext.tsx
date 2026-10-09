@@ -26,6 +26,7 @@ import {
   updateSlotPreset,
 } from "@/browser/utils/uiLayouts";
 import type { Keybind } from "@/common/types/keybind";
+import type { Result } from "@/common/types/result";
 
 interface UILayoutsContextValue {
   layoutPresets: LayoutPresetsConfig;
@@ -36,12 +37,15 @@ interface UILayoutsContextValue {
 
   applySlotToWorkspace: (workspaceId: string, slot: LayoutSlotNumber) => Promise<void>;
 
-  /** Capture the currently-selected workspace's layout into the given slot. */
+  /**
+   * Capture the currently-selected workspace's layout into the given slot. Errs (without saving)
+   * with a user-facing message when the layout holds no tab a preset can store.
+   */
   saveCurrentWorkspaceToSlot: (
     workspaceId: string,
     slot: LayoutSlotNumber,
     name?: string | null
-  ) => Promise<LayoutPreset>;
+  ) => Promise<Result<LayoutPreset>>;
 
   renameSlot: (slot: LayoutSlotNumber, newName: string) => Promise<void>;
   deleteSlot: (slot: LayoutSlotNumber) => Promise<void>;
@@ -146,7 +150,7 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
       workspaceId: string,
       slot: LayoutSlotNumber,
       name?: string | null
-    ): Promise<LayoutPreset> => {
+    ): Promise<Result<LayoutPreset>> => {
       assert(
         typeof workspaceId === "string" && workspaceId.length > 0,
         "workspaceId must be non-empty"
@@ -161,13 +165,16 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
           ? trimmedName
           : (existingPreset?.name ?? `Slot ${slot}`);
 
-      const preset = createPresetFromCurrentWorkspace(
+      const result = createPresetFromCurrentWorkspace(
         workspaceId,
         resolvedName,
         existingPreset?.id
       );
-      await saveAll(updateSlotPreset(base, slot, preset));
-      return preset;
+      if (!result.success) {
+        return result;
+      }
+      await saveAll(updateSlotPreset(base, slot, result.data));
+      return result;
     },
     [getConfigForWrite, saveAll]
   );
