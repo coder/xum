@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { Bell, BellOff, Ellipsis, Info, Menu, Pencil } from "lucide-react";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -140,6 +140,26 @@ function setWorkspaceNotifyOnResponse(workspaceId: string, enabled: boolean): vo
   });
 }
 
+// Touch phones, where the header wraps (see .mobile-sticky-header in globals.css). The header
+// changes its DOM order here, so it reads the query in JS rather than with CSS order.
+const PHONE_HEADER_QUERY = "(max-width: 480px) and (pointer: coarse)";
+
+function subscribePhoneHeader(onChange: () => void): () => void {
+  // eslint-disable-next-line @typescript-eslint/no-empty-function -- no matchMedia outside a browser
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return () => {};
+  const mql = window.matchMedia(PHONE_HEADER_QUERY);
+  mql.addEventListener("change", onChange);
+  return () => mql.removeEventListener("change", onChange);
+}
+
+function getPhoneHeaderSnapshot(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia(PHONE_HEADER_QUERY).matches
+  );
+}
+
 export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   workspaceId,
   projectName,
@@ -248,6 +268,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     }
   }, [workspaceId, openTerminalPopout, runtimeConfig, onOpenTerminal]);
 
+  const isPhoneHeader = useSyncExternalStore(
+    subscribePhoneHeader,
+    getPhoneHeaderSnapshot,
+    () => false
+  );
   const isTouchMobileScreen =
     typeof window !== "undefined" &&
     window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
@@ -623,6 +648,104 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // those controls and the MCP/editor/terminal buttons become unclickable.
   const isDesktop = isDesktopMode();
 
+  // Mirror sidebar share/archive actions in the workspace menu bar for quick access.
+  const moreActionsMenu = (
+    <Popover open={moreMenuOpen} onOpenChange={setMoreMenuOpen}>
+      <Tooltip {...(moreMenuOpen ? { open: false } : {})}>
+        <TooltipTrigger asChild>
+          <PopoverTrigger asChild>
+            <Button
+              ref={moreActionsButtonRef}
+              variant="ghost"
+              size="icon"
+              // A sibling of the actions group (not inside it) so phones can keep it at
+              // the top right of the title row while the other actions wrap below.
+              // ml-3 matches the group's gap-2 + ml-1 spacing on wider screens.
+              className={cn(
+                "text-muted hover:text-foreground ml-3 h-6 w-6 shrink-0",
+                isDesktop && "titlebar-no-drag"
+              )}
+              aria-label="Workspace actions"
+              data-testid="workspace-more-actions"
+            >
+              <Ellipsis className="h-3.5 w-3.5" />
+            </Button>
+          </PopoverTrigger>
+        </TooltipTrigger>
+        {/* Same words as the button's aria-label, so sighted and screen-reader users get one
+            name for this control (#5681). */}
+        <TooltipContent side="bottom" align="end">
+          Workspace actions
+        </TooltipContent>
+      </Tooltip>
+
+      <PopoverContent
+        side="bottom"
+        align="end"
+        sideOffset={6}
+        // Size to the widest row ("Messages from other workspaces" + shortcut
+        // overflowed a fixed 240px), but never wider than the viewport.
+        className="w-max max-w-[calc(100vw-1rem)] !min-w-[240px] p-1"
+        onClick={(event: React.MouseEvent<HTMLDivElement>) => {
+          event.stopPropagation();
+        }}
+      >
+        {/* Keep MCP configuration in the more actions menu to keep the workspace menu bar lean. */}
+        <WorkspaceActionsMenuContent
+          onConfigureMcp={() => setMcpModalOpen(true)}
+          onConfigureHeartbeat={canConfigureHeartbeat ? () => setHeartbeatModalOpen(true) : null}
+          onConfigureUnrelatedMessaging={() => setUnrelatedMessagingWorkspaceId(workspaceId)}
+          onOpenTouchFullscreenReview={
+            hasRepository && isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
+          }
+          onEnterImmersiveReview={
+            hasRepository && !isTouchMobileScreen ? handleEnterImmersiveReview : null
+          }
+          onOpenTimeline={
+            timelineSidebarHidden ? () => setTimelineDialogWorkspaceId(workspaceId) : null
+          }
+          onOpenStats={timelineSidebarHidden ? () => setStatsDialogWorkspaceId(workspaceId) : null}
+          onOpenArtifacts={
+            artifactsExperimentEnabled && timelineSidebarHidden
+              ? () => setArtifactsDialogWorkspaceId(workspaceId)
+              : null
+          }
+          onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
+          // Scratch chats have no repo: review events are ignored by
+          // RightSidebar and fork is unsupported on the backend, so hide
+          // both instead of offering dead menu items.
+          onForkChat={
+            hasRepository
+              ? (anchorEl) => {
+                  void handleForkChat(anchorEl);
+                }
+              : null
+          }
+          onTogglePinned={
+            workspaceEntry && isWorkspacePinnable(workspaceEntry)
+              ? () => {
+                  void setWorkspacePinned(workspaceId, !isWorkspacePinned(workspaceEntry));
+                }
+              : null
+          }
+          isPinned={workspaceEntry ? isWorkspacePinned(workspaceEntry) : false}
+          onArchiveChat={
+            workspaceEntry?.parentWorkspaceId != null
+              ? null
+              : (anchorEl) => {
+                  // handleArchiveChat runs preflight and opens a confirmation dialog
+                  // when streaming or untracked files are detected.
+                  void handleArchiveChat(anchorEl);
+                }
+          }
+          onCloseMenu={() => setMoreMenuOpen(false)}
+          shortcutClassName="mobile-hide-shortcut-hints"
+          configureMcpTestId="workspace-mcp-button"
+        />
+      </PopoverContent>
+    </Popover>
+  );
+
   return (
     <div
       ref={menuBarRef}
@@ -717,9 +840,16 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           </span>
         )}
       </div>
+      {/* On touch phones the 44px buttons do not fit beside the title, so the header wraps.
+          The menu stays at the top right of the title row and the other actions move to the
+          row below. The DOM order changes too (not only CSS order), so keyboard focus follows
+          the visual order. */}
+      {isPhoneHeader && moreActionsMenu}
       <div
         className={cn(
-          "mobile-header-actions flex items-center gap-2",
+          "flex items-center gap-2",
+          // Phones give these actions their own row below the title and the menu.
+          isPhoneHeader && "basis-full",
           isDesktop && "titlebar-no-drag"
         )}
       >
@@ -734,8 +864,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <TooltipTrigger asChild>
               <PopoverTrigger asChild>
                 {/* A click only opens the settings: it used to also flip "Notify on all
-                    responses", so nobody could look at the settings without changing them
-                    (#5691). The checkbox and the shortcut toggle it. */}
+                      responses", so nobody could look at the settings without changing them
+                      (#5691). The checkbox and the shortcut toggle it. */}
                 <button
                   type="button"
                   className={cn(
@@ -756,8 +886,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               </PopoverTrigger>
             </TooltipTrigger>
             {/* A plain label: the settings live only in the popover. When the tooltip repeated
-                them, Radix reopened it on the refocused bell after Escape closed the popover,
-                and a second copy of the settings appeared (#5691). */}
+                  them, Radix reopened it on the refocused bell after Escape closed the popover,
+                  and a second copy of the settings appeared (#5691). */}
             <TooltipContent side="bottom" align="end">
               Notifications
               <br />
@@ -853,103 +983,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           </TooltipContent>
         </Tooltip>
       </div>
-      {/* Mirror sidebar share/archive actions in the workspace menu bar for quick access. */}
-      <Popover open={moreMenuOpen} onOpenChange={setMoreMenuOpen}>
-        <Tooltip {...(moreMenuOpen ? { open: false } : {})}>
-          <TooltipTrigger asChild>
-            <PopoverTrigger asChild>
-              <Button
-                ref={moreActionsButtonRef}
-                variant="ghost"
-                size="icon"
-                // A sibling of the actions group (not inside it) so phones can keep it at
-                // the top right of the title row while the other actions wrap below.
-                // ml-3 matches the group's gap-2 + ml-1 spacing on wider screens.
-                className={cn(
-                  "mobile-header-more text-muted hover:text-foreground ml-3 h-6 w-6 shrink-0",
-                  isDesktop && "titlebar-no-drag"
-                )}
-                aria-label="Workspace actions"
-                data-testid="workspace-more-actions"
-              >
-                <Ellipsis className="h-3.5 w-3.5" />
-              </Button>
-            </PopoverTrigger>
-          </TooltipTrigger>
-          {/* Same words as the button's aria-label, so sighted and screen-reader users get one
-              name for this control (#5681). */}
-          <TooltipContent side="bottom" align="end">
-            Workspace actions
-          </TooltipContent>
-        </Tooltip>
-
-        <PopoverContent
-          side="bottom"
-          align="end"
-          sideOffset={6}
-          // Size to the widest row ("Messages from other workspaces" + shortcut
-          // overflowed a fixed 240px), but never wider than the viewport.
-          className="w-max max-w-[calc(100vw-1rem)] !min-w-[240px] p-1"
-          onClick={(event: React.MouseEvent<HTMLDivElement>) => {
-            event.stopPropagation();
-          }}
-        >
-          {/* Keep MCP configuration in the more actions menu to keep the workspace menu bar lean. */}
-          <WorkspaceActionsMenuContent
-            onConfigureMcp={() => setMcpModalOpen(true)}
-            onConfigureHeartbeat={canConfigureHeartbeat ? () => setHeartbeatModalOpen(true) : null}
-            onConfigureUnrelatedMessaging={() => setUnrelatedMessagingWorkspaceId(workspaceId)}
-            onOpenTouchFullscreenReview={
-              hasRepository && isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
-            }
-            onEnterImmersiveReview={
-              hasRepository && !isTouchMobileScreen ? handleEnterImmersiveReview : null
-            }
-            onOpenTimeline={
-              timelineSidebarHidden ? () => setTimelineDialogWorkspaceId(workspaceId) : null
-            }
-            onOpenStats={
-              timelineSidebarHidden ? () => setStatsDialogWorkspaceId(workspaceId) : null
-            }
-            onOpenArtifacts={
-              artifactsExperimentEnabled && timelineSidebarHidden
-                ? () => setArtifactsDialogWorkspaceId(workspaceId)
-                : null
-            }
-            onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
-            // Scratch chats have no repo: review events are ignored by
-            // RightSidebar and fork is unsupported on the backend, so hide
-            // both instead of offering dead menu items.
-            onForkChat={
-              hasRepository
-                ? (anchorEl) => {
-                    void handleForkChat(anchorEl);
-                  }
-                : null
-            }
-            onTogglePinned={
-              workspaceEntry && isWorkspacePinnable(workspaceEntry)
-                ? () => {
-                    void setWorkspacePinned(workspaceId, !isWorkspacePinned(workspaceEntry));
-                  }
-                : null
-            }
-            isPinned={workspaceEntry ? isWorkspacePinned(workspaceEntry) : false}
-            onArchiveChat={
-              workspaceEntry?.parentWorkspaceId != null
-                ? null
-                : (anchorEl) => {
-                    // handleArchiveChat runs preflight and opens a confirmation dialog
-                    // when streaming or untracked files are detected.
-                    void handleArchiveChat(anchorEl);
-                  }
-            }
-            onCloseMenu={() => setMoreMenuOpen(false)}
-            shortcutClassName="mobile-hide-shortcut-hints"
-            configureMcpTestId="workspace-mcp-button"
-          />
-        </PopoverContent>
-      </Popover>
+      {!isPhoneHeader && moreActionsMenu}
       <WorkspaceHeartbeatModal
         workspaceId={workspaceId}
         open={heartbeatModalOpen}
