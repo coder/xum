@@ -1081,6 +1081,68 @@ describe("Config", () => {
       }
     });
 
+    // Trust lookups strip trailing slashes, so a row kept under an untrusted alias would be
+    // checked against a trusted canonical entry. The whole group fails closed instead.
+    it("does not trust any alias of an unresolved group unless every alias was trusted", () => {
+      writeProjects([
+        ["/home/u/repo", { trusted: true, customInstructions: "one", workspaces: [row("ws-one")] }],
+        [
+          "/home/u/repo/",
+          { trusted: false, customInstructions: "two", workspaces: [row("ws-two")] },
+        ],
+      ]);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        const loaded = config.loadConfigOrDefault();
+        expect(loaded.projects.get("/home/u/repo")?.trusted).not.toBe(true);
+        expect(loaded.projects.get("/home/u/repo/")?.trusted).not.toBe(true);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    // Management calls (remove, trust, settings) look up the stripped path. When no alias is
+    // stored under it, the first alias takes the canonical key; the others keep their own.
+    it("keeps an unresolved group reachable under the canonical key", async () => {
+      writeProjects([
+        ["/home/u/repo/", { customInstructions: "one", workspaces: [row("ws-one")] }],
+        ["/home/u/repo//", { customInstructions: "two", workspaces: [row("ws-two")] }],
+      ]);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        await flushConfigEdits();
+        const expected: Array<[string, string[]]> = [
+          ["/home/u/repo", ["ws-one"]],
+          ["/home/u/repo//", ["ws-two"]],
+        ];
+        expect(savedRowIds()).toEqual(expected);
+        await new Config(tempDir).editConfig((cfg) => cfg);
+        expect(savedRowIds()).toEqual(expected);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("keeps one copy of a byte-identical legacy row without an id", () => {
+      const legacy = { name: "legacy", path: path.join(config.srcDir, "repo", "legacy") };
+      const other = { name: "other", path: path.join(config.srcDir, "repo", "other") };
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["/home/u/repo", { workspaces: [legacy] }],
+            ["/home/u/repo/", { workspaces: [legacy, other] }],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.projects.get("/home/u/repo")?.workspaces.map((w) => w.name)).toEqual([
+        "legacy",
+        "other",
+      ]);
+    });
+
     // Only a hand edit stores the very same key twice. A map cannot hold both entries, so the
     // rows of both are kept under that key instead of dropping one entry.
     it("keeps the rows of two conflicting entries stored under the same key", async () => {

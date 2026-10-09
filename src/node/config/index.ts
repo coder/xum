@@ -965,6 +965,9 @@ function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null 
   const settings = new Map<string, unknown>();
   const workspaces: ProjectConfig["workspaces"] = [];
   const rowJsonById = new Map<string, string>();
+  // Legacy rows without an id: a byte-identical copy in two aliases is one workspace. Keeping
+  // both would let the id migration give both copies the same stable id.
+  const idlessRowJson = new Set<string>();
   for (const { config } of group) {
     if (!Array.isArray(config.workspaces)) return null;
     for (const [field, value] of Object.entries(config) as Array<[string, unknown]>) {
@@ -979,9 +982,14 @@ function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null 
     }
     for (const workspace of config.workspaces) {
       const json = JSON.stringify(workspace);
-      const seenJson = workspace.id ? rowJsonById.get(workspace.id) : undefined;
+      if (!workspace.id) {
+        if (!idlessRowJson.has(json)) workspaces.push(workspace);
+        idlessRowJson.add(json);
+        continue;
+      }
+      const seenJson = rowJsonById.get(workspace.id);
       if (seenJson === undefined) {
-        if (workspace.id) rowJsonById.set(workspace.id, json);
+        rowJsonById.set(workspace.id, json);
         workspaces.push(workspace);
       } else if (seenJson !== json) {
         return null;
@@ -1004,9 +1012,9 @@ function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null 
  * Build the project map from the loaded entries. Stored keys that normalize to the same path
  * ("/repo" and "/repo/") are aliases of one project. `new Map(pairs)` used to keep only the last
  * alias, so the next save dropped the other aliases' workspace rows. Group every alias first,
- * then merge the group, or keep each alias of an unresolved group under its own stored key,
- * unchanged: distinct stored strings never overwrite each other, and the alias stored under the
- * canonical key (if any) stays reachable by the normal lookup.
+ * then merge the group, or keep each alias of an unresolved group under its own stored key:
+ * distinct stored strings never overwrite each other. An unresolved group always has an entry
+ * under the canonical key, and its trust is shared and fails closed.
  */
 function buildProjectsFromStoredEntries(entries: StoredProjectEntry[]): Map<string, ProjectConfig> {
   const groups = new Map<string, StoredProjectEntry[]>();
@@ -1032,17 +1040,28 @@ function buildProjectsFromStoredEntries(entries: StoredProjectEntry[]): Map<stri
       path: key,
       storedKeys,
     });
-    for (const entry of group) {
-      const existing = projects.get(entry.storedKey);
+    // Trust lookups strip trailing slashes, so every alias's workspaces are checked against the
+    // canonical entry. Fail closed: unless every alias was trusted, none is.
+    const groupTrusted = group.every((entry) => entry.config.trusted === true);
+    // Remove, trust and settings calls look up the stripped path too. When no alias is stored
+    // under it, the first alias takes the canonical key so the project stays manageable.
+    const canonicalStored = group.some((entry) => entry.storedKey === key);
+    group.forEach((entry, index) => {
+      const entryKey = !canonicalStored && index === 0 ? key : entry.storedKey;
+      const config =
+        !groupTrusted && entry.config.trusted === true
+          ? { ...entry.config, trusted: false }
+          : entry.config;
+      const existing = projects.get(entryKey);
       // Two entries with the very same stored key (only a hand edit makes them) cannot stay
       // apart in a map: keep both entries' rows under that key rather than drop one.
       projects.set(
-        entry.storedKey,
+        entryKey,
         existing
-          ? { ...existing, workspaces: [...existing.workspaces, ...entry.config.workspaces] }
-          : entry.config
+          ? { ...existing, workspaces: [...existing.workspaces, ...config.workspaces] }
+          : config
       );
-    }
+    });
   }
   return projects;
 }
