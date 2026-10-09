@@ -1606,18 +1606,17 @@ export async function createOrpcServer({
         return;
       }
 
-      // #5945: a missing file (/llms.txt, /assets/x.js) or a /.well-known/ probe gets a 404 instead
-      // of the SPA page. The check reads only the pathname string (a fixed number of prefix and
-      // extension checks, no filesystem call). `/workspace/<id>` is a client route whatever its
-      // ID: legacy IDs are `${project}-${branch}` and can contain dots (next.js-main).
+      // #5945: a missing file (/llms.txt, /assets/x.js) or a dot segment probe (/.well-known/*,
+      // /.env, /.git/config) gets a 404 instead of the SPA page. The check reads only the pathname
+      // string (a fixed number of prefix and extension checks, no filesystem call).
+      // `/workspace/<id>` is a client route whatever its ID: legacy IDs are `${project}-${branch}`
+      // and can contain dots (next.js-main).
       const isWorkspaceRoute =
         req.path.startsWith("/workspace/") && !req.path.includes("/", "/workspace/".length);
       if (
         req.path !== "/index.html" &&
         !isWorkspaceRoute &&
-        (req.path === "/.well-known" ||
-          req.path.startsWith("/.well-known/") ||
-          path.posix.extname(req.path) !== "")
+        (req.path.includes("/.") || path.posix.extname(req.path) !== "")
       ) {
         return next();
       }
