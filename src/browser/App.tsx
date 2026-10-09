@@ -131,6 +131,7 @@ import { WorkspaceActiveGoalsWarningToast } from "@/browser/components/ActiveGoa
 import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
+import { markAppShellReady } from "@/browser/utils/perf/appShellReady";
 
 function RootRouteShell(props: {
   leftSidebarCollapsed: boolean;
@@ -1411,7 +1412,10 @@ function AppInner() {
 
   return (
     <>
-      <div className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
+      <div
+        className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]"
+        ref={markAppShellReady}
+      >
         <LeftSidebar
           collapsed={sidebarCollapsed}
           onToggleCollapsed={handleToggleSidebar}
