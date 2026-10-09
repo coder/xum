@@ -174,11 +174,25 @@ describe("aiSelectionIntent", () => {
     send();
     // The save is in flight or failed.
     expect(getAutoRoutingPick(WS, "exec", "model")).toBe(true);
-
     saveAuto(true);
+    expect(getAutoRoutingPick(WS, "exec", "model")).toBeUndefined();
+
     setAutoRoutingPick(WS, "exec", "model", true);
     send();
     expect(getAutoRoutingPick(WS, "exec", "model")).toBeUndefined();
+  });
+
+  test("an unsent Auto pick outlasts metadata refreshes, even one that matches it", () => {
+    const save = (thinkingLevel: "off" | "high", autoModelRouting: boolean) =>
+      setWorkspaceAiMetadata(WS, {
+        aiSettingsByAgent: { exec: { model: MODEL_A, thinkingLevel, autoModelRouting } },
+      });
+    save("off", true);
+    setAutoRoutingPick(WS, "exec", "model", true);
+    save("high", true);
+    // Another window turns Auto off; the composer keeps the user's choice.
+    save("high", false);
+    expect(getAutoRoutingPick(WS, "exec", "model")).toBe(true);
   });
 
   test("a pick scoped to Plan does not apply to Exec", () => {

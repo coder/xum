@@ -32,8 +32,8 @@ export type AiSelectionTokens = Partial<
   Record<AiSelectionField | "agentId" | AutoRoutingFlag, number>
 >;
 
-interface PendingSelection {
-  value: string;
+interface PendingSelection<T = string> {
+  value: T;
   token: number;
   /** A successful send carried it: it ends once the agent's saved bucket holds it. */
   sent?: true;
@@ -51,7 +51,7 @@ const pendingByScope = new Map<string, Partial<Record<AiSelectionField, PendingS
 const pendingAgentByWorkspace = new Map<string, PendingSelection>();
 const pendingAutoRoutingByScope = new Map<
   string,
-  Partial<Record<AutoRoutingDimension, { value: boolean; token: number }>>
+  Partial<Record<AutoRoutingDimension, PendingSelection<boolean>>>
 >();
 const metadataByWorkspace = new Map<string, WorkspaceAiMetadata>();
 const agentBasesByScope = new Map<string, ReadonlyMap<string, string | undefined>>();
@@ -105,7 +105,8 @@ export function setWorkspaceAiMetadata(workspaceId: string, source: WorkspaceAiM
     const picks = pendingAutoRoutingByScope.get(key);
     if (picks == null) continue;
     for (const dimension of ["model", "thinkingLevel"] as const) {
-      if (picks[dimension]?.value === (settings[AUTO_ROUTING_FLAG[dimension]] === true)) {
+      const pick = picks[dimension];
+      if (pick?.sent === true && pick.value === (settings[AUTO_ROUTING_FLAG[dimension]] === true)) {
         delete picks[dimension];
       }
     }
@@ -172,8 +173,8 @@ export function setWorkspaceAgentPick(workspaceId: string, agentId: string): voi
 }
 
 /**
- * An Auto pick lasts until the agent's saved flag matches it, or until a send that carries it
- * succeeds while the saved flag already holds it (that save emits no metadata).
+ * Auto picks follow the field picks' lifecycle: a sent one lasts until the agent's saved flag
+ * holds it (at once when the flag already does, since that save emits no metadata).
  */
 export function getAutoRoutingPick(
   scopeId: string,
@@ -356,9 +357,11 @@ export function consumeAiSelectionIntent(
   for (const dimension of ["model", "thinkingLevel"] as const) {
     const pick = autoPicks?.[dimension];
     const flag = AUTO_ROUTING_FLAG[dimension];
-    if (pick == null || pick.token !== attachedTokens[flag]) continue;
+    if (autoPicks == null || pick == null || pick.token !== attachedTokens[flag]) continue;
     if (pick.value === (getSavedAiSettings(workspaceId, agentId)?.[flag] === true)) {
-      delete autoPicks?.[dimension];
+      delete autoPicks[dimension];
+    } else {
+      autoPicks[dimension] = { ...pick, sent: true };
     }
   }
   const pending = pendingByScope.get(key);

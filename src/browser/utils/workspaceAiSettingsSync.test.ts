@@ -218,10 +218,6 @@ describe("getWorkspaceAiSelection", () => {
 
     setAutoRoutingPick(WS, "exec", "model", true);
     expect(getAutoRouting(WS, "model", "exec")).toBe(true);
-    // Saving the picked value drops the pick, so a later saved change shows through.
-    save({ autoModelRouting: true });
-    save({});
-    expect(getAutoRouting(WS, "model", "exec")).toBe(false);
 
     // A legacy workspace's single bucket owns the flag too.
     const legacy = "resolver-legacy";
