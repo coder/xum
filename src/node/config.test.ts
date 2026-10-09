@@ -890,6 +890,37 @@ describe("Config", () => {
         "ws-root",
       ]);
     });
+
+    // #5919: a drive-root project must not become the parent of every project on that drive:
+    // the load-time hierarchy merge would move their workspace rows into the root's bucket.
+    it("keeps other projects on the drive separate from a drive-root project", async () => {
+      const driveWorkspace = path.join(config.srcDir, "drive", "feature");
+      const repoWorkspace = path.join(config.srcDir, "repo", "main");
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["C:\\", { workspaces: [{ path: driveWorkspace, id: "ws-drive", name: "feature" }] }],
+            [
+              "C:\\Users\\me\\repo",
+              { workspaces: [{ path: repoWorkspace, id: "ws-repo", name: "main" }] },
+            ],
+          ],
+        })
+      );
+
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).loadConfigOrDefault();
+      const repo = reloaded.projects.get("C:\\Users\\me\\repo");
+      expect(repo?.parentProjectPath).toBeUndefined();
+      expect(repo?.workspaces.map((workspace) => workspace.id)).toEqual(["ws-repo"]);
+      // The drive-root key loads as "C:" today; its spelling is tracked separately. Find the
+      // drive-root bucket without depending on that spelling.
+      const driveRows = [...reloaded.projects]
+        .filter(([projectPath]) => projectPath !== "C:\\Users\\me\\repo")
+        .flatMap(([, project]) => project.workspaces.map((workspace) => workspace.id));
+      expect(driveRows).toEqual(["ws-drive"]);
+    });
   });
 
   describe("loadConfigOrDefault customInstructions sanitizing", () => {

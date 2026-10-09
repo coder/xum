@@ -12,11 +12,25 @@ export function normalizeForDescendantComparison(value: string): string {
   return isWindowsPath ? normalized.toLowerCase() : normalized;
 }
 
+/**
+ * True for a normalized filesystem root: "" (POSIX "/"), a drive "c:", or a UNC server or share
+ * ("//srv", "//srv/share"). Expects normalizeForDescendantComparison output.
+ */
+function isNormalizedFilesystemRoot(normalized: string): boolean {
+  if (normalized === "") return true;
+  if (normalized.length === 2 && normalized.charCodeAt(1) === 58 /* : */) return true;
+  if (!normalized.startsWith("//")) return false;
+  // "//srv" or "//srv/share": at most one more separator after the server name.
+  const shareSeparator = normalized.indexOf("/", 2);
+  return shareSeparator === -1 || !normalized.includes("/", shareSeparator + 1);
+}
+
 export function isPathDescendant(parentPath: string, candidatePath: string): boolean {
   const parent = normalizeForDescendantComparison(parentPath);
-  // The POSIX root normalizes to "". A root project restored from an older config (#5917) is
-  // never a parent: it would adopt every project and the hierarchy merge would move their rows.
-  if (parent === "") return false;
+  // A root project restored from an older config (POSIX "/", #5917; a Windows drive or UNC
+  // share root, #5919) is never a parent: it would adopt every project below it, and the
+  // load-time hierarchy merge would move their workspace rows into the root's bucket.
+  if (isNormalizedFilesystemRoot(parent)) return false;
   const candidate = normalizeForDescendantComparison(candidatePath);
   return candidate.startsWith(`${parent}/`) && candidate.length > parent.length + 1;
 }
