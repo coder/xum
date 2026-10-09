@@ -2,89 +2,22 @@ name: Formal
 
 # Runs the formal/ model checks (TLC for the TLA+ specs, Lean/lake for the proofs).
 # - schedule / workflow_dispatch: every model with every config, slow ones included.
-# - pull_request: only the models whose spec or modeled source changed, with
+# - pull_request: only models whose formal/ directory changed; workflow edits run all.
 #   FORMAL_FAST=1 (each check.sh skips its configs that take over ~10 min).
-# Not a required check (#5399): a red run names the model whose EXPECT table or
-# proof no longer matches the code.
+# Models are handwritten, not generated from TypeScript: production-only edits do not
+# rerun unchanged models. Full daily runs remain the safety net.
+# Not a required check (#5399): a red run names the failing model's EXPECT table or proof.
 
 on:
   schedule:
     - cron: "0 6 * * *" # Daily at 6 AM UTC
   workflow_dispatch: {}
   pull_request:
-    # Coarse gate: the union of the per-model filters in the plan job below.
-    # Keep the two lists in sync.
+    # Coarse gate: model and workflow edits only, never ordinary production-source edits.
+    # The plan job below selects the changed models, or all models for workflow edits.
     paths:
       - ".github/workflows/formal.yml"
       - "formal/**"
-      - "src/browser/features/ChatInput/composerDraftText.ts"
-      - "src/browser/features/ChatInput/index.tsx"
-      - "src/browser/features/ChatInput/useCreationWorkspace.ts"
-      - "src/browser/features/Messages/ChatBarrier/RetryBarrier.tsx"
-      - "src/browser/features/Messages/ChatBarrier/StreamingBarrier.tsx"
-      - "src/browser/hooks/useAIViewKeybinds.ts"
-      - "src/browser/stores/DraftStore.ts"
-      - "src/browser/utils/chatCommands.ts"
-      - "src/browser/utils/commands/sources.ts"
-      - "src/browser/utils/compaction/handler.ts"
-      - "src/browser/utils/stopStream.ts"
-      - "src/common/orpc/schemas/api.ts"
-      - "src/common/utils/messages/retryEligibility.ts"
-      - "src/common/utils/planStorage.ts"
-      - "src/common/utils/workflowRetryEligibility.ts"
-      - "src/constants/agentMessaging.ts"
-      - "src/constants/runtimeReads.ts"
-      - "src/node/config/index.ts"
-      - "src/node/config/installationIdentity.ts"
-      - "src/node/runtime/RemoteRuntime.ts"
-      - "src/node/runtime/Runtime.ts"
-      - "src/node/runtime/SSH2ConnectionPool.ts"
-      - "src/node/runtime/SSHRuntime.ts"
-      - "src/node/runtime/backgroundCommands.ts"
-      - "src/node/runtime/execFileIO.ts"
-      - "src/node/runtime/runtimeFactory.ts"
-      - "src/node/runtime/sshBackoff.ts"
-      - "src/node/runtime/sshConnectionPool.ts"
-      - "src/node/runtime/transports/**"
-      - "src/node/services/*ompact*.ts"
-      - "src/node/services/agentPeerMessageBroker.ts"
-      - "src/node/services/agentSession.ts"
-      - "src/node/services/aiService.ts"
-      - "src/node/services/backgroundProcessExecutor.ts"
-      - "src/node/services/backgroundProcessManager.ts"
-      - "src/node/services/di/layers/core.ts"
-      - "src/node/services/draftService.ts"
-      - "src/node/services/goalContinuationPolicy.ts"
-      - "src/node/services/heartbeatService.ts"
-      - "src/node/services/history*.ts"
-      - "src/node/services/idleDispatcher.ts"
-      - "src/node/services/initStateManager.ts"
-      - "src/node/services/messageQueue.ts"
-      - "src/node/services/retryManager.ts"
-      - "src/node/services/sendIds.ts"
-      - "src/node/services/streamManager.ts"
-      - "src/node/services/taskHandleStore.ts"
-      - "src/node/services/taskService.ts"
-      - "src/node/services/tools/bash.ts"
-      - "src/node/services/tools/task_message_parent.ts"
-      - "src/node/services/tools/task_message_sibling.ts"
-      - "src/node/services/tools/task_send_message.ts"
-      - "src/node/services/turnCoordinator.ts"
-      - "src/node/services/turnRequestBuilder.ts"
-      - "src/node/services/utils/fileChangeTracker.ts"
-      - "src/node/services/utils/forkOrchestrator.ts"
-      - "src/node/services/workflows/**"
-      - "src/node/services/workspaceGoalService.ts"
-      - "src/node/services/workspaceService.ts"
-      - "src/node/services/workspaceTurnManager.ts"
-      - "src/node/services/workspaceUseLeases.ts"
-      - "src/node/utils/concurrency/**"
-      - "src/node/utils/main/crossProcessLock.ts"
-      - "src/node/utils/runtime/helpers.ts"
-      - "src/node/utils/runtime/planLocation.ts"
-      - "src/node/utils/writeFileAtomic.ts"
-      - "src/node/worktree/WorktreeManager.ts"
-      - "vscode/src/webview/App.tsx"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -121,171 +54,51 @@ jobs:
         id: filter
         if: github.event_name == 'pull_request'
         with:
-          # One filter per formal/ model: its own directory plus the source files its spec cites.
+          # Each handwritten model is selected only by edits to its own directory.
+          # Workflow edits select every model in the step below.
           filters: |
             workflow:
               - '.github/workflows/formal.yml'
             background-processes:
               - 'formal/background-processes/**'
-              - 'src/node/runtime/backgroundCommands.ts'
-              - 'src/node/services/backgroundProcessExecutor.ts'
-              - 'src/node/services/backgroundProcessManager.ts'
-              - 'src/node/services/di/layers/core.ts'
-              - 'src/node/services/tools/bash.ts'
-              - 'src/node/services/workspaceService.ts'
-              - 'src/node/services/workspaceUseLeases.ts'
             compaction:
               - 'formal/compaction/**'
-              - 'src/node/services/*ompact*.ts'
-              - 'src/node/services/agentSession.ts'
-              - 'src/node/services/historyService.ts'
-              - 'src/node/utils/concurrency/fileLock.ts'
             composer-drafts:
               - 'formal/composer-drafts/**'
-              - 'src/browser/features/ChatInput/composerDraftText.ts'
-              - 'src/browser/features/ChatInput/index.tsx'
-              - 'src/browser/features/ChatInput/useCreationWorkspace.ts'
-              - 'src/browser/stores/DraftStore.ts'
-              - 'src/browser/utils/chatCommands.ts'
-              - 'src/node/services/agentSession.ts'
-              - 'src/node/services/draftService.ts'
-              - 'src/node/services/historyService.ts'
-              - 'src/node/services/messageQueue.ts'
-              - 'src/node/services/sendIds.ts'
-              - 'src/node/services/workspaceService.ts'
             delegated-turns:
               - 'formal/delegated-turns/**'
-              - 'src/node/services/agentSession.ts'
-              - 'src/node/services/taskHandleStore.ts'
-              - 'src/node/services/taskService.ts'
-              - 'src/node/services/workspaceService.ts'
-              - 'src/node/services/workspaceTurnManager.ts'
             filelock:
               - 'formal/filelock/**'
-              - 'src/node/utils/concurrency/fileLock.ts'
-              - 'src/node/utils/concurrency/processLiveness.ts'
-              - 'src/node/utils/main/crossProcessLock.ts'
             history-crash:
               - 'formal/history-crash/**'
-              - 'src/node/services/agentSession.ts'
-              - 'src/node/services/aiService.ts'
-              - 'src/node/services/history*.ts'
-              - 'src/node/services/streamManager.ts'
-              - 'src/node/services/turnRequestBuilder.ts'
-              - 'src/node/utils/concurrency/fileLock.ts'
-              - 'src/node/utils/writeFileAtomic.ts'
             history-locator:
               - 'formal/history-locator/**'
-              - 'src/node/services/history*.ts'
             message-queue:
               - 'formal/message-queue/**'
-              - 'src/node/services/agentSession.ts'
-              - 'src/node/services/messageQueue.ts'
-              - 'src/node/services/taskService.ts'
-              - 'src/node/services/workspaceService.ts'
             peer-limits:
               - 'formal/peer-limits/**'
-              - 'src/constants/agentMessaging.ts'
-              - 'src/node/services/agentPeerMessageBroker.ts'
-              - 'src/node/services/taskService.ts'
-              - 'src/node/services/tools/task_message_parent.ts'
-              - 'src/node/services/tools/task_message_sibling.ts'
-              - 'src/node/services/tools/task_send_message.ts'
-              - 'src/node/services/workspaceTurnManager.ts'
             plan-storage:
               - 'formal/plan-storage/**'
-              - 'src/common/utils/planStorage.ts'
-              - 'src/node/config/index.ts'
-              - 'src/node/config/installationIdentity.ts'
-              - 'src/node/runtime/RemoteRuntime.ts'
-              - 'src/node/services/agentSession.ts'
-              - 'src/node/services/utils/fileChangeTracker.ts'
-              - 'src/node/services/workspaceService.ts'
-              - 'src/node/utils/runtime/helpers.ts'
-              - 'src/node/utils/runtime/planLocation.ts'
             primitives:
               - 'formal/primitives/**'
-              - 'src/node/services/workflows/keyedFifoLock.ts'
-              - 'src/node/utils/concurrency/**'
-              - 'src/node/utils/main/crossProcessLock.ts'
             process-liveness:
               - 'formal/process-liveness/**'
-              - 'src/node/utils/concurrency/fileLock.ts'
-              - 'src/node/utils/concurrency/processLiveness.ts'
-              - 'src/node/utils/main/crossProcessLock.ts'
             ssh-pool:
               - 'formal/ssh-pool/**'
-              - 'src/constants/runtimeReads.ts'
-              - 'src/node/runtime/RemoteRuntime.ts'
-              - 'src/node/runtime/Runtime.ts'
-              - 'src/node/runtime/SSH2ConnectionPool.ts'
-              - 'src/node/runtime/SSHRuntime.ts'
-              - 'src/node/runtime/execFileIO.ts'
-              - 'src/node/runtime/sshBackoff.ts'
-              - 'src/node/runtime/sshConnectionPool.ts'
-              - 'src/node/runtime/transports/**'
             stream-retry:
               - 'formal/stream-retry/**'
-              - 'src/browser/features/Messages/ChatBarrier/RetryBarrier.tsx'
-              - 'src/browser/features/Messages/ChatBarrier/StreamingBarrier.tsx'
-              - 'src/browser/hooks/useAIViewKeybinds.ts'
-              - 'src/browser/utils/commands/sources.ts'
-              - 'src/browser/utils/compaction/handler.ts'
-              - 'src/browser/utils/stopStream.ts'
-              - 'src/common/orpc/schemas/api.ts'
-              - 'src/common/utils/messages/retryEligibility.ts'
-              - 'src/node/services/agentSession.ts'
-              - 'src/node/services/aiService.ts'
-              - 'src/node/services/retryManager.ts'
-              - 'src/node/services/streamManager.ts'
-              - 'src/node/services/turnCoordinator.ts'
-              - 'src/node/services/workspaceService.ts'
-              - 'vscode/src/webview/App.tsx'
             task-launch:
               - 'formal/task-launch/**'
-              - 'src/node/runtime/runtimeFactory.ts'
-              - 'src/node/services/agentSession.ts'
-              - 'src/node/services/sendIds.ts'
-              - 'src/node/services/taskService.ts'
-              - 'src/node/services/utils/forkOrchestrator.ts'
-              - 'src/node/services/workspaceService.ts'
-              - 'src/node/services/workspaceUseLeases.ts'
             task-lifecycle:
               - 'formal/task-lifecycle/**'
-              - 'src/node/services/taskService.ts'
-              - 'src/node/services/workspaceService.ts'
-              - 'src/node/services/workspaceTurnManager.ts'
             workflow-runs:
               - 'formal/workflow-runs/**'
-              - 'src/common/utils/workflowRetryEligibility.ts'
-              - 'src/node/services/taskService.ts'
-              - 'src/node/services/workflows/**'
             workspace-goals:
               - 'formal/workspace-goals/**'
-              - 'src/node/services/agentSession.ts'
-              - 'src/node/services/goalContinuationPolicy.ts'
-              - 'src/node/services/heartbeatService.ts'
-              - 'src/node/services/idleDispatcher.ts'
-              - 'src/node/services/messageQueue.ts'
-              - 'src/node/services/workspaceGoalService.ts'
-              - 'src/node/services/workspaceService.ts'
             workspace-leases:
               - 'formal/workspace-leases/**'
-              - 'src/node/runtime/runtimeFactory.ts'
-              - 'src/node/services/agentSession.ts'
-              - 'src/node/services/initStateManager.ts'
-              - 'src/node/services/taskService.ts'
-              - 'src/node/services/turnRequestBuilder.ts'
-              - 'src/node/services/workspaceService.ts'
-              - 'src/node/services/workspaceUseLeases.ts'
-              - 'src/node/worktree/WorktreeManager.ts'
             workspace-lifecycle:
               - 'formal/workspace-lifecycle/**'
-              - 'src/node/services/agentSession.ts'
-              - 'src/node/services/initStateManager.ts'
-              - 'src/node/services/taskService.ts'
-              - 'src/node/services/workspaceService.ts'
-              - 'src/node/worktree/WorktreeManager.ts'
       - name: Select models
         id: models
         env:
