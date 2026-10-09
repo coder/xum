@@ -28,13 +28,30 @@ export default {
 const TOKENS = ["--color-muted", "--color-secondary"];
 
 /**
+ * Texts whose contrast depends on a background the token change does not touch. Each one is a
+ * known follow-up: remove its selector when the follow-up is fixed.
+ * - The selected right-sidebar tab's count sits on the tab's darker pill (#5965).
+ * - Flat-sidebar project badges are tinted with the project's own color.
+ */
+const KNOWN_NON_TOKEN_BACKGROUNDS = [
+  '[role="tab"][aria-selected="true"]',
+  '[data-testid^="workspace-project-badge"]',
+].join(", ");
+
+/**
  * Every muted and secondary text under `root` reaches 4.5:1, and at least `minimum` texts of
  * each listed token were found, so an empty screen cannot pass.
  */
+/** The token texts under `root`, without the known non-token backgrounds. */
+const checkedTokenTexts = (root: HTMLElement) =>
+  tokenTextContrasts(root, TOKENS).filter(
+    (entry) => !entry.element.closest(KNOWN_NON_TOKEN_BACKGROUNDS)
+  );
+
 async function expectTokenTextsReadable(root: HTMLElement, minimum: Record<string, number>) {
   await waitFor(
     () => {
-      const found = tokenTextContrasts(root, TOKENS);
+      const found = checkedTokenTexts(root);
       for (const [token, count] of Object.entries(minimum)) {
         const ofToken = found.filter((entry) => entry.token === token);
         if (ofToken.length < count) {
@@ -44,10 +61,7 @@ async function expectTokenTextsReadable(root: HTMLElement, minimum: Record<strin
     },
     { timeout: 15_000 }
   );
-  const failing = tokenTextContrasts(root, TOKENS)
-    // Known follow-up outside the token change: the selected right-sidebar tab's count sits on
-    // the tab's darker pill (#5965). Remove this skip when that issue is fixed.
-    .filter((entry) => !entry.element.closest('[role="tab"][aria-selected="true"]'))
+  const failing = checkedTokenTexts(root)
     .filter((entry) => entry.ratio < 4.5)
     .map((entry) => `${entry.token} ${entry.ratio.toFixed(2)}:1 "${entry.text}"`);
   // A joined string, so a failure names every text instead of a truncated array.
@@ -78,42 +92,58 @@ index 1111111..2222222 100644
  }
 `;
 
+/** A workspace with both sidebars open. Flat mode shows the sidebar header's "New chat" button. */
+function setupWorkspaceWithSidebars(options: { flatSidebar: boolean }) {
+  const client = setupSimpleChatStory({
+    workspaceId: "ws-light-tokens",
+    workspaceName: "feature/light-tokens",
+    projectName: "my-app",
+    messages: [
+      createUserMessage("u1", "Add a ready log to start().", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP - 60_000,
+      }),
+      createAssistantMessage("a1", "Added the log line in src/app.ts.", {
+        historySequence: 2,
+        timestamp: STABLE_TIMESTAMP,
+      }),
+    ],
+    gitDiff: { diffOutput: REVIEW_DIFF, numstatOutput: "1\t0\tsrc/app.ts" },
+    userPreferences: options.flatSidebar ? { ui: { sidebarFlatMode: true } } : undefined,
+  });
+  // setupSimpleChatStory collapses the right sidebar; open both for this screen.
+  expandLeftSidebar();
+  expandRightSidebar();
+  updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "review");
+  return client;
+}
+
+async function waitForWorkspace(canvasElement: HTMLElement) {
+  await within(canvasElement).findByText(
+    "Added the log line in src/app.ts.",
+    {},
+    { timeout: 15_000 }
+  );
+}
+
 export const WorkspaceWithSidebars: AppStory = {
   globals: { theme: "light" },
   parameters: lightContract,
-  render: () => (
-    <AppWithMocks
-      setup={() => {
-        const client = setupSimpleChatStory({
-          workspaceId: "ws-light-tokens",
-          workspaceName: "feature/light-tokens",
-          projectName: "my-app",
-          messages: [
-            createUserMessage("u1", "Add a ready log to start().", {
-              historySequence: 1,
-              timestamp: STABLE_TIMESTAMP - 60_000,
-            }),
-            createAssistantMessage("a1", "Added the log line in src/app.ts.", {
-              historySequence: 2,
-              timestamp: STABLE_TIMESTAMP,
-            }),
-          ],
-          gitDiff: { diffOutput: REVIEW_DIFF, numstatOutput: "1\t0\tsrc/app.ts" },
-        });
-        // setupSimpleChatStory collapses the right sidebar; open both for this screen.
-        expandLeftSidebar();
-        expandRightSidebar();
-        updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "review");
-        return client;
-      }}
-    />
-  ),
+  render: () => <AppWithMocks setup={() => setupWorkspaceWithSidebars({ flatSidebar: false })} />,
   play: async ({ canvasElement }) => {
-    await within(canvasElement).findByText(
-      "Added the log line in src/app.ts.",
-      {},
-      { timeout: 15_000 }
-    );
+    await waitForWorkspace(canvasElement);
+    await expectTokenTextsReadable(canvasElement, { "--color-muted": 3 });
+  },
+};
+
+// The flat sidebar's header has the one `--color-secondary` text on these screens ("New chat").
+export const WorkspaceWithFlatSidebar: AppStory = {
+  globals: { theme: "light" },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={() => setupWorkspaceWithSidebars({ flatSidebar: true })} />,
+  play: async ({ canvasElement }) => {
+    await waitForWorkspace(canvasElement);
+    await within(canvasElement).findByText("New chat", {}, { timeout: 15_000 });
     await expectTokenTextsReadable(canvasElement, { "--color-muted": 3, "--color-secondary": 1 });
   },
 };
