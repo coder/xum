@@ -65,6 +65,8 @@ describe("subProjects", () => {
 
   test("still nests Windows projects under a non-root Windows parent", () => {
     expect(isPathDescendant("C:\\a", "C:\\a\\b")).toBe(true);
+    // "/:" is a POSIX directory, not a drive root.
+    expect(isPathDescendant("/:", "/:/repo")).toBe(true);
     expect(isPathDescendant("\\\\srv\\share\\a", "\\\\srv\\share\\a\\b")).toBe(true);
   });
 

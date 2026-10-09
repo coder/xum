@@ -18,7 +18,11 @@ export function normalizeForDescendantComparison(value: string): string {
  */
 function isNormalizedFilesystemRoot(normalized: string): boolean {
   if (normalized === "") return true;
-  if (normalized.length === 2 && normalized.charCodeAt(1) === 58 /* : */) return true;
+  // Drive roots arrive lowercased ("c:"). Require a letter: "/:" is a valid POSIX directory.
+  if (normalized.length === 2 && normalized.charCodeAt(1) === 58 /* : */) {
+    const drive = normalized.charCodeAt(0);
+    return drive >= 97 /* a */ && drive <= 122 /* z */;
+  }
   if (!normalized.startsWith("//")) return false;
   // "//srv" or "//srv/share": at most one more separator after the server name.
   const shareSeparator = normalized.indexOf("/", 2);
