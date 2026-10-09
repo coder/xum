@@ -222,13 +222,18 @@ export function handOffCreationAiSelection(
   notify();
 }
 
-/** The workspace's saved settings for an agent; a legacy workspace has only `aiSettings`. */
+/**
+ * The workspace's saved settings for an agent. Only a legacy workspace without per-agent
+ * settings uses `aiSettings`: once they exist, it holds another agent's last settings.
+ */
 export function getSavedAiSettings(
   workspaceId: string,
   agentId: string
 ): NonNullable<WorkspaceAiMetadata["aiSettingsByAgent"]>[string] | undefined {
   const metadata = metadataByWorkspace.get(workspaceId);
-  return metadata?.aiSettingsByAgent?.[normalizeAgent(agentId)] ?? metadata?.aiSettings;
+  return metadata?.aiSettingsByAgent != null
+    ? metadata.aiSettingsByAgent[normalizeAgent(agentId)]
+    : metadata?.aiSettings;
 }
 
 function isSavedPick(

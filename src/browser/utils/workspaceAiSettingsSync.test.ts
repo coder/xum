@@ -129,6 +129,15 @@ describe("getWorkspaceAiSelection", () => {
     }
   });
 
+  test("an agent without saved settings ignores the legacy bucket once per-agent settings exist", () => {
+    seed(["saved", "legacy", "project"]);
+    expect(getWorkspaceAiSelection(WS, "plan")).toEqual({
+      model: "openai:project",
+      thinkingLevel: "medium",
+      reasoningMode: "standard",
+    });
+  });
+
   test("a custom agent resolves its base agent's defaults from the loaded agent list", () => {
     getAppConfigStore().updateOptimistically({
       defaultModel: "openai:global",
