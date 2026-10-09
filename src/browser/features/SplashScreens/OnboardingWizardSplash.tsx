@@ -61,6 +61,11 @@ function getServerAuthToken(): string | null {
   return urlToken?.length ? urlToken : getStoredAuthToken();
 }
 
+// Wizard text uses text-content-secondary, not text-muted: the light theme's muted token is
+// below WCAG AA (4.5:1) on the dialog backgrounds (#5944). The token stays as is because it
+// colors muted text across the whole app.
+const WIZARD_DOCS_LINK_CLASSNAME = "text-content-secondary";
+
 const KBD_CLASSNAME =
   "bg-background-secondary text-foreground border-border-medium rounded border px-2 py-0.5 font-mono text-xs";
 
@@ -76,6 +81,9 @@ function ProgressDots(props: { count: number; activeIndex: number }) {
   return (
     <div
       className="flex items-center gap-1"
+      // aria-label is not allowed on a div without a role (Lighthouse aria-prohibited-attr,
+      // #5944). The dots are one picture of the progress, so "img" names them as a whole.
+      role="img"
       aria-label={`Step ${props.activeIndex + 1} of ${props.count}`}
     >
       {Array.from({ length: props.count }).map((_, i) => (
@@ -93,7 +101,7 @@ function ProgressDots(props: { count: number; activeIndex: number }) {
 function WizardHeader(props: { stepIndex: number; totalSteps: number }) {
   return (
     <div className="flex items-center justify-end gap-2">
-      <span className="text-muted text-xs">
+      <span className="text-content-secondary text-xs">
         {props.stepIndex + 1} / {props.totalSteps}
       </span>
       <ProgressDots count={props.totalSteps} activeIndex={props.stepIndex} />
@@ -119,7 +127,7 @@ function Card(props: {
         </span>
         {props.title}
       </div>
-      <div className="text-muted mt-2 text-sm">{props.children}</div>
+      <div className="text-content-secondary mt-2 text-sm">{props.children}</div>
     </div>
   );
 }
@@ -596,7 +604,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                 href="https://coder.com"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-accent hover:underline"
+                className="text-accent underline"
               >
                 Coder
               </a>
@@ -627,14 +635,14 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
                   <div className="mt-2 space-y-1">
                     <div className="flex items-center justify-between gap-4">
-                      <span className="text-muted">Balance</span>
+                      <span className="text-content-secondary">Balance</span>
                       <span className="text-foreground font-mono">
                         {formatMuxGatewayBalance(muxGatewayAccountStatus?.remaining_microdollars)}
                       </span>
                     </div>
 
                     <div className="flex items-center justify-between gap-4">
-                      <span className="text-muted">Concurrent requests per user</span>
+                      <span className="text-content-secondary">Concurrent requests per user</span>
                       <span className="text-foreground font-mono">
                         {muxGatewayAccountStatus?.ai_gateway_concurrent_requests_per_user ?? "—"}
                       </span>
@@ -651,13 +659,13 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                     <p className="text-destructive font-medium">
                       Your Xum Gateway credits are depleted.
                     </p>
-                    <p className="text-muted mt-1">
+                    <p className="text-content-secondary mt-1">
                       Gateway routing has been disabled. Configure another provider below, or visit{" "}
                       <a
                         href={MUX_GATEWAY_ORIGIN}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="text-accent hover:underline"
+                        className="text-accent underline"
                       >
                         {new URL(MUX_GATEWAY_ORIGIN).host}
                       </a>{" "}
@@ -707,7 +715,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                   href="https://discord.gg/VfZXvtnR"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-accent hover:underline"
+                  className="text-accent underline"
                 >
                   Discord
                 </a>
@@ -718,7 +726,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                   href={MUX_GATEWAY_ORIGIN}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-accent hover:underline"
+                  className="text-accent underline"
                 >
                   claim here
                 </a>
@@ -729,7 +737,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               You can enable this in{" "}
               <button
                 type="button"
-                className="text-accent hover:underline"
+                className="text-accent underline"
                 onClick={() => openProvidersSettings()}
               >
                 Settings → Providers
@@ -785,7 +793,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               })}
             </div>
 
-            <div className="text-muted mt-2 flex items-center gap-2 text-xs">
+            <div className="text-content-secondary mt-2 flex items-center gap-2 text-xs">
               <span className="h-2 w-2 rounded-full bg-green-500" />
               <span>Configured</span>
               <span className="bg-border-medium h-2 w-2 rounded-full" />
@@ -797,7 +805,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
             Configure keys and endpoints in{" "}
             <button
               type="button"
-              className="text-accent hover:underline"
+              className="text-accent underline"
               onClick={() => openProvidersSettings()}
             >
               Settings → Providers
@@ -882,7 +890,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               <div className="mt-1 flex flex-wrap items-center gap-2">
                 <span>Agent picker</span>
                 <kbd className={KBD_CLASSNAME}>{agentPickerShortcut}</kbd>
-                <span className="text-muted mx-1">•</span>
+                <span className="text-content-secondary mx-1">•</span>
                 <span>Cycle agent</span>
                 <kbd className={KBD_CLASSNAME}>{cycleAgentShortcut}</kbd>
               </div>
@@ -890,8 +898,12 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
           </div>
 
           <div className="mt-3 flex items-center gap-3">
-            <DocsLink path="/agents">Agent docs</DocsLink>
-            <DocsLink path="/agents/plan-mode">Plan mode</DocsLink>
+            <DocsLink path="/agents" className={WIZARD_DOCS_LINK_CLASSNAME}>
+              Agent docs
+            </DocsLink>
+            <DocsLink path="/agents/plan-mode" className={WIZARD_DOCS_LINK_CLASSNAME}>
+              Plan mode
+            </DocsLink>
           </div>
         </>
       ),
@@ -973,7 +985,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
           </p>
 
           <div className="mt-3 flex flex-wrap items-center gap-2">
-            <span className="text-muted text-sm">Open command palette</span>
+            <span className="text-content-secondary text-sm">Open command palette</span>
             <kbd className={KBD_CLASSNAME}>{commandPaletteShortcut}</kbd>
           </div>
 
@@ -1133,7 +1145,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
         </>
       }
     >
-      <div className="text-muted flex flex-col gap-4">
+      <div className="text-content-secondary flex flex-col gap-4">
         <WizardHeader stepIndex={stepIndex} totalSteps={totalSteps} />
 
         <div
@@ -1151,7 +1163,9 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
             <span>{currentStep.title}</span>
           </div>
 
-          <div className="text-muted flex flex-col gap-3 text-sm">{currentStep.body}</div>
+          <div className="text-content-secondary flex flex-col gap-3 text-sm">
+            {currentStep.body}
+          </div>
         </div>
       </div>
     </SplashScreen>
