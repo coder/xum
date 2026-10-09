@@ -857,10 +857,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       <div
         className={cn(
           "flex items-center gap-2",
-          // Phones give these actions their own row below the title and the menu. The row wraps
-          // so a full header (PR and stack badges, skills, Stats, Artifacts) never pushes the
-          // last 44px touch targets past the right edge of a 375px screen.
-          isPhoneHeader && "basis-full flex-wrap",
+          // Phones give these actions their own row below the title and the menu. The header
+          // stays at two rows: a full row (PR and stack badges, skills, Stats, Artifacts) is wider
+          // than a 375px screen, so it scrolls sideways like the footer bar instead of wrapping
+          // into a third row or pushing the last 44px touch targets past the right edge.
+          isPhoneHeader && "scrollbar-none scroll-fade-x min-w-0 basis-full overflow-x-auto",
           isDesktop && "titlebar-no-drag"
         )}
       >
