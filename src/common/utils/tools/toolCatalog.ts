@@ -1031,23 +1031,56 @@ export function dedupeNativeToolReferences(messages: ModelMessage[]): ModelMessa
       ) {
         return part;
       }
-      let partChanged = false;
-      const value = part.output.value.map((item) => {
+      // Classify first: the projection shape depends on whether any reference
+      // survives in this result (Anthropic rejects a tool result mixing text
+      // with references, see buildToolSearchModelOutput).
+      const partSeen = new Set<string>();
+      let hasNew = false;
+      let hasRepeat = false;
+      for (const item of part.output.value) {
         const name = nativeToolReferenceName(item);
         if (name === undefined) {
-          return item;
+          continue;
         }
-        if (seen.has(name)) {
-          partChanged = true;
-          return { type: "text" as const, text: `${NATIVE_TOOL_REFERENCE_DEDUPED_PREFIX}${name}` };
+        if (seen.has(name) || partSeen.has(name)) {
+          hasRepeat = true;
+        } else {
+          partSeen.add(name);
+          hasNew = true;
         }
-        seen.add(name);
-        return item;
-      });
-      if (!partChanged) {
+      }
+      if (!hasRepeat) {
+        for (const name of partSeen) {
+          seen.add(name);
+        }
         return part;
       }
       changed = true;
+      const localSeen = new Set<string>();
+      const value: typeof part.output.value = [];
+      for (const item of part.output.value) {
+        const name = nativeToolReferenceName(item);
+        if (name === undefined) {
+          value.push(item);
+          continue;
+        }
+        if (seen.has(name) || localSeen.has(name)) {
+          // Fully repeated result: every reference becomes an invertible
+          // marker (text-only output). Mixed result: drop the repeat, since a
+          // marker beside the retained references would be rejected; the raw
+          // form stays recoverable from persisted history on the next turn.
+          if (!hasNew) {
+            value.push({
+              type: "text" as const,
+              text: `${NATIVE_TOOL_REFERENCE_DEDUPED_PREFIX}${name}`,
+            });
+          }
+          continue;
+        }
+        localSeen.add(name);
+        seen.add(name);
+        value.push(item);
+      }
       return { ...part, output: { type: "content" as const, value } };
     });
     if (!changed) {

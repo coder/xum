@@ -1060,11 +1060,11 @@ describe("dedupeNativeToolReferences", () => {
     expect(JSON.stringify(dedupeNativeToolReferences(messages))).toBe(JSON.stringify(deduped));
   });
 
-  test("unprojectNativeToolReferences inverts the projection byte-exactly", () => {
+  test("unprojectNativeToolReferences inverts a full projection byte-exactly", () => {
     const messages = [
       searchResultMessage("call-1", referencesOutput("alpha", "beta")),
       searchResultMessage("call-2", referencesOutput("beta", "alpha")),
-      searchResultMessage("call-3", referencesOutput("beta", "gamma")),
+      searchResultMessage("call-3", referencesOutput("beta")),
     ];
     const deduped = dedupeNativeToolReferences(messages);
     expect(JSON.stringify(unprojectNativeToolReferences(deduped))).toBe(JSON.stringify(messages));
@@ -1076,7 +1076,7 @@ describe("dedupeNativeToolReferences", () => {
     // Restoration is a pure function of the part itself, so two results that
     // share a reused toolCallId can never restore each other's content.
     const first = searchResultMessage("dup", referencesOutput("alpha", "beta"));
-    const second = searchResultMessage("dup", referencesOutput("gamma", "beta"));
+    const second = searchResultMessage("dup", referencesOutput("beta", "alpha"));
     const deduped = dedupeNativeToolReferences([first, second]);
     expect(JSON.stringify(unprojectNativeToolReferences([deduped[1]])[0])).toBe(
       JSON.stringify(second)
@@ -1086,7 +1086,7 @@ describe("dedupeNativeToolReferences", () => {
     );
   });
 
-  test("a mixed result keeps new references and markers for repeats", () => {
+  test("a mixed result drops repeats: text beside retained references is rejected", () => {
     const messages = [
       searchResultMessage("call-1", referencesOutput("alpha")),
       searchResultMessage("call-2", referencesOutput("alpha", "beta")),
@@ -1094,13 +1094,17 @@ describe("dedupeNativeToolReferences", () => {
     const deduped = dedupeNativeToolReferences(messages);
     expect(deduped[0]).toBe(messages[0]);
     expect(JSON.stringify(deduped[1])).toBe(
-      JSON.stringify(
-        searchResultMessage("call-2", {
-          type: "content",
-          value: [marker("alpha"), reference("beta")],
-        })
-      )
+      JSON.stringify(searchResultMessage("call-2", referencesOutput("beta")))
     );
+    // No deduped result may mix text items with tool references (Anthropic 400s).
+    for (const message of dedupeNativeToolReferences(messages)) {
+      if (message.role !== "tool") continue;
+      for (const part of message.content) {
+        if (part.type !== "tool-result" || part.output.type !== "content") continue;
+        const kinds = new Set(part.output.value.map((item) => item.type));
+        expect(kinds.has("text") && kinds.has("custom")).toBe(false);
+      }
+    }
   });
 
   test("dedupes across parallel searches in one step", () => {
@@ -1126,10 +1130,7 @@ describe("dedupeNativeToolReferences", () => {
     expect(JSON.stringify(deduped)).toContain('"toolCallId":"call-1"');
     const parts = (deduped as { content: Array<{ output: unknown }> }).content;
     expect(parts[0].output).toEqual(referencesOutput("alpha"));
-    expect(parts[1].output).toEqual({
-      type: "content",
-      value: [marker("alpha"), reference("beta")],
-    });
+    expect(parts[1].output).toEqual(referencesOutput("beta"));
   });
 
   test("returns the same array when nothing repeats", () => {
@@ -1154,12 +1155,7 @@ describe("dedupeNativeToolReferences", () => {
     expect(extended[0]).toBe(dedupedPrefix[0]);
     expect(extended[1]).toBe(dedupedPrefix[1]);
     expect(JSON.stringify(extended[2])).toBe(
-      JSON.stringify(
-        searchResultMessage("call-3", {
-          type: "content",
-          value: [marker("beta"), reference("gamma")],
-        })
-      )
+      JSON.stringify(searchResultMessage("call-3", referencesOutput("gamma")))
     );
   });
 

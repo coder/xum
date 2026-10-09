@@ -2965,7 +2965,14 @@ export class StreamManager {
       log.warn("[continuous-compaction] prefix locator missing; retaining full context");
       return null;
     }
-    return [...swap.prefix, ...stripMessageCacheControl(messages.slice(index))];
+    // The retained tail may hold a projected repeated search whose first
+    // occurrence the swapped-out prefix carried; restore the raw references so
+    // the caller's dedupe re-decides against the swapped transcript. Done here
+    // so every swap site (per-step and fallback rebuild) inverts identically.
+    return [
+      ...swap.prefix,
+      ...stripMessageCacheControl(unprojectNativeToolReferences(messages.slice(index))),
+    ];
   }
 
   private createStreamResult(
@@ -3037,11 +3044,7 @@ export class StreamManager {
         }
         const swap = stepTracker?.pendingPrefixSwap;
         if (swap && stepTracker?.workspaceId) {
-          // Swap from the raw references: the carried tail may hold a
-          // projected repeat whose first occurrence the swap is about to drop,
-          // and only the raw form lets the post-swap dedupe keep that tool
-          // loaded. The markers carry everything needed to invert.
-          const swapped = this.swapPrefix(unprojectNativeToolReferences(effectiveMessages), swap);
+          const swapped = this.swapPrefix(effectiveMessages, swap);
           if (swapped) {
             const store = this.historyService.getContinuousCompactionJournal(
               stepTracker.workspaceId
