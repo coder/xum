@@ -282,6 +282,8 @@ export interface CustomEventPayloads {
     /** The main chat whose right sidebar shows the tab. */
     workspaceId: string;
     sideChatWorkspaceId: string;
+    /** A New tab launcher to replace, rather than adding to the focused pane. */
+    tabsetId?: string;
   };
   [CUSTOM_EVENTS.OPEN_MCP_APP_VIEW]: {
     workspaceId: string;

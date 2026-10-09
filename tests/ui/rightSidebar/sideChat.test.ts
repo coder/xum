@@ -12,7 +12,7 @@ jest.mock("lottie-react", () => ({
   default: () => null,
 }));
 
-import { act, fireEvent, waitFor } from "@testing-library/react";
+import { act, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { workspaceStore, useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
@@ -132,6 +132,145 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
   beforeAll(async () => {
     await preloadTestModules();
   });
+
+  test("the launcher opens idle independent side chats without submitting the main draft or stopping its stream", async () => {
+    const app = await createAppHarness({
+      branchPrefix: "side-launcher",
+      beforeRender: (workspaceId) =>
+        updatePersistedState(getRightSidebarLayoutKey(workspaceId), {
+          version: 1,
+          openTabsOnly: true,
+          nextId: 4,
+          focusedTabsetId: "other-pane",
+          root: {
+            type: "split",
+            id: "split",
+            direction: "horizontal",
+            sizes: [50, 50],
+            children: [
+              { type: "tabset", id: "launcher-pane", tabs: ["new"], activeTab: "new" },
+              { type: "tabset", id: "other-pane", tabs: ["costs"], activeTab: "costs" },
+            ],
+          },
+        }),
+    });
+    const service = app.env.services.toORPCContext().workspaceService;
+    const send = jest.spyOn(service, "sendMessage");
+    const parentStream = createStreamCollector(app.env.orpc, app.workspaceId);
+    parentStream.start();
+    try {
+      await parentStream.waitForSubscription(10_000);
+      await sendFrom(() => getMainComposer(app), app.workspaceId, "[mock:long-stream] main");
+      expect(await parentStream.waitForEvent("stream-start", 10_000)).not.toBeNull();
+      const draft = "Keep this unsent main question";
+      act(() =>
+        getDraftStore().setText({ kind: "workspace", workspaceId: app.workspaceId }, draft)
+      );
+      await waitFor(() => expect(getMainComposer(app).value).toBe(draft));
+      send.mockClear();
+
+      const pane = app.view.container.querySelector<HTMLElement>(
+        '[data-tabset-id="launcher-pane"]'
+      )!;
+      fireEvent.click(await within(pane).findByRole("button", { name: "Side chat" }));
+      const firstId = await waitForSideChatId(app);
+      await waitFor(
+        () => {
+          expect(getSideComposer(app, firstId).value).toBe("");
+          expect(pane.querySelector('[role="tab"][id$="-tab-new"]')).toBeNull();
+          const tab = pane.querySelector(`[role="tab"][id$="-tab-side:${firstId}"]`);
+          expect(tab).not.toBeNull();
+          expect(
+            document.activeElement === tab ||
+              getSidePane(app, firstId)?.contains(document.activeElement)
+          ).toBe(true);
+        },
+        { timeout: 10_000 }
+      );
+      expect(isStreaming(firstId)).toBe(false);
+      expect(send).not.toHaveBeenCalled();
+      expect(getMainComposer(app).value).toBe(draft);
+      const firstDraft = "An unsent first side question";
+      act(() => getDraftStore().setText({ kind: "workspace", workspaceId: firstId }, firstDraft));
+      await waitFor(() => expect(getSideComposer(app, firstId).value).toBe(firstDraft));
+
+      fireEvent.click(within(pane).getByRole("button", { name: "New tab" }));
+      fireEvent.click(await within(pane).findByRole("button", { name: "Side chat" }));
+      const secondId = await waitFor(
+        async () => {
+          const chats = (await app.env.orpc.workspace.list()).filter(
+            (ws) => ws.sideChatParentWorkspaceId === app.workspaceId
+          );
+          expect(chats).toHaveLength(2);
+          return chats.find((ws) => ws.id !== firstId)!.id;
+        },
+        { timeout: 10_000 }
+      );
+      await waitFor(() => expect(getSideComposer(app, secondId).value).toBe(""), {
+        timeout: 10_000,
+      });
+      expect(isStreaming(secondId)).toBe(false);
+      expect(send).not.toHaveBeenCalled();
+      expect(pane.querySelector(`[role="tab"][id$="-tab-side:${firstId}"]`)).not.toBeNull();
+      expect(getMainComposer(app).value).toBe(draft);
+      expect(parentStream.getEvents().some((event) => event.type === "stream-abort")).toBe(false);
+
+      await sendFrom(() => getSideComposer(app, secondId), secondId, "Only the second side chat");
+      await waitFor(
+        () =>
+          expect(getSidePane(app, secondId)?.textContent).toContain(
+            "Mock response: Only the second side chat"
+          ),
+        { timeout: 30_000 }
+      );
+      fireEvent.click(pane.querySelector(`[role="tab"][id$="-tab-side:${firstId}"]`)!);
+      await waitFor(() => expect(getSideComposer(app, firstId).value).toBe(firstDraft));
+      expect(getSidePane(app, firstId)?.textContent).not.toContain("Only the second side chat");
+      expect(getMainComposer(app).value).toBe(draft);
+    } finally {
+      send.mockRestore();
+      parentStream.stop();
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("the launcher prevents duplicate requests and remains usable after creation fails", async () => {
+    const app = await createAppHarness({ branchPrefix: "side-launcher-retry" });
+    const service = app.env.services.toORPCContext().workspaceService;
+    const create = jest.spyOn(service, "createSideChat");
+    let rejectCreation!: (error: Error) => void;
+    create.mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectCreation = reject;
+        })
+    );
+    try {
+      const sidebar = app.view.container.querySelector<HTMLElement>(
+        '[aria-label="Workspace insights"]'
+      )!;
+      fireEvent.click(await within(sidebar).findByRole("button", { name: "New tab" }));
+      const row = await within(sidebar).findByRole("button", { name: "Side chat" });
+      fireEvent.click(row);
+      fireEvent.click(row);
+      await waitFor(() => expect(create).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+      expect((row as HTMLButtonElement).disabled).toBe(true);
+      act(() => rejectCreation(new Error("Try the side chat again")));
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("Try the side chat again");
+        expect((row as HTMLButtonElement).disabled).toBe(false);
+      });
+      expect(sidebar.querySelector('[role="tabpanel"][id$="-panel-new"]')).not.toBeNull();
+      fireEvent.click(row);
+      const id = await waitForSideChatId(app);
+      await waitFor(() => expect(getSideComposer(app, id).value).toBe(""), { timeout: 10_000 });
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(isStreaming(id)).toBe(false);
+    } finally {
+      create.mockRestore();
+      await app.dispose();
+    }
+  }, 90_000);
 
   test("opens next to the main chat, stays out of the workspace list, and closing discards it", async () => {
     const app = await createAppHarness({ branchPrefix: "side-chat-tab" });

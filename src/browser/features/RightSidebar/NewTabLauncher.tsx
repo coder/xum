@@ -14,6 +14,8 @@ interface NewTabLauncherProps {
   tools: BaseTabType[];
   onOpenTool: (tool: BaseTabType) => void;
   onOpenTerminal: () => void;
+  onOpenSideChat?: () => void;
+  creatingSideChat: boolean;
   /**
    * Focus the first row once shown. Set only when the user asked for a New tab ("+" or the
    * shortcut), never for the New tab a fresh workspace starts with, so the launcher does not
@@ -42,7 +44,9 @@ export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
   // Arrow keys move between rows (Tab works too, since every row is a button).
   const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
-    const rows = Array.from(listRef.current?.querySelectorAll<HTMLButtonElement>("button") ?? []);
+    const rows = Array.from(
+      listRef.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? []
+    );
     if (rows.length === 0) return;
     e.preventDefault();
     const current = rows.indexOf(document.activeElement as HTMLButtonElement);
@@ -82,13 +86,16 @@ export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
           shortcut={formatKeybind(KEYBINDS.OPEN_TERMINAL)}
           onClick={props.onOpenTerminal}
         />
-      </div>
-      {/* Side chats start from the chat input, so this row only points there. */}
-      <div className="text-muted flex items-start gap-3 px-2 py-1 text-xs">
-        <MessagesSquare className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-        <span className="min-w-0">
-          Ask a side question: type <code className="text-foreground">/side</code> in the chat.
-        </span>
+        {props.onOpenSideChat != null && (
+          <LauncherRow
+            Icon={MessagesSquare}
+            name="Side chat"
+            description="Ask separately with this conversation as context"
+            shortcut="/side"
+            onClick={props.onOpenSideChat}
+            disabled={props.creatingSideChat}
+          />
+        )}
       </div>
     </div>
   );
@@ -100,6 +107,7 @@ const LauncherRow: React.FC<{
   description: string;
   shortcut?: string;
   onClick: () => void;
+  disabled?: boolean;
 }> = (props) => {
   // The tool name is the row's accessible name; the description is read as its description.
   const descriptionId = React.useId();
@@ -109,9 +117,10 @@ const LauncherRow: React.FC<{
       aria-label={props.name}
       aria-describedby={descriptionId}
       onClick={props.onClick}
+      disabled={props.disabled}
       className={cn(
         "group flex w-full min-w-0 items-start gap-3 rounded-md px-2 py-2 text-left transition-colors",
-        "hover:bg-hover focus-visible:bg-hover focus-visible:outline-none"
+        "hover:bg-hover focus-visible:bg-hover focus-visible:outline-none disabled:opacity-50"
       )}
     >
       <props.Icon
@@ -125,7 +134,7 @@ const LauncherRow: React.FC<{
         </span>
       </span>
       {props.shortcut != null && (
-        <kbd className="mobile-hide-shortcut-hints text-muted mt-0.5 shrink-0 font-sans text-[10px]">
+        <kbd className="mobile-hide-shortcut-hints text-muted mt-0.5 shrink-0 font-sans text-[10px] max-[768px]:hidden">
           {props.shortcut}
         </kbd>
       )}

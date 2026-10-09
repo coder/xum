@@ -1416,6 +1416,8 @@ function createOutputLogEntries() {
  * Output tab selected with an empty log feed.
  */
 export const OutputTabEmpty: Story = {
+  // Empty Output is captured beside the narrow launcher; keep this isolated play for debugging.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
@@ -1436,6 +1438,11 @@ export const OutputTabEmpty: Story = {
       <RightSidebarStoryContent workspaceId="ws-output-empty" />
     </RightSidebarStoryShell>
   ),
+  play: async ({ canvasElement }) => {
+    const output = await within(canvasElement).findByRole("tabpanel", { name: /^output/i });
+    await expect(within(output).getByRole("button", { name: "Delete output logs" })).toBeVisible();
+    await expect(output.querySelector(".overflow-y-auto")).toBeEmptyDOMElement();
+  },
 };
 
 /**
@@ -1533,7 +1540,7 @@ export const NewTabLauncher: Story = {
     const tools = within(launcher as HTMLElement)
       .getAllByRole("button")
       .map((button) => button.getAttribute("aria-label")!)
-      .filter((name) => name !== "Terminal");
+      .filter((name) => name !== "Terminal" && name !== "Side chat");
     for (const name of tools) {
       const row = await canvas.findByRole("button", { name });
       row.focus();
@@ -1557,16 +1564,53 @@ export const NewTabLauncher: Story = {
  * that scrolls sideways (hidden scrollbar, faded edges) with "+" pinned at the end.
  */
 export const NewTabLauncherNarrow: Story = {
+  // Match Pixel's named desktop exactly; the global Storybook "desktop" is smaller.
+  parameters: {
+    viewport: {
+      options: {
+        pixelDesktop: {
+          name: "Pixel desktop",
+          styles: { width: "1900px", height: "1080px" },
+          type: "desktop",
+        },
+      },
+    },
+  },
+  globals: { viewport: { value: "pixelDesktop", isRotated: false } },
   render: () => (
     <RightSidebarStoryShell
       setup={() => {
         localStorage.removeItem(RIGHT_SIDEBAR_TAB_KEY);
-        localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "300");
-        seedSidebarLayout(
-          "ws-new-tab-narrow",
-          ["costs", "review", "instructions", "goal", "workflows", "new"],
-          "new"
-        );
+        // Share the existing empty-Output captures instead of spending more Pixel variants.
+        // After the border/divider, this gives the launcher ~300px and Output ~400px.
+        localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "705");
+        const layout: RightSidebarLayoutState = {
+          version: 1,
+          openTabsOnly: true,
+          nextId: 4,
+          focusedTabsetId: "launcher",
+          root: {
+            type: "split",
+            id: "launcher-output",
+            direction: "vertical",
+            sizes: [300 / 7, 400 / 7],
+            children: [
+              {
+                type: "tabset",
+                id: "launcher",
+                tabs: ["costs", "review", "instructions", "goal", "workflows", "new"],
+                activeTab: "new",
+              },
+              {
+                type: "tabset",
+                id: "output",
+                tabs: ["costs", "review", "output"],
+                activeTab: "output",
+              },
+            ],
+          },
+        };
+        localStorage.setItem(getRightSidebarLayoutKey("ws-new-tab-narrow"), JSON.stringify(layout));
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-new-tab-narrow",
@@ -1574,6 +1618,7 @@ export const NewTabLauncherNarrow: Story = {
           projectName: "my-app",
           messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
           sessionUsage: createSessionUsage(0.12),
+          logEntries: [],
         });
         expandRightSidebar();
         return client;
@@ -1584,11 +1629,25 @@ export const NewTabLauncherNarrow: Story = {
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await canvas.findByRole("tab", { name: /^new tab/i, selected: true });
-    await canvas.findByRole("button", { name: "Terminal" });
-    // The open tabs overflow a 300px strip: the selected New tab must still show in full.
-    await canvas.findByRole("tab", { name: /stats.*\$0\.12/i });
-    await expectSelectedTabVisible(canvasElement);
+    const newTab = await canvas.findByRole("tab", { name: /^new tab/i, selected: true });
+    const launcher = newTab.closest<HTMLElement>("[data-tabset-id]")!;
+    const sideChat = within(launcher).getByRole("button", { name: "Side chat" });
+    await expect(sideChat).toBeVisible();
+    await expect(launcher.getBoundingClientRect().width).toBeGreaterThanOrEqual(295);
+    await expect(launcher.getBoundingClientRect().width).toBeLessThanOrEqual(305);
+    // The open tabs overflow this narrow strip: the selected New tab stays fully reachable.
+    await within(launcher).findByRole("tab", { name: /stats.*\$0\.12/i });
+    await expectSelectedTabVisible(launcher);
+
+    const output = await canvas.findByRole("tabpanel", { name: /^output/i });
+    await expect(output).toBeVisible();
+    await expect(within(output).getByRole("button", { name: "Delete output logs" })).toBeVisible();
+    await expect(output.querySelector(".overflow-y-auto")).toBeEmptyDOMElement();
+    // Both states must share one capture, not merely exist off-screen or in a hidden tab.
+    const outputRect = output.getBoundingClientRect();
+    await expect(outputRect.left).toBeGreaterThanOrEqual(launcher.getBoundingClientRect().right);
+    await expect(outputRect.right).toBeLessThanOrEqual(window.innerWidth);
+    await expect(sideChat.getBoundingClientRect().bottom).toBeLessThanOrEqual(window.innerHeight);
   },
 };
 

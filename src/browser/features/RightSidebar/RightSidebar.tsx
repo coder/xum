@@ -37,6 +37,7 @@ import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { getErrorMessage } from "@/common/utils/errors";
 import { showFeedbackToast } from "@/browser/utils/feedbackToast";
+import { openSideChat } from "@/browser/utils/chatCommands";
 
 // Per-tab panel components are no longer imported here directly — the
 // `tabRegistry` owns label + panel rendering for static tabs (see
@@ -325,6 +326,8 @@ interface RightSidebarTabsetNodeProps {
   onOpenToolFromNewTab: (tabsetId: string, tool: BaseTabType) => void;
   /** Create a terminal from this tabset's New tab launcher (replaces the New tab) */
   onOpenTerminalFromNewTab: (tabsetId: string) => void;
+  onOpenSideChatFromNewTab?: (tabsetId: string) => void;
+  creatingSideChat: boolean;
   /** Close a static or New tab of this tabset (terminal and side chat tabs have their own) */
   onCloseTab: (tabsetId: string, tab: TabType) => void;
   /** Whether this tabset is the whole layout (its lone New tab then cannot be closed) */
@@ -662,6 +665,12 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
               tools={props.launcherTools}
               onOpenTool={(tool) => props.onOpenToolFromNewTab(props.node.id, tool)}
               onOpenTerminal={() => props.onOpenTerminalFromNewTab(props.node.id)}
+              onOpenSideChat={
+                props.onOpenSideChatFromNewTab == null
+                  ? undefined
+                  : () => props.onOpenSideChatFromNewTab?.(props.node.id)
+              }
+              creatingSideChat={props.creatingSideChat}
               autoFocus={props.launcherAutoFocusTabsetId === props.node.id}
               onAutoFocusConsumed={props.onLauncherAutoFocusConsumed}
             />
@@ -1250,6 +1259,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
   }, [setCollapsed, setLayout, workspaceId]);
 
+  const [launcherToolToFocus, setLauncherToolToFocus] = React.useState<TabType | null>(null);
   const sidebarContainerRef = React.useRef<HTMLDivElement>(null);
 
   // /side chat tabs. Side chats this sidebar just opened whose metadata has not arrived yet, so
@@ -1267,7 +1277,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       pendingSideChatIdsRef.current.add(detail.sideChatWorkspaceId);
       setCollapsed(false);
       // Each /side opens another chat; keep earlier chats reachable until the user closes them.
-      setLayout((prev) => selectOrAddTab(prev, makeSideChatTabType(detail.sideChatWorkspaceId)));
+      const tab = makeSideChatTabType(detail.sideChatWorkspaceId);
+      setLayout((prev) =>
+        detail.tabsetId == null
+          ? selectOrAddTab(prev, tab)
+          : openToolFromNewTab(prev, detail.tabsetId, tab)
+      );
+      if (detail.tabsetId != null) setLauncherToolToFocus(tab);
     };
     window.addEventListener(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, handleOpenSideChatTab);
     return () =>
@@ -1779,7 +1795,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     [createTerminalTab]
   );
 
-  const [launcherToolToFocus, setLauncherToolToFocus] = React.useState<BaseTabType | null>(null);
   React.useEffect(() => {
     if (launcherToolToFocus == null) return;
     // The launcher button has unmounted. Keep keyboard users in the replacement tab rather
@@ -1789,6 +1804,27 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       ?.focus();
     setLauncherToolToFocus(null);
   }, [baseId, launcherToolToFocus, layout.focusedTabsetId]);
+
+  const sideChatCreationPending = React.useRef(false);
+  const [creatingSideChat, setCreatingSideChat] = React.useState(false);
+  const handleOpenSideChatFromNewTab = (tabsetId: string) => {
+    if (api == null || sideChatCreationPending.current) return;
+    // Lock before React commits the disabled row so rapid clicks cannot create duplicates.
+    sideChatCreationPending.current = true;
+    setCreatingSideChat(true);
+    openSideChat({ api, workspaceId, tabsetId })
+      .catch((error: unknown) => {
+        showFeedbackToast({
+          type: "error",
+          title: "Side Chat Failed",
+          message: getErrorMessage(error),
+        });
+      })
+      .finally(() => {
+        sideChatCreationPending.current = false;
+        setCreatingSideChat(false);
+      });
+  };
 
   const handleOpenToolFromNewTab = React.useCallback(
     (tabsetId: string, tool: BaseTabType) => {
@@ -2088,6 +2124,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         onAddNewTab={handleAddNewTab}
         onOpenToolFromNewTab={handleOpenToolFromNewTab}
         onOpenTerminalFromNewTab={handleOpenTerminalFromNewTab}
+        onOpenSideChatFromNewTab={
+          currentWorkspaceMetadata?.sideChatParentWorkspaceId != null
+            ? undefined
+            : handleOpenSideChatFromNewTab
+        }
+        creatingSideChat={creatingSideChat}
         onCloseTab={closeNonTerminalTab}
         isOnlyTabset={layout.root.type === "tabset"}
         launcherTools={launcherTools}
