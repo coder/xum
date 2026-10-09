@@ -299,6 +299,40 @@ describe("AppConfigStore", () => {
     expect(sent).toEqual([[{ appearance: { theme: "light" } }]]);
   });
 
+  test("an edit on the next connection is sent when the replaced connection's write settles late", async () => {
+    // This request ignores its abort signal and settles only after the next connection's edit.
+    let settleDead!: (error: Error) => void;
+    const dead = createClient(
+      () => ({ appearance: { theme: "dark" } }),
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          settleDead = reject;
+        })
+    );
+    const sent: unknown[][] = [];
+    const live = createClient(
+      () => ({ appearance: { theme: "dark" } }),
+      (input) => {
+        sent.push(input.patches);
+        return Promise.resolve();
+      }
+    );
+    const store = new AppConfigStore();
+    store.setClient(dead);
+    await store.refresh();
+
+    store.updateUserPreferences({ appearance: { transcriptDensity: "hyper" } });
+    store.setClient(live);
+    await store.refresh();
+    store.updateUserPreferences({ appearance: { theme: "light" } });
+    const aborted = new Error("aborted");
+    aborted.name = "AbortError";
+    settleDead(aborted);
+    await store.flushUserPreferences().catch(() => undefined);
+
+    expect(sent).toEqual([[{ appearance: { theme: "light" } }]]);
+  });
+
   test("a write cut off by a closed socket settles as unconfirmed", async () => {
     const closed = new Error("WebSocket closed (code 1006)");
     closed.name = "AbortError";

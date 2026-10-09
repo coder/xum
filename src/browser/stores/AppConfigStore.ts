@@ -133,6 +133,12 @@ export class AppConfigStore {
     this.client = client;
     this.clientController?.abort();
     this.clientController = client ? new AbortController() : null;
+    // Edits queued behind a request to the replaced connection go with it. Dropping them here,
+    // not when that request settles, keeps the edits made on the next connection.
+    if (this.queuedPatches.length > 0) {
+      this.queuedPatches = [];
+      this.publish();
+    }
 
     this.subscriptionController?.abort();
     this.subscriptionController = null;
@@ -273,10 +279,9 @@ export class AppConfigStore {
           console.warn("Failed to save user preferences:", error);
           if (signal?.aborted || isAbortError(error)) {
             // The connection was lost or replaced mid-request. The server may still apply it (a
-            // frozen backend does when it resumes), so do not claim it failed; drop the edits
-            // queued behind it, and let the next connection's snapshot show what was saved.
+            // frozen backend does when it resumes), so do not claim it failed; the next
+            // connection's snapshot shows what was saved.
             failure = USER_PREFERENCE_SAVE_UNCONFIRMED_MESSAGE;
-            this.queuedPatches = [];
           } else {
             failure ??= USER_PREFERENCE_SAVE_FAILED_MESSAGE;
           }

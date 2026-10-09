@@ -1,12 +1,22 @@
 import { useRef } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { getAppConfigStore, useAppConfig } from "@/browser/stores/AppConfigStore";
+import {
+  getAppConfigStore,
+  USER_PREFERENCE_SAVE_FAILED_MESSAGE,
+  useAppConfig,
+} from "@/browser/stores/AppConfigStore";
+import { showFeedbackToast } from "@/browser/utils/feedbackToast";
 import {
   RUNTIME_ENABLEMENT_IDS,
   normalizeRuntimeEnablement,
   type RuntimeEnablement,
   type RuntimeEnablementId,
 } from "@/common/types/runtime";
+
+interface RuntimeEnablementPatch {
+  runtimeEnablement?: RuntimeEnablement;
+  defaultRuntime?: RuntimeEnablementId | null;
+}
 
 interface RuntimeEnablementState {
   enablement: RuntimeEnablement;
@@ -50,6 +60,20 @@ export function useRuntimeEnablement(): RuntimeEnablementState {
   const enablement = enablementRef.current;
   const defaultRuntime = normalizeDefaultRuntime(rawDefaultRuntime);
 
+  // As for preference writes: while disconnected (or before the config loads) a change would
+  // never be sent and the next refresh would silently revert it, so refuse it visibly.
+  const persist = (payload: RuntimeEnablementPatch) => {
+    if (!api || !store.getSnapshot()) {
+      showFeedbackToast({ type: "error", message: USER_PREFERENCE_SAVE_FAILED_MESSAGE });
+      return;
+    }
+    store.updateOptimistically(payload);
+    api.config.updateRuntimeEnablement(payload).catch(() => {
+      showFeedbackToast({ type: "error", message: USER_PREFERENCE_SAVE_FAILED_MESSAGE });
+      void store.refresh();
+    });
+  };
+
   const setRuntimeEnabled = (
     id: RuntimeEnablementId,
     enabled: boolean,
@@ -60,26 +84,17 @@ export function useRuntimeEnablement(): RuntimeEnablementState {
       [id]: enabled,
     };
 
-    const payload: {
-      runtimeEnablement: RuntimeEnablement;
-      defaultRuntime?: RuntimeEnablementId | null;
-    } = { runtimeEnablement: nextMap };
+    const payload: RuntimeEnablementPatch = { runtimeEnablement: nextMap };
 
     if (nextDefaultRuntime !== undefined) {
       payload.defaultRuntime = nextDefaultRuntime;
     }
 
-    store.updateOptimistically(payload);
-    api?.config?.updateRuntimeEnablement(payload).catch(() => {
-      void store.refresh();
-    });
+    persist(payload);
   };
 
   const setDefaultRuntime = (id: RuntimeEnablementId | null) => {
-    store.updateOptimistically({ defaultRuntime: id });
-    api?.config?.updateRuntimeEnablement({ defaultRuntime: id }).catch(() => {
-      void store.refresh();
-    });
+    persist({ defaultRuntime: id });
   };
 
   return { enablement, setRuntimeEnabled, defaultRuntime, setDefaultRuntime };
