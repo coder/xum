@@ -1036,7 +1036,7 @@ describe("Config", () => {
       ]);
     });
 
-    // A conflicting group (same id with different rows, or one setting with two values) keeps
+    // A conflicting group (two different rows with the same id) keeps
     // the loader's previous result: `new Map(stripped pairs)`, the last entry at the position of
     // the first. This oracle is that expression, so the test pins "no change" for conflicts
     // (#5929 tracks a lossless design).
@@ -1061,18 +1061,18 @@ describe("Config", () => {
         ],
       ],
       [
-        "a settings conflict with another project in between",
+        "a same-id conflict with another project in between",
         () => [
-          ["/home/u/repo/", { customInstructions: "two", workspaces: [row("ws-two")] }],
+          ["/home/u/repo/", { workspaces: [row("ws-same", { title: "second" }), row("ws-two")] }],
           ["/home/u/other", { workspaces: [row("ws-other")] }],
-          ["/home/u/repo", { customInstructions: "one", workspaces: [row("ws-one")] }],
+          ["/home/u/repo", { workspaces: [row("ws-same", { title: "first" }), row("ws-one")] }],
         ],
       ],
       [
-        "the same stored key twice",
+        "the same stored key twice with a same-id conflict",
         () => [
-          ["/home/u/repo", { customInstructions: "one", workspaces: [row("ws-one")] }],
-          ["/home/u/repo", { customInstructions: "two", workspaces: [row("ws-two")] }],
+          ["/home/u/repo", { workspaces: [row("ws-same", { title: "first" }), row("ws-one")] }],
+          ["/home/u/repo", { workspaces: [row("ws-same", { title: "second" }), row("ws-two")] }],
         ],
       ],
     ];
@@ -1111,19 +1111,56 @@ describe("Config", () => {
       expect(metadata.every((meta) => meta.projectPath === "/home/u/repo")).toBe(true);
     });
 
-    it("merges settings that only one alias sets", async () => {
-      writeProjects([
-        ["/home/u/repo/", { customInstructions: "keep me", workspaces: [row("ws-two")] }],
-        ["/home/u/repo", { workspaces: [row("ws-one")] }],
-      ]);
+    // Project settings come from the last entry, as the previous loader's `new Map` did. A
+    // setting that only an earlier alias holds may be one the user cleared since, so merging it
+    // back would revive it.
+    for (const order of ["canonical last", "alias last"] as const) {
+      const [earlierKey, lastKey] =
+        order === "canonical last"
+          ? ["/home/u/repo/", "/home/u/repo"]
+          : ["/home/u/repo", "/home/u/repo/"];
 
-      await flushConfigEdits();
+      it(`drops a setting that only an earlier alias sets (${order})`, async () => {
+        writeProjects([
+          [
+            earlierKey,
+            {
+              customInstructions: "stale",
+              runtimeOverridesEnabled: true,
+              workspaces: [row("ws-early")],
+            },
+          ],
+          [lastKey, { workspaces: [row("ws-last")] }],
+        ]);
 
-      const [[key, project]] = readSavedProjects();
-      expect(key).toBe("/home/u/repo");
-      expect(project.customInstructions).toBe("keep me");
-      expect(project.workspaces.map((w) => w.id)).toEqual(["ws-two", "ws-one"]);
-    });
+        await flushConfigEdits();
+        const [[key, project]] = readSavedProjects();
+        expect(key).toBe("/home/u/repo");
+        expect(project.customInstructions).toBeUndefined();
+        expect(project.runtimeOverridesEnabled).toBeUndefined();
+        expect(project.workspaces.map((w) => w.id)).toEqual(["ws-early", "ws-last"]);
+
+        const reloaded = new Config(tempDir).loadConfigOrDefault().projects.get("/home/u/repo");
+        expect(reloaded?.customInstructions).toBeUndefined();
+        expect(reloaded?.runtimeOverridesEnabled).toBeUndefined();
+      });
+
+      it(`keeps the last alias's settings, even when an earlier alias differs (${order})`, async () => {
+        writeProjects([
+          [earlierKey, { customInstructions: "old", workspaces: [row("ws-early")] }],
+          [lastKey, { customInstructions: "current", workspaces: [row("ws-last")] }],
+        ]);
+
+        await flushConfigEdits();
+        const [[key, project]] = readSavedProjects();
+        expect(key).toBe("/home/u/repo");
+        expect(project.customInstructions).toBe("current");
+        expect(project.workspaces.map((w) => w.id)).toEqual(["ws-early", "ws-last"]);
+
+        const reloaded = new Config(tempDir).loadConfigOrDefault().projects.get("/home/u/repo");
+        expect(reloaded?.customInstructions).toBe("current");
+      });
+    }
 
     it("writes the same projects on a second load and save after a merge", async () => {
       writeProjects([

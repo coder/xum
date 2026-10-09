@@ -956,13 +956,13 @@ interface StoredProjectEntry {
 
 /**
  * Merge one group of aliases (stored keys that normalize to the same path), or return null when
- * a merge would have to choose: two different rows with the same id, or a project setting that
- * two aliases set to different values. Rows with distinct ids and settings only one alias sets
- * are combined; a byte-identical duplicate row is kept once. The project is trusted only when
- * every alias was: the canonical spelling says nothing about which alias the user trusted.
+ * a merge would have to choose between two different rows with the same id. Rows with distinct
+ * ids are combined, and a byte-identical duplicate row is kept once. Project settings come from
+ * the last entry, as the previous `new Map(pairs)` loader did: a setting only an earlier alias
+ * holds may be one the user cleared since. The project is trusted only when every alias was:
+ * the canonical spelling says nothing about which alias the user trusted.
  */
 function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null {
-  const settings = new Map<string, unknown>();
   const workspaces: ProjectConfig["workspaces"] = [];
   const rowJsonById = new Map<string, string>();
   // Legacy rows without an id: a byte-identical copy in two aliases is one workspace. Keeping
@@ -970,16 +970,6 @@ function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null 
   const idlessRowJson = new Set<string>();
   for (const { config } of group) {
     if (!Array.isArray(config.workspaces)) return null;
-    for (const [field, value] of Object.entries(config) as Array<[string, unknown]>) {
-      // parentProjectPath is derived again from the keys right after loading.
-      if (value === undefined || ["workspaces", "trusted", "parentProjectPath"].includes(field)) {
-        continue;
-      }
-      if (settings.has(field) && JSON.stringify(settings.get(field)) !== JSON.stringify(value)) {
-        return null;
-      }
-      settings.set(field, value);
-    }
     for (const workspace of config.workspaces) {
       const json = JSON.stringify(workspace);
       if (!workspace.id) {
@@ -996,10 +986,8 @@ function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null 
       }
     }
   }
-  const merged: ProjectConfig = {
-    ...(Object.fromEntries(settings) as Partial<ProjectConfig>),
-    workspaces,
-  };
+  const merged: ProjectConfig = { ...group[group.length - 1].config, workspaces };
+  delete merged.trusted;
   if (group.every(({ config }) => config.trusted === true)) {
     merged.trusted = true;
   } else if (group.some(({ config }) => config.trusted !== undefined)) {
@@ -1012,8 +1000,8 @@ function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null 
  * Build the project map from the loaded entries. Stored keys that normalize to the same path
  * ("/repo" and "/repo/") are aliases of one project. `new Map(pairs)` used to keep only the last
  * alias, so the next save dropped the other aliases' workspace rows. Group every alias first,
- * then merge a group that merges without a choice. A conflicting group still keeps only its last
- * entry, as before (#5929).
+ * then merge the group's rows. A group with two different rows under one id still keeps only
+ * its last entry, as before (#5929).
  */
 function buildProjectsFromStoredEntries(entries: StoredProjectEntry[]): Map<string, ProjectConfig> {
   const groups = new Map<string, StoredProjectEntry[]>();
