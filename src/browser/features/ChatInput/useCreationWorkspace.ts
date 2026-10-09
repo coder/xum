@@ -10,7 +10,7 @@ import type {
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
-import { setAutoRoutingPick } from "@/browser/utils/aiSelectionIntent";
+import { handOffCreationAiSelection } from "@/browser/utils/aiSelectionIntent";
 import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
@@ -119,16 +119,28 @@ function resolveCreationAgentId(
     : agentId;
 }
 
-function syncCreationPreferences(projectPath: string, workspaceId: string, agentId: string): void {
+function syncCreationPreferences(
+  projectPath: string,
+  workspaceId: string,
+  agentId: string,
+  reasoningMode: string
+): void {
   // Without the experiment the composer offers no Auto, so the creation scope has no choice.
   const experiments = getAppConfigStore().getSnapshot()?.experiments;
-  if (experiments?.[EXPERIMENT_IDS.AUTO_MODEL_ROUTING] === true) {
-    for (const dimension of ["model", "thinkingLevel"] as const) {
-      // The workspace shows the creation choice until a send saves it.
-      const creationAuto = getAutoRouting(getProjectScopeId(projectPath), dimension, agentId);
-      setAutoRoutingPick(workspaceId, agentId, dimension, creationAuto);
-    }
-  }
+  const projectScopeId = getProjectScopeId(projectPath);
+  // Until the creation save lands the workspace has no saved settings, and project defaults
+  // hold no reasoning mode.
+  handOffCreationAiSelection(workspaceId, agentId, {
+    reasoningMode,
+    ...(experiments?.[EXPERIMENT_IDS.AUTO_MODEL_ROUTING] === true
+      ? {
+          autoRouting: {
+            model: getAutoRouting(projectScopeId, "model", agentId),
+            thinkingLevel: getAutoRouting(projectScopeId, "thinkingLevel", agentId),
+          },
+        }
+      : {}),
+  });
 
   // Auto-enable notifications if the project-level preference is set
   if (
@@ -635,7 +647,7 @@ export function useCreationWorkspace({
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).
-        syncCreationPreferences(projectPath, metadata.id, creationAgentId);
+        syncCreationPreferences(projectPath, metadata.id, creationAgentId, settings.reasoningMode);
 
         // Switch to the workspace immediately after creation unless the user navigated away
         // from the draft that initiated the creation (avoid yanking focus to the new workspace).

@@ -198,6 +198,30 @@ export function setAutoRoutingPick(
   notify();
 }
 
+/**
+ * Workspace creation saves the creation composer's choices itself (its first send, or the
+ * settings save before an initial /goal), so the new workspace shows them as sent picks.
+ */
+export function handOffCreationAiSelection(
+  workspaceId: string,
+  agentId: string,
+  selection: { reasoningMode: string; autoRouting?: Record<AutoRoutingDimension, boolean> }
+): void {
+  const key = scopeKey(workspaceId, agentId);
+  pendingByScope.set(key, {
+    ...pendingByScope.get(key),
+    reasoningMode: { value: selection.reasoningMode, token: nextToken++, sent: true },
+  });
+  const autoRouting = selection.autoRouting;
+  if (autoRouting != null) {
+    pendingAutoRoutingByScope.set(key, {
+      model: { value: autoRouting.model, token: nextToken++, sent: true },
+      thinkingLevel: { value: autoRouting.thinkingLevel, token: nextToken++, sent: true },
+    });
+  }
+  notify();
+}
+
 /** The workspace's saved settings for an agent; a legacy workspace has only `aiSettings`. */
 export function getSavedAiSettings(
   workspaceId: string,

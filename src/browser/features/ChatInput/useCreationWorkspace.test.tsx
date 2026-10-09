@@ -6,7 +6,9 @@ import {
   getAutoRoutingPick,
   resetAiSelectionIntentForTests,
   setAutoRoutingPick,
+  setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
@@ -2096,9 +2098,48 @@ describe("useCreationWorkspace", () => {
     const options = sendMessageMock.mock.calls[0]?.[0]?.options;
     expect(options?.autoModelRouting).toBe(true);
     expect(options?.autoThinkingLevel).toBe(true);
-    // The workspace shows both creation choices until a send saves them.
+    // The workspace shows both creation choices until its metadata holds them.
     expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "model")).toBe(true);
     expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "thinkingLevel")).toBe(true);
+    setWorkspaceAiMetadata(TEST_WORKSPACE_ID, {
+      aiSettingsByAgent: {
+        exec: {
+          model: "gpt-4",
+          thinkingLevel: "medium",
+          autoModelRouting: true,
+          autoThinkingLevel: true,
+        },
+      },
+    });
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "model")).toBeUndefined();
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "thinkingLevel")).toBeUndefined();
+  });
+
+  test("the new workspace keeps the creation reasoning mode until its metadata holds it", async () => {
+    setupWindow({});
+    draftSettingsState = createDraftSettingsHarness({ agentId: "exec", reasoningMode: "pro" });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("launch workspace");
+    });
+
+    // The created metadata has no AI settings yet; project defaults hold no reasoning mode.
+    expect(getWorkspaceAiSelection(TEST_WORKSPACE_ID, "exec").reasoningMode).toBe("pro");
+    const save = (reasoningMode: DraftWorkspaceSettings["reasoningMode"]) =>
+      setWorkspaceAiMetadata(TEST_WORKSPACE_ID, {
+        aiSettingsByAgent: { exec: { model: "gpt-4", thinkingLevel: "medium", reasoningMode } },
+      });
+    save("pro");
+    // Another window's later change shows through.
+    save("standard");
+    expect(getWorkspaceAiSelection(TEST_WORKSPACE_ID, "exec").reasoningMode).toBe("standard");
   });
 
   test("handleSend returns failure when sendMessage fails and clears draft", async () => {
@@ -2466,6 +2507,7 @@ function createDraftSettingsHarness(
     runtimeString?: string | undefined;
     defaultRuntimeMode?: RuntimeChoice;
     agentId?: string;
+    reasoningMode?: DraftWorkspaceSettings["reasoningMode"];
     coderConfigFallback?: CoderWorkspaceConfig;
     sshHostFallback?: string;
   }>
@@ -2474,6 +2516,7 @@ function createDraftSettingsHarness(
     selectedRuntime: initial?.selectedRuntime ?? { mode: "local" as const },
     defaultRuntimeMode: initial?.defaultRuntimeMode ?? "worktree",
     agentId: initial?.agentId ?? "exec",
+    reasoningMode: initial?.reasoningMode ?? "standard",
     trunkBranch: initial?.trunkBranch ?? "main",
     runtimeString: initial?.runtimeString,
     coderConfigFallback: initial?.coderConfigFallback ?? { existingWorkspace: false },
@@ -2482,6 +2525,7 @@ function createDraftSettingsHarness(
     selectedRuntime: ParsedRuntime;
     defaultRuntimeMode: RuntimeChoice;
     agentId: string;
+    reasoningMode: DraftWorkspaceSettings["reasoningMode"];
     trunkBranch: string;
     runtimeString: string | undefined;
     coderConfigFallback: CoderWorkspaceConfig;
@@ -2521,7 +2565,7 @@ function createDraftSettingsHarness(
       const settings: DraftWorkspaceSettings = {
         model: "gpt-4",
         thinkingLevel: "medium",
-        reasoningMode: "standard",
+        reasoningMode: state.reasoningMode,
         agentId: state.agentId,
         selectedRuntime: state.selectedRuntime,
         defaultRuntimeMode: state.defaultRuntimeMode,
