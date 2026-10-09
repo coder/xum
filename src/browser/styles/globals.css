@@ -855,8 +855,36 @@ body,
     touch-action: manipulation;
   }
 
+  /* iOS Safari zooms the page when a text field below 16px gets focus (documented WebKit
+     behavior), and the viewport meta no longer blocks zoom (#5972). Components with inline font
+     sizes read this variable; it exists only here, so desktop sizes do not change. */
+  :root {
+    --min-text-entry-font-size: 16px;
+  }
+
   body {
     font-size: 15px;
+  }
+
+  /* Raise text-entry fields to the minimum. This rule is outside Tailwind's layers, so it beats
+     `text-xs`/`text-sm` utilities. CSS cannot compare a field's own size with the minimum
+     (`max(16px, 1em)` reads the parent's size), so fields with a larger size class are skipped
+     instead of shrunk. */
+  :is(
+    input:not([type]),
+    input[type="text"],
+    input[type="search"],
+    input[type="email"],
+    input[type="url"],
+    input[type="tel"],
+    input[type="password"],
+    input[type="number"],
+    textarea,
+    select,
+    [contenteditable="true"],
+    [contenteditable="plaintext-only"]
+  ):not(.text-lg, .text-xl, .text-2xl, .text-3xl) {
+    font-size: var(--min-text-entry-font-size);
   }
 
   .mobile-hide-shortcut-hints {
