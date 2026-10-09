@@ -181,4 +181,42 @@ describe("CommandSuggestions", () => {
     expect(propagated).toBe(false);
     window.removeEventListener("keydown", windowListener);
   });
+
+  it("announces the active suggestion to screen readers while the list is open", () => {
+    // Focus stays in the composer, so screen readers hear the list only through a live region
+    // (#5962). The region must exist before it gets text, so it stays mounted while hidden.
+    const items = ["/alpha", "/beta", "/gamma"].map((display) => ({
+      ...makeSuggestion(display.slice(1)),
+      display,
+    }));
+    function Harness() {
+      const [visible, setVisible] = useState(false);
+      return (
+        <div>
+          <CommandSuggestions
+            suggestions={items}
+            onSelectSuggestion={() => undefined}
+            onDismiss={() => setVisible(false)}
+            isVisible={visible}
+          />
+          <button onClick={() => setVisible(true)}>Open</button>
+        </div>
+      );
+    }
+    const { getByRole, getByText } = render(<Harness />);
+    const status = getByRole("status");
+    expect(status.textContent).toBe("");
+
+    fireEvent.click(getByText("Open"));
+    expect(status.textContent).toContain(items[0].display);
+    expect(status.textContent).toContain(String(items.length));
+
+    fireEvent.keyDown(document, { key: "ArrowDown" });
+    expect(status.textContent).toContain(items[1].display);
+    expect(status.textContent).not.toContain(items[0].display);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(getByRole("status")).toBe(status);
+    expect(status.textContent).toBe("");
+  });
 });

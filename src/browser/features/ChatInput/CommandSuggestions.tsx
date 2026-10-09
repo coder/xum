@@ -210,11 +210,25 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [isVisible, onDismiss]);
 
-  if (!isVisible || suggestions.length === 0) {
-    return null;
+  const isOpen = isVisible && suggestions.length > 0;
+  const activeSuggestion = suggestions[selectedIndex] ?? suggestions[0];
+  // Focus stays in the composer, so screen readers hear the list only through this live region
+  // (#5962). It stays mounted while the list is closed: a region that appears together with its
+  // text is not announced reliably. It renders in document.body because the composer dock sits in
+  // the transcript scrollport, where the transcript's loading status must stay the only status.
+  const status = createPortal(
+    <div role="status" className="sr-only">
+      {isOpen && activeSuggestion
+        ? `${activeSuggestion.display}, ${suggestions.indexOf(activeSuggestion) + 1} of ${suggestions.length}`
+        : ""}
+    </div>,
+    document.body
+  );
+
+  if (!isOpen) {
+    return status;
   }
 
-  const activeSuggestion = suggestions[selectedIndex] ?? suggestions[0];
   const resolvedListId = listId ?? `command-suggestions-list`;
 
   const content = (
@@ -286,10 +300,11 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
     </div>
   );
 
-  // Use portal when anchorRef is provided (to escape overflow:hidden containers)
-  if (anchorRef) {
-    return createPortal(content, document.body);
-  }
-
-  return content;
+  return (
+    <>
+      {status}
+      {/* Use portal when anchorRef is provided (to escape overflow:hidden containers) */}
+      {anchorRef ? createPortal(content, document.body) : content}
+    </>
+  );
 };
