@@ -32,6 +32,16 @@ function hugeList(total: number, line: (k: number) => string): string {
 
 const bulletLine = (k: number) => `- item ${k} with **bold ${k}** and \`code ${k}\`\n`;
 
+const TABLE_HEAD = "| n | value | code |\n|---:|:---|---|\n";
+const tableRow = (k: number) => `| ${k} | **v${k}** and [l](https://x/${k}) | \`c${k}\` |\n`;
+
+// One huge table of about `total` chars, `prefix` before each row's cells (a container marker).
+function hugeTable(total: number, row = tableRow, prefix = ""): string {
+  let out = TABLE_HEAD.replace(/^/gm, prefix).replace(new RegExp(`${prefix}$`), "");
+  for (let k = 1; out.length < total; k++) out += prefix + row(k);
+  return out;
+}
+
 describe("MarkdownChunker", () => {
   test("cuts a huge streaming list at item starts, so the open chunk stays small", () => {
     const full = hugeList(50_000, bulletLine);
@@ -103,6 +113,38 @@ describe("MarkdownChunker", () => {
     expect(chunks.join("")).toBe(closed);
   });
 
+  // A container starts the block, so the block is not a table. Streamdown merges a footnote or
+  // `$$` block with later blocks, so the block can hold more than the table. Both stay one chunk.
+  test.each([
+    ["inside a list item", `- item\n\n${hugeTable(6_000, tableRow, "  ")}`],
+    ["inside a blockquote", hugeTable(6_000, tableRow, "> ")],
+    ["inside an HTML block", `<div>\n${hugeTable(6_000)}</div>\n`],
+    ["with a footnote", hugeTable(6_000, (k) => `| ${k} | v${k}[^1] | c |\n`) + "\n[^1]: Note.\n"],
+    ["with $$", hugeTable(6_000, (k) => `| ${k} | $$x_${k}$$ | c |\n`)],
+  ])("a table %s stays whole", (_where, text) => {
+    for (let end = 200; end < text.length + 499; end += 499) {
+      const prefix = text.slice(0, Math.min(end, text.length));
+      expect(new MarkdownChunker(2_000).update(prefix)).toEqual([prefix]);
+    }
+  });
+
+  test("a block whose text differs from the input is never sealed", () => {
+    // Streamdown's blocks turn CRLF into LF, so they no longer match the input.
+    const text = Array.from({ length: 20 }, (_, k) => `Paragraph ${k} text.`).join("\r\n\r\n");
+    expect(new MarkdownChunker(40).update(text).join("")).toBe(text);
+  });
+
+  // #5664: a partial marker (`…\n\n30` before its `.`) must not seal the list before it, even when
+  // the open range is close to the chunk size. Every chunk size puts some marker near a limit.
+  test("a partial ordered marker at a chunk limit does not split the list", () => {
+    const full = Array.from({ length: 40 }, (_, k) => `${k + 1}. Item ${k + 1} text`).join("\n\n");
+    for (let maxChars = 60; maxChars <= 140; maxChars++) {
+      const chunker = new MarkdownChunker(maxChars);
+      for (let end = 1; end <= full.length; end++) chunker.update(full.slice(0, end));
+      expect(chunker.completedChunks()).toEqual([full]);
+    }
+  });
+
   test("replaced text starts over instead of keeping a stale sealed prefix", () => {
     const chunker = new MarkdownChunker(20);
     chunker.update("First paragraph here.\n\nSecond paragraph here.\n\nThird.");
@@ -171,6 +213,20 @@ describe("ChunkedStreamingMarkdown", () => {
 
     expect(expected.length).toBeGreaterThan(100);
     expect(chunked).toEqual(expected);
+  });
+
+  test("a completed chunked reply with a huge table renders like one static render", async () => {
+    const reply = `${denseReply(4)}\n\n${hugeTable(9_000)}\nAfter the table.\n\n${denseReply(4)}`;
+    for (let end = 500; end < reply.length; end += 700) renderRow(reply.slice(0, end), true);
+    renderRow(reply, false);
+    await waitForText("Section 0");
+    const single = renderSingle(reply);
+    const rows = (element: Element) =>
+      [...element.querySelectorAll("tr")].map((tr) => tr.textContent);
+    expect(rows(single).length).toBeGreaterThan(100);
+    expect(container.querySelectorAll("table")).toHaveLength(9);
+    expect(rows(container)).toEqual(rows(single));
+    expect(blockOutline(container)).toEqual(blockOutline(single));
   });
 
   // Tags, ordered starts and checkbox states: the structure a reader sees, minus chunk wrappers.
