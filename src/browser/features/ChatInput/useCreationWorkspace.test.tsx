@@ -1548,6 +1548,37 @@ describe("useCreationWorkspace", () => {
     });
   });
 
+  test("an initial goal command saves the creation composer's Auto choices", async () => {
+    const { workspaceApi } = setupWindow({});
+    getAppConfigStore().updateOptimistically({
+      experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
+    });
+    setAutoRoutingPick(getProjectScopeId(TEST_PROJECT_PATH), "exec", "model", true);
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "/goal ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        typedText: "/goal ship the feature",
+      });
+    });
+
+    expect(workspaceApi.sendMessage.mock.calls.length).toBe(0);
+    expect(workspaceApi.updateAgentAISettings.mock.calls[0]?.[0]?.aiSettings).toEqual({
+      model: "gpt-4",
+      thinkingLevel: "medium",
+      reasoningMode: "standard",
+      autoModelRouting: true,
+    });
+  });
+
   test("handleSend hands a refused initial goal command to the new workspace composer", async () => {
     const setGoalMock = mock(
       (_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> =>
