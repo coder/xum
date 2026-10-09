@@ -196,13 +196,11 @@ export async function prepareMessagesForProvider(
 
   // --- ModelMessage-level transforms ---
 
-  const modelMessages = dedupeNativeToolReferences(
-    applyNativeToolSearchReplay(
-      normalizeLegacyToolSearchMessages(
-        sanitizeAssistantModelMessages(rawModelMessages, workspaceId)
-      ),
-      deferLoadingToolNames ?? new Set()
-    )
+  const modelMessages = applyNativeToolSearchReplay(
+    normalizeLegacyToolSearchMessages(
+      sanitizeAssistantModelMessages(rawModelMessages, workspaceId)
+    ),
+    deferLoadingToolNames ?? new Set()
   );
 
   log.debug_obj(`${workspaceId}/2_model_messages.json`, modelMessages);
@@ -234,9 +232,15 @@ export async function prepareMessagesForProvider(
       ? stripReasoningReplay(transformedMessages, "anthropic")
       : transformedMessages;
 
+  // Dedupe after transformModelMessages: its orphan strip (self-healing for
+  // interrupted/corrupted history) can remove a result whose reference would
+  // otherwise consume a tool's single dedupe slot, unloading the tool from the
+  // final request. Decide against the transcript the provider actually sees.
+  const dedupedMessages = dedupeNativeToolReferences(segmentMessages);
+
   // Apply cache control for Anthropic models AFTER transformation
   const finalMessages = applyCacheControl(
-    segmentMessages,
+    dedupedMessages,
     modelString,
     anthropicCacheTtl,
     providersConfig

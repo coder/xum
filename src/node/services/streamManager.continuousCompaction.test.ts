@@ -625,6 +625,9 @@ describe("continuous prefix prepareStep and journal", () => {
     const references = JSON.stringify(second.messages).match(/"tool-reference"/g) ?? [];
     expect(references).toHaveLength(1);
     expect(JSON.stringify(second.messages)).not.toContain("old-search");
+    // The retained bash result reuses the search result's toolCallId ("keep");
+    // restoration must match the projected occurrence, not the reusable ID.
+    expect(JSON.stringify(second.messages)).toContain("kept output");
   });
 
   it.each([

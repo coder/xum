@@ -114,8 +114,7 @@ import {
   computeContextLoadedToolNames,
   dedupeNativeToolReferences,
   computeLoadedToolNames,
-  recordNativeToolSearchResults,
-  restoreNativeToolSearchResults,
+  restoreProjectedToolSearchResults,
   type NativeToolSearchResultPart,
   type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
@@ -2983,10 +2982,21 @@ export class StreamManager {
     // #5086: see the `between_tools` replay guard in prepareStep.
     let previousToolSetKey: string | undefined;
     let seenPrefixSwap: ContinuousPrefixSwap | undefined;
-    // Raw tool-search results seen by this run's steps, keyed by toolCallId.
-    // The reference dedupe below projects repeats out of the returned messages
-    // the SDK carries forward, so a later prefix swap restores from here.
-    const rawToolSearchResults = new Map<string, NativeToolSearchResultPart>();
+    // Tool-search projections made by this run's steps, keyed by JSON of the
+    // projected part. The reference dedupe below projects repeats out of the
+    // returned messages the SDK carries forward, so a later prefix swap
+    // restores the raw forms from here. Values are chain-compressed to the
+    // fully raw part: a projection's input may itself be an earlier projection.
+    const toolSearchProjections = new Map<string, NativeToolSearchResultPart>();
+    const recordToolSearchProjection = (
+      projected: NativeToolSearchResultPart,
+      raw: NativeToolSearchResultPart
+    ) => {
+      toolSearchProjections.set(
+        JSON.stringify(projected),
+        toolSearchProjections.get(JSON.stringify(raw)) ?? raw
+      );
+    };
     // Outgoing rows before this index predate the latest in-turn prefix change.
     let reasoningReplayBoundary = 0;
     // XUM_DISABLE_AGENT_TOOLS=1 sends no tools at all (see isAgentToolsDisabled). Every chat
@@ -3005,7 +3015,6 @@ export class StreamManager {
         // streamText runs multiple internal LLM calls (steps) when tools are enabled.
         const rewritten = await transformStepMessages(stepMessages);
         let effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
-        recordNativeToolSearchResults(effectiveMessages, rawToolSearchResults);
         if (stepTracker?.prefixSwapInvalidated) {
           // Cross-family fallback must not send the old provider's cached prefix.
           // Release only on the session's stop, after fallback reset/locks have completed.
@@ -3047,7 +3056,7 @@ export class StreamManager {
           // repeat whose first occurrence the swap is about to drop, and only
           // the raw form lets the post-swap dedupe keep that tool loaded.
           const swapped = this.swapPrefix(
-            restoreNativeToolSearchResults(effectiveMessages, rawToolSearchResults),
+            restoreProjectedToolSearchResults(effectiveMessages, toolSearchProjections),
             swap
           );
           if (swapped) {
@@ -3084,7 +3093,10 @@ export class StreamManager {
         // projection is decided against, and the SDK accumulates the next step's
         // input from these returned messages, so a reference dropped against a
         // swapped-out prefix would stay lost for the rest of the turn.
-        effectiveMessages = dedupeNativeToolReferences(effectiveMessages);
+        effectiveMessages = dedupeNativeToolReferences(
+          effectiveMessages,
+          recordToolSearchProjection
+        );
         if (stepTracker) {
           stepTracker.latestMessages = effectiveMessages;
         }
@@ -3156,7 +3168,8 @@ export class StreamManager {
             );
             // Same per-step transforms the construction-time messages receive.
             rebuiltFirstStepMessages = dedupeNativeToolReferences(
-              await transformStepMessages(rebuilt)
+              await transformStepMessages(rebuilt),
+              recordToolSearchProjection
             );
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;

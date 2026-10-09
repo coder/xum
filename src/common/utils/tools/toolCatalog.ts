@@ -1015,7 +1015,11 @@ function nativeToolReferenceName(item: unknown): string | undefined {
  * wherever final per-request messages are produced (history pipeline and
  * per-step transforms), keeping live and replayed requests byte-identical.
  */
-export function dedupeNativeToolReferences(messages: ModelMessage[]): ModelMessage[] {
+export function dedupeNativeToolReferences(
+  messages: ModelMessage[],
+  /** Invoked per projected result so per-step callers can undo it at a prefix swap. */
+  onProject?: (projected: NativeToolSearchResultPart, raw: NativeToolSearchResultPart) => void
+): ModelMessage[] {
   const seen = new Set<string>();
   let anyChanged = false;
   const deduped = messages.map((message) => {
@@ -1052,7 +1056,9 @@ export function dedupeNativeToolReferences(messages: ModelMessage[]): ModelMessa
         kept.length > 0
           ? { type: "content", value: kept }
           : { type: "text", value: `All matched tools are already loaded: ${dropped.join(", ")}` };
-      return { ...part, output };
+      const projected = { ...part, output };
+      onProject?.(projected, part);
+      return projected;
     });
     if (!changed) {
       return message;
@@ -1069,46 +1075,20 @@ export type NativeToolSearchResultPart = Extract<
 >;
 
 /**
- * In-turn memory of raw tool-search results for restoreNativeToolSearchResults.
- * The dedupe projection above is request-only, but the AI SDK accumulates the
- * next step's input from the returned (projected) messages, so the raw result
- * survives only here once a step projected it. First sighting wins: a result
- * enters the step messages raw when its tool executes and is only ever
- * projected afterwards.
- */
-export function recordNativeToolSearchResults(
-  messages: readonly ModelMessage[],
-  store: Map<string, NativeToolSearchResultPart>
-): void {
-  for (const message of messages) {
-    if (message.role !== "tool") {
-      continue;
-    }
-    for (const part of message.content) {
-      if (
-        part.type === "tool-result" &&
-        isMuxToolSearchName(part.toolName) &&
-        part.output.type === "content" &&
-        !store.has(part.toolCallId)
-      ) {
-        store.set(part.toolCallId, part);
-      }
-    }
-  }
-}
-
-/**
- * Swap-time undo of the dedupe projection: substitute each carried (possibly
- * projected) tool-search result with its recorded raw form so a prefix swap
- * that drops a reference's first occurrence can keep the tool loaded through a
- * retained duplicate. Callers re-run dedupeNativeToolReferences on the swapped
+ * Swap-time undo of the dedupe projection: substitute each carried projected
+ * tool-search result with its recorded raw form so a prefix swap that drops a
+ * reference's first occurrence can keep the tool loaded through a retained
+ * duplicate. `projections` maps JSON of a projected part to its raw form
+ * (recorded via dedupe's `onProject`); matching on the serialized projection,
+ * not the reusable toolCallId, keeps unrelated results that happen to share an
+ * ID untouched. Callers re-run dedupeNativeToolReferences on the swapped
  * transcript, which re-projects whatever is still a repeat.
  */
-export function restoreNativeToolSearchResults(
+export function restoreProjectedToolSearchResults(
   messages: ModelMessage[],
-  store: ReadonlyMap<string, NativeToolSearchResultPart>
+  projections: ReadonlyMap<string, NativeToolSearchResultPart>
 ): ModelMessage[] {
-  if (store.size === 0) {
+  if (projections.size === 0) {
     return messages;
   }
   let anyChanged = false;
@@ -1118,8 +1098,11 @@ export function restoreNativeToolSearchResults(
     }
     let changed = false;
     const content: ToolModelMessage["content"] = message.content.map((part) => {
-      const raw = part.type === "tool-result" ? store.get(part.toolCallId) : undefined;
-      if (raw === undefined || raw === part) {
+      if (part.type !== "tool-result" || !isMuxToolSearchName(part.toolName)) {
+        return part;
+      }
+      const raw = projections.get(JSON.stringify(part));
+      if (raw === undefined) {
         return part;
       }
       changed = true;
