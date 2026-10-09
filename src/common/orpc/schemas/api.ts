@@ -1883,6 +1883,14 @@ export const workspace = {
       z.object({ success: z.literal(false), error: z.string() }),
     ]),
   },
+  /** Start an ephemeral `/side` chat forked from a workspace (see WorkspaceService.createSideChat). */
+  createSideChat: {
+    input: z.object({ parentWorkspaceId: z.string() }),
+    output: z.discriminatedUnion("success", [
+      z.object({ success: z.literal(true), metadata: FrontendWorkspaceMetadataSchema }),
+      z.object({ success: z.literal(false), error: z.string() }),
+    ]),
+  },
   stageAttachment: {
     input: z.object({
       workspaceId: z.string(),

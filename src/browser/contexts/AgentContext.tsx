@@ -15,7 +15,8 @@ import { useAPI } from "@/browser/contexts/API";
 import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { matchesKeybind, KEYBINDS, paneHandlesKeyEvent } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { getProjectScopeId, GLOBAL_SCOPE_ID } from "@/common/constants/storage";
 import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
@@ -266,8 +267,13 @@ function AgentProviderWithState(props: {
     }
   }, [effectiveAgentId, isCurrentAgentLocked, selectableAgents, setAgentId]);
 
+  // The main chat and the /side chat tab each mount an AgentProvider; only the pane that owns the
+  // focused element reacts, so one keystroke never cycles both chats' agents. The picker this opens
+  // is routed by focus too (see AgentModePicker's OPEN_AGENT_PICKER listener).
+  const paneScope = useChatPaneScope();
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (!paneHandlesKeyEvent(paneScope, e.target)) return;
       if (matchesKeybind(e, KEYBINDS.TOGGLE_AGENT)) {
         e.preventDefault();
         if (!isCurrentAgentLocked) {
@@ -285,7 +291,7 @@ function AgentProviderWithState(props: {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [cycleToNextAgent, isCurrentAgentLocked]);
+  }, [cycleToNextAgent, isCurrentAgentLocked, paneScope]);
 
   useEffect(() => {
     const handleRefreshRequested = () => {

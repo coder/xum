@@ -9,7 +9,9 @@ import {
   isEditableElement,
   KEYBINDS,
   matchesKeybind,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { cn } from "@/common/lib/utils";
@@ -145,11 +147,15 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
   // above: the shortcut target listens for Discard itself, outside editable fields and never
   // under a modal (the banner is hidden behind it).
   const ownsDiscardShortcut = props.canSend === false && props.isShortcutTarget;
+  // The main chat and the /side chat tab can each have a shortcut target; only the pane owning
+  // the focused element discards, so one keystroke never discards in both chats.
+  const paneScope = useChatPaneScope();
   useEffect(() => {
     if (!ownsDiscardShortcut) return;
     const handler = (event: KeyboardEvent) => {
       if (
         !matchesKeybind(event, KEYBINDS.DISCARD_HELD_INPUT) ||
+        !paneHandlesKeyEvent(paneScope, event.target) ||
         isEditableElement(event.target) ||
         isDialogOpen()
       ) {
@@ -170,7 +176,7 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [ownsDiscardShortcut, api, props.workspaceId, props.heldInput.id]);
+  }, [ownsDiscardShortcut, api, props.workspaceId, props.heldInput.id, paneScope]);
 
   return (
     <ChatDockSurface>

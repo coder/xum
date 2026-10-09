@@ -19,7 +19,9 @@ import {
   isDialogOpen,
   isTerminalFocused,
   matchesKeybind,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
 
 const SHORTCUT_HINT_CLASS =
@@ -109,6 +111,9 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     return () => clearInterval(interval);
   }, [isExpanded, hasRunning]);
 
+  // The main chat and the /side chat tab each mount a banner; the chord goes to the pane owning
+  // the focused element so focus never jumps into the other chat's list.
+  const paneScope = useChatPaneScope();
   // Listens only while there is something to focus, so the chord is not consumed otherwise.
   useEffect(() => {
     if (count === 0) return;
@@ -127,6 +132,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (!matchesKeybind(event, KEYBINDS.FOCUS_BACKGROUND_PROCESSES) || isDialogOpen()) return;
+      if (!paneHandlesKeyEvent(paneScope, event.target)) return;
       if (isCommandPaletteTarget(event.target)) return;
       if (isTerminalFocused(event.target)) return; // the terminal owns its keystrokes
       if (rootRef.current?.closest("[inert]")) return;
@@ -154,7 +160,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, onFocusRequest);
     };
-  }, [count, props.workspaceId]);
+  }, [count, props.workspaceId, paneScope]);
 
   useEffect(() => {
     if (focusRequest > 0) focusProcessRow(listRef.current, 0);

@@ -11,7 +11,9 @@ import {
   isDialogOpen,
   isEditableElement,
   matchesKeybind,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { stopStream } from "@/browser/utils/stopStream";
@@ -110,10 +112,14 @@ const RetryButton: React.FC<{ disabled: boolean; onRetry: () => void }> = (props
   useEffect(() => {
     onRetryRef.current = props.onRetry;
   });
+  // The main chat and the /side chat tab can both show Retry; only the pane owning the focused
+  // element retries, so one Shift+R never retries both chats.
+  const paneScope = useChatPaneScope();
   useEffect(() => {
     const handleKeyDownCapture = (e: KeyboardEvent) => {
       if (
         !matchesKeybind(e, KEYBINDS.RESUME_STREAM) ||
+        !paneHandlesKeyEvent(paneScope, e.target) ||
         isDesktopViewportFocused(e.target) ||
         isDialogOpen() ||
         isEditableElement(e.target)
@@ -125,7 +131,7 @@ const RetryButton: React.FC<{ disabled: boolean; onRetry: () => void }> = (props
     };
     window.addEventListener("keydown", handleKeyDownCapture, { capture: true });
     return () => window.removeEventListener("keydown", handleKeyDownCapture, { capture: true });
-  }, []);
+  }, [paneScope]);
 
   return (
     <button

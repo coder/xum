@@ -13,6 +13,8 @@ export const WORKSPACE_ONLY_COMMAND_KEYS: ReadonlySet<string> = new Set([
   "refine",
   "fork",
   "new",
+  "side",
+  "btw",
   "plan",
   "heartbeat",
 ]);
@@ -29,6 +31,7 @@ export const WORKSPACE_ONLY_COMMAND_TYPE_LIST = [
   "refine",
   "fork",
   "new",
+  "side",
   "plan-show",
   "plan-open",
   "heartbeat-set",
@@ -48,3 +51,17 @@ export type WorkspaceOnlyCommandType = (typeof WORKSPACE_ONLY_COMMAND_TYPE_LIST)
 export const WORKSPACE_ONLY_COMMAND_TYPES: ReadonlySet<string> = new Set(
   WORKSPACE_ONLY_COMMAND_TYPE_LIST
 );
+
+/** Side chats inherit a workspace; they cannot start work or mutate its persistent settings. */
+export const SIDE_CHAT_DISALLOWED_COMMAND_TYPES: ReadonlySet<string> = new Set([
+  ...WORKSPACE_ONLY_COMMAND_TYPES,
+  "idle-compaction",
+]);
+
+/** Include invalid/missing-argument parses so they get the same side-chat gate. */
+export const SIDE_CHAT_DISALLOWED_COMMAND_KEYS: ReadonlySet<string> = new Set([
+  ...WORKSPACE_ONLY_COMMAND_KEYS,
+  "idle",
+  "workflow",
+  "goal",
+]);

@@ -4077,6 +4077,7 @@ export class Config {
               taskPrompt: workspace.taskPrompt,
               taskTrunkBranch: workspace.taskTrunkBranch,
               taskIsolation: workspace.taskIsolation,
+              sideChatParentWorkspaceId: workspace.sideChatParentWorkspaceId,
               taskDesktopOwnerWorkspaceId: workspace.taskDesktopOwnerWorkspaceId,
               taskSticky: workspace.taskSticky,
               taskExecutionId: workspace.taskExecutionId,
@@ -4384,6 +4385,7 @@ export class Config {
               taskPrompt: workspace.taskPrompt,
               taskTrunkBranch: workspace.taskTrunkBranch,
               taskIsolation: workspace.taskIsolation,
+              sideChatParentWorkspaceId: workspace.sideChatParentWorkspaceId,
               taskDesktopOwnerWorkspaceId: workspace.taskDesktopOwnerWorkspaceId,
               taskSticky: workspace.taskSticky,
               taskExecutionId: workspace.taskExecutionId,
@@ -4467,6 +4469,7 @@ export class Config {
             taskPrompt: workspace.taskPrompt,
             taskTrunkBranch: workspace.taskTrunkBranch,
             taskIsolation: workspace.taskIsolation,
+            sideChatParentWorkspaceId: workspace.sideChatParentWorkspaceId,
             taskDesktopOwnerWorkspaceId: workspace.taskDesktopOwnerWorkspaceId,
             taskSticky: workspace.taskSticky,
             taskExecutionId: workspace.taskExecutionId,
@@ -4571,6 +4574,12 @@ export class Config {
        */
       refuseTakenName?: true;
       /**
+       * Revalidate a shared-checkout parent's identity/path and lifecycle state inside this
+       * registration write. Local task-tree locks cannot fence a different backend's archive
+       * or removal, so a side chat must not be registered using a stale parent snapshot.
+       */
+      requireActiveParent?: { workspaceId: string; workspacePath: string };
+      /**
        * Also set this other workspace's runtimeConfig in the same write, so both land or neither
        * does. A Coder fork marks its source as sharing the Coder workspace this way (#5114).
        * Rejects, writing nothing, when that workspace is gone.
@@ -4582,6 +4591,23 @@ export class Config {
     } = {}
   ): Promise<void> {
     await this.editConfig((config) => {
+      const requiredParent = options.requireActiveParent;
+      if (requiredParent != null) {
+        const parent = config.projects
+          .get(projectPath)
+          ?.workspaces.find((workspace) => workspace.id === requiredParent.workspaceId);
+        if (
+          parent == null ||
+          parent.path !== requiredParent.workspacePath ||
+          parent.pendingRemoval != null ||
+          parent.pendingArchive != null ||
+          isWorkspaceArchived(parent.archivedAt, parent.unarchivedAt)
+        ) {
+          throw new Error(
+            `Parent workspace ${requiredParent.workspaceId} changed or is being archived/removed; retry from an active workspace.`
+          );
+        }
+      }
       const sourceUpdate = options.sourceRuntimeConfigUpdate;
       if (sourceUpdate != null) {
         const source = [...config.projects.values()]
@@ -4668,6 +4694,7 @@ export class Config {
         taskPrompt: metadata.taskPrompt,
         taskTrunkBranch: metadata.taskTrunkBranch,
         taskIsolation: metadata.taskIsolation,
+        sideChatParentWorkspaceId: metadata.sideChatParentWorkspaceId,
         taskDesktopOwnerWorkspaceId: metadata.taskDesktopOwnerWorkspaceId,
         taskSticky: metadata.taskSticky,
         taskExecutionId: metadata.taskExecutionId,

@@ -144,6 +144,13 @@ export const CUSTOM_EVENTS = {
   OPEN_GOAL_TAB: "mux:openGoalTab",
 
   /**
+   * Open a /side chat as a right-sidebar tab of its parent workspace. Dispatched cancelable: the
+   * sidebar calls preventDefault() once it shows the tab, and the sender falls back to opening
+   * the side chat full-screen when nothing did (sidebar hidden on narrow viewports).
+   */
+  OPEN_SIDE_CHAT_TAB: "mux:openSideChatTab",
+
+  /**
    * Open an MCP Apps view in the Artifacts tab (artifacts experiment): uncollapse the right
    * sidebar and select the tab, or open the Artifacts dialog on small viewports.
    */
@@ -261,6 +268,11 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.OPEN_GOAL_TAB]: {
     workspaceId: string;
     openCompleteInput?: boolean;
+  };
+  [CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB]: {
+    /** The main chat whose right sidebar shows the tab. */
+    workspaceId: string;
+    sideChatWorkspaceId: string;
   };
   [CUSTOM_EVENTS.OPEN_MCP_APP_VIEW]: {
     workspaceId: string;

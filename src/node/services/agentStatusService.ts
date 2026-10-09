@@ -218,6 +218,8 @@ export class AgentStatusService {
         const id = ws.id ?? ws.name;
         if (typeof id !== "string" || id.length === 0) continue;
         if (isWorkspaceArchived(ws.archivedAt, ws.unarchivedAt)) continue;
+        // Side chats have no sidebar status UI; inherited context must not trigger paid background work.
+        if (ws.sideChatParentWorkspaceId != null) continue;
         const state = this.tracked.get(id);
         if (state?.inFlight) continue;
         const snapshot = snapshots.get(id);

@@ -15,6 +15,8 @@ import {
   buildAppAttributionHeaders,
   ProviderModelFactory,
 } from "./providerModelFactory";
+import { createTestHistoryService } from "./testHistoryService";
+import { buildRequiredToolPatterns } from "@/common/utils/tools/toolPolicy";
 import { HistoryService } from "./historyService";
 import { CompactionCancellation } from "./compactionCancellation";
 import { InitStateManager } from "./initStateManager";
@@ -170,6 +172,7 @@ async function experimentsServiceWith(
 function createBasicAIService(
   root?: string,
   options?: {
+    historyService?: HistoryService;
     sessionUsageService?: SessionUsageService;
     devToolsService?: DevToolsService;
     experimentsService?: ExperimentsService;
@@ -178,7 +181,7 @@ function createBasicAIService(
   }
 ): BasicAIServiceParts {
   const config = new Config(root);
-  const historyService = new HistoryService(config);
+  const historyService = options?.historyService ?? new HistoryService(config);
   const initStateManager = new InitStateManager(config);
   const providersConfigStore = new ProvidersConfigStore(config.rootDir);
   const providerService = new ProviderService(config, providersConfigStore);
@@ -509,6 +512,240 @@ function stubCommonStreamMessageDependencies(args: {
 
   return { getToolsForModelSpy, resolveAndCreateModelSpy };
 }
+
+describe("AIService side-chat tool ceiling", () => {
+  afterEach(() => mock.restore());
+
+  it.each([true, false])(
+    "runs repository read-tool hooks only outside side chats (side=%s)",
+    async (sideChat) => {
+      const testHistory = await createTestHistoryService();
+      try {
+        const metadata = createLocalWorkspaceMetadata("read-hooks", testHistory.tempDir, {
+          ...(sideChat ? { sideChatParentWorkspaceId: "main" } : {}),
+        });
+        const harness = createBasicAIService(testHistory.tempDir, {
+          historyService: testHistory.historyService,
+        });
+        await harness.config.editConfig((cfg) => {
+          cfg.projects.set(testHistory.tempDir, { trusted: true, workspaces: [] });
+          return cfg;
+        });
+        const hookDir = path.join(testHistory.tempDir, ".xum");
+        await fs.mkdir(hookDir, { recursive: true });
+        await fs.writeFile(path.join(testHistory.tempDir, "context.txt"), "read-only context");
+        for (const hook of ["tool_pre", "tool_post"]) {
+          const hookPath = path.join(hookDir, hook);
+          await fs.writeFile(hookPath, `#!/bin/bash\nprintf changed > '${hook}.ran'\n`);
+          await fs.chmod(hookPath, 0o755);
+        }
+        const startStreamCalls: TurnExecutionOptions[] = [];
+        const { getToolsForModelSpy } = stubCommonStreamMessageDependencies({
+          ...harness,
+          metadata,
+          startStreamCalls,
+        });
+        getToolsForModelSpy.mockImplementation(realGetToolsForModel);
+        spyOn(harness.historyService, "appendToHistory").mockRestore();
+        spyOn(harness.historyService, "commitPartial").mockRestore();
+        const user = createMuxMessage("user", "user", "Read the context file");
+        await harness.historyService.appendToHistory(metadata.id, user);
+        const result = await harness.service.streamMessage({
+          messages: [user],
+          workspaceId: metadata.id,
+          modelString: "openai:gpt-5.2",
+          thinkingLevel: "off",
+        });
+        expect(result.success).toBe(true);
+        expect(getToolsForModelSpy.mock.calls[0]?.[1]?.trusted).toBe(!sideChat);
+        const execute = startStreamCalls[0]?.tools?.file_read?.execute;
+        if (!execute) throw new Error("Expected a real local read tool");
+        const readResult: unknown = await execute(
+          { path: "context.txt" },
+          { toolCallId: "read-file", messages: [], context: undefined }
+        );
+        expect(readResult).toMatchObject({ success: true, content: "1\tread-only context" });
+        for (const hook of ["tool_pre", "tool_post"]) {
+          const ran = await fs.access(path.join(testHistory.tempDir, `${hook}.ran`)).then(
+            () => true,
+            () => false
+          );
+          expect(ran).toBe(!sideChat);
+        }
+      } finally {
+        await testHistory.cleanup();
+      }
+    }
+  );
+
+  for (const sideChat of [true, false]) {
+    it.each([false, true])(
+      `${sideChat ? "side" : "ordinary"} chat enforces its tool boundary across assembly and fallback (snapshot=%s)`,
+      async (snapshot) => {
+        const testHistory = await createTestHistoryService();
+        let removeHook: () => void = () => undefined;
+        try {
+          const sourceModel = KNOWN_MODELS.SONNET.id;
+          const fallbackModel = KNOWN_MODELS.GPT.id;
+          await writeMainConfig(testHistory.tempDir, {
+            modelFallbacks: { [sourceModel]: { models: [fallbackModel] } },
+          });
+          const metadata = createLocalWorkspaceMetadata("tool-ceiling", testHistory.tempDir, {
+            ...(sideChat ? { sideChatParentWorkspaceId: "main-workspace" } : {}),
+          });
+          const experimentsService = await experimentsServiceWith(testHistory.tempDir, [
+            EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+            EXPERIMENT_IDS.RLM,
+          ]);
+          const harness = createBasicAIService(testHistory.tempDir, {
+            historyService: testHistory.historyService,
+            experimentsService,
+          });
+          const read = mock(() => Promise.resolve({ contents: "local file contents" }));
+          const mutate = mock(() => Promise.resolve({ changed: true }));
+          const readTool: Tool = {
+            description: "Read local context",
+            inputSchema: jsonSchema({ type: "object", properties: {} }),
+            execute: read,
+          };
+          const mutatingTool: Tool = { ...readTool, execute: mutate };
+          const nativeTool: Tool = {
+            type: "provider",
+            id: "openai.web_search",
+            isProviderExecuted: true,
+            args: {},
+            inputSchema: jsonSchema({ type: "object", properties: {} }),
+          };
+          const startStreamCalls: TurnExecutionOptions[] = [];
+          const { getToolsForModelSpy } = stubCommonStreamMessageDependencies({
+            ...harness,
+            metadata,
+            startStreamCalls,
+            useRequestedModelString: true,
+            allTools: {
+              file_read: readTool,
+              models_list: readTool,
+              bash: mutatingTool,
+              native_search: nativeTool,
+            },
+          });
+          // Keep real disk history in this request test, unlike the generic shaping stub.
+          spyOn(harness.historyService, "appendToHistory").mockRestore();
+          spyOn(harness.historyService, "commitPartial").mockRestore();
+          const user = createMuxMessage("user", "user", "Explain the inherited context");
+          expect((await harness.historyService.appendToHistory(metadata.id, user)).success).toBe(
+            true
+          );
+
+          harness.service.turnRequestBuilderBindings.extraTools = {
+            // Grants alone cannot distinguish a safe built-in from a same-name replacement.
+            file_read: mutatingTool,
+            extra_mutation: mutatingTool,
+            code_execution: mutatingTool,
+          };
+          const listServers = mock(() => Promise.resolve({}));
+          const getToolsForWorkspace = mock(() =>
+            Promise.resolve({
+              tools: { mcp_mutation: mutatingTool },
+              promptDescriptors: [],
+              stats: {
+                totalTools: 1,
+                activeServerCount: 1,
+                failedServerCount: 0,
+                failedServerNames: [],
+              },
+            })
+          );
+          harness.service.turnRequestBuilderBindings.mcpServerManager = {
+            listServers,
+            getToolsForWorkspace,
+          } as unknown as MCPServerManager;
+          const agent = resolvedAgentResultFor(metadata);
+          if (!agent.success) throw new Error("Expected resolved agent");
+          agent.data.effectiveToolPolicy = [
+            { regex_match: ".*", action: "enable" },
+            { regex_match: "bash", action: "require" },
+          ];
+          agent.data.switchableAgents = [
+            { id: "exec", toolPolicy: agent.data.effectiveToolPolicy },
+          ];
+          spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(agent);
+          const beforeHook: string[][] = [];
+          removeHook = eventSpine.useBefore(
+            "request.assemble",
+            (ctx) => {
+              beforeHook.push(Object.keys(ctx.tools));
+              ctx.tools = {
+                ...ctx.tools,
+                hook_mutation: mutatingTool,
+                web_search: nativeTool,
+                ...(sideChat ? { code_execution: mutatingTool } : {}),
+              };
+            },
+            { workspaceId: metadata.id }
+          );
+          const requestAssemblySnapshot = snapshot
+            ? eventSpine.captureRequestAssembly(metadata.id)
+            : undefined;
+          if (snapshot) removeHook();
+
+          const result = await harness.service.streamMessage({
+            messages: [user],
+            workspaceId: metadata.id,
+            modelString: sourceModel,
+            thinkingLevel: "off",
+            // Caller policy cannot widen the metadata-derived side-chat boundary either.
+            toolPolicy: [{ regex_match: "bash", action: "require" }],
+            requestAssemblySnapshot,
+          });
+          expect(result.success).toBe(true);
+          const started = startStreamCalls[0];
+          if (!started) throw new Error("Expected captured stream request");
+          const fallback = await started.modelFallback!.prepare(fallbackModel);
+          expect(fallback.success).toBe(true);
+          if (!fallback.success) throw new Error("Expected fallback request");
+          expect(beforeHook).toHaveLength(2);
+          expect(getToolsForModelSpy).toHaveBeenCalledTimes(2);
+          for (const request of [started, fallback.data]) {
+            const tools = request.tools ?? {};
+            if (sideChat) {
+              expect(Object.keys(tools).sort()).toEqual(["file_read", "models_list"]);
+              expect(started.toolSearchState).toBeUndefined();
+              expect(buildRequiredToolPatterns(started.toolPolicy)).toHaveLength(0);
+            } else {
+              expect(tools.code_execution).toBeDefined();
+              expect(tools.code_execution).not.toBe(mutatingTool);
+              expect(tools.bash).toBeDefined();
+              expect(tools.hook_mutation).toBeDefined();
+              expect(tools.native_search).toBeDefined();
+              expect(buildRequiredToolPatterns(started.toolPolicy)).toHaveLength(1);
+            }
+          }
+          if (sideChat) {
+            expect(listServers).not.toHaveBeenCalled();
+            expect(getToolsForWorkspace).not.toHaveBeenCalled();
+            expect(beforeHook.every((names) => !names.includes("code_execution"))).toBe(true);
+            const execute = started.tools?.file_read?.execute;
+            if (!execute) throw new Error("Expected granted local read tool");
+            await execute({}, { toolCallId: "read", messages: [], context: undefined });
+            expect(read).toHaveBeenCalledTimes(1);
+          } else {
+            expect(getToolsForWorkspace).toHaveBeenCalledTimes(1);
+            expect(beforeHook.every((names) => names.includes("code_execution"))).toBe(true);
+          }
+          expect(mutate).not.toHaveBeenCalled();
+          const history = await harness.historyService.getHistoryFromLatestBoundary(metadata.id);
+          expect(history.success).toBe(true);
+          if (history.success)
+            expect(history.data.some((row) => row.role === "assistant")).toBe(true);
+        } finally {
+          removeHook();
+          await testHistory.cleanup();
+        }
+      }
+    );
+  }
+});
 
 describe("AIService workspace metadata lookup", () => {
   it("reads one workspace without enumerating or probing its archived peers", async () => {

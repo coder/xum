@@ -107,6 +107,7 @@ import {
 } from "./additionalSystemContext";
 import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
+import { sideChatCapabilityGrants, withSideChatInstructions } from "./sideChat";
 import type { EvaluationService } from "./evaluation/evaluationService";
 import type { InstructionSources } from "@/common/types/instructions";
 import { extractToolInstructionsFromSources } from "./systemMessage";
@@ -233,6 +234,7 @@ import {
   type SimulationContext,
 } from "./streamSimulation";
 import { applyToolPolicyAndExperiments, captureMcpToolTelemetry } from "./toolAssembly";
+import { applyCapabilityGrants } from "@/common/utils/tools/capabilityGrants";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 
 const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
@@ -1361,6 +1363,10 @@ export class TurnRequestBuilder {
     }
 
     const metadata = metadataResult.data;
+    // Side chats share the main checkout: metadata, never a caller opt-in, imposes the
+    // local-read ceiling so agent/caller configuration cannot grant mutating capabilities.
+    const capabilityGrants = sideChatCapabilityGrants(metadata);
+    const isSideChat = capabilityGrants != null;
     const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
     const logSlowStreamStartup = (details: Record<string, unknown>): void => {
       const totalMs = Date.now() - startTime;
@@ -1580,9 +1586,20 @@ export class TurnRequestBuilder {
       taskSettings,
       taskDepth,
       shouldDisableTaskToolsForDepth,
-      effectiveToolPolicy,
-      switchableAgents,
+      effectiveToolPolicy: agentToolPolicy,
+      switchableAgents: resolvedSwitchableAgents,
     } = agentResult.data;
+    // Side conversations must not inherit completion requirements for work in the main chat.
+    // Grants cap the tools; keep normal enable/disable policy but never require recovery calls.
+    const effectiveToolPolicy = isSideChat
+      ? agentToolPolicy?.filter((rule) => rule.action !== "require")
+      : agentToolPolicy;
+    const switchableAgents = isSideChat
+      ? resolvedSwitchableAgents?.map((agent) => ({
+          ...agent,
+          toolPolicy: agent.toolPolicy.filter((rule) => rule.action !== "require"),
+        }))
+      : resolvedSwitchableAgents;
     // Explicit summaries remain recovery operations, not token-budget turns.
     // Inspect this request's last effective user row, never an older compact command.
     const latestUserMessage = providerRequestMessages.findLast(
@@ -1693,7 +1710,7 @@ export class TurnRequestBuilder {
     // case the inventory is rebuilt below from the overrides the validated
     // serve actually used, or omitted entirely when the serve failed closed.
     let mcpServers =
-      this.dependencies.bindings.mcpServerManager && mcpOverridesAuthoritative
+      !isSideChat && this.dependencies.bindings.mcpServerManager && mcpOverridesAuthoritative
         ? await this.dependencies.bindings.mcpServerManager.listServers(
             metadata.projectPath,
             mcpOverrides,
@@ -1722,9 +1739,14 @@ export class TurnRequestBuilder {
         workspaceAdditionalSystemContext = "";
       }
     }
-    const scratchpadAdditionalSystemInstructions = mergeAdditionalSystemInstructions(
-      workspaceAdditionalSystemContext,
-      additionalSystemInstructions
+    // Side chats get their guardrails on every turn (including retries and resumes), so they do
+    // not depend on the renderer remembering to send them.
+    const scratchpadAdditionalSystemInstructions = withSideChatInstructions(
+      metadata,
+      mergeAdditionalSystemInstructions(
+        workspaceAdditionalSystemContext,
+        additionalSystemInstructions
+      )
     );
     recordStartupPhaseTiming("loadAdditionalSystemContextMs", loadAdditionalSystemContextStartedAt);
 
@@ -1927,7 +1949,8 @@ export class TurnRequestBuilder {
     let mcpPromptRuntime: MCPPromptRuntime | undefined;
     let mcpSetupDurationMs = 0;
 
-    if (this.dependencies.bindings.mcpServerManager) {
+    // Do not start external servers for a conversation that can never call their tools.
+    if (!isSideChat && this.dependencies.bindings.mcpServerManager) {
       const mcpServerManager = this.dependencies.bindings.mcpServerManager;
       const mcpToolSetupStartedAt = Date.now();
       try {
@@ -2016,7 +2039,7 @@ export class TurnRequestBuilder {
     // (see prepareToolSearch below). Without MCP tools there is nothing to
     // defer, so the feature stays fully inactive.
     const toolSearchRuntime: ToolSearchRuntime | undefined =
-      toolSearchEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
+      !isSideChat && toolSearchEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
 
     const createTempDirForStreamStartedAt = Date.now();
     const runtimeTempDir = await this.dependencies.streamManager.createTempDirForStream(
@@ -2493,8 +2516,9 @@ export class TurnRequestBuilder {
       // Session-segment memory index advertised in the memory tool
       // description (same disclosure mechanic as skills).
       memoryIndexEntries: memoryContext?.indexEntries,
-      // Trust gating: only run hooks/scripts when the full shared workspace runtime is trusted.
-      trusted: sharedExecutionTrusted,
+      // Even a permitted read tool must not run mutating repo tool_pre/tool_post scripts.
+      // Ordinary chats retain the existing shared-runtime trust gate.
+      trusted: !isSideChat && sharedExecutionTrusted,
     };
     const emitNestedPtcToolEvent = (event: PTCEventWithParent) => {
       if (event.type === "tool-call-start" || event.type === "tool-call-end") {
@@ -2506,7 +2530,7 @@ export class TurnRequestBuilder {
       runtime: toolsForModelConfig.runtime,
       hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
     });
-    const ptcEnabled = experiments.programmaticToolCalling;
+    const ptcEnabled = !isSideChat && experiments.programmaticToolCalling;
     const mcpWarningSection = mcpStats
       ? formatMcpWarningSection(mcpStats.failedServerCount, mcpStats.failedServerNames)
       : undefined;
@@ -2561,16 +2585,21 @@ export class TurnRequestBuilder {
 
         const applyPolicyStartedAt = Date.now();
         let attemptTools = await applyToolPolicyAndExperiments({
+          capabilityGrants,
           allTools: this.dependencies.wrapToolsForDelegation(
             workspaceId,
             withExecutionScope(allTools, executionScope),
             delegatedToolNames
           ),
-          extraTools: this.dependencies.bindings.extraTools,
+          // Runtime extras may shadow a granted built-in name with arbitrary execution.
+          extraTools: isSideChat ? undefined : this.dependencies.bindings.extraTools,
           effectiveToolPolicy,
           switchableAgentToolPolicies: switchableAgents?.map((agent) => agent.toolPolicy),
           activeAgentId: effectiveAgentId,
-          experiments,
+          // Side chats expose granted reads directly, not an executable PTC/RLM bridge.
+          experiments: isSideChat
+            ? { ...experiments, programmaticToolCalling: false, rlm: false }
+            : experiments,
           emitNestedToolEvent: emitNestedPtcToolEvent,
           sandbox: {
             workspaceId,
@@ -2721,6 +2750,15 @@ export class TurnRequestBuilder {
             );
             attemptSystemTokens = await tokenizer.countTokens(attemptSystem);
           }
+        }
+
+        // Assembly hooks (live or replayed) can replace the tool map. Reapply the metadata
+        // ceiling after every attempt's hooks, including fallbacks; never trust an injected
+        // code_execution, provider-native tool or mutator just because policy allowed it.
+        if (capabilityGrants) {
+          attemptTools = isAgentToolsDisabled()
+            ? {}
+            : applyCapabilityGrants(attemptTools, capabilityGrants);
         }
 
         // The window section goes last, resolved from the rows being sent, so start() can

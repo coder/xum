@@ -39,6 +39,7 @@ const TelemetryCommandTypeSchema = z.enum([
   "compact",
   "new",
   "fork",
+  "side",
   "vim",
   "model",
   "mode",

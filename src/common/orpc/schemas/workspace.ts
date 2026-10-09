@@ -239,6 +239,10 @@ export const WorkspaceMetadataSchema = z.object({
     description:
       "If set, this workspace is a child workspace spawned from the parent workspaceId (enables nesting in UI and backend orchestration).",
   }),
+  sideChatParentWorkspaceId: z.string().optional().meta({
+    description:
+      "If set, this workspace is an ephemeral /side chat forked from the given workspace: it shares that workspace's checkout, is hidden from the sidebar, and is discarded when the user leaves it.",
+  }),
   agentType: z.string().optional().meta({
     description: 'If set, selects an agent preset for this workspace (e.g., "explore" or "exec").',
   }),

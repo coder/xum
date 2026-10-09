@@ -8,6 +8,7 @@ import React, {
   useMemo,
 } from "react";
 import { Lightbulb } from "lucide-react";
+import { SideChatBanner } from "@/browser/components/SideChatBanner/SideChatBanner";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
@@ -162,10 +163,16 @@ interface ChatPaneProps {
   immersiveHidden?: boolean;
 }
 
-type ChatPaneContentProps = Omit<
+export type ChatPaneContentProps = Omit<
   ChatPaneProps,
   "leftSidebarCollapsed" | "onToggleLeftSidebarCollapsed" | "immersiveHidden"
->;
+> & {
+  /**
+   * Rendered inside another surface (the /side chat tab in the right sidebar) rather than as
+   * the page's main chat, so the touch-device header spacer does not apply.
+   */
+  embedded?: boolean;
+};
 
 type ReviewsState = ReturnType<typeof useReviews>;
 
@@ -289,6 +296,14 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
             />
           </PerfRenderMarker>
 
+          {meta?.sideChatParentWorkspaceId != null && (
+            <SideChatBanner
+              key={workspaceId}
+              workspaceId={workspaceId}
+              parentWorkspaceId={meta.sideChatParentWorkspaceId}
+            />
+          )}
+
           <ChatPaneContent
             workspaceId={workspaceId}
             projectPath={props.projectPath}
@@ -316,7 +331,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   );
 };
 
-const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
+export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const {
     workspaceId,
     projectName,
@@ -1491,7 +1506,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             The composer dock is IN-FLOW scroll content (sticky to the scrollport
             bottom), so this region — and therefore the scrollport's clientHeight —
             never resizes when the composer grows or shrinks. */}
-        <div className="mobile-header-spacer relative flex-1 overflow-hidden">
+        <div
+          className={cn(
+            "relative flex-1 overflow-hidden",
+            props.embedded !== true && "mobile-header-spacer"
+          )}
+        >
           <div
             ref={contentRef}
             onWheel={handleTranscriptWheel}

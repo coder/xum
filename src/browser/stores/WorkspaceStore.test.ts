@@ -1967,6 +1967,207 @@ describe("WorkspaceStore", () => {
     expect(store.isOnChatSubscriptionActive("workspace-2")).toBe(false);
   });
 
+  // The /side chat tab renders a second live transcript next to the routed chat.
+  describe("pinned workspace subscription", () => {
+    const onChatSignals = (workspaceId: string) =>
+      mockOnChat.mock.calls
+        .filter(([input]) => input?.workspaceId === workspaceId)
+        .map(([, options]) => options?.signal);
+
+    beforeEach(() => {
+      mockChatScript([], { keepOpen: true });
+    });
+
+    it("keeps two side panes live alongside the routed chat and releases only the closed pane", async () => {
+      createAndAddWorkspace(store, "main");
+      createAndAddWorkspace(store, "side-a", {}, false);
+      createAndAddWorkspace(store, "side-b", {}, false);
+      const releaseA = store.acquirePinnedWorkspace("side-a");
+      const releaseB = store.acquirePinnedWorkspace("side-b");
+      await tick(0);
+      for (const id of ["main", "side-a", "side-b"]) {
+        expect(store.isOnChatSubscriptionActive(id)).toBe(true);
+        expect(onChatSignals(id)).toHaveLength(1);
+        expect(onChatSignals(id)[0]?.aborted).toBe(false);
+      }
+
+      // Switching the routed chat must not restart either side chat's replay.
+      createAndAddWorkspace(store, "other");
+      await tick(0);
+      expect(onChatSignals("main")[0]?.aborted).toBe(true);
+      for (const id of ["side-a", "side-b"]) {
+        expect(onChatSignals(id)).toHaveLength(1);
+        expect(onChatSignals(id)[0]?.aborted).toBe(false);
+      }
+
+      // Close the last-mounted pane first: the older pane must keep its subscription.
+      releaseB();
+      expect(onChatSignals("side-b")[0]?.aborted).toBe(true);
+      expect(store.isOnChatSubscriptionActive("side-b")).toBe(false);
+      expect(store.isOnChatSubscriptionActive("side-a")).toBe(true);
+      expect(onChatSignals("side-a")[0]?.aborted).toBe(false);
+      expect(store.isOnChatSubscriptionActive("other")).toBe(true);
+      expect(onChatSignals("other")[0]?.aborted).toBe(false);
+      releaseA();
+      expect(store.isOnChatSubscriptionActive("side-a")).toBe(false);
+    });
+
+    it("subscribes once when the pinned workspace is also active", async () => {
+      createAndAddWorkspace(store, "main");
+      const release = store.acquirePinnedWorkspace("main");
+      await tick(0);
+      expect(onChatSignals("main")).toHaveLength(1);
+
+      // Unpinning keeps the routed chat's loop; deactivating while pinned keeps it too.
+      release();
+      const releaseAgain = store.acquirePinnedWorkspace("main");
+      store.setActiveWorkspaceId(null);
+      await tick(0);
+      expect(onChatSignals("main")).toHaveLength(1);
+      expect(onChatSignals("main")[0]?.aborted).toBe(false);
+      expect(store.isOnChatSubscriptionActive("main")).toBe(true);
+      releaseAgain();
+      expect(onChatSignals("main")[0]?.aborted).toBe(true);
+    });
+
+    it("releases duplicate owners independently and ignores repeated cleanup", async () => {
+      createAndAddWorkspace(store, "side", {}, false);
+      const releaseFirst = store.acquirePinnedWorkspace("side");
+      const releaseSecond = store.acquirePinnedWorkspace("side");
+      await tick(0);
+      expect(onChatSignals("side")).toHaveLength(1);
+      expect(mockGetSessionUsage).toHaveBeenCalledTimes(1);
+
+      releaseFirst();
+      releaseFirst();
+      expect(store.isOnChatSubscriptionActive("side")).toBe(true);
+      expect(onChatSignals("side")[0]?.aborted).toBe(false);
+      releaseSecond();
+      expect(store.isOnChatSubscriptionActive("side")).toBe(false);
+      expect(onChatSignals("side")[0]?.aborted).toBe(true);
+
+      const releaseNew = store.acquirePinnedWorkspace("side");
+      await tick(0);
+      releaseSecond();
+      expect(store.isOnChatSubscriptionActive("side")).toBe(true);
+      expect(onChatSignals("side")[1]?.aborted).toBe(false);
+      releaseNew();
+      expect(onChatSignals("side")[1]?.aborted).toBe(true);
+    });
+
+    it("aborts all pins on disposal without letting old cleanup release later owners", async () => {
+      createAndAddWorkspace(store, "main");
+      createAndAddWorkspace(store, "side-a", {}, false);
+      createAndAddWorkspace(store, "side-b", {}, false);
+      const releaseA = store.acquirePinnedWorkspace("side-a");
+      const releaseB = store.acquirePinnedWorkspace("side-b");
+      await tick(0);
+      store.dispose();
+      for (const id of ["main", "side-a", "side-b"]) {
+        expect(onChatSignals(id)[0]?.aborted).toBe(true);
+        expect(store.isOnChatSubscriptionActive(id)).toBe(false);
+      }
+
+      createAndAddWorkspace(store, "side-a", {}, false);
+      const releaseNew = store.acquirePinnedWorkspace("side-a");
+      releaseA();
+      releaseB();
+      expect(store.isOnChatSubscriptionActive("side-a")).toBe(true);
+      expect(store.isOnChatSubscriptionActive("side-b")).toBe(false);
+      releaseNew();
+      expect(store.isOnChatSubscriptionActive("side-a")).toBe(false);
+    });
+
+    it("delivers independent live events to two pinned transcripts", async () => {
+      const streams = new Map([
+        ["side-a", createControllableAsyncIterable<WorkspaceChatMessage>()],
+        ["side-b", createControllableAsyncIterable<WorkspaceChatMessage>()],
+      ]);
+      mockOnChat.mockImplementation(async function* (input, options) {
+        const stream = streams.get(input?.workspaceId ?? "");
+        if (!stream) {
+          await waitForAbortSignal(options?.signal);
+          return;
+        }
+        options?.signal?.addEventListener("abort", () => stream.close(), { once: true });
+        yield* stream.iterable;
+      });
+      createAndAddWorkspace(store, "main");
+      for (const [id, stream] of streams) {
+        createAndAddWorkspace(store, id, {}, false);
+        store.acquirePinnedWorkspace(id);
+        stream.push(caughtUpEvent());
+      }
+      expect(
+        await waitUntil(() =>
+          [...streams.keys()].every((id) => store.getWorkspaceState(id).isTranscriptCaughtUp)
+        )
+      ).toBe(true);
+
+      for (const [id, stream] of streams) {
+        stream.push(streamStartEvent(id, `response-${id}`));
+        expect(await waitUntil(() => store.getWorkspaceState(id).canInterrupt)).toBe(true);
+        if (id === "side-a") {
+          expect(store.getWorkspaceState("side-b").canInterrupt).toBe(false);
+        }
+      }
+      expect(store.getWorkspaceState("side-a").canInterrupt).toBe(true);
+      expect(store.getWorkspaceState("side-b").canInterrupt).toBe(true);
+    });
+
+    it("starts late-registered pins and invalidates their owners on removal", async () => {
+      const releaseOld = store.acquirePinnedWorkspace("late-side");
+      await tick(0);
+      expect(onChatSignals("late-side")).toHaveLength(0);
+
+      createAndAddWorkspace(store, "late-side", {}, false);
+      await tick(0);
+      expect(onChatSignals("late-side")).toHaveLength(1);
+      expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "late-side" });
+
+      store.removeWorkspace("late-side");
+      expect(onChatSignals("late-side")[0]?.aborted).toBe(true);
+      expect(store.isOnChatSubscriptionActive("late-side")).toBe(false);
+
+      // A re-registered workspace with the same id is not silently re-pinned.
+      createAndAddWorkspace(store, "late-side", {}, false);
+      await tick(0);
+      expect(onChatSignals("late-side")).toHaveLength(1);
+
+      const releaseNew = store.acquirePinnedWorkspace("late-side");
+      await tick(0);
+      // Cleanup from the removed incarnation must not steal a new owner's subscription.
+      releaseOld();
+      expect(store.isOnChatSubscriptionActive("late-side")).toBe(true);
+      expect(onChatSignals("late-side")[1]?.aborted).toBe(false);
+      releaseNew();
+      expect(onChatSignals("late-side")[1]?.aborted).toBe(true);
+    });
+
+    it("trusts the caught-up aggregator over activity snapshots for the pinned workspace", async () => {
+      mockActivityList.mockResolvedValue({ side: createActivitySnapshot(10, { streaming: true }) });
+      mockActivitySubscribe.mockImplementation(idleActivitySubscription);
+      mockChatStreamFor("side", () => [
+        createHistoryMessageEvent("history-1", 1),
+        fullCaughtUpEvent(),
+      ]);
+      recreateStore();
+      createAndAddWorkspace(store, "main");
+      createAndAddWorkspace(store, "side", {}, false);
+
+      // Unsubscribed: the activity snapshot's streaming flag is the only signal.
+      expect(await waitUntil(() => store.getWorkspaceState("side").canInterrupt)).toBe(true);
+
+      store.acquirePinnedWorkspace("side");
+      expect(await waitUntil(() => store.getWorkspaceState("side").isTranscriptCaughtUp)).toBe(
+        true
+      );
+      const state = store.getWorkspaceState("side");
+      expect(state.messages).toHaveLength(1);
+      expect(state.canInterrupt).toBe(false);
+    });
+  });
+
   describe("stale cached transcript", () => {
     const workspaceId = "stale-transcript-workspace";
     const otherWorkspaceId = "stale-transcript-other";
@@ -5895,6 +6096,29 @@ describe("WorkspaceStore", () => {
         isFinal: true,
         completedAt: initialRecency + 1,
       });
+    });
+
+    it("does not fire activity-driven completion for the pinned side chat", async () => {
+      const activeWorkspaceId = "active-workspace-pinned-stop";
+      const pinnedWorkspaceId = "pinned-workspace-stop";
+      const initialRecency = new Date("2024-01-05T00:00:00.000Z").getTime();
+      const initialSnapshot = createActivitySnapshot(initialRecency);
+      const releaseCompletion = mockBackgroundActivityTransition(
+        pinnedWorkspaceId,
+        initialSnapshot,
+        [{ ...initialSnapshot, recency: initialRecency + 1, streaming: false }]
+      );
+      const onResponseComplete = createResponseCompleteSpy();
+
+      recreateStore(onResponseComplete);
+      createAndAddWorkspace(store, activeWorkspaceId);
+      createAndAddWorkspace(store, pinnedWorkspaceId, {}, false);
+      store.acquirePinnedWorkspace(pinnedWorkspaceId);
+      releaseCompletion();
+      await tick(0);
+
+      // The side chat is on screen with a live onChat loop; its stream-end is authoritative.
+      expect(onResponseComplete).not.toHaveBeenCalled();
     });
 
     it("marks background compaction stops from activity snapshots as non-notifying completions", async () => {

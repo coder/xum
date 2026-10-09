@@ -1,5 +1,14 @@
-import { afterEach, describe, it, expect, test } from "bun:test";
-import { isMac, matchesKeybind, isKeybindDeprecated, KEYBINDS } from "./keybinds";
+import { afterEach, beforeEach, describe, it, expect, test } from "bun:test";
+import { GlobalWindow } from "happy-dom";
+import {
+  isMac,
+  matchesKeybind,
+  isKeybindDeprecated,
+  KEYBINDS,
+  paneHandlesKeyEvent,
+  SIDE_CHAT_PANE_ATTR,
+  type ChatPaneScope,
+} from "./keybinds";
 import type { Keybind } from "@/common/types/keybind";
 
 // Many tests below swap in a stub `window` ({ api: { platform } }) without restoring it.
@@ -458,4 +467,93 @@ describe("global keybind collisions", () => {
       ).toEqual(["lower <-> upper"]);
     });
   }
+});
+
+describe("paneHandlesKeyEvent", () => {
+  // Preserve DOM globals for other files sharing this bun process.
+  const globals = globalThis as unknown as Record<
+    "window" | "document" | "HTMLElement" | "Node",
+    unknown
+  >;
+  let previous: typeof globals;
+  const scopes: ChatPaneScope[] = ["main", "side:alpha", "side:beta"];
+
+  beforeEach(() => {
+    previous = {
+      window: globals.window,
+      document: globals.document,
+      HTMLElement: globals.HTMLElement,
+      Node: globals.Node,
+    };
+    const happyWindow = new GlobalWindow();
+    globals.window = happyWindow;
+    globals.document = happyWindow.document;
+    globals.HTMLElement = happyWindow.HTMLElement;
+    globals.Node = happyWindow.Node;
+  });
+
+  afterEach(() => {
+    globals.window = previous.window;
+    globals.document = previous.document;
+    globals.HTMLElement = previous.HTMLElement;
+    globals.Node = previous.Node;
+  });
+
+  test("exactly one of main and two visible side panes handles each target", () => {
+    const mainInput = document.createElement("textarea");
+    document.body.appendChild(mainInput);
+    const mainText = document.createTextNode("Main transcript");
+    document.body.appendChild(mainText);
+    const targets: Array<[EventTarget | null, ChatPaneScope]> = [
+      [mainInput, "main"],
+      [mainText, "main"],
+      [document.body, "main"],
+      [document, "main"],
+      [null, "main"],
+    ];
+    const focusTargets: Array<[HTMLElement, ChatPaneScope]> = [[mainInput, "main"]];
+    for (const workspaceId of ["alpha", "beta"]) {
+      const sidePane = document.createElement("div");
+      sidePane.setAttribute(SIDE_CHAT_PANE_ATTR, workspaceId);
+      sidePane.tabIndex = -1;
+      const sideInput = document.createElement("textarea");
+      const child = document.createElement("span");
+      const text = document.createTextNode("Side transcript");
+      child.appendChild(text);
+      sidePane.append(sideInput, child);
+      document.body.appendChild(sidePane);
+      const scope: ChatPaneScope = `side:${workspaceId}`;
+      targets.push([sideInput, scope], [sidePane, scope], [child, scope], [text, scope]);
+      focusTargets.push([sideInput, scope], [sidePane, scope]);
+    }
+
+    for (const [target, owner] of targets) {
+      expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, target))).toEqual([owner]);
+    }
+    // Agent-picker events route by activeElement, not by the original keyboard event target.
+    for (const [target, owner] of focusTargets) {
+      target.focus();
+      expect(document.activeElement).toBe(target);
+      expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, document.activeElement))).toEqual([
+        owner,
+      ]);
+    }
+  });
+
+  test("the nearest pane marker owns nested descendants", () => {
+    const outerPane = document.createElement("div");
+    outerPane.setAttribute(SIDE_CHAT_PANE_ATTR, "alpha");
+    const innerPane = document.createElement("div");
+    innerPane.setAttribute(SIDE_CHAT_PANE_ATTR, "beta");
+    const text = document.createTextNode("Nested transcript");
+    innerPane.appendChild(text);
+    outerPane.appendChild(innerPane);
+    document.body.appendChild(outerPane);
+
+    expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["side:beta"]);
+    innerPane.removeAttribute(SIDE_CHAT_PANE_ATTR);
+    expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["side:alpha"]);
+    outerPane.removeAttribute(SIDE_CHAT_PANE_ATTR);
+    expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["main"]);
+  });
 });
