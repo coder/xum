@@ -41,3 +41,58 @@ export function textContrast(element: HTMLElement): number {
   const [hi, lo] = [luminance(text), luminance(background)].sort((a, b) => b - a);
   return (hi + 0.05) / (lo + 0.05);
 }
+
+export interface TokenTextContrast {
+  element: HTMLElement;
+  token: string;
+  text: string;
+  ratio: number;
+}
+
+/**
+ * Contrast of every visible text element under `root` whose color is one of the CSS color
+ * tokens in `tokenVars` (for example `--color-muted`). A play can then check a token across a
+ * whole screen without naming elements or class names. Elements dimmed with opacity and inactive
+ * controls are skipped: their contrast does not come from the token alone (WCAG also exempts
+ * inactive controls).
+ */
+export function tokenTextContrasts(root: HTMLElement, tokenVars: string[]): TokenTextContrast[] {
+  const tokenByColor = resolveTokenColors(root.ownerDocument, tokenVars);
+  const results: TokenTextContrast[] = [];
+  for (const element of root.querySelectorAll<HTMLElement>("*")) {
+    const token = tokenByColor.get(getComputedStyle(element).color);
+    if (!token) continue;
+    const ownText = [...element.childNodes]
+      .filter((node) => node.nodeType === Node.TEXT_NODE)
+      .map((node) => node.textContent ?? "")
+      .join("")
+      .trim();
+    if (!ownText) continue;
+    const rect = element.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) continue;
+    if (element.closest(":disabled, [aria-disabled='true']")) continue;
+    let dimmed = false;
+    for (let node: HTMLElement | null = element; node; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (style.visibility === "hidden" || Number(style.opacity) < 1) dimmed = true;
+    }
+    if (dimmed) continue;
+    results.push({ element, token, text: ownText.slice(0, 40), ratio: textContrast(element) });
+  }
+  return results;
+}
+
+/**
+ * Computed color string of each token: the root's custom property, normalized on a canvas to the
+ * `rgb(r, g, b)` form that computed `color` values use. It never touches the DOM, because plays
+ * call it inside `waitFor`, which re-runs its callback on every DOM mutation.
+ */
+function resolveTokenColors(doc: Document, tokenVars: string[]): Map<string, string> {
+  const rootStyle = getComputedStyle(doc.documentElement);
+  const tokenByColor = new Map<string, string>();
+  for (const tokenVar of tokenVars) {
+    const [r, g, b] = toRgba(rootStyle.getPropertyValue(tokenVar).trim());
+    tokenByColor.set(`rgb(${r}, ${g}, ${b})`, tokenVar);
+  }
+  return tokenByColor;
+}
