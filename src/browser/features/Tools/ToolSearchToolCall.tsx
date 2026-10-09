@@ -29,6 +29,26 @@ type ToolSearchView =
   | { kind: "error"; error: string }
   | { kind: "none" };
 
+type ToolSearchDiscovery = NonNullable<ToolSearchToolResult["discovery"]>;
+
+/** Keep only well-formed discovery data (persisted results may be corrupted); drop it otherwise. */
+function toDiscovery(value: unknown): ToolSearchDiscovery | undefined {
+  if (value == null || typeof value !== "object") return undefined;
+  const discovery = value as { candidates?: unknown; note?: unknown };
+  if (!Array.isArray(discovery.candidates) || typeof discovery.note !== "string") {
+    return undefined;
+  }
+  const candidates = discovery.candidates.filter(
+    (candidate): candidate is ToolSearchDiscovery["candidates"][number] =>
+      candidate != null &&
+      typeof candidate === "object" &&
+      typeof (candidate as { name?: unknown }).name === "string" &&
+      typeof (candidate as { approxTokens?: unknown }).approxTokens === "number"
+  );
+  if (candidates.length === 0) return undefined;
+  return { candidates, note: discovery.note };
+}
+
 /** Normalize a persisted tool result into a render view (defensive: pending / malformed ⇒ none). */
 export function toToolSearchView(result: unknown): ToolSearchView {
   const unwrapped = unwrapResult(result);
@@ -53,6 +73,7 @@ export function toToolSearchView(result: unknown): ToolSearchView {
           typeof match.description === "string" ? match : { ...match, description: "" }
         ),
       totalDeferred: typeof candidate.totalDeferred === "number" ? candidate.totalDeferred : 0,
+      discovery: toDiscovery(candidate.discovery),
     },
   };
 }
@@ -71,6 +92,7 @@ export const ToolSearchToolCall: React.FC<ToolSearchToolCallProps> = (props) => 
 
   const view = toToolSearchView(props.result);
   const matches = view.kind === "matches" ? view.result.matches : [];
+  const discovery = view.kind === "matches" ? view.result.discovery : undefined;
 
   return (
     <ToolContainer expanded={expanded} className="@container">
@@ -81,7 +103,9 @@ export const ToolSearchToolCall: React.FC<ToolSearchToolCallProps> = (props) => 
         {view.kind === "matches" && (
           // Hide the count in very narrow containers so the truncating query keeps priority.
           <span className="text-muted hidden whitespace-nowrap @[300px]:inline">
-            {matches.length} {matches.length === 1 ? "match" : "matches"}
+            {discovery != null && matches.length === 0
+              ? `${discovery.candidates.length} found, none loaded`
+              : `${matches.length} ${matches.length === 1 ? "match" : "matches"}`}
           </span>
         )}
         <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>
@@ -91,11 +115,36 @@ export const ToolSearchToolCall: React.FC<ToolSearchToolCallProps> = (props) => 
         <ToolDetails>
           {view.kind === "error" && <ErrorBox>{view.error}</ErrorBox>}
 
-          {view.kind === "matches" && matches.length === 0 && (
+          {view.kind === "matches" && matches.length === 0 && discovery == null && (
             <div className="text-muted px-1 py-1 text-[11px] italic">
               No deferred tools matched “{view.result.query}”
               {view.result.totalDeferred > 0 &&
                 ` (${view.result.totalDeferred} deferred ${view.result.totalDeferred === 1 ? "tool" : "tools"} available)`}
+            </div>
+          )}
+
+          {discovery != null && (
+            <div className="flex flex-col">
+              {discovery.candidates.map((candidate, index) => (
+                <div
+                  key={candidate.name}
+                  className={index === 0 ? "px-2 py-1.5" : "border-t border-white/5 px-2 py-1.5"}
+                >
+                  <div className="text-foreground text-[12.5px] font-medium break-all">
+                    {candidate.name}
+                    {candidate.serverName && (
+                      <span className="text-muted ml-1.5 font-normal">{candidate.serverName}</span>
+                    )}
+                  </div>
+                  <div className="text-secondary mt-0.5 text-[11.5px] leading-snug">
+                    ~{candidate.approxTokens.toLocaleString("en-US")} tokens
+                    {candidate.oversized && <span className="text-muted"> · oversized</span>}
+                  </div>
+                </div>
+              ))}
+              <div className="text-muted border-t border-white/5 px-2 py-1.5 text-[11px] italic">
+                {discovery.note}
+              </div>
             </div>
           )}
 

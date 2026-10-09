@@ -79,6 +79,78 @@ describe("ToolSearchToolCall", () => {
     }
   });
 
+  test("renders discovery candidates and the note instead of the no-match copy", () => {
+    const view = render(
+      <TooltipProvider>
+        <ToolSearchToolCall
+          args={{ query: "render chart" }}
+          status="completed"
+          defaultExpanded={true}
+          result={{
+            query: "render chart",
+            matches: [],
+            totalDeferred: 7,
+            discovery: {
+              candidates: [
+                {
+                  name: "fat_chart_tool",
+                  serverName: "charts",
+                  approxTokens: 5200,
+                  oversized: true,
+                },
+                { name: "small_helper", approxTokens: 90 },
+              ],
+              note: "Definitions too large to auto-load. Search the exact tool name to load it.",
+            },
+          }}
+        />
+      </TooltipProvider>
+    );
+
+    expect(view.getByText("fat_chart_tool")).toBeTruthy();
+    expect(view.getByText("small_helper")).toBeTruthy();
+    expect(view.getByText(/Search the exact tool name/)).toBeTruthy();
+    expect(view.getByText(/~5,200 tokens/)).toBeTruthy();
+    expect(view.getByText(/oversized/)).toBeTruthy();
+    expect(view.queryByText(/No deferred tools matched/)).toBeNull();
+  });
+
+  test("toToolSearchView preserves discovery and drops malformed candidates", () => {
+    const view = toToolSearchView({
+      query: "q",
+      matches: [],
+      totalDeferred: 3,
+      discovery: {
+        candidates: [
+          { name: "ok_tool", approxTokens: 1200, oversized: true },
+          { name: "bad_tokens", approxTokens: "lots" },
+          null,
+          "garbage",
+        ],
+        note: "note text",
+      },
+    });
+    expect(view.kind).toBe("matches");
+    if (view.kind === "matches") {
+      expect(view.result.discovery).toEqual({
+        candidates: [{ name: "ok_tool", approxTokens: 1200, oversized: true }],
+        note: "note text",
+      });
+    }
+
+    // Malformed discovery (no usable candidates / non-string note) is dropped entirely.
+    const dropped = toToolSearchView({
+      query: "q",
+      matches: [],
+      totalDeferred: 3,
+      discovery: { candidates: [{ approxTokens: 5 }], note: 42 },
+    });
+    expect(dropped.kind).toBe("matches");
+    if (dropped.kind === "matches") {
+      expect(dropped.result.discovery).toBeUndefined();
+    }
+  });
+
   test("toToolSearchView coerces non-string descriptions so React never renders objects", () => {
     const view = toToolSearchView({
       query: "q",
