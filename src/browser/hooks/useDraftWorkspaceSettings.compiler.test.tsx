@@ -40,11 +40,12 @@ function loadCompiledHook(): typeof UseDraftWorkspaceSettings {
     filename: HOOK_PATH,
     babelrc: false,
     configFile: false,
-    presets: ["@babel/preset-typescript"],
-    plugins: [
-      ["babel-plugin-react-compiler", reactCompilerConfig],
-      "@babel/plugin-transform-modules-commonjs",
+    // Same module output as the repo's Jest Babel config, from declared dependencies only.
+    presets: [
+      ["@babel/preset-env", { targets: { node: "current" }, modules: "commonjs" }],
+      "@babel/preset-typescript",
     ],
+    plugins: [["babel-plugin-react-compiler", reactCompilerConfig]],
   });
   assert(compiled?.code, "React Compiler produced no output for useDraftWorkspaceSettings.ts");
 
