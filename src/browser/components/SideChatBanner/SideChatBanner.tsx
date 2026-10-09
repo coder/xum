@@ -3,7 +3,7 @@ import { ArrowLeft, MessagesSquare } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { isEscapeDismissOverlayOpen } from "@/browser/hooks/useEscapeToDismiss";
 import {
   useOptionalWorkspaceSidebarState,
@@ -19,7 +19,6 @@ import {
   KEYBINDS,
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 
 interface SideChatBannerProps {
   workspaceId: string;
@@ -34,7 +33,9 @@ interface SideChatBannerProps {
 export function SideChatBanner(props: SideChatBannerProps) {
   const { navigateToWorkspace } = useRouter();
   const { workspaceMetadata } = useWorkspaceContext();
-  const [vimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, { listener: true });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const sideChatState = useWorkspaceSidebarState(props.workspaceId);
   const parentState = useOptionalWorkspaceSidebarState(props.parentWorkspaceId);
 
