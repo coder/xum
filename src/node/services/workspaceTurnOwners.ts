@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import type { ProjectsConfig } from "@/node/config";
+import type { ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 
 /**
@@ -17,14 +17,22 @@ import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
  * Non-guarantee: the narrowed lookup relies only on the owner rule. A record that breaks it (for
  * example a running record for a claimed root owned by someone other than its creator) is missed,
  * while the global scan returns it. Only fixtures or hand edits create such records. Changing the
- * owner rule in createWorkspaceTurn must update this module.
+ * owner rule in createWorkspaceTurn must update this module. A symlinked `sessions/<owner>` is
+ * missed the same way: the global scan skips it, the owner listing follows it.
  *
- * Agent tasks (rows with `parentWorkspaceId`) can hold records from several ancestors, so they
- * fall back for now.
+ * An AGENT-TASK target (a row with `parentWorkspaceId`) admits only its ancestors (the reawaken
+ * path's isDescendantAgentTaskInConfig), so its records live in its config ancestors' directories.
+ * No code rewrites `parentWorkspaceId`, so the ancestors now are the ancestors at admission. This
+ * assumes only `mode: "new"` writes creating records and creates roots only. A missing or
+ * duplicated row on the chain, or more than MAX_ANCESTOR_LEVELS levels (a cycle), falls back.
  */
 export type WorkspaceTurnOwners =
   | { kind: "creator"; ownerWorkspaceId: string }
+  | { kind: "ancestors"; ownerWorkspaceIds: string[] }
   | { kind: "fallback"; reason: string };
+
+// Admission walks at most 32 levels (isDescendantAgentTaskUsingParentById), so 64 covers it.
+const MAX_ANCESTOR_LEVELS = 64;
 
 export function resolveWorkspaceTurnOwners(
   config: ProjectsConfig,
@@ -36,7 +44,7 @@ export function resolveWorkspaceTurnOwners(
   );
   if (rows.length !== 1) return { kind: "fallback", reason: `${rows.length} config rows` };
   const row = rows[0];
-  if (row.parentWorkspaceId != null) return { kind: "fallback", reason: "agent task" };
+  if (row.parentWorkspaceId != null) return resolveAncestors(config, row);
 
   // Config loading keeps tag values as written, so a hand-edited tag can be a non-string.
   const claim: unknown =
@@ -50,4 +58,31 @@ export function resolveWorkspaceTurnOwners(
     return { kind: "fallback", reason: "creator claim is not a path segment" };
   }
   return { kind: "creator", ownerWorkspaceId: claim };
+}
+
+// Only agent tasks build the row map; root targets keep the single filter above (#5569).
+function resolveAncestors(config: ProjectsConfig, row: WorkspaceConfigEntry): WorkspaceTurnOwners {
+  // Every row by ID, a duplicated ID as null, so a duplicate ancestor cannot hide behind the first.
+  const rowsById = new Map<string, WorkspaceConfigEntry | null>();
+  for (const project of config.projects.values()) {
+    for (const entry of project.workspaces) {
+      if (entry.id != null) rowsById.set(entry.id, rowsById.has(entry.id) ? null : entry);
+    }
+  }
+  const ownerWorkspaceIds: string[] = [];
+  for (let current = row; current.parentWorkspaceId != null; ) {
+    const parentId = current.parentWorkspaceId;
+    if (ownerWorkspaceIds.length === MAX_ANCESTOR_LEVELS) {
+      return { kind: "fallback", reason: `more than ${MAX_ANCESTOR_LEVELS} ancestor levels` };
+    }
+    const parent = rowsById.get(parentId);
+    // The ID becomes a sessions/<owner> path segment, as a creator claim does.
+    const segment = path.basename(parentId) === parentId && parentId !== "." && parentId !== "..";
+    if (parent == null || !segment || parentId.trim() === "" || parentId.includes("\0")) {
+      return { kind: "fallback", reason: `ancestor ${parentId}: missing, duplicate or unsafe row` };
+    }
+    ownerWorkspaceIds.push(parentId);
+    current = parent;
+  }
+  return { kind: "ancestors", ownerWorkspaceIds };
 }

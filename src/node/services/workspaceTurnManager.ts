@@ -1432,6 +1432,8 @@ export class WorkspaceTurnManager {
       }
       const targetEntry = findWorkspaceEntry(cfg, existingWorkspaceId);
 
+      // The owner rule. The active-turn lookup reads only the owners it admits
+      // (workspaceTurnOwners.ts), so changing it must update that module.
       const ownsExistingWorkspaceTurn = ownerWorkspaceTurns.some(
         (record) => record.createdWorkspace && record.workspaceId === existingWorkspaceId
       );
@@ -5712,13 +5714,13 @@ export class WorkspaceTurnManager {
       this.activeWorkspaceTurnHandleByWorkspaceId.delete(workspaceId);
     }
 
-    // #5569: a confirmed creator's directory holds every record of a root target (see
-    // workspaceTurnOwners.ts), so read that one directory instead of every owner's.
-    const fromCreator = await this.findActiveWorkspaceTurnInCreatorDir(workspaceId);
-    if (fromCreator.kind === "found") return fromCreator.record;
+    // #5569: a root's confirmed creator, or an agent task's config ancestors, hold every record
+    // of the target (see workspaceTurnOwners.ts), so read those directories instead of every owner's.
+    const fromOwners = await this.findActiveWorkspaceTurnInOwnerDirs(workspaceId);
+    if (fromOwners.kind === "found") return fromOwners.record;
     log.debug("Active workspace-turn lookup fell back to a global scan", {
       workspaceId,
-      reason: fromCreator.reason,
+      reason: fromOwners.reason,
     });
 
     const records = await this.taskHandleStore.listAllWorkspaceTurns({
@@ -5727,7 +5729,7 @@ export class WorkspaceTurnManager {
     return records.toReversed().find((record) => record.workspaceId === workspaceId) ?? null;
   }
 
-  private async findActiveWorkspaceTurnInCreatorDir(
+  private async findActiveWorkspaceTurnInOwnerDirs(
     workspaceId: string
   ): Promise<
     | { kind: "found"; record: WorkspaceTurnTaskHandleRecord | null }
@@ -5735,6 +5737,34 @@ export class WorkspaceTurnManager {
   > {
     const owners = resolveWorkspaceTurnOwners(this.config.loadConfigOrDefault(), workspaceId);
     if (owners.kind === "fallback") return owners;
+    if (owners.kind === "ancestors") {
+      let lists: WorkspaceTurnTaskHandleRecord[][];
+      try {
+        lists = await Promise.all(
+          owners.ownerWorkspaceIds.map((owner) =>
+            this.taskHandleStore.listWorkspaceTurns(owner, { statuses: ["starting", "running"] })
+          )
+        );
+      } catch (error) {
+        return { kind: "fallback", reason: `ancestor listing failed: ${getErrorMessage(error)}` };
+      }
+      // The global scan's comparator, and its stable sort keeps each owner's own order.
+      const forTarget = lists
+        .flat()
+        .filter((record) => record.workspaceId === workspaceId)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      const newest = forTarget.at(-1);
+      if (newest == null) return { kind: "found", record: null };
+      // Across owners the global scan breaks a createdAt tie by the readdir order of sessions/,
+      // which only that scan reproduces.
+      const tiedAcrossOwners = forTarget.some(
+        (record) =>
+          record.ownerWorkspaceId !== newest.ownerWorkspaceId &&
+          record.createdAt.localeCompare(newest.createdAt) === 0
+      );
+      if (tiedAcrossOwners) return { kind: "fallback", reason: "createdAt tie across owners" };
+      return { kind: "found", record: newest };
+    }
     let records: WorkspaceTurnTaskHandleRecord[];
     try {
       // One unfiltered listing both confirms the claim and answers it, so the two cannot disagree.
