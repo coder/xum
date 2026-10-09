@@ -20,6 +20,7 @@ import type * as aiSdk from "ai";
 import { tool, type ModelMessage, type Tool, type ToolResultPart } from "ai";
 import { z } from "zod";
 import * as modelStatsModule from "@/common/utils/tokens/modelStats";
+import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import {
@@ -67,6 +68,33 @@ async function startStreamCapturingStreamTextForTests(
   if (!result.success) throw new Error("Expected stream to start");
   await result.data.completion;
   return { streamText, streamManager };
+}
+
+/** One in-turn assistant step: a reasoning part (replay data in `replayOptions`) and a tool call. */
+function inTurnReasoningStep(
+  replayOptions: Record<string, Record<string, string>>
+): ModelMessage[] {
+  return [
+    { role: "user", content: "hello" },
+    {
+      role: "assistant",
+      content: [
+        { type: "reasoning", text: "note", providerOptions: replayOptions },
+        { type: "tool-call", toolCallId: "c1", toolName: "bash", input: {} },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "c1",
+          toolName: "bash",
+          output: { type: "text", value: "ok" },
+        },
+      ],
+    },
+  ];
 }
 
 describe("StreamManager - sequential tool execution", () => {
@@ -427,27 +455,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
     // Preserved thinking: a thinking block replayed after the advertised tools changed
     // would fail the prefix check on enforced accounts. between_tools cannot carry
     // blockBinding, and only the direct API route sends drop_block for adaptive.
-    const inTurn: ModelMessage[] = [
-      { role: "user", content: "hello" },
-      {
-        role: "assistant",
-        content: [
-          { type: "reasoning", text: "note", providerOptions: { anthropic: { signature: "s" } } },
-          { type: "tool-call", toolCallId: "c1", toolName: "bash", input: {} },
-        ],
-      },
-      {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "c1",
-            toolName: "bash",
-            output: { type: "text", value: "ok" },
-          },
-        ],
-      },
-    ];
+    const inTurn = inTurnReasoningStep({ anthropic: { signature: "s" } });
     const replaysReasoning = (step: PreparedStepForTests) =>
       (step?.messages ?? inTurn).some(
         (message) =>
@@ -482,6 +490,48 @@ describe("StreamManager - tool search activeTools scoping", () => {
     expect(await run({ type: "adaptive" })).toEqual([true, false, false]);
     // Native tool search (#5262) keeps the tool set, so the blocks stay valid.
     expect(await run({ type: "between_tools" }, true)).toEqual([true, true, true]);
+  });
+
+  test("a tool-set change ends in-turn reasoning replay for Claude on Bedrock (#5841)", async () => {
+    // Bedrock Converse replays in-turn Claude thinking from the `bedrock` namespace, and
+    // Bedrock cannot take drop_block, so a changed tool set must strip it as on the
+    // other non-direct Claude routes. Other Bedrock models keep their reasoning.
+    const bedrock = createAmazonBedrock({
+      region: "us-east-1",
+      accessKeyId: "test",
+      secretAccessKey: "test",
+    });
+    const run = async (modelId: string) => {
+      const inTurn = inTurnReasoningStep({ bedrock: { signature: "s" } });
+      const toolSearchState: ToolSearchStreamState = {
+        catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
+        deferredToolNames: new Set(["slack_send_message"]),
+        allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
+        activatedToolNames: new Set(),
+        native: false,
+      };
+      const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
+        model: bedrock(modelId),
+        modelString: `bedrock:${modelId}`,
+        messages,
+        toolSearchState,
+      });
+      const prepareStep = capturePrepareStep(streamTextSpy);
+      const reasoningCount = (step: PreparedStepForTests) =>
+        (step?.messages ?? inTurn).filter(
+          (message) =>
+            message.role === "assistant" &&
+            typeof message.content !== "string" &&
+            message.content.some((part) => part.type === "reasoning")
+        ).length;
+      const counts = [reasoningCount(await prepareStep({ messages: inTurn }))];
+      toolSearchState.activatedToolNames.add("slack_send_message");
+      counts.push(reasoningCount(await prepareStep({ messages: inTurn })));
+      return counts;
+    };
+
+    expect(await run("us.anthropic.claude-sonnet-5-5")).toEqual([1, 0]);
+    expect(await run("deepseek.r1-v1:0")).toEqual([1, 1]);
   });
 
   test("an in-turn Anthropic thinking strip leaves a replay receipt on the turn's row", async () => {

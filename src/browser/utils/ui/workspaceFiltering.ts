@@ -1011,6 +1011,9 @@ export function buildSortedWorkspacesByProject(
     for (const ws of config.workspaces) {
       if (!ws.id) continue;
       const meta = workspaceMetadata.get(ws.id);
+      // /side chats are ephemeral views of their main chat, never sidebar rows (like Codex,
+      // where a side conversation never shows up in the thread list).
+      if (meta?.sideChatParentWorkspaceId != null) continue;
       if (meta) {
         metadataList.push(meta);
         includedIds.add(ws.id);
@@ -1022,7 +1025,7 @@ export function buildSortedWorkspacesByProject(
   // Second pass: add workspaces from metadata not yet in projects config
   // (handles race condition where metadata event arrives before config refresh completes)
   for (const [id, metadata] of workspaceMetadata) {
-    if (!includedIds.has(id)) {
+    if (!includedIds.has(id) && metadata.sideChatParentWorkspaceId == null) {
       const projectWorkspaces = result.get(metadata.projectPath) ?? [];
       projectWorkspaces.push(metadata);
       result.set(metadata.projectPath, projectWorkspaces);

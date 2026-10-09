@@ -18,9 +18,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function collectReasoningModeSlots(doc: Record<string, unknown>): ReasoningModeSlot[] {
-  const slots: ReasoningModeSlot[] = [
-    { owner: doc, modeKey: "advisorReasoningMode", markerKey: "advisorCyberReasoningMode" },
-  ];
+  const slots: ReasoningModeSlot[] = [];
   const addSettings = (value: unknown) => {
     if (isRecord(value)) {
       slots.push({ owner: value, modeKey: "reasoningMode", markerKey: "cyberReasoningMode" });

@@ -325,8 +325,12 @@ const PROJECT_ITEM_BASE_CLASS =
   "group sticky top-0 z-30 py-2 pl-2 pr-1 flex select-none items-center border-l-transparent bg-surface-primary transition-colors duration-150";
 
 // Shared classes for the chevron toggle buttons on project/section headers.
+// The hit area is 24x24 px (WCAG target-size, #5951), but the negative margins keep the layout
+// and the inner box keeps the 20x20 px look, so the visual design does not change.
 const PROJECT_TOGGLE_BUTTON_CLASSES =
-  "text-secondary hover:bg-hover hover:border-border-light mr-1.5 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent p-0 transition-all duration-200";
+  "group/toggle text-secondary -my-0.5 -ml-0.5 mr-1 flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center bg-transparent p-0";
+const PROJECT_TOGGLE_BOX_CLASSES =
+  "group-hover/toggle:bg-hover group-hover/toggle:border-border-light flex h-5 w-5 items-center justify-center rounded border border-transparent transition-all duration-200";
 
 function getProjectFallbackLabel(projectPath: string): string {
   const abbreviatedPath = PlatformPaths.abbreviate(projectPath);
@@ -2644,7 +2648,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                   <button
                     onClick={() => onAddProject()}
                     aria-label="Add project"
-                    className="text-secondary hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
+                    // text-content-secondary: the light theme's text-secondary is 2.9:1 (#5950).
+                    className="text-content-secondary hover:bg-hover hover:text-foreground hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
                   >
                     <span className="text-base leading-none">+</span>
                     <span>Add Project</span>
@@ -2666,12 +2671,16 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                         aria-label={`${isScratchSectionExpanded ? "Collapse" : "Expand"} scratch chats`}
                         className={PROJECT_TOGGLE_BUTTON_CLASSES}
                       >
-                        <ChevronRight
-                          className="h-4 w-4 transition-transform duration-200"
-                          style={{
-                            transform: isScratchSectionExpanded ? "rotate(90deg)" : "rotate(0deg)",
-                          }}
-                        />
+                        <span className={PROJECT_TOGGLE_BOX_CLASSES}>
+                          <ChevronRight
+                            className="h-4 w-4 transition-transform duration-200"
+                            style={{
+                              transform: isScratchSectionExpanded
+                                ? "rotate(90deg)"
+                                : "rotate(0deg)",
+                            }}
+                          />
+                        </span>
                       </button>
                       <div className="flex min-w-0 flex-1 items-center pr-1">
                         <span className="text-foreground truncate text-sm font-medium">Chats</span>
@@ -2778,20 +2787,22 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                         aria-label={`${isMultiProjectSectionExpanded ? "Collapse" : "Expand"} multi-project workspaces`}
                         className={PROJECT_TOGGLE_BUTTON_CLASSES}
                       >
-                        <span className="relative flex h-4 w-4 items-center justify-center">
-                          <ChevronRight
-                            className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
-                            style={{
-                              transform: isMultiProjectSectionExpanded
-                                ? "rotate(90deg)"
-                                : "rotate(0deg)",
-                            }}
-                          />
-                          {isMultiProjectSectionExpanded ? (
-                            <FolderOpen className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0" />
-                          ) : (
-                            <Folder className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0" />
-                          )}
+                        <span className={PROJECT_TOGGLE_BOX_CLASSES}>
+                          <span className="relative flex h-4 w-4 items-center justify-center">
+                            <ChevronRight
+                              className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
+                              style={{
+                                transform: isMultiProjectSectionExpanded
+                                  ? "rotate(90deg)"
+                                  : "rotate(0deg)",
+                              }}
+                            />
+                            {isMultiProjectSectionExpanded ? (
+                              <FolderOpen className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0" />
+                            ) : (
+                              <Folder className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0" />
+                            )}
+                          </span>
                         </span>
                       </button>
                       <div className="flex min-w-0 flex-1 items-center pr-2">
@@ -2852,7 +2863,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                 projectHeaderPaths.length === 0 &&
                 multiProjectWorkspaces.length === 0 ? (
                   <div className="px-4 py-8 text-center">
-                    <p className="text-muted mb-4 text-[13px]">No projects</p>
+                    {/* text-content-secondary: text-muted and text-secondary are below WCAG AA in
+                        the light theme (#5950). */}
+                    <p className="text-content-secondary mb-4 text-[13px]">No projects</p>
                     <div className="flex flex-col gap-2">
                       <button
                         onClick={handleAddScratchWorkspace}
@@ -2862,7 +2875,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                       </button>
                       <button
                         onClick={() => onAddProject()}
-                        className="border-border-light text-secondary hover:bg-hover cursor-pointer rounded border px-4 py-2 text-[13px] transition-colors duration-200"
+                        className="border-border-light text-content-secondary hover:bg-hover hover:text-foreground cursor-pointer rounded border px-4 py-2 text-[13px] transition-colors duration-200"
                       >
                         Add Project
                       </button>
@@ -2975,28 +2988,34 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               data-project-path={projectPath}
                               className={PROJECT_TOGGLE_BUTTON_CLASSES}
                             >
-                              <span className="relative flex h-4 w-4 items-center justify-center">
-                                <ChevronRight
-                                  className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
-                                  style={{
-                                    transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
-                                  }}
-                                />
-                                {isExpanded ? (
-                                  <FolderOpen
-                                    className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
-                                    style={
-                                      projectFolderColor ? { color: projectFolderColor } : undefined
-                                    }
+                              <span className={PROJECT_TOGGLE_BOX_CLASSES}>
+                                <span className="relative flex h-4 w-4 items-center justify-center">
+                                  <ChevronRight
+                                    className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
+                                    style={{
+                                      transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
+                                    }}
                                   />
-                                ) : (
-                                  <Folder
-                                    className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
-                                    style={
-                                      projectFolderColor ? { color: projectFolderColor } : undefined
-                                    }
-                                  />
-                                )}
+                                  {isExpanded ? (
+                                    <FolderOpen
+                                      className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
+                                      style={
+                                        projectFolderColor
+                                          ? { color: projectFolderColor }
+                                          : undefined
+                                      }
+                                    />
+                                  ) : (
+                                    <Folder
+                                      className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
+                                      style={
+                                        projectFolderColor
+                                          ? { color: projectFolderColor }
+                                          : undefined
+                                      }
+                                    />
+                                  )}
+                                </span>
                               </span>
                             </button>
                           )}

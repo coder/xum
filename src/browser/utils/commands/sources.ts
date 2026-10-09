@@ -421,6 +421,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     };
   };
 
+  // Side chats live in their parent's pane, not as selectable workspaces. Read lazily so all
+  // palette lists (and their submit handlers) see the same current membership.
+  const selectableWorkspaces = () =>
+    Array.from(p.workspaceMetadata.values()).filter(
+      (meta) => meta.sideChatParentWorkspaceId == null
+    );
+
   // Workspaces
   actions.push(() => {
     const list: CommandAction[] = [];
@@ -444,7 +451,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
 
     // Switch to workspace
     // Iterate through all workspace metadata (now keyed by workspace ID)
-    for (const meta of p.workspaceMetadata.values()) {
+    for (const meta of selectableWorkspaces()) {
       const isCurrent = selected?.workspaceId === meta.id;
       const isStreaming = p.streamingModels?.has(meta.id) ?? false;
       // Title is primary (if set), name is secondary identifier
@@ -473,71 +480,73 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     if (selected?.namedWorkspacePath) {
       const workspaceDisplayName = `${selected.projectName}/${selected.namedWorkspacePath.split("/").pop() ?? selected.namedWorkspacePath}`;
       const selectedMeta = p.workspaceMetadata.get(selected.workspaceId);
-      list.push({
-        id: CommandIds.workspaceOpenTerminalCurrent(),
-        title: "New Terminal Window",
-        subtitle: workspaceDisplayName,
-        section: section.workspaces,
-        // Note: Cmd/Ctrl+T opens integrated terminal in sidebar (not shown here since this opens a popout)
-        run: () => {
-          p.onOpenWorkspaceInTerminal(selected.workspaceId, selectedMeta?.runtimeConfig);
-        },
-      });
-      // A sub-agent gets the user-confirmed removal that lists its unpreserved work (#5106); the
-      // plain remove below refuses a dirty checkout, and a model's task_remove refuses it too.
-      if (selectedMeta?.parentWorkspaceId != null) {
+      if (selectedMeta?.sideChatParentWorkspaceId == null) {
         list.push({
-          id: CommandIds.workspaceRemoveSubagent(),
-          title: "Remove Current Sub-agent…",
+          id: CommandIds.workspaceOpenTerminalCurrent(),
+          title: "New Terminal Window",
           subtitle: workspaceDisplayName,
           section: section.workspaces,
-          run: () =>
-            p.onRemoveSubagent(selected.workspaceId, selectedMeta.title ?? selectedMeta.name),
-        });
-      } else {
-        list.push({
-          id: CommandIds.workspaceRemove(),
-          title: "Remove Current Workspace…",
-          subtitle: workspaceDisplayName,
-          section: section.workspaces,
-          run: async () => {
-            const branchName =
-              selectedMeta?.name ??
-              selected.namedWorkspacePath.split("/").pop() ??
-              selected.namedWorkspacePath;
-            const ok = await p.confirmDialog(
-              removeWorkspaceConfirmOptions("Remove current workspace?", {
-                name: branchName,
-                runtimeConfig: selectedMeta?.runtimeConfig,
-                projects: selectedMeta?.projects,
-                kind: selectedMeta?.kind,
-              })
-            );
-            if (ok) await p.onRemoveWorkspace(selected.workspaceId);
+          // Note: Cmd/Ctrl+T opens integrated terminal in sidebar (not shown here since this opens a popout)
+          run: () => {
+            p.onOpenWorkspaceInTerminal(selected.workspaceId, selectedMeta?.runtimeConfig);
           },
         });
-      }
-      // #4983: the keyboard path for the interrupted-delegated-setup banner's Keep button.
-      if (selectedMeta?.delegatedCreationInterrupted === true) {
-        list.push({
-          id: CommandIds.workspaceKeepInterruptedDelegated(),
-          title: "Keep Workspace After Interrupted Setup",
-          subtitle: workspaceDisplayName,
-          section: section.workspaces,
-          run: async () => {
-            if (!p.api) return;
-            const result = await p.api.workspace.keepInterruptedDelegatedWorkspace({
-              workspaceId: selected.workspaceId,
-            });
-            if (!result.success) {
-              showCommandFeedbackToast({
-                type: "error",
-                title: "Could not keep the workspace",
-                message: result.error,
+        // A sub-agent gets the user-confirmed removal that lists its unpreserved work (#5106); the
+        // plain remove below refuses a dirty checkout, and a model's task_remove refuses it too.
+        if (selectedMeta?.parentWorkspaceId != null) {
+          list.push({
+            id: CommandIds.workspaceRemoveSubagent(),
+            title: "Remove Current Sub-agent…",
+            subtitle: workspaceDisplayName,
+            section: section.workspaces,
+            run: () =>
+              p.onRemoveSubagent(selected.workspaceId, selectedMeta.title ?? selectedMeta.name),
+          });
+        } else {
+          list.push({
+            id: CommandIds.workspaceRemove(),
+            title: "Remove Current Workspace…",
+            subtitle: workspaceDisplayName,
+            section: section.workspaces,
+            run: async () => {
+              const branchName =
+                selectedMeta?.name ??
+                selected.namedWorkspacePath.split("/").pop() ??
+                selected.namedWorkspacePath;
+              const ok = await p.confirmDialog(
+                removeWorkspaceConfirmOptions("Remove current workspace?", {
+                  name: branchName,
+                  runtimeConfig: selectedMeta?.runtimeConfig,
+                  projects: selectedMeta?.projects,
+                  kind: selectedMeta?.kind,
+                })
+              );
+              if (ok) await p.onRemoveWorkspace(selected.workspaceId);
+            },
+          });
+        }
+        // #4983: the keyboard path for the interrupted-delegated-setup banner's Keep button.
+        if (selectedMeta?.delegatedCreationInterrupted === true) {
+          list.push({
+            id: CommandIds.workspaceKeepInterruptedDelegated(),
+            title: "Keep Workspace After Interrupted Setup",
+            subtitle: workspaceDisplayName,
+            section: section.workspaces,
+            run: async () => {
+              if (!p.api) return;
+              const result = await p.api.workspace.keepInterruptedDelegatedWorkspace({
+                workspaceId: selected.workspaceId,
               });
-            }
-          },
-        });
+              if (!result.success) {
+                showCommandFeedbackToast({
+                  type: "error",
+                  title: "Could not keep the workspace",
+                  message: result.error,
+                });
+              }
+            },
+          });
+        }
       }
       list.push({
         id: CommandIds.workspaceEditTitle(),
@@ -624,7 +633,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       }
     }
 
-    if (p.workspaceMetadata.size > 0) {
+    if (selectableWorkspaces().length > 0) {
       list.push({
         id: CommandIds.workspaceOpenTerminal(),
         title: "Open Terminal Window for Workspace…",
@@ -639,7 +648,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "Workspace",
               placeholder: "Search workspaces…",
               getOptions: () =>
-                Array.from(p.workspaceMetadata.values()).map((meta) => {
+                selectableWorkspaces().map((meta) => {
                   // Use workspace name instead of extracting from path
                   const label = `${meta.projectName} / ${meta.name}`;
                   return {
@@ -657,7 +666,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             },
           ],
           onSubmit: (vals) => {
-            const meta = p.workspaceMetadata.get(vals.workspaceId);
+            const meta = selectableWorkspaces().find((entry) => entry.id === vals.workspaceId);
+            if (!meta) return;
             p.onOpenWorkspaceInTerminal(vals.workspaceId, meta?.runtimeConfig);
           },
         },
@@ -676,7 +686,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "Select workspace",
               placeholder: "Search workspaces…",
               getOptions: () =>
-                Array.from(p.workspaceMetadata.values()).map((meta) => {
+                selectableWorkspaces().map((meta) => {
                   const label = `${meta.projectName} / ${meta.name}`;
                   return {
                     id: meta.id,
@@ -697,9 +707,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "New title",
               placeholder: "Enter new workspace title",
               getInitialValue: (values) => {
-                const meta = Array.from(p.workspaceMetadata.values()).find(
-                  (m) => m.id === values.workspaceId
-                );
+                const meta = selectableWorkspaces().find((m) => m.id === values.workspaceId);
                 return meta?.title ?? meta?.name ?? "";
               },
               validate: (v) => (!v.trim() ? "Title is required" : null),
@@ -724,7 +732,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "Select workspace",
               placeholder: "Search workspaces…",
               getOptions: () =>
-                Array.from(p.workspaceMetadata.values()).map((meta) => {
+                selectableWorkspaces().map((meta) => {
                   const label = `${meta.projectName}/${meta.name}`;
                   return {
                     id: meta.id,
@@ -741,10 +749,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             },
           ],
           onSubmit: async (vals) => {
-            const meta = Array.from(p.workspaceMetadata.values()).find(
-              (m) => m.id === vals.workspaceId
-            );
-            if (meta?.parentWorkspaceId != null) {
+            const meta = selectableWorkspaces().find((m) => m.id === vals.workspaceId);
+            if (!meta) return;
+            if (meta.parentWorkspaceId != null) {
               // Sub-agents get the confirmation that lists their unpreserved work (#5106).
               await p.onRemoveSubagent(meta.id, meta.title ?? meta.name);
               return;

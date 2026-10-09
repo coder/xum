@@ -3342,6 +3342,9 @@ export class AgentSession {
     // TaskService owns child recovery; replaying a stopped child must never restart it.
     metadata ??= await this.getWorkspaceMetadataForRetry();
     if (!metadata || metadata.parentWorkspaceId != null) return;
+    // Opening/replaying a side chat must never continue inherited work, including old side chats
+    // with resumable partials or compaction follow-ups. Only explicit user send/retry starts it.
+    if (metadata.sideChatParentWorkspaceId != null) return;
     // Reuse the bulk startup snapshot throughout retry derivation instead of rescanning all workspaces.
     return this.startupRecovery.run(() => this.scheduleStartupAutoRetryIfNeeded(metadata));
   }
@@ -10057,21 +10060,10 @@ export class AgentSession {
       this.markActiveStreamHadAnyOutput();
       this.emitChatEvent(payload);
     });
-    forward("advisor-output", (payload) => {
-      this.markActiveStreamHadAnyOutput();
-      this.emitChatEvent(payload);
-    });
-    forward("advisor-reasoning-output", (payload) => {
-      this.markActiveStreamHadAnyOutput();
-      this.emitChatEvent(payload);
-    });
     forward("task-created", (payload) => {
       this.emitChatEvent(payload);
     });
     forward("workflow-run-attached", (payload) => {
-      this.emitChatEvent(payload);
-    });
-    forward("advisor-phase", (payload) => {
       this.emitChatEvent(payload);
     });
     forward("session-usage-delta", (payload) => {

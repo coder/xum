@@ -113,7 +113,7 @@ async function closeSettingsWithEscape(): Promise<void> {
 }
 
 export const SectionsSmoke: AppStory = {
-  // Pixel budget: the App task, advisor, and compaction settings stories already capture this
+  // Pixel budget: the App task and compaction settings stories already capture this
   // dialog on desktop, so this file's snapshot slot goes to PhoneFullScreen.
   parameters: { pixel: PIXEL_DISABLED },
   render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,

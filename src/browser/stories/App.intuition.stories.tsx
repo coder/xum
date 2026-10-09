@@ -173,7 +173,6 @@ export const ReasoningSettings: AppStory = {
             intuition: {
               modelString: "openai:gpt-6.1-sol",
               thinkingLevel: "high",
-              advisorEnabled: true,
             },
           },
         });
@@ -199,8 +198,6 @@ export const ReasoningSettings: AppStory = {
     card.scrollIntoView({ block: "center" });
     await expect(within(card).getByRole("combobox")).toBeVisible();
     await expect(within(card).getAllByRole("switch")).toHaveLength(1);
-    await expect(within(card).queryByLabelText("Toggle intuition advisor")).toBeNull();
-    await expect(settings.getByLabelText("Toggle name_workspace advisor")).toBeInTheDocument();
     const reasoning = within(card).getByRole("button", { name: "Reasoning" });
     await expect(reasoning).toHaveTextContent("High");
     await userEvent.click(reasoning);

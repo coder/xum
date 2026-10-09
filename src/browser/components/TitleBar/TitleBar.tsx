@@ -209,14 +209,16 @@ export function TitleBar(props: TitleBarProps) {
               className={cn(
                 // Keep the version row shrinkable so long git-describe values ellipsize
                 // instead of overlapping the gateway/settings controls.
-                "flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-inherit transition-opacity hover:opacity-70",
+                "flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-inherit transition-opacity",
                 isDesktop && "titlebar-no-drag"
               )}
               onClick={handleOpenAboutDialog}
             >
+              {/* text-content-secondary, not the bar's text-muted: the light theme's muted token is
+                  3.5:1 on the sidebar color, below WCAG AA (#5950). */}
               <div
                 className={cn(
-                  "min-w-0 flex-1 truncate font-normal tracking-wider",
+                  "text-content-secondary min-w-0 flex-1 truncate font-normal tracking-wider",
                   leftInset > 0 ? "text-[10px]" : "text-xs"
                 )}
               >

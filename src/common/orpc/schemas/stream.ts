@@ -478,48 +478,6 @@ export const BashOutputEventSchema = z.object({
 });
 
 /**
- * UI-only advisor progress update for live phase display.
- *
- * This is intentionally NOT part of the tool result returned to the model.
- * It is streamed over workspace.onChat so the UI can show honest advisor progress.
- */
-export const AdvisorPhaseEventSchema = z.object({
-  type: z.literal("advisor-phase"),
-  workspaceId: z.string(),
-  toolCallId: z.string(),
-  phase: z.enum(["preparing_context", "waiting_for_response", "finalizing_result"]),
-  timestamp: z.number().meta({ description: "When the phase changed (Date.now())" }),
-});
-
-/**
- * UI-only incremental output from the advisor tool.
- *
- * This is intentionally NOT part of the tool result returned to the model.
- * It is streamed over workspace.onChat so users can read advice while it is generated.
- */
-export const AdvisorOutputEventSchema = z.object({
-  type: z.literal("advisor-output"),
-  workspaceId: z.string(),
-  toolCallId: z.string(),
-  text: z.string(),
-  timestamp: z.number().meta({ description: "When output was received (Date.now())" }),
-});
-
-/**
- * UI-only incremental reasoning from the advisor tool.
- *
- * This is intentionally NOT part of the tool result returned to the model.
- * It is streamed over workspace.onChat so users can see advisor thinking while it is generated.
- */
-export const AdvisorReasoningOutputEventSchema = z.object({
-  type: z.literal("advisor-reasoning-output"),
-  workspaceId: z.string(),
-  toolCallId: z.string(),
-  text: z.string(),
-  timestamp: z.number().meta({ description: "When reasoning output was received (Date.now())" }),
-});
-
-/**
  * UI-only notification that a task tool call has created a child workspace.
  *
  * This is intentionally NOT part of the tool result returned to the model.
@@ -842,6 +800,29 @@ export const PrefixSwapInvalidatedEventSchema = z.object({
   messageId: z.string(),
 });
 
+// Inert legacy wire shapes: version 3 session tapes can contain advisor progress.
+// Keep validating those recordings without restoring a producer or dedicated UI.
+const legacyAdvisorEventFields = {
+  workspaceId: z.string(),
+  toolCallId: z.string(),
+  timestamp: z.number(),
+};
+const LegacyAdvisorOutputEventSchema = z.object({
+  ...legacyAdvisorEventFields,
+  type: z.literal("advisor-output"),
+  text: z.string(),
+});
+const LegacyAdvisorReasoningOutputEventSchema = z.object({
+  ...legacyAdvisorEventFields,
+  type: z.literal("advisor-reasoning-output"),
+  text: z.string(),
+});
+const LegacyAdvisorPhaseEventSchema = z.object({
+  ...legacyAdvisorEventFields,
+  type: z.literal("advisor-phase"),
+  phase: z.enum(["preparing_context", "waiting_for_response", "finalizing_result"]),
+});
+
 export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   PrefixSwapInvalidatedEventSchema,
   // Stream lifecycle events
@@ -860,11 +841,11 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   ToolCallDeltaEventSchema,
   ToolCallEndEventSchema,
   BashOutputEventSchema,
-  AdvisorOutputEventSchema,
-  AdvisorReasoningOutputEventSchema,
+  LegacyAdvisorOutputEventSchema,
+  LegacyAdvisorReasoningOutputEventSchema,
+  LegacyAdvisorPhaseEventSchema,
   TaskCreatedEventSchema,
   WorkflowRunAttachedEventSchema,
-  AdvisorPhaseEventSchema,
   // Reasoning events
   ReasoningDeltaEventSchema,
   ReasoningEndEventSchema,

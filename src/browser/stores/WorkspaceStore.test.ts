@@ -570,33 +570,6 @@ const toolCallEndEvent = (
   ...overrides,
 });
 
-const advisorPhaseEvent = (
-  workspaceId: string,
-  toolCallId: string,
-  phase: ChatEvent<"advisor-phase">["phase"],
-  timestamp: number
-): WorkspaceChatMessage => ({ type: "advisor-phase", workspaceId, toolCallId, phase, timestamp });
-
-const advisorOutputEvent = (
-  workspaceId: string,
-  toolCallId: string,
-  text: string,
-  timestamp: number
-): WorkspaceChatMessage => ({ type: "advisor-output", workspaceId, toolCallId, text, timestamp });
-
-const advisorReasoningOutputEvent = (
-  workspaceId: string,
-  toolCallId: string,
-  text: string,
-  timestamp: number
-): WorkspaceChatMessage => ({
-  type: "advisor-reasoning-output",
-  workspaceId,
-  toolCallId,
-  text,
-  timestamp,
-});
-
 function createWorkflowRunRecord(overrides: Partial<WorkflowRunRecord> = {}): WorkflowRunRecord {
   return {
     id: "wfr_live",
@@ -1883,7 +1856,7 @@ describe("WorkspaceStore", () => {
     });
 
     /**
-     * Leave live advisor output from a first (history-less) attempt, then end it so the
+     * Leave live bash output from a first (history-less) attempt, then end it so the
      * retry is a full replay. The output is cleared only by resetChatStateForReplay, so
      * its absence proves the reset ran.
      */
@@ -1894,20 +1867,20 @@ describe("WorkspaceStore", () => {
           ? [
               caughtUpEvent(),
               Promise.resolve(),
-              advisorOutputEvent(workspaceId, "call-replay-probe", "partial advice", 1),
+              bashOutputEvent(workspaceId, "call-replay-probe", "partial output"),
               endFirstAttempt.wait,
             ]
           : [() => waitForAbortSignal(signal)]
       );
       expect(
         await waitUntil(
-          () => store.getAdvisorToolLiveOutput(workspaceId, "call-replay-probe") !== null
+          () => store.getBashToolLiveOutput(workspaceId, "call-replay-probe") !== null
         )
       ).toBe(true);
       endFirstAttempt.release();
       expect(await waitUntil(() => subscriptions() === 2)).toBe(true);
       await tick(0);
-      expect(store.getAdvisorToolLiveOutput(workspaceId, "call-replay-probe")).toBeNull();
+      expect(store.getBashToolLiveOutput(workspaceId, "call-replay-probe")).toBeNull();
       mockChatScript([], { keepOpen: true });
     };
 
@@ -1992,6 +1965,207 @@ describe("WorkspaceStore", () => {
     store.setActiveWorkspaceId(null);
     expect(store.isOnChatSubscriptionActive("workspace-1")).toBe(false);
     expect(store.isOnChatSubscriptionActive("workspace-2")).toBe(false);
+  });
+
+  // The /side chat tab renders a second live transcript next to the routed chat.
+  describe("pinned workspace subscription", () => {
+    const onChatSignals = (workspaceId: string) =>
+      mockOnChat.mock.calls
+        .filter(([input]) => input?.workspaceId === workspaceId)
+        .map(([, options]) => options?.signal);
+
+    beforeEach(() => {
+      mockChatScript([], { keepOpen: true });
+    });
+
+    it("keeps two side panes live alongside the routed chat and releases only the closed pane", async () => {
+      createAndAddWorkspace(store, "main");
+      createAndAddWorkspace(store, "side-a", {}, false);
+      createAndAddWorkspace(store, "side-b", {}, false);
+      const releaseA = store.acquirePinnedWorkspace("side-a");
+      const releaseB = store.acquirePinnedWorkspace("side-b");
+      await tick(0);
+      for (const id of ["main", "side-a", "side-b"]) {
+        expect(store.isOnChatSubscriptionActive(id)).toBe(true);
+        expect(onChatSignals(id)).toHaveLength(1);
+        expect(onChatSignals(id)[0]?.aborted).toBe(false);
+      }
+
+      // Switching the routed chat must not restart either side chat's replay.
+      createAndAddWorkspace(store, "other");
+      await tick(0);
+      expect(onChatSignals("main")[0]?.aborted).toBe(true);
+      for (const id of ["side-a", "side-b"]) {
+        expect(onChatSignals(id)).toHaveLength(1);
+        expect(onChatSignals(id)[0]?.aborted).toBe(false);
+      }
+
+      // Close the last-mounted pane first: the older pane must keep its subscription.
+      releaseB();
+      expect(onChatSignals("side-b")[0]?.aborted).toBe(true);
+      expect(store.isOnChatSubscriptionActive("side-b")).toBe(false);
+      expect(store.isOnChatSubscriptionActive("side-a")).toBe(true);
+      expect(onChatSignals("side-a")[0]?.aborted).toBe(false);
+      expect(store.isOnChatSubscriptionActive("other")).toBe(true);
+      expect(onChatSignals("other")[0]?.aborted).toBe(false);
+      releaseA();
+      expect(store.isOnChatSubscriptionActive("side-a")).toBe(false);
+    });
+
+    it("subscribes once when the pinned workspace is also active", async () => {
+      createAndAddWorkspace(store, "main");
+      const release = store.acquirePinnedWorkspace("main");
+      await tick(0);
+      expect(onChatSignals("main")).toHaveLength(1);
+
+      // Unpinning keeps the routed chat's loop; deactivating while pinned keeps it too.
+      release();
+      const releaseAgain = store.acquirePinnedWorkspace("main");
+      store.setActiveWorkspaceId(null);
+      await tick(0);
+      expect(onChatSignals("main")).toHaveLength(1);
+      expect(onChatSignals("main")[0]?.aborted).toBe(false);
+      expect(store.isOnChatSubscriptionActive("main")).toBe(true);
+      releaseAgain();
+      expect(onChatSignals("main")[0]?.aborted).toBe(true);
+    });
+
+    it("releases duplicate owners independently and ignores repeated cleanup", async () => {
+      createAndAddWorkspace(store, "side", {}, false);
+      const releaseFirst = store.acquirePinnedWorkspace("side");
+      const releaseSecond = store.acquirePinnedWorkspace("side");
+      await tick(0);
+      expect(onChatSignals("side")).toHaveLength(1);
+      expect(mockGetSessionUsage).toHaveBeenCalledTimes(1);
+
+      releaseFirst();
+      releaseFirst();
+      expect(store.isOnChatSubscriptionActive("side")).toBe(true);
+      expect(onChatSignals("side")[0]?.aborted).toBe(false);
+      releaseSecond();
+      expect(store.isOnChatSubscriptionActive("side")).toBe(false);
+      expect(onChatSignals("side")[0]?.aborted).toBe(true);
+
+      const releaseNew = store.acquirePinnedWorkspace("side");
+      await tick(0);
+      releaseSecond();
+      expect(store.isOnChatSubscriptionActive("side")).toBe(true);
+      expect(onChatSignals("side")[1]?.aborted).toBe(false);
+      releaseNew();
+      expect(onChatSignals("side")[1]?.aborted).toBe(true);
+    });
+
+    it("aborts all pins on disposal without letting old cleanup release later owners", async () => {
+      createAndAddWorkspace(store, "main");
+      createAndAddWorkspace(store, "side-a", {}, false);
+      createAndAddWorkspace(store, "side-b", {}, false);
+      const releaseA = store.acquirePinnedWorkspace("side-a");
+      const releaseB = store.acquirePinnedWorkspace("side-b");
+      await tick(0);
+      store.dispose();
+      for (const id of ["main", "side-a", "side-b"]) {
+        expect(onChatSignals(id)[0]?.aborted).toBe(true);
+        expect(store.isOnChatSubscriptionActive(id)).toBe(false);
+      }
+
+      createAndAddWorkspace(store, "side-a", {}, false);
+      const releaseNew = store.acquirePinnedWorkspace("side-a");
+      releaseA();
+      releaseB();
+      expect(store.isOnChatSubscriptionActive("side-a")).toBe(true);
+      expect(store.isOnChatSubscriptionActive("side-b")).toBe(false);
+      releaseNew();
+      expect(store.isOnChatSubscriptionActive("side-a")).toBe(false);
+    });
+
+    it("delivers independent live events to two pinned transcripts", async () => {
+      const streams = new Map([
+        ["side-a", createControllableAsyncIterable<WorkspaceChatMessage>()],
+        ["side-b", createControllableAsyncIterable<WorkspaceChatMessage>()],
+      ]);
+      mockOnChat.mockImplementation(async function* (input, options) {
+        const stream = streams.get(input?.workspaceId ?? "");
+        if (!stream) {
+          await waitForAbortSignal(options?.signal);
+          return;
+        }
+        options?.signal?.addEventListener("abort", () => stream.close(), { once: true });
+        yield* stream.iterable;
+      });
+      createAndAddWorkspace(store, "main");
+      for (const [id, stream] of streams) {
+        createAndAddWorkspace(store, id, {}, false);
+        store.acquirePinnedWorkspace(id);
+        stream.push(caughtUpEvent());
+      }
+      expect(
+        await waitUntil(() =>
+          [...streams.keys()].every((id) => store.getWorkspaceState(id).isTranscriptCaughtUp)
+        )
+      ).toBe(true);
+
+      for (const [id, stream] of streams) {
+        stream.push(streamStartEvent(id, `response-${id}`));
+        expect(await waitUntil(() => store.getWorkspaceState(id).canInterrupt)).toBe(true);
+        if (id === "side-a") {
+          expect(store.getWorkspaceState("side-b").canInterrupt).toBe(false);
+        }
+      }
+      expect(store.getWorkspaceState("side-a").canInterrupt).toBe(true);
+      expect(store.getWorkspaceState("side-b").canInterrupt).toBe(true);
+    });
+
+    it("starts late-registered pins and invalidates their owners on removal", async () => {
+      const releaseOld = store.acquirePinnedWorkspace("late-side");
+      await tick(0);
+      expect(onChatSignals("late-side")).toHaveLength(0);
+
+      createAndAddWorkspace(store, "late-side", {}, false);
+      await tick(0);
+      expect(onChatSignals("late-side")).toHaveLength(1);
+      expect(mockGetSessionUsage).toHaveBeenCalledWith({ workspaceId: "late-side" });
+
+      store.removeWorkspace("late-side");
+      expect(onChatSignals("late-side")[0]?.aborted).toBe(true);
+      expect(store.isOnChatSubscriptionActive("late-side")).toBe(false);
+
+      // A re-registered workspace with the same id is not silently re-pinned.
+      createAndAddWorkspace(store, "late-side", {}, false);
+      await tick(0);
+      expect(onChatSignals("late-side")).toHaveLength(1);
+
+      const releaseNew = store.acquirePinnedWorkspace("late-side");
+      await tick(0);
+      // Cleanup from the removed incarnation must not steal a new owner's subscription.
+      releaseOld();
+      expect(store.isOnChatSubscriptionActive("late-side")).toBe(true);
+      expect(onChatSignals("late-side")[1]?.aborted).toBe(false);
+      releaseNew();
+      expect(onChatSignals("late-side")[1]?.aborted).toBe(true);
+    });
+
+    it("trusts the caught-up aggregator over activity snapshots for the pinned workspace", async () => {
+      mockActivityList.mockResolvedValue({ side: createActivitySnapshot(10, { streaming: true }) });
+      mockActivitySubscribe.mockImplementation(idleActivitySubscription);
+      mockChatStreamFor("side", () => [
+        createHistoryMessageEvent("history-1", 1),
+        fullCaughtUpEvent(),
+      ]);
+      recreateStore();
+      createAndAddWorkspace(store, "main");
+      createAndAddWorkspace(store, "side", {}, false);
+
+      // Unsubscribed: the activity snapshot's streaming flag is the only signal.
+      expect(await waitUntil(() => store.getWorkspaceState("side").canInterrupt)).toBe(true);
+
+      store.acquirePinnedWorkspace("side");
+      expect(await waitUntil(() => store.getWorkspaceState("side").isTranscriptCaughtUp)).toBe(
+        true
+      );
+      const state = store.getWorkspaceState("side");
+      expect(state.messages).toHaveLength(1);
+      expect(state.canInterrupt).toBe(false);
+    });
   });
 
   describe("stale cached transcript", () => {
@@ -5924,6 +6098,29 @@ describe("WorkspaceStore", () => {
       });
     });
 
+    it("does not fire activity-driven completion for the pinned side chat", async () => {
+      const activeWorkspaceId = "active-workspace-pinned-stop";
+      const pinnedWorkspaceId = "pinned-workspace-stop";
+      const initialRecency = new Date("2024-01-05T00:00:00.000Z").getTime();
+      const initialSnapshot = createActivitySnapshot(initialRecency);
+      const releaseCompletion = mockBackgroundActivityTransition(
+        pinnedWorkspaceId,
+        initialSnapshot,
+        [{ ...initialSnapshot, recency: initialRecency + 1, streaming: false }]
+      );
+      const onResponseComplete = createResponseCompleteSpy();
+
+      recreateStore(onResponseComplete);
+      createAndAddWorkspace(store, activeWorkspaceId);
+      createAndAddWorkspace(store, pinnedWorkspaceId, {}, false);
+      store.acquirePinnedWorkspace(pinnedWorkspaceId);
+      releaseCompletion();
+      await tick(0);
+
+      // The side chat is on screen with a live onChat loop; its stream-end is authoritative.
+      expect(onResponseComplete).not.toHaveBeenCalled();
+    });
+
     it("marks background compaction stops from activity snapshots as non-notifying completions", async () => {
       const activeWorkspaceId = "active-workspace-compaction-snapshot";
       const backgroundWorkspaceId = "background-workspace-compaction-snapshot";
@@ -7087,372 +7284,6 @@ describe("WorkspaceStore", () => {
       expect(live.stdout).toContain("buffered");
     });
   });
-  describe("advisor-phase events", () => {
-    it("tracks the latest live advisor phase while the advisor tool is running", async () => {
-      const workspaceId = "advisor-phase-workspace-1";
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorPhaseEvent(workspaceId, "call-advisor-1", "preparing_context", 1),
-        advisorPhaseEvent(workspaceId, "call-advisor-1", "waiting_for_response", 2),
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLatestPhase = await waitUntil(
-        () =>
-          store.getAdvisorToolLivePhase(workspaceId, "call-advisor-1")?.phase ===
-          "waiting_for_response"
-      );
-      expect(hasLatestPhase).toBe(true);
-
-      const live = store.getAdvisorToolLivePhase(workspaceId, "call-advisor-1");
-      expect(live).toEqual({
-        phase: "waiting_for_response",
-        timestamp: 2,
-      });
-
-      const liveAgain = store.getAdvisorToolLivePhase(workspaceId, "call-advisor-1");
-      expect(liveAgain).toBe(live);
-    });
-
-    it("clears live advisor phase on advisor tool-call-end", async () => {
-      const workspaceId = "advisor-phase-workspace-2";
-      let releaseToolEnd: (() => void) | undefined;
-      const waitForToolEnd = new Promise<void>((resolve) => {
-        releaseToolEnd = resolve;
-      });
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorPhaseEvent(workspaceId, "call-advisor-2", "finalizing_result", 1),
-        waitForToolEnd,
-        toolCallEndEvent(
-          workspaceId,
-          "call-advisor-2",
-          "advisor",
-          { success: true },
-          {
-            messageId: "m-advisor-2",
-            timestamp: 2,
-          }
-        ),
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLivePhase = await waitUntil(
-        () =>
-          store.getAdvisorToolLivePhase(workspaceId, "call-advisor-2")?.phase ===
-          "finalizing_result"
-      );
-      expect(hasLivePhase).toBe(true);
-
-      releaseToolEnd?.();
-
-      const clearedLivePhase = await waitUntil(
-        () => store.getAdvisorToolLivePhase(workspaceId, "call-advisor-2") === undefined
-      );
-      expect(clearedLivePhase).toBe(true);
-    });
-
-    it("ignores duplicate advisor phases for the same tool call", async () => {
-      const workspaceId = "advisor-phase-workspace-3";
-      let releaseDuplicate: (() => void) | undefined;
-      const waitForDuplicate = new Promise<void>((resolve) => {
-        releaseDuplicate = resolve;
-      });
-
-      mockChatScript(
-        [
-          caughtUpEvent(),
-          Promise.resolve(),
-          advisorPhaseEvent(workspaceId, "call-advisor-3", "waiting_for_response", 1),
-          waitForDuplicate,
-          advisorPhaseEvent(workspaceId, "call-advisor-3", "waiting_for_response", 2),
-        ],
-        { keepOpen: true }
-      );
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasInitialPhase = await waitUntil(
-        () => store.getAdvisorToolLivePhase(workspaceId, "call-advisor-3")?.timestamp === 1
-      );
-      expect(hasInitialPhase).toBe(true);
-
-      const live = store.getAdvisorToolLivePhase(workspaceId, "call-advisor-3");
-      expect(live).toEqual({
-        phase: "waiting_for_response",
-        timestamp: 1,
-      });
-      if (!live) throw new Error("Expected live advisor phase");
-
-      let notificationCount = 0;
-      const unsubscribe = store.subscribeKey(workspaceId, () => {
-        notificationCount += 1;
-      });
-
-      releaseDuplicate?.();
-      await tick(10);
-
-      const liveAfterDuplicate = store.getAdvisorToolLivePhase(workspaceId, "call-advisor-3");
-      expect(liveAfterDuplicate).toBe(live);
-      expect(liveAfterDuplicate).toEqual({
-        phase: "waiting_for_response",
-        timestamp: 1,
-      });
-      expect(notificationCount).toBe(0);
-
-      unsubscribe();
-    });
-  });
-
-  describe("advisor-output events", () => {
-    it("accumulates live advisor output while the advisor tool is running", async () => {
-      const workspaceId = "advisor-output-workspace-1";
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorOutputEvent(workspaceId, "call-advisor-output-1", "first ", 1),
-        advisorOutputEvent(workspaceId, "call-advisor-output-1", "second", 2),
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveOutput = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-1")?.text ===
-          "first second"
-      );
-      expect(hasLiveOutput).toBe(true);
-
-      const live = store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-1");
-      expect(live).toEqual({ text: "first second", timestamp: 2 });
-      expect(store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-1")).toBe(live);
-    });
-
-    it("clears live advisor output on advisor tool-call-end", async () => {
-      const workspaceId = "advisor-output-workspace-2";
-      let releaseToolEnd: (() => void) | undefined;
-      const waitForToolEnd = new Promise<void>((resolve) => {
-        releaseToolEnd = resolve;
-      });
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorOutputEvent(workspaceId, "call-advisor-output-2", "partial advice", 1),
-        waitForToolEnd,
-        toolCallEndEvent(
-          workspaceId,
-          "call-advisor-output-2",
-          "advisor",
-          { type: "advice", advice: "partial advice" },
-          { messageId: "m-advisor-output-2", timestamp: 2 }
-        ),
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveOutput = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-2")?.text ===
-          "partial advice"
-      );
-      expect(hasLiveOutput).toBe(true);
-
-      releaseToolEnd?.();
-
-      const clearedLiveOutput = await waitUntil(
-        () => store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-2") === null
-      );
-      expect(clearedLiveOutput).toBe(true);
-    });
-
-    it("clears stale live advisor output after message deletion", async () => {
-      const workspaceId = "advisor-output-workspace-delete";
-      let releaseDelete: (() => void) | undefined;
-      const waitForDelete = new Promise<void>((resolve) => {
-        releaseDelete = resolve;
-      });
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorOutputEvent(workspaceId, "call-advisor-output-delete", "stale partial advice", 1),
-        waitForDelete,
-        { type: "delete", historySequences: [1] },
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveOutput = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-delete")?.text ===
-          "stale partial advice"
-      );
-      expect(hasLiveOutput).toBe(true);
-      const advisorListener = mock(() => undefined);
-      const unsubscribe = store.subscribeAdvisorLive(
-        workspaceId,
-        "call-advisor-output-delete",
-        advisorListener
-      );
-
-      releaseDelete?.();
-
-      const clearedLiveOutput = await waitUntil(
-        () => store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-delete") === null
-      );
-      expect(clearedLiveOutput).toBe(true);
-      // The delete-time sweep must release the keyed channel as well (which notifies its
-      // subscriber): with the transient entry gone, no later sweep can rediscover this key.
-      expect(advisorListener).toHaveBeenCalledTimes(1);
-      // Private on purpose: deletion (not a bump) is the leak guard, with no public observable.
-      const { advisorLiveStore } = getInternal<{
-        advisorLiveStore: { has: (key: string) => boolean };
-      }>(store);
-      expect(advisorLiveStore.has(`${workspaceId}\u0000call-advisor-output-delete`)).toBe(false);
-      unsubscribe();
-    });
-
-    it("releases keyed advisor channels when a full replay resets transient state", async () => {
-      const workspaceId = "advisor-output-full-replay-reset";
-
-      const endFirstAttempt = createReleaseGate();
-      // The first attempt ends without history, so the retry is a full replay that
-      // resets transient state; the retry itself stays open and silent.
-      const subscriptions = mockChatReconnectScript((attempt, signal) =>
-        attempt === 1
-          ? [
-              caughtUpEvent(),
-              Promise.resolve(),
-              advisorOutputEvent(workspaceId, "call-advisor-replay-reset", "partial advice", 1),
-              endFirstAttempt.wait,
-            ]
-          : [() => waitForAbortSignal(signal)]
-      );
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveOutput = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-replay-reset")?.text ===
-          "partial advice"
-      );
-      expect(hasLiveOutput).toBe(true);
-      const advisorListener = mock(() => undefined);
-      const unsubscribe = store.subscribeAdvisorLive(
-        workspaceId,
-        "call-advisor-replay-reset",
-        advisorListener
-      );
-
-      endFirstAttempt.release();
-      expect(await waitUntil(() => subscriptions() === 2)).toBe(true);
-      await tick(0);
-
-      // The replaced transient maps were the only record of this tool-call ID,
-      // so the reset itself must release the keyed channel (notifying its subscriber).
-      expect(advisorListener).toHaveBeenCalledTimes(1);
-      expect(store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-replay-reset")).toBeNull();
-      // Private on purpose: deletion (not a bump) is the leak guard, with no public observable.
-      const { advisorLiveStore } = getInternal<{
-        advisorLiveStore: { has: (key: string) => boolean };
-      }>(store);
-      expect(advisorLiveStore.has(`${workspaceId}\u0000call-advisor-replay-reset`)).toBe(false);
-      unsubscribe();
-      mockChatScript([], { keepOpen: true });
-    });
-
-    it("replays pre-caught-up advisor output after full replay catches up", async () => {
-      const workspaceId = "advisor-output-workspace-3";
-
-      mockChatScript([
-        advisorOutputEvent(workspaceId, "call-advisor-output-3", "buffered advice", 1),
-        Promise.resolve(),
-        caughtUpEvent({ replay: "full" }),
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveOutput = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-3")?.text ===
-          "buffered advice"
-      );
-      expect(hasLiveOutput).toBe(true);
-    });
-  });
-
-  describe("advisor-reasoning-output events", () => {
-    it("accumulates live advisor reasoning while the advisor tool is running", async () => {
-      const workspaceId = "advisor-reasoning-workspace-1";
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorReasoningOutputEvent(workspaceId, "call-advisor-reasoning-1", "thinking ", 1),
-        advisorReasoningOutputEvent(workspaceId, "call-advisor-reasoning-1", "through risk", 2),
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveReasoning = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveReasoning(workspaceId, "call-advisor-reasoning-1")?.text ===
-          "thinking through risk"
-      );
-      expect(hasLiveReasoning).toBe(true);
-
-      const live = store.getAdvisorToolLiveReasoning(workspaceId, "call-advisor-reasoning-1");
-      expect(live).toEqual({ text: "thinking through risk", timestamp: 2 });
-      expect(store.getAdvisorToolLiveReasoning(workspaceId, "call-advisor-reasoning-1")).toBe(live);
-    });
-
-    it("clears live advisor reasoning on advisor tool-call-end", async () => {
-      const workspaceId = "advisor-reasoning-workspace-2";
-      let releaseToolEnd: (() => void) | undefined;
-      const waitForToolEnd = new Promise<void>((resolve) => {
-        releaseToolEnd = resolve;
-      });
-
-      mockChatScript([
-        caughtUpEvent(),
-        Promise.resolve(),
-        advisorReasoningOutputEvent(workspaceId, "call-advisor-reasoning-2", "partial thought", 1),
-        waitForToolEnd,
-        toolCallEndEvent(
-          workspaceId,
-          "call-advisor-reasoning-2",
-          "advisor",
-          { type: "advice", advice: "final advice" },
-          { messageId: "m-advisor-reasoning-2", timestamp: 2 }
-        ),
-      ]);
-
-      createAndAddWorkspace(store, workspaceId);
-
-      const hasLiveReasoning = await waitUntil(
-        () =>
-          store.getAdvisorToolLiveReasoning(workspaceId, "call-advisor-reasoning-2")?.text ===
-          "partial thought"
-      );
-      expect(hasLiveReasoning).toBe(true);
-
-      releaseToolEnd?.();
-
-      const clearedLiveReasoning = await waitUntil(
-        () => store.getAdvisorToolLiveReasoning(workspaceId, "call-advisor-reasoning-2") === null
-      );
-      expect(clearedLiveReasoning).toBe(true);
-    });
-  });
-
   describe("workflow-run-attached events", () => {
     it("exposes the exact workflow run while the workflow tool is running", async () => {
       const workspaceId = "workflow-run-attached-workspace-1";

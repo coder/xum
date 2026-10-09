@@ -159,6 +159,10 @@ export const WorkspaceConfigSchema = z.object({
     description:
       "If set, this workspace is a child workspace spawned from the parent workspaceId (enables nesting in UI and backend orchestration).",
   }),
+  sideChatParentWorkspaceId: z.string().optional().meta({
+    description:
+      'If set, this workspace is an ephemeral /side chat forked from the given workspace: its `path` points at that workspace\'s checkout (with taskIsolation "none"), and it is discarded when the user leaves it or the backend restarts.',
+  }),
   memoryOwnerWorkspaceId: z.string().optional().meta({
     description:
       "Memory owner pinned when an intermediate ancestor was removed while this descendant stayed alive: the parentWorkspaceId chain no longer reaches the task-tree root, so this keeps /memories/workspace bound to the root's store (memoryWorkspaceOwner.ts). Set only by workspace removal.",

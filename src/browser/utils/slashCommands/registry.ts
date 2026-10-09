@@ -345,6 +345,31 @@ const newCommandDefinition: SlashCommandDefinition = {
   },
 };
 
+// Opening a side chat is separate from sending a question: let the user compose in the new pane.
+const parseSideCommand: NonNullable<SlashCommandDefinition["handler"]> = ({
+  rawInput,
+  definition,
+}) => {
+  const input = rawInput.trim();
+  return input.length === 0
+    ? { type: "side" }
+    : { type: "command-invalid-args", command: definition.key, input, usage: `/${definition.key}` };
+};
+
+const sideCommandDefinition: SlashCommandDefinition = {
+  key: "side",
+  description: "Open a new side chat next to this chat. Closing it discards it.",
+  appendSpace: false,
+  handler: parseSideCommand,
+};
+
+const btwCommandDefinition: SlashCommandDefinition = {
+  key: "btw",
+  description: "Alias for /side.",
+  appendSpace: false,
+  handler: parseSideCommand,
+};
+
 const IDLE_USAGE = `/idle ${SLASH_COMMAND_HINTS.idle}`;
 const HEARTBEAT_USAGE = `/heartbeat ${SLASH_COMMAND_HINTS.heartbeat}`;
 const HEARTBEAT_INTERVAL_GRANULARITY_MS = 60_000;
@@ -696,6 +721,8 @@ export const SLASH_COMMAND_DEFINITIONS: readonly SlashCommandDefinition[] = [
 
   forkCommandDefinition,
   newCommandDefinition,
+  sideCommandDefinition,
+  btwCommandDefinition,
   vimCommandDefinition,
   idleCommandDefinition,
   heartbeatCommandDefinition,

@@ -8,6 +8,7 @@ import React, {
   useMemo,
 } from "react";
 import { Lightbulb } from "lucide-react";
+import { SideChatBanner } from "@/browser/components/SideChatBanner/SideChatBanner";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
@@ -162,10 +163,16 @@ interface ChatPaneProps {
   immersiveHidden?: boolean;
 }
 
-type ChatPaneContentProps = Omit<
+export type ChatPaneContentProps = Omit<
   ChatPaneProps,
   "leftSidebarCollapsed" | "onToggleLeftSidebarCollapsed" | "immersiveHidden"
->;
+> & {
+  /**
+   * Rendered inside another surface (the /side chat tab in the right sidebar) rather than as
+   * the page's main chat, so the touch-device header spacer does not apply.
+   */
+  embedded?: boolean;
+};
 
 type ReviewsState = ReturnType<typeof useReviews>;
 
@@ -269,30 +276,44 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
           "[@media(max-width:768px)]:min-w-0"
         )}
       >
-        <PerfRenderMarker id="chat-pane.header">
-          <WorkspaceMenuBar
+        {/* The chat is the page's primary content, so it is the one `main` landmark in every
+            layout (landmark-one-main, #5956). The footer stays outside it so it remains the page's
+            contentinfo landmark, and the project and right sidebars stay outside too. The wrapper
+            keeps the column flex layout and adds no positioning context. */}
+        <main className="flex min-h-0 flex-1 flex-col">
+          <PerfRenderMarker id="chat-pane.header">
+            <WorkspaceMenuBar
+              workspaceId={workspaceId}
+              projectName={props.projectName}
+              projectPath={props.projectPath}
+              workspaceName={props.workspaceName}
+              workspaceTitle={workspaceTitle}
+              leftSidebarCollapsed={props.leftSidebarCollapsed}
+              onToggleLeftSidebarCollapsed={props.onToggleLeftSidebarCollapsed}
+              namedWorkspacePath={props.namedWorkspacePath}
+              runtimeConfig={props.runtimeConfig}
+              onOpenTerminal={props.onOpenTerminal}
+            />
+          </PerfRenderMarker>
+
+          {meta?.sideChatParentWorkspaceId != null && (
+            <SideChatBanner
+              key={workspaceId}
+              workspaceId={workspaceId}
+              parentWorkspaceId={meta.sideChatParentWorkspaceId}
+            />
+          )}
+
+          <ChatPaneContent
             workspaceId={workspaceId}
-            projectName={props.projectName}
             projectPath={props.projectPath}
+            projectName={props.projectName}
             workspaceName={props.workspaceName}
-            workspaceTitle={workspaceTitle}
-            leftSidebarCollapsed={props.leftSidebarCollapsed}
-            onToggleLeftSidebarCollapsed={props.onToggleLeftSidebarCollapsed}
             namedWorkspacePath={props.namedWorkspacePath}
             runtimeConfig={props.runtimeConfig}
             onOpenTerminal={props.onOpenTerminal}
           />
-        </PerfRenderMarker>
-
-        <ChatPaneContent
-          workspaceId={workspaceId}
-          projectPath={props.projectPath}
-          projectName={props.projectName}
-          workspaceName={props.workspaceName}
-          namedWorkspacePath={props.namedWorkspacePath}
-          runtimeConfig={props.runtimeConfig}
-          onOpenTerminal={props.onOpenTerminal}
-        />
+        </main>
 
         {/* Reset the footer's scroll and popover state because ChatPane remains mounted across
             workspace switches. */}
@@ -310,7 +331,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   );
 };
 
-const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
+export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const {
     workspaceId,
     projectName,
@@ -1485,7 +1506,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             The composer dock is IN-FLOW scroll content (sticky to the scrollport
             bottom), so this region — and therefore the scrollport's clientHeight —
             never resizes when the composer grows or shrinks. */}
-        <div className="mobile-header-spacer relative flex-1 overflow-hidden">
+        <div
+          className={cn(
+            "relative flex-1 overflow-hidden",
+            props.embedded !== true && "mobile-header-spacer"
+          )}
+        >
           <div
             ref={contentRef}
             onWheel={handleTranscriptWheel}

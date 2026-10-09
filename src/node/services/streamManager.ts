@@ -736,6 +736,15 @@ function isAnthropicMessagesModel(model: LanguageModel): boolean {
   );
 }
 
+// Claude through Bedrock Converse (@ai-sdk/amazon-bedrock), whose converter replays
+// in-turn thinking from the `bedrock` namespace. Same id test as the SDK's own
+// isAnthropicModel, plus the metadata model for opaque ids that map to Claude
+// (application inference profile ARNs with mappedToModel).
+function isBedrockClaudeModel(model: LanguageModel, metadataModel: string | undefined): boolean {
+  if (typeof model === "string" || model.provider !== "amazon-bedrock") return false;
+  return model.modelId.includes("anthropic") || metadataModel?.includes("claude-") === true;
+}
+
 // Stream state enum for exhaustive checking
 enum StreamState {
   IDLE = "idle",
@@ -3157,7 +3166,7 @@ export class StreamManager {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
             }
             // onStepMessages fired above with the pre-rebuild transcript;
-            // re-notify so consumers (advisor transcript ref) track the
+            // re-notify so consumers track the
             // messages this step actually sends.
             request.onStepMessages?.(rebuiltFirstStepMessages);
           } catch (error) {
@@ -3175,6 +3184,7 @@ export class StreamManager {
         // keep replaying (#5279). This applies to every Anthropic Messages thinking mode,
         // not only `between_tools` (which cannot carry blockBinding): only the direct API
         // route sends `drop_block`, so adaptive/enabled thinking on other routes would 400.
+        // Claude on Bedrock gets the same strip (#5841): Bedrock cannot take drop_block.
         const toolSetKey = activeTools === undefined ? "" : [...activeTools].sort().join("\n");
         const consumedSwap = stepTracker?.consumedPrefixSwap;
         const outgoing = rebuiltFirstStepMessages ?? effectiveMessages;
@@ -3190,7 +3200,8 @@ export class StreamManager {
         previousToolSetKey = toolSetKey;
         if (
           (sendsBetweenToolsThinking(request.providerOptions) ||
-            isAnthropicMessagesModel(request.model)) &&
+            isAnthropicMessagesModel(request.model) ||
+            isBedrockClaudeModel(request.model, request.budgetMetadataModel)) &&
           outgoing.some(
             (message, index) =>
               index < reasoningReplayBoundary &&
@@ -3208,6 +3219,10 @@ export class StreamManager {
           } else {
             effectiveMessages = stripped;
           }
+          // No receipt for Bedrock: Xum never replays Bedrock thinking across turns
+          // (sanitizeReasoningReplayMetadata keeps no `bedrock` namespace), so the
+          // stripped blocks cannot come back, and a receipt would strip later
+          // Anthropic-route thinking in the same segment for nothing.
           if (stepTracker && isAnthropicMessagesModel(request.model)) {
             stepTracker.anthropicThinkingStripped = true;
           }

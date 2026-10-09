@@ -1538,7 +1538,7 @@ export class ProviderModelFactory {
     const self = this;
     return Effect.gen(function* () {
       // Perf harness replay mode (XUM_REPLAY_TAPES): no provider call, by construction. Every
-      // chat, status, title, compaction, refine, memory, advisor and intuition model is created
+      // chat, status, title, compaction, refine, memory and intuition model is created
       // through here, so no per-service gate is needed.
       if (isSessionTapeReplayMode()) {
         return Err<SendMessageError>({

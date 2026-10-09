@@ -58,7 +58,8 @@ export function StatsContainer(props: StatsContainerProps) {
                 type="button"
                 className={`rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors ${
                   isActive
-                    ? "bg-accent text-foreground"
+                    ? // text-foreground on the accent failed WCAG AA in every theme (#5980).
+                      "bg-accent text-accent-foreground"
                     : "text-muted hover:text-foreground hover:bg-accent/50"
                 }`}
                 onClick={() => setSubTab(option.value)}

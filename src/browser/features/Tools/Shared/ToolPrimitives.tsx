@@ -24,7 +24,6 @@ import {
   Keyboard,
   Layers,
   LayoutGrid,
-  Lightbulb,
   MessageCircleQuestion,
   Monitor,
   Move,
@@ -259,7 +258,6 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   // Cpu reads as "the models (compute) you can pick from"; distinct from the
   // Brain/BrainCircuit glyphs used for memory tools.
   models_list: Cpu,
-  advisor: Lightbulb,
   ask_user_question: MessageCircleQuestion,
   file_read: BookOpen,
   session_history: History,

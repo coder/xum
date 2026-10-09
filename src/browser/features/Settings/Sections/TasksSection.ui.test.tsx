@@ -268,7 +268,6 @@ describe("TasksSection Exec subagent defaults", () => {
       agentAiDefaults: {
         intuition: {
           modelString: "openai:gpt-6-luna",
-          advisorEnabled: true,
           thinkingLevel: "high",
         },
       },
@@ -282,15 +281,9 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(within(card).getByRole<HTMLSelectElement>("combobox", { name: "Model" }).value).toBe(
       "openai:gpt-6-luna"
     );
-    expect(within(card).queryByLabelText("Toggle intuition advisor")).toBeNull();
     expect(within(card).getAllByRole("switch")).toHaveLength(1);
     expect(within(card).getAllByRole("combobox")).toHaveLength(1);
     expect(within(card).getByRole("button", { name: "Reasoning" }).textContent).toContain("High");
-    expect(
-      within(getAgentCardByName(view, "Name Workspace")).getByLabelText(
-        "Toggle name_workspace advisor"
-      )
-    ).toBeTruthy();
     selectReasoningOption(card, "Medium");
     await waitFor(() => {
       expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition).toMatchObject({
@@ -435,16 +428,6 @@ describe("TasksSection Exec subagent defaults", () => {
     expect(within(getExecSubagentRow(view)).getByText("Exec")).toBeTruthy();
     expect(view.getByText("UI agents")).toBeTruthy();
     expect(view.getByText("Sub-agents")).toBeTruthy();
-  });
-
-  test("defaults advisor on for Exec and Plan", async () => {
-    const view = renderTasksSection();
-
-    const planAdvisorSwitch = await view.findByRole("switch", { name: "Toggle plan advisor" });
-    const execAdvisorSwitch = view.getByRole("switch", { name: "Toggle exec advisor" });
-
-    expect(execAdvisorSwitch.getAttribute("aria-checked")).toBe("true");
-    expect(planAdvisorSwitch.getAttribute("aria-checked")).toBe("true");
   });
 
   test("preserves unchanged nested subagent defaults when saving an agent-only change", async () => {

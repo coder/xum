@@ -17,6 +17,7 @@ import {
   Sparkles,
   Target,
   ListTree,
+  MessagesSquare,
   Terminal as TerminalIcon,
   Workflow,
   X,
@@ -75,7 +76,9 @@ export const StatsTabLabel: React.FC<StatsTabLabelProps> = ({ workspaceId }) => 
     <>
       Stats
       {sessionCost !== null && (
-        <span className="text-muted text-[10px] tabular-nums">
+        // No own color: the count inherits the tab's. A muted count failed WCAG AA on the
+        // selected tab's bg-hover in every theme (#5965).
+        <span className="text-[10px] tabular-nums">
           ${sessionCost < 0.01 ? "<0.01" : sessionCost.toFixed(2)}
         </span>
       )}
@@ -138,7 +141,9 @@ export const ReviewTabLabel: React.FC<ReviewTabLabelProps> = ({ reviewStats }) =
     <>
       Review
       {reviewStats !== null && reviewStats.total > 0 && (
-        <span className="text-muted text-[10px]">
+        // No own color: the count inherits the tab's. A muted count failed WCAG AA on the
+        // selected tab's bg-hover in every theme (#5965).
+        <span className="text-[10px]">
           {reviewStats.read}/{reviewStats.total}
         </span>
       )}
@@ -318,8 +323,10 @@ export const InstructionsTabLabel: React.FC<InstructionsTabLabelProps> = ({ work
     <>
       Instructions
       {showBadge && (
+        // No own color: the count inherits the tab's. A muted count failed WCAG AA on the
+        // selected tab's bg-hover in every theme (#5965).
         <span
-          className="text-muted text-[10px] tabular-nums"
+          className="text-[10px] tabular-nums"
           aria-label={
             chatInstructionsActive
               ? `${baseCount} instruction files plus active Chat Instructions`
@@ -337,6 +344,34 @@ export const InstructionsTabLabel: React.FC<InstructionsTabLabelProps> = ({ work
         </span>
       )}
     </>
+  );
+};
+
+/** /side chat tab label: closing the tab discards the side chat. */
+export const SideChatTabLabel: React.FC<{ onClose: () => void }> = (props) => {
+  return (
+    <span className="inline-flex items-center gap-1">
+      <MessagesSquare className="h-3 w-3 shrink-0" />
+      <span>Side chat</span>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            className="text-muted hover:text-destructive -my-0.5 rounded p-0.5 transition-colors"
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onClose();
+            }}
+            aria-label="Close side chat"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">
+          Close and discard side chat ({formatKeybind(KEYBINDS.CLOSE_TAB)})
+        </TooltipContent>
+      </Tooltip>
+    </span>
   );
 };
 

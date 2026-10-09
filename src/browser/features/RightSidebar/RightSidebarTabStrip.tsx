@@ -74,7 +74,10 @@ const SortableTab: React.FC<{
   const sortableOnKeyDown = listeners?.onKeyDown;
 
   return (
-    <div className={cn("relative shrink-0", isDesktop && "titlebar-no-drag")} style={style}>
+    <div
+      className={cn("relative mr-1 mb-1 inline-flex align-middle", isDesktop && "titlebar-no-drag")}
+      style={style}
+    >
       <Tooltip>
         <TooltipTrigger asChild>
           <div
@@ -168,26 +171,31 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         // In desktop mode, make header draggable for window movement
         isDesktop && "titlebar-drag"
       )}
-      role="tablist"
-      aria-label={ariaLabel}
     >
-      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
-        {items.map((item, index) => (
-          <SortableTab
-            key={item.id}
-            item={item}
-            index={index}
-            tabsetId={tabsetId}
-            isDesktop={isDesktop}
-          />
-        ))}
+      {/* The tablist owns only tabs (aria-required-children, #5951), so the "+" button is its
+          sibling. To keep "+" right after the last tab when the tabs wrap, the tabs and "+" flow
+          as inline boxes in one block. The tablist is a plain inline box, not `display: contents`,
+          because Safari has dropped the role of `display: contents` elements (#5962). Margins
+          on each item, offset by negative margins here, stand in for a 4 px flex gap. */}
+      <div className="-mr-1 -mb-1 min-w-0 flex-1">
+        <div className="inline" role="tablist" aria-label={ariaLabel}>
+          {items.map((item, index) => (
+            <SortableTab
+              key={item.id}
+              item={item}
+              index={index}
+              tabsetId={tabsetId}
+              isDesktop={isDesktop}
+            />
+          ))}
+        </div>
         {onAddTerminal && (
           <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="button"
                 className={cn(
-                  "text-muted hover:bg-hover hover:text-foreground shrink-0 rounded-md p-1 transition-colors",
+                  "text-muted hover:bg-hover hover:text-foreground mr-1 mb-1 shrink-0 rounded-md p-1 align-middle transition-colors",
                   isDesktop && "titlebar-no-drag"
                 )}
                 onClick={onAddTerminal}

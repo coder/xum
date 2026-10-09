@@ -8,6 +8,27 @@ export const SHIKI_DARK_THEME = "min-dark";
 export const SHIKI_LIGHT_THEME = "min-light";
 
 /**
+ * Darker replacements for min-light colors that miss WCAG AA (4.5:1) on the light code
+ * backgrounds the app renders: `--color-code-bg` in light and flexoki-light, and the review
+ * diff's green and red line tints over it (#5980). Same hue, lower lightness, chosen for at
+ * least 4.6:1 on the darkest of those (the flexoki-light removed-line tint).
+ * Keyed by theme name, so Shiki applies them only to min-light; min-dark keeps its colors.
+ * Keys must be lowercase: Shiki lowercases a color before the lookup.
+ */
+export const SHIKI_COLOR_REPLACEMENTS: Record<string, Record<string, string>> = {
+  [SHIKI_LIGHT_THEME]: {
+    "#c2c3c5": "#64666a", // comment
+    "#1976d2": "#1667b7", // constant, number, link
+    "#ff9800": "#945800", // function parameter
+    "#22863a": "#1e7533", // tag, quoted string
+    "#d32f2f": "#c22929", // keyword, storage
+    "#cd3131": "#c02e2e", // error token
+    "#316bcd": "#2d63be", // info token
+    "#cd9731": "#82601f", // warning token
+  },
+};
+
+/**
  * Whether a theme-mode string maps to the light Shiki theme.
  *
  * Accepts both base modes (`"light"`/`"dark"`) and namespaced variants

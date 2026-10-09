@@ -1,6 +1,8 @@
 /**
- * The root page with no project selected (#5948): its empty-state line meets WCAG AA contrast in
- * every theme. Lighthouse measured the light theme's muted text at 3.8:1 before the fix.
+ * The root page with no project (#5948, #5950): its empty-state line, the title bar's version, the
+ * sidebar's "No projects" text and both "Add Project" buttons meet WCAG AA contrast in every
+ * theme. Lighthouse measured the light theme's muted and secondary text at 2.9-3.8:1 before the
+ * fixes.
  */
 
 import { expect, within } from "@storybook/test";
@@ -29,7 +31,23 @@ const contractStory = (theme: ThemeMode): AppStory => ({
       {},
       { timeout: 15_000 }
     );
-    await expect(textContrast(line)).toBeGreaterThanOrEqual(4.5);
+    const versionButton = await canvas.findByRole("button", { name: "Open about dialog" });
+    const version = versionButton.querySelector<HTMLElement>("div.truncate");
+    if (!version) throw new Error("version text not found in the title bar");
+    const texts = [
+      line,
+      version,
+      await canvas.findByText("No projects"),
+      // The sidebar header's button (aria-label "Add project") and the empty state's button.
+      ...(await canvas.findAllByRole("button", { name: /^\+?\s*Add project$/i })),
+    ];
+    // The two "Add Project" buttons and the three texts: a missing one would skip its check.
+    await expect(texts).toHaveLength(5);
+    for (const text of texts) {
+      await expect(textContrast(text), `contrast of "${text.textContent}"`).toBeGreaterThanOrEqual(
+        4.5
+      );
+    }
   },
 });
 

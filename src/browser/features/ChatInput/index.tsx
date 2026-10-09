@@ -108,7 +108,9 @@ import {
   isCommandPaletteTarget,
   isDialogOpen,
   isEditableElement,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import {
   hasBudgetedResumableGoal,
   modelHasPricingData,
@@ -310,6 +312,10 @@ interface EditSession {
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
   const { variant } = props;
+  // A /side chat composer is mounted next to the main one. Window shortcuts act only in the pane
+  // that owns the focused element, and unscoped palette events (open model selector, voice, toasts)
+  // belong to the main composer so they fire once.
+  const paneScope = useChatPaneScope();
   const { userProjects } = useProjectContext();
   const creationScope =
     variant === "creation"
@@ -590,7 +596,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
 
   const { open } = useSettings();
-  const { selectedWorkspace, beginWorkspaceCreation } = useWorkspaceContext();
+  const { selectedWorkspace, beginWorkspaceCreation, workspaceMetadata } = useWorkspaceContext();
   const { agentId, currentAgent, agents } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
@@ -1290,7 +1296,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   useEffect(() => {
     const handleGlobalKeyDown = (event: KeyboardEvent) => {
-      if (isEditableElement(event.target)) {
+      if (isEditableElement(event.target) || !paneHandlesKeyEvent(paneScope, event.target)) {
         return;
       }
 
@@ -1317,7 +1323,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       window.removeEventListener("keydown", handleGlobalKeyDown);
     };
-  }, [focusMessageInput, openModelSelector]);
+  }, [focusMessageInput, openModelSelector, paneScope]);
 
   // When entering editing mode, save current draft and populate with message content.
   // Runs once per edit target: the draft callbacks change identity as the user types, and
@@ -1471,6 +1477,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent<UpdateDetail>).detail;
       if (detail.workspaceId != null && workspaceIdForComposerClear !== detail.workspaceId) {
+        return;
+      }
+      // Unscoped updates come from the palette / main UI; the side composer only takes updates
+      // addressed to its own workspace so text is never inserted into both composers.
+      if (detail.workspaceId == null && paneScope !== "main") {
         return;
       }
       const { inputs } = detail;
@@ -1662,6 +1673,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     draftScope,
     focusMessageInput,
     api,
+    paneScope,
   ]);
 
   useEffect(() => {
@@ -1692,6 +1704,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Allow external components to open the Model Selector
   useEffect(() => {
+    // Unscoped palette event: the main composer owns it (see paneScope).
+    if (paneScope !== "main") return;
     const handler = () => {
       // Open the inline ModelSelector and let it take focus itself
       modelSelectorRef.current?.open();
@@ -1699,7 +1713,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     window.addEventListener(CUSTOM_EVENTS.OPEN_MODEL_SELECTOR, handler as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.OPEN_MODEL_SELECTOR, handler as EventListener);
-  }, []);
+  }, [paneScope]);
 
   // Show toast when thinking level is changed via command palette (workspace only)
   useEffect(() => {
@@ -1736,6 +1750,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Show toast feedback for analytics rebuild command palette action.
   useEffect(() => {
+    // Unscoped palette event: the main composer owns it so the toast shows once.
+    if (paneScope !== "main") return;
     const handler = (event: Event) => {
       const detail = (
         event as CustomEvent<CustomEventPayloads[typeof CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST]>
@@ -1757,11 +1773,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     window.addEventListener(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, handler as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, handler as EventListener);
-  }, [pushToast]);
+  }, [pushToast, paneScope]);
 
   // Voice input: command palette toggle + global recording keybinds
   useEffect(() => {
-    if (!voiceInput.shouldShowUI) return;
+    // Unscoped palette event: only the main composer starts recording (see paneScope).
+    if (!voiceInput.shouldShowUI || paneScope !== "main") return;
 
     const handleToggle = () => {
       if (!voiceInput.isAvailable) {
@@ -1778,7 +1795,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       window.removeEventListener(CUSTOM_EVENTS.TOGGLE_VOICE_INPUT, handleToggle as EventListener);
     };
-  }, [voiceInput, pushToast, voiceInputUnavailableMessage]);
+  }, [voiceInput, pushToast, voiceInputUnavailableMessage, paneScope]);
 
   // Auto-focus chat input when workspace changes (workspace only).
   const workspaceIdForFocus = variant === "workspace" ? props.workspaceId : null;
@@ -1965,6 +1982,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       attachments,
       fileParts: commandFileParts.length > 0 ? commandFileParts : undefined,
       attachedReviewIds: options?.reviews ? options.reviews.ids : reviewIdsForCheck,
+      isSideChat:
+        commandWorkspaceId != null &&
+        workspaceMetadata.get(commandWorkspaceId)?.sideChatParentWorkspaceId != null,
       isCurrent: () => {
         const scope = asyncCommandScopeRef.current;
         return (
@@ -3335,11 +3355,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     placeholder={placeholder}
                     disabled={!editingMessageForUi && (disabled || sendInFlightBlocksInput)}
                     aria-label={editingMessageForUi ? "Edit message" : "Message"}
+                    // No aria-expanded: the textbox role does not allow it (#5951), and a
+                    // textarea cannot take role="combobox" without screen readers treating
+                    // the multi-line composer as a single-line field.
                     aria-autocomplete="list"
                     aria-controls={
                       composerSuggestions.isVisible ? composerSuggestions.listId : undefined
                     }
-                    aria-expanded={composerSuggestions.isVisible}
                     // Creation favors prompt space; workspaces preserve transcript space. Mobile
                     // hides the shortcut hints the workspace floor exists for, so that room is
                     // dead space on a screen that has none to spare.

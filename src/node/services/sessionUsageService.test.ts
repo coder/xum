@@ -404,19 +404,19 @@ describe("SessionUsageService", () => {
     it("keeps mixed-model session totals separate while lastRequest follows the latest write", async () => {
       const workspaceId = "test-workspace";
       const parentModel = "openai:gpt-5.2";
-      const advisorModel = "anthropic:claude-sonnet-4-20250514";
+      const intuitionModel = "anthropic:claude-sonnet-4-20250514";
       const parentUsage = createUsage(100, 50);
-      const advisorUsage = createUsage(40, 10);
+      const intuitionUsage = createUsage(40, 10);
 
       await service.recordUsage(workspaceId, parentModel, parentUsage);
-      await service.recordUsage(workspaceId, advisorModel, advisorUsage);
+      await service.recordUsage(workspaceId, intuitionModel, intuitionUsage);
 
       const result = await service.getSessionUsage(workspaceId);
       expect(result).toBeDefined();
       expect(result?.byModel[parentModel]).toEqual(parentUsage);
-      expect(result?.byModel[advisorModel]).toEqual(advisorUsage);
-      expect(result?.lastRequest?.model).toBe(advisorModel);
-      expect(result?.lastRequest?.usage).toEqual(advisorUsage);
+      expect(result?.byModel[intuitionModel]).toEqual(intuitionUsage);
+      expect(result?.lastRequest?.model).toBe(intuitionModel);
+      expect(result?.lastRequest?.usage).toEqual(intuitionUsage);
     });
 
     it("should update lastRequest with each recordUsage call", async () => {
@@ -849,7 +849,7 @@ describe("SessionUsageService", () => {
         anthropic: { cacheCreationInputTokens: 10 },
       };
       const toolUsage = {
-        toolName: "advisor",
+        toolName: "intuition",
         toolCallId: "tool-call-1",
         timestamp: Date.now(),
         model,
@@ -917,7 +917,7 @@ describe("SessionUsageService", () => {
       const rawModel = "coder:prod-anthropic/claude-opus-4-5";
       const metadataModel = "anthropic:claude-opus-4-5";
       const toolUsage = {
-        toolName: "advisor",
+        toolName: "intuition",
         toolCallId: "tool-call-coder-1",
         timestamp: Date.now(),
         model: rawModel,
@@ -1006,7 +1006,7 @@ describe("SessionUsageService", () => {
         },
       };
       const validOtherModelToolUsage = {
-        toolName: "advisor",
+        toolName: "intuition",
         toolCallId: "tool-call-valid-2",
         timestamp: 1_700_000_000_050,
         model: otherModel,

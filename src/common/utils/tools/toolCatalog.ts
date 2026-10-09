@@ -127,7 +127,7 @@ export interface ToolSearchStreamState {
 /**
  * Per-send runtime holder shared between tool creation (getToolsForModel) and
  * stream wiring. `state` is only assigned after the post-policy gate decides
- * the feature is active (mirrors the advisorRuntime mutable-ref precedent).
+ * the feature is active.
  */
 export interface ToolSearchRuntime {
   state?: ToolSearchStreamState;

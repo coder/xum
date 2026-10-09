@@ -195,6 +195,10 @@ import {
 } from "@/node/services/additionalSystemContext";
 import { REVIEW_STATE_FILE_NAME } from "@/node/services/reviewStateService";
 import {
+  getSideChatCreationRefusal,
+  materializeSideChatHistorySnapshot,
+} from "@/node/services/sideChat";
+import {
   generateWorkspaceIdentity,
   type NameGenerationCandidate,
 } from "@/node/services/workspaceTitleGenerator";
@@ -4289,6 +4293,8 @@ export class WorkspaceService
       await this.cleanupOrphanScratchWorkdirs().catch((error: unknown) => {
         log.debug("Failed to clean orphaned scratch workdirs", { error });
       });
+      // Side chats survive restart like other conversations. Only explicit close or their
+      // parent's removal/archive discards them; startup cannot infer ownership from age.
       const allMetadata = await this.config.getAllWorkspaceMetadata({ probeCheckouts: false });
       await this.cleanupOrphanSessionDirs(allMetadata).catch((error: unknown) => {
         log.debug("Failed to clean orphaned session directories", { error });
@@ -7333,6 +7339,22 @@ export class WorkspaceService
       warnings?: WorkspaceRemoveWarning[];
     }
   > {
+    return await this.removeLocked(workspaceId, force, options);
+  }
+
+  private async removeLocked(
+    workspaceId: string,
+    force: boolean,
+    options?: {
+      beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
+      acknowledgedDescendantIds?: string[];
+    }
+  ): Promise<
+    Result<void> & {
+      descendants?: WorkspaceRemovalDescendant[];
+      warnings?: WorkspaceRemoveWarning[];
+    }
+  > {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
       const operation = async () => {
         const decision = options?.beforeRemove == null ? true : await options.beforeRemove();
@@ -7492,6 +7514,22 @@ export class WorkspaceService
   }
 
   private async removeUnlocked(
+    workspaceId: string,
+    force = false,
+    binding?: RemovalAttemptBinding,
+    options?: RemovalCheckoutOptions
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }> {
+    const result = await this.removeSingleWorkspaceUnlocked(workspaceId, force, binding, options);
+    // Both removal entrypoints must discard side chats, but only after the parent is gone.
+    // Keep this outside the parent's checkout locks and do not reacquire a task-tree lock:
+    // callers may already hold the same tree owner lock for the entire removal cascade.
+    if (result.success && this.config.findWorkspace(workspaceId) == null) {
+      await this.removeSideChatsOf(workspaceId, true);
+    }
+    return result;
+  }
+
+  private async removeSingleWorkspaceUnlocked(
     workspaceId: string,
     force = false,
     binding?: RemovalAttemptBinding,
@@ -10168,6 +10206,13 @@ export class WorkspaceService
           if (workspaceEntry) {
             workspaceEntry.name = newName;
             workspaceEntry.path = newPath;
+            // Side chats keep their own names but share this checkout. Publish the new paths
+            // together so they never retain the vanished pre-rename worktree/SSH directory.
+            for (const entry of projectConfig.workspaces) {
+              if (entry.sideChatParentWorkspaceId === workspaceId && entry.path === oldPath) {
+                entry.path = newPath;
+              }
+            }
           }
         }
         return config;
@@ -11683,9 +11728,25 @@ export class WorkspaceService
     acknowledgedUntrackedPaths?: string[],
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
-    return await this.withTaskTreeLifecycleLock(workspaceId, async () =>
+    const result = await this.withTaskTreeLifecycleLock(workspaceId, async () =>
       this.archiveWithDescendants(workspaceId, acknowledgedUntrackedPaths, options)
     );
+    await this.removeSideChatsAfterArchive(workspaceId, result);
+    return result;
+  }
+
+  /**
+   * An archived workspace's checkout may be snapshotted or deleted, and its side chats share it:
+   * they go with the archive, like with removal. Each removal takes its own (different) lock.
+   */
+  private async removeSideChatsAfterArchive(
+    workspaceId: string,
+    result: Result<ArchiveWorkspaceResult>,
+    taskTreeLockHeld = false
+  ): Promise<void> {
+    if (result.success && result.data.kind === "archived") {
+      await this.removeSideChatsOf(workspaceId, taskTreeLockHeld);
+    }
   }
 
   /** Unarchived sub-agents of a workspace, deepest-first: the ones its archive cascades over. */
@@ -11940,6 +12001,7 @@ export class WorkspaceService
       return Err(`Failed to archive workspace: ${getErrorMessage(error)}`);
     }
     if (!gate.success) return Err(`Cannot archive workspace: ${gate.error}`);
+    const archivedDescendantIds: string[] = [];
     try {
       for (const descendant of descendants) {
         const result = await this.archiveUnlocked(descendant.workspaceId, undefined, {
@@ -11963,6 +12025,7 @@ export class WorkspaceService
             `Cannot archive sub-agent ${descendant.title} (${descendant.workspaceId}): ${failure}`
           );
         }
+        archivedDescendantIds.push(descendant.workspaceId);
       }
       return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, {
         ...options,
@@ -11977,6 +12040,10 @@ export class WorkspaceService
           error: getErrorMessage(error),
         });
       });
+      // Descendants bypass archive(). Clean their side chats even if a later archive failed,
+      // after releasing the shared-checkout mutation gates that removal needs to acquire.
+      // The task-tree lock remains held, so nested removal must not reacquire that lock.
+      for (const id of archivedDescendantIds) await this.removeSideChatsOf(id, true);
     }
   }
 
@@ -11992,7 +12059,13 @@ export class WorkspaceService
     acknowledgedUntrackedPaths?: string[],
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
-    return await this.archiveWithDescendants(workspaceId, acknowledgedUntrackedPaths, options);
+    const result = await this.archiveWithDescendants(
+      workspaceId,
+      acknowledgedUntrackedPaths,
+      options
+    );
+    await this.removeSideChatsAfterArchive(workspaceId, result, true);
+    return result;
   }
 
   /**
@@ -14448,6 +14521,192 @@ export class WorkspaceService
     }
   }
 
+  /**
+   * Start a `/side` chat (Codex's side conversation): an ephemeral fork of `parentWorkspaceId`
+   * that inherits its history, shares its checkout, and is hidden from the workspace list. Each
+   * invocation starts an independent conversation; existing side chats are left alone.
+   *
+   * Unlike fork(), no checkout is created: the row persists the parent's checkout path with
+   * taskIsolation "none", which every removal path already treats as "never delete this
+   * directory". Init and staged-attachment copies are skipped because the parent's checkout
+   * already has them; only the plan (stored by workspace name) is copied.
+   */
+  async createSideChat(
+    parentWorkspaceId: string
+  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; projectPath: string }>> {
+    // Held through registration: removal and archive of the parent take the same lock, so a side
+    // chat is never registered against a parent (or checkout) that is going away meanwhile. The
+    // parent is re-read inside the lock for the same reason.
+    return await this.withTaskTreeLifecycleLock(parentWorkspaceId, () =>
+      this.createSideChatLocked(parentWorkspaceId)
+    );
+  }
+
+  private async createSideChatLocked(
+    parentWorkspaceId: string
+  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; projectPath: string }>> {
+    if (this.archivingWorkspaces.has(parentWorkspaceId)) {
+      return Err(`Workspace is being archived: ${parentWorkspaceId}.`);
+    }
+    const parentMetadataResult = await this.aiService.getWorkspaceMetadata(parentWorkspaceId);
+    if (!parentMetadataResult.success) {
+      return Err(`Failed to get workspace metadata: ${parentMetadataResult.error}`);
+    }
+    const parentMetadata = parentMetadataResult.data;
+    const refusal = getSideChatCreationRefusal(parentMetadata);
+    if (refusal != null) {
+      return Err(refusal);
+    }
+    if (isWorkspaceArchived(parentMetadata.archivedAt, parentMetadata.unarchivedAt)) {
+      return Err("Side chats are not available in archived workspaces.");
+    }
+    const parentWorkspace = this.config.findWorkspace(parentWorkspaceId);
+    if (parentWorkspace == null) {
+      return Err(`Workspace not found: ${parentWorkspaceId}`);
+    }
+
+    // Each /side request creates an independent conversation; existing side chats stay open.
+    const newWorkspaceId = this.config.generateStableId();
+    // Unique per side chat, so the plan path and runtime identity never collide with a real
+    // workspace; the user never sees it (the title is shown instead).
+    const name = `side-${newWorkspaceId}`;
+    const projectPath = parentMetadata.projectPath;
+    const partialSnapshot = await this.historyService.readPartial(parentWorkspaceId);
+
+    const session = this.getOrCreateSession(newWorkspaceId);
+    this.initStateManager.startInit(newWorkspaceId, projectPath);
+    const initLogger = this.createInitLogger(newWorkspaceId);
+    const initAbortController = new AbortController();
+    this.initAbortControllers.set(newWorkspaceId, initAbortController);
+    initLogger.logStep("Sharing the main chat's checkout for this side chat — skipping init");
+    initLogger.logComplete(0);
+
+    const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
+    const newSessionDir = path.join(this.config.sessionsDir, newWorkspaceId);
+    let registered = false;
+    try {
+      const historyCopyResult = await this.historyService.copyHistorySnapshotToNewWorkspace(
+        parentWorkspaceId,
+        newWorkspaceId
+      );
+      if (!historyCopyResult.success) {
+        throw new Error(historyCopyResult.error);
+      }
+      // The parent's scratchpad context applies to questions about it as well.
+      for (const fileName of [
+        ADDITIONAL_SYSTEM_CONTEXT_FILENAME,
+        ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
+      ]) {
+        await copyIfExists(
+          path.join(parentSessionDir, fileName),
+          path.join(newSessionDir, fileName)
+        );
+      }
+      // Preserve the main chat's visible context, never its live/recoverable execution state.
+      await materializeSideChatHistorySnapshot({
+        historyService: this.historyService,
+        partialSnapshot,
+        targetWorkspaceId: newWorkspaceId,
+      });
+      await resetForkedSessionUsage(this.sessionUsageService, newWorkspaceId, newSessionDir);
+
+      const metadata: FrontendWorkspaceMetadata = {
+        id: newWorkspaceId,
+        name,
+        title: `Side chat: ${parentMetadata.title ?? parentMetadata.name}`,
+        projectName: parentMetadata.projectName,
+        projectPath,
+        projects: parentMetadata.projects,
+        createdAt: new Date().toISOString(),
+        runtimeConfig: parentMetadata.runtimeConfig,
+        namedWorkspacePath: parentWorkspace.workspacePath,
+        subProjectPath: parentMetadata.subProjectPath,
+        // Match fork(): renderer storage alone cannot preserve backend model/agent overrides.
+        aiSettings: parentMetadata.aiSettings,
+        aiSettingsByAgent: parentMetadata.aiSettingsByAgent,
+        agentId: parentMetadata.agentId,
+        taskIsolation: "none",
+        sideChatParentWorkspaceId: parentWorkspaceId,
+      };
+      await this.config.addWorkspace(projectPath, metadata, {
+        refuseTakenName: true,
+        requireActiveParent: {
+          workspaceId: parentWorkspaceId,
+          workspacePath: parentWorkspace.workspacePath,
+        },
+      });
+      registered = true;
+
+      // Plans live under the workspace's name, which the side chat does not share, so the
+      // parent's plan is copied for the side chat to see the same plan context. After the
+      // registration, like fork() (#5175); removing the side chat deletes the copy.
+      const sideChatRuntime = createRuntimeForWorkspace(metadata);
+      const parentRuntime = createRuntime(parentMetadata.runtimeConfig, {
+        projectPath,
+        workspaceName: parentMetadata.name,
+        workspacePath: parentWorkspace.workspacePath,
+      });
+      await copyPlanFileAcrossRuntimes(
+        parentRuntime,
+        sideChatRuntime,
+        await this.resolvePlanLocation(parentMetadata, parentRuntime),
+        await resolvePlanFilePath(this.config, sideChatRuntime, {
+          name,
+          projectName: parentMetadata.projectName,
+          projectPath,
+          runtimeConfig: parentMetadata.runtimeConfig,
+        })
+      );
+
+      const enrichedMetadata = this.enrichFrontendMetadata(metadata);
+      session.emitMetadata(enrichedMetadata);
+      return Ok({ metadata: enrichedMetadata, projectPath });
+    } catch (error) {
+      const message = `Failed to start side chat: ${getErrorMessage(error)}`;
+      if (registered) {
+        // The row shares the parent's checkout, so removal only deletes the side chat's own
+        // state (and any plan copy).
+        const removed = await this.removeWhileTaskTreeLocked(newWorkspaceId, true).catch(
+          (removeError: unknown) => Err(getErrorMessage(removeError))
+        );
+        if (!removed.success) {
+          log.warn("Failed to roll back a side chat", { newWorkspaceId, error: removed.error });
+        }
+        return Err(message);
+      }
+      // Nothing was registered, so the session directory and in-memory state are all there is
+      // to undo.
+      await this.discardCreationStateAfterRollback(newWorkspaceId, initAbortController, true);
+      return Err(message);
+    }
+  }
+
+  /**
+   * Discard the `/side` chats of a workspace. Side chats are ephemeral and share the parent's
+   * checkout, so parent removal/archive discards all of them. A failure leaves a hidden row
+   * that a later explicit close or parent cleanup can retry.
+   */
+  private async removeSideChatsOf(
+    parentWorkspaceId: string,
+    taskTreeLockHeld = false
+  ): Promise<void> {
+    const sideChatIds = [...this.config.loadConfigOrDefault().projects.values()]
+      .flatMap((project) => project.workspaces)
+      .flatMap((ws) =>
+        ws.sideChatParentWorkspaceId === parentWorkspaceId && ws.id != null ? [ws.id] : []
+      );
+    for (const sideChatId of sideChatIds) {
+      const result = await (
+        taskTreeLockHeld
+          ? this.removeWhileTaskTreeLocked(sideChatId, true)
+          : this.remove(sideChatId, true)
+      ).catch((error: unknown) => Err(getErrorMessage(error)));
+      if (!result.success) {
+        log.warn("Failed to discard side chat", { sideChatId, error: result.error });
+      }
+    }
+  }
+
   async prepareManualWorkflowInvocation(workspaceId: string): Promise<void> {
     const trimmed = workspaceId.trim();
     assert(trimmed.length > 0, "prepareManualWorkflowInvocation requires workspaceId");
@@ -15271,6 +15530,11 @@ export class WorkspaceService
     }
     if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
       return Err("Workspace is archived. Unarchive it before attaching files.");
+    }
+    // Side chats are ephemeral and share the parent's checkout: staging here would leave
+    // uploaded files behind after discard. Inherited attachments remain readable.
+    if (metadata.sideChatParentWorkspaceId != null) {
+      return Err("Attach files in the main chat instead of a side chat.");
     }
 
     // Deferred runtimes (Coder/SSH/devcontainer) return from create before

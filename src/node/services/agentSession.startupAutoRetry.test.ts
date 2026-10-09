@@ -209,6 +209,108 @@ describe("AgentSession startup auto-retry recovery", () => {
     }
   });
 
+  test.each(["user tail", "assistant partial", "compaction follow-up"] as const)(
+    "side chats do not automatically recover an inherited %s",
+    async (tail) => {
+      const workspaceId = "side-startup-recovery";
+      const metadata: WorkspaceMetadata = {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath: "/tmp/project",
+        runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+        sideChatParentWorkspaceId: "main",
+      };
+      const clock = makeTestEffectRunner();
+      const { session, historyService, events, aiService, cleanup } = await createSessionBundle(
+        workspaceId,
+        { getWorkspaceMetadata: mock(() => Promise.resolve(Ok(metadata))) },
+        { clock }
+      );
+      const stream = spyOn(aiService, "streamMessage");
+      cleanups.push(
+        () => clock.dispose(),
+        async () => {
+          await cleanup();
+          stream.mockRestore();
+        }
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("inherited-user", "user", "Continue main work")
+      );
+      if (tail === "assistant partial") {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("partial", "assistant", "Working", { partial: true })
+        );
+      } else if (tail === "compaction follow-up") {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("summary", "assistant", "Summary", {
+            muxMetadata: {
+              type: "compaction-summary",
+              pendingFollowUp: {
+                text: "Continue main work",
+                model: "openai:gpt-4o",
+                agentId: "exec",
+              },
+            },
+          })
+        );
+      }
+      const before = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      await session.runStartupRecovery(metadata);
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(events.filter((event) => event.type === "auto-retry-scheduled")).toHaveLength(0);
+      expect(stream).not.toHaveBeenCalled();
+      expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(before);
+    }
+  );
+
+  test.each(["send", "retry"] as const)(
+    "a side chat still accepts an explicit user %s",
+    async (action) => {
+      const workspaceId = "explicit-side-turn";
+      const { session, historyService, aiService, cleanup } = await createSessionBundle(
+        workspaceId,
+        {
+          getWorkspaceMetadata: mock(() =>
+            Promise.resolve(
+              Ok({
+                id: workspaceId,
+                name: workspaceId,
+                projectName: "project",
+                projectPath: "/tmp/project",
+                runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+                sideChatParentWorkspaceId: "main",
+              })
+            )
+          ),
+        }
+      );
+      const stream = spyOn(aiService, "streamMessage");
+      cleanups.push(async () => {
+        await cleanup();
+        stream.mockRestore();
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("side-user", "user", "Explain this")
+      );
+      await session.ensureStartupAutoRetryCheck();
+      expect(stream).not.toHaveBeenCalled();
+      const options = { model: "anthropic:claude-sonnet-4-5", agentId: "exec" };
+      const result =
+        action === "send"
+          ? await session.sendMessage("Explain another thing", options)
+          : await session.resumeStream(options);
+      expect(result.success).toBe(true);
+      expect(stream).toHaveBeenCalledTimes(1);
+    }
+  );
+
   test("schedules startup auto-retry for interrupted user tail", async () => {
     const workspaceId = "startup-retry-user-tail";
     const clock = makeTestEffectRunner();

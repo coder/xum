@@ -10,7 +10,9 @@ import {
   isTerminalFocused,
   isDialogOpen,
   isCommandPaletteTarget,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { isCompactingStream, cancelCompaction } from "@/browser/utils/compaction/handler";
 import { stopStream } from "@/browser/utils/stopStream";
@@ -66,9 +68,13 @@ export function useAIViewKeybinds({
   resumeInterruptedStream,
 }: UseAIViewKeybindsParams): void {
   const { api } = useAPI();
+  // The main chat and the /side chat tab both mount these window listeners; only the pane that
+  // owns the event's target acts, so Esc/Ctrl+I/Shift+G never hit both chats at once.
+  const paneScope = useChatPaneScope();
 
   useEffect(() => {
     const handleInterruptKeyDown = (e: KeyboardEvent) => {
+      if (!paneHandlesKeyEvent(paneScope, e.target)) return;
       // Check vim-aware interrupt keybind
       const interruptKeybind = vimEnabled
         ? KEYBINDS.INTERRUPT_STREAM_VIM
@@ -137,6 +143,7 @@ export function useAIViewKeybinds({
     };
 
     const handleKeyDownCapture = (e: KeyboardEvent) => {
+      if (!paneHandlesKeyEvent(paneScope, e.target)) return;
       // Remote desktops own their keyboard, including chat/editor shortcuts.
       if (isDesktopViewportFocused(e.target)) return;
       const dialogOpen = isDialogOpen();
@@ -217,5 +224,6 @@ export function useAIViewKeybinds({
     canResumeInterruptedStream,
     resumeInterruptedStream,
     api,
+    paneScope,
   ]);
 }

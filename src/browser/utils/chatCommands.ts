@@ -52,6 +52,8 @@ import {
 } from "@/common/utils/goals/budgetPricing";
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
 import {
+  SIDE_CHAT_DISALLOWED_COMMAND_KEYS,
+  SIDE_CHAT_DISALLOWED_COMMAND_TYPES,
   WORKSPACE_ONLY_COMMAND_KEYS,
   WORKSPACE_ONLY_COMMAND_TYPES,
   type WorkspaceOnlyCommandType,
@@ -242,6 +244,8 @@ export interface SlashCommandEnv {
   resetContext?: () => Promise<"reset" | "noop">;
   truncateHistory?: (percentage?: number) => Promise<void>;
   isCurrent?: () => boolean;
+  /** The composer belongs to an ephemeral /side chat (see handleSideCommand). */
+  isSideChat?: boolean;
 }
 
 interface WorkspaceCommandEnv extends SlashCommandEnv {
@@ -366,6 +370,37 @@ export async function processSlashCommand(
   env: SlashCommandEnv
 ): Promise<CommandResult> {
   if (!parsed) return complete("restore");
+  const workspaceOnlyKey = (() => {
+    switch (parsed.type) {
+      case "command-missing-args":
+      case "command-invalid-args":
+      case "command-unknown-flag":
+      case "unknown-command":
+        return parsed.command;
+      default:
+        return null;
+    }
+  })();
+  const isWorkspaceCommandType = isWorkspaceOnlyParsedCommand(parsed);
+  const isWorkspaceOnlyCommand =
+    isWorkspaceCommandType ||
+    (workspaceOnlyKey ? WORKSPACE_ONLY_COMMAND_KEYS.has(workspaceOnlyKey) : false);
+  // Side chats cannot own workspace/project operations. Gate them before any handler,
+  // including the early workflow, idle and heartbeat branches, so no backend mutation starts.
+  if (
+    env.isSideChat === true &&
+    (SIDE_CHAT_DISALLOWED_COMMAND_TYPES.has(parsed.type) ||
+      (workspaceOnlyKey != null && SIDE_CHAT_DISALLOWED_COMMAND_KEYS.has(workspaceOnlyKey)))
+  ) {
+    return complete("restore", [
+      showToast({
+        id: Date.now().toString(),
+        type: "error",
+        message: "Command not available in side chats. Press Esc to return to the main chat.",
+      }),
+    ]);
+  }
+
   const client = env.api;
   const notConnected = () =>
     complete("restore", [
@@ -733,21 +768,6 @@ export async function processSlashCommand(
     return complete("consume", [{ type: "clear-input" }, { type: "toggle-vim" }]);
   }
 
-  const workspaceOnlyKey = (() => {
-    switch (parsed.type) {
-      case "command-missing-args":
-      case "command-invalid-args":
-      case "command-unknown-flag":
-      case "unknown-command":
-        return parsed.command;
-      default:
-        return null;
-    }
-  })();
-  const isWorkspaceCommandType = isWorkspaceOnlyParsedCommand(parsed);
-  const isWorkspaceOnlyCommand =
-    isWorkspaceCommandType ||
-    (workspaceOnlyKey ? WORKSPACE_ONLY_COMMAND_KEYS.has(workspaceOnlyKey) : false);
   if (isWorkspaceOnlyCommand && env.variant !== "workspace") {
     return complete("restore", [
       showToast({
@@ -878,6 +898,10 @@ export async function processSlashCommand(
       case "fork":
         if (!client) return notConnected();
         return handleForkCommand(parsed, { ...env, api: client });
+      case "side":
+        if (!env.workspaceId) throw new Error("Workspace ID required");
+        if (!client) return notConnected();
+        return handleSideCommand({ ...env, api: client, workspaceId: env.workspaceId });
       case "new":
         if (!env.workspaceId) throw new Error("Workspace ID required");
         if (!client) return notConnected();
@@ -1217,6 +1241,45 @@ function handleClearCommand(
       return complete("restore", [
         showToast({ id: Date.now().toString(), type: "error", message: normalized.message }),
       ]);
+    }
+  });
+}
+
+/**
+ * /side (Codex's side conversation): open an ephemeral fork of this chat. It opens as a tab in
+ * this workspace's right sidebar so both chats stay visible (closing the tab discards it). Where
+ * the sidebar is hidden (narrow viewports) it takes over the chat view instead, like Codex, and
+ * leaving it discards it (useDiscardSideChatOnLeave).
+ */
+function handleSideCommand(env: WorkspaceCommandEnv): CommandResult {
+  return phase([{ type: "clear-input" }, { type: "set-sending", sending: true }], async () => {
+    const failed = (message: string) =>
+      complete("restore", [
+        showToast({ id: Date.now().toString(), type: "error", title: "Side Chat Failed", message }),
+        { type: "set-sending", sending: false },
+      ]);
+    try {
+      const result = await env.api.workspace.createSideChat({
+        parentWorkspaceId: env.workspaceId,
+      });
+      if (!result.success) {
+        return failed(result.error);
+      }
+      const sideWorkspaceId = result.metadata.id;
+      // Same model/agent/thinking settings as the main chat, like a fork.
+      copyWorkspaceStorage(env.workspaceId, sideWorkspaceId);
+      const openTab = new CustomEvent(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, {
+        detail: { workspaceId: env.workspaceId, sideChatWorkspaceId: sideWorkspaceId },
+        cancelable: true,
+      });
+      // dispatchEvent returns false once the sidebar claimed the event (showed the tab).
+      if (window.dispatchEvent(openTab)) {
+        dispatchWorkspaceSwitch(result.metadata);
+      }
+      trackCommandUsed("side");
+      return complete("consume", [{ type: "set-sending", sending: false }]);
+    } catch (error) {
+      return failed(error instanceof Error ? error.message : "Failed to start side chat");
     }
   });
 }

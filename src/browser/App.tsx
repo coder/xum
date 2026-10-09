@@ -131,6 +131,7 @@ import { WorkspaceActiveGoalsWarningToast } from "@/browser/components/ActiveGoa
 import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
+import { markAppShellReady } from "@/browser/utils/perf/appShellReady";
 
 function RootRouteShell(props: {
   leftSidebarCollapsed: boolean;
@@ -1364,6 +1365,12 @@ function AppInner() {
       if (isWorkspaceFocused) {
         return;
       }
+      // /side chats are short-lived questions answered next to (or in place of) their main chat,
+      // which already has the user's attention; they never notify (they inherit the main chat's
+      // notify setting through copied storage, and a click would open the side chat full-screen).
+      if (workspaceMetadataRef.current.get(event.workspaceId)?.sideChatParentWorkspaceId != null) {
+        return;
+      }
 
       // Check if notifications are enabled for this workspace.
       const notifyEnabled =
@@ -1411,7 +1418,10 @@ function AppInner() {
 
   return (
     <>
-      <div className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
+      <div
+        className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]"
+        ref={markAppShellReady}
+      >
         <LeftSidebar
           collapsed={sidebarCollapsed}
           onToggleCollapsed={handleToggleSidebar}
