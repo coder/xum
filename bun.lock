@@ -80,6 +80,7 @@
         "marked": "17.0.1",
         "minimist": "^1.2.8",
         "motion": "^12.23.24",
+        "negotiator": "^1.0.0",
         "ollama-ai-provider-v2": "^3.5.0",
         "openai": "^6.18.0",
         "parse-duration": "^2.1.4",

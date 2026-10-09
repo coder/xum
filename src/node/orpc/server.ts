@@ -6,6 +6,7 @@
  * The CLI entry point (server.ts) uses this to start the server.
  */
 import express, { type Express } from "express";
+import Negotiator from "negotiator";
 import * as fs from "fs/promises";
 import * as http from "http";
 import type * as net from "net";
@@ -56,6 +57,7 @@ import {
 } from "@/common/constants/coderOAuth";
 import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { assert } from "@/common/utils/assert";
+import { isHashedStaticAssetName, PRECOMPRESSED_ENCODINGS } from "@/node/orpc/staticAssets";
 import { getAppProxyBasePathFromPathname, stripAppProxyBasePath } from "@/common/appProxyBasePath";
 
 type AliveWebSocket = WebSocket & { isAlive?: boolean };
@@ -1026,9 +1028,53 @@ export async function createOrpcServer({
     // Serve JS/CSS/assets from disk, but never serve index.html — the SPA fallback
     // (below all API routes) serves the injected version with base href + proxy template.
     const serveStaticAssets = express.static(staticDir, { index: false });
+    // Content-hashed files (#5943) are cached for a year and sent as the build-time .br/.gz
+    // sibling when the client accepts it. These headers are set only when a file is actually
+    // sent, so a missing hashed-looking path still reaches the SPA fallback untouched.
+    const hashedOptions = { index: false, maxAge: "1y", immutable: true } as const;
+    const negotiatedEncodings = [...PRECOMPRESSED_ENCODINGS.map((e) => e.encoding), "identity"];
+    const serveHashedIdentity = express.static(staticDir, {
+      ...hashedOptions,
+      setHeaders: (res) => res.vary("Accept-Encoding"),
+    });
+    const serveHashedEncoded = express.static(staticDir, {
+      ...hashedOptions,
+      // A byte range of the compressed stream is not a range of the resource: send it whole.
+      acceptRanges: false,
+      setHeaders: (res, filePath) => {
+        const precompressed = PRECOMPRESSED_ENCODINGS.find((e) => filePath.endsWith(e.extension));
+        assert(precompressed, `unexpected precompressed asset path: ${filePath}`);
+        res.vary("Accept-Encoding");
+        res.setHeader("Content-Encoding", precompressed.encoding);
+        res.type(path.extname(filePath.slice(0, -precompressed.extension.length)));
+      },
+    });
     app.use((req, res, next) => {
       if (req.path === "/index.html") return next();
-      serveStaticAssets(req, res, next);
+      if (!isHashedStaticAssetName(req.path.slice(1))) {
+        serveStaticAssets(req, res, next);
+        return;
+      }
+      // Client q-values decide first. On ties the server order wins (brotli, then gzip):
+      // req.acceptsEncodings breaks ties by header order and would pick gzip for every browser
+      // ("gzip, deflate, br, zstd").
+      const [encoding] = new Negotiator(req).encodings(negotiatedEncodings, {
+        preferred: negotiatedEncodings,
+      });
+      const precompressed = PRECOMPRESSED_ENCODINGS.find((e) => e.encoding === encoding);
+      const requestPath = splitRequestUrlPathAndQuery(req.url);
+      if (!precompressed || !requestPath) {
+        serveHashedIdentity(req, res, next);
+        return;
+      }
+      const originalUrl = req.url;
+      req.url = `${requestPath.pathname}${precompressed.extension}${requestPath.querySuffix}`;
+      serveHashedEncoded(req, res, (error?: unknown) => {
+        req.url = originalUrl;
+        if (error) return next(error);
+        // No precompressed sibling on disk: serve the identity file.
+        serveHashedIdentity(req, res, next);
+      });
     });
   }
 
