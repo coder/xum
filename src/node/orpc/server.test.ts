@@ -1,5 +1,6 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
+import * as http from "http";
 import * as net from "net";
 import * as os from "os";
 import * as path from "path";
@@ -302,6 +303,227 @@ async function expectWebSocketOriginCase(input: {
     input.allowHttpOrigin ? { allowHttpOrigin: true } : {}
   );
 }
+
+interface RawResponse {
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  body: string;
+}
+
+// node:http instead of fetch: fetch decodes Content-Encoding transparently, which would hide
+// which file (identity, .br or .gz) the server actually sent.
+function rawRequest(
+  baseUrl: string,
+  urlPath: string,
+  options: { method?: string; headers?: Record<string, string> } = {}
+): Promise<RawResponse> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      new URL(urlPath, baseUrl),
+      { method: options.method ?? "GET", headers: options.headers },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString("utf-8"),
+          })
+        );
+        res.on("error", reject);
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+function varyIncludesAcceptEncoding(headers: http.IncomingHttpHeaders): boolean {
+  const vary = headers.vary;
+  return (
+    vary
+      ?.split(",")
+      .map((value) => value.trim().toLowerCase())
+      .includes("accept-encoding") ?? false
+  );
+}
+
+describe("createOrpcServer hashed static asset compression", () => {
+  const HASHED_JS = "main-AbCd1234.js";
+  const IDENTITY_BODY = "console.log('identity body');";
+  // Distinct bytes and lengths per file so each assertion proves which file the server sent.
+  const BROTLI_BODY = "fake brotli payload";
+  const GZIP_BODY = "fake gzip payload, longer";
+  const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
+  const staticFiles = {
+    [HASHED_JS]: IDENTITY_BODY,
+    [`${HASHED_JS}.br`]: BROTLI_BODY,
+    [`${HASHED_JS}.gz`]: GZIP_BODY,
+    "plain-ZyXw9876.js": "console.log('no precompressed siblings');",
+    "manifest.json": '{"name":"xum"}',
+    "manifest.json.br": "unhashed brotli must never be sent",
+    "terminal.html": "<!doctype html><title>terminal</title>",
+  };
+
+  test("negotiates the precompressed file by Accept-Encoding and caches it as immutable", async () => {
+    const { server, close } = await createStaticTestServer({ files: staticFiles });
+
+    try {
+      const identity = await rawRequest(server.baseUrl, `/${HASHED_JS}`);
+      expect(identity.headers["content-type"]).toContain("javascript");
+
+      const cases: Array<{
+        urlPath: string;
+        acceptEncoding: string | undefined;
+        encoding: string | undefined;
+        body: string;
+      }> = [
+        // Browsers list gzip before br; brotli must still win.
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "gzip, deflate, br, zstd",
+          encoding: "br",
+          body: BROTLI_BODY,
+        },
+        { urlPath: `/${HASHED_JS}?v=1`, acceptEncoding: "br", encoding: "br", body: BROTLI_BODY },
+        { urlPath: `/${HASHED_JS}`, acceptEncoding: "gzip", encoding: "gzip", body: GZIP_BODY },
+        // A higher client q-value beats the server's brotli preference.
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "gzip;q=1, br;q=0.1",
+          encoding: "gzip",
+          body: GZIP_BODY,
+        },
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "identity;q=1, br;q=0.5",
+          encoding: undefined,
+          body: IDENTITY_BODY,
+        },
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: undefined,
+          encoding: undefined,
+          body: IDENTITY_BODY,
+        },
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "identity",
+          encoding: undefined,
+          body: IDENTITY_BODY,
+        },
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "br;q=0, gzip;q=0",
+          encoding: undefined,
+          body: IDENTITY_BODY,
+        },
+        // No .br/.gz on disk: fall back to the identity file, not an error or the SPA HTML.
+        {
+          urlPath: "/plain-ZyXw9876.js",
+          acceptEncoding: "br, gzip",
+          encoding: undefined,
+          body: staticFiles["plain-ZyXw9876.js"],
+        },
+      ];
+
+      for (const testCase of cases) {
+        const label = `${testCase.urlPath} with Accept-Encoding ${testCase.acceptEncoding ?? "(none)"}`;
+        const res = await rawRequest(server.baseUrl, testCase.urlPath, {
+          headers: testCase.acceptEncoding ? { "Accept-Encoding": testCase.acceptEncoding } : {},
+        });
+        expect(res.status, label).toBe(200);
+        expect(res.headers["content-encoding"], label).toBe(testCase.encoding);
+        expect(res.body, label).toBe(testCase.body);
+        expect(res.headers["content-type"], label).toBe(identity.headers["content-type"]);
+        expect(varyIncludesAcceptEncoding(res.headers), label).toBe(true);
+        expect(res.headers["cache-control"], label).toBe(IMMUTABLE_CACHE_CONTROL);
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("keeps existing headers for unhashed files, the SPA index and missing hashed paths", async () => {
+    const { server, close } = await createStaticTestServer({ files: staticFiles });
+
+    try {
+      const cases = [
+        {
+          urlPath: "/manifest.json",
+          cacheControl: "public, max-age=0",
+          body: staticFiles["manifest.json"],
+        },
+        {
+          urlPath: "/terminal.html",
+          cacheControl: "public, max-age=0",
+          body: staticFiles["terminal.html"],
+        },
+        { urlPath: "/", cacheControl: "no-store", body: "<title>mux</title>" },
+        { urlPath: "/index.html", cacheControl: "no-store", body: "<title>mux</title>" },
+        // Hashed-looking but absent: the SPA fallback answers without any new asset headers.
+        { urlPath: "/missing-AbCd1234.js", cacheControl: "no-store", body: "<title>mux</title>" },
+      ];
+
+      for (const testCase of cases) {
+        const res = await rawRequest(server.baseUrl, testCase.urlPath, {
+          headers: { "Accept-Encoding": "br, gzip" },
+        });
+        expect(res.status, testCase.urlPath).toBe(200);
+        expect(res.body, testCase.urlPath).toContain(testCase.body);
+        expect(res.headers["content-encoding"], testCase.urlPath).toBeUndefined();
+        expect(res.headers["cache-control"], testCase.urlPath).toBe(testCase.cacheControl);
+        expect(varyIncludesAcceptEncoding(res.headers), testCase.urlPath).toBe(false);
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("answers HEAD on an encoded hashed asset with the GET headers and no body", async () => {
+    const { server, close } = await createStaticTestServer({ files: staticFiles });
+
+    try {
+      const headers = { "Accept-Encoding": "br" };
+      const get = await rawRequest(server.baseUrl, `/${HASHED_JS}`, { headers });
+      const head = await rawRequest(server.baseUrl, `/${HASHED_JS}`, { method: "HEAD", headers });
+      expect(head.status).toBe(200);
+      expect(head.body).toBe("");
+      expect(head.headers["content-encoding"]).toBe("br");
+      expect(head.headers["content-length"]).toBe(String(BROTLI_BODY.length));
+      for (const name of ["content-type", "content-length", "cache-control", "vary", "etag"]) {
+        expect(head.headers[name], name).toBe(get.headers[name]);
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("ignores Range on encoded hashed assets but honors it on identity responses", async () => {
+    const { server, close } = await createStaticTestServer({ files: staticFiles });
+
+    try {
+      // A byte range of the brotli stream is not a range of the identity resource: send it whole.
+      const encoded = await rawRequest(server.baseUrl, `/${HASHED_JS}`, {
+        headers: { "Accept-Encoding": "br", Range: "bytes=0-3" },
+      });
+      expect(encoded.status).toBe(200);
+      expect(encoded.body).toBe(BROTLI_BODY);
+      expect(encoded.headers["content-range"]).toBeUndefined();
+      expect(encoded.headers["accept-ranges"]).toBeUndefined();
+
+      const identity = await rawRequest(server.baseUrl, `/${HASHED_JS}`, {
+        headers: { Range: "bytes=0-3" },
+      });
+      expect(identity.status).toBe(206);
+      expect(identity.headers["content-range"]).toBe(`bytes 0-3/${IDENTITY_BODY.length}`);
+      expect(identity.body).toBe(IDENTITY_BODY.slice(0, 4));
+    } finally {
+      await close();
+    }
+  });
+});
 
 describe("createOrpcServer", () => {
   test("serveStatic fallback does not swallow /api routes", async () => {
