@@ -1626,8 +1626,11 @@ describe("useCreationWorkspace", () => {
   test("handleSend reports a thrown initial goal command as a goal failure, not a creation failure", async () => {
     // #5493 item 1: the workspace exists and holds the typed command, so a command that throws
     // must not surface as "Failed to create workspace".
-    spyOn(ChatCommandsModule, "processSlashCommand").mockRejectedValueOnce(
-      new Error("goal backend exploded")
+    // Reject lazily, when the command runs. Bun 1.2's mockRejectedValueOnce creates the rejected
+    // promise here, so it fails this test as an unhandled rejection before the hook calls the
+    // command, and the unconsumed mock then breaks later tests in the file (#5939).
+    spyOn(ChatCommandsModule, "processSlashCommand").mockImplementationOnce(() =>
+      Promise.reject(new Error("goal backend exploded"))
     );
     setupWindow({});
     const getHook = renderUseCreationWorkspace({
