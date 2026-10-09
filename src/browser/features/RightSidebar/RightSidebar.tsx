@@ -556,7 +556,14 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
   };
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col" onMouseDownCapture={setFocused}>
+    // Keyboard focus moving into a pane (Tab, a launcher or terminal taking focus) focuses it
+    // too, not just a click, so pane-scoped shortcuts act on the pane the user is in.
+    <div
+      className="flex min-h-0 min-w-0 flex-1 flex-col"
+      data-tabset-id={props.node.id}
+      onMouseDownCapture={setFocused}
+      onFocusCapture={setFocused}
+    >
       <SortableContext items={sortableIds} strategy={rectSortingStrategy}>
         <RightSidebarTabStrip
           ariaLabel="Sidebar views"
@@ -1591,7 +1598,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       e.preventDefault();
       if (isDialogOpen()) return;
 
-      const focusedTabset = findTabset(layout.root, layout.focusedTabsetId);
+      // The pane holding keyboard focus, when focus is in this sidebar; else the focused pane.
+      const container = sidebarContainerRef.current;
+      const targetTabsetId =
+        e.target instanceof Element && container?.contains(e.target)
+          ? e.target.closest<HTMLElement>("[data-tabset-id]")?.dataset.tabsetId
+          : undefined;
+      const focusedTabset = findTabset(layout.root, targetTabsetId ?? layout.focusedTabsetId);
       if (focusedTabset?.type !== "tabset") return;
 
       const activeTab = focusedTabset.activeTab;
@@ -1795,6 +1808,18 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [handleAddNewTab]);
+
+  // The command palette's "Right Sidebar: New Tab" (it hides itself while the sidebar is
+  // responsively hidden, so no layout guard is needed here).
+  React.useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB>).detail;
+      if (detail?.workspaceId !== workspaceId) return;
+      handleAddNewTab();
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, handler);
+    return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, handler);
+  }, [handleAddNewTab, workspaceId]);
 
   // Tools the New tab launcher offers. Unavailable ones are left out rather than shown
   // disabled; experiment tabs follow their experiment, Debug follows the LLM debug logs

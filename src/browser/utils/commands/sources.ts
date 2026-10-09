@@ -55,7 +55,6 @@ import {
 import { formatProjectHierarchyLabel, getTopLevelProjectEntries } from "@/common/utils/subProjects";
 import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLayouts";
 import {
-  addNewTabToTabset,
   hasTab,
   openToolFromNewTab,
   selectTabInTabset,
@@ -949,9 +948,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           // (Without a DOM, e.g. command-source unit tests, there is no layout to check.)
           visible: () =>
             typeof HTMLElement === "undefined" || !isWorkspaceRightSidebarHidden(document.body),
+          // The sidebar opens it, as for "+" and the shortcut, so the launcher also takes focus.
           run: () => {
-            updateRightSidebarLayout(wsId, (s) => addNewTabToTabset(s, s.focusedTabsetId));
-            updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            window.dispatchEvent(
+              createCustomEvent(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, { workspaceId: wsId })
+            );
           },
         },
         {

@@ -144,6 +144,12 @@ export const CUSTOM_EVENTS = {
   OPEN_GOAL_TAB: "mux:openGoalTab",
 
   /**
+   * Open (and focus) a New tab in the focused right-sidebar pane, the same path as "+" and the
+   * keyboard shortcut. Detail: { workspaceId: string }
+   */
+  OPEN_NEW_SIDEBAR_TAB: "mux:openNewSidebarTab",
+
+  /**
    * Open a /side chat as a right-sidebar tab of its parent workspace. Dispatched cancelable: the
    * sidebar calls preventDefault() once it shows the tab, and the sender falls back to opening
    * the side chat full-screen when nothing did (sidebar hidden on narrow viewports).
@@ -268,6 +274,9 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.OPEN_GOAL_TAB]: {
     workspaceId: string;
     openCompleteInput?: boolean;
+  };
+  [CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB]: {
+    workspaceId: string;
   };
   [CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB]: {
     /** The main chat whose right sidebar shows the tab. */

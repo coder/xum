@@ -38,6 +38,7 @@ import {
   getTerminalTitlesKey,
 } from "@/common/constants/storage";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 // RightSidebarLayoutState used for initial setup via persisted-state helpers - acceptable for test fixtures
 import {
@@ -802,6 +803,58 @@ describeIntegration("RightSidebar (UI)", () => {
       const reviewPanel = sidebar.querySelector('[role="tabpanel"][id*="review"]');
       expect(costsPanel).toBeTruthy();
       expect(reviewPanel).toBeTruthy();
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("Close Tab closes the active tab of the pane holding keyboard focus", async () => {
+    // Focus sits in the bottom pane while the layout still names the top one: keyboard focus
+    // moves without the mousedown that used to be the only thing updating it.
+    const splitLayout: RightSidebarLayoutState = {
+      version: 1,
+      openTabsOnly: true,
+      nextId: 10,
+      root: {
+        type: "split",
+        id: "split-1",
+        direction: "horizontal",
+        sizes: [50, 50],
+        children: [
+          { type: "tabset", id: "tabset-top", tabs: ["costs"], activeTab: "costs" },
+          { type: "tabset", id: "tabset-bottom", tabs: ["review"], activeTab: "review" },
+        ],
+      },
+      focusedTabsetId: "tabset-top",
+    };
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarLayoutKey(workspaceId), splitLayout);
+    });
+
+    try {
+      const reviewPanel = await findSidebarPanel(sidebar, "-panel-review");
+      fireEvent.keyDown(reviewPanel, { key: "w", ctrlKey: true });
+
+      await waitFor(() => {
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+      });
+      expect(sidebar.querySelector('[role="tab"][aria-controls*="costs"]')).not.toBeNull();
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("the palette's New Tab request opens the launcher with focus in it", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs"]));
+
+    try {
+      await findSidebarTab(sidebar, "costs");
+      window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, { workspaceId }));
+
+      const launcher = await findSidebarPanel(sidebar, "-panel-new");
+      await waitFor(() => {
+        expect(launcher.contains(document.activeElement)).toBe(true);
+      });
     } finally {
       await cleanup();
     }

@@ -2345,6 +2345,26 @@ describe("session tape palette commands", () => {
   });
 });
 
+describe("Right Sidebar: New Tab palette action", () => {
+  test("asks the workspace's sidebar to open the New tab (which also focuses its launcher)", async () => {
+    await withTestWindow(() => {
+      const action = getActions().find(
+        (candidate) => candidate.id === CommandIds.navRightSidebarNewTab()
+      );
+      const requests: string[] = [];
+      const record = (event: Event) =>
+        requests.push((event as CustomEvent<{ workspaceId: string }>).detail.workspaceId);
+      window.addEventListener(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, record);
+      try {
+        void action!.run();
+        expect(requests).toEqual(["w1"]);
+      } finally {
+        window.removeEventListener(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, record);
+      }
+    });
+  });
+});
+
 describe("Right Sidebar: Add Tool palette action (#5767)", () => {
   test("Stats also asks for the Stats dialog; other tools do not", async () => {
     await withTestWindow(async () => {
