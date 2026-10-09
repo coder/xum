@@ -368,7 +368,9 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               )}
               role="combobox"
               aria-expanded={isOpen}
-              aria-label={triggerAriaLabel}
+              // A combobox takes no name from its content, so fall back to a name that
+              // includes the visible model (button-name, #5951).
+              aria-label={triggerAriaLabel ?? (displayValue ? `Model: ${displayValue}` : "Model")}
               variant="ghost"
               size="xs"
               onClick={() => setIsOpen((prev) => !prev)}

@@ -967,6 +967,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                 variant="ghost"
                 size="icon"
                 onClick={() => void handleOpenInEditor()}
+                aria-label="Open in editor"
                 className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0"
               >
                 <Pencil className="h-3.5 w-3.5" />
