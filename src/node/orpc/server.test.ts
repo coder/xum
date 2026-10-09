@@ -544,6 +544,10 @@ describe("createOrpcServer SPA fallback for file and well-known paths", () => {
         "/.env",
         "/.git/config",
         "/assets/.env",
+        // Express keeps percent escapes in req.path; serve-static decodes them before its lookup.
+        "/%2Eenv",
+        "/%2ewell-known/ai-catalog.json",
+        "/missing%2Ejs",
         "/assets/x.js",
         "/other/missing.js",
         "/workspace/abc/missing.js",
@@ -583,6 +587,9 @@ describe("createOrpcServer SPA fallback for file and well-known paths", () => {
         "/workspace/next.js-main",
         "/workspace/proj-release-1.2",
         "/workspace/proj-fix.js",
+        "/workspace/next%2Ejs-main",
+        // A malformed escape must not throw; the path has no dot, so it stays a client route.
+        "/settings%E0",
         "/settings",
         "/settings/providers",
         "/project?path=%2Fhome%2Fdev%2Frepo.git",

@@ -1604,10 +1604,20 @@ export async function createOrpcServer({
       // and can contain dots (next.js-main).
       const isWorkspaceRoute =
         req.path.startsWith("/workspace/") && !req.path.includes("/", "/workspace/".length);
+      // Express keeps percent escapes in req.path (/%2Eenv), but serve-static decodes them before
+      // its lookup, so classify the decoded path. A malformed escape keeps the raw path.
+      let filePath = req.path;
+      if (filePath.includes("%")) {
+        try {
+          filePath = decodeURIComponent(filePath);
+        } catch {
+          // Not decodable: classify the raw path.
+        }
+      }
       if (
         req.path !== "/index.html" &&
         !isWorkspaceRoute &&
-        (req.path.includes("/.") || path.posix.extname(req.path) !== "")
+        (filePath.includes("/.") || path.posix.extname(filePath) !== "")
       ) {
         return next();
       }
