@@ -38,13 +38,25 @@ function toDiscovery(value: unknown): ToolSearchDiscovery | undefined {
   if (!Array.isArray(discovery.candidates) || typeof discovery.note !== "string") {
     return undefined;
   }
-  const candidates = discovery.candidates.filter(
-    (candidate): candidate is ToolSearchDiscovery["candidates"][number] =>
-      candidate != null &&
-      typeof candidate === "object" &&
-      typeof (candidate as { name?: unknown }).name === "string" &&
-      typeof (candidate as { approxTokens?: unknown }).approxTokens === "number"
-  );
+  // Rebuild each candidate from validated fields only: a malformed optional
+  // field (e.g. an object serverName) rendered as a React child would throw.
+  const candidates: ToolSearchDiscovery["candidates"] = [];
+  for (const candidate of discovery.candidates) {
+    if (candidate == null || typeof candidate !== "object") continue;
+    const { name, approxTokens, serverName, oversized } = candidate as {
+      name?: unknown;
+      approxTokens?: unknown;
+      serverName?: unknown;
+      oversized?: unknown;
+    };
+    if (typeof name !== "string" || typeof approxTokens !== "number") continue;
+    candidates.push({
+      name,
+      approxTokens,
+      ...(typeof serverName === "string" ? { serverName } : {}),
+      ...(oversized === true ? { oversized: true as const } : {}),
+    });
+  }
   if (candidates.length === 0) return undefined;
   return { candidates, note: discovery.note };
 }

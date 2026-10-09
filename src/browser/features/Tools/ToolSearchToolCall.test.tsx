@@ -138,6 +138,31 @@ describe("ToolSearchToolCall", () => {
       });
     }
 
+    // Malformed optional fields are stripped (an object serverName rendered as
+    // a React child would throw), never passed through.
+    const stripped = toToolSearchView({
+      query: "q",
+      matches: [],
+      totalDeferred: 3,
+      discovery: {
+        candidates: [
+          { name: "bad_server", approxTokens: 10, serverName: { nested: true }, oversized: "yes" },
+          { name: "good_server", approxTokens: 20, serverName: "charts", oversized: true },
+        ],
+        note: "note text",
+      },
+    });
+    expect(stripped.kind).toBe("matches");
+    if (stripped.kind === "matches") {
+      expect(stripped.result.discovery).toEqual({
+        candidates: [
+          { name: "bad_server", approxTokens: 10 },
+          { name: "good_server", approxTokens: 20, serverName: "charts", oversized: true },
+        ],
+        note: "note text",
+      });
+    }
+
     // Malformed discovery (no usable candidates / non-string note) is dropped entirely.
     const dropped = toToolSearchView({
       query: "q",
