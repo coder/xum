@@ -153,7 +153,9 @@ function RootRouteShell(props: {
         </div>
       ) : null}
       <div className="flex flex-1 items-center justify-center px-6">
-        <p className="text-muted text-sm">Select or add a project to get started.</p>
+        {/* text-content-secondary, not text-muted: the light theme's muted token is 3.8:1 on this
+            surface, below WCAG AA for text-sm (#5948). */}
+        <p className="text-content-secondary text-sm">Select or add a project to get started.</p>
       </div>
     </div>
   );
