@@ -62,8 +62,6 @@ import { getAppProxyBasePathFromPathname, stripAppProxyBasePath } from "@/common
 
 type AliveWebSocket = WebSocket & { isAlive?: boolean };
 
-const ROBOTS_TXT = "User-agent: *\nDisallow: /\n";
-
 export { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH, ORPC_WS_PATH };
 
 const WS_HEARTBEAT_INTERVAL_MS = 30_000;
@@ -1597,13 +1595,6 @@ export async function createOrpcServer({
       // Don't swallow API/ORPC routes with index.html.
       if (req.path.startsWith("/orpc") || req.path.startsWith("/api")) {
         return next();
-      }
-
-      // #5945: the server is a private app UI, so ask every crawler to stay out. Served from
-      // code, because the npm package and Docker image ship dist/ files by extension only.
-      if (req.path === "/robots.txt") {
-        res.type("text/plain").send(ROBOTS_TXT);
-        return;
       }
 
       // #5945: a missing file (/llms.txt, /assets/x.js) or a dot segment probe (/.well-known/*,

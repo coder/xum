@@ -528,26 +528,15 @@ describe("createOrpcServer hashed static asset compression", () => {
 describe("createOrpcServer SPA fallback for file and well-known paths", () => {
   const SPA_TITLE = "<title>mux</title>";
 
-  test("serves a robots.txt that disallows every crawler", async () => {
-    const { server, close } = await createStaticTestServer();
-
-    try {
-      for (const urlPath of ["/robots.txt", `${APP_PROXY_BASE_PATH}/robots.txt`]) {
-        const res = await rawRequest(server.baseUrl, urlPath);
-        expect(res.status, urlPath).toBe(200);
-        expect(res.headers["content-type"], urlPath).toContain("text/plain");
-        expect(res.body, urlPath).toBe("User-agent: *\nDisallow: /\n");
-      }
-    } finally {
-      await close();
-    }
-  });
-
   test("answers missing file paths and /.well-known/ with 404 instead of the SPA page", async () => {
     const { server, close } = await createStaticTestServer();
 
     try {
       const urlPaths = [
+        // No robots.txt on purpose: a 4xx makes Lighthouse skip its robots audit, while
+        // `Disallow: /` failed is-crawlable and dropped SEO from 91 to 63.
+        "/robots.txt",
+        `${APP_PROXY_BASE_PATH}/robots.txt`,
         "/llms.txt",
         "/.well-known/ai-catalog.json",
         "/.well-known/security",
