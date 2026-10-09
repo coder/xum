@@ -89,7 +89,8 @@ const SortableTab: React.FC<{
             {...(listeners ?? {})}
             className={cn(
               "group relative flex min-w-0 max-w-[240px] items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1 text-xs font-medium transition-colors duration-150",
-              "cursor-grab touch-none active:cursor-grabbing",
+              // Let touch users pan the overflowing strip; mouse pointers still drag/reorder.
+              "cursor-grab touch-pan-x active:cursor-grabbing",
               // Reserve the X's space even while hidden: hovering/focusing/selecting a tab must
               // neither cover its text nor change its label width (especially for long titles).
               // Coarse pointers need the larger target even on tablets wide enough to show

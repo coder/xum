@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { DndContext, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
-import { SortableContext, horizontalListSortingStrategy } from "@dnd-kit/sortable";
+import { arrayMove, SortableContext, horizontalListSortingStrategy } from "@dnd-kit/sortable";
 import { useState } from "react";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import {
@@ -41,6 +41,12 @@ function StripFixture(props: { width: number }) {
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
   const [selected, setSelected] = useState<TabType>("new");
   const [closed, setClosed] = useState<TabType[]>([]);
+  const [order, setOrder] = useState<TabType[]>([
+    "new",
+    "instructions",
+    "side:side-title",
+    "terminal:long-title",
+  ]);
   const close = (tab: TabType) => setClosed((prev) => [...prev, tab]);
   const definitions: Array<
     Pick<RightSidebarTabStripItem, "tab" | "label" | "tooltip" | "closeLabel">
@@ -75,7 +81,8 @@ function StripFixture(props: { width: number }) {
       tooltip: LONG_TITLE,
     },
   ];
-  const items = definitions
+  const items = order
+    .map((tab) => definitions.find((item) => item.tab === tab)!)
     .filter((item) => !closed.includes(item.tab))
     .map((item) => ({
       ...item,
@@ -92,7 +99,19 @@ function StripFixture(props: { width: number }) {
           className="bg-surface-primary border-border text-foreground border"
           style={{ width: props.width, maxWidth: "100%" }}
         >
-          <DndContext sensors={sensors}>
+          <DndContext
+            sensors={sensors}
+            onDragEnd={({ active, over }) => {
+              if (!over) return;
+              setOrder((prev) =>
+                arrayMove(
+                  prev,
+                  prev.findIndex((tab) => `fixture:${tab}` === active.id),
+                  prev.findIndex((tab) => `fixture:${tab}` === over.id)
+                )
+              );
+            }}
+          >
             <SortableContext
               items={items.map((item) => `fixture:${item.tab}`)}
               strategy={horizontalListSortingStrategy}
