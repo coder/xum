@@ -160,8 +160,20 @@ export function PRStackBadge(props: PRStackBadgeProps) {
       }
     };
 
+    // The header and footer hide their trigger with CSS at some widths, and that no longer
+    // hides the portaled menu with it.
+    const handleResize = () => {
+      if (triggerRef.current?.getClientRects().length === 0) {
+        setIsOpen(false);
+      }
+    };
+
     document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
+    window.addEventListener("resize", handleResize);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      window.removeEventListener("resize", handleResize);
+    };
   }, [isOpen]);
 
   return (
