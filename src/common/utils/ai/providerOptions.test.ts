@@ -468,7 +468,6 @@ describe("buildProviderOptions - Anthropic", () => {
         "claude-sonnet-5-5",
         "claude-haiku-5-5",
         "claude-fable-5-1",
-        "claude-mythos-5-1",
       ]) {
         expect(thinkingFor(`anthropic:${model}`)).toEqual({
           type: "adaptive",
@@ -484,7 +483,12 @@ describe("buildProviderOptions - Anthropic", () => {
     });
 
     test("leaves models that do not bind thinking to the prefix unchanged", () => {
-      for (const model of ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"]) {
+      for (const model of [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-mythos-5-1",
+      ]) {
         expect(thinkingFor(`anthropic:${model}`)).not.toHaveProperty("blockBinding");
       }
     });

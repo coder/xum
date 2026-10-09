@@ -982,6 +982,80 @@ describe("modelMessageTransform", () => {
         { type: "text", text: "done" },
       ]);
     });
+
+    // #5887: interleaved thinking can put text between two thinking blocks before a tool
+    // call. Moving the second block forward edits the prefix every later block is bound to.
+    it("replays a tool-call message that starts with thinking in its original block order", () => {
+      const redacted = { anthropic: { redactedData: "opaque" } };
+      const toolCall = {
+        type: "tool-call",
+        toolCallId: "c1",
+        toolName: "bash",
+        input: {},
+      } as const;
+      const toolResult: ToolModelMessage = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "c1",
+            toolName: "bash",
+            output: { type: "text", value: "ok" },
+          },
+        ],
+      };
+      const openers = [
+        { type: "reasoning", text: "plan", providerOptions: sig("sig-1") },
+        { type: "reasoning", text: "", providerOptions: redacted },
+      ] as const;
+      for (const opener of openers) {
+        const content: AssistantModelMessage["content"] = [
+          opener,
+          { type: "text", text: "Let me check." },
+          { type: "reasoning", text: "check", providerOptions: sig("sig-2") },
+          toolCall,
+        ];
+        const messages: ModelMessage[] = [
+          { role: "user", content: [{ type: "text", text: "go" }] },
+          { role: "assistant", content },
+          toolResult,
+        ];
+
+        expect(assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))).toEqual(
+          content
+        );
+      }
+    });
+
+    it("still moves thinking first when a tool-call message starts with text", () => {
+      // Manual extended thinking requires the final assistant turn to start with thinking.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Let me check." },
+            { type: "reasoning", text: "check", providerOptions: sig("sig-1") },
+            { type: "tool-call", toolCallId: "c1", toolName: "bash", input: {} },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "c1",
+              toolName: "bash",
+              output: { type: "text", value: "ok" },
+            },
+          ],
+        },
+      ];
+
+      expect(
+        assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))?.[0]
+      ).toEqual({ type: "reasoning", text: "check", providerOptions: sig("sig-1") });
+    });
   });
 
   describe("reasoning part handling for OpenAI", () => {

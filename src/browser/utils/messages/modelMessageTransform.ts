@@ -1134,7 +1134,12 @@ function ensureAnthropicThinkingBeforeToolCalls(messages: ModelMessage[]): Model
 
     const content = assistantMsg.content;
     const hasToolCall = content.some((part) => part.type === "tool-call");
-    if (!hasToolCall) {
+    // A message that already starts with thinking meets the API rule (manual thinking: the
+    // final assistant turn must start with a thinking block). Keep its block order: with
+    // interleaved thinking, text can sit between two thinking blocks, and moving a block
+    // edits the prefix every later block is bound to (#5887). Preserved thinking: "send it
+    // back unchanged ... in the order received".
+    if (!hasToolCall || content[0]?.type === "reasoning") {
       result.push(msg);
       continue;
     }
