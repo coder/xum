@@ -128,6 +128,97 @@ describe("continuous compaction provider replay", () => {
     expect(rows.data[0].metadata?.compactionBoundary).toBe(true);
   });
 
+  it("builds visible tail copies whose thinking Anthropic requests leave out", async () => {
+    // Preserved thinking: the rolling summary replaces the rows the tail's thinking
+    // was bound to, so the copies must not replay it. They keep the text for the UI.
+    const handler = new CompactionHandler({
+      workspaceId,
+      historyService: store.historyService,
+      sessionDir: path.join(store.tempDir, "pending"),
+      emitter: new EventEmitter(),
+    });
+    const prompt = createMuxMessage("recent-user", "user", "Verify the fix");
+    const answer = createMuxMessage("recent-answer", "assistant", "", {
+      stepStartPartIndices: [0, 2],
+    });
+    answer.parts = [
+      { type: "reasoning", text: "plan", providerOptions: { anthropic: { signature: "s1" } } },
+      {
+        type: "dynamic-tool",
+        toolCallId: "check",
+        toolName: "bash",
+        state: "output-available",
+        input: { script: "bun test", timeout_secs: 10 },
+        output: { success: true, output: "Tests passed" },
+      },
+      { type: "reasoning", text: "", providerOptions: { anthropic: { redactedData: "r1" } } },
+      { type: "reasoning", text: "legacy", signature: "legacy" },
+      {
+        type: "reasoning",
+        text: "gemini thought",
+        providerOptions: { google: { thoughtSignature: "g" } },
+      },
+      { type: "text", text: "Done" },
+    ];
+    const { boundary, copies } = handler.buildContinuousCompactionRows({
+      messages: [],
+      text: "Summary",
+      model: "anthropic:test-model",
+      tail: [prompt, answer],
+      systemMessageTokens: 0,
+      attachmentTokens: 0,
+    });
+    const answerCopy = copies[1];
+    expect(answerCopy.metadata?.uiVisible).toBe(true);
+    expect(answerCopy.parts.map((part) => part.type)).toEqual(
+      answer.parts.map((part) => part.type)
+    );
+    expect(answerCopy.metadata?.stepStartPartIndices).toEqual([0, 2]);
+    expect(answerCopy.parts[0]).toEqual({ type: "reasoning", text: "plan" });
+    expect(answerCopy.parts[4]).toMatchObject({
+      providerOptions: { google: { thoughtSignature: "g" } },
+    });
+    for (const part of answerCopy.parts) {
+      if (part.type !== "reasoning") continue;
+      expect(part.signature).toBeUndefined();
+      expect(part.providerOptions?.anthropic).toBeUndefined();
+    }
+
+    const toAnthropic = (rows: MuxMessage[]) =>
+      prepareMessagesForProvider({
+        messagesWithSentinel: rows.map((row, index) => ({
+          ...row,
+          metadata: { ...row.metadata, historySequence: index },
+        })),
+        effectiveAgentId: "exec",
+        toolNamesForSentinel: [],
+        providerForMessages: "anthropic",
+        effectiveThinkingLevel: "high",
+        modelString: "anthropic:test-model",
+        workspaceId,
+      });
+    // Replayable Anthropic thinking = a reasoning part with a signature or redacted data.
+    // Unsigned "..." placeholders for tool-use turns are not sent by the SDK.
+    const replayedThinking = (wire: Awaited<ReturnType<typeof toAnthropic>>) =>
+      wire.flatMap((message) =>
+        message.role === "assistant" && typeof message.content !== "string"
+          ? message.content.filter(
+              (part) =>
+                part.type === "reasoning" &&
+                (part.providerOptions?.anthropic != null || part.text !== "...")
+            )
+          : []
+      );
+    // Control: the original rows replay their signed and redacted blocks.
+    expect(replayedThinking(await toAnthropic([prompt, answer])).length).toBeGreaterThan(0);
+    const wire = await toAnthropic([boundary, ...copies]);
+    expect(replayedThinking(wire)).toEqual([]);
+    const assistantParts = wire.flatMap((message) =>
+      message.role === "assistant" && typeof message.content !== "string" ? message.content : []
+    );
+    expect(assistantParts.some((part) => part.type === "tool-call")).toBe(true);
+  });
+
   for (const provider of ["anthropic", "openai"]) {
     it(`replays the durable summary, prompt, and sliced tool pairs through the ${provider} pipeline`, async () => {
       const old = createMuxMessage(

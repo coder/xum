@@ -2,6 +2,8 @@
 // the old code.
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
+import { KNOWN_MODELS } from "../../../src/common/constants/knownModels";
+import { formatModelDisplayName } from "../../../src/common/utils/ai/modelDisplay";
 import { disableTutorials, openPlayground } from "./helpers";
 
 test(
@@ -119,9 +121,13 @@ test(
       await expect(search).toBeHidden();
       await expect(screen.getByRole("combobox").filter({ hasText: label })).toBeVisible();
     };
+    // Haiku has no fast mode on any route, so the toast must name the model, not the route. Use
+    // the curated `haiku` model: the picker only offers listed models, so a retired Haiku id
+    // stops matching once the alias moves.
+    const haiku = KNOWN_MODELS.HAIKU;
+    const haikuLabel = formatModelDisplayName(haiku.providerModelId);
     try {
-      // Haiku 4.5 has no fast mode on any route, so the toast must name the model, not the route.
-      await pickModel("Opus 5.5", "anthropic:claude-haiku-4-5", "Haiku 4.5");
+      await pickModel("Opus 5.5", haiku.id, haikuLabel);
       await composer.tap();
       await browser.keyboard.press("Control+Shift+F");
       await expect(screen.getByText(/this model has no fast mode/)).toBeVisible();
@@ -130,7 +136,7 @@ test(
       // The first switch can fail before it changes the model, so restore only when it did.
       const onOpus = await screen.getByRole("combobox").filter({ hasText: "Opus 5.5" }).isVisible();
       if (!onOpus) {
-        await pickModel("Haiku 4.5", "anthropic:claude-opus-5-5", "Opus 5.5");
+        await pickModel(haikuLabel, "anthropic:claude-opus-5-5", "Opus 5.5");
       }
     }
   }

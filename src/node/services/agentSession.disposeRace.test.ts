@@ -185,13 +185,13 @@ describe("AgentSession disposal race conditions", () => {
         releaseModel = resolve;
       });
       const gatedAiService = {
-        createModelWithPinnedMetadata: async () => {
+        createModelWithPinnedOptions: async () => {
           await modelGate;
           return Err({ type: "api_key_not_found" as const, provider: "anthropic" });
         },
         // Side-channel candidates are confined to workspace-configured
         // providers; metadata must resolve with a model or the writer settles
-        // null before createModelWithPinnedMetadata — the gate above would
+        // null before createModelWithPinnedOptions — the gate above would
         // never park the send.
         getWorkspaceMetadata: () =>
           Promise.resolve(Ok({ aiSettings: { model: "anthropic:claude-sonnet-4-5" } })),

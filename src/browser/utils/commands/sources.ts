@@ -15,7 +15,7 @@ import {
 } from "@/common/types/thinking";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { getFastModeProvider } from "@/browser/utils/fastModeServiceTier";
+import { getFastModeProvider, ultrafastModeAvailable } from "@/browser/utils/fastModeServiceTier";
 import { openaiCyberModeAvailable } from "@/common/utils/ai/cyberMode";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import {
@@ -127,6 +127,8 @@ export interface BuildSourcesParams {
   ) => void;
   getFastMode: () => boolean;
   onToggleFastMode: () => void | Promise<void>;
+  getUltrafastMode: () => boolean;
+  onToggleUltrafastMode: () => void | Promise<void>;
   /** config.json keepScreenAwake from the shared app config cache; undefined until it loads. */
   getKeepScreenAwake?: () => boolean | undefined;
   /** Native host computer use for the selected workspace; null when unsupported or no workspace. */
@@ -1481,6 +1483,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     const providerOptionRoute = providerOptionGateModel
       ? p.getRouteForModel?.(normalizeToCanonical(providerOptionGateModel))
       : undefined;
+    // Fast and Ultrafast are one mutually exclusive tier preference, so both actions report the
+    // same current tier instead of each calling the other's active tier "Standard".
+    const premiumTierLabel = p.getFastMode()
+      ? "Fast — faster responses at higher cost"
+      : p.getUltrafastMode()
+        ? "Ultrafast — fastest responses, highest cost"
+        : "Standard";
     const fastModeAction: CommandAction | null =
       p.providersConfig != null &&
       getFastModeProvider(providerOptionGateModel ?? "", {
@@ -1490,10 +1499,25 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         ? {
             id: CommandIds.toggleFastMode(),
             title: "Toggle Fast Mode",
-            subtitle: `Current: ${p.getFastMode() ? "Fast — faster responses at higher cost" : "Standard"}`,
+            subtitle: `Current: ${premiumTierLabel}`,
             section: section.mode,
             shortcutHint: formatKeybind(KEYBINDS.TOGGLE_FAST_MODE),
             run: p.onToggleFastMode,
+          }
+        : null;
+    const ultrafastModeAction: CommandAction | null =
+      p.providersConfig != null &&
+      ultrafastModeAvailable(providerOptionGateModel ?? "", {
+        providersConfig: p.providersConfig,
+        resolvedRouteProvider: providerOptionRoute,
+      })
+        ? {
+            id: CommandIds.toggleUltrafastMode(),
+            title: "Toggle Ultrafast Mode",
+            subtitle: `Current: ${premiumTierLabel}`,
+            section: section.mode,
+            shortcutHint: formatKeybind(KEYBINDS.TOGGLE_ULTRAFAST_MODE),
+            run: p.onToggleUltrafastMode,
           }
         : null;
     // The picker rows are the only pointer path to Auto; the model-cycle and thinking-step
@@ -1616,6 +1640,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       if (fastModeAction) {
         list.push(fastModeAction);
       }
+      if (ultrafastModeAction) list.push(ultrafastModeAction);
       const computerUse = p.computerUse;
       if (computerUse != null) {
         list.push({
@@ -1684,6 +1709,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // Creation composers use their project-scoped preferences before a workspace exists.
       list.push(...autoRoutingActions);
       if (fastModeAction) list.push(fastModeAction);
+      if (ultrafastModeAction) list.push(ultrafastModeAction);
     }
 
     return list;

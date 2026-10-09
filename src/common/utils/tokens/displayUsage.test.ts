@@ -312,6 +312,18 @@ describe("createDisplayUsage", () => {
       }
     );
 
+    test("applies Haiku 5.5's 5x tier only above its published 100K boundary", () => {
+      for (const tokens of [100000, 100001]) {
+        const multiplier = tokens > 100000 ? 5 : 1;
+        const result = createDisplayUsage(
+          { inputTokens: tokens, outputTokens: 1000, totalTokens: tokens + 1000 },
+          "anthropic:claude-haiku-5-5"
+        );
+        expect(result?.input.cost_usd).toBeCloseTo(((tokens * 0.1) / 1e6) * multiplier, 12);
+        expect(result?.output.cost_usd).toBeCloseTo(0.001 * 0.5 * multiplier, 12);
+      }
+    });
+
     test("keeps GPT-5.5 on base rates at the published 272K boundary", () => {
       const usage: LanguageModelV2Usage = {
         inputTokens: 272000,
@@ -628,9 +640,8 @@ describe("OpenAI service-tier pricing (#4352)", () => {
   });
 
   test("prices Ultrafast at 6x Standard in both context bands", () => {
-    // gpt-6-astra has a published Ultrafast card; gpt-6.1-sol does not and falls
-    // back to the same announced 6x multiplier, above its Fast card.
-    for (const model of ["openai:gpt-6-astra", "openai:gpt-6.1-sol"]) {
+    // gpt-6-luna has no Ultrafast card and falls back to the same 6x multiplier.
+    for (const model of ["openai:gpt-6-astra", "openai:gpt-6.1-sol", "openai:gpt-6-luna"]) {
       for (const inputTokens of [100_000, 300_000]) {
         expect(cost(model, inputTokens, "ultrafast")).toBeCloseTo(6 * cost(model, inputTokens), 9);
       }

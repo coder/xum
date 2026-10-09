@@ -247,6 +247,7 @@ export async function appendReplayFixtureTurn(
         responseHeaders: null,
         rawResponse: null,
         rawChunks: null,
+        inputTransformations: null,
       },
     };
     ctx.devtoolsLines.push(JSON.stringify(runEntry), JSON.stringify(stepEntry));

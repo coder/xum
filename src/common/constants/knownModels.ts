@@ -103,11 +103,20 @@ const MODEL_DEFINITIONS = {
     // estimate depending on content type.
     tokenizerOverride: "anthropic/claude-sonnet-4.5",
   },
+  // Claude Haiku 5.5 - released October 7, 2026, successor to Haiku 4.5. Tiered pricing:
+  // $0.10/M input, $0.50/M output up to 100K prompt tokens, 5x above. API id
+  // `claude-haiku-5-5`; Haiku 4.5 stays usable as the custom model string
+  // `anthropic:claude-haiku-4-5`. Unlike Haiku 4.5 it uses adaptive thinking only
+  // (`budget_tokens` returns 400), but it still accepts `disabled` at effort high or
+  // below, so "off" stays available.
   HAIKU: {
     provider: "anthropic",
-    providerModelId: "claude-haiku-4-5",
+    providerModelId: "claude-haiku-5-5",
     aliases: ["haiku"],
-    tokenizerOverride: "anthropic/claude-3.5-haiku",
+    // Haiku 5.5 uses the newer Claude 4.7+ tokenizer (~30% more tokens than Haiku 4.5 for
+    // the same text), which isn't published upstream; reuse Opus 4.5 for approximate
+    // counting (same situation as OPUS above).
+    tokenizerOverride: "anthropic/claude-opus-4.5",
   },
   // GPT-6.1 Sol - released September 29, 2026, successor to GPT-6 Sol at the same
   // Standard pricing ($2/M input, $10/M output) with cheaper cache reads ($0.10/M).
@@ -266,6 +275,7 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
+  "anthropic:claude-haiku-4-5": "anthropic/claude-3.5-haiku",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
   "openai:daybreak-blue-latest": "openai/gpt-5",
   "openai:daybreak-red-latest": "openai/gpt-5",

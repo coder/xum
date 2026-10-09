@@ -82,6 +82,7 @@ export const CommandIds = {
   toggleProReasoning: () => "thinking:toggle-pro-reasoning" as const,
   toggleCyberReasoning: () => "thinking:toggle-cyber-reasoning" as const,
   toggleFastMode: () => "thinking:toggle-fast-mode" as const,
+  toggleUltrafastMode: () => "thinking:toggle-ultrafast-mode" as const,
   toggleComputerUse: () => "mode:toggle-computer-use" as const,
   toggleAutoRouting: (dimension: "model" | "thinkingLevel") =>
     `auto-routing:toggle:${dimension}` as const,

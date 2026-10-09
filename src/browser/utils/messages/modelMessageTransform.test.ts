@@ -892,6 +892,98 @@ describe("modelMessageTransform", () => {
     });
   });
 
+  describe("Anthropic preserved thinking blocks", () => {
+    // Newer Claude models bind every replayed thinking block to its prefix, so
+    // each block must go back as returned: own signature, own position.
+    const thinkingOn = { anthropicThinkingEnabled: true };
+    const sig = (signature: string) => ({ anthropic: { signature } });
+
+    function assistantContent(messages: ModelMessage[]) {
+      const assistant = messages.find(
+        (msg): msg is AssistantModelMessage => msg.role === "assistant"
+      );
+      expect(assistant).toBeDefined();
+      return assistant?.content;
+    }
+
+    it("joins the streamed deltas of one block but keeps adjacent signed blocks apart", () => {
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            // Block 1 streamed as two deltas; Anthropic signs the last one.
+            { type: "reasoning", text: "pl" },
+            { type: "reasoning", text: "an", providerOptions: sig("sig-1") },
+            // Block 2 directly follows block 1.
+            { type: "reasoning", text: "check", providerOptions: sig("sig-2") },
+            // Block 3: empty thinking with only a signature.
+            { type: "reasoning", text: "", providerOptions: sig("sig-3") },
+            { type: "text", text: "done" },
+          ],
+        },
+      ];
+
+      expect(assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))).toEqual([
+        { type: "reasoning", text: "plan", providerOptions: sig("sig-1") },
+        { type: "reasoning", text: "check", providerOptions: sig("sig-2") },
+        { type: "reasoning", text: "", providerOptions: sig("sig-3") },
+        { type: "text", text: "done" },
+      ]);
+    });
+
+    it("keeps redacted_thinking blocks in place and never merges them with neighbors", () => {
+      const redacted = { anthropic: { redactedData: "opaque" } };
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "reasoning", text: "", providerOptions: redacted },
+            { type: "reasoning", text: "", providerOptions: redacted },
+            // An unsigned delta after a redacted block starts a new block.
+            { type: "reasoning", text: "next", providerOptions: sig("sig-1") },
+            { type: "text", text: "done" },
+          ],
+        },
+      ];
+
+      expect(assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))).toEqual([
+        { type: "reasoning", text: "", providerOptions: redacted },
+        { type: "reasoning", text: "", providerOptions: redacted },
+        { type: "reasoning", text: "next", providerOptions: sig("sig-1") },
+        { type: "text", text: "done" },
+      ]);
+    });
+
+    it("still merges OpenAI reasoning deltas that carry the itemId on the first part", () => {
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "a",
+              providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+            },
+            { type: "reasoning", text: "b" },
+            { type: "text", text: "done" },
+          ],
+        },
+      ];
+
+      expect(assistantContent(transformModelMessages(messages, "openai"))).toEqual([
+        {
+          type: "reasoning",
+          text: "ab",
+          providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+        },
+        { type: "text", text: "done" },
+      ]);
+    });
+  });
+
   describe("reasoning part handling for OpenAI", () => {
     it("should preserve reasoning parts for OpenAI provider (managed via explicit history)", () => {
       const messages: ModelMessage[] = [

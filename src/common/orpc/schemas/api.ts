@@ -3369,6 +3369,9 @@ const DevToolsStepSchema = z.object({
   responseHeaders: z.record(z.string(), z.string()).nullable(),
   rawResponse: z.unknown().nullable(),
   rawChunks: z.unknown().nullable(),
+  inputTransformations: z
+    .array(z.object({ type: z.string(), path: z.string(), reason: z.string().optional() }))
+    .nullable(),
 });
 
 const DevToolsRunSummarySchema = z.object({

@@ -1942,7 +1942,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       }),
     ];
     const summaryAiService: BranchSummaryAiService = {
-      createModelWithPinnedMetadata: (modelString: string) =>
+      createModelWithPinnedOptions: (modelString: string) =>
         Promise.resolve(
           Ok({
             model: new MockLanguageModelV3({
@@ -1966,8 +1966,13 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
                 }),
             }),
             metadataModel: modelString,
+            effectiveModelString: modelString,
+            wireProviderName: "anthropic",
+            optionsModelString: modelString,
+            optionsProvidersConfig: {},
+            optionsMuxProviderOptions: {},
           })
-        ) as ReturnType<BranchSummaryAiService["createModelWithPinnedMetadata"]>,
+        ) as ReturnType<BranchSummaryAiService["createModelWithPinnedOptions"]>,
       getWorkspaceMetadata: () =>
         Promise.resolve(Ok({ aiSettings: { model: "anthropic:claude-haiku-4-5" } })) as ReturnType<
           BranchSummaryAiService["getWorkspaceMetadata"]

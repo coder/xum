@@ -20,6 +20,9 @@ import {
   getFastModeProvider,
   getFastModeUnavailableReason,
   isFastModeActive,
+  isUltrafastModeActive,
+  type PremiumServiceTier,
+  ultrafastModeAvailable,
 } from "./utils/fastModeServiceTier";
 import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
 import { buildSortedWorkspacesByProject } from "./utils/ui/workspaceFiltering";
@@ -574,6 +577,20 @@ function AppInner() {
     return provider != null && isFastModeActive(provider, providersConfig[provider]);
   }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
 
+  // Plain function: React Compiler handles memoization.
+  const getUltrafastModeActive = () => {
+    const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
+    if (!scopeId || providersConfig == null) return false;
+
+    const model = getModelForWorkspace(scopeId);
+    return (
+      ultrafastModeAvailable(model, {
+        providersConfig,
+        resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
+      }) && isUltrafastModeActive(providersConfig.openai)
+    );
+  };
+
   const fastModeToggleInFlightRef = useRef(false);
   // Native host computer use belongs to the selected workspace. Offer it only where the backend
   // accepts it: in the desktop app, for workspaces that run on this machine.
@@ -586,57 +603,81 @@ function AppInner() {
     computerUse.status?.supported === true &&
     (isWorktreeRuntime(selectedRuntimeConfig) || isLocalProjectRuntime(selectedRuntimeConfig));
 
-  const toggleFastMode = useCallback(async () => {
-    const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
-    if (!api || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current) return;
+  // Fast and Ultrafast share one toggle path: they write the same provider tier preference.
+  const togglePremiumServiceTier = useCallback(
+    async (targetServiceTier: PremiumServiceTier) => {
+      const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
+      if (!api || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current) return;
 
-    // Creation composers use the same project-scoped model preference as their selector,
-    // so the global shortcut remains available before the first workspace exists.
-    // Serialize requests so a quick double press cannot compute two writes from stale config.
-    fastModeToggleInFlightRef.current = true;
-    const model = getModelForWorkspace(scopeId);
-    const provider = getFastModeProvider(model, {
-      providersConfig,
-      resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
-    });
-    if (provider == null) {
-      fastModeToggleInFlightRef.current = false;
-      // The shortcut used to do nothing here, so it looked broken (#5693). Say why instead.
-      window.dispatchEvent(
-        createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
-          type: "error",
-          title: "Fast mode",
-          message:
-            getFastModeUnavailableReason(model, providersConfig) === "model"
-              ? `Fast mode is not available for ${model}: this model has no fast mode.`
-              : `Fast mode is not available for ${model} on its current provider route, for example through a gateway or a custom base URL.`,
-        })
-      );
-      return;
-    }
-
-    try {
-      const patch = await applyFastModeToggle(api.providers, provider, providersConfig[provider]);
-      if (patch) {
-        updateOptimistically(provider, patch);
-      } else {
-        await refreshProvidersConfig();
+      // Creation composers use the same project-scoped model preference as their selector,
+      // so the global shortcut remains available before the first workspace exists.
+      // Serialize requests so a quick double press cannot compute two writes from stale config.
+      fastModeToggleInFlightRef.current = true;
+      const model = getModelForWorkspace(scopeId);
+      const availabilityOptions = {
+        providersConfig,
+        resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
+      };
+      const provider = getFastModeProvider(model, availabilityOptions);
+      if (
+        targetServiceTier === "ultrafast" &&
+        !ultrafastModeAvailable(model, availabilityOptions)
+      ) {
+        fastModeToggleInFlightRef.current = false;
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
+            type: "error",
+            title: "Ultrafast mode",
+            message: `Ultrafast mode is not available for ${model} on its current provider route and wire format.`,
+          })
+        );
+        return;
       }
-    } catch {
-      await refreshProvidersConfig();
-    } finally {
-      fastModeToggleInFlightRef.current = false;
-    }
-  }, [
-    api,
-    creationScopeId,
-    getModelForWorkspace,
-    getRouteForModel,
-    providersConfig,
-    refreshProvidersConfig,
-    selectedWorkspace,
-    updateOptimistically,
-  ]);
+      if (provider == null) {
+        fastModeToggleInFlightRef.current = false;
+        // The shortcut used to do nothing here, so it looked broken (#5693). Say why instead.
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
+            type: "error",
+            title: "Fast mode",
+            message:
+              getFastModeUnavailableReason(model, providersConfig) === "model"
+                ? `Fast mode is not available for ${model}: this model has no fast mode.`
+                : `Fast mode is not available for ${model} on its current provider route, for example through a gateway or a custom base URL.`,
+          })
+        );
+        return;
+      }
+
+      try {
+        const patch = await applyFastModeToggle(
+          api.providers,
+          provider,
+          providersConfig[provider],
+          targetServiceTier
+        );
+        if (patch) {
+          updateOptimistically(provider, patch);
+        } else {
+          await refreshProvidersConfig();
+        }
+      } catch {
+        await refreshProvidersConfig();
+      } finally {
+        fastModeToggleInFlightRef.current = false;
+      }
+    },
+    [
+      api,
+      creationScopeId,
+      getModelForWorkspace,
+      getRouteForModel,
+      providersConfig,
+      refreshProvidersConfig,
+      selectedWorkspace,
+      updateOptimistically,
+    ]
+  );
 
   const registerParamsRef = useRef<BuildSourcesParams | null>(null);
 
@@ -907,7 +948,9 @@ function AppInner() {
     getReasoningMode: getReasoningModeForWorkspace,
     onToggleReasoningMode: toggleReasoningModeFromPalette,
     getFastMode: getFastModeActive,
-    onToggleFastMode: toggleFastMode,
+    onToggleFastMode: () => togglePremiumServiceTier("priority"),
+    getUltrafastMode: getUltrafastModeActive,
+    onToggleUltrafastMode: () => togglePremiumServiceTier("ultrafast"),
     // Read when the palette opens, from the shared cache (one fetch + one config subscription
     // per session), so showing the state costs no IPC call (#5791).
     getKeepScreenAwake: () => getAppConfigStore().getSnapshot()?.keepScreenAwake,
@@ -1038,7 +1081,13 @@ function AppInner() {
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_FAST_MODE)) {
         e.preventDefault();
         // Modals trap focus and hide the page behind them; don't change hidden page UI.
-        if (!isDialogOpen()) toggleFastMode().catch(() => undefined);
+        if (!isDialogOpen()) togglePremiumServiceTier("priority").catch(() => undefined);
+      } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ULTRAFAST_MODE)) {
+        e.preventDefault();
+        // A held chord would re-toggle once each write settles, leaving the tier timing-dependent.
+        if (!isDialogOpen() && !e.repeat) {
+          togglePremiumServiceTier("ultrafast").catch(() => undefined);
+        }
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_COMPUTER_USE) && computerUseAvailable) {
         e.preventDefault();
         // A held shortcut would race enable and disable requests and leave either state behind.
@@ -1109,7 +1158,7 @@ function AppInner() {
     isCommandPaletteOpen,
     closeCommandPalette,
     openCommandPalette,
-    toggleFastMode,
+    togglePremiumServiceTier,
     computerUseAvailable,
     computerUse,
     openSettings,

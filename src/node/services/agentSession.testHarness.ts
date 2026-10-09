@@ -128,11 +128,6 @@ export function createAgentSessionAIServiceFake(
   const getClosingSignal = options.getClosingSignal;
   const aiService: AgentSessionAIService & EventEmitter = Object.assign(aiEmitter, {
     // Real implementations report failures as Err results, never rejections.
-    createModelWithPinnedMetadata: mock(() =>
-      Promise.resolve(
-        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
-      )
-    ),
     createModelWithPinnedOptions: mock(() =>
       Promise.resolve(
         Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })

@@ -4,7 +4,11 @@
  */
 
 import type { ModelMessage, AssistantModelMessage, ToolModelMessage } from "ai";
-import { isContextBudgetWarningMessage, type MuxMessage } from "@/common/types/message";
+import {
+  isContextBudgetWarningMessage,
+  type MuxMessage,
+  type MuxReasoningPart,
+} from "@/common/types/message";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import { MAX_POST_COMPACTION_INJECTION_CHARS } from "@/common/constants/attachments";
 import { hasProviderReplayableContent } from "@/common/utils/messages/providerEligibility";
@@ -866,15 +870,15 @@ function stripUnsignedAnthropicReasoning(messages: ModelMessage[]): ModelMessage
       return msg;
     }
 
-    // Filter out reasoning parts without anthropic.signature in providerOptions
+    // Keep reasoning the SDK can replay: signed `thinking` blocks and
+    // `redacted_thinking` blocks (redactedData, no signature). Dropping a replayable
+    // block would move every later block off the prefix it was signed against.
     const content = assistantMsg.content.filter((part) => {
       if (part.type !== "reasoning") {
         return true;
       }
-      // Check for anthropic.signature in providerOptions
-      const anthropicMeta = (part.providerOptions as { anthropic?: { signature?: string } })
-        ?.anthropic;
-      return anthropicMeta?.signature != null;
+      const anthropicMeta = anthropicReasoningMeta(part);
+      return anthropicMeta?.signature != null || anthropicMeta?.redactedData != null;
     });
 
     const result: typeof assistantMsg = { ...assistantMsg, content };
@@ -899,11 +903,38 @@ function stripUnsignedAnthropicReasoning(messages: ModelMessage[]): ModelMessage
   });
 }
 
+type AnthropicReasoningMeta = NonNullable<MuxReasoningPart["providerOptions"]>["anthropic"];
+
+function anthropicReasoningMeta(part: {
+  providerOptions?: Record<string, unknown>;
+}): AnthropicReasoningMeta | undefined {
+  return part.providerOptions?.anthropic as AnthropicReasoningMeta | undefined;
+}
+
+/**
+ * Whether `part` continues the reasoning block that `lastPart` belongs to.
+ * Anthropic signs the LAST streamed part of each thinking block, so a signed
+ * part closes its block: merging the next part into it would fuse two blocks
+ * under one signature and invalidate every later block (preserved thinking).
+ * A redacted_thinking block is one opaque part and never merges either way.
+ */
+function continuesReasoningBlock(
+  lastPart: { providerOptions?: Record<string, unknown>; signature?: string },
+  part: { providerOptions?: Record<string, unknown> }
+): boolean {
+  const lastMeta = anthropicReasoningMeta(lastPart);
+  if (lastMeta?.signature != null || lastMeta?.redactedData != null || lastPart.signature) {
+    return false;
+  }
+  return anthropicReasoningMeta(part)?.redactedData == null;
+}
+
 /**
  * Coalesce consecutive parts of the same type within each message.
  * Streaming creates many individual text/reasoning parts; merge them for easier debugging.
  * Also reduces JSON overhead when sending messages to the API.
- * Tool calls remain atomic (not merged).
+ * Tool calls remain atomic (not merged). Reasoning merges only within one
+ * provider block (see continuesReasoningBlock).
  */
 function coalesceConsecutiveParts(messages: ModelMessage[]): ModelMessage[] {
   return messages.map((msg) => {
@@ -932,8 +963,12 @@ function coalesceConsecutiveParts(messages: ModelMessage[]): ModelMessage[] {
         continue;
       }
 
-      // Merge consecutive reasoning parts (extended thinking)
-      if (part.type === "reasoning" && lastPart?.type === "reasoning") {
+      // Merge consecutive reasoning parts of one block (extended thinking)
+      if (
+        part.type === "reasoning" &&
+        lastPart?.type === "reasoning" &&
+        continuesReasoningBlock(lastPart, part)
+      ) {
         lastPart.text += part.text;
         // Streaming splits one reasoning block across many parts and replay
         // metadata can land on any of them: Anthropic signatures arrive on the

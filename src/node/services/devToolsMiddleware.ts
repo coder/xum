@@ -27,6 +27,7 @@ import {
   redactHeaders,
 } from "./devToolsHeaderCapture";
 import type { DevToolsService } from "./devToolsService";
+import { readInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -145,6 +146,7 @@ function createEmptyStep(
     responseHeaders: null,
     rawResponse: null,
     rawChunks: null,
+    inputTransformations: null,
   };
 }
 
@@ -405,6 +407,7 @@ export function createDevToolsMiddleware(
           responseHeaders: null,
           rawResponse: null,
           rawChunks: null,
+          inputTransformations: null,
         });
       };
 
@@ -435,6 +438,7 @@ export function createDevToolsMiddleware(
               : null,
           rawResponse: result.response?.body ?? null,
           rawChunks: null,
+          inputTransformations: readInputTransformations([result.response?.body]),
           error: null,
         });
 
@@ -451,6 +455,7 @@ export function createDevToolsMiddleware(
           responseHeaders: null,
           rawResponse: null,
           rawChunks: null,
+          inputTransformations: null,
         });
         throw error;
       }
@@ -521,6 +526,7 @@ export function createDevToolsMiddleware(
           | "responseHeaders"
           | "rawResponse"
           | "rawChunks"
+          | "inputTransformations"
         >
       ): Promise<void> => {
         if (finalized) {
@@ -566,6 +572,7 @@ export function createDevToolsMiddleware(
           responseHeaders,
           rawResponse: fullStreamChunks,
           rawChunks,
+          inputTransformations: readInputTransformations(rawChunks),
         });
       };
 
@@ -596,6 +603,7 @@ export function createDevToolsMiddleware(
           responseHeaders: null,
           rawResponse: null,
           rawChunks: null,
+          inputTransformations: null,
         });
         throw error;
       }
@@ -690,6 +698,7 @@ export function createDevToolsMiddleware(
                   responseHeaders,
                   rawResponse: fullStreamChunks,
                   rawChunks,
+                  inputTransformations: readInputTransformations(rawChunks),
                 });
                 controller.close();
                 return;
@@ -714,6 +723,7 @@ export function createDevToolsMiddleware(
               responseHeaders,
               rawResponse: fullStreamChunks,
               rawChunks,
+              inputTransformations: readInputTransformations(rawChunks),
             });
             controller.error(error);
           }
@@ -732,6 +742,7 @@ export function createDevToolsMiddleware(
               responseHeaders,
               rawResponse: fullStreamChunks,
               rawChunks,
+              inputTransformations: readInputTransformations(rawChunks),
             });
           }
         },

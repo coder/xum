@@ -4,6 +4,9 @@ import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import { describe, expect, mock, test } from "bun:test";
 import { asSchema, type Tool } from "ai";
 import { z } from "zod";
+import * as fs from "fs/promises";
+import * as os from "os";
+import * as path from "path";
 
 import { Ok } from "@/common/types/result";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -81,6 +84,7 @@ describe("supportsAnthropicNativeWebFetch", () => {
     ["claude-mythos-5-1", true],
     ["claude-opus-5-5", true],
     ["claude-sonnet-5-5", true],
+    ["claude-haiku-5-5", true],
     ["claude-sonnet-4-6", true],
     ["claude-opus-4-6", true],
     ["claude-opus-4-8", true],
@@ -909,5 +913,52 @@ describe("getToolsForModel", () => {
     );
 
     expect(tools.web_fetch).toBeDefined();
+  });
+
+  // Haiku 5.5 supports Anthropic's native web_fetch, but provider tools skip
+  // tool_pre/tool_post hooks. Moving the `haiku` alias from 4.5 must not drop a
+  // user's hook enforcement, so Haiku keeps the hook-wrapped client fetcher.
+  test("keeps tool_pre enforcement on web_fetch for Claude Haiku 5.5", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-tools-hook-"));
+    try {
+      const hookDir = path.join(tempDir, ".xum");
+      await fs.mkdir(hookDir, { recursive: true });
+      await fs.writeFile(
+        path.join(hookDir, "tool_pre"),
+        '#!/bin/bash\necho "egress blocked" >&2\nexit 1\n'
+      );
+      await fs.chmod(path.join(hookDir, "tool_pre"), 0o755);
+      const toolsFor = (model: string) =>
+        getToolsForModel(
+          model,
+          {
+            cwd: tempDir,
+            runtime: new LocalRuntime(tempDir),
+            runtimeTempDir: tempDir,
+            workspaceId: "ws-1",
+            trusted: true,
+          },
+          "ws-1",
+          createInitStateManager()
+        );
+
+      const haikuFetch = (await toolsFor("anthropic:claude-haiku-5-5")).web_fetch;
+      if (haikuFetch.execute == null) {
+        throw new Error("Expected Haiku 5.5 to keep the client web_fetch tool");
+      }
+      const result = (await haikuFetch.execute(
+        { url: "http://127.0.0.1:9/" },
+        { toolCallId: "call-1", messages: [], context: undefined }
+      )) as { error?: string };
+      expect(result.error).toContain("egress blocked");
+
+      // Other Claude 4.6+ models still get the provider-native tool (hooks skipped).
+      expect((await toolsFor("anthropic:claude-sonnet-5-5")).web_fetch).toMatchObject({
+        type: "provider",
+        id: "anthropic.web_fetch_20250910",
+      });
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
   });
 });

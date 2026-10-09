@@ -36,6 +36,7 @@ import {
   isKimiK3Model,
   openaiSupportsProMode,
   OPENROUTER_REASONING_EFFORT,
+  anthropicThinksUnlessDisabled,
 } from "@/common/types/thinking";
 import {
   isGeminiFlashMinimalRejectingModelName,
@@ -145,7 +146,7 @@ interface OpenRouterReasoningOptions {
     exclude?: boolean;
     // "max" is not in OpenRouter's generic low/medium/high set; it is the only
     // effort Kimi K3 accepts (model metadata supported_efforts: ["max"]).
-    effort?: "low" | "medium" | "high" | "max";
+    effort?: "none" | "low" | "medium" | "high" | "max";
   };
 }
 
@@ -181,7 +182,14 @@ type ProviderOptions =
   | { zai: ZaiLanguageModelChatOptions }
   | { xai: XaiBuiltProviderOptions }
   | { "github-copilot": OpenAICompatibleGatewayProviderOptions }
+  | { bedrock: BedrockProviderOptions }
   | Record<string, never>; // Empty object for unsupported providers
+
+/** The subset of @ai-sdk/amazon-bedrock options Xum sends. */
+interface BedrockProviderOptions {
+  [key: string]: JSONValue | undefined;
+  additionalModelRequestFields?: Record<string, JSONValue>;
+}
 
 function resolveAnthropic1MCapabilityModel(
   modelString: string,
@@ -391,14 +399,15 @@ export function buildProviderOptions(
   // Fast mode follows the actual route/wire, not capability aliases or thinking.
   // Ultrafast is additionally model-gated; unsupported models drop the tier.
   const requestedServiceTier = muxProviderOptions?.openai?.serviceTier;
+  const serviceTierRouteOptions = {
+    providersConfig,
+    resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
+    openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+  };
   const serviceTier =
     requestedServiceTier != null &&
-    openaiServiceTierAvailable(modelString, {
-      providersConfig,
-      resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
-      openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
-    }) &&
-    openaiModelSupportsServiceTier(modelString, requestedServiceTier, providersConfig)
+    openaiServiceTierAvailable(modelString, serviceTierRouteOptions) &&
+    openaiModelSupportsServiceTier(modelString, requestedServiceTier, serviceTierRouteOptions)
       ? requestedServiceTier
       : undefined;
 
@@ -456,7 +465,8 @@ export function buildProviderOptions(
     // Opus 4.5 uses enabled thinking with a budgetTokens ceiling.
     const isOpus45 = capModelName?.includes("opus-4-5") ?? false;
     const isOpus46 = capModelName?.includes("opus-4-6") ?? false;
-    // Opus 4.7+ and Sonnet 5+ — the native-xhigh tier, which also uses adaptive thinking.
+    // Opus 4.7+, Sonnet 5+ and Haiku 5+ — the native-xhigh tier, which also uses adaptive
+    // thinking. Haiku 5.5 must land here: it rejects `budget_tokens` (400).
     const supportsNativeXhigh = anthropicSupportsNativeXhigh(capabilityModel);
     const isSonnet46 = capModelName?.includes("sonnet-4-6") ?? false;
     const usesAdaptiveThinking = isOpus46 || supportsNativeXhigh || isSonnet46;
@@ -775,14 +785,22 @@ export function buildProviderOptions(
     const reasoningEffort = isKimiK3Model(capabilityModel)
       ? "max"
       : OPENROUTER_REASONING_EFFORT[effectiveThinking];
+    // Haiku 5.5 reasons adaptively when `reasoning` is omitted, so "off" must
+    // disable it explicitly, as on the direct and Bedrock routes. OpenRouter
+    // documents effort "none" as disabling reasoning entirely.
+    const disableReasoning =
+      !reasoningEffort &&
+      effectiveThinking === "off" &&
+      anthropicThinksUnlessDisabled(capabilityModel);
 
     log.debug("buildProviderOptions: OpenRouter config", {
       reasoningEffort,
+      disableReasoning,
       thinkingLevel: effectiveThinking,
     });
 
     // OpenRouter spreads this namespace directly into the HTTP body.
-    if (reasoningEffort || serviceTier != null) {
+    if (reasoningEffort || disableReasoning || serviceTier != null) {
       const options = {
         openrouter: {
           ...(serviceTier != null && { service_tier: serviceTier }),
@@ -794,6 +812,7 @@ export function buildProviderOptions(
               exclude: false,
             },
           }),
+          ...(disableReasoning && { reasoning: { effort: "none" } }),
         },
       } satisfies { openrouter: OpenRouterReasoningOptions };
       log.debug("buildProviderOptions: Returning OpenRouter options", options);
@@ -894,6 +913,33 @@ export function buildProviderOptions(
       },
     } satisfies { "github-copilot": OpenAICompatibleGatewayProviderOptions };
     log.debug("buildProviderOptions: Returning OpenAI-compatible gateway options", options);
+    return options;
+  }
+
+  // Bedrock gets no thinking options yet, so Claude runs with the model's own
+  // default there (#5839). For Haiku 4.5 that default is no thinking, so the
+  // `haiku` alias kept "off" on Bedrock. Haiku 5.5 thinks adaptively when
+  // `thinking` is omitted, so "off" must be sent explicitly: otherwise Bedrock users
+  // silently pay for reasoning, and the workspace-naming fallback (which runs at "off")
+  // loses its forced tool choice. Mirror the direct route: disabled thinking at low
+  // effort (Haiku 5.5 accepts disabled thinking at high effort or below). The SDK
+  // serializes `reasoningConfig: { type: "disabled" }` as nothing for Claude, so the
+  // fields go through additionalModelRequestFields verbatim.
+  if (
+    formatProvider === "bedrock" &&
+    origin === "anthropic" &&
+    effectiveThinking === "off" &&
+    anthropicThinksUnlessDisabled(capabilityModel)
+  ) {
+    const options = {
+      bedrock: {
+        additionalModelRequestFields: {
+          thinking: { type: "disabled" },
+          output_config: { effort: getAnthropicEffort(effectiveThinking, capabilityModel) },
+        },
+      },
+    } satisfies { bedrock: BedrockProviderOptions };
+    log.debug("buildProviderOptions: Returning Bedrock options", options);
     return options;
   }
 

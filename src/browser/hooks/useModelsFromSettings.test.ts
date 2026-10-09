@@ -640,7 +640,7 @@ describe("useModelsFromSettings provider availability gating", () => {
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
-        models: ["claude-haiku-4.5"],
+        models: ["claude-haiku-5.5"],
       },
     };
     routePriority = ["github-copilot", "direct"];

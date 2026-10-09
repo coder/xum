@@ -37,6 +37,7 @@ import {
   useMuxGatewayAccountStatus,
 } from "@/browser/hooks/useMuxGatewayAccountStatus";
 import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
+import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { getAgentsInitNudgeKey } from "@/common/constants/storage";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -653,12 +654,12 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                     <p className="text-muted mt-1">
                       Gateway routing has been disabled. Configure another provider below, or visit{" "}
                       <a
-                        href="https://gateway.mux.coder.com"
+                        href={MUX_GATEWAY_ORIGIN}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="text-accent hover:underline"
                       >
-                        gateway.mux.coder.com
+                        {new URL(MUX_GATEWAY_ORIGIN).host}
                       </a>{" "}
                       to add credits.
                     </p>
@@ -714,7 +715,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               <li>
                 vouchers which you can{" "}
                 <a
-                  href="https://gateway.mux.coder.com"
+                  href={MUX_GATEWAY_ORIGIN}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-accent hover:underline"

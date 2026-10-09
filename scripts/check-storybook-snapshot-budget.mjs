@@ -45,7 +45,9 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 // (SkillIndicator.stories.tsx, phone + laptop in dark + light).
 // +1 snapshot / +1 file: the phone-width Providers layout (ProvidersSection.stories.tsx,
 // phone in dark; the rest of the file stays excluded).
-const MAX_SNAPSHOTS = 686;
+// +1 snapshot: the Ultrafast closed-state indicator (ChatInput.stories.tsx ThinkingSelectorUltrafast,
+// phone in dark; the file was already counted).
+const MAX_SNAPSHOTS = 687;
 const MAX_SNAPSHOT_ENABLED_FILES = 120;
 
 const { values } = parseArgs({

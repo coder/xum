@@ -20,6 +20,7 @@ import { Command } from "commander";
 
 import { getErrorMessage } from "@/common/utils/errors";
 import { Config, type ProjectConfig } from "@/node/config";
+import { resolvesToFilesystemRoot, PROJECT_AT_FILESYSTEM_ROOT_ERROR } from "@/node/utils/pathUtils";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
@@ -244,6 +245,7 @@ async function runTrust(options: TrustCLIOptions): Promise<number> {
   // discovery and hooks actually consult.
   const wasTrusted = await resolveProjectTrusted(realConfig, projectDir);
   if (wasTrusted !== trusted) {
+    const trustDirIsRoot = await resolvesToFilesystemRoot(trustDir);
     await realConfig.editConfig((config) => {
       const setEntryTrusted = (dir: string, createIfMissing: boolean) => {
         let project = config.projects.get(dir);
@@ -254,7 +256,10 @@ async function runTrust(options: TrustCLIOptions): Promise<number> {
           // Mirror the desktop setTrust handler (projects.setTrust in
           // src/node/orpc/router.ts): create a minimal project entry when the project
           // was never added to mux, so headless CLI use works without the desktop app
-          // or server.
+          // or server. Never at the filesystem root, as the desktop handler refuses (#5917).
+          if (dir === trustDir && trustDirIsRoot) {
+            throw new Error(PROJECT_AT_FILESYSTEM_ROOT_ERROR);
+          }
           project = { workspaces: [] };
           config.projects.set(dir, project);
         }

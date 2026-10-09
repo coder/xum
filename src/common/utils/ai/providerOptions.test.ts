@@ -4,6 +4,7 @@
 
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createAnthropic } from "@ai-sdk/anthropic";
+import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
 import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import { generateText, streamText } from "ai";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -142,10 +143,16 @@ describe("buildProviderOptions - Anthropic", () => {
     });
   }
 
-  // Native-xhigh models (Opus 4.7+ / Sonnet 5+): xhigh is a distinct native
+  // Native-xhigh models (Opus 4.7+ / Sonnet 5+ / Haiku 5+): xhigh is a distinct native
   // effort and adaptive thinking requires `display: "summarized"` to return
-  // thinking content.
-  for (const model of ["claude-opus-4-7", "claude-opus-5", "claude-sonnet-5"] as const) {
+  // thinking content. Haiku 5.5 rejects `budget_tokens` but accepts `disabled`, so it
+  // must take this path rather than the budgetTokens path Haiku 4.5 still uses.
+  for (const model of [
+    "claude-opus-4-7",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-5-5",
+  ] as const) {
     describe(`${model} (native xhigh effort + summarized display)`, () => {
       for (const { thinking, expectedThinking, effort } of [
         {
@@ -459,6 +466,7 @@ describe("buildProviderOptions - Anthropic", () => {
       for (const model of [
         "claude-opus-5-5",
         "claude-sonnet-5-5",
+        "claude-haiku-5-5",
         "claude-fable-5-1",
         "claude-mythos-5-1",
       ]) {
@@ -1406,11 +1414,13 @@ describe("buildProviderOptions - OpenAI", () => {
 
     test.each([
       ["openai:gpt-6-astra", "ultrafast"],
+      ["openai:gpt-6.1-sol", "ultrafast"],
+      ["openai:gpt-6.1-sol-2026-09-29", "ultrafast"],
       // GPT-5.6 Sol preview access is no longer supported, so the tier is dropped.
       ["openai:gpt-5.6-sol", undefined],
       ["openai:gpt-5.6", undefined],
-      // Announced but not yet served in the API; must not fall back to Fast either.
-      ["openai:gpt-6.1-sol", undefined],
+      // Unsupported models must not fall back to Fast either.
+      ["openai:gpt-6-luna", undefined],
       ["openai:gpt-6-sol", undefined],
       ["openai:gpt-5.6-terra", undefined],
     ] as const)("gates the Ultrafast tier by model: %s -> %s", (model, expected) => {
@@ -1420,6 +1430,15 @@ describe("buildProviderOptions - OpenAI", () => {
         })
       );
       expect(openai?.serviceTier).toBe(expected);
+    });
+
+    test("drops Ultrafast on the Chat Completions wire, which rejects it", () => {
+      const openai = getOpenAIOptions(
+        buildProviderOptions("openai:gpt-6.1-sol", "medium", undefined, undefined, {
+          openai: { serviceTier: "ultrafast", wireFormat: "chatCompletions" },
+        })
+      );
+      expect(openai?.serviceTier).toBeUndefined();
     });
 
     test("resolves Ultrafast support through a mapped alias", () => {
@@ -3162,6 +3181,83 @@ describe("buildProviderOptions - OpenRouter", () => {
 
     expect(buildProviderOptions("openrouter:z-ai/glm-4.6", "off")).toEqual({});
   });
+
+  // Haiku 5.5 reasons adaptively when `reasoning` is omitted (a live OpenRouter call
+  // spent ~200 reasoning tokens on a short prompt), so "off" must disable it.
+  test.each([
+    ["the canonical alias routed to OpenRouter", "anthropic:claude-haiku-5-5"],
+    ["an explicit OpenRouter model", "openrouter:anthropic/claude-haiku-5.5"],
+  ])("Haiku 5.5 off disables reasoning for %s", async (_label, modelString) => {
+    const capturedBodies: Array<Record<string, unknown>> = [];
+    const captureFetch: typeof fetch = Object.assign(
+      (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (typeof init?.body !== "string") {
+          throw new Error("Expected a JSON request body");
+        }
+        capturedBodies.push(JSON.parse(init.body) as Record<string, unknown>);
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: "chat_test",
+              object: "chat.completion",
+              created: 0,
+              model: "anthropic/claude-haiku-5.5",
+              choices: [
+                { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+              ],
+              usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+            }),
+            { headers: { "content-type": "application/json" } }
+          )
+        );
+      },
+      { preconnect: fetch.preconnect.bind(fetch) }
+    );
+    const options = buildProviderOptions(
+      modelString,
+      "off",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "openrouter"
+    );
+
+    await generateText({
+      model: createOpenRouter({ apiKey: "test", fetch: captureFetch })(
+        "anthropic/claude-haiku-5.5"
+      ),
+      prompt: "Return ok.",
+      providerOptions: options as Parameters<typeof generateText>[0]["providerOptions"],
+      maxRetries: 0,
+    });
+
+    expect(capturedBodies).toHaveLength(1);
+    expect(capturedBodies[0].reasoning).toEqual({ effort: "none" });
+  });
+
+  test("leaves other levels and older Claude models on the OpenRouter defaults", () => {
+    const openRouterOptions = (model: string, level: Parameters<typeof buildProviderOptions>[1]) =>
+      buildProviderOptions(
+        model,
+        level,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        "openrouter"
+      );
+
+    expect(openRouterOptions("anthropic:claude-haiku-5-5", "low")).toEqual({
+      openrouter: { reasoning: { enabled: true, effort: "low", exclude: false } },
+    });
+    // Haiku 4.5 does not reason unless asked, so omitting `reasoning` already means "off".
+    expect(openRouterOptions("anthropic:claude-haiku-4-5", "off")).toEqual({});
+  });
 });
 
 describe("buildProviderOptions - xAI", () => {
@@ -3677,5 +3773,87 @@ describe("custom provider wire origins", () => {
 
     expect("anthropic" in result).toBe(false);
     expect("openai" in result).toBe(false);
+  });
+});
+
+describe("buildProviderOptions - Claude on Bedrock", () => {
+  const bedrockOptions = (model: string, level: Parameters<typeof buildProviderOptions>[1]) =>
+    buildProviderOptions(
+      model,
+      level,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "bedrock"
+    );
+
+  // Haiku 5.5 thinks adaptively when `thinking` is omitted, so "off" (the `haiku`
+  // alias default and the workspace-naming fallback level) must be explicit. The real
+  // Bedrock provider drops `reasoningConfig: { type: "disabled" }` for Claude, so this
+  // checks the bytes it actually sends.
+  test.each([
+    ["the canonical alias routed to Bedrock", "anthropic:claude-haiku-5-5"],
+    ["an explicit Bedrock model", "bedrock:anthropic.claude-haiku-5-5"],
+  ])("Haiku 5.5 off disables thinking for %s", async (_label, model) => {
+    const options = bedrockOptions(model, "off");
+    const captured: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const captureFetch = Object.assign(
+      (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1]
+      ): Promise<Response> => {
+        if (typeof init?.body !== "string") {
+          throw new Error("Expected the Bedrock provider to send a JSON string body");
+        }
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        captured.push({
+          path: decodeURIComponent(new URL(url).pathname),
+          body: JSON.parse(init.body) as Record<string, unknown>,
+        });
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+              stopReason: "end_turn",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } }
+          )
+        );
+      },
+      { preconnect: fetch.preconnect.bind(fetch) }
+    );
+    // Mirrors providerModelFactory's bearer-token Bedrock handler.
+    const bedrock = createAmazonBedrock({
+      region: "us-east-1",
+      apiKey: "test-bearer",
+      fetch: captureFetch,
+    });
+
+    await generateText({
+      model: bedrock("anthropic.claude-haiku-5-5"),
+      prompt: "Return ok.",
+      providerOptions: options as Parameters<typeof generateText>[0]["providerOptions"],
+      maxRetries: 0,
+    });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].path).toBe("/model/anthropic.claude-haiku-5-5/converse");
+    expect(captured[0].body.additionalModelRequestFields).toEqual({
+      thinking: { type: "disabled" },
+      output_config: { effort: "low" },
+    });
+  });
+
+  test("leaves other levels and older Claude models on the Bedrock defaults", () => {
+    // The Bedrock route sends no thinking options for these yet (#5839). Haiku 4.5
+    // does not think unless asked, so omitting `thinking` already means "off".
+    expect(bedrockOptions("anthropic:claude-haiku-5-5", "low")).toEqual({});
+    expect(bedrockOptions("anthropic:claude-haiku-4-5", "off")).toEqual({});
+    expect(bedrockOptions("anthropic:claude-sonnet-5-5", "off")).toEqual({});
   });
 });

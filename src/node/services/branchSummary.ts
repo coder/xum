@@ -22,11 +22,15 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { buildCompactionPrompt } from "@/common/constants/ui";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
-import { anthropicRejectsDisabledThinking } from "@/common/types/thinking";
+import {
+  anthropicRejectsDisabledThinking,
+  anthropicThinksUnlessDisabled,
+} from "@/common/types/thinking";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
+import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
@@ -56,14 +60,15 @@ export const BRANCH_SUMMARY_LABEL = "Summary of the abandoned branch:";
 
 /**
  * Structural subset of AIService so tests can pass lightweight fakes.
- * Pinned-metadata creation (not plain createModel): usage recorded below must
+ * Pinned creation (not plain createModel): usage recorded below must
  * carry the creation-time pricing identity, or a Coder catalog refresh
  * mid-generation could re-attribute the spend (same rationale as the status
- * generator and /refine).
+ * generator and /refine). The pinned route also selects the wire for the
+ * provider options below.
  */
 export type BranchSummaryAiService = Pick<
   AIService,
-  "createModelWithPinnedMetadata" | "getWorkspaceMetadata"
+  "createModelWithPinnedOptions" | "getWorkspaceMetadata"
 >;
 
 /** RLM is a sub-experiment of Programmatic Tool Calling: without PTC it stays inert. */
@@ -370,7 +375,7 @@ async function generateAbandonedBranchSummaryText(input: {
     // refresh) would otherwise block OUTSIDE every deadline race — the
     // synchronous edit-resend path past BRANCH_SUMMARY_TIMEOUT_MS, and
     // workspace removal indefinitely on the background drain.
-    const modelPromise = input.aiService.createModelWithPinnedMetadata(modelString, {
+    const modelPromise = input.aiService.createModelWithPinnedOptions(modelString, {
       agentInitiated: true,
       workspaceId: input.workspaceId,
     });
@@ -400,7 +405,12 @@ async function generateAbandonedBranchSummaryText(input: {
       // No thinking provider options are passed, so the call stays thinking-free
       // on top of the thinking-stripped transcript, except on models that cannot
       // disable thinking: those get low effort and thinking headroom instead.
-      const alwaysThinks = anthropicRejectsDisabledThinking(modelResult.data.metadataModel);
+      // Models that think unless told not to (Haiku 5.5) get explicit disabled
+      // thinking, or their thinking could use up the small summary budget. Each
+      // route spells that differently, so it is built for the pinned route.
+      const pinned = modelResult.data;
+      const alwaysThinks = anthropicRejectsDisabledThinking(pinned.metadataModel);
+      const thinksUnlessDisabled = anthropicThinksUnlessDisabled(pinned.metadataModel);
       const stream = streamText({
         model: modelResult.data.model,
         system: input.system,
@@ -409,6 +419,19 @@ async function generateAbandonedBranchSummaryText(input: {
           ? BRANCH_SUMMARY_MAX_OUTPUT_TOKENS + BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS
           : BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
         ...(alwaysThinks && { providerOptions: { anthropic: { effort: "low" } } }),
+        ...(thinksUnlessDisabled && {
+          providerOptions: buildProviderOptions(
+            pinned.optionsModelString,
+            "off",
+            undefined,
+            undefined,
+            pinned.optionsMuxProviderOptions,
+            undefined,
+            undefined,
+            pinned.optionsProvidersConfig,
+            pinned.optionsRouteProvider
+          ) as Parameters<typeof streamText>[0]["providerOptions"],
+        }),
         abortSignal,
       });
       // Consume deltas incrementally (not stream.text) so a deadline that

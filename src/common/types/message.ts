@@ -1062,6 +1062,14 @@ export interface MuxMetadata {
   modelFallback?: ModelFallbackRecord;
   /** Present when the composer's Auto entry classified this turn's difficulty. */
   autoModelRouting?: AutoModelRoutingRecord;
+  /**
+   * Receipt of an Anthropic thinking-signature repair: this turn retried without replayed
+   * thinking after a 400 "Invalid `signature` in `thinking` block". Preserved thinking binds
+   * each block to its prefix, and putting removed blocks back invalidates every later block,
+   * so request building strips Anthropic thinking for the rest of the context segment (until
+   * the next compaction or reset boundary) once any row carries this.
+   */
+  anthropicThinkingReplay?: "off";
   // Last step's provider metadata (for context window cache display)
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
@@ -1237,6 +1245,11 @@ export interface MuxReasoningPart {
   providerOptions?: {
     anthropic?: {
       signature?: string;
+      /**
+       * Anthropic `redacted_thinking` data. The SDK replays the part as a
+       * redacted_thinking block when there is no signature.
+       */
+      redactedData?: string;
     };
     openai?: {
       itemId?: string;

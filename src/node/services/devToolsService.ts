@@ -15,6 +15,7 @@ import type { Config } from "@/node/config";
 import { log } from "@/node/services/log";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
+import { sanitizeInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
 
 /**
  * Retention policy for in-memory DevTools state.
@@ -258,6 +259,9 @@ function applyStepBackwardCompatibilityDefaults(step: DevToolsStep): DevToolsSte
     responseHeaders: step.responseHeaders ?? null,
     rawResponse: step.rawResponse ?? null,
     rawChunks: step.rawChunks ?? null,
+    // Rows from older binaries lack the field; hand-edited or damaged rows must not
+    // reach the renderer as non-arrays.
+    inputTransformations: sanitizeInputTransformations(step.inputTransformations),
   };
 }
 

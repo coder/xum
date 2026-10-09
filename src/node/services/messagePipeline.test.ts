@@ -226,9 +226,9 @@ describe("reasoning replay in built provider requests", () => {
     expect(JSON.stringify(result)).not.toContain("orphan thoughts");
   });
 
-  it("strips replayed Anthropic reasoning for Sonnet 5.5 between_tools (edited history)", async () => {
-    // #5086: between_tools cannot carry block_binding, so a history block whose prefix
-    // changed (an edit, or a system/tools change) must not be replayed.
+  it("strips replayed Anthropic reasoning at off for prefix-bound models (edited history)", async () => {
+    // #5086: between_tools and disabled thinking cannot carry block_binding, so a history
+    // block whose prefix changed (an edit, or a system/tools change) must not be replayed.
     const history = historyWith([
       {
         type: "reasoning",
@@ -244,9 +244,90 @@ describe("reasoning replay in built provider requests", () => {
     expect(
       JSON.stringify(await buildRequest("anthropic", "off", history, "anthropic:claude-sonnet-5-5"))
     ).toContain("earlier answer");
-    // Adaptive Sonnet 5.5 and Sonnet 5 "off" (disabled) keep replaying it.
+    expect(await replayed("anthropic:claude-haiku-5-5", "off")).toBe(0);
+    // Adaptive thinking and models that do not bind blocks (Sonnet 5 "off") keep replaying it.
     expect(await replayed("anthropic:claude-sonnet-5-5", "low")).toBe(1);
+    expect(await replayed("anthropic:claude-haiku-5-5", "low")).toBe(1);
     expect(await replayed("anthropic:claude-sonnet-5", "off")).toBe(1);
+  });
+
+  describe("Anthropic thinking-repair receipt", () => {
+    const signedTurn = (id: string, metadata: MuxMessage["metadata"] = {}): MuxMessage => ({
+      id,
+      role: "assistant",
+      metadata: { timestamp: 1001, ...metadata },
+      parts: [
+        {
+          type: "reasoning",
+          text: `${id} thinking`,
+          providerOptions: { anthropic: { signature: `sig_${id}` } },
+        },
+        { type: "text", text: `${id} answer` },
+      ],
+    });
+    const replayedCount = async (history: MuxMessage[]) =>
+      reasoningRequestParts(
+        await buildRequest("anthropic", "medium", history, "anthropic:claude-opus-5-5")
+      ).length;
+
+    it("strips Anthropic thinking from every row once the segment holds a receipt", async () => {
+      // Preserved thinking: the repaired turn sent no thinking, so putting the earlier
+      // blocks back would invalidate the blocks produced since.
+      const history = (receipt: boolean): MuxMessage[] => [
+        createMuxMessage("user-1", "user", "first", { timestamp: 1000 }),
+        signedTurn("assistant-1"),
+        createMuxMessage("user-2", "user", "second", { timestamp: 1002 }),
+        signedTurn("assistant-2", receipt ? { anthropicThinkingReplay: "off" } : {}),
+        createMuxMessage("user-3", "user", "third", { timestamp: 1004 }),
+      ];
+
+      expect(await replayedCount(history(false))).toBe(2);
+      expect(await replayedCount(history(true))).toBe(0);
+      const serialized = JSON.stringify(
+        await buildRequest("anthropic", "medium", history(true), "anthropic:claude-opus-5-5")
+      );
+      expect(serialized).toContain("assistant-1 answer");
+      expect(serialized).toContain("assistant-2 answer");
+    });
+
+    const boundaries: Array<{ kind: string; row: MuxMessage }> = [
+      {
+        kind: "compaction",
+        row: {
+          id: "summary",
+          role: "assistant",
+          metadata: { compactionBoundary: true, compacted: "user", compactionEpoch: 1 },
+          parts: [{ type: "text", text: "summary of earlier turns" }],
+        },
+      },
+      {
+        kind: "reset",
+        row: {
+          id: "reset",
+          role: "assistant",
+          metadata: { contextBoundaryKind: "reset" },
+          parts: [],
+        },
+      },
+    ];
+    for (const boundary of boundaries) {
+      it(`replays again after a ${boundary.kind} boundary that follows the receipt`, async () => {
+        const history: MuxMessage[] = [
+          createMuxMessage("user-1", "user", "first", { timestamp: 1000 }),
+          signedTurn("assistant-1", { anthropicThinkingReplay: "off" }),
+          boundary.row,
+          createMuxMessage("user-2", "user", "second", { timestamp: 1002 }),
+          signedTurn("assistant-2"),
+          createMuxMessage("user-3", "user", "third", { timestamp: 1004 }),
+        ];
+
+        // assistant-2 was produced in the new segment, so its thinking replays.
+        const parts = reasoningRequestParts(
+          await buildRequest("anthropic", "medium", history, "anthropic:claude-opus-5-5")
+        );
+        expect(parts.map((part) => part.text)).toContain("assistant-2 thinking");
+      });
+    }
   });
 
   it("includes OpenAI reasoning encrypted content but not the server-side itemId", async () => {

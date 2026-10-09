@@ -1809,8 +1809,10 @@ export class Config {
         }
         const projectKey: unknown = pair[0];
         // The lenient normalization below silently drops the WHOLE
-        // project when its key is empty or non-string ("Filtering out
-        // project with invalid path"), and an id-less legacy workspace
+        // project when its key is non-string ("Filtering out project with
+        // invalid path"). An empty key now loads as "/" there (#5917), but
+        // strict mode keeps failing closed on it until a save rewrites the
+        // key; an id-less legacy workspace
         // inside it is raw-invisible too (its stable id lives only in
         // session metadata.json, which only the normalized enumeration
         // resolves). Accepting the pair here would hand destructive
@@ -1884,13 +1886,16 @@ export class Config {
     }
     const normalizedPairs = rawPairs
       .filter(([projectPath]) => {
-        if (!projectPath || typeof projectPath !== "string") {
+        // "" is accepted: earlier saves wrote the root project "/" as "" (#5917). It loads as
+        // "/" below instead of dropping the project and its workspace rows.
+        if (typeof projectPath !== "string") {
           log.warn("Filtering out project with invalid path", { projectPath });
           return false;
         }
         return true;
       })
-      .map(([projectPath, projectConfig]) => {
+      .map(([storedProjectPath, projectConfig]) => {
+        const projectPath = storedProjectPath === "" ? "/" : storedProjectPath;
         if (Array.isArray(projectConfig?.workspaces)) {
           for (const workspace of projectConfig.workspaces) {
             this.rememberLegacyTaskVariantWorkspace(projectPath, workspace);
@@ -4471,24 +4476,6 @@ export class Config {
       }
     }
 
-    // Filtered rows still inherit family identity from archived ancestors in the registry.
-    this.ensureWorkspaceIndex(config);
-    const parentById = new Map(workspaceMetadata.map((meta) => [meta.id, meta.parentWorkspaceId]));
-    const parentOf = (id: string) =>
-      parentById.has(id)
-        ? parentById.get(id)
-        : this.workspaceIndex.get(id)?.workspace.parentWorkspaceId;
-    for (const metadata of workspaceMetadata) {
-      const chain: string[] = [];
-      let root = metadata.id;
-      while (parentOf(root) && !chain.includes(root)) {
-        chain.push(root);
-        root = parentOf(root)!;
-      }
-      // A malformed cycle gets one representative, even for descendants entering it.
-      const cycle = chain.indexOf(root);
-      metadata.rootWorkspaceId = cycle < 0 ? root : chain.slice(cycle).sort()[0];
-    }
     const filtered = workspaceMetadata.filter((metadata) => {
       if (options?.archived == null || options.archived === "all") return true;
       return (

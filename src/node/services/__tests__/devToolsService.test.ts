@@ -31,6 +31,7 @@ function makeStep(overrides: Partial<DevToolsStep> & { id: string; runId: string
     responseHeaders: null,
     rawResponse: null,
     rawChunks: null,
+    inputTransformations: null,
     ...rest,
   };
 }
@@ -570,6 +571,7 @@ describe("DevToolsService", () => {
       delete (legacyStep as Record<string, unknown>).rawChunks;
       delete (legacyStep as Record<string, unknown>).requestHeaders;
       delete (legacyStep as Record<string, unknown>).responseHeaders;
+      delete (legacyStep as Record<string, unknown>).inputTransformations;
       const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
 
       await fs.mkdir(path.dirname(logPath), { recursive: true });
@@ -586,6 +588,40 @@ describe("DevToolsService", () => {
       expect(runWithSteps?.steps[0]?.requestHeaders).toBeNull();
       expect(runWithSteps?.steps[0]?.responseHeaders).toBeNull();
       expect(runWithSteps?.steps[0]?.rawChunks).toBeNull();
+      expect(runWithSteps?.steps[0]?.inputTransformations).toBeNull();
+    });
+
+    it("drops malformed input transformation entries when replaying persisted steps", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const run = makeRun("run-1");
+      const step = {
+        ...makeStep({ id: "step-1", runId: "run-1" }),
+        inputTransformations: [
+          {
+            type: "thinking_dropped",
+            path: "messages.1.content.0",
+            reason: "prefix_binding_mismatch",
+          },
+          { type: "thinking_dropped" },
+          "junk",
+        ],
+      };
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(
+        logPath,
+        `${JSON.stringify({ type: "run", run })}\n${JSON.stringify({ type: "step", step })}\n`,
+        "utf-8"
+      );
+
+      const runWithSteps = await new DevToolsService(config).getRunWithSteps("ws-1", "run-1");
+      expect(runWithSteps?.steps[0]?.inputTransformations).toEqual([
+        {
+          type: "thinking_dropped",
+          path: "messages.1.content.0",
+          reason: "prefix_binding_mismatch",
+        },
+      ]);
     });
 
     it("skips corrupted lines while replaying persisted logs", async () => {
