@@ -46,6 +46,7 @@ import {
   getTabConfig,
   type BaseTabType,
 } from "@/browser/features/RightSidebar/Tabs/tabConfig";
+import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import {
   getEffectiveSlotKeybind,
   getLayoutsConfigOrDefault,
@@ -943,6 +944,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           section: section.navigation,
           shortcutHint: formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB),
           keywords: ["new tab", "launcher", "tools", "open"],
+          // Narrow layouts hide the right sidebar entirely, so a New tab would be invisible; the
+          // keyboard shortcut refuses there for the same reason.
+          // (Without a DOM, e.g. command-source unit tests, there is no layout to check.)
+          visible: () =>
+            typeof HTMLElement === "undefined" || !isWorkspaceRightSidebarHidden(document.body),
           run: () => {
             updateRightSidebarLayout(wsId, (s) => addNewTabToTabset(s, s.focusedTabsetId));
             updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
