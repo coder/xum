@@ -2,9 +2,10 @@ import { createContext, useContext, type ReactNode } from "react";
 import type { ChatPaneScope } from "@/browser/utils/ui/keybinds";
 
 /**
- * Which chat pane a subtree renders: the routed main chat, or the /side chat tab in the right
- * sidebar. Window-level shortcuts and unscoped global events (model selector, voice input, ...)
- * consult it so the two mounted panes never both react (see paneHandlesKeyEvent).
+ * Which chat pane a subtree renders: the routed main chat, or a specific /side workspace in the
+ * right sidebar. Window-level shortcuts consult it so only the focused pane reacts, even with
+ * several side tabs visible (see paneHandlesKeyEvent). Unscoped global events (model selector,
+ * voice input, ...) belong only to the main chat.
  */
 const ChatPaneScopeContext = createContext<ChatPaneScope>("main");
 

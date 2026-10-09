@@ -1481,7 +1481,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       }
       // Unscoped updates come from the palette / main UI; the side composer only takes updates
       // addressed to its own workspace so text is never inserted into both composers.
-      if (detail.workspaceId == null && paneScope === "side") {
+      if (detail.workspaceId == null && paneScope !== "main") {
         return;
       }
       const { inputs } = detail;
@@ -1705,7 +1705,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Allow external components to open the Model Selector
   useEffect(() => {
     // Unscoped palette event: the main composer owns it (see paneScope).
-    if (paneScope === "side") return;
+    if (paneScope !== "main") return;
     const handler = () => {
       // Open the inline ModelSelector and let it take focus itself
       modelSelectorRef.current?.open();
@@ -1751,7 +1751,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Show toast feedback for analytics rebuild command palette action.
   useEffect(() => {
     // Unscoped palette event: the main composer owns it so the toast shows once.
-    if (paneScope === "side") return;
+    if (paneScope !== "main") return;
     const handler = (event: Event) => {
       const detail = (
         event as CustomEvent<CustomEventPayloads[typeof CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST]>
@@ -1778,7 +1778,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Voice input: command palette toggle + global recording keybinds
   useEffect(() => {
     // Unscoped palette event: only the main composer starts recording (see paneScope).
-    if (!voiceInput.shouldShowUI || paneScope === "side") return;
+    if (!voiceInput.shouldShowUI || paneScope !== "main") return;
 
     const handleToggle = () => {
       if (!voiceInput.isAvailable) {

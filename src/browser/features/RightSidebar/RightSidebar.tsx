@@ -36,6 +36,7 @@ import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { getErrorMessage } from "@/common/utils/errors";
+import { showFeedbackToast } from "@/browser/utils/feedbackToast";
 
 // Per-tab panel components are no longer imported here directly — the
 // `tabRegistry` owns label + panel rendering for static tabs (see
@@ -596,8 +597,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           />
         )}
 
-        {/* The active side chat tab: a second live chat pane next to the main chat. Mounted only
-            while active, so at most one side chat holds the store's pinned subscription. */}
+        {/* Mount this pane's selected side chat; other split panes may show their own side chats. */}
         {activeSideChatWorkspaceId != null && (
           <div
             role="tabpanel"
@@ -1201,11 +1201,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       event.preventDefault();
       pendingSideChatIdsRef.current.add(detail.sideChatWorkspaceId);
       setCollapsed(false);
-      // One side chat per workspace (like Codex): the backend already discarded the previous
-      // one, so its tab is replaced rather than kept.
-      setLayout((prev) =>
-        selectOrAddTab(removeSideChatTabs(prev), makeSideChatTabType(detail.sideChatWorkspaceId))
-      );
+      // Each /side opens another chat; keep earlier chats reachable until the user closes them.
+      setLayout((prev) => selectOrAddTab(prev, makeSideChatTabType(detail.sideChatWorkspaceId)));
     };
     window.addEventListener(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, handleOpenSideChatTab);
     return () =>
@@ -1471,34 +1468,44 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     [focusActiveTerminal, getBaseLayout, setLayout, terminalTitlesKey]
   );
 
-  // Closing a side chat's tab discards the side chat: side chats are ephemeral (Codex form
-  // factor), and the tab is their only way back in. Removal is forced and only deletes the side
-  // chat's own row and session; it shares this workspace's checkout, which removal never touches.
-  const handleCloseSideChat = React.useCallback(
-    (tab: TabType) => {
-      const sideChatWorkspaceId = getSideChatTabWorkspaceId(tab);
-      // Without a client the side chat cannot be discarded: keep its tab so closing can be
-      // retried, instead of hiding a side chat that lives on.
-      if (sideChatWorkspaceId == null || api == null) return;
-      setLayout((prev) => removeTabEverywhere(prev, tab));
-      api.workspace
-        .remove({ workspaceId: sideChatWorkspaceId, options: { force: true } })
-        .then((result) => {
-          if (!result.success)
-            console.warn("[RightSidebar] Failed to discard side chat:", result.error);
-        })
-        .catch((error: unknown) => {
-          // The backend sweeps leftover side chats at startup.
-          console.warn("[RightSidebar] Failed to discard side chat:", error);
-        });
-    },
-    [api, setLayout]
-  );
-
-  // Drop tabs of side chats that no longer exist: discarded by a newer /side, removed with
-  // their workspace, or swept at startup (side chats never survive a restart).
   const { workspaceMetadata: allWorkspaceMetadata, loaded: workspaceMetadataLoaded } =
     workspaceMetadataContext;
+
+  // Persisted tab ids are untrusted: a corrupt side:<id> must never force-delete an ordinary
+  // workspace or another chat's child. Keep valid tabs until removal succeeds so failures retry.
+  const handleCloseSideChat = React.useCallback(
+    (tab: TabType) => {
+      const id = getSideChatTabWorkspaceId(tab);
+      if (id == null) return;
+      const metadata = allWorkspaceMetadata.get(id);
+      if (metadata == null && (!workspaceMetadataLoaded || pendingSideChatIdsRef.current.has(id))) {
+        return;
+      }
+      if (metadata?.sideChatParentWorkspaceId !== workspaceId) {
+        setLayout((prev) => removeTabEverywhere(prev, tab));
+        return;
+      }
+      if (api == null) return;
+      api.workspace
+        .remove({ workspaceId: id, options: { force: true } })
+        .then((result) => {
+          if (!result.success) throw new Error(result.error);
+          setLayout((prev) => removeTabEverywhere(prev, tab));
+        })
+        .catch((error: unknown) => {
+          console.warn("[RightSidebar] Failed to discard side chat:", error);
+          showFeedbackToast({
+            type: "error",
+            title: "Could not close side chat",
+            message: getErrorMessage(error),
+          });
+        });
+    },
+    [allWorkspaceMetadata, api, setLayout, workspaceId, workspaceMetadataLoaded]
+  );
+
+  // Drop missing/misowned side-chat tabs without deleting anything. Pending ids stay until
+  // their metadata arrives; valid side chats remain reachable until explicitly closed.
   React.useEffect(() => {
     if (!workspaceMetadataLoaded) return;
     const pending = pendingSideChatIdsRef.current;
@@ -1507,11 +1514,15 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     }
     const staleTabs = collectAllTabs(layout.root).filter((tab) => {
       const id = getSideChatTabWorkspaceId(tab);
-      return id != null && !allWorkspaceMetadata.has(id) && !pending.has(id);
+      if (id == null) return false;
+      const metadata = allWorkspaceMetadata.get(id);
+      return metadata != null
+        ? metadata.sideChatParentWorkspaceId !== workspaceId
+        : !pending.has(id);
     });
     if (staleTabs.length === 0) return;
     setLayout((prev) => staleTabs.reduce((acc, tab) => removeTabEverywhere(acc, tab), prev));
-  }, [allWorkspaceMetadata, layout, setLayout, workspaceMetadataLoaded]);
+  }, [allWorkspaceMetadata, layout, setLayout, workspaceId, workspaceMetadataLoaded]);
 
   // Keyboard shortcut for closing active terminal tab (Ctrl/Cmd+W)
   React.useEffect(() => {
@@ -1980,10 +1991,3 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 // Memoize to prevent re-renders when parent (AIView) re-renders during streaming
 // Only re-renders when workspaceId or chatAreaRef changes, or internal state updates
 export const RightSidebar = React.memo(RightSidebarComponent);
-
-/** Remove every /side chat tab from the layout. */
-function removeSideChatTabs(layout: RightSidebarLayoutState): RightSidebarLayoutState {
-  return collectAllTabs(layout.root)
-    .filter((tab) => getSideChatTabWorkspaceId(tab) != null)
-    .reduce((acc, tab) => removeTabEverywhere(acc, tab), layout);
-}

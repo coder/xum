@@ -119,6 +119,59 @@ interface ToastEventDetail {
 const getActions = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) =>
   mk(over).flatMap((source) => source());
 
+describe("workspace selectors exclude ephemeral side chats", () => {
+  const root: FrontendWorkspaceMetadata = {
+    id: "root",
+    name: "root",
+    projectName: "project",
+    projectPath: "/repo",
+    namedWorkspacePath: "/repo/root",
+    runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+  };
+  const side: FrontendWorkspaceMetadata = {
+    ...root,
+    id: "side",
+    name: "side",
+    sideChatParentWorkspaceId: root.id,
+  };
+
+  test("switch, terminal, title and removal lists use the same filtered membership", async () => {
+    const workspaceMetadata = new Map([
+      [root.id, root],
+      [side.id, side],
+    ]);
+    const actions = getActions({ workspaceMetadata });
+    expect(actions.some((action) => action.id === CommandIds.workspaceSwitch(root.id))).toBe(true);
+    expect(actions.some((action) => action.id === CommandIds.workspaceSwitch(side.id))).toBe(false);
+    for (const id of [
+      CommandIds.workspaceOpenTerminal(),
+      CommandIds.workspaceEditTitleAny(),
+      CommandIds.workspaceRemoveAny(),
+    ]) {
+      const action = actions.find((candidate) => candidate.id === id);
+      const field = action?.prompt?.fields[0];
+      if (field?.type !== "select") throw new Error("expected workspace selector");
+      expect((await field.getOptions({})).map((option) => option.id)).toEqual([root.id]);
+    }
+    // It is still useful to rename the current side chat, but not to remove/open a workspace
+    // terminal for it (the tab's own Close action owns discarding the ephemeral conversation).
+    const current = getActions({
+      workspaceMetadata,
+      selectedWorkspace: {
+        workspaceId: side.id,
+        projectPath: side.projectPath,
+        projectName: side.projectName,
+        namedWorkspacePath: side.namedWorkspacePath,
+      },
+    });
+    expect(current.some((action) => action.id === CommandIds.workspaceEditTitle())).toBe(true);
+    expect(current.some((action) => action.id === CommandIds.workspaceOpenTerminalCurrent())).toBe(
+      false
+    );
+    expect(current.some((action) => action.id === CommandIds.workspaceRemove())).toBe(false);
+  });
+});
+
 describe("Auto routing palette actions", () => {
   const ids = [
     CommandIds.toggleAutoRouting("model"),

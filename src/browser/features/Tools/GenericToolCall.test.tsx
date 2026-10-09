@@ -51,7 +51,7 @@ describe("GenericToolCall MCP header label", () => {
       </APIContext.Provider>
     );
     const badge = view.queryByRole("button", { name: /^Server information: / });
-    const header = badge?.parentElement ?? view.container.querySelector("div > div");
+    const header = badge?.parentElement ?? view.container.querySelector<HTMLElement>("div > div");
     if (!header) throw new Error("Tool header not rendered");
     return { view, badge, header };
   }

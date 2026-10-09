@@ -561,28 +561,106 @@ describe("processSlashCommand model and gating results", () => {
     });
   });
 
-  test("side chats refuse workspace commands, including a nested /side", async () => {
-    const createSideChat = mock(() => Promise.resolve({ success: false, error: "unused" }));
+  test("side chats gate every workspace operation before any early handler runs", async () => {
+    const forbidden = mock(() => Promise.reject(new Error("must not reach backend")));
     const env = createEnv({
       isSideChat: true,
-      api: { workspace: { createSideChat } } as unknown as SlashCommandEnv["api"],
+      api: createTestApiClient({
+        workflows: { start: forbidden },
+        projects: { idleCompaction: { set: forbidden } },
+        workspace: { createSideChat: forbidden, heartbeat: { get: forbidden, set: forbidden } },
+      }),
     });
     for (const parsed of [
-      parseCommand("/side why?"),
+      parseCommand("/side"),
+      parseCommand("/btw"),
       parseCommand("/fork"),
       parseCommand("/new"),
+      parseCommand("/idle 2"),
+      parseCommand("/heartbeat 10"),
+      { type: "workflow-run", scriptPath: "skill://flow/workflow.js", argsText: "{}" } as const,
+      {
+        type: "command-invalid-args",
+        command: "workflow",
+        input: "bad",
+        usage: "/workflow",
+      } as const,
+      parseCommand("/idle bad"),
+      parseCommand("/heartbeat bad"),
+      parseCommand("/goal"),
     ]) {
       const result = await processSlashCommand(parsed, env);
-      if (result.kind !== "complete") throw new Error("expected complete result");
+      if (result.kind !== "complete") throw new Error("expected gate before async handler");
       expectDisposition(result, "restore");
-      expect(result.actions.some((action) => action.type === "show-toast")).toBe(true);
+      expect(
+        result.actions.some(
+          (action) => action.type === "show-toast" && action.toast.type === "error"
+        )
+      ).toBe(true);
     }
-    expect(createSideChat).not.toHaveBeenCalled();
+    expect(forbidden).not.toHaveBeenCalled();
 
-    // Conversation-local commands still work in a side chat.
+    // Conversation-local preferences stay usable; they do not start a workspace operation.
     const vim = await processSlashCommand({ type: "vim-toggle" }, env);
     if (vim.kind !== "complete") throw new Error("expected complete result");
     expectDisposition(vim, "consume");
+    expect(vim.actions).toContainEqual({ type: "toggle-vim" });
+    const model = await processSlashCommand(
+      { type: "model-set", modelString: "anthropic:claude-sonnet-4-6" },
+      createEnv({ isSideChat: true })
+    );
+    if (model.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(model, "consume");
+    expect(model.actions).toContainEqual({
+      type: "set-preferred-model",
+      model: "anthropic:claude-sonnet-4-6",
+    });
+  });
+
+  test("/side and /btw open a blank side chat without sending a first message", async () => {
+    ensureWindowDispatchEvent();
+    const sendMessage = mock(() => Promise.reject(new Error("must not auto-send")));
+    const createSideChat = mock(() =>
+      Promise.resolve({
+        success: true as const,
+        metadata: {
+          id: "side-id",
+          name: "side",
+          projectName: "project",
+          projectPath: "/tmp/project",
+          namedWorkspacePath: "/tmp/side",
+          runtimeConfig: { type: "local" as const },
+          sideChatParentWorkspaceId: "test-ws",
+        },
+      })
+    );
+    const env = createEnv({
+      api: createTestApiClient({ workspace: { createSideChat, sendMessage } }),
+    });
+    for (const input of ["/side", "/btw"]) {
+      const { result } = await finishCommand(await processSlashCommand(parseCommand(input), env));
+      expectDisposition(result, "consume");
+    }
+    expect(createSideChat).toHaveBeenCalledTimes(2);
+    expect(createSideChat).toHaveBeenCalledWith({ parentWorkspaceId: "test-ws" });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("arguments to /side and /btw preserve the input and never create or send", async () => {
+    const forbidden = mock(() => Promise.reject(new Error("must not reach backend")));
+    const env = createEnv({
+      api: createTestApiClient({
+        workspace: { createSideChat: forbidden, sendMessage: forbidden },
+      }),
+    });
+    for (const input of ["/side why?", "/btw --help"]) {
+      const { result, batches } = await finishCommand(
+        await processSlashCommand(parseCommand(input), env)
+      );
+      expectDisposition(result, "restore");
+      expect(batches.flat().some((action) => action.type === "clear-input")).toBe(false);
+    }
+    expect(forbidden).not.toHaveBeenCalled();
   });
 
   test("/side starts a side chat of the current workspace and restores input on failure", async () => {
@@ -591,8 +669,8 @@ describe("processSlashCommand model and gating results", () => {
     );
     const { batches, result } = await finishCommand(
       await processSlashCommand(
-        { type: "side", question: "why?" },
-        createEnv({ api: { workspace: { createSideChat } } as unknown as SlashCommandEnv["api"] })
+        { type: "side" },
+        createEnv({ api: createTestApiClient({ workspace: { createSideChat } }) })
       )
     );
     expect(createSideChat).toHaveBeenCalledWith({ parentWorkspaceId: "test-ws" });

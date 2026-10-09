@@ -844,19 +844,16 @@ export class WorkspaceStore {
 
   // Supporting data structures
   private aggregators = new Map<string, StreamingMessageAggregator>();
-  // Live onChat subscription loops keyed by workspace. Keys are always a subset of
-  // {activeWorkspaceId, pinnedWorkspaceId} (so size <= 2); membership is THE "has a live
-  // subscription" check. The controller's signal is the loop signal, so a refresh request can
-  // bind to the loop it was made under.
+  // Live onChat loops cover only the registered active workspace and mounted side chats.
+  // Membership is the "has a live subscription" check. The controller's signal is the loop
+  // signal, so a refresh request can bind to the loop it was made under.
   private onChatControllers = new Map<string, AbortController>();
 
   // Workspace selected in the UI (set from WorkspaceContext routing state).
   private activeWorkspaceId: string | null = null;
-  // Secondary visible chat (the /side chat tab in the right sidebar) that renders a second live
-  // transcript next to the routed chat, so it needs its own onChat subscription. A single slot:
-  // keeping every background workspace subscribed is exactly what the one-subscription design
-  // avoids, and only one side chat pane can be on screen at a time.
-  private pinnedWorkspaceId: string | null = null;
+  // Split tabsets can show several side chats at once. Count their mounted owners so closing
+  // one pane never unsubscribes another, without keeping hidden background chats subscribed.
+  private pinnedWorkspaces = new Map<string, { count: number }>();
 
   // Workspaces whose first onChat replay since activation has not settled yet (#4662).
   // Kept outside chatTransientState because full-replay resets replace transient objects.
@@ -1646,42 +1643,41 @@ export class WorkspaceStore {
     }
   }
 
-  /**
-   * Keep a second workspace's onChat subscription live alongside the active one. The /side
-   * chat tab calls this on mount/unmount (via {@link usePinnedWorkspaceChat}) so its pane gets
-   * a caught-up transcript and live stream events while the routed chat stays subscribed too.
-   */
-  setPinnedWorkspaceId(workspaceId: string | null): void {
+  /** Keep a mounted side chat live until this owner's idempotent release is called. */
+  acquirePinnedWorkspace(workspaceId: string): () => void {
     assert(
-      workspaceId === null || (typeof workspaceId === "string" && workspaceId.length > 0),
-      "setPinnedWorkspaceId requires a non-empty workspaceId or null"
+      typeof workspaceId === "string" && workspaceId.length > 0,
+      "acquirePinnedWorkspace requires a non-empty workspaceId"
     );
 
-    if (this.pinnedWorkspaceId === workspaceId) {
-      return;
+    const pin = this.pinnedWorkspaces.get(workspaceId) ?? { count: 0 };
+    this.pinnedWorkspaces.set(workspaceId, pin);
+    pin.count++;
+    if (pin.count === 1) {
+      this.ensureOnChatSubscriptions();
+      // Same as activation: usage deltas that arrived while unsubscribed are only on disk.
+      if (this.isWorkspaceRegistered(workspaceId)) {
+        this.refreshSessionUsage(workspaceId);
+        this.states.bump(workspaceId);
+      }
     }
 
-    const previousPinnedId = this.pinnedWorkspaceId;
-    this.pinnedWorkspaceId = workspaceId;
-    this.ensureOnChatSubscriptions();
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      // Removal/disposal invalidates old owners; their cleanup must not release a new pin
+      // acquired later under the same workspace id.
+      if (this.pinnedWorkspaces.get(workspaceId) !== pin) return;
+      if (--pin.count > 0) return;
 
-    // Same as activation: usage deltas that arrived while unsubscribed are only on disk.
-    if (workspaceId && this.isWorkspaceRegistered(workspaceId)) {
-      this.refreshSessionUsage(workspaceId);
-    }
-
-    // Subscription membership feeds getWorkspaceState()/getWorkspaceShellStatus(), so both
-    // the unpinned and newly pinned workspaces must recompute.
-    if (previousPinnedId && this.aggregators.has(previousPinnedId)) {
-      this.states.bump(previousPinnedId);
-    }
-    if (workspaceId && this.aggregators.has(workspaceId)) {
-      this.states.bump(workspaceId);
-    }
-  }
-
-  getPinnedWorkspaceId(): string | null {
-    return this.pinnedWorkspaceId;
+      this.pinnedWorkspaces.delete(workspaceId);
+      this.ensureOnChatSubscriptions();
+      // Subscription membership changes whether selectors trust live state or activity.
+      if (this.isWorkspaceRegistered(workspaceId)) {
+        this.states.bump(workspaceId);
+      }
+    };
   }
 
   isOnChatSubscriptionActive(workspaceId: string): boolean {
@@ -1699,7 +1695,7 @@ export class WorkspaceStore {
    * cleanup) must skip these because their live onChat subscription is authoritative.
    */
   private isWorkspaceOnScreen(workspaceId: string): boolean {
-    return workspaceId === this.activeWorkspaceId || workspaceId === this.pinnedWorkspaceId;
+    return workspaceId === this.activeWorkspaceId || this.pinnedWorkspaces.has(workspaceId);
   }
 
   private ensureActivitySubscription(): void {
@@ -1731,7 +1727,7 @@ export class WorkspaceStore {
   /** Registered workspaces that should own a live onChat subscription right now. */
   private getDesiredOnChatWorkspaceIds(): Set<string> {
     const desired = new Set<string>();
-    for (const workspaceId of [this.activeWorkspaceId, this.pinnedWorkspaceId]) {
+    for (const workspaceId of [this.activeWorkspaceId, ...this.pinnedWorkspaces.keys()]) {
       if (workspaceId && this.isWorkspaceRegistered(workspaceId)) {
         desired.add(workspaceId);
       }
@@ -1740,10 +1736,6 @@ export class WorkspaceStore {
   }
 
   private assertOnChatSubscriptionsMatch(desired: ReadonlySet<string>): void {
-    assert(
-      this.onChatControllers.size <= 2,
-      `[WorkspaceStore] Expected at most two live onChat subscriptions (active + pinned), found ${this.onChatControllers.size}`
-    );
     assert(
       this.onChatControllers.size === desired.size,
       `[WorkspaceStore] Expected ${desired.size} live onChat subscriptions, found ${this.onChatControllers.size}`
@@ -1817,14 +1809,14 @@ export class WorkspaceStore {
   }
 
   /**
-   * Reconcile live onChat subscriptions with {active, pinned}: stop loops for workspaces that
-   * left the set, start loops for ones that joined. A workspace that is both active and pinned
-   * keeps one loop, and switching the active workspace never disturbs the pinned loop.
+   * Reconcile live onChat subscriptions with the active and mounted side workspaces: stop
+   * loops for workspaces that left the set, start loops for ones that joined. Active/pinned
+   * overlap keeps one loop, and switching the active workspace never disturbs pinned loops.
    */
   private ensureOnChatSubscriptions(): void {
     const desired = this.getDesiredOnChatWorkspaceIds();
 
-    // Teardown first so the live set never transiently exceeds its bound.
+    // Teardown first so hidden workspaces stop receiving events before new panes start.
     for (const workspaceId of Array.from(this.onChatControllers.keys())) {
       if (!desired.has(workspaceId)) {
         this.stopOnChatSubscription(workspaceId);
@@ -4758,9 +4750,7 @@ export class WorkspaceStore {
     if (this.activeWorkspaceId === workspaceId) {
       this.activeWorkspaceId = null;
     }
-    if (this.pinnedWorkspaceId === workspaceId) {
-      this.pinnedWorkspaceId = null;
-    }
+    this.pinnedWorkspaces.delete(workspaceId);
 
     const statsUnsubscribe = this.statsUnsubscribers.get(workspaceId);
     if (statsUnsubscribe) {
@@ -4846,8 +4836,8 @@ export class WorkspaceStore {
     }
 
     // Re-evaluate live subscriptions after additions/removals.
-    // removeWorkspace can null activeWorkspaceId/pinnedWorkspaceId when the removed
-    // workspace was active/pinned (e.g., stale singleton state between integration tests),
+    // removeWorkspace can clear active/pinned ownership when the removed workspace
+    // was visible (e.g., stale singleton state between integration tests),
     // leaving addWorkspace's ensureOnChatSubscriptions targeting the old workspace.
     // This final call reconciles the subscriptions with the current active/pinned ids
     // + registration state.
@@ -4896,7 +4886,7 @@ export class WorkspaceStore {
     this.clientChangeController.abort();
 
     this.activeWorkspaceId = null;
-    this.pinnedWorkspaceId = null;
+    this.pinnedWorkspaces.clear();
     this.chatReplayPendingWorkspaces.clear();
     this.pendingReplayReset.clear();
     this.states.clear();
@@ -5734,20 +5724,12 @@ export function useWorkspaceShellStatus(workspaceId: string): WorkspaceShellStat
  * out without unmounting.
  */
 export function usePinnedWorkspaceChat(workspaceId: string | null): void {
-  // Syncing an external store with the mount lifecycle is what effects are for.
+  // Each mounted pane owns its release, so split-pane unmount order cannot unpin its peers.
   useEffect(() => {
     if (!workspaceId) {
       return;
     }
-    const store = getStoreInstance();
-    store.setPinnedWorkspaceId(workspaceId);
-    return () => {
-      // A newer pane may already have pinned another workspace (mount/unmount ordering
-      // across tab switches); only release the slot if it is still ours.
-      if (store.getPinnedWorkspaceId() === workspaceId) {
-        store.setPinnedWorkspaceId(null);
-      }
-    };
+    return getStoreInstance().acquirePinnedWorkspace(workspaceId);
   }, [workspaceId]);
 }
 

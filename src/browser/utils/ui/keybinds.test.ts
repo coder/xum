@@ -7,6 +7,7 @@ import {
   KEYBINDS,
   paneHandlesKeyEvent,
   SIDE_CHAT_PANE_ATTR,
+  type ChatPaneScope,
 } from "./keybinds";
 import type { Keybind } from "@/common/types/keybind";
 
@@ -469,48 +470,90 @@ describe("global keybind collisions", () => {
 });
 
 describe("paneHandlesKeyEvent", () => {
-  // Same DOM-global save/restore as workspaceDomNav.test.ts: later files in this bun process may
-  // depend on whatever window/document/HTMLElement were installed before.
-  const globals = globalThis as unknown as Record<"window" | "document" | "HTMLElement", unknown>;
-  let previous: Pick<typeof globals, "window" | "document" | "HTMLElement">;
+  // Preserve DOM globals for other files sharing this bun process.
+  const globals = globalThis as unknown as Record<
+    "window" | "document" | "HTMLElement" | "Node",
+    unknown
+  >;
+  let previous: typeof globals;
+  const scopes: ChatPaneScope[] = ["main", "side:alpha", "side:beta"];
 
   beforeEach(() => {
     previous = {
       window: globals.window,
       document: globals.document,
       HTMLElement: globals.HTMLElement,
+      Node: globals.Node,
     };
     const happyWindow = new GlobalWindow();
     globals.window = happyWindow;
     globals.document = happyWindow.document;
     globals.HTMLElement = happyWindow.HTMLElement;
+    globals.Node = happyWindow.Node;
   });
 
   afterEach(() => {
     globals.window = previous.window;
     globals.document = previous.document;
     globals.HTMLElement = previous.HTMLElement;
+    globals.Node = previous.Node;
   });
 
-  test("exactly one pane handles each target", () => {
-    const sidePane = document.createElement("div");
-    sidePane.setAttribute(SIDE_CHAT_PANE_ATTR, "");
-    const sideInput = document.createElement("textarea");
-    sidePane.appendChild(sideInput);
+  test("exactly one of main and two visible side panes handles each target", () => {
     const mainInput = document.createElement("textarea");
-    document.body.append(sidePane, mainInput);
-
-    const targets: Array<[EventTarget | null, "main" | "side"]> = [
-      [sideInput, "side"],
-      [sidePane, "side"],
+    document.body.appendChild(mainInput);
+    const mainText = document.createTextNode("Main transcript");
+    document.body.appendChild(mainText);
+    const targets: Array<[EventTarget | null, ChatPaneScope]> = [
       [mainInput, "main"],
+      [mainText, "main"],
       [document.body, "main"],
-      // Nothing focused (or a non-element target) belongs to the main pane.
+      [document, "main"],
       [null, "main"],
     ];
-    for (const [target, owner] of targets) {
-      expect(paneHandlesKeyEvent("side", target)).toBe(owner === "side");
-      expect(paneHandlesKeyEvent("main", target)).toBe(owner === "main");
+    const focusTargets: Array<[HTMLElement, ChatPaneScope]> = [[mainInput, "main"]];
+    for (const workspaceId of ["alpha", "beta"]) {
+      const sidePane = document.createElement("div");
+      sidePane.setAttribute(SIDE_CHAT_PANE_ATTR, workspaceId);
+      sidePane.tabIndex = -1;
+      const sideInput = document.createElement("textarea");
+      const child = document.createElement("span");
+      const text = document.createTextNode("Side transcript");
+      child.appendChild(text);
+      sidePane.append(sideInput, child);
+      document.body.appendChild(sidePane);
+      const scope: ChatPaneScope = `side:${workspaceId}`;
+      targets.push([sideInput, scope], [sidePane, scope], [child, scope], [text, scope]);
+      focusTargets.push([sideInput, scope], [sidePane, scope]);
     }
+
+    for (const [target, owner] of targets) {
+      expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, target))).toEqual([owner]);
+    }
+    // Agent-picker events route by activeElement, not by the original keyboard event target.
+    for (const [target, owner] of focusTargets) {
+      target.focus();
+      expect(document.activeElement).toBe(target);
+      expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, document.activeElement))).toEqual([
+        owner,
+      ]);
+    }
+  });
+
+  test("the nearest pane marker owns nested descendants", () => {
+    const outerPane = document.createElement("div");
+    outerPane.setAttribute(SIDE_CHAT_PANE_ATTR, "alpha");
+    const innerPane = document.createElement("div");
+    innerPane.setAttribute(SIDE_CHAT_PANE_ATTR, "beta");
+    const text = document.createTextNode("Nested transcript");
+    innerPane.appendChild(text);
+    outerPane.appendChild(innerPane);
+    document.body.appendChild(outerPane);
+
+    expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["side:beta"]);
+    innerPane.removeAttribute(SIDE_CHAT_PANE_ATTR);
+    expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["side:alpha"]);
+    outerPane.removeAttribute(SIDE_CHAT_PANE_ATTR);
+    expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["main"]);
   });
 });

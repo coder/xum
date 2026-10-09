@@ -345,25 +345,28 @@ const newCommandDefinition: SlashCommandDefinition = {
   },
 };
 
-// /side mirrors Codex's side conversations: everything after the command is a question sent
-// straight into the new side chat. /btw is Codex's alias for the same command.
-const parseSideCommand = ({ rawInput }: { rawInput: string }): ParsedCommand => {
-  const question = rawInput.trim();
-  return question.length === 0 ? { type: "side" } : { type: "side", question };
+// Opening a side chat is separate from sending a question: let the user compose in the new pane.
+const parseSideCommand: NonNullable<SlashCommandDefinition["handler"]> = ({
+  rawInput,
+  definition,
+}) => {
+  const input = rawInput.trim();
+  return input.length === 0
+    ? { type: "side" }
+    : { type: "command-invalid-args", command: definition.key, input, usage: `/${definition.key}` };
 };
 
 const sideCommandDefinition: SlashCommandDefinition = {
   key: "side",
-  description:
-    "Ask a side question in a temporary fork of this chat, opened next to it. Closing it discards it.",
-  inputHint: SLASH_COMMAND_HINTS.side,
+  description: "Open a new side chat next to this chat. Closing it discards it.",
+  appendSpace: false,
   handler: parseSideCommand,
 };
 
 const btwCommandDefinition: SlashCommandDefinition = {
   key: "btw",
   description: "Alias for /side.",
-  inputHint: SLASH_COMMAND_HINTS.side,
+  appendSpace: false,
   handler: parseSideCommand,
 };
 

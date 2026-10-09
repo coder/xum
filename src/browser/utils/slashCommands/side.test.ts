@@ -8,16 +8,22 @@ describe("/side command", () => {
     expect(parseCommand("/side   ")).toEqual({ type: "side" });
   });
 
-  it("treats everything after /side as the question, newlines included", () => {
-    expect(parseCommand("/side why is this\nslow?")).toEqual({
-      type: "side",
-      question: "why is this\nslow?",
-    });
+  it("rejects questions and flags instead of sending them or discarding the text", () => {
+    for (const command of ["side", "btw"]) {
+      for (const input of ["why is this\nslow?", "--help"]) {
+        expect(parseCommand(`/${command} ${input}`)).toEqual({
+          type: "command-invalid-args",
+          command,
+          input,
+          usage: `/${command}`,
+        });
+      }
+    }
   });
 
-  it("accepts /btw as an alias", () => {
-    expect(parseCommand("/btw what does foo do?")).toEqual(parseCommand("/side what does foo do?"));
+  it("accepts /btw as an alias without arguments", () => {
     expect(parseCommand("/btw")).toEqual({ type: "side" });
+    expect(parseCommand("/btw   ")).toEqual({ type: "side" });
   });
 
   it("is not suggested while creating a workspace", () => {

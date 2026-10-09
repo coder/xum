@@ -18,6 +18,9 @@ import { getDraftStore } from "@/browser/stores/DraftStore";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { SIDE_CHAT_PANE_ATTR } from "@/browser/utils/ui/keybinds";
 
+import { getRightSidebarLayoutKey } from "@/common/constants/storage";
+import { updatePersistedState, readPersistedState } from "@/browser/hooks/usePersistedState";
+import { collectAllTabs, type RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
 
@@ -80,7 +83,7 @@ async function sendFrom(
   fireEvent.click(sendButton);
 }
 
-/** The side chat the backend registered for this parent (exactly one, by design). */
+/** Await the first side chat created by a test (tests with multiple chats list them explicitly). */
 async function waitForSideChatId(app: AppHarness): Promise<string> {
   return waitFor(
     async () => {
@@ -128,8 +131,11 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await app.chat.expectTranscriptContains(`Mock response: ${mainPrompt}`);
       await app.chat.expectStreamComplete();
 
-      await sendFrom(() => getMainComposer(app), app.workspaceId, `/side ${sideQuestion}`);
+      await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const sideChatId = await waitForSideChatId(app);
+      await waitFor(() => expect(getSidePane(app)).not.toBeNull());
+      expect(isStreaming(sideChatId)).toBe(false);
+      await sendFrom(() => getSideComposer(app), sideChatId, sideQuestion);
 
       // The side pane streams the inherited history plus its own turn while the main chat
       // remains the routed workspace.
@@ -187,6 +193,109 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     }
   }, 90_000);
 
+  test("a failed or rejected discard keeps the side tab available for retry", async () => {
+    const app = await createAppHarness({ branchPrefix: "side-close-retry" });
+    const service = app.env.services.toORPCContext().workspaceService;
+    const remove = jest.spyOn(service, "remove");
+    try {
+      await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
+      const id = await waitForSideChatId(app);
+      const closeButton = await waitFor(() => {
+        const button = app.view.container.querySelector<HTMLButtonElement>(
+          'button[aria-label="Close side chat"]'
+        );
+        if (!button) throw new Error("side tab not ready");
+        return button;
+      });
+      remove.mockResolvedValueOnce({ success: false, error: "Keep this tab for retry" });
+      fireEvent.click(closeButton);
+      await waitFor(() =>
+        expect(app.view.container.textContent).toContain("Keep this tab for retry")
+      );
+      expect(app.view.container.contains(closeButton)).toBe(true);
+      expect(await app.env.orpc.workspace.getInfo({ workspaceId: id })).not.toBeNull();
+
+      remove.mockRejectedValueOnce(new Error("Retry after connection failure"));
+      fireEvent.click(closeButton);
+      await waitFor(() =>
+        expect(app.view.container.textContent).toContain("Retry after connection failure")
+      );
+      expect(app.view.container.contains(closeButton)).toBe(true);
+
+      // Successful retry is the only path that removes the still-reachable tab.
+      fireEvent.click(closeButton);
+      await waitFor(() => expect(app.view.container.contains(closeButton)).toBe(false));
+      expect(await app.env.orpc.workspace.getInfo({ workspaceId: id })).toBeNull();
+    } finally {
+      remove.mockRestore();
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("corrupt side tabs never force-delete an ordinary workspace", async () => {
+    let remove: jest.SpyInstance | undefined;
+    const app = await createAppHarness({
+      branchPrefix: "side-invalid-target",
+      beforeRenderEnvironment: (env) => {
+        remove = jest.spyOn(env.services.toORPCContext().workspaceService, "remove");
+      },
+      beforeRender: (workspaceId) => {
+        // A persisted side:<id> referencing its own ordinary parent is not a side chat.
+        updatePersistedState(getRightSidebarLayoutKey(workspaceId), {
+          version: 1,
+          nextId: 2,
+          focusedTabsetId: "tabset-1",
+          root: {
+            type: "tabset",
+            id: "tabset-1",
+            tabs: ["costs", `side:${workspaceId}`],
+            activeTab: "costs",
+          },
+        });
+      },
+    });
+    try {
+      await waitFor(() => {
+        const layout = readPersistedState<RightSidebarLayoutState | null>(
+          getRightSidebarLayoutKey(app.workspaceId),
+          null
+        );
+        expect(layout && collectAllTabs(layout.root)).not.toContain(`side:${app.workspaceId}`);
+      });
+      expect(remove).not.toHaveBeenCalled();
+      expect(await app.env.orpc.workspace.getInfo({ workspaceId: app.workspaceId })).not.toBeNull();
+    } finally {
+      remove?.mockRestore();
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("opening another side chat keeps the previous chat's tab", async () => {
+    const app = await createAppHarness({ branchPrefix: "multiple-side-tabs" });
+    try {
+      await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
+      const firstId = await waitForSideChatId(app);
+      await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
+      const ids = await waitFor(async () => {
+        const sideChats = (await app.env.orpc.workspace.list()).filter(
+          (metadata) => metadata.sideChatParentWorkspaceId === app.workspaceId
+        );
+        expect(sideChats).toHaveLength(2);
+        return sideChats.map((metadata) => metadata.id);
+      });
+      expect(ids).toContain(firstId);
+      await waitFor(() => {
+        for (const id of ids) {
+          expect(
+            app.view.container.querySelector(`[role="tab"][id$="-tab-side:${id}"]`)
+          ).not.toBeNull();
+        }
+      });
+    } finally {
+      await app.dispose();
+    }
+  }, 90_000);
+
   // Esc is a window-level shortcut that both mounted chat panes listen for; only the pane that
   // holds focus may act on it. Focus sits on each pane's transcript, not a composer (which handles
   // Esc itself), so the window listeners' pane scoping is what decides which chat stops.
@@ -210,13 +319,10 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       // when its stream starts, and the first listener to stop a stream claims the event
       // (preventDefault). Starting the focused pane's stream last puts the OTHER pane's listener
       // first, so a listener that ignored focus would stop the wrong chat.
-      await sendFrom(
-        () => getMainComposer(app),
-        app.workspaceId,
-        "/side [mock:long-stream] side stream"
-      );
+      await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const sideChatId = await waitForSideChatId(app);
-      await waitFor(() => expect(isStreaming(sideChatId)).toBe(true), { timeout: 30_000 });
+      await waitFor(() => expect(getSidePane(app)).not.toBeNull());
+      await startStream("side", sideChatId, "[mock:long-stream] side stream");
       await startStream("main", app.workspaceId, "[mock:long-stream] main stream");
 
       // Focus in the main transcript: only the main chat stops.

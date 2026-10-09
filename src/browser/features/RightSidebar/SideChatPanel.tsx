@@ -18,8 +18,8 @@ interface SideChatPanelProps {
  * the main chat, so both can be followed at once. The user asked for this instead of Codex's
  * full-screen takeover; the takeover remains the fallback where the sidebar is hidden.
  *
- * - The store keeps the side chat's transcript live through its pinned subscription slot while
- *   this panel is mounted (the routed main chat holds the other slot).
+ * - Each mounted panel retains its own live transcript subscription alongside the routed chat,
+ *   so multiple split-visible side chats do not replace each other's subscriptions.
  * - The scope provider and the pane attribute keep window-level chat shortcuts (Esc interrupt,
  *   focus, model/agent/thinking cycling) on the pane that has focus.
  * - The agent/thinking/background-bash providers are per workspace, like AIView's.
@@ -37,9 +37,9 @@ export function SideChatPanel(props: SideChatPanelProps) {
   }
 
   return (
-    <ChatPaneScopeProvider scope="side">
+    <ChatPaneScopeProvider scope={`side:${metadata.id}`}>
       <div
-        {...{ [SIDE_CHAT_PANE_ATTR]: "" }}
+        {...{ [SIDE_CHAT_PANE_ATTR]: metadata.id }}
         // Focusable so a click on non-focusable transcript space keeps keyboard focus (and with
         // it the chat shortcuts) in this pane instead of falling back to <body>, the main pane.
         tabIndex={-1}

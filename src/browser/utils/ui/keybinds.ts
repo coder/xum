@@ -217,22 +217,31 @@ export function isTerminalFocused(target: EventTarget | null): boolean {
 }
 
 /**
- * Marks the /side chat pane in the right sidebar. A second chat pane is mounted there next to
- * the main one, and both register the same window-level chat shortcuts; this attribute tells
- * them apart (see paneHandlesKeyEvent).
+ * Marks each /side chat pane with its workspace ID. Multiple side tabs can be visible together,
+ * so the value distinguishes their window-level chat shortcuts (see paneHandlesKeyEvent).
  */
 export const SIDE_CHAT_PANE_ATTR = "data-side-chat-pane";
 
 /** Which chat pane a set of window-level shortcuts belongs to. */
-export type ChatPaneScope = "main" | "side";
+export type ChatPaneScope = "main" | `side:${string}`;
 
 /**
- * Whether a chat pane's window-level shortcut should act on this event: the side pane acts only
- * while focus is inside it, the main pane everywhere else (including when nothing is focused).
+ * A side pane handles only events inside its own workspace's nearest pane marker; the main pane
+ * handles everything outside side panes (including when nothing is focused). Text-node targets
+ * resolve through their parent so they follow the same ownership as focused elements.
  */
 export function paneHandlesKeyEvent(scope: ChatPaneScope, target: EventTarget | null): boolean {
-  const inSidePane = hasClosestWithAttr(target, SIDE_CHAT_PANE_ATTR);
-  return scope === "side" ? inSidePane : !inSidePane;
+  const element =
+    typeof HTMLElement !== "undefined" && target instanceof HTMLElement
+      ? target
+      : typeof Node !== "undefined" && target instanceof Node
+        ? target.parentElement
+        : null;
+  const sidePane = element?.closest(`[${SIDE_CHAT_PANE_ATTR}]`);
+  const sideWorkspaceId = sidePane?.getAttribute(SIDE_CHAT_PANE_ATTR);
+  return scope === "main"
+    ? !sidePane
+    : sideWorkspaceId != null && scope === `side:${sideWorkspaceId}`;
 }
 
 /**

@@ -1,22 +1,48 @@
+import type { CapabilityGrants } from "@/common/types/capabilityGrants";
 import type { RuntimeMode } from "@/common/types/runtime";
 import { RUNTIME_MODE, runtimeModeSupportsSharedTaskWorkspace } from "@/common/types/runtime";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { mergeAdditionalSystemInstructions } from "@/common/utils/additionalSystemInstructions";
 import { getRuntimeType } from "@/node/runtime/initHook";
 
+/** A hard ceiling, independent of agent/caller policy: side chats may inspect, never act. */
+export const SIDE_CHAT_TOOL_GRANTS: CapabilityGrants = {
+  version: 1,
+  bridgeTools: {
+    allow: [
+      "file_read",
+      "agent_skill_list",
+      "agent_skill_read",
+      "agent_skill_read_file",
+      "todo_read",
+      "get_goal",
+      "review_pane_get",
+      "models_list",
+      "session_history",
+      "ask_user_question",
+    ],
+  },
+  vars: false,
+  hostEvents: false,
+};
+
+export function sideChatCapabilityGrants(
+  metadata: Pick<WorkspaceMetadata, "sideChatParentWorkspaceId">
+): CapabilityGrants | undefined {
+  return metadata.sideChatParentWorkspaceId != null ? SIDE_CHAT_TOOL_GRANTS : undefined;
+}
+
 /**
  * `/side` chats mirror Codex's side conversations: an ephemeral fork of the current chat that
- * inherits its history, runs in the same checkout, and is discarded when the user returns to the
- * main chat. They are for asking questions without derailing the main chat, so the hidden
- * instructions below keep the model in an "understand, don't change" posture: the main chat may
- * still be working in the same checkout, and side-chat writes would interfere with it.
+ * inherits its history and shares its checkout until closed. The request builder enforces a
+ * local-read-only tool ceiling because model actions could interfere with the main chat's work.
+ * These instructions explain how to use inherited context without continuing that work.
  */
 export const SIDE_CHAT_SYSTEM_INSTRUCTIONS = [
   "You are in a side chat: a temporary conversation forked from the user's main chat so they can ask questions without disturbing it. The main chat may keep working while you answer, and this side chat is discarded when the user closes it.",
   "The conversation history before this side chat was inherited from the main chat. Treat it as reference-only context: do not continue, resume, or finish the main chat's in-progress work here.",
-  "Side chats are for interactive dialogue aimed at understanding: answer questions, explain code and decisions, discuss options, and read files or run read-only commands when that helps you answer.",
-  "Do not write, edit, create, move, or delete files, and do not perform other operations that change state or could interfere with the main chat, which may still be working in the same checkout. This includes git operations that change the repository, installing dependencies, starting or stopping processes, editing plans, goals, or todos, and spawning sub-agents or workflows.",
-  "If the user asks for such a change, describe what you would do and suggest making the change from the main chat instead.",
+  "Side chats are for understanding: answer questions, explain code and decisions, and discuss options using the inherited transcript, user-provided context, and the available local read tools. You cannot run shell commands, browse the network, change files or state, or delegate work here. Say when the available context is insufficient instead of guessing.",
+  "Do not continue the main chat's work or claim to have changed the checkout. If the user asks for a change or an operation outside your local read tools, explain what is needed and suggest requesting it in the main chat instead.",
 ].join("\n\n");
 
 /** Appends the side-chat guardrails to a turn's additional instructions; other chats pass through. */

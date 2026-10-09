@@ -6,19 +6,20 @@ description: Ask a quick side question without derailing the main chat
 Use `/side` (or its alias `/btw`) to ask a side question in a temporary copy of the current chat. The side chat opens as a **Side chat** tab in the right sidebar, so you can follow it and the main chat at the same time. The side chat knows everything the main chat knows, but nothing you say in it is added to the main chat.
 
 ```
-/side [question]
+/side
 ```
 
-With a question, the side chat opens and sends it right away. Without one, it opens empty so you can type.
+The command takes no arguments. It opens an empty composer; type your question in the side chat.
 
 ## How side chats work
 
 - **Inherits context**: the side chat starts from the main chat's conversation, including a turn that is still streaming, and uses the same model and settings.
 - **Main chat keeps going**: an agent working in the main chat keeps working next to the side chat. Keyboard shortcuts such as <kbd>Esc</kbd> to interrupt apply to whichever chat has focus.
 - **Same checkout**: the side chat runs in the main chat's working tree, so it sees uncommitted changes.
-- **Understanding, not changes**: side chats are for interactive questions and explanations. The agent is instructed not to edit files or run commands that would interfere with the main chat. Make changes from the main chat instead.
-- **Temporary**: closing the tab (its close button, middle-click, or <kbd>Ctrl+W</kbd> / <kbd>Cmd+W</kbd> while it is focused) discards the side chat. Side chats never appear in the workspace list and do not survive a restart.
-- **One at a time**: starting a new side chat discards the previous one for that workspace and replaces its tab. Side chats can't be nested, and workspace commands such as `/fork`, `/compact` and `/goal` are not available inside them.
+- **Understanding, not changes**: side chats are for interactive questions and explanations. Only read-only inspection tools are available: no shell, file edits, workflows, sub-agents, or project-defined tools can change the shared checkout. Make changes from the main chat instead.
+- **Attachments**: add files in the main chat before opening a side chat, or ask the side chat to read an existing local file. New attachment uploads in side chats are disabled so they cannot leave files behind in the shared checkout.
+- **Disposable**: closing the tab (its close button, middle-click, or <kbd>Ctrl+W</kbd> / <kbd>Cmd+W</kbd> while it is focused) discards that side chat. Removing or archiving the main workspace discards its side chats too. Open side-chat tabs survive app restarts and stay out of the workspace list.
+- **Multiple conversations**: run `/side` again in the main chat to open another independent tab. Closing one leaves the others intact. Side chats can't be nested, and workspace commands such as `/fork`, `/compact` and `/goal` are not available inside them.
 
 When the right sidebar is hidden (narrow windows and phones), the side chat takes over the chat view instead. Press <kbd>Esc</kbd> (or <kbd>Ctrl+C</kbd> in Vim mode) when it is idle, or click **Return to main chat**, to go back; leaving discards it.
 

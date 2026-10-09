@@ -31,7 +31,7 @@ export type ParsedCommand =
   | { type: "dream" }
   | { type: "refine"; apply?: boolean }
   | { type: "fork"; startMessage?: string }
-  | { type: "side"; question?: string }
+  | { type: "side" }
   | { type: "new"; startMessage?: string }
   | { type: "vim-toggle" }
   | { type: "plan-show" }
