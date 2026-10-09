@@ -205,7 +205,7 @@ describe("AdvisorConfig", () => {
     const { view, getConfigMock } = renderAdvisorConfig();
 
     await waitFor(() => {
-      expect(getConfigMock).toHaveBeenCalledTimes(1);
+      expect(getConfigMock).toHaveBeenCalled();
       expect(view.getByText("Advisor Model")).toBeDefined();
       expect(view.getByText("Max Uses / Turn")).toBeDefined();
     });

@@ -2,12 +2,7 @@ import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { collapseLeftSidebar, setWorkspaceInput } from "@/browser/stories/helpers/uiState";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  getAutoModelRoutingKey,
-  getModelKey,
-  getReasoningModeKey,
-} from "@/common/constants/storage";
+import { setAutoRoutingPick } from "@/browser/utils/aiSelectionIntent";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createFileReadTool } from "@/browser/stories/mocks/tools";
@@ -436,10 +431,9 @@ export const ThinkingSelectorOpen: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        updatePersistedState(getModelKey("ws-thinking-selector"), "openai:gpt-6.1-sol");
-        updatePersistedState(getReasoningModeKey("ws-thinking-selector"), "pro");
         return setupSimpleChatStory({
           workspaceId: "ws-thinking-selector",
+          aiSettings: { model: "openai:gpt-6.1-sol", thinkingLevel: "off", reasoningMode: "pro" },
           providersConfig: {
             openai: {
               apiKeySet: true,
@@ -494,10 +488,9 @@ export const ThinkingSelectorCyberOpen: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        updatePersistedState(getModelKey("ws-thinking-selector-cyber"), "openai:gpt-6.1-sol");
-        updatePersistedState(getReasoningModeKey("ws-thinking-selector-cyber"), "cyber");
         return setupSimpleChatStory({
           workspaceId: "ws-thinking-selector-cyber",
+          aiSettings: { model: "openai:gpt-6.1-sol", thinkingLevel: "off", reasoningMode: "cyber" },
           providersConfig: {
             openai: {
               apiKeySet: true,
@@ -563,9 +556,9 @@ export const ThinkingSelectorUltrafast: AppStory = {
       <AppWithMocks
         setup={() => {
           collapseLeftSidebar();
-          updatePersistedState(getModelKey("ws-thinking-selector-ultrafast"), "openai:gpt-6.1-sol");
           return setupSimpleChatStory({
             workspaceId: "ws-thinking-selector-ultrafast",
+            aiSettings: { model: "openai:gpt-6.1-sol", thinkingLevel: "off" },
             providersConfig: {
               openai: {
                 apiKeySet: true,
@@ -647,10 +640,9 @@ export const NarrowControlRowCollapse: AppStory = {
           collapseLeftSidebar();
           // Active Pro and fast modes exercise both compact selector status indicators while the
           // narrow-width assertions prove the row still sheds optional detail before overflowing.
-          updatePersistedState(getModelKey("ws-composer-breakpoints"), "openai:gpt-6.1-sol");
-          updatePersistedState(getReasoningModeKey("ws-composer-breakpoints"), "pro");
           return setupSimpleChatStory({
             workspaceId: "ws-composer-breakpoints",
+            aiSettings: { model: "openai:gpt-6.1-sol", thinkingLevel: "off", reasoningMode: "pro" },
             providersConfig: {
               openai: {
                 apiKeySet: true,
@@ -1141,10 +1133,10 @@ export const AutoModelRoutingActive: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        updatePersistedState(getModelKey("ws-auto-routing"), "openai:gpt-5.6-sol");
-        updatePersistedState(getAutoModelRoutingKey("ws-auto-routing"), true);
+        setAutoRoutingPick("ws-auto-routing", "exec", "model", true);
         return setupSimpleChatStory({
           workspaceId: "ws-auto-routing",
+          aiSettings: { model: "openai:gpt-5.6-sol", thinkingLevel: "off" },
           experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
           providersConfig: {
             openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
@@ -1191,9 +1183,9 @@ export const AutoModelRoutingKeyboard: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        updatePersistedState(getModelKey("ws-auto-routing-keyboard"), "openai:gpt-5.6-sol");
         return setupSimpleChatStory({
           workspaceId: "ws-auto-routing-keyboard",
+          aiSettings: { model: "openai:gpt-5.6-sol", thinkingLevel: "off" },
           experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
           providersConfig: {
             openai: { apiKeySet: true, isEnabled: true, isConfigured: true },

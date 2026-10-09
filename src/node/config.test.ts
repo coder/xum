@@ -1309,6 +1309,36 @@ describe("Config", () => {
     expect(workspace != null && Object.hasOwn(workspace, "taskExperiments")).toBe(false);
   });
 
+  it("keeps notify-on-response entries while a workspace row has no ID yet", () => {
+    fs.writeFileSync(
+      path.join(tempDir, "config.json"),
+      JSON.stringify({
+        projects: [["/repo", { workspaces: [{ path: "/repo/legacy", name: "legacy" }] }]],
+        userPreferences: { notifications: { notifyOnResponseByWorkspace: { "legacy-id": true } } },
+      })
+    );
+
+    expect(config.loadConfigOrDefault().userPreferences).toEqual({
+      notifications: { notifyOnResponseByWorkspace: { "legacy-id": true } },
+    });
+  });
+
+  it("drops notify-on-response entries of removed workspaces at load time", () => {
+    fs.writeFileSync(
+      path.join(tempDir, "config.json"),
+      JSON.stringify({
+        projects: [["/repo", { workspaces: [{ path: "/repo/ws", id: "ws-kept", name: "ws" }] }]],
+        userPreferences: {
+          notifications: { notifyOnResponseByWorkspace: { "ws-kept": true, "ws-removed": true } },
+        },
+      })
+    );
+
+    expect(config.loadConfigOrDefault().userPreferences).toEqual({
+      notifications: { notifyOnResponseByWorkspace: { "ws-kept": true } },
+    });
+  });
+
   describe("deferred change notifications", () => {
     it("flushes slow sequential edits and unrelated edits once", async () => {
       let notifications = 0;
@@ -2208,10 +2238,8 @@ describe("Config", () => {
       });
 
       const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        migrations?: { userPreferencesInitialized?: unknown };
         userPreferences?: unknown;
       };
-      expect(raw.migrations?.userPreferencesInitialized).toBe(true);
       expect(raw.userPreferences).toEqual({
         appearance: { theme: "dark" },
         navigation: { projectOrder: ["/repo"] },
@@ -2242,20 +2270,6 @@ describe("Config", () => {
       expect(raw.llmDebugLogs).toBe(true);
     });
 
-    it("treats existing user preferences as initialized for cross-origin sync", () => {
-      fs.writeFileSync(
-        path.join(tempDir, "config.json"),
-        JSON.stringify({
-          projects: [],
-          userPreferences: {
-            appearance: { theme: "flexoki-dark" },
-          },
-        })
-      );
-
-      expect(config.loadConfigOrDefault().migrations?.userPreferencesInitialized).toBe(true);
-    });
-
     it("normalizes invalid user preference values on load", () => {
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
@@ -2263,14 +2277,13 @@ describe("Config", () => {
           projects: [],
           userPreferences: {
             appearance: { theme: "legacy-light", transcriptDensity: "wide" },
-            notifications: { notifyOnResponseByWorkspace: { "ws-1": true, "ws-2": "yes" } },
+            review: { defaultBaseByProject: { "/repo/a": "main", "/repo/b": 42 } },
           },
         })
       );
 
       expect(config.loadConfigOrDefault().userPreferences).toEqual({
-        appearance: { theme: "light" },
-        notifications: { notifyOnResponseByWorkspace: { "ws-1": true } },
+        review: { defaultBaseByProject: { "/repo/a": "main" } },
       });
     });
   });
@@ -2352,11 +2365,6 @@ describe("Config", () => {
         proposePlanImplementReplacesChatHistory: true,
       });
       expect(saved.agentAiDefaults?.foo?.subagent?.reasoningMode).toBe("pro");
-
-      await config.saveUserConfig({ userPreferences: null });
-      const cleared = config.loadConfigOrDefault();
-      expect(cleared.userPreferences).toBeUndefined();
-      expect(cleared.migrations?.userPreferencesInitialized).toBe(true);
     });
 
     it("preserves advisor validation errors", async () => {

@@ -479,7 +479,7 @@ export function ProvidersSection() {
 
   const { api } = useAPI();
   const { config, loading: configLoading, refresh, updateOptimistically } = useProvidersConfig();
-  const { workspaceMetadata, selectedWorkspace, refreshWorkspaceMetadata } = useWorkspaceContext();
+  const { refreshWorkspaceMetadata } = useWorkspaceContext();
   const visibleProviders = useMemo(() => getProviderIdsForUi(config), [config]);
   const {
     data: muxGatewayAccountStatus,
@@ -1848,11 +1848,6 @@ export function ProvidersSection() {
       // would recreate the entry (setConfig creates absent sections).
       providerTypeWritesRef.current.delete(provider);
 
-      const workspaceIds = new Set(workspaceMetadata.keys());
-      if (selectedWorkspace) {
-        workspaceIds.add(selectedWorkspace.workspaceId);
-      }
-
       clearCustomProviderRemoveError(provider);
       setCustomProviderNotice(null);
       setCustomProviderRemoving(provider);
@@ -1887,7 +1882,7 @@ export function ProvidersSection() {
             // Browser cache repair still needs to run after backend removal succeeds.
           }
         } finally {
-          repairLocalModelPreferencesForRemovedProvider(provider, workspaceIds);
+          repairLocalModelPreferencesForRemovedProvider(provider);
         }
 
         setExpandedProvider((prev) => (prev === provider ? null : prev));
@@ -1909,9 +1904,7 @@ export function ProvidersSection() {
       clearCustomProviderRemoveError,
       refresh,
       refreshWorkspaceMetadata,
-      selectedWorkspace,
       setProvidersExpandedProvider,
-      workspaceMetadata,
     ]
   );
 

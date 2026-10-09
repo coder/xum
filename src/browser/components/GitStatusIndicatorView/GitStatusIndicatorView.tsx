@@ -1,5 +1,6 @@
 import React from "react";
 import type { GitStatus } from "@/common/types/workspace";
+import type { GitStatusIndicatorMode } from "@/common/constants/storage";
 import type { GitCommit, GitBranchHeader } from "@/common/utils/git/parseGitLog";
 import { cn } from "@/common/lib/utils";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
@@ -38,8 +39,6 @@ function formatCountAbbrev(count: number): string {
   const normalized = raw.endsWith(".0") ? raw.slice(0, -2) : raw;
   return `${count < 0 ? "-" : ""}${normalized}m`;
 }
-
-export type GitStatusIndicatorMode = "divergence" | "line-delta";
 
 export interface GitStatusIndicatorViewProps {
   gitStatus: GitStatus | null;

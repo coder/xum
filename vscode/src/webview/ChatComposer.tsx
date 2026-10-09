@@ -9,12 +9,10 @@ import { matchesKeybind, formatKeybind, KEYBINDS } from "xum/browser/utils/ui/ke
 import { CUSTOM_EVENTS, createCustomEvent } from "xum/common/constants/events";
 import { useAPI } from "xum/browser/contexts/API";
 import { useAgent } from "xum/browser/contexts/AgentContext";
-import { useThinkingLevel } from "xum/browser/hooks/useThinkingLevel";
-import { useReasoningMode } from "xum/browser/hooks/useReasoningMode";
-import type { WorkspaceAISettingsCache } from "xum/browser/utils/workspaceModeAi";
-import { normalizeAgentId } from "xum/common/utils/agentIds";
+import { useWorkspaceAiSelection } from "xum/browser/utils/workspaceAiSettingsSync";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
-import { usePersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
+import { usePersistedState } from "xum/browser/hooks/usePersistedState";
+import { useUserPreferences } from "xum/browser/stores/AppConfigStore";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
 import { normalizeSelectedModel } from "xum/common/utils/ai/models";
 import {
@@ -41,12 +39,7 @@ import {
   COMPOSER_CONTROL_HEIGHT_CLASS,
   COMPOSER_WORKSPACE_ICON_ONLY_HIDE_CLASS,
 } from "xum/constants/layout";
-import {
-  VIM_ENABLED_KEY,
-  getInputKey,
-  getModelKey,
-  getWorkspaceAISettingsByAgentKey,
-} from "xum/common/constants/storage";
+import { getInputKey } from "xum/common/constants/storage";
 
 const SEND_MESSAGE_TIMEOUT_MS = 30_000;
 
@@ -111,8 +104,6 @@ function ChatComposerInner(props: {
   // #4820: without a workspace scope a pick would write the webview's global agent key.
   const agentPickerUsable = props.agentScoped && isAgentSelectionLocked !== true;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const [thinkingLevel] = useThinkingLevel();
-  const [reasoningMode] = useReasoningMode();
 
   const { options: providerOptions } = useProviderOptions();
   const use1M = providerOptions.anthropic?.use1MContext ?? false;
@@ -128,21 +119,16 @@ function ChatComposerInner(props: {
     setDefaultModel,
   } = useModelsFromSettings();
 
-  const modelKey = getModelKey(props.workspaceId);
-  const [preferredModel, setPreferredModel] = usePersistedState<string>(modelKey, defaultModel, {
-    listener: true,
-  });
-
   // Gateway-preserving, like the desktop composer: an explicit gateway pick (e.g.
   // openrouter:openai/gpt-5) stays selected instead of showing as its direct-provider model.
-  const storedModel = normalizeSelectedModel(preferredModel);
+  const storedModel = useWorkspaceAiSelection(props.workspaceId, agentId).model;
 
   const inputKey = getInputKey(props.workspaceId);
   const [input, setInput] = usePersistedState<string>(inputKey, "", { listener: true });
 
-  const [vimEnabled, setVimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, {
-    listener: true,
-  });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const [isSending, setIsSending] = useState(false);
 
   const aggregator = props.aggregator;
@@ -200,22 +186,6 @@ function ChatComposerInner(props: {
     const selectedModel = normalizeSelectedModel(model);
     ensureModelInSettings(selectedModel);
     markAiSelectionIntent(props.workspaceId, "model", selectedModel);
-    setPreferredModel(selectedModel);
-
-    // Like the desktop composer, record the pick in the active agent's cache so
-    // WorkspaceModeAISync restores it (not the seeded model) after switching agents and back.
-    updatePersistedState<WorkspaceAISettingsCache>(
-      getWorkspaceAISettingsByAgentKey(props.workspaceId),
-      (prev) => ({
-        ...(prev && typeof prev === "object" ? prev : {}),
-        [normalizeAgentId(agentId, "exec")]: {
-          model: selectedModel,
-          thinkingLevel,
-          reasoningMode,
-        },
-      }),
-      {}
-    );
 
     // #4781: nothing is written here; the next send persists the pick (desktop parity).
   };
@@ -248,10 +218,12 @@ function ChatComposerInner(props: {
     }
 
     if (trimmed === "/vim") {
-      const next = !vimEnabled;
-      setVimEnabled(next);
+      // Vim mode lives in Xum's config, which the webview cannot write.
       setInput("");
-      props.onNotice({ level: "info", message: `Vim mode ${next ? "enabled" : "disabled"}.` });
+      props.onNotice({
+        level: "info",
+        message: `Vim mode is ${vimEnabled ? "enabled" : "disabled"}. Change it in Xum.`,
+      });
       return;
     }
 
@@ -288,7 +260,8 @@ function ChatComposerInner(props: {
       ...baseOptions,
       skipAiSettingsPersistence: !mayPersist,
     });
-    const persist = aiSelection.intent !== undefined;
+    // An agent-only or Auto-only pick attaches a token but no field intent; it is explicit too.
+    const persist = Object.values(aiSelection.attachedTokens).some((token) => token !== undefined);
     if (persist) {
       aiPersistenceByWorkspace.set(props.workspaceId, "in-flight");
     }
@@ -297,7 +270,7 @@ function ChatComposerInner(props: {
       const options = {
         ...baseOptions,
         skipAiSettingsPersistence: !persist,
-        ...(persist ? { aiSelectionIntent: aiSelection.intent } : {}),
+        ...(aiSelection.intent ? { aiSelectionIntent: aiSelection.intent } : {}),
       };
 
       const result = await api.workspace.sendMessage(
@@ -323,7 +296,7 @@ function ChatComposerInner(props: {
 
       if (persist) {
         // A pick made while this send was in flight has a newer token and stays pending.
-        consumeAiSelectionIntent(props.workspaceId, agentId, aiSelection.attachedTokens);
+        consumeAiSelectionIntent(props.workspaceId, agentId, aiSelection);
       }
       props.onSendComplete();
     } catch (error) {
@@ -489,7 +462,12 @@ function ChatComposerInner(props: {
 
               <ContextUsageIndicatorButton
                 data={contextUsageData}
-                autoCompaction={autoCompactionSettings}
+                // No setter: the host blocks every config write from the webview, so the
+                // threshold is shown read-only.
+                autoCompaction={{
+                  threshold: autoCompactionSettings.threshold,
+                  rolloverEnabled: autoCompactionSettings.rolloverEnabled,
+                }}
               />
             </div>
 

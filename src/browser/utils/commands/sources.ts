@@ -7,7 +7,7 @@ import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedb
 import { showFeedbackToast as showCommandFeedbackToast } from "@/browser/utils/feedbackToast";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
-import type { AutoRoutingDimension } from "@/browser/utils/modelChange";
+import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
 import {
   THINKING_LEVELS,
   type OpenAIReasoningMode,
@@ -27,15 +27,11 @@ import assert from "@/common/utils/assert";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
-  DEFAULT_TERMINAL_BADGE_CONFIG,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
-  SIDEBAR_HIDE_SUBAGENTS_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
-  TERMINAL_BADGE_CONFIG_KEY,
   normalizeTerminalBadgeConfig,
-  type TerminalBadgeConfig,
 } from "@/common/constants/storage";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { CommandIds } from "@/browser/utils/commandIds";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { stopStream } from "@/browser/utils/stopStream";
@@ -801,44 +797,42 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       {
         id: CommandIds.navToggleHideSubAgents(),
         title: "Toggle Hide Sub-Agents in Sidebar",
-        subtitle: `Current: ${readPersistedState(SIDEBAR_HIDE_SUBAGENTS_KEY, false) ? "Hidden" : "Shown"}`,
+        subtitle: `Current: ${getUserPreferences().ui?.sidebarHideSubAgents ? "Hidden" : "Shown"}`,
         section: section.navigation,
         keywords: ["sub-agents", "subagents", "hide", "show", "sidebar"],
         run: () => {
-          updatePersistedState<boolean>(SIDEBAR_HIDE_SUBAGENTS_KEY, (prev) => !prev, false);
+          const hidden = getUserPreferences().ui?.sidebarHideSubAgents ?? false;
+          updateUserPreferences({ ui: { sidebarHideSubAgents: !hidden } });
         },
       },
       {
         id: CommandIds.navToggleFlatChatList(),
         title: "Toggle Flat Chat List",
-        subtitle: `Current: ${readPersistedState(SIDEBAR_FLAT_MODE_KEY, false) ? "Flat" : "Grouped"}`,
+        subtitle: `Current: ${getUserPreferences().ui?.sidebarFlatMode ? "Flat" : "Grouped"}`,
         section: section.navigation,
         keywords: ["flat", "chat", "list", "projects", "folders", "sidebar"],
         run: () => {
-          updatePersistedState<boolean>(SIDEBAR_FLAT_MODE_KEY, (prev) => !prev, false);
+          const flat = getUserPreferences().ui?.sidebarFlatMode ?? false;
+          updateUserPreferences({ ui: { sidebarFlatMode: !flat } });
         },
       },
       {
         id: CommandIds.navToggleTerminalBadge(),
         title: "Toggle Terminal Badge",
         subtitle: `Current: ${
-          normalizeTerminalBadgeConfig(
-            readPersistedState(TERMINAL_BADGE_CONFIG_KEY, DEFAULT_TERMINAL_BADGE_CONFIG)
-          ).enabled
+          normalizeTerminalBadgeConfig(getUserPreferences().appearance?.terminalBadgeConfig).enabled
             ? "Shown"
             : "Hidden"
         }`,
         section: section.navigation,
         keywords: ["terminal", "badge", "watermark", "overlay", "workspace", "tab"],
         run: () => {
-          updatePersistedState<TerminalBadgeConfig>(
-            TERMINAL_BADGE_CONFIG_KEY,
-            (prev) => {
-              const config = normalizeTerminalBadgeConfig(prev);
-              return { ...config, enabled: !config.enabled };
-            },
-            DEFAULT_TERMINAL_BADGE_CONFIG
+          const config = normalizeTerminalBadgeConfig(
+            getUserPreferences().appearance?.terminalBadgeConfig
           );
+          updateUserPreferences({
+            appearance: { terminalBadgeConfig: { ...config, enabled: !config.enabled } },
+          });
         },
       },
     ];

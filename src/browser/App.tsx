@@ -10,11 +10,7 @@ import { ProjectCreateModal } from "./components/ProjectCreateModal/ProjectCreat
 import { MultiProjectWorkspaceCreateModal } from "./components/MultiProjectWorkspaceCreateModal/MultiProjectWorkspaceCreateModal";
 import { AIView } from "./components/AIView/AIView";
 import { ErrorBoundary } from "./components/ErrorBoundary/ErrorBoundary";
-import {
-  usePersistedState,
-  updatePersistedState,
-  readPersistedState,
-} from "./hooks/usePersistedState";
+import { usePersistedState, updatePersistedState } from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { useComputerUse } from "./hooks/useComputerUse";
 import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
@@ -37,7 +33,7 @@ import {
 import { getVisibleWorkspaceIds } from "./utils/ui/workspaceDomNav";
 import { useUnreadTracking } from "./hooks/useUnreadTracking";
 import { useWorkspaceStoreRaw, useWorkspaceRecency } from "./stores/WorkspaceStore";
-import { getAppConfigStore } from "./stores/AppConfigStore";
+import { getAppConfigStore, getUserPreferences } from "./stores/AppConfigStore";
 import {
   getResponseCompleteNotificationBody,
   shouldNotifyOnResponseComplete,
@@ -67,30 +63,20 @@ import {
 } from "@/common/utils/subProjects";
 import {
   THINKING_LEVELS,
-  coerceOpenAIReasoningMode,
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import { createCustomEvent, CUSTOM_EVENTS } from "@/common/constants/events";
 import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
-  getAgentIdKey,
   getAgentsInitNudgeKey,
-  getModelKey,
-  getNotifyOnResponseKey,
   getProjectScopeId,
-  getThinkingLevelByModelKey,
-  getReasoningModeKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
   getWorkspaceLastReadKey,
   EXPANDED_PROJECTS_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_WIDTH_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
 } from "@/common/constants/storage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { UpdateChannel } from "@/common/types/project";
 import { useTelemetry } from "./hooks/useTelemetry";
@@ -98,7 +84,7 @@ import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useStartWorkspaceCreation } from "./hooks/useStartWorkspaceCreation";
 import { useAPI } from "@/browser/contexts/API";
 import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
-import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
+import { getAutoRouting, getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
 import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
@@ -130,7 +116,7 @@ import { WindowsToolchainBanner } from "./components/WindowsToolchainBanner/Wind
 import { RosettaBanner } from "./components/RosettaBanner/RosettaBanner";
 
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { getAutoRoutingKey, setAutoRoutingChoice } from "@/browser/utils/modelChange";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -138,7 +124,6 @@ import { getErrorMessage } from "@/common/utils/errors";
 import assert from "@/common/utils/assert";
 import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { prependInitialAppProxyBasePath } from "@/browser/utils/frontendBasePath";
@@ -503,65 +488,27 @@ function AppInner() {
   } = useCommandRegistry();
 
   /**
-   * Get the selected model for a workspace, preserving explicit gateway prefixes.
+   * The workspace's effective AI selection, preserving explicit gateway prefixes. A sub-agent
+   * resolves for its own agent.
    */
-  const getModelForWorkspace = useCallback(
-    (workspaceId: string): string => {
-      const defaultModel = getDefaultModel();
-      const preferredModel = readPersistedState<string | null>(getModelKey(workspaceId), null);
+  const getAiSelectionForWorkspace = useCallback(
+    (workspaceId: string) => {
       const metadata = workspaceMetadata.get(workspaceId);
-      const persistedAgentId =
-        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
-          .trim()
-          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
-      const agentId =
-        metadata?.parentWorkspaceId != null && metadata.agentId
-          ? metadata.agentId
-          : persistedAgentId;
-      return resolveEffectiveComposerModel(preferredModel, metadata, agentId, defaultModel);
+      return getWorkspaceAiSelection(
+        workspaceId,
+        metadata?.parentWorkspaceId != null && metadata.agentId ? metadata.agentId : undefined
+      );
     },
     [workspaceMetadata]
   );
-
-  const getThinkingLevelForWorkspace = useCallback(
-    (workspaceId: string): ThinkingLevel => {
-      if (!workspaceId) {
-        return "off";
-      }
-
-      const scopedKey = getThinkingLevelKey(workspaceId);
-      const scoped = readPersistedState<ThinkingLevel | undefined>(scopedKey, undefined);
-      if (scoped !== undefined) {
-        return THINKING_LEVELS.includes(scoped) ? scoped : "off";
-      }
-
-      // Keep this render-time palette lookup pure. ThinkingProvider owns migration to the
-      // workspace-scoped key, while the palette can read legacy values as a fallback.
-      const model = getModelForWorkspace(workspaceId);
-      const legacy = readPersistedState<ThinkingLevel | undefined>(
-        getThinkingLevelByModelKey(model),
-        undefined
-      );
-      if (legacy !== undefined && THINKING_LEVELS.includes(legacy)) {
-        return legacy;
-      }
-
-      // Fallback: check canonical key for legacy entries stored before gateway-aware normalization.
-      const canonicalModel = normalizeToCanonical(model);
-      if (canonicalModel !== model) {
-        const canonicalLegacy = readPersistedState<ThinkingLevel | undefined>(
-          getThinkingLevelByModelKey(canonicalModel),
-          undefined
-        );
-        if (canonicalLegacy !== undefined && THINKING_LEVELS.includes(canonicalLegacy)) {
-          return canonicalLegacy;
-        }
-      }
-
-      return "off";
-    },
-    [getModelForWorkspace]
+  const getModelForWorkspace = useCallback(
+    (workspaceId: string): string => getAiSelectionForWorkspace(workspaceId).model,
+    [getAiSelectionForWorkspace]
   );
+  const getThinkingLevelForWorkspace = (workspaceId: string): ThinkingLevel =>
+    workspaceId ? getAiSelectionForWorkspace(workspaceId).thinkingLevel : "off";
+  const getReasoningModeForWorkspace = (workspaceId: string): OpenAIReasoningMode =>
+    workspaceId ? getAiSelectionForWorkspace(workspaceId).reasoningMode : "standard";
 
   // Pro mode is Responses-only; the palette command hides under chatCompletions
   // and on non-passthrough routes (mirroring the send path's header gating).
@@ -576,18 +523,7 @@ function AppInner() {
     [routing]
   );
 
-  const getReasoningModeForWorkspace = useCallback((workspaceId: string): OpenAIReasoningMode => {
-    if (!workspaceId) {
-      return "standard";
-    }
-    const stored = readPersistedState<OpenAIReasoningMode | null>(
-      getReasoningModeKey(workspaceId),
-      null
-    );
-    // Coerce untrusted persisted values so corrupt entries self-heal to "standard".
-    return coerceOpenAIReasoningMode(stored) ?? "standard";
-  }, []);
-
+  // Palette picks stay in memory until a user message sends them.
   const setThinkingLevelFromPalette = useCallback(
     (workspaceId: string, level: ThinkingLevel) => {
       if (!workspaceId) {
@@ -595,41 +531,9 @@ function AppInner() {
       }
 
       const normalized = THINKING_LEVELS.includes(level) ? level : "off";
-      const model = getModelForWorkspace(workspaceId);
-      const key = getThinkingLevelKey(workspaceId);
-      const reasoningMode = getReasoningModeForWorkspace(workspaceId);
-
-      // Use the utility function which handles localStorage and event dispatch
-      // ThinkingProvider will pick this up via its listener
-      updatePersistedState(key, normalized);
       markAiSelectionIntent(workspaceId, "thinkingLevel", normalized);
       // The palette bypasses ThinkingProvider.setThinkingLevel, so leave Auto here too.
       setAutoRoutingChoice(workspaceId, "thinkingLevel", false);
-
-      type WorkspaceAISettingsByAgentCache = Partial<
-        Record<
-          string,
-          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-        >
-      >;
-
-      const normalizedAgentId =
-        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
-          .trim()
-          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
-
-      updatePersistedState<WorkspaceAISettingsByAgentCache>(
-        getWorkspaceAISettingsByAgentKey(workspaceId),
-        (prev) => {
-          const record: WorkspaceAISettingsByAgentCache =
-            prev && typeof prev === "object" ? prev : {};
-          return {
-            ...record,
-            [normalizedAgentId]: { model, thinkingLevel: normalized, reasoningMode },
-          };
-        },
-        {}
-      );
 
       if (api) {
         // Mid-turn change: also apply to the active turn's next model step so
@@ -646,51 +550,20 @@ function AppInner() {
         );
       }
     },
-    [api, getModelForWorkspace, getReasoningModeForWorkspace]
+    [api]
   );
 
-  // Keep palette choices local until a user message sends the full settings.
-  const toggleReasoningModeFromPalette = useCallback(
-    (workspaceId: string, mode: Exclude<OpenAIReasoningMode, "standard">) => {
-      if (!workspaceId) {
-        return;
-      }
-
-      const next: OpenAIReasoningMode =
-        getReasoningModeForWorkspace(workspaceId) === mode ? "standard" : mode;
-      const model = getModelForWorkspace(workspaceId);
-      const thinkingLevel = getThinkingLevelForWorkspace(workspaceId);
-
-      updatePersistedState(getReasoningModeKey(workspaceId), next);
-      markAiSelectionIntent(workspaceId, "reasoningMode", next);
-
-      type WorkspaceAISettingsByAgentCache = Partial<
-        Record<
-          string,
-          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-        >
-      >;
-
-      const normalizedAgentId =
-        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
-          .trim()
-          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
-
-      updatePersistedState<WorkspaceAISettingsByAgentCache>(
-        getWorkspaceAISettingsByAgentKey(workspaceId),
-        (prev) => {
-          const record: WorkspaceAISettingsByAgentCache =
-            prev && typeof prev === "object" ? prev : {};
-          return {
-            ...record,
-            [normalizedAgentId]: { model, thinkingLevel, reasoningMode: next },
-          };
-        },
-        {}
-      );
-    },
-    [getModelForWorkspace, getReasoningModeForWorkspace, getThinkingLevelForWorkspace]
-  );
+  const toggleReasoningModeFromPalette = (
+    workspaceId: string,
+    mode: Exclude<OpenAIReasoningMode, "standard">
+  ) => {
+    if (!workspaceId) {
+      return;
+    }
+    const next: OpenAIReasoningMode =
+      getReasoningModeForWorkspace(workspaceId) === mode ? "standard" : mode;
+    markAiSelectionIntent(workspaceId, "reasoningMode", next);
+  };
 
   const getFastModeActive = useCallback(() => {
     const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
@@ -1048,7 +921,7 @@ function AppInner() {
         direction,
         sortedWorkspacesByProject,
         userProjects,
-        readPersistedState(SIDEBAR_FLAT_MODE_KEY, false)
+        getUserPreferences().ui?.sidebarFlatMode
           ? { multiProjectEnabled: multiProjectWorkspacesEnabled }
           : false
       );
@@ -1085,10 +958,9 @@ function AppInner() {
       ? { enabled: computerUse.enabledHere, onToggle: computerUse.toggle }
       : null,
     autoModelRoutingEnabled,
-    // The composer's useAutoRoutingSelection listens on the same keys, so a palette write lands
+    // The composer's useAutoRoutingSelection reads the same picks, so a palette write lands
     // in the picker rows the way a row click does.
-    getAutoRouting: (scopeId, dimension) =>
-      readPersistedState<boolean>(getAutoRoutingKey(scopeId, dimension), false) === true,
+    getAutoRouting: (scopeId, dimension) => getAutoRouting(scopeId, dimension),
     onSetAutoRouting: (scopeId, dimension, active) =>
       setAutoRoutingChoice(scopeId, dimension, active),
     getEffectiveComposerModel: getModelForWorkspace,
@@ -1492,7 +1364,9 @@ function AppInner() {
       }
 
       // Check if notifications are enabled for this workspace.
-      const notifyEnabled = readPersistedState(getNotifyOnResponseKey(event.workspaceId), false);
+      const notifyEnabled =
+        getUserPreferences().notifications?.notifyOnResponseByWorkspace?.[event.workspaceId] ===
+        true;
       if (!notifyEnabled) {
         return;
       }

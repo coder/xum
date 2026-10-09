@@ -102,8 +102,10 @@ export function isAllowedOrpcPath(path: string[]): boolean {
  * task settings. Only the fields AppConfigStore reads are forwarded (an allow-list, so fields added
  * later stay in the host).
  * Of the task settings, only proposePlanImplementReplacesChatHistory (a boolean) is forwarded (#4942).
- * Of the user preferences, only appearance.bashCollapsedSummaryMode (a valid mode) and
- * appearance.transcriptDensity (a valid density) are forwarded, and agentAiDefaults is forwarded
+ * Of the user preferences, only appearance.bashCollapsedSummaryMode (a valid mode),
+ * appearance.transcriptDensity (a valid density), appearance.vimEnabled (a boolean),
+ * ui.artifactsAllowCdnScripts (a boolean) and the numeric
+ * entries of ai.autoCompactionThresholdByModel are forwarded, and agentAiDefaults is forwarded
  * rebuilt by normalizeAgentAiDefaults (#4972, #4979, #4962).
  *
  * providers.getConfig (#4766): it carries no keys (only apiKeySet-style booleans), but base URLs and
@@ -129,6 +131,8 @@ const WEBVIEW_APP_CONFIG_FIELDS = [
   "routeOverrides",
   "minThinkingLevelByModel",
   "experiments",
+  "defaultModel",
+  "hiddenModels",
 ];
 const REDACTED_PROVIDER_CONFIG_FIELDS = new Set([
   "baseUrl",
@@ -181,8 +185,41 @@ function projectAppConfig(value: unknown): Record<string, unknown> {
   if (isTranscriptDensity(transcriptDensity)) {
     projectedAppearance.transcriptDensity = transcriptDensity;
   }
+  const vimEnabled = appearance?.vimEnabled;
+  if (typeof vimEnabled === "boolean") {
+    projectedAppearance.vimEnabled = vimEnabled;
+  }
+  const projectedPreferences: Record<string, unknown> = {};
   if (Object.keys(projectedAppearance).length > 0) {
-    projected.userPreferences = { appearance: projectedAppearance };
+    projectedPreferences.appearance = projectedAppearance;
+  }
+  // The composer's context meter shows the per-model compaction threshold; only the numbers cross.
+  const ai =
+    typeof userPreferences === "object" && userPreferences !== null
+      ? (userPreferences.ai as Record<string, unknown> | null | undefined)
+      : undefined;
+  const thresholds = ai?.autoCompactionThresholdByModel;
+  if (typeof thresholds === "object" && thresholds !== null) {
+    const projectedThresholds = Object.fromEntries(
+      Object.entries(thresholds).filter(
+        ([, percent]) => typeof percent === "number" && Number.isFinite(percent)
+      )
+    );
+    if (Object.keys(projectedThresholds).length > 0) {
+      projectedPreferences.ai = { autoCompactionThresholdByModel: projectedThresholds };
+    }
+  }
+  // MCP app frames grant CDN script sources only while the user allows them.
+  const ui =
+    typeof userPreferences === "object" && userPreferences !== null
+      ? (userPreferences.ui as Record<string, unknown> | null | undefined)
+      : undefined;
+  const allowCdnScripts = ui?.artifactsAllowCdnScripts;
+  if (typeof allowCdnScripts === "boolean") {
+    projectedPreferences.ui = { artifactsAllowCdnScripts: allowCdnScripts };
+  }
+  if (Object.keys(projectedPreferences).length > 0) {
+    projected.userPreferences = projectedPreferences;
   }
   // Agent switches and plan actions fall back to the per-agent defaults (Settings > Tasks) when the
   // workspace has no settings for the target agent (#4962). normalizeAgentAiDefaults rebuilds each

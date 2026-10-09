@@ -37,7 +37,7 @@ import {
 } from "xum/browser/stores/BackgroundBashStore";
 import { useChatViewDataReadyDeadline } from "xum/browser/components/ChatPane/useChatViewDataReady";
 import { mergeConsecutiveStreamErrors } from "xum/browser/utils/messages/messageUtils";
-import { seedWorkspaceLocalStorageFromBackend } from "xum/browser/contexts/WorkspaceContext";
+import { clearAiSelectionState, setWorkspaceAiMetadata } from "xum/browser/utils/aiSelectionIntent";
 import { WorkspaceModeAISync } from "xum/browser/components/WorkspaceModeAISync/WorkspaceModeAISync";
 import { resolvePersistedAgentId } from "xum/common/utils/agentIds";
 import {
@@ -55,10 +55,8 @@ import {
   matchesKeybind,
   KEYBINDS,
 } from "xum/browser/utils/ui/keybinds";
-import { readPersistedState } from "xum/browser/hooks/usePersistedState";
-import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
+import { getAppConfigStore, getUserPreferences } from "xum/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
-import { VIM_ENABLED_KEY } from "xum/common/constants/storage";
 import { useAutoScroll } from "xum/browser/hooks/useAutoScroll";
 import { useTranscriptDensity } from "xum/browser/hooks/useTranscriptDensity";
 import {
@@ -104,7 +102,6 @@ import { CHAT_BUFFER_LIMITS } from "./config";
 import { createVscodeOrpcLink } from "./createVscodeOrpcLink";
 import { WebviewLiveBashOutput } from "./liveBashOutput";
 import { WebviewTranscriptBarrier } from "./transcriptBarrier";
-import { seedWebviewPreferences } from "./seedPreferences";
 import type { VscodeBridge } from "./vscodeBridge";
 
 // Shared chat components need these providers; the webview has no desktop shell to supply them
@@ -130,7 +127,7 @@ function WebviewChatProviders(props: {
         props.workspaceAi
           ? {
               parentWorkspaceId: props.workspaceAi.parentWorkspaceId,
-              // Same identity resolution as the seeding: a child task's creation-time agentType
+              // Same identity resolution as the composer: a child task's creation-time agentType
               // wins over an agentId restamped by a recovery send.
               agentId: resolvePersistedAgentId(props.workspaceAi, "") || undefined,
             }
@@ -285,7 +282,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   // The API context wraps the whole webview app: its body calls shared hooks that read it
   // (useResumeStream for the interrupted divider and its keybind).
   return (
-    <APIProvider client={apiClient}>
+    <APIProvider client={apiClient} skipAppConfigStore>
       <WebviewApp bridge={bridge} apiClient={apiClient} />
     </APIProvider>
   );
@@ -304,6 +301,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
 
   const activeWorkspaceIdRef = useRef<string | null>(null);
   const connectionKeyRef = useRef<string | null>(null);
+  const lastApiConnectionKeyRef = useRef<string | null>(null);
   activeWorkspaceIdRef.current = selectedWorkspaceId;
 
   const chatReplayStateRef = useRef<ChatReplayState | null>(null);
@@ -489,28 +487,22 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   // server connection (it rejects calls in file mode), and reconnect them for each server, so a
   // recovery or a switch to another server fetches them again. The host
   // redacts both results (see redactWebviewOrpcResult).
-  // The app config snapshot also seeds the backend preferences shared components read from
-  // localStorage (#4972, #4962), on connect and on every config change.
   useEffect(() => {
     if (apiConnectionKey === null) {
       return;
     }
     const providersConfigStore = getProvidersConfigStore();
     const appConfigStore = getAppConfigStore();
-    // Until this server's config loads, the seeded keys may hold another server's values: the
-    // store keeps the previous server's snapshot, and localStorage can outlive the previous webview
-    // session. Clear them first so a send in that window never uses another server's agent defaults.
-    seedWebviewPreferences(null);
-    const unsubscribeSeed = appConfigStore.subscribe(() => {
-      seedWebviewPreferences(appConfigStore.getSnapshot());
-    });
+    // Until this server's config loads, the store still holds the previous server's config. Clear
+    // it first so nothing in that window, a send included, uses another server's preferences or
+    // agent defaults.
+    appConfigStore.clearCachedState();
     providersConfigStore.setClient(apiClient);
     appConfigStore.setClient(apiClient);
     // The background processes strip and the bash tool cards' live process status (#5092). A
     // server switch already dropped the previous server's cached rows (connectionStatus handler).
     backgroundBashStore.setClient(apiClient);
     return () => {
-      unsubscribeSeed();
       providersConfigStore.setClient(null);
       appConfigStore.setClient(null);
       backgroundBashStore.setClient(null);
@@ -542,20 +534,26 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
             backgroundBashStore.setClient(null);
             backgroundBashStore.clearCachedState();
           }
+          // AI picks and metadata belong to one server: a switch to another server drops them
+          // before its workspaces arrive, a reconnect to the same server keeps them.
+          if (nextConnectionKey !== null) {
+            const lastApiConnectionKey = lastApiConnectionKeyRef.current;
+            if (lastApiConnectionKey !== null && lastApiConnectionKey !== nextConnectionKey) {
+              clearAiSelectionState();
+            }
+            lastApiConnectionKeyRef.current = nextConnectionKey;
+          }
           setConnectionStatus(msg.status);
           return;
         }
         case "workspaces":
-          // Seed each workspace's persisted agent/AI settings into the composer's storage, with the
-          // desktop's own rules (#4738): a main workspace is snapshotted once per webview load, a
-          // sub-agent workspace follows its backend settings.
+          // The composer resolves each workspace's agent and AI settings from them (#4738).
           for (const workspace of msg.workspaces) {
             if (!workspace.ai) continue;
-            const previousAi = workspacesRef.current.find((w) => w.id === workspace.id)?.ai;
-            seedWorkspaceLocalStorageFromBackend(
-              { id: workspace.id, ...workspace.ai },
-              previousAi ? { id: workspace.id, ...previousAi } : undefined
-            );
+            setWorkspaceAiMetadata(workspace.id, {
+              projectPath: workspace.projectPath,
+              ...workspace.ai,
+            });
           }
           workspacesRef.current = msg.workspaces;
           setWorkspaces(msg.workspaces);
@@ -858,7 +856,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
         return;
       }
 
-      const vimEnabled = readPersistedState(VIM_ENABLED_KEY, false);
+      const vimEnabled = getUserPreferences().appearance?.vimEnabled === true;
       const interruptKeybind = vimEnabled
         ? KEYBINDS.INTERRUPT_STREAM_VIM
         : KEYBINDS.INTERRUPT_STREAM_NORMAL;

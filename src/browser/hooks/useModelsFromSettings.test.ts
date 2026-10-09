@@ -1,6 +1,6 @@
 // Bootstrap DOM before API imports can initialize Radix layout effects.
 import { installDom } from "../../../tests/ui/dom";
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import * as APIModule from "@/browser/contexts/API";
 import * as ProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
@@ -17,8 +17,7 @@ import type {
   ProviderModelEntry,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
-import { updatePersistedState } from "./usePersistedState";
-import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 function countOccurrences(haystack: string[], needle: string): number {
   return haystack.filter((v) => v === needle).length;
@@ -127,11 +126,14 @@ async function setupUseModelsHookTest() {
   routePriority = ["direct"];
   routeOverrides = {};
   apiMock = null;
+  getAppConfigStore().updateOptimistically({ defaultModel: undefined, hiddenModels: undefined });
   await installUseModelsModuleMocks();
 }
 
 async function cleanupUseModelsHookTest() {
   cleanup();
+  // The store is an app-wide singleton; a default left here changes later files' send model.
+  getAppConfigStore().updateOptimistically({ defaultModel: undefined, hiddenModels: undefined });
   await restoreUseModelsModuleMocks();
   mock.restore();
   cleanupDom?.();
@@ -220,7 +222,7 @@ describe("useModelsFromSettings selected model preservation", () => {
 
   test("getDefaultModel preserves explicit gateway-scoped defaults", () => {
     const gatewayModel = "openrouter:openai/gpt-5";
-    globalThis.window.localStorage.setItem(DEFAULT_MODEL_KEY, JSON.stringify(gatewayModel));
+    getAppConfigStore().updateOptimistically({ defaultModel: gatewayModel });
 
     expect(getDefaultModel()).toBe(gatewayModel);
   });
@@ -238,12 +240,40 @@ describe("useModelsFromSettings selected model preservation", () => {
     });
 
     await waitFor(() => expect(result.current.defaultModel).toBe("openrouter:openai/gpt-5"));
-    expect(globalThis.window.localStorage.getItem(DEFAULT_MODEL_KEY)).toBe(
-      JSON.stringify("openrouter:openai/gpt-5")
-    );
     expect(updateModelPreferences).toHaveBeenCalledWith({
       defaultModel: "openrouter:openai/gpt-5",
     });
+  });
+
+  test("refuses a default model change visibly while disconnected", () => {
+    const alert = spyOn(window, "alert").mockImplementation(() => undefined);
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    act(() => {
+      result.current.setDefaultModel("openrouter:openai/gpt-5");
+    });
+
+    expect(getAppConfigStore().getSnapshot()?.defaultModel).toBeUndefined();
+    expect(alert).toHaveBeenCalledTimes(1);
+  });
+
+  test("a default model save cut off by a lost connection is reported as unconfirmed", async () => {
+    // Without a mounted composer the toast falls back to window.alert (fresh window per test).
+    const alerts: unknown[] = [];
+    window.alert = (message?: unknown) => alerts.push(message);
+    // oRPC settles a request on a closed socket with an AbortError.
+    const closed = new Error("WebSocket closed (code 1006)");
+    closed.name = "AbortError";
+    apiMock = { config: { updateModelPreferences: mock(() => Promise.reject(closed)) } };
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    act(() => {
+      result.current.setDefaultModel("openrouter:openai/gpt-5");
+    });
+
+    await waitFor(() =>
+      expect(alerts).toEqual(["Connection lost: settings may not have been saved"])
+    );
   });
 
   test("ensureModelInSettings skips syncing explicit gateway-scoped selections", () => {
@@ -727,10 +757,7 @@ describe("useModelsFromSettings provider availability gating", () => {
   });
 
   test("keeps persisted hiddenModels separate from provider-hidden models", () => {
-    globalThis.window.localStorage.setItem(
-      HIDDEN_MODELS_KEY,
-      JSON.stringify([KNOWN_MODELS.GPT.id])
-    );
+    getAppConfigStore().updateOptimistically({ hiddenModels: [KNOWN_MODELS.GPT.id] });
 
     providersConfig = {
       anthropic: { apiKeySet: false, isEnabled: true, isConfigured: false },
@@ -800,6 +827,7 @@ describe("useModelsFromSettings hidden-model gateway identity", () => {
   afterEach(cleanupUseModelsHookTest);
 
   test("hiding an explicit Coder gateway model hides that entry, not the direct model", async () => {
+    apiMock = { config: { updateModelPreferences: mock(() => Promise.resolve(undefined)) } };
     // Cross-typed instance: name "openai", type "anthropic". Name-only
     // canonicalization would persist openai:claude-opus-4-1, leaving the
     // Coder entry visible and hiding the distinct direct OpenAI model.
@@ -854,8 +882,10 @@ describe("useModelsFromSettings hidden-model persistence", () => {
     providersConfig = { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } };
     const persist = mock(() => Promise.resolve());
     apiMock = { config: { updateModelPreferences: persist } };
-    updatePersistedState(DEFAULT_MODEL_KEY, KNOWN_MODELS.GPT.id);
-    updatePersistedState(HIDDEN_MODELS_KEY, [luna]);
+    getAppConfigStore().updateOptimistically({
+      defaultModel: KNOWN_MODELS.GPT.id,
+      hiddenModels: [luna],
+    });
     let hook = renderHook(() => useModelsFromSettings());
     expect(hook.result.current.models).not.toContain(luna);
 

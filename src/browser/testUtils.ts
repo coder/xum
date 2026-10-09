@@ -2,11 +2,14 @@ import { createRequire } from "node:module";
 import type { APIClient } from "@/browser/contexts/API";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import type { ExperimentId } from "@/common/constants/experiments";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import { getDefaultAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
 import { DEFAULT_RUNTIME_ENABLEMENT } from "@/common/types/runtime";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 
 // Shared test utilities for browser tests
@@ -148,7 +151,6 @@ export type TestClientConfig = Awaited<ReturnType<APIClient["config"]["getConfig
  */
 export function createTestConfig(overrides: Partial<TestClientConfig> = {}): TestClientConfig {
   return {
-    userPreferencesInitialized: false,
     taskSettings: DEFAULT_TASK_SETTINGS,
     autoModelRouting: getDefaultAutoModelRoutingConfig(),
     advisorModelString: null,
@@ -168,6 +170,18 @@ export function createTestConfig(overrides: Partial<TestClientConfig> = {}): Tes
     goalDefaults: DEFAULT_GOAL_DEFAULTS,
     experiments: {},
     ...overrides,
+  };
+}
+
+/** `config` procedures whose user preferences live in memory and take merge-patch writes. */
+export function createTestPreferencesConfig(initial: UserPreferences = {}) {
+  let userPreferences = initial;
+  return {
+    getConfig: () => Promise.resolve(createTestConfig({ userPreferences })),
+    updateUserPreferences: (input: { patches: unknown[] }) => {
+      userPreferences = input.patches.reduce(applyMergePatch, userPreferences) as UserPreferences;
+      return Promise.resolve();
+    },
   };
 }
 
@@ -216,6 +230,11 @@ export function setTestExperiment(experimentId: ExperimentId, enabled: boolean |
   store.updateOptimistically({
     experiments: { ...store.getSnapshot()?.experiments, [experimentId]: enabled === true },
   });
+}
+
+/** Sets agentAiDefaults in the shared AppConfigStore snapshot; undefined clears it. */
+export function setTestAgentAiDefaults(agentAiDefaults: AgentAiDefaults | undefined): void {
+  getAppConfigStore().updateOptimistically({ agentAiDefaults });
 }
 
 /** Clears the experiments snapshot so the store singleton does not leak flags between tests. */

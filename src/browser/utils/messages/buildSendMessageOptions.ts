@@ -9,7 +9,6 @@ export interface SendMessageOptionsInput {
   reasoningMode: OpenAIReasoningMode;
   agentId: string;
   providerOptions: MuxProviderOptions;
-  disableWorkspaceAgents?: boolean;
   /** Composer Auto selection; only real user sends set it (compaction/resume paths leave it unset). */
   autoModelRouting?: boolean;
   /** Composer thinking level set to Auto; independent of autoModelRouting. */
@@ -34,7 +33,6 @@ export function buildSendMessageOptions(input: SendMessageOptionsInput): SendMes
     model: input.model,
     agentId: input.agentId,
     providerOptions: input.providerOptions,
-    disableWorkspaceAgents: input.disableWorkspaceAgents ? true : undefined,
     autoModelRouting: input.autoModelRouting ? true : undefined,
     autoThinkingLevel: input.autoThinkingLevel ? true : undefined,
   };

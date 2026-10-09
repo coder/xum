@@ -1,7 +1,6 @@
 import { type Locator, type Page } from "@playwright/test";
 import { electronTest as test, electronExpect as expect } from "../electronTest";
 import { getXumE2EEnv } from "../env";
-import { REVIEW_SORT_ORDER_KEY } from "../../../src/common/constants/storage";
 import { STORAGE_KEYS } from "../../../src/constants/workspaceDefaults";
 import {
   readReactProfileSnapshot,
@@ -9,7 +8,7 @@ import {
   withChromeProfiles,
   writePerfArtifacts,
 } from "../utils/perfProfile";
-import { disableReviewTutorial, seedLargeReviewSingleFileDiff } from "../utils/reviewPerfFixture";
+import { seedLargeReviewSingleFileDiff, setReviewPreferences } from "../utils/reviewPerfFixture";
 
 const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 const HUNK_ITERATION_COUNT = 60;
@@ -104,17 +103,10 @@ async function waitForAllSyntaxHighlighted(
 async function primeReviewForHeadDiff(page: Page, workspaceId: string): Promise<void> {
   const reviewDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspaceId);
 
-  await page.evaluate(
-    ({ diffBaseKey, sortOrderKey }) => {
-      window.localStorage.setItem(diffBaseKey, JSON.stringify("HEAD"));
-      window.localStorage.setItem("review-show-read", JSON.stringify(true));
-      window.localStorage.setItem(sortOrderKey, JSON.stringify("file-order"));
-    },
-    {
-      diffBaseKey: reviewDiffBaseKey,
-      sortOrderKey: REVIEW_SORT_ORDER_KEY,
-    }
-  );
+  await page.evaluate((diffBaseKey) => {
+    window.localStorage.setItem(diffBaseKey, JSON.stringify("HEAD"));
+  }, reviewDiffBaseKey);
+  await setReviewPreferences(page, { showRead: true, sortOrder: "file-order" });
 }
 
 test.describe("immersive review hunk iteration performance profiling", () => {
@@ -125,8 +117,6 @@ test.describe("immersive review hunk iteration performance profiling", () => {
     ui,
     workspace,
   }, testInfo) => {
-    await disableReviewTutorial(page);
-
     const diffSummary = seedLargeReviewSingleFileDiff(workspace.demoProject.workspacePath);
     const expectedOverlayLineCount = diffSummary.lineCount + diffSummary.deletedLines;
     expect(diffSummary.hunkCount).toBeGreaterThan(HUNK_ITERATION_COUNT);

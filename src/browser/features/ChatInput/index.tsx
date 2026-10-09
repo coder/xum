@@ -23,20 +23,13 @@ import { createErrorToast } from "@/browser/features/ChatInput/ChatInputToasts";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import { parseCommand } from "@/browser/utils/slashCommands/parser";
-import {
-  readPersistedState,
-  usePersistedState,
-  updatePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { usePersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { ThinkingSelector } from "@/browser/components/ThinkingSelector/ThinkingSelector";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
-import { useUserPreferencePersistence } from "@/browser/contexts/UserPreferencesContext";
-import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
-import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import {
@@ -47,23 +40,11 @@ import {
   useAutoRoutingSelection,
   useSendMessageOptions,
 } from "@/browser/hooks/useSendMessageOptions";
+import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
-  applyAutoRoutingOutcome,
-  setWorkspaceModelWithOrigin,
-  setWorkspaceThinkingLevelWithOrigin,
-} from "@/browser/utils/modelChange";
-import {
-  resolveAutoRoutingForAgent,
-  resolveWorkspaceAiSettingsForAgent,
-} from "@/browser/utils/workspaceModeAi";
-import {
-  getModelKey,
-  getReasoningModeKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
-  AGENT_AI_DEFAULTS_KEY,
-  VIM_ENABLED_KEY,
-  RUNTIME_ENABLEMENT_KEY,
   getProjectScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
@@ -104,6 +85,14 @@ import {
   useWorkspaceStoreRaw,
   useWorkspaceUsage,
 } from "@/browser/stores/WorkspaceStore";
+import {
+  flushUserPreferences,
+  getUserPreferences,
+  updateUserPreferences,
+  useAgentAiDefaults,
+  useAppConfig,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { getPlaceholderTip } from "./placeholderTips";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
@@ -143,9 +132,8 @@ import {
   type PendingUserMessage,
 } from "@/browser/utils/chatEditing";
 
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
-import { type OpenAIReasoningMode, type ThinkingLevel } from "@/common/types/thinking";
-import { DEFAULT_RUNTIME_ENABLEMENT, normalizeRuntimeEnablement } from "@/common/types/runtime";
+import { type ThinkingLevel } from "@/common/types/thinking";
+import { normalizeRuntimeEnablement } from "@/common/types/runtime";
 import {
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
@@ -321,7 +309,6 @@ interface EditSession {
 
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
-  const { waitForPreferencePersisted } = useUserPreferencePersistence();
   const { variant } = props;
   const { userProjects } = useProjectContext();
   const creationScope =
@@ -332,8 +319,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const creationSubProjectPath = creationScope?.subProjectPath ?? undefined;
   const creationProject =
     variant === "creation" ? userProjects.get(creationParentProjectPath) : undefined;
-  const [thinkingLevel] = useThinkingLevel();
-  const [reasoningMode] = useReasoningMode();
   const atMentionProjectPath =
     variant === "creation" && props.kind !== "scratch" ? props.projectPath : null;
   const asyncCommandScopeRef = useRef<{ variant: typeof variant; workspaceId: string | null }>({
@@ -432,11 +417,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const onModelChange = props.onModelChange;
 
   // User request: keep creation runtime controls synced with Settings enablement toggles.
-  const [rawRuntimeEnablement] = usePersistedState(
-    RUNTIME_ENABLEMENT_KEY,
-    DEFAULT_RUNTIME_ENABLEMENT,
-    { listener: true }
-  );
+  const rawRuntimeEnablement = useAppConfig((config) => config.runtimeEnablement);
   const runtimeEnablement = normalizeRuntimeEnablement(rawRuntimeEnablement);
 
   // Track concurrent sends with a counter (not boolean) to handle queued follow-ups correctly.
@@ -620,17 +601,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { models, hiddenModelsForSelector, ensureModelInSettings, defaultModel, setDefaultModel } =
     useModelsFromSettings();
 
-  const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
-    AGENT_AI_DEFAULTS_KEY,
-    {},
-    {
-      listener: true,
-    }
-  );
+  const agentAiDefaults = useAgentAiDefaults();
   const telemetry = useTelemetry();
-  const [vimEnabled, setVimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, {
-    listener: true,
-  });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const { startSequence: startTutorial } = useTutorial();
 
   // Track transcription provider prerequisites from Settings → Providers.
@@ -693,7 +668,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     variant,
     workspaceId,
     projectPath: atMentionProjectPath,
-    disableWorkspaceAgents: sendMessageOptions.disableWorkspaceAgents === true,
   });
   const { agentSkillDescriptors, handleInputCaretChange, mcpPromptDescriptors } =
     composerSuggestions;
@@ -751,13 +725,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   };
 
   const setPreferredModel = (model: string) => {
-    type WorkspaceAISettingsByAgentCache = Partial<
-      Record<
-        string,
-        { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-      >
-    >;
-
     const selectedModel = normalizeSelectedModel(model);
     if (
       variant === "workspace" &&
@@ -775,10 +742,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     ensureModelInSettings(selectedModel); // Ensure model exists in Settings
     // A concrete pick (selector, /model, or the cycle shortcut) always leaves Auto.
     setAutoModelRoutingActive(false);
-    // Deliberate pick: pins the model on a sub-agent once a message sends it.
-    if (variant === "workspace" && workspaceId) {
-      markAiSelectionIntent(workspaceId, "model", selectedModel);
-    }
 
     if (onModelChange) {
       // Notify parent of model change (for context switch warning + persisted model metadata).
@@ -792,24 +755,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       }
     }
 
-    if (variant !== "workspace" || !workspaceId) {
-      return;
+    // Marked after onModelChange so its explicit-switch record still sees the previous model;
+    // this also pins a same-model pick on a sub-agent once a message sends it.
+    if (variant === "workspace" && workspaceId) {
+      markAiSelectionIntent(workspaceId, "model", selectedModel);
     }
-
-    const normalizedAgentId = normalizeAgentId(agentId, "exec");
-
-    updatePersistedState<WorkspaceAISettingsByAgentCache>(
-      getWorkspaceAISettingsByAgentKey(workspaceId),
-      (prev) => {
-        const record: WorkspaceAISettingsByAgentCache =
-          prev && typeof prev === "object" ? prev : {};
-        return {
-          ...record,
-          [normalizedAgentId]: { model: selectedModel, thinkingLevel, reasoningMode },
-        };
-      },
-      {}
-    );
   };
 
   // Model cycling candidates: all visible models (custom + built-in, minus hidden).
@@ -878,7 +828,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           draftId: props.pendingDraftId,
           userModel: preferredModel,
           agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
-          autoRoutingEnabled: autoModelRoutingEnabled,
         }
       : {
           // Dummy values for workspace variant (never used)
@@ -933,7 +882,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           sshHostFallback: creationState.sshHostFallback,
           defaultRuntimeMode: creationState.defaultRuntimeMode,
           onSelectedRuntimeChange: creationState.setSelectedRuntime,
-          onSetDefaultRuntime: creationState.setDefaultRuntimeChoice,
           disabled: isSendInFlight,
           projectPath: creationParentProjectPath,
           // Surface the actually-targeted project (possibly a sub-project) to
@@ -1079,8 +1027,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     const scopeId = getProjectScopeId(creationParentProjectPath);
-    const modelKey = getModelKey(scopeId);
-    const thinkingKey = getThinkingLevelKey(scopeId);
 
     const fallbackModel = defaultModel;
 
@@ -1095,15 +1041,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     prevCreationAgentIdRef.current = normalizedAgentId;
     prevCreationScopeIdRef.current = scopeId;
 
-    const existingModel = readPersistedState<string>(modelKey, fallbackModel);
-    const existingThinking = readPersistedState<ThinkingLevel>(thinkingKey, "off");
+    const existingModel = readScopedAiDefault(scopeId, "model") ?? fallbackModel;
+    const existingThinking = readScopedAiDefault(scopeId, "thinkingLevel") ?? "off";
     // Configured defaults (direct or base-chain, field-wise) must reach the
     // first turn of a new workspace too, not just post-creation agent syncs:
     // a custom agent inheriting model/thinking/pro from its base would
     // otherwise send the first prompt with the ambient model and Pro gated off
     // until WorkspaceModeAISync corrects the workspace.
-    const reasoningKey = getReasoningModeKey(scopeId);
-    const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
+    const existingReasoning = getWorkspaceAiSelection(scopeId).reasoningMode;
     const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
     const {
       resolvedModel,
@@ -1118,41 +1063,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       existingReasoningMode: existingReasoning,
       agentBaseById,
     });
-    // Agent resolution in creation scopes uses configured defaults because they keep no
-    // per-agent routing choices or settings buckets.
-    const autoRoutingOutcome = resolveAutoRoutingForAgent({
-      agentId: normalizedAgentId,
-      agentAiDefaults,
-      agentBaseById,
-      explicitSwitch: isExplicitAgentSwitch,
-      experimentEnabled: autoModelRoutingEnabled,
-    });
     if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(scopeId, resolvedModel, isExplicitAgentSwitch ? "agent" : "sync");
     }
 
     if (existingThinking !== resolvedThinking) {
-      setWorkspaceThinkingLevelWithOrigin(
-        scopeId,
-        resolvedThinking,
-        isExplicitAgentSwitch ? "agent" : "sync"
-      );
+      writeScopedAiDefault(scopeId, "thinkingLevel", resolvedThinking);
     }
 
     if (existingReasoning !== resolvedReasoning) {
-      updatePersistedState(reasoningKey, resolvedReasoning);
+      markAiSelectionIntent(scopeId, "reasoningMode", resolvedReasoning);
     }
-
-    applyAutoRoutingOutcome(scopeId, autoRoutingOutcome);
-  }, [
-    agentAiDefaults,
-    agentId,
-    agents,
-    autoModelRoutingEnabled,
-    creationParentProjectPath,
-    defaultModel,
-    variant,
-  ]);
+  }, [agentAiDefaults, agentId, agents, creationParentProjectPath, defaultModel, variant]);
 
   const chatDockColumnWidthClass = useChatDockColumnWidthClass();
 
@@ -2081,7 +2003,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             setPreferredModel(action.model);
             break;
           case "toggle-vim":
-            setVimEnabled((enabled) => !enabled);
+            updateUserPreferences({
+              appearance: { vimEnabled: getUserPreferences().appearance?.vimEnabled !== true },
+            });
             break;
           case "set-sending":
             setSendingCount((count) => count + (action.sending ? 1 : -1));
@@ -2312,9 +2236,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           ? {
               kind: "workspace",
               workspaceId,
-              disableWorkspaceAgents:
-                sendMessageOptions.disableWorkspaceAgents === true ||
-                transferredDraftProjectDiscovery,
+              disableWorkspaceAgents: transferredDraftProjectDiscovery,
             }
           : null;
     // Captured before command resolution so the row the new workspace opens with shows what was
@@ -2809,10 +2731,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // acceptance also means the preference landed.)
         const preferencePersisted = await runWithCatch(
           async () => {
-            await waitForPreferencePersisted(
-              { kind: "autoCompactionThreshold", model: effectiveModel },
-              resolutionSignal
-            );
+            await flushUserPreferences();
             return true;
           },
           (error) => {
@@ -2977,9 +2896,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             editConflictToastRef.current = null;
             setToast((current) => (current === conflictToast.toast ? null : current));
           }
-          if (aiSelection.intent) {
-            consumeAiSelectionIntent(props.workspaceId, intentAgentId, aiSelection.attachedTokens);
-          }
+          consumeAiSelectionIntent(props.workspaceId, intentAgentId, aiSelection);
           // Track telemetry for successful message send
           telemetry.messageSent(
             props.workspaceId,

@@ -35,7 +35,6 @@ import {
 } from "./mocks/workspaces";
 import { createMockORPCClient, type MockSessionUsage } from "./mocks/orpc";
 import {
-  GIT_STATUS_INDICATOR_MODE_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
@@ -696,7 +695,6 @@ export const GitStatusPopover: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        window.localStorage.setItem(GIT_STATUS_INDICATOR_MODE_KEY, JSON.stringify("line-delta"));
         window.localStorage.setItem(LEFT_SIDEBAR_COLLAPSED_KEY, JSON.stringify(false));
 
         const workspaces = [
@@ -865,7 +863,6 @@ export const PlanMermaidWithCosts: AppStory = {
         });
 
         window.localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        window.localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         window.localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "500");
         window.localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
 
@@ -976,7 +973,6 @@ export const CostsTabRich: AppStory = {
         });
 
         window.localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        window.localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         window.localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "500");
         window.localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
 

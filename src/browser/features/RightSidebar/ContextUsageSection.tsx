@@ -1,9 +1,7 @@
 import React from "react";
 import { useWorkspaceUsage } from "@/browser/stores/WorkspaceStore";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
+import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { resolveCompactionModel } from "@/browser/utils/messages/compactionModelPreference";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import { calculateTokenMeterData } from "@/common/utils/tokens/tokenMeterUtils";
@@ -22,14 +20,8 @@ interface ContextUsageSectionProps {
  */
 export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ workspaceId }) => {
   const usage = useWorkspaceUsage(workspaceId);
-  const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
-    AGENT_AI_DEFAULTS_KEY,
-    {},
-    {
-      listener: true,
-    }
-  );
-  const configuredCompactionModel = agentAiDefaults.compact?.modelString ?? "";
+  const configuredCompactionModel =
+    useAppConfig((config) => config.agentAiDefaults?.compact?.modelString) ?? "";
   const { has1MContext } = useProviderOptions();
   const pendingSendOptions = useSendMessageOptions(workspaceId);
   const { config: providersConfig } = useProvidersConfig();

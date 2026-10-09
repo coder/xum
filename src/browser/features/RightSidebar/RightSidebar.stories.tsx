@@ -24,7 +24,7 @@ import { UILayoutsProvider } from "@/browser/contexts/UILayoutsContext";
 import { WorkspaceProvider } from "@/browser/contexts/WorkspaceContext";
 import { SplashScreenProvider } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { TerminalRouterProvider } from "@/browser/terminal/TerminalRouterContext";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
@@ -32,14 +32,12 @@ import { createAssistantMessage, createUserMessage } from "@/browser/stories/moc
 import type { MockSessionUsage } from "@/browser/stories/mocks/orpc";
 import { blurActiveElement } from "@/browser/stories/storyPlayHelpers";
 import { setupSimpleChatStory, setupStreamingChatStory } from "@/browser/stories/helpers/chatSetup";
-import { setHunkFirstSeen, setReviewSortOrder } from "@/browser/stories/helpers/reviews";
+import { setHunkFirstSeen } from "@/browser/stories/helpers/reviews";
 import { expandRightSidebar } from "@/browser/stories/helpers/uiState";
 import {
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   SELECTED_WORKSPACE_KEY,
-  UI_THEME_KEY,
-  getAutoCompactionThresholdKey,
   getRightSidebarLayoutKey,
 } from "@/common/constants/storage";
 import type { Meta, StoryObj } from "@storybook/react-vite";
@@ -89,7 +87,6 @@ function resetStorybookPersistedStateForStory(): void {
   }
 
   localStorage.removeItem(SELECTED_WORKSPACE_KEY);
-  localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
 }
 
 function getStorybookRenderKey(): string | null {
@@ -233,7 +230,6 @@ export const CostsTab: Story = {
     <RightSidebarStoryShell
       setup={() => {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-costs"));
@@ -277,7 +273,6 @@ export const CostsTabWithCacheCreate: Story = {
     <RightSidebarStoryShell
       setup={() => {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "350");
         const modelUsage = {
@@ -348,7 +343,6 @@ export const CostsTabMultiModel: Story = {
     <RightSidebarStoryShell
       setup={() => {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-multi-model"));
@@ -648,12 +642,10 @@ export const ReviewTabSortByLastEdit: Story = {
           [HUNK_IDS.client]: now - 5 * 60 * 1000,
         });
 
-        // Set sort order to "last-edit"
-        setReviewSortOrder("last-edit");
-
         const client = setupSimpleChatStory({
           workspaceId,
           workspaceName: "feature/sorting",
+          userPreferences: { review: { sortOrder: "last-edit" } },
           projectName: "my-app",
           messages: [
             createUserMessage("msg-1", "Add utilities and refactor button", { historySequence: 1 }),
@@ -724,12 +716,10 @@ export const ReviewTabSortByFileOrder: Story = {
         const workspaceId = "ws-review-file-order";
         localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
 
-        // Set sort order to "file-order" (default)
-        setReviewSortOrder("file-order");
-
         const client = setupSimpleChatStory({
           workspaceId,
           workspaceName: "feature/file-order",
+          userPreferences: { review: { sortOrder: "file-order" } },
           projectName: "my-app",
           messages: [
             createUserMessage("msg-1", "Make some changes", { historySequence: 1 }),
@@ -1260,20 +1250,19 @@ export const CompactionModelWarning: Story = {
     <RightSidebarStoryShell
       setup={() => {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         localStorage.setItem("statsContainer:subTab", JSON.stringify("cost"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-compact-warning"));
-
-        // Set auto-compact threshold to 80% for anthropic:claude-opus-4-1
-        // 80% of 200k = 160k, which exceeds gpt-4o's 128k context
-        updatePersistedState(getAutoCompactionThresholdKey("anthropic:claude-opus-4-1"), 80);
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-compact-warning",
           workspaceName: "feature/compaction",
           projectName: "my-app",
           agentAiDefaults: { compact: { modelString: "openai:gpt-4o" } },
+          // 80% of 200k = 160k, which exceeds gpt-4o's 128k context
+          userPreferences: {
+            ai: { autoCompactionThresholdByModel: { "anthropic:claude-opus-4-1": 80 } },
+          },
           messages: [
             createUserMessage("msg-1", "Help me refactor this large codebase", {
               historySequence: 1,
@@ -1398,7 +1387,6 @@ export const OutputTabEmpty: Story = {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("output"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-output-empty"));
-        localStorage.removeItem("output-tab-level");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-output-empty",
@@ -1426,7 +1414,6 @@ export const OutputTabWithLogs: Story = {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("output"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-output-logs"));
-        localStorage.removeItem("output-tab-level");
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-output-logs",
@@ -1454,12 +1441,12 @@ export const OutputTabErrorsOnly: Story = {
         localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("output"));
         localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
         localStorage.removeItem(getRightSidebarLayoutKey("ws-output-errors"));
-        // Persist the level filter to "error" so only error entries display.
-        localStorage.setItem("output-tab-level", JSON.stringify("error"));
 
         const client = setupSimpleChatStory({
           workspaceId: "ws-output-errors",
           workspaceName: "feature/logging",
+          // Only error entries display.
+          userPreferences: { ui: { outputTabLevel: "error" } },
           projectName: "my-app",
           messages: [createUserMessage("msg-1", "Check errors", { historySequence: 1 })],
           logEntries: createOutputLogEntries(),

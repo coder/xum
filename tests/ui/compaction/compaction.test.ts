@@ -16,9 +16,8 @@ import { BackgroundProcessManager } from "@/node/services/backgroundProcessManag
 import { fireEvent } from "@testing-library/react";
 import { createAppHarness } from "../harness";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { getAppConfigStore, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { resolveAutoCompactionThreshold } from "@/common/utils/compaction/autoCompactionThreshold";
 
 interface ServiceContainerPrivates {
@@ -82,12 +81,13 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
 const FORCE_THRESHOLD_PERCENT = 10;
 
 /**
- * Move the per-model slider the way the UI does (a persisted-state write that the
- * UserPreferencesProvider mirrors into config.json). 10% threshold + 5% force buffer =>
- * force compaction triggers at 15%.
+ * Move the per-model slider the way the UI does (a merge patch to config.json).
+ * 10% threshold + 5% force buffer => force compaction triggers at 15%.
  */
 function moveThresholdSlider(percent: number): void {
-  updatePersistedState(getAutoCompactionThresholdKey(WORKSPACE_DEFAULTS.model), percent);
+  updateUserPreferences({
+    ai: { autoCompactionThresholdByModel: { [WORKSPACE_DEFAULTS.model]: percent } },
+  });
 }
 
 /** The backend reads the threshold from config.json; wait until the mirrored write landed. */
@@ -207,13 +207,24 @@ describe("Compaction UI (mock AI router)", () => {
       await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
 
       const sendMessage = jest.spyOn(app.env.services.workspaceService, "sendMessage");
-      const saveUserConfig = jest
-        .spyOn(app.env.config, "saveUserConfig")
-        .mockRejectedValue(new Error("disk full"));
+      let failSave: (error: Error) => void = () => undefined;
+      const updateUserPreferences = jest
+        .spyOn(app.env.config, "updateUserPreferences")
+        .mockImplementation(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              failSave = reject;
+            })
+        );
+      const flush = jest.spyOn(getAppConfigStore(), "flushUserPreferences");
       const draft = "Draft that must survive a failed settings save";
       moveThresholdSlider(FORCE_THRESHOLD_PERCENT);
-      await waitFor(() => expect(saveUserConfig).toHaveBeenCalled(), { timeout: 10_000 });
+      await waitFor(() => expect(updateUserPreferences).toHaveBeenCalled(), { timeout: 10_000 });
       await app.chat.send(draft);
+      // Fail the save only once the send waits on it.
+      await waitFor(() => expect(flush).toHaveBeenCalled(), { timeout: 10_000 });
+      failSave(new Error("disk full"));
+      flush.mockRestore();
 
       // The composer refuses the send visibly rather than streaming with a stale threshold.
       await waitFor(

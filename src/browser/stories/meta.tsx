@@ -13,14 +13,8 @@ import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  SELECTED_WORKSPACE_KEY,
-  SIDEBAR_AGE_GROUPING_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
-  TERMINAL_BADGE_CONFIG_KEY,
-  UI_THEME_KEY,
-} from "@/common/constants/storage";
+import { resetAiSelectionIntentForTests } from "@/browser/utils/aiSelectionIntent";
+import { SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // META CONFIG
@@ -85,23 +79,14 @@ interface AppWithMocksProps {
 
 function resetStorybookPersistedStateForStory(): void {
   // Storybook can preserve localStorage across story renders on one origin.
-  // Reset persisted state so each story starts from a known route + theme.
+  // Reset persisted state so each story starts from a known route.
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
-    localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
-    // Stories that disable sidebar age grouping must not leak the setting
-    // into later stories via the shared localStorage origin.
-    localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
-    // The flat chat list story persists sidebarFlatMode; clear it via the
-    // persisted-state helper so a mounted sidebar's subscribed snapshot
-    // observes the reset instead of keeping the flat layout.
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, undefined);
-    // Terminal badge stories seed an enabled badge config; clear it so other
-    // stories with terminals don't render order-dependent badge overlays.
-    localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
   }
-  // Startup waits for this story's own experiments instead of the previous story's snapshot.
-  getAppConfigStore().updateOptimistically({ experiments: undefined });
+  // Startup waits for this story's own snapshot instead of the previous story's.
+  getAppConfigStore().updateOptimistically({ experiments: undefined, userPreferences: undefined });
+  // Unsent AI picks live in memory, and the test-runner renders all stories of a file in one page.
+  resetAiSelectionIntentForTests();
 }
 function getStorybookRenderKey(): string | null {
   if (typeof window === "undefined") {

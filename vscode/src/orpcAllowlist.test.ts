@@ -115,7 +115,7 @@ describe("plan implement setting (#4942)", () => {
 });
 
 describe("webview preferences (#4972, #4962)", () => {
-  test("forwards a valid bash collapsed-summary mode and transcript density and nothing else from userPreferences", () => {
+  test("forwards a valid bash collapsed-summary mode, transcript density and vim flag and nothing else from userPreferences", () => {
     expect(
       redactWebviewOrpcResult(["config", "getConfig"], {
         userPreferences: {
@@ -135,7 +135,11 @@ describe("webview preferences (#4972, #4962)", () => {
       })
     ).toEqual({
       userPreferences: {
-        appearance: { bashCollapsedSummaryMode: "intent", transcriptDensity: "hyper" },
+        appearance: {
+          bashCollapsedSummaryMode: "intent",
+          transcriptDensity: "hyper",
+          vimEnabled: true,
+        },
       },
     });
   });
@@ -169,6 +173,34 @@ describe("webview preferences (#4972, #4962)", () => {
         },
       })
     ).toEqual({ userPreferences: { appearance: { bashCollapsedSummaryMode: "intent" } } });
+  });
+
+  test("forwards the numeric per-model compaction thresholds and no other AI preference", () => {
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        userPreferences: {
+          ai: {
+            projectDefaults: { "/home/alice/secret-project": { model: "openai:gpt-5" } },
+            autoCompactionThresholdByModel: {
+              "anthropic:claude-opus-5-5": 60,
+              "openai:gpt-5": "70",
+            },
+          },
+        },
+      })
+    ).toEqual({
+      userPreferences: {
+        ai: { autoCompactionThresholdByModel: { "anthropic:claude-opus-5-5": 60 } },
+      },
+    });
+  });
+
+  test("forwards the CDN script toggle and no other UI preference", () => {
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        userPreferences: { ui: { artifactsAllowCdnScripts: false, sidebarFlatMode: true } },
+      })
+    ).toEqual({ userPreferences: { ui: { artifactsAllowCdnScripts: false } } });
   });
 
   test("forwards agentAiDefaults rebuilt from named fields, without invalid agents", () => {
@@ -334,11 +366,13 @@ describe("app and providers config (#4766)", () => {
     expect(isAllowedOrpcPath(["config", "updateRoutePreferences"])).toBe(false);
   });
 
-  test("projects config.getConfig to the model-routing and thinking-floor fields", () => {
+  test("projects config.getConfig to the model-routing, thinking-floor and model-preference fields", () => {
     const config = {
       routePriority: ["mux-gateway", "direct"],
       routeOverrides: { "openai:gpt-5.6-terra": "direct" },
       minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
+      defaultModel: "openai:gpt-5.6-terra",
+      hiddenModels: ["anthropic:claude-opus-5-5"],
       heartbeatDefaultPrompt: "private prompt",
       userPreferences: { name: "alice" },
       taskSettings: { maxParallelAgentTasks: 3 },
@@ -347,6 +381,8 @@ describe("app and providers config (#4766)", () => {
       routePriority: ["mux-gateway", "direct"],
       routeOverrides: { "openai:gpt-5.6-terra": "direct" },
       minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
+      defaultModel: "openai:gpt-5.6-terra",
+      hiddenModels: ["anthropic:claude-opus-5-5"],
     });
   });
 

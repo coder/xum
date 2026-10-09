@@ -5,7 +5,12 @@ import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as tooltipModule from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
+import {
+  createTestApiClient,
+  createTestConfig,
+  type TestApiOverrides,
+  type TestClientConfig,
+} from "@/browser/testUtils";
 import * as WorkspaceModule from "@/browser/contexts/WorkspaceContext";
 import * as ExperimentsModule from "@/browser/hooks/useExperiments";
 import * as ModelsModule from "@/browser/hooks/useModelsFromSettings";
@@ -15,8 +20,10 @@ import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { getModelKey } from "@/common/constants/storage";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+} from "@/browser/utils/aiSelectionIntent";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { FALLBACK_AGENTS } from "./TasksSection.agents";
@@ -137,6 +144,7 @@ interface RenderTasksSectionOptions {
   /** When set, serves this discovered-agent list instead of FALLBACK_AGENTS. */
   agents?: AgentDefinitionDescriptor[];
   workspaceModel?: string;
+  minThinkingLevelByModel?: TestClientConfig["minThinkingLevelByModel"];
 }
 
 function renderTasksSection(options: RenderTasksSectionOptions = {}) {
@@ -145,6 +153,7 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
     Promise.resolve(
       createTestConfig({
         agentAiDefaults: options.agentAiDefaults ?? {},
+        minThinkingLevelByModel: options.minThinkingLevelByModel,
       })
     )
   );
@@ -161,8 +170,9 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
   // Discovery only runs for a selected workspace's project.
   selectedWorkspaceMock =
     options.agents || options.workspaceModel ? { projectPath: "/proj", workspaceId: "ws-1" } : null;
+  resetAiSelectionIntentForTests();
   if (options.workspaceModel) {
-    updatePersistedState(getModelKey("ws-1"), options.workspaceModel);
+    markAiSelectionIntent("ws-1", "model", options.workspaceModel);
   }
 
   // Inject the per-test client through the real provider; mocking the API module leaks into
@@ -303,10 +313,8 @@ describe("TasksSection Exec subagent defaults", () => {
 
   test("Intuition can display and save Off and Low below the chat minimum", async () => {
     experimentsEnabledByDefault = true;
-    getAppConfigStore().updateOptimistically({
-      minThinkingLevelByModel: { "openai:gpt-6-luna": "high" },
-    });
     const view = renderTasksSection({
+      minThinkingLevelByModel: { "openai:gpt-6-luna": "high" },
       agentAiDefaults: {
         intuition: { modelString: "openai:gpt-6-luna", thinkingLevel: "low" },
         explore: { modelString: "openai:gpt-6-luna", thinkingLevel: "low" },

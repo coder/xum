@@ -47,15 +47,23 @@ const DRAFT_SCOPE_ID_PREFIX = "__draft__/";
 export const GLOBAL_SCOPE_ID = "__global__";
 
 /**
+ * Global, project, pending and draft composer scopes. Every other id is a workspace id,
+ * including legacy `<project basename>-<branch>` ids that start with "__".
+ */
+export function isNonWorkspaceScopeId(scopeId: string): boolean {
+  return (
+    scopeId === GLOBAL_SCOPE_ID ||
+    scopeId.startsWith(getProjectScopeId("")) ||
+    scopeId.startsWith(getPendingScopeId("")) ||
+    scopeId.startsWith(DRAFT_SCOPE_ID_PREFIX)
+  );
+}
+
+/**
  * Get the localStorage key for the UI theme preference (global)
  * Format: "uiTheme"
  */
 export const UI_THEME_KEY = "uiTheme";
-
-/**
- * LocalStorage key for the hidden Power Mode UI easter egg (global).
- */
-export const POWER_MODE_ENABLED_KEY = "powerModeEnabled";
 
 /**
  * Get the localStorage key for the last selected provider when adding custom models (global)
@@ -78,24 +86,9 @@ export const SELECTED_WORKSPACE_KEY = "selectedWorkspace";
 export const LAST_VISITED_ROUTE_KEY = "lastVisitedRoute";
 
 /**
- * User preference for what to show on app launch (global).
- * Values: "dashboard" (legacy storage value that now opens the recent project page)
- * | "new-chat" | "last-workspace"
+ * What to show on app launch. "dashboard" is a legacy value that now opens the recent project page.
  */
-export const LAUNCH_BEHAVIOR_KEY = "launchBehavior";
-
 export type LaunchBehavior = "dashboard" | "new-chat" | "last-workspace";
-
-/**
- * Synchronous mirror for the backend full-width transcript preference.
- */
-export const CHAT_TRANSCRIPT_FULL_WIDTH_KEY = "chatTranscriptFullWidth";
-
-/**
- * Ordered project paths in the left sidebar.
- * Format: "mux:projectOrder"
- */
-export const PROJECT_ORDER_KEY = "mux:projectOrder";
 
 /**
  * Get the localStorage key for expanded projects in sidebar (global)
@@ -111,25 +104,6 @@ export const EXPANDED_PROJECTS_KEY = "expandedProjects";
  * Keyed by projectPath.
  */
 export const WORKSPACE_DRAFTS_BY_PROJECT_KEY = "workspaceDraftsByProject";
-
-/**
- * LocalStorage keys for Xum Gateway routing preferences (global).
- *
- * Note: localStorage is origin-scoped (includes port), so these values are also
- * mirrored into ~/.xum/config.json for portability across server ports.
- */
-export const GATEWAY_MODELS_KEY = "gateway-models"; // enabled model IDs (canonical)
-export const GATEWAY_ENABLED_KEY = "gateway-enabled"; // global on/off toggle
-
-/**
- * Storage key for runtime enablement settings (shared via ~/.xum/config.json).
- */
-export const RUNTIME_ENABLEMENT_KEY = "runtimeEnablement";
-
-/**
- * Storage key for global default runtime selection (shared via ~/.xum/config.json).
- */
-export const DEFAULT_RUNTIME_KEY = "defaultRuntime";
 
 /**
  * Browser-mode server auth token. Stored as a raw string (not JSON): older builds read it with a
@@ -192,73 +166,6 @@ export function getMCPServersKey(projectPath: string): string {
  */
 export function getBrowserSelectedSessionKey(projectPath: string): string {
   return `browserSelectedSession:${projectPath}`;
-}
-
-/**
- * Get the localStorage key for thinking level preference per scope (workspace/project).
- * Format: "thinkingLevel:{scopeId}"
- */
-export function getThinkingLevelKey(scopeId: string): string {
-  return `thinkingLevel:${scopeId}`;
-}
-
-/**
- * Get the localStorage key for the OpenAI pro reasoning-mode toggle per scope
- * (workspace/project). Format: "reasoningMode:{scopeId}"
- */
-export function getReasoningModeKey(scopeId: string): string {
-  return `reasoningMode:${scopeId}`;
-}
-
-/**
- * Get the localStorage key for per-agent workspace AI overrides cache.
- * Format: "workspaceAiSettingsByAgent:{workspaceId}"
- */
-export function getWorkspaceAISettingsByAgentKey(workspaceId: string): string {
-  return `workspaceAiSettingsByAgent:${workspaceId}`;
-}
-
-/**
- * LEGACY: Get the localStorage key for thinking level preference per model (global).
- * Format: "thinkingLevel:model:{modelName}"
- *
- * Kept for one-time migration to per-workspace thinking.
- */
-export function getThinkingLevelByModelKey(modelName: string): string {
-  return `thinkingLevel:model:${modelName}`;
-}
-
-/**
- * Get the localStorage key for the user's preferred model for a workspace
- */
-export function getModelKey(workspaceId: string): string {
-  return `model:${workspaceId}`;
-}
-
-/**
- * Get the localStorage key for the composer's Auto selection (auto-model-routing
- * experiment). Kept separate from the model key so the concrete model survives
- * as the routing fallback.
- */
-export function getAutoModelRoutingKey(workspaceId: string): string {
-  return `autoModelRouting:${workspaceId}`;
-}
-
-/**
- * Get the localStorage key for the composer's Auto thinking-level selection
- * (auto-model-routing experiment). Independent of the model Auto key: either
- * dimension can be routed while the other stays concrete.
- */
-export function getAutoThinkingLevelKey(workspaceId: string): string {
-  return `autoThinkingLevel:${workspaceId}`;
-}
-
-/**
- * Explicit routing picks stay separate from the metadata-hydrated per-agent AI settings
- * cache, which carries no routing state.
- */
-export function getAutoRoutingChoiceByAgentKey(workspaceId: string): string {
-  return `autoRoutingChoiceByAgent:${workspaceId}`;
 }
 
 /**
@@ -355,48 +262,6 @@ export function getAutoRetryKey(workspaceId: string): string {
 }
 
 /**
- * Get the localStorage key for the selected agent definition id for a scope.
- * Format: "agentId:{scopeId}"
- */
-export function getAgentIdKey(scopeId: string): string {
-  return `agentId:${scopeId}`;
-}
-
-/**
- * Get the localStorage key for the pinned third agent id for a scope.
- * Format: "pinnedAgentId:{scopeId}"
- */
-export function getPinnedAgentIdKey(scopeId: string): string {
-  return `pinnedAgentId:${scopeId}`;
-}
-/**
- * Get the localStorage key for "disable workspace agents" toggle per scope.
- * When true, workspace-specific agents are disabled - only built-in and global agents are loaded.
- * Useful for "unbricking" when iterating on agent files in a workspace worktree.
- * Format: "disableWorkspaceAgents:{scopeId}"
- */
-export function getDisableWorkspaceAgentsKey(scopeId: string): string {
-  return `disableWorkspaceAgents:${scopeId}`;
-}
-/**
- * Get the localStorage key for the default runtime for a project
- * Defaults to worktree if not set; can only be changed via the "Default for project" checkbox.
- * Format: "runtime:{projectPath}"
- */
-export function getRuntimeKey(projectPath: string): string {
-  return `runtime:${projectPath}`;
-}
-
-/**
- * Get the localStorage key for trunk branch preference for a project
- * Stores the last used trunk branch when creating a workspace
- * Format: "trunkBranch:{projectPath}"
- */
-export function getTrunkBranchKey(projectPath: string): string {
-  return `trunkBranch:${projectPath}`;
-}
-
-/**
  * Get the localStorage key for whether to show the "Initialize with AGENTS.md" nudge for a project.
  * Set to true when a project is first added; cleared when user dismisses or runs /init.
  * Format: "agentsInitNudge:{projectPath}"
@@ -405,62 +270,9 @@ export function getAgentsInitNudgeKey(projectPath: string): string {
   return `agentsInitNudge:${projectPath}`;
 }
 
-/**
- * Get the localStorage key for the last runtime config used per provider for a project.
- *
- * Value shape is a provider-keyed object (e.g. { ssh: { host }, docker: { image } }) so we can
- * add new options without adding more storage keys.
- *
- * Format: "lastRuntimeConfig:{projectPath}"
- */
-export function getLastRuntimeConfigKey(projectPath: string): string {
-  return `lastRuntimeConfig:${projectPath}`;
-}
+export const GIT_STATUS_INDICATOR_MODES = ["divergence", "line-delta"] as const;
 
-/**
- * Get the localStorage key for the default model (global).
- *
- * Note: This is used as a fallback when creating new workspaces.
- * Format: "model-default"
- */
-export const DEFAULT_MODEL_KEY = "model-default";
-
-/**
- * Get the localStorage key for the hidden models list (global).
- * Format: "hidden-models"
- */
-export const HIDDEN_MODELS_KEY = "hidden-models";
-
-/**
- * Get the localStorage key for cached per-agent AI defaults (global).
- * Format: "agentAiDefaults"
- */
-export const AGENT_AI_DEFAULTS_KEY = "agentAiDefaults";
-
-/**
- * Provider-specific AI options, synced through userPreferences.
- */
-export const PROVIDER_OPTIONS_ANTHROPIC_KEY = "provider_options_anthropic";
-export const PROVIDER_OPTIONS_GOOGLE_KEY = "provider_options_google";
-
-/**
- * Get the localStorage key for vim mode preference (global)
- * Format: "vimEnabled"
- */
-export const VIM_ENABLED_KEY = "vimEnabled";
-
-/**
- * Git status indicator display mode (global)
- * Stores: "line-delta" | "divergence"
- */
-
-export const GIT_STATUS_INDICATOR_MODE_KEY = "gitStatusIndicatorMode";
-
-/**
- * Editor configuration for "Open in Editor" feature (global)
- * Format: "editorConfig"
- */
-export const EDITOR_CONFIG_KEY = "editorConfig";
+export type GitStatusIndicatorMode = (typeof GIT_STATUS_INDICATOR_MODES)[number];
 
 export type EditorType = "vscode" | "cursor" | "zed" | "custom";
 
@@ -494,12 +306,6 @@ export function normalizeEditorConfig(value: unknown): EditorConfig {
   return { editor, customCommand };
 }
 
-/**
- * Transcript density display preference (global)
- * Stores: "normal" | "hyper"
- */
-export const TRANSCRIPT_DENSITY_KEY = "transcriptDensity";
-
 export const TRANSCRIPT_DENSITIES = ["normal", "hyper"] as const;
 
 export type TranscriptDensity = (typeof TRANSCRIPT_DENSITIES)[number];
@@ -513,12 +319,6 @@ export function isTranscriptDensity(value: unknown): value is TranscriptDensity 
 export function normalizeTranscriptDensity(value: unknown): TranscriptDensity {
   return isTranscriptDensity(value) ? value : DEFAULT_TRANSCRIPT_DENSITY;
 }
-
-/**
- * Collapsed bash tool summary display mode (global)
- * Stores: "command" | "intent-command" | "intent"
- */
-export const BASH_COLLAPSED_SUMMARY_MODE_KEY = "bashCollapsedSummaryMode";
 
 export const BASH_COLLAPSED_SUMMARY_MODES = ["command", "intent-command", "intent"] as const;
 
@@ -536,12 +336,6 @@ export function isBashCollapsedSummaryMode(value: unknown): value is BashCollaps
 export function normalizeBashCollapsedSummaryMode(value: unknown): BashCollapsedSummaryMode {
   return isBashCollapsedSummaryMode(value) ? value : DEFAULT_BASH_COLLAPSED_SUMMARY_MODE;
 }
-
-/**
- * Integrated terminal font configuration (global)
- * Stores: { fontFamily: string; fontSize: number }
- */
-export const TERMINAL_FONT_CONFIG_KEY = "terminalFontConfig";
 
 export interface TerminalFontConfig {
   fontFamily: string;
@@ -571,13 +365,6 @@ export function normalizeTerminalFontConfig(value: unknown): TerminalFontConfig 
 
   return { fontFamily, fontSize };
 }
-
-/**
- * Terminal badge overlay configuration (global)
- * Scroll-fixed workspace/tab watermark rendered above the terminal canvas,
- * similar to iTerm2 badges. Stores: { enabled, template, position, opacity, fontSize }
- */
-export const TERMINAL_BADGE_CONFIG_KEY = "terminalBadgeConfig";
 
 export const TERMINAL_BADGE_POSITIONS = [
   "top-left",
@@ -644,24 +431,6 @@ export function normalizeTerminalBadgeConfig(value: unknown): TerminalBadgeConfi
 }
 
 /**
- * Tutorial state storage key (global)
- * Stores: { disabled: boolean, completed: { creation?: true, workspace?: true, review?: true } }
- */
-export const TUTORIAL_STATE_KEY = "tutorialState";
-
-export type TutorialSequence = "creation" | "workspace" | "review";
-
-export interface TutorialState {
-  disabled: boolean;
-  completed: Partial<Record<TutorialSequence, true>>;
-}
-
-export const DEFAULT_TUTORIAL_STATE: TutorialState = {
-  disabled: false,
-  completed: {},
-};
-
-/**
  * Get the localStorage key for review (hunk read) state per workspace
  * Stores which hunks have been marked as read during code review
  * Legacy: migrated to the backend review-state.json; read once for import, then removed.
@@ -688,26 +457,6 @@ export function getReviewSelectedHunkKey(workspaceId: string): string {
 export function getHunkFirstSeenKey(workspaceId: string): string {
   return `hunkFirstSeen:${workspaceId}`;
 }
-
-/**
- * Project-scoped default diff base for code review.
- * Format: "review-default-base:{projectPath}"
- */
-export function getReviewDefaultBaseKey(projectPath: string): string {
-  return `review-default-base:${projectPath}`;
-}
-
-/**
- * Global code review behavior for including uncommitted changes.
- * Format: "review-include-uncommitted"
- */
-export const REVIEW_INCLUDE_UNCOMMITTED_KEY = "review-include-uncommitted";
-
-/**
- * Get the localStorage key for review sort order preference (global)
- * Format: "review-sort-order"
- */
-export const REVIEW_SORT_ORDER_KEY = "review-sort-order";
 
 /**
  * Get the localStorage key for hunk expand/collapse state in Review tab
@@ -739,35 +488,11 @@ export function getFileTreeExpandStateKey(workspaceId: string): string {
 }
 
 /**
- * LocalStorage key for file tree view mode in the Review tab (global).
- * Format: "reviewFileTreeViewMode"
- */
-export const REVIEW_FILE_TREE_VIEW_MODE_KEY = "reviewFileTreeViewMode";
-
-/**
  * Get the localStorage key for persisted legacy agent status for a workspace.
  * Stores the most recent successful status_set payload (emoji, message, url)
  * so historical status rows and older sessions can still be reconstructed.
  * Format: "statusState:{workspaceId}"
  */
-
-/**
- * Get the localStorage key for "notify on response" toggle per workspace.
- * When true, a browser notification is shown when assistant responses complete.
- * Format: "notifyOnResponse:{workspaceId}"
- */
-export function getNotifyOnResponseKey(workspaceId: string): string {
-  return `notifyOnResponse:${workspaceId}`;
-}
-
-/**
- * Get the localStorage key for "auto-enable notifications" toggle per project.
- * When true, new workspaces in this project automatically have notifications enabled.
- * Format: "notifyOnResponseAutoEnable:{projectPath}"
- */
-export function getNotifyOnResponseAutoEnableKey(projectPath: string): string {
-  return `notifyOnResponseAutoEnable:${projectPath}`;
-}
 
 export function getStatusStateKey(workspaceId: string): string {
   return `statusState:${workspaceId}`;
@@ -786,27 +511,6 @@ export function getWorkspaceLastReadKey(workspaceId: string): string {
  * Format: "sidebarCollapsed"
  */
 export const LEFT_SIDEBAR_COLLAPSED_KEY = "sidebarCollapsed";
-
-/**
- * Whether the sidebar groups older workspaces under collapsible
- * "Older than X days" age tiers (boolean, default true).
- * When false, all workspaces render as one flat recency-sorted list.
- * Format: "sidebarAgeGrouping"
- */
-export const SIDEBAR_AGE_GROUPING_KEY = "sidebarAgeGrouping";
-
-/**
- * When true, show all sidebar chats in one list instead of project folders.
- * Format: "sidebarFlatMode" (boolean, default false)
- */
-export const SIDEBAR_FLAT_MODE_KEY = "sidebarFlatMode";
-
-/**
- * Hide sub-agent rows in the left sidebar and summarize their activity on
- * parent rows instead.
- * Format: "sidebarHideSubAgents" (boolean, default false)
- */
-export const SIDEBAR_HIDE_SUBAGENTS_KEY = "sidebarHideSubAgents";
 
 /**
  * Left sidebar width
@@ -860,13 +564,6 @@ export const ARTIFACTS_SELECTION_KEY = "artifacts:selection";
 export const ARTIFACTS_SELECTION_MAX_WORKSPACES = 16;
 /** Room for 16 entries with paths of about 1,000 chars; older workspaces drop first. */
 export const ARTIFACTS_SELECTION_MAX_CHARS = 20_000;
-
-/**
- * Whether sandboxed HTML/SVG artifacts may load scripts and fonts from the CDN allowlist
- * (Settings -> Experiments -> Artifacts). Global, default true.
- * Format: "artifacts:allowCdnScripts" (boolean)
- */
-export const ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY = "artifacts:allowCdnScripts";
 
 /**
  * Get the localStorage key for terminal titles per workspace.
@@ -929,23 +626,6 @@ export function getDesktopPopoutKey(workspaceId: string): string {
   return `desktop-popout:${workspaceId}`;
 }
 
-/**
- * Get the localStorage key for auto-compaction enabled preference per workspace
- * Format: "autoCompaction:enabled:{workspaceId}"
- */
-export function getAutoCompactionEnabledKey(workspaceId: string): string {
-  return `autoCompaction:enabled:${workspaceId}`;
-}
-
-/**
- * Get the localStorage key for auto-compaction threshold percentage per model
- * Format: "autoCompaction:threshold:{model}"
- * Stored per-model because different models have different context windows
- */
-export function getAutoCompactionThresholdKey(model: string): string {
-  return `autoCompaction:threshold:${model}`;
-}
-
 /** localStorage-backed LRU caches (see src/browser/utils/lruCache.ts). */
 export const SESSION_COST_CACHE_ENTRY_PREFIX = "session-cost:";
 export const SESSION_COST_CACHE_INDEX_KEY = "session-cost-index";
@@ -970,15 +650,7 @@ export function getReviewDiffBaseKey(workspaceId: string): string {
 export const POST_COMPACTION_COLLAPSED_KEY = "postCompaction:collapsed";
 export const POST_COMPACTION_FILES_EXPANDED_KEY = "postCompaction:filesExpanded";
 export const STATS_CONTAINER_SUB_TAB_KEY = "statsContainer:subTab";
-export const STATS_TAB_VIEW_MODE_KEY = "statsTab:viewMode";
-export const STATS_TAB_SHOW_MODE_BREAKDOWN_KEY = "statsTab:showModeBreakdown";
-export const COSTS_TAB_VIEW_MODE_KEY = "costsTab:viewMode";
-export const OUTPUT_TAB_LEVEL_KEY = "output-tab-level";
-export const REVIEW_SHOW_READ_KEY = "review-show-read";
 export const MERMAID_DIAGRAM_ZOOM_KEY = "mermaid-diagram-zoom";
-export const ANALYTICS_TIME_RANGE_KEY = "analytics:timeRange";
-export const ANALYTICS_TIMING_METRIC_KEY = "analytics:timingMetric";
-export const ANALYTICS_TIME_ZONE_MODE_KEY = "analytics:timeZoneMode";
 export const ROSETTA_BANNER_DISMISSED_KEY = "rosettaBannerDismissedAt";
 export const WINDOWS_TOOLCHAIN_BANNER_DISMISSED_KEY = "windowsToolchainBannerDismissedAt";
 export const REMOTE_CONNECTION_URL_KEY = "remoteConnectionUrl";
@@ -996,8 +668,6 @@ export const EXPANDED_TASK_GROUPS_KEY = "expandedTaskGroups";
 export const FILE_TREE_EXPAND_STATE_MAX_CHARS = 512;
 /** auto-expand:{workspaceId}: the per-tool map keeps the most recently toggled tools that fit. */
 export const AUTO_EXPAND_PREFS_MAX_CHARS = 512;
-/** autoRoutingChoiceByAgent:{workspaceId}: one entry per agent ever chosen; the owner keeps the newest. */
-export const AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS = 384;
 /** reviewSearchState:{workspaceId}: longer searches still work but are not restored on reload. */
 export const REVIEW_SEARCH_STATE_MAX_CHARS = 256;
 /**
@@ -1020,7 +690,7 @@ export const WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS = 2000;
  */
 export const WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS = 1024;
 /**
- * model:{workspaceId} holds a "provider:modelId" string. Custom model ids are checked against it
+ * Model preferences hold a "provider:modelId" string. Custom model ids are checked against it
  * where they are entered (getModelIdLengthError); built-in ids are far shorter.
  */
 export const MODEL_KEY_MAX_CHARS = 128;
@@ -1050,13 +720,12 @@ export const MAX_PERSISTED_KEY_CHARS = 8192;
  * - `cache`: derived data the app can refetch; the only kind the quota handler may evict.
  * - `draft`: unsent composer/creation input; never evicted.
  * - `workspace-scoped`: per-workspace review data and UI state; never evicted.
- * - `synced`: frontend copy of backend-owned preferences; never evicted.
- * - `ui`: small UI preferences; never evicted.
+ * - `ui`: small UI state and preferences not yet stored on the backend; never evicted.
  *
  * Removal is always allowed, registered or not, so legacy cleanups keep working. A legacy key that
  * is only read and removed needs no registration; registered legacy keys use `maxValueChars: 0`.
  */
-export type PersistedKeyKind = "ui" | "cache" | "workspace-scoped" | "draft" | "synced";
+export type PersistedKeyKind = "ui" | "cache" | "workspace-scoped" | "draft";
 
 /**
  * `workspaceId` keys append a scope id to a fixed prefix. The scope id is usually a workspace id,
@@ -1137,8 +806,7 @@ function projectPrefix(getKey: (projectPath: string) => string): string {
 
 // Budget sizing: booleans/numbers 16-32, enums and ids 32-128, paths/refs/URLs 256-2048, structured
 // values from their shapes with headroom. Per-workspace keys count once per workspace in the
-// budget model, so they are sized tightly; global and backend-synced keys generously (a refused
-// sync would leave a stale frontend copy).
+// budget model, so they are sized tightly; global keys generously.
 //
 // Budget policy (#5225): a key's budget must cover the largest value its owner writes. An owner
 // whose value grows with user input (paths, ids, URLs, free text, per-item maps) bounds it where
@@ -1149,12 +817,6 @@ function projectPrefix(getKey: (projectPath: string) => string): string {
 // exceed its budget is a bug in its owner.
 export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Copied on fork.
-  // Record<agentId, { model, thinkingLevel, reasoningMode? }>, hydrated from workspace metadata.
-  workspaceKey(getWorkspaceAISettingsByAgentKey, "synced", true, 1024),
-  workspaceKey(getModelKey, "ui", true, MODEL_KEY_MAX_CHARS),
-  workspaceKey(getAutoModelRoutingKey, "ui", true, 16),
-  workspaceKey(getAutoThinkingLevelKey, "ui", true, 16),
-  workspaceKey(getAutoRoutingChoiceByAgentKey, "ui", true, AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS),
   // { thinking?, tools?: Record<toolName, boolean> }: one entry per tool the user toggled.
   workspaceKey(getAutoExpandPrefsKey, "ui", true, AUTO_EXPAND_PREFS_MAX_CHARS),
   // Creation-draft scopes only. ~80 skeleton + generatedIdentity <= ~410 (propose_name: name <= 20
@@ -1163,9 +825,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // The VS Code webview composer's unsent text. Longer drafts still work for the session (kept in
   // memory); the webview then persists only the last text that fit.
   workspaceKey(getInputKey, "draft", false, 8192, "webview"),
-  workspaceKey(getAgentIdKey, "synced", true, 128),
-  workspaceKey(getPinnedAgentIdKey, "ui", true, 128),
-  workspaceKey(getThinkingLevelKey, "ui", true, 32),
   workspaceKey(getReviewSelectedHunkKey, "workspace-scoped", true, 256),
   workspaceKey(
     getFileTreeExpandStateKey,
@@ -1175,7 +834,6 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   ),
   workspaceKey(getReviewSearchStateKey, "workspace-scoped", true, REVIEW_SEARCH_STATE_MAX_CHARS),
   workspaceKey(getReviewImmersiveKey, "workspace-scoped", true, 16),
-  workspaceKey(getAutoCompactionEnabledKey, "ui", true, 16),
   workspaceKey(getWorkspaceLastReadKey, "workspace-scoped", true, 32),
   // Not a cache: a status_set result compacted out of history cannot be re-derived after reload
   // (see StreamingMessageAggregator.loadPersistedAgentStatus), so it must never be evicted.
@@ -1197,12 +855,8 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // SendMessageError; transient (shown as a toast after navigation, then removed).
   workspaceKey(getPendingWorkspaceSendErrorKey, "workspace-scoped", false, 768),
   workspaceKey(getPendingDraftSkillDiscoveryKey, "workspace-scoped", false, 16),
-  // Synced: UserPreferencesContext mirrors notifyOnResponseByWorkspace from the backend.
-  workspaceKey(getNotifyOnResponseKey, "synced", false, 16),
 
   // Per-workspace keys that deleteWorkspaceStorage used to miss, leaving orphans behind.
-  workspaceKey(getReasoningModeKey, "ui", false, 32),
-  workspaceKey(getDisableWorkspaceAgentsKey, "ui", false, 16),
   workspaceKey(getPinnedTodoExpandedKey, "ui", false, 16),
   workspaceKey(getSubAgentTasksExpandedKey, "ui", false, 16),
   workspaceKey(getRightSidebarLayoutKey, "ui", false, RIGHT_SIDEBAR_LAYOUT_MAX_CHARS),
@@ -1214,45 +868,18 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getReviewDiffBaseKey, "ui", false, 256),
 
   // Global UI state.
-  globalKey(UI_THEME_KEY, "synced", 64),
-  globalKey(POWER_MODE_ENABLED_KEY, "ui", 16),
+  // Paint cache of appearance.theme for index.html, written by ThemeProvider.
+  globalKey(UI_THEME_KEY, "cache", 64),
   globalKey(ARTIFACTS_SELECTION_KEY, "ui", ARTIFACTS_SELECTION_MAX_CHARS),
   globalKey(LAST_CUSTOM_MODEL_PROVIDER_KEY, "ui", 128),
   // { workspaceId } (older builds also stored paths; readers use only the id).
   globalKey(SELECTED_WORKSPACE_KEY, "ui", 256),
   globalKey(LAST_VISITED_ROUTE_KEY, "ui", 4096),
-  globalKey(LAUNCH_BEHAVIOR_KEY, "synced", 32),
-  globalKey(CHAT_TRANSCRIPT_FULL_WIDTH_KEY, "synced", 16),
-  // string[] of project paths.
-  globalKey(PROJECT_ORDER_KEY, "synced", 32 * 1024),
   globalKey(EXPANDED_PROJECTS_KEY, "ui", 32 * 1024),
   // Legacy creation draft list, now in the backend drafts/list.json (imported once by DraftStore,
   // then removed, #5225). Never written again, so no budget (0).
   globalKey(WORKSPACE_DRAFTS_BY_PROJECT_KEY, "draft", 0),
-  globalKey(RUNTIME_ENABLEMENT_KEY, "synced", 1024),
-  globalKey(DEFAULT_RUNTIME_KEY, "synced", 256),
-  globalKey(DEFAULT_MODEL_KEY, "synced", 256),
-  // string[] of model ids; Record<agentId, defaults>.
-  globalKey(HIDDEN_MODELS_KEY, "synced", 32 * 1024),
-  globalKey(AGENT_AI_DEFAULTS_KEY, "synced", 32 * 1024),
-  globalKey(PROVIDER_OPTIONS_ANTHROPIC_KEY, "synced", 4096),
-  globalKey(PROVIDER_OPTIONS_GOOGLE_KEY, "synced", 4096),
-  globalKey(VIM_ENABLED_KEY, "synced", 16),
-  globalKey(GIT_STATUS_INDICATOR_MODE_KEY, "ui", 32),
-  globalKey(EDITOR_CONFIG_KEY, "synced", 2048),
-  globalKey(TRANSCRIPT_DENSITY_KEY, "synced", 32),
-  globalKey(BASH_COLLAPSED_SUMMARY_MODE_KEY, "synced", 32),
-  globalKey(TERMINAL_FONT_CONFIG_KEY, "synced", 1024),
-  globalKey(TERMINAL_BADGE_CONFIG_KEY, "synced", 2048),
-  globalKey(TUTORIAL_STATE_KEY, "ui", 256),
-  globalKey(REVIEW_INCLUDE_UNCOMMITTED_KEY, "synced", 16),
-  globalKey(REVIEW_SORT_ORDER_KEY, "ui", 32),
-  globalKey(REVIEW_FILE_TREE_VIEW_MODE_KEY, "ui", 32),
   globalKey(LEFT_SIDEBAR_COLLAPSED_KEY, "ui", 16),
-  globalKey(SIDEBAR_AGE_GROUPING_KEY, "ui", 16),
-  globalKey(SIDEBAR_FLAT_MODE_KEY, "ui", 16),
-  globalKey(SIDEBAR_HIDE_SUBAGENTS_KEY, "ui", 16),
-  globalKey(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, "ui", 16),
   globalKey(LEFT_SIDEBAR_WIDTH_KEY, "ui", 16),
   globalKey(MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY, "ui", 32),
   // Legacy global tab; still read as a fallback for the per-workspace layout.
@@ -1271,31 +898,14 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(POST_COMPACTION_COLLAPSED_KEY, "ui", 16),
   globalKey(POST_COMPACTION_FILES_EXPANDED_KEY, "ui", 16),
   globalKey(STATS_CONTAINER_SUB_TAB_KEY, "ui", 32),
-  globalKey(STATS_TAB_VIEW_MODE_KEY, "ui", 32),
-  globalKey(STATS_TAB_SHOW_MODE_BREAKDOWN_KEY, "ui", 16),
-  globalKey(COSTS_TAB_VIEW_MODE_KEY, "ui", 32),
-  globalKey(OUTPUT_TAB_LEVEL_KEY, "ui", 32),
-  globalKey(REVIEW_SHOW_READ_KEY, "ui", 16),
   globalKey(MERMAID_DIAGRAM_ZOOM_KEY, "ui", 32),
-  globalKey(ANALYTICS_TIME_RANGE_KEY, "ui", 32),
-  globalKey(ANALYTICS_TIMING_METRIC_KEY, "ui", 32),
-  globalKey(ANALYTICS_TIME_ZONE_MODE_KEY, "ui", 32),
   globalKey(EXPANDED_OLD_WORKSPACES_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
   globalKey(EXPANDED_SECTIONS_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
   globalKey(EXPANDED_COMPLETED_SUB_AGENTS_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
   globalKey(EXPANDED_TASK_GROUPS_KEY, "ui", SIDEBAR_EXPANSION_MAP_MAX_CHARS),
 
-  // Per-model auto-compaction threshold percentage (synced).
-  globalPrefix(getAutoCompactionThresholdKey(""), "synced", 16, "model"),
-
   // Project-scoped families ("{prefix}{projectPath}").
-  globalPrefix(projectPrefix(getTrunkBranchKey), "synced", 256, "project"),
-  // Provider-keyed last runtime options (e.g. { ssh: { host }, docker: { image } }).
-  globalPrefix(projectPrefix(getLastRuntimeConfigKey), "synced", 1024, "project"),
-  globalPrefix(projectPrefix(getRuntimeKey), "ui", 256, "project"),
   globalPrefix(projectPrefix(getAgentsInitNudgeKey), "ui", 16, "project"),
-  globalPrefix(projectPrefix(getReviewDefaultBaseKey), "synced", 256, "project"),
-  globalPrefix(projectPrefix(getNotifyOnResponseAutoEnableKey), "synced", 16, "project"),
   globalPrefix(projectPrefix(getArchivedWorkspacesExpandedKey), "ui", 16, "project"),
   globalPrefix(projectPrefix(getBrowserSelectedSessionKey), "ui", 256, "project"),
 
@@ -1384,7 +994,7 @@ export function getPersistedKeyKind(key: string): PersistedKeyKind | undefined {
 /**
  * New workspaces get crypto.randomBytes(5) hex ids (Config.generateStableId). Orphan GC only
  * collects keys whose scope id has this shape, so legacy-format ids, creation-draft, pending,
- * project and global scopes and legacy keys that share a prefix (e.g. "thinkingLevel:model:{model}") are never collected.
+ * project and global scopes are never collected.
  * Failing closed here leaks a little space at worst; guessing wrong would delete user data.
  */
 const STABLE_WORKSPACE_ID_PATTERN = /^[0-9a-f]{10}$/;

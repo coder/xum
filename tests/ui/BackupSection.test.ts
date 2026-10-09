@@ -10,7 +10,7 @@ import { BackupSection } from "@/browser/features/Settings/Sections/BackupSectio
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { BACKUP_CONTENT_DEFAULTS } from "@/common/config/schemas/settingsBackup";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
+import { resetTestExperiments } from "@/browser/testUtils";
 
 type MockOptions = Parameters<typeof createMockORPCClient>[0];
 type MockClient = ReturnType<typeof createMockORPCClient>;
@@ -298,14 +298,17 @@ describe("BackupSection", () => {
   });
 
   test("disables destructive actions once the config stream dies", async () => {
-    let failStream!: (error: Error) => void;
+    // The shared AppConfigStore subscribes too, so fail every stream.
+    const failStreams: ((error: Error) => void)[] = [];
     const { view } = renderBackupSection({}, (client) => {
       const real = client.config.onConfigChanged.bind(client.config);
       jest.spyOn(client.config, "onConfigChanged").mockImplementation(async (input, options) => {
         const iterator = await real(input, options);
         const failure = new Promise<never>((_, reject) => {
-          failStream = reject;
+          failStreams.push(reject);
         });
+        // Streams no one reads any more must not surface the rejection as unhandled.
+        failure.catch(() => undefined);
         return {
           next: () => Promise.race([failure, iterator.next()]),
           return: iterator.return?.bind(iterator),
@@ -320,7 +323,7 @@ describe("BackupSection", () => {
     );
 
     await act(async () => {
-      failStream(new Error("stream torn down"));
+      for (const failStream of failStreams) failStream(new Error("stream torn down"));
       await Promise.resolve();
     });
 
@@ -1203,27 +1206,22 @@ describe("BackupSection", () => {
 
   test("offers the global artifacts toggle and its shortcut only with the Artifacts experiment", async () => {
     const shortcut = { key: "u", code: "KeyU", ctrlKey: true, altKey: true };
-    try {
-      const off = renderBackupSection();
-      const offCanvas = within(off.view.container);
-      await offCanvas.findByRole("checkbox", { name: "Global instructions" });
-      expect(offCanvas.queryByRole("checkbox", { name: "Pinned global artifacts" })).toBeNull();
-      fireEvent.keyDown(window, shortcut);
-      // Nothing to toggle: the draft stays unchanged, so saving stays disabled.
-      expect(
-        offCanvas.getByRole("button", { name: "Save settings" }).hasAttribute("disabled")
-      ).toBe(true);
-      off.view.unmount();
+    const off = renderBackupSection();
+    const offCanvas = within(off.view.container);
+    await offCanvas.findByRole("checkbox", { name: "Global instructions" });
+    expect(offCanvas.queryByRole("checkbox", { name: "Pinned global artifacts" })).toBeNull();
+    fireEvent.keyDown(window, shortcut);
+    // Nothing to toggle: the draft stays unchanged, so saving stays disabled.
+    expect(offCanvas.getByRole("button", { name: "Save settings" }).hasAttribute("disabled")).toBe(
+      true
+    );
+    off.view.unmount();
 
-      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
-      const on = renderBackupSection();
-      const onCanvas = within(on.view.container);
-      const toggle = await onCanvas.findByRole("checkbox", { name: "Pinned global artifacts" });
-      expect(toggle.getAttribute("aria-checked")).toBe("false");
-      fireEvent.keyDown(window, shortcut);
-      await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
-    } finally {
-      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, null);
-    }
+    const on = renderBackupSection({ experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true } });
+    const onCanvas = within(on.view.container);
+    const toggle = await onCanvas.findByRole("checkbox", { name: "Pinned global artifacts" });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    fireEvent.keyDown(window, shortcut);
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
   });
 });

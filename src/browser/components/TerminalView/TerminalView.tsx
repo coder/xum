@@ -1,13 +1,8 @@
 import { useRef, useEffect, useState, useCallback, useLayoutEffect } from "react";
 import { init, Terminal, FitAddon } from "ghostty-web";
 import { useAPI } from "@/browser/contexts/API";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  DEFAULT_TERMINAL_FONT_CONFIG,
-  TERMINAL_FONT_CONFIG_KEY,
-  normalizeTerminalFontConfig,
-  type TerminalFontConfig,
-} from "@/common/constants/storage";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { normalizeTerminalFontConfig } from "@/common/constants/storage";
 import { useTerminalRouter } from "@/browser/terminal/TerminalRouterContext";
 import {
   appendTerminalIconFallback,
@@ -179,10 +174,8 @@ export function TerminalView({
   // Track whether we've received the initial screen state from backend
   const [isLoading, setIsLoading] = useState(true);
 
-  const [rawTerminalFontConfig] = usePersistedState<TerminalFontConfig>(
-    TERMINAL_FONT_CONFIG_KEY,
-    DEFAULT_TERMINAL_FONT_CONFIG,
-    { listener: true }
+  const rawTerminalFontConfig = useUserPreferences(
+    (preferences) => preferences.appearance?.terminalFontConfig
   );
   const terminalFontConfig = normalizeTerminalFontConfig(rawTerminalFontConfig);
   const { api } = useAPI();

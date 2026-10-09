@@ -502,7 +502,7 @@ function createWorkspaceQuickPickItem(
     detailParts.push(`Created: ${new Date(workspace.createdAt).toLocaleDateString()}`);
   }
 
-  const aiByAgent =
+  const aiByAgent: typeof workspace.aiSettingsByAgent =
     workspace.aiSettingsByAgent ??
     (workspace.aiSettings
       ? {

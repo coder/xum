@@ -13,14 +13,15 @@ import {
   resetTestExperiments,
   type TestClientConfig,
 } from "@/browser/testUtils";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { flushUserPreferences, getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { useExperiment } from "@/browser/hooks/useExperiments";
 import * as RealSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as RealTelemetryModule from "@/browser/hooks/useTelemetry";
 import { GeneralSection } from "./GeneralSection";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import { BASH_COLLAPSED_SUMMARY_MODE_KEY, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
+import { DEFAULT_TERMINAL_FONT_CONFIG } from "@/common/constants/storage";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
   type CoderWorkspaceArchiveBehavior,
@@ -47,6 +48,7 @@ interface MockAPIClient {
     updateChatTranscriptFullWidth: (input: { enabled: boolean }) => Promise<void>;
     updateLlmDebugLogs: (input: { enabled: boolean }) => Promise<void>;
     updateKeepScreenAwake: (input: { enabled: boolean }) => Promise<void>;
+    updateUserPreferences: (input: { patches: unknown[] }) => Promise<void>;
     onConfigChanged: (
       input?: unknown,
       options?: { signal?: AbortSignal }
@@ -336,6 +338,15 @@ function createMockAPI(
           return Promise.resolve();
         }),
         updateKeepScreenAwake: updateKeepScreenAwakeMock,
+        updateUserPreferences: ({ patches }: { patches: unknown[] }) => {
+          for (const patch of patches) {
+            config.userPreferences = applyMergePatch(
+              config.userPreferences,
+              patch
+            ) as MockConfig["userPreferences"];
+          }
+          return Promise.resolve();
+        },
         onConfigChanged,
       },
       server: {
@@ -646,20 +657,22 @@ describe("GeneralSection", () => {
     expect(setup.setMock).not.toHaveBeenCalled();
   });
 
-  test("persists flat chat list mode from the Sidebar group", () => {
-    const { view } = renderGeneralSection();
-    const sidebarHeading = view.getByRole("heading", { name: "Sidebar" });
+  test("persists flat chat list mode from the Sidebar group", async () => {
+    const setup = renderGeneralSection();
+    const sidebarHeading = setup.view.getByRole("heading", { name: "Sidebar" });
     const sidebarGroup = sidebarHeading.parentElement;
     expect(sidebarGroup).not.toBeNull();
     const toggle = within(sidebarGroup!).getByLabelText("Toggle flat chat list");
 
     fireEvent.click(toggle);
 
-    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("true");
+    await act(() => flushUserPreferences());
+    expect(setup.config.userPreferences?.ui?.sidebarFlatMode).toBe(true);
   });
 
   test("persists the collapsed bash summaries display mode", async () => {
-    const { view } = renderGeneralSection();
+    const setup = renderGeneralSection();
+    const view = setup.view;
 
     await waitFor(() => {
       expect(getSelectTrigger(view, "Collapsed bash summaries").textContent).toContain(
@@ -669,9 +682,26 @@ describe("GeneralSection", () => {
 
     await chooseSelectOption(view, "Collapsed bash summaries", "Intent");
 
-    expect(window.localStorage.getItem(BASH_COLLAPSED_SUMMARY_MODE_KEY)).toBe(
-      JSON.stringify("intent")
-    );
+    await flushUserPreferences();
+    expect(setup.config.userPreferences?.appearance?.bashCollapsedSummaryMode).toBe("intent");
+  });
+
+  test("clearing the terminal font family keeps the field empty and the font size", async () => {
+    const setup = renderGeneralSection();
+    setup.config.userPreferences = {
+      appearance: { terminalFontConfig: { fontFamily: "Menlo", fontSize: 16 } },
+    };
+    await act(() => getAppConfigStore().refresh());
+    const input = setup.view.getByPlaceholderText(DEFAULT_TERMINAL_FONT_CONFIG.fontFamily);
+    expect((input as HTMLInputElement).value).toBe("Menlo");
+
+    await userEvent
+      .setup({ document: input.ownerDocument })
+      .type(input, "{Backspace}".repeat("Menlo".length));
+    await act(() => flushUserPreferences());
+
+    expect(setup.config.userPreferences?.appearance?.terminalFontConfig).toEqual({ fontSize: 16 });
+    expect((input as HTMLInputElement).value).toBe("");
   });
 
   test("loads the SSH host setting in browser mode", async () => {
@@ -719,6 +749,32 @@ describe("GeneralSection", () => {
       expect(toggle.getAttribute("aria-checked")).toBe("false");
       expect(updateChatTranscriptFullWidthMock).toHaveBeenCalledWith({ enabled: false });
     });
+  });
+
+  test("a failed full-width save shows the saved value again", async () => {
+    const setup = renderGeneralSection({ chatTranscriptFullWidth: true });
+    const toggle = setup.view.getByRole("switch", { name: "Toggle full-width chat transcript" });
+    await settleMountLoads(setup);
+    setup.updateChatTranscriptFullWidthMock.mockRejectedValueOnce(new Error("config write failed"));
+
+    fireEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(setup.updateChatTranscriptFullWidthMock).toHaveBeenCalledWith({ enabled: false })
+    );
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+  });
+
+  test("the full-width toggle shows the shared config store value", async () => {
+    // The transcript reads the store, so the switch must not show a value from its own read.
+    const setup = renderGeneralSection({ chatTranscriptFullWidth: true });
+    const toggle = setup.view.getByRole("switch", { name: "Toggle full-width chat transcript" });
+    await settleMountLoads(setup);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    act(() => getAppConfigStore().updateOptimistically({ chatTranscriptFullWidth: false }));
+
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
   });
 
   test("shows the keep screen awake toggle only in the desktop app", async () => {
@@ -991,11 +1047,12 @@ describe("GeneralSection", () => {
     const { api, updateCoderPrefsMock } = createMockAPI({
       worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
     });
-    let rejectGetConfig: ((error?: unknown) => void) | undefined;
+    // The shared AppConfigStore fetches too, so settle every pending call.
+    const rejectGetConfig: Array<(error?: unknown) => void> = [];
     api.config.getConfig = mock(
       () =>
         new Promise<MockConfig>((_resolve, reject) => {
-          rejectGetConfig = reject;
+          rejectGetConfig.push(reject);
         })
     );
     mockApi = api;
@@ -1007,13 +1064,13 @@ describe("GeneralSection", () => {
     );
 
     await waitFor(() => {
-      expect(rejectGetConfig).toBeDefined();
+      expect(rejectGetConfig.length).toBeGreaterThan(0);
     });
 
     const trigger = getSelectTrigger(view, "Worktree archive behavior");
     expect(trigger.hasAttribute("disabled")).toBe(true);
 
-    rejectGetConfig?.(new Error("config read failed"));
+    for (const reject of rejectGetConfig) reject(new Error("config read failed"));
 
     await waitFor(() => {
       expect(trigger.hasAttribute("disabled")).toBe(false);
@@ -1034,11 +1091,11 @@ describe("GeneralSection", () => {
       worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
     });
     const loadedConfig = await getConfigMock();
-    let resolveGetConfig: ((value: MockConfig) => void) | undefined;
+    const resolveGetConfig: Array<(value: MockConfig) => void> = [];
     api.config.getConfig = mock(
       () =>
         new Promise<MockConfig>((resolve) => {
-          resolveGetConfig = resolve;
+          resolveGetConfig.push(resolve);
         })
     );
     mockApi = api;
@@ -1050,7 +1107,7 @@ describe("GeneralSection", () => {
     );
 
     await waitFor(() => {
-      expect(resolveGetConfig).toBeDefined();
+      expect(resolveGetConfig.length).toBeGreaterThan(0);
     });
 
     const trigger = getSelectTrigger(view, "Worktree archive behavior");
@@ -1059,11 +1116,13 @@ describe("GeneralSection", () => {
     fireEvent.mouseDown(trigger);
     expect(updateCoderPrefsMock).not.toHaveBeenCalled();
 
-    resolveGetConfig?.({
-      ...loadedConfig,
-      coderWorkspaceArchiveBehavior: "delete",
-      worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
-    });
+    for (const resolve of resolveGetConfig) {
+      resolve({
+        ...loadedConfig,
+        coderWorkspaceArchiveBehavior: "delete",
+        worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
+      });
+    }
 
     await waitFor(() => {
       expect(updateCoderPrefsMock).not.toHaveBeenCalled();

@@ -7,7 +7,6 @@ import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
 import * as APIModule from "@/browser/contexts/API";
-import * as AgentContextModule from "@/browser/contexts/AgentContext";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
@@ -172,12 +171,6 @@ function installWorkspaceMenuBarTestDoubles() {
 
   spyOn(APIModule, "useAPI").mockImplementation(
     () => ({ api: mockApi }) as unknown as ReturnType<typeof APIModule.useAPI>
-  );
-  spyOn(AgentContextModule, "useAgent").mockImplementation(
-    () =>
-      ({ disableWorkspaceAgents: false }) as unknown as ReturnType<
-        typeof AgentContextModule.useAgent
-      >
   );
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>

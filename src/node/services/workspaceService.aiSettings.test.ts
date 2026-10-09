@@ -19,6 +19,8 @@ import {
   type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
 import { saveWorkspaces } from "./taskService.testHarness";
+import type { ExperimentsService } from "./experimentsService";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 describe("WorkspaceService sendMessage AI settings persistence", () => {
   // Backend-initiated turns (peer messages, task wakes, heartbeats) carry the recipient's
@@ -61,6 +63,9 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
           config,
           historyService,
           aiService: createMockAIService({ isStreaming: mock(() => false) }),
+          experimentsService: {
+            isExperimentEnabled: (id: string) => id === EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
+          } as unknown as ExperimentsService,
         });
         const fakeSession = {
           ...createCompactionAdmissionMocks(),
@@ -87,6 +92,8 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
             agentId,
             model: "openai:gpt-5.2",
             thinkingLevel: "high",
+            autoModelRouting: true,
+            autoThinkingLevel: true,
             ...(skip ? { skipAiSettingsPersistence: true } : {}),
           },
           synthetic ? { synthetic: true } : undefined
@@ -114,7 +121,12 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
                 aiSettings: remembered.aiSettings,
                 aiSettingsByAgent: {
                   ...remembered.aiSettingsByAgent,
-                  [agentId]: { model: "openai:gpt-5.2", thinkingLevel: "high" },
+                  [agentId]: {
+                    model: "openai:gpt-5.2",
+                    thinkingLevel: "high",
+                    autoModelRouting: true,
+                    autoThinkingLevel: true,
+                  },
                 },
               }
         );
@@ -437,10 +449,16 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
   const workspacePath = "/tmp/proj/ws";
   let workspaceService: WorkspaceService;
   let harness: WorkspaceServiceHarness;
+  let autoRoutingEnabled: boolean;
 
   beforeEach(async () => {
+    autoRoutingEnabled = true;
     harness = await createWorkspaceServiceHarness({
       aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      experimentsService: {
+        isExperimentEnabled: (id: string) =>
+          autoRoutingEnabled && id === EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
+      } as unknown as ExperimentsService,
     });
     workspaceService = harness.service;
     await saveWorkspaces(harness.config, projectPath, [
@@ -489,6 +507,107 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     expect(readEntry()?.aiSettingsByAgent?.exec).toEqual({
       model: "openai:not-priced-model",
       thinkingLevel: "off",
+    });
+  });
+
+  const saveWithAutoChoices = () =>
+    saveWorkspaces(harness.config, projectPath, [
+      {
+        id: "ws",
+        path: workspacePath,
+        name: "ws",
+        aiSettingsByAgent: {
+          exec: {
+            model: "openai:gpt-4o-mini",
+            thinkingLevel: "off",
+            autoModelRouting: true,
+            autoThinkingLevel: true,
+          },
+        },
+      },
+    ]);
+
+  test.each([
+    [{}, {}],
+    // A plan handoff runs its send without Auto but keeps the agent's Auto choices.
+    [{ savedAutoRouting: { model: true, thinkingLevel: false } }, { autoModelRouting: true }],
+    [{ autoModelRouting: true, savedAutoRouting: { model: false, thinkingLevel: false } }, {}],
+  ])("a send saves the Auto choices it carries: %j", async (sendFlags, savedFlags) => {
+    await saveWithAutoChoices();
+    const svc = workspaceService as unknown as {
+      maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
+    };
+
+    await svc.maybePersistAISettingsFromOptions("ws", {
+      agentId: "exec",
+      model: "openai:gpt-4o-mini",
+      thinkingLevel: "off",
+      ...sendFlags,
+    });
+
+    expect(readEntry()?.aiSettingsByAgent?.exec).toEqual({
+      model: "openai:gpt-4o-mini",
+      thinkingLevel: "off",
+      ...savedFlags,
+    });
+  });
+
+  test.each([[{}], [{ savedAutoRouting: { model: false, thinkingLevel: false } }]])(
+    "a send while the Auto experiment is off keeps the saved Auto choices: %j",
+    async (sendFlags) => {
+      // The client hides Auto then, so the send says nothing about the saved choices.
+      autoRoutingEnabled = false;
+      await saveWithAutoChoices();
+      const svc = workspaceService as unknown as {
+        maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
+      };
+
+      await svc.maybePersistAISettingsFromOptions("ws", {
+        agentId: "exec",
+        model: "openai:gpt-5.2",
+        thinkingLevel: "high",
+        ...sendFlags,
+      });
+
+      expect(readEntry()?.aiSettingsByAgent?.exec).toEqual({
+        model: "openai:gpt-5.2",
+        thinkingLevel: "high",
+        autoModelRouting: true,
+        autoThinkingLevel: true,
+      });
+    }
+  );
+
+  test("a picker update keeps the saved Auto choices", async () => {
+    await saveWithAutoChoices();
+
+    const result = await workspaceService.updateAgentAISettings("ws", "exec", {
+      model: "openai:gpt-5.2",
+      thinkingLevel: "high",
+    });
+
+    expect(result.success).toBe(true);
+    expect(readEntry()?.aiSettingsByAgent?.exec).toEqual({
+      model: "openai:gpt-5.2",
+      thinkingLevel: "high",
+      autoModelRouting: true,
+      autoThinkingLevel: true,
+    });
+  });
+
+  test("an update saves the Auto choices it carries", async () => {
+    const result = await workspaceService.updateAgentAISettings("ws", "exec", {
+      model: "openai:gpt-5.2",
+      thinkingLevel: "high",
+      autoModelRouting: true,
+      autoThinkingLevel: false,
+    });
+
+    expect(result.success).toBe(true);
+    expect(readEntry()?.aiSettingsByAgent?.exec).toEqual({
+      model: "openai:gpt-5.2",
+      thinkingLevel: "high",
+      autoModelRouting: true,
     });
   });
 

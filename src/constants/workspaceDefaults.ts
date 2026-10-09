@@ -1,13 +1,11 @@
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
-import { getReviewDefaultBaseKey, getReviewDiffBaseKey } from "@/common/constants/storage";
+import { getReviewDiffBaseKey } from "@/common/constants/storage";
 import { THINKING_LEVEL_OFF } from "@/common/types/thinking";
 
 /**
  * Storage key helpers for persisted settings.
  */
 export const STORAGE_KEYS = {
-  /** Per-project default diff base for code review. Pass projectPath. */
-  reviewDefaultBase: getReviewDefaultBaseKey,
   /** Per-workspace diff base override. Pass workspaceId. */
   reviewDiffBase: getReviewDiffBaseKey,
 } as const;
@@ -19,14 +17,8 @@ Object.freeze(STORAGE_KEYS);
  *
  * These defaults are IMMUTABLE and serve as the fallback when:
  * - A new workspace is created
- * - A workspace has no stored override in localStorage
+ * - A workspace has no stored override in its metadata
  * - Settings are reset to defaults
- *
- * Per-workspace overrides persist in localStorage using keys like:
- * - `agentId:{workspaceId}`
- * - `model:{workspaceId}`
- * - `thinkingLevel:{workspaceId}`
- * - `input:{workspaceId}`
  *
  * The global defaults themselves CANNOT be changed by users.
  * Only per-workspace overrides are mutable.

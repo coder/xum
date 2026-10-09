@@ -1,12 +1,11 @@
 import { type Page } from "@playwright/test";
 import { electronExpect as expect, electronTest as test } from "../electronTest";
-import { REVIEW_SORT_ORDER_KEY } from "../../../src/common/constants/storage";
 import { STORAGE_KEYS } from "../../../src/constants/workspaceDefaults";
 import {
-  disableReviewTutorial,
   seedLargeReviewSingleFileDiff,
   seedReviewHydrationJumpDiff,
   seedReviewMarkReadIterationDiff,
+  setReviewPreferences,
 } from "../utils/reviewPerfFixture";
 
 test.skip(
@@ -41,18 +40,13 @@ async function primeReviewForHeadDiff(
 ): Promise<void> {
   const reviewDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspaceId);
 
-  await page.evaluate(
-    ({ diffBaseKey, sortOrderKey, showReadHunks }) => {
-      window.localStorage.setItem(diffBaseKey, JSON.stringify("HEAD"));
-      window.localStorage.setItem("review-show-read", JSON.stringify(showReadHunks));
-      window.localStorage.setItem(sortOrderKey, JSON.stringify("file-order"));
-    },
-    {
-      diffBaseKey: reviewDiffBaseKey,
-      sortOrderKey: REVIEW_SORT_ORDER_KEY,
-      showReadHunks: options.showReadHunks ?? true,
-    }
-  );
+  await page.evaluate((diffBaseKey) => {
+    window.localStorage.setItem(diffBaseKey, JSON.stringify("HEAD"));
+  }, reviewDiffBaseKey);
+  await setReviewPreferences(page, {
+    showRead: options.showReadHunks ?? true,
+    sortOrder: "file-order",
+  });
 }
 
 async function startHydrationSampler(
@@ -180,7 +174,6 @@ test.describe("immersive review hydration stability", () => {
     ui,
     workspace,
   }) => {
-    await disableReviewTutorial(page);
     const diffSummary = seedReviewMarkReadIterationDiff(workspace.demoProject.workspacePath);
 
     await primeReviewForHeadDiff(page, workspace.demoProject.workspaceId);
@@ -273,7 +266,6 @@ test.describe("immersive review hydration stability", () => {
     ui,
     workspace,
   }) => {
-    await disableReviewTutorial(page);
     const diffSummary = seedReviewMarkReadIterationDiff(workspace.demoProject.workspacePath);
 
     await primeReviewForHeadDiff(page, workspace.demoProject.workspaceId, { showReadHunks: false });
@@ -360,7 +352,6 @@ test.describe("immersive review hydration stability", () => {
     ui,
     workspace,
   }) => {
-    await disableReviewTutorial(page);
     const diffSummary = seedReviewHydrationJumpDiff(workspace.demoProject.workspacePath);
     const expectedFullOverlayLineCount = diffSummary.lineCount + diffSummary.deletedLines;
 
@@ -433,7 +424,6 @@ test.describe("immersive review hydration stability", () => {
     ui,
     workspace,
   }) => {
-    await disableReviewTutorial(page);
     const diffSummary = seedLargeReviewSingleFileDiff(workspace.demoProject.workspacePath, {
       hunkCount: 24,
       hunkSpacing: 20,
@@ -551,7 +541,6 @@ test.describe("immersive review hydration stability", () => {
     ui,
     workspace,
   }) => {
-    await disableReviewTutorial(page);
     const diffSummary = seedLargeReviewSingleFileDiff(workspace.demoProject.workspacePath, {
       hunkCount: 24,
       hunkSpacing: 20,

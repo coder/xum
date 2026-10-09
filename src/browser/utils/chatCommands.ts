@@ -63,9 +63,13 @@ import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/a
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import type { ChatAttachment } from "../features/ChatInput/ChatAttachments";
 import { dispatchWorkspaceSwitch } from "./workspaceEvents";
-import { getRuntimeKey } from "@/common/constants/storage";
 import { copyWorkspaceStorage } from "@/browser/utils/workspaceStorage";
-import { readPersistedRawString } from "@/browser/hooks/usePersistedState";
+import {
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSendOptions,
+  snapshotPendingAiSelection,
+} from "@/browser/utils/aiSelectionIntent";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
@@ -128,6 +132,7 @@ export interface ForkResult {
  */
 export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   const { client } = options;
+  const copyPendingAiSelectionTo = snapshotPendingAiSelection(options.sourceWorkspaceId);
   // The backend copies the source's draft file into the fork: save the latest (debounced) edit
   // first. A failed save does not block the fork, which then copies the last saved draft; the
   // source keeps the change and retries it.
@@ -146,6 +151,7 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   }
 
   copyWorkspaceStorage(options.sourceWorkspaceId, result.metadata.id);
+  copyPendingAiSelectionTo(result.metadata.id);
 
   // Get workspace info for switching
   const workspaceInfo = await client.workspace.getInfo({ workspaceId: result.metadata.id });
@@ -164,12 +170,19 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   const startMessage = options.startMessage;
   const sendMessageOptions = options.sendMessageOptions;
   if (startMessage && sendMessageOptions) {
+    const forkId = result.metadata.id;
+    const agentId = sendMessageOptions.agentId;
     requestAnimationFrame(() => {
+      // Like a composer send, the start message saves the copied picks it carries, so they end.
+      const aiSelection = getAiSelectionIntentForSendOptions(forkId, agentId, sendMessageOptions);
       client.workspace
         .sendMessage({
-          workspaceId: result.metadata.id,
+          workspaceId: forkId,
           message: startMessage,
           options: sendMessageOptions,
+        })
+        .then((sent) => {
+          if (sent.success) consumeAiSelectionIntent(forkId, agentId, aiSelection);
         })
         .catch(() => {
           // Best-effort: the user can send the message manually if this fails.
@@ -1379,18 +1392,18 @@ export async function createNewWorkspace(
     effectiveTrunk = recommendedTrunk ?? "main";
   }
 
-  // Use saved default runtime preference if not explicitly provided
-  let effectiveRuntime = options.runtime;
-  if (effectiveRuntime === undefined) {
-    const runtimeKey = getRuntimeKey(options.projectPath);
-    const savedRuntime = readPersistedRawString(runtimeKey);
-    if (savedRuntime) {
-      effectiveRuntime = savedRuntime;
-    }
+  // /new cannot ask for the host, image or config path the other runtimes need, so only a
+  // configured local default applies; anything else gets the backend's worktree default.
+  let runtime = options.runtime;
+  if (runtime === undefined) {
+    // A project default replaces the global one, as in the creation UI.
+    const projects = new Map(await options.client.projects.list());
+    const defaultRuntime =
+      projects.get(options.projectPath)?.defaultRuntime ??
+      getAppConfigStore().getSnapshot()?.defaultRuntime;
+    if (defaultRuntime === RUNTIME_MODE.LOCAL) runtime = defaultRuntime;
   }
-
-  // Parse runtime config if provided.
-  const runtimeConfig = parseRuntimeString(effectiveRuntime);
+  const runtimeConfig = parseRuntimeString(runtime);
 
   const result = await options.client.workspace.create({
     projectPath: options.projectPath,

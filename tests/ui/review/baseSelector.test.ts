@@ -21,7 +21,9 @@ import { renderReviewPanel, type RenderedApp } from "../renderReviewPanel";
 import { cleanupView, setupWorkspaceView } from "../helpers";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { STORAGE_KEYS } from "@/constants/workspaceDefaults";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import type { APIClient } from "@/browser/contexts/API";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 configureTestRetries(2);
 
@@ -132,9 +134,8 @@ describeIntegration("ReviewPanel base selector", () => {
     await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
       const cleanupDom = installDom();
 
-      // Reset persisted review-base keys so this test validates trunk auto-detection
+      // Reset the persisted workspace review base so this test validates trunk auto-detection
       // rather than inheriting state from prior tests in the same browser storage.
-      updatePersistedState(STORAGE_KEYS.reviewDefaultBase(metadata.projectPath), null);
       updatePersistedState(STORAGE_KEYS.reviewDiffBase(workspaceId), null);
 
       const view = renderReviewPanel({
@@ -243,6 +244,64 @@ describeIntegration("ReviewPanel base selector", () => {
         ).not.toBeNull();
       } finally {
         await cleanupView(view, cleanupDom);
+      }
+    });
+  }, 90_000);
+
+  test("a project default that loads after the startup gate wins over trunk detection", async () => {
+    await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
+      const cleanupDom = installDom();
+      const projectPath = metadata.projectPath;
+      const baseKey = STORAGE_KEYS.reviewDiffBase(workspaceId);
+      const setProjectBase = (base: string | null) =>
+        env.orpc.config.updateUserPreferences({
+          patches: [{ review: { defaultBaseByProject: { [projectPath]: base } } }],
+        });
+      await setProjectBase("HEAD");
+      updatePersistedState(baseKey, null);
+      // A fresh app has no snapshot; the store keeps the previous test's.
+      getAppConfigStore().clearCachedState();
+
+      let releaseConfigRead!: () => void;
+      const configReadReleased = new Promise<void>((resolve) => (releaseConfigRead = resolve));
+      const heldConfig = new Proxy(env.orpc.config, {
+        get(target, prop, receiver) {
+          if (prop !== "getConfig") return Reflect.get(target, prop, receiver) as unknown;
+          return async (...args: Parameters<APIClient["config"]["getConfig"]>) => {
+            await configReadReleased;
+            return target.getConfig(...args);
+          };
+        },
+      });
+      const apiClient = new Proxy(env.orpc, {
+        get: (target, prop, receiver) =>
+          prop === "config" ? heldConfig : (Reflect.get(target, prop, receiver) as unknown),
+      });
+      const view = renderReviewPanel({ apiClient, metadata });
+
+      try {
+        await setupReviewPanel(view, metadata, workspaceId);
+        // Trunk detection would persist a base within this window if it ran unguarded.
+        await expect(
+          waitFor(
+            () => {
+              if (readPersistedState<string | null>(baseKey, null) === null) {
+                throw new Error("workspace base not written");
+              }
+            },
+            { timeout: 3_000 }
+          )
+        ).rejects.toThrow("workspace base not written");
+
+        releaseConfigRead();
+        await waitFor(() => expect(getDisplayedBase(view.container)).toBe("HEAD"), {
+          timeout: 10_000,
+        });
+        expect(readPersistedState<string | null>(baseKey, null)).toBeNull();
+      } finally {
+        releaseConfigRead();
+        await cleanupView(view, cleanupDom);
+        await setProjectBase(null);
       }
     });
   }, 90_000);

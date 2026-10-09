@@ -9,39 +9,25 @@ import type {
 } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
-import {
-  coerceOpenAIReasoningMode,
-  type OpenAIReasoningMode,
-  type ThinkingLevel,
-} from "@/common/types/thinking";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
-import {
-  getAutoRoutingKey,
-  recordAutoRoutingChoiceForAgent,
-  setWorkspaceModelWithOrigin,
-  type AutoRoutingDimension,
-} from "@/browser/utils/modelChange";
-import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { handOffCreationAiSelection } from "@/browser/utils/aiSelectionIntent";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
-  AGENT_AI_DEFAULTS_KEY,
-  getAgentIdKey,
-  getModelKey,
-  getNotifyOnResponseAutoEnableKey,
-  getNotifyOnResponseKey,
-  getReasoningModeKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
   getPendingScopeId,
   getDraftScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
   getWorkspaceNameStateKey,
-  GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
+import {
+  getAppConfigStore,
+  getUserPreferences,
+  updateUserPreferences,
+} from "@/browser/stores/AppConfigStore";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { SendMessageError } from "@/common/types/errors";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -94,9 +80,8 @@ import {
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { resolveDevcontainerSelection } from "@/browser/utils/devcontainerSelection";
 import { getErrorMessage } from "@/common/utils/errors";
-import { normalizeAgentId } from "@/common/utils/agentIds";
+import { resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 export type CreationSendResult = { success: true } | { success: false; error?: SendMessageError };
 export type CreationInitialSlashCommand = Extract<ParsedCommand, { type: "goal-set" }> & {
@@ -120,111 +105,50 @@ interface UseCreationWorkspaceOptions {
   /** User's currently selected model (for name generation fallback) */
   userModel?: string;
   agentBaseById?: ReadonlyMap<string, string | undefined>;
-  autoRoutingEnabled?: boolean;
+}
+
+// Project defaults can still name a removed built-in agent, and only user actions write
+// preferences, so creation resolves it at read time. An empty map means the agents have not
+// loaded, and a custom agent may reuse a removed id.
+function resolveCreationAgentId(
+  agentId: string,
+  agentBaseById: ReadonlyMap<string, string | undefined> | undefined
+): string {
+  return agentBaseById && agentBaseById.size > 0
+    ? resolveRemovedBuiltinAgentId(agentId, agentBaseById.keys())
+    : agentId;
 }
 
 function syncCreationPreferences(
   projectPath: string,
   workspaceId: string,
-  agentBaseById: ReadonlyMap<string, string | undefined> | undefined,
-  autoRoutingEnabled: boolean
+  agentId: string,
+  reasoningMode: string
 ): void {
+  // Without the experiment the composer offers no Auto, so the creation scope has no choice.
+  const experiments = getAppConfigStore().getSnapshot()?.experiments;
   const projectScopeId = getProjectScopeId(projectPath);
-
-  // Sync model from project scope to workspace scope
-  // This ensures the model used for creation is persisted for future resumes
-  const projectModel = readPersistedState<string | null>(getModelKey(projectScopeId), null);
-  if (projectModel) {
-    setWorkspaceModelWithOrigin(workspaceId, projectModel, "sync");
-  }
-  const projectAgentId = readPersistedState<string | null>(getAgentIdKey(projectScopeId), null);
-  const globalDefaultAgentId = readPersistedState<string>(
-    getAgentIdKey(GLOBAL_SCOPE_ID),
-    WORKSPACE_DEFAULTS.agentId
-  );
-  const effectiveAgentId =
-    typeof projectAgentId === "string" && projectAgentId.trim().length > 0
-      ? normalizeAgentId(projectAgentId, WORKSPACE_DEFAULTS.agentId)
-      : normalizeAgentId(globalDefaultAgentId, WORKSPACE_DEFAULTS.agentId);
-  updatePersistedState(getAgentIdKey(workspaceId), effectiveAgentId);
-
-  // Preserve only creation choices that differ from configured defaults; recording
-  // defaults would prevent later Settings changes from taking effect.
-  const configuredDefaults = resolveConfiguredAiDefaults(
-    effectiveAgentId,
-    readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {}),
-    agentBaseById
-  );
-  const routingChoice: Partial<Record<AutoRoutingDimension, boolean>> = {};
-  for (const [dimension, configuredAuto] of [
-    ["model", configuredDefaults.autoModelRouting === true],
-    ["thinkingLevel", configuredDefaults.autoThinkingLevel === true],
-  ] as const) {
-    const creationAuto =
-      readPersistedState<boolean>(getAutoRoutingKey(projectScopeId, dimension), false) === true;
-    if (creationAuto) {
-      updatePersistedState(getAutoRoutingKey(workspaceId, dimension), true);
-    }
-    if (creationAuto !== configuredAuto) {
-      routingChoice[dimension] = creationAuto;
-    }
-  }
-  // Without the experiment the composer offers no Auto, so a mismatch is not a pick.
-  if (autoRoutingEnabled && Object.keys(routingChoice).length > 0) {
-    recordAutoRoutingChoiceForAgent(workspaceId, effectiveAgentId, routingChoice);
-  }
-
-  const projectThinkingLevel = readPersistedState<ThinkingLevel | null>(
-    getThinkingLevelKey(projectScopeId),
-    null
-  );
-  if (projectThinkingLevel !== null) {
-    updatePersistedState(getThinkingLevelKey(workspaceId), projectThinkingLevel);
-  }
-
-  // Mirror thinkingLevel: carry the creation-time pro reasoning-mode choice into
-  // the new workspace's scope so it survives the project→workspace transition.
-  // Coerced so a corrupt persisted value is dropped instead of copied forward.
-  const projectReasoningMode = coerceOpenAIReasoningMode(
-    readPersistedState<OpenAIReasoningMode | null>(getReasoningModeKey(projectScopeId), null)
-  );
-  if (projectReasoningMode != null) {
-    updatePersistedState(getReasoningModeKey(workspaceId), projectReasoningMode);
-  }
-
-  if (projectModel) {
-    const effectiveThinking: ThinkingLevel = projectThinkingLevel ?? "off";
-
-    type AgentSettingsCache = Partial<
-      Record<
-        string,
-        { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-      >
-    >;
-    updatePersistedState<AgentSettingsCache>(
-      getWorkspaceAISettingsByAgentKey(workspaceId),
-      (prev) => {
-        const record: AgentSettingsCache = prev && typeof prev === "object" ? prev : {};
-        return {
-          ...record,
-          [effectiveAgentId]: {
-            model: projectModel,
-            thinkingLevel: effectiveThinking,
-            ...(projectReasoningMode != null ? { reasoningMode: projectReasoningMode } : {}),
+  // Until the creation save lands the workspace has no saved settings, and project defaults
+  // hold no reasoning mode.
+  handOffCreationAiSelection(workspaceId, agentId, {
+    reasoningMode,
+    ...(experiments?.[EXPERIMENT_IDS.AUTO_MODEL_ROUTING] === true
+      ? {
+          autoRouting: {
+            model: getAutoRouting(projectScopeId, "model", agentId),
+            thinkingLevel: getAutoRouting(projectScopeId, "thinkingLevel", agentId),
           },
-        };
-      },
-      {}
-    );
-  }
+        }
+      : {}),
+  });
 
   // Auto-enable notifications if the project-level preference is set
-  const autoEnableNotifications = readPersistedState<boolean>(
-    getNotifyOnResponseAutoEnableKey(projectPath),
-    false
-  );
-  if (autoEnableNotifications) {
-    updatePersistedState(getNotifyOnResponseKey(workspaceId), true);
+  if (
+    getUserPreferences().workspaceCreation?.byProject?.[projectPath]?.notifyOnResponseAutoEnable
+  ) {
+    updateUserPreferences({
+      notifications: { notifyOnResponseByWorkspace: { [workspaceId]: true } },
+    });
   }
 }
 
@@ -263,8 +187,6 @@ interface UseCreationWorkspaceReturn {
   defaultRuntimeMode: RuntimeChoice;
   /** Set the currently selected runtime (discriminated union) */
   setSelectedRuntime: (runtime: ParsedRuntime) => void;
-  /** Set the default runtime choice for this project (persists via checkbox) */
-  setDefaultRuntimeChoice: (choice: RuntimeChoice) => void;
   toast: Toast | null;
   setToast: (toast: Toast | null) => void;
   isSending: boolean;
@@ -344,7 +266,6 @@ export function useCreationWorkspace({
   draftId,
   userModel,
   agentBaseById,
-  autoRoutingEnabled = false,
 }: UseCreationWorkspaceOptions): UseCreationWorkspaceReturn {
   const workspaceContext = useOptionalWorkspaceContext();
   const promoteWorkspaceDraft = workspaceContext?.promoteWorkspaceDraft;
@@ -362,9 +283,6 @@ export function useCreationWorkspace({
 
   // Keep router state fresh synchronously so auto-navigation checks don't lag behind route changes.
   latestRouteRef.current = { currentWorkspaceId, currentProjectId, pendingDraftId };
-  // Read through a ref so a per-render agent map does not destabilize handleSend.
-  const agentBaseByIdRef = useRef(agentBaseById);
-  agentBaseByIdRef.current = agentBaseById;
   const { api } = useAPI();
   const { getProjectConfig, refreshProjects, loading: projectsLoading } = useProjectContext();
   const { config: providersConfig } = useProvidersConfig();
@@ -383,14 +301,9 @@ export function useCreationWorkspace({
     useState<RuntimeAvailabilityState>({ status: "loading" });
 
   // Centralized draft workspace settings with automatic persistence
-  const {
-    settings,
-    coderConfigFallback,
-    sshHostFallback,
-    setSelectedRuntime,
-    setDefaultRuntimeChoice,
-    setTrunkBranch,
-  } = useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk);
+  const { settings, coderConfigFallback, sshHostFallback, setSelectedRuntime, setTrunkBranch } =
+    useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk);
+  const creationAgentId = resolveCreationAgentId(settings.agentId, agentBaseById);
 
   // Persist draft workspace name generation state per draft (so multiple drafts don't share a
   // single auto-naming/manual-name state).
@@ -573,14 +486,13 @@ export function useCreationWorkspace({
         const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
         const createTitle = normalizedTitle || undefined;
 
-        // Read send options fresh from localStorage at send time to avoid
-        // race conditions with React state updates (requestAnimationFrame batching
-        // in usePersistedState can delay state updates after model selection).
+        // Read send options at send time: render state can lag a pick made just
+        // before sending.
         // Override agentId from current draft settings so first-send uses the same
         // project/global/default resolution chain as the creation UI.
         const sendMessageOptions = {
           ...getSendOptionsFromStorage(projectScopeId),
-          agentId: settings.agentId,
+          agentId: creationAgentId,
         };
         // Use normalized override if provided, otherwise fall back to already-normalized storage model
         const normalizedOverride = optionsOverride?.model
@@ -685,11 +597,14 @@ export function useCreationWorkspace({
         const initialAiSettingsPersisted = api.workspace
           .updateAgentAISettings({
             workspaceId: metadata.id,
-            agentId: settings.agentId,
+            agentId: creationAgentId,
             aiSettings: {
               model: settings.model,
               thinkingLevel: settings.thinkingLevel,
               reasoningMode: settings.reasoningMode,
+              // The Auto choices the first send would save: an initial /goal sends no message.
+              autoModelRouting: sendMessageOptions.autoModelRouting,
+              autoThinkingLevel: sendMessageOptions.autoThinkingLevel,
             },
             persistSelectedAgentId: true,
           })
@@ -732,12 +647,7 @@ export function useCreationWorkspace({
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).
-        syncCreationPreferences(
-          projectPath,
-          metadata.id,
-          agentBaseByIdRef.current,
-          autoRoutingEnabled
-        );
+        syncCreationPreferences(projectPath, metadata.id, creationAgentId, settings.reasoningMode);
 
         // Switch to the workspace immediately after creation unless the user navigated away
         // from the draft that initiated the creation (avoid yanking focus to the new workspace).
@@ -1040,7 +950,7 @@ export function useCreationWorkspace({
       settings.selectedRuntime,
       runtimeAvailabilityState,
       setSelectedRuntime,
-      settings.agentId,
+      creationAgentId,
       settings.model,
       settings.thinkingLevel,
       settings.reasoningMode,
@@ -1049,7 +959,6 @@ export function useCreationWorkspace({
       workspaceNameState.autoGenerate,
       message,
       subProjectPath,
-      autoRoutingEnabled,
       draftId,
       promoteWorkspaceDraft,
       deleteWorkspaceDraft,
@@ -1109,7 +1018,6 @@ export function useCreationWorkspace({
     sshHostFallback,
     defaultRuntimeMode: settings.defaultRuntimeMode,
     setSelectedRuntime,
-    setDefaultRuntimeChoice,
     toast,
     setToast,
     isSending,

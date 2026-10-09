@@ -6,30 +6,30 @@ import { ThinkingProvider } from "./ThinkingContext";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { AgentProvider, type AgentContextValue } from "@/browser/contexts/AgentContext";
 import { ProviderOptionsProvider } from "@/browser/contexts/ProviderOptionsContext";
-import {
-  WorkspaceContext,
-  type WorkspaceContext as WorkspaceContextValue,
-} from "@/browser/contexts/WorkspaceContext";
 import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { ThinkingLevel } from "@/common/types/thinking";
-import {
-  getAutoThinkingLevelKey,
-  getModelKey,
-  getProjectScopeId,
-  getReasoningModeKey,
-  getThinkingLevelByModelKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
-} from "@/common/constants/storage";
+import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
+import { getProjectScopeId } from "@/common/constants/storage";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
-import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import {
+  createTestApiClient,
+  createTestPreferencesConfig,
+  type TestApiOverrides,
+} from "@/browser/testUtils";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
+import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
+import {
+  getPendingAiSelection,
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+  setWorkspaceAiMetadata,
+  type WorkspaceAiMetadata,
+} from "@/browser/utils/aiSelectionIntent";
 
 let currentClientMock: TestApiOverrides<APIClient> = {};
-let metadataMap = new Map<string, FrontendWorkspaceMetadata>();
 const METADATA_WAIT_OPTIONS = { timeout: 5000, interval: 50 };
 
 // Setup basic DOM environment for testing-library
@@ -65,13 +65,6 @@ interface TestProps {
   workspaceId: string;
 }
 
-type WorkspaceUpdateAgentAISettingsArgs = Parameters<
-  APIClient["workspace"]["updateAgentAISettings"]
->[0];
-type WorkspaceUpdateAgentAISettingsResult = Awaited<
-  ReturnType<APIClient["workspace"]["updateAgentAISettings"]>
->;
-
 const TestComponent: React.FC<TestProps> = (props) => {
   const [thinkingLevel] = useThinkingLevel();
   return (
@@ -90,8 +83,6 @@ const agentContextValue: AgentContextValue = {
   loadFailed: false,
   refresh: () => Promise.resolve(),
   refreshing: false,
-  disableWorkspaceAgents: false,
-  setDisableWorkspaceAgents: () => undefined,
 };
 
 const ThinkingSetterComponent: React.FC = () => {
@@ -113,225 +104,66 @@ const ReasoningModeComponent: React.FC = () => {
   return <div data-testid="reasoning-mode">{reasoningMode}</div>;
 };
 
-function renderWithAPI(children: React.ReactNode) {
+function renderWithAPI(children: React.ReactNode, preferences?: UserPreferences) {
   return render(
-    <APIProvider client={createTestApiClient(currentClientMock)}>{children}</APIProvider>
-  );
-}
-
-function createWorkspaceMetadata(
-  overrides: Partial<FrontendWorkspaceMetadata> & Pick<FrontendWorkspaceMetadata, "id">
-): FrontendWorkspaceMetadata {
-  return {
-    projectPath: "/tmp/project",
-    projectName: "project",
-    name: "main",
-    namedWorkspacePath: "/tmp/project/main",
-    createdAt: "2026-01-01T00:00:00.000Z",
-    runtimeConfig: { type: "local", srcBaseDir: "/tmp/.mux/src" },
-    ...overrides,
-  };
-}
-
-function setWorkspaceMetadata(metadata: FrontendWorkspaceMetadata) {
-  metadataMap = new Map([[metadata.id, metadata]]);
-}
-
-function createEmptyAsyncIterable<T>(): AsyncIterable<T> {
-  return {
-    async *[Symbol.asyncIterator](): AsyncIterator<T> {
-      await Promise.resolve();
-      if (Date.now() < 0) yield undefined as T;
-    },
-  };
-}
-
-type WorkspaceAISettingsByAgentCache = Partial<
-  Record<string, { model: string; thinkingLevel: ThinkingLevel }>
->;
-
-function applyWorkspaceStorageOverrides(props: {
-  workspaceId: string;
-  modelOverride?: string | null;
-  thinkingOverride?: "off" | null;
-}) {
-  if (props.modelOverride !== undefined) {
-    if (props.modelOverride == null) {
-      window.localStorage.removeItem(getModelKey(props.workspaceId));
-    } else {
-      updatePersistedState(getModelKey(props.workspaceId), props.modelOverride);
-    }
-  }
-
-  if (props.thinkingOverride !== undefined) {
-    if (props.thinkingOverride == null) {
-      window.localStorage.removeItem(getThinkingLevelKey(props.workspaceId));
-    } else {
-      updatePersistedState(getThinkingLevelKey(props.workspaceId), props.thinkingOverride);
-    }
-  }
-}
-
-function createWorkspaceContextValue(): WorkspaceContextValue {
-  return {
-    workspaceMetadata: metadataMap,
-    loading: false,
-    loaded: true,
-    loadError: null,
-    archivingWorkspaceIds: new Set<string>(),
-    workspaceDraftPromotionsByProject: {},
-    promoteWorkspaceDraft: () => undefined,
-    createWorkspace: () =>
-      Promise.resolve({
-        projectPath: "/tmp/project",
-        projectName: "project",
-        namedWorkspacePath: "/tmp/project/main",
-        workspaceId: "created-workspace",
-      }),
-    removeWorkspace: () => Promise.resolve({ success: true }),
-    removeSubagent: () => Promise.resolve({ success: true }),
-    updateWorkspaceTitle: () => Promise.resolve({ success: true }),
-    setWorkspacePinned: () => Promise.resolve({ success: true }),
-    reorderPinnedWorkspaces: () => Promise.resolve({ success: true }),
-    preflightArchiveWorkspace: () => Promise.resolve({ success: true }),
-    archiveWorkspace: () => Promise.resolve({ success: true }),
-    unarchiveWorkspace: () => Promise.resolve({ success: true }),
-    refreshWorkspaceMetadata: () => Promise.resolve(),
-    setWorkspaceMetadata: () => undefined,
-    selectedWorkspace: null,
-    setSelectedWorkspace: () => undefined,
-    pendingNewWorkspaceProject: null,
-    pendingNewWorkspaceSubProjectPath: null,
-    pendingNewWorkspaceDraftId: null,
-    beginWorkspaceCreation: () => undefined,
-    workspaceDraftsByProject: {},
-    createWorkspaceDraft: () => undefined,
-    updateWorkspaceDraftSubProject: () => undefined,
-    openWorkspaceDraft: () => undefined,
-    deleteWorkspaceDraft: () => undefined,
-    getWorkspaceInfo: (workspaceId) => Promise.resolve(metadataMap.get(workspaceId) ?? null),
-  };
-}
-
-function readWorkspaceAISettingsCache(workspaceId: string): WorkspaceAISettingsByAgentCache {
-  return readPersistedState<WorkspaceAISettingsByAgentCache>(
-    getWorkspaceAISettingsByAgentKey(workspaceId),
-    {}
-  );
-}
-
-function createWorkspaceClient(): APIClient {
-  const workspaceOverrides = currentClientMock.workspace ?? {};
-  const projectOverrides = currentClientMock.projects ?? {};
-  const serverOverrides = currentClientMock.server ?? {};
-
-  return createTestApiClient({
-    ...currentClientMock,
-    workspace: {
-      list: () => Promise.resolve(Array.from(metadataMap.values())),
-      onMetadata: () => Promise.resolve(createEmptyAsyncIterable()),
-      onChat: () => Promise.resolve(createEmptyAsyncIterable()),
-      getSessionUsage: () => Promise.resolve(undefined),
-      updateAgentAISettings: mock(() =>
-        Promise.resolve({ success: true as const, data: undefined })
-      ),
-      activity: {
-        list: () => Promise.resolve({}),
-        subscribe: () => Promise.resolve(createEmptyAsyncIterable()),
-        ...workspaceOverrides.activity,
-      },
-      truncateHistory: () => Promise.resolve({ success: true as const, data: undefined }),
-      interruptStream: () => Promise.resolve({ success: true as const, data: undefined }),
-      ...workspaceOverrides,
-    },
-    projects: {
-      list: () => Promise.resolve([]),
-      listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
-      secrets: {
-        get: () => Promise.resolve([]),
-        ...projectOverrides.secrets,
-      },
-      ...projectOverrides,
-    },
-    server: {
-      getLaunchProject: () => Promise.resolve(null),
-      ...serverOverrides,
-    },
-  });
-}
-
-function renderWithWorkspaceMetadata(props: {
-  workspaceId: string;
-  modelOverride?: string | null;
-  thinkingOverride?: "off" | null;
-  children: React.ReactNode;
-}) {
-  applyWorkspaceStorageOverrides(props);
-
-  return render(
-    <APIProvider client={createWorkspaceClient()}>
-      <WorkspaceContext.Provider value={createWorkspaceContextValue()}>
-        {props.children}
-      </WorkspaceContext.Provider>
+    <APIProvider
+      client={createTestApiClient({
+        config: createTestPreferencesConfig(preferences),
+        ...currentClientMock,
+      })}
+    >
+      {children}
     </APIProvider>
   );
 }
 
+function seedWorkspace(workspaceId: string, aiSettings?: WorkspaceAiMetadata["aiSettings"]) {
+  setWorkspaceAiMetadata(workspaceId, { projectPath: "/tmp/project", aiSettings });
+}
+
 describe("ThinkingContext", () => {
   // Make getDefaultModel deterministic.
-  // (getDefaultModel reads from the global "model-default" localStorage key.)
   beforeEach(() => {
-    currentClientMock = {
-      workspace: {
-        updateAgentAISettings: mock(() =>
-          Promise.resolve({
-            success: true as const,
-            data: undefined,
-          })
-        ),
-      },
-    };
-    metadataMap = new Map();
+    currentClientMock = {};
     window.localStorage.clear();
-    window.localStorage.setItem("model-default", JSON.stringify("openai:default"));
+    getAppConfigStore().updateOptimistically({ defaultModel: "openai:default" });
   });
 
   afterEach(() => {
     cleanup();
-    metadataMap = new Map();
+    getAppConfigStore().updateOptimistically({
+      userPreferences: undefined,
+      defaultModel: undefined,
+    });
+    resetAiSelectionIntentForTests();
     currentClientMock = {};
   });
 
-  test("uses metadata model before global default but keeps explicit model", async () => {
+  test("uses metadata model before global default but keeps an unsent pick", async () => {
     const cases = [
-      { workspaceId: "ws-model-metadata", override: null, expected: "openai:gpt-5.5" },
+      { workspaceId: "ws-model-metadata", pick: null, expected: "openai:gpt-5.5" },
       {
         workspaceId: "ws-model-explicit",
-        override: "anthropic:explicit-model",
+        pick: "anthropic:explicit-model",
         expected: "anthropic:explicit-model",
       },
     ];
 
     for (const testCase of cases) {
-      const metadata = createWorkspaceMetadata({
-        id: testCase.workspaceId,
-        aiSettings: { model: "openai:gpt-5.5", thinkingLevel: "high" },
-      });
-      setWorkspaceMetadata(metadata);
+      seedWorkspace(testCase.workspaceId, { model: "openai:gpt-5.5", thinkingLevel: "high" });
+      if (testCase.pick != null) {
+        markAiSelectionIntent(testCase.workspaceId, "model", testCase.pick);
+      }
 
-      const view = renderWithWorkspaceMetadata({
-        workspaceId: testCase.workspaceId,
-        modelOverride: testCase.override,
-        children: (
-          <ProviderOptionsProvider>
-            <AgentProvider value={agentContextValue}>
-              <ThinkingProvider workspaceId={testCase.workspaceId}>
-                <SendOptionsComponent workspaceId={testCase.workspaceId} />
-              </ThinkingProvider>
-            </AgentProvider>
-          </ProviderOptionsProvider>
-        ),
-      });
+      const view = renderWithAPI(
+        <ProviderOptionsProvider>
+          <AgentProvider value={agentContextValue}>
+            <ThinkingProvider workspaceId={testCase.workspaceId}>
+              <SendOptionsComponent workspaceId={testCase.workspaceId} />
+            </ThinkingProvider>
+          </AgentProvider>
+        </ProviderOptionsProvider>
+      );
 
       await waitFor(() => {
         expect(view.getByTestId("base-model").textContent).toBe(testCase.expected);
@@ -340,137 +172,57 @@ describe("ThinkingContext", () => {
     }
   });
 
-  test("setting thinking uses metadata model before global default", async () => {
+  test("setting thinking keeps the pick in memory without a backend write", async () => {
     const workspaceId = "ws-set-thinking-metadata-model";
-    updatePersistedState(getReasoningModeKey(workspaceId), "pro");
-    const updateAgentAISettings = mock<
-      (args: WorkspaceUpdateAgentAISettingsArgs) => Promise<WorkspaceUpdateAgentAISettingsResult>
-    >(() =>
-      Promise.resolve({
-        success: true as const,
-        data: undefined,
-      })
+    const updateAgentAISettings = mock(() =>
+      Promise.resolve({ success: true as const, data: undefined })
     );
-    currentClientMock = {
-      workspace: { updateAgentAISettings },
-    };
+    currentClientMock = { workspace: { updateAgentAISettings } };
+    seedWorkspace(workspaceId, { model: "metadataModel:abc", thinkingLevel: "high" });
 
-    setWorkspaceMetadata(
-      createWorkspaceMetadata({
-        id: workspaceId,
-        aiSettings: { model: "metadataModel:abc", thinkingLevel: "high" },
-      })
+    const view = renderWithAPI(
+      <ThinkingProvider workspaceId={workspaceId}>
+        <ThinkingSetterComponent />
+        <TestComponent workspaceId={workspaceId} />
+      </ThinkingProvider>
     );
-
-    const view = renderWithWorkspaceMetadata({
-      workspaceId,
-      modelOverride: null,
-      children: (
-        <ThinkingProvider workspaceId={workspaceId}>
-          <ThinkingSetterComponent />
-        </ThinkingProvider>
-      ),
-    });
 
     const button = await view.findByTestId("set-thinking-medium", undefined, METADATA_WAIT_OPTIONS);
     act(() => {
       button.click();
     });
 
-    const expectedSettings = {
-      model: "metadataModel:abc",
-      thinkingLevel: "medium" as const,
-      reasoningMode: "pro" as const,
-    };
     await waitFor(() => {
-      expect(readWorkspaceAISettingsCache(workspaceId).exec).toEqual(expectedSettings);
+      expect(view.getByTestId("thinking").textContent).toBe(`medium:${workspaceId}`);
     }, METADATA_WAIT_OPTIONS);
-
+    expect(getPendingAiSelection(workspaceId, "exec", "thinkingLevel")).toBe("medium");
     expect(updateAgentAISettings).not.toHaveBeenCalled();
   });
 
-  test("setting thinking preserves an explicit Coder gateway model identity", async () => {
-    // A cross-typed instance ({name: "openai", type: "anthropic"}) makes
-    // coder:openai/<claude> a valid gateway selection. Changing the thinking
-    // level must persist that identity intact — normalizeToCanonical would
-    // rewrite it to openai:<claude> from the name alone and silently reroute
-    // the workspace to direct OpenAI.
-    const workspaceId = "ws-set-thinking-coder-model";
-    const coderModel = "coder:openai/claude-opus-4-5";
-    const updateAgentAISettings = mock<
-      (args: WorkspaceUpdateAgentAISettingsArgs) => Promise<WorkspaceUpdateAgentAISettingsResult>
-    >(() =>
-      Promise.resolve({
-        success: true as const,
-        data: undefined,
-      })
-    );
-    currentClientMock = {
-      workspace: { updateAgentAISettings },
-    };
-
-    setWorkspaceMetadata(
-      createWorkspaceMetadata({
-        id: workspaceId,
-        aiSettings: { model: coderModel, thinkingLevel: "high" },
-      })
-    );
-
-    const view = renderWithWorkspaceMetadata({
-      workspaceId,
-      modelOverride: null,
-      children: (
-        <ThinkingProvider workspaceId={workspaceId}>
-          <ThinkingSetterComponent />
-        </ThinkingProvider>
-      ),
-    });
-
-    const button = await view.findByTestId("set-thinking-medium", undefined, METADATA_WAIT_OPTIONS);
-    act(() => {
-      button.click();
-    });
-
-    const expectedSettings = {
-      model: coderModel,
-      thinkingLevel: "medium" as const,
-      reasoningMode: "standard" as const,
-    };
-    await waitFor(() => {
-      expect(readWorkspaceAISettingsCache(workspaceId).exec).toEqual(expectedSettings);
-    }, METADATA_WAIT_OPTIONS);
-    expect(updateAgentAISettings).not.toHaveBeenCalled();
-  });
-
-  test("self-heals corrupt persisted reasoningMode to standard but keeps valid pro", async () => {
-    // Corrupt persisted values (e.g. from a future downgrade) must coerce to
+  test("self-heals a corrupt saved reasoningMode to standard but keeps valid pro", async () => {
+    // Corrupt saved values (e.g. from a future downgrade) must coerce to
     // "standard" instead of flowing into SendMessageOptionsSchema and bricking sends.
     const cases = [
-      { workspaceId: "ws-reasoning-corrupt", persisted: "ultra", expected: "standard" },
-      { workspaceId: "ws-reasoning-valid", persisted: "pro", expected: "pro" },
+      { workspaceId: "ws-reasoning-corrupt", saved: "ultra", expected: "standard" },
+      { workspaceId: "ws-reasoning-valid", saved: "pro", expected: "pro" },
     ];
 
     for (const testCase of cases) {
-      const metadata = createWorkspaceMetadata({ id: testCase.workspaceId });
-      setWorkspaceMetadata(metadata);
-      window.localStorage.setItem(
-        getReasoningModeKey(testCase.workspaceId),
-        JSON.stringify(testCase.persisted)
-      );
-
-      const view = renderWithWorkspaceMetadata({
-        workspaceId: testCase.workspaceId,
-        modelOverride: null,
-        children: (
-          <ProviderOptionsProvider>
-            <AgentProvider value={agentContextValue}>
-              <ThinkingProvider workspaceId={testCase.workspaceId}>
-                <ReasoningModeComponent />
-              </ThinkingProvider>
-            </AgentProvider>
-          </ProviderOptionsProvider>
-        ),
+      seedWorkspace(testCase.workspaceId, {
+        model: "openai:gpt-5.5",
+        thinkingLevel: "high",
+        reasoningMode: testCase.saved as OpenAIReasoningMode,
       });
+
+      const view = renderWithAPI(
+        <ProviderOptionsProvider>
+          <AgentProvider value={agentContextValue}>
+            <ThinkingProvider workspaceId={testCase.workspaceId}>
+              <ReasoningModeComponent />
+            </ThinkingProvider>
+          </AgentProvider>
+        </ProviderOptionsProvider>
+      );
 
       await waitFor(() => {
         expect(view.getByTestId("reasoning-mode").textContent).toBe(testCase.expected);
@@ -479,49 +231,9 @@ describe("ThinkingContext", () => {
     }
   });
 
-  test("uses metadata thinking before off but keeps explicit thinking", async () => {
-    const cases = [
-      {
-        workspaceId: "ws-thinking-metadata",
-        override: null,
-        expected: "high:ws-thinking-metadata",
-      },
-      {
-        workspaceId: "ws-thinking-explicit",
-        override: "off" as const,
-        expected: "off:ws-thinking-explicit",
-      },
-    ];
-
-    for (const testCase of cases) {
-      const metadata = createWorkspaceMetadata({
-        id: testCase.workspaceId,
-        aiSettings: { model: "openai:gpt-5.5", thinkingLevel: "high" },
-      });
-      setWorkspaceMetadata(metadata);
-
-      const view = renderWithWorkspaceMetadata({
-        workspaceId: testCase.workspaceId,
-        thinkingOverride: testCase.override,
-        children: (
-          <ThinkingProvider workspaceId={testCase.workspaceId}>
-            <TestComponent workspaceId={testCase.workspaceId} />
-          </ThinkingProvider>
-        ),
-      });
-
-      await waitFor(() => {
-        expect(view.getByTestId("thinking").textContent).toBe(testCase.expected);
-      }, METADATA_WAIT_OPTIONS);
-      cleanup();
-    }
-  });
-
   test("switching models does not remount children", async () => {
     const workspaceId = "ws-1";
-
-    updatePersistedState(getModelKey(workspaceId), "openai:gpt-5.2");
-    updatePersistedState(getThinkingLevelKey(workspaceId), "high");
+    seedWorkspace(workspaceId, { model: "openai:gpt-5.2", thinkingLevel: "high" });
 
     let unmounts = 0;
 
@@ -547,7 +259,7 @@ describe("ThinkingContext", () => {
     });
 
     act(() => {
-      updatePersistedState(getModelKey(workspaceId), "anthropic:claude-3.5");
+      markAiSelectionIntent(workspaceId, "model", "anthropic:claude-3.5");
     });
 
     // Thinking is workspace-scoped (not per-model), so switching models should not change it.
@@ -556,36 +268,6 @@ describe("ThinkingContext", () => {
     });
 
     expect(unmounts).toBe(0);
-  });
-  test("migrates legacy per-model thinking to the workspace-scoped key", async () => {
-    const workspaceId = "ws-1";
-
-    updatePersistedState(getModelKey(workspaceId), "openai:gpt-5.2");
-    updatePersistedState(getThinkingLevelByModelKey("openai:gpt-5.2"), "low");
-
-    const view = renderWithAPI(
-      <ThinkingProvider workspaceId={workspaceId}>
-        <TestComponent workspaceId={workspaceId} />
-      </ThinkingProvider>
-    );
-
-    await waitFor(() => {
-      expect(view.getByTestId("thinking").textContent).toBe("low:ws-1");
-    });
-
-    // Migration should have populated the new workspace-scoped key.
-    const persisted = window.localStorage.getItem(getThinkingLevelKey(workspaceId));
-    expect(persisted).toBeTruthy();
-    expect(JSON.parse(persisted!)).toBe("low");
-
-    // Switching models should not change the workspace-scoped value.
-    act(() => {
-      updatePersistedState(getModelKey(workspaceId), "anthropic:claude-3.5");
-    });
-
-    await waitFor(() => {
-      expect(view.getByTestId("thinking").textContent).toBe("low:ws-1");
-    });
   });
 
   test("cycles thinking with metadata model before global default", async () => {
@@ -596,35 +278,13 @@ describe("ThinkingContext", () => {
     const effectiveThinkingLevel = enforceThinkingPolicy(metadataModel, currentThinkingLevel);
     const expectedThinkingLevel =
       allowed[(allowed.indexOf(effectiveThinkingLevel) + 1) % allowed.length];
+    seedWorkspace(workspaceId, { model: metadataModel, thinkingLevel: currentThinkingLevel });
 
-    const updateAgentAISettings = mock<
-      (args: WorkspaceUpdateAgentAISettingsArgs) => Promise<WorkspaceUpdateAgentAISettingsResult>
-    >(() =>
-      Promise.resolve({
-        success: true as const,
-        data: undefined,
-      })
+    const view = renderWithAPI(
+      <ThinkingProvider workspaceId={workspaceId}>
+        <TestComponent workspaceId={workspaceId} />
+      </ThinkingProvider>
     );
-    currentClientMock = {
-      workspace: { updateAgentAISettings },
-    };
-
-    setWorkspaceMetadata(
-      createWorkspaceMetadata({
-        id: workspaceId,
-        aiSettings: { model: metadataModel, thinkingLevel: currentThinkingLevel },
-      })
-    );
-
-    const view = renderWithWorkspaceMetadata({
-      workspaceId,
-      modelOverride: null,
-      children: (
-        <ThinkingProvider workspaceId={workspaceId}>
-          <TestComponent workspaceId={workspaceId} />
-        </ThinkingProvider>
-      ),
-    });
 
     await waitFor(() => {
       expect(view.getByTestId("thinking").textContent).toBe(
@@ -638,16 +298,11 @@ describe("ThinkingContext", () => {
       );
     });
 
-    const expectedSettings = {
-      model: metadataModel,
-      thinkingLevel: expectedThinkingLevel,
-      reasoningMode: "standard" as const,
-    };
     await waitFor(() => {
-      expect(readWorkspaceAISettingsCache(workspaceId).exec).toEqual(expectedSettings);
+      expect(view.getByTestId("thinking").textContent).toBe(
+        `${expectedThinkingLevel}:${workspaceId}`
+      );
     }, METADATA_WAIT_OPTIONS);
-
-    expect(updateAgentAISettings).not.toHaveBeenCalled();
   });
 
   test("requests a mid-turn override for the active workspace turn on slider changes", async () => {
@@ -658,26 +313,14 @@ describe("ThinkingContext", () => {
         thinkingLevel: ThinkingLevel;
       }) => Promise<{ success: true; data: { accepted: boolean } }>
     >(() => Promise.resolve({ success: true as const, data: { accepted: true } }));
-    currentClientMock = {
-      workspace: {
-        updateAgentAISettings: mock(() =>
-          Promise.resolve({ success: true as const, data: undefined })
-        ),
-        setActiveTurnThinkingLevel,
-      },
-    };
+    currentClientMock = { workspace: { setActiveTurnThinkingLevel } };
+    seedWorkspace(workspaceId);
 
-    setWorkspaceMetadata(createWorkspaceMetadata({ id: workspaceId }));
-
-    const view = renderWithWorkspaceMetadata({
-      workspaceId,
-      modelOverride: null,
-      children: (
-        <ThinkingProvider workspaceId={workspaceId}>
-          <ThinkingSetterComponent />
-        </ThinkingProvider>
-      ),
-    });
+    const view = renderWithAPI(
+      <ThinkingProvider workspaceId={workspaceId}>
+        <ThinkingSetterComponent />
+      </ThinkingProvider>
+    );
 
     const button = await view.findByTestId("set-thinking-medium", undefined, METADATA_WAIT_OPTIONS);
     act(() => {
@@ -715,12 +358,7 @@ describe("ThinkingContext", () => {
     // Project/global scopes have no active turn to override; the route must
     // not fire (persisted settings alone drive the next turn).
     await waitFor(() => {
-      expect(
-        readPersistedState<ThinkingLevel | null>(
-          getThinkingLevelKey(getProjectScopeId(projectPath)),
-          null
-        )
-      ).toBe("medium");
+      expect(getUserPreferences().ai?.projectDefaults?.[projectPath]?.thinkingLevel).toBe("medium");
     }, METADATA_WAIT_OPTIONS);
     expect(setActiveTurnThinkingLevel).not.toHaveBeenCalled();
   });
@@ -728,18 +366,17 @@ describe("ThinkingContext", () => {
   test("cycles thinking level via keybind in project-scoped (creation) flow", async () => {
     const projectPath = "/Users/dev/my-project";
 
-    // Force a model with a multi-level thinking policy.
-    updatePersistedState(getModelKey(getProjectScopeId(projectPath)), "openai:gpt-4.1");
-
     const ProjectChild: React.FC = () => {
       const [thinkingLevel] = useThinkingLevel();
       return <div data-testid="thinking-project">{thinkingLevel}</div>;
     };
 
+    // Force a model with a multi-level thinking policy.
     const view = renderWithAPI(
       <ThinkingProvider projectPath={projectPath}>
         <ProjectChild />
-      </ThinkingProvider>
+      </ThinkingProvider>,
+      { ai: { projectDefaults: { [projectPath]: { model: "openai:gpt-4.1" } } } }
     );
 
     await waitFor(() => {
@@ -762,13 +399,13 @@ describe("ThinkingContext", () => {
   test("a concrete pick via setter or keybind leaves Auto thinking routing", async () => {
     const projectPath = "/Users/dev/auto-thinking";
     const scopeId = getProjectScopeId(projectPath);
-    updatePersistedState(getModelKey(scopeId), "openai:gpt-4.1");
-    updatePersistedState(getAutoThinkingLevelKey(scopeId), true);
+    setAutoRoutingChoice(scopeId, "thinkingLevel", true);
 
     const view = renderWithAPI(
       <ThinkingProvider projectPath={projectPath}>
         <ThinkingSetterComponent />
-      </ThinkingProvider>
+      </ThinkingProvider>,
+      { ai: { projectDefaults: { [projectPath]: { model: "openai:gpt-4.1" } } } }
     );
 
     const button = await view.findByTestId("set-thinking-medium", undefined, METADATA_WAIT_OPTIONS);
@@ -776,17 +413,17 @@ describe("ThinkingContext", () => {
       button.click();
     });
     await waitFor(() => {
-      expect(readPersistedState<boolean>(getAutoThinkingLevelKey(scopeId), true)).toBe(false);
+      expect(getAutoRouting(scopeId, "thinkingLevel")).toBe(false);
     }, METADATA_WAIT_OPTIONS);
 
-    updatePersistedState(getAutoThinkingLevelKey(scopeId), true);
+    setAutoRoutingChoice(scopeId, "thinkingLevel", true);
     act(() => {
       window.dispatchEvent(
         new window.KeyboardEvent("keydown", { key: "T", ctrlKey: true, shiftKey: true })
       );
     });
     await waitFor(() => {
-      expect(readPersistedState<boolean>(getAutoThinkingLevelKey(scopeId), true)).toBe(false);
+      expect(getAutoRouting(scopeId, "thinkingLevel")).toBe(false);
     }, METADATA_WAIT_OPTIONS);
   });
 });

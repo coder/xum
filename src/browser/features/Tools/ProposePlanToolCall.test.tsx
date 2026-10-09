@@ -13,25 +13,26 @@ import * as DiffRendererModule from "@/browser/features/Shared/DiffRenderer";
 import * as ReviewTypesModule from "@/common/types/review";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import {
-  AGENT_AI_DEFAULTS_KEY,
-  getAgentIdKey,
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
-  getModelKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
-} from "@/common/constants/storage";
+  getPendingAiSelection,
+  getWorkspaceAgentId,
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+  setWorkspaceAiMetadata,
+} from "@/browser/utils/aiSelectionIntent";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import {
   createTestApiClient,
   createTestConfig,
   type TestClientConfig,
   resetTestExperiments,
+  setTestAgentAiDefaults,
   setTestExperiment,
 } from "@/browser/testUtils";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 
@@ -231,8 +232,6 @@ function wrapToolCall(content: JSX.Element, agentId = "plan") {
         loadFailed: false,
         refresh: () => Promise.resolve(),
         refreshing: false,
-        disableWorkspaceAgents: false,
-        setDisableWorkspaceAgents: noop,
       }}
     >
       <TooltipProvider>{content}</TooltipProvider>
@@ -277,7 +276,18 @@ function createMockApi(
   } = {}
 ): MockApi {
   return {
-    config: { getConfig: () => Promise.resolve(overrides.config ?? DEFAULT_CONFIG) },
+    // APIProvider connects AppConfigStore, whose fetch must keep the agent defaults and
+    // experiments a test seeded.
+    config: {
+      getConfig: () =>
+        Promise.resolve(
+          overrides.config ?? {
+            ...DEFAULT_CONFIG,
+            agentAiDefaults: getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {},
+            experiments: getAppConfigStore().getSnapshot()?.experiments ?? {},
+          }
+        ),
+    },
     workspace: {
       getPlanContent:
         overrides.getPlanContent ??
@@ -309,10 +319,15 @@ function renderCompletedPlan(props: Partial<ProposePlanProps> = {}) {
   });
 }
 
-function startInPlanMode(workspaceId = WORKSPACE_ID, model?: string, thinkingLevel?: string) {
-  window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("plan"));
-  if (model) updatePersistedState(getModelKey(workspaceId), model);
-  if (thinkingLevel) updatePersistedState(getThinkingLevelKey(workspaceId), thinkingLevel);
+function startInPlanMode(
+  workspaceId = WORKSPACE_ID,
+  model?: string,
+  thinkingLevel: ThinkingLevel = "off"
+) {
+  setWorkspaceAiMetadata(workspaceId, {
+    agentId: "plan",
+    ...(model ? { aiSettingsByAgent: { plan: { model, thinkingLevel } } } : {}),
+  });
 }
 
 function recordSendMessage(calls: SendMessageArgs[]): MockApi["workspace"]["sendMessage"] {
@@ -360,6 +375,8 @@ describe("ProposePlanToolCall", () => {
 
   afterEach(async () => {
     resetTestExperiments();
+    resetAiSelectionIntentForTests();
+    setTestAgentAiDefaults(undefined);
     cleanup();
     await restoreProposePlanModuleMocks();
     barrierSpy?.mockRestore();
@@ -556,7 +573,7 @@ describe("ProposePlanToolCall", () => {
     const execThinking = "low";
 
     startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: execModel, thinkingLevel: execThinking },
     });
 
@@ -577,24 +594,32 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.autoThinkingLevel).toBe(false);
 
     // Clicking Implement should switch the workspace agent to exec.
-    //
-    // Note: some tests in this repo mock the `usePersistedState` module globally. In that case,
-    // `updatePersistedState` won't actually write to localStorage here, so we assert the call.
-    const agentKey = getAgentIdKey(WORKSPACE_ID);
-    const modelKey = getModelKey(WORKSPACE_ID);
-    const thinkingKey = getThinkingLevelKey(WORKSPACE_ID);
-    const updatePersistedStateMaybeMock = updatePersistedState as unknown as {
-      mock?: { calls: unknown[][] };
-    };
-    if (updatePersistedStateMaybeMock.mock) {
-      expect(updatePersistedState).toHaveBeenCalledWith(agentKey, "exec");
-      expect(updatePersistedState).toHaveBeenCalledWith(modelKey, execModel);
-      expect(updatePersistedState).toHaveBeenCalledWith(thinkingKey, execThinking);
-    } else {
-      expect(JSON.parse(window.localStorage.getItem(agentKey)!)).toBe("exec");
-      expect(JSON.parse(window.localStorage.getItem(modelKey)!)).toBe(execModel);
-      expect(JSON.parse(window.localStorage.getItem(thinkingKey)!)).toBe(execThinking);
-    }
+    expect(getWorkspaceAgentId(WORKSPACE_ID)).toBe("exec");
+  });
+
+  test("Implement sends the unsent Exec pick and ends it once it is saved", async () => {
+    const pickedModel = "openai:gpt-5.2-pro";
+    // Picked while Exec was the agent, then the workspace switched to Plan.
+    markAiSelectionIntent(WORKSPACE_ID, "model", pickedModel);
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    expect(sendMessageCalls[0]?.options.model).toBe(pickedModel);
+    setWorkspaceAiMetadata(WORKSPACE_ID, {
+      agentId: "exec",
+      aiSettingsByAgent: { exec: { model: pickedModel, thinkingLevel: "high" } },
+    });
+    await waitFor(() =>
+      expect(getPendingAiSelection(WORKSPACE_ID, "exec", "model")).toBeUndefined()
+    );
+    // The handoff's agent pick ended with the save too, so a later agent change applies.
+    setWorkspaceAiMetadata(WORKSPACE_ID, { agentId: "plan" });
+    expect(getWorkspaceAgentId(WORKSPACE_ID)).toBe("plan");
   });
 
   test("Implement keeps the exec model when the composer has Auto routing selected", async () => {
@@ -602,9 +627,9 @@ describe("ProposePlanToolCall", () => {
     // drop the Auto flag.
     const execModel = "openai:gpt-5.2";
     startInPlanMode(WORKSPACE_ID, execModel, "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, { exec: { modelString: execModel } });
+    setTestAgentAiDefaults({ exec: { modelString: execModel } });
     setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
-    updatePersistedState(getAutoModelRoutingKey(WORKSPACE_ID), true);
+    setAutoRoutingChoice(WORKSPACE_ID, "model", true);
 
     const sendMessageCalls: SendMessageArgs[] = [];
     mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
@@ -617,10 +642,10 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.autoModelRouting).not.toBe(true);
   });
 
-  test("Implement sends unrouted, then leaves the composer on exec's Auto default", async () => {
+  test("Implement sends unrouted but saves exec's Auto default for its later sends", async () => {
     const execModel = "openai:gpt-5.2";
     startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: execModel, autoModelRouting: true, autoThinkingLevel: true },
     });
     setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
@@ -635,18 +660,23 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.model).toBe(execModel);
     expect(sendMessageCalls[0]?.options.autoModelRouting).toBe(false);
     expect(sendMessageCalls[0]?.options.autoThinkingLevel).toBe(false);
-    expect(readPersistedState(getAutoModelRoutingKey(WORKSPACE_ID), false)).toBe(true);
-    expect(readPersistedState(getAutoThinkingLevelKey(WORKSPACE_ID), false)).toBe(true);
+    expect(sendMessageCalls[0]?.options.savedAutoRouting).toEqual({
+      model: true,
+      thinkingLevel: true,
+    });
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {
     const execWorkspaceModel = "openai:gpt-5.2-pro";
     const execWorkspaceThinking = "medium";
 
-    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {});
-    updatePersistedState(getWorkspaceAISettingsByAgentKey(WORKSPACE_ID), {
-      exec: { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking },
+    setTestAgentAiDefaults({});
+    setWorkspaceAiMetadata(WORKSPACE_ID, {
+      agentId: "plan",
+      aiSettingsByAgent: {
+        plan: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "high" },
+        exec: { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking },
+      },
     });
 
     const sendMessageCalls: SendMessageArgs[] = [];

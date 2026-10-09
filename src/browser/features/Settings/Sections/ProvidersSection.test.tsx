@@ -19,9 +19,7 @@ import type {
   ProvidersConfigMap,
 } from "@/common/orpc/types";
 
-let repairRemovedProviderMock = mock(
-  (_provider: string, _workspaceIds: Iterable<string>) => undefined
-);
+let repairRemovedProviderMock = mock((_provider: string) => undefined);
 
 // Snapshot the real exports before any mock below replaces them: the namespace import is a live
 // binding, so restoring from it would republish the mock into later test files.
@@ -39,10 +37,8 @@ void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
 );
 
 void mock.module("@/browser/utils/modelPreferenceRepair", () => ({
-  repairLocalModelPreferencesForRemovedProvider: (
-    provider: string,
-    workspaceIds: Iterable<string>
-  ) => repairRemovedProviderMock(provider, workspaceIds),
+  repairLocalModelPreferencesForRemovedProvider: (provider: string) =>
+    repairRemovedProviderMock(provider),
 }));
 
 let providersConfigMock: ProvidersConfigMap | null = null;
@@ -225,9 +221,7 @@ describe("ProvidersSection", () => {
     void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
       createSelectPrimitiveDouble()
     );
-    repairRemovedProviderMock = mock(
-      (_provider: string, _workspaceIds: Iterable<string>) => undefined
-    );
+    repairRemovedProviderMock = mock((_provider: string) => undefined);
     providersConfigMock = null;
     providersRefreshMock.mockClear();
     updateOptimisticallyMock.mockClear();
@@ -645,7 +639,7 @@ describe("ProvidersSection", () => {
       expect(view.removeCustomProvider).toHaveBeenCalledWith({ provider: CUSTOM_PROVIDER_ID });
     });
     expect(confirmMock).toHaveBeenCalledTimes(1);
-    expect(repairRemovedProviderMock).toHaveBeenCalledWith(CUSTOM_PROVIDER_ID, expect.any(Set));
+    expect(repairRemovedProviderMock).toHaveBeenCalledWith(CUSTOM_PROVIDER_ID);
   });
 
   test("invalidates queued format writes when the provider is removed", async () => {

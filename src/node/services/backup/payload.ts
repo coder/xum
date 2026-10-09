@@ -916,14 +916,29 @@ const BACKED_UP_APPEARANCE_FIELDS = [
   "terminalFontConfig",
   "terminalBadgeConfig",
   "vimEnabled",
+  "powerModeEnabled",
+  "gitStatusIndicatorMode",
 ] as const satisfies ReadonlyArray<keyof Appearance>;
 
-function projectAppearance(value: Appearance | undefined): Appearance | undefined {
+type Review = NonNullable<UserPreferences["review"]>;
+
+// `defaultBaseByProject` is keyed by local project paths, so it stays out of a backup.
+const BACKED_UP_REVIEW_FIELDS = [
+  "includeUncommitted",
+  "sortOrder",
+  "fileTreeViewMode",
+  "showRead",
+] as const satisfies ReadonlyArray<keyof Review>;
+
+function projectFields<T extends object>(
+  value: T | undefined,
+  fields: ReadonlyArray<keyof T>
+): Partial<T> | undefined {
   if (!value) return undefined;
-  const projected: Appearance = {};
-  for (const field of BACKED_UP_APPEARANCE_FIELDS) {
+  const projected: Partial<T> = {};
+  for (const field of fields) {
     if (value[field] !== undefined) {
-      Object.assign(projected, { [field]: copyJson(value[field]) });
+      projected[field] = copyJson(value[field]);
     }
   }
   return Object.keys(projected).length > 0 ? projected : undefined;
@@ -956,7 +971,7 @@ export function projectBackupPreferences(value: unknown): UserPreferences {
   const parsed = UserPreferencesSchema.parse(value ?? {});
   const projected: UserPreferences = {};
 
-  const appearance = projectAppearance(parsed.appearance);
+  const appearance = projectFields(parsed.appearance, BACKED_UP_APPEARANCE_FIELDS);
   if (appearance !== undefined) projected.appearance = appearance;
   if (parsed.navigation?.launchBehavior !== undefined) {
     projected.navigation = { launchBehavior: parsed.navigation.launchBehavior };
@@ -973,8 +988,13 @@ export function projectBackupPreferences(value: unknown): UserPreferences {
     }
     if (Object.keys(ai).length > 0) projected.ai = ai;
   }
-  if (parsed.review?.includeUncommitted !== undefined) {
-    projected.review = { includeUncommitted: parsed.review.includeUncommitted };
+  const review = projectFields(parsed.review, BACKED_UP_REVIEW_FIELDS);
+  if (review !== undefined) projected.review = review;
+  if (parsed.ui !== undefined) {
+    // The artifact CDN choice is a security setting: a repository that could turn it back on
+    // would reopen the CDN request channel to hostile artifacts.
+    const { artifactsAllowCdnScripts, ...ui } = parsed.ui;
+    if (Object.keys(ui).length > 0) projected.ui = copyJson(ui);
   }
 
   return projected;
@@ -1010,6 +1030,7 @@ export function mergeBackupPreferences(
       : {}),
     ...(projected.ai ? { ai: mergeAiPreferences(current?.ai, projected.ai) } : {}),
     ...(projected.review ? { review: { ...current?.review, ...projected.review } } : {}),
+    ...(projected.ui ? { ui: { ...current?.ui, ...projected.ui } } : {}),
   });
 }
 

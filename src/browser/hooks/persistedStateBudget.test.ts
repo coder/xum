@@ -13,19 +13,10 @@ import { installDom } from "../../../tests/ui/dom";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import * as storageModule from "@/common/constants/storage";
 import {
-  GLOBAL_SCOPE_ID,
   PERSISTED_KEY_REGISTRY,
-  getAgentIdKey,
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
-  getDisableWorkspaceAgentsKey,
   getDraftScopeId,
-  getModelKey,
   getPersistedKeyKind,
   getPersistedKeyRegistration,
-  getProjectScopeId,
-  getReasoningModeKey,
-  getThinkingLevelKey,
   type PersistedKeyRegistration,
 } from "@/common/constants/storage";
 
@@ -50,20 +41,6 @@ const MODEL_COUNT = 50;
 const NON_EVICTABLE_CEILING_CHARS = 2.5 * 1024 * 1024;
 const LOCAL_STORAGE_BUDGET_CEILING_CHARS = 3.5 * 1024 * 1024;
 
-/**
- * Workspace keys that creation flows also write under project and global scope ids (creation
- * defaults), so they are counted once per project plus once for the global scope.
- */
-const PROJECT_SCOPED_WORKSPACE_KEYS = [
-  getModelKey,
-  getAgentIdKey,
-  getThinkingLevelKey,
-  getReasoningModeKey,
-  getDisableWorkspaceAgentsKey,
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
-];
-
 function projectPath(index: number): string {
   const prefix = `/Users/someone/src/github.com/org/project-${index}/`;
   return prefix + "p".repeat(PROJECT_PATH_CHARS - prefix.length);
@@ -78,7 +55,6 @@ const workspaceIds = Array.from({ length: WORKSPACE_COUNT }, (_, index) => works
 const draftScopeIds = Array.from({ length: DRAFT_SCOPE_COUNT }, (_, index) =>
   getDraftScopeId(projectPaths[index % PROJECT_COUNT], `${index}`.padStart(36, "d"))
 );
-const projectScopeIds = [...projectPaths.map(getProjectScopeId), GLOBAL_SCOPE_ID];
 
 /** Every concrete key the worst-case model writes for one registration. */
 function modelledKeys(entry: PersistedKeyRegistration): string[] {
@@ -89,11 +65,7 @@ function modelledKeys(entry: PersistedKeyRegistration): string[] {
         : entry.scopes === "webview"
           ? workspaceIds
           : [...workspaceIds, ...draftScopeIds];
-    const keys = scopeIds.map(entry.getKey);
-    if (PROJECT_SCOPED_WORKSPACE_KEYS.includes(entry.getKey)) {
-      keys.push(...projectScopeIds.map(entry.getKey));
-    }
-    return keys;
+    return scopeIds.map(entry.getKey);
   }
   if (entry.match === "exact") return [entry.key];
   switch (entry.instances) {
@@ -204,12 +176,7 @@ describe("localStorage budget", () => {
   // silently stop persisting.
   test("every key constant and key function resolves to a registration", () => {
     // Legacy keys that are only read and removed (migrations/cleanups), never written.
-    const legacyOnly = new Set([
-      "GATEWAY_MODELS_KEY",
-      "GATEWAY_ENABLED_KEY",
-      "getInputAttachmentsKey",
-      "getAutoRetryKey",
-    ]);
+    const legacyOnly = new Set(["getInputAttachmentsKey", "getAutoRetryKey"]);
     const unregistered: string[] = [];
     for (const [name, value] of Object.entries(storageModule)) {
       if (legacyOnly.has(name)) continue;

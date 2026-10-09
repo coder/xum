@@ -15,31 +15,6 @@ interface Subscriber {
   listener: boolean;
 }
 
-export type PersistedStateWriteSource = "local" | "backend";
-
-export interface PersistedStateWriteEvent {
-  key: string;
-  newValue: unknown;
-  source: PersistedStateWriteSource;
-}
-
-type PersistedStateWriteListener = (event: PersistedStateWriteEvent) => void;
-
-const writeListeners = new Set<PersistedStateWriteListener>();
-
-export function subscribePersistedStateWrites(listener: PersistedStateWriteListener): () => void {
-  writeListeners.add(listener);
-  return () => {
-    writeListeners.delete(listener);
-  };
-}
-
-function notifyWriteListeners(event: PersistedStateWriteEvent): void {
-  for (const listener of writeListeners) {
-    listener(event);
-  }
-}
-
 const subscribersByKey = new Map<string, Set<Subscriber>>();
 
 function addSubscriber(key: string, subscriber: Subscriber): () => void {
@@ -57,13 +32,13 @@ function addSubscriber(key: string, subscriber: Subscriber): () => void {
   };
 }
 
-function notifySubscribers(key: string, origin?: string, includeNonListeners = false) {
+function notifySubscribers(key: string, origin?: string) {
   const subs = subscribersByKey.get(key);
   if (!subs) return;
 
   for (const sub of subs) {
-    // If listener=false, only react to this hook instance or explicit cache hydration.
-    if (!includeNonListeners && !sub.listener) {
+    // If listener=false, only react to this hook instance.
+    if (!sub.listener) {
       if (!origin || origin !== sub.componentId) continue;
     }
     sub.callback();
@@ -444,8 +419,8 @@ export function copyLegacyPersistedRawString(key: string, value: string): boolea
 
 /**
  * Remove many keys in one pass (startup cleanups, workspace deletion, orphan GC), then notify
- * write listeners and hook subscribers once per key so mounted consumers do not write a stale
- * value back. Unlike updatePersistedState it dispatches no per-key window CustomEvent: the only
+ * hook subscribers once per key so mounted consumers do not write a stale value back. Unlike
+ * updatePersistedState it dispatches no per-key window CustomEvent: the only
  * key-specific window listeners (sidebar last-read keys of listed workspaces, resizable sidebar
  * widths, experiment flags) never watch keys these callers remove.
  */
@@ -455,7 +430,7 @@ export function removePersistedStateKeys(keys: readonly string[]): void {
   }
   const storage = window.localStorage;
   // Absent keys are skipped so callers that pass every possible key (workspace deletion) do not
-  // wake listeners, e.g. the preferences sync, for values that never existed.
+  // wake subscribers for values that never existed.
   const removed = keys.filter(
     (key) => storage.getItem(key) !== null || getOverBudgetSessionValues().has(key)
   );
@@ -464,14 +439,8 @@ export function removePersistedStateKeys(keys: readonly string[]): void {
     storage.removeItem(key);
   }
   for (const key of removed) {
-    notifyWriteListeners({ key, newValue: undefined, source: "local" });
     notifySubscribers(key);
   }
-}
-
-/** True when a cross-tab `storage` event came from the persisted-state storage area. */
-export function isPersistedStateStorageEvent(event: StorageEvent): boolean {
-  return typeof window !== "undefined" && event.storageArea === window.localStorage;
 }
 
 const persistedStateStorageViews = new WeakMap<Storage, Storage>();
@@ -479,10 +448,10 @@ const persistedStateStorageViews = new WeakMap<Storage, Storage>();
 /**
  * A read view of the persisted state, or null outside a browser. Only for reads and identity
  * checks by code that takes an injectable Storage (tests pass their own); writes must go through
- * updatePersistedState/syncPersistedStateFromBackend/removePersistedStateKeys. getItem returns what
- * the helpers' readers return, including a session-only over-budget value, so e.g. the preference
- * sync never reads an older on-disk value than the one the user just set. The view is stable per
- * Storage, so identity checks against it work.
+ * updatePersistedState/removePersistedStateKeys. getItem returns what the helpers' readers
+ * return, including a session-only over-budget value, so a caller never reads an older on-disk
+ * value than the one the user just set. The view is stable per Storage, so identity checks
+ * against it work.
  */
 export function getPersistedStateStorage(): Storage | null {
   if (!isLocalStorageReadable()) {
@@ -540,8 +509,6 @@ export function updatePersistedState<T>(
       return false;
     }
 
-    notifyWriteListeners({ key, newValue, source: "local" });
-
     // Notify same-tab subscribers (usePersistedState) immediately.
     notifySubscribers(key);
 
@@ -555,28 +522,6 @@ export function updatePersistedState<T>(
   } catch (error) {
     reportWriteFailureOnce(key, error);
     return false;
-  }
-}
-
-export function syncPersistedStateFromBackend(key: string, newValue: unknown): void {
-  if (typeof window === "undefined" || !window.localStorage) {
-    return;
-  }
-
-  try {
-    if (!writePersistedValue(key, newValue)) {
-      return;
-    }
-
-    notifyWriteListeners({ key, newValue, source: "backend" });
-    notifySubscribers(key, undefined, true);
-
-    const customEvent = new CustomEvent(getStorageChangeEvent(key), {
-      detail: { key, newValue, source: "backend" },
-    });
-    window.dispatchEvent(customEvent);
-  } catch (error) {
-    reportWriteFailureOnce(key, error);
   }
 }
 
@@ -677,8 +622,6 @@ export function usePersistedState<T>(
         if (!writePersistedValue(key, newValue)) {
           return;
         }
-
-        notifyWriteListeners({ key, newValue, source: "local" });
 
         // Notify hook subscribers synchronously (keeps UI responsive).
         notifySubscribers(key, componentIdRef.current);

@@ -1,6 +1,6 @@
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getAppConfigStore, useAppConfig } from "@/browser/stores/AppConfigStore";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import {
   DEFAULT_ROUTE_PRIORITY,
@@ -74,9 +74,8 @@ export function useRouting(): RoutingState {
   // app session) instead of per-mount fetches: surfaces render one picker per
   // row, so per-instance subscriptions fanned out O(rows) backend reads.
   const store = getAppConfigStore();
-  const appConfig = useSyncExternalStore(store.subscribe, store.getSnapshot);
-  const routePriority = appConfig?.routePriority ?? DEFAULT_ROUTE_PRIORITY;
-  const routeOverrides = appConfig?.routeOverrides ?? EMPTY_ROUTE_OVERRIDES;
+  const routePriority = useAppConfig((config) => config.routePriority) ?? DEFAULT_ROUTE_PRIORITY;
+  const routeOverrides = useAppConfig((config) => config.routeOverrides) ?? EMPTY_ROUTE_OVERRIDES;
 
   const isConfigured = useCallback(
     (provider: string) =>

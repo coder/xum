@@ -2,8 +2,6 @@ import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { createMuxMessage } from "@/common/types/message";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { getAutoCompactionThresholdKey, getModelKey } from "@/common/constants/storage";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
@@ -27,8 +25,6 @@ const LEAD_IN = "Model-only instructions for retrieving earlier context windows.
 
 function setupTokenBudgetStory(inputTokens = 2400) {
   collapseLeftSidebar();
-  updatePersistedState(getModelKey(WORKSPACE_ID), MODEL);
-  updatePersistedState(getAutoCompactionThresholdKey(MODEL), 70);
   const history = [
     createMuxMessage("earlier", "user", "Keep the migration reversible.", {
       historySequence: 1,
@@ -110,7 +106,9 @@ function setupTokenBudgetStory(inputTokens = 2400) {
   return setupSimpleChatStory({
     workspaceId: WORKSPACE_ID,
     workspaceName: "token-budget",
+    aiSettings: { model: MODEL, thinkingLevel: "off" },
     experiments: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true, [EXPERIMENT_IDS.MEMORY]: true },
+    userPreferences: { ai: { autoCompactionThresholdByModel: { [MODEL]: 70 } } },
     messages: [
       ...history.map((message) => ({ ...message, type: "message" as const })),
       createAssistantMessage("retrieval", "I'll retrieve the earlier decision before continuing.", {

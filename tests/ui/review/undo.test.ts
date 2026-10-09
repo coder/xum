@@ -1,7 +1,6 @@
 import "../dom";
 import { fireEvent, waitFor, within } from "@testing-library/react";
 
-import { REVIEW_SORT_ORDER_KEY } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { STORAGE_KEYS } from "@/constants/workspaceDefaults";
 import type { APIClient } from "@/browser/contexts/API";
@@ -17,15 +16,15 @@ import { cleanupView, setupTestDom, setupWorkspaceView } from "../helpers";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
-function renderReviewPanelForUndoTests(params: {
+async function renderReviewPanelForUndoTests(params: {
   apiClient: APIClient;
   metadata: FrontendWorkspaceMetadata;
   workspaceId: string;
-}): RenderedApp {
+}): Promise<RenderedApp> {
   updatePersistedState(STORAGE_KEYS.reviewDiffBase(params.workspaceId), "HEAD");
-  updatePersistedState("review-include-uncommitted", true);
-  updatePersistedState("review-show-read", false);
-  updatePersistedState(REVIEW_SORT_ORDER_KEY, "file-order");
+  await params.apiClient.config.updateUserPreferences({
+    patches: [{ review: { includeUncommitted: true, showRead: false, sortOrder: "file-order" } }],
+  });
 
   return renderReviewPanel({
     apiClient: params.apiClient,
@@ -85,7 +84,7 @@ describeIntegration("Immersive review undo (UI + ORPC)", () => {
       const cleanupDom = setupTestDom();
       await seedTwoHunkReviewDiff(env.orpc, workspaceId);
 
-      const view = renderReviewPanelForUndoTests({
+      const view = await renderReviewPanelForUndoTests({
         apiClient: env.orpc,
         metadata,
         workspaceId,

@@ -17,15 +17,14 @@ import {
 import { copyToClipboard } from "@/browser/utils/clipboard";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { getDefaultModel, useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
-import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { resolveAdvisorEnabledForAgent } from "@/common/constants/advisor";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
-  AGENT_AI_DEFAULTS_KEY,
-  GLOBAL_SCOPE_ID,
-  getAgentIdKey,
-  getModelKey,
-} from "@/common/constants/storage";
+  getAppConfigStore,
+  updateUserPreferences,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import {
@@ -432,14 +431,9 @@ export function TasksSection() {
   const pendingSaveRef = useRef<TasksSectionSavePayload | null>(null);
 
   const { models, hiddenModelsForSelector } = useModelsFromSettings();
-  const [globalDefaultAgentIdRaw, setGlobalDefaultAgentIdRaw] = usePersistedState<string>(
-    getAgentIdKey(GLOBAL_SCOPE_ID),
-    WORKSPACE_DEFAULTS.agentId,
-    {
-      listener: true,
-    }
+  const newWorkspaceDefaultAgentId = coerceAgentId(
+    useUserPreferences((preferences) => preferences.ai?.globalDefaults?.agentId)
   );
-  const newWorkspaceDefaultAgentId = coerceAgentId(globalDefaultAgentIdRaw);
   const portableDesktopEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   // Dream only runs when both flags are on (see memoryConsolidationService);
@@ -454,15 +448,8 @@ export function TasksSection() {
   // "Inherit", we show thinking levels for the workspace model (falling back to
   // the global default). This mirrors the workspace model resolution chain used when sending messages.
   const selectedWorkspaceId = selectedWorkspace?.workspaceId ?? null;
-  const defaultModel = getDefaultModel();
-  const workspaceModelStorageKey = selectedWorkspaceId
-    ? getModelKey(selectedWorkspaceId)
-    : "__tasks_workspace_model_fallback__";
-  const [workspaceModelRaw] = usePersistedState<unknown>(workspaceModelStorageKey, defaultModel, {
-    listener: true,
-  });
-  const inheritedEffectiveModel =
-    (typeof workspaceModelRaw === "string" ? workspaceModelRaw.trim() : "") || defaultModel;
+  const workspaceModel = useWorkspaceAiSelection(selectedWorkspaceId ?? "").model;
+  const inheritedEffectiveModel = selectedWorkspaceId ? workspaceModel : getDefaultModel();
 
   const lastSyncedTaskSettingsRef = useRef<TaskSettings | null>(null);
   const lastSyncedAgentAiDefaultsRef = useRef<AgentAiDefaults | null>(null);
@@ -481,7 +468,6 @@ export function TasksSection() {
         setTaskSettings(normalizedTaskSettings);
         const normalizedAgentDefaults = normalizeAgentAiDefaults(cfg.agentAiDefaults);
         setAgentAiDefaults(normalizedAgentDefaults);
-        updatePersistedState(AGENT_AI_DEFAULTS_KEY, normalizedAgentDefaults);
 
         setLoadFailed(false);
         lastSyncedTaskSettingsRef.current = normalizedTaskSettings;
@@ -563,8 +549,8 @@ export function TasksSection() {
       return;
     }
 
-    // Keep agent defaults cache up-to-date for any syncers/non-react readers.
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, agentAiDefaults);
+    // Readers of the shared store see the edit before the debounced save lands.
+    getAppConfigStore().updateOptimistically({ agentAiDefaults });
 
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current);
@@ -688,7 +674,7 @@ export function TasksSection() {
   };
 
   const setNewWorkspaceDefaultAgentId = (agentId: string) => {
-    setGlobalDefaultAgentIdRaw(coerceAgentId(agentId));
+    updateUserPreferences({ ai: { globalDefaults: { agentId: coerceAgentId(agentId) } } });
   };
 
   const setAgentModel = (agentId: string, value: string) => {

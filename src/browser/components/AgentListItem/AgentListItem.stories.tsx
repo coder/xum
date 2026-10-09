@@ -14,7 +14,6 @@ import { NOW, createWorkspace } from "@/browser/stories/mocks/workspaces";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
-  GIT_STATUS_INDICATOR_MODE_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   getStatusStateKey,
   getWorkspaceLastReadKey,
@@ -161,7 +160,6 @@ function StoryScaffold(props: {
   }
   workspaceStore.setActiveWorkspaceId(props.activeWorkspaceId ?? null);
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, false);
-  updatePersistedState(GIT_STATUS_INDICATOR_MODE_KEY, "line-delta");
   updatePersistedState(getStatusStateKey("ws-selected"), {
     emoji: "🔍",
     message: "Agent text will go here like so",

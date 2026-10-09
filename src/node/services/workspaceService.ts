@@ -377,6 +377,7 @@ import type {
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
 } from "@/common/orpc/schemas";
+import type { WorkspaceAgentAISettingsSchema } from "@/common/orpc/schemas/workspaceAiSettings";
 import { SendMessageOptionsSchema } from "@/common/orpc/schemas";
 import {
   type AgentMessageDispatchMode,
@@ -634,12 +635,32 @@ const AUTO_NEW_WORKSPACE_BASE_NAME = "workspace";
 
 // Shared type for workspace-scoped AI settings (model + thinking)
 type WorkspaceAISettings = z.infer<typeof WorkspaceAISettingsSchema>;
+type WorkspaceAgentAISettings = z.infer<typeof WorkspaceAgentAISettingsSchema>;
 type WorkspaceHeartbeatSettings = z.infer<typeof WorkspaceHeartbeatSettingsSchema>;
 // intervalMs: null clears the per-workspace override so the global default applies (#5692).
 type WorkspaceHeartbeatSettingsUpdate = Omit<Partial<WorkspaceHeartbeatSettings>, "intervalMs"> & {
   intervalMs?: number | null;
 };
 type WorkspaceGoalDefaultsOverride = z.infer<typeof WorkspaceGoalDefaultsOverrideSchema>;
+
+// Optional fields the update omits keep their stored value: older clients omit reasoningMode,
+// and only sends and workspace creation carry the auto-routing flags.
+function mergeAgentAISettings(
+  prev: WorkspaceAgentAISettings | undefined,
+  next: WorkspaceAgentAISettings
+): WorkspaceAgentAISettings {
+  const reasoningMode = next.reasoningMode ?? prev?.reasoningMode;
+  const autoModelRouting = next.autoModelRouting ?? prev?.autoModelRouting;
+  const autoThinkingLevel = next.autoThinkingLevel ?? prev?.autoThinkingLevel;
+  return {
+    model: next.model,
+    thinkingLevel: next.thinkingLevel,
+    ...(reasoningMode != null ? { reasoningMode } : {}),
+    ...(autoModelRouting === true ? { autoModelRouting } : {}),
+    ...(autoThinkingLevel === true ? { autoThinkingLevel } : {}),
+  };
+}
+
 interface HeartbeatWorkspaceConfigEntry {
   normalizedWorkspaceId: string;
   /** Project/workspace paths so editConfig transforms can re-find the FRESH entry. */
@@ -13204,8 +13225,8 @@ export class WorkspaceService
   }
 
   private normalizeWorkspaceAISettings(
-    aiSettings: WorkspaceAISettings
-  ): Result<WorkspaceAISettings, string> {
+    aiSettings: WorkspaceAgentAISettings
+  ): Result<WorkspaceAgentAISettings, string> {
     const rawModel = aiSettings.model;
     const model = normalizeSelectedModel(rawModel).trim();
     if (!model) {
@@ -13219,6 +13240,12 @@ export class WorkspaceService
       model,
       thinkingLevel: aiSettings.thinkingLevel,
       ...(aiSettings.reasoningMode != null ? { reasoningMode: aiSettings.reasoningMode } : {}),
+      ...(aiSettings.autoModelRouting != null
+        ? { autoModelRouting: aiSettings.autoModelRouting }
+        : {}),
+      ...(aiSettings.autoThinkingLevel != null
+        ? { autoThinkingLevel: aiSettings.autoThinkingLevel }
+        : {}),
     });
   }
 
@@ -13239,7 +13266,7 @@ export class WorkspaceService
 
   private extractWorkspaceAISettingsFromSendOptions(
     options: SendMessageOptions | undefined
-  ): WorkspaceAISettings | null {
+  ): WorkspaceAgentAISettings | null {
     const rawModel = options?.model;
     if (typeof rawModel !== "string" || rawModel.trim().length === 0) {
       return null;
@@ -13263,7 +13290,21 @@ export class WorkspaceService
     // preserves any previously stored value instead of wiping it.
     const reasoningMode = options?.reasoningMode;
 
-    return { model, thinkingLevel, ...(reasoningMode != null ? { reasoningMode } : {}) };
+    // Clients hide Auto while the experiment is off, so such a send carries no Auto choice
+    // and the merge keeps the saved ones.
+    if (!this.isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING)) {
+      return { model, thinkingLevel, ...(reasoningMode != null ? { reasoningMode } : {}) };
+    }
+
+    return {
+      model,
+      thinkingLevel,
+      ...(reasoningMode != null ? { reasoningMode } : {}),
+      // Clients send the auto-routing flags only when on, so an absent flag means off.
+      autoModelRouting: options?.savedAutoRouting?.model ?? options?.autoModelRouting === true,
+      autoThinkingLevel:
+        options?.savedAutoRouting?.thinkingLevel ?? options?.autoThinkingLevel === true,
+    };
   }
 
   /**
@@ -13331,7 +13372,7 @@ export class WorkspaceService
   private async persistWorkspaceAISettingsForAgent(
     workspaceId: string,
     agentId: string,
-    aiSettings: WorkspaceAISettings | null,
+    aiSettings: WorkspaceAgentAISettings | null,
     options?: {
       emitMetadata?: boolean;
       disableWorkspaceAgents?: boolean;
@@ -13393,11 +13434,7 @@ export class WorkspaceService
       const aiSettingsChanged =
         options?.pinsOnly !== true &&
         aiSettings != null &&
-        (prev?.model !== aiSettings.model ||
-          prev?.thinkingLevel !== aiSettings.thinkingLevel ||
-          // Absent reasoningMode preserves the previous value (see write below),
-          // so only an explicit different value counts as a change.
-          (aiSettings.reasoningMode != null && prev?.reasoningMode !== aiSettings.reasoningMode));
+        !isDeepStrictEqual(prev, mergeAgentAISettings(prev, aiSettings));
       const selectedAgentChanged =
         options?.pinsOnly !== true &&
         options?.persistSelectedAgentId === true &&
@@ -13424,12 +13461,12 @@ export class WorkspaceService
       }
 
       const prev = workspaceEntry.aiSettingsByAgent?.[normalizedAgentId];
+      const nextAgentSettings =
+        aiSettings != null && options?.pinsOnly !== true
+          ? mergeAgentAISettings(prev, aiSettings)
+          : undefined;
       const aiSettingsChanged =
-        options?.pinsOnly !== true &&
-        aiSettings != null &&
-        (prev?.model !== aiSettings.model ||
-          prev?.thinkingLevel !== aiSettings.thinkingLevel ||
-          (aiSettings.reasoningMode != null && prev?.reasoningMode !== aiSettings.reasoningMode));
+        nextAgentSettings != null && !isDeepStrictEqual(prev, nextAgentSettings);
       const selectedAgentChanged =
         options?.pinsOnly !== true &&
         options?.persistSelectedAgentId === true &&
@@ -13445,16 +13482,10 @@ export class WorkspaceService
         workspaceEntry.taskAiPins = nextPins;
       }
 
-      if (aiSettings != null && options?.pinsOnly !== true) {
-        // Callers that omit reasoningMode (older clients, thinking-only updates)
-        // must not wipe a previously persisted value — self-healing merge.
-        const mergedReasoningMode = aiSettings.reasoningMode ?? prev?.reasoningMode;
+      if (nextAgentSettings != null) {
         workspaceEntry.aiSettingsByAgent = {
           ...(workspaceEntry.aiSettingsByAgent ?? {}),
-          [normalizedAgentId]: {
-            ...aiSettings,
-            ...(mergedReasoningMode != null ? { reasoningMode: mergedReasoningMode } : {}),
-          },
+          [normalizedAgentId]: nextAgentSettings,
         };
       }
 
@@ -13501,7 +13532,7 @@ export class WorkspaceService
   async updateAgentAISettings(
     workspaceId: string,
     agentId: string,
-    aiSettings: WorkspaceAISettings,
+    aiSettings: WorkspaceAgentAISettings,
     options?: { persistSelectedAgentId?: boolean }
   ): Promise<Result<void, string>> {
     try {
@@ -14094,6 +14125,9 @@ export class WorkspaceService
         namedWorkspacePath,
         // Preserve sub-project cwd/prompt context when forking via /fork.
         subProjectPath: sourceMetadata.subProjectPath,
+        aiSettings: sourceMetadata.aiSettings,
+        aiSettingsByAgent: sourceMetadata.aiSettingsByAgent,
+        agentId: sourceMetadata.agentId,
         // Forks with a continue message stay pending until the first accepted user send
         // can generate a more specific title, unless the user edits the title first.
         pendingAutoTitle: pendingAutoTitle === true ? true : undefined,

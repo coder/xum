@@ -11,7 +11,7 @@ test(
   { tags: ["bugbash", "5687"] },
   async ({ app, screen, browser }) => {
     await browser.setViewport({ width: 1440, height: 900 });
-    await disableTutorials(browser);
+    await disableTutorials(app);
     await app.open();
     const composer = screen.getByRole("textbox", "Message");
     await expect(composer).toBeVisible({ timeout: 15_000 });

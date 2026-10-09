@@ -151,7 +151,7 @@ import {
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
 } from "./workspace";
-import { WorkspaceAISettingsSchema } from "./workspaceAiSettings";
+import { WorkspaceAgentAISettingsSchema, WorkspaceAISettingsSchema } from "./workspaceAiSettings";
 import { AgentSkillListResultSchema, AgentSkillPackageSchema, SkillNameSchema } from "./agentSkill";
 import {
   AvailableWorkflowSchema,
@@ -1793,7 +1793,7 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       agentId: AgentIdSchema,
-      aiSettings: WorkspaceAISettingsSchema,
+      aiSettings: WorkspaceAgentAISettingsSchema,
       persistSelectedAgentId: z.boolean().nullish(),
     }),
     output: ResultSchema(z.void(), z.string()),
@@ -3100,7 +3100,6 @@ export const config = {
   getConfig: {
     input: z.void(),
     output: z.object({
-      userPreferencesInitialized: z.boolean(),
       userPreferences: UserPreferencesSchema.optional(),
       taskSettings: ResolvedTaskSettingsSchema,
       muxGatewayEnabled: z.boolean().optional(),
@@ -3138,7 +3137,6 @@ export const config = {
   },
   saveConfig: {
     input: z.object({
-      userPreferences: UserPreferencesSchema.nullish(),
       taskSettings: ResolvedTaskSettingsSchema.nullish(),
       advisorModelString: AdvisorModelStringSchema.nullish(),
       advisorThinkingLevel: AdvisorThinkingLevelSchema.nullish(),
@@ -3146,6 +3144,13 @@ export const config = {
       advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.nullish(),
       advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.nullish(),
       agentAiDefaults: AgentAiDefaultsSchema.optional(),
+    }),
+    output: z.void(),
+  },
+  updateUserPreferences: {
+    input: z.object({
+      // RFC 7386 merge patches against the stored userPreferences, applied in order.
+      patches: z.array(z.record(z.string(), z.unknown())),
     }),
     output: z.void(),
   },

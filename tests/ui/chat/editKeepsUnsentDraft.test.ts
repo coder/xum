@@ -10,9 +10,8 @@ jest.mock("lottie-react", () => ({
 }));
 import { act, fireEvent, waitFor, within } from "@testing-library/react";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getDraftStore } from "@/browser/stores/DraftStore";
-import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
+import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
 import type { ReviewNoteData } from "@/common/types/review";
 import { EDIT_HISTORY_CHANGED_MESSAGE } from "@/constants/transcriptBarrier";
@@ -364,18 +363,20 @@ async function restoreQueuedMessageWithNote(app: AppHarness, scope: DraftScope, 
  * pending settings save first. Only that save is held; later config writes go through.
  */
 async function holdNextSendBeforeClear(app: AppHarness) {
-  const realSave = app.env.config.saveUserConfig.bind(app.env.config);
+  const realSave = app.env.config.updateUserPreferences.bind(app.env.config);
   let release: () => void = () => undefined;
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
   const spy = jest
-    .spyOn(app.env.config, "saveUserConfig")
+    .spyOn(app.env.config, "updateUserPreferences")
     .mockImplementationOnce(async (...args: Parameters<typeof realSave>) => {
       await gate;
       return realSave(...args);
     });
-  updatePersistedState(getAutoCompactionThresholdKey(WORKSPACE_DEFAULTS.model), 80);
+  updateUserPreferences({
+    ai: { autoCompactionThresholdByModel: { [WORKSPACE_DEFAULTS.model]: 80 } },
+  });
   await waitFor(() => expect(spy).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
   return { release, spy };
 }

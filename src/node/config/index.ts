@@ -6,6 +6,7 @@ import { EventEmitter } from "events";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { isTaskAttemptId } from "@/node/utils/taskAttemptId";
 import { Effect, Semaphore } from "effect";
+import { ORPCError } from "@orpc/server";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
 import { EXPERIMENT_OVERRIDES_FILE_NAME } from "@/node/services/experimentsService";
@@ -41,7 +42,12 @@ import {
   normalizeAutoModelRoutingConfig,
   type AutoModelRoutingConfigInput,
 } from "@/common/types/autoModelRouting";
-import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
+import {
+  normalizeUserPreferences,
+  UserPreferencesSchema,
+  type UserPreferences,
+} from "@/common/config/schemas/userPreferences";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { SettingsBackupSchema } from "@/common/config/schemas/settingsBackup";
 import {
   isLayoutPresetsConfigEmpty,
@@ -749,6 +755,33 @@ function delegatedCreationInterruptedField(workspace: Workspace): {
   return workspace.delegatedCreation?.interruptedAt != null
     ? { delegatedCreationInterrupted: true }
     : {};
+}
+
+/** The notify map gains an entry per auto-notified workspace, so entries of removed ones go. */
+function dropRemovedWorkspaceNotifications(
+  preferences: UserPreferences | undefined,
+  projects: Map<string, ProjectConfig>
+): UserPreferences | undefined {
+  const notifyByWorkspace = preferences?.notifications?.notifyOnResponseByWorkspace;
+  if (!notifyByWorkspace) {
+    return preferences;
+  }
+  const workspaces = [...projects.values()].flatMap((project) => project.workspaces);
+  // A legacy id-less row resolves its ID only after this load; a later load prunes once the ID
+  // migration has persisted it.
+  if (workspaces.some((workspace) => !workspace.id)) {
+    return preferences;
+  }
+  const workspaceIds = new Set(workspaces.map((workspace) => workspace.id));
+  return normalizeUserPreferences({
+    ...preferences,
+    notifications: {
+      ...preferences.notifications,
+      notifyOnResponseByWorkspace: Object.fromEntries(
+        Object.entries(notifyByWorkspace).filter(([workspaceId]) => workspaceIds.has(workspaceId))
+      ),
+    },
+  });
 }
 
 function normalizePersistedWorkspace(
@@ -2248,11 +2281,11 @@ export class Config {
     const runtimeEnablement = normalizeRuntimeEnablementOverrides(parsed.runtimeEnablement);
     const defaultRuntime = normalizeRuntimeEnablementId(parsed.defaultRuntime);
 
-    const userPreferences = normalizeUserPreferences(parsed.userPreferences);
+    const userPreferences = dropRemovedWorkspaceNotifications(
+      normalizeUserPreferences(parsed.userPreferences),
+      projectsMap
+    );
     const migrations = normalizeConfigMigrations(parsed.migrations);
-    if (parsed.userPreferences !== undefined) {
-      migrations.userPreferencesInitialized = true;
-    }
 
     const layoutPresetsRaw = normalizeLayoutPresetsConfig(parsed.layoutPresets);
     const layoutPresets = isLayoutPresetsConfigEmpty(layoutPresetsRaw)
@@ -2571,14 +2604,9 @@ export class Config {
       const migrations = normalizeConfigMigrations(config.migrations);
       // Any true flag (known or from a newer version) must persist; the spread
       // below writes them all, so gate only on presence.
-      if (
-        Object.keys(migrations).length > 0 ||
-        config.userPreferences !== undefined ||
-        config.agentAiDefaults?.exec != null
-      ) {
+      if (Object.keys(migrations).length > 0 || config.agentAiDefaults?.exec != null) {
         data.migrations = {
           ...migrations,
-          ...(config.userPreferences !== undefined ? { userPreferencesInitialized: true } : {}),
           // Written for downgrade compatibility so older builds do not re-run
           // their exec split migration against the projected legacy map.
           ...(config.agentAiDefaults?.exec != null ? { execSubagentDefaultsSplit: true } : {}),
@@ -2812,7 +2840,6 @@ export class Config {
   getClientConfig() {
     const config = this.loadConfigOrDefault();
     return {
-      userPreferencesInitialized: config.migrations?.userPreferencesInitialized === true,
       userPreferences: config.userPreferences,
       taskSettings: config.taskSettings ?? DEFAULT_TASK_SETTINGS,
       muxGatewayEnabled: config.muxGatewayEnabled,
@@ -3092,9 +3119,23 @@ export class Config {
     });
   }
 
+  async updateUserPreferences(patches: readonly unknown[]): Promise<void> {
+    await this.editConfig((config) => {
+      const merged = patches.reduce<unknown>(
+        (prefs, patch) => applyMergePatch(prefs, patch),
+        config.userPreferences
+      );
+      // Normalization drops invalid fields, so an invalid patch would silently delete the
+      // stored value; refuse it instead.
+      if (!UserPreferencesSchema.safeParse(merged ?? {}).success) {
+        throw new ORPCError("BAD_REQUEST", { message: "Invalid user preferences patch" });
+      }
+      return { ...config, userPreferences: normalizeUserPreferences(merged) };
+    });
+  }
+
   async saveUserConfig(input: {
     taskSettings?: unknown;
-    userPreferences?: unknown;
     advisorModelString?: string | null;
     advisorThinkingLevel?: string | null;
     advisorReasoningMode?: OpenAIReasoningMode | null;
@@ -3118,14 +3159,6 @@ export class Config {
           ...normalizeTaskSettings(config.taskSettings),
           ...definedInput,
         });
-      }
-
-      if (input.userPreferences !== undefined) {
-        result.userPreferences = normalizeUserPreferences(input.userPreferences);
-        result.migrations = {
-          ...(result.migrations ?? {}),
-          userPreferencesInitialized: true,
-        };
       }
 
       if (input.advisorModelString !== undefined) {

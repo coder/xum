@@ -19,6 +19,24 @@ export function getSettingsDialog(): HTMLElement {
 }
 
 /**
+ * Wait until AppLoader's fade-in has committed. Motion cancels the finished WAAPI fade a frame
+ * before it writes the final opacity, so for that frame the app shell reads opacity 0 and a
+ * direct toBeVisible on any element inside it fails.
+ */
+export async function waitForAppFadeInDone(element: Element): Promise<void> {
+  await waitFor(
+    () => {
+      for (let node: Element | null = element; node; node = node.parentElement) {
+        if (getComputedStyle(node).opacity !== "1" || node.getAnimations().length > 0) {
+          throw new Error("App shell is still fading in");
+        }
+      }
+    },
+    { timeout: 5000 }
+  );
+}
+
+/**
  * Wait for chat messages to finish loading.
  *
  * Waits for data-loaded="true" on the message window, then one RAF

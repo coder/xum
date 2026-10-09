@@ -94,6 +94,7 @@ import {
   normalizeUserPreferences,
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 import {
@@ -598,8 +599,14 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     ] satisfies AgentDefinitionDescriptor[]);
 
-  let userPreferences = normalizeUserPreferences(initialUserPreferences);
-  let userPreferencesInitialized = initialUserPreferences !== undefined;
+  // Stories paint dark by default, so the theme preference shown in Settings matches.
+  // Tutorials are off so their overlays cannot cover a story.
+  let userPreferences = normalizeUserPreferences(
+    applyMergePatch(
+      { appearance: { theme: "dark" }, ui: { tutorialState: { disabled: true } } },
+      initialUserPreferences ?? {}
+    )
+  );
   let taskSettings = normalizeTaskSettings(initialTaskSettings ?? DEFAULT_TASK_SETTINGS);
 
   let agentAiDefaults = normalizeAgentAiDefaults(initialAgentAiDefaults ?? {});
@@ -850,7 +857,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     config: {
       getConfig: () =>
         Promise.resolve({
-          userPreferencesInitialized,
           userPreferences,
           taskSettings,
           muxGatewayEnabled,
@@ -874,24 +880,25 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           agentHeartbeatsEnabled,
           experiments,
         }),
-      saveConfig: (input: {
-        taskSettings?: unknown;
-        userPreferences?: unknown;
-        agentAiDefaults?: unknown;
-      }) => {
+      saveConfig: (input: { taskSettings?: unknown; agentAiDefaults?: unknown }) => {
         if (input.taskSettings != null) {
           taskSettings = normalizeTaskSettings(input.taskSettings);
-        }
-
-        if (input.userPreferences !== undefined) {
-          userPreferences = normalizeUserPreferences(input.userPreferences);
-          userPreferencesInitialized = true;
         }
 
         if (input.agentAiDefaults !== undefined) {
           agentAiDefaults = normalizeAgentAiDefaults(input.agentAiDefaults);
         }
 
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateUserPreferences: (input: { patches: unknown[] }) => {
+        userPreferences = normalizeUserPreferences(
+          input.patches.reduce<unknown>(
+            (prefs, patch) => applyMergePatch(prefs, patch),
+            userPreferences
+          )
+        );
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },

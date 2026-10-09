@@ -1,109 +1,42 @@
-import {
-  getAgentIdKey,
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
-  getModelKey,
-  getReasoningModeKey,
-  getThinkingLevelByModelKey,
-  getThinkingLevelKey,
-  getDisableWorkspaceAgentsKey,
-} from "@/common/constants/storage";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
-import {
-  buildSendMessageOptions,
-  normalizeModelPreference,
-} from "@/browser/utils/messages/buildSendMessageOptions";
+import { buildSendMessageOptions } from "@/browser/utils/messages/buildSendMessageOptions";
 import type { SendMessageOptions } from "@/common/orpc/types";
-import {
-  coerceOpenAIReasoningMode,
-  type OpenAIReasoningMode,
-  type ThinkingLevel,
-} from "@/common/types/thinking";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { readScopeAgentId } from "@/browser/utils/scopedAiDefaults";
+import { getAutoRouting, getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { migrateGlobalToPerModel } from "@/browser/contexts/ProviderOptionsContext";
 
-/**
- * Read provider options from localStorage
- */
 function getProviderOptions(): MuxProviderOptions {
-  const anthropic = readPersistedState<MuxProviderOptions["anthropic"]>(
-    "provider_options_anthropic",
-    {}
-  );
-  const google = readPersistedState<MuxProviderOptions["google"]>("provider_options_google", {});
-
+  const providerOptions = getUserPreferences().ai?.providerOptions;
   return {
-    anthropic,
-    google,
+    anthropic: migrateGlobalToPerModel(providerOptions?.anthropic),
+    google: providerOptions?.google,
   };
 }
 
 /**
- * Non-hook equivalent of useSendMessageOptions — reads current preferences from localStorage.
+ * Non-hook equivalent of useSendMessageOptions: resolves the current picks and preferences.
  * Used by compaction, resume, idle-compaction, and plan execution outside React context.
  */
 export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptions {
-  const defaultModel = getDefaultModel();
-  const rawModel = readPersistedState<string>(getModelKey(workspaceId), defaultModel);
-  const baseModel = normalizeModelPreference(rawModel, defaultModel);
-
-  // Read thinking level (workspace-scoped).
-  // Migration: if the workspace-scoped value is missing, fall back to legacy per-model storage
-  // once, then persist into the workspace-scoped key.
-  const scopedKey = getThinkingLevelKey(workspaceId);
-  const existingScoped = readPersistedState<ThinkingLevel | undefined>(scopedKey, undefined);
-  const thinkingLevel =
-    existingScoped ??
-    readPersistedState<ThinkingLevel>(
-      getThinkingLevelByModelKey(baseModel),
-      WORKSPACE_DEFAULTS.thinkingLevel
-    );
-  if (existingScoped === undefined) {
-    // Best-effort: avoid losing a user's existing per-model preference.
-    updatePersistedState<ThinkingLevel>(scopedKey, thinkingLevel);
-  }
-
-  const agentId = readPersistedState<string>(
-    getAgentIdKey(workspaceId),
-    WORKSPACE_DEFAULTS.agentId
-  );
-
-  // OpenAI pro reasoning mode (workspace-scoped); absent = standard.
-  // Coerce untrusted persisted values so corrupt entries self-heal to "standard"
-  // instead of failing SendMessageOptionsSchema on retry/resume/creation flows.
-  const reasoningMode =
-    coerceOpenAIReasoningMode(
-      readPersistedState<OpenAIReasoningMode | null>(getReasoningModeKey(workspaceId), null)
-    ) ?? "standard";
+  const agentId = readScopeAgentId(workspaceId);
+  const selection = getWorkspaceAiSelection(workspaceId, agentId);
 
   const providerOptions = getProviderOptions();
 
-  const disableWorkspaceAgents = readPersistedState<boolean>(
-    getDisableWorkspaceAgentsKey(workspaceId),
-    false
-  );
-
-  // Same gate as useAutoRoutingSelection: a stale persisted true must not
-  // reach the backend once the experiment is off.
+  // Same gate as useAutoRoutingSelection: a saved true must not reach the backend
+  // once the experiment is off.
   const autoRoutingEnabled =
     getAppConfigStore().getSnapshot()?.experiments?.[EXPERIMENT_IDS.AUTO_MODEL_ROUTING] === true;
-  const autoModelRouting =
-    autoRoutingEnabled &&
-    readPersistedState<boolean>(getAutoModelRoutingKey(workspaceId), false) === true;
+  const autoModelRouting = autoRoutingEnabled && getAutoRouting(workspaceId, "model", agentId);
   const autoThinkingLevel =
-    autoRoutingEnabled &&
-    readPersistedState<boolean>(getAutoThinkingLevelKey(workspaceId), false) === true;
+    autoRoutingEnabled && getAutoRouting(workspaceId, "thinkingLevel", agentId);
 
   return buildSendMessageOptions({
-    model: baseModel,
+    ...selection,
     agentId,
-    thinkingLevel,
-    reasoningMode,
     providerOptions,
-    disableWorkspaceAgents,
     autoModelRouting,
     autoThinkingLevel,
   });

@@ -5,16 +5,13 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { Profiler } from "react";
 
 import { installDom } from "../../../tests/ui/dom";
-import { readPersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import {
-  BASH_COLLAPSED_SUMMARY_MODE_KEY,
-  GLOBAL_SCOPE_ID,
-  getAgentIdKey,
-  getThinkingLevelKey,
-} from "xum/common/constants/storage";
-import { resetAiSelectionIntentForTests } from "xum/browser/utils/aiSelectionIntent";
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+  setWorkspaceAgentPick,
+} from "xum/browser/utils/aiSelectionIntent";
 import { formatModelDisplayName } from "xum/common/utils/ai/modelDisplay";
-import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
+import { getAppConfigStore, getUserPreferences } from "xum/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
 import { CHAT_VIEW_DATA_READY_TIMEOUT_MS } from "xum/browser/components/ChatPane/useChatViewDataReady";
 import { createMuxMessage, type MuxMetadata } from "xum/common/types/message";
@@ -1066,8 +1063,7 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     cleanup();
     // The store is an app-wide singleton; drop what a test loaded so later tests start clean.
     getAppConfigStore().updateOptimistically({
-      bashCollapsedSummaryMode: undefined,
-      transcriptDensity: undefined,
+      userPreferences: undefined,
       agentAiDefaults: undefined,
     });
     cleanupDom?.();
@@ -1076,8 +1072,6 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
 
   test("bash headers follow the user's collapsed-summary mode once config arrives", async () => {
     const script = "ls -la && git log --oneline -3";
-    // Left over from an earlier webview session; it must not apply before this server's config.
-    updatePersistedState(BASH_COLLAPSED_SUMMARY_MODE_KEY, "intent");
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, [
@@ -1110,6 +1104,12 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://y" } });
     await emitBackgroundBashes(bridge, WORKSPACE.id);
     expect(view.queryByText(script)).not.toBeNull();
+
+    // A deep-equal config from the new server still restores the mode.
+    await bridge.answer("config.getConfig", {
+      userPreferences: { appearance: { bashCollapsedSummaryMode: "intent" } },
+    });
+    expect(view.queryByText(script)).toBeNull();
   });
 
   test("hyper transcript density collapses a finished turn's work into a work bundle (#4979)", async () => {
@@ -1248,6 +1248,40 @@ describe("vscode webview backend preferences (#4972, #4962)", () => {
       options: { agentId: "exec", model: "anthropic:claude-opus-5-5", thinkingLevel: "low" },
     });
   });
+
+  test("shows the saved compaction threshold read-only", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      userMessage("Summarize the repo"),
+      {
+        type: "message",
+        id: "a1",
+        role: "assistant",
+        parts: [{ type: "text", text: "Done." }],
+        metadata: {
+          historySequence: 2,
+          timestamp: 2,
+          model: "anthropic:claude-opus-5-5",
+          contextUsage: { inputTokens: 50_000, outputTokens: 1_000, totalTokens: undefined },
+        },
+      },
+    ]);
+    await bridge.answer("config.getConfig", {
+      userPreferences: {
+        ai: { autoCompactionThresholdByModel: { "anthropic:claude-opus-5-5": 60 } },
+      },
+    });
+
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: /^Context usage/ }));
+      await Promise.resolve();
+    });
+    const dialog = document.body.querySelector('[role="dialog"]');
+    expect(dialog?.textContent).toContain("Auto-compact at 60%");
+    // A drag would call config.updateUserPreferences, which the host blocks.
+    expect(dialog?.querySelector('[style*="ew-resize"]')).toBeNull();
+  });
 });
 
 describe("vscode webview AI settings persistence", () => {
@@ -1255,6 +1289,7 @@ describe("vscode webview AI settings persistence", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    resetAiSelectionIntentForTests();
   });
 
   afterEach(() => {
@@ -1306,7 +1341,7 @@ describe("vscode webview AI settings persistence", () => {
     // not clamp; the backend applies the authoritative floor to the turn.
     // "low" is below the default model's built-in minimum (medium), so a client-side clamp would
     // raise it; it is also not the default, so the test proves the stored choice is what is sent.
-    updatePersistedState(getThinkingLevelKey(WORKSPACE.id), "low");
+    markAiSelectionIntent(WORKSPACE.id, "thinkingLevel", "low");
     const { bridge, view } = await renderSelected();
     const options = await sendMessage(bridge, view);
     expect(options.thinkingLevel).toBe("low");
@@ -1392,7 +1427,7 @@ describe("vscode webview workspace AI settings", () => {
     });
     // A stale local pick must not change the agent a child task runs with.
     await act(async () => {
-      updatePersistedState(getAgentIdKey(WORKSPACE.id), "plan");
+      setWorkspaceAgentPick(WORKSPACE.id, "plan");
       await Promise.resolve();
     });
 
@@ -1424,6 +1459,8 @@ describe("vscode webview workspace AI settings", () => {
       model: "anthropic:claude-opus-5-5",
       thinkingLevel: "low",
     });
+    // Settle the persisting send so this webview session has no unresolved one (#4781).
+    await bridge.answer("workspace.sendMessage", { success: true, data: {} });
   });
 
   test("keeps a model picked for one agent after switching agents and back", async () => {
@@ -1587,7 +1624,7 @@ describe("vscode webview agent lookup", () => {
     });
     // The click must not open the picker: an unscoped pick would write the webview's global agent key.
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    expect(readPersistedState(getAgentIdKey(GLOBAL_SCOPE_ID), null)).toBeNull();
+    expect(getUserPreferences().ai?.globalDefaults).toBeUndefined();
   });
 
   test("looks up agents again when the connection recovers from file mode (#4797)", async () => {
@@ -1617,19 +1654,23 @@ describe("vscode webview app and providers config", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    resetAiSelectionIntentForTests();
   });
 
   afterEach(() => {
     cleanup();
-    // The store is an app-wide singleton; drop the floors a test loaded so later tests start clean.
-    getAppConfigStore().updateOptimistically({ minThinkingLevelByModel: undefined });
+    // The store is an app-wide singleton; drop what a test loaded so later tests start clean.
+    getAppConfigStore().updateOptimistically({
+      minThinkingLevelByModel: undefined,
+      defaultModel: undefined,
+    });
     cleanupDom?.();
     cleanupDom = null;
   });
 
   test("shows the thinking level raised to the user's configured minimum", async () => {
     // "low" is below both the built-in minimum (MED) and the configured one (HIGH).
-    updatePersistedState(getThinkingLevelKey(WORKSPACE.id), "low");
+    markAiSelectionIntent(WORKSPACE.id, "thinkingLevel", "low");
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge);
@@ -1666,6 +1707,27 @@ describe("vscode webview app and providers config", () => {
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
     expect(bridge.orpcCalls("config.getConfig")).toHaveLength(1);
     expect(bridge.orpcCalls("providers.getConfig")).toHaveLength(1);
+  });
+
+  test("shows and sends the configured default model when the config loads after the composer", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    await bridge.answer("config.getConfig", { defaultModel: "openai:gpt-5.6-terra" });
+    expect(view.getByRole("combobox").textContent).toContain(
+      formatModelDisplayName("gpt-5.6-terra")
+    );
+
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    await typeInto(textarea, "hello");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+    const sends = bridge.orpcCalls("workspace.sendMessage");
+    expect(sends).toHaveLength(1);
+    expect(sends[0].input).toMatchObject({ options: { model: "openai:gpt-5.6-terra" } });
   });
 });
 
@@ -1786,7 +1848,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
     await reply(bridge, OK);
   });
 
-  test("persists an explicit model pick once, at the next send", async () => {
+  test("persists an explicit model pick until the host's metadata holds it", async () => {
     // "low" is below Opus 5.5's built-in minimum (MED): the companion thinking level must be sent
     // (and so persisted) as stored, not raised to a client-side floor.
     const { bridge, view } = await open([
@@ -1794,21 +1856,60 @@ describe("vscode webview explicit AI-setting persistence", () => {
     ]);
     await pickModel(view, "Opus 5.5");
 
-    const first = await send(bridge, view);
-    expect(first).toMatchObject({
+    const picked = {
       agentId: "plan",
       model: "anthropic:claude-opus-5-5",
       thinkingLevel: "low",
       skipAiSettingsPersistence: false,
       aiSelectionIntent: { model: true },
+    };
+    expect(await send(bridge, view)).toMatchObject(picked);
+    await reply(bridge, OK);
+    // The metadata pump has not delivered the saved model yet, so the pick still applies.
+    expect(await send(bridge, view)).toMatchObject(picked);
+    await reply(bridge, OK);
+
+    await bridge.emit({
+      type: "workspaces",
+      workspaces: [mainWorkspace({ model: "anthropic:claude-opus-5-5", thinkingLevel: "low" })],
+    });
+    const saved = await send(bridge, view);
+    expect(saved.model).toBe("anthropic:claude-opus-5-5");
+    expect(saved.skipAiSettingsPersistence).toBe(true);
+    expect(saved.aiSelectionIntent).toBeUndefined();
+    await reply(bridge, OK);
+    expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
+  });
+
+  test("drops an unsent pick on a server switch but keeps it across a reconnect", async () => {
+    // The host posts the server's workspaces, and the chat catches up again, after each connection.
+    async function reconnect(bridge: TestBridge, baseUrl: string) {
+      await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl } });
+      await bridge.emit({ type: "workspaces", workspaces: [mainWorkspace(TERRA_HIGH)] });
+      await bridge.emit({
+        type: "chatEvent",
+        workspaceId: WORKSPACE.id,
+        event: { type: "caught-up" },
+      });
+      await emitBackgroundBashes(bridge, WORKSPACE.id);
+    }
+    const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
+    await pickModel(view, "Opus 5.5");
+
+    await bridge.emit({ type: "connectionStatus", status: { mode: "file" } });
+    await reconnect(bridge, "http://x");
+    expect(await send(bridge, view)).toMatchObject({
+      model: "anthropic:claude-opus-5-5",
+      aiSelectionIntent: { model: true },
     });
     await reply(bridge, OK);
 
-    const second = await send(bridge, view);
-    expect(second.skipAiSettingsPersistence).toBe(true);
-    expect(second.aiSelectionIntent).toBeUndefined();
+    // Another server with a workspace of the same ID saves another model.
+    await reconnect(bridge, "http://y");
+    const options = await send(bridge, view);
+    expect(options.model).toBe(TERRA_HIGH.model);
+    expect(options.aiSelectionIntent).toBeUndefined();
     await reply(bridge, OK);
-    expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
   });
 
   test("persists only the last of several rapid picks", async () => {
@@ -1837,6 +1938,26 @@ describe("vscode webview explicit AI-setting persistence", () => {
       skipAiSettingsPersistence: false,
       aiSelectionIntent: { thinkingLevel: true },
     });
+    await reply(bridge, OK);
+  });
+
+  test("persists an agent-only pick until the host's metadata holds it", async () => {
+    const workspace = mainWorkspace(TERRA_HIGH);
+    const { bridge, view } = await open([workspace]);
+    await bridge.answer("agents.list", AGENT_DESCRIPTORS);
+    await pickAgent(view, "exec");
+
+    const picked = await send(bridge, view);
+    expect(picked).toMatchObject({ agentId: "exec", skipAiSettingsPersistence: false });
+    expect(picked.aiSelectionIntent).toBeUndefined();
+    await reply(bridge, OK);
+
+    await bridge.emit({
+      type: "workspaces",
+      workspaces: [{ ...workspace, ai: { ...workspace.ai, agentId: "exec" } }],
+    });
+    const saved = await send(bridge, view);
+    expect(saved).toMatchObject({ agentId: "exec", skipAiSettingsPersistence: true });
     await reply(bridge, OK);
   });
 
@@ -2457,7 +2578,7 @@ describe("vscode webview retry barrier (#5092)", () => {
     const view = render(<App bridge={bridge} />);
     await selectWorkspace(bridge, failedTurn("network"), subAgent);
     await act(async () => {
-      updatePersistedState(getAgentIdKey(subAgent.id), "plan");
+      setWorkspaceAgentPick(subAgent.id, "plan");
       await Promise.resolve();
     });
 
@@ -2471,7 +2592,7 @@ describe("vscode webview retry barrier (#5092)", () => {
     await selectWorkspace(bridge, [userRow("u1", 1)], subAgent);
     await stopMidStream(bridge);
     await act(async () => {
-      updatePersistedState(getAgentIdKey(subAgent.id), "plan");
+      setWorkspaceAgentPick(subAgent.id, "plan");
       await Promise.resolve();
     });
 

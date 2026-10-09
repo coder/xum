@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { useWorkspaceState, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import {
@@ -15,10 +14,9 @@ import {
 } from "@/browser/utils/compaction/suggestion";
 import { executeCompaction } from "@/browser/utils/chatCommands";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
+import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { isProviderConfigFixableError } from "@/common/utils/messages/retryEligibility";
 import type { FilePart, ProvidersConfigMap } from "@/common/orpc/types";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import {
   buildAgentSkillMetadata,
   buildMcpPromptUserText,
@@ -153,14 +151,8 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
 
   const showCompactionUI = isContextExceeded || isCompactionRecoveryFlow;
 
-  const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
-    AGENT_AI_DEFAULTS_KEY,
-    {},
-    {
-      listener: true,
-    }
-  );
-  const configuredCompactionModel = agentAiDefaults.compact?.modelString ?? "";
+  const configuredCompactionModel =
+    useAppConfig((config) => config.agentAiDefaults?.compact?.modelString) ?? "";
 
   useEffect(() => {
     if (!api) return;

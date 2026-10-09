@@ -9,27 +9,255 @@
  * Intentionally in memory only (per window) and scoped by workspace + agent: a Plan
  * pick never applies to Exec after a plan→exec handoff. Each pick gets a fresh token so
  * a re-pick made while an earlier send is outstanding survives that send's consume.
+ * Pending picks are also the composer's unsent values (see resolveWorkspaceAiSelection),
+ * next to the latest workspace AI metadata, so a reload drops an unsent pick. The agent pick
+ * follows the same token lifecycle as the field picks.
  */
 import type { AiSelectionIntent } from "@/common/types/agentAiSettings";
-import { getAgentIdKey } from "@/common/constants/storage";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
+import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
 import assert from "@/common/utils/assert";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 
 export type AiSelectionField = keyof AiSelectionIntent;
-export type AiSelectionTokens = Partial<Record<AiSelectionField, number>>;
+export type AutoRoutingDimension = "model" | "thinkingLevel";
+export const AUTO_ROUTING_FLAG = {
+  model: "autoModelRouting",
+  thinkingLevel: "autoThinkingLevel",
+} as const satisfies Record<AutoRoutingDimension, string>;
+type AutoRoutingFlag = (typeof AUTO_ROUTING_FLAG)[AutoRoutingDimension];
+export type AiSelectionTokens = Partial<
+  Record<AiSelectionField | "agentId" | AutoRoutingFlag, number>
+>;
 
-interface PendingSelection {
-  value: string;
-  token: number;
+/** What a send carries; consumeAiSelectionIntent ends its picks once the send succeeds. */
+export interface PreparedAiSelection {
+  intent: AiSelectionIntent | undefined;
+  attachedTokens: AiSelectionTokens;
+  /** Revision of the workspace's saved AI settings when the send was prepared. */
+  savedRevision: number;
 }
 
+interface PendingSelection<T = string> {
+  value: T;
+  token: number;
+  /** A successful send carried it: it ends once the agent's saved bucket holds it. */
+  sent?: true;
+}
+
+export type WorkspaceAiMetadata = Pick<
+  FrontendWorkspaceMetadata,
+  "aiSettings" | "aiSettingsByAgent"
+> &
+  Partial<
+    Pick<FrontendWorkspaceMetadata, "projectPath" | "agentId" | "agentType" | "parentWorkspaceId">
+  >;
+
 const pendingByScope = new Map<string, Partial<Record<AiSelectionField, PendingSelection>>>();
+const pendingAgentByWorkspace = new Map<string, PendingSelection>();
+const pendingAutoRoutingByScope = new Map<
+  string,
+  Partial<Record<AutoRoutingDimension, PendingSelection<boolean>>>
+>();
+const metadataByWorkspace = new Map<string, WorkspaceAiMetadata>();
+const savedRevisionByWorkspace = new Map<string, number>();
+const agentBasesByScope = new Map<string, ReadonlyMap<string, string | undefined>>();
+const listeners = new Set<() => void>();
 let nextToken = 1;
+let version = 0;
+
+function notify(): void {
+  version++;
+  for (const listener of listeners) listener();
+}
+
+export function subscribeAiSelection(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+export function getAiSelectionVersion(): number {
+  return version;
+}
+
+export function setWorkspaceAiMetadata(workspaceId: string, source: WorkspaceAiMetadata): void {
+  const metadata: WorkspaceAiMetadata = {
+    projectPath: source.projectPath,
+    agentId: source.agentId,
+    agentType: source.agentType,
+    parentWorkspaceId: source.parentWorkspaceId,
+    aiSettings: source.aiSettings,
+    aiSettingsByAgent: source.aiSettingsByAgent,
+  };
+  const previous = metadataByWorkspace.get(workspaceId);
+  if (JSON.stringify(previous) === JSON.stringify(metadata)) return;
+  metadataByWorkspace.set(workspaceId, metadata);
+  savedRevisionByWorkspace.set(workspaceId, getSavedRevision(workspaceId) + 1);
+  const agentPick = pendingAgentByWorkspace.get(workspaceId);
+  if (agentPick?.sent === true && agentPick.value === resolvePersistedAgentId(metadata, "")) {
+    pendingAgentByWorkspace.delete(workspaceId);
+  }
+  for (const [agentId, settings] of Object.entries(metadata.aiSettingsByAgent ?? {})) {
+    const key = scopeKey(workspaceId, agentId);
+    const pending = pendingByScope.get(key);
+    if (pending != null) {
+      for (const field of Object.keys(pending) as AiSelectionField[]) {
+        const selection = pending[field];
+        // An unsent pick stays the composer's value even when it equals the saved one.
+        if (selection?.sent === true && isSavedPick(workspaceId, agentId, field, selection.value)) {
+          delete pending[field];
+        }
+      }
+      if (Object.keys(pending).length === 0) pendingByScope.delete(key);
+    }
+    const picks = pendingAutoRoutingByScope.get(key);
+    if (picks == null) continue;
+    for (const dimension of ["model", "thinkingLevel"] as const) {
+      const pick = picks[dimension];
+      if (pick?.sent === true && pick.value === (settings[AUTO_ROUTING_FLAG[dimension]] === true)) {
+        delete picks[dimension];
+      }
+    }
+  }
+  notify();
+}
+
+export function getWorkspaceAiMetadata(workspaceId: string): WorkspaceAiMetadata | undefined {
+  return metadataByWorkspace.get(workspaceId);
+}
+
+function getSavedRevision(workspaceId: string): number {
+  return savedRevisionByWorkspace.get(workspaceId) ?? 0;
+}
+
+/**
+ * Agent id -> base id of the agents loaded for a workspace or creation scope, so readers outside
+ * the agent context still resolve a custom agent's inherited defaults.
+ */
+export function setAgentBases(
+  scopeId: string,
+  agents: ReadonlyArray<{ id: string; base?: string }>
+): void {
+  const bases = new Map(agents.map((agent) => [agent.id, agent.base]));
+  const previous = agentBasesByScope.get(scopeId);
+  if (previous != null && JSON.stringify([...previous]) === JSON.stringify([...bases])) return;
+  agentBasesByScope.set(scopeId, bases);
+  notify();
+}
+
+export function getAgentBases(
+  scopeId: string
+): ReadonlyMap<string, string | undefined> | undefined {
+  return agentBasesByScope.get(scopeId);
+}
 
 function normalizeAgent(agentId: string): string {
   return agentId.trim().toLowerCase() || WORKSPACE_DEFAULTS.agentId;
+}
+
+/** The workspace's agent without an unsent pick: metadata, then project and global defaults. */
+function getSavedWorkspaceAgentId(workspaceId: string): string {
+  const metadata = metadataByWorkspace.get(workspaceId);
+  const ai = getUserPreferences().ai;
+  const projectAgentId =
+    metadata?.projectPath != null
+      ? ai?.projectDefaults?.[metadata.projectPath]?.agentId
+      : undefined;
+  return (
+    resolvePersistedAgentId(metadata, "") ||
+    normalizeAgentId(projectAgentId, "") ||
+    normalizeAgentId(ai?.globalDefaults?.agentId, WORKSPACE_DEFAULTS.agentId)
+  );
+}
+
+export function getWorkspaceAgentId(workspaceId: string): string {
+  return pendingAgentByWorkspace.get(workspaceId)?.value ?? getSavedWorkspaceAgentId(workspaceId);
+}
+
+/**
+ * Records an unsent agent pick. Picking the saved agent still records one: while a send of
+ * another agent is in flight, the saved agent is stale.
+ */
+export function setWorkspaceAgentPick(workspaceId: string, agentId: string): void {
+  const value = normalizeAgentId(agentId, WORKSPACE_DEFAULTS.agentId);
+  pendingAgentByWorkspace.set(workspaceId, { value, token: nextToken++ });
+  notify();
+}
+
+/**
+ * Auto picks follow the field picks' lifecycle: a sent one lasts until the agent's saved flag
+ * holds it (at once when the flag already does, since that save emits no metadata).
+ */
+export function getAutoRoutingPick(
+  scopeId: string,
+  agentId: string,
+  dimension: AutoRoutingDimension
+): boolean | undefined {
+  return pendingAutoRoutingByScope.get(scopeKey(scopeId, agentId))?.[dimension]?.value;
+}
+
+export function setAutoRoutingPick(
+  scopeId: string,
+  agentId: string,
+  dimension: AutoRoutingDimension,
+  active: boolean
+): void {
+  const key = scopeKey(scopeId, agentId);
+  pendingAutoRoutingByScope.set(key, {
+    ...pendingAutoRoutingByScope.get(key),
+    [dimension]: { value: active, token: nextToken++ },
+  });
+  notify();
+}
+
+/**
+ * Workspace creation saves the creation composer's choices itself (its first send, or the
+ * settings save before an initial /goal), so the new workspace shows them as sent picks.
+ */
+export function handOffCreationAiSelection(
+  workspaceId: string,
+  agentId: string,
+  selection: { reasoningMode: string; autoRouting?: Record<AutoRoutingDimension, boolean> }
+): void {
+  const key = scopeKey(workspaceId, agentId);
+  pendingByScope.set(key, {
+    ...pendingByScope.get(key),
+    reasoningMode: { value: selection.reasoningMode, token: nextToken++, sent: true },
+  });
+  const autoRouting = selection.autoRouting;
+  if (autoRouting != null) {
+    pendingAutoRoutingByScope.set(key, {
+      model: { value: autoRouting.model, token: nextToken++, sent: true },
+      thinkingLevel: { value: autoRouting.thinkingLevel, token: nextToken++, sent: true },
+    });
+  }
+  notify();
+}
+
+/**
+ * The workspace's saved settings for an agent. Only a legacy workspace without per-agent
+ * settings uses `aiSettings`: once they exist, it holds another agent's last settings.
+ */
+export function getSavedAiSettings(
+  workspaceId: string,
+  agentId: string
+): NonNullable<WorkspaceAiMetadata["aiSettingsByAgent"]>[string] | undefined {
+  const metadata = metadataByWorkspace.get(workspaceId);
+  return metadata?.aiSettingsByAgent != null
+    ? metadata.aiSettingsByAgent[normalizeAgent(agentId)]
+    : metadata?.aiSettings;
+}
+
+function isSavedPick(
+  workspaceId: string,
+  agentId: string,
+  field: AiSelectionField,
+  value: string
+): boolean {
+  const saved = metadataByWorkspace.get(workspaceId)?.aiSettingsByAgent?.[normalizeAgent(agentId)];
+  return saved != null && comparable(field, saved[field]) === value;
 }
 
 function scopeKey(workspaceId: string, agentId: string): string {
@@ -53,15 +281,20 @@ export function markAiSelectionIntent(
   field: AiSelectionField,
   value: string
 ): void {
-  const agentId = readPersistedState<string>(
-    getAgentIdKey(workspaceId),
-    WORKSPACE_DEFAULTS.agentId
-  );
-  const key = scopeKey(workspaceId, agentId);
+  const key = scopeKey(workspaceId, getWorkspaceAgentId(workspaceId));
   const normalized = comparable(field, value);
   assert(normalized != null, "markAiSelectionIntent: value must be non-empty");
   const token = nextToken++;
   pendingByScope.set(key, { ...pendingByScope.get(key), [field]: { value: normalized, token } });
+  notify();
+}
+
+export function getPendingAiSelection(
+  workspaceId: string,
+  agentId: string,
+  field: AiSelectionField
+): string | undefined {
+  return pendingByScope.get(`${workspaceId}\u0000${normalizeAgent(agentId)}`)?.[field]?.value;
 }
 
 /**
@@ -72,10 +305,14 @@ export function getAiSelectionIntentForSend(
   workspaceId: string,
   agentId: string,
   sent: { model?: string; thinkingLevel?: string; reasoningMode?: string }
-): { intent: AiSelectionIntent | undefined; attachedTokens: AiSelectionTokens } {
+): PreparedAiSelection {
   const pending = pendingByScope.get(scopeKey(workspaceId, agentId));
   const intent: AiSelectionIntent = {};
   const attachedTokens: AiSelectionTokens = {};
+  const agentPick = pendingAgentByWorkspace.get(workspaceId);
+  if (agentPick?.value === normalizeAgentId(agentId, WORKSPACE_DEFAULTS.agentId)) {
+    attachedTokens.agentId = agentPick.token;
+  }
   if (pending != null) {
     for (const field of ["model", "thinkingLevel", "reasoningMode"] as const) {
       const selection = pending[field];
@@ -87,13 +324,15 @@ export function getAiSelectionIntentForSend(
   return {
     intent: Object.keys(intent).length > 0 ? intent : undefined,
     attachedTokens,
+    savedRevision: getSavedRevision(workspaceId),
   };
 }
 
 /**
  * Send-path wrapper: one-shot sends (skipAiSettingsPersistence) persist nothing and so
- * pin nothing, and an Auto-routed dimension was not deliberately picked for this send.
- * Returns the tokens to consume only for the fields actually attached.
+ * pin and consume nothing. An Auto-routed dimension was not deliberately picked for this
+ * send, so it pins nothing, but the send still saves the picked value, so its pick is
+ * consumed like any other.
  */
 export function getAiSelectionIntentForSendOptions(
   workspaceId: string,
@@ -105,60 +344,140 @@ export function getAiSelectionIntentForSendOptions(
     skipAiSettingsPersistence?: boolean;
     autoModelRouting?: boolean;
     autoThinkingLevel?: boolean;
+    savedAutoRouting?: Record<AutoRoutingDimension, boolean>;
   }
-): { intent: AiSelectionIntent | undefined; attachedTokens: AiSelectionTokens } {
+): PreparedAiSelection {
   if (options.skipAiSettingsPersistence === true) {
-    return { intent: undefined, attachedTokens: {} };
+    return { intent: undefined, attachedTokens: {}, savedRevision: getSavedRevision(workspaceId) };
   }
   const candidate = getAiSelectionIntentForSend(workspaceId, agentId, options);
-  const intent: AiSelectionIntent = {};
-  const attachedTokens: AiSelectionTokens = {};
-  const keep = (field: AiSelectionField, allowed: boolean) => {
-    if (!allowed || candidate.intent?.[field] !== true) return;
-    intent[field] = true;
-    attachedTokens[field] = candidate.attachedTokens[field];
+  const intent: AiSelectionIntent = { ...candidate.intent };
+  if (options.autoModelRouting === true) delete intent.model;
+  if (options.autoThinkingLevel === true) delete intent.thinkingLevel;
+  const attachedTokens: AiSelectionTokens = { ...candidate.attachedTokens };
+  // The backend saves the send's Auto flags the same way.
+  const savedAuto: Record<AutoRoutingDimension, boolean> = options.savedAutoRouting ?? {
+    model: options.autoModelRouting === true,
+    thinkingLevel: options.autoThinkingLevel === true,
   };
-  keep("model", options.autoModelRouting !== true);
-  keep("thinkingLevel", options.autoThinkingLevel !== true);
-  keep("reasoningMode", true);
+  const autoPicks = pendingAutoRoutingByScope.get(scopeKey(workspaceId, agentId));
+  for (const dimension of ["model", "thinkingLevel"] as const) {
+    const pick = autoPicks?.[dimension];
+    if (pick?.value === savedAuto[dimension]) {
+      attachedTokens[AUTO_ROUTING_FLAG[dimension]] = pick.token;
+    }
+  }
   return {
     intent: Object.keys(intent).length > 0 ? intent : undefined,
     attachedTokens,
+    savedRevision: candidate.savedRevision,
   };
 }
 
-/** Clears attached picks after a successful send, unless the user re-picked meanwhile. */
+/**
+ * After a successful send: an attached pick ends once the saved bucket (or agent) holds it, so
+ * a save still in flight or failed keeps it. A re-pick made meanwhile has a new token and survives.
+ * Saved settings that changed while the send ran can be another window's later send, so the
+ * picks end then too; a save of this send still in flight shows when it arrives.
+ */
 export function consumeAiSelectionIntent(
   workspaceId: string,
   agentId: string,
-  attachedTokens: AiSelectionTokens
+  prepared: Pick<PreparedAiSelection, "attachedTokens" | "savedRevision">
 ): void {
+  const { attachedTokens } = prepared;
+  const savedChanged = getSavedRevision(workspaceId) !== prepared.savedRevision;
+  const agentPick = pendingAgentByWorkspace.get(workspaceId);
+  if (agentPick != null && agentPick.token === attachedTokens.agentId) {
+    const savedAgentId = resolvePersistedAgentId(metadataByWorkspace.get(workspaceId), "");
+    if (savedChanged || agentPick.value === savedAgentId) {
+      pendingAgentByWorkspace.delete(workspaceId);
+    } else {
+      pendingAgentByWorkspace.set(workspaceId, { ...agentPick, sent: true });
+    }
+  }
   const key = scopeKey(workspaceId, agentId);
+  const autoPicks = pendingAutoRoutingByScope.get(key);
+  for (const dimension of ["model", "thinkingLevel"] as const) {
+    const pick = autoPicks?.[dimension];
+    const flag = AUTO_ROUTING_FLAG[dimension];
+    if (autoPicks == null || pick == null || pick.token !== attachedTokens[flag]) continue;
+    if (
+      savedChanged ||
+      pick.value === (getSavedAiSettings(workspaceId, agentId)?.[flag] === true)
+    ) {
+      delete autoPicks[dimension];
+    } else {
+      autoPicks[dimension] = { ...pick, sent: true };
+    }
+  }
   const pending = pendingByScope.get(key);
-  if (pending == null) return;
+  if (pending == null) {
+    notify();
+    return;
+  }
   const next = { ...pending };
-  for (const field of Object.keys(attachedTokens) as AiSelectionField[]) {
-    if (next[field]?.token === attachedTokens[field]) delete next[field];
+  for (const field of ["model", "thinkingLevel", "reasoningMode"] as const) {
+    const selection = next[field];
+    if (selection == null || selection.token !== attachedTokens[field]) continue;
+    if (savedChanged || isSavedPick(workspaceId, agentId, field, selection.value)) {
+      delete next[field];
+    } else {
+      next[field] = { ...selection, sent: true };
+    }
   }
   if (Object.keys(next).length === 0) {
     pendingByScope.delete(key);
   } else {
     pendingByScope.set(key, next);
   }
+  notify();
 }
 
-/** Whether a local field value still reflects an unsent deliberate pick (reseed guard). */
-export function hasPendingAiSelectionIntent(
-  workspaceId: string,
-  agentId: string,
-  field: AiSelectionField,
-  localValue: string | undefined
-): boolean {
-  const selection = pendingByScope.get(scopeKey(workspaceId, agentId))?.[field];
-  return selection != null && comparable(field, localValue) === selection.value;
+/** A removed provider's pending model picks would otherwise outrank the repaired settings. */
+export function dropPendingModelPicks(shouldDrop: (model: string) => boolean): void {
+  for (const pending of pendingByScope.values()) {
+    if (pending.model != null && shouldDrop(pending.model.value)) delete pending.model;
+  }
+  notify();
 }
 
-/** Test-only: forget all pending picks. */
-export function resetAiSelectionIntentForTests(): void {
+/**
+ * A fork starts from what the source composer shows, including its unsent picks. Taken before
+ * the fork runs: a source send meanwhile ends the picks the user forked with.
+ */
+export function snapshotPendingAiSelection(
+  sourceWorkspaceId: string
+): (destWorkspaceId: string) => void {
+  const sourcePrefix = `${sourceWorkspaceId}\u0000`;
+  const bySourceAgent = <T extends object>(picks: Map<string, T>) =>
+    [...picks]
+      .filter(([key]) => key.startsWith(sourcePrefix))
+      .map(([key, value]) => [key.slice(sourcePrefix.length), { ...value }] as const);
+  const fieldPicks = bySourceAgent(pendingByScope);
+  const autoPicks = bySourceAgent(pendingAutoRoutingByScope);
+  const agentPick = pendingAgentByWorkspace.get(sourceWorkspaceId);
+  return (destWorkspaceId) => {
+    for (const [agentId, pending] of fieldPicks) {
+      pendingByScope.set(scopeKey(destWorkspaceId, agentId), pending);
+    }
+    for (const [agentId, picks] of autoPicks) {
+      pendingAutoRoutingByScope.set(scopeKey(destWorkspaceId, agentId), picks);
+    }
+    if (agentPick != null) pendingAgentByWorkspace.set(destWorkspaceId, agentPick);
+    notify();
+  };
+}
+
+/** Forgets all pending picks and metadata: another server can reuse a workspace ID. */
+export function clearAiSelectionState(): void {
   pendingByScope.clear();
+  pendingAgentByWorkspace.clear();
+  pendingAutoRoutingByScope.clear();
+  metadataByWorkspace.clear();
+  savedRevisionByWorkspace.clear();
+  agentBasesByScope.clear();
+  notify();
 }
+
+export const resetAiSelectionIntentForTests = clearAiSelectionState;

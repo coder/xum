@@ -1,24 +1,14 @@
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { useReasoningMode } from "./useReasoningMode";
 import { useThinkingLevel } from "./useThinkingLevel";
-import { useAgent } from "@/browser/contexts/AgentContext";
-import { usePersistedState } from "./usePersistedState";
-import {
-  buildSendMessageOptions,
-  normalizeModelPreference,
-} from "@/browser/utils/messages/buildSendMessageOptions";
-import { DEFAULT_MODEL_KEY, getModelKey } from "@/common/constants/storage";
+import { useAgent, useOptionalAgent } from "@/browser/contexts/AgentContext";
+import { buildSendMessageOptions } from "@/browser/utils/messages/buildSendMessageOptions";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { useProviderOptions } from "./useProviderOptions";
 import { useExperimentValue } from "./useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
-import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
-import {
-  getAutoRoutingKey,
-  setAutoRoutingChoice,
-  type AutoRoutingDimension,
-} from "@/browser/utils/modelChange";
+import { useAutoRouting, useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
+import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
 
 /**
  * Extended send options that includes both the canonical model used for backend routing
@@ -29,21 +19,21 @@ export interface SendMessageOptionsWithBase extends SendMessageOptions {
   baseModel: string;
 }
 
-/**
- * Ignores persisted Auto while the experiment is disabled. In workspace scopes, user
- * updates also record the active agent's routing choice.
- */
+/** Ignores saved Auto while the experiment is disabled. */
 export function useAutoRoutingSelection(
   workspaceId: string,
   dimension: AutoRoutingDimension
 ): [active: boolean, setActive: (active: boolean) => void] {
   const experimentEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
-  const [persisted] = usePersistedState<boolean>(getAutoRoutingKey(workspaceId, dimension), false, {
-    listener: true,
-  });
+  const agents = useOptionalAgent()?.agents ?? [];
+  const active = useAutoRouting(
+    workspaceId,
+    dimension,
+    new Map(agents.map((agent) => [agent.id, agent.base]))
+  );
   return [
-    experimentEnabled && persisted === true,
-    (active) => setAutoRoutingChoice(workspaceId, dimension, active),
+    experimentEnabled && active,
+    (next) => setAutoRoutingChoice(workspaceId, dimension, next),
   ];
 }
 
@@ -54,36 +44,17 @@ export function useAutoRoutingSelection(
 export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWithBase {
   const [thinkingLevel] = useThinkingLevel();
   const [reasoningMode] = useReasoningMode();
-  const { agentId, disableWorkspaceAgents } = useAgent();
-  const { workspaceMetadata } = useWorkspaceContext();
+  const { agentId, agents } = useAgent();
   const { options: providerOptions } = useProviderOptions();
 
-  // Subscribe to the global default model preference so backend-seeded values apply
-  // immediately on fresh origins (e.g., when switching ports).
-  const [defaultModelPref] = usePersistedState<string>(
-    DEFAULT_MODEL_KEY,
-    WORKSPACE_DEFAULTS.model,
-    { listener: true }
-  );
-  const defaultModel = normalizeModelPreference(defaultModelPref, WORKSPACE_DEFAULTS.model);
-
-  // Workspace-scoped model preference. If unset, fall back to metadata, then global default.
-  // Note: we intentionally *don't* pass defaultModel as the usePersistedState initialValue;
-  // initialValue is sticky and would lock in the fallback before startup seeding.
-  const [preferredModel] = usePersistedState<string | null>(getModelKey(workspaceId), null, {
-    listener: true,
-  });
+  const baseModel = useWorkspaceAiSelection(
+    workspaceId,
+    agentId,
+    new Map(agents.map((agent) => [agent.id, agent.base]))
+  ).model;
 
   const [autoModelRouting] = useAutoRoutingSelection(workspaceId, "model");
   const [autoThinkingLevel] = useAutoRoutingSelection(workspaceId, "thinkingLevel");
-
-  // Prefer metadata over the global default until workspace localStorage seeding catches up.
-  const baseModel = resolveEffectiveComposerModel(
-    preferredModel,
-    workspaceMetadata.get(workspaceId),
-    agentId,
-    defaultModel
-  );
 
   const options = buildSendMessageOptions({
     agentId,
@@ -91,7 +62,6 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
     reasoningMode,
     model: baseModel,
     providerOptions,
-    disableWorkspaceAgents,
     autoModelRouting,
     autoThinkingLevel,
   });

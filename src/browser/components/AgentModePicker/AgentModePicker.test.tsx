@@ -47,14 +47,9 @@ const CUSTOM_AGENT: AgentDefinitionDescriptor = {
   subagentRunnable: false,
 };
 
-const noop = () => {
-  // intentional noop for tests
-};
 const defaultContextProps = {
   currentAgent: undefined,
   isAgentSelectionLocked: false,
-  disableWorkspaceAgents: false,
-  setDisableWorkspaceAgents: noop,
 };
 
 let cleanupDom: (() => void) | null = null;

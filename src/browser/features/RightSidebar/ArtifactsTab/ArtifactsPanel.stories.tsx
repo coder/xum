@@ -2,10 +2,8 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { useEffect, useRef, type ReactNode } from "react";
 import { APIProvider } from "@/browser/contexts/API";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { PIXEL_DISABLED } from "@/browser/stories/meta";
-import { ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY } from "@/common/constants/storage";
 import type {
   ArtifactEntry,
   ArtifactListing,
@@ -207,10 +205,12 @@ function renderPanel(
 ) {
   const workspaceId = options.workspaceId ?? WORKSPACE_ID;
   writeArtifactSelection(workspaceId, { scope: "artifact", path: selectedPath, version: null });
-  updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, options.allowCdn ?? true);
   return (
     <APIProvider
-      client={createMockORPCClient({ artifacts: { listing: listingFor(files), files } })}
+      client={createMockORPCClient({
+        artifacts: { listing: listingFor(files), files },
+        userPreferences: { ui: { artifactsAllowCdnScripts: options.allowCdn ?? true } },
+      })}
     >
       {/* Sidebar-like column: fills a phone screen, right-docked at laptop width. */}
       <div className="bg-background flex h-screen justify-end">
@@ -344,7 +344,6 @@ export const DiffLaptop: Story = {
 
 /** Every renderer at once, one panel per cell: stacked on phones, a 3-column grid on laptops. */
 function renderGallery() {
-  updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true);
   for (const renderer of RENDERERS) {
     writeArtifactSelection(`${WORKSPACE_ID}-${renderer.path}`, {
       scope: "artifact",
@@ -1076,7 +1075,6 @@ function DesktopApiStub(props: { children: ReactNode }) {
 }
 
 function renderMcpAppView(html: string = MCP_APP_VIEW_HTML) {
-  updatePersistedState(ARTIFACTS_ALLOW_CDN_SCRIPTS_KEY, true);
   openMcpAppView(WORKSPACE_ID, {
     toolCallId: MCP_APP_TOOL_CALL_ID,
     serverName: "weather",

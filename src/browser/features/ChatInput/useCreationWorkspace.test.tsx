@@ -1,6 +1,16 @@
 import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import {
+  getAutoRoutingPick,
+  resetAiSelectionIntentForTests,
+  setAutoRoutingPick,
+  setWorkspaceAiMetadata,
+} from "@/browser/utils/aiSelectionIntent";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as RouterContextModule from "@/browser/contexts/RouterContext";
 import type { DraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
@@ -9,29 +19,17 @@ import * as DraftWorkspaceSettingsModule from "@/browser/hooks/useDraftWorkspace
 import * as ChatCommandsModule from "@/browser/utils/chatCommands";
 import type { ProjectConfig } from "@/common/types/project";
 import {
-  GLOBAL_SCOPE_ID,
-  AGENT_AI_DEFAULTS_KEY,
-  getAgentIdKey,
-  getAutoModelRoutingKey,
-  getAutoRoutingChoiceByAgentKey,
-  getAutoThinkingLevelKey,
-  getModelKey,
   getPendingDraftSkillDiscoveryKey,
   getPendingScopeId,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
-  getThinkingLevelKey,
   getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
 import { toDraftAttachmentMetadata } from "@/common/utils/drafts";
 
-import {
-  CODER_RUNTIME_PLACEHOLDER,
-  type CoderWorkspaceConfig,
-  type ParsedRuntime,
-} from "@/common/types/runtime";
+import type { CoderWorkspaceConfig, ParsedRuntime } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import type {
   FrontendWorkspaceMetadata,
@@ -85,6 +83,10 @@ const draftBackend = createTestApiClient({
 
 const readPersistedStateCalls: Array<[string, unknown]> = [];
 let persistedPreferences: Record<string, unknown> = {};
+
+function setPreferences(userPreferences: UserPreferences | undefined): void {
+  getAppConfigStore().updateOptimistically({ userPreferences });
+}
 const readPersistedStateMock = mock((key: string, defaultValue: unknown) => {
   readPersistedStateCalls.push([key, defaultValue]);
   if (Object.prototype.hasOwnProperty.call(persistedPreferences, key)) {
@@ -677,6 +679,8 @@ describe("useCreationWorkspace", () => {
     restorePersistedStateMocks = installPersistedStateMocks();
     mockProjectConfigMap = new Map([[TEST_PROJECT_PATH, { workspaces: [], trusted: true }]]);
     persistedPreferences = {};
+    setPreferences(undefined);
+    getAppConfigStore().updateOptimistically({ agentAiDefaults: undefined });
     readPersistedStateCalls.length = 0;
     updatePersistedStateCalls.length = 0;
     draftSettingsInvocations = [];
@@ -695,6 +699,8 @@ describe("useCreationWorkspace", () => {
   });
 
   afterEach(async () => {
+    resetAiSelectionIntentForTests();
+    getAppConfigStore().updateOptimistically({ experiments: undefined });
     getDraftStore().setClient(null);
     cleanup();
     restorePersistedStateMocks?.();
@@ -886,9 +892,10 @@ describe("useCreationWorkspace", () => {
       nameGeneration: nameGenerationMock,
     });
 
-    persistedPreferences[getAgentIdKey(getProjectScopeId(TEST_PROJECT_PATH))] = "plan";
-    // Set model preference for the project scope (read by getSendOptionsFromStorage)
-    persistedPreferences[getModelKey(getProjectScopeId(TEST_PROJECT_PATH))] = "gpt-4";
+    // Project defaults are read by getSendOptionsFromStorage.
+    setPreferences({
+      ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "plan", model: "gpt-4" } } },
+    });
 
     draftSettingsState = createDraftSettingsHarness({
       selectedRuntime: { mode: "ssh", host: "example.com" },
@@ -1543,6 +1550,37 @@ describe("useCreationWorkspace", () => {
     });
   });
 
+  test("an initial goal command saves the creation composer's Auto choices", async () => {
+    const { workspaceApi } = setupWindow({});
+    getAppConfigStore().updateOptimistically({
+      experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
+    });
+    setAutoRoutingPick(getProjectScopeId(TEST_PROJECT_PATH), "exec", "model", true);
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "/goal ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        typedText: "/goal ship the feature",
+      });
+    });
+
+    expect(workspaceApi.sendMessage.mock.calls.length).toBe(0);
+    expect(workspaceApi.updateAgentAISettings.mock.calls[0]?.[0]?.aiSettings).toEqual({
+      model: "gpt-4",
+      thinkingLevel: "medium",
+      reasoningMode: "standard",
+      autoModelRouting: true,
+    });
+  });
+
   test("handleSend hands a refused initial goal command to the new workspace composer", async () => {
     const setGoalMock = mock(
       (_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> =>
@@ -1897,7 +1935,7 @@ describe("useCreationWorkspace", () => {
     expect(workspaceApi.create.mock.calls.length).toBe(0);
   });
 
-  test("syncs global default agent to workspace when project agent is unset", async () => {
+  test("sends the global default agent when the project agent is unset", async () => {
     const listBranchesMock = mock(
       (): Promise<BranchListResult> =>
         Promise.resolve({
@@ -1933,8 +1971,12 @@ describe("useCreationWorkspace", () => {
       nameGeneration: nameGenerationMock,
     });
 
-    persistedPreferences[getAgentIdKey(GLOBAL_SCOPE_ID)] = "ask";
-    persistedPreferences[getModelKey(getProjectScopeId(TEST_PROJECT_PATH))] = "gpt-4";
+    setPreferences({
+      ai: {
+        globalDefaults: { agentId: "ask" },
+        projectDefaults: { [TEST_PROJECT_PATH]: { model: "gpt-4" } },
+      },
+    });
 
     draftSettingsState = createDraftSettingsHarness({
       selectedRuntime: { mode: "ssh", host: "example.com" },
@@ -1959,7 +2001,6 @@ describe("useCreationWorkspace", () => {
     });
 
     expect(handleSendResult).toEqual({ success: true });
-    expect(updatePersistedStateCalls).toContainEqual([getAgentIdKey(TEST_WORKSPACE_ID), "ask"]);
 
     const sendCall = sendMessageMock.mock.calls[0];
     if (!sendCall) {
@@ -1969,61 +2010,137 @@ describe("useCreationWorkspace", () => {
     expect(sendRequest?.options?.agentId).toBe("ask");
   });
 
-  test.each([true, false])(
-    "records only creation routing picks that differ from the agent's Auto default (experiment %p)",
-    async (autoRoutingEnabled) => {
-      setupWindow({
-        listBranches: mock(
-          (): Promise<BranchListResult> =>
-            Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
-        ),
-        sendMessage: mock(
-          (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
-            Promise.resolve({ success: true as const, data: {} })
-        ),
-        create: mock(
-          (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
-            Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
-        ),
+  test("resolves a project default naming a removed built-in agent before copying it", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({ success: true as const, data: {} })
+    );
+    const updateAgentAISettingsMock = mock(
+      (_args: WorkspaceUpdateAgentAISettingsArgs): Promise<WorkspaceUpdateAgentAISettingsResult> =>
+        Promise.resolve({ success: true, data: undefined } as WorkspaceUpdateAgentAISettingsResult)
+    );
+    setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+      sendMessage: sendMessageMock,
+      updateAgentAISettings: updateAgentAISettingsMock,
+      create: mock(
+        (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+          Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+      ),
+    });
+
+    setPreferences({
+      ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "mux", model: "gpt-4" } } },
+    });
+    draftSettingsState = createDraftSettingsHarness({ agentId: "mux" });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+      agentBaseById: new Map([
+        ["exec", undefined],
+        ["plan", undefined],
+      ]),
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+    await act(async () => {
+      await getHook().handleSend("launch workspace");
+    });
+
+    expect(updateAgentAISettingsMock.mock.calls[0]?.[0]?.agentId).toBe("exec");
+    expect(sendMessageMock.mock.calls[0]?.[0]?.options?.agentId).toBe("exec");
+  });
+
+  test("the first send carries the creation composer's Auto picks to the new workspace", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({ success: true as const, data: {} })
+    );
+    setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+      sendMessage: sendMessageMock,
+      create: mock(
+        (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+          Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+      ),
+    });
+
+    getAppConfigStore().updateOptimistically({
+      agentAiDefaults: { exec: { autoModelRouting: true } },
+      experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
+    });
+    setPreferences({
+      ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "exec", model: "gpt-4" } } },
+    });
+    // Model Auto comes from the default; thinking Auto was picked in the creation composer.
+    setAutoRoutingPick(getProjectScopeId(TEST_PROJECT_PATH), "exec", "thinkingLevel", true);
+    draftSettingsState = createDraftSettingsHarness({ agentId: "exec" });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+    await act(async () => {
+      await getHook().handleSend("launch workspace");
+    });
+
+    const options = sendMessageMock.mock.calls[0]?.[0]?.options;
+    expect(options?.autoModelRouting).toBe(true);
+    expect(options?.autoThinkingLevel).toBe(true);
+    // The workspace shows both creation choices until its metadata holds them.
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "model")).toBe(true);
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "thinkingLevel")).toBe(true);
+    setWorkspaceAiMetadata(TEST_WORKSPACE_ID, {
+      aiSettingsByAgent: {
+        exec: {
+          model: "gpt-4",
+          thinkingLevel: "medium",
+          autoModelRouting: true,
+          autoThinkingLevel: true,
+        },
+      },
+    });
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "model")).toBeUndefined();
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "thinkingLevel")).toBeUndefined();
+  });
+
+  test("the new workspace keeps the creation reasoning mode until its metadata holds it", async () => {
+    setupWindow({});
+    draftSettingsState = createDraftSettingsHarness({ agentId: "exec", reasoningMode: "pro" });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("launch workspace");
+    });
+
+    // The created metadata has no AI settings yet; project defaults hold no reasoning mode.
+    expect(getWorkspaceAiSelection(TEST_WORKSPACE_ID, "exec").reasoningMode).toBe("pro");
+    const save = (reasoningMode: DraftWorkspaceSettings["reasoningMode"]) =>
+      setWorkspaceAiMetadata(TEST_WORKSPACE_ID, {
+        aiSettingsByAgent: { exec: { model: "gpt-4", thinkingLevel: "medium", reasoningMode } },
       });
-
-      const projectScopeId = getProjectScopeId(TEST_PROJECT_PATH);
-      persistedPreferences[AGENT_AI_DEFAULTS_KEY] = { exec: { autoModelRouting: true } };
-      persistedPreferences[getAgentIdKey(projectScopeId)] = "exec";
-      persistedPreferences[getModelKey(projectScopeId)] = "gpt-4";
-      // Model Auto came from the default; thinking Auto was picked in the creation composer.
-      persistedPreferences[getAutoModelRoutingKey(projectScopeId)] = true;
-      persistedPreferences[getAutoThinkingLevelKey(projectScopeId)] = true;
-      draftSettingsState = createDraftSettingsHarness({ agentId: "exec" });
-
-      const getHook = renderUseCreationWorkspace({
-        projectPath: TEST_PROJECT_PATH,
-        onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
-        message: "launch workspace",
-        autoRoutingEnabled,
-      });
-      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
-
-      await act(async () => {
-        await getHook().handleSend("launch workspace");
-      });
-
-      expect(updatePersistedStateCalls).toContainEqual([
-        getAutoModelRoutingKey(TEST_WORKSPACE_ID),
-        true,
-      ]);
-      expect(updatePersistedStateCalls).toContainEqual([
-        getAutoThinkingLevelKey(TEST_WORKSPACE_ID),
-        true,
-      ]);
-      const recordedChoices = updatePersistedStateCalls
-        .filter(([key]) => key === getAutoRoutingChoiceByAgentKey(TEST_WORKSPACE_ID))
-        .map(([, updater]) => (updater as (prev: unknown) => unknown)({}));
-      expect(recordedChoices).toEqual(
-        autoRoutingEnabled ? [{ exec: { thinkingLevel: true } }] : []
-      );
-    }
-  );
+    save("pro");
+    // Another window's later change shows through.
+    save("standard");
+    expect(getWorkspaceAiSelection(TEST_WORKSPACE_ID, "exec").reasoningMode).toBe("standard");
+  });
 
   test("handleSend returns failure when sendMessage fails and clears draft", async () => {
     const listBranchesMock = mock(
@@ -2377,12 +2494,7 @@ describe("useCreationWorkspace", () => {
     expect(onWorkspaceCreated.mock.calls.length).toBe(0);
     await waitFor(() => expect(getHook().toast?.message).toBe("backend exploded"));
     await waitFor(() => expect(getHook().isSending).toBe(false));
-
-    // Side effect: send-options reader may migrate thinking level into the project scope.
-    const thinkingKey = getThinkingLevelKey(getProjectScopeId(TEST_PROJECT_PATH));
-    if (updatePersistedStateCalls.length > 0) {
-      expect(updatePersistedStateCalls).toEqual([[thinkingKey, "off"]]);
-    }
+    expect(updatePersistedStateCalls).toEqual([]);
   });
 });
 
@@ -2395,6 +2507,7 @@ function createDraftSettingsHarness(
     runtimeString?: string | undefined;
     defaultRuntimeMode?: RuntimeChoice;
     agentId?: string;
+    reasoningMode?: DraftWorkspaceSettings["reasoningMode"];
     coderConfigFallback?: CoderWorkspaceConfig;
     sshHostFallback?: string;
   }>
@@ -2403,6 +2516,7 @@ function createDraftSettingsHarness(
     selectedRuntime: initial?.selectedRuntime ?? { mode: "local" as const },
     defaultRuntimeMode: initial?.defaultRuntimeMode ?? "worktree",
     agentId: initial?.agentId ?? "exec",
+    reasoningMode: initial?.reasoningMode ?? "standard",
     trunkBranch: initial?.trunkBranch ?? "main",
     runtimeString: initial?.runtimeString,
     coderConfigFallback: initial?.coderConfigFallback ?? { existingWorkspace: false },
@@ -2411,6 +2525,7 @@ function createDraftSettingsHarness(
     selectedRuntime: ParsedRuntime;
     defaultRuntimeMode: RuntimeChoice;
     agentId: string;
+    reasoningMode: DraftWorkspaceSettings["reasoningMode"];
     trunkBranch: string;
     runtimeString: string | undefined;
     coderConfigFallback: CoderWorkspaceConfig;
@@ -2434,39 +2549,9 @@ function createDraftSettingsHarness(
     }
   });
 
-  const setDefaultRuntimeChoice = mock((choice: RuntimeChoice) => {
-    state.defaultRuntimeMode = choice;
-    // Update selected runtime to match new default
-    if (choice === "coder") {
-      state.selectedRuntime = {
-        mode: "ssh",
-        host: CODER_RUNTIME_PLACEHOLDER,
-        coder: { existingWorkspace: false },
-      };
-      state.runtimeString = `ssh ${CODER_RUNTIME_PLACEHOLDER}`;
-      return;
-    }
-    if (choice === "ssh") {
-      const host = state.selectedRuntime.mode === "ssh" ? state.selectedRuntime.host : "";
-      state.selectedRuntime = { mode: "ssh", host };
-      state.runtimeString = host ? `ssh ${host}` : "ssh";
-    } else if (choice === "docker") {
-      const image = state.selectedRuntime.mode === "docker" ? state.selectedRuntime.image : "";
-      state.selectedRuntime = { mode: "docker", image };
-      state.runtimeString = image ? `docker ${image}` : "docker";
-    } else if (choice === "local") {
-      state.selectedRuntime = { mode: "local" };
-      state.runtimeString = undefined;
-    } else {
-      state.selectedRuntime = { mode: "worktree" };
-      state.runtimeString = undefined;
-    }
-  });
-
   return {
     state,
     setSelectedRuntime,
-    setDefaultRuntimeChoice,
     setTrunkBranch,
     getRuntimeString,
     snapshot(): {
@@ -2474,14 +2559,13 @@ function createDraftSettingsHarness(
       coderConfigFallback: CoderWorkspaceConfig;
       sshHostFallback: string;
       setSelectedRuntime: typeof setSelectedRuntime;
-      setDefaultRuntimeChoice: typeof setDefaultRuntimeChoice;
       setTrunkBranch: typeof setTrunkBranch;
       getRuntimeString: typeof getRuntimeString;
     } {
       const settings: DraftWorkspaceSettings = {
         model: "gpt-4",
         thinkingLevel: "medium",
-        reasoningMode: "standard",
+        reasoningMode: state.reasoningMode,
         agentId: state.agentId,
         selectedRuntime: state.selectedRuntime,
         defaultRuntimeMode: state.defaultRuntimeMode,
@@ -2492,7 +2576,6 @@ function createDraftSettingsHarness(
         coderConfigFallback: state.coderConfigFallback,
         sshHostFallback: state.sshHostFallback,
         setSelectedRuntime,
-        setDefaultRuntimeChoice,
         setTrunkBranch,
         getRuntimeString,
       };
@@ -2511,7 +2594,7 @@ interface HookOptions {
       markPendingInitialSend?: boolean;
     }
   ) => void;
-  autoRoutingEnabled?: boolean;
+  agentBaseById?: ReadonlyMap<string, string | undefined>;
   message?: string;
   draftId?: string | null;
 }

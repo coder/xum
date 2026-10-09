@@ -20,10 +20,6 @@ import { ProjectProvider, useProjectContext } from "../../contexts/ProjectContex
 import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
 import { WorkspaceProvider, useWorkspaceContext } from "../../contexts/WorkspaceContext";
 import { RouterProvider } from "../../contexts/RouterContext";
-import {
-  hydrateUserPreferencesLocalCache,
-  UserPreferencesProvider,
-} from "@/browser/contexts/UserPreferencesContext";
 import { TerminalRouterProvider } from "../../terminal/TerminalRouterContext";
 import { UpdateRestartOverlay } from "@/browser/components/UpdateRestartOverlay/UpdateRestartOverlay";
 
@@ -34,12 +30,8 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
   const bootstrappedRef = useRef(false);
 
-  // Connected here so startup can wait for the first config snapshot (experiments); the gate
-  // stays mounted, so this also follows reconnects.
-  useEffect(() => {
-    getAppConfigStore().setClient(apiState.api ?? null);
-  }, [apiState.api]);
-
+  // The bound starts once the API client exists: a token prompt or a slow connect must not use it
+  // up, or RouterProvider picks the launch route from code defaults.
   useEffect(() => {
     if (bootstrappedRef.current || !apiState.api) {
       return;
@@ -50,28 +42,21 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
     const timeoutPromise = new Promise<"timeout">((resolve) => {
       timeoutId = setTimeout(resolve, USER_PREFERENCES_BOOTSTRAP_TIMEOUT_MS, "timeout");
     });
-    const hydratePromise = hydrateUserPreferencesLocalCache({
-      configClient: apiState.api.config,
-      signal: abortController.signal,
-    }).catch((error) => {
-      console.warn("Failed to bootstrap user preferences:", error);
-      return undefined;
-    });
 
     const appConfigStore = getAppConfigStore();
     let unsubscribeAppConfig: (() => void) | undefined;
     const appConfigPromise = new Promise<void>((resolve) => {
       const resolveWhenLoaded = () => {
-        if (appConfigStore.getSnapshot()?.experiments) resolve();
+        if (appConfigStore.getSnapshot()?.userPreferences) resolve();
       };
       unsubscribeAppConfig = appConfigStore.subscribe(resolveWhenLoaded);
       abortController.signal.addEventListener("abort", () => resolve(), { once: true });
       resolveWhenLoaded();
     }).finally(() => unsubscribeAppConfig?.());
 
-    const startup = Promise.race([Promise.all([hydratePromise, appConfigPromise]), timeoutPromise]);
-    // User preference hydration must happen before RouterProvider reads launch behavior, but
-    // startup still needs a hard fallback so a slow backend cannot trap users on the boot screen.
+    const startup = Promise.race([appConfigPromise, timeoutPromise]);
+    // RouterProvider reads launch behavior from the first snapshot, but a slow backend must not
+    // trap users on the boot screen.
     void startup
       .then((result) => {
         if (result === "timeout") {
@@ -155,9 +140,7 @@ export function AppLoader(props: AppLoaderProps) {
           <RouterProvider>
             <ProjectProvider>
               <WorkspaceProvider>
-                <UserPreferencesProvider>
-                  <AppLoaderInner />
-                </UserPreferencesProvider>
+                <AppLoaderInner />
               </WorkspaceProvider>
             </ProjectProvider>
           </RouterProvider>

@@ -19,6 +19,7 @@ import {
 } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 type APIClient = ReturnType<typeof createClient>;
 
@@ -95,6 +96,8 @@ interface APIProviderProps {
   client?: APIClient;
   /** WebSocket factory for testing. Defaults to native WebSocket constructor. */
   createWebSocket?: (url: string) => WebSocket;
+  /** The VS Code webview connects AppConfigStore itself, only while its host has a server. */
+  skipAppConfigStore?: boolean;
 }
 
 const noopConnectionControl = (_token?: string) => undefined;
@@ -175,6 +178,16 @@ async function reloadIfServerBuildChanged(
   } catch {
     // Version discovery must not disturb an already reconnected client.
   }
+}
+
+// Connected here rather than in AppLoader so terminal and desktop popouts get the config store too.
+function useAppConfigStoreClient(api: APIClient | null, skip = false) {
+  useEffect(() => {
+    if (skip) return;
+    const store = getAppConfigStore();
+    store.setClient(api);
+    return () => store.setClient(null);
+  }, [api, skip]);
 }
 
 function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
@@ -663,6 +676,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
         return { status: "error", api: null, error: state.error, ...base };
     }
   }, [state, authenticate, retry]);
+  useAppConfigStoreClient(value.api);
 
   // Always render children - consumers handle their own loading/error states
   return (
@@ -675,11 +689,12 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
 }
 
 function InjectedClientAPIProvider(
-  props: Pick<APIProviderProps, "children"> & { client: APIClient }
+  props: Pick<APIProviderProps, "children" | "skipAppConfigStore"> & { client: APIClient }
 ) {
   // User rationale: injected clients are already fully constructed, so wrapping them in the
   // browser liveness/reconnect state machine risks leaking async state updates into tests.
   window.__ORPC_CLIENT__ = props.client;
+  useAppConfigStoreClient(props.client, props.skipAppConfigStore);
 
   return (
     <APIContext.Provider
@@ -699,7 +714,12 @@ function InjectedClientAPIProvider(
 export const APIProvider = (props: APIProviderProps) => {
   if (props.client) {
     return (
-      <InjectedClientAPIProvider client={props.client}>{props.children}</InjectedClientAPIProvider>
+      <InjectedClientAPIProvider
+        client={props.client}
+        skipAppConfigStore={props.skipAppConfigStore}
+      >
+        {props.children}
+      </InjectedClientAPIProvider>
     );
   }
 

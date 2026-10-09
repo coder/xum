@@ -5,8 +5,6 @@
 import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { TUTORIAL_STATE_KEY } from "@/common/constants/storage";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { RenderedApp } from "./renderReviewPanel";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
@@ -311,7 +309,8 @@ export async function cleanupView(view: RenderedApp, cleanupDom: () => void): Pr
  * Called automatically by setupTestDom().
  */
 export function disableTutorial(): void {
-  updatePersistedState(TUTORIAL_STATE_KEY, { disabled: true, completed: {} });
+  // Runtime-only, like a sandbox launch: the tutorial preference lives in the backend config.
+  globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = false;
 }
 
 /**

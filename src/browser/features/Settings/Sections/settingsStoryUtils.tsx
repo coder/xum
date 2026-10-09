@@ -14,13 +14,8 @@ import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import type { ExperimentId } from "@/common/constants/experiments";
-import {
-  LAST_CUSTOM_MODEL_PROVIDER_KEY,
-  SELECTED_WORKSPACE_KEY,
-  SIDEBAR_AGE_GROUPING_KEY,
-  TERMINAL_BADGE_CONFIG_KEY,
-  UI_THEME_KEY,
-} from "@/common/constants/storage";
+import { LAST_CUSTOM_MODEL_PROVIDER_KEY, SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { ProvidersConfigMap, ServerAuthSession } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectConfig } from "@/common/types/project";
@@ -37,15 +32,6 @@ interface SettingsSectionStoryProps {
 export function resetStorybookPersistedStateForStory(): void {
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
-    localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
-
-    // Sidebar stories can write sidebarAgeGrouping=false into the shared
-    // origin; clear it so the GeneralSection switch snapshots its default.
-    localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
-
-    // Terminal badge stories seed an enabled badge config; clear it so the
-    // default GeneralSection story snapshots the disabled (collapsed) rows.
-    localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
 
     // The Coder catalog ModelsSection stories seed the add row's provider;
     // clear it so the other ModelsSection stories snapshot their default.
@@ -133,6 +119,7 @@ interface SetupSettingsStoryOptions {
   serverAuthSessions?: ServerAuthSession[];
   /** Initial backend experiment values for config.getConfig */
   experiments?: Partial<Record<ExperimentId, boolean>>;
+  userPreferences?: UserPreferences;
 }
 
 /** Setup basic workspace for settings stories. */
@@ -154,6 +141,7 @@ export function setupSettingsStory(options: SetupSettingsStoryOptions): APIClien
     serverAuthSessions: options.serverAuthSessions,
     experiments: options.experiments,
     layoutPresets: options.layoutPresets,
+    userPreferences: options.userPreferences,
   });
 }
 

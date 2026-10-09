@@ -113,7 +113,7 @@ export type ParsedRuntime =
   | { mode: "devcontainer"; configPath: string; shareCredentials?: boolean };
 
 /**
- * Parse runtime string from localStorage or UI input into structured result.
+ * Parse runtime string from a CLI flag or UI input into structured result.
  * Format: "ssh <host>" -> { mode: "ssh", host: "<host>" }
  *         "docker <image>" -> { mode: "docker", image: "<image>" }
  *         "worktree" -> { mode: "worktree" }
@@ -121,7 +121,6 @@ export type ParsedRuntime =
  *         undefined/null -> { mode: "worktree" } (default)
  *
  * Note: "ssh" or "docker" without arguments returns null (invalid).
- * Use this for UI state management (localStorage, form inputs).
  */
 export function parseRuntimeModeAndHost(runtime: string | null | undefined): ParsedRuntime | null {
   if (!runtime) {

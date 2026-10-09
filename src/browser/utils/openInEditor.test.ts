@@ -4,6 +4,7 @@ import { openInEditor } from "./openInEditor";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX } from "@/common/constants/remoteConnection";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 interface GlobalWithOptionalWindow {
   window?: unknown;
@@ -194,12 +195,15 @@ describe("openInEditor", () => {
     // a sticky durable marker permanently refusing snapshot archives of the workspace.
     const windowWithZed = {
       api: {},
-      localStorage: { getItem: () => JSON.stringify({ editor: "zed" }) },
+      localStorage: { getItem: () => null },
       open: (url: string, target?: string) => {
         calls.push([url, target]);
         return null;
       },
     };
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { appearance: { editorConfig: { editor: "zed" } } },
+    });
     const result = await withWindow(windowWithZed, () =>
       openInEditor({
         api,
@@ -208,7 +212,7 @@ describe("openInEditor", () => {
         runtimeConfig: { type: "docker", image: "node:20", containerName: "mux-ws" },
         isFile: true,
       })
-    );
+    ).finally(() => getAppConfigStore().updateOptimistically({ userPreferences: undefined }));
 
     expect(result.success).toBe(false);
     expect(recordEditorOpen).not.toHaveBeenCalled();

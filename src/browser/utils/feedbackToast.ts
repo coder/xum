@@ -3,6 +3,7 @@ import {
   createCustomEvent,
   type CustomEventPayloads,
 } from "@/common/constants/events";
+import { isDialogOpen } from "@/browser/utils/ui/keybinds";
 
 export type FeedbackToast = CustomEventPayloads[typeof CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST];
 
@@ -18,8 +19,10 @@ export function showFeedbackToast(feedback: FeedbackToast): void {
 
   // Analytics view does not mount ChatInput, so keep a basic alert fallback
   // for command palette actions that need user feedback.
+  // A composer behind an open modal (Settings, Analytics) cannot show its toast.
   const hasChatInputToastHost =
     typeof document !== "undefined" &&
+    !isDialogOpen() &&
     document.querySelector('[data-component="ChatInputSection"]') !== null;
 
   if (hasChatInputToastHost) {

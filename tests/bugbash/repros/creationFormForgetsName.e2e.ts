@@ -8,7 +8,7 @@ test(
   "the creation form forgets the name of the workspace it just created",
   { tags: ["bugbash", "N3"] },
   async ({ app, screen, browser }) => {
-    await disableTutorials(browser);
+    await disableTutorials(app);
     // The app opens on the project's default creation form.
     await app.open();
     const name = screen.getByRole("textbox", "workspace-name");

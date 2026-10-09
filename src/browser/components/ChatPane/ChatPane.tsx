@@ -39,7 +39,6 @@ import {
   type TranscriptTailStackItem,
 } from "./layoutStack";
 import { getRetryBarrierDerivation } from "./retryBarrierDerivation";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { ChatInput, type ChatInputAPI } from "@/browser/features/ChatInput/index";
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import {
@@ -54,7 +53,7 @@ import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
 import { useBoundedTranscriptReveal } from "@/browser/hooks/useBoundedTranscriptReveal";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   useWorkspaceAggregator,
   useWorkspaceState,
@@ -649,7 +648,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     !isCompacting && autoCompactionResult.shouldShowWarning && !contextSwitchWarning;
 
   // Vim mode state - needed for keybind selection (Ctrl+C in vim, Esc otherwise)
-  const [vimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, { listener: true });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
 
   // Use auto-scroll hook for scroll management
   const {

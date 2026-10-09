@@ -13,8 +13,10 @@ import {
   recordWorkspaceModelChange,
   setWorkspaceModelWithOrigin,
 } from "@/browser/utils/modelChange";
-import { getModelKey } from "@/common/constants/storage";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  getPendingAiSelection,
+  resetAiSelectionIntentForTests,
+} from "@/browser/utils/aiSelectionIntent";
 import { createTestApiClient } from "@/browser/testUtils";
 
 async function* emptyStream() {
@@ -371,16 +373,14 @@ describe("useContextSwitchWarning", () => {
       result.current.handleModelChange(coderModel);
     });
 
-    expect(readPersistedState<string | null>(getModelKey(props.workspaceId), null)).toBe(
-      coderModel
-    );
+    expect(getPendingAiSelection(props.workspaceId, "exec", "model")).toBe(coderModel);
 
     // Re-selecting the identical selection stays a no-op.
-    window.localStorage.clear();
+    resetAiSelectionIntentForTests();
     act(() => {
       result.current.handleModelChange(directModel);
     });
-    expect(readPersistedState<string | null>(getModelKey(props.workspaceId), null)).toBeNull();
+    expect(getPendingAiSelection(props.workspaceId, "exec", "model")).toBeUndefined();
   });
 
   test("warns when gateway model strings are normalized for explicit switches", async () => {
