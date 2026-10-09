@@ -391,7 +391,8 @@ export function BranchSelector({ workspaceId, workspaceName, className }: Branch
   if (currentBranch === false) {
     return (
       <div className={cn("group flex items-center gap-0.5", className)}>
-        <div className="text-muted-light flex max-w-[180px] min-w-0 items-center gap-1 px-1 py-0.5 font-mono text-[11px]">
+        {/* text-muted, not text-muted-light: the light theme's muted-light is 2.7:1 on the footer (#5980). */}
+        <div className="text-muted flex max-w-[180px] min-w-0 items-center gap-1 px-1 py-0.5 font-mono text-[11px]">
           <span className="truncate">{workspaceName}</span>
         </div>
       </div>
@@ -405,7 +406,7 @@ export function BranchSelector({ workspaceId, workspaceName, className }: Branch
           <button
             disabled={isSwitching}
             className={cn(
-              "text-muted-light hover:bg-hover hover:text-foreground flex min-w-0 max-w-[180px] items-center gap-1 rounded-sm px-1 py-0.5 font-mono text-[11px] transition-colors",
+              "text-muted hover:bg-hover hover:text-foreground flex min-w-0 max-w-[180px] items-center gap-1 rounded-sm px-1 py-0.5 font-mono text-[11px] transition-colors",
               isRefreshing && "animate-pulse" // Show pulse during switch instead of replacing content
             )}
           >

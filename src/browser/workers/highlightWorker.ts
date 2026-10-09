@@ -7,6 +7,7 @@ import * as Comlink from "comlink";
 import { createHighlighter, type Highlighter } from "shiki";
 import {
   mapToShikiLang,
+  SHIKI_COLOR_REPLACEMENTS,
   SHIKI_DARK_THEME,
   SHIKI_LIGHT_THEME,
 } from "../utils/highlighting/shiki-shared";
@@ -45,6 +46,7 @@ const api = {
     return hl.codeToHtml(code, {
       lang: shikiLang,
       theme: shikiTheme,
+      colorReplacements: SHIKI_COLOR_REPLACEMENTS,
     });
   },
 };

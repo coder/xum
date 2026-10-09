@@ -28,7 +28,12 @@
 import * as Comlink from "comlink";
 import type { Highlighter } from "shiki";
 import type { HighlightWorkerAPI } from "@/browser/workers/highlightWorker";
-import { mapToShikiLang, SHIKI_DARK_THEME, SHIKI_LIGHT_THEME } from "./shiki-shared";
+import {
+  mapToShikiLang,
+  SHIKI_COLOR_REPLACEMENTS,
+  SHIKI_DARK_THEME,
+  SHIKI_LIGHT_THEME,
+} from "./shiki-shared";
 import { isVscodeWebview } from "@/browser/utils/env";
 
 // 5 s is generous for human-scale files (a 10k-LoC file at typical line lengths
@@ -233,6 +238,7 @@ async function highlightMainThread(
   return highlighter.codeToHtml(code, {
     lang: shikiLang,
     theme: shikiTheme,
+    colorReplacements: SHIKI_COLOR_REPLACEMENTS,
   });
 }
 
