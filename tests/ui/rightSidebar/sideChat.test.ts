@@ -560,7 +560,9 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       expect([...new Set(interruptSpy.mock.calls.map(([workspaceId]) => workspaceId))]).toEqual([
         firstId,
       ]);
-      await waitFor(() => expect(isStreaming(firstId)).toBe(false));
+      // Observing the call only proves routing, not completion: interrupt performs async cleanup.
+      await expect(interruptSpy.mock.results[0]?.value).resolves.toMatchObject({ success: true });
+      await waitFor(() => expect(isStreaming(firstId)).toBe(false), { timeout: 10_000 });
       expect(isStreaming(secondId)).toBe(true);
     } finally {
       interruptSpy.mockRestore();
