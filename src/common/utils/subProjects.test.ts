@@ -35,6 +35,41 @@ describe("subProjects", () => {
     ).toBeUndefined();
   });
 
+  // #5919: a drive-root or UNC share-root project from an older config must not adopt every
+  // project on that drive or share.
+  test("never treats a Windows drive root as a parent project", () => {
+    for (const driveRoot of ["C:\\", "C:/", "C:", "c:\\\\"]) {
+      expect(isPathDescendant(driveRoot, "C:\\repo")).toBe(false);
+    }
+    const derived = deriveProjectHierarchy(
+      new Map<string, ProjectConfig>([
+        ["C:\\", project()],
+        ["C:\\repo", project()],
+      ])
+    );
+    expect(derived.get("C:\\repo")?.parentProjectPath).toBeUndefined();
+  });
+
+  test("never treats a UNC share root as a parent project", () => {
+    for (const shareRoot of ["\\\\srv\\share\\", "\\\\srv\\share", "//srv/share/"]) {
+      expect(isPathDescendant(shareRoot, "\\\\srv\\share\\repo")).toBe(false);
+    }
+    const derived = deriveProjectHierarchy(
+      new Map<string, ProjectConfig>([
+        ["\\\\srv\\share", project()],
+        ["\\\\srv\\share\\repo", project()],
+      ])
+    );
+    expect(derived.get("\\\\srv\\share\\repo")?.parentProjectPath).toBeUndefined();
+  });
+
+  test("still nests Windows projects under a non-root Windows parent", () => {
+    expect(isPathDescendant("C:\\a", "C:\\a\\b")).toBe(true);
+    // "/:" is a POSIX directory, not a drive root.
+    expect(isPathDescendant("/:", "/:/repo")).toBe(true);
+    expect(isPathDescendant("\\\\srv\\share\\a", "\\\\srv\\share\\a\\b")).toBe(true);
+  });
+
   test("treats Windows drive-letter paths as case-insensitive", () => {
     expect(isPathDescendant("C:\\Repo", "c:\\repo\\packages\\api")).toBe(true);
   });
