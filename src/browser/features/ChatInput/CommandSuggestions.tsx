@@ -214,13 +214,15 @@ export const CommandSuggestions: React.FC<CommandSuggestionsProps> = ({
   const activeSuggestion = suggestions[selectedIndex] ?? suggestions[0];
   // Focus stays in the composer, so screen readers hear the list only through this live region
   // (#5962). It stays mounted while the list is closed: a region that appears together with its
-  // text is not announced reliably.
-  const status = (
+  // text is not announced reliably. It renders in document.body because the composer dock sits in
+  // the transcript scrollport, where the transcript's loading status must stay the only status.
+  const status = createPortal(
     <div role="status" className="sr-only">
       {isOpen && activeSuggestion
         ? `${activeSuggestion.display}, ${suggestions.indexOf(activeSuggestion) + 1} of ${suggestions.length}`
         : ""}
-    </div>
+    </div>,
+    document.body
   );
 
   if (!isOpen) {

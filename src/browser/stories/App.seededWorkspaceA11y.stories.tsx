@@ -7,6 +7,8 @@
 
 import { expect, waitFor, within } from "@storybook/test";
 
+import { RIGHT_SIDEBAR_WIDTH_KEY } from "@/common/constants/storage";
+
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
@@ -21,38 +23,36 @@ export default {
 };
 
 /** Lighthouse's seeded page: one project, one workspace with a 4-message chat, both sidebars open. */
-const renderSeededWorkspace = () => (
-  <AppWithMocks
-    setup={() => {
-      const client = setupSimpleChatStory({
-        workspaceId: "ws-a11y-seeded",
-        workspaceName: "a11y-seeded",
-        projectName: "xum",
-        messages: [
-          createUserMessage("msg-1", "What does this repo do?", {
-            historySequence: 1,
-            timestamp: STABLE_TIMESTAMP - 60_000,
-          }),
-          createAssistantMessage("msg-2", "It is a desktop app for parallel agent work.", {
-            historySequence: 2,
-            timestamp: STABLE_TIMESTAMP - 50_000,
-          }),
-          createUserMessage("msg-3", "Where is the composer?", {
-            historySequence: 3,
-            timestamp: STABLE_TIMESTAMP - 40_000,
-          }),
-          createAssistantMessage("msg-4", "In src/browser/features/ChatInput.", {
-            historySequence: 4,
-            timestamp: STABLE_TIMESTAMP - 30_000,
-          }),
-        ],
-      });
-      expandLeftSidebar();
-      expandRightSidebar();
-      return client;
-    }}
-  />
-);
+function renderSeededClient() {
+  const client = setupSimpleChatStory({
+    workspaceId: "ws-a11y-seeded",
+    workspaceName: "a11y-seeded",
+    projectName: "xum",
+    messages: [
+      createUserMessage("msg-1", "What does this repo do?", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP - 60_000,
+      }),
+      createAssistantMessage("msg-2", "It is a desktop app for parallel agent work.", {
+        historySequence: 2,
+        timestamp: STABLE_TIMESTAMP - 50_000,
+      }),
+      createUserMessage("msg-3", "Where is the composer?", {
+        historySequence: 3,
+        timestamp: STABLE_TIMESTAMP - 40_000,
+      }),
+      createAssistantMessage("msg-4", "In src/browser/features/ChatInput.", {
+        historySequence: 4,
+        timestamp: STABLE_TIMESTAMP - 30_000,
+      }),
+    ],
+  });
+  expandLeftSidebar();
+  expandRightSidebar();
+  return client;
+}
+
+const renderSeededWorkspace = () => <AppWithMocks setup={renderSeededClient} />;
 
 /**
  * landmark-one-main (#5956): the page has exactly one `main` landmark, and it holds the chat
@@ -139,6 +139,64 @@ const contractStory = (theme: ThemeMode): AppStory => ({
 
 export const Light = contractStory("light");
 export const Dark = contractStory("dark");
+
+/**
+ * Narrowest right sidebar (#5962). The right sidebar is hidden at phone width, so its narrowest
+ * real layout is the minimum sidebar width. The tabs and "+" flow inline there, so the strip must
+ * wrap without overflow and keep "+" after the last tab: in the same row, or first in the next.
+ */
+const NARROW_SIDEBAR_WIDTH_PX = 300;
+
+const narrowSidebarStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme },
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, JSON.stringify(NARROW_SIDEBAR_WIDTH_PX));
+        return renderSeededClient();
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const tablist = await canvas.findByRole(
+      "tablist",
+      { name: "Sidebar views" },
+      { timeout: 15_000 }
+    );
+    const sidebar = canvas.getByRole("complementary", { name: "Workspace insights" });
+    await waitFor(() =>
+      expect(sidebar.getBoundingClientRect().width).toBe(NARROW_SIDEBAR_WIDTH_PX)
+    );
+    await expect(tablist.getClientRects().length).toBeGreaterThan(0);
+    const tabs = within(tablist).getAllByRole("tab");
+    const addTerminal = within(sidebar).getByRole("button", { name: "New terminal" });
+    await waitFor(() => expect(addTerminal).toBeVisible());
+    const bounds = sidebar.getBoundingClientRect();
+    const rows = new Set<number>();
+    for (const element of [...tabs, addTerminal]) {
+      const rect = element.getBoundingClientRect();
+      await expect(rect.left).toBeGreaterThanOrEqual(bounds.left);
+      await expect(rect.right).toBeLessThanOrEqual(bounds.right);
+      rows.add(Math.round(rect.top + rect.height / 2));
+    }
+    // At this width the strip wraps, which is the case the inline flow exists for.
+    await expect(rows.size).toBeGreaterThan(1);
+    const lastTab = tabs[tabs.length - 1].getBoundingClientRect();
+    const add = addTerminal.getBoundingClientRect();
+    const sameRow = Math.abs(add.top + add.height / 2 - (lastTab.top + lastTab.height / 2)) < 1;
+    if (sameRow) {
+      await expect(Math.abs(add.left - (lastTab.right + TAB_GAP_PX))).toBeLessThan(1);
+    } else {
+      await expect(add.top).toBeGreaterThanOrEqual(lastTab.bottom);
+      await expect(Math.abs(add.left - tabs[0].getBoundingClientRect().left)).toBeLessThan(1);
+    }
+  },
+});
+
+export const NarrowSidebarLight = narrowSidebarStory("light");
+export const NarrowSidebarDark = narrowSidebarStory("dark");
 
 /** Phone width (390 px, iPhone 16e). */
 const PHONE_WIDTH_PX = 390;
