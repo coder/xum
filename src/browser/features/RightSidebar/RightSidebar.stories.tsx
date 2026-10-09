@@ -43,7 +43,7 @@ import {
 } from "@/common/constants/storage";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
-import type { ComponentType, ReactNode } from "react";
+import type { ComponentType, CSSProperties, ReactNode } from "react";
 import { useEffect, useRef } from "react";
 import type { TabType } from "@/browser/types/rightSidebar";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
@@ -1609,5 +1609,60 @@ export const ManyTabsSingleRow: Story = {
     // Wait for the cost badge: it widens Stats after mount, pushing the selected tab right.
     await canvas.findByRole("tab", { name: /stats.*\$0\.34/i });
     await expectSelectedTabVisible(canvasElement);
+  },
+};
+
+/** Whether a real pointer at the element's center lands on it (what Playwright's click checks). */
+function isHitTarget(element: HTMLElement): boolean {
+  const rect = element.getBoundingClientRect();
+  const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  return hit != null && element.contains(hit);
+}
+
+/**
+ * A Windows/Linux titlebar-overlay inset wider than the pane (Linux e2e reported one larger than
+ * the whole sidebar) must not squeeze the one-row strip to nothing: tabs stay clickable.
+ */
+export const TabsReachableUnderWideTitlebarInset: Story = {
+  // Play-only: a regression check, nothing new to look at.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    // On a wrapper, not :root, so the override cannot leak into later stories.
+    <div className="contents" style={{ "--titlebar-right-inset": "2000px" } as CSSProperties}>
+      <RightSidebarStoryShell
+        setup={() => {
+          localStorage.removeItem(RIGHT_SIDEBAR_TAB_KEY);
+          localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
+          seedSidebarLayout("ws-wide-inset", ["costs", "review"], "costs");
+
+          const client = setupSimpleChatStory({
+            workspaceId: "ws-wide-inset",
+            workspaceName: "feature/wide-inset",
+            projectName: "my-app",
+            messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
+          });
+          expandRightSidebar();
+          return client;
+        }}
+      >
+        <RightSidebarStoryContent workspaceId="ws-wide-inset" />
+      </RightSidebarStoryShell>
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const stats = await canvas.findByRole("tab", { name: /^stats/i, selected: true });
+    const review = await canvas.findByRole("tab", { name: /^review/i });
+    await expectSelectedTabVisible(canvasElement);
+    await waitFor(() => {
+      if (!isHitTarget(stats)) throw new Error("selected tab is not under the pointer");
+    });
+    // Like Playwright: bring the other tab into view, then it must take the click.
+    review.scrollIntoView({ block: "nearest", inline: "nearest" });
+    await waitFor(() => {
+      if (!isHitTarget(review)) throw new Error("unselected tab is not under the pointer");
+    });
+    await userEvent.click(review);
+    await canvas.findByRole("tab", { name: /^review/i, selected: true });
   },
 };

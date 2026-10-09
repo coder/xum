@@ -1325,6 +1325,19 @@ html[data-renderer-inactive] *::after {
   );
 }
 
+/* titlebar-safe-right that never takes more than the element's width minus 10rem, for rows
+ * whose content would otherwise be squeezed to nothing (the right-sidebar tab strip scrolls in
+ * one row, so a full inset on a narrow pane left no visible, clickable tab). Below that width
+ * content may sit under the overlay controls, which beats being unreachable. 10rem keeps the
+ * full 138px Windows/Linux fallback inset at the sidebar's 300px minimum width. Percentage
+ * padding resolves against the parent's width, which matches a full-width row. */
+.titlebar-safe-right-capped {
+  padding-right: max(
+    var(--titlebar-safe-right-gutter, 0px),
+    min(var(--titlebar-right-inset, 0px), calc(100% - 10rem))
+  );
+}
+
 /* Baseline gutter tokens — pair with titlebar-safe-* classes to declare
  * the component's built-in horizontal spacing as a CSS custom property.
  * The titlebar-safe utilities read these to ensure padding never drops

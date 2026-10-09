@@ -257,7 +257,9 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
     <div
       ref={setNodeRef}
       className={cn(
-        "border-border-light titlebar-safe-right titlebar-safe-right-gutter-2 flex min-w-0 items-center gap-1 border-b px-2 py-1.5 transition-colors",
+        // Capped inset: the tabs live in one scrolling row, so the full overlay inset on a
+        // narrow pane would shrink that row to zero and hide every tab.
+        "border-border-light titlebar-safe-right-capped titlebar-safe-right-gutter-2 flex min-w-0 items-center gap-1 border-b px-2 py-1.5 transition-colors",
         isDesktop && DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
         showDropHighlight && "bg-accent/30",
         isDraggingFromHere && "bg-accent/10",
