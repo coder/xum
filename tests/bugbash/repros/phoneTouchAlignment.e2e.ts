@@ -108,3 +108,40 @@ test(
       .toBeLessThanOrEqual(2);
   }
 );
+
+test(
+  "The workspace actions menu stays on the title row on a touch phone",
+  { tags: ["bugbash", "touch-alignment"] },
+  async ({ app, screen, browser }) => {
+    await browser.setViewport({ width: 390, height: 844 });
+    // The header picks its button order with matchMedia, which the copied CSS rules cannot
+    // reach: report a coarse pointer to scripts too.
+    await browser.addInitScript(() => {
+      const matchMedia = window.matchMedia.bind(window);
+      window.matchMedia = (query: string) =>
+        matchMedia(query.replaceAll("(pointer: coarse)", "(min-width: 0px)"));
+    });
+    await openPlayground(app, screen, browser);
+    await applyTouchPointerRules(browser);
+
+    // The 44px buttons do not fit beside the title, so the header wraps. Before the fix the
+    // three-dots menu wrapped with the other actions and sat under the title, 44px lower.
+    await expect
+      .poll(() =>
+        centerGap(
+          browser,
+          '[data-testid="workspace-title"]',
+          '[data-testid="workspace-more-actions"]'
+        )
+      )
+      .toBeLessThanOrEqual(2);
+    // Keyboard focus follows the DOM, so the menu must also come before the row below it.
+    const menuFirst = await browser.evaluate(() => {
+      const menu = document.querySelector('[data-testid="workspace-more-actions"]');
+      const terminal = document.querySelector('[aria-label="New terminal"]');
+      if (!menu || !terminal) return false;
+      return (menu.compareDocumentPosition(terminal) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    });
+    expect(menuFirst).toBe(true);
+  }
+);
