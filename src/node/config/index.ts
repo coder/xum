@@ -945,6 +945,96 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
 
   return next;
 }
+
+interface StoredProjectEntry {
+  /** The key exactly as config.json stores it. */
+  storedKey: string;
+  /** The normalized project path the loader uses as the map key. */
+  key: string;
+  config: ProjectConfig;
+}
+
+/**
+ * Merge one group of aliases (stored keys that normalize to the same path), or return null when
+ * a merge would have to choose between two different rows with the same id. Rows with distinct
+ * ids are combined, and a byte-identical duplicate row is kept once. Project settings come from
+ * the last entry, as the previous `new Map(pairs)` loader did: a setting only an earlier alias
+ * holds may be one the user cleared since. The project is trusted only when every alias was:
+ * the canonical spelling says nothing about which alias the user trusted.
+ */
+function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null {
+  const workspaces: ProjectConfig["workspaces"] = [];
+  const rowJsonById = new Map<string, string>();
+  // Legacy rows without an id: a byte-identical copy in two aliases is one workspace. Keeping
+  // both would let the id migration give both copies the same stable id.
+  const idlessRowJson = new Set<string>();
+  for (const { config } of group) {
+    if (!Array.isArray(config.workspaces)) return null;
+    for (const workspace of config.workspaces) {
+      const json = JSON.stringify(workspace);
+      if (!workspace.id) {
+        if (!idlessRowJson.has(json)) workspaces.push(workspace);
+        idlessRowJson.add(json);
+        continue;
+      }
+      const seenJson = rowJsonById.get(workspace.id);
+      if (seenJson === undefined) {
+        rowJsonById.set(workspace.id, json);
+        workspaces.push(workspace);
+      } else if (seenJson !== json) {
+        return null;
+      }
+    }
+  }
+  const merged: ProjectConfig = { ...group[group.length - 1].config, workspaces };
+  delete merged.trusted;
+  if (group.every(({ config }) => config.trusted === true)) {
+    merged.trusted = true;
+  } else if (group.some(({ config }) => config.trusted !== undefined)) {
+    merged.trusted = false;
+  }
+  return merged;
+}
+
+/**
+ * Build the project map from the loaded entries. Stored keys that normalize to the same path
+ * ("/repo" and "/repo/") are aliases of one project. `new Map(pairs)` used to keep only the last
+ * alias, so the next save dropped the other aliases' workspace rows. Group every alias first,
+ * then merge the group's rows. A group with two different rows under one id still keeps only
+ * its last entry, as before (#5929).
+ */
+function buildProjectsFromStoredEntries(entries: StoredProjectEntry[]): Map<string, ProjectConfig> {
+  const groups = new Map<string, StoredProjectEntry[]>();
+  for (const entry of entries) {
+    const group = groups.get(entry.key);
+    if (group) group.push(entry);
+    else groups.set(entry.key, [entry]);
+  }
+  const projects = new Map<string, ProjectConfig>();
+  for (const [key, group] of groups) {
+    if (group.length === 1) {
+      projects.set(key, group[0].config);
+      continue;
+    }
+    const storedKeys = group.map((entry) => entry.storedKey);
+    const merged = mergeProjectAliases(group);
+    if (merged) {
+      log.warn("Merged project config entries with the same path", { path: key, storedKeys });
+      projects.set(key, merged);
+      continue;
+    }
+    // Conflicting aliases keep main's behavior (`new Map(pairs)`): the last entry wins, at the
+    // position of the first. Keeping every conflicting entry under its own key broke trust and
+    // project mutators, which look up the stripped path; a lossless design is #5929.
+    log.error("Project config entries share a path but conflict; keeping the last entry", {
+      path: key,
+      storedKeys,
+    });
+    projects.set(key, group[group.length - 1].config);
+  }
+  return projects;
+}
+
 /**
  * The built-in Chat with Mux workspace (removed in #3123) lived in a hidden
  * `<xumHome>/system/Mux` project. Real upgraded installs still carry that
@@ -1884,7 +1974,7 @@ export class Config {
         this.legacyTaskVariantGroups.delete(workspaceId);
       }
     }
-    const normalizedPairs = rawPairs
+    const storedEntries = rawPairs
       .filter(([projectPath]) => {
         // "" is accepted: earlier saves wrote the root project "/" as "" (#5917). It loads as
         // "/" below instead of dropping the project and its workspace rows.
@@ -1901,13 +1991,13 @@ export class Config {
             this.rememberLegacyTaskVariantWorkspace(projectPath, workspace);
           }
         }
-        const normalizedProjectConfig = normalizeProjectRuntimeSettings(projectConfig);
-        return [stripTrailingSlashes(projectPath), normalizedProjectConfig] as [
-          string,
-          ProjectConfig,
-        ];
+        return {
+          storedKey: storedProjectPath,
+          key: stripTrailingSlashes(projectPath),
+          config: normalizeProjectRuntimeSettings(projectConfig),
+        };
       });
-    return new Map(normalizedPairs);
+    return buildProjectsFromStoredEntries(storedEntries);
   }
 
   private normalizeParsedConfig(
