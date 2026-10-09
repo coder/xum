@@ -440,6 +440,9 @@ jobs:
       - name: Verify Windows plugin path aliases
         shell: pwsh
         run: bun test src/node/services/agentPlugins/discovery.test.ts -t "coalesces Windows case aliases"
+      - name: Verify Windows namespaced filesystem roots
+        shell: pwsh
+        run: bun test src/node/utils/pathUtils.test.ts -t "refuses Windows namespaced roots"
       - name: Run Windows integration smoke tests
         shell: pwsh
         run: |

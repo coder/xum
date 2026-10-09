@@ -1,4 +1,5 @@
 import type { ProjectConfig } from "@/common/types/project";
+import { isRootPathString } from "@/common/utils/pathRoot";
 import { PlatformPaths } from "@/common/utils/paths";
 
 export function normalizeForDescendantComparison(value: string): string {
@@ -12,29 +13,16 @@ export function normalizeForDescendantComparison(value: string): string {
   return isWindowsPath ? normalized.toLowerCase() : normalized;
 }
 
-/**
- * True for a normalized filesystem root: "" (POSIX "/"), a drive "c:", or a UNC server or share
- * ("//srv", "//srv/share"). Expects normalizeForDescendantComparison output.
- */
-function isNormalizedFilesystemRoot(normalized: string): boolean {
-  if (normalized === "") return true;
-  // Drive roots arrive lowercased ("c:"). Require a letter: "/:" is a valid POSIX directory.
-  if (normalized.length === 2 && normalized.charCodeAt(1) === 58 /* : */) {
-    const drive = normalized.charCodeAt(0);
-    return drive >= 97 /* a */ && drive <= 122 /* z */;
-  }
-  if (!normalized.startsWith("//")) return false;
-  // "//srv" or "//srv/share": at most one more separator after the server name.
-  const shareSeparator = normalized.indexOf("/", 2);
-  return shareSeparator === -1 || !normalized.includes("/", shareSeparator + 1);
-}
-
 export function isPathDescendant(parentPath: string, candidatePath: string): boolean {
-  const parent = normalizeForDescendantComparison(parentPath);
   // A root project restored from an older config (POSIX "/", #5917; a Windows drive or UNC
-  // share root, #5919) is never a parent: it would adopt every project below it, and the
-  // load-time hierarchy merge would move their workspace rows into the root's bucket.
-  if (isNormalizedFilesystemRoot(parent)) return false;
+  // share root, #5919; a namespaced root such as "\\\\?\\UNC\\srv\\share", #5924) is never a
+  // parent: it would adopt every project below it, and the load-time hierarchy merge would move
+  // their workspace rows into the root's bucket. Keys can come from any runtime, so the win32
+  // rules apply; they also cover every POSIX root spelling.
+  if (isRootPathString(parentPath, "win32")) return false;
+  const parent = normalizeForDescendantComparison(parentPath);
+  // "" is no root spelling, but it is no project either.
+  if (parent === "") return false;
   const candidate = normalizeForDescendantComparison(candidatePath);
   return candidate.startsWith(`${parent}/`) && candidate.length > parent.length + 1;
 }
