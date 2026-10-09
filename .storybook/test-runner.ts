@@ -1,5 +1,7 @@
 import type { TestRunnerConfig } from "@storybook/test-runner";
-import { expect } from "@playwright/test";
+// This hook is reloaded between Jest suites in the same worker. Importing @playwright/test
+// initializes a second test runner and fails on reload; use browser waits and Node assertions.
+import assert from "node:assert/strict";
 
 // Real :hover for the primary-button contrast stories (#6022). A play runs inside the page and
 // cannot set :hover, so only stories under this id prefix get two page-level helpers backed by
@@ -30,14 +32,14 @@ const config: TestRunnerConfig = {
       for (const width of [1200, 375]) {
         // A visible-sidebar tablet and a phone viewport, both with a narrow overflowing strip.
         await page.setViewportSize({ width, height: 900 });
-        await expect
-          .poll(() => page.evaluate(() => matchMedia("(pointer: coarse)").matches))
-          .toBe(true);
+        await page.waitForFunction(() => matchMedia("(pointer: coarse)").matches, undefined, {
+          timeout: 5000,
+        });
         await tabs.first().click();
-        await expect(tabs.first()).toHaveAttribute("aria-selected", "true");
+        await tabs.first().and(page.locator('[aria-selected="true"]')).waitFor({ timeout: 5000 });
         const before = await row.evaluate((el) => el.scrollLeft);
-        // Two short gestures normally reveal the last tab; bound retries without panning all
-        // the way to the strip's end, keeping this regression inside the normal CI timeout.
+        // Wait for native scroll completion: a tap during inertial scrolling cancels the
+        // scroll instead of selecting the tab, especially under parallel CI load.
         for (let swipe = 0; swipe < 4; swipe++) {
           const point = await row.evaluate((el) => {
             const r = el.getBoundingClientRect();
@@ -53,6 +55,12 @@ const config: TestRunnerConfig = {
             }
             throw new Error("No tab label available to swipe");
           });
+          await row.evaluate((el) => {
+            el.removeAttribute("data-scroll-settled");
+            el.addEventListener("scrollend", () => el.setAttribute("data-scroll-settled", ""), {
+              once: true,
+            });
+          });
           await client.send("Input.dispatchTouchEvent", {
             type: "touchStart",
             touchPoints: [{ x: point.x, y: point.y }],
@@ -62,12 +70,12 @@ const config: TestRunnerConfig = {
               type: "touchMove",
               touchPoints: [{ x: point.x + (point.xDistance * step) / 3, y: point.y }],
             });
-            // Deliver moves across rendered frames, like a finger, without time-based sleeps.
             await page.evaluate(
               () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
             );
           }
           await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+          await row.and(page.locator("[data-scroll-settled]")).waitFor({ timeout: 5000 });
           const reachedLastTab = await row.evaluate((el) => {
             const last = Array.from(el.querySelectorAll('[role="tab"]')).at(-1);
             if (!last) return false;
@@ -77,22 +85,28 @@ const config: TestRunnerConfig = {
           });
           if (reachedLastTab) break;
         }
-        await expect.poll(() => row.evaluate((el) => el.scrollLeft)).toBeGreaterThan(before + 50);
-        await expect(tabs.evaluateAll((elements) => elements.map((el) => el.id))).resolves.toEqual(
-          initialOrder
+        await page.waitForFunction(
+          (start) => (document.querySelector('[role="tablist"]')?.scrollLeft ?? 0) > start + 50,
+          before,
+          { timeout: 5000 }
+        );
+        assert.deepEqual(
+          await tabs.evaluateAll((elements) => elements.map((el) => el.id)),
+          initialOrder,
+          "Touch panning must not reorder tabs"
         );
         // An initially offscreen tab is now hit-testable and selectable without programmatic scrolling.
         const last = await tabs.last().boundingBox();
         const bounds = await row.boundingBox();
         if (!last || !bounds) throw new Error("Scrolled tab is missing");
-        expect(last.x + 20).toBeGreaterThanOrEqual(bounds.x);
-        expect(last.x + 20).toBeLessThan(bounds.x + bounds.width);
+        assert(last.x + 20 >= bounds.x, "Last tab must be inside the left edge");
+        assert(last.x + 20 < bounds.x + bounds.width, "Last tab must be inside the right edge");
         await client.send("Input.dispatchTouchEvent", {
           type: "touchStart",
           touchPoints: [{ x: last.x + 20, y: last.y + last.height / 2 }],
         });
         await client.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
-        await expect(tabs.last()).toHaveAttribute("aria-selected", "true");
+        await tabs.last().and(page.locator('[aria-selected="true"]')).waitFor({ timeout: 5000 });
       }
 
       // The same surface must still support the existing distance-activated mouse reorder.
@@ -109,9 +123,16 @@ const config: TestRunnerConfig = {
         steps: 12,
       });
       await page.mouse.up();
-      await expect
-        .poll(() => tabs.evaluateAll((elements) => elements.map((el) => el.id)))
-        .toEqual([initialOrder[1], initialOrder[0], ...initialOrder.slice(2)]);
+      await page.waitForFunction(
+        (expected) => {
+          const actual = Array.from(document.querySelectorAll('[role="tablist"] [role="tab"]'));
+          return (
+            actual.length === expected.length && actual.every((tab, i) => tab.id === expected[i])
+          );
+        },
+        [initialOrder[1], initialOrder[0], ...initialOrder.slice(2)],
+        { timeout: 5000 }
+      );
     } finally {
       await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
       await client.detach();

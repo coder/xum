@@ -174,7 +174,7 @@ const narrowSidebarStory = (theme: ThemeMode): AppStory => ({
           root: {
             type: "tabset",
             id: "tabset-1",
-            tabs: ["stats", "review", "explorer", "terminal", "output", "new"],
+            tabs: ["costs", "review", "instructions", "terminal", "output", "new"],
             activeTab: "new",
           },
         });
@@ -195,7 +195,7 @@ const narrowSidebarStory = (theme: ThemeMode): AppStory => ({
     );
     await expect(tablist.getClientRects().length).toBeGreaterThan(0);
     const tabs = within(tablist).getAllByRole("tab");
-    const addTab = within(sidebar).getByRole("button", { name: "New tab", exact: true });
+    const addTab = within(sidebar).getByRole("button", { name: "New tab" });
     await waitFor(() => expect(addTab).toBeVisible());
     const bounds = sidebar.getBoundingClientRect();
     for (const element of [tablist, addTab]) {
