@@ -10336,7 +10336,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "## How side chats work",
       "",
-      "- **Inherits context**: the side chat starts from the main chat's conversation, including a turn that is still streaming, and uses the same model and settings.",
+      "- **Inherits context, not execution**: the side chat receives a frozen copy of the main chat's conversation and uses the same model and settings. An unfinished response is reference-only: pending tool calls are not run again. Opening or reopening a side chat never automatically resumes a turn; it waits for your question or an explicit retry.",
       "- **Main chat keeps going**: an agent working in the main chat keeps working next to the side chat. Keyboard shortcuts such as <kbd>Esc</kbd> to interrupt apply to whichever chat has focus.",
       "- **Same checkout**: the side chat runs in the main chat's working tree, so it sees uncommitted changes.",
       "- **Understanding, not changes**: side chats are for interactive questions and explanations. Only read-only inspection tools are available: no shell, file edits, workflows, sub-agents, or project-defined tools can change the shared checkout. Make changes from the main chat instead.",

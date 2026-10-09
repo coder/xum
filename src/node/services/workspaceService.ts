@@ -194,7 +194,10 @@ import {
   ADDITIONAL_SYSTEM_CONTEXT_FILENAME,
 } from "@/node/services/additionalSystemContext";
 import { REVIEW_STATE_FILE_NAME } from "@/node/services/reviewStateService";
-import { getSideChatCreationRefusal } from "@/node/services/sideChat";
+import {
+  getSideChatCreationRefusal,
+  materializeSideChatHistorySnapshot,
+} from "@/node/services/sideChat";
 import {
   generateWorkspaceIdentity,
   type NameGenerationCandidate,
@@ -14593,11 +14596,10 @@ export class WorkspaceService
           path.join(newSessionDir, fileName)
         );
       }
-      // A main chat that is mid-turn: the side chat sees what it has produced so far.
-      await materializeForkedPartialSnapshot({
+      // Preserve the main chat's visible context, never its live/recoverable execution state.
+      await materializeSideChatHistorySnapshot({
         historyService: this.historyService,
         partialSnapshot,
-        sourceWorkspaceId: parentWorkspaceId,
         targetWorkspaceId: newWorkspaceId,
       });
       await resetForkedSessionUsage(this.sessionUsageService, newWorkspaceId, newSessionDir);

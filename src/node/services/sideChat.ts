@@ -1,9 +1,118 @@
+import { randomUUID } from "node:crypto";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
+import type { HistoryService } from "./historyService";
 import type { CapabilityGrants } from "@/common/types/capabilityGrants";
 import type { RuntimeMode } from "@/common/types/runtime";
 import { RUNTIME_MODE, runtimeModeSupportsSharedTaskWorkspace } from "@/common/types/runtime";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { mergeAdditionalSystemInstructions } from "@/common/utils/additionalSystemInstructions";
 import { getRuntimeType } from "@/node/runtime/initHook";
+
+/** Copied context is not a turn to finish, nor a tool invocation owned by this workspace. */
+function inertSideChatMessage(message: MuxMessage): MuxMessage {
+  const hasPendingTools = message.parts.some(
+    (part) => part.type === "dynamic-tool" && part.state === "input-available"
+  );
+  const original = message.metadata;
+  const hasPendingFollowUp =
+    original?.muxMetadata?.type === "compaction-summary" &&
+    original.muxMetadata.pendingFollowUp != null;
+  if (
+    !hasPendingTools &&
+    !hasPendingFollowUp &&
+    original?.partial == null &&
+    original?.streamFinalized == null &&
+    original?.error == null &&
+    original?.errorType == null &&
+    original?.retrySendOptions == null
+  ) {
+    return message;
+  }
+  const metadata = { ...original };
+  delete metadata.partial;
+  delete metadata.streamFinalized;
+  delete metadata.error;
+  delete metadata.errorType;
+  delete metadata.retrySendOptions;
+  if (metadata.muxMetadata?.type === "compaction-summary") {
+    metadata.muxMetadata = { ...metadata.muxMetadata };
+    delete metadata.muxMetadata.pendingFollowUp;
+  }
+  return {
+    ...message,
+    metadata,
+    parts: message.parts.map((part) =>
+      part.type === "dynamic-tool" && part.state === "input-available"
+        ? {
+            type: "text" as const,
+            text: `[Main-chat ${part.toolName} call was unfinished when this context was copied; it is not running in this side chat.]`,
+            timestamp: part.timestamp,
+          }
+        : part
+    ),
+  };
+}
+
+/**
+ * Finish only the *copy* as reference context before registering a side chat. Forks deliberately
+ * keep resumable partials; side chats must not inherit that behavior. Direct updates also clear
+ * flags/refresh text when the part count is unchanged (commitPartial intentionally skips those).
+ */
+export async function materializeSideChatHistorySnapshot(params: {
+  historyService: HistoryService;
+  targetWorkspaceId: string;
+  partialSnapshot: MuxMessage | null;
+}): Promise<void> {
+  const history = await params.historyService.getHistoryFromLatestBoundary(
+    params.targetWorkspaceId
+  );
+  if (!history.success) throw new Error(history.error);
+  const messages: MuxMessage[] = [];
+  for (const copied of history.data) {
+    const partial = params.partialSnapshot;
+    // A completed row may have landed after the partial was captured. Never replace it with
+    // the older partial, or resurrect an orphan whose own id/sequence is absent from the copy.
+    const snapshot =
+      partial != null &&
+      copied.id === partial.id &&
+      copied.metadata?.historySequence === partial.metadata?.historySequence &&
+      (copied.metadata?.partial === true || copied.parts.length === 0) &&
+      partial.parts.length >= copied.parts.length
+        ? partial
+        : copied;
+    const inert = inertSideChatMessage(snapshot);
+    if (inert !== copied) {
+      const updated = await params.historyService.updateHistory(params.targetWorkspaceId, inert);
+      if (!updated.success) throw new Error(updated.error);
+    }
+    messages.push(inert);
+  }
+
+  // Empty placeholders and hidden snapshots are not visible replies. If the inherited display
+  // tail is a user turn, close that context without answering it or showing a retry barrier.
+  const visibleTail = messages.findLast(
+    (message) =>
+      message.role !== "system" &&
+      !isModelHiddenMessage(message) &&
+      (message.metadata?.synthetic !== true || message.metadata.uiVisible === true) &&
+      message.parts.some((part) =>
+        part.type === "text" || part.type === "reasoning" ? part.text.trim().length > 0 : true
+      )
+  );
+  if (visibleTail?.role === "user") {
+    const appended = await params.historyService.appendToHistory(
+      params.targetWorkspaceId,
+      createMuxMessage(
+        randomUUID(),
+        "assistant",
+        "Main-chat context copied for reference. Ask a side question; the main chat continues separately.",
+        { synthetic: true, uiVisible: true }
+      )
+    );
+    if (!appended.success) throw new Error(appended.error);
+  }
+}
 
 /** A hard ceiling, independent of agent/caller policy: side chats may inspect, never act. */
 export const SIDE_CHAT_TOOL_GRANTS: CapabilityGrants = {

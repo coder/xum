@@ -119,6 +119,185 @@ describe("WorkspaceService.createSideChat", () => {
     expect(existsSync(path.join(parentPath, "README.md"))).toBe(true);
   });
 
+  test.each([
+    "text partial",
+    "pending tools",
+    "persisted partial",
+    "equal part counts",
+    "empty placeholder",
+    "user only",
+    "newer completed row",
+  ] as const)("copies %s as inert context without changing the parent", async (scenario) => {
+    const history = harness.historyService;
+    expect(
+      (
+        await history.appendToHistory(
+          parentId,
+          createMuxMessage("working-user", "user", "Continue the main work")
+        )
+      ).success
+    ).toBe(true);
+    const assistant = createMuxMessage("working-assistant", "assistant", "older text", {
+      historySequence: 3,
+      ...(scenario === "persisted partial" || scenario === "equal part counts"
+        ? { partial: true, error: "old error", errorType: "network" as const }
+        : {}),
+    });
+    if (
+      scenario === "empty placeholder" ||
+      scenario === "text partial" ||
+      scenario === "pending tools"
+    ) {
+      assistant.parts = [];
+    }
+    if (scenario === "newer completed row")
+      assistant.parts = [{ type: "text", text: "Completed main work" }];
+    if (scenario !== "user only")
+      expect((await history.appendToHistory(parentId, assistant)).success).toBe(true);
+    if (
+      ["text partial", "pending tools", "equal part counts", "newer completed row"].includes(
+        scenario
+      )
+    ) {
+      const partial = {
+        ...assistant,
+        parts: [{ type: "text" as const, text: "latest partial text" }],
+      };
+      if (scenario === "pending tools") {
+        partial.parts = [];
+        expect(
+          (
+            await history.writePartial(parentId, {
+              ...assistant,
+              parts: [
+                {
+                  type: "dynamic-tool",
+                  toolCallId: "read-done",
+                  toolName: "file_read",
+                  state: "output-available",
+                  input: { path: "README.md" },
+                  output: { contents: "completed read" },
+                },
+                {
+                  type: "dynamic-tool",
+                  toolCallId: "running-bash",
+                  toolName: "bash",
+                  state: "input-available",
+                  input: { script: "perform work" },
+                },
+                {
+                  type: "dynamic-tool",
+                  toolCallId: "waiting-question",
+                  toolName: "ask_user_question",
+                  state: "input-available",
+                  input: { questions: [] },
+                },
+              ],
+            })
+          ).success
+        ).toBe(true);
+      } else {
+        expect((await history.writePartial(parentId, partial)).success).toBe(true);
+      }
+    }
+    const sourceHistory = await history.getHistoryFromLatestBoundary(parentId);
+    const sourcePartial = await history.readPartial(parentId);
+    const stop = spyOn(harness.aiService, "stopStream");
+    try {
+      const sideId = await createSideChatOk(parentId);
+      const copied = await history.getHistoryFromLatestBoundary(sideId);
+      if (!copied.success) throw new Error(copied.error);
+      expect(copied.data.slice(0, 2).map((row) => row.id)).toEqual(["parent-u1", "parent-a1"]);
+      expect(copied.data.some((row) => row.metadata?.partial === true)).toBe(false);
+      expect(copied.data.some((row) => row.metadata?.error != null)).toBe(false);
+      expect(
+        copied.data
+          .flatMap((row) => row.parts)
+          .some((part) => part.type === "dynamic-tool" && part.state === "input-available")
+      ).toBe(false);
+      expect(await history.readPartial(sideId)).toBeNull();
+      const tail = copied.data.at(-1);
+      expect(tail?.role).toBe("assistant");
+      expect(tail?.parts.length).toBeGreaterThan(0);
+      if (scenario === "text partial" || scenario === "equal part counts") {
+        expect(tail?.parts).toContainEqual({ type: "text", text: "latest partial text" });
+      }
+      if (scenario === "newer completed row") {
+        expect(tail?.parts).toEqual(assistant.parts);
+      }
+      if (scenario === "pending tools") {
+        const completedRead = tail?.parts.find(
+          (part) => part.type === "dynamic-tool" && part.toolCallId === "read-done"
+        );
+        expect(completedRead).toMatchObject({
+          state: "output-available",
+          output: { contents: "completed read" },
+        });
+      }
+      expect(await history.getHistoryFromLatestBoundary(parentId)).toEqual(sourceHistory);
+      expect(await history.readPartial(parentId)).toEqual(sourcePartial);
+      expect(stop).not.toHaveBeenCalled();
+    } finally {
+      stop.mockRestore();
+    }
+  });
+
+  test("copied compaction context keeps its boundary but not its pending continuation", async () => {
+    const history = harness.historyService;
+    const summary = createMuxMessage("pending-summary", "assistant", "Completed context summary", {
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+      muxMetadata: {
+        type: "compaction-summary",
+        pendingFollowUp: {
+          text: "Continue the main work",
+          model: "openai:gpt-4o",
+          agentId: "exec",
+        },
+      },
+    });
+    expect((await history.appendToHistory(parentId, summary)).success).toBe(true);
+    const before = await history.getHistoryFromLatestBoundary(parentId);
+
+    const sideId = await createSideChatOk(parentId);
+    const copied = await history.getHistoryFromLatestBoundary(sideId);
+    if (!copied.success) throw new Error(copied.error);
+    expect(copied.data).toHaveLength(1);
+    expect(copied.data[0].parts).toEqual(summary.parts);
+    expect(copied.data[0].metadata).toMatchObject({
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+      muxMetadata: { type: "compaction-summary" },
+    });
+    const marker = copied.data[0].metadata?.muxMetadata;
+    if (marker?.type !== "compaction-summary") throw new Error("summary marker missing");
+    expect(marker.pendingFollowUp).toBeUndefined();
+    expect(await history.getHistoryFromLatestBoundary(parentId)).toEqual(before);
+  });
+
+  test("fails creation rather than publishing a resumable snapshot if normalization fails", async () => {
+    expect(
+      (
+        await harness.historyService.appendToHistory(
+          parentId,
+          createMuxMessage("unfinished", "assistant", "Working", { partial: true })
+        )
+      ).success
+    ).toBe(true);
+    const update = spyOn(harness.historyService, "updateHistory").mockResolvedValueOnce(
+      Err("disk full")
+    );
+    try {
+      expect((await harness.service.createSideChat(parentId)).success).toBe(false);
+      expect(sideChatIdsOf(parentId)).toEqual([]);
+      expect(config.findWorkspace(parentId)).not.toBeNull();
+    } finally {
+      update.mockRestore();
+    }
+  });
+
   test("refuses to start a side chat from a side chat", async () => {
     const sideChatId = await createSideChatOk(parentId);
 
