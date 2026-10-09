@@ -16,10 +16,9 @@ import { isModelAvailable } from "@/common/routing";
 import type { ProviderModelEntry, ProvidersConfigMap } from "@/common/orpc/types";
 import {
   getAppConfigStore,
+  saveConfigOptimistically,
   useAppConfig,
-  USER_PREFERENCE_SAVE_FAILED_MESSAGE,
 } from "@/browser/stores/AppConfigStore";
-import { showFeedbackToast } from "@/browser/utils/feedbackToast";
 
 import {
   BUILT_IN_MODELS,
@@ -106,18 +105,7 @@ export function useModelsFromSettings() {
 
   const persistModelPrefs = useCallback(
     (patch: { defaultModel?: string; hiddenModels?: string[] }) => {
-      const store = getAppConfigStore();
-      // As for preference writes: while disconnected (or before the config loads) a change would
-      // never be sent and the next refresh would silently revert it, so refuse it visibly.
-      if (!api || !store.getSnapshot()) {
-        showFeedbackToast({ type: "error", message: USER_PREFERENCE_SAVE_FAILED_MESSAGE });
-        return;
-      }
-      store.updateOptimistically(patch);
-      api.config.updateModelPreferences(patch).catch(() => {
-        showFeedbackToast({ type: "error", message: USER_PREFERENCE_SAVE_FAILED_MESSAGE });
-        void store.refresh();
-      });
+      saveConfigOptimistically(api, patch, (client) => client.config.updateModelPreferences(patch));
     },
     [api]
   );

@@ -43,7 +43,7 @@ const INITIAL_READ_RETRY_MS = 250;
 const MAX_INITIAL_READ_RETRY_MS = 5_000;
 const EMPTY_USER_PREFERENCES: UserPreferences = {};
 const EMPTY_AGENT_AI_DEFAULTS: AgentAiDefaults = {};
-export const USER_PREFERENCE_SAVE_FAILED_MESSAGE = "Settings could not be saved";
+const USER_PREFERENCE_SAVE_FAILED_MESSAGE = "Settings could not be saved";
 const USER_PREFERENCE_SAVE_UNCONFIRMED_MESSAGE =
   "Connection lost: settings may not have been saved";
 
@@ -383,6 +383,33 @@ export function updateUserPreferences(patch: UserPreferencesPatch): void {
 
 export function flushUserPreferences(): Promise<void> {
   return getAppConfigStore().flushUserPreferences();
+}
+
+/**
+ * Shows a top-level config change at once and sends it. Refused while disconnected or before the
+ * config loads: it would never be sent, and the next refresh would silently revert it.
+ */
+export function saveConfigOptimistically(
+  api: APIClient | null,
+  updates: Partial<AppConfigSnapshot>,
+  send: (api: APIClient) => Promise<unknown>
+): void {
+  const store = getAppConfigStore();
+  if (!api || !store.getSnapshot()) {
+    showFeedbackToast({ type: "error", message: USER_PREFERENCE_SAVE_FAILED_MESSAGE });
+    return;
+  }
+  store.updateOptimistically(updates);
+  send(api).catch((error: unknown) => {
+    // As for preference writes, a request cut off by a lost connection may still be applied.
+    showFeedbackToast({
+      type: "error",
+      message: isAbortError(error)
+        ? USER_PREFERENCE_SAVE_UNCONFIRMED_MESSAGE
+        : USER_PREFERENCE_SAVE_FAILED_MESSAGE,
+    });
+    void store.refresh();
+  });
 }
 
 export function useUserPreferences<T>(select: (preferences: UserPreferences) => T): T {

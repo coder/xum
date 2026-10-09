@@ -1,11 +1,6 @@
 import { useRef } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import {
-  getAppConfigStore,
-  USER_PREFERENCE_SAVE_FAILED_MESSAGE,
-  useAppConfig,
-} from "@/browser/stores/AppConfigStore";
-import { showFeedbackToast } from "@/browser/utils/feedbackToast";
+import { saveConfigOptimistically, useAppConfig } from "@/browser/stores/AppConfigStore";
 import {
   RUNTIME_ENABLEMENT_IDS,
   normalizeRuntimeEnablement,
@@ -41,7 +36,6 @@ function normalizeDefaultRuntime(value: unknown): RuntimeEnablementId | null {
 
 export function useRuntimeEnablement(): RuntimeEnablementState {
   const { api } = useAPI();
-  const store = getAppConfigStore();
   const rawEnablement = useAppConfig((config) => config.runtimeEnablement);
   const rawDefaultRuntime = useAppConfig((config) => config.defaultRuntime);
 
@@ -60,18 +54,10 @@ export function useRuntimeEnablement(): RuntimeEnablementState {
   const enablement = enablementRef.current;
   const defaultRuntime = normalizeDefaultRuntime(rawDefaultRuntime);
 
-  // As for preference writes: while disconnected (or before the config loads) a change would
-  // never be sent and the next refresh would silently revert it, so refuse it visibly.
   const persist = (payload: RuntimeEnablementPatch) => {
-    if (!api || !store.getSnapshot()) {
-      showFeedbackToast({ type: "error", message: USER_PREFERENCE_SAVE_FAILED_MESSAGE });
-      return;
-    }
-    store.updateOptimistically(payload);
-    api.config.updateRuntimeEnablement(payload).catch(() => {
-      showFeedbackToast({ type: "error", message: USER_PREFERENCE_SAVE_FAILED_MESSAGE });
-      void store.refresh();
-    });
+    saveConfigOptimistically(api, payload, (client) =>
+      client.config.updateRuntimeEnablement(payload)
+    );
   };
 
   const setRuntimeEnabled = (

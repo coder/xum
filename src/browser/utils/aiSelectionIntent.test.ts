@@ -210,24 +210,27 @@ describe("aiSelectionIntent", () => {
 
     expect(
       getAiSelectionIntentForSendOptions(WS, "exec", { ...sent, skipAiSettingsPersistence: true })
-        .intent
-    ).toBeUndefined();
-
-    const autoModel = getAiSelectionIntentForSendOptions(WS, "exec", {
-      ...sent,
-      autoModelRouting: true,
-    });
-    expect(autoModel.intent).toEqual({ thinkingLevel: true });
-    // Only attached fields are consumed; the model pick stays pending.
-    setWorkspaceAiMetadata(WS, {
-      aiSettingsByAgent: { exec: { model: MODEL_B, thinkingLevel: "high" } },
-    });
-    consumeAiSelectionIntent(WS, "exec", autoModel.attachedTokens);
-    expect(getAiSelectionIntentForSend(WS, "exec", sent).intent).toEqual({ model: true });
-
-    markAiSelectionIntent(WS, "thinkingLevel", "high");
+    ).toEqual({ intent: undefined, attachedTokens: {} });
+    expect(
+      getAiSelectionIntentForSendOptions(WS, "exec", { ...sent, autoModelRouting: true }).intent
+    ).toEqual({ thinkingLevel: true });
     expect(
       getAiSelectionIntentForSendOptions(WS, "exec", { ...sent, autoThinkingLevel: true }).intent
     ).toEqual({ model: true });
+  });
+
+  test("an Auto send ends the model pick it saved, so a later change from another window shows", () => {
+    markAiSelectionIntent(WS, "model", MODEL_A);
+    const send = getAiSelectionIntentForSendOptions(WS, "exec", {
+      model: MODEL_A,
+      thinkingLevel: "off",
+      autoModelRouting: true,
+    });
+    consumeAiSelectionIntent(WS, "exec", send.attachedTokens);
+    setWorkspaceAiMetadata(WS, {
+      aiSettingsByAgent: { exec: { model: MODEL_A, thinkingLevel: "off", autoModelRouting: true } },
+    });
+    saveExecModel(MODEL_B);
+    expect(getPendingAiSelection(WS, "exec", "model")).toBeUndefined();
   });
 });

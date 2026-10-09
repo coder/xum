@@ -315,8 +315,9 @@ export function getAiSelectionIntentForSend(
 
 /**
  * Send-path wrapper: one-shot sends (skipAiSettingsPersistence) persist nothing and so
- * pin nothing, and an Auto-routed dimension was not deliberately picked for this send.
- * Returns the tokens to consume only for the fields actually attached.
+ * pin and consume nothing. An Auto-routed dimension was not deliberately picked for this
+ * send, so it pins nothing, but the send still saves the picked value, so its pick is
+ * consumed like any other.
  */
 export function getAiSelectionIntentForSendOptions(
   workspaceId: string,
@@ -335,16 +336,10 @@ export function getAiSelectionIntentForSendOptions(
     return { intent: undefined, attachedTokens: {} };
   }
   const candidate = getAiSelectionIntentForSend(workspaceId, agentId, options);
-  const intent: AiSelectionIntent = {};
-  const attachedTokens: AiSelectionTokens = { agentId: candidate.attachedTokens.agentId };
-  const keep = (field: AiSelectionField, allowed: boolean) => {
-    if (!allowed || candidate.intent?.[field] !== true) return;
-    intent[field] = true;
-    attachedTokens[field] = candidate.attachedTokens[field];
-  };
-  keep("model", options.autoModelRouting !== true);
-  keep("thinkingLevel", options.autoThinkingLevel !== true);
-  keep("reasoningMode", true);
+  const intent: AiSelectionIntent = { ...candidate.intent };
+  if (options.autoModelRouting === true) delete intent.model;
+  if (options.autoThinkingLevel === true) delete intent.thinkingLevel;
+  const attachedTokens: AiSelectionTokens = { ...candidate.attachedTokens };
   // The backend saves the send's Auto flags the same way.
   const savedAuto: Record<AutoRoutingDimension, boolean> = options.savedAutoRouting ?? {
     model: options.autoModelRouting === true,

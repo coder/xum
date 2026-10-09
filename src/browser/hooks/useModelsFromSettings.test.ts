@@ -257,6 +257,25 @@ describe("useModelsFromSettings selected model preservation", () => {
     expect(alert).toHaveBeenCalledTimes(1);
   });
 
+  test("a default model save cut off by a lost connection is reported as unconfirmed", async () => {
+    // Without a mounted composer the toast falls back to window.alert (fresh window per test).
+    const alerts: unknown[] = [];
+    window.alert = (message?: unknown) => alerts.push(message);
+    // oRPC settles a request on a closed socket with an AbortError.
+    const closed = new Error("WebSocket closed (code 1006)");
+    closed.name = "AbortError";
+    apiMock = { config: { updateModelPreferences: mock(() => Promise.reject(closed)) } };
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    act(() => {
+      result.current.setDefaultModel("openrouter:openai/gpt-5");
+    });
+
+    await waitFor(() =>
+      expect(alerts).toEqual(["Connection lost: settings may not have been saved"])
+    );
+  });
+
   test("ensureModelInSettings skips syncing explicit gateway-scoped selections", () => {
     const setModels = mock(() => Promise.resolve(undefined));
     providersConfig = {
