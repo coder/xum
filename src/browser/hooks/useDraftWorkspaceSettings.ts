@@ -401,21 +401,9 @@ export function useDraftWorkspaceSettings(
       ? parsedDefault.configPath
       : lastDevcontainerConfigPath;
 
-  const defaultRuntime = buildRuntimeForMode(
-    defaultRuntimeMode,
-    { host: defaultSshHost, coder: defaultSshCoder },
-    defaultDockerImage,
-    lastShareCredentials,
-    defaultDevcontainerConfigPath,
-    lastDevcontainerShareCredentials
-  );
-
-  // Currently selected runtime for this session (initialized from default)
-  // Uses discriminated union: SSH has host, Docker has image
-  // Until the user or a Settings change picks one it follows the defaults, so options that
-  // load after mount apply.
+  // Currently selected runtime for this session. Until the user or a Settings change picks
+  // one it follows the defaults (derived below), so options that load after mount apply.
   const [runtimePick, setSelectedRuntimeState] = useState<ParsedRuntime | null>(null);
-  const selectedRuntime = runtimePick ?? defaultRuntime;
 
   // Project changes remount ChatInput (key includes projectPath), so this effect only handles
   // live Settings updates to the default runtime while staying on the same project.
@@ -446,6 +434,21 @@ export function useDraftWorkspaceSettings(
     defaultDevcontainerConfigPath,
     lastDevcontainerShareCredentials,
   ]);
+
+  // The pure default runtime is built after the hook calls above: built before them, React
+  // Compiler left it uncached, so with no pick `selectedRuntime` and `setSelectedRuntime`
+  // changed on every keystroke and re-rendered CreationControls (#5937).
+  // useDraftWorkspaceSettings.compiler.test.tsx guards their identity.
+  // Uses discriminated union: SSH has host, Docker has image.
+  const defaultRuntime = buildRuntimeForMode(
+    defaultRuntimeMode,
+    { host: defaultSshHost, coder: defaultSshCoder },
+    defaultDockerImage,
+    lastShareCredentials,
+    defaultDevcontainerConfigPath,
+    lastDevcontainerShareCredentials
+  );
+  const selectedRuntime = runtimePick ?? defaultRuntime;
 
   const lastSshHost = lastSsh.host;
   const lastSshCoder = lastSsh.coder;
