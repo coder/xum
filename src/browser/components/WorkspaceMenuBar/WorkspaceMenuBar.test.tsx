@@ -104,6 +104,8 @@ function getLastMenuContentProps() {
             onOpenTouchFullscreenReview?: (() => void) | null;
             onOpenTimeline?: (() => void) | null;
             onOpenStats?: (() => void) | null;
+            onOpenArtifacts?: (() => void) | null;
+            onOpenTerminal?: (() => void) | null;
             onConfigureUnrelatedMessaging?: (() => void) | null;
           },
         ]
@@ -633,6 +635,37 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     });
     expect(lastOpen()).toBe(true);
     terminal.remove();
+  });
+
+  it("touch phones swap the header terminal button for Stats and Artifacts", () => {
+    // Narrow viewport (sidebar hidden) plus the coarse-pointer phone header query.
+    stubMatchMedia(
+      (query) =>
+        query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)` ||
+        query === "(max-width: 480px) and (pointer: coarse)"
+    );
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+    const artifactsSpy = spyOn(ArtifactsDialogModule, "ArtifactsDialog").mockImplementation(
+      (() => null) as unknown as typeof ArtifactsDialogModule.ArtifactsDialog
+    );
+    const onOpenTerminal = mock(() => undefined);
+
+    const view = render(<WorkspaceMenuBar {...defaultProps} onOpenTerminal={onOpenTerminal} />);
+
+    expect(view.queryByRole("button", { name: "New terminal" })).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "Stats" }));
+    expect(getLastStatsDialogProps()).toMatchObject({ open: true, workspaceId });
+    fireEvent.click(view.getByRole("button", { name: "Artifacts" }));
+    expect(
+      (artifactsSpy.mock.calls.at(-1) as Array<{ open: boolean }> | undefined)?.[0]?.open
+    ).toBe(true);
+
+    // The More menu offers the terminal instead, and does not repeat the header actions.
+    const menu = getLastMenuContentProps();
+    expect(menu?.onOpenStats ?? null).toBeNull();
+    expect(menu?.onOpenArtifacts ?? null).toBeNull();
+    act(() => menu?.onOpenTerminal?.());
+    expect(onOpenTerminal).toHaveBeenCalledTimes(1);
   });
 
   it("lets global shortcuts through while the Workspace details button has focus", () => {

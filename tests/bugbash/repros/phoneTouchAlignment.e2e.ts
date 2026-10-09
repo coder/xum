@@ -138,9 +138,9 @@ test(
     // Keyboard focus follows the DOM, so the menu must also come before the row below it.
     const menuFirst = await browser.evaluate(() => {
       const menu = document.querySelector('[data-testid="workspace-more-actions"]');
-      const terminal = document.querySelector('[aria-label="New terminal"]');
-      if (!menu || !terminal) return false;
-      return (menu.compareDocumentPosition(terminal) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+      const bell = document.querySelector('[data-testid="notify-on-response-button"]');
+      if (!menu || !bell) return false;
+      return (menu.compareDocumentPosition(bell) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
     });
     expect(menuFirst).toBe(true);
   }

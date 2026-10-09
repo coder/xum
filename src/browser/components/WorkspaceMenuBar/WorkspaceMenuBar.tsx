@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { Bell, BellOff, Ellipsis, Info, Menu, Pencil } from "lucide-react";
+import { AppWindow, BarChart3, Bell, BellOff, Ellipsis, Info, Menu, Pencil } from "lucide-react";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { cn } from "@/common/lib/utils";
@@ -565,6 +565,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   useEffect(() => {
     // Small delay to ensure UI is rendered
     const timer = setTimeout(() => {
+      // Its only step points at the header terminal button, which touch phones move into the
+      // More menu. Without a target the tutorial would show only an empty dimmed backdrop.
+      if (getPhoneHeaderSnapshot()) return;
       startTutorial("workspace");
     }, 300);
     return () => clearTimeout(timer);
@@ -704,12 +707,18 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           onOpenTimeline={
             timelineSidebarHidden ? () => setTimelineDialogWorkspaceId(workspaceId) : null
           }
-          onOpenStats={timelineSidebarHidden ? () => setStatsDialogWorkspaceId(workspaceId) : null}
+          // Touch phones show Stats and Artifacts in the header row instead (see below).
+          onOpenStats={
+            timelineSidebarHidden && !isPhoneHeader
+              ? () => setStatsDialogWorkspaceId(workspaceId)
+              : null
+          }
           onOpenArtifacts={
-            artifactsExperimentEnabled && timelineSidebarHidden
+            artifactsExperimentEnabled && timelineSidebarHidden && !isPhoneHeader
               ? () => setArtifactsDialogWorkspaceId(workspaceId)
               : null
           }
+          onOpenTerminal={isPhoneHeader ? handleOpenTerminal : null}
           onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
           // Scratch chats have no repo: review events are ignored by
           // RightSidebar and fork is unsupported on the backend, so hide
@@ -965,23 +974,69 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             </TooltipContent>
           </Tooltip>
         </div>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={handleOpenTerminal}
-              className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0 [&_svg]:h-4 [&_svg]:w-4"
-              data-tutorial="terminal-button"
-              aria-label="New terminal"
-            >
-              <WorkspaceTerminalIcon />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" align="center">
-            New terminal ({formatKeybind(KEYBINDS.OPEN_TERMINAL)})
-          </TooltipContent>
-        </Tooltip>
+        {isPhoneHeader ? (
+          // Touch phones: the terminal opens as a pop-out window, which mobile Safari does not
+          // show, so the header row offers Stats and Artifacts (the hidden right sidebar's tabs)
+          // and New terminal moves into the More menu.
+          timelineSidebarHidden && (
+            <>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => setStatsDialogWorkspaceId(workspaceId)}
+                    className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0"
+                    aria-label="Stats"
+                    data-testid="workspace-header-stats-button"
+                  >
+                    <BarChart3 className="h-3.5 w-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" align="center">
+                  Stats
+                </TooltipContent>
+              </Tooltip>
+              {artifactsExperimentEnabled && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => setArtifactsDialogWorkspaceId(workspaceId)}
+                      className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0"
+                      aria-label="Artifacts"
+                      data-testid="workspace-header-artifacts-button"
+                    >
+                      <AppWindow className="h-3.5 w-3.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" align="center">
+                    Artifacts
+                  </TooltipContent>
+                </Tooltip>
+              )}
+            </>
+          )
+        ) : (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={handleOpenTerminal}
+                className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0 [&_svg]:h-4 [&_svg]:w-4"
+                data-tutorial="terminal-button"
+                aria-label="New terminal"
+              >
+                <WorkspaceTerminalIcon />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" align="center">
+              New terminal ({formatKeybind(KEYBINDS.OPEN_TERMINAL)})
+            </TooltipContent>
+          </Tooltip>
+        )}
       </div>
       {!isPhoneHeader && moreActionsMenu}
       <WorkspaceHeartbeatModal
