@@ -3335,11 +3335,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     placeholder={placeholder}
                     disabled={!editingMessageForUi && (disabled || sendInFlightBlocksInput)}
                     aria-label={editingMessageForUi ? "Edit message" : "Message"}
+                    // No aria-expanded: the textbox role does not allow it (#5951), and a
+                    // textarea cannot take role="combobox" without screen readers treating
+                    // the multi-line composer as a single-line field.
                     aria-autocomplete="list"
                     aria-controls={
                       composerSuggestions.isVisible ? composerSuggestions.listId : undefined
                     }
-                    aria-expanded={composerSuggestions.isVisible}
                     // Creation favors prompt space; workspaces preserve transcript space. Mobile
                     // hides the shortcut hints the workspace floor exists for, so that room is
                     // dead space on a screen that has none to spare.

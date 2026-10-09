@@ -168,19 +168,21 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         // In desktop mode, make header draggable for window movement
         isDesktop && "titlebar-drag"
       )}
-      role="tablist"
-      aria-label={ariaLabel}
     >
       <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
-        {items.map((item, index) => (
-          <SortableTab
-            key={item.id}
-            item={item}
-            index={index}
-            tabsetId={tabsetId}
-            isDesktop={isDesktop}
-          />
-        ))}
+        {/* The tablist owns only tabs (aria-required-children, #5951), so the "+" button is its
+            sibling. `contents` keeps the tabs and the button in one wrapping row, as before. */}
+        <div className="contents" role="tablist" aria-label={ariaLabel}>
+          {items.map((item, index) => (
+            <SortableTab
+              key={item.id}
+              item={item}
+              index={index}
+              tabsetId={tabsetId}
+              isDesktop={isDesktop}
+            />
+          ))}
+        </div>
         {onAddTerminal && (
           <Tooltip>
             <TooltipTrigger asChild>

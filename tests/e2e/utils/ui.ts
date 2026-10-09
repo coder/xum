@@ -527,9 +527,10 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
 
     async addTerminal(): Promise<void> {
       // Click the sidebar's "+" button to add a new terminal tab. The workspace header has a
-      // second "New terminal" button, so scope the lookup to the sidebar tab strip.
+      // second "New terminal" button, so scope the lookup to the sidebar. The button sits next to
+      // the tablist, not inside it: a tablist may hold only tabs (#5951).
       const addButton = page
-        .getByRole("tablist", { name: "Sidebar views" })
+        .getByRole("complementary", { name: "Workspace insights" })
         .getByRole("button", { name: "New terminal" });
       await expect(addButton).toBeVisible();
       await addButton.click();
