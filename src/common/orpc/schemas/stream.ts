@@ -800,6 +800,29 @@ export const PrefixSwapInvalidatedEventSchema = z.object({
   messageId: z.string(),
 });
 
+// Inert legacy wire shapes: version 3 session tapes can contain advisor progress.
+// Keep validating those recordings without restoring a producer or dedicated UI.
+const legacyAdvisorEventFields = {
+  workspaceId: z.string(),
+  toolCallId: z.string(),
+  timestamp: z.number(),
+};
+const LegacyAdvisorOutputEventSchema = z.object({
+  ...legacyAdvisorEventFields,
+  type: z.literal("advisor-output"),
+  text: z.string(),
+});
+const LegacyAdvisorReasoningOutputEventSchema = z.object({
+  ...legacyAdvisorEventFields,
+  type: z.literal("advisor-reasoning-output"),
+  text: z.string(),
+});
+const LegacyAdvisorPhaseEventSchema = z.object({
+  ...legacyAdvisorEventFields,
+  type: z.literal("advisor-phase"),
+  phase: z.enum(["preparing_context", "waiting_for_response", "finalizing_result"]),
+});
+
 export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   PrefixSwapInvalidatedEventSchema,
   // Stream lifecycle events
@@ -818,6 +841,9 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   ToolCallDeltaEventSchema,
   ToolCallEndEventSchema,
   BashOutputEventSchema,
+  LegacyAdvisorOutputEventSchema,
+  LegacyAdvisorReasoningOutputEventSchema,
+  LegacyAdvisorPhaseEventSchema,
   TaskCreatedEventSchema,
   WorkflowRunAttachedEventSchema,
   // Reasoning events

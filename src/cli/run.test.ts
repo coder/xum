@@ -275,8 +275,10 @@ describe("xum CLI", () => {
       expect(result.output).not.toContain("Unknown or unsupported experiment");
     });
 
-    test("promoted experiment IDs are accepted as no-ops", async () => {
+    test("promoted and retired experiment IDs are accepted as no-ops", async () => {
       const result = await runRunDirect([
+        "-e",
+        "advisor-tool",
         "-e",
         "tool-search",
         "-e",

@@ -32,11 +32,12 @@ export const EXPERIMENT_IDS = {
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
 
 /**
- * Former experiment IDs whose features are now always on. CLI `-e` parsing
- * accepts them as no-ops so existing automation (for example terminal-bench)
+ * Former experiment IDs whose features are now always on or retired. CLI `-e`
+ * parsing accepts them as no-ops so existing automation (for example terminal-bench)
  * keeps working instead of failing on an unknown experiment.
  */
 export const PROMOTED_EXPERIMENT_IDS: ReadonlySet<string> = new Set([
+  "advisor-tool", // Retired; accepted only for CLI compatibility.
   "agent-plugins",
   "dynamic-workflows",
   "timeline",

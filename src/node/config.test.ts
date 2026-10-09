@@ -2551,6 +2551,7 @@ describe("Config", () => {
       advisorReasoningMode: "pro",
       advisorMaxUsesPerTurn: 2,
       advisorMaxOutputTokens: 1024,
+      advisorCyberReasoningMode: false,
     },
     {
       advisorModelString: 42,
@@ -2559,6 +2560,13 @@ describe("Config", () => {
       advisorMaxUsesPerTurn: -1,
       advisorMaxOutputTokens: "invalid",
       advisorCyberReasoningMode: true,
+    },
+    {
+      advisorModelString: "openai:gpt-5.6",
+      advisorThinkingLevel: "high",
+      advisorReasoningMode: "standard",
+      advisorMaxUsesPerTurn: null,
+      advisorMaxOutputTokens: null,
     },
   ])("ignores legacy advisor settings without losing unrelated config: %j", async (legacy) => {
     const doc = {
@@ -2569,7 +2577,10 @@ describe("Config", () => {
         exec: {
           modelString: "openai:gpt-5.6-sol",
           enabled: true,
-          advisorEnabled: legacy.advisorMaxUsesPerTurn > 0 ? false : "invalid",
+          advisorEnabled:
+            legacy.advisorMaxUsesPerTurn != null && legacy.advisorMaxUsesPerTurn > 0
+              ? false
+              : "invalid",
           subagent: { thinkingLevel: "high" },
         },
         plan: { advisorEnabled: true },
@@ -2604,6 +2615,40 @@ describe("Config", () => {
     expect(saved.userPreferences).toEqual(doc.userPreferences);
     expect(saved.agentAiDefaults).toEqual(loaded.agentAiDefaults);
     expect(saved.taskSettings?.maxParallelAgentTasks).toBe(4);
+    const readDisk = () =>
+      JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        agentAiDefaults: Record<string, Record<string, unknown>>;
+      };
+    const persisted = readDisk();
+    expect(persisted).toMatchObject(legacy);
+    expect(persisted.agentAiDefaults.exec.advisorEnabled).toEqual(
+      doc.agentAiDefaults.exec.advisorEnabled
+    );
+    expect(persisted.agentAiDefaults.plan).toEqual(doc.agentAiDefaults.plan);
+    expect(persisted).not.toHaveProperty("legacyAdvisorSettings");
+    expect(config.getClientConfig()).not.toHaveProperty("legacyAdvisorSettings");
+
+    // A fresh instance must recapture compatibility data while still allowing edits
+    // to the current defaults; neither advisor-only entries nor malformed flags run.
+    const reopened = new Config(tempDir);
+    await reopened.editConfig((current) => ({
+      ...current,
+      agentAiDefaults: {
+        ...current.agentAiDefaults,
+        exec: { ...current.agentAiDefaults?.exec, thinkingLevel: "medium" },
+      },
+    }));
+    const rewritten = readDisk();
+    expect(rewritten).toMatchObject(legacy);
+    expect(rewritten.agentAiDefaults.exec).toMatchObject({
+      thinkingLevel: "medium",
+      advisorEnabled: doc.agentAiDefaults.exec.advisorEnabled,
+    });
+    expect(rewritten.agentAiDefaults.plan).toEqual(doc.agentAiDefaults.plan);
+    const reloaded = new Config(tempDir).loadConfigOrDefault({ throwOnError: true });
+    expect(reloaded.agentAiDefaults?.exec?.thinkingLevel).toBe("medium");
+    expect(reloaded.agentAiDefaults?.exec).not.toHaveProperty("advisorEnabled");
+    expect(reloaded.agentAiDefaults).not.toHaveProperty("plan");
   });
 
   describe("API config mutations", () => {

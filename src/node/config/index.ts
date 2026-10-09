@@ -133,6 +133,17 @@ import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking
 
 // Re-export project/provider types from dedicated schema/types files (for preload usage)
 export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig };
+
+// Retired advisor settings are inert downgrade data, never part of the current API
+// or agent defaults. Carry them with each snapshot so unrelated saves cannot erase
+// them, and a later disk reload can replace or remove them without stale side caches.
+type LegacyAdvisorProjectsConfig = ProjectsConfig & {
+  legacyAdvisorSettings?: {
+    root: Record<string, unknown>;
+    agentEnabled: Record<string, unknown>;
+  };
+};
+
 export { FileLeaseManager } from "./fileLeaseManager";
 export { ProvidersConfigStore, type ProvidersConfig } from "./providersConfigStore";
 export { SecretsStore } from "./secretsStore";
@@ -2341,7 +2352,7 @@ export class Config {
       ? undefined
       : layoutPresetsRaw;
 
-    return {
+    const config: LegacyAdvisorProjectsConfig = {
       projects: projectsMap,
       apiServerBindHost: parseOptionalNonEmptyString(parsed.apiServerBindHost),
       apiServerServeWebUi: parseOptionalBoolean(parsed.apiServerServeWebUi) ? true : undefined,
@@ -2393,6 +2404,34 @@ export class Config {
       settingsBackup: SettingsBackupSchema.optional().catch(undefined).parse(parsed.settingsBackup),
       legacyOnePasswordAccountName: parseOptionalNonEmptyString(parsed.onePasswordAccountName),
     };
+    const root = Object.fromEntries(
+      [
+        "advisorModelString",
+        "advisorThinkingLevel",
+        "advisorReasoningMode",
+        "advisorMaxUsesPerTurn",
+        "advisorMaxOutputTokens",
+        "advisorCyberReasoningMode",
+      ]
+        .filter((key) => Object.hasOwn(parsed, key))
+        .map((key) => [key, parsed[key]])
+    );
+    const agentEnabled = Object.fromEntries(
+      Object.entries(parsed.agentAiDefaults ?? {}).flatMap(([agentId, entry]) =>
+        entry &&
+        typeof entry === "object" &&
+        !Array.isArray(entry) &&
+        Object.hasOwn(entry, "advisorEnabled")
+          ? [[agentId, (entry as { advisorEnabled: unknown }).advisorEnabled]]
+          : []
+      )
+    );
+    if (Object.keys(root).length > 0 || Object.keys(agentEnabled).length > 0) {
+      // Preserve raw values, including malformed ones: they must never be validated
+      // as active settings or make an unrelated load/edit fail.
+      config.legacyAdvisorSettings = { root, agentEnabled };
+    }
+    return config;
   }
 
   /**
@@ -2418,7 +2457,7 @@ export class Config {
    * atomic write) happens before the rename, so a failure means the previous bytes are
    * still on disk; nothing after the write can fail.
    */
-  private saveConfigEffect(config: ProjectsConfig): Effect.Effect<void, unknown> {
+  private saveConfigEffect(config: LegacyAdvisorProjectsConfig): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
@@ -2599,9 +2638,25 @@ export class Config {
       if (config.viewedSplashScreens) {
         data.viewedSplashScreens = config.viewedSplashScreens;
       }
-      if (config.agentAiDefaults && Object.keys(config.agentAiDefaults).length > 0) {
-        const normalizedAgentAiDefaults = normalizeAiDefaultsModelStrings(config.agentAiDefaults);
-        data.agentAiDefaults = normalizedAgentAiDefaults;
+      const legacyAdvisorSettings = config.legacyAdvisorSettings;
+      if (
+        (config.agentAiDefaults && Object.keys(config.agentAiDefaults).length > 0) ||
+        Object.keys(legacyAdvisorSettings?.agentEnabled ?? {}).length > 0
+      ) {
+        const normalizedAgentAiDefaults = normalizeAiDefaultsModelStrings(
+          config.agentAiDefaults ?? {}
+        );
+        // Include advisor-only entries omitted at runtime, without overwriting edits
+        // or bypassing normalization of current, non-advisor defaults.
+        data.agentAiDefaults = Object.fromEntries([
+          ...Object.entries(normalizedAgentAiDefaults),
+          ...Object.entries(legacyAdvisorSettings?.agentEnabled ?? {}).map(
+            ([agentId, advisorEnabled]) => [
+              agentId,
+              { ...normalizedAgentAiDefaults[agentId], advisorEnabled },
+            ]
+          ),
+        ]);
 
         // Downgrade-compatibility projection only: older builds resolve
         // delegated runs from the legacy root map. Never read back at runtime;
@@ -2675,6 +2730,8 @@ export class Config {
       if (legacyOnePasswordAccountName) {
         data.onePasswordAccountName = legacyOnePasswordAccountName;
       }
+
+      if (legacyAdvisorSettings) Object.assign(data, legacyAdvisorSettings.root);
 
       const persistedWorkspaceIds = new Set<string>();
       for (const [, project] of data.projects) {
