@@ -11,7 +11,6 @@
  * - Tool policy composition (agent → caller)
  */
 
-import { resolveAdvisorEnabledForAgent } from "@/common/constants/advisor";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { SendMessageError } from "@/common/types/errors";
 import type { SendMessageOptions } from "@/common/orpc/types";
@@ -537,15 +536,10 @@ export async function resolveAgentForStream(
   // --- Tool policy composition ---
   // Agent policy establishes baseline (deny-all + enable whitelist + runtime restrictions).
   // Caller policy then narrows further if needed.
-  const advisorEnabled = resolveAdvisorEnabledForAgent(
-    effectiveAgentId,
-    cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
-  );
   const agentToolPolicy = resolveToolPolicyForAgent({
     agents: agentsForInheritance,
     isSubagent: isSubagentWorkspace,
     disableTaskToolsForDepth: shouldDisableTaskToolsForDepth,
-    advisorEnabled,
   });
 
   // Caller require policies (e.g. task completion enforcement) must take precedence.
@@ -631,10 +625,6 @@ export async function resolveAgentForStream(
               agents: chain,
               isSubagent: false,
               disableTaskToolsForDepth: shouldDisableTaskToolsForDepth,
-              advisorEnabled: resolveAdvisorEnabledForAgent(
-                descriptor.id,
-                cfg.agentAiDefaults?.[descriptor.id]?.advisorEnabled
-              ),
             })
           );
           if (toolPolicy === undefined) return undefined;

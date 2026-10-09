@@ -6,11 +6,7 @@ import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
-import {
-  isGrokFrontierModel,
-  type OpenAIReasoningMode,
-  type ThinkingLevel,
-} from "@/common/types/thinking";
+import { isGrokFrontierModel, type ThinkingLevel } from "@/common/types/thinking";
 import type { ProviderName } from "@/common/constants/providers";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import type { AvailableModel } from "@/common/utils/ai/selectableModels";
@@ -25,7 +21,6 @@ import { createFileEditReplaceStringTool } from "@/node/services/tools/file_edit
 import { createFileEditInsertTool } from "@/node/services/tools/file_edit_insert";
 import { createAskUserQuestionTool } from "@/node/services/tools/ask_user_question";
 import { createIntuitionTool } from "@/node/services/tools/intuition";
-import { createAdvisorTool } from "@/node/services/tools/advisor";
 import { createProposePlanTool } from "@/node/services/tools/propose_plan";
 import { createTodoWriteTool, createTodoReadTool } from "@/node/services/tools/todo";
 import {
@@ -113,7 +108,6 @@ import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FileState } from "@/node/services/agentSession";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
-import type { ModelMessage } from "@/common/types/message";
 import type { GoalDefaults } from "@/constants/goals";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
 
@@ -127,20 +121,6 @@ export interface ToolModelUsageEvent {
   providerMetadata?: Record<string, unknown>;
   toolCallId?: string;
   timestamp: number;
-}
-
-export interface AdvisorToolCallSnapshot {
-  toolCallId: string;
-  toolName: "advisor";
-  input: Record<string, unknown>;
-  stepText: string;
-  stepReasoning: string;
-}
-
-export interface AdvisorStepCaptureRef {
-  currentStepText: string;
-  currentStepReasoning: string;
-  frozenSnapshotsByToolCallId: Map<string, AdvisorToolCallSnapshot>;
 }
 
 export type WorkspaceHeartbeatSettings = NonNullable<WorkspaceMetadata["heartbeat"]>;
@@ -376,29 +356,6 @@ export interface ToolConfiguration {
     maxUsesPerTurn: number;
     /** Shared by every tool rebuild in this parent turn (including refusal fallback). */
     usesThisTurn: number;
-    createModel: NonNullable<ToolConfiguration["advisorRuntime"]>["createModel"];
-    resolveAgentBody: () => Promise<string | null>;
-    /** Evaluation recall; present only for the built-in body with a bound EvaluationService. */
-    createEvaluationModel?: ProviderModelFactory["createEvaluationModel"];
-    evaluationService?: EvaluationService;
-    abortSignal: AbortSignal;
-  };
-  /** Runtime bundle for the advisor tool (present only when advisor is eligible for this stream). */
-  advisorRuntime?: {
-    /** The advisor model string (e.g. "anthropic:claude-sonnet-4-20250514") */
-    advisorModelString: string;
-    /** Optional reasoning/thinking level metadata for the advisor request. */
-    reasoningLevel?: string;
-    /** Independent of the parent chat's reasoning mode and advisor effort. */
-    reasoningMode?: OpenAIReasoningMode;
-    /** Normalized max uses per turn: null = unlimited, positive integer = exact cap */
-    maxUsesPerTurn: number | null;
-    /** Normalized max output tokens cap for advisor responses: undefined = unlimited, positive integer = explicit cap */
-    maxOutputTokens?: number;
-    /** Returns the live conversation transcript up to the current tool call */
-    getTranscriptSnapshot: () => ModelMessage[];
-    /** Returns the frozen same-step capture snapshot for a specific advisor tool call, if available. */
-    takeToolCallSnapshot: (toolCallId: string) => AdvisorToolCallSnapshot | undefined;
     /**
      * Creates a model and pins its request identity, route, and config together.
      * Coder identities retain their actual instance and scoped aliases; option
@@ -419,7 +376,10 @@ export interface ToolConfiguration {
       optionsMuxProviderOptions?: MuxProviderOptions;
       optionsRouteProvider?: ProviderName;
     }>;
-    /** The abort signal from the parent stream */
+    resolveAgentBody: () => Promise<string | null>;
+    /** Evaluation recall; present only for the built-in body with a bound EvaluationService. */
+    createEvaluationModel?: ProviderModelFactory["createEvaluationModel"];
+    evaluationService?: EvaluationService;
     abortSignal: AbortSignal;
   };
   /**
@@ -934,7 +894,6 @@ export async function getToolsForModel(
     mux_config_write: createXumConfigWriteTool(config),
     skills_catalog_search: createSkillsCatalogSearchTool(config),
     skills_catalog_read: createSkillsCatalogReadTool(config),
-    ...(config.advisorRuntime ? { advisor: createAdvisorTool(config) } : {}),
     ...(config.intuitionRuntime ? { intuition: createIntuitionTool(config) } : {}),
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
@@ -1138,7 +1097,6 @@ export async function getToolsForModel(
       enableFamilyMessaging: config.enableFamilyMessaging,
       enableAnalyticsQuery: Boolean(config.analyticsService),
       enableDynamicWorkflows: Boolean(config.workflowService),
-      enableAdvisor: Boolean(config.advisorRuntime),
       enableIntuition: Boolean(config.intuitionRuntime),
       enableSessionHistory: config.experiments?.tokenBudget === true,
       enableMemory: Boolean(config.memoryService && config.experiments?.memory),

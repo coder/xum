@@ -8,7 +8,6 @@ import type { ContextWindowIds } from "./contextWindowRollover";
 import * as path from "node:path";
 
 import assert from "@/common/utils/assert";
-import { ADVISOR_USAGE_GUIDANCE } from "@/common/constants/advisor";
 import { isTokenBudgetInternalMessage, type MuxMessage } from "@/common/types/message";
 import {
   getHistoryItemId,
@@ -544,8 +543,6 @@ export interface BuildStreamSystemContextOptions {
   scratchDirSet?: boolean;
   xumScope?: XumToolScope;
   loadDesktopCapability?: () => Promise<DesktopCapability>;
-  /** Whether the advisor tool is available for the current agent */
-  advisorToolAvailable?: boolean;
   /**
    * Whether the memory tool is in the toolset (memory experiment + policy).
    * Gates the hot-memories block: preloaded memory content must not survive
@@ -581,7 +578,7 @@ export interface BuildStreamSystemContextOptions {
 export interface StreamSystemContextResult {
   /**
    * Resolved agent prompt as independently-authored sections (agent body with
-   * inheritance, optional subagent append_prompt, optional advisor guidance).
+   * inheritance and optional subagent append_prompt).
    * Kept per-section so scoped Model:/Mode:/Tool: extraction never lets a
    * trailing scoped heading in one section swallow the next section's text.
    */
@@ -796,15 +793,6 @@ function mergeAdditionalInstructions(
   return primaryInstructions ?? secondaryInstructions;
 }
 
-function buildAdvisorGuidanceSection(): string {
-  return [
-    "<advisor-guidance>",
-    "You have access to an advisor tool that consults a stronger model for strategic guidance.",
-    ADVISOR_USAGE_GUIDANCE,
-    "</advisor-guidance>",
-  ].join("\n");
-}
-
 /**
  * Proactive-memory guidance (memory experiment). Modeled on Anthropic's
  * memory-tool system-prompt protocol and Claude Code's auto-memory
@@ -934,7 +922,6 @@ export async function buildStreamSystemContext(
     mcpServers,
     xumScope,
     loadDesktopCapability,
-    advisorToolAvailable,
   } = opts;
 
   const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
@@ -1031,13 +1018,9 @@ export async function buildStreamSystemContext(
   if (isSubagentWorkspace && subagentAppendPrompt) {
     agentSystemPromptSections.push(subagentAppendPrompt);
   }
-  if (advisorToolAvailable) {
-    // Keep prompt guidance in lockstep with actual tool availability for the agent.
-    agentSystemPromptSections.push(buildAdvisorGuidanceSection());
-  }
   if (opts.memoryToolAvailable) {
-    // Same lockstep rule: the post-policy system-context rebuild strips this
-    // section when tool policy removes the memory tool.
+    // The post-policy system-context rebuild strips this section when tool
+    // policy removes the memory tool.
     agentSystemPromptSections.push(
       buildMemoryGuidanceSection(
         opts.intuitionToolAvailable === true,

@@ -136,7 +136,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
     overrides: Partial<ToolModelUsageEventForTests> = {}
   ): ToolModelUsageEventForTests {
     return {
-      toolName: overrides.toolName ?? "advisor",
+      toolName: overrides.toolName ?? "intuition",
       toolCallId: overrides.toolCallId ?? "tool-call-1",
       timestamp: overrides.timestamp ?? Date.now(),
       model: overrides.model ?? "anthropic:claude-sonnet-4-20250514",
@@ -278,7 +278,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
   test("persists per-invocation tool model usages on the final assistant message", async () => {
     const startTime = Date.now() - 1000;
     const firstToolUsage = createToolModelUsageEvent({
-      toolName: "advisor",
+      toolName: "intuition",
       toolCallId: "tool-call-1",
       timestamp: startTime + 50,
       model: "openai:gpt-4",
@@ -290,7 +290,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
       providerMetadata: { openai: { reasoningTokens: 4 } },
     });
     const secondToolUsage = createToolModelUsageEvent({
-      toolName: "advisor",
+      toolName: "intuition",
       toolCallId: "tool-call-2",
       timestamp: startTime + 90,
       model: "openai:gpt-4",
@@ -351,7 +351,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
                 workspaceId,
                 firstMessageId,
                 createToolModelUsageEvent({
-                  toolName: "advisor",
+                  toolName: "intuition",
                   toolCallId: "tool-call-first",
                   usage: { inputTokens: 24, outputTokens: 6, totalTokens: 30 },
                 })
@@ -368,7 +368,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
                 workspaceId,
                 firstMessageId,
                 createToolModelUsageEvent({
-                  toolName: "advisor",
+                  toolName: "intuition",
                   toolCallId: "tool-call-stale",
                   usage: { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
                 })
@@ -388,7 +388,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
     });
     expect(readToolModelUsages(firstMessage)).toMatchObject([
       {
-        toolName: "advisor",
+        toolName: "intuition",
         toolCallId: "tool-call-first",
       },
     ]);

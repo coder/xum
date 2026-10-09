@@ -37,7 +37,6 @@ export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
  * keeps working instead of failing on an unknown experiment.
  */
 export const PROMOTED_EXPERIMENT_IDS: ReadonlySet<string> = new Set([
-  "advisor-tool",
   "agent-plugins",
   "dynamic-workflows",
   "timeline",

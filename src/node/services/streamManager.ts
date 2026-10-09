@@ -3166,7 +3166,7 @@ export class StreamManager {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
             }
             // onStepMessages fired above with the pre-rebuild transcript;
-            // re-notify so consumers (advisor transcript ref) track the
+            // re-notify so consumers track the
             // messages this step actually sends.
             request.onStepMessages?.(rebuiltFirstStepMessages);
           } catch (error) {

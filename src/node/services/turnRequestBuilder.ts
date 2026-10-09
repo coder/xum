@@ -42,16 +42,12 @@ import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 
-import {
-  ADVISOR_DEFAULT_MAX_USES_PER_TURN,
-  resolveAdvisorEnabledForAgent,
-} from "@/common/constants/advisor";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 
 import type { SendMessageError } from "@/common/types/errors";
 import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
-import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
+import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -63,7 +59,6 @@ import {
   getForcedXaiSearchToolNames,
   getToolsForModel,
   supportsAnthropicToolSearch,
-  type AdvisorStepCaptureRef,
   type MCPPromptRuntime,
   type ToolConfiguration,
 } from "@/common/utils/tools/tools";
@@ -87,7 +82,6 @@ import { log } from "./log";
 import type { StreamManager } from "./streamManager";
 import {
   type ModelFallbackOptions,
-  type StreamTextOnChunk,
   type TurnCompletion,
   type TurnExecutionOptions,
   type TurnStreamHandle,
@@ -97,7 +91,6 @@ import { emitTurnEnvelope } from "./turnEnvelope";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { listAvailableModels } from "@/common/utils/ai/selectableModels";
 import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
-import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -1615,16 +1608,6 @@ export class TurnRequestBuilder {
     // config trust for sub-agent delegation.
     const sharedExecutionTrusted =
       isWorkspaceTrustedForSharedExecution(metadata, cfg.projects) && !projectAutomationDisabled();
-    // #5253: register the advisor when any switchable agent enables it, so the
-    // tool block stays the same across switches; the active policy refuses it.
-    const agentAdvisorEnabled = (
-      switchableAgents?.map((agent) => agent.id) ?? [effectiveAgentId]
-    ).some((agentId) =>
-      resolveAdvisorEnabledForAgent(agentId, cfg.agentAiDefaults?.[agentId]?.advisorEnabled)
-    );
-    const advisorModelString = cfg.advisorModelString?.trim() ?? "";
-    const advisorToolEligible = agentAdvisorEnabled && advisorModelString.length > 0;
-
     const effectiveGoalDefaults = mergeGoalDefaults(
       normalizeGoalDefaults(cfg.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
       metadata.goalDefaults ?? null
@@ -1874,7 +1857,6 @@ export class TurnRequestBuilder {
     const turnInstructionSources: { current?: InstructionSources } = {};
     const buildStreamSystemContextForToolset = (
       toolset: {
-        advisorToolAvailable: boolean;
         memoryToolAvailable: boolean;
         intuitionToolAvailable: boolean;
       },
@@ -1900,7 +1882,6 @@ export class TurnRequestBuilder {
         mcpServers,
         xumScope,
         loadDesktopCapability,
-        advisorToolAvailable: toolset.advisorToolAvailable,
         memoryToolAvailable: toolset.memoryToolAvailable,
         tokenBudgetEnabled,
         workspaceMemoryWritable: memoryAccess.workspace === "readwrite",
@@ -1913,11 +1894,9 @@ export class TurnRequestBuilder {
       });
 
     // Build provisional agent context before tool policy finalizes the toolset.
-    // The final system prompt is rebuilt after policy application so advisor guidance cannot
-    // survive when the resolved toolset strips the advisor tool.
+    // Rebuild after policy application so guidance only describes available tools.
     const buildStreamSystemContextStartedAt = Date.now();
     const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset({
-      advisorToolAvailable: advisorToolEligible,
       memoryToolAvailable: memoryToolEligible,
       intuitionToolAvailable: intuitionToolEligible,
     });
@@ -2086,96 +2065,6 @@ export class TurnRequestBuilder {
 
     emitStartupBreadcrumb("loading_tools");
     assert(workspaceId.trim().length > 0, "streamMessage requires a non-empty workspaceId");
-    if (advisorToolEligible) {
-      assert(
-        advisorModelString.length > 0,
-        "advisorModelString must be non-empty when advisor is eligible"
-      );
-    }
-    // Mutable ref updated by StreamManager.prepareStep so the advisor tool reads the live
-    // transcript lazily at execute time instead of capturing a stale snapshot here.
-    const advisorTranscriptRef: { messages?: ModelMessage[] } = {};
-    const advisorStepCaptureRef: AdvisorStepCaptureRef = {
-      currentStepText: "",
-      currentStepReasoning: "",
-      frozenSnapshotsByToolCallId: new Map(),
-    };
-    const onAdvisorChunk: StreamTextOnChunk = ({ chunk }) => {
-      switch (chunk.type) {
-        case "text-delta": {
-          // Providers/SDKs can stream advisor text deltas under different field names.
-          const chunkText = extractChunkDeltaText(chunk as Record<string, unknown>, [
-            "textDelta",
-            "delta",
-            "text",
-          ]);
-          if (chunkText.length > 0) {
-            advisorStepCaptureRef.currentStepText += chunkText;
-          }
-          return;
-        }
-        case "reasoning-delta": {
-          // Anthropic signature updates can arrive as reasoning deltas without text.
-          const chunkText = extractChunkDeltaText(chunk as Record<string, unknown>, [
-            "text",
-            "textDelta",
-            "delta",
-          ]);
-          if (chunkText.length > 0) {
-            advisorStepCaptureRef.currentStepReasoning += chunkText;
-          }
-          return;
-        }
-        case "tool-call": {
-          if (chunk.toolName !== "advisor") {
-            return;
-          }
-          const toolCallId = chunk.toolCallId?.trim?.() ?? "";
-          // Skip malformed tool calls defensively — the normal tool-error
-          // path will handle bad input; crashing the stream callback would
-          // be worse than missing the snapshot.
-          if (
-            toolCallId.length === 0 ||
-            !isPlainObject(chunk.input) ||
-            advisorStepCaptureRef.frozenSnapshotsByToolCallId.has(toolCallId)
-          ) {
-            return;
-          }
-          advisorStepCaptureRef.frozenSnapshotsByToolCallId.set(toolCallId, {
-            toolCallId,
-            toolName: "advisor",
-            input: { ...chunk.input },
-            stepText: advisorStepCaptureRef.currentStepText,
-            stepReasoning: advisorStepCaptureRef.currentStepReasoning,
-          });
-          return;
-        }
-        default:
-          return;
-      }
-    };
-    // Normalize: undefined -> default, null -> unlimited, positive int -> exact cap.
-    const advisorMaxUses =
-      cfg.advisorMaxUsesPerTurn === null
-        ? null
-        : (cfg.advisorMaxUsesPerTurn ?? ADVISOR_DEFAULT_MAX_USES_PER_TURN);
-    assert(
-      cfg.advisorMaxOutputTokens == null ||
-        (Number.isInteger(cfg.advisorMaxOutputTokens) && cfg.advisorMaxOutputTokens > 0),
-      "advisorMaxOutputTokens must be null, undefined, or a positive integer"
-    );
-    const advisorMaxOutputTokens =
-      cfg.advisorMaxOutputTokens != null && cfg.advisorMaxOutputTokens > 0
-        ? cfg.advisorMaxOutputTokens
-        : undefined;
-    // Clamp the persisted advisor thinking level so the tool metadata matches the
-    // providerOptions actually sent to generateText().
-    const advisorReasoningLevel = enforceThinkingPolicy(
-      advisorModelString,
-      cfg.advisorThinkingLevel ?? THINKING_LEVEL_OFF,
-      undefined,
-      this.dependencies.providerService.getConfig()
-    );
     const xumEnv = getXumEnv(metadata.projectPath, runtimeType, metadata.name, {
       workspaceId,
       modelString,
@@ -2405,41 +2294,6 @@ export class TurnRequestBuilder {
       secrets: projectSecretsRecord,
       xumEnv,
       runtimeTempDir,
-      ...(advisorToolEligible
-        ? {
-            advisorRuntime: {
-              advisorModelString,
-              reasoningLevel: advisorReasoningLevel,
-              reasoningMode: cfg.advisorReasoningMode,
-              maxUsesPerTurn: advisorMaxUses,
-              maxOutputTokens: advisorMaxOutputTokens,
-              getTranscriptSnapshot: () => {
-                const messages = advisorTranscriptRef.messages;
-                assert(
-                  messages != null,
-                  "advisor transcript ref must be populated before advisor execution"
-                );
-                return messages;
-              },
-              takeToolCallSnapshot: (toolCallId) => {
-                const normalizedToolCallId = toolCallId.trim();
-                assert(normalizedToolCallId.length > 0, "advisor toolCallId must be non-empty");
-                const snapshot =
-                  advisorStepCaptureRef.frozenSnapshotsByToolCallId.get(normalizedToolCallId);
-                if (snapshot == null) {
-                  return undefined;
-                }
-                const didDelete =
-                  advisorStepCaptureRef.frozenSnapshotsByToolCallId.delete(normalizedToolCallId);
-                assert(didDelete, "advisor tool-call snapshot must be deleted when consumed");
-                assert(snapshot.toolName === "advisor", "advisor snapshot must belong to advisor");
-                return snapshot;
-              },
-              createModel: createToolModel,
-              abortSignal: combinedAbortSignal,
-            },
-          }
-        : {}),
       ...(intuitionSettings
         ? {
             intuitionRuntime: {
@@ -2522,7 +2376,7 @@ export class TurnRequestBuilder {
           const eventModel = event.model.trim();
           assert(eventModel.length > 0, "tool model usage event model must be non-empty");
           // Persist tool-side model usage under its own model bucket so session costs keep
-          // advisor/system-side pricing separate from the parent chat model.
+          // tool/system-side pricing separate from the parent chat model.
           const providerMetadata = event.providerMetadata;
           // Prefer the creation-time identity captured when the tool model
           // was created; models not created through the tool runtime fall
@@ -2791,7 +2645,6 @@ export class TurnRequestBuilder {
 
         const intuitionAdvertised = attemptTools.intuition !== undefined;
         const intuitionToolAvailable = activeAgentAllows("intuition");
-        const advisorToolAvailable = activeAgentAllows("advisor");
         const memoryToolAvailable = attemptTools.memory !== undefined;
         const memoryContextForModel = await upgradeMemoryContextForModel(
           memoryToolAvailable,
@@ -2800,7 +2653,6 @@ export class TurnRequestBuilder {
         const canReuseSystemContext =
           options.reusePrePolicySystemContext &&
           mcpServers === mcpServersAtPrePolicy &&
-          advisorToolAvailable === advisorToolEligible &&
           memoryToolAvailable === memoryToolEligible &&
           intuitionToolAvailable === intuitionToolEligible &&
           memoryContextForModel === memoryContext;
@@ -2808,7 +2660,7 @@ export class TurnRequestBuilder {
         const systemContext = canReuseSystemContext
           ? prePolicyStreamSystemContext
           : await buildStreamSystemContextForToolset(
-              { advisorToolAvailable, memoryToolAvailable, intuitionToolAvailable },
+              { memoryToolAvailable, intuitionToolAvailable },
               seed.rawModelString,
               memoryContextForModel
             );
@@ -3562,15 +3414,6 @@ export class TurnRequestBuilder {
         thinkingLevel: streamThinkingLevel,
         headers: requestHeaders,
         callSettingsOverrides: resolvedOverrides.standard,
-        onChunk: advisorToolEligible ? onAdvisorChunk : undefined,
-        onStepMessages: advisorToolEligible
-          ? (stepMessages) => {
-              advisorTranscriptRef.messages = stepMessages;
-              advisorStepCaptureRef.currentStepText = "";
-              advisorStepCaptureRef.currentStepReasoning = "";
-              advisorStepCaptureRef.frozenSnapshotsByToolCallId.clear();
-            }
-          : undefined,
         providedRuntimeTempDir: runtimeTempDir,
         modelFallback,
         toolSearchState: toolSearchRuntime?.state,

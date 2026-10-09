@@ -12,6 +12,7 @@ import {
   withProjectRegistrationLock,
 } from "./config/projectRegistrationLock";
 import { acquireProcessFileLock } from "./utils/concurrency/fileLock";
+import { AppConfigOnDiskSchema } from "@/common/config/schemas/appConfigOnDisk";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -1390,7 +1391,6 @@ describe("Config", () => {
           ],
         ],
         agentAiDefaults: { exec: { reasoningMode: "cyber", subagent: { reasoningMode: "cyber" } } },
-        advisorReasoningMode: "cyber",
       });
       await flushConfigEdits();
 
@@ -1405,8 +1405,7 @@ describe("Config", () => {
         workspace?.taskAiPins?.reasoningMode,
         reloaded.agentAiDefaults?.exec?.reasoningMode,
         reloaded.agentAiDefaults?.exec?.subagent?.reasoningMode,
-        reloaded.advisorReasoningMode,
-      ]).toEqual(["cyber", "cyber", "cyber", "cyber", "cyber", "cyber"]);
+      ]).toEqual(["cyber", "cyber", "cyber", "cyber", "cyber"]);
     });
 
     it("keeps Cyber in runtime state after a save that encodes it", async () => {
@@ -1799,24 +1798,26 @@ describe("Config", () => {
       // Real writes, recorded: each edit spreads a new object, so the recorded arguments
       // keep the value each write carried.
       const saveConfig = spyOn(
-        config as unknown as { saveConfig: (cfg: { advisorMaxUsesPerTurn?: number }) => unknown },
+        config as unknown as {
+          saveConfig: (cfg: { heartbeatDefaultIntervalMs?: number }) => unknown;
+        },
         "saveConfig"
       );
-      const setUses = (value: number) =>
-        config.editConfig((cfg) => ({ ...cfg, advisorMaxUsesPerTurn: value }));
+      const setInterval = (value: number) =>
+        config.editConfig((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: value * 60_000 }));
       // Three edits while the first is still in its slot, three more once it has stepped out
       // and is waiting; the order must hold across both.
-      const edits = [setUses(1), setUses(2), setUses(3)];
+      const edits = [setInterval(1), setInterval(2), setInterval(3)];
       await new Promise((resolve) => setTimeout(resolve, 100));
       expect(saveConfig).not.toHaveBeenCalled();
-      edits.push(setUses(4), setUses(5), setUses(6));
+      edits.push(setInterval(4), setInterval(5), setInterval(6));
       await otherProcess[Symbol.asyncDispose]();
       await Promise.all(edits);
 
-      expect(saveConfig.mock.calls.map(([cfg]) => cfg.advisorMaxUsesPerTurn)).toEqual([
-        1, 2, 3, 4, 5, 6,
+      expect(saveConfig.mock.calls.map(([cfg]) => cfg.heartbeatDefaultIntervalMs)).toEqual([
+        60_000, 120_000, 180_000, 240_000, 300_000, 360_000,
       ]);
-      expect(new Config(tempDir).loadConfigOrDefault().advisorMaxUsesPerTurn).toBe(6);
+      expect(new Config(tempDir).loadConfigOrDefault().heartbeatDefaultIntervalMs).toBe(360_000);
     });
 
     it("invokes the edit callback exactly once, with or without waiting for the lock", async () => {
@@ -2543,44 +2544,66 @@ describe("Config", () => {
     });
   });
 
-  describe("advisor reasoning mode", () => {
-    it("round-trips modes independently of effort and preserves omitted settings", async () => {
-      await config.saveUserConfig({
-        advisorModelString: "openai:gpt-5.6",
-        advisorThinkingLevel: "high",
-        advisorReasoningMode: "pro",
-      });
-      await config.saveUserConfig({ advisorMaxUsesPerTurn: 2 });
+  it.each([
+    {
+      advisorModelString: "openai:gpt-5.6",
+      advisorThinkingLevel: "high",
+      advisorReasoningMode: "pro",
+      advisorMaxUsesPerTurn: 2,
+      advisorMaxOutputTokens: 1024,
+    },
+    {
+      advisorModelString: 42,
+      advisorThinkingLevel: { invalid: true },
+      advisorReasoningMode: "invalid",
+      advisorMaxUsesPerTurn: -1,
+      advisorMaxOutputTokens: "invalid",
+      advisorCyberReasoningMode: true,
+    },
+  ])("ignores legacy advisor settings without losing unrelated config: %j", async (legacy) => {
+    const doc = {
+      projects: [["/repo", { workspaces: [] }]],
+      defaultModel: "openai:gpt-5.6-sol",
+      userPreferences: { appearance: { theme: "flexoki-light" as const } },
+      agentAiDefaults: {
+        exec: {
+          modelString: "openai:gpt-5.6-sol",
+          enabled: true,
+          advisorEnabled: legacy.advisorMaxUsesPerTurn > 0 ? false : "invalid",
+          subagent: { thinkingLevel: "high" },
+        },
+        plan: { advisorEnabled: true },
+      },
+      ...legacy,
+    };
+    // The removed feature needs no migration: generic disk-schema passthrough still
+    // preserves unknown root keys for config-tool writes and downgrade compatibility.
+    expect(AppConfigOnDiskSchema.parse(doc)).toMatchObject(legacy);
+    fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(doc));
 
-      expect(new Config(tempDir).loadConfigOrDefault()).toMatchObject({
-        advisorThinkingLevel: "high",
-        advisorReasoningMode: "pro",
-      });
-
-      await config.saveUserConfig({ advisorReasoningMode: "standard" });
-      expect(new Config(tempDir).loadConfigOrDefault().advisorReasoningMode).toBe("standard");
-      await config.saveUserConfig({ advisorReasoningMode: null });
-      expect(new Config(tempDir).loadConfigOrDefault().advisorReasoningMode).toBeUndefined();
-      expect(
-        JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8"))
-      ).not.toHaveProperty("advisorReasoningMode");
+    const loaded = config.loadConfigOrDefault({ throwOnError: true });
+    expect(loaded.projects.has("/repo")).toBe(true);
+    expect(loaded.defaultModel).toBe(doc.defaultModel);
+    expect(loaded.userPreferences).toEqual(doc.userPreferences);
+    expect(loaded.agentAiDefaults?.exec).toMatchObject({
+      modelString: "openai:gpt-5.6-sol",
+      enabled: true,
+      subagent: { thinkingLevel: "high" },
     });
+    expect(loaded.agentAiDefaults?.exec).not.toHaveProperty("advisorEnabled");
+    expect(loaded.agentAiDefaults).not.toHaveProperty("plan");
+    for (const key of Object.keys(legacy)) {
+      expect(loaded).not.toHaveProperty(key);
+      expect(config.getClientConfig()).not.toHaveProperty(key);
+    }
 
-    it.each(["invalid", 1, null, { mode: "pro" }])(
-      "discards invalid persisted advisor reasoning mode %j without losing other settings",
-      async (advisorReasoningMode) => {
-        fs.writeFileSync(
-          path.join(tempDir, "config.json"),
-          JSON.stringify({ projects: [], advisorReasoningMode, advisorThinkingLevel: "high" })
-        );
-        expect(config.loadConfigOrDefault().advisorReasoningMode).toBeUndefined();
-        expect(config.loadConfigOrDefault().advisorThinkingLevel).toBe("high");
-        await config.saveUserConfig({ advisorMaxUsesPerTurn: 2 });
-        expect(
-          JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8"))
-        ).not.toHaveProperty("advisorReasoningMode");
-      }
-    );
+    await config.saveUserConfig({ taskSettings: { maxParallelAgentTasks: 4 } });
+    const saved = new Config(tempDir).loadConfigOrDefault({ throwOnError: true });
+    expect(saved.projects.has("/repo")).toBe(true);
+    expect(saved.defaultModel).toBe(doc.defaultModel);
+    expect(saved.userPreferences).toEqual(doc.userPreferences);
+    expect(saved.agentAiDefaults).toEqual(loaded.agentAiDefaults);
+    expect(saved.taskSettings?.maxParallelAgentTasks).toBe(4);
   });
 
   describe("API config mutations", () => {
@@ -2620,22 +2643,6 @@ describe("Config", () => {
         proposePlanImplementReplacesChatHistory: true,
       });
       expect(saved.agentAiDefaults?.foo?.subagent?.reasoningMode).toBe("pro");
-    });
-
-    it("preserves advisor validation errors", async () => {
-      for (const [value, message] of [
-        [1.5, "Advisor max uses per turn must be an integer"],
-        [0, "Advisor max uses per turn must be positive"],
-      ] as const) {
-        let thrown: unknown;
-        try {
-          await config.saveUserConfig({ advisorMaxUsesPerTurn: value });
-        } catch (error) {
-          thrown = error;
-        }
-        expect(thrown).toBeInstanceOf(Error);
-        expect((thrown as Error).message).toBe(message);
-      }
     });
 
     it("normalizes model and runtime mutations", async () => {
@@ -3546,7 +3553,6 @@ describe("Config", () => {
         thinkingLevel: "medium",
         reasoningMode: "pro",
         enabled: undefined,
-        advisorEnabled: undefined,
         subagent: {
           modelString: "openai:gpt-5.3-codex",
           thinkingLevel: "xhigh",

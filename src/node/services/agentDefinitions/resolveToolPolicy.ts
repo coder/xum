@@ -22,8 +22,6 @@ export interface ResolveToolPolicyOptions {
   agents: readonly AgentLikeForPolicy[];
   isSubagent: boolean;
   disableTaskToolsForDepth: boolean;
-  /** Whether the advisor tool is eligible for this agent (experiment on + per-agent config) */
-  advisorEnabled?: boolean;
 }
 
 // Tools that are never allowed in autonomous sub-agent flows.
@@ -152,14 +150,6 @@ export function resolveToolPolicyForAgent(options: ResolveToolPolicyOptions): To
       runtimePolicy.push({ regex_match: "propose_plan", action: "disable" });
       runtimePolicy.push({ regex_match: "agent_report", action: "enable" });
     }
-  }
-
-  // Advisor tool gating: enable only when explicitly eligible, disable otherwise.
-  // This rule is last so it overrides broad inherited patterns like add: [".*"].
-  if (options.advisorEnabled) {
-    runtimePolicy.push({ regex_match: "advisor", action: "enable" });
-  } else {
-    runtimePolicy.push({ regex_match: "advisor", action: "disable" });
   }
 
   return [...agentPolicy, ...runtimePolicy];

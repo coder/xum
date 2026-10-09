@@ -640,7 +640,7 @@ function buildProjectSettingsInstructionSets(
 export interface BuildSystemMessageFromSourcesOptions {
   /**
    * Resolved agent prompt as independently-authored sections (agent body,
-   * subagent append_prompt, advisor guidance, …). Per-section so a trailing
+   * subagent append_prompt, tool guidance, …). Per-section so a trailing
    * scoped heading in one section cannot swallow the next section's text.
    */
   agentSystemPromptSections?: readonly string[];

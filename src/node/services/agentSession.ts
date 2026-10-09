@@ -10057,21 +10057,10 @@ export class AgentSession {
       this.markActiveStreamHadAnyOutput();
       this.emitChatEvent(payload);
     });
-    forward("advisor-output", (payload) => {
-      this.markActiveStreamHadAnyOutput();
-      this.emitChatEvent(payload);
-    });
-    forward("advisor-reasoning-output", (payload) => {
-      this.markActiveStreamHadAnyOutput();
-      this.emitChatEvent(payload);
-    });
     forward("task-created", (payload) => {
       this.emitChatEvent(payload);
     });
     forward("workflow-run-attached", (payload) => {
-      this.emitChatEvent(payload);
-    });
-    forward("advisor-phase", (payload) => {
       this.emitChatEvent(payload);
     });
     forward("session-usage-delta", (payload) => {

@@ -153,9 +153,6 @@ export function createTestConfig(overrides: Partial<TestClientConfig> = {}): Tes
   return {
     taskSettings: DEFAULT_TASK_SETTINGS,
     autoModelRouting: getDefaultAutoModelRoutingConfig(),
-    advisorModelString: null,
-    advisorThinkingLevel: null,
-    advisorReasoningMode: null,
     coderWorkspaceArchiveBehavior: DEFAULT_CODER_ARCHIVE_BEHAVIOR,
     worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
     runtimeEnablement: { ...DEFAULT_RUNTIME_ENABLEMENT },

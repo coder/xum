@@ -59,9 +59,7 @@ export const Tasks: Story = {
     });
 
     await waitFor(() => {
-      const inputs = canvas
-        .queryAllByRole("spinbutton")
-        .filter((input) => !input.getAttribute("aria-label")?.startsWith("Advisor"));
+      const inputs = canvas.queryAllByRole("spinbutton");
       if (inputs.length !== 2) {
         throw new Error(`Expected 2 task settings inputs, got ${inputs.length}`);
       }
