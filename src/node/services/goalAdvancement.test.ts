@@ -202,6 +202,27 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
     return requestDispatch.mock.calls.length - after;
   }
 
+  /**
+   * Runs `trigger`, then waits until the session has run the failed turn's terminal policy.
+   * waitForIdle alone returns too early (#5923): a turn that fails before its stream starts
+   * leaves the session idle until its completion arrives, so waitForIdle can resolve before the
+   * policy starts. The policy emits the turn's stream-error while it still holds the session
+   * busy, so waiting for that event and then for idle waits for the whole policy.
+   */
+  async function afterFailedTurnSettles(trigger: () => unknown): Promise<void> {
+    const streamError = Promise.withResolvers<void>();
+    const unsubscribe = session.onChatEvent(({ message }) => {
+      if (message.type === "stream-error") streamError.resolve();
+    });
+    try {
+      await trigger();
+      await streamError.promise;
+    } finally {
+      unsubscribe();
+    }
+    await session.waitForIdle();
+  }
+
   describe("terminal stream error", () => {
     /** An active goal whose kickoff continuation failed with a non-retryable provider error. */
     async function failedGoalTurn(): Promise<{ goal: GoalRecordV1; resumeRequests: number }> {
@@ -331,8 +352,7 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       // The user's message waits behind the failing turn. A terminal error leaves the queue for
       // the next drain, which refuses it into held input.
       queueStaleManualMessage();
-      release();
-      await session.waitForIdle();
+      await afterFailedTurnSettles(release);
       // Target assertion: the goal does not resume over the user's queued input...
       expect(await waitForRequests(requestsBefore, 200)).toBe(0);
       session.drainQueuedMessagesIfIdle();
@@ -917,6 +937,8 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       const { release, requestsBefore } = await gatedFailingTurn();
       const work = queueHeldBackAutomaticWork();
       release();
+      // Not afterFailedTurnSettles: "a user Stop while blocked" relies on its Stop landing before
+      // the failed turn's terminal policy runs (an idle Stop records no user stop), #5923.
       await session.waitForIdle();
       return { withdraw: work.withdraw, requestsBefore };
     }
@@ -940,9 +962,7 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       await session.setAutoRetryEnabled(false);
       await setGoalOk(service, { workspaceId, objective: "Ship G4" });
       // The kickoff fires and fails; the persisted opt-out arms no resume.
-      expect(await dispatchAt(Date.now())).toBe(true);
-      await session.waitForIdle();
-      await settle(() => Promise.resolve(false), 50);
+      await afterFailedTurnSettles(async () => expect(await dispatchAt(Date.now())).toBe(true));
       // Target assertion: the failed kickoff is not left installed for a later turn to re-dispatch.
       expect(await eligibilityAfterBackoff()).toMatchObject({ reason: "no_pending_candidate" });
       // A later unrelated turn that succeeds continues the goal as an ordinary stream end: a new
@@ -965,9 +985,7 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       await setGoalOk(service, { workspaceId, status: "active", expectedGoalId: goal.goalId });
       const resumed = await service.checkGoalContinuationEligibility(workspaceId, Date.now());
       expect(resumed.eligible ? resumed.candidate?.source : resumed.reason).toBe("kickoff");
-      release();
-      await session.waitForIdle();
-      await settle(() => Promise.resolve(false), 50);
+      await afterFailedTurnSettles(release);
       // Target assertion: retiring the failed turn's kickoff leaves the Resume's own kickoff.
       expect(await eligibilityAfterBackoff()).toMatchObject({
         eligible: true,
@@ -980,8 +998,7 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       const work = queueHeldBackAutomaticWork();
       // The user's message, queued behind the held-back work, is refused into held input.
       queueStaleManualMessage();
-      release();
-      await session.waitForIdle();
+      await afterFailedTurnSettles(release);
       work.withdraw();
       await settle(() => Promise.resolve(session.hasPendingUserInput()), 1_000);
       expect(session.hasPendingUserInput()).toBe(true);
@@ -1056,8 +1073,7 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       const { release, requestsBefore } = await gatedFailingTurn();
       // The user's message waits behind the failing turn; the terminal error leaves it queued.
       session.queueMessage("Do this next", { model: TEST_MODEL, agentId: "exec" });
-      release();
-      await session.waitForIdle();
+      await afterFailedTurnSettles(release);
       expect(await waitForRequests(requestsBefore, 100)).toBe(0);
       // Hold the dequeued send in its preflight (turn-lease confirmation): the queue is empty, so
       // only the preparation blocks the advancement. Its PREPARING phase does today, and
