@@ -1274,7 +1274,6 @@ describe("ProviderService custom provider mutations", () => {
                 modelString: `${provider}:agent-model`,
                 thinkingLevel: "high",
                 enabled: false,
-                advisorEnabled: true,
               },
               plan: { modelString: "openai:gpt-5", thinkingLevel: "medium" },
               review: {
@@ -1321,7 +1320,6 @@ describe("ProviderService custom provider mutations", () => {
       expect(appConfig.agentAiDefaults?.exec).toEqual({
         thinkingLevel: "high",
         enabled: false,
-        advisorEnabled: true,
       });
       expect(appConfig.agentAiDefaults?.plan).toEqual({
         modelString: "openai:gpt-5",

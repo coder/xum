@@ -459,6 +459,27 @@ describe("replayed tapes stay data", () => {
     expect(displayedAfter(replayed, workspaceId)).toEqual(expected);
   });
 
+  test("legacy advisor events remain replayable without changing the displayed transcript", async () => {
+    const workspaceId = "ws-legacy-advisor";
+    const events = syntheticReplayTranscript(workspaceId);
+    const legacyBase = { workspaceId, toolCallId: "advisor-call", timestamp: 1 };
+    const legacyEvents: WorkspaceChatMessage[] = [
+      { ...legacyBase, type: "advisor-output", text: "Old advice" },
+      { ...legacyBase, type: "advisor-reasoning-output", text: "Old reasoning" },
+      { ...legacyBase, type: "advisor-phase", phase: "finalizing_result" },
+    ];
+    const recorded = [...events.slice(0, 2), ...legacyEvents, ...events.slice(2)];
+    const tape = expectLoaded(
+      loadSessionTape(buildSyntheticSessionTape(recorded, { offsetMs: () => 0 }))
+    );
+    const replayed: WorkspaceChatMessage[] = [];
+    for await (const event of replaySessionTape(tape, { pacing: "recorded" })) {
+      replayed.push(event);
+    }
+    expect(replayed).toEqual(recorded);
+    expect(displayedAfter(replayed, workspaceId)).toEqual(displayedAfter(events, workspaceId));
+  });
+
   test("hostile recorded content is only yielded as data: no network, no process, no file changes", async () => {
     // Recorded remote URLs (an image file part, a markdown image, an MCP origin), tool calls and
     // events that trigger renderer effects live (gateway-expired error, skill completion, input

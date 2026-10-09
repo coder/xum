@@ -208,11 +208,6 @@ export class StreamTranslator {
         ];
       }
 
-      case "advisor-output":
-      case "advisor-reasoning-output": {
-        return this.translateAdvisorTextToolCallUpdate(event);
-      }
-
       case "error":
         return this.translateToolFailure(sessionId, event.messageId, event.error, event.errorType);
 
@@ -560,23 +555,6 @@ export class StreamTranslator {
       return undefined;
     }
     return [textToolContent(text)];
-  }
-
-  private translateAdvisorTextToolCallUpdate(
-    event: Extract<WorkspaceChatMessage, { type: "advisor-output" | "advisor-reasoning-output" }>
-  ): SessionUpdate[] {
-    return [
-      {
-        sessionUpdate: "tool_call_update",
-        toolCallId: event.toolCallId,
-        status: "in_progress",
-        content: [textToolContent(event.text)],
-        _meta: {
-          source: event.type,
-          timestamp: event.timestamp,
-        },
-      },
-    ];
   }
 
   private translatePlanUpdate(

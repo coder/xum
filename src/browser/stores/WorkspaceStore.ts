@@ -47,10 +47,7 @@ import {
   runSubscriptionLoop,
   sleepWithAbort,
 } from "@/browser/stores/subscriptionTransport";
-import {
-  ADVISOR_LIVE_OUTPUT_MAX_CHARS,
-  BASH_TRUNCATE_MAX_TOTAL_BYTES,
-} from "@/common/constants/toolLimits";
+import { BASH_TRUNCATE_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { useCallback, useContext, useEffect, useState, useSyncExternalStore } from "react";
 import { LiveBashOutputSourceContext } from "@/browser/stores/liveBashOutputSource";
@@ -63,9 +60,6 @@ import {
   isInitEnd,
   isInitOutput,
   isInitStart,
-  isAdvisorOutputEvent,
-  isAdvisorReasoningOutputEvent,
-  isAdvisorPhaseEvent,
   isBashOutputEvent,
   isTaskCreatedEvent,
   isWorkflowRunAttachedEvent,
@@ -76,7 +70,6 @@ import {
   isRuntimeStatus,
 } from "@/common/orpc/types";
 import {
-  type AdvisorPhaseEvent,
   type StreamAbortEvent,
   type StreamAbortReasonSnapshot,
   type StreamDeltaEvent,
@@ -414,19 +407,6 @@ export interface WorkspaceConsumersState {
   topFilePaths?: Array<{ path: string; tokens: number }>; // Top 10 files aggregated across all file tools
 }
 
-export interface AdvisorLivePhaseState {
-  phase: AdvisorPhaseEvent["phase"];
-  timestamp: number;
-}
-
-export interface AdvisorLiveTextState {
-  text: string;
-  timestamp: number;
-}
-
-export type AdvisorLiveOutputState = AdvisorLiveTextState;
-export type AdvisorLiveReasoningState = AdvisorLiveTextState;
-
 export interface WorkflowToolLiveRunState {
   runId: string;
   run?: WorkflowRunRecord;
@@ -458,9 +438,6 @@ interface WorkspaceChatTransientState {
   queuedMessage: QueuedMessage | null;
   heldInputs: readonly HeldInput[];
   liveBashOutput: Map<string, LiveBashOutputInternal>;
-  liveAdvisorOutput: Map<string, AdvisorLiveOutputState>;
-  liveAdvisorReasoning: Map<string, AdvisorLiveReasoningState>;
-  liveAdvisorPhase: Map<string, AdvisorLivePhaseState>;
   liveTaskIds: Map<string, string[]>;
   liveWorkflowRuns: Map<string, WorkflowToolLiveRunState>;
   autoRetryStatus: AutoRetryStatus | null;
@@ -565,27 +542,6 @@ function getBufferedReplayedStreamMessageId(events: WorkspaceChatMessage[]): str
   return messageId;
 }
 
-function appendAdvisorLiveText(
-  liveTextByToolCallId: Map<string, AdvisorLiveTextState>,
-  toolCallId: string,
-  chunk: string,
-  timestamp: number
-): boolean {
-  const prev = liveTextByToolCallId.get(toolCallId);
-  const appendedText = `${prev?.text ?? ""}${chunk}`;
-  const text =
-    appendedText.length > ADVISOR_LIVE_OUTPUT_MAX_CHARS
-      ? appendedText.slice(-ADVISOR_LIVE_OUTPUT_MAX_CHARS)
-      : appendedText;
-
-  if (prev?.text === text && prev.timestamp === timestamp) {
-    return false;
-  }
-
-  liveTextByToolCallId.set(toolCallId, { text, timestamp });
-  return true;
-}
-
 // Same resilience rationale as the chat view's decoration deadline: a subscribe attempt
 // that never resolves (hung backend) must not hide a readable cached conversation behind
 // the skeleton forever. A since replay normally lands well within a second, so this only
@@ -613,9 +569,6 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     queuedMessage: null,
     heldInputs: NO_HELD_INPUTS,
     liveBashOutput: new Map(),
-    liveAdvisorOutput: new Map(),
-    liveAdvisorReasoning: new Map(),
-    liveAdvisorPhase: new Map(),
     liveTaskIds: new Map(),
     liveWorkflowRuns: new Map(),
     autoRetryStatus: null,
@@ -796,10 +749,6 @@ function getStreamingMessageKey(workspaceId: string, messageId: string): string 
   return workspaceId + "\0" + messageId;
 }
 
-function getAdvisorLiveKey(workspaceId: string, toolCallId: string): string {
-  return workspaceId + "\0" + toolCallId;
-}
-
 export class WorkspaceStore {
   // Per-workspace state (lazy computed on get)
   private states = new MapStore<string, WorkspaceState>();
@@ -969,7 +918,6 @@ export class WorkspaceStore {
   // release it even when no terminal chat event names the message.
   private streamingMessageKeys = new Map<string, string>();
   private streamingMessageStore = new MapStore<string, void>();
-  private advisorLiveStore = new MapStore<string, void>();
   private streamingStatsStore = new MapStore<string, WorkspaceStreamingStats | null>();
 
   /**
@@ -1149,13 +1097,6 @@ export class WorkspaceStore {
         );
       }
 
-      // Cleanup ephemeral advisor/task state once the actual tool result is available.
-      if (toolCallEnd.toolName === "advisor") {
-        transient?.liveAdvisorOutput.delete(toolCallEnd.toolCallId);
-        transient?.liveAdvisorReasoning.delete(toolCallEnd.toolCallId);
-        transient?.liveAdvisorPhase.delete(toolCallEnd.toolCallId);
-        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallEnd.toolCallId));
-      }
       if (toolCallEnd.toolName === "task") {
         transient?.liveTaskIds.delete(toolCallEnd.toolCallId);
       }
@@ -2244,24 +2185,15 @@ export class WorkspaceStore {
   ): void {
     const transient = this.chatTransientState.get(workspaceId);
     if (!transient) return;
-    if (
-      transient.liveBashOutput.size === 0 &&
-      transient.liveAdvisorOutput.size === 0 &&
-      transient.liveAdvisorReasoning.size === 0 &&
-      transient.liveWorkflowRuns.size === 0
-    ) {
+    if (transient.liveBashOutput.size === 0 && transient.liveWorkflowRuns.size === 0) {
       return;
     }
 
     const activeBashToolCallIds = new Set<string>();
-    const activeAdvisorToolCallIds = new Set<string>();
     const activeWorkflowToolCallIds = new Set<string>();
     const collectToolCallId = (toolName: string, toolCallId: string) => {
       if (toolName === "bash") {
         activeBashToolCallIds.add(toolCallId);
-      }
-      if (toolName === "advisor") {
-        activeAdvisorToolCallIds.add(toolCallId);
       }
       if (isWorkflowRunEmittingToolName(toolName)) {
         activeWorkflowToolCallIds.add(toolCallId);
@@ -2282,22 +2214,6 @@ export class WorkspaceStore {
     for (const toolCallId of Array.from(transient.liveBashOutput.keys())) {
       if (!activeBashToolCallIds.has(toolCallId)) {
         transient.liveBashOutput.delete(toolCallId);
-      }
-    }
-
-    for (const toolCallId of Array.from(transient.liveAdvisorReasoning.keys())) {
-      if (!activeAdvisorToolCallIds.has(toolCallId)) {
-        transient.liveAdvisorReasoning.delete(toolCallId);
-        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
-      }
-    }
-
-    for (const toolCallId of Array.from(transient.liveAdvisorOutput.keys())) {
-      if (!activeAdvisorToolCallIds.has(toolCallId)) {
-        transient.liveAdvisorOutput.delete(toolCallId);
-        // Release the keyed channel version too; once the transient entry is
-        // gone, the workspace-removal sweep can no longer discover this key.
-        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
       }
     }
 
@@ -2328,38 +2244,12 @@ export class WorkspaceStore {
     return this.states.subscribeKey(workspaceId, listener);
   };
 
-  subscribeAdvisorLive(workspaceId: string, toolCallId: string, listener: () => void): () => void {
-    return this.advisorLiveStore.subscribeKey(getAdvisorLiveKey(workspaceId, toolCallId), listener);
-  }
-
   getBashToolLiveOutput(workspaceId: string, toolCallId: string): LiveBashOutputView | null {
     const state = this.chatTransientState.get(workspaceId)?.liveBashOutput.get(toolCallId);
 
     // Important: return the stored object reference so useSyncExternalStore sees a stable snapshot.
     // (Returning a fresh object every call can trigger an infinite re-render loop.)
     return state ?? null;
-  }
-
-  getAdvisorToolLiveOutput(workspaceId: string, toolCallId: string): AdvisorLiveOutputState | null {
-    const state = this.chatTransientState.get(workspaceId)?.liveAdvisorOutput.get(toolCallId);
-
-    return state ?? null;
-  }
-
-  getAdvisorToolLiveReasoning(
-    workspaceId: string,
-    toolCallId: string
-  ): AdvisorLiveReasoningState | null {
-    const state = this.chatTransientState.get(workspaceId)?.liveAdvisorReasoning.get(toolCallId);
-
-    return state ?? null;
-  }
-
-  getAdvisorToolLivePhase(
-    workspaceId: string,
-    toolCallId: string
-  ): AdvisorLivePhaseState | undefined {
-    return this.chatTransientState.get(workspaceId)?.liveAdvisorPhase.get(toolCallId);
   }
 
   getTaskToolLiveTaskIds(workspaceId: string, toolCallId: string): string[] | null {
@@ -4347,17 +4237,6 @@ export class WorkspaceStore {
 
     // Reset per-workspace transient state so the next replay rebuilds from the backend source of truth.
     const previousTransient = this.chatTransientState.get(workspaceId);
-    // Release keyed advisor channels before the transient maps are replaced:
-    // they are the only record of these tool-call IDs, so the caught-up and
-    // workspace-removal sweeps can never rediscover the keys afterwards.
-    if (previousTransient) {
-      for (const toolCallId of new Set([
-        ...previousTransient.liveAdvisorOutput.keys(),
-        ...previousTransient.liveAdvisorReasoning.keys(),
-      ])) {
-        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
-      }
-    }
     const nextTransient = createInitialChatTransientState();
 
     // Preserve active hydration across full replay resets so workspace-switch catch-up
@@ -4685,15 +4564,6 @@ export class WorkspaceStore {
     this.cancelPendingStreamingBump(workspaceId);
     this.streamingStatsStore.delete(workspaceId);
     this.releaseStreamingMessageChannel(workspaceId);
-    const transientForRemoval = this.chatTransientState.get(workspaceId);
-    if (transientForRemoval) {
-      for (const toolCallId of new Set([
-        ...transientForRemoval.liveAdvisorOutput.keys(),
-        ...transientForRemoval.liveAdvisorReasoning.keys(),
-      ])) {
-        this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
-      }
-    }
     this.lastUserPromptStore.bump(workspaceId);
     this.lastUserPromptStore.delete(workspaceId);
 
@@ -4977,14 +4847,11 @@ export class WorkspaceStore {
       return false;
     }
 
-    // Buffer high-frequency stream events (including bash/task/advisor live updates) until
+    // Buffer high-frequency stream events (including bash/task live updates) until
     // caught-up so full-replay reconnects can deterministically rebuild transient state.
     return (
       data.type in this.bufferedEventHandlers ||
       data.type === "bash-output" ||
-      data.type === "advisor-output" ||
-      data.type === "advisor-reasoning-output" ||
-      data.type === "advisor-phase" ||
       data.type === "task-created" ||
       data.type === "workflow-run-attached"
     );
@@ -5147,21 +5014,9 @@ export class WorkspaceStore {
       if (replay === "full" || !data.cursor?.stream || streamContextMismatched) {
         // Live tool-call UI is tied to the active stream context; clear it when replay
         // replaces history, reports no active stream, or reports a different stream ID.
-        const clearedAdvisorToolCallIds = new Set([
-          ...transient.liveAdvisorOutput.keys(),
-          ...transient.liveAdvisorReasoning.keys(),
-        ]);
         transient.liveBashOutput.clear();
-        transient.liveAdvisorOutput.clear();
-        transient.liveAdvisorReasoning.clear();
-        transient.liveAdvisorPhase.clear();
         transient.liveWorkflowRuns.clear();
         transient.liveTaskIds.clear();
-        // delete() notifies subscribers, so mounted advisor cards re-read null
-        // instead of keeping pre-reconnect live output.
-        for (const toolCallId of clearedAdvisorToolCallIds) {
-          this.advisorLiveStore.delete(getAdvisorLiveKey(workspaceId, toolCallId));
-        }
       }
 
       if (sinceContext) {
@@ -5407,61 +5262,6 @@ export class WorkspaceStore {
 
       // High-frequency: throttle UI updates like other delta-style events.
       this.scheduleIdleStateBump(workspaceId);
-      return;
-    }
-
-    if (isAdvisorOutputEvent(data)) {
-      if (data.text.length === 0) return;
-
-      const transient = this.assertChatTransientState(workspaceId);
-      if (
-        !appendAdvisorLiveText(
-          transient.liveAdvisorOutput,
-          data.toolCallId,
-          data.text,
-          data.timestamp
-        )
-      ) {
-        return;
-      }
-
-      this.advisorLiveStore.bump(getAdvisorLiveKey(workspaceId, data.toolCallId));
-      return;
-    }
-
-    if (isAdvisorReasoningOutputEvent(data)) {
-      if (data.text.length === 0) return;
-
-      const transient = this.assertChatTransientState(workspaceId);
-      if (
-        !appendAdvisorLiveText(
-          transient.liveAdvisorReasoning,
-          data.toolCallId,
-          data.text,
-          data.timestamp
-        )
-      ) {
-        return;
-      }
-
-      this.advisorLiveStore.bump(getAdvisorLiveKey(workspaceId, data.toolCallId));
-      return;
-    }
-
-    if (isAdvisorPhaseEvent(data)) {
-      const transient = this.assertChatTransientState(workspaceId);
-      const prev = transient.liveAdvisorPhase.get(data.toolCallId);
-
-      // Avoid unnecessary re-renders if the phase is unchanged.
-      if (prev?.phase === data.phase) return;
-
-      transient.liveAdvisorPhase.set(data.toolCallId, {
-        phase: data.phase,
-        timestamp: data.timestamp,
-      });
-
-      // Low-frequency: bump immediately so advisor progress updates feel responsive.
-      this.states.bump(workspaceId);
       return;
     }
 
@@ -5798,69 +5598,6 @@ export function useBashToolLiveOutput(
       if (!workspaceId || !toolCallId) return null;
       if (hostSource) return hostSource.get(workspaceId, toolCallId);
       return store.getBashToolLiveOutput(workspaceId, toolCallId);
-    }
-  );
-}
-
-/**
- * Hook to get UI-only live output for a running advisor tool call.
- */
-export function useAdvisorToolLiveOutput(
-  workspaceId: string | undefined,
-  toolCallId: string | undefined
-): AdvisorLiveOutputState | null {
-  const store = getStoreInstance();
-
-  return useSyncExternalStore(
-    (listener) => {
-      if (!workspaceId || !toolCallId) return () => undefined;
-      return store.subscribeAdvisorLive(workspaceId, toolCallId, listener);
-    },
-    () => {
-      if (!workspaceId || !toolCallId) return null;
-      return store.getAdvisorToolLiveOutput(workspaceId, toolCallId);
-    }
-  );
-}
-
-/**
- * Hook to get UI-only live reasoning for a running advisor tool call.
- */
-export function useAdvisorToolLiveReasoning(
-  workspaceId: string | undefined,
-  toolCallId: string | undefined
-): AdvisorLiveReasoningState | null {
-  const store = getStoreInstance();
-
-  return useSyncExternalStore(
-    (listener) => {
-      if (!workspaceId || !toolCallId) return () => undefined;
-      return store.subscribeAdvisorLive(workspaceId, toolCallId, listener);
-    },
-    () => {
-      if (!workspaceId || !toolCallId) return null;
-      return store.getAdvisorToolLiveReasoning(workspaceId, toolCallId);
-    }
-  );
-}
-
-/**
- * Hook to get UI-only live advisor phase for a running advisor tool call.
- */
-export function useAdvisorToolLivePhase(
-  workspaceId: string | undefined,
-  toolCallId: string | undefined
-): AdvisorLivePhaseState | undefined {
-  const store = getStoreInstance();
-
-  return useSyncExternalStore(
-    (listener) => {
-      if (!workspaceId) return () => undefined;
-      return store.subscribeKey(workspaceId, listener);
-    },
-    () => {
-      if (!workspaceId || !toolCallId) return undefined;
-      return store.getAdvisorToolLivePhase(workspaceId, toolCallId);
     }
   );
 }

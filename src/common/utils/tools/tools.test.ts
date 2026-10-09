@@ -120,6 +120,39 @@ describe("supportsAnthropicToolSearch", () => {
 });
 
 describe("getToolsForModel", () => {
+  // A shared advisor cannot be the right stronger model for both Haiku and Astra chats;
+  // configuring that relationship adds too much UX burden. Legacy state must not revive it.
+  test("ignores a legacy advisor runtime instead of registering a callable tool", async () => {
+    const createModel = mock(() => Promise.reject(new Error("retired tool must not run")));
+    // Callers from an older session may still supply extra runtime fields. They must not
+    // resurrect the removed tool, while ordinary tools remain available.
+    const legacyRuntime = {
+      advisorRuntime: {
+        advisorModelString: "openai:gpt-5.2",
+        maxUsesPerTurn: 3,
+        getTranscriptSnapshot: () => [],
+        takeToolCallSnapshot: () => undefined,
+        createModel,
+        abortSignal: new AbortController().signal,
+      },
+    };
+    const tools = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime: new LocalRuntime(process.cwd()),
+        runtimeTempDir: "/tmp",
+        ...legacyRuntime,
+      },
+      "ws-1",
+      createInitStateManager()
+    );
+
+    expect(tools.advisor).toBeUndefined();
+    expect(tools.bash.execute).toBeFunction();
+    expect(createModel).not.toHaveBeenCalled();
+  });
+
   test("only includes agent_report when enableAgentReport=true", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();

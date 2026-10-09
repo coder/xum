@@ -156,8 +156,8 @@ describe("applyToolPolicyAndExperiments", () => {
   });
 
   test("context-coupled tools stay model-visible under PTC; media tools bridge", async () => {
-    // memory/advisor: AIService keys system-prompt context (memory index /
-    // hot set, advisor guidance) off their top-level presence. attach_file /
+    // memory: AIService keys system-prompt context (memory index /
+    // hot set) off their top-level presence. attach_file /
     // desktop_screenshot are bridgeable instead: the ToolBridge strips their
     // base64 from sandbox-visible values and the code_execution attachments
     // carrier delivers the real bytes to request-time extraction, so nested
@@ -166,7 +166,6 @@ describe("applyToolPolicyAndExperiments", () => {
       allTools: {
         bash: executableTool("Run a command"),
         memory: executableTool("Memory"),
-        advisor: executableTool("Advisor"),
         attach_file: executableTool("Attach"),
         desktop_screenshot: executableTool("Screenshot"),
       },
@@ -174,7 +173,7 @@ describe("applyToolPolicyAndExperiments", () => {
       experiments: { programmaticToolCalling: true },
       emitNestedToolEvent: () => undefined,
     });
-    expect(Object.keys(result).sort()).toEqual(["advisor", "code_execution", "memory"]);
+    expect(Object.keys(result).sort()).toEqual(["code_execution", "memory"]);
 
     // The media tools must actually be reachable inside the sandbox; hidden
     // from the model-visible set but not dropped.

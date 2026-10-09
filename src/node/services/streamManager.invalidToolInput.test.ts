@@ -6,7 +6,7 @@ import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import { tool } from "ai";
 import type { LanguageModelV3Prompt, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { createMuxMessage } from "@/common/types/message";
-import { AdvisorToolInputSchema } from "@/common/utils/tools/toolDefinitions";
+import { z } from "zod";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { StreamManager } from "./streamManager";
 import { createTestHistoryService } from "./testHistoryService";
@@ -16,7 +16,7 @@ describe("StreamManager - invalid tool input", () => {
     const h = await createTestHistoryService();
     const workspaceId = "invalid-tool-input";
     const messageId = "invalid-tool-input-assistant";
-    const toolCallId = "advisor-invalid-call";
+    const toolCallId = "test_tool-invalid-call";
     const oversized = "x".repeat(2100);
     let providerCalls = 0;
     let retryPrompt: LanguageModelV3Prompt | undefined;
@@ -35,7 +35,7 @@ describe("StreamManager - invalid tool input", () => {
                 {
                   type: "tool-call",
                   toolCallId,
-                  toolName: "advisor",
+                  toolName: "test_tool",
                   input: JSON.stringify({ question: oversized }),
                 },
                 {
@@ -60,7 +60,7 @@ describe("StreamManager - invalid tool input", () => {
       expect(
         (
           await h.historyService.appendManyToHistory(workspaceId, [
-            createMuxMessage("user", "user", "Ask the advisor"),
+            createMuxMessage("user", "user", "Run the test tool"),
             createMuxMessage(messageId, "assistant", ""),
           ])
         ).success
@@ -71,15 +71,15 @@ describe("StreamManager - invalid tool input", () => {
         historySequence: 1,
         model,
         modelString: "openai:gpt-4o",
-        messages: [{ role: "user", content: "Ask the advisor" }],
+        messages: [{ role: "user", content: "Run the test tool" }],
         system: "Use tools",
         runtime: new LocalRuntime(h.tempDir),
         providedRuntimeTempDir: runtimeDir,
         tools: {
-          advisor: tool({
-            description: "test advisor",
-            inputSchema: AdvisorToolInputSchema,
-            execute: (): Promise<{ advice: string }> =>
+          test_tool: tool({
+            description: "test test_tool",
+            inputSchema: z.object({ question: z.string().max(2000) }),
+            execute: (): Promise<{ result: string }> =>
               Promise.reject(new Error("invalid input must not execute")),
           }),
         },
@@ -99,7 +99,7 @@ describe("StreamManager - invalid tool input", () => {
       expect(retryToolResult.output.type).toBe("error-text");
       if (retryToolResult.output.type !== "error-text") throw new Error("Expected error-text");
       const summary = retryToolResult.output.value;
-      expect(summary).toContain("advisor");
+      expect(summary).toContain("test_tool");
       expect(summary).toContain("question");
       expect(summary).toContain("2000");
       expect(summary).toContain("received 2100 characters");

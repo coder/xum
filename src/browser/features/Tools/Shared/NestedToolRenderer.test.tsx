@@ -92,6 +92,27 @@ describe("NestedToolRenderer", () => {
     expect(getByText("Result")).toBeDefined();
   });
 
+  test("saved advisor calls remain expandable without a dedicated renderer", async () => {
+    const view = render(
+      <Providers>
+        <NestedToolRenderer
+          toolName="advisor"
+          input={{ question: "Review this approach" }}
+          output={{ advice: "Keep the change small" }}
+          status="completed"
+        />
+      </Providers>
+    );
+
+    fireEvent.click(view.getByText("advisor"));
+    expect(view.getByText("Arguments")).toBeDefined();
+    expect(view.getByText("Result")).toBeDefined();
+    await waitFor(() => {
+      expect(view.container.textContent).toContain("Review this approach");
+      expect(view.container.textContent).toContain("Keep the change small");
+    });
+  });
+
   test("reconstructed failure shape skips missing duration/exit-code fields", () => {
     const { queryByText } = render(
       <Providers>

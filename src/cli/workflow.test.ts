@@ -86,7 +86,7 @@ describe("xum workflow CLI helpers", () => {
     await trustProject(muxRoot, repo);
 
     const result =
-      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/echo-review.js --dir ${repo} -e dynamic-workflows -e agent-plugins`
+      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/echo-review.js --dir ${repo} -e dynamic-workflows -e agent-plugins -e advisor-tool`
         .env({ ...process.env, MUX_ROOT: muxRoot })
         .nothrow()
         .quiet();

@@ -49,7 +49,6 @@ function makeDoc(count: number): Record<string, unknown> {
       plan: { model: "anthropic:claude-opus-5-5", thinkingLevel: "high" },
       explore: { model: "anthropic:claude-sonnet-5-5", thinkingLevel: "medium" },
     },
-    advisorReasoningMode: "pro",
   };
 }
 

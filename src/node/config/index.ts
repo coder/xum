@@ -129,15 +129,21 @@ import {
   tryProjectRegistrationFileLock,
   withProjectRegistrationFileLock,
 } from "@/node/config/projectRegistrationLock";
-import {
-  coerceOpenAIReasoningMode,
-  coerceThinkingLevel,
-  type OpenAIReasoningMode,
-  type ThinkingLevel,
-} from "@/common/types/thinking";
+import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 
 // Re-export project/provider types from dedicated schema/types files (for preload usage)
 export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig };
+
+// Retired advisor settings are inert downgrade data, never part of the current API
+// or agent defaults. Carry them with each snapshot so unrelated saves cannot erase
+// them, and a later disk reload can replace or remove them without stale side caches.
+type LegacyAdvisorProjectsConfig = ProjectsConfig & {
+  legacyAdvisorSettings?: {
+    root: Record<string, unknown>;
+    agentEnabled: Record<string, unknown>;
+  };
+};
+
 export { FileLeaseManager } from "./fileLeaseManager";
 export { ProvidersConfigStore, type ProvidersConfig } from "./providersConfigStore";
 export { SecretsStore } from "./secretsStore";
@@ -652,22 +658,6 @@ function parseOptionalPort(value: unknown): number | undefined {
   return value;
 }
 
-function parseOptionalPositiveInteger(value: unknown): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
-    return undefined;
-  }
-
-  if (value <= 0) {
-    return undefined;
-  }
-
-  return value;
-}
-
-function parseOptionalThinkingLevel(value: unknown): ThinkingLevel | undefined {
-  return coerceThinkingLevel(value);
-}
-
 function parseOptionalHeartbeatIntervalMs(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
     return undefined;
@@ -1163,15 +1153,6 @@ function configLoadFailureState(configFile: string): ConfigLoadFailureState {
  * Encapsulates all config paths and operations, making them dependency-injectable
  * and testable. Pass a custom rootDir for tests to avoid polluting ~/.xum
  */
-
-function normalizeAdvisorPositiveInteger(value: number | null, label: string): number | null {
-  if (value == null) {
-    return null;
-  }
-  assert(Number.isInteger(value), `${label} must be an integer`);
-  assert(value > 0, `${label} must be positive`);
-  return value;
-}
 
 /**
  * What an edit already holds of the project registration lock when it enters the queue:
@@ -2281,17 +2262,6 @@ export class Config {
         : normalizeAutoModelRoutingConfig(parsed.autoModelRouting);
 
     const defaultModel = normalizeOptionalModelString(parsed.defaultModel);
-    const advisorModelString = parseOptionalNonEmptyString(parsed.advisorModelString);
-    const advisorThinkingLevel = parseOptionalThinkingLevel(parsed.advisorThinkingLevel);
-    const advisorReasoningMode = coerceOpenAIReasoningMode(parsed.advisorReasoningMode);
-    const advisorMaxUsesPerTurn =
-      parsed.advisorMaxUsesPerTurn === null
-        ? null
-        : parseOptionalPositiveInteger(parsed.advisorMaxUsesPerTurn);
-    const advisorMaxOutputTokens =
-      parsed.advisorMaxOutputTokens === null
-        ? null
-        : parseOptionalPositiveInteger(parsed.advisorMaxOutputTokens);
     const hiddenMigrations = normalizeConfigMigrations(parsed.migrations);
     const existingHiddenModels = normalizeOptionalModelStringArray(parsed.hiddenModels);
     if (existingHiddenModels === undefined && hiddenMigrations.hiddenModelsInitialized === true) {
@@ -2382,7 +2352,7 @@ export class Config {
       ? undefined
       : layoutPresetsRaw;
 
-    return {
+    const config: LegacyAdvisorProjectsConfig = {
       projects: projectsMap,
       apiServerBindHost: parseOptionalNonEmptyString(parsed.apiServerBindHost),
       apiServerServeWebUi: parseOptionalBoolean(parsed.apiServerServeWebUi) ? true : undefined,
@@ -2416,11 +2386,6 @@ export class Config {
       modelFallbacks,
       autoModelRouting,
       defaultModel,
-      advisorModelString,
-      advisorThinkingLevel,
-      advisorReasoningMode,
-      advisorMaxUsesPerTurn,
-      advisorMaxOutputTokens,
       hiddenModels,
       agentAiDefaults,
       migrations,
@@ -2439,6 +2404,34 @@ export class Config {
       settingsBackup: SettingsBackupSchema.optional().catch(undefined).parse(parsed.settingsBackup),
       legacyOnePasswordAccountName: parseOptionalNonEmptyString(parsed.onePasswordAccountName),
     };
+    const root = Object.fromEntries(
+      [
+        "advisorModelString",
+        "advisorThinkingLevel",
+        "advisorReasoningMode",
+        "advisorMaxUsesPerTurn",
+        "advisorMaxOutputTokens",
+        "advisorCyberReasoningMode",
+      ]
+        .filter((key) => Object.hasOwn(parsed, key))
+        .map((key) => [key, parsed[key]])
+    );
+    const agentEnabled = Object.fromEntries(
+      Object.entries(parsed.agentAiDefaults ?? {}).flatMap(([agentId, entry]) =>
+        entry &&
+        typeof entry === "object" &&
+        !Array.isArray(entry) &&
+        Object.hasOwn(entry, "advisorEnabled")
+          ? [[agentId, (entry as { advisorEnabled: unknown }).advisorEnabled]]
+          : []
+      )
+    );
+    if (Object.keys(root).length > 0 || Object.keys(agentEnabled).length > 0) {
+      // Preserve raw values, including malformed ones: they must never be validated
+      // as active settings or make an unrelated load/edit fail.
+      config.legacyAdvisorSettings = { root, agentEnabled };
+    }
+    return config;
   }
 
   /**
@@ -2464,7 +2457,7 @@ export class Config {
    * atomic write) happens before the rename, so a failure means the previous bytes are
    * still on disk; nothing after the write can fail.
    */
-  private saveConfigEffect(config: ProjectsConfig): Effect.Effect<void, unknown> {
+  private saveConfigEffect(config: LegacyAdvisorProjectsConfig): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
@@ -2564,39 +2557,6 @@ export class Config {
         data.defaultModel = defaultModel;
       }
 
-      const advisorModelString = parseOptionalNonEmptyString(config.advisorModelString);
-      if (advisorModelString !== undefined) {
-        data.advisorModelString = advisorModelString;
-      }
-
-      const advisorReasoningMode = coerceOpenAIReasoningMode(config.advisorReasoningMode);
-      if (advisorReasoningMode !== undefined) {
-        data.advisorReasoningMode = advisorReasoningMode;
-      }
-
-      const advisorThinkingLevel = parseOptionalThinkingLevel(config.advisorThinkingLevel);
-      if (advisorThinkingLevel !== undefined) {
-        data.advisorThinkingLevel = advisorThinkingLevel;
-      }
-
-      if (config.advisorMaxUsesPerTurn === null) {
-        data.advisorMaxUsesPerTurn = null;
-      } else {
-        const advisorMaxUsesPerTurn = parseOptionalPositiveInteger(config.advisorMaxUsesPerTurn);
-        if (advisorMaxUsesPerTurn !== undefined) {
-          data.advisorMaxUsesPerTurn = advisorMaxUsesPerTurn;
-        }
-      }
-
-      if (config.advisorMaxOutputTokens === null) {
-        data.advisorMaxOutputTokens = null;
-      } else {
-        const advisorMaxOutputTokens = parseOptionalPositiveInteger(config.advisorMaxOutputTokens);
-        if (advisorMaxOutputTokens !== undefined) {
-          data.advisorMaxOutputTokens = advisorMaxOutputTokens;
-        }
-      }
-
       const hiddenModels = normalizeOptionalModelStringArray(config.hiddenModels);
       if (hiddenModels !== undefined) {
         data.hiddenModels = hiddenModels;
@@ -2678,9 +2638,25 @@ export class Config {
       if (config.viewedSplashScreens) {
         data.viewedSplashScreens = config.viewedSplashScreens;
       }
-      if (config.agentAiDefaults && Object.keys(config.agentAiDefaults).length > 0) {
-        const normalizedAgentAiDefaults = normalizeAiDefaultsModelStrings(config.agentAiDefaults);
-        data.agentAiDefaults = normalizedAgentAiDefaults;
+      const legacyAdvisorSettings = config.legacyAdvisorSettings;
+      if (
+        (config.agentAiDefaults && Object.keys(config.agentAiDefaults).length > 0) ||
+        Object.keys(legacyAdvisorSettings?.agentEnabled ?? {}).length > 0
+      ) {
+        const normalizedAgentAiDefaults = normalizeAiDefaultsModelStrings(
+          config.agentAiDefaults ?? {}
+        );
+        // Include advisor-only entries omitted at runtime, without overwriting edits
+        // or bypassing normalization of current, non-advisor defaults.
+        data.agentAiDefaults = Object.fromEntries([
+          ...Object.entries(normalizedAgentAiDefaults),
+          ...Object.entries(legacyAdvisorSettings?.agentEnabled ?? {}).map(
+            ([agentId, advisorEnabled]) => [
+              agentId,
+              { ...normalizedAgentAiDefaults[agentId], advisorEnabled },
+            ]
+          ),
+        ]);
 
         // Downgrade-compatibility projection only: older builds resolve
         // delegated runs from the legacy root map. Never read back at runtime;
@@ -2754,6 +2730,8 @@ export class Config {
       if (legacyOnePasswordAccountName) {
         data.onePasswordAccountName = legacyOnePasswordAccountName;
       }
+
+      if (legacyAdvisorSettings) Object.assign(data, legacyAdvisorSettings.root);
 
       const persistedWorkspaceIds = new Set<string>();
       for (const [, project] of data.projects) {
@@ -2940,11 +2918,6 @@ export class Config {
       modelFallbacks: config.modelFallbacks,
       autoModelRouting: config.autoModelRouting ?? getDefaultAutoModelRoutingConfig(),
       defaultModel: config.defaultModel,
-      advisorModelString: config.advisorModelString ?? null,
-      advisorThinkingLevel: config.advisorThinkingLevel ?? null,
-      advisorReasoningMode: config.advisorReasoningMode ?? null,
-      advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
-      advisorMaxOutputTokens: config.advisorMaxOutputTokens,
       hiddenModels: config.hiddenModels,
       hiddenModelsInitialized: config.migrations?.hiddenModelsInitialized === true,
       coderWorkspaceArchiveBehavior:
@@ -3226,11 +3199,6 @@ export class Config {
 
   async saveUserConfig(input: {
     taskSettings?: unknown;
-    advisorModelString?: string | null;
-    advisorThinkingLevel?: string | null;
-    advisorReasoningMode?: OpenAIReasoningMode | null;
-    advisorMaxUsesPerTurn?: number | null;
-    advisorMaxOutputTokens?: number | null;
     agentAiDefaults?: unknown;
   }): Promise<void> {
     await this.editConfig((config) => {
@@ -3251,27 +3219,6 @@ export class Config {
         });
       }
 
-      if (input.advisorModelString !== undefined) {
-        result.advisorModelString = parseOptionalNonEmptyString(input.advisorModelString);
-      }
-      if (input.advisorReasoningMode !== undefined) {
-        result.advisorReasoningMode = coerceOpenAIReasoningMode(input.advisorReasoningMode);
-      }
-      if (input.advisorThinkingLevel !== undefined) {
-        result.advisorThinkingLevel = parseOptionalThinkingLevel(input.advisorThinkingLevel);
-      }
-      if (input.advisorMaxUsesPerTurn !== undefined) {
-        result.advisorMaxUsesPerTurn = normalizeAdvisorPositiveInteger(
-          input.advisorMaxUsesPerTurn,
-          "Advisor max uses per turn"
-        );
-      }
-      if (input.advisorMaxOutputTokens !== undefined) {
-        result.advisorMaxOutputTokens = normalizeAdvisorPositiveInteger(
-          input.advisorMaxOutputTokens,
-          "Advisor max output tokens"
-        );
-      }
       if (input.agentAiDefaults !== undefined) {
         const normalized = normalizeAgentAiDefaults(input.agentAiDefaults);
         result.agentAiDefaults = Object.keys(normalized).length > 0 ? normalized : undefined;

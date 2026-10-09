@@ -879,7 +879,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     preparedPayloadMessageIds: string[][];
     preparedToolNamesForSentinel: string[][];
     streamSystemContextMuxScopes: XumToolScope[];
-    streamSystemContextAdvisorFlags: Array<boolean | undefined>;
     streamSystemContextMemoryToolFlags: Array<boolean | undefined>;
     streamSystemContextIntuitionFlags: Array<boolean | undefined>;
     streamSystemContextHotMemoriesBlocks: Array<string | undefined>;
@@ -932,7 +931,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const preparedPayloadMessageIds: string[][] = [];
     const preparedToolNamesForSentinel: string[][] = [];
     const streamSystemContextMuxScopes: XumToolScope[] = [];
-    const streamSystemContextAdvisorFlags: Array<boolean | undefined> = [];
     const streamSystemContextMemoryToolFlags: Array<boolean | undefined> = [];
     const streamSystemContextIntuitionFlags: Array<boolean | undefined> = [];
     const streamSystemContextHotMemoriesBlocks: Array<string | undefined> = [];
@@ -966,7 +964,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           throw new Error("Expected xumScope in stream system context build args");
         }
         streamSystemContextMuxScopes.push(contextArgs.xumScope);
-        streamSystemContextAdvisorFlags.push(contextArgs.advisorToolAvailable);
         streamSystemContextMemoryToolFlags.push(contextArgs.memoryToolAvailable);
         streamSystemContextIntuitionFlags.push(contextArgs.intuitionToolAvailable);
         streamSystemContextHotMemoriesBlocks.push(contextArgs.hotMemoriesBlock);
@@ -994,7 +991,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       preparedPayloadMessageIds,
       preparedToolNamesForSentinel,
       streamSystemContextMuxScopes,
-      streamSystemContextAdvisorFlags,
       streamSystemContextMemoryToolFlags,
       streamSystemContextIntuitionFlags,
       streamSystemContextHotMemoriesBlocks,
@@ -1011,48 +1007,24 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     };
   }
 
-  interface AdvisorRuntimeForTests {
-    createModel: (modelString: string) => Promise<LanguageModel>;
-    takeToolCallSnapshot: (toolCallId: string) =>
-      | {
-          toolCallId: string;
-          toolName: "advisor";
-          input: Record<string, unknown>;
-          stepText: string;
-          stepReasoning: string;
-        }
-      | undefined;
-  }
-
-  type AdvisorOnChunk = (event: {
-    chunk: {
-      type: string;
-      delta?: string;
-      toolCallId?: string;
-      toolName?: string;
-      input?: unknown;
-    };
-  }) => PromiseLike<void> | void;
-
-  async function enableAdvisorForHarness(
+  async function enableIntuitionForHarness(
     harness: StreamMessageHarness,
-    advisorModelString: string = KNOWN_MODELS.SONNET.id
+    model: string
   ): Promise<void> {
-    const baseConfig = harness.config.loadConfigOrDefault();
-    await harness.config.editConfig(() => ({
-      ...baseConfig,
-      advisorModelString,
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(harness.config.rootDir)
+    );
+    await harness.config.editConfig((cfg) => ({
+      ...cfg,
       agentAiDefaults: {
-        ...baseConfig.agentAiDefaults,
-        exec: {
-          ...baseConfig.agentAiDefaults?.exec,
-          advisorEnabled: true,
-        },
+        ...cfg.agentAiDefaults,
+        intuition: { modelString: model, thinkingLevel: "high" },
       },
     }));
   }
 
-  async function startAdvisorStream(
+  async function startTestStream(
     harness: StreamMessageHarness,
     workspaceId: string
   ): Promise<Awaited<ReturnType<AIService["streamMessage"]>>> {
@@ -1082,41 +1054,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       throw new Error("Expected goalToolContext in tool configuration");
     }
     return goalToolContext;
-  }
-
-  function getAdvisorRuntimeFromHarness(harness: StreamMessageHarness): AdvisorRuntimeForTests {
-    const toolConfig = getToolConfigFromHarness(harness);
-    const advisorRuntime = (toolConfig as { advisorRuntime?: AdvisorRuntimeForTests })
-      .advisorRuntime;
-    expect(advisorRuntime).toBeDefined();
-    if (!advisorRuntime) {
-      throw new Error("Expected advisorRuntime in tool configuration");
-    }
-    return advisorRuntime;
-  }
-
-  function getAdvisorCallbacksFromHarness(harness: StreamMessageHarness): {
-    onChunk: AdvisorOnChunk;
-    onStepMessages: (messages: ModelMessage[]) => void;
-  } {
-    expect(harness.startStreamCalls).toHaveLength(1);
-    const startStreamCall = harness.startStreamCalls[0];
-    if (!startStreamCall) {
-      throw new Error("Expected streamManager.startStream call arguments");
-    }
-
-    const onChunk = startStreamCall.onChunk;
-    const onStepMessages = startStreamCall.onStepMessages;
-    expect(typeof onChunk).toBe("function");
-    expect(typeof onStepMessages).toBe("function");
-    if (typeof onChunk !== "function" || typeof onStepMessages !== "function") {
-      throw new Error("Expected advisor startStream callbacks");
-    }
-
-    return {
-      onChunk: onChunk as AdvisorOnChunk,
-      onStepMessages: onStepMessages as (messages: ModelMessage[]) => void,
-    };
   }
 
   afterEach(() => {
@@ -1686,7 +1623,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
     const harness = createHarness(xumHome.path, metadata, { experimentsService });
 
-    await startAdvisorStream(harness, workspaceId);
+    await startTestStream(harness, workspaceId);
 
     expect(getToolConfigFromHarness(harness).enableFamilyMessaging).toBe(true);
   });
@@ -1988,7 +1925,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     ]);
   });
 
-  it("reuses the pre-policy stream system context when advisor availability is unchanged", async () => {
+  it("reuses the pre-policy stream system context when tool availability is unchanged", async () => {
     using xumHome = new DisposableTempDir("ai-service-reuse-system-context");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -2005,7 +1942,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(harness.streamSystemContextAdvisorFlags).toEqual([false]);
     // Tool-scoped instructions come from the snapshot the system message used.
     expect(harness.streamSystemContextInstructionInputs).toEqual([undefined]);
     expect(harness.toolInstructionSources).toHaveLength(1);
@@ -2017,43 +1953,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
   });
 
-  it("rebuilds the stream system context when policy removes advisor guidance", async () => {
-    using xumHome = new DisposableTempDir("ai-service-rebuild-system-context-advisor");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-rebuild-system-context-advisor";
-    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for advisor availability gating
-    const stubTool: Tool = {} as never;
-    const harness = createHarness(xumHome.path, metadata, {
-      allTools: { advisor: stubTool },
-      postPolicyTools: {},
-    });
-    await harness.config.editConfig((cfg) => {
-      cfg.advisorModelString = KNOWN_MODELS.SONNET.id;
-      return cfg;
-    });
-
-    const result = await harness.service.streamMessage({
-      messages: [createMuxMessage("latest-user", "user", "hello")],
-      workspaceId,
-      modelString: "openai:gpt-5.2",
-      thinkingLevel: "off",
-    });
-
-    expect(result.success).toBe(true);
-    expect(harness.streamSystemContextAdvisorFlags).toEqual([true, false]);
-    // The post-policy rebuild reuses the first build's instruction snapshot
-    // instead of re-reading AGENTS.md files, and tool extraction shares it.
-    const [firstSnapshot] = harness.streamSystemContextInstructionOutputs;
-    expect(harness.streamSystemContextInstructionInputs).toHaveLength(2);
-    expect(harness.streamSystemContextInstructionInputs[0]).toBeUndefined();
-    expect(harness.streamSystemContextInstructionInputs[1]).toBe(firstSnapshot);
-    expect(harness.toolInstructionSources).toHaveLength(1);
-    expect(harness.toolInstructionSources[0]).toBe(firstSnapshot);
-  });
-
   it("shares one agent definition cache per turn and starts each turn with a fresh one", async () => {
     using xumHome = new DisposableTempDir("ai-service-agent-definition-cache");
     const projectPath = path.join(xumHome.path, "project");
@@ -2061,17 +1960,18 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     const workspaceId = "workspace-agent-definition-cache";
     const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for advisor availability gating
+    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for memory availability gating
     const stubTool: Tool = {} as never;
-    // Policy strips the advisor so each turn rebuilds its system context once.
+    // Policy strips memory so each turn rebuilds its system context once.
     const harness = createHarness(xumHome.path, metadata, {
-      allTools: { advisor: stubTool },
+      experimentsService: await experimentsServiceWith(xumHome.path, [EXPERIMENT_IDS.MEMORY]),
+      allTools: { memory: stubTool },
       postPolicyTools: {},
     });
-    await harness.config.editConfig((cfg) => {
-      cfg.advisorModelString = KNOWN_MODELS.SONNET.id;
-      return cfg;
-    });
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
+    );
 
     for (const messageId of ["turn-1", "turn-2"]) {
       const result = await harness.service.streamMessage({
@@ -3640,76 +3540,53 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   });
 
   it.each([
-    { advisorReasoningMode: "pro", parentMode: "standard" },
-    { advisorReasoningMode: "standard", parentMode: "pro" },
-    { advisorReasoningMode: undefined, parentMode: "pro" },
-  ] as const)("pins advisor mode independently of the parent: %j", async (testCase) => {
-    using xumHome = new DisposableTempDir("ai-service-advisor-reasoning-mode");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-    const workspaceId = "workspace-advisor-reasoning-mode";
-    const harness = createHarness(
-      xumHome.path,
-      createLocalWorkspaceMetadata(workspaceId, projectPath)
-    );
-    await enableAdvisorForHarness(harness, "openai:gpt-5.6");
-    await harness.config.saveUserConfig({
-      advisorThinkingLevel: "high",
-      advisorReasoningMode: testCase.advisorReasoningMode,
-    });
-    const result = await harness.service.streamMessage({
-      messages: [createMuxMessage("latest-user", "user", "continue")],
-      workspaceId,
-      modelString: "openai:gpt-5.6",
-      thinkingLevel: "max",
-      reasoningMode: testCase.parentMode,
-    });
-    expect(result.success).toBe(true);
-    expect(getToolConfigFromHarness(harness).advisorRuntime).toMatchObject({
-      reasoningLevel: "high",
-      reasoningMode: testCase.advisorReasoningMode,
-    });
-  });
-
-  it.each([
     { model: "openai:gpt-5.6", wireFormat: "responses", route: "openai" },
     { model: "openai:gpt-5.6", wireFormat: "chatCompletions", route: "openai" },
     { model: "mux-gateway:openai/gpt-5.6", wireFormat: "responses", route: "mux-gateway" },
-  ] as const)("pins advisor wire and route independently of live config: %j", async (testCase) => {
-    using xumHome = new DisposableTempDir("ai-service-advisor-reasoning-route");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-    const workspaceId = "workspace-advisor-reasoning-route";
-    const harness = createHarness(
-      xumHome.path,
-      createLocalWorkspaceMetadata(workspaceId, projectPath)
-    );
-    const providersStore = new ProvidersConfigStore(harness.config.rootDir);
-    providersStore.saveProvidersConfig({
-      openai: { apiKey: "sk-test-key", wireFormat: testCase.wireFormat },
-      "mux-gateway": { couponCode: "test-coupon" },
-    });
-    await harness.config.editConfig((cfg) => ({
-      ...cfg,
-      routePriority: ["direct"],
-      muxGatewayEnabled: true,
-    }));
-    await enableAdvisorForHarness(harness, testCase.model);
-    await startAdvisorStream(harness, workspaceId);
-    const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].advisorRuntime;
-    if (!runtime) throw new Error("Expected advisor runtime");
-    harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
-    const created = await runtime.createModel(testCase.model);
-    providersStore.saveProvidersConfig({
-      openai: { apiKey: "changed-key", wireFormat: "responses" },
-    });
+  ] as const)(
+    "pins intuition wire and route independently of live config: %j",
+    async (testCase) => {
+      using xumHome = new DisposableTempDir("ai-service-intuition-reasoning-route");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "workspace-intuition-reasoning-route";
+      const harness = createHarness(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, projectPath),
+        {
+          experimentsService: await experimentsServiceWith(xumHome.path, [
+            EXPERIMENT_IDS.MEMORY,
+            EXPERIMENT_IDS.MEMORY_INTUITION,
+          ]),
+        }
+      );
+      const providersStore = new ProvidersConfigStore(harness.config.rootDir);
+      providersStore.saveProvidersConfig({
+        openai: { apiKey: "sk-test-key", wireFormat: testCase.wireFormat },
+        "mux-gateway": { couponCode: "test-coupon" },
+      });
+      await harness.config.editConfig((cfg) => ({
+        ...cfg,
+        routePriority: ["direct"],
+        muxGatewayEnabled: true,
+      }));
+      await enableIntuitionForHarness(harness, testCase.model);
+      await startTestStream(harness, workspaceId);
+      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].intuitionRuntime;
+      if (!runtime) throw new Error("Expected intuition runtime");
+      harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
+      const created = await runtime.createModel(testCase.model);
+      providersStore.saveProvidersConfig({
+        openai: { apiKey: "changed-key", wireFormat: "responses" },
+      });
 
-    expect(created.optionsRouteProvider).toBe(testCase.route);
-    expect(normalizeToCanonical(created.optionsModelString)).toBe("openai:gpt-5.6");
-    if (testCase.route === "openai") {
-      expect(created.optionsMuxProviderOptions?.openai?.wireFormat).toBe(testCase.wireFormat);
+      expect(created.optionsRouteProvider).toBe(testCase.route);
+      expect(normalizeToCanonical(created.optionsModelString)).toBe("openai:gpt-5.6");
+      if (testCase.route === "openai") {
+        expect(created.optionsMuxProviderOptions?.openai?.wireFormat).toBe(testCase.wireFormat);
+      }
     }
-  });
+  );
 
   it.each([
     { modelId: "gpt-6-astra", refresh: "none" },
@@ -3717,15 +3594,21 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     { modelId: "team-astra", refresh: "retyped" },
     { modelId: "team-astra", refresh: "removed" },
   ])(
-    "preserves the actual Coder instance and scoped alias for advisor Pro: %j",
+    "preserves the actual Coder instance and scoped alias for intuition Pro: %j",
     async (testCase) => {
-      using xumHome = new DisposableTempDir("ai-service-advisor-coder-pro");
+      using xumHome = new DisposableTempDir("ai-service-intuition-coder-pro");
       const projectPath = path.join(xumHome.path, "project");
       await fs.mkdir(projectPath, { recursive: true });
-      const workspaceId = "workspace-advisor-coder-pro";
+      const workspaceId = "workspace-intuition-coder-pro";
       const harness = createHarness(
         xumHome.path,
-        createLocalWorkspaceMetadata(workspaceId, projectPath)
+        createLocalWorkspaceMetadata(workspaceId, projectPath),
+        {
+          experimentsService: await experimentsServiceWith(xumHome.path, [
+            EXPERIMENT_IDS.MEMORY,
+            EXPERIMENT_IDS.MEMORY_INTUITION,
+          ]),
+        }
       );
       const model = `coder:prod-openai/${testCase.modelId}`;
       await writeProvidersConfig(xumHome.path, {
@@ -3747,8 +3630,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           models: [{ id: "prod-openai/team-astra", mappedToModel: "openai:gpt-6-astra" }],
         },
       });
-      await enableAdvisorForHarness(harness, model);
-      await startAdvisorStream(harness, workspaceId);
+      await enableIntuitionForHarness(harness, model);
+      await startTestStream(harness, workspaceId);
       // Avoid an OAuth exchange; the real option/route adapter below must retain
       // the selected instance instead of re-resolving the unrelated "openai" instance.
       harness.resolveAndCreateModelSpy.mockImplementation(
@@ -3776,8 +3659,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           });
         }
       );
-      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].advisorRuntime;
-      if (!runtime) throw new Error("Expected advisor runtime");
+      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].intuitionRuntime;
+      if (!runtime) throw new Error("Expected intuition runtime");
       if (testCase.refresh !== "none") {
         const snapshot = new ProvidersConfigStore(harness.config.rootDir).loadProvidersConfig();
         if (!snapshot) throw new Error("Expected the initial Coder configuration");
@@ -4133,175 +4016,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
   });
 
-  it("freezes advisor tool-call snapshots at the tool-call boundary", async () => {
-    using xumHome = new DisposableTempDir("ai-service-advisor-step-snapshot-boundary");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-advisor-step-snapshot-boundary";
-    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    const harness = createHarness(xumHome.path, metadata);
-    await enableAdvisorForHarness(harness);
-
-    await startAdvisorStream(harness, workspaceId);
-
-    const advisorRuntime = getAdvisorRuntimeFromHarness(harness);
-    const { onChunk, onStepMessages } = getAdvisorCallbacksFromHarness(harness);
-    onStepMessages([{ role: "user", content: "continue" }]);
-
-    const input = { focus: "shared context" };
-    await onChunk({ chunk: { type: "text-delta", delta: "draft answer" } });
-    await onChunk({ chunk: { type: "reasoning-delta", delta: "risk analysis" } });
-    await onChunk({
-      chunk: {
-        type: "tool-call",
-        toolCallId: "advisor-call-1",
-        toolName: "advisor",
-        input,
-      },
-    });
-    input.focus = "mutated after freeze";
-
-    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-1")).toEqual({
-      toolCallId: "advisor-call-1",
-      toolName: "advisor",
-      input: { focus: "shared context" },
-      stepText: "draft answer",
-      stepReasoning: "risk analysis",
-    });
-  });
-
-  it("keeps multiple advisor tool-call snapshots isolated within the same step", async () => {
-    using xumHome = new DisposableTempDir("ai-service-advisor-step-snapshot-isolated");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-advisor-step-snapshot-isolated";
-    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    const harness = createHarness(xumHome.path, metadata);
-    await enableAdvisorForHarness(harness);
-
-    await startAdvisorStream(harness, workspaceId);
-
-    const advisorRuntime = getAdvisorRuntimeFromHarness(harness);
-    const { onChunk, onStepMessages } = getAdvisorCallbacksFromHarness(harness);
-    onStepMessages([{ role: "user", content: "continue" }]);
-
-    await onChunk({ chunk: { type: "text-delta", delta: "alpha" } });
-    await onChunk({ chunk: { type: "reasoning-delta", delta: "first" } });
-    await onChunk({
-      chunk: {
-        type: "tool-call",
-        toolCallId: "advisor-call-1",
-        toolName: "advisor",
-        input: {},
-      },
-    });
-    await onChunk({ chunk: { type: "text-delta", delta: " beta" } });
-    await onChunk({ chunk: { type: "reasoning-delta", delta: " second" } });
-    await onChunk({
-      chunk: {
-        type: "tool-call",
-        toolCallId: "advisor-call-2",
-        toolName: "advisor",
-        input: {},
-      },
-    });
-
-    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-1")).toMatchObject({
-      stepText: "alpha",
-      stepReasoning: "first",
-    });
-    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-2")).toMatchObject({
-      stepText: "alpha beta",
-      stepReasoning: "first second",
-    });
-  });
-
-  it("resets advisor step capture buffers and frozen snapshots between steps", async () => {
-    using xumHome = new DisposableTempDir("ai-service-advisor-step-snapshot-reset");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-advisor-step-snapshot-reset";
-    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    const harness = createHarness(xumHome.path, metadata);
-    await enableAdvisorForHarness(harness);
-
-    await startAdvisorStream(harness, workspaceId);
-
-    const advisorRuntime = getAdvisorRuntimeFromHarness(harness);
-    const { onChunk, onStepMessages } = getAdvisorCallbacksFromHarness(harness);
-    onStepMessages([{ role: "user", content: "step 1" }]);
-
-    await onChunk({ chunk: { type: "text-delta", delta: "old text" } });
-    await onChunk({ chunk: { type: "reasoning-delta", delta: "old reasoning" } });
-    await onChunk({
-      chunk: {
-        type: "tool-call",
-        toolCallId: "advisor-call-1",
-        toolName: "advisor",
-        input: {},
-      },
-    });
-
-    onStepMessages([{ role: "user", content: "step 2" }]);
-    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-1")).toBeUndefined();
-
-    await onChunk({ chunk: { type: "text-delta", delta: "new text" } });
-    await onChunk({ chunk: { type: "reasoning-delta", delta: "new reasoning" } });
-    await onChunk({
-      chunk: {
-        type: "tool-call",
-        toolCallId: "advisor-call-2",
-        toolName: "advisor",
-        input: {},
-      },
-    });
-
-    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-2")).toEqual({
-      toolCallId: "advisor-call-2",
-      toolName: "advisor",
-      input: {},
-      stepText: "new text",
-      stepReasoning: "new reasoning",
-    });
-  });
-
-  it("consumes advisor tool-call snapshots on first read", async () => {
-    using xumHome = new DisposableTempDir("ai-service-advisor-step-snapshot-consume");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-advisor-step-snapshot-consume";
-    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    const harness = createHarness(xumHome.path, metadata);
-    await enableAdvisorForHarness(harness);
-
-    await startAdvisorStream(harness, workspaceId);
-
-    const advisorRuntime = getAdvisorRuntimeFromHarness(harness);
-    const { onChunk, onStepMessages } = getAdvisorCallbacksFromHarness(harness);
-    onStepMessages([{ role: "user", content: "continue" }]);
-
-    await onChunk({ chunk: { type: "text-delta", delta: "visible text" } });
-    await onChunk({
-      chunk: {
-        type: "tool-call",
-        toolCallId: "advisor-call-1",
-        toolName: "advisor",
-        input: {},
-      },
-    });
-
-    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-1")).toMatchObject({
-      toolCallId: "advisor-call-1",
-      stepText: "visible text",
-    });
-    expect(advisorRuntime.takeToolCallSnapshot("advisor-call-1")).toBeUndefined();
-  });
-
-  it("resolves advisor tool metadata pricing without changing the stored model bucket", async () => {
+  it("resolves nested tool metadata pricing without changing the stored model bucket", async () => {
     using xumHome = new DisposableTempDir("ai-service-tool-model-usage");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -4347,7 +4062,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     const event: ToolModelUsageEvent = {
       source: "tool",
-      toolName: "advisor",
+      toolName: "intuition",
       model: "anthropic:custom-sonnet",
       usage: {
         inputTokens: 120,
@@ -4419,9 +4134,20 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(typeof sessionUsageDeltaRecord.timestamp).toBe("number");
   });
 
-  it("keeps pricing identities independent for overlapping Advisor and Intuition creations of the same model", async () => {
-    using xumHome = new DisposableTempDir("ai-tool-invocation-pricing");
-    const metadata = createLocalWorkspaceMetadata("tool-invocation-pricing", xumHome.path);
+  it("records API-equivalent costs for intuition tool usage through Codex OAuth", async () => {
+    const toolName = "intuition";
+    using xumHome = new DisposableTempDir("ai-service-tool-model-usage-oauth");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-tool-model-usage-oauth";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const recordUsage = mock(() => Promise.resolve(undefined));
+    const getSessionUsage = mock(() => Promise.resolve(undefined));
+    const sessionUsageService = {
+      recordUsage,
+      getSessionUsage,
+    } as unknown as SessionUsageService;
     const experimentsService = new ExperimentsService({
       telemetryService: new TelemetryService(xumHome.path),
       xumHome: xumHome.path,
@@ -4429,189 +4155,102 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
       (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
     );
-    const harness = createHarness(xumHome.path, metadata, { experimentsService });
+    const harness = createHarness(xumHome.path, metadata, {
+      sessionUsageService,
+      experimentsService,
+    });
     harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
       harness.config,
       new MemoryMetaService(xumHome.path)
     );
-    const model = "xai:grok-4-1-fast";
+
     new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
-      xai: { apiKey: "test-key" },
-    });
-    await enableAdvisorForHarness(harness, model);
-    await harness.config.editConfig((cfg) => ({
-      ...cfg,
-      agentAiDefaults: {
-        ...cfg.agentAiDefaults,
-        intuition: { modelString: model, thinkingLevel: "high" },
+      openai: {
+        codexOauth: {
+          type: "oauth",
+          access: "test-access-token",
+          refresh: "test-refresh-token",
+          expires: Date.now() + 60_000,
+          accountId: "test-account-id",
+        },
       },
-    }));
+    });
     const result = await harness.service.streamMessage({
-      messages: [createMuxMessage("user", "user", "hello")],
-      workspaceId: metadata.id,
+      messages: [createMuxMessage("latest-user", "user", "continue")],
+      workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
     });
+
     expect(result.success).toBe(true);
-    const tools = harness.getToolsForModelSpy.mock.calls[0]?.[1];
-    if (!tools?.advisorRuntime || !tools.intuitionRuntime || !tools.reportModelUsage)
-      throw new Error("Expected both tool runtimes");
-    harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
-    const advisor = await tools.advisorRuntime.createModel(model);
-    const intuition = await tools.intuitionRuntime.createModel(model);
-    const record = spyOn(harness.streamManager, "recordToolModelUsage");
-    for (const [toolName, created] of [
-      ["advisor", advisor],
-      ["intuition", intuition],
-    ] as const) {
-      tools.reportModelUsage({
-        source: "tool",
-        toolName,
-        model,
-        metadataModel: created.metadataModel,
-        usage: { inputTokens: 120, outputTokens: 45, totalTokens: 165 },
-        timestamp: 1,
-      });
+    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
+    if (!toolConfig || typeof toolConfig !== "object") {
+      throw new Error("Expected getToolsForModel to receive a tool configuration object");
     }
-    expect(record.mock.calls.map((call) => call[2].metadataModel)).toEqual([
-      model,
-      "xai:grok-4-1-fast-reasoning",
-    ]);
+
+    const runtime = toolConfig.intuitionRuntime;
+    if (!runtime) throw new Error(`Expected ${toolName} runtime`);
+    const resolveModel =
+      harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
+    const created = await runtime.createModel(KNOWN_MODELS.GPT.id);
+    const creationOptions = resolveModel.mock.calls.at(-1)?.[3];
+    expect(creationOptions).toMatchObject({
+      agentInitiated: true,
+      workspaceId,
+    });
+    // Cost estimates must remain available after an authentication change.
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      openai: { apiKey: "new-direct-key" },
+    });
+
+    const reportModelUsage = (
+      toolConfig as {
+        reportModelUsage?: (event: ToolModelUsageEvent) => void;
+      }
+    ).reportModelUsage;
+    if (!reportModelUsage) {
+      throw new Error("Expected reportModelUsage callback on tool configuration");
+    }
+
+    const event: ToolModelUsageEvent = {
+      source: "tool",
+      toolName,
+      model: KNOWN_MODELS.GPT.id,
+      metadataModel: created.metadataModel,
+      usage: {
+        inputTokens: 120,
+        outputTokens: 45,
+        totalTokens: 165,
+      },
+      providerMetadata: {
+        openai: { reasoningTokens: 5 },
+      },
+      timestamp: Date.now(),
+    };
+    const expectedDisplayUsage = createDisplayUsage(
+      event.usage,
+      event.model,
+      event.providerMetadata
+    );
+    expect(expectedDisplayUsage).toBeDefined();
+    if (!expectedDisplayUsage) {
+      throw new Error("Expected tool usage event to produce display usage");
+    }
+    expect(expectedDisplayUsage.costsIncluded).toBeUndefined();
+    expect(expectedDisplayUsage.input.cost_usd).toBeGreaterThan(0);
+    expect(expectedDisplayUsage.output.cost_usd).toBeGreaterThan(0);
+    expect(expectedDisplayUsage.reasoning.cost_usd).toBeGreaterThan(0);
+
+    reportModelUsage(event);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(recordUsage).toHaveBeenCalledWith(
+      workspaceId,
+      normalizeToCanonical(event.model),
+      expectedDisplayUsage
+    );
   });
-
-  it.each(["advisor", "intuition"] as const)(
-    "records API-equivalent costs for %s tool usage through Codex OAuth",
-    async (toolName) => {
-      using xumHome = new DisposableTempDir("ai-service-tool-model-usage-oauth");
-      const projectPath = path.join(xumHome.path, "project");
-      await fs.mkdir(projectPath, { recursive: true });
-
-      const workspaceId = "workspace-tool-model-usage-oauth";
-      const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-      const recordUsage = mock(() => Promise.resolve(undefined));
-      const getSessionUsage = mock(() => Promise.resolve(undefined));
-      const sessionUsageService = {
-        recordUsage,
-        getSessionUsage,
-      } as unknown as SessionUsageService;
-      const experimentsService = new ExperimentsService({
-        telemetryService: new TelemetryService(xumHome.path),
-        xumHome: xumHome.path,
-      });
-      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
-      );
-      const harness = createHarness(xumHome.path, metadata, {
-        sessionUsageService,
-        experimentsService,
-      });
-      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-        harness.config,
-        new MemoryMetaService(xumHome.path)
-      );
-
-      new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
-        openai: {
-          codexOauth: {
-            type: "oauth",
-            access: "test-access-token",
-            refresh: "test-refresh-token",
-            expires: Date.now() + 60_000,
-            accountId: "test-account-id",
-          },
-        },
-      });
-      const baseConfig = harness.config.loadConfigOrDefault();
-      await harness.config.editConfig(() => ({
-        ...baseConfig,
-        advisorModelString: KNOWN_MODELS.GPT.id,
-        agentAiDefaults: {
-          ...baseConfig.agentAiDefaults,
-          exec: {
-            ...baseConfig.agentAiDefaults?.exec,
-            advisorEnabled: true,
-          },
-        },
-      }));
-
-      const result = await harness.service.streamMessage({
-        messages: [createMuxMessage("latest-user", "user", "continue")],
-        workspaceId,
-        modelString: "openai:gpt-5.2",
-        thinkingLevel: "off",
-      });
-
-      expect(result.success).toBe(true);
-      const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
-      if (!toolConfig || typeof toolConfig !== "object") {
-        throw new Error("Expected getToolsForModel to receive a tool configuration object");
-      }
-
-      const runtime =
-        toolName === "advisor" ? toolConfig.advisorRuntime : toolConfig.intuitionRuntime;
-      if (!runtime) throw new Error(`Expected ${toolName} runtime`);
-      const resolveModel =
-        harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
-      const created = await runtime.createModel(KNOWN_MODELS.GPT.id);
-      const creationOptions = resolveModel.mock.calls.at(-1)?.[3];
-      expect(creationOptions).toMatchObject({
-        agentInitiated: true,
-        workspaceId,
-      });
-      // Cost estimates must remain available after an authentication change.
-      new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
-        openai: { apiKey: "new-direct-key" },
-      });
-
-      const reportModelUsage = (
-        toolConfig as {
-          reportModelUsage?: (event: ToolModelUsageEvent) => void;
-        }
-      ).reportModelUsage;
-      if (!reportModelUsage) {
-        throw new Error("Expected reportModelUsage callback on tool configuration");
-      }
-
-      const event: ToolModelUsageEvent = {
-        source: "tool",
-        toolName,
-        model: KNOWN_MODELS.GPT.id,
-        metadataModel: created.metadataModel,
-        usage: {
-          inputTokens: 120,
-          outputTokens: 45,
-          totalTokens: 165,
-        },
-        providerMetadata: {
-          openai: { reasoningTokens: 5 },
-        },
-        timestamp: Date.now(),
-      };
-      const expectedDisplayUsage = createDisplayUsage(
-        event.usage,
-        event.model,
-        event.providerMetadata
-      );
-      expect(expectedDisplayUsage).toBeDefined();
-      if (!expectedDisplayUsage) {
-        throw new Error("Expected tool usage event to produce display usage");
-      }
-      expect(expectedDisplayUsage.costsIncluded).toBeUndefined();
-      expect(expectedDisplayUsage.input.cost_usd).toBeGreaterThan(0);
-      expect(expectedDisplayUsage.output.cost_usd).toBeGreaterThan(0);
-      expect(expectedDisplayUsage.reasoning.cost_usd).toBeGreaterThan(0);
-
-      reportModelUsage(event);
-      await Promise.resolve();
-      await Promise.resolve();
-
-      expect(recordUsage).toHaveBeenCalledWith(
-        workspaceId,
-        normalizeToCanonical(event.model),
-        expectedDisplayUsage
-      );
-    }
-  );
 
   it("logs and swallows tool model usage persistence failures", async () => {
     using xumHome = new DisposableTempDir("ai-service-tool-model-usage-failure");
@@ -4654,7 +4293,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     const event: ToolModelUsageEvent = {
       source: "tool",
-      toolName: "advisor",
+      toolName: "intuition",
       model: "anthropic:claude-sonnet-4-20250514",
       usage: {
         inputTokens: 50,
@@ -4677,7 +4316,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect.objectContaining({
         error: recordUsageError,
         workspaceId,
-        toolName: "advisor",
+        toolName: "intuition",
         model: event.model,
       })
     );

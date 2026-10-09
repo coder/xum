@@ -52,7 +52,6 @@ export const AgentAiDefaultsEntrySchema = z.object({
   autoModelRouting: z.boolean().optional(),
   autoThinkingLevel: z.boolean().optional(),
   enabled: z.boolean().optional(),
-  advisorEnabled: z.boolean().optional(),
   subagent: AgentAiSubagentProfileSchema.optional(),
 });
 
@@ -219,11 +218,6 @@ export const AppConfigOnDiskSchema = z
       .optional()
       .catch(undefined),
     defaultModel: z.string().optional(),
-    advisorModelString: z.string().optional(),
-    advisorThinkingLevel: ThinkingLevelSchema.optional(),
-    advisorReasoningMode: OpenAIReasoningModeSchema.optional(),
-    advisorMaxUsesPerTurn: z.number().int().positive().nullable().optional(),
-    advisorMaxOutputTokens: z.number().int().positive().nullable().optional(),
     hiddenModels: z.array(z.string()).optional(),
     preferredCompactionModel: z.string().optional(),
     agentAiDefaults: AgentAiDefaultsSchema.optional(),

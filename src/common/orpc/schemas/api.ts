@@ -211,7 +211,7 @@ import {
 import { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntry";
 import { UserPreferencesSchema } from "../../config/schemas/userPreferences";
 import { TaskSettingsSchema } from "../../config/schemas/taskSettings";
-import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
+import { ThinkingLevelSchema } from "../../types/thinking";
 import { AutoModelRoutingConfigSchema } from "../../types/autoModelRouting";
 
 // Native host computer use (desktop app only)
@@ -3066,10 +3066,6 @@ const ResolvedTaskSettingsSchema = TaskSettingsSchema.required({
   maxTaskNestingDepth: true,
 });
 
-const AdvisorModelStringSchema = z.string().nullable();
-const AdvisorThinkingLevelSchema = ThinkingLevelSchema.nullable();
-const AdvisorMaxUsesPerTurnSchema = z.number().int().positive().nullable();
-const AdvisorMaxOutputTokensSchema = z.number().int().positive().nullable();
 const GoalDefaultsConfigSchema = z.object({
   defaultBudgetCents: z
     .number()
@@ -3110,11 +3106,6 @@ export const config = {
       modelFallbacks: ModelFallbacksSchema.optional(),
       autoModelRouting: AutoModelRoutingConfigSchema,
       defaultModel: z.string().optional(),
-      advisorModelString: AdvisorModelStringSchema,
-      advisorThinkingLevel: AdvisorThinkingLevelSchema,
-      advisorReasoningMode: OpenAIReasoningModeSchema.nullable(),
-      advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.optional(),
-      advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.optional(),
       hiddenModels: z.array(z.string()).optional(),
       hiddenModelsInitialized: z.boolean().optional(),
       coderWorkspaceArchiveBehavior: z.enum(CODER_ARCHIVE_BEHAVIORS),
@@ -3138,11 +3129,6 @@ export const config = {
   saveConfig: {
     input: z.object({
       taskSettings: ResolvedTaskSettingsSchema.nullish(),
-      advisorModelString: AdvisorModelStringSchema.nullish(),
-      advisorThinkingLevel: AdvisorThinkingLevelSchema.nullish(),
-      advisorReasoningMode: OpenAIReasoningModeSchema.nullish(),
-      advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.nullish(),
-      advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.nullish(),
       agentAiDefaults: AgentAiDefaultsSchema.optional(),
     }),
     output: z.void(),
