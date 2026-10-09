@@ -49,6 +49,26 @@ describe("iOS standalone viewport", () => {
     expect(statusBarStyle ?? "default").toBe("default");
   });
 
+  // WCAG 1.4.4 (#5972): users must be able to pinch-zoom the app. Lighthouse's meta-viewport audit
+  // fails `user-scalable=no` and any `maximum-scale` below 5.
+  test("lets users zoom the page", async () => {
+    const html = await readFile(path.join(process.cwd(), "index.html"), "utf8");
+    const page = new window.DOMParser().parseFromString(html, "text/html");
+    const content = page.querySelector('meta[name="viewport"]')?.getAttribute("content");
+    if (content == null) throw new Error("index.html has no viewport meta");
+
+    const tokens = new Map(
+      content.split(",").map((token) => {
+        const [key, value = ""] = token.split("=").map((part) => part.trim().toLowerCase());
+        return [key, value] as const;
+      })
+    );
+    const userScalable = tokens.get("user-scalable");
+    expect(userScalable === "no" || userScalable === "0").toBe(false);
+    const maximumScale = tokens.get("maximum-scale");
+    if (maximumScale !== undefined) expect(Number(maximumScale)).toBeGreaterThanOrEqual(5);
+  });
+
   test("leaves the CSS dvh fallback in place outside iOS standalone", () => {
     setStandalone(undefined);
     setInnerHeight(700);
