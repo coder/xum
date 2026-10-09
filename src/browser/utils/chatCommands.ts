@@ -64,7 +64,7 @@ import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import type { ChatAttachment } from "../features/ChatInput/ChatAttachments";
 import { dispatchWorkspaceSwitch } from "./workspaceEvents";
 import { copyWorkspaceStorage } from "@/browser/utils/workspaceStorage";
-import { copyPendingAiSelection } from "@/browser/utils/aiSelectionIntent";
+import { snapshotPendingAiSelection } from "@/browser/utils/aiSelectionIntent";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
@@ -128,6 +128,7 @@ export interface ForkResult {
  */
 export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   const { client } = options;
+  const copyPendingAiSelectionTo = snapshotPendingAiSelection(options.sourceWorkspaceId);
   // The backend copies the source's draft file into the fork: save the latest (debounced) edit
   // first. A failed save does not block the fork, which then copies the last saved draft; the
   // source keeps the change and retries it.
@@ -146,7 +147,7 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   }
 
   copyWorkspaceStorage(options.sourceWorkspaceId, result.metadata.id);
-  copyPendingAiSelection(options.sourceWorkspaceId, result.metadata.id);
+  copyPendingAiSelectionTo(result.metadata.id);
 
   // Get workspace info for switching
   const workspaceInfo = await client.workspace.getInfo({ workspaceId: result.metadata.id });

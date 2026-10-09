@@ -5,11 +5,14 @@ import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts"
 import { toDraftAttachmentMetadata } from "@/common/utils/drafts";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSend,
   getWorkspaceAgentId,
   markAiSelectionIntent,
   resetAiSelectionIntentForTests,
   setAutoRoutingPick,
   setWorkspaceAgentPick,
+  setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
 import { getAutoRouting, getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { installDom } from "../../../tests/ui/dom";
@@ -17,6 +20,19 @@ import { forkWorkspace } from "./chatCommands";
 
 const SOURCE_ID = "fork-source-ws";
 const FORK_ID = "fork-child-ws";
+const FORK_METADATA: FrontendWorkspaceMetadata = {
+  id: FORK_ID,
+  name: "fork",
+  projectName: "project",
+  projectPath: "/tmp/project",
+  namedWorkspacePath: "/tmp/project/fork",
+  runtimeConfig: { type: "local" },
+};
+const FORKED = {
+  success: true as const,
+  metadata: FORK_METADATA,
+  projectPath: FORK_METADATA.projectPath,
+};
 
 let cleanupDom: (() => void) | undefined;
 
@@ -75,23 +91,10 @@ describe("forkWorkspace", () => {
   });
 
   test("the fork keeps the source's unsent AI picks", async () => {
-    const forkMetadata: FrontendWorkspaceMetadata = {
-      id: FORK_ID,
-      name: "fork",
-      projectName: "project",
-      projectPath: "/tmp/project",
-      namedWorkspacePath: "/tmp/project/fork",
-      runtimeConfig: { type: "local" },
-    };
     const client = createTestApiClient({
       workspace: {
-        fork: () =>
-          Promise.resolve({
-            success: true as const,
-            metadata: forkMetadata,
-            projectPath: forkMetadata.projectPath,
-          }),
-        getInfo: () => Promise.resolve(forkMetadata),
+        fork: () => Promise.resolve(FORKED),
+        getInfo: () => Promise.resolve(FORK_METADATA),
       },
     });
     setWorkspaceAgentPick(SOURCE_ID, "plan");
@@ -110,5 +113,28 @@ describe("forkWorkspace", () => {
       reasoningMode: "pro",
     });
     expect(getAutoRouting(FORK_ID, "thinkingLevel")).toBe(true);
+  });
+
+  test("the fork keeps the picks a source send ends while the fork runs", async () => {
+    const MODEL = "openai:gpt-5.2";
+    const client = createTestApiClient({
+      workspace: {
+        fork: () => {
+          const sent = getAiSelectionIntentForSend(SOURCE_ID, "exec", { model: MODEL });
+          setWorkspaceAiMetadata(SOURCE_ID, {
+            aiSettingsByAgent: { exec: { model: MODEL, thinkingLevel: "off" } },
+          });
+          consumeAiSelectionIntent(SOURCE_ID, "exec", sent.attachedTokens);
+          return Promise.resolve(FORKED);
+        },
+        getInfo: () => Promise.resolve(FORK_METADATA),
+      },
+    });
+    markAiSelectionIntent(SOURCE_ID, "model", MODEL);
+
+    await forkWorkspace({ client, sourceWorkspaceId: SOURCE_ID });
+
+    // The backend built the fork from the source's settings before that send saved them.
+    expect(getWorkspaceAiSelection(FORK_ID, "exec").model).toBe(MODEL);
   });
 });

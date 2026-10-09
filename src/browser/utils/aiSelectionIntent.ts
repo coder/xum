@@ -419,21 +419,31 @@ export function dropPendingModelPicks(shouldDrop: (model: string) => boolean): v
   notify();
 }
 
-/** A fork starts from what the source composer shows, including its unsent picks. */
-export function copyPendingAiSelection(sourceWorkspaceId: string, destWorkspaceId: string): void {
+/**
+ * A fork starts from what the source composer shows, including its unsent picks. Taken before
+ * the fork runs: a source send meanwhile ends the picks the user forked with.
+ */
+export function snapshotPendingAiSelection(
+  sourceWorkspaceId: string
+): (destWorkspaceId: string) => void {
   const sourcePrefix = `${sourceWorkspaceId}\u0000`;
-  for (const [key, pending] of [...pendingByScope]) {
-    if (!key.startsWith(sourcePrefix)) continue;
-    pendingByScope.set(scopeKey(destWorkspaceId, key.slice(sourcePrefix.length)), { ...pending });
-  }
-  for (const [key, picks] of [...pendingAutoRoutingByScope]) {
-    if (!key.startsWith(sourcePrefix)) continue;
-    const destKey = scopeKey(destWorkspaceId, key.slice(sourcePrefix.length));
-    pendingAutoRoutingByScope.set(destKey, { ...picks });
-  }
+  const bySourceAgent = <T extends object>(picks: Map<string, T>) =>
+    [...picks]
+      .filter(([key]) => key.startsWith(sourcePrefix))
+      .map(([key, value]) => [key.slice(sourcePrefix.length), { ...value }] as const);
+  const fieldPicks = bySourceAgent(pendingByScope);
+  const autoPicks = bySourceAgent(pendingAutoRoutingByScope);
   const agentPick = pendingAgentByWorkspace.get(sourceWorkspaceId);
-  if (agentPick != null) pendingAgentByWorkspace.set(destWorkspaceId, agentPick);
-  notify();
+  return (destWorkspaceId) => {
+    for (const [agentId, pending] of fieldPicks) {
+      pendingByScope.set(scopeKey(destWorkspaceId, agentId), pending);
+    }
+    for (const [agentId, picks] of autoPicks) {
+      pendingAutoRoutingByScope.set(scopeKey(destWorkspaceId, agentId), picks);
+    }
+    if (agentPick != null) pendingAgentByWorkspace.set(destWorkspaceId, agentPick);
+    notify();
+  };
 }
 
 /** Forgets all pending picks and metadata: another server can reuse a workspace ID. */
