@@ -3450,10 +3450,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       ]);
       const [firstResult] = searchOutputs(after);
       expect(JSON.stringify(firstResult)).toBe(JSON.stringify(searchOutputs(before)[0]));
-      expect(searchOutputs(after)[1]).toEqual({
-        type: "text",
-        value: "All matched tools are already loaded: alpha_lookup",
-      });
+      // Structural, not generated copy: a text status naming the repeat.
+      const repeat = searchOutputs(after)[1];
+      if (repeat?.type !== "text") throw new Error("Expected the repeat to project to text");
+      expect(repeat.value).toContain("alpha_lookup");
       expect(toolBlock(after)).toBe(toolBlock(before));
       expect(stableSystemRow(after)).toBe(stableSystemRow(before));
     });

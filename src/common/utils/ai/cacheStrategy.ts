@@ -130,7 +130,7 @@ function addCacheControlToLastContentPart(
   if (typeof content === "string") {
     return {
       ...msg,
-      providerOptions: cacheOpts,
+      providerOptions: { ...msg.providerOptions, ...cacheOpts },
     };
   }
 
@@ -138,9 +138,14 @@ function addCacheControlToLastContentPart(
   // Use type assertion since we're adding providerOptions which is valid but not in base types
   if (Array.isArray(content) && content.length > 0) {
     const lastIndex = content.length - 1;
-    const newContent = content.map((part, i) =>
-      i === lastIndex ? { ...part, providerOptions: cacheOpts } : part
-    );
+    // Merge, never replace: the part can already carry providerOptions (for
+    // example the tool-search dedupe projection's restoration stash). Approval
+    // parts have no providerOptions field, hence the `in` narrowing.
+    const newContent = content.map((part, i) => {
+      if (i !== lastIndex) return part;
+      const existing = "providerOptions" in part ? part.providerOptions : undefined;
+      return { ...part, providerOptions: { ...existing, ...cacheOpts } };
+    });
     // Type assertion needed: ModelMessage types are strict unions but providerOptions
     // on content parts is valid per SDK docs
     const result = { ...msg, content: newContent };

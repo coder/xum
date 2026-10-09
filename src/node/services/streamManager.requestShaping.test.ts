@@ -364,6 +364,13 @@ describe("StreamManager - tool search activeTools scoping", () => {
   });
 
   test("per-step transform drops a native tool_reference an earlier result already sent", async () => {
+    const referencesOutput = (referencedTools: string[]): unknown => ({
+      type: "content",
+      value: referencedTools.map((toolName) => ({
+        type: "custom",
+        providerOptions: { anthropic: { type: "tool-reference", toolName } },
+      })),
+    });
     const searchResult = (toolCallId: string, referencedTools: string[]): ModelMessage => {
       const raw: unknown = {
         role: "tool",
@@ -372,13 +379,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
             type: "tool-result",
             toolCallId,
             toolName: "tool_catalog_search",
-            output: {
-              type: "content",
-              value: referencedTools.map((toolName) => ({
-                type: "custom",
-                providerOptions: { anthropic: { type: "tool-reference", toolName } },
-              })),
-            },
+            output: referencesOutput(referencedTools),
           },
         ],
       };
@@ -398,11 +399,28 @@ describe("StreamManager - tool search activeTools scoping", () => {
     const step = await prepareStep({ messages: inTurn });
     const stepMessages = step?.messages;
     if (stepMessages == null) throw new Error("Expected prepareStep to rewrite the messages");
-    // The first reference is untouched; the repeat is dropped from the second result.
+    // The first reference is untouched; the repeat is dropped from the second
+    // result, whose raw output moves to the restoration stash.
     expect(stepMessages[1]).toBe(inTurn[1]);
-    expect(JSON.stringify(stepMessages[2])).toBe(
-      JSON.stringify(searchResult("call-2", ["slack_list_channels"]))
-    );
+    const projected: unknown = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "call-2",
+          toolName: "tool_catalog_search",
+          output: referencesOutput(["slack_list_channels"]),
+          providerOptions: {
+            mux: {
+              rawToolSearchOutput: JSON.stringify(
+                referencesOutput(["slack_send_message", "slack_list_channels"])
+              ),
+            },
+          },
+        },
+      ],
+    };
+    expect(JSON.stringify(stepMessages[2])).toBe(JSON.stringify(projected));
   });
 
   test("a tool-set change ends in-turn reasoning replay on Anthropic requests (#5086)", async () => {

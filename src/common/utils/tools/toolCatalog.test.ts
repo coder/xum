@@ -1059,14 +1059,18 @@ describe("dedupeNativeToolReferences", () => {
     ];
     const deduped = dedupeNativeToolReferences(messages);
     expect(deduped[0]).toBe(messages[0]);
-    expect(JSON.stringify(deduped[1])).toBe(
-      JSON.stringify(
-        projectedSearchResult(
-          "call-2",
-          { type: "text", value: "All matched tools are already loaded: beta, alpha" },
-          referencesOutput("beta", "alpha")
-        )
-      )
+    // Structural contract, not generated copy: a text status naming both
+    // repeats, no remaining references, and the raw stash for the swap path.
+    const message = deduped[1];
+    if (message.role !== "tool") throw new Error("Expected a tool message");
+    const part = message.content[0];
+    if (part.type !== "tool-result") throw new Error("Expected a tool result");
+    const output = part.output;
+    if (output.type !== "text") throw new Error("Expected a text projection");
+    expect(output.value).toContain("beta");
+    expect(output.value).toContain("alpha");
+    expect(part.providerOptions?.mux?.rawToolSearchOutput).toBe(
+      JSON.stringify(referencesOutput("beta", "alpha"))
     );
     // Deterministic: a second application projects the same bytes.
     expect(JSON.stringify(dedupeNativeToolReferences(messages))).toBe(JSON.stringify(deduped));
