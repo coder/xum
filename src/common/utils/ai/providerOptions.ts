@@ -399,14 +399,15 @@ export function buildProviderOptions(
   // Fast mode follows the actual route/wire, not capability aliases or thinking.
   // Ultrafast is additionally model-gated; unsupported models drop the tier.
   const requestedServiceTier = muxProviderOptions?.openai?.serviceTier;
+  const serviceTierRouteOptions = {
+    providersConfig,
+    resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
+    openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+  };
   const serviceTier =
     requestedServiceTier != null &&
-    openaiServiceTierAvailable(modelString, {
-      providersConfig,
-      resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
-      openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
-    }) &&
-    openaiModelSupportsServiceTier(modelString, requestedServiceTier, providersConfig)
+    openaiServiceTierAvailable(modelString, serviceTierRouteOptions) &&
+    openaiModelSupportsServiceTier(modelString, requestedServiceTier, serviceTierRouteOptions)
       ? requestedServiceTier
       : undefined;
 

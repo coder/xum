@@ -469,6 +469,10 @@ export const KEYBINDS = {
   // macOS: Cmd+Shift+F, Win/Linux: Ctrl+Shift+F
   TOGGLE_FAST_MODE: { key: "F", ctrl: true, shift: true },
 
+  /** Toggle OpenAI Ultrafast mode for the selected workspace model (supported models only) */
+  // code keeps the chord layout-safe: macOS Option changes the produced key.
+  TOGGLE_ULTRAFAST_MODE: { key: "U", code: "KeyU", ctrl: true, alt: true, shift: true },
+
   /** Turn computer use on or off for the selected workspace (desktop app only) */
   TOGGLE_COMPUTER_USE: { key: "X", ctrl: true, shift: true },
 

@@ -640,9 +640,8 @@ describe("OpenAI service-tier pricing (#4352)", () => {
   });
 
   test("prices Ultrafast at 6x Standard in both context bands", () => {
-    // gpt-6-astra has a published Ultrafast card; gpt-6.1-sol does not and falls
-    // back to the same announced 6x multiplier, above its Fast card.
-    for (const model of ["openai:gpt-6-astra", "openai:gpt-6.1-sol"]) {
+    // gpt-6-luna has no Ultrafast card and falls back to the same 6x multiplier.
+    for (const model of ["openai:gpt-6-astra", "openai:gpt-6.1-sol", "openai:gpt-6-luna"]) {
       for (const inputTokens of [100_000, 300_000]) {
         expect(cost(model, inputTokens, "ultrafast")).toBeCloseTo(6 * cost(model, inputTokens), 9);
       }

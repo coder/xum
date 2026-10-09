@@ -1713,15 +1713,19 @@ export class ProviderModelFactory {
           muxProviderOptions?.openai?.serviceTier ?? providersConfig.openai?.serviceTier
         );
         const serviceTierProvidersConfig = self.providerService.getConfig(providersConfig);
-        const serviceTierAvailable = openaiServiceTierAvailable(modelString, {
+        const serviceTierRouteOptions = {
           providersConfig: serviceTierProvidersConfig,
           openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
-        });
+        };
+        const serviceTierAvailable = openaiServiceTierAvailable(
+          modelString,
+          serviceTierRouteOptions
+        );
         if (
           serviceTier.success &&
           serviceTierAvailable &&
           // Ultrafast is model-gated: drop it rather than send a tier the model rejects.
-          openaiModelSupportsServiceTier(modelString, serviceTier.data, serviceTierProvidersConfig)
+          openaiModelSupportsServiceTier(modelString, serviceTier.data, serviceTierRouteOptions)
         ) {
           serviceTierDefault = {
             namespace: "openai",

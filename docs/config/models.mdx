@@ -39,7 +39,7 @@ GPT-6.1 Sol (the `gpt` and `sol` aliases) and GPT-6 Astra support thinking from 
 
 ### OpenAI Ultrafast
 
-To use OpenAI's fastest processing tier, choose **ultrafast** as the service tier in **Settings → Providers → OpenAI**. Xum sends it only to models that OpenAI serves Ultrafast for: GPT-6 Astra. Other models run without a service tier instead of falling back to Fast. Ultrafast costs 6× the Standard price, and Xum's cost tracking uses that rate. OpenAI says GPT-6.1 Sol Ultrafast will arrive later.
+To use OpenAI's fastest processing tier, turn on the thinking selector's **Ultrafast mode** row (it sits next to **Fast mode**), run **Toggle Ultrafast Mode** from the command palette, or use its keyboard shortcut. You can also choose **ultrafast** as the service tier in **Settings → Providers → OpenAI**. Fast and Ultrafast are mutually exclusive, and turning either off restores the tier you had before. Xum sends it only to models that OpenAI serves Ultrafast for: GPT-6.1 Sol and GPT-6 Astra. It also needs a route that sends OpenAI's own Responses API: direct OpenAI on the default wire format, Coder instances of type OpenAI, or custom OpenAI Responses providers. Direct OpenAI set to Chat Completions, Coder OpenAI-compatible instances, OpenRouter, Xum Gateway, and GitHub Copilot do not accept the tier. Elsewhere the request runs without a service tier instead of falling back to Fast. Ultrafast costs 6× the Standard price, and Xum's cost tracking uses that rate.
 
 ### Pro reasoning mode (GPT-6)
 
