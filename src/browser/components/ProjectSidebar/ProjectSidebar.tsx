@@ -2644,7 +2644,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                   <button
                     onClick={() => onAddProject()}
                     aria-label="Add project"
-                    className="text-secondary hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
+                    // text-content-secondary: the light theme's text-secondary is 2.9:1 (#5950).
+                    className="text-content-secondary hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
                   >
                     <span className="text-base leading-none">+</span>
                     <span>Add Project</span>
@@ -2852,7 +2853,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                 projectHeaderPaths.length === 0 &&
                 multiProjectWorkspaces.length === 0 ? (
                   <div className="px-4 py-8 text-center">
-                    <p className="text-muted mb-4 text-[13px]">No projects</p>
+                    {/* text-content-secondary: text-muted and text-secondary are below WCAG AA in
+                        the light theme (#5950). */}
+                    <p className="text-content-secondary mb-4 text-[13px]">No projects</p>
                     <div className="flex flex-col gap-2">
                       <button
                         onClick={handleAddScratchWorkspace}
@@ -2862,7 +2865,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                       </button>
                       <button
                         onClick={() => onAddProject()}
-                        className="border-border-light text-secondary hover:bg-hover cursor-pointer rounded border px-4 py-2 text-[13px] transition-colors duration-200"
+                        className="border-border-light text-content-secondary hover:bg-hover cursor-pointer rounded border px-4 py-2 text-[13px] transition-colors duration-200"
                       >
                         Add Project
                       </button>

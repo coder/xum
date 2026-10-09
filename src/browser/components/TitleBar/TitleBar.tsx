@@ -214,9 +214,11 @@ export function TitleBar(props: TitleBarProps) {
               )}
               onClick={handleOpenAboutDialog}
             >
+              {/* text-content-secondary, not the bar's text-muted: the light theme's muted token is
+                  3.5:1 on the sidebar color, below WCAG AA (#5950). */}
               <div
                 className={cn(
-                  "min-w-0 flex-1 truncate font-normal tracking-wider",
+                  "text-content-secondary min-w-0 flex-1 truncate font-normal tracking-wider",
                   leftInset > 0 ? "text-[10px]" : "text-xs"
                 )}
               >
