@@ -1,7 +1,8 @@
 /**
  * Seeded workspace page (#5951): the ARIA and target-size audits that Lighthouse failed on a
  * workspace with a short chat. The play checks the same facts with role queries, in a real
- * browser so the toggle's hit area is measured. Contrast is a separate decision (#5950).
+ * browser so the toggle's hit area is measured. Contrast is a separate decision (#5950). The
+ * phone stories cover the main landmark at 390 px (#5956).
  */
 
 import { expect, waitFor, within } from "@storybook/test";
@@ -53,6 +54,25 @@ const renderSeededWorkspace = () => (
   />
 );
 
+/**
+ * landmark-one-main (#5956): the page has exactly one `main` landmark, and it holds the chat
+ * (the composer), not the project sidebar, the right sidebar or the footer.
+ */
+async function expectOneMainLandmark(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  const composer = await canvas.findByRole("textbox", { name: "Message" }, { timeout: 15_000 });
+  const mains = canvas.getAllByRole("main");
+  await expect(mains).toHaveLength(1);
+  await expect(mains[0]).toContainElement(composer);
+  await expect(within(mains[0]).queryByRole("navigation", { name: "Projects" })).toBeNull();
+  await expect(
+    within(mains[0]).queryByRole("complementary", { name: "Workspace insights" })
+  ).toBeNull();
+  // The workspace footer is the page's contentinfo landmark. Inside `main` it would stop being one.
+  await expect(canvas.getByRole("contentinfo")).toBeInTheDocument();
+  await expect(within(mains[0]).queryByRole("contentinfo")).toBeNull();
+}
+
 /** WCAG 2.2 target-size minimum (Lighthouse `target-size`). */
 const MIN_TARGET_PX = 24;
 
@@ -99,8 +119,37 @@ const contractStory = (theme: ThemeMode): AppStory => ({
   render: renderSeededWorkspace,
   play: async ({ canvasElement }) => {
     await expectSeededPageAudits(canvasElement);
+    await expectOneMainLandmark(canvasElement);
   },
 });
 
 export const Light = contractStory("light");
 export const Dark = contractStory("dark");
+
+/** Phone width (390 px, iPhone 16e). */
+const PHONE_WIDTH_PX = 390;
+
+/**
+ * Phone layout (#5956): Lighthouse's mobile preset found no main landmark. The test-runner applies
+ * neither `globals.viewport` nor Pixel viewports, so a fixed-width wrapper frames the page at
+ * 390 px for the play. The landmark does not depend on the media query, so the assertion holds
+ * at the real phone viewport too (`globals.viewport` shows that locally).
+ */
+const phoneStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme, viewport: { value: "mobile2", isRotated: false } },
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  decorators: [
+    (Story) => (
+      <div style={{ width: PHONE_WIDTH_PX, height: 844, overflow: "hidden" }}>
+        <Story />
+      </div>
+    ),
+  ],
+  render: renderSeededWorkspace,
+  play: async ({ canvasElement }) => {
+    await expectOneMainLandmark(canvasElement);
+  },
+});
+
+export const PhoneLight = phoneStory("light");
+export const PhoneDark = phoneStory("dark");

@@ -269,30 +269,36 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
           "[@media(max-width:768px)]:min-w-0"
         )}
       >
-        <PerfRenderMarker id="chat-pane.header">
-          <WorkspaceMenuBar
+        {/* The chat is the page's primary content, so it is the one `main` landmark in every
+            layout (landmark-one-main, #5956). The footer stays outside it so it remains the page's
+            contentinfo landmark, and the project and right sidebars stay outside too. The wrapper
+            keeps the column flex layout and adds no positioning context. */}
+        <main className="flex min-h-0 flex-1 flex-col">
+          <PerfRenderMarker id="chat-pane.header">
+            <WorkspaceMenuBar
+              workspaceId={workspaceId}
+              projectName={props.projectName}
+              projectPath={props.projectPath}
+              workspaceName={props.workspaceName}
+              workspaceTitle={workspaceTitle}
+              leftSidebarCollapsed={props.leftSidebarCollapsed}
+              onToggleLeftSidebarCollapsed={props.onToggleLeftSidebarCollapsed}
+              namedWorkspacePath={props.namedWorkspacePath}
+              runtimeConfig={props.runtimeConfig}
+              onOpenTerminal={props.onOpenTerminal}
+            />
+          </PerfRenderMarker>
+
+          <ChatPaneContent
             workspaceId={workspaceId}
-            projectName={props.projectName}
             projectPath={props.projectPath}
+            projectName={props.projectName}
             workspaceName={props.workspaceName}
-            workspaceTitle={workspaceTitle}
-            leftSidebarCollapsed={props.leftSidebarCollapsed}
-            onToggleLeftSidebarCollapsed={props.onToggleLeftSidebarCollapsed}
             namedWorkspacePath={props.namedWorkspacePath}
             runtimeConfig={props.runtimeConfig}
             onOpenTerminal={props.onOpenTerminal}
           />
-        </PerfRenderMarker>
-
-        <ChatPaneContent
-          workspaceId={workspaceId}
-          projectPath={props.projectPath}
-          projectName={props.projectName}
-          workspaceName={props.workspaceName}
-          namedWorkspacePath={props.namedWorkspacePath}
-          runtimeConfig={props.runtimeConfig}
-          onOpenTerminal={props.onOpenTerminal}
-        />
+        </main>
 
         {/* Reset the footer's scroll and popover state because ChatPane remains mounted across
             workspace switches. */}
