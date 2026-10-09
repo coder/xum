@@ -445,7 +445,7 @@ describe("createOrpcServer hashed static asset compression", () => {
     }
   });
 
-  test("keeps existing headers for unhashed files, the SPA index and missing hashed paths", async () => {
+  test("keeps existing headers for unhashed files and the SPA index", async () => {
     const { server, close } = await createStaticTestServer({ files: staticFiles });
 
     try {
@@ -462,8 +462,6 @@ describe("createOrpcServer hashed static asset compression", () => {
         },
         { urlPath: "/", cacheControl: "no-store", body: "<title>mux</title>" },
         { urlPath: "/index.html", cacheControl: "no-store", body: "<title>mux</title>" },
-        // Hashed-looking but absent: the SPA fallback answers without any new asset headers.
-        { urlPath: "/missing-AbCd1234.js", cacheControl: "no-store", body: "<title>mux</title>" },
       ];
 
       for (const testCase of cases) {
@@ -525,6 +523,96 @@ describe("createOrpcServer hashed static asset compression", () => {
   });
 });
 
+// #5945: crawlers and agents probe /robots.txt, /llms.txt and /.well-known/*. Answering them with
+// the SPA page (status 200, text/html) makes Lighthouse report invalid files instead of absent ones.
+describe("createOrpcServer SPA fallback for file and well-known paths", () => {
+  const SPA_TITLE = "<title>mux</title>";
+
+  test("serves a robots.txt that disallows every crawler", async () => {
+    const { server, close } = await createStaticTestServer();
+
+    try {
+      for (const urlPath of ["/robots.txt", `${APP_PROXY_BASE_PATH}/robots.txt`]) {
+        const res = await rawRequest(server.baseUrl, urlPath);
+        expect(res.status, urlPath).toBe(200);
+        expect(res.headers["content-type"], urlPath).toContain("text/plain");
+        expect(res.body, urlPath).toBe("User-agent: *\nDisallow: /\n");
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("answers missing file paths and /.well-known/ with 404 instead of the SPA page", async () => {
+    const { server, close } = await createStaticTestServer();
+
+    try {
+      const urlPaths = [
+        "/llms.txt",
+        "/.well-known/ai-catalog.json",
+        "/.well-known/security",
+        "/.well-known",
+        "/assets/x.js",
+        "/other/missing.js",
+        "/workspace/abc/missing.js",
+        "/favicon.png?v=1",
+        `${APP_PROXY_BASE_PATH}/llms.txt`,
+      ];
+      for (const urlPath of urlPaths) {
+        const res = await rawRequest(server.baseUrl, urlPath);
+        expect(res.status, urlPath).toBe(404);
+        expect(res.body, urlPath).not.toContain(SPA_TITLE);
+        expect(res.headers["cache-control"], urlPath).not.toBe("no-store");
+      }
+
+      // Hashed-looking but absent (#5953): no immutable cache or encoding headers either.
+      const missingHashed = await rawRequest(server.baseUrl, "/missing-AbCd1234.js", {
+        headers: { "Accept-Encoding": "br, gzip" },
+      });
+      expect(missingHashed.status).toBe(404);
+      expect(missingHashed.body).not.toContain(SPA_TITLE);
+      expect(missingHashed.headers["content-encoding"]).toBeUndefined();
+      expect(missingHashed.headers["cache-control"]).toBeUndefined();
+      expect(varyIncludesAcceptEncoding(missingHashed.headers)).toBe(false);
+    } finally {
+      await close();
+    }
+  });
+
+  test("keeps serving the no-store SPA page for client routes and API files", async () => {
+    const { server, close } = await createStaticTestServer();
+
+    try {
+      const spaPaths = [
+        "/",
+        "/index.html",
+        "/workspace/abc",
+        // Legacy workspace IDs are `${project}-${branch}` and can contain dots.
+        "/workspace/next.js-main",
+        "/workspace/proj-release-1.2",
+        "/workspace/proj-fix.js",
+        "/settings",
+        "/settings/providers",
+        "/project?path=%2Fhome%2Fdev%2Frepo.git",
+        `${APP_PROXY_BASE_PATH}/workspace/abc`,
+      ];
+      for (const urlPath of spaPaths) {
+        const res = await rawRequest(server.baseUrl, urlPath);
+        expect(res.status, urlPath).toBe(200);
+        expect(res.body, urlPath).toContain(SPA_TITLE);
+        expect(res.headers["cache-control"], urlPath).toBe("no-store");
+      }
+
+      // API paths that end in a file extension stay with their own handlers.
+      const spec = await rawRequest(server.baseUrl, "/api/spec.json");
+      expect(spec.status).toBe(200);
+      expect(spec.headers["content-type"]).toContain("application/json");
+    } finally {
+      await close();
+    }
+  });
+});
+
 describe("createOrpcServer", () => {
   test("serveStatic fallback does not swallow /api routes", async () => {
     // Minimal context stub - router won't be exercised by this test.
@@ -572,10 +660,17 @@ describe("createOrpcServer", () => {
       expect(countOccurrences(rootHtml, '<base href="./" />')).toBe(1);
       expectSlashlessRootRedirectBeforeBase(rootHtml, "./");
 
-      const doubleSlashRes = await fetch(`${server.baseUrl}//attacker.example`);
-      expect(doubleSlashRes.status).toBe(200);
-      const doubleSlashHtml = await doubleSlashRes.text();
-      expect(doubleSlashHtml).not.toContain("location.replace(location.origin+pathname");
+      // A dotted host looks like a file name and gets a 404 (#5945). The dotless host keeps the
+      // redirect guard covered on an SPA response.
+      for (const [urlPath, status] of [
+        ["//attacker.example", 404],
+        ["//attacker", 200],
+      ] as const) {
+        const doubleSlashRes = await fetch(`${server.baseUrl}${urlPath}`);
+        expect(doubleSlashRes.status, urlPath).toBe(status);
+        const doubleSlashHtml = await doubleSlashRes.text();
+        expect(doubleSlashHtml, urlPath).not.toContain("location.replace(location.origin+pathname");
+      }
 
       const deepRouteRes = await fetch(`${server.baseUrl}/some/spa/route`);
       expect(deepRouteRes.status).toBe(200);

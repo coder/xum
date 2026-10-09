@@ -62,6 +62,8 @@ import { getAppProxyBasePathFromPathname, stripAppProxyBasePath } from "@/common
 
 type AliveWebSocket = WebSocket & { isAlive?: boolean };
 
+const ROBOTS_TXT = "User-agent: *\nDisallow: /\n";
+
 export { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH, ORPC_WS_PATH };
 
 const WS_HEARTBEAT_INTERVAL_MS = 30_000;
@@ -1594,6 +1596,29 @@ export async function createOrpcServer({
     app.use((req, res, next) => {
       // Don't swallow API/ORPC routes with index.html.
       if (req.path.startsWith("/orpc") || req.path.startsWith("/api")) {
+        return next();
+      }
+
+      // #5945: the server is a private app UI, so ask every crawler to stay out. Served from
+      // code, because the npm package and Docker image ship dist/ files by extension only.
+      if (req.path === "/robots.txt") {
+        res.type("text/plain").send(ROBOTS_TXT);
+        return;
+      }
+
+      // #5945: a missing file (/llms.txt, /assets/x.js) or a /.well-known/ probe gets a 404 instead
+      // of the SPA page. The check reads only the pathname string (a fixed number of prefix and
+      // extension checks, no filesystem call). `/workspace/<id>` is a client route whatever its
+      // ID: legacy IDs are `${project}-${branch}` and can contain dots (next.js-main).
+      const isWorkspaceRoute =
+        req.path.startsWith("/workspace/") && !req.path.includes("/", "/workspace/".length);
+      if (
+        req.path !== "/index.html" &&
+        !isWorkspaceRoute &&
+        (req.path === "/.well-known" ||
+          req.path.startsWith("/.well-known/") ||
+          path.posix.extname(req.path) !== "")
+      ) {
         return next();
       }
 
