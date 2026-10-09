@@ -31,46 +31,47 @@ describe("firstLoadJs", () => {
   test("counts only statically reachable chunks, with served sizes from precompressed siblings", async () => {
     // The script only stats sibling sizes, so the content need not be valid brotli.
     await fs.writeFile(path.join(dir, "main-AAAAAAAA.js.br"), "x".repeat(7));
-    const mainRaw = (await fs.stat(path.join(dir, "main-AAAAAAAA.js"))).size;
-    const sharedRaw = (await fs.stat(path.join(dir, "shared-BBBBBBBB.js"))).size;
-
+    const size = async (file: string) => (await fs.stat(path.join(dir, file))).size;
+    const [main, shared, deep] = await Promise.all(
+      ["main-AAAAAAAA.js", "shared-BBBBBBBB.js", "deep-EEEEEEEE.js"].map(size)
+    );
     const { exitCode, stdout, stderr } = await runScript([dir, "--json"]);
     expect(exitCode, stderr).toBe(0);
     const report = JSON.parse(stdout) as { files: unknown[]; totals: unknown };
-    // Sorted by raw size. The dynamic import and the __vite__mapDeps string keep the lazy chunk
-    // off the first load; the stylesheet link is not JS.
+    // Sorted by raw size. Only shared's `export * from` reaches the unpreloaded deep chunk. The
+    // `import()` and __vite__mapDeps string keep the lazy chunk out; the stylesheet is not JS.
+    const raw = (file: string, bytes: number) => ({
+      file,
+      rawBytes: bytes,
+      brBytes: bytes,
+      gzipBytes: bytes,
+      precompressed: { br: false, gzip: false },
+    });
     expect(report.files).toEqual([
-      {
-        file: "main-AAAAAAAA.js",
-        rawBytes: mainRaw,
-        brBytes: 7,
-        gzipBytes: mainRaw,
-        precompressed: { br: true, gzip: false },
-      },
-      {
-        file: "shared-BBBBBBBB.js",
-        rawBytes: sharedRaw,
-        brBytes: sharedRaw,
-        gzipBytes: sharedRaw,
-        precompressed: { br: false, gzip: false },
-      },
+      { ...raw("main-AAAAAAAA.js", main), brBytes: 7, precompressed: { br: true, gzip: false } },
+      raw("shared-BBBBBBBB.js", shared),
+      raw("deep-EEEEEEEE.js", deep),
     ]);
     expect(report.totals).toEqual({
-      files: 2,
-      rawBytes: mainRaw + sharedRaw,
-      brBytes: 7 + sharedRaw,
-      gzipBytes: mainRaw + sharedRaw,
+      files: 3,
+      rawBytes: main + shared + deep,
+      brBytes: 7 + shared + deep,
+      gzipBytes: main + shared + deep,
     });
   });
 
-  test("forbidden sources fail only when a first-load chunk contains them", async () => {
+  test("forbidden sources fail when a first-load chunk has them or has no source map", async () => {
     const lazyOnly = await runScript([dir, "--forbid", "node_modules/lazy-only/"]);
     expect(lazyOnly.exitCode, lazyOnly.stderr).toBe(0);
-
     const firstLoad = await runScript([dir, "--forbid", "node_modules/shared-dep/"]);
     expect(firstLoad.exitCode).toBe(1);
     expect(firstLoad.stderr).toContain(
       "shared-BBBBBBBB.js has ../node_modules/shared-dep/index.js"
     );
+    // Skipping a chunk without a map would let a forbidden module back on unnoticed.
+    await fs.rm(path.join(dir, "deep-EEEEEEEE.js.map"));
+    const noMap = await runScript([dir, "--forbid", "node_modules/lazy-only/"]);
+    expect(noMap.exitCode).toBe(2);
+    expect(noMap.stderr).toContain("deep-EEEEEEEE.js has no source map");
   });
 });
