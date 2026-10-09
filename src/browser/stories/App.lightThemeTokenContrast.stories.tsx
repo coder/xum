@@ -46,7 +46,7 @@ async function expectTokenTextsReadable(root: HTMLElement, minimum: Record<strin
   );
   const failing = tokenTextContrasts(root, TOKENS)
     // Known follow-up outside the token change: the selected right-sidebar tab's count sits on
-    // the tab's darker pill (#5951 lists it with the other non-token items).
+    // the tab's darker pill (#5965). Remove this skip when that issue is fixed.
     .filter((entry) => !entry.element.closest('[role="tab"][aria-selected="true"]'))
     .filter((entry) => entry.ratio < 4.5)
     .map((entry) => `${entry.token} ${entry.ratio.toFixed(2)}:1 "${entry.text}"`);
