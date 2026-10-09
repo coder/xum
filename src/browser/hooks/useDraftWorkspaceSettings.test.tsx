@@ -191,6 +191,28 @@ describe("useDraftWorkspaceSettings", () => {
     });
   });
 
+  test("a live Settings default runtime change replaces an explicit pick", async () => {
+    const projectPath = "/tmp/project";
+    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, {}));
+
+    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
+      wrapper,
+    });
+    await waitFor(() => expect(getUserPreferences().workspaceCreation).toBeDefined());
+
+    act(() => {
+      result.current.setSelectedRuntime({ mode: "local" });
+    });
+    expect(result.current.settings.selectedRuntime).toEqual({ mode: "local" });
+
+    act(() => {
+      getAppConfigStore().updateOptimistically({ defaultRuntime: "docker" });
+    });
+    await waitFor(() => {
+      expect(result.current.settings.selectedRuntime).toMatchObject({ mode: "docker" });
+    });
+  });
+
   test("seeds SSH host from the remembered value when switching modes", async () => {
     const projectPath = "/tmp/project";
 
