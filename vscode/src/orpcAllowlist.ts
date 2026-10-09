@@ -103,7 +103,8 @@ export function isAllowedOrpcPath(path: string[]): boolean {
  * later stay in the host).
  * Of the task settings, only proposePlanImplementReplacesChatHistory (a boolean) is forwarded (#4942).
  * Of the user preferences, only appearance.bashCollapsedSummaryMode (a valid mode),
- * appearance.transcriptDensity (a valid density), appearance.vimEnabled (a boolean) and the numeric
+ * appearance.transcriptDensity (a valid density), appearance.vimEnabled (a boolean),
+ * ui.artifactsAllowCdnScripts (a boolean) and the numeric
  * entries of ai.autoCompactionThresholdByModel are forwarded, and agentAiDefaults is forwarded
  * rebuilt by normalizeAgentAiDefaults (#4972, #4979, #4962).
  *
@@ -207,6 +208,15 @@ function projectAppConfig(value: unknown): Record<string, unknown> {
     if (Object.keys(projectedThresholds).length > 0) {
       projectedPreferences.ai = { autoCompactionThresholdByModel: projectedThresholds };
     }
+  }
+  // MCP app frames grant CDN script sources only while the user allows them.
+  const ui =
+    typeof userPreferences === "object" && userPreferences !== null
+      ? (userPreferences.ui as Record<string, unknown> | null | undefined)
+      : undefined;
+  const allowCdnScripts = ui?.artifactsAllowCdnScripts;
+  if (typeof allowCdnScripts === "boolean") {
+    projectedPreferences.ui = { artifactsAllowCdnScripts: allowCdnScripts };
   }
   if (Object.keys(projectedPreferences).length > 0) {
     projected.userPreferences = projectedPreferences;

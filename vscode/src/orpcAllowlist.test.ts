@@ -195,6 +195,14 @@ describe("webview preferences (#4972, #4962)", () => {
     });
   });
 
+  test("forwards the CDN script toggle and no other UI preference", () => {
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        userPreferences: { ui: { artifactsAllowCdnScripts: false, sidebarFlatMode: true } },
+      })
+    ).toEqual({ userPreferences: { ui: { artifactsAllowCdnScripts: false } } });
+  });
+
   test("forwards agentAiDefaults rebuilt from named fields, without invalid agents", () => {
     expect(
       redactWebviewOrpcResult(["config", "getConfig"], {
