@@ -110,7 +110,7 @@
   border-radius: 3px;
   font-family: var(--font-monospace);
   font-size: 12px;
-  color: #d19a66;
+  color: var(--color-code-inline);
 }
 
 .markdown-content pre {

@@ -122,6 +122,8 @@
   --color-surface-sky: hsla(191, 67%, 89%, 1);
 
   --color-code-bg: hsl(210 40% 96%);
+  /* The dark #d19a66 is 2.5:1 on white; same hue, darker, for WCAG AA (#5980). */
+  --color-code-inline: hsl(29 54% 36%);
 
   --color-button-bg: hsl(210 35% 94%);
   --color-button-text: hsl(210 20% 20%);
@@ -377,6 +379,8 @@
   --color-surface-sky: color-mix(in srgb, var(--color-info) 16%, var(--color-background) 84%);
 
   --color-code-bg: #f2f0e5;
+  /* The dark #d19a66 is 2.4:1 on #fffcf0; same hue, darker, for WCAG AA (#5980). */
+  --color-code-inline: hsl(29 54% 36%);
 
   --color-button-bg: #e6e4d9;
   --color-button-text: #100f0f;

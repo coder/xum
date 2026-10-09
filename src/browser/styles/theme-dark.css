@@ -86,6 +86,8 @@
 
     /* Code */
     --color-code-bg: hsl(0 6.43% 8.04%);
+    /* Inline code in chat messages. Light themes override it with a darker shade (#5980). */
+    --color-code-inline: #d19a66;
 
     /* Buttons */
     --color-button-bg: hsl(0 0% 24%);
