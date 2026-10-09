@@ -148,4 +148,29 @@ describe("PRStackBadge", () => {
     fireEvent.mouseDown(view.getAllByTestId("stack-branch-row")[0]);
     expect(view.queryByRole("menu")).not.toBeNull();
   });
+
+  it("focuses the first linked row when it opens", () => {
+    const stack: WorkspaceStackInfo = {
+      ...STACK,
+      branches: [
+        ...STACK.branches,
+        { branch: "mike/feat-d", isCurrent: false, needsRebase: false },
+      ],
+    };
+    const view = render(<PRStackBadge stack={stack} />);
+    fireEvent.click(view.getByRole("button", { name: "View stack with 4 branches" }));
+
+    // The top row has no PR to open, so focus skips it.
+    expect(document.activeElement?.getAttribute("data-branch")).toBe("mike/feat-c");
+  });
+
+  it("returns focus to the trigger when Escape closes it from a row", () => {
+    const view = render(<PRStackBadge stack={STACK} />);
+    const trigger = view.getByRole("button", { name: "View stack with 3 branches" });
+    fireEvent.click(trigger);
+
+    fireEvent.keyDown(view.getAllByTestId("stack-branch-row")[0], { key: "Escape" });
+    expect(view.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
 });

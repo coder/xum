@@ -112,6 +112,7 @@ export function PRStackBadge(props: PRStackBadgeProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [menuStyle, setMenuStyle] = useState<CSSProperties>();
   const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuDirection = props.menuDirection ?? "down";
 
@@ -147,6 +148,11 @@ export function PRStackBadge(props: PRStackBadgeProps) {
       return;
     }
 
+    // The portal puts the menu last in the Tab order instead of right after the trigger.
+    menuRef.current
+      ?.querySelector<HTMLElement>("a[role='menuitem']")
+      ?.focus({ preventScroll: true });
+
     const handleClickOutside = (event: MouseEvent) => {
       const target = event.target as Node;
       if (!containerRef.current?.contains(target) && !menuRef.current?.contains(target)) {
@@ -167,10 +173,12 @@ export function PRStackBadge(props: PRStackBadgeProps) {
           event.preventDefault();
           stopKeyboardPropagation(event);
           setIsOpen(false);
+          triggerRef.current?.focus();
         }
       }}
     >
       <Button
+        ref={triggerRef}
         type="button"
         variant="ghost"
         size="sm"
