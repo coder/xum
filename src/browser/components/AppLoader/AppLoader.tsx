@@ -30,10 +30,10 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
   const [ready, setReady] = useState(false);
   const bootstrappedRef = useRef(false);
 
-  // The bound starts at mount, not on connect, so an unreachable backend cannot hold the boot
-  // screen either; AppLoaderInner shows the connection state from there.
+  // The bound starts once the API client exists: a token prompt or a slow connect must not use it
+  // up, or RouterProvider picks the launch route from code defaults.
   useEffect(() => {
-    if (bootstrappedRef.current) {
+    if (bootstrappedRef.current || !apiState.api) {
       return;
     }
 
@@ -81,7 +81,7 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
         clearTimeout(timeoutId);
       }
     };
-  }, []);
+  }, [apiState.api]);
 
   // bootstrappedRef is set together with `ready`, so `ready` alone decides here; reading
   // the ref during render would make React Compiler skip this component.

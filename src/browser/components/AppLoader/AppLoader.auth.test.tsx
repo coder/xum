@@ -171,13 +171,15 @@ describe("AppLoader", () => {
     expect(getByTestId("LoadingScreenMock").textContent).toBeTruthy();
   });
 
-  test("leaves the preferences screen after the bound while the backend never connects", async () => {
+  // Leaving the gate mounts RouterProvider, which picks the launch route once.
+  test("keeps the preferences screen past the bound until the backend connects", async () => {
     apiStatus = "connecting";
     apiError = null;
 
-    const { findByText, getByText } = render(<AppLoader />);
+    const { getByText, queryByText } = render(<AppLoader />);
 
+    await new Promise((resolve) => setTimeout(resolve, 2500));
     expect(getByText(/Loading preferences/)).toBeTruthy();
-    expect(await findByText(/Loading Xum/, undefined, { timeout: 3000 })).toBeTruthy();
+    expect(queryByText(/Loading Xum/)).toBeNull();
   });
 });
