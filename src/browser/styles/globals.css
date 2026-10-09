@@ -191,7 +191,9 @@
 
   --color-interrupted: hsl(0 0% 50%);
   --color-backgrounded: hsl(200 70% 50%);
-  --color-review-accent: hsl(212 85% 48%); /* saturated blue — distinct from amber/yellow warning states */
+  --color-review-accent: hsl(
+    212 85% 48%
+  ); /* saturated blue — distinct from amber/yellow warning states */
   --color-git-dirty: hsl(38 92% 50%);
   --color-error: hsl(0 68% 46%);
   --color-error-bg: hsl(0 82% 94%);
@@ -313,7 +315,11 @@
   --color-plan-mode-light: color-mix(in srgb, var(--color-plan-mode), white 42%);
   --color-plan-mode-alpha: hsl(from var(--color-plan-mode) h s l / 0.08);
 
-  --color-ask-mode: color-mix(in srgb, var(--color-exec-mode) 62%, var(--color-plan-mode)); /* Blend between plan and exec */
+  --color-ask-mode: color-mix(
+    in srgb,
+    var(--color-exec-mode) 62%,
+    var(--color-plan-mode)
+  ); /* Blend between plan and exec */
   --color-ask-mode-hover: color-mix(in srgb, var(--color-ask-mode), white 18%);
   --color-ask-mode-light: color-mix(in srgb, var(--color-ask-mode), white 42%);
   --color-ask-mode-alpha: hsl(from var(--color-ask-mode) h s l / 0.08);
@@ -365,7 +371,11 @@
   --color-surface-primary: #fffcf0;
   --color-surface-secondary: #f8f5e8;
   --color-content-destructive: #af3029;
-  --color-surface-destructive: color-mix(in srgb, var(--color-danger) 12%, var(--color-background) 88%);
+  --color-surface-destructive: color-mix(
+    in srgb,
+    var(--color-danger) 12%,
+    var(--color-background) 88%
+  );
   --color-surface-invert-secondary: #403e3c;
   --color-surface-tertiary: #f2f0e5;
   --color-surface-quaternary: #dad8ce;
@@ -497,7 +507,11 @@
   --color-code-type: #24837b;
   --color-code-keyword: #205ea6;
 
-  --color-toast-success-bg: color-mix(in srgb, var(--color-accent) 18%, var(--color-background) 82%);
+  --color-toast-success-bg: color-mix(
+    in srgb,
+    var(--color-accent) 18%,
+    var(--color-background) 82%
+  );
   --color-toast-success-text: color-mix(in srgb, var(--color-accent), black 28%);
   --color-toast-error-bg: color-mix(in srgb, var(--color-danger) 18%, var(--color-background) 82%);
   --color-toast-error-text: color-mix(in srgb, var(--color-danger), black 22%);
@@ -547,7 +561,11 @@
   --color-plan-mode-light: color-mix(in srgb, var(--color-plan-mode), white 22%);
   --color-plan-mode-alpha: hsl(from var(--color-plan-mode) h s l / 0.12);
 
-  --color-ask-mode: color-mix(in srgb, var(--color-exec-mode) 62%, var(--color-plan-mode)); /* Blend between plan and exec */
+  --color-ask-mode: color-mix(
+    in srgb,
+    var(--color-exec-mode) 62%,
+    var(--color-plan-mode)
+  ); /* Blend between plan and exec */
   --color-ask-mode-hover: color-mix(in srgb, var(--color-ask-mode), white 10%);
   --color-ask-mode-light: color-mix(in srgb, var(--color-ask-mode), white 22%);
   --color-ask-mode-alpha: hsl(from var(--color-ask-mode) h s l / 0.12);
@@ -594,7 +612,11 @@
   --color-surface-primary: #100f0f;
   --color-surface-secondary: #1c1b1a;
   --color-content-destructive: #d14d41;
-  --color-surface-destructive: color-mix(in srgb, var(--color-danger) 16%, var(--color-background) 84%);
+  --color-surface-destructive: color-mix(
+    in srgb,
+    var(--color-danger) 16%,
+    var(--color-background) 84%
+  );
   --color-surface-invert-secondary: #b7b5ac;
   --color-surface-tertiary: #282726;
   --color-surface-quaternary: #343331;
@@ -729,7 +751,11 @@
   --color-terminal-bg: #100f0f;
   --color-terminal-fg: #cecdc3;
 
-  --color-toast-success-bg: color-mix(in srgb, var(--color-accent) 13%, var(--color-background) 87%);
+  --color-toast-success-bg: color-mix(
+    in srgb,
+    var(--color-accent) 13%,
+    var(--color-background) 87%
+  );
   --color-toast-success-text: color-mix(in srgb, var(--color-accent), white 22%);
   --color-toast-error-bg: color-mix(in srgb, var(--color-danger) 15%, var(--color-background) 85%);
   --color-toast-error-text: var(--color-danger);
@@ -968,6 +994,20 @@ body,
   }
 }
 
+/* Touch phones: the 44px touch targets do not fit the title and every workspace action on one
+   row, so the header wraps. Keep the workspace actions menu at the top right of the title row
+   and give the other actions their own row below, instead of leaving the menu under the title. */
+@media (max-width: 480px) and (pointer: coarse) {
+  .mobile-header-more {
+    order: 2;
+  }
+
+  .mobile-header-actions {
+    order: 3;
+    flex-basis: 100%;
+  }
+}
+
 /* Hide right sidebar when the workspace shell is too narrow to fit
    ChatPane(min 384px) + RightSidebar(min 300px) side-by-side. */
 @container (max-width: 684px) {
@@ -1022,7 +1062,6 @@ body,
    Note: This is a CSS-only solution; the actual fix requires the viewport
    meta tag to include 'interactive-widget=resizes-content' which is handled
    in index.html */
-
 
 @import "./tool-surfaces.css";
 code {
@@ -1188,7 +1227,6 @@ html[data-renderer-inactive] *::after {
   animation: connector-dash-scroll 0.4s linear infinite;
 }
 
-
 @keyframes connector-elbow-dash-scroll {
   from {
     stroke-dashoffset: 6;
@@ -1287,7 +1325,12 @@ html[data-renderer-inactive] *::after {
  * the component's built-in horizontal spacing as a CSS custom property.
  * The titlebar-safe utilities read these to ensure padding never drops
  * below the component's natural gutter. */
-.titlebar-safe-left-gutter-4 { --titlebar-safe-left-gutter: 1rem; }      /* px-4 */
-.titlebar-safe-right-gutter-3 { --titlebar-safe-right-gutter: 0.75rem; } /* px-3 */
-.titlebar-safe-right-gutter-2 { --titlebar-safe-right-gutter: 0.5rem; }  /* px-2 */
-
+.titlebar-safe-left-gutter-4 {
+  --titlebar-safe-left-gutter: 1rem;
+} /* px-4 */
+.titlebar-safe-right-gutter-3 {
+  --titlebar-safe-right-gutter: 0.75rem;
+} /* px-3 */
+.titlebar-safe-right-gutter-2 {
+  --titlebar-safe-right-gutter: 0.5rem;
+} /* px-2 */
