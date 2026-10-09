@@ -7,6 +7,7 @@
 
 import { expect, waitFor, within } from "@storybook/test";
 
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { RIGHT_SIDEBAR_WIDTH_KEY } from "@/common/constants/storage";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
@@ -153,7 +154,7 @@ const narrowSidebarStory = (theme: ThemeMode): AppStory => ({
   render: () => (
     <AppWithMocks
       setup={() => {
-        localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, JSON.stringify(NARROW_SIDEBAR_WIDTH_PX));
+        updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, NARROW_SIDEBAR_WIDTH_PX);
         return renderSeededClient();
       }}
     />
