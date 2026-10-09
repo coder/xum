@@ -209,7 +209,7 @@ export function TitleBar(props: TitleBarProps) {
               className={cn(
                 // Keep the version row shrinkable so long git-describe values ellipsize
                 // instead of overlapping the gateway/settings controls.
-                "flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-inherit transition-opacity hover:opacity-70",
+                "flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-inherit transition-opacity",
                 isDesktop && "titlebar-no-drag"
               )}
               onClick={handleOpenAboutDialog}

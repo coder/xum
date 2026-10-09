@@ -2645,7 +2645,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                     onClick={() => onAddProject()}
                     aria-label="Add project"
                     // text-content-secondary: the light theme's text-secondary is 2.9:1 (#5950).
-                    className="text-content-secondary hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
+                    className="text-content-secondary hover:bg-hover hover:text-foreground hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
                   >
                     <span className="text-base leading-none">+</span>
                     <span>Add Project</span>
@@ -2865,7 +2865,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                       </button>
                       <button
                         onClick={() => onAddProject()}
-                        className="border-border-light text-content-secondary hover:bg-hover cursor-pointer rounded border px-4 py-2 text-[13px] transition-colors duration-200"
+                        className="border-border-light text-content-secondary hover:bg-hover hover:text-foreground cursor-pointer rounded border px-4 py-2 text-[13px] transition-colors duration-200"
                       >
                         Add Project
                       </button>
