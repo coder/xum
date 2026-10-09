@@ -302,6 +302,16 @@ const findFirstTerminalSessionTab = (
 };
 
 /**
+ * Whether right-sidebar commands have a visible sidebar to act on. Narrow layouts hide the
+ * sidebar entirely, so opening tabs there would produce no visible result (the keyboard
+ * shortcuts refuse for the same reason). Without a DOM (command-source unit tests) there is no
+ * layout to check.
+ */
+function isRightSidebarShown(): boolean {
+  return typeof HTMLElement === "undefined" || !isWorkspaceRightSidebarHidden(document.body);
+}
+
+/**
  * Build a "Hide/Show <Name>" command for a config-defined tab.
  *
  * Each command-source factory is re-invoked per palette render, so the
@@ -322,6 +332,7 @@ function buildToggleTabCommand(
     title: `${visible ? "Hide" : "Show"} ${reg.name}`,
     section: navigationSection,
     keywords: reg.paletteKeywords ?? [tabId],
+    visible: isRightSidebarShown,
     run: () => {
       updateRightSidebarLayout(workspaceId, (s) => toggleTab(s, tabId as TabType));
       if (!visible) {
@@ -943,11 +954,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           section: section.navigation,
           shortcutHint: formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB),
           keywords: ["new tab", "launcher", "tools", "open"],
-          // Narrow layouts hide the right sidebar entirely, so a New tab would be invisible; the
-          // keyboard shortcut refuses there for the same reason.
-          // (Without a DOM, e.g. command-source unit tests, there is no layout to check.)
-          visible: () =>
-            typeof HTMLElement === "undefined" || !isWorkspaceRightSidebarHidden(document.body),
+          visible: isRightSidebarShown,
           // The sidebar opens it, as for "+" and the shortcut, so the launcher also takes focus.
           run: () => {
             window.dispatchEvent(
