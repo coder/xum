@@ -1660,6 +1660,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         return;
       }
 
+      // A main-chat shortcut must not silently remove static/New tabs from a sidebar hidden
+      // by the responsive layout. Keep the platform-close prevention above unchanged.
+      if (container != null && isRightSidebarResponsivelyHidden(container)) return;
       // Static and New tabs: closing the last tab leaves the New tab.
       closeNonTerminalTab(focusedTabset.id, activeTab);
     };

@@ -844,6 +844,33 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
+  test.each(["costs", "new"] as const)(
+    "Close Tab preserves the hidden sidebar's active %s tab",
+    async (tab) => {
+      const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout([tab, "review"]));
+      try {
+        const activeTab = await findSidebarTab(sidebar, tab);
+        const composer = within(document.body).getByRole("textbox", { name: "Message" });
+        composer.focus();
+        // happy-dom does not apply the responsive stylesheet; reproduce its computed result.
+        sidebar.style.display = "none";
+        fireEvent.keyDown(composer, { key: "w", ctrlKey: true });
+        expect(getTabs(sidebar)).toHaveLength(2);
+        expect(activeTab.getAttribute("aria-selected")).toBe("true");
+
+        // The same shortcut still closes the tab once the sidebar is visible again.
+        sidebar.style.removeProperty("display");
+        fireEvent.keyDown(composer, { key: "w", ctrlKey: true });
+        await waitFor(() => expect(getTabs(sidebar)).toHaveLength(1));
+        expect(sidebar.contains(activeTab)).toBe(false);
+      } finally {
+        sidebar.style.removeProperty("display");
+        await cleanup();
+      }
+    },
+    60_000
+  );
+
   test("New Tab leaves keystrokes and focus in the controlled browser", async () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs"]));
     const viewport = document.createElement("div");
