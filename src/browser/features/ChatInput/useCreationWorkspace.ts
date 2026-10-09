@@ -599,6 +599,9 @@ export function useCreationWorkspace({
               model: settings.model,
               thinkingLevel: settings.thinkingLevel,
               reasoningMode: settings.reasoningMode,
+              // The Auto choices the first send would save: an initial /goal sends no message.
+              autoModelRouting: sendMessageOptions.autoModelRouting,
+              autoThinkingLevel: sendMessageOptions.autoThinkingLevel,
             },
             persistSelectedAgentId: true,
           })

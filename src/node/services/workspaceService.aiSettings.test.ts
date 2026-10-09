@@ -558,6 +558,22 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     });
   });
 
+  test("an update saves the Auto choices it carries", async () => {
+    const result = await workspaceService.updateAgentAISettings("ws", "exec", {
+      model: "openai:gpt-5.2",
+      thinkingLevel: "high",
+      autoModelRouting: true,
+      autoThinkingLevel: false,
+    });
+
+    expect(result.success).toBe(true);
+    expect(readEntry()?.aiSettingsByAgent?.exec).toEqual({
+      model: "openai:gpt-5.2",
+      thinkingLevel: "high",
+      autoModelRouting: true,
+    });
+  });
+
   test("persists AI settings for sub-agent workspaces so auto-resume can use latest model", async () => {
     interface WorkspaceServiceTestAccess {
       maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
