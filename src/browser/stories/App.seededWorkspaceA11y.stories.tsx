@@ -73,6 +73,9 @@ async function expectOneMainLandmark(canvasElement: HTMLElement) {
   await expect(within(mains[0]).queryByRole("contentinfo")).toBeNull();
 }
 
+/** Space between the right sidebar's tabs and the "+" button. */
+const TAB_GAP_PX = 4;
+
 /** WCAG 2.2 target-size minimum (Lighthouse `target-size`). */
 const MIN_TARGET_PX = 24;
 
@@ -97,6 +100,17 @@ async function expectSeededPageAudits(canvasElement: HTMLElement) {
   const addTerminal = within(tabStrip).getByRole("button", { name: "New terminal" });
   // The sidebar fades in, so wait for it before checking visibility.
   await waitFor(() => expect(addTerminal).toBeVisible());
+  // The tablist renders its own box: Safari has dropped the role of `display: contents`
+  // elements, which have no client rects (#5962).
+  await expect(tablist.getClientRects().length).toBeGreaterThan(0);
+  // "+" stays right after the last tab, in the same row, when the tabs wrap.
+  const tabs = within(tablist).getAllByRole("tab");
+  const lastTab = tabs[tabs.length - 1].getBoundingClientRect();
+  const add = addTerminal.getBoundingClientRect();
+  await expect(Math.abs(add.left - (lastTab.right + TAB_GAP_PX))).toBeLessThan(1);
+  await expect(
+    Math.abs(add.top + add.height / 2 - (lastTab.top + lastTab.height / 2))
+  ).toBeLessThan(1);
 
   // button-name: icon-only and combobox triggers need a name of their own.
   await expect(await canvas.findByRole("button", { name: "Open in editor" })).toBeVisible();
