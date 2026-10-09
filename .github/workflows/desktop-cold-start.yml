@@ -21,7 +21,7 @@ jobs:
       - name: Validate inputs
         run: |
           [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "SHAs must be 40-char lowercase hex"; exit 1; }
-          [[ "$PAIRS" =~ ^[0-9]+$ ]] && ((10#$PAIRS >= 2)) || { echo "pairs must be an integer >= 2"; exit 1; }
+          [[ "$PAIRS" =~ ^([2-9]|[1-9][0-9]+)$ ]] || { echo "pairs must be an integer >= 2"; exit 1; }
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ inputs.head_sha }}
