@@ -64,11 +64,7 @@ describe("aiSelectionIntent", () => {
     setWorkspaceAiMetadata(WS, { agentId: "plan" });
     expect(getWorkspaceAgentId(WS)).toBe("exec");
 
-    consumeAiSelectionIntent(
-      WS,
-      "exec",
-      getAiSelectionIntentForSend(WS, "exec", {}).attachedTokens
-    );
+    consumeAiSelectionIntent(WS, "exec", getAiSelectionIntentForSend(WS, "exec", {}));
     expect(getWorkspaceAgentId(WS)).toBe("exec");
     setWorkspaceAiMetadata(WS, { agentId: "exec" });
     setWorkspaceAiMetadata(WS, { agentId: "plan" });
@@ -80,7 +76,7 @@ describe("aiSelectionIntent", () => {
     setWorkspaceAgentPick(WS, "exec");
     const first = getAiSelectionIntentForSend(WS, "exec", {});
     setWorkspaceAgentPick(WS, "plan");
-    consumeAiSelectionIntent(WS, "exec", first.attachedTokens);
+    consumeAiSelectionIntent(WS, "exec", first);
     setWorkspaceAiMetadata(WS, { agentId: "exec" });
     expect(getWorkspaceAgentId(WS)).toBe("plan");
   });
@@ -88,11 +84,7 @@ describe("aiSelectionIntent", () => {
   test("a sent agent pick the saved agent already holds ends at once", () => {
     setWorkspaceAiMetadata(WS, { agentId: "plan" });
     setWorkspaceAgentPick(WS, "plan");
-    consumeAiSelectionIntent(
-      WS,
-      "plan",
-      getAiSelectionIntentForSend(WS, "plan", {}).attachedTokens
-    );
+    consumeAiSelectionIntent(WS, "plan", getAiSelectionIntentForSend(WS, "plan", {}));
     // A no-op save emits no metadata; another window's later change still applies.
     setWorkspaceAiMetadata(WS, { agentId: "exec" });
     expect(getWorkspaceAgentId(WS)).toBe("exec");
@@ -121,7 +113,7 @@ describe("aiSelectionIntent", () => {
     markAiSelectionIntent(WS, "model", MODEL_A);
     const first = getAiSelectionIntentForSend(WS, "exec", { model: MODEL_A });
     markAiSelectionIntent(WS, "model", MODEL_A); // same value, new token
-    consumeAiSelectionIntent(WS, "exec", first.attachedTokens);
+    consumeAiSelectionIntent(WS, "exec", first);
     expect(getAiSelectionIntentForSend(WS, "exec", { model: MODEL_A }).intent).toEqual({
       model: true,
     });
@@ -135,7 +127,7 @@ describe("aiSelectionIntent", () => {
     const latest = getAiSelectionIntentForSend(WS, "exec", { model: MODEL_A });
     expect(latest.attachedTokens.model).not.toBe(staleTokens.model);
     saveExecModel(MODEL_A);
-    consumeAiSelectionIntent(WS, "exec", latest.attachedTokens);
+    consumeAiSelectionIntent(WS, "exec", latest);
     expect(getAiSelectionIntentForSend(WS, "exec", { model: MODEL_A }).intent).toBeUndefined();
   });
 
@@ -145,7 +137,7 @@ describe("aiSelectionIntent", () => {
     consumeAiSelectionIntent(
       WS,
       "exec",
-      getAiSelectionIntentForSend(WS, "exec", { model: MODEL_B }).attachedTokens
+      getAiSelectionIntentForSend(WS, "exec", { model: MODEL_B })
     );
     // The save is in flight or failed: the composer keeps the sent pick.
     expect(getPendingAiSelection(WS, "exec", "model")).toBe(MODEL_B);
@@ -167,7 +159,6 @@ describe("aiSelectionIntent", () => {
         WS,
         "exec",
         getAiSelectionIntentForSendOptions(WS, "exec", { model: MODEL_A, autoModelRouting: true })
-          .attachedTokens
       );
     saveAuto(false);
     setAutoRoutingPick(WS, "exec", "model", true);
@@ -208,9 +199,12 @@ describe("aiSelectionIntent", () => {
     markAiSelectionIntent(WS, "thinkingLevel", "high");
     const sent = { model: MODEL_A, thinkingLevel: "high" };
 
-    expect(
-      getAiSelectionIntentForSendOptions(WS, "exec", { ...sent, skipAiSettingsPersistence: true })
-    ).toEqual({ intent: undefined, attachedTokens: {} });
+    const oneShot = getAiSelectionIntentForSendOptions(WS, "exec", {
+      ...sent,
+      skipAiSettingsPersistence: true,
+    });
+    expect(oneShot.intent).toBeUndefined();
+    expect(oneShot.attachedTokens).toEqual({});
     expect(
       getAiSelectionIntentForSendOptions(WS, "exec", { ...sent, autoModelRouting: true }).intent
     ).toEqual({ thinkingLevel: true });
@@ -226,11 +220,36 @@ describe("aiSelectionIntent", () => {
       thinkingLevel: "off",
       autoModelRouting: true,
     });
-    consumeAiSelectionIntent(WS, "exec", send.attachedTokens);
+    consumeAiSelectionIntent(WS, "exec", send);
     setWorkspaceAiMetadata(WS, {
       aiSettingsByAgent: { exec: { model: MODEL_A, thinkingLevel: "off", autoModelRouting: true } },
     });
     saveExecModel(MODEL_B);
     expect(getPendingAiSelection(WS, "exec", "model")).toBeUndefined();
+  });
+
+  test("picks a send carried end when another window's later send saves over them first", () => {
+    const save = (agentId: string, exec: { model: string; autoModelRouting?: boolean }) =>
+      setWorkspaceAiMetadata(WS, {
+        agentId,
+        aiSettingsByAgent: { exec: { ...exec, thinkingLevel: "off" } },
+      });
+    save("plan", { model: MODEL_A });
+    setWorkspaceAgentPick(WS, "exec");
+    markAiSelectionIntent(WS, "model", MODEL_B);
+    setAutoRoutingPick(WS, "exec", "model", true);
+    const send = getAiSelectionIntentForSendOptions(WS, "exec", {
+      model: MODEL_B,
+      thinkingLevel: "off",
+      autoModelRouting: true,
+    });
+    // This send's save and another window's later changes arrive before the send returns.
+    save("exec", { model: MODEL_B, autoModelRouting: true });
+    save("plan", { model: MODEL_A });
+    consumeAiSelectionIntent(WS, "exec", send);
+
+    expect(getWorkspaceAgentId(WS)).toBe("plan");
+    expect(getPendingAiSelection(WS, "exec", "model")).toBeUndefined();
+    expect(getAutoRoutingPick(WS, "exec", "model")).toBeUndefined();
   });
 });

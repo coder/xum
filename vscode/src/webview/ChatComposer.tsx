@@ -296,7 +296,7 @@ function ChatComposerInner(props: {
 
       if (persist) {
         // A pick made while this send was in flight has a newer token and stays pending.
-        consumeAiSelectionIntent(props.workspaceId, agentId, aiSelection.attachedTokens);
+        consumeAiSelectionIntent(props.workspaceId, agentId, aiSelection);
       }
       props.onSendComplete();
     } catch (error) {

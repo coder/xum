@@ -547,7 +547,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       },
     };
     // Picks the send carries, consumed like a composer send's.
-    const { attachedTokens } = getAiSelectionIntentForSendOptions(
+    const aiSelection = getAiSelectionIntentForSendOptions(
       workspaceId,
       args.targetAgentId,
       options
@@ -558,7 +558,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       options,
     });
     if (sendResult.success) {
-      consumeAiSelectionIntent(workspaceId, args.targetAgentId, attachedTokens);
+      consumeAiSelectionIntent(workspaceId, args.targetAgentId, aiSelection);
       return null;
     }
     const formatted = formatSendMessageError(sendResult.error);

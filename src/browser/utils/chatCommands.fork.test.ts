@@ -124,7 +124,7 @@ describe("forkWorkspace", () => {
           setWorkspaceAiMetadata(SOURCE_ID, {
             aiSettingsByAgent: { exec: { model: MODEL, thinkingLevel: "off" } },
           });
-          consumeAiSelectionIntent(SOURCE_ID, "exec", sent.attachedTokens);
+          consumeAiSelectionIntent(SOURCE_ID, "exec", sent);
           return Promise.resolve(FORKED);
         },
         getInfo: () => Promise.resolve(FORK_METADATA),

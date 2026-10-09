@@ -174,11 +174,7 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
     const agentId = sendMessageOptions.agentId;
     requestAnimationFrame(() => {
       // Like a composer send, the start message saves the copied picks it carries, so they end.
-      const { attachedTokens } = getAiSelectionIntentForSendOptions(
-        forkId,
-        agentId,
-        sendMessageOptions
-      );
+      const aiSelection = getAiSelectionIntentForSendOptions(forkId, agentId, sendMessageOptions);
       client.workspace
         .sendMessage({
           workspaceId: forkId,
@@ -186,7 +182,7 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
           options: sendMessageOptions,
         })
         .then((sent) => {
-          if (sent.success) consumeAiSelectionIntent(forkId, agentId, attachedTokens);
+          if (sent.success) consumeAiSelectionIntent(forkId, agentId, aiSelection);
         })
         .catch(() => {
           // Best-effort: the user can send the message manually if this fails.
