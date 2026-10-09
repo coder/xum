@@ -12,7 +12,7 @@
  */
 
 import "../dom";
-import { fireEvent, waitFor, within } from "@testing-library/react";
+import { createEvent, fireEvent, waitFor, within } from "@testing-library/react";
 
 import { getApiKey, shouldRunIntegrationTests } from "../../testUtils";
 import {
@@ -840,6 +840,43 @@ describeIntegration("RightSidebar (UI)", () => {
       });
       expect(sidebar.querySelector('[role="tab"][aria-controls*="costs"]')).not.toBeNull();
     } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("New Tab leaves keystrokes and focus in the controlled browser", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs"]));
+    const viewport = document.createElement("div");
+    viewport.setAttribute(BROWSER_VIEWPORT_ATTR, "");
+    const input = document.createElement("input");
+    viewport.appendChild(input);
+    document.body.appendChild(viewport);
+    try {
+      await findSidebarTab(sidebar, "costs");
+      input.focus();
+      const pressNewTab = (target: HTMLElement | Window) => {
+        const event = createEvent.keyDown(target, {
+          key: "n",
+          code: "KeyN",
+          ctrlKey: true,
+          altKey: true,
+        });
+        // happy-dom infers AltGraph from any Ctrl+Alt chord; model physical Ctrl+Alt here.
+        Object.defineProperty(event, "getModifierState", { value: () => false });
+        return fireEvent(target, event);
+      };
+      expect(pressNewTab(input)).toBe(true);
+      expect(document.activeElement).toBe(input);
+      expect(getTabs(sidebar)).toHaveLength(1);
+      expect(sidebar.querySelector('[role="tabpanel"][id$="-panel-new"]')).toBeNull();
+
+      // The same chord still opens and focuses the launcher outside a controlled viewport.
+      input.blur();
+      pressNewTab(window);
+      const launcher = await findSidebarPanel(sidebar, "-panel-new");
+      await waitFor(() => expect(launcher.contains(document.activeElement)).toBe(true));
+    } finally {
+      viewport.remove();
       await cleanup();
     }
   }, 60_000);

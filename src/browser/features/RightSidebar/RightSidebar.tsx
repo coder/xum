@@ -1779,12 +1779,24 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     [createTerminalTab]
   );
 
+  const [launcherToolToFocus, setLauncherToolToFocus] = React.useState<BaseTabType | null>(null);
+  React.useEffect(() => {
+    if (launcherToolToFocus == null) return;
+    // The launcher button has unmounted. Keep keyboard users in the replacement tab rather
+    // than dropping focus on body; tools with their own focus target retain that behavior.
+    document
+      .getElementById(`${baseId}-${layout.focusedTabsetId}-tab-${launcherToolToFocus}`)
+      ?.focus();
+    setLauncherToolToFocus(null);
+  }, [baseId, launcherToolToFocus, layout.focusedTabsetId]);
+
   const handleOpenToolFromNewTab = React.useCallback(
     (tabsetId: string, tool: BaseTabType) => {
       // Same follow-ups as opening these tabs by shortcut: panels with keyboard navigation
       // take focus because the user just picked them.
       if (tool === "review") _setFocusTrigger((prev) => prev + 1);
       if (tool === "artifacts") setAutoFocusArtifacts(true);
+      if (tool !== "review" && tool !== "artifacts") setLauncherToolToFocus(tool);
       setLayout((prev) => openToolFromNewTab(prev, tabsetId, tool));
     },
     [setLayout]
@@ -1810,9 +1822,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         // The narrow layout hides the sidebar; there is no strip to add a tab to.
         (container != null && isRightSidebarResponsivelyHidden(container)) ||
         isDialogOpen() ||
-        // Remote desktops and terminals own their keystrokes.
+        // Remote viewports and terminals own their keystrokes.
         isTerminalFocused(e.target) ||
-        isDesktopViewportFocused(e.target)
+        isDesktopViewportFocused(e.target) ||
+        isBrowserViewportFocused(e.target)
       ) {
         return;
       }

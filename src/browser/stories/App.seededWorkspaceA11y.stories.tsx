@@ -109,7 +109,7 @@ async function expectSeededPageAudits(canvasElement: HTMLElement) {
   await expect(nonTabChildren).toEqual([]);
   const tabStrip = tablist.parentElement;
   if (!tabStrip) throw new Error("Tab strip not rendered");
-  const addTab = within(tabStrip).getByRole("button", { name: "New tab", exact: true });
+  const addTab = within(tabStrip).getByRole("button", { name: "New tab" });
   // The launcher replaces direct terminal creation but must remain outside the tablist.
   // The sidebar fades in, so wait for it before checking visibility.
   await waitFor(() => expect(addTab).toBeVisible());

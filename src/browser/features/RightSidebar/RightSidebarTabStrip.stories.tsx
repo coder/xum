@@ -12,6 +12,7 @@ import {
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
 import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import type { TabType } from "@/browser/types/rightSidebar";
+import { MOBILE_TOUCH_TARGET_PX } from "@/constants/layout";
 import { RightSidebarTabStrip, type RightSidebarTabStripItem } from "./RightSidebarTabStrip";
 import {
   NewTabLabel,
@@ -148,6 +149,19 @@ async function checkStableControls(canvasElement: HTMLElement) {
     // reserved (possibly still CSS-hidden) X directly; real pointer hover is checked separately.
     const close = tab.querySelector<HTMLButtonElement>('button[aria-label^="Close "]')!;
     await expect(close).not.toBeNull();
+    const closeRect = close.getBoundingClientRect();
+    const rowRect = tab.closest('[role="tablist"]')!.getBoundingClientRect();
+    await expect(closeRect.top).toBeGreaterThanOrEqual(rowRect.top);
+    await expect(closeRect.bottom).toBeLessThanOrEqual(rowRect.bottom);
+    // Pixel does not emulate touch. This contract also runs in a coarse-pointer browser at
+    // phone and wide tablet widths: static/New targets must fit even beyond mobile CSS's cap.
+    if (
+      window.matchMedia("(pointer: coarse)").matches &&
+      ["new", "instructions"].includes(tab.id)
+    ) {
+      await expect(closeRect.width).toBeGreaterThanOrEqual(MOBILE_TOUCH_TARGET_PX);
+      await expect(closeRect.height).toBeGreaterThanOrEqual(MOBILE_TOUCH_TARGET_PX);
+    }
     const text = label.querySelector("span.truncate") ?? label;
     await expect(text.getBoundingClientRect().right).toBeLessThanOrEqual(
       close.getBoundingClientRect().left

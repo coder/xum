@@ -28,6 +28,7 @@ import { getRetryBarrierDerivation } from "@/browser/components/ChatPane/retryBa
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { preloadTestModules } from "../../ipc/setup";
+import { createStreamCollector } from "../../ipc/streamCollector";
 import { createAppHarness, type AppHarness } from "../harness";
 
 const SIDE_PANE_SELECTOR = `[${SIDE_CHAT_PANE_ATTR}]`;
@@ -518,10 +519,13 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     const app = await createAppHarness({ branchPrefix: "split-side-chats" });
     const service = app.env.services.toORPCContext().workspaceService;
     const interruptSpy = jest.spyOn(service, "interruptStream");
+    const collectors: ReturnType<typeof createStreamCollector>[] = [];
     try {
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const firstId = await waitForSideChatId(app);
-      await waitFor(() => expect(getSideComposer(app, firstId).value).toBe(""));
+      await waitFor(() => expect(getSideComposer(app, firstId).value).toBe(""), {
+        timeout: 10_000,
+      });
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const secondId = await waitFor(async () => {
         const sideChats = (await app.env.orpc.workspace.list()).filter(
@@ -539,22 +543,42 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
           return dockTabToEdge(layout, firstTab, entry.tabsetId, entry.tabsetId, "left");
         });
       });
-      await waitFor(() => {
-        expect(getSidePane(app, firstId)).not.toBeNull();
-        expect(getSidePane(app, secondId)).not.toBeNull();
-      });
+      await waitFor(
+        () => {
+          expect(getSideComposer(app, firstId).disabled).toBe(false);
+          expect(getSideComposer(app, secondId).disabled).toBe(false);
+        },
+        { timeout: 10_000 }
+      );
+      // Clicking Send does not await backend acceptance. Observe real starts before checking
+      // the independently subscribed panes, rather than racing the default one-second wait.
+      const firstStream = createStreamCollector(app.env.orpc, firstId);
+      const secondStream = createStreamCollector(app.env.orpc, secondId);
+      collectors.push(firstStream, secondStream);
+      for (const collector of collectors) collector.start();
+      await Promise.all(collectors.map((collector) => collector.waitForSubscription(10_000)));
       await sendFrom(() => getSideComposer(app, firstId), firstId, "[mock:long-stream] first side");
-      await waitFor(() => expect(isStreaming(firstId)).toBe(true));
+      expect(await firstStream.waitForEvent("stream-start", 10_000)).not.toBeNull();
+      await waitFor(() => expect(isStreaming(firstId)).toBe(true), { timeout: 10_000 });
       await sendFrom(
         () => getSideComposer(app, secondId),
         secondId,
         "[mock:long-stream] second side"
       );
-      await waitFor(() => expect(isStreaming(secondId)).toBe(true));
+      expect(await secondStream.waitForEvent("stream-start", 10_000)).not.toBeNull();
+      await waitFor(() => expect(isStreaming(secondId)).toBe(true), { timeout: 10_000 });
       interruptSpy.mockClear();
-      const firstTranscript = getSidePane(app, firstId)!.querySelector<HTMLElement>(
-        '[data-testid="message-window"]'
-      )!;
+      const firstTranscript = await waitFor(
+        () => {
+          const transcript = getSidePane(app, firstId)?.querySelector<HTMLElement>(
+            '[data-testid="message-window"]'
+          );
+          if (transcript == null) throw new Error("First side transcript not ready");
+          expect(isStreaming(firstId)).toBe(true);
+          return transcript;
+        },
+        { timeout: 10_000 }
+      );
       pressEscapeOn(firstTranscript);
       await waitFor(() => expect(interruptSpy).toHaveBeenCalled());
       expect([...new Set(interruptSpy.mock.calls.map(([workspaceId]) => workspaceId))]).toEqual([
@@ -563,8 +587,12 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       // Observing the call only proves routing, not completion: interrupt performs async cleanup.
       await expect(interruptSpy.mock.results[0]?.value).resolves.toMatchObject({ success: true });
       await waitFor(() => expect(isStreaming(firstId)).toBe(false), { timeout: 10_000 });
-      expect(isStreaming(secondId)).toBe(true);
+      expect(await firstStream.waitForEvent("stream-abort", 10_000)).not.toBeNull();
+      // The finite mock may finish naturally during setup on slow CI. The invariant is that
+      // Escape did not abort its sibling, not that the sibling stays live for a fixed duration.
+      expect(secondStream.getEvents().some((event) => event.type === "stream-abort")).toBe(false);
     } finally {
+      for (const collector of collectors) collector.stop();
       interruptSpy.mockRestore();
       await app.dispose();
     }

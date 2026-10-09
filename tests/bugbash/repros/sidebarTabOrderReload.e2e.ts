@@ -15,7 +15,11 @@ test(
     const tablist = screen.getByRole("tablist", "Sidebar views");
     // The strip shows only opened tabs: open Artifacts, then Goal after it, from New tabs.
     for (const tool of ["Artifacts", "Goal"]) {
-      await tablist.getByRole("button", "New tab").tap();
+      // The launcher button is a sibling of the tablist so the list owns only tabs.
+      await screen
+        .getByRole("complementary", "Workspace insights")
+        .getByRole("button", "New tab")
+        .tap();
       await screen
         .getByRole("tabpanel", /^New tab/)
         .getByRole("button", tool)

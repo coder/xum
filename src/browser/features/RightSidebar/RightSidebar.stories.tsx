@@ -1514,6 +1514,8 @@ export const NewTabLauncher: Story = {
           projectName: "my-app",
           messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
         });
+        // The keyboard play opens Workflows, not just its launcher row.
+        client.workflows.listScripts = () => Promise.resolve([]);
         expandRightSidebar();
         return client;
       }}
@@ -1526,6 +1528,26 @@ export const NewTabLauncher: Story = {
     await canvas.findByRole("tab", { name: /^new tab/i, selected: true });
     await canvas.findByRole("button", { name: "Review" });
     await expect(canvas.getAllByRole("tab")).toHaveLength(1);
+
+    const launcher = canvasElement.querySelector('[role="tabpanel"][id$="-panel-new"]')!;
+    const tools = within(launcher as HTMLElement)
+      .getAllByRole("button")
+      .map((button) => button.getAttribute("aria-label")!)
+      .filter((name) => name !== "Terminal");
+    for (const name of tools) {
+      const row = await canvas.findByRole("button", { name });
+      row.focus();
+      await userEvent.keyboard("{Enter}");
+      await waitFor(() => {
+        const tab = canvas.getByRole("tab", { selected: true });
+        const panel = document.getElementById(tab.getAttribute("aria-controls")!);
+        // Review/Artifacts keep their specialized panel focus; other tools focus their tab.
+        return expect(
+          document.activeElement === tab || panel?.contains(document.activeElement)
+        ).toBe(true);
+      });
+      await userEvent.click(canvas.getByRole("button", { name: "New tab" }));
+    }
   },
 };
 

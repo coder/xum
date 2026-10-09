@@ -92,10 +92,11 @@ const SortableTab: React.FC<{
               "cursor-grab touch-none active:cursor-grabbing",
               // Reserve the X's space even while hidden: hovering/focusing/selecting a tab must
               // neither cover its text nor change its label width (especially for long titles).
-              // Reserve the existing mobile CSS's larger hit target too, so it can't cover text.
+              // Coarse pointers need the larger target even on tablets wide enough to show
+              // the sidebar; reserve matching row height/padding so it never clips or covers text.
               item.closeLabel != null &&
                 item.onClose &&
-                "pr-6 [@media(max-width:768px)_and_(pointer:coarse)]:min-h-11 [@media(max-width:768px)_and_(pointer:coarse)]:pr-12",
+                "pr-6 [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:pr-12",
               item.selected
                 ? "bg-hover text-foreground"
                 : "bg-transparent text-muted hover:bg-hover/50 hover:text-foreground",
@@ -167,7 +168,7 @@ const TabCloseButton: React.FC<{
   <button
     type="button"
     className={cn(
-      "text-muted hover:text-foreground absolute right-1 top-1/2 -translate-y-1/2 rounded p-0.5",
+      "text-muted hover:text-foreground absolute right-1 top-1/2 flex -translate-y-1/2 items-center justify-center rounded p-0.5 [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:min-w-11",
       props.selected
         ? "bg-hover"
         : "bg-hover invisible group-focus-within:visible group-hover:visible [@media(pointer:coarse)]:visible"
