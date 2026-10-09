@@ -260,7 +260,8 @@ function ChatComposerInner(props: {
       ...baseOptions,
       skipAiSettingsPersistence: !mayPersist,
     });
-    const persist = aiSelection.intent !== undefined;
+    // An agent-only or Auto-only pick attaches a token but no field intent; it is explicit too.
+    const persist = Object.values(aiSelection.attachedTokens).some((token) => token !== undefined);
     if (persist) {
       aiPersistenceByWorkspace.set(props.workspaceId, "in-flight");
     }
@@ -269,7 +270,7 @@ function ChatComposerInner(props: {
       const options = {
         ...baseOptions,
         skipAiSettingsPersistence: !persist,
-        ...(persist ? { aiSelectionIntent: aiSelection.intent } : {}),
+        ...(aiSelection.intent ? { aiSelectionIntent: aiSelection.intent } : {}),
       };
 
       const result = await api.workspace.sendMessage(

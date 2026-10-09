@@ -1459,6 +1459,8 @@ describe("vscode webview workspace AI settings", () => {
       model: "anthropic:claude-opus-5-5",
       thinkingLevel: "low",
     });
+    // Settle the persisting send so this webview session has no unresolved one (#4781).
+    await bridge.answer("workspace.sendMessage", { success: true, data: {} });
   });
 
   test("keeps a model picked for one agent after switching agents and back", async () => {
@@ -1936,6 +1938,26 @@ describe("vscode webview explicit AI-setting persistence", () => {
       skipAiSettingsPersistence: false,
       aiSelectionIntent: { thinkingLevel: true },
     });
+    await reply(bridge, OK);
+  });
+
+  test("persists an agent-only pick until the host's metadata holds it", async () => {
+    const workspace = mainWorkspace(TERRA_HIGH);
+    const { bridge, view } = await open([workspace]);
+    await bridge.answer("agents.list", AGENT_DESCRIPTORS);
+    await pickAgent(view, "exec");
+
+    const picked = await send(bridge, view);
+    expect(picked).toMatchObject({ agentId: "exec", skipAiSettingsPersistence: false });
+    expect(picked.aiSelectionIntent).toBeUndefined();
+    await reply(bridge, OK);
+
+    await bridge.emit({
+      type: "workspaces",
+      workspaces: [{ ...workspace, ai: { ...workspace.ai, agentId: "exec" } }],
+    });
+    const saved = await send(bridge, view);
+    expect(saved).toMatchObject({ agentId: "exec", skipAiSettingsPersistence: true });
     await reply(bridge, OK);
   });
 
