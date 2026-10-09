@@ -161,6 +161,7 @@ export class IdleCompactionService {
       const thresholdMs = idleHours * HOURS_TO_MS;
 
       for (const workspace of projectConfig.workspaces) {
+        if (workspace.sideChatParentWorkspaceId != null) continue;
         if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) continue;
         const workspaceId = workspace.id ?? workspace.name;
         if (!workspaceId) continue;
@@ -284,6 +285,10 @@ export class IdleCompactionService {
   ): Promise<{ eligible: boolean; reason?: string }> {
     // Recheck queued work too: a workspace can be archived while waiting for compaction.
     const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    // Inherited timestamps are reference context, not permission to start a background side turn.
+    if (workspace?.sideChatParentWorkspaceId != null) {
+      return { eligible: false, reason: "side_chat" };
+    }
     if (workspace && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
       return { eligible: false, reason: "archived" };
     }

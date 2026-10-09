@@ -1718,6 +1718,24 @@ describe("AgentStatusService", () => {
     expect(generateSpy.mock.calls[1][0]).toContain("User: Pivot after config failure");
   });
 
+  test("side chats never generate an invisible sidebar status", async () => {
+    const workspace = makeWorkspaceEntry({ sideChatParentWorkspaceId: "parent" });
+    projectsConfig = makeProjectsConfig([workspace]);
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("side-context", "user", "Inherited context")
+    );
+
+    const service = createService();
+    await getInternals(service).runTick();
+    expect(generateSpy).not.toHaveBeenCalled();
+    expect(setSidebarStatusMock).not.toHaveBeenCalled();
+
+    delete workspace.sideChatParentWorkspaceId;
+    await getInternals(service).runTick();
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+  });
+
   test("archived workspaces are not regenerated", async () => {
     projectsConfig = makeProjectsConfig([
       makeWorkspaceEntry({ archivedAt: new Date().toISOString() } as Partial<Workspace>),

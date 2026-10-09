@@ -10,7 +10,8 @@ import { createMuxMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { Err } from "@/common/types/result";
 import { getPlanFilePath } from "@/common/utils/planStorage";
-import type { Config } from "@/node/config";
+import { Config } from "@/node/config";
+import { getSelfIdentity } from "@/node/utils/concurrency/processLiveness";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { createTestProject, saveWorkspaces } from "./taskService.testHarness";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
@@ -297,6 +298,69 @@ describe("WorkspaceService.createSideChat", () => {
       update.mockRestore();
     }
   });
+
+  test.each(["removed", "moved", "pending removal", "pending archive", "archived"] as const)(
+    "registration refuses when another backend leaves the parent %s before the config write",
+    async (change) => {
+      const otherConfig = new Config(config.rootDir);
+      const edit = config.editConfig.bind(config);
+      const add = config.addWorkspace.bind(config);
+      let registering = false;
+      const registration = spyOn(config, "addWorkspace").mockImplementation((...args) => {
+        registering = true;
+        return add(...args);
+      });
+      const sideId = "aabbcc0011";
+      const stableId = spyOn(config, "generateStableId").mockReturnValue(sideId);
+      // Interleave after addWorkspace is entered, but before its serialized callback sees the
+      // fresh config. A check in createSideChat (or before editConfig) is already stale here.
+      const commit = spyOn(config, "editConfig").mockImplementation(async (...args) => {
+        if (!registering) return edit(...args);
+        registering = false;
+        await otherConfig.editConfig((current) => {
+          const project = current.projects.get(projectPath)!;
+          const parent = project.workspaces.find((row) => row.id === parentId)!;
+          const marker = {
+            instanceId: "other-backend",
+            pid: process.pid,
+            identity: { ...getSelfIdentity() },
+            at: new Date().toISOString(),
+          };
+          switch (change) {
+            case "removed":
+              project.workspaces = project.workspaces.filter((row) => row.id !== parentId);
+              break;
+            case "moved":
+              parent.path = `${parentPath}-renamed`;
+              break;
+            case "pending removal":
+              parent.pendingRemoval = { ...marker, removalId: "other-removal" };
+              break;
+            case "pending archive":
+              parent.pendingArchive = { ...marker, archiveId: "other-archive" };
+              break;
+            case "archived":
+              parent.archivedAt = new Date().toISOString();
+              break;
+          }
+          return current;
+        });
+        return edit(...args);
+      });
+      try {
+        const created = await harness.service.createSideChat(parentId);
+        expect(registration).toHaveBeenCalled();
+        expect(created.success).toBe(false);
+        expect(otherConfig.findWorkspace(sideId)).toBeNull();
+        expect(sideChatIdsOf(parentId)).toEqual([]);
+        expect(existsSync(path.join(config.sessionsDir, sideId))).toBe(false);
+      } finally {
+        commit.mockRestore();
+        registration.mockRestore();
+        stableId.mockRestore();
+      }
+    }
+  );
 
   test("refuses to start a side chat from a side chat", async () => {
     const sideChatId = await createSideChatOk(parentId);

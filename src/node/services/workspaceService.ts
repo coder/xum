@@ -12001,6 +12001,7 @@ export class WorkspaceService
       return Err(`Failed to archive workspace: ${getErrorMessage(error)}`);
     }
     if (!gate.success) return Err(`Cannot archive workspace: ${gate.error}`);
+    const archivedDescendantIds: string[] = [];
     try {
       for (const descendant of descendants) {
         const result = await this.archiveUnlocked(descendant.workspaceId, undefined, {
@@ -12024,6 +12025,7 @@ export class WorkspaceService
             `Cannot archive sub-agent ${descendant.title} (${descendant.workspaceId}): ${failure}`
           );
         }
+        archivedDescendantIds.push(descendant.workspaceId);
       }
       return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, {
         ...options,
@@ -12038,6 +12040,10 @@ export class WorkspaceService
           error: getErrorMessage(error),
         });
       });
+      // Descendants bypass archive(). Clean their side chats even if a later archive failed,
+      // after releasing the shared-checkout mutation gates that removal needs to acquire.
+      // The task-tree lock remains held, so nested removal must not reacquire that lock.
+      for (const id of archivedDescendantIds) await this.removeSideChatsOf(id, true);
     }
   }
 
@@ -14622,7 +14628,13 @@ export class WorkspaceService
         taskIsolation: "none",
         sideChatParentWorkspaceId: parentWorkspaceId,
       };
-      await this.config.addWorkspace(projectPath, metadata, { refuseTakenName: true });
+      await this.config.addWorkspace(projectPath, metadata, {
+        refuseTakenName: true,
+        requireActiveParent: {
+          workspaceId: parentWorkspaceId,
+          workspacePath: parentWorkspace.workspacePath,
+        },
+      });
       registered = true;
 
       // Plans live under the workspace's name, which the side chat does not share, so the
