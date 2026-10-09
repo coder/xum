@@ -556,9 +556,9 @@ export const ThinkingSelectorUltrafast: AppStory = {
       <AppWithMocks
         setup={() => {
           collapseLeftSidebar();
-          updatePersistedState(getModelKey("ws-thinking-selector-ultrafast"), "openai:gpt-6.1-sol");
           return setupSimpleChatStory({
             workspaceId: "ws-thinking-selector-ultrafast",
+            aiSettings: { model: "openai:gpt-6.1-sol", thinkingLevel: "off" },
             providersConfig: {
               openai: {
                 apiKeySet: true,
