@@ -644,7 +644,7 @@ type WorkspaceHeartbeatSettingsUpdate = Omit<Partial<WorkspaceHeartbeatSettings>
 type WorkspaceGoalDefaultsOverride = z.infer<typeof WorkspaceGoalDefaultsOverrideSchema>;
 
 // Optional fields the update omits keep their stored value: older clients omit reasoningMode,
-// and the picker update routes never carry the auto-routing flags, which only sends persist.
+// and only sends and workspace creation carry the auto-routing flags.
 function mergeAgentAISettings(
   prev: WorkspaceAgentAISettings | undefined,
   next: WorkspaceAgentAISettings
@@ -13225,8 +13225,8 @@ export class WorkspaceService
   }
 
   private normalizeWorkspaceAISettings(
-    aiSettings: WorkspaceAISettings
-  ): Result<WorkspaceAISettings, string> {
+    aiSettings: WorkspaceAgentAISettings
+  ): Result<WorkspaceAgentAISettings, string> {
     const rawModel = aiSettings.model;
     const model = normalizeSelectedModel(rawModel).trim();
     if (!model) {
@@ -13240,6 +13240,12 @@ export class WorkspaceService
       model,
       thinkingLevel: aiSettings.thinkingLevel,
       ...(aiSettings.reasoningMode != null ? { reasoningMode: aiSettings.reasoningMode } : {}),
+      ...(aiSettings.autoModelRouting != null
+        ? { autoModelRouting: aiSettings.autoModelRouting }
+        : {}),
+      ...(aiSettings.autoThinkingLevel != null
+        ? { autoThinkingLevel: aiSettings.autoThinkingLevel }
+        : {}),
     });
   }
 
@@ -13520,7 +13526,7 @@ export class WorkspaceService
   async updateAgentAISettings(
     workspaceId: string,
     agentId: string,
-    aiSettings: WorkspaceAISettings,
+    aiSettings: WorkspaceAgentAISettings,
     options?: { persistSelectedAgentId?: boolean }
   ): Promise<Result<void, string>> {
     try {

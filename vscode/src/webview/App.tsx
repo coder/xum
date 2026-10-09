@@ -37,7 +37,7 @@ import {
 } from "xum/browser/stores/BackgroundBashStore";
 import { useChatViewDataReadyDeadline } from "xum/browser/components/ChatPane/useChatViewDataReady";
 import { mergeConsecutiveStreamErrors } from "xum/browser/utils/messages/messageUtils";
-import { setWorkspaceAiMetadata } from "xum/browser/utils/aiSelectionIntent";
+import { clearAiSelectionState, setWorkspaceAiMetadata } from "xum/browser/utils/aiSelectionIntent";
 import { WorkspaceModeAISync } from "xum/browser/components/WorkspaceModeAISync/WorkspaceModeAISync";
 import { resolvePersistedAgentId } from "xum/common/utils/agentIds";
 import {
@@ -301,6 +301,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
 
   const activeWorkspaceIdRef = useRef<string | null>(null);
   const connectionKeyRef = useRef<string | null>(null);
+  const lastApiConnectionKeyRef = useRef<string | null>(null);
   activeWorkspaceIdRef.current = selectedWorkspaceId;
 
   const chatReplayStateRef = useRef<ChatReplayState | null>(null);
@@ -532,6 +533,15 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
             // so it never paints them; the connection effect installs the new server's client.
             backgroundBashStore.setClient(null);
             backgroundBashStore.clearCachedState();
+          }
+          // AI picks and metadata belong to one server: a switch to another server drops them
+          // before its workspaces arrive, a reconnect to the same server keeps them.
+          if (nextConnectionKey !== null) {
+            const lastApiConnectionKey = lastApiConnectionKeyRef.current;
+            if (lastApiConnectionKey !== null && lastApiConnectionKey !== nextConnectionKey) {
+              clearAiSelectionState();
+            }
+            lastApiConnectionKeyRef.current = nextConnectionKey;
           }
           setConnectionStatus(msg.status);
           return;
