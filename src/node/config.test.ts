@@ -1016,113 +1016,6 @@ describe("Config", () => {
       ]);
     });
 
-    // Unresolved group: merging would have to pick one of two different rows (or settings).
-    // Keep every alias exactly as stored instead; the raw keys are distinct, so none overwrites
-    // another, and the canonical lookup still finds the alias stored under the canonical key.
-    for (const order of ["canonical first", "alias first"] as const) {
-      it(`keeps every alias unchanged when two rows share an id but differ (${order})`, async () => {
-        const canonical: StoredPair = [
-          "/home/u/repo",
-          { workspaces: [row("ws-same", { title: "first" }), row("ws-one")] },
-        ];
-        const alias: StoredPair = [
-          "/home/u/repo/",
-          { workspaces: [row("ws-same", { title: "second" }), row("ws-two")] },
-        ];
-        const stored = order === "canonical first" ? [canonical, alias] : [alias, canonical];
-        writeProjects(stored);
-        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
-        try {
-          await flushConfigEdits();
-          await flushConfigEdits();
-
-          expect(readSavedProjects()).toEqual(stored);
-          expect(JSON.stringify(errorSpy.mock.calls)).toContain('"/home/u/repo/"');
-          const reloaded = new Config(tempDir);
-          expect(
-            reloaded.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces
-          ).toMatchObject([{ id: "ws-same", title: "first" }, { id: "ws-one" }]);
-          // The other alias must not break the readers that walk every project. Both copies of
-          // the conflicting row stay listed: nothing is hidden or dropped until a user resolves it.
-          const metadata = await reloaded.getAllWorkspaceMetadata({ probeCheckouts: false });
-          expect(metadata.map((meta) => meta.id).sort()).toEqual([
-            "ws-one",
-            "ws-same",
-            "ws-same",
-            "ws-two",
-          ]);
-        } finally {
-          errorSpy.mockRestore();
-        }
-      });
-    }
-
-    it("keeps every alias unchanged when their project settings conflict", async () => {
-      const stored: StoredPair[] = [
-        ["/home/u/repo", { customInstructions: "one", workspaces: [row("ws-one")] }],
-        ["/home/u/repo/", { customInstructions: "two", workspaces: [row("ws-two")] }],
-      ];
-      writeProjects(stored);
-      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
-      try {
-        await flushConfigEdits();
-        expect(readSavedProjects()).toEqual(stored);
-        // Lookups by id and the strict loader still work with both aliases present.
-        const reloaded = new Config(tempDir);
-        expect(reloaded.findWorkspace("ws-two")?.projectPath).toBe("/home/u/repo/");
-        expect((await reloaded.getWorkspaceMetadataById("ws-one"))?.projectPath).toBe(
-          "/home/u/repo"
-        );
-        expect(
-          [...reloaded.loadConfigOrDefault({ throwOnError: true }).projects.keys()].sort()
-        ).toEqual(["/home/u/repo", "/home/u/repo/"]);
-      } finally {
-        errorSpy.mockRestore();
-      }
-    });
-
-    // Trust lookups strip trailing slashes, so a row kept under an untrusted alias would be
-    // checked against a trusted canonical entry. The whole group fails closed instead.
-    it("does not trust any alias of an unresolved group unless every alias was trusted", () => {
-      writeProjects([
-        ["/home/u/repo", { trusted: true, customInstructions: "one", workspaces: [row("ws-one")] }],
-        [
-          "/home/u/repo/",
-          { trusted: false, customInstructions: "two", workspaces: [row("ws-two")] },
-        ],
-      ]);
-      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
-      try {
-        const loaded = config.loadConfigOrDefault();
-        expect(loaded.projects.get("/home/u/repo")?.trusted).not.toBe(true);
-        expect(loaded.projects.get("/home/u/repo/")?.trusted).not.toBe(true);
-      } finally {
-        errorSpy.mockRestore();
-      }
-    });
-
-    // Management calls (remove, trust, settings) look up the stripped path. When no alias is
-    // stored under it, the first alias takes the canonical key; the others keep their own.
-    it("keeps an unresolved group reachable under the canonical key", async () => {
-      writeProjects([
-        ["/home/u/repo/", { customInstructions: "one", workspaces: [row("ws-one")] }],
-        ["/home/u/repo//", { customInstructions: "two", workspaces: [row("ws-two")] }],
-      ]);
-      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
-      try {
-        await flushConfigEdits();
-        const expected: Array<[string, string[]]> = [
-          ["/home/u/repo", ["ws-one"]],
-          ["/home/u/repo//", ["ws-two"]],
-        ];
-        expect(savedRowIds()).toEqual(expected);
-        await new Config(tempDir).editConfig((cfg) => cfg);
-        expect(savedRowIds()).toEqual(expected);
-      } finally {
-        errorSpy.mockRestore();
-      }
-    });
-
     it("keeps one copy of a byte-identical legacy row without an id", () => {
       const legacy = { name: "legacy", path: path.join(config.srcDir, "repo", "legacy") };
       const other = { name: "other", path: path.join(config.srcDir, "repo", "other") };
@@ -1143,20 +1036,79 @@ describe("Config", () => {
       ]);
     });
 
-    // Only a hand edit stores the very same key twice. A map cannot hold both entries, so the
-    // rows of both are kept under that key instead of dropping one entry.
-    it("keeps the rows of two conflicting entries stored under the same key", async () => {
-      writeProjects([
-        ["/home/u/repo", { customInstructions: "one", workspaces: [row("ws-one")] }],
-        ["/home/u/repo", { customInstructions: "two", workspaces: [row("ws-two")] }],
-      ]);
-      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
-      try {
-        await flushConfigEdits();
-        expect(savedRowIds()).toEqual([["/home/u/repo", ["ws-one", "ws-two"]]]);
-      } finally {
-        errorSpy.mockRestore();
-      }
+    // A conflicting group (same id with different rows, or one setting with two values) keeps
+    // the loader's previous result: `new Map(stripped pairs)`, the last entry at the position of
+    // the first. This oracle is that expression, so the test pins "no change" for conflicts
+    // (#5929 tracks a lossless design).
+    function previousLoaderResult(stored: StoredPair[]): StoredPair[] {
+      return [...new Map(stored.map(([key, project]) => [key.replace(/\/+$/, ""), project]))];
+    }
+
+    // Builders: row() needs the per-test config, which exists only inside a test.
+    const conflictCases: Array<[string, () => StoredPair[]]> = [
+      [
+        "a same-id conflict, canonical first",
+        () => [
+          ["/home/u/repo", { workspaces: [row("ws-same", { title: "first" }), row("ws-one")] }],
+          ["/home/u/repo/", { workspaces: [row("ws-same", { title: "second" }), row("ws-two")] }],
+        ],
+      ],
+      [
+        "a same-id conflict, alias first",
+        () => [
+          ["/home/u/repo/", { workspaces: [row("ws-same", { title: "second" }), row("ws-two")] }],
+          ["/home/u/repo", { workspaces: [row("ws-same", { title: "first" }), row("ws-one")] }],
+        ],
+      ],
+      [
+        "a settings conflict with another project in between",
+        () => [
+          ["/home/u/repo/", { customInstructions: "two", workspaces: [row("ws-two")] }],
+          ["/home/u/other", { workspaces: [row("ws-other")] }],
+          ["/home/u/repo", { customInstructions: "one", workspaces: [row("ws-one")] }],
+        ],
+      ],
+      [
+        "the same stored key twice",
+        () => [
+          ["/home/u/repo", { customInstructions: "one", workspaces: [row("ws-one")] }],
+          ["/home/u/repo", { customInstructions: "two", workspaces: [row("ws-two")] }],
+        ],
+      ],
+    ];
+    for (const [name, buildStored] of conflictCases) {
+      it(`keeps the previous loader result for ${name}`, async () => {
+        const stored = buildStored();
+        writeProjects(stored);
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          await flushConfigEdits();
+          expect(readSavedProjects()).toEqual(previousLoaderResult(stored));
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+    }
+
+    it("gives merged legacy rows without an id distinct workspace ids", async () => {
+      const first = { name: "first", path: path.join(config.srcDir, "repo", "first") };
+      const second = { name: "second", path: path.join(config.srcDir, "repo", "second") };
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["/home/u/repo/", { workspaces: [first] }],
+            ["/home/u/repo", { workspaces: [first, second] }],
+          ],
+        })
+      );
+
+      const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+
+      const ids = metadata.map((meta) => meta.id);
+      expect(ids).toHaveLength(2);
+      expect(new Set(ids).size).toBe(2);
+      expect(metadata.every((meta) => meta.projectPath === "/home/u/repo")).toBe(true);
     });
 
     it("merges settings that only one alias sets", async () => {

@@ -1012,9 +1012,8 @@ function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null 
  * Build the project map from the loaded entries. Stored keys that normalize to the same path
  * ("/repo" and "/repo/") are aliases of one project. `new Map(pairs)` used to keep only the last
  * alias, so the next save dropped the other aliases' workspace rows. Group every alias first,
- * then merge the group, or keep each alias of an unresolved group under its own stored key:
- * distinct stored strings never overwrite each other. An unresolved group always has an entry
- * under the canonical key, and its trust is shared and fails closed.
+ * then merge a group that merges without a choice. A conflicting group still keeps only its last
+ * entry, as before (#5929).
  */
 function buildProjectsFromStoredEntries(entries: StoredProjectEntry[]): Map<string, ProjectConfig> {
   const groups = new Map<string, StoredProjectEntry[]>();
@@ -1036,32 +1035,14 @@ function buildProjectsFromStoredEntries(entries: StoredProjectEntry[]): Map<stri
       projects.set(key, merged);
       continue;
     }
-    log.error("Project config entries share a path but conflict; keeping each stored key", {
+    // Conflicting aliases keep main's behavior (`new Map(pairs)`): the last entry wins, at the
+    // position of the first. Keeping every conflicting entry under its own key broke trust and
+    // project mutators, which look up the stripped path; a lossless design is #5929.
+    log.error("Project config entries share a path but conflict; keeping the last entry", {
       path: key,
       storedKeys,
     });
-    // Trust lookups strip trailing slashes, so every alias's workspaces are checked against the
-    // canonical entry. Fail closed: unless every alias was trusted, none is.
-    const groupTrusted = group.every((entry) => entry.config.trusted === true);
-    // Remove, trust and settings calls look up the stripped path too. When no alias is stored
-    // under it, the first alias takes the canonical key so the project stays manageable.
-    const canonicalStored = group.some((entry) => entry.storedKey === key);
-    group.forEach((entry, index) => {
-      const entryKey = !canonicalStored && index === 0 ? key : entry.storedKey;
-      const config =
-        !groupTrusted && entry.config.trusted === true
-          ? { ...entry.config, trusted: false }
-          : entry.config;
-      const existing = projects.get(entryKey);
-      // Two entries with the very same stored key (only a hand edit makes them) cannot stay
-      // apart in a map: keep both entries' rows under that key rather than drop one.
-      projects.set(
-        entryKey,
-        existing
-          ? { ...existing, workspaces: [...existing.workspaces, ...config.workspaces] }
-          : config
-      );
-    });
+    projects.set(key, group[group.length - 1].config);
   }
   return projects;
 }
