@@ -51,7 +51,7 @@ COPY Makefile fmt.mk ./
 COPY src/ src/
 COPY tsconfig.json tsconfig.main.json ./
 COPY scripts/generate-version.sh scripts/generate-builtin-agents.sh scripts/generate-builtin-skills.sh scripts/
-COPY scripts/gen_builtin_skills.ts scripts/gen_workflow_runtime_sources.ts scripts/
+COPY scripts/gen_builtin_skills.ts scripts/gen_workflow_runtime_sources.ts scripts/precompress-static.ts scripts/
 COPY docs/ docs/
 COPY index.html terminal.html desktop.html vite.config.ts ./
 COPY public/ public/
@@ -127,6 +127,7 @@ COPY --from=builder /app/dist/static ./dist/static
 COPY --from=builder /app/dist/*.html ./dist/
 COPY --from=builder /app/dist/*.css ./dist/
 COPY --from=builder /app/dist/*.js ./dist/
+COPY --from=builder /app/dist/*.br /app/dist/*.gz ./dist/
 
 # Copy TypeScript lib files used by the bundled PTC validator at server startup.
 COPY --from=builder /app/dist/typescript-lib ./dist/typescript-lib

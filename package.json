@@ -260,6 +260,8 @@
     "dist/**/*.woff2",
     "dist/**/*.json",
     "dist/**/*.png",
+    "dist/**/*.br",
+    "dist/**/*.gz",
     "dist/assets/**/*",
     "npm-shrinkwrap.json",
     "README.md",

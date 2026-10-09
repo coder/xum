@@ -115,6 +115,7 @@ jobs:
               - 'scripts/generate-builtin-skills.sh'
               - 'scripts/gen_builtin_skills.ts'
               - 'scripts/gen_workflow_runtime_sources.ts'
+              - 'scripts/precompress-static.ts'
               - 'scripts/check-analytics-worker.cjs'
               - 'docs/**'
               - 'index.html'
