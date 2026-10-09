@@ -1,5 +1,6 @@
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
+import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import {
   BarChart3,
   GitBranch,
@@ -68,6 +69,8 @@ interface WorkspaceActionsMenuContentProps {
   onOpenArtifacts?: (() => void) | null;
   /** Stats dialog; only set while the right sidebar (home of the Stats tab) is hidden. */
   onOpenStats?: (() => void) | null;
+  /** Touch phones only: the header row carries Stats and Artifacts there, so New terminal moves here. */
+  onOpenTerminal?: (() => void) | null;
   onStopRuntime?: (() => void) | null;
   onForkChat?: ((anchorEl: HTMLElement) => void) | null;
   /** Pin/unpin toggle; pass null on sub-agent rows (only root chats are pinnable). */
@@ -204,6 +207,20 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
             props.onOpenArtifacts?.();
           }}
           testId="workspace-artifacts-button"
+        />
+      )}
+      {props.onOpenTerminal && (
+        <WorkspaceActionButton
+          label="New terminal"
+          shortcut={formatKeybind(KEYBINDS.OPEN_TERMINAL)}
+          shortcutClassName={props.shortcutClassName}
+          icon={<WorkspaceTerminalIcon className="h-3 w-3 shrink-0" />}
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onCloseMenu();
+            props.onOpenTerminal?.();
+          }}
+          testId="workspace-terminal-button"
         />
       )}
       {props.onStopRuntime && (
