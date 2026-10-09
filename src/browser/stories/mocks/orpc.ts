@@ -263,6 +263,8 @@ export interface MockORPCClientOptions {
   providersConfig?: ProvidersConfigMap;
   /** List of available provider names */
   providersList?: string[];
+  /** Splash screens already seen. Default: all of them, so no splash covers the story. */
+  viewedSplashScreens?: string[];
   /** Server auth sessions for Settings → Server Access stories */
   serverAuthSessions?: ServerAuthSession[];
   /** Mock for projects.remove - return typed error to simulate failure */
@@ -428,6 +430,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     onChat,
     executeBash,
     providersConfig = { anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true } },
+    viewedSplashScreens = ["onboarding-wizard-v1"],
     providersList = [],
     serverAuthSessions: initialServerAuthSessions = [],
     onProjectRemove,
@@ -781,7 +784,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       status: () => Promise.resolve({ enabled: true, explicit: false }),
     },
     splashScreens: {
-      getViewedSplashScreens: () => Promise.resolve(["onboarding-wizard-v1"]),
+      getViewedSplashScreens: () => Promise.resolve(viewedSplashScreens),
       markSplashScreenViewed: () => Promise.resolve(undefined),
     },
     server: {
