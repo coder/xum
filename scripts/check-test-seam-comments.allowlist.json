@@ -6,7 +6,6 @@
     { "file": "src/browser/stores/WorkspaceStore.ts", "symbol": "workspaceStore.addWorkspace", "reason": "production caller: App.tsx (workspace creation/restore paths)" },
     { "file": "src/browser/stores/WorkspaceStore.ts", "symbol": "workspaceStore.setActiveWorkspaceId", "reason": "production caller: WorkspaceContext.tsx active-workspace effect" },
     { "file": "src/browser/stores/WorkspaceStore.ts", "symbol": "findRenderedRefineProposalHash", "reason": "production caller: getDisplayedRefineProposalHash in the same file" },
-    { "file": "src/browser/utils/aiSelectionIntent.ts", "symbol": "resetAiSelectionIntentForTests", "reason": "module-singleton reset hook named ...ForTests" },
     { "file": "src/browser/utils/highlighting/highlightWorkerClient.ts", "symbol": "highlightWithBudget", "reason": "production caller: enqueueHighlightWithBudget in the same file" },
     { "file": "src/browser/utils/highlighting/highlightWorkerClient.ts", "symbol": "enqueueHighlightWithBudget", "reason": "production caller: highlightCode in the same file" },
     { "file": "src/browser/utils/highlighting/highlightWorkerClient.ts", "symbol": "__resetForTests", "reason": "module-singleton reset hook named ...ForTests" },

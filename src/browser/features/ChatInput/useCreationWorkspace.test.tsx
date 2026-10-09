@@ -3,6 +3,7 @@ import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
+  getAutoRoutingPick,
   resetAiSelectionIntentForTests,
   setAutoRoutingPick,
 } from "@/browser/utils/aiSelectionIntent";
@@ -1547,6 +1548,37 @@ describe("useCreationWorkspace", () => {
     });
   });
 
+  test("an initial goal command saves the creation composer's Auto choices", async () => {
+    const { workspaceApi } = setupWindow({});
+    getAppConfigStore().updateOptimistically({
+      experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
+    });
+    setAutoRoutingPick(getProjectScopeId(TEST_PROJECT_PATH), "exec", "model", true);
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "/goal ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        typedText: "/goal ship the feature",
+      });
+    });
+
+    expect(workspaceApi.sendMessage.mock.calls.length).toBe(0);
+    expect(workspaceApi.updateAgentAISettings.mock.calls[0]?.[0]?.aiSettings).toEqual({
+      model: "gpt-4",
+      thinkingLevel: "medium",
+      reasoningMode: "standard",
+      autoModelRouting: true,
+    });
+  });
+
   test("handleSend hands a refused initial goal command to the new workspace composer", async () => {
     const setGoalMock = mock(
       (_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> =>
@@ -2064,6 +2096,9 @@ describe("useCreationWorkspace", () => {
     const options = sendMessageMock.mock.calls[0]?.[0]?.options;
     expect(options?.autoModelRouting).toBe(true);
     expect(options?.autoThinkingLevel).toBe(true);
+    // The workspace shows both creation choices until a send saves them.
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "model")).toBe(true);
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "thinkingLevel")).toBe(true);
   });
 
   test("handleSend returns failure when sendMessage fails and clears draft", async () => {

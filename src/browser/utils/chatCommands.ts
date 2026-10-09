@@ -1382,10 +1382,16 @@ export async function createNewWorkspace(
 
   // /new cannot ask for the host, image or config path the other runtimes need, so only a
   // configured local default applies; anything else gets the backend's worktree default.
-  const defaultRuntime = getAppConfigStore().getSnapshot()?.defaultRuntime;
-  const runtimeConfig = parseRuntimeString(
-    options.runtime ?? (defaultRuntime === RUNTIME_MODE.LOCAL ? defaultRuntime : undefined)
-  );
+  let runtime = options.runtime;
+  if (runtime === undefined) {
+    // A project default replaces the global one, as in the creation UI.
+    const projects = new Map(await options.client.projects.list());
+    const defaultRuntime =
+      projects.get(options.projectPath)?.defaultRuntime ??
+      getAppConfigStore().getSnapshot()?.defaultRuntime;
+    if (defaultRuntime === RUNTIME_MODE.LOCAL) runtime = defaultRuntime;
+  }
+  const runtimeConfig = parseRuntimeString(runtime);
 
   const result = await options.client.workspace.create({
     projectPath: options.projectPath,

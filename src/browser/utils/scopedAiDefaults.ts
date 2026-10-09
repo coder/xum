@@ -11,6 +11,8 @@ import {
 } from "@/browser/utils/aiSelectionIntent";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import { getProjectScopeId, GLOBAL_SCOPE_ID } from "@/common/constants/storage";
+import { normalizeAgentId } from "@/common/utils/agentIds";
+import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 // Global defaults have no model, so a global model read is always undefined.
 type AiDefaults = NonNullable<NonNullable<UserPreferences["ai"]>["projectDefaults"]>[string];
@@ -85,8 +87,34 @@ export function useScopedAiDefault<F extends ScopedAiField>(
   const serverValue = useUserPreferences((preferences) =>
     scope ? selectServerDefault(preferences, scope, field) : undefined
   );
+  // A workspace without a saved agent shows the project or global default agent.
+  useUserPreferences((preferences) => preferences.ai);
   const workspaceValue = useSyncExternalStore(subscribeAiSelection, () =>
     scope ? undefined : readWorkspaceDefault(scopeId, field)
   );
   return scope ? serverValue : workspaceValue;
+}
+
+/** The scope's agent as AgentProvider shows it: a project without one inherits the global agent. */
+function resolveScopeAgentId(
+  scoped: string | undefined,
+  globalAgentId: string | undefined
+): string {
+  return (
+    normalizeAgentId(scoped, "") || normalizeAgentId(globalAgentId, WORKSPACE_DEFAULTS.agentId)
+  );
+}
+
+export function readScopeAgentId(scopeId: string): string {
+  return resolveScopeAgentId(
+    readScopedAiDefault(scopeId, "agentId"),
+    readScopedAiDefault(GLOBAL_SCOPE_ID, "agentId")
+  );
+}
+
+export function useScopeAgentId(scopeId: string): string {
+  return resolveScopeAgentId(
+    useScopedAiDefault(scopeId, "agentId"),
+    useScopedAiDefault(GLOBAL_SCOPE_ID, "agentId")
+  );
 }

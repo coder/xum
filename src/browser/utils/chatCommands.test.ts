@@ -18,7 +18,7 @@ import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { createTestApiClient } from "@/browser/testUtils";
-import type { RuntimeConfig } from "@/common/types/runtime";
+import type { RuntimeConfig, RuntimeEnablementId } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
   EDIT_HISTORY_CHANGED_MESSAGE,
@@ -1633,9 +1633,14 @@ describe("createNewWorkspace", () => {
     getAppConfigStore().updateOptimistically({ defaultRuntime: undefined });
   });
 
-  test("/new applies only a configured local default runtime", async () => {
+  test("/new applies only a configured local default runtime, the project's first", async () => {
     const runtimeConfigs: Array<RuntimeConfig | undefined> = [];
+    let projectDefaultRuntime: RuntimeEnablementId | undefined;
     const client = createTestApiClient({
+      projects: {
+        list: () =>
+          Promise.resolve([["/repo", { workspaces: [], defaultRuntime: projectDefaultRuntime }]]),
+      },
       workspace: {
         create: (input: { runtimeConfig?: RuntimeConfig }) => {
           runtimeConfigs.push(input.runtimeConfig);
@@ -1644,11 +1649,17 @@ describe("createNewWorkspace", () => {
       },
     });
 
-    for (const defaultRuntime of ["local", "ssh"]) {
-      getAppConfigStore().updateOptimistically({ defaultRuntime });
+    for (const [globalDefault, projectDefault] of [
+      ["local", undefined],
+      ["ssh", undefined],
+      ["local", "worktree"],
+      ["worktree", "local"],
+    ] as const) {
+      getAppConfigStore().updateOptimistically({ defaultRuntime: globalDefault });
+      projectDefaultRuntime = projectDefault;
       await createNewWorkspace({ client, projectPath: "/repo", trunkBranch: "main" });
     }
 
-    expect(runtimeConfigs).toEqual([{ type: "local" }, undefined]);
+    expect(runtimeConfigs).toEqual([{ type: "local" }, undefined, undefined, { type: "local" }]);
   });
 });

@@ -2896,9 +2896,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             editConflictToastRef.current = null;
             setToast((current) => (current === conflictToast.toast ? null : current));
           }
-          if (aiSelection.intent) {
-            consumeAiSelectionIntent(props.workspaceId, intentAgentId, aiSelection.attachedTokens);
-          }
+          consumeAiSelectionIntent(props.workspaceId, intentAgentId, aiSelection.attachedTokens);
           // Track telemetry for successful message send
           telemetry.messageSent(
             props.workspaceId,

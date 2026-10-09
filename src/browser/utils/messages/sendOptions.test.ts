@@ -8,6 +8,7 @@ import {
   setWorkspaceAiMetadata,
 } from "@/browser/utils/aiSelectionIntent";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { getProjectScopeId } from "@/common/constants/storage";
 import { installDom } from "../../../../tests/ui/dom";
 import { getSendOptionsFromStorage } from "./sendOptions";
 import { SendMessageOptionsSchema } from "@/common/orpc/schemas/stream";
@@ -65,6 +66,18 @@ describe("getSendOptionsFromStorage", () => {
     expect(SendMessageOptionsSchema.parse(JSON.parse(JSON.stringify(options))).thinkingLevel).toBe(
       options.thinkingLevel
     );
+  });
+
+  test("a project without its own agent sends the inherited global agent's Auto choice", () => {
+    setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { ai: { globalDefaults: { agentId: "plan" } } },
+    });
+    const scopeId = getProjectScopeId("/send-options-project");
+    setAutoRoutingPick(scopeId, "plan", "model", true);
+    const options = getSendOptionsFromStorage(scopeId);
+    expect(options.agentId).toBe("plan");
+    expect(options.autoModelRouting).toBe(true);
   });
 
   test("preserves explicit gateway-scoped saved workspace models", () => {
