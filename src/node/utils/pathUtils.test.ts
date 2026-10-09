@@ -4,7 +4,9 @@ import * as path from "path";
 import {
   expandTilde,
   validateProjectPath,
+  isFilesystemRoot,
   isGitRepository,
+  resolvesToFilesystemRoot,
   stripTrailingSlashes,
 } from "./pathUtils";
 
@@ -72,6 +74,26 @@ describe("pathUtils", () => {
           error: "A project cannot be the filesystem root",
         });
       }
+    });
+
+    // #5924: path.win32.parse reports the root of "\\\\?\\UNC\\srv\\share\\" as "\\\\?\\UNC\\", so
+    // the share root used to pass. The "Test / Windows" CI job runs this test.
+    const itOnWindows = process.platform === "win32" ? it : it.skip;
+    itOnWindows("refuses Windows namespaced roots", async () => {
+      for (const root of [
+        "\\\\?\\UNC\\srv\\share\\",
+        "\\\\?\\UNC\\srv\\share",
+        "\\\\.\\UNC\\srv\\share",
+        "\\\\?\\C:\\",
+        "\\\\srv\\share\\",
+      ]) {
+        expect(await resolvesToFilesystemRoot(root)).toBe(true);
+        expect(await validateProjectPath(root)).toEqual({
+          valid: false,
+          error: "A project cannot be the filesystem root",
+        });
+      }
+      expect(isFilesystemRoot("\\\\?\\UNC\\srv\\share\\repo")).toBe(false);
     });
 
     let tempDir: string;

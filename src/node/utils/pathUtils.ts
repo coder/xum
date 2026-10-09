@@ -2,6 +2,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { execFileAsync } from "./disposableExec";
 import { PlatformPaths } from "./paths.main";
+import { isRootPathString } from "@/common/utils/pathRoot";
 
 /**
  * Result of path validation
@@ -56,13 +57,18 @@ export function stripTrailingSlashes(inputPath: string): string {
 export const PROJECT_AT_FILESYSTEM_ROOT_ERROR = "A project cannot be the filesystem root";
 
 /**
- * True when `inputPath` resolves to a filesystem root (`/` on POSIX, a drive root on Windows).
- * Project add, create and trust flows refuse such paths: file completions, git status and
- * review scans would walk the whole disk. Configs that already hold a root project still load.
+ * True when `inputPath` resolves to a filesystem root (`/` on POSIX; a drive, UNC share or
+ * namespaced root such as `\\\\?\\UNC\\srv\\share` on Windows). Project add, create and trust flows
+ * refuse such paths: file completions, git status and review scans would walk the whole disk.
+ * Configs that already hold a root project still load. Not path.parse: on Windows it reports
+ * the root of `\\\\?\\UNC\\srv\\share\\` as `\\\\?\\UNC\\` (#5924).
  */
 export function isFilesystemRoot(inputPath: string): boolean {
-  const resolved = path.resolve(inputPath);
-  return path.parse(resolved).root === resolved;
+  // The host's rules: on POSIX a backslash is a file-name character.
+  return isRootPathString(
+    path.resolve(inputPath),
+    process.platform === "win32" ? "win32" : "posix"
+  );
 }
 
 /**
