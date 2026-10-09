@@ -945,6 +945,108 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
 
   return next;
 }
+
+interface StoredProjectEntry {
+  /** The key exactly as config.json stores it. */
+  storedKey: string;
+  /** The normalized project path the loader uses as the map key. */
+  key: string;
+  config: ProjectConfig;
+}
+
+/**
+ * Merge one group of aliases (stored keys that normalize to the same path), or return null when
+ * a merge would have to choose: two different rows with the same id, or a project setting that
+ * two aliases set to different values. Rows with distinct ids and settings only one alias sets
+ * are combined; a byte-identical duplicate row is kept once. The project is trusted only when
+ * every alias was: the canonical spelling says nothing about which alias the user trusted.
+ */
+function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null {
+  const settings = new Map<string, unknown>();
+  const workspaces: ProjectConfig["workspaces"] = [];
+  const rowJsonById = new Map<string, string>();
+  for (const { config } of group) {
+    if (!Array.isArray(config.workspaces)) return null;
+    for (const [field, value] of Object.entries(config) as Array<[string, unknown]>) {
+      // parentProjectPath is derived again from the keys right after loading.
+      if (value === undefined || ["workspaces", "trusted", "parentProjectPath"].includes(field)) {
+        continue;
+      }
+      if (settings.has(field) && JSON.stringify(settings.get(field)) !== JSON.stringify(value)) {
+        return null;
+      }
+      settings.set(field, value);
+    }
+    for (const workspace of config.workspaces) {
+      const json = JSON.stringify(workspace);
+      const seenJson = workspace.id ? rowJsonById.get(workspace.id) : undefined;
+      if (seenJson === undefined) {
+        if (workspace.id) rowJsonById.set(workspace.id, json);
+        workspaces.push(workspace);
+      } else if (seenJson !== json) {
+        return null;
+      }
+    }
+  }
+  const merged: ProjectConfig = {
+    ...(Object.fromEntries(settings) as Partial<ProjectConfig>),
+    workspaces,
+  };
+  if (group.every(({ config }) => config.trusted === true)) {
+    merged.trusted = true;
+  } else if (group.some(({ config }) => config.trusted !== undefined)) {
+    merged.trusted = false;
+  }
+  return merged;
+}
+
+/**
+ * Build the project map from the loaded entries. Stored keys that normalize to the same path
+ * ("/repo" and "/repo/") are aliases of one project. `new Map(pairs)` used to keep only the last
+ * alias, so the next save dropped the other aliases' workspace rows. Group every alias first,
+ * then merge the group, or keep each alias of an unresolved group under its own stored key,
+ * unchanged: distinct stored strings never overwrite each other, and the alias stored under the
+ * canonical key (if any) stays reachable by the normal lookup.
+ */
+function buildProjectsFromStoredEntries(entries: StoredProjectEntry[]): Map<string, ProjectConfig> {
+  const groups = new Map<string, StoredProjectEntry[]>();
+  for (const entry of entries) {
+    const group = groups.get(entry.key);
+    if (group) group.push(entry);
+    else groups.set(entry.key, [entry]);
+  }
+  const projects = new Map<string, ProjectConfig>();
+  for (const [key, group] of groups) {
+    if (group.length === 1) {
+      projects.set(key, group[0].config);
+      continue;
+    }
+    const storedKeys = group.map((entry) => entry.storedKey);
+    const merged = mergeProjectAliases(group);
+    if (merged) {
+      log.warn("Merged project config entries with the same path", { path: key, storedKeys });
+      projects.set(key, merged);
+      continue;
+    }
+    log.error("Project config entries share a path but conflict; keeping each stored key", {
+      path: key,
+      storedKeys,
+    });
+    for (const entry of group) {
+      const existing = projects.get(entry.storedKey);
+      // Two entries with the very same stored key (only a hand edit makes them) cannot stay
+      // apart in a map: keep both entries' rows under that key rather than drop one.
+      projects.set(
+        entry.storedKey,
+        existing
+          ? { ...existing, workspaces: [...existing.workspaces, ...entry.config.workspaces] }
+          : entry.config
+      );
+    }
+  }
+  return projects;
+}
+
 /**
  * The built-in Chat with Mux workspace (removed in #3123) lived in a hidden
  * `<xumHome>/system/Mux` project. Real upgraded installs still carry that
@@ -1884,7 +1986,7 @@ export class Config {
         this.legacyTaskVariantGroups.delete(workspaceId);
       }
     }
-    const normalizedPairs = rawPairs
+    const storedEntries = rawPairs
       .filter(([projectPath]) => {
         // "" is accepted: earlier saves wrote the root project "/" as "" (#5917). It loads as
         // "/" below instead of dropping the project and its workspace rows.
@@ -1901,13 +2003,13 @@ export class Config {
             this.rememberLegacyTaskVariantWorkspace(projectPath, workspace);
           }
         }
-        const normalizedProjectConfig = normalizeProjectRuntimeSettings(projectConfig);
-        return [stripTrailingSlashes(projectPath), normalizedProjectConfig] as [
-          string,
-          ProjectConfig,
-        ];
+        return {
+          storedKey: storedProjectPath,
+          key: stripTrailingSlashes(projectPath),
+          config: normalizeProjectRuntimeSettings(projectConfig),
+        };
       });
-    return new Map(normalizedPairs);
+    return buildProjectsFromStoredEntries(storedEntries);
   }
 
   private normalizeParsedConfig(
