@@ -1031,57 +1031,45 @@ export function dedupeNativeToolReferences(messages: ModelMessage[]): ModelMessa
       ) {
         return part;
       }
-      // Classify first: the projection shape depends on whether any reference
-      // survives in this result (Anthropic rejects a tool result mixing text
-      // with references, see buildToolSearchModelOutput).
-      const partSeen = new Set<string>();
-      let hasNew = false;
-      let hasRepeat = false;
+      const kept: typeof part.output.value = [];
+      const dropped: string[] = [];
       for (const item of part.output.value) {
         const name = nativeToolReferenceName(item);
-        if (name === undefined) {
+        if (name !== undefined && seen.has(name)) {
+          dropped.push(name);
           continue;
         }
-        if (seen.has(name) || partSeen.has(name)) {
-          hasRepeat = true;
-        } else {
-          partSeen.add(name);
-          hasNew = true;
-        }
-      }
-      if (!hasRepeat) {
-        for (const name of partSeen) {
+        if (name !== undefined) {
           seen.add(name);
         }
+        kept.push(item);
+      }
+      if (dropped.length === 0) {
         return part;
       }
       changed = true;
-      const localSeen = new Set<string>();
-      const value: typeof part.output.value = [];
-      for (const item of part.output.value) {
-        const name = nativeToolReferenceName(item);
-        if (name === undefined) {
-          value.push(item);
-          continue;
-        }
-        if (seen.has(name) || localSeen.has(name)) {
-          // Fully repeated result: every reference becomes an invertible
-          // marker (text-only output). Mixed result: drop the repeat, since a
-          // marker beside the retained references would be rejected; the raw
-          // form stays recoverable from persisted history on the next turn.
-          if (!hasNew) {
-            value.push({
-              type: "text" as const,
-              text: `${NATIVE_TOOL_REFERENCE_DEDUPED_PREFIX}${name}`,
-            });
-          }
-          continue;
-        }
-        localSeen.add(name);
-        seen.add(name);
-        value.push(item);
-      }
-      return { ...part, output: { type: "content" as const, value } };
+      const output: ToolResultOutput =
+        kept.length > 0
+          ? { type: "content", value: kept }
+          : { type: "text", value: `All matched tools are already loaded: ${dropped.join(", ")}` };
+      // The projection must stay invertible: the AI SDK carries returned
+      // (projected) messages into later steps and across fallback restarts,
+      // and a prefix swap can drop the occurrence the projection kept, so the
+      // swap path restores the raw output from this stash
+      // (unprojectNativeToolReferences). Adapters serialize only their own
+      // providerOptions namespace, so `mux` never reaches the wire. Stored as
+      // a JSON string because the output union is not typed as a JSONValue; a
+      // re-projection of an already-projected part keeps the original stash.
+      return {
+        ...part,
+        output,
+        providerOptions: {
+          ...part.providerOptions,
+          mux: {
+            rawToolSearchOutput: stashedRawToolSearchJson(part) ?? JSON.stringify(part.output),
+          },
+        },
+      };
     });
     if (!changed) {
       return message;
@@ -1092,32 +1080,35 @@ export function dedupeNativeToolReferences(messages: ModelMessage[]): ModelMessa
   return anyChanged ? deduped : messages;
 }
 
-/**
- * Marker left in place of a deduped duplicate `tool_reference`. The projection
- * must stay invertible from the transcript alone: the AI SDK carries returned
- * (projected) messages into later steps and across fallback restarts, and a
- * prefix swap can drop the occurrence the projection kept, so the swap path
- * re-derives raw references from these markers (unprojectNativeToolReferences)
- * with no per-run state to lose or collide.
- */
-export const NATIVE_TOOL_REFERENCE_DEDUPED_PREFIX = "Tool already loaded above: ";
+/** Serialized raw output stashed on a projected tool-search result, undefined otherwise. */
+function stashedRawToolSearchJson(part: ToolResultPart): string | undefined {
+  const mux = isPlainRecord(part.providerOptions) ? part.providerOptions.mux : undefined;
+  const raw = isPlainRecord(mux) ? mux.rawToolSearchOutput : undefined;
+  return typeof raw === "string" ? raw : undefined;
+}
 
-/** Tool name of a dedupe marker item, undefined for anything else. */
-function dedupedReferenceMarkerName(item: unknown): string | undefined {
-  return isPlainRecord(item) &&
-    item.type === "text" &&
-    typeof item.text === "string" &&
-    item.text.startsWith(NATIVE_TOOL_REFERENCE_DEDUPED_PREFIX)
-    ? item.text.slice(NATIVE_TOOL_REFERENCE_DEDUPED_PREFIX.length)
-    : undefined;
+/** Validated raw output parsed from the stash, undefined for anything malformed. */
+function stashedRawToolSearchOutput(part: ToolResultPart): ToolResultOutput | undefined {
+  const json = stashedRawToolSearchJson(part);
+  if (json === undefined) {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(json);
+    return isPlainRecord(parsed) && parsed.type === "content" && Array.isArray(parsed.value)
+      ? (parsed as ToolResultOutput)
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
- * Inverse of the dedupe projection: convert its markers back into raw
- * `tool_reference` items so a prefix swap re-decides every reference against
- * the swapped transcript (dedupeNativeToolReferences then re-projects whatever
- * is still a repeat). Applied only to in-memory step arrays mux itself
- * produced: markers never reach disk, and persisted results replay as raw
+ * Inverse of the dedupe projection: restore each projected result's stashed
+ * raw output so a prefix swap re-decides every reference against the swapped
+ * transcript (dedupeNativeToolReferences then re-projects whatever is still a
+ * repeat). Applied only to in-memory step arrays mux itself produced: the
+ * stash never reaches disk or the wire, and persisted results replay as raw
  * matches, so crafted history cannot inject references through this path.
  */
 export function unprojectNativeToolReferences(messages: ModelMessage[]): ModelMessage[] {
@@ -1128,30 +1119,21 @@ export function unprojectNativeToolReferences(messages: ModelMessage[]): ModelMe
     }
     let changed = false;
     const content: ToolModelMessage["content"] = message.content.map((part) => {
-      if (
-        part.type !== "tool-result" ||
-        !isMuxToolSearchName(part.toolName) ||
-        part.output.type !== "content"
-      ) {
+      if (part.type !== "tool-result" || !isMuxToolSearchName(part.toolName)) {
         return part;
       }
-      let partChanged = false;
-      const value = part.output.value.map((item) => {
-        const name = dedupedReferenceMarkerName(item);
-        if (name === undefined) {
-          return item;
-        }
-        partChanged = true;
-        return {
-          type: "custom" as const,
-          providerOptions: { anthropic: { type: "tool-reference", toolName: name } },
-        };
-      });
-      if (!partChanged) {
+      const raw = stashedRawToolSearchOutput(part);
+      if (raw === undefined) {
         return part;
       }
       changed = true;
-      return { ...part, output: { type: "content" as const, value } };
+      const { mux: _stash, ...remaining } = part.providerOptions ?? {};
+      if (Object.keys(remaining).length > 0) {
+        return { ...part, output: raw, providerOptions: remaining };
+      }
+      // Omit an emptied providerOptions entirely so the round trip is byte-exact.
+      const { providerOptions: _omitted, ...bare } = part;
+      return { ...bare, output: raw };
     });
     if (!changed) {
       return message;

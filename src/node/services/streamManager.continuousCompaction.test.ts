@@ -18,6 +18,7 @@ import {
   ContinuousCompactionJournalSchema,
   type ContinuousCompactionJournal,
 } from "@/common/orpc/schemas/continuousCompaction";
+import { countToolReferences } from "@/common/utils/tools/toolCatalog";
 import type { StreamManager, TurnEngineEvent, TurnExecutionOptions } from "./streamManager";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import { prepareStepForTests, type PreparedStepForTests } from "./streamManager.suite.testHarness";
@@ -616,7 +617,9 @@ describe("continuous prefix prepareStep and journal", () => {
     const turn = await startLiveTurn();
     const first = await turn.run(withRepeatedReference());
     assert(first?.messages, "Expected deduped messages");
-    expect(JSON.stringify(first.messages).match(/"tool-reference"/g)).toHaveLength(1);
+    // Count wire references via outputs: the projected result's stash keeps
+    // the raw reference bytes in providerOptions, off the wire.
+    expect([...countToolReferences(first.messages).values()]).toEqual([1]);
     expect(turn.manager.setPrefixSwap(workspaceId, fixture.swap)).toBe(true);
     // The SDK carries the projected first-step messages into the next step.
     const second = await turn.run(first.messages, 2);

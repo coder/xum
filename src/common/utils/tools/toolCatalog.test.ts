@@ -10,7 +10,6 @@ import {
   collectDeferLoadingToolNames,
   dedupeNativeToolReferences,
   unprojectNativeToolReferences,
-  NATIVE_TOOL_REFERENCE_DEDUPED_PREFIX,
   computeActiveToolNames,
   computeLoadedToolNames,
   extractPreActivatedToolNames,
@@ -1036,12 +1035,24 @@ describe("dedupeNativeToolReferences", () => {
     return raw as ModelMessage;
   }
 
-  const marker = (toolName: string) => ({
-    type: "text" as const,
-    text: `${NATIVE_TOOL_REFERENCE_DEDUPED_PREFIX}${toolName}`,
-  });
+  /** Expected shape of a projected result: new output plus the raw stash. */
+  function projectedSearchResult(toolCallId: string, output: unknown, raw: unknown): ModelMessage {
+    const value: unknown = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId,
+          toolName: TOOL_SEARCH_TOOL_NAME,
+          output,
+          providerOptions: { mux: { rawToolSearchOutput: JSON.stringify(raw) } },
+        },
+      ],
+    };
+    return value as ModelMessage;
+  }
 
-  test("a repeated search projects every duplicate to a deterministic marker", () => {
+  test("a fully repeated search projects to a deterministic text result", () => {
     const messages = [
       searchResultMessage("call-1", referencesOutput("alpha", "beta")),
       searchResultMessage("call-2", referencesOutput("beta", "alpha")),
@@ -1050,10 +1061,11 @@ describe("dedupeNativeToolReferences", () => {
     expect(deduped[0]).toBe(messages[0]);
     expect(JSON.stringify(deduped[1])).toBe(
       JSON.stringify(
-        searchResultMessage("call-2", {
-          type: "content",
-          value: [marker("beta"), marker("alpha")],
-        })
+        projectedSearchResult(
+          "call-2",
+          { type: "text", value: "All matched tools are already loaded: beta, alpha" },
+          referencesOutput("beta", "alpha")
+        )
       )
     );
     // Deterministic: a second application projects the same bytes.
@@ -1068,8 +1080,19 @@ describe("dedupeNativeToolReferences", () => {
     ];
     const deduped = dedupeNativeToolReferences(messages);
     expect(JSON.stringify(unprojectNativeToolReferences(deduped))).toBe(JSON.stringify(messages));
-    // Marker-free arrays keep their identity.
+    // Stash-free arrays keep their identity.
     expect(unprojectNativeToolReferences(messages)).toBe(messages);
+  });
+
+  test("unprojectNativeToolReferences inverts a mixed projection byte-exactly", () => {
+    // The mixed result keeps its new reference on the wire, yet the swap path
+    // must still recover the dropped repeat from the stash.
+    const messages = [
+      searchResultMessage("call-1", referencesOutput("alpha")),
+      searchResultMessage("call-2", referencesOutput("alpha", "beta")),
+    ];
+    const deduped = dedupeNativeToolReferences(messages);
+    expect(JSON.stringify(unprojectNativeToolReferences(deduped))).toBe(JSON.stringify(messages));
   });
 
   test("each projected occurrence restores its own references, even under reused toolCallIds", () => {
@@ -1094,7 +1117,9 @@ describe("dedupeNativeToolReferences", () => {
     const deduped = dedupeNativeToolReferences(messages);
     expect(deduped[0]).toBe(messages[0]);
     expect(JSON.stringify(deduped[1])).toBe(
-      JSON.stringify(searchResultMessage("call-2", referencesOutput("beta")))
+      JSON.stringify(
+        projectedSearchResult("call-2", referencesOutput("beta"), referencesOutput("alpha", "beta"))
+      )
     );
     // No deduped result may mix text items with tool references (Anthropic 400s).
     for (const message of dedupeNativeToolReferences(messages)) {
@@ -1155,7 +1180,13 @@ describe("dedupeNativeToolReferences", () => {
     expect(extended[0]).toBe(dedupedPrefix[0]);
     expect(extended[1]).toBe(dedupedPrefix[1]);
     expect(JSON.stringify(extended[2])).toBe(
-      JSON.stringify(searchResultMessage("call-3", referencesOutput("gamma")))
+      JSON.stringify(
+        projectedSearchResult(
+          "call-3",
+          referencesOutput("gamma"),
+          referencesOutput("beta", "gamma")
+        )
+      )
     );
   });
 
