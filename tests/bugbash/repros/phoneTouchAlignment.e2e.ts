@@ -108,3 +108,25 @@ test(
       .toBeLessThanOrEqual(2);
   }
 );
+
+test(
+  "The workspace actions menu stays on the title row on a touch phone",
+  { tags: ["bugbash", "touch-alignment"] },
+  async ({ app, screen, browser }) => {
+    await browser.setViewport({ width: 390, height: 844 });
+    await openPlayground(app, screen, browser);
+    await applyTouchPointerRules(browser);
+
+    // The 44px buttons do not fit beside the title, so the header wraps. Before the fix the
+    // three-dots menu wrapped with the other actions and sat under the title, 44px lower.
+    await expect
+      .poll(() =>
+        centerGap(
+          browser,
+          '[data-testid="workspace-title"]',
+          '[data-testid="workspace-more-actions"]'
+        )
+      )
+      .toBeLessThanOrEqual(2);
+  }
+);
