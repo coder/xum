@@ -725,6 +725,24 @@ export function closeTabInTabset(
   return { ...state, root, focusedTabsetId };
 }
 
+/**
+ * The tab shown where `tab` was, after closing it turned `prev` into `next`: the pane's new
+ * active tab, or the focused pane's when the pane itself closed. Null when `tab` was not on
+ * screen (not its pane's active tab), so closing it reveals nothing.
+ */
+export function getTabRevealedByClose(
+  prev: RightSidebarLayoutState,
+  next: RightSidebarLayoutState,
+  tabsetId: string,
+  tab: TabType
+): TabType | null {
+  const before = findTabset(prev.root, tabsetId);
+  if (before?.type !== "tabset" || before.activeTab !== tab) return null;
+  const after = findTabset(next.root, tabsetId);
+  if (after?.type === "tabset") return after.activeTab;
+  return getFocusedActiveTab(next, NEW_TAB);
+}
+
 /** Drop a tabset from the tree, promoting its sibling in place of their split. */
 function removeTabsetNode(
   node: RightSidebarLayoutNode,

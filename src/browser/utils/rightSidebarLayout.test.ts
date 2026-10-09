@@ -9,6 +9,7 @@ import {
   addNewTabToTabset,
   addTabToFocusedTabset,
   closeTabInTabset,
+  getTabRevealedByClose,
   collectAllTabsWithTabset,
   dockTabToEdge,
   getDefaultRightSidebarLayoutState,
@@ -205,6 +206,24 @@ test("closing the last tab of the only pane leaves the New tab; closing that New
   const closed = closeTabInTabset(single(["review"]), "tabset-1", "review");
   expect(rootTabset(closed)).toMatchObject({ tabs: ["new"], activeTab: "new" });
   expect(closeTabInTabset(closed, "tabset-1", "new")).toBe(closed);
+});
+
+test("getTabRevealedByClose names the terminal a close uncovers, so it can take focus", () => {
+  const close = (prev: RightSidebarLayoutState, tabsetId: string, tab: TabType) =>
+    getTabRevealedByClose(prev, closeTabInTabset(prev, tabsetId, tab), tabsetId, tab);
+
+  // The pane's next tab comes on screen.
+  expect(close(single(["costs", "terminal:t1"], "costs"), "tabset-1", "costs")).toBe("terminal:t1");
+  // The pane closed: the focused pane's active tab is what the user now looks at.
+  expect(
+    close(
+      split(tabset("tabset-1", ["new"]), tabset("tabset-2", ["terminal:t2"]), "tabset-2"),
+      "tabset-1",
+      "new"
+    )
+  ).toBe("terminal:t2");
+  // Closing a background tab uncovers nothing, so focus stays where it is.
+  expect(close(single(["costs", "review"], "review"), "tabset-1", "costs")).toBeNull();
 });
 
 test("closing the last tab of one pane collapses the split into the other pane", () => {

@@ -45,6 +45,7 @@ import {
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import type { TabType } from "@/browser/types/rightSidebar";
+import { BROWSER_VIEWPORT_ATTR } from "@/browser/utils/ui/keybinds";
 
 const RIGHT_SIDEBAR_SELECTOR = '[role="complementary"][aria-label="Workspace insights"]';
 
@@ -372,6 +373,35 @@ describeIntegration("RightSidebar (UI)", () => {
         expect(sidebar.querySelector('[role="tab"][aria-controls*="costs"]')).toBeNull();
       });
     } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("Close Tab leaves the tab alone while the interactive browser has focus", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() =>
+      seedLayout(["costs", "review"], "review")
+    );
+    // Stands in for the browser tab's viewport: keystrokes inside it belong to the page.
+    const viewport = document.createElement("div");
+    viewport.setAttribute(BROWSER_VIEWPORT_ATTR, "");
+    const viewportButton = document.createElement("button");
+    viewport.appendChild(viewportButton);
+    document.body.appendChild(viewport);
+
+    try {
+      await findSidebarTab(sidebar, "review");
+      const closeTab = { key: "w", ctrlKey: true };
+
+      expect(fireEvent.keyDown(viewportButton, closeTab)).toBe(true);
+      expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).not.toBeNull();
+
+      // Outside the viewport the same chord still closes the active tab.
+      fireEvent.keyDown(window, closeTab);
+      await waitFor(() => {
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+      });
+    } finally {
+      viewport.remove();
       await cleanup();
     }
   }, 60_000);

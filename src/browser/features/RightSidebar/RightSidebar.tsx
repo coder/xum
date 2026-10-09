@@ -52,8 +52,10 @@ import {
   formatKeybind,
   isDialogOpen,
   isEditableElement,
+  isBrowserViewportFocused,
   isDesktopViewportFocused,
   isTerminalFocused,
+  matchesNewSidebarTabKeybind,
 } from "@/browser/utils/ui/keybinds";
 import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { cn } from "@/common/lib/utils";
@@ -82,6 +84,7 @@ import {
   addNewTabToTabset,
   addTabToFocusedTabset,
   closeTabInTabset,
+  getTabRevealedByClose,
   collectAllTabs,
   collectAllTabsWithTabset,
   dockTabToEdge,
@@ -1163,18 +1166,25 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     );
   }, [initialActiveTab]);
 
-  const focusActiveTerminal = React.useCallback(
-    (state: RightSidebarLayoutState) => {
-      const activeTab = getFocusedActiveTab(state, NEW_TAB);
-      if (!isTerminalTab(activeTab)) {
+  /** Give keyboard focus to `tab` when it is a terminal that just came on screen. */
+  const focusTerminalTab = React.useCallback(
+    (tab: TabType | null) => {
+      if (tab == null || !isTerminalTab(tab)) {
         return;
       }
-      const sessionId = getTerminalSessionId(activeTab);
+      const sessionId = getTerminalSessionId(tab);
       if (sessionId) {
         setAutoFocusTerminalSession(sessionId);
       }
     },
     [setAutoFocusTerminalSession]
+  );
+
+  const focusActiveTerminal = React.useCallback(
+    (state: RightSidebarLayoutState) => {
+      focusTerminalTab(getFocusedActiveTab(state, NEW_TAB));
+    },
+    [focusTerminalTab]
   );
 
   const setLayout = React.useCallback(
@@ -1502,6 +1512,18 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     [focusActiveTerminal, getBaseLayout, setLayout, terminalTitlesKey]
   );
 
+  // Close a static or New tab (close button, middle-click, or CLOSE_TAB). When that uncovers a
+  // terminal, focus it, as closing a terminal tab does, so typing goes where the user looks.
+  const closeNonTerminalTab = React.useCallback(
+    (tabsetId: string, tab: TabType) => {
+      const prev = getBaseLayout();
+      const nextLayout = closeTabInTabset(prev, tabsetId, tab);
+      setLayout(() => nextLayout);
+      focusTerminalTab(getTabRevealedByClose(prev, nextLayout, tabsetId, tab));
+    },
+    [focusTerminalTab, getBaseLayout, setLayout]
+  );
+
   const { workspaceMetadata: allWorkspaceMetadata, loaded: workspaceMetadataLoaded } =
     workspaceMetadataContext;
 
@@ -1561,7 +1583,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // Keyboard shortcut for closing the focused pane's active tab, whatever its type
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (isDesktopViewportFocused(e.target)) return;
+      // Remote desktops and the interactive browser own their keystrokes, so Ctrl/Cmd+W
+      // reaches them (e.g. closes the controlled browser's page) instead of closing our tab.
+      if (isDesktopViewportFocused(e.target) || isBrowserViewportFocused(e.target)) return;
       if (!matchesKeybind(e, KEYBINDS.CLOSE_TAB)) return;
       // Always prevent platform default (Cmd/Ctrl+W closes window), even during dialogs.
       e.preventDefault();
@@ -1594,12 +1618,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       }
 
       // Static and New tabs: closing the last tab leaves the New tab.
-      setLayout((prev) => closeTabInTabset(prev, focusedTabset.id, activeTab));
+      closeNonTerminalTab(focusedTabset.id, activeTab);
     };
 
     window.addEventListener("keydown", handleKeyDown, { capture: true });
     return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
-  }, [api, focusActiveTerminal, handleCloseSideChat, layout, removeTerminalTab, setLayout]);
+  }, [api, closeNonTerminalTab, handleCloseSideChat, layout, removeTerminalTab]);
 
   // Sync terminal tabs with backend sessions on workspace mount.
   // - Adds tabs for backend sessions that don't have tabs (restore after reload)
@@ -1739,13 +1763,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     [setLayout]
   );
 
-  const handleCloseTab = React.useCallback(
-    (tabsetId: string, tab: TabType) => {
-      setLayout((prev) => closeTabInTabset(prev, tabsetId, tab));
-    },
-    [setLayout]
-  );
-
   // "+" in a strip (tabsetId) or the shortcut (focused tabset): show that tabset's New tab and
   // move focus into its launcher.
   const handleAddNewTab = React.useCallback(
@@ -1760,7 +1777,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   React.useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (!matchesKeybind(e, KEYBINDS.NEW_SIDEBAR_TAB)) return;
+      if (!matchesNewSidebarTabKeybind(e)) return;
       const container = sidebarContainerRef.current;
       if (
         // The narrow layout hides the sidebar; there is no strip to add a tab to.
@@ -2019,7 +2036,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         onAddNewTab={handleAddNewTab}
         onOpenToolFromNewTab={handleOpenToolFromNewTab}
         onOpenTerminalFromNewTab={handleOpenTerminalFromNewTab}
-        onCloseTab={handleCloseTab}
+        onCloseTab={closeNonTerminalTab}
         isOnlyTabset={layout.root.type === "tabset"}
         launcherTools={launcherTools}
         launcherAutoFocusTabsetId={launcherAutoFocusTabsetId}
