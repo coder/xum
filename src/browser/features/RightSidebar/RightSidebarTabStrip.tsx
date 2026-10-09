@@ -90,9 +90,12 @@ const SortableTab: React.FC<{
             className={cn(
               "group relative flex min-w-0 max-w-[240px] items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1 text-xs font-medium transition-colors duration-150",
               "cursor-grab touch-none active:cursor-grabbing",
-              // Only the selected tab keeps room for its X; elsewhere the X overlays the label's
-              // end on hover/focus, so idle tabs stay as compact as their label.
-              item.selected && item.closeLabel != null && item.onClose && "pr-6",
+              // Reserve the X's space even while hidden: hovering/focusing/selecting a tab must
+              // neither cover its text nor change its label width (especially for long titles).
+              // Reserve the existing mobile CSS's larger hit target too, so it can't cover text.
+              item.closeLabel != null &&
+                item.onClose &&
+                "pr-6 [@media(max-width:768px)_and_(pointer:coarse)]:min-h-11 [@media(max-width:768px)_and_(pointer:coarse)]:pr-12",
               item.selected
                 ? "bg-hover text-foreground"
                 : "bg-transparent text-muted hover:bg-hover/50 hover:text-foreground",
@@ -152,10 +155,9 @@ const SortableTab: React.FC<{
 
 /**
  * X button for tabs whose label has no close button of its own. Absolutely positioned so it
- * takes no room: the selected tab reserves padding for it, other tabs show it over the end of
- * the label on hover or keyboard focus (focus-within also covers the tab itself having focus,
- * so Tab reaches the X next). `invisible` rather than transparent: a hidden X must not catch
- * clicks (or taps) on the label.
+ * takes no room: all closeable tabs reserve the same padding for it, whether it is visible or
+ * not. Keyboard focus on the tab reveals the X before Tab reaches it. Touch shows it always,
+ * since touch users cannot hover. `invisible` keeps a hidden X from catching label clicks.
  */
 const TabCloseButton: React.FC<{
   label: string;
@@ -168,7 +170,7 @@ const TabCloseButton: React.FC<{
       "text-muted hover:text-foreground absolute right-1 top-1/2 -translate-y-1/2 rounded p-0.5",
       props.selected
         ? "bg-hover"
-        : "bg-hover invisible group-focus-within:visible group-hover:visible"
+        : "bg-hover invisible group-focus-within:visible group-hover:visible [@media(pointer:coarse)]:visible"
     )}
     onClick={(e) => {
       e.stopPropagation();

@@ -114,6 +114,7 @@ import {
   openTerminalPopout,
   type TerminalSessionCreateOptions,
 } from "@/browser/utils/terminal";
+import { SideChatTabTitle } from "./Tabs/TabLabels";
 import { ReviewAssistedStatsReporter } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
 import {
   NewTabLabel,
@@ -463,7 +464,15 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
         ? formatKeybind(keybinds[tabPosition])
         : undefined;
 
-    const tooltip = keybindStr;
+    const sideChatWorkspaceId = getSideChatTabWorkspaceId(tab);
+    const tooltip = sideChatWorkspaceId ? (
+      <>
+        <SideChatTabTitle workspaceId={sideChatWorkspaceId} />
+        {keybindStr && ` (${keybindStr})`}
+      </>
+    ) : (
+      keybindStr
+    );
 
     // Build label by delegating to the per-tab Label component declared in
     // the tab registry. Terminal tabs are special-cased (multi-instance label
@@ -485,8 +494,13 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           onClose={() => props.onCloseTerminal(tab)}
         />
       );
-    } else if (getSideChatTabWorkspaceId(tab) != null) {
-      label = <SideChatTabLabel onClose={() => props.onCloseSideChat(tab)} />;
+    } else if (sideChatWorkspaceId != null) {
+      label = (
+        <SideChatTabLabel
+          workspaceId={sideChatWorkspaceId}
+          onClose={() => props.onCloseSideChat(tab)}
+        />
+      );
     } else {
       label = tab;
     }

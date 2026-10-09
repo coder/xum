@@ -1,5 +1,5 @@
 /**
- * /side opens the side chat as a "Side chat" tab in the right sidebar: a second live chat pane
+ * /side opens a titled side chat tab in the right sidebar: a second live chat pane
  * next to the routed main chat. Drives the real app against the mock AI router.
  */
 
@@ -136,8 +136,11 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
 
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const sideChatId = await waitForSideChatId(app);
-      await waitFor(() => expect(getSidePane(app)).not.toBeNull());
+      await waitFor(() => expect(getSideComposer(app).value).toBe(""));
       expect(isStreaming(sideChatId)).toBe(false);
+      expect(await app.env.orpc.workspace.getInfo({ workspaceId: sideChatId })).toMatchObject({
+        pendingAutoTitle: true,
+      });
       await sendFrom(() => getSideComposer(app), sideChatId, sideQuestion);
 
       // The side pane streams the inherited history plus its own turn while the main chat
@@ -153,9 +156,15 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
         { timeout: 30_000 }
       );
       expect(decodeURIComponent(window.location.pathname)).toBe(`/workspace/${app.workspaceId}`);
-      expect(
-        app.view.container.querySelector(`[role="tab"][id$="-tab-side:${sideChatId}"]`)
-      ).not.toBeNull();
+      // Titles are live metadata, not a fixed "Side chat" label or the main chat's title.
+      const title = "Understanding the cache behavior";
+      await app.env.orpc.workspace.updateTitle({ workspaceId: sideChatId, title });
+      await waitFor(() => {
+        expect(
+          app.view.container.querySelector(`[role="tab"][id$="-tab-side:${sideChatId}"]`)
+            ?.textContent
+        ).toContain(title);
+      });
 
       // Both chats are on screen: the main transcript (without the side turn) and two composers.
       const mainTranscript = Array.from(
