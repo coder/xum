@@ -140,4 +140,12 @@ describe("PRStackBadge", () => {
     fireEvent.mouseDown(document.body);
     expect(view.queryByRole("menu")).toBeNull();
   });
+
+  it("stays open while a row is pressed so its link click can land", () => {
+    const view = render(<PRStackBadge stack={STACK} />);
+    fireEvent.click(view.getByRole("button", { name: "View stack with 3 branches" }));
+
+    fireEvent.mouseDown(view.getAllByTestId("stack-branch-row")[0]);
+    expect(view.queryByRole("menu")).not.toBeNull();
+  });
 });
