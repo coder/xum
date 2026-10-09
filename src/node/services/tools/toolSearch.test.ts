@@ -9,10 +9,12 @@ import { applyCacheControlToTools } from "@/common/utils/ai/cacheStrategy";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import {
   applyNativeToolSearchReplay,
+  extractPreActivatedToolNames,
   LEGACY_TOOL_SEARCH_TOOL_NAME,
   NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS,
   normalizeLegacyToolSearchMessages,
   prepareToolSearch,
+  TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS,
   TOOL_SEARCH_TOOL_NAME,
   type ToolSearchRuntime,
 } from "@/common/utils/tools/toolCatalog";
@@ -97,9 +99,10 @@ describe("tool catalog search provider compatibility", () => {
 
 describe("tool catalog search native Anthropic deferred loading (#5262)", () => {
   const mcpNames = ["zulip_list_channels", "zulip_send_message"];
-  // Large enough for native deferral (#5405); neutral prose keeps search scoring unchanged.
+  // Large enough in aggregate for native deferral (#5405) while each definition
+  // stays under the keyword auto-load cap; neutral prose keeps scoring unchanged.
   const filler = " Lorem ipsum dolor sit amet.".repeat(
-    Math.ceil(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS / 28)
+    Math.ceil(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS / 2 / 28)
   );
 
   function nativeTools(runtime: ToolSearchRuntime) {
@@ -115,7 +118,10 @@ describe("tool catalog search native Anthropic deferred loading (#5262)", () => 
           description: `List channels.${filler}`,
           inputSchema: z.object({}),
         }),
-        zulip_send_message: tool({ description: "Send a message", inputSchema: z.object({}) }),
+        zulip_send_message: tool({
+          description: `Send a message.${filler}`,
+          inputSchema: z.object({}),
+        }),
       },
       mcpToolNames: mcpNames,
       promptCacheActive: true,
@@ -243,5 +249,87 @@ describe("tool catalog search native Anthropic deferred loading (#5262)", () => 
     });
     const replayed = toolResultOf(bodies[2]);
     expect(JSON.stringify(replayed?.content)).toBe(JSON.stringify(liveResult?.content));
+  });
+});
+
+describe("tool catalog search oversized auto-load guard", () => {
+  const bigFiller = "x".repeat(TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS + 1);
+  // Keeps the aggregate over the native deferral gate (#5405) while this
+  // definition stays under the auto-load cap.
+  const smallFiller = "y".repeat(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS - bigFiller.length);
+
+  function guardTools(runtime: ToolSearchRuntime) {
+    const prepared = prepareToolSearch({
+      tools: {
+        [TOOL_SEARCH_TOOL_NAME]: createToolSearchTool({
+          ...createTestToolConfig(os.tmpdir()),
+          toolSearchRuntime: runtime,
+        }),
+        zulip_megatool: tool({
+          description: `Send a message.${bigFiller}`,
+          inputSchema: z.object({}),
+        }),
+        zulip_send_message: tool({
+          description: `Send a message.${smallFiller}`,
+          inputSchema: z.object({}),
+        }),
+      },
+      mcpToolNames: ["zulip_megatool", "zulip_send_message"],
+      promptCacheActive: true,
+    });
+    runtime.state = prepared.state;
+    return prepared.tools;
+  }
+
+  const options = { toolCallId: "call-1", messages: [], context: undefined };
+
+  test("a keyword search matching an oversized tool loads nothing anywhere", async () => {
+    const runtime: ToolSearchRuntime = {};
+    const searchTool = guardTools(runtime)[TOOL_SEARCH_TOOL_NAME];
+    const output: unknown = await searchTool.execute!({ query: "send zulip message" }, options);
+    expect(output).toMatchObject({
+      matches: [],
+      discovery: {
+        candidates: [{ name: "zulip_send_message" }, { name: "zulip_megatool", oversized: true }],
+      },
+    });
+    // Nothing activated now, and nothing re-activated from a restart replay.
+    expect(runtime.state!.activatedToolNames.size).toBe(0);
+    const persisted: unknown = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "call-1",
+          toolName: TOOL_SEARCH_TOOL_NAME,
+          output: { type: "json", value: output },
+        },
+      ],
+    };
+    expect(extractPreActivatedToolNames([persisted as ModelMessage]).size).toBe(0);
+    // Native mode sends the discovery result as text, never as references.
+    const modelOutput: unknown = await searchTool.toModelOutput!({
+      toolCallId: "call-1",
+      input: {},
+      output,
+    });
+    expect(modelOutput).toEqual({ type: "text", value: JSON.stringify(output) });
+  });
+
+  test("an exact-name query loads the oversized tool", async () => {
+    const runtime: ToolSearchRuntime = {};
+    const searchTool = guardTools(runtime)[TOOL_SEARCH_TOOL_NAME];
+    const output: unknown = await searchTool.execute!({ query: "zulip_megatool" }, options);
+    expect(output).toMatchObject({ matches: [{ name: "zulip_megatool" }] });
+    expect([...runtime.state!.activatedToolNames]).toEqual(["zulip_megatool"]);
+    const modelOutput: unknown = await searchTool.toModelOutput!({
+      toolCallId: "call-1",
+      input: {},
+      output,
+    });
+    expect(modelOutput).toMatchObject({
+      type: "content",
+      value: [{ providerOptions: { anthropic: { toolName: "zulip_megatool" } } }],
+    });
   });
 });

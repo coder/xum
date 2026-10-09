@@ -16,8 +16,11 @@ import {
   normalizeLegacyToolSearchMessages,
   prepareToolSearch,
   rebuildToolSearchState,
+  resolveToolSearchQuery,
   searchToolCatalog,
   seedToolSearchActivationsFromMessages,
+  TOOL_SEARCH_DISCOVERY_NOTE,
+  TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS,
   TOOL_SEARCH_TOOL_NAME,
   type ToolCatalogEntry,
   type ToolSearchStreamState,
@@ -804,6 +807,72 @@ describe("searchToolCatalog", () => {
 
   test("empty query returns nothing", () => {
     expect(searchToolCatalog(catalog, "   ")).toEqual([]);
+  });
+});
+
+describe("resolveToolSearchQuery (oversized auto-load guard)", () => {
+  const bigChars = TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS + 1;
+  const catalog: ToolCatalogEntry[] = [
+    {
+      name: "slack_send_message",
+      description: "Send a message to a channel",
+      paramText: "",
+      definitionChars: 900,
+    },
+    {
+      name: "notion_query_everything",
+      description: "Query anything, send any message",
+      paramText: "",
+      definitionChars: bigChars,
+    },
+  ];
+
+  test("a keyword search without an oversized match behaves exactly like searchToolCatalog", () => {
+    const resolved = resolveToolSearchQuery(catalog, "slack channel", 5);
+    expect(resolved.matches).toEqual(searchToolCatalog(catalog, "slack channel", 5));
+    expect(resolved.matches.map((match) => match.name)).toEqual(["slack_send_message"]);
+    expect(resolved.discovery).toBeUndefined();
+  });
+
+  test("an oversized weak match flips the result to discovery: nothing loads, all candidates listed", () => {
+    const resolved = resolveToolSearchQuery(catalog, "send message", null);
+    expect(resolved.matches).toEqual([]);
+    expect(resolved.discovery?.note).toBe(TOOL_SEARCH_DISCOVERY_NOTE);
+    // All ranked candidates, in rank order, so nothing is silently skipped.
+    expect(resolved.discovery?.candidates.map((candidate) => candidate.name)).toEqual(
+      searchToolCatalog(catalog, "send message", null).map((match) => match.name)
+    );
+    const oversized = resolved.discovery?.candidates.find(
+      (candidate) => candidate.name === "notion_query_everything"
+    );
+    expect(oversized?.oversized).toBe(true);
+    expect(oversized?.approxTokens).toBe(Math.round(bigChars / 2.7));
+    const small = resolved.discovery?.candidates.find(
+      (candidate) => candidate.name === "slack_send_message"
+    );
+    expect(small?.oversized).toBeUndefined();
+    expect(small?.approxTokens).toBe(Math.round(900 / 2.7));
+  });
+
+  test("an exact-name query loads just that tool, any size, skipping ranking and the guard", () => {
+    const resolved = resolveToolSearchQuery(catalog, "  Notion_Query_Everything  ", null);
+    expect(resolved.matches.map((match) => match.name)).toEqual(["notion_query_everything"]);
+    expect(resolved.discovery).toBeUndefined();
+    // Exact lookup skips ranking: a fuzzy search for this name would also
+    // match the oversized tool (its description shares the tokens) and flip
+    // to discovery; the exact name returns the one tool alone.
+    const small = resolveToolSearchQuery(catalog, "  Slack_Send_Message  ", null);
+    expect(small.matches.map((match) => match.name)).toEqual(["slack_send_message"]);
+    expect(small.discovery).toBeUndefined();
+  });
+
+  test("entries without a recorded definition size are never guarded", () => {
+    const legacy: ToolCatalogEntry[] = [
+      { name: "mystery_tool", description: "does mysterious things", paramText: "" },
+    ];
+    const resolved = resolveToolSearchQuery(legacy, "mysterious", null);
+    expect(resolved.matches.map((match) => match.name)).toEqual(["mystery_tool"]);
+    expect(resolved.discovery).toBeUndefined();
   });
 });
 

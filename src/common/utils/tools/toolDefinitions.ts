@@ -3877,7 +3877,10 @@ CREATE TABLE IF NOT EXISTS delegation_rollups (
       "they exist but their definitions are not loaded in your tool list. " +
       "Call tool_catalog_search with task/capability keywords to load matching tools; they become callable on the next step. " +
       "Do not call a deferred tool before a search has loaded it, because its parameters are unknown until then. " +
-      "If a tool you need was not loaded, refine the query (a search may not return every matching deferred tool).",
+      "If a tool you need was not loaded, refine the query (a search may not return every matching deferred tool). " +
+      "A query that is exactly one tool's full name loads just that tool, regardless of its size. " +
+      "A keyword search that matches an oversized tool definition loads nothing and instead lists the ranked candidates " +
+      "with approximate token sizes; re-search with the exact name of each tool you want.",
     schema: z
       .object({
         query: z

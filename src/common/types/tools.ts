@@ -518,6 +518,23 @@ export interface ToolSearchToolResult {
   matches: Array<{ name: string; description: string; serverName?: string }>;
   /** Total deferred-catalog size, so the model/UI can see there are more undiscovered tools. */
   totalDeferred: number;
+  /**
+   * Present when an oversized definition kept a keyword search from
+   * auto-loading. Nothing was loaded (`matches` is empty, so activation and
+   * replay seeding skip the result by construction); the ranked candidates are
+   * listed, with approximate wire-token sizes, for an explicit exact-name
+   * re-search. Inline type literals (like `matches`) keep the result
+   * JSONValue-assignable for scoped-mode toModelOutput.
+   */
+  discovery?: {
+    candidates: Array<{
+      name: string;
+      serverName?: string;
+      approxTokens: number;
+      oversized?: true;
+    }>;
+    note: string;
+  };
 }
 
 // Notify Tool Types
