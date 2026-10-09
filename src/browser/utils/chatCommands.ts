@@ -64,7 +64,11 @@ import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import type { ChatAttachment } from "../features/ChatInput/ChatAttachments";
 import { dispatchWorkspaceSwitch } from "./workspaceEvents";
 import { copyWorkspaceStorage } from "@/browser/utils/workspaceStorage";
-import { snapshotPendingAiSelection } from "@/browser/utils/aiSelectionIntent";
+import {
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSendOptions,
+  snapshotPendingAiSelection,
+} from "@/browser/utils/aiSelectionIntent";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
@@ -166,12 +170,23 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   const startMessage = options.startMessage;
   const sendMessageOptions = options.sendMessageOptions;
   if (startMessage && sendMessageOptions) {
+    const forkId = result.metadata.id;
+    const agentId = sendMessageOptions.agentId;
     requestAnimationFrame(() => {
+      // Like a composer send, the start message saves the copied picks it carries, so they end.
+      const { attachedTokens } = getAiSelectionIntentForSendOptions(
+        forkId,
+        agentId,
+        sendMessageOptions
+      );
       client.workspace
         .sendMessage({
-          workspaceId: result.metadata.id,
+          workspaceId: forkId,
           message: startMessage,
           options: sendMessageOptions,
+        })
+        .then((sent) => {
+          if (sent.success) consumeAiSelectionIntent(forkId, agentId, attachedTokens);
         })
         .catch(() => {
           // Best-effort: the user can send the message manually if this fails.

@@ -13290,6 +13290,12 @@ export class WorkspaceService
     // preserves any previously stored value instead of wiping it.
     const reasoningMode = options?.reasoningMode;
 
+    // Clients hide Auto while the experiment is off, so such a send carries no Auto choice
+    // and the merge keeps the saved ones.
+    if (!this.isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING)) {
+      return { model, thinkingLevel, ...(reasoningMode != null ? { reasoningMode } : {}) };
+    }
+
     return {
       model,
       thinkingLevel,

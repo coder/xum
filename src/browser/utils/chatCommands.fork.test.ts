@@ -137,4 +137,42 @@ describe("forkWorkspace", () => {
     // The backend built the fork from the source's settings before that send saved them.
     expect(getWorkspaceAiSelection(FORK_ID, "exec").model).toBe(MODEL);
   });
+
+  test("the fork's start message ends the copied picks it saves", async () => {
+    const MODEL = "openai:gpt-5.2";
+    const LATER_MODEL = "anthropic:claude-sonnet-4-5";
+    let resolveSent!: () => void;
+    const sent = new Promise<void>((resolve) => {
+      resolveSent = resolve;
+    });
+    const client = createTestApiClient({
+      workspace: {
+        fork: () => Promise.resolve(FORKED),
+        getInfo: () => Promise.resolve(FORK_METADATA),
+        sendMessage: () => {
+          resolveSent();
+          return Promise.resolve({ success: true as const, data: {} });
+        },
+      },
+    });
+    markAiSelectionIntent(SOURCE_ID, "model", MODEL);
+
+    await forkWorkspace({
+      client,
+      sourceWorkspaceId: SOURCE_ID,
+      startMessage: "continue here",
+      sendMessageOptions: { model: MODEL, thinkingLevel: "off", agentId: "exec" },
+    });
+    await sent;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const saveForkModel = (model: string) =>
+      setWorkspaceAiMetadata(FORK_ID, {
+        aiSettingsByAgent: { exec: { model, thinkingLevel: "off" } },
+      });
+    saveForkModel(MODEL);
+    // Another window's later change shows through.
+    saveForkModel(LATER_MODEL);
+
+    expect(getWorkspaceAiSelection(FORK_ID, "exec").model).toBe(LATER_MODEL);
+  });
 });

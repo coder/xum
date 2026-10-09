@@ -751,6 +751,20 @@ describe("GeneralSection", () => {
     });
   });
 
+  test("a failed full-width save shows the saved value again", async () => {
+    const setup = renderGeneralSection({ chatTranscriptFullWidth: true });
+    const toggle = setup.view.getByRole("switch", { name: "Toggle full-width chat transcript" });
+    await settleMountLoads(setup);
+    setup.updateChatTranscriptFullWidthMock.mockRejectedValueOnce(new Error("config write failed"));
+
+    fireEvent.click(toggle);
+
+    await waitFor(() =>
+      expect(setup.updateChatTranscriptFullWidthMock).toHaveBeenCalledWith({ enabled: false })
+    );
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+  });
+
   test("the full-width toggle shows the shared config store value", async () => {
     // The transcript reads the store, so the switch must not show a value from its own read.
     const setup = renderGeneralSection({ chatTranscriptFullWidth: true });

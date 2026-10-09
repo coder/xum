@@ -10,7 +10,7 @@ import {
 import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
 import {
-  getAppConfigStore,
+  saveConfigOptimistically,
   updateUserPreferences,
   useUserPreferences,
 } from "@/browser/stores/AppConfigStore";
@@ -433,20 +433,14 @@ export function GeneralSection() {
   );
 
   const handleChatTranscriptFullWidthChange = (checked: boolean) => {
-    getAppConfigStore().updateOptimistically({ chatTranscriptFullWidth: checked });
-
-    if (!api?.config?.updateChatTranscriptFullWidth) {
-      return;
-    }
-
-    chatTranscriptFullWidthUpdateChainRef.current = chatTranscriptFullWidthUpdateChainRef.current
-      .catch(() => {
-        // Best-effort only.
-      })
-      .then(() => api.config.updateChatTranscriptFullWidth({ enabled: checked }))
-      .catch(() => {
-        // Best-effort persistence.
-      });
+    saveConfigOptimistically(api ?? null, { chatTranscriptFullWidth: checked }, (client) => {
+      // Chained so a quick toggle back cannot land before the toggle it reverses.
+      const update = chatTranscriptFullWidthUpdateChainRef.current.then(() =>
+        client.config.updateChatTranscriptFullWidth({ enabled: checked })
+      );
+      chatTranscriptFullWidthUpdateChainRef.current = update.catch(() => undefined);
+      return update;
+    });
   };
 
   const handleLlmDebugLogsChange = (checked: boolean) => {
