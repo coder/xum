@@ -151,7 +151,7 @@ import {
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
 } from "./workspace";
-import { WorkspaceAISettingsSchema } from "./workspaceAiSettings";
+import { WorkspaceAgentAISettingsSchema, WorkspaceAISettingsSchema } from "./workspaceAiSettings";
 import { AgentSkillListResultSchema, AgentSkillPackageSchema, SkillNameSchema } from "./agentSkill";
 import {
   AvailableWorkflowSchema,
@@ -1793,7 +1793,7 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       agentId: AgentIdSchema,
-      aiSettings: WorkspaceAISettingsSchema,
+      aiSettings: WorkspaceAgentAISettingsSchema,
       persistSelectedAgentId: z.boolean().nullish(),
     }),
     output: ResultSchema(z.void(), z.string()),
