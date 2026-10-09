@@ -1015,11 +1015,7 @@ function nativeToolReferenceName(item: unknown): string | undefined {
  * wherever final per-request messages are produced (history pipeline and
  * per-step transforms), keeping live and replayed requests byte-identical.
  */
-export function dedupeNativeToolReferences(
-  messages: ModelMessage[],
-  /** Invoked per projected result so per-step callers can undo it at a prefix swap. */
-  onProject?: (projected: NativeToolSearchResultPart, raw: NativeToolSearchResultPart) => void
-): ModelMessage[] {
+export function dedupeNativeToolReferences(messages: ModelMessage[]): ModelMessage[] {
   const seen = new Set<string>();
   let anyChanged = false;
   const deduped = messages.map((message) => {
@@ -1035,30 +1031,24 @@ export function dedupeNativeToolReferences(
       ) {
         return part;
       }
-      const kept: typeof part.output.value = [];
-      const dropped: string[] = [];
-      for (const item of part.output.value) {
+      let partChanged = false;
+      const value = part.output.value.map((item) => {
         const name = nativeToolReferenceName(item);
-        if (name !== undefined && seen.has(name)) {
-          dropped.push(name);
-          continue;
+        if (name === undefined) {
+          return item;
         }
-        if (name !== undefined) {
-          seen.add(name);
+        if (seen.has(name)) {
+          partChanged = true;
+          return { type: "text" as const, text: `${NATIVE_TOOL_REFERENCE_DEDUPED_PREFIX}${name}` };
         }
-        kept.push(item);
-      }
-      if (dropped.length === 0) {
+        seen.add(name);
+        return item;
+      });
+      if (!partChanged) {
         return part;
       }
       changed = true;
-      const output: ToolResultOutput =
-        kept.length > 0
-          ? { type: "content", value: kept }
-          : { type: "text", value: `All matched tools are already loaded: ${dropped.join(", ")}` };
-      const projected = { ...part, output };
-      onProject?.(projected, part);
-      return projected;
+      return { ...part, output: { type: "content" as const, value } };
     });
     if (!changed) {
       return message;
@@ -1069,28 +1059,35 @@ export function dedupeNativeToolReferences(
   return anyChanged ? deduped : messages;
 }
 
-export type NativeToolSearchResultPart = Extract<
-  ToolModelMessage["content"][number],
-  { type: "tool-result" }
->;
+/**
+ * Marker left in place of a deduped duplicate `tool_reference`. The projection
+ * must stay invertible from the transcript alone: the AI SDK carries returned
+ * (projected) messages into later steps and across fallback restarts, and a
+ * prefix swap can drop the occurrence the projection kept, so the swap path
+ * re-derives raw references from these markers (unprojectNativeToolReferences)
+ * with no per-run state to lose or collide.
+ */
+export const NATIVE_TOOL_REFERENCE_DEDUPED_PREFIX = "Tool already loaded above: ";
+
+/** Tool name of a dedupe marker item, undefined for anything else. */
+function dedupedReferenceMarkerName(item: unknown): string | undefined {
+  return isPlainRecord(item) &&
+    item.type === "text" &&
+    typeof item.text === "string" &&
+    item.text.startsWith(NATIVE_TOOL_REFERENCE_DEDUPED_PREFIX)
+    ? item.text.slice(NATIVE_TOOL_REFERENCE_DEDUPED_PREFIX.length)
+    : undefined;
+}
 
 /**
- * Swap-time undo of the dedupe projection: substitute each carried projected
- * tool-search result with its recorded raw form so a prefix swap that drops a
- * reference's first occurrence can keep the tool loaded through a retained
- * duplicate. `projections` maps JSON of a projected part to its raw form
- * (recorded via dedupe's `onProject`); matching on the serialized projection,
- * not the reusable toolCallId, keeps unrelated results that happen to share an
- * ID untouched. Callers re-run dedupeNativeToolReferences on the swapped
- * transcript, which re-projects whatever is still a repeat.
+ * Inverse of the dedupe projection: convert its markers back into raw
+ * `tool_reference` items so a prefix swap re-decides every reference against
+ * the swapped transcript (dedupeNativeToolReferences then re-projects whatever
+ * is still a repeat). Applied only to in-memory step arrays mux itself
+ * produced: markers never reach disk, and persisted results replay as raw
+ * matches, so crafted history cannot inject references through this path.
  */
-export function restoreProjectedToolSearchResults(
-  messages: ModelMessage[],
-  projections: ReadonlyMap<string, NativeToolSearchResultPart>
-): ModelMessage[] {
-  if (projections.size === 0) {
-    return messages;
-  }
+export function unprojectNativeToolReferences(messages: ModelMessage[]): ModelMessage[] {
   let anyChanged = false;
   const restored = messages.map((message) => {
     if (message.role !== "tool") {
@@ -1098,15 +1095,30 @@ export function restoreProjectedToolSearchResults(
     }
     let changed = false;
     const content: ToolModelMessage["content"] = message.content.map((part) => {
-      if (part.type !== "tool-result" || !isMuxToolSearchName(part.toolName)) {
+      if (
+        part.type !== "tool-result" ||
+        !isMuxToolSearchName(part.toolName) ||
+        part.output.type !== "content"
+      ) {
         return part;
       }
-      const raw = projections.get(JSON.stringify(part));
-      if (raw === undefined) {
+      let partChanged = false;
+      const value = part.output.value.map((item) => {
+        const name = dedupedReferenceMarkerName(item);
+        if (name === undefined) {
+          return item;
+        }
+        partChanged = true;
+        return {
+          type: "custom" as const,
+          providerOptions: { anthropic: { type: "tool-reference", toolName: name } },
+        };
+      });
+      if (!partChanged) {
         return part;
       }
       changed = true;
-      return raw;
+      return { ...part, output: { type: "content" as const, value } };
     });
     if (!changed) {
       return message;

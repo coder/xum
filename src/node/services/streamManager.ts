@@ -114,8 +114,7 @@ import {
   computeContextLoadedToolNames,
   dedupeNativeToolReferences,
   computeLoadedToolNames,
-  restoreProjectedToolSearchResults,
-  type NativeToolSearchResultPart,
+  unprojectNativeToolReferences,
   type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
 import { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
@@ -2982,21 +2981,7 @@ export class StreamManager {
     // #5086: see the `between_tools` replay guard in prepareStep.
     let previousToolSetKey: string | undefined;
     let seenPrefixSwap: ContinuousPrefixSwap | undefined;
-    // Tool-search projections made by this run's steps, keyed by JSON of the
-    // projected part. The reference dedupe below projects repeats out of the
-    // returned messages the SDK carries forward, so a later prefix swap
-    // restores the raw forms from here. Values are chain-compressed to the
-    // fully raw part: a projection's input may itself be an earlier projection.
-    const toolSearchProjections = new Map<string, NativeToolSearchResultPart>();
-    const recordToolSearchProjection = (
-      projected: NativeToolSearchResultPart,
-      raw: NativeToolSearchResultPart
-    ) => {
-      toolSearchProjections.set(
-        JSON.stringify(projected),
-        toolSearchProjections.get(JSON.stringify(raw)) ?? raw
-      );
-    };
+
     // Outgoing rows before this index predate the latest in-turn prefix change.
     let reasoningReplayBoundary = 0;
     // XUM_DISABLE_AGENT_TOOLS=1 sends no tools at all (see isAgentToolsDisabled). Every chat
@@ -3052,13 +3037,11 @@ export class StreamManager {
         }
         const swap = stepTracker?.pendingPrefixSwap;
         if (swap && stepTracker?.workspaceId) {
-          // Swap from the raw results: the carried tail may hold a projected
-          // repeat whose first occurrence the swap is about to drop, and only
-          // the raw form lets the post-swap dedupe keep that tool loaded.
-          const swapped = this.swapPrefix(
-            restoreProjectedToolSearchResults(effectiveMessages, toolSearchProjections),
-            swap
-          );
+          // Swap from the raw references: the carried tail may hold a
+          // projected repeat whose first occurrence the swap is about to drop,
+          // and only the raw form lets the post-swap dedupe keep that tool
+          // loaded. The markers carry everything needed to invert.
+          const swapped = this.swapPrefix(unprojectNativeToolReferences(effectiveMessages), swap);
           if (swapped) {
             const store = this.historyService.getContinuousCompactionJournal(
               stepTracker.workspaceId
@@ -3093,10 +3076,7 @@ export class StreamManager {
         // projection is decided against, and the SDK accumulates the next step's
         // input from these returned messages, so a reference dropped against a
         // swapped-out prefix would stay lost for the rest of the turn.
-        effectiveMessages = dedupeNativeToolReferences(
-          effectiveMessages,
-          recordToolSearchProjection
-        );
+        effectiveMessages = dedupeNativeToolReferences(effectiveMessages);
         if (stepTracker) {
           stepTracker.latestMessages = effectiveMessages;
         }
@@ -3168,8 +3148,7 @@ export class StreamManager {
             );
             // Same per-step transforms the construction-time messages receive.
             rebuiltFirstStepMessages = dedupeNativeToolReferences(
-              await transformStepMessages(rebuilt),
-              recordToolSearchProjection
+              await transformStepMessages(rebuilt)
             );
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
