@@ -33,6 +33,7 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import assert from "@/common/utils/assert";
+import { dedupeNativeToolReferences } from "@/common/utils/tools/toolCatalog";
 import { replaceOrAppendMessageById } from "@/node/services/aiService";
 import { assemblePromptPayload } from "@/node/services/turnContextAssembler";
 import { parseModelString } from "@/node/services/providerModelFactory";
@@ -181,8 +182,9 @@ export async function captureLanguageModelPrompt(params: {
       // prepareStep — they run on step 0 too, so the recorded prompt
       // includes them.
       const withoutWorkflowRunRecords = stripWorkflowRunRecordsFromModelMessages(stepMessages);
-      const rewritten =
-        await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords);
+      const rewritten = dedupeNativeToolReferences(
+        await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords)
+      );
       return rewritten === stepMessages ? undefined : { messages: rewritten };
     },
   });

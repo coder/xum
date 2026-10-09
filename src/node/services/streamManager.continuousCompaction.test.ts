@@ -18,6 +18,7 @@ import {
   ContinuousCompactionJournalSchema,
   type ContinuousCompactionJournal,
 } from "@/common/orpc/schemas/continuousCompaction";
+import { countToolReferences } from "@/common/utils/tools/toolCatalog";
 import type { StreamManager, TurnEngineEvent, TurnExecutionOptions } from "./streamManager";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import { prepareStepForTests, type PreparedStepForTests } from "./streamManager.suite.testHarness";
@@ -557,6 +558,79 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(await run(result.messages, 2)).toBeUndefined();
     expect(write).not.toHaveBeenCalled();
     expect(latestMessages()).toEqual(result.messages);
+  });
+
+  const searchResult = (toolCallId: string): ai.ModelMessage => {
+    const raw: unknown = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId,
+          toolName: "tool_catalog_search",
+          output: {
+            type: "content",
+            value: [
+              {
+                type: "custom",
+                providerOptions: {
+                  anthropic: { type: "tool-reference", toolName: "zulip_send_message" },
+                },
+              },
+            ],
+          },
+        },
+      ],
+    };
+    return raw as ai.ModelMessage;
+  };
+  const withRepeatedReference = (): ai.ModelMessage[] => [
+    ...originalMessages.slice(0, 3),
+    {
+      role: "assistant",
+      content: [{ type: "tool-call", toolCallId: "old-search", toolName: "bash", input: {} }],
+    },
+    searchResult("old-search"),
+    ...originalMessages.slice(3),
+    searchResult("keep"),
+  ];
+
+  it("dedupes native tool_references against the swapped prefix, not the dropped one", async () => {
+    // The only earlier reference to the tool lives in the dropped prefix; the
+    // retained tail repeats it. Deduping before the swap would project the tail
+    // against the dropped prefix and lose the turn's only surviving reference.
+    const { run, swapState } = await setupLiveSwap();
+    const result = await run(withRepeatedReference());
+    assert(result?.messages, "Expected swapped messages");
+    expect(swapState()).toBe("consumed");
+    const references = JSON.stringify(result.messages).match(/"tool-reference"/g);
+    expect(references).toHaveLength(1);
+    expect(JSON.stringify(result.messages)).not.toContain("old-search");
+  });
+
+  it("restores a reference projected on an earlier step when the swap drops its anchor", async () => {
+    // The dedupe projection is request-only, but the SDK accumulates the next
+    // step's input from the returned (projected) messages. A later swap that
+    // drops the first occurrence must fall back to the retained result's raw
+    // reference, not the carried projection that already removed it.
+    const fixture = await setup();
+    const turn = await startLiveTurn();
+    const first = await turn.run(withRepeatedReference());
+    assert(first?.messages, "Expected deduped messages");
+    // Count wire references via outputs: the projected result's stash keeps
+    // the raw reference bytes in providerOptions, off the wire.
+    expect([...countToolReferences(first.messages).values()]).toEqual([1]);
+    expect(turn.manager.setPrefixSwap(workspaceId, fixture.swap)).toBe(true);
+    // The SDK carries the projected first-step messages into the next step.
+    const second = await turn.run(first.messages, 2);
+    assert(second?.messages, "Expected swapped messages");
+    expect(turn.swapState()).toBe("consumed");
+    const references = JSON.stringify(second.messages).match(/"tool-reference"/g) ?? [];
+    expect(references).toHaveLength(1);
+    expect(JSON.stringify(second.messages)).not.toContain("old-search");
+    // The retained bash result reuses the search result's toolCallId ("keep");
+    // restoration must match the projected occurrence, not the reusable ID.
+    expect(JSON.stringify(second.messages)).toContain("kept output");
   });
 
   it.each([

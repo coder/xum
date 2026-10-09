@@ -8,6 +8,8 @@ import {
   buildToolCatalogOverview,
   buildToolSearchModelOutput,
   collectDeferLoadingToolNames,
+  dedupeNativeToolReferences,
+  unprojectNativeToolReferences,
   computeActiveToolNames,
   computeLoadedToolNames,
   extractPreActivatedToolNames,
@@ -1077,6 +1079,240 @@ describe("native tool search model output", () => {
     expect(replayed[1]).toBe(messages[1]);
     const scoped = [searchResultMessage({ type: "json", value: result })];
     expect(applyNativeToolSearchReplay(scoped, new Set())).toBe(scoped);
+  });
+});
+
+describe("dedupeNativeToolReferences", () => {
+  const reference = (toolName: string) => ({
+    type: "custom" as const,
+    providerOptions: { anthropic: { type: "tool-reference", toolName } },
+  });
+  const referencesOutput = (...names: string[]) => ({
+    type: "content" as const,
+    value: names.map(reference),
+  });
+
+  function searchResultMessage(
+    toolCallId: string,
+    output: unknown,
+    toolName = TOOL_SEARCH_TOOL_NAME
+  ): ModelMessage {
+    const raw: unknown = {
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId, toolName, output }],
+    };
+    return raw as ModelMessage;
+  }
+
+  /** Expected shape of a projected result: new output plus the raw stash. */
+  function projectedSearchResult(toolCallId: string, output: unknown, raw: unknown): ModelMessage {
+    const value: unknown = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId,
+          toolName: TOOL_SEARCH_TOOL_NAME,
+          output,
+          providerOptions: { mux: { rawToolSearchOutput: JSON.stringify(raw) } },
+        },
+      ],
+    };
+    return value as ModelMessage;
+  }
+
+  test("a fully repeated search projects to a deterministic text result", () => {
+    const messages = [
+      searchResultMessage("call-1", referencesOutput("alpha", "beta")),
+      searchResultMessage("call-2", referencesOutput("beta", "alpha")),
+    ];
+    const deduped = dedupeNativeToolReferences(messages);
+    expect(deduped[0]).toBe(messages[0]);
+    // Structural contract, not generated copy: a text status naming both
+    // repeats, no remaining references, and the raw stash for the swap path.
+    const message = deduped[1];
+    if (message.role !== "tool") throw new Error("Expected a tool message");
+    const part = message.content[0];
+    if (part.type !== "tool-result") throw new Error("Expected a tool result");
+    const output = part.output;
+    if (output.type !== "text") throw new Error("Expected a text projection");
+    expect(output.value).toContain("beta");
+    expect(output.value).toContain("alpha");
+    expect(part.providerOptions?.mux?.rawToolSearchOutput).toBe(
+      JSON.stringify(referencesOutput("beta", "alpha"))
+    );
+    // Deterministic: a second application projects the same bytes.
+    expect(JSON.stringify(dedupeNativeToolReferences(messages))).toBe(JSON.stringify(deduped));
+  });
+
+  test("unprojectNativeToolReferences inverts a full projection byte-exactly", () => {
+    const messages = [
+      searchResultMessage("call-1", referencesOutput("alpha", "beta")),
+      searchResultMessage("call-2", referencesOutput("beta", "alpha")),
+      searchResultMessage("call-3", referencesOutput("beta")),
+    ];
+    const deduped = dedupeNativeToolReferences(messages);
+    expect(JSON.stringify(unprojectNativeToolReferences(deduped))).toBe(JSON.stringify(messages));
+    // Stash-free arrays keep their identity.
+    expect(unprojectNativeToolReferences(messages)).toBe(messages);
+  });
+
+  test("unprojectNativeToolReferences inverts a mixed projection byte-exactly", () => {
+    // The mixed result keeps its new reference on the wire, yet the swap path
+    // must still recover the dropped repeat from the stash.
+    const messages = [
+      searchResultMessage("call-1", referencesOutput("alpha")),
+      searchResultMessage("call-2", referencesOutput("alpha", "beta")),
+    ];
+    const deduped = dedupeNativeToolReferences(messages);
+    expect(JSON.stringify(unprojectNativeToolReferences(deduped))).toBe(JSON.stringify(messages));
+  });
+
+  test("each projected occurrence restores its own references, even under reused toolCallIds", () => {
+    // Restoration is a pure function of the part itself, so two results that
+    // share a reused toolCallId can never restore each other's content.
+    const first = searchResultMessage("dup", referencesOutput("alpha", "beta"));
+    const second = searchResultMessage("dup", referencesOutput("beta", "alpha"));
+    const deduped = dedupeNativeToolReferences([first, second]);
+    expect(JSON.stringify(unprojectNativeToolReferences([deduped[1]])[0])).toBe(
+      JSON.stringify(second)
+    );
+    expect(JSON.stringify(unprojectNativeToolReferences([deduped[0]])[0])).toBe(
+      JSON.stringify(first)
+    );
+  });
+
+  test("a mixed result drops repeats: text beside retained references is rejected", () => {
+    const messages = [
+      searchResultMessage("call-1", referencesOutput("alpha")),
+      searchResultMessage("call-2", referencesOutput("alpha", "beta")),
+    ];
+    const deduped = dedupeNativeToolReferences(messages);
+    expect(deduped[0]).toBe(messages[0]);
+    expect(JSON.stringify(deduped[1])).toBe(
+      JSON.stringify(
+        projectedSearchResult("call-2", referencesOutput("beta"), referencesOutput("alpha", "beta"))
+      )
+    );
+    // No deduped result may mix text items with tool references (Anthropic 400s).
+    for (const message of dedupeNativeToolReferences(messages)) {
+      if (message.role !== "tool") continue;
+      for (const part of message.content) {
+        if (part.type !== "tool-result" || part.output.type !== "content") continue;
+        const kinds = new Set(part.output.value.map((item) => item.type));
+        expect(kinds.has("text") && kinds.has("custom")).toBe(false);
+      }
+    }
+  });
+
+  test("dedupes across parallel searches in one step", () => {
+    // Two searches of one assistant step land as parts of a single tool message.
+    const raw: unknown = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "call-1",
+          toolName: TOOL_SEARCH_TOOL_NAME,
+          output: referencesOutput("alpha"),
+        },
+        {
+          type: "tool-result",
+          toolCallId: "call-2",
+          toolName: TOOL_SEARCH_TOOL_NAME,
+          output: referencesOutput("alpha", "beta"),
+        },
+      ],
+    };
+    const [deduped] = dedupeNativeToolReferences([raw as ModelMessage]);
+    expect(JSON.stringify(deduped)).toContain('"toolCallId":"call-1"');
+    const parts = (deduped as { content: Array<{ output: unknown }> }).content;
+    expect(parts[0].output).toEqual(referencesOutput("alpha"));
+    expect(parts[1].output).toEqual(referencesOutput("beta"));
+  });
+
+  test("returns the same array when nothing repeats", () => {
+    const messages = [
+      searchResultMessage("call-1", referencesOutput("alpha")),
+      searchResultMessage("call-2", referencesOutput("beta")),
+      searchResultMessage("call-3", { type: "json", value: { hits: [] } }),
+    ];
+    expect(dedupeNativeToolReferences(messages)).toBe(messages);
+  });
+
+  test("appending messages never rewrites the deduped prefix", () => {
+    const prefix = [
+      searchResultMessage("call-1", referencesOutput("alpha")),
+      searchResultMessage("call-2", referencesOutput("alpha", "beta")),
+    ];
+    const dedupedPrefix = dedupeNativeToolReferences(prefix);
+    const extended = dedupeNativeToolReferences([
+      ...dedupedPrefix,
+      searchResultMessage("call-3", referencesOutput("beta", "gamma")),
+    ]);
+    expect(extended[0]).toBe(dedupedPrefix[0]);
+    expect(extended[1]).toBe(dedupedPrefix[1]);
+    expect(JSON.stringify(extended[2])).toBe(
+      JSON.stringify(
+        projectedSearchResult(
+          "call-3",
+          referencesOutput("gamma"),
+          referencesOutput("beta", "gamma")
+        )
+      )
+    );
+  });
+
+  test("a compacted prefix that dropped the first reference re-references in the later result", () => {
+    const first = searchResultMessage("call-1", referencesOutput("alpha"));
+    const later = searchResultMessage("call-2", referencesOutput("alpha"));
+    expect(JSON.stringify(dedupeNativeToolReferences([first, later])[1].content)).toContain(
+      '"type":"text"'
+    );
+    // Compaction removed the first referencing result: the later one stands.
+    expect(dedupeNativeToolReferences([later])[0]).toBe(later);
+  });
+
+  test("leaves scoped-mode outputs and other tools untouched", () => {
+    const messages = [
+      searchResultMessage("call-1", { type: "json", value: { matches: [] } }),
+      searchResultMessage("call-2", referencesOutput("alpha"), "bash"),
+      searchResultMessage("call-3", referencesOutput("alpha"), "bash"),
+    ];
+    expect(dedupeNativeToolReferences(messages)).toBe(messages);
+  });
+
+  test("replayed history dedupes to the same bytes as the live steps", () => {
+    const deferred = new Set(["alpha", "beta"]);
+    const firstResult = {
+      query: "alpha",
+      matches: [{ name: "alpha", description: "A" }],
+      totalDeferred: 2,
+    };
+    const secondResult = {
+      query: "alpha beta",
+      matches: [
+        { name: "alpha", description: "A" },
+        { name: "beta", description: "B" },
+      ],
+      totalDeferred: 2,
+    };
+    // Live: toModelOutput builds each result, the per-step transform dedupes.
+    const live = dedupeNativeToolReferences([
+      searchResultMessage("call-1", buildToolSearchModelOutput(firstResult, deferred)),
+      searchResultMessage("call-2", buildToolSearchModelOutput(secondResult, deferred)),
+    ]);
+    // Replay: persisted raw results are rewritten, then deduped the same way.
+    const replayed = dedupeNativeToolReferences(
+      applyNativeToolSearchReplay(
+        [
+          searchResultMessage("call-1", { type: "json", value: firstResult }),
+          searchResultMessage("call-2", { type: "json", value: secondResult }),
+        ],
+        deferred
+      )
+    );
+    expect(JSON.stringify(replayed)).toBe(JSON.stringify(live));
   });
 });
 

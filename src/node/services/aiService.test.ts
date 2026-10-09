@@ -3398,6 +3398,65 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(toolBlock(after)).toBe(toolBlock(before));
       expect(stableSystemRow(after)).toBe(stableSystemRow(before));
     });
+
+    // A later search re-matching an already-loaded tool must not re-reference
+    // it: Anthropic expands every tool_reference into the full definition
+    // again. The repeat projects to a text result, and the first referencing
+    // result keeps its bytes so the cached prefix still appends.
+    it("references a natively loaded tool once across repeated searches", async () => {
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const searchTurn = (suffix: string): MuxMessage[] => [
+        createMuxMessage(`search-user-${suffix}`, "user", "look something up"),
+        createMuxMessage(`search-assistant-${suffix}`, "assistant", "", undefined, [
+          {
+            type: "dynamic-tool",
+            toolCallId: `search-call-${suffix}`,
+            toolName: "tool_catalog_search",
+            state: "output-available",
+            input: { query: "lookup" },
+            output: {
+              query: "lookup",
+              matches: [{ name: "alpha_lookup", description: "Look something up" }],
+              totalDeferred: 1,
+            },
+          },
+        ]),
+      ];
+      const searchOutputs = (request: TurnExecutionOptions) =>
+        request.messages.flatMap((message) =>
+          message.role !== "tool"
+            ? []
+            : message.content.flatMap((part) =>
+                part.type === "tool-result" && part.toolName === "tool_catalog_search"
+                  ? [part.output]
+                  : []
+              )
+        );
+      const {
+        requests: [before, after],
+        observations,
+      } = await streamPair(
+        xumHome.path,
+        [
+          { toolSearch: true, history: searchTurn("one") },
+          { toolSearch: true, history: [...searchTurn("one"), ...searchTurn("two")] },
+        ],
+        (request) => searchOutputs(request).map((output) => output.type)
+      );
+      // The repeat search projects to text; only the first result references.
+      expect(observations).toEqual([
+        JSON.stringify(["content"]),
+        JSON.stringify(["content", "text"]),
+      ]);
+      const [firstResult] = searchOutputs(after);
+      expect(JSON.stringify(firstResult)).toBe(JSON.stringify(searchOutputs(before)[0]));
+      // Structural, not generated copy: a text status naming the repeat.
+      const repeat = searchOutputs(after)[1];
+      if (repeat?.type !== "text") throw new Error("Expected the repeat to project to text");
+      expect(repeat.value).toContain("alpha_lookup");
+      expect(toolBlock(after)).toBe(toolBlock(before));
+      expect(stableSystemRow(after)).toBe(stableSystemRow(before));
+    });
   });
 
   it.each([true, false])(

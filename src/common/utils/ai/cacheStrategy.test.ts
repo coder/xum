@@ -245,6 +245,29 @@ describe("cacheStrategy", () => {
       }); // Last part has cache control
     });
 
+    it("merges cache options into existing part providerOptions", () => {
+      // The tool-search dedupe projection stashes restoration data on the last
+      // part's providerOptions; adding cache control must not delete it.
+      const raw: unknown = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "tool_catalog_search",
+            output: { type: "text", value: "repeat status" },
+            providerOptions: { mux: { rawToolSearchOutput: "{}" } },
+          },
+        ],
+      };
+      const result = applyCacheControl([raw as ModelMessage], "anthropic:claude-3-5-sonnet");
+      const content = result[0].content as Array<{ providerOptions?: unknown }>;
+      expect(content[0].providerOptions).toEqual({
+        mux: { rawToolSearchOutput: "{}" },
+        anthropic: { cacheControl: { type: "ephemeral" } },
+      });
+    });
+
     it("should include cache TTL when provided", () => {
       const messages: ModelMessage[] = [{ role: "user", content: "Hello" }];
       const result = applyCacheControl(messages, "anthropic:claude-3-5-sonnet", "1h");

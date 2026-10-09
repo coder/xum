@@ -112,7 +112,9 @@ import {
   collectDeferLoadingToolNames,
   computeActiveToolNames,
   computeContextLoadedToolNames,
+  dedupeNativeToolReferences,
   computeLoadedToolNames,
+  unprojectNativeToolReferences,
   type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
 import { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
@@ -413,7 +415,9 @@ function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
  * (messagePipeline's neutralizer only sees persisted history), then extract supported
  * attachments out of tool-result JSON so providers don't treat them as text. Idempotent on an
  * already-transformed prefix. The settled-step budget floor reuses it so it measures exactly the
- * request the next step's preflight will check.
+ * request the next step's preflight will check. Native tool_reference dedupe is NOT part of
+ * this transform: it must run after a prefix swap (see prepareStep), which replaces the prefix
+ * the projection is decided against.
  */
 function transformStepMessages(messages: ModelMessage[]): Promise<ModelMessage[]> {
   return extractToolMediaAsUserMessagesFromModelMessages(
@@ -2746,13 +2750,15 @@ export class StreamManager {
           const nextMessages =
             request.contextBudgetLimit == null
               ? undefined
-              : await transformStepMessages([
-                  ...(stepTracker?.latestMessages ?? [
-                    ...request.messages,
-                    ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
-                  ]),
-                  ...step.response.messages,
-                ]);
+              : dedupeNativeToolReferences(
+                  await transformStepMessages([
+                    ...(stepTracker?.latestMessages ?? [
+                      ...request.messages,
+                      ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
+                    ]),
+                    ...step.response.messages,
+                  ])
+                );
           const nextRequest =
             nextMessages == null
               ? undefined
@@ -2959,7 +2965,14 @@ export class StreamManager {
       log.warn("[continuous-compaction] prefix locator missing; retaining full context");
       return null;
     }
-    return [...swap.prefix, ...stripMessageCacheControl(messages.slice(index))];
+    // The retained tail may hold a projected repeated search whose first
+    // occurrence the swapped-out prefix carried; restore the raw references so
+    // the caller's dedupe re-decides against the swapped transcript. Done here
+    // so every swap site (per-step and fallback rebuild) inverts identically.
+    return [
+      ...swap.prefix,
+      ...stripMessageCacheControl(unprojectNativeToolReferences(messages.slice(index))),
+    ];
   }
 
   private createStreamResult(
@@ -2975,6 +2988,7 @@ export class StreamManager {
     // #5086: see the `between_tools` replay guard in prepareStep.
     let previousToolSetKey: string | undefined;
     let seenPrefixSwap: ContinuousPrefixSwap | undefined;
+
     // Outgoing rows before this index predate the latest in-turn prefix change.
     let reasoningReplayBoundary = 0;
     // XUM_DISABLE_AGENT_TOOLS=1 sends no tools at all (see isAgentToolsDisabled). Every chat
@@ -3061,6 +3075,11 @@ export class StreamManager {
           }
           if (stepTracker.pendingPrefixSwap === swap) stepTracker.pendingPrefixSwap = undefined;
         }
+        // Dedupe after the swap, never before: the swap replaces the prefix this
+        // projection is decided against, and the SDK accumulates the next step's
+        // input from these returned messages, so a reference dropped against a
+        // swapped-out prefix would stay lost for the rest of the turn.
+        effectiveMessages = dedupeNativeToolReferences(effectiveMessages);
         if (stepTracker) {
           stepTracker.latestMessages = effectiveMessages;
         }
@@ -3131,7 +3150,9 @@ export class StreamManager {
               thinkingOverride
             );
             // Same per-step transforms the construction-time messages receive.
-            rebuiltFirstStepMessages = await transformStepMessages(rebuilt);
+            rebuiltFirstStepMessages = dedupeNativeToolReferences(
+              await transformStepMessages(rebuilt)
+            );
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
             }

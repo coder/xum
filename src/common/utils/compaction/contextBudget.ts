@@ -178,6 +178,8 @@ function measureBudgetContent(
       | "assistant-part"
       | "reasoning-options"
       | "openai-reasoning-options"
+      | "tool-result-options"
+      | "mux-tool-result-options"
       | "output";
   }> = [{ value: result, kind }];
   while (stack.length > 0) {
@@ -265,6 +267,14 @@ function measureBudgetContent(
         typeof child === "string"
       )
         continue;
+      // The dedupe projection's restoration stash (toolCatalog.ts) never reaches
+      // the wire: adapters serialize only their own providerOptions namespace.
+      if (
+        entry.kind === "mux-tool-result-options" &&
+        key === "rawToolSearchOutput" &&
+        typeof child === "string"
+      )
+        continue;
       toolResultChars += JSON.stringify(key).length + 2;
       textParts?.push(key);
       let childKind: typeof entry.kind = "json";
@@ -273,6 +283,10 @@ function measureBudgetContent(
         else if (record.role === "user" || record.role === "tool") childKind = "parts";
       } else if (isPart && record.type === "tool-result" && key === "output") {
         childKind = "output";
+      } else if (isPart && record.type === "tool-result" && key === "providerOptions") {
+        childKind = "tool-result-options";
+      } else if (entry.kind === "tool-result-options" && key === "mux") {
+        childKind = "mux-tool-result-options";
       } else if (entry.kind === "output" && record.type === "content" && key === "value") {
         childKind = "parts";
       } else if (
