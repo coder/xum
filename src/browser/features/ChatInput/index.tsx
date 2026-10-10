@@ -1259,9 +1259,26 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
 
   const handleSendRef = useRef<() => Promise<void>>(() => Promise.resolve());
+  // #6033: callers of the imperative send() (ProjectPage's "Run /init" banner) call it once. While
+  // the branch list loads, Send is refused, so the call is kept and sent once the list loads.
+  const creationBranchesLoadingRef = useRef(creationBranchesLoading);
+  const sendAfterBranchesLoadRef = useRef(false);
   const send = useCallback(() => {
+    if (creationBranchesLoadingRef.current) {
+      sendAfterBranchesLoadRef.current = true;
+      return Promise.resolve();
+    }
     return handleSendRef.current();
   }, []);
+  useEffect(() => {
+    if (creationBranchesLoading || !sendAfterBranchesLoadRef.current) return;
+    sendAfterBranchesLoadRef.current = false;
+    // Passive effects run after the layout effect below has pointed handleSendRef at this
+    // commit's handleSend, whose canSend already sees the loaded branches.
+    handleSendRef.current().catch((error: unknown) => {
+      console.error("Deferred creation send failed:", error);
+    });
+  }, [creationBranchesLoading]);
 
   const onReady = props.onReady;
 
@@ -3014,6 +3031,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // render-time write, which React Compiler rejects) updates it in the commit's own task.
   useLayoutEffect(() => {
     handleSendRef.current = handleSend;
+    creationBranchesLoadingRef.current = creationBranchesLoading;
   });
 
   // Handler for Escape in vim normal mode - cancels edit if editing

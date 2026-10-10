@@ -25,7 +25,8 @@ import {
 } from "../helpers";
 import { ChatHarness } from "../harness";
 
-import { getDraftScopeId } from "@/common/constants/storage";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getAgentsInitNudgeKey, getDraftScopeId } from "@/common/constants/storage";
 import type { DraftScope } from "@/common/orpc/schemas/drafts";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -79,11 +80,12 @@ function holdBranchList(env: ReturnType<typeof getSharedEnv>) {
   return { spy, release };
 }
 
-async function openCreationViewWithHeldBranches() {
+async function openCreationViewWithHeldBranches(options?: { showAgentsInitBanner?: boolean }) {
   const env = getSharedEnv();
   const cleanupDom = setupTestDom();
   const view = renderApp({ apiClient: env.orpc });
   const projectPath = await addProjectViaUI(view, getSharedRepoPath());
+  if (options?.showAgentsInitBanner) updatePersistedState(getAgentsInitNudgeKey(projectPath), true);
   // Held before the creation view mounts: its first listBranches call is the one that matters.
   const held = holdBranchList(env);
   await openProjectCreationView(view, projectPath);
@@ -130,6 +132,39 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
       const trunkBranch = create.mock.calls[0]?.[2];
       expect(typeof trunkBranch === "string" && trunkBranch.length > 0).toBe(true);
       expect(view.container.textContent ?? "").not.toContain(TRUNK_REQUIRED);
+    } finally {
+      held.release();
+      held.spy.mockRestore();
+      create.mockRestore();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  // The ProjectPage "Run /init" banner sends through the composer's imperative send(), once.
+  test("Run /init clicked while the branches load sends /init once they load", async () => {
+    const { view, cleanupDom, held, create } = await openCreationViewWithHeldBranches({
+      showAgentsInitBanner: true,
+    });
+    try {
+      const runInit = await waitFor(
+        () => {
+          const button = view.container.querySelector<HTMLButtonElement>(
+            '[data-testid="agents-init-run"]'
+          );
+          if (!button) throw new Error("Run /init banner not shown");
+          return button;
+        },
+        { timeout: 10_000 }
+      );
+      fireEvent.click(runInit);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(create).not.toHaveBeenCalled();
+      expect(view.container.textContent ?? "").not.toContain(TRUNK_REQUIRED);
+
+      held.release();
+      await waitFor(() => expect(create).toHaveBeenCalled(), { timeout: 30_000 });
+      const trunkBranch = create.mock.calls[0]?.[2];
+      expect(typeof trunkBranch === "string" && trunkBranch.length > 0).toBe(true);
     } finally {
       held.release();
       held.spy.mockRestore();
