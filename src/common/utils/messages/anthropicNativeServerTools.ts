@@ -1,6 +1,6 @@
 import type { MuxMessage } from "@/common/types/message";
 import type { DynamicToolPart } from "@/common/types/toolParts";
-import { ANTHROPIC_NATIVE_SERVER_TOOL_MAX_CIPHERTEXT_CHARS } from "@/constants/anthropicServerTools";
+import { ANTHROPIC_NATIVE_SERVER_TOOL_MAX_ROW_CIPHERTEXT_CHARS } from "@/constants/anthropicServerTools";
 import { stripEncryptedContent } from "./stripEncryptedContent";
 
 /**
@@ -50,19 +50,37 @@ function isReplayableWebSearchResult(item: unknown): boolean {
  *   after both calls, and the server tool's result opens the next step. One stored part cannot
  *   replay the call and the result at their two positions, and moving them changes the prefix
  *   the later thinking is bound to.
- * - Ciphertext above ANTHROPIC_NATIVE_SERVER_TOOL_MAX_CIPHERTEXT_CHARS (row size bound).
+ * - Ciphertext that would take the row's total above
+ *   ANTHROPIC_NATIVE_SERVER_TOOL_MAX_ROW_CIPHERTEXT_CHARS (row size bound).
+ *   `rowCiphertextChars` is what the row's other parts already keep (see rowCiphertextChars).
  */
 export function toStoredServerToolPart(
   part: DynamicToolPart,
-  options: { resultFollowsCall: boolean }
+  options: { resultFollowsCall: boolean; rowCiphertextChars: number }
 ): DynamicToolPart {
   if (part.providerExecuted !== true || part.state !== "output-available") return part;
   const titled = withNullTitles(part);
   const native =
     options.resultFollowsCall &&
     isNativeAnthropicReplayable(titled) &&
-    ciphertextChars(part.output) <= ANTHROPIC_NATIVE_SERVER_TOOL_MAX_CIPHERTEXT_CHARS;
+    options.rowCiphertextChars + ciphertextChars(part.output) <=
+      ANTHROPIC_NATIVE_SERVER_TOOL_MAX_ROW_CIPHERTEXT_CHARS;
   return native ? titled : demote(part);
+}
+
+/** Ciphertext the stored provider-executed parts of one row keep (only native parts keep any). */
+export function rowCiphertextChars(parts: ReadonlyArray<MuxMessage["parts"][number]>): number {
+  let total = 0;
+  for (const part of parts) {
+    if (
+      part.type === "dynamic-tool" &&
+      part.providerExecuted === true &&
+      part.state === "output-available"
+    ) {
+      total += ciphertextChars(part.output);
+    }
+  }
+  return total;
 }
 
 /** Total encryptedContent length of a replayable web_search output (an array of results). */

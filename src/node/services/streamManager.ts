@@ -129,6 +129,7 @@ import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/
 import { stripEncryptedContent } from "@/common/utils/messages/stripEncryptedContent";
 import {
   isNativeAnthropicReplayable,
+  rowCiphertextChars,
   toStoredServerToolPart,
 } from "@/common/utils/messages/anthropicNativeServerTools";
 import { countAnthropicInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
@@ -3567,8 +3568,13 @@ export class StreamManager {
             state: "output-available" as const,
             output,
           },
-          // Nothing arrived between the call and its result (see toStoredServerToolPart).
-          { resultFollowsCall: existingPartIndex === streamInfo.parts.length - 1 }
+          {
+            // Nothing arrived between the call and its result (see toStoredServerToolPart).
+            resultFollowsCall: existingPartIndex === streamInfo.parts.length - 1,
+            // The call part itself holds no output yet, so it adds nothing to this sum.
+            rowCiphertextChars:
+              existingPart.providerExecuted === true ? rowCiphertextChars(streamInfo.parts) : 0,
+          }
         );
         streamInfo.parts[existingPartIndex] = stored;
         if (stored.state === "output-available") emittedOutput = stored.output;

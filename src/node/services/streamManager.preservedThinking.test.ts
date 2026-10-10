@@ -9,6 +9,7 @@ import { Ok } from "@/common/types/result";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { assemblePromptPayload } from "./turnContextAssembler";
 import type { TurnEngineEvent } from "./streamManager";
+import { ANTHROPIC_NATIVE_SERVER_TOOL_MAX_ROW_CIPHERTEXT_CHARS } from "@/constants/anthropicServerTools";
 import {
   createStreamManagerForTests,
   engineInternals,
@@ -1172,6 +1173,133 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
       expect(thinkingTypes(body)).toEqual([]);
       expectPairedTools(body);
       expect(JSON.stringify(body)).toContain("found");
+    });
+
+    test("searches past the row's ciphertext budget are stored as the client pair", async () => {
+      const workspaceId = "preserved-thinking-row-ciphertext-budget";
+      const search = (index: number, id: string, ciphertext: string) => [
+        {
+          type: "content_block_start",
+          index,
+          content_block: { type: "server_tool_use", id, name: "web_search", input: { query: id } },
+        },
+        { type: "content_block_stop", index },
+        {
+          type: "content_block_start",
+          index: index + 1,
+          content_block: {
+            type: "web_search_tool_result",
+            tool_use_id: id,
+            content: [{ ...searchResults[0], encrypted_content: ciphertext }],
+          },
+        },
+        { type: "content_block_stop", index: index + 1 },
+      ];
+      // Two searches that fit the budget only one at a time, then thinking after them.
+      const half = "h".repeat(ANTHROPIC_NATIVE_SERVER_TOOL_MAX_ROW_CIPHERTEXT_CHARS / 2 + 1);
+      const twoSearches = () =>
+        sse([
+          messageStart,
+          ...thinkingBlock(0, "plan", "sig-plan"),
+          ...search(1, "srvtoolu_1", half),
+          ...search(3, "srvtoolu_2", half),
+          ...thinkingBlock(5, "read", "sig-read"),
+          { type: "content_block_start", index: 6, content_block: { type: "text", text: "" } },
+          { type: "content_block_delta", index: 6, delta: { type: "text_delta", text: "done" } },
+          { type: "content_block_stop", index: 6 },
+          {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 1 },
+          },
+          { type: "message_stop" },
+        ]);
+      const scripted = await runServerToolTurn(workspaceId, twoSearches, []);
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const row = history.data.find((message) => message.id === scripted.messageId);
+      const stored = (row?.parts ?? []).flatMap((part) =>
+        part.type === "dynamic-tool" ? [[part.toolCallId, part.providerExecuted === true]] : []
+      );
+      expect(stored).toEqual([
+        ["srvtoolu_1", true],
+        ["srvtoolu_2", false],
+      ]);
+      expect(JSON.stringify(row).length).toBeLessThan(
+        ANTHROPIC_NATIVE_SERVER_TOOL_MAX_ROW_CIPHERTEXT_CHARS
+      );
+      // The second search is demoted with thinking after it: the receipt keeps it out.
+      expect(row?.metadata?.anthropicThinkingReplay).toBe("off");
+    });
+
+    test("a native search replays its ciphertext byte for byte, however long", async () => {
+      // Real encrypted_content values can exceed the generic provider-output string bound.
+      // The signed thinking after the search is bound to the exact ciphertext.
+      const workspaceId = "preserved-thinking-long-ciphertext";
+      const ciphertext = "c".repeat(30_000);
+      const scripted = scriptedAnthropicModel([textResponse]);
+      const row = createMuxMessage("assistant-1", "assistant", "", { historySequence: 1 }, [
+        {
+          type: "reasoning",
+          text: "plan",
+          providerOptions: { anthropic: { signature: "sig-plan" } },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: "srvtoolu_1",
+          toolName: "web_search",
+          state: "output-available",
+          input: { query: "xum" },
+          providerExecuted: true,
+          output: [
+            {
+              type: "web_search_result",
+              url: "https://example.com/xum",
+              title: "Xum",
+              pageAge: null,
+              encryptedContent: ciphertext,
+            },
+          ],
+        },
+        {
+          type: "reasoning",
+          text: "read",
+          providerOptions: { anthropic: { signature: "sig-read" } },
+        },
+        { type: "text", text: "found" },
+      ]);
+      const messages = await prepareMessagesForProvider({
+        messagesWithSentinel: [
+          createMuxMessage("user-1", "user", "search", { historySequence: 0 }),
+          row,
+          createMuxMessage("user-2", "user", "next", { historySequence: 2 }),
+        ],
+        effectiveAgentId: "exec",
+        toolNamesForSentinel: [],
+        providerForMessages: "anthropic",
+        effectiveThinkingLevel: "high",
+        modelString: "anthropic:claude-opus-5-5",
+        workspaceId,
+      });
+      const replay = aiSdk.streamText({
+        model: scripted.model,
+        messages,
+        tools: { web_search: scripted.provider.tools.webSearch_20250305({ maxUses: 5 }) as Tool },
+        maxRetries: 0,
+      });
+      await replay.consumeStream();
+      expect(scripted.bodies).toHaveLength(1);
+      const blocks = firstAssistantBlocks(scripted.bodies[0]);
+      expect(blocks.map((block) => block.type)).toEqual([
+        "thinking",
+        "server_tool_use",
+        "web_search_tool_result",
+        "thinking",
+        "text",
+      ]);
+      const content = blocks[2].content as Array<{ encrypted_content: string }>;
+      expect(content[0].encrypted_content).toBe(ciphertext);
     });
 
     test("a client-pair row from before native replay keeps today's request shape", async () => {

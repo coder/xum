@@ -1,13 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { DynamicToolPart } from "@/common/types/toolParts";
-import { ANTHROPIC_NATIVE_SERVER_TOOL_MAX_CIPHERTEXT_CHARS } from "@/constants/anthropicServerTools";
-import { toStoredServerToolPart } from "./anthropicNativeServerTools";
+import { ANTHROPIC_NATIVE_SERVER_TOOL_MAX_ROW_CIPHERTEXT_CHARS } from "@/constants/anthropicServerTools";
+import { rowCiphertextChars, toStoredServerToolPart } from "./anthropicNativeServerTools";
 
 /** A completed Anthropic web_search part whose results carry these ciphertext lengths. */
-function webSearchPart(ciphertextLengths: number[]): DynamicToolPart {
+function webSearchPart(id: string, ciphertextLengths: number[]): DynamicToolPart {
   return {
     type: "dynamic-tool",
-    toolCallId: "srvtoolu_1",
+    toolCallId: id,
     toolName: "web_search",
     state: "output-available",
     input: { query: "xum" },
@@ -26,25 +26,45 @@ function hasCiphertext(part: DynamicToolPart): boolean {
   return part.state === "output-available" && JSON.stringify(part.output).includes("eee");
 }
 
-describe("toStoredServerToolPart ciphertext bound (#5887)", () => {
-  const limit = ANTHROPIC_NATIVE_SERVER_TOOL_MAX_CIPHERTEXT_CHARS;
+/** Stores the parts in order, the way StreamManager completes them within one row. */
+function storeRow(parts: DynamicToolPart[]): DynamicToolPart[] {
+  const stored: DynamicToolPart[] = [];
+  for (const part of parts) {
+    stored.push(
+      toStoredServerToolPart(part, {
+        resultFollowsCall: true,
+        rowCiphertextChars: rowCiphertextChars(stored),
+      })
+    );
+  }
+  return stored;
+}
 
-  test("keeps native replay when the summed ciphertext is at the limit", () => {
-    // Two results: the bound is per call, not per result.
-    const stored = toStoredServerToolPart(webSearchPart([limit - 10, 10]), {
-      resultFollowsCall: true,
-    });
-    expect(stored.providerExecuted).toBe(true);
-    expect(hasCiphertext(stored)).toBe(true);
+describe("toStoredServerToolPart ciphertext bound (#5887)", () => {
+  const limit = ANTHROPIC_NATIVE_SERVER_TOOL_MAX_ROW_CIPHERTEXT_CHARS;
+
+  test("keeps native replay when the row's summed ciphertext is at the limit", () => {
+    // Three results over two calls: the bound sums every result of every search in the row.
+    const row = storeRow([
+      webSearchPart("srvtoolu_1", [limit - 30, 10]),
+      webSearchPart("srvtoolu_2", [20]),
+    ]);
+    expect(row.map((part) => part.providerExecuted)).toEqual([true, true]);
+    expect(row.every(hasCiphertext)).toBe(true);
+    expect(rowCiphertextChars(row)).toBe(limit);
   });
 
-  test("stores the client pair without ciphertext above the limit", () => {
-    const stored = toStoredServerToolPart(webSearchPart([limit - 10, 11]), {
-      resultFollowsCall: true,
-    });
-    expect(stored.providerExecuted).toBeUndefined();
-    expect(hasCiphertext(stored)).toBe(false);
+  test("stores the search that crosses the limit as the client pair without ciphertext", () => {
+    const row = storeRow([
+      webSearchPart("srvtoolu_1", [limit - 30, 10]),
+      webSearchPart("srvtoolu_2", [21]),
+      // A later small search still fits: only the ciphertext kept counts.
+      webSearchPart("srvtoolu_3", [20]),
+    ]);
+    expect(row.map((part) => part.providerExecuted)).toEqual([true, undefined, true]);
+    expect(hasCiphertext(row[1])).toBe(false);
     // The search itself stays in history (URLs and titles), only the ciphertext is dropped.
-    expect(stored.state === "output-available" && Array.isArray(stored.output)).toBe(true);
+    expect(row[1].state === "output-available" && Array.isArray(row[1].output)).toBe(true);
+    expect(rowCiphertextChars(row)).toBe(limit);
   });
 });

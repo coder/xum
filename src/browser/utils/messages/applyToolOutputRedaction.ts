@@ -3,6 +3,7 @@
  * Produces a cloned array safe for sending to providers without touching persisted history/UI.
  */
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
+import { isNativeAnthropicReplayable } from "@/common/utils/messages/anthropicNativeServerTools";
 import { sanitizeUnknownForProviderOutput } from "@/common/utils/providerOutputSanitization";
 import { stripToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 import { stripWorkflowRunRecordForModel } from "@/common/utils/workflowRunMessages";
@@ -85,6 +86,19 @@ function stripLegacyImageToolOutputForModel(output: unknown): unknown {
   return stripped;
 }
 
+/**
+ * #5887: a natively replayed Anthropic web search sends its ciphertext back as the API returned
+ * it. The signed thinking after the search is bound to those exact bytes, and real values exceed
+ * the generic string bound, so only the other fields are sanitized. The predicate guarantees an
+ * array of web_search_result records with string ciphertext.
+ */
+function sanitizeKeepingCiphertext(output: unknown[]): unknown[] {
+  return output.map((item) => {
+    const { encryptedContent, ...rest } = item as Record<string, unknown>;
+    return { ...(sanitizeUnknownForProviderOutput(rest) as object), encryptedContent };
+  });
+}
+
 export function applyToolOutputRedaction(messages: MuxMessage[]): MuxMessage[] {
   return messages.map((msg) => {
     if (msg.role !== "assistant") return msg;
@@ -98,9 +112,12 @@ export function applyToolOutputRedaction(messages: MuxMessage[]): MuxMessage[] {
         providerPart.toolName,
         stripToolOutputUiOnly(providerPart.output)
       );
-      const sanitizedOutput = sanitizeUnknownForProviderOutput(
-        stripLegacyImageToolOutputForModel(outputWithoutUiOnly)
-      );
+      const sanitizedOutput =
+        isNativeAnthropicReplayable(providerPart) && Array.isArray(providerPart.output)
+          ? sanitizeKeepingCiphertext(providerPart.output)
+          : sanitizeUnknownForProviderOutput(
+              stripLegacyImageToolOutputForModel(outputWithoutUiOnly)
+            );
       const nestedCalls = providerPart.nestedCalls?.map((nestedCall) => {
         if (nestedCall.state !== "output-available") {
           return nestedCall;
