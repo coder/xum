@@ -174,7 +174,8 @@ export const WorkspaceWithSidebars: AppStory = {
   },
 };
 
-// The flat sidebar's header has the one `--color-secondary` text on these screens ("New chat").
+// The flat sidebar's header adds "New chat", a `--color-muted` text since #6010 (it was the one
+// `--color-secondary` text on these screens), so it counts toward the muted minimum.
 export const WorkspaceWithFlatSidebar: AppStory = {
   globals: { theme: "light" },
   parameters: lightContract,
@@ -182,7 +183,7 @@ export const WorkspaceWithFlatSidebar: AppStory = {
   play: async ({ canvasElement }) => {
     await waitForWorkspace(canvasElement);
     await within(canvasElement).findByText("New chat", {}, { timeout: 15_000 });
-    await expectTokenTextsReadable(canvasElement, { "--color-muted": 3, "--color-secondary": 1 });
+    await expectTokenTextsReadable(canvasElement, { "--color-muted": 4 });
   },
 };
 
