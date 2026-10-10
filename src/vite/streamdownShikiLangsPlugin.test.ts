@@ -30,6 +30,7 @@ describe("streamdownShikiLangsPlugin", () => {
     expect(id).toEqual(expect.any(String));
     const code = h.load(id);
     expect(typeof code).toBe("string");
+    // eslint-disable-next-line no-restricted-syntax -- evaluates the generated stub module, not a project import
     const mod = (await import(`data:text/javascript,${String(code)}`)) as { default: unknown };
     expect(mod.default).toEqual([]);
     h.finish();
