@@ -45,7 +45,14 @@ import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { DEFAULT_APP_MODEL } from "./aiMode";
 import { EXPLORE_CONFIGS } from "./sandbox/inputs";
-import { type JobOutcome, launchJob, type ModelJob, modelJob, probeApp } from "./sandbox/launch";
+import {
+  JOB_EXIT_3,
+  type JobOutcome,
+  launchJob,
+  type ModelJob,
+  modelJob,
+  probeApp,
+} from "./sandbox/launch";
 import { Ledger, priced } from "./sandbox/proxyPolicy";
 import { Refusal } from "./sandbox/runner";
 
@@ -149,20 +156,21 @@ const EXIT_MEANING: Record<number, string> = {
   3: "infrastructure error, or the container state is unknown",
   4: "e2e internal error, or incomplete evidence",
   5: "proxy fault",
+  6: "e2e infrastructure error",
   130: "interrupted",
 };
 
 /**
  * One charter's code, with the launcher's precedence (sandbox/launch.ts exitFor): an unknown
  * container state (3), then a stop (130), then a proxy fault (5), then a refusal (2) or an
- * error (4), then the job's own code.
+ * error (4), then the job's own code (e2e's 3 as 6, so 3 means only an unknown container).
  */
 function charterCode(outcome: JobOutcome): number {
   if (outcome.cleanup.startsWith("unknown")) return 3;
   if (outcome.stopped != null) return 130;
   if (outcome.proxyFault != null) return 5;
   if ("error" in outcome) return outcome.error instanceof Refusal ? 2 : 4;
-  return outcome.code!;
+  return outcome.code === 3 ? JOB_EXIT_3 : outcome.code!;
 }
 
 const usd = (nanoUsd: number) => `$${(nanoUsd / 1e9).toFixed(4)}`;

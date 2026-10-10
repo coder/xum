@@ -61,6 +61,13 @@ export interface CallRecord {
 export interface ProxyOptions {
   /** Inside a folder that only this user can enter (mode 0700). */
   socketPath: string;
+  /**
+   * Where the private folder of the inner HTTP socket goes (mode 0700, this user's). It must not
+   * be mounted into the container: the container may reach the HTTP server only through the
+   * front socket. The launcher passes the job folder, so a SIGKILLed launcher leaves one folder
+   * to remove. Default: the temp folder.
+   */
+  privateParent?: string;
   /** From the host config only. `baseUrl` has no `/v1`, like ANTHROPIC_BASE_URL. */
   upstream: { baseUrl: string; apiKey: string };
   job: JobPolicy;
@@ -112,9 +119,12 @@ class SseUsage {
 }
 
 export async function startProxy(options: ProxyOptions) {
-  const dir = fs.statSync(path.dirname(options.socketPath));
-  if ((dir.mode & 0o777) !== 0o700 || dir.uid !== process.getuid?.()) {
-    throw new Error("proxy: the socket folder must be mode 0700 and owned by this user");
+  for (const folder of [path.dirname(options.socketPath), options.privateParent]) {
+    if (folder == null) continue;
+    const dir = fs.statSync(folder);
+    if ((dir.mode & 0o777) !== 0o700 || dir.uid !== process.getuid?.()) {
+      throw new Error("proxy: the socket folders must be mode 0700 and owned by this user");
+    }
   }
   const deadlineMs = options.deadlineMs ?? DEADLINE_MS;
   const calls = new Set<{ abort: AbortController; done: Promise<void> }>();
@@ -268,9 +278,17 @@ export async function startProxy(options: ProxyOptions) {
     });
     calls.add(call);
   });
-  // Not in the job folder: the container must reach the HTTP server only through the front.
-  const inner = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-proxy-"));
-  const innerPath = path.join(inner, "http.sock");
+  // Not in a mounted folder: the container must reach the HTTP server only through the front.
+  // A unix socket path holds at most 107 bytes on Linux. Bun 1.3.12 binds longer ones (measured),
+  // but Node binds a cut-off path without an error. In a privateParent the names are short:
+  // `<parent>/h-XXXXXX/s` is as long as the launcher's `<job folder>/proxy/sock`, so the inner
+  // socket never needs a longer path than the job socket (a long TMPDIR, such as a CI runner's).
+  const inner = fs.mkdtempSync(
+    options.privateParent == null
+      ? path.join(os.tmpdir(), "xum-bugbash-proxy-")
+      : path.join(options.privateParent, "h-")
+  );
+  const innerPath = path.join(inner, "s");
   const pipes = new Set<net.Socket>();
   const front = net.createServer((outer) => {
     // Deferred: Bun 1.3.12 ignores a destroy() inside the connection handler itself.

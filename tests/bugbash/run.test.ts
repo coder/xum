@@ -146,6 +146,14 @@ test("B2: a stopped run exits with the signal, and a refused launch exits 2", as
   expect(await runBugBash([...charters("a")], ENV, live, refused.deps)).toBe(2);
 });
 
+test("D1: a charter whose e2e exits 3 ends the run with 6, and only an unknown container gives 3", async () => {
+  const stop = new AbortController().signal;
+  const own3 = fakeLaunch(() => ({ code: 3, cleanup: "removed" }));
+  expect(await runBugBash([...charters("a")], ENV, stop, own3.deps)).toBe(6);
+  const unknown = fakeLaunch(() => ({ code: 3, cleanup: "unknown: x" }));
+  expect(await runBugBash([...charters("a")], ENV, stop, unknown.deps)).toBe(3);
+});
+
 test("B2: a charter that exits 130 on its own fails the run", async () => {
   const { deps } = fakeLaunch(() => ({ code: 130, cleanup: "removed" }));
   const stop = new AbortController().signal;
