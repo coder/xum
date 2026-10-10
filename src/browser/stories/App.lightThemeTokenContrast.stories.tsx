@@ -7,6 +7,9 @@
  * The code stories (#5980) check, in light and flexoki-light, every syntax-highlighted token in
  * a code block and in the review diff (with its green and red line tints), inline code in both
  * message kinds, the selected right-sidebar tab (#5965) and the selected Stats pill.
+ *
+ * The review diff's gutter (+ and − signs, line numbers) is checked in all four themes, on the
+ * line tints and under the review-range highlight (#5985).
  */
 
 import { expect, waitFor, within } from "@storybook/test";
@@ -16,6 +19,7 @@ import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_TAB_KEY } from "@/common/consta
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   colorContrastOn,
+  flatGradientColor,
   textContrasts,
   tokenTextContrasts,
   type TextContrast,
@@ -27,10 +31,12 @@ import {
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
 
 import { setupSimpleChatStory } from "./helpers/chatSetup";
+import { createReview } from "./helpers/reviews";
 import { expandLeftSidebar, expandRightSidebar } from "./helpers/uiState";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { createMockORPCClient } from "./mocks/orpc";
+import { seedMockReviewState } from "./mocks/reviewState";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 import { openSettingsDialog } from "./storyPlayHelpers";
 
@@ -219,8 +225,24 @@ index 1111111..2222222 100644
  }
 `;
 
+/**
+ * A review on removed line 2, the first context line (old 3) and added line 1, so the diff shows
+ * an added, a removed and a context line both with and without the review-range highlight.
+ */
+const GUTTER_REVIEW = createReview(
+  "review-gutter",
+  "src/server.ts",
+  "-2-3 +1",
+  "Check the retry count.",
+  "pending",
+  STABLE_TIMESTAMP
+);
+
 /** A workspace whose chat and review diff show highlighted code and inline code. */
-function setupCodeWorkspace(tab: "review" | "costs") {
+function setupCodeWorkspace(tab: "review" | "costs", withGutterReview = false) {
+  if (withGutterReview) {
+    seedMockReviewState("ws-light-code", { reviews: { [GUTTER_REVIEW.id]: GUTTER_REVIEW } });
+  }
   const client = setupSimpleChatStory({
     workspaceId: "ws-light-code",
     workspaceName: "feature/light-code",
@@ -318,6 +340,50 @@ async function expectCodeReadable(canvasElement: HTMLElement, theme: ThemeMode) 
   await expectReadable(onRealBackgrounds);
 }
 
+type GutterKind = "add" | "remove" | "context";
+
+const GUTTER_KIND: Record<string, GutterKind> = { "+": "add", "−": "remove", "": "context" };
+
+/**
+ * The review diff's gutter text reaches 4.5:1: the + and − signs and every line number, each on
+ * its own line tint (#5985). Each kind of line must be seen both plain and under the
+ * review-range highlight (a flat gradient over the tint), so neither case passes by absence.
+ */
+async function expectDiffGutterReadable(canvasElement: HTMLElement) {
+  const entries = await waitFor(
+    () => {
+      const found: Array<TextContrast & { label: string }> = [];
+      const seen = new Set<string>();
+      for (const indicator of canvasElement.querySelectorAll<HTMLElement>(
+        "[data-diff-indicator]"
+      )) {
+        const gutter = indicator.previousElementSibling;
+        if (!(gutter instanceof HTMLElement)) continue;
+        const kind = GUTTER_KIND[indicator.textContent?.trim() ?? ""];
+        if (!kind) continue;
+        const image = getComputedStyle(indicator).backgroundImage;
+        // A highlight the contrast helper cannot read would be measured as if it were absent.
+        if (image !== "none" && !flatGradientColor(image))
+          throw new Error(`unread highlight ${image}`);
+        const where = image === "none" ? "plain" : "highlighted";
+        const texts = [...textContrasts(indicator), ...textContrasts(gutter)];
+        // Context lines have no sign: their texts are the line numbers alone.
+        if (texts.length === 0) continue;
+        seen.add(`${kind} ${where}`);
+        found.push(...texts.map((entry) => ({ ...entry, label: `${kind} ${where} gutter` })));
+      }
+      for (const kind of ["add", "remove", "context"]) {
+        for (const where of ["plain", "highlighted"]) {
+          if (!seen.has(`${kind} ${where}`)) throw new Error(`no ${kind} ${where} diff line yet`);
+        }
+      }
+      return found;
+    },
+    { timeout: 15_000 }
+  );
+  await expectReadable(entries);
+}
+
 const codeStory = (theme: ThemeMode): AppStory => ({
   globals: { theme },
   parameters: lightContract,
@@ -329,6 +395,21 @@ const codeStory = (theme: ThemeMode): AppStory => ({
 
 export const CodeLight = codeStory("light");
 export const CodeFlexokiLight = codeStory("flexoki-light");
+
+/** The gutter only, in every theme: the dark themes' syntax colors are #5983. */
+const diffGutterStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={() => setupCodeWorkspace("review", true)} />,
+  play: async ({ canvasElement }) => {
+    await expectDiffGutterReadable(canvasElement);
+  },
+});
+
+export const DiffGutterLight = diffGutterStory("light");
+export const DiffGutterFlexokiLight = diffGutterStory("flexoki-light");
+export const DiffGutterDark = diffGutterStory("dark");
+export const DiffGutterFlexokiDark = diffGutterStory("flexoki-dark");
 
 const statsStory = (theme: ThemeMode): AppStory => ({
   globals: { theme },

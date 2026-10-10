@@ -17,11 +17,48 @@ function over(top: Rgba, bottom: Rgba): Rgba {
   return [mix(0), mix(1), mix(2), 1];
 }
 
+/** Splits a CSS list on top-level commas only: colors such as rgba(...) contain commas too. */
+function splitTopLevel(list: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < list.length; i++) {
+    const ch = list[i];
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    else if (ch === "," && depth === 0) {
+      parts.push(list.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  parts.push(list.slice(start).trim());
+  return parts;
+}
+
+/**
+ * The color of a one-color `linear-gradient(c, c)` background image, or null. The review diff
+ * paints its review-range highlight this way, on top of the line's tint (#5985). The computed
+ * value lists one layer per shorthand layer (`linear-gradient(...), none`); `none` paints nothing.
+ */
+export function flatGradientColor(backgroundImage: string): Rgba | null {
+  const layers = splitTopLevel(backgroundImage).filter((layer) => layer !== "none");
+  if (layers.length !== 1) return null;
+  const match = /^linear-gradient\((.+)\)$/.exec(layers[0]);
+  if (!match) return null;
+  const stops = splitTopLevel(match[1]);
+  if (stops.length !== 2 || stops[0] !== stops[1]) return null;
+  return toRgba(stops[0]);
+}
+
 /** The opaque color behind `element`: its own and its ancestors' backgrounds, composited. */
 function compositedBackground(element: HTMLElement): Rgba {
   const layers: Rgba[] = [];
   for (let node: HTMLElement | null = element; node; node = node.parentElement) {
-    const bg = toRgba(getComputedStyle(node).backgroundColor);
+    const style = getComputedStyle(node);
+    // A background image paints above the same element's background color.
+    const overlay = flatGradientColor(style.backgroundImage);
+    if (overlay && overlay[3] > 0) layers.push(overlay);
+    const bg = toRgba(style.backgroundColor);
     if (bg[3] > 0) layers.push(bg);
     if (bg[3] === 1) break;
   }
