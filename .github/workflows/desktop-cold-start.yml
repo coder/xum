@@ -37,7 +37,10 @@ jobs:
           cd "$RUNNER_TEMP/base" && bun install --frozen-lockfile && make build
       - name: Run cold-start A/B
         env: { ELECTRON_DISABLE_SANDBOX: 1 }
-        run: xvfb-run -a node --import tsx scripts/perf/desktopColdStart.ts --base "$RUNNER_TEMP/base" --head "$GITHUB_WORKSPACE" --pairs "$PAIRS" --json > cold-start.json
+        # Redirect inside sh -c: Ubuntu 22.04's xvfb-run runs the command with 2>&1, which mixed progress lines into the JSON.
+        run: |
+          # shellcheck disable=SC2016 # the inner sh -c expands these
+          xvfb-run -a sh -c 'node --import tsx scripts/perf/desktopColdStart.ts --base "$RUNNER_TEMP/base" --head "$GITHUB_WORKSPACE" --pairs "$PAIRS" --json > cold-start.json'
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         if: always()
         with:
