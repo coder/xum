@@ -16,10 +16,13 @@ import { expect, waitFor, within } from "@storybook/test";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_TAB_KEY } from "@/common/constants/storage";
+import { SECTION_COLOR_PALETTE } from "@/common/constants/ui";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   colorContrastOn,
   flatGradientColor,
+  opaqueBackgroundOwner,
+  textContrastOnBase,
   textContrasts,
   tokenTextContrasts,
   type TextContrast,
@@ -31,13 +34,14 @@ import {
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
 
 import { setupSimpleChatStory } from "./helpers/chatSetup";
+import { setWorkspaceDrafts } from "./helpers/drafts";
 import { createReview } from "./helpers/reviews";
-import { expandLeftSidebar, expandRightSidebar } from "./helpers/uiState";
+import { expandLeftSidebar, expandRightSidebar, selectWorkspace } from "./helpers/uiState";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { createMockORPCClient } from "./mocks/orpc";
 import { seedMockReviewState } from "./mocks/reviewState";
-import { STABLE_TIMESTAMP } from "./mocks/workspaces";
+import { createWorkspace, groupWorkspacesByProject, STABLE_TIMESTAMP } from "./mocks/workspaces";
 import { openSettingsDialog } from "./storyPlayHelpers";
 
 export default {
@@ -47,18 +51,8 @@ export default {
 
 const TOKENS = ["--color-muted", "--color-secondary"];
 
-/**
- * Texts whose contrast depends on a background the token change does not touch. Each one is a
- * known follow-up: remove its selector when the follow-up is fixed.
- * - Flat-sidebar project badges are tinted with the project's own color (#5978).
- */
-const KNOWN_NON_TOKEN_BACKGROUNDS = '[data-testid^="workspace-project-badge"]';
-
-/** The token texts under `root`, without the known non-token backgrounds. */
-const checkedTokenTexts = (root: HTMLElement) =>
-  tokenTextContrasts(root, TOKENS).filter(
-    (entry) => !entry.element.closest(KNOWN_NON_TOKEN_BACKGROUNDS)
-  );
+/** The token texts under `root`. Project badges have their own stories (#5978). */
+const checkedTokenTexts = (root: HTMLElement) => tokenTextContrasts(root, TOKENS);
 
 /**
  * Every muted and secondary text under `root` reaches 4.5:1, and at least `minimum` texts of
@@ -186,6 +180,109 @@ export const WorkspaceWithFlatSidebar: AppStory = {
     await expectTokenTextsReadable(canvasElement, { "--color-muted": 3, "--color-secondary": 1 });
   },
 };
+
+// ─── Flat-sidebar project badges (#5978) ─────────────────────────────────────────────────────
+
+/** Every palette color, plus the two custom hex extremes a user can type. */
+const BADGE_COLORS = [...SECTION_COLOR_PALETTE.map(([name]) => name), "#000000", "#ffffff"];
+
+const badgeProjectName = (color: string) => `badge-${color.replace("#", "hex-").toLowerCase()}`;
+
+/**
+ * A flat sidebar with one chat and one draft per badge color. The first chat is selected, so
+ * one row shows the selected background and the rest the unselected one.
+ */
+function setupProjectBadges() {
+  const workspaces = BADGE_COLORS.map((color) =>
+    createWorkspace({
+      id: `ws-${badgeProjectName(color)}`,
+      name: `chat-${badgeProjectName(color)}`,
+      projectName: badgeProjectName(color),
+    })
+  );
+  const projects = groupWorkspacesByProject(workspaces);
+  for (const [index, color] of BADGE_COLORS.entries()) {
+    const path = workspaces[index].projectPath;
+    const config = projects.get(path);
+    if (!config) throw new Error(`no project config for ${path}`);
+    projects.set(path, { ...config, color });
+    setWorkspaceDrafts(path, [{ draftId: `draft-${index}`, workspaceName: `draft-${index}` }]);
+  }
+  selectWorkspace(workspaces[0]);
+  expandLeftSidebar();
+  return createMockORPCClient({
+    projects,
+    workspaces,
+    userPreferences: { ui: { sidebarFlatMode: true } },
+  });
+}
+
+/**
+ * Every chat and draft badge reaches 4.5:1 on an unselected row and on the selected row. Hovered
+ * rows use the selected row's background (`hover:bg-surface-secondary`), and `:hover` cannot be
+ * triggered from a play, so the selected color stands in for both.
+ */
+async function expectProjectBadgesReadable(canvasElement: HTMLElement) {
+  const badges = await waitFor(
+    () => {
+      const found = [
+        ...canvasElement.querySelectorAll<HTMLElement>('[data-testid^="workspace-project-badge-"]'),
+      ];
+      const drafts = found.filter((badge) => badge.dataset.testid?.includes("-draft-"));
+      if (
+        found.length - drafts.length < BADGE_COLORS.length ||
+        drafts.length < BADGE_COLORS.length
+      ) {
+        throw new Error(
+          `expected ${BADGE_COLORS.length} chat and draft badges, found ${found.length}`
+        );
+      }
+      return found;
+    },
+    { timeout: 15_000 }
+  );
+  const rowBackground = (badge: HTMLElement) => {
+    const row = opaqueBackgroundOwner(badge);
+    if (!row) throw new Error(`no opaque row behind "${badge.textContent}"`);
+    return getComputedStyle(row).backgroundColor;
+  };
+  const selected = badges.find((badge) =>
+    badge.dataset.testid?.endsWith(`ws-${badgeProjectName(BADGE_COLORS[0])}`)
+  );
+  if (!selected) throw new Error("no badge on the selected chat");
+  const selectedBackground = rowBackground(selected);
+  const unselectedBackground = rowBackground(badges[badges.length - 1]);
+  // Both row states must be on screen, or one of them would pass by absence.
+  await expect(selectedBackground).not.toBe(unselectedBackground);
+
+  await expectReadable(
+    badges.flatMap((badge) =>
+      [
+        ["unselected", unselectedBackground],
+        ["selected or hovered", selectedBackground],
+      ].map(([state, base]) => ({
+        element: badge,
+        text: badge.textContent ?? "",
+        ratio: textContrastOnBase(badge, base),
+        label: `${badge.dataset.testid?.includes("-draft-") ? "draft" : "chat"} badge, ${state} row`,
+      }))
+    )
+  );
+}
+
+const projectBadgeStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={setupProjectBadges} />,
+  play: async ({ canvasElement }) => {
+    await expectProjectBadgesReadable(canvasElement);
+  },
+});
+
+export const ProjectBadgesLight = projectBadgeStory("light");
+export const ProjectBadgesFlexokiLight = projectBadgeStory("flexoki-light");
+export const ProjectBadgesDark = projectBadgeStory("dark");
+export const ProjectBadgesFlexokiDark = projectBadgeStory("flexoki-dark");
 
 export const Settings: AppStory = {
   globals: { theme: "light" },

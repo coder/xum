@@ -84,6 +84,25 @@ export function textContrast(element: HTMLElement): number {
 }
 
 /**
+ * WCAG 2.x contrast of an element's text on its own (often translucent) background drawn over
+ * the opaque color `base`, a computed color string. Lets a play check a tinted chip on every
+ * background its row can have (for example the selected row color), not only the current one.
+ */
+export function textContrastOnBase(element: HTMLElement, base: string): number {
+  const style = getComputedStyle(element);
+  const background = over(toRgba(style.backgroundColor), toRgba(base));
+  return contrastRatio(over(toRgba(style.color), background), background);
+}
+
+/** The nearest ancestor of `element` (or itself) whose background is opaque. */
+export function opaqueBackgroundOwner(element: HTMLElement): HTMLElement | null {
+  for (let node: HTMLElement | null = element; node; node = node.parentElement) {
+    if (toRgba(getComputedStyle(node).backgroundColor)[3] === 1) return node;
+  }
+  return null;
+}
+
+/**
  * WCAG 2.x contrast of the CSS color `color` drawn on the background behind `element`. Lets a
  * play check a color value (for example a replacement in a syntax theme) on the backgrounds the
  * app really renders, including tints that only exist on some lines.
