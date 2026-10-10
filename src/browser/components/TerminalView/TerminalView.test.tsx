@@ -218,6 +218,44 @@ describe("TerminalView", () => {
     expect(secondOnExit.mock.calls[0]?.[0]).toBe(7);
   });
 
+  // The container stays visibility:hidden ("Connecting...") until the first screen state, and a
+  // browser drops focus from a hidden element, so autofocus must wait for it (T3, #5971).
+  test("keeps autofocus pending until the terminal shows its first screen", async () => {
+    // The focus path checks `instanceof HTMLTextAreaElement`; installDom does not expose it.
+    const previousTextArea = globalThis.HTMLTextAreaElement;
+    globalThis.HTMLTextAreaElement = window.HTMLTextAreaElement;
+    try {
+      mockRouter.subscribe = mock((_sessionId: string, callbacks: TerminalSubscribeCallbacks) => {
+        subscribeCallbacks.push(callbacks);
+        return unsubscribeMock;
+      });
+      const onAutoFocusConsumed = mock(() => undefined);
+      const view = render(
+        <TerminalView
+          workspaceId="workspace-1"
+          sessionId="terminal-1"
+          visible
+          setDocumentTitle={false}
+          autoFocus
+          onAutoFocusConsumed={onAutoFocusConsumed}
+        />,
+        { wrapper: APIWrapper }
+      );
+
+      await waitFor(() => expect(mockRouter.subscribe).toHaveBeenCalledTimes(1));
+      // Give the focus retry loop a few frames while the screen is still hidden.
+      await act(() => new Promise((resolve) => setTimeout(resolve, 100)));
+      expect(onAutoFocusConsumed).not.toHaveBeenCalled();
+
+      act(() => subscribeCallbacks[0].onScreenState(""));
+
+      await waitFor(() => expect(onAutoFocusConsumed).toHaveBeenCalledTimes(1));
+      expect(document.activeElement).toBe(view.container.querySelector("textarea"));
+    } finally {
+      globalThis.HTMLTextAreaElement = previousTextArea;
+    }
+  });
+
   test("renders the badge overlay with substituted template when enabled", async () => {
     getAppConfigStore().updateOptimistically({
       userPreferences: {
