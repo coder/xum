@@ -85,7 +85,8 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   if (!hasCostData) {
     return (
       <div className="text-light font-primary text-[13px] leading-relaxed">
-        <div className="text-secondary px-5 py-10 text-center">
+        {/* text-muted: text-secondary is below WCAG AA here in the dark themes (#6010). */}
+        <div className="text-muted px-5 py-10 text-center">
           <p>No messages yet.</p>
           <p>Send a message to see cost statistics.</p>
         </div>

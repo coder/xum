@@ -2,6 +2,13 @@ import React, { useState, useRef, useLayoutEffect } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "@/common/lib/utils";
 
+// The bubble's secondary texts (step counter, body, Skip, opt-out). Plain text-muted on the modal
+// background is below WCAG AA in dark (3.78) and flexoki-light (4.47); 30% of the text color
+// clears it in all four themes (#6010). A class, not an inline style, so hover:text-foreground
+// still wins on the buttons.
+const TUTORIAL_MUTED_TEXT =
+  "text-[color:color-mix(in_srgb,var(--color-muted),var(--color-text)_30%)]";
+
 export interface TutorialStep {
   target: string; // data-tutorial attribute value
   title: string;
@@ -176,13 +183,13 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
         {/* Header */}
         <div className="mb-2 flex items-start justify-between">
           <h3 className="text-sm font-semibold">{step.title}</h3>
-          <span className="text-muted text-xs">
+          <span className={cn(TUTORIAL_MUTED_TEXT, "text-xs")}>
             {currentStep}/{totalSteps}
           </span>
         </div>
 
         {/* Content */}
-        <p className="text-muted mb-4 text-xs leading-relaxed">{step.content}</p>
+        <p className={cn(TUTORIAL_MUTED_TEXT, "mb-4 text-xs leading-relaxed")}>{step.content}</p>
 
         {/* Actions */}
         <div className="flex items-center justify-between">
@@ -191,20 +198,23 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
           <div className="flex items-center gap-3">
             <button
               onClick={onDismiss}
-              className="text-muted hover:text-foreground text-xs transition-colors"
+              className={cn(TUTORIAL_MUTED_TEXT, "hover:text-foreground text-xs transition-colors")}
             >
               Skip
             </button>
             <button
               onClick={onDisableTutorial}
-              className="text-muted hover:text-foreground text-[10px] underline transition-colors"
+              className={cn(
+                TUTORIAL_MUTED_TEXT,
+                "hover:text-foreground text-[10px] underline transition-colors"
+              )}
             >
               Don&apos;t show tutorials again
             </button>
           </div>
           <button
             onClick={isLastStep ? onDismiss : onNext}
-            className="bg-accent rounded px-3 py-1.5 text-xs font-medium text-white transition-colors hover:opacity-90"
+            className="bg-accent text-accent-foreground rounded px-3 py-1.5 text-xs font-medium transition-colors hover:opacity-90"
           >
             {isLastStep ? "Done" : "Next"}
           </button>
