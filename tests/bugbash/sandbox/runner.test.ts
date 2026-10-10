@@ -361,7 +361,7 @@ async function jobSession(over: Record<string, string>, graceMs?: number) {
   const s = session(stop, graceMs);
   await s.ensureImage();
   s.own(JOB);
-  const job = s.runJob(["--rm", "img"], drain, 60_000);
+  const job = s.runJob(["--rm"], ["img"], drain, 60_000);
   job.catch(() => undefined);
   while (!calls().includes("run ")) await Bun.sleep(20);
   return { s, stop, job };
@@ -392,12 +392,17 @@ test.each([
   ["no container", "", "unknown"],
   ["a container with our name and labels", "c1 xbb-1 boot:pid abc\n", "removed"],
   ["a foreign container with our name", "c2 xbb-1 other:pid abc\n", "unknown"],
+  [
+    "two containers with our name and labels",
+    "c1 xbb-1 boot:pid abc\nc3 xbb-1 boot:pid abc\n",
+    "unknown",
+  ],
 ])("C3: `docker run` dies before the cidfile, %s", async (_name, present, state) => {
   fs.writeFileSync(path.join(bin, "containers"), present);
   const { s, job } = await jobSession({ RUN: "die" });
   expect((await job).code).toBe(125);
   expect(await s.cleanup()).toStartWith(state);
-  expect(registry()).toBe(present.startsWith("c1") ? "" : present);
+  expect(registry()).toBe(state === "removed" ? "" : present);
 });
 
 test.each([
@@ -508,8 +513,17 @@ test.each([
   const s = session();
   await s.ensureImage();
   s.own(JOB);
-  expect(await failure(s.runJob([name, value, "img"], drain, 1_000))).toThrow(Refusal);
+  expect(await failure(s.runJob([name, value], ["img"], drain, 1_000))).toThrow(Refusal);
   expect(calls()).not.toContain("run ");
+});
+
+test("C9: a short option after the image is the job's own argument and passes", async () => {
+  fake({ IMAGES: "sha256:abc" });
+  const s = session();
+  await s.ensureImage();
+  s.own(JOB);
+  await s.runJob(["--rm"], ["img", "run", "-g", "x"], drain, 60_000).catch(() => undefined);
+  expect(calls()).toMatch(/^run .* --rm img run -g x \[/m);
 });
 
 test("C11: the stop hooks finish before the lifeline closes", async () => {
@@ -534,7 +548,7 @@ test("C11: a stop hook that never settles still lets the lifeline close and clea
   sessions.push(s);
   await s.ensureImage();
   s.own(JOB);
-  const job = s.runJob(["--rm", "img"], drain, 60_000);
+  const job = s.runJob(["--rm"], ["img"], drain, 60_000);
   job.catch(() => undefined);
   while (!calls().includes("run ")) await Bun.sleep(20);
   s.onStop(() => new Promise(() => undefined));

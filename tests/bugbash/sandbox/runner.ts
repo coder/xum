@@ -22,7 +22,12 @@ const KILL_AFTER_MS = 5_000;
 const GRACE_MS = 60_000;
 /** How long one stop hook gets before the lifeline closes anyway: a hung hook must not block it. */
 const HOOK_MS = 10_000;
-/** A short option, or a flag that names, labels or tracks the container: runJob() sets those. */
+/**
+ * A short option, or a flag that names, labels or tracks the container: runJob() sets those. It
+ * applies to the docker-run flags only, so the job's own arguments (e2e's `-g`) pass. `--detach`
+ * and `--rm=false` pass too: harmless while launch.ts is the only caller, since cleanup removes
+ * the container by ID. Refuse them if runJob() ever takes flags from a wider caller.
+ */
 const CALLER_FLAG = /^(-[^-]|--(name|label|label-file|cidfile)(=|$))/;
 
 export class Refusal extends Error {}
@@ -210,21 +215,26 @@ export class Session {
   }
 
   /**
-   * Runs the owned job's container: `docker run --name <job> --label … --cidfile …` and then
-   * `args`. Its stdin is the lifeline: entry.ts stops the job on EOF, and the container also
+   * Runs the owned job's container: `docker run --name <job> --label … --cidfile …`, then
+   * `flags`, then `command` (the image and its arguments). Its stdin is the lifeline: entry.ts stops the job on EOF, and the container also
    * gets EOF when this process dies. Its stdout goes to `receive`, its stderr to ours. A stop or
    * the timeout closes the lifeline; the client is killed only if it outlives the grace period.
    * cleanup() then removes the container by the ID that the CLI wrote to the cidfile.
    */
-  async runJob<T>(args: string[], receive: (out: Readable) => Promise<T>, timeoutMs: number) {
+  async runJob<T>(
+    flags: string[],
+    command: [image: string, ...args: string[]],
+    receive: (out: Readable) => Promise<T>,
+    timeoutMs: number
+  ) {
     const job = this.#owned;
     if (job == null) throw new Error("runJob() needs own() first");
     if (this.#stopped != null) throw new Stopped(this.#stopped);
-    const flag = args.find((arg) => CALLER_FLAG.test(arg));
+    const flag = flags.find((arg) => CALLER_FLAG.test(arg));
     if (flag != null) throw new Refusal(`runJob() sets ${flag} itself; use long options`);
     // prettier-ignore
     const named = ["run", "--name", job.name, "--label", `xum.bugbash.owner=${job.owner}`,
-      "--label", `xum.bugbash.checkout=${job.checkout}`, "--cidfile", this.#cidFile(), ...args];
+      "--label", `xum.bugbash.checkout=${job.checkout}`, "--cidfile", this.#cidFile(), ...flags, ...command];
     const received: Promise<T>[] = [];
     const r = await this.#spawn("docker", named, this.#client!, timeoutMs, (child) => {
       this.#runClient = child;
@@ -284,8 +294,10 @@ export class Session {
     const ps = ["ps", "-aq", "--no-trunc", ...filters];
     const found = await this.#spawn("docker", ps, this.#client!, 15_000);
     if (!found.ok) return `unknown: ${found.error}`;
-    if (found.stdout !== "")
-      return this.#removeById(found.stdout.split("\n")[0], job, "name and labels");
+    const ids = found.stdout.split("\n").filter((line) => line !== "");
+    // Docker names are unique, so two matches mean the lookup is not what this code assumes.
+    if (ids.length > 1) return `unknown: ${ids.length} containers match the name and labels`;
+    if (ids.length === 1) return this.#removeById(ids[0], job, "name and labels");
     if (this.#runClient != null) return "unknown: `docker run` left no container ID";
     return "removed"; // no `docker run` ran, so no container of this job can exist
   }

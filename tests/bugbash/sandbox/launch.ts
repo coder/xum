@@ -280,8 +280,17 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
       ...bind(staged, "/repo"), ...mounts(), ...proxyMount,
       ...bind(path.join(jobDir, "passwd"), "/etc/passwd"), ...bind(path.join(jobDir, "group"), "/etc/group"),
       ...Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
-      "--workdir", "/repo/tests/bugbash", "--entrypoint", "bun", image, "sandbox/entry.ts",
-      "--export", output, "--", "node", "../../node_modules/e2e/dist/cli/bin.js", ...args];
+      "--workdir", "/repo/tests/bugbash", "--entrypoint", "bun"];
+    const command: [string, ...string[]] = [
+      image,
+      "sandbox/entry.ts",
+      "--export",
+      output,
+      "--",
+      "node",
+      "../../node_modules/e2e/dist/cli/bin.js",
+      ...args,
+    ];
     // A signal during the synchronous staging runs its handler only at the next turn of the
     // event loop. This yield lets it run, so own() throws and no container starts (measured).
     await new Promise((resolve) => setImmediate(resolve));
@@ -297,7 +306,7 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
       if (!result.complete) session.stop(`export: ${result.error}`);
       return result;
     };
-    const job = await session.runJob(flags, receive, DEADLINE_MS);
+    const job = await session.runJob(flags, command, receive, DEADLINE_MS);
     const { complete, files, error } = job.received;
     log(
       `${name} exit ${job.code}, ${files} files, ${complete ? "complete" : `incomplete: ${error}`}`
