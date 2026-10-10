@@ -6,8 +6,8 @@ set -euo pipefail
 # Usage: ./scripts/wait_pr_codex.sh <pr_number> [--once]
 #
 # Exits:
-#   0 - Codex approved (thumbs-up on PR description or explicit approval comment)
-#   1 - Codex left comments to address OR failed to review (e.g. rate limit)
+#   0 - Codex approved, or reported a usage limit with no outstanding findings
+#   1 - Codex left comments to address OR failed to review for another reason
 #  10 - still waiting for Codex response (only in --once mode)
 
 if [ $# -lt 1 ] || [ $# -gt 2 ]; then
@@ -85,9 +85,7 @@ if [[ -n "$REACTIONS_SCAN_CACHE_FILE" ]]; then
   fi
 fi
 
-# Keep these regexes in sync with ./scripts/check_codex_comments.sh.
 CODEX_APPROVAL_REGEX="Didn't find any major issues"
-CODEX_RATE_LIMIT_REGEX="usage limits have been reached"
 
 if [ "$SKIP_FETCH_SYNC" = "0" ]; then
   # Check for dirty working tree
@@ -447,16 +445,11 @@ CHECK_CODEX_STATUS_ONCE() {
 
   LAST_REQUEST_AT="$request_at"
 
-  # If Codex can't run (usage limits, etc) it posts a comment we shouldn't treat as "approval".
-  rate_limit_comment=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_RATE_LIMIT_REGEX" '[.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))) | {createdAt, body}] | sort_by(.createdAt) | last // empty | .body // empty')
-
-  if [[ -n "$rate_limit_comment" ]]; then
-    echo ""
-    echo "❌ Codex was unable to review (usage limits)."
-    echo ""
-    echo "$rate_limit_comment"
-    return 1
-  fi
+  # A fresh quota notice may pass the gate, but only after the full findings check below.
+  rate_limit_comment=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" '
+    include "codex_comments";
+    [.[] | select(.createdAt > $request_at and .isMinimized != true and codex_usage_limit($bot))]
+    | sort_by(.createdAt) | last // empty | .body // empty')
 
   approval_comment=$(echo "$all_comments" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg request_at "$request_at" --arg regex "$CODEX_APPROVAL_REGEX" '[.[] | select(.author.login == $bot and .createdAt > $request_at and (.body | test($regex))) | {createdAt, body}] | sort_by(.createdAt) | last // empty | .body // empty')
 
@@ -486,6 +479,7 @@ CHECK_CODEX_STATUS_ONCE() {
   codex_response_count_comments=$(echo "$all_comments" | jq -r -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$pr_head" --arg request_at "$request_at" '
     include "codex_comments";
     [.[] | select(.author.login == $bot and .createdAt > $request_at)
+      | select(codex_usage_limit($bot) | not)
       | select(
           ((.body | codex_without_help | startswith("<!-- codex-pull-request-review-summary -->"))
             or ((.body | codex_without_help | startswith("Security review completed."))
@@ -556,6 +550,12 @@ CHECK_CODEX_STATUS_ONCE() {
       return 1
       ;;
   esac
+
+  if [[ -n "$rate_limit_comment" && "$codex_response_count_comments" -eq 0 ]]; then
+    echo ""
+    echo "✅ Codex gate passed: review skipped because usage limits were reached; no outstanding findings."
+    return 0
+  fi
 
   if [ "$codex_response_count" -eq 0 ]; then
     return 10
