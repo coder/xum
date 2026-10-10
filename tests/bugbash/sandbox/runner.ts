@@ -78,6 +78,9 @@ export class Session {
    * leader when a member ignores SIGTERM, so a stop signals groups, not children (#5877).
    */
   readonly #groups = new Set<number>();
+  /** The start time of each group's leader, read right after its spawn (see groupState). */
+  readonly #leaders = new Map<number, string | undefined>();
+  readonly #signalGroup: (group: number, signal: NodeJS.Signals) => void;
   #stopped: string | null = null;
   #client: Record<string, string> | null = null;
   #clientDir: string | null = null;
@@ -95,8 +98,15 @@ export class Session {
   /** The entry point aborts `stop` from its SIGINT and SIGTERM handlers. */
   constructor(
     stop: AbortSignal,
-    options: { root?: string; graceMs?: number; log?: (line: string) => void } = {}
+    options: {
+      root?: string;
+      graceMs?: number;
+      log?: (line: string) => void;
+      /** Injection point: runner.test.ts records the group signals; production uses killGroup. */
+      signalGroup?: (group: number, signal: NodeJS.Signals) => void;
+    } = {}
   ) {
+    this.#signalGroup = options.signalGroup ?? killGroup;
     this.#root = options.root ?? ROOT;
     this.#graceMs = options.graceMs ?? GRACE_MS;
     this.#log = options.log ?? ((line) => console.error(`sandbox ${line}`));
@@ -288,20 +298,28 @@ export class Session {
   }
 
   /**
-   * Signals a tracked group that still has a member. A group ID stays reserved while any member
-   * lives, so a signal right after a live probe cannot reach a new group with a reused ID.
+   * Signals a tracked group only while it is still ours: it has a live member and its ID was not
+   * reused (groupState). Other agents share this host, so an emptied group is never signalled.
    */
   #signal(group: number, signal: NodeJS.Signals) {
     if (!this.#groups.has(group)) return;
-    if (!groupAlive(group)) this.#groups.delete(group);
-    else killGroup(group, signal);
+    if (!this.#ours(group)) return;
+    this.#signalGroup(group, signal);
+  }
+
+  /** Whether a tracked group is still ours. One that is not stops being tracked. */
+  #ours(group: number): boolean {
+    if (groupState(group, this.#leaders.get(group)) === "ours") return true;
+    this.#groups.delete(group);
+    this.#leaders.delete(group);
+    return false;
   }
 
   /** Waits until every tracked group is empty, or `ms` ends. Returns the groups left. */
   async #groupsGone(ms: number): Promise<number[]> {
     const end = Date.now() + ms;
     for (;;) {
-      for (const group of this.#groups) if (!groupAlive(group)) this.#groups.delete(group);
+      for (const group of this.#groups) this.#ours(group);
       if (this.#groups.size === 0 || Date.now() >= end) return [...this.#groups];
       await Bun.sleep(50);
     }
@@ -397,7 +415,10 @@ export class Session {
     else child.stdout?.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
     child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
     const group = child.pid;
-    if (group != null) this.#groups.add(group);
+    if (group != null) {
+      this.#groups.add(group);
+      this.#leaders.set(group, startTime(String(group)));
+    }
     // The job's deadline closes its lifeline like a stop. Other commands get SIGKILL.
     const timer = setTimeout(() => {
       if (stream != null) this.#stop("deadline");
@@ -408,7 +429,7 @@ export class Session {
         clearTimeout(timer);
         this.#children.delete(child);
         // An empty group is done. A group with members left stays tracked until cleanup.
-        if (group != null && !groupAlive(group)) this.#groups.delete(group);
+        if (group != null) this.#ours(group);
         resolve({
           ok: code === 0,
           code: code ?? (signal != null ? 128 + os.constants.signals[signal] : 1),
@@ -438,13 +459,38 @@ function killGroup(group: number, signal: NodeJS.Signals) {
   }
 }
 
-/** Whether a process group of this user has a member: signal 0 tests it without a signal. */
-function groupAlive(group: number): boolean {
+/** Fields of /proc/<pid>/stat after the command name: state, ppid, pgrp, ..., start time. */
+function readStat(pid: string, proc: string): string[] | undefined {
   try {
-    process.kill(-group, 0);
-    return true;
-  } catch (error) {
-    if (GONE.has((error as NodeJS.ErrnoException).code ?? "")) return false;
-    throw error;
+    const stat = fs.readFileSync(path.join(proc, pid, "stat"), "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  } catch {
+    return undefined; // the process is gone, or not ours to read
   }
+}
+const startTime = (pid: string, proc = "/proc") => readStat(pid, proc)?.[19];
+
+/**
+ * Whether the process group `group` is still the one this session started. "none": no live
+ * (non-zombie) process has that group ID. "reused": a live process leads a group with that ID,
+ * but it is not the leader that this session spawned (another start time), so the ID was freed
+ * and given to someone else: Linux reuses a group ID only after the group emptied. "ours":
+ * live members, and either our own leader or no leader at all (the leader exited and members
+ * stayed). The check reads /proc right before each signal; a reuse inside that short window
+ * would need the group to empty and its ID to come round again in between.
+ */
+export function groupState(
+  group: number,
+  leaderStart: string | undefined,
+  proc = "/proc"
+): "ours" | "none" | "reused" {
+  let members = 0;
+  for (const pid of fs.readdirSync(proc)) {
+    if (!/^\d+$/.test(pid)) continue;
+    const fields = readStat(pid, proc);
+    if (fields?.[2] !== String(group) || /^[ZX]$/.test(fields[0])) continue;
+    if (pid === String(group) && fields[19] !== leaderStart) return "reused";
+    members += 1;
+  }
+  return members > 0 ? "ours" : "none";
 }

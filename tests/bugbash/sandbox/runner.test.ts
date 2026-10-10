@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { launch } from "./launch";
-import { readImageLock, Refusal, Session, Stopped } from "./runner";
+import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
 
 // Each test runs the real build.sh in a throwaway git repo and a fake `docker` on PATH. The
 // runner gives docker a stripped env, so the fake reads its answers from bin/fake.env.
@@ -415,6 +415,57 @@ test("C7: a group member left by a finished command is killed; the state is not 
   expect(alive(grandchild)).toBe(false);
   // It ignores SIGTERM: cleanup kills it at once instead of waiting for the 5 s TERM-to-KILL.
   expect(Date.now() - started).toBeLessThan(3_000);
+});
+
+test("a tracked group whose members all exited is never signalled (its ID can be reused)", async () => {
+  fake({ PULL: "leave" });
+  const signals: string[] = [];
+  const s = new Session(new AbortController().signal, {
+    root,
+    log: () => undefined,
+    signalGroup: (group, signal) => signals.push(`${group} ${signal}`),
+  });
+  sessions.push(s);
+  await s.ensureImage();
+  // The group of `pull` is still tracked: its member outlived the leader. Now it exits too.
+  const grandchild = Number(fs.readFileSync(path.join(bin, "grandchild.pid"), "utf8"));
+  process.kill(grandchild, "SIGKILL");
+  while (fs.existsSync(`/proc/${grandchild}`) && !/\) [ZX] /.test(stat(grandchild)))
+    await Bun.sleep(10);
+  expect(await s.cleanup()).toBe("none");
+  expect(signals).toEqual([]);
+});
+const stat = (pid: number) => {
+  try {
+    return fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch {
+    return "";
+  }
+};
+
+test("groupState tells our group from an emptied or reused group ID", () => {
+  const proc = path.join(root, "proc");
+  // pid (comm) state ppid pgrp, then fields up to the start time (field 22).
+  const proc_ = (pid: number, state: string, pgrp: number, start: number) => {
+    fs.mkdirSync(path.join(proc, String(pid)), { recursive: true });
+    const rest = Array.from({ length: 16 }, () => "0").join(" ");
+    fs.writeFileSync(
+      path.join(proc, String(pid), "stat"),
+      `${pid} (a b) ${state} 1 ${pgrp} ${rest} ${start} 0\n`
+    );
+  };
+  fs.mkdirSync(proc);
+  fs.writeFileSync(path.join(proc, "uptime"), "1 1\n"); // not a pid: skipped
+  expect(groupState(100, "500", proc)).toBe("none");
+  proc_(101, "S", 100, 600); // a member that outlived its leader
+  expect(groupState(100, "500", proc)).toBe("ours");
+  proc_(100, "S", 100, 500); // our leader, by its start time
+  expect(groupState(100, "500", proc)).toBe("ours");
+  fs.rmSync(path.join(proc, "101"), { recursive: true });
+  proc_(100, "S", 100, 900); // another process leads a group with our old ID
+  expect(groupState(100, "500", proc)).toBe("reused");
+  proc_(100, "Z", 100, 500); // only a zombie left
+  expect(groupState(100, "500", proc)).toBe("none");
 });
 
 test.each([
