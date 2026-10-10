@@ -193,6 +193,28 @@ describe("MCPServerManager", () => {
     }
   });
 
+  test("testForApi tells the server only a workspace ID whose plugin context resolved", async () => {
+    using tmp = new DisposableTempDir("mcp-api-workspace-id");
+    const config = new Config(tmp.path);
+    const apiConfigService = new MCPConfigService(config);
+    spyOn(apiConfigService, "listServers").mockResolvedValue({});
+    const resolve = spyOn(apiConfigService, "resolveWorkspaceAgentPluginsContext");
+    const apiManager = new MCPServerManager(apiConfigService, { config });
+    const testServer = spyOn(apiManager, "test").mockResolvedValue({ success: true, tools: [] });
+    try {
+      // Known workspace of this project (padding trimmed, as the resolver does).
+      resolve.mockResolvedValueOnce({ projectRoot: tmp.path, projectKey: "key" });
+      await apiManager.testForApi({ name: "plugin:i:s", workspaceId: " ws-7 " });
+      expect(testServer.mock.calls[0]?.[0].workspaceId).toBe("ws-7");
+      // Unknown, stale or other-project workspace: the resolver rejects it, so no ID is sent.
+      resolve.mockResolvedValueOnce(undefined);
+      await apiManager.testForApi({ name: "plugin:i:s", workspaceId: "ws-other" });
+      expect(testServer.mock.calls[1]?.[0]).not.toHaveProperty("workspaceId");
+    } finally {
+      apiManager.dispose();
+    }
+  });
+
   test("testForApi resolves project trust from config before delegating", async () => {
     for (const trusted of [true, false]) {
       using tmp = new DisposableTempDir(`mcp-api-trust-${trusted}`);

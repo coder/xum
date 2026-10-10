@@ -5202,7 +5202,12 @@ export class MCPServerManager {
         headers: input.headers,
         projectSecrets,
         agentPlugins,
-        ...(input.workspaceId != null ? { workspaceId: input.workspaceId } : {}),
+        // Only a workspace ID whose plugin context resolved (known workspace, same project)
+        // reaches the server as XUM_WORKSPACE_ID: a raw, padded or mismatched ID would make a
+        // plugin save settings under a file the intended workspace's hooks never read.
+        ...(agentPlugins != null && input.workspaceId != null
+          ? { workspaceId: input.workspaceId.trim() }
+          : {}),
       });
     } catch (error) {
       // Preparation (secrets, plugin context, config listing) can reject before test() runs.

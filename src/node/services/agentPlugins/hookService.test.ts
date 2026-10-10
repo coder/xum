@@ -636,6 +636,54 @@ describe("AgentPluginHookService", () => {
     }
   );
 
+  test.each(["dispose", "epoch"] as const)(
+    "a %s that lands while a hook reads its settings stops the call",
+    async (mode) => {
+      const harness = await createHarness();
+      await writeHookPlugin(
+        harness.container,
+        "revoked-mid-read",
+        `({ "tool.execute.before": () => ({ deny: "removed hook ran" }) })`,
+        { tools: ["file_read"] }
+      );
+      await harness.ensure();
+
+      // Pause the settings read (its first step resolves PLUGIN_DATA) and revoke meanwhile.
+      const realRealpath = fs.realpath.bind(fs);
+      const gate = Promise.withResolvers<void>();
+      const reached = Promise.withResolvers<void>();
+      const realpathSpy = spyOn(fs, "realpath").mockImplementation((async (
+        ...args: Parameters<typeof fs.realpath>
+      ) => {
+        reached.resolve();
+        await gate.promise;
+        return realRealpath(...args);
+      }) as typeof fs.realpath);
+      const mountSpy = spyOn(harness.sandboxHost, "withPersistentMount");
+      try {
+        const ctx = makeToolCtx("file_read", { path: "/repo/a.txt" });
+        const running = runTool(harness.spine, ctx);
+        await reached.promise;
+        if (mode === "dispose") await harness.service.disposeWorkspace(WORKSPACE_ID);
+        else {
+          const stagingRoot = path.join(harness.tmp.path, STAGING_DIR_NAME);
+          await fs.mkdir(stagingRoot, { recursive: true });
+          await bumpContainerMutationEpoch(stagingRoot);
+        }
+        gate.resolve();
+        await running;
+
+        expect(ctx.executed).toBe(true);
+        expect(ctx.blocked).toBeUndefined();
+        expect(mountSpy).not.toHaveBeenCalled();
+      } finally {
+        gate.resolve();
+        realpathSpy.mockRestore();
+        mountSpy.mockRestore();
+      }
+    }
+  );
+
   test("an admitted context snapshot reacquires a dropped sandbox instead of retaining its runtime", async () => {
     const harness = await createHarness();
     await writeHookPlugin(
