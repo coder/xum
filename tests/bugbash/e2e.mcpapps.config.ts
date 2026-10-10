@@ -58,6 +58,10 @@ const targets = base.targets.map((target) => ({
     command: {
       ...target.app.command,
       args: ["startApp.ts", "--port", "{port}", "--mcp-apps"],
+      // e2e gives the app only `command.env`, and this config loads only in a model-driven
+      // sandbox job (mcpapps/hostPause.ts). Without this marker startApp.ts would leave agent
+      // tools, terminals and project automation on while the explorer drives the app (S3).
+      env: { ...target.app.command.env, BUGBASH_MODEL_DRIVEN: "1" },
     },
   },
 })) as typeof base.targets;
