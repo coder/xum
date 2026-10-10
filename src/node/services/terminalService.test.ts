@@ -655,6 +655,52 @@ describe("TerminalService", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockPTYService.createSession as any) = createSessionMock;
   });
+
+  it("completes an exit subscription that attaches after the shell exited (#6029)", async () => {
+    let capturedOnExit: ((code: number) => void) | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockPTYService.createSession as any) = mock(
+      (
+        params: TerminalCreateParams,
+        _runtime: unknown,
+        _path: string,
+        _onData: unknown,
+        onExit: (code: number) => void
+      ) => {
+        capturedOnExit = onExit;
+        return Promise.resolve({
+          sessionId: "session-late",
+          workspaceId: params.workspaceId,
+          cols: 80,
+          rows: 24,
+        });
+      }
+    );
+
+    try {
+      await service.create({ workspaceId: "ws-1", cols: 80, rows: 24 });
+
+      const early: number[] = [];
+      service.onExit("session-late", (code) => early.push(code));
+      if (!capturedOnExit) throw new Error("Expected createSession to capture onExit callback");
+      capturedOnExit(7);
+
+      // The renderer subscribes from a mount effect, so the shell can already be gone.
+      const late: number[] = [];
+      service.onExit("session-late", (code) => late.push(code));
+      const unknown: number[] = [];
+      service.onExit("never-existed", (code) => unknown.push(code));
+
+      expect(early).toEqual([7]);
+      // 0 is the renderer's convention for "ended before the listener attached".
+      expect(late).toEqual([0]);
+      expect(unknown).toEqual([0]);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mockPTYService.createSession as any) = createSessionMock;
+    }
+  });
+
   describe("pop-out attachments (#5673)", () => {
     it("a session with a live pop-out is not listed, so the sidebar does not adopt it", () => {
       getWorkspaceSessionIdsMock.mockImplementation(

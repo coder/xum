@@ -1241,10 +1241,16 @@ export class TerminalService {
 
   onExit(sessionId: string, callback: (code: number) => void): () => void {
     const emitter = this.exitEmitters.get(sessionId);
-    if (!emitter)
+    if (!emitter) {
+      // #6029: the emitter exists from before create() returns the ID until the PTY exits,
+      // so a missing one means the session already ended (or never existed). Report it now,
+      // or a late subscriber (the renderer subscribes from a mount effect) waits forever.
+      // 0 matches the renderer's "ended before the listener attached" fallback.
+      callback(0);
       return () => {
         /* no-op */
       };
+    }
 
     const handler = (code: number) => callback(code);
     emitter.on("exit", handler);
