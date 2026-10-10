@@ -37,7 +37,7 @@ jobs:
           cd "$RUNNER_TEMP/base" && bun install --frozen-lockfile && make build
       - name: Run cold-start A/B
         env: { ELECTRON_DISABLE_SANDBOX: 1 }
-        run: xvfb-run -a bun scripts/perf/desktopColdStart.ts --base "$RUNNER_TEMP/base" --head "$GITHUB_WORKSPACE" --pairs "$PAIRS" --json > cold-start.json
+        run: xvfb-run -a node --import tsx scripts/perf/desktopColdStart.ts --base "$RUNNER_TEMP/base" --head "$GITHUB_WORKSPACE" --pairs "$PAIRS" --json > cold-start.json
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         if: always()
         with:
