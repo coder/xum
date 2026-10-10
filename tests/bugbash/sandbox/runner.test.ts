@@ -60,6 +60,7 @@ case "$1" in
       # One model call through the job's proxy socket, like the container's forwarder makes.
       proxycall) for a in "$@"; do case "$a" in *dst=/repo/.sandbox-proxy,readonly) psrc=\${a#type=bind,src=}; psrc=\${psrc%%,*} ;; esac; done
         echo "proxy dir mode $(stat -c %a "$psrc")" >> "$bin/calls.log"
+        echo "job folder: $(ls "$(dirname "$psrc")" | sed 's/xum-bugbash-proxy-.*/xum-bugbash-proxy-X/' | sort | tr '\n' ' ')" >> "$bin/calls.log"
         curl -s --unix-socket "$psrc/sock" -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
           -d '{"model":"'"$CALLMODEL"'","max_tokens":10,"messages":[{"role":"user","content":"'"$CALL"'"}]}' \\
           http://proxy/anthropic/v1/messages >> "$bin/calls.log"; echo >> "$bin/calls.log"
@@ -70,8 +71,8 @@ case "$1" in
     printf '{"p":"app.log","n":2}\nok'; [ "$RUN" = cut ] || printf '{"end":true}\n'
     [ "$RUN" = linger ] || unregister "$id"; exit 7 ;;
   # container inspect --format <name|owner|checkout> <id>
-  container) [ "$INSPECT_RC" = 0 ] || { echo "daemon down" >&2; exit 1; }
-    for id in "$@"; do :; done
+  container) for id in "$@"; do :; done
+    [ "$INSPECT_RC" = 0 ] && [ "$id" != "\${INSPECT_FAIL_ID-}" ] || { echo "daemon down" >&2; exit 1; }
     awk -v id="$id" '$1==id {print "/" $2 "|" $3 "|" $4; f=1} END {exit !f}' "$bin/containers" ||
       { echo "Error response from daemon: No such container: $id" >&2; exit 1; } ;;
   rm) shift 2; [ "\${RM-}" = slow ] && sleep 1; [ "\${RM-}" = noop ] && exit 0; for id in "$@"; do unregister "$id"; done ;;
@@ -710,6 +711,26 @@ test("ownerState: dead, alive, or cannot tell", () => {
     expect(ownerState(owner)).toBe("cannot tell");
 });
 
+test("D1: under hidepid (or an unknown /proc policy) a gone PID cannot tell", () => {
+  const { boot, pidns } = self();
+  const proc = (opts: string) => () =>
+    `22 1 0:21 / /sys rw - sysfs sysfs rw\n1907 1906 0:171 / /proc rw,nosuid - proc proc ${opts}\n`;
+  const gone = `${boot}:${pidns}:${NO_PID}:1`;
+  expect(ownerState(gone, proc("rw"))).toBe("dead");
+  expect(ownerState(gone, proc("rw,hidepid=0"))).toBe("dead");
+  for (const hidden of ["rw,hidepid=2", "rw,hidepid=invisible", "rw,gid=4,hidepid=1"])
+    expect(ownerState(gone, proc(hidden))).toBe("cannot tell");
+  expect(ownerState(gone, () => "22 1 0:21 / /sys rw - sysfs sysfs rw\n")).toBe("cannot tell");
+  expect(
+    ownerState(gone, () => {
+      throw new Error("EACCES");
+    })
+  ).toBe("cannot tell");
+  // A present entry is proof either way.
+  const alive = `${boot}:${pidns}:${process.pid}:${procStart(process.pid)}`;
+  expect(ownerState(alive, proc("rw,hidepid=2"))).toBe("alive");
+});
+
 test("C2: a launch lists the leftovers of its checkout and removes nothing", async () => {
   const { lines } = leftovers();
   const all = Object.values(lines);
@@ -838,20 +859,27 @@ test("C2: a launch lists the leftovers even when the image pull fails", async ()
   ).toBe(true);
 });
 
-test("C2: recover refuses when a listed container cannot be inspected", async () => {
+test("D1: recover reports a leftover it cannot inspect, removes the others, and exits 3", async () => {
   const { lines } = leftovers();
-  fs.writeFileSync(path.join(bin, "containers"), lines.dead + "\n");
-  fake({ INSPECT_RC: "1" });
+  // Two dead leftovers; the first cannot be inspected, so its owner is unknown.
+  const second = lines.dead.replace(/^\w+/, "f".repeat(64)).replace("aaaaa1", "aaaaaf");
+  fs.writeFileSync(path.join(bin, "containers"), [lines.dead, second].join("\n") + "\n");
+  const unreadable = lines.dead.split(" ")[0];
+  fake({ INSPECT_FAIL_ID: unreadable });
   const real = fs.realpathSync(root);
+  const logged: string[] = [];
   const o = {
     root: real,
     cwd: real,
     env: {},
     stop: new AbortController().signal,
-    log: () => undefined,
+    log: (line: string) => logged.push(line),
   };
-  expect(await failure(recover(o))).toThrow(/docker container inspect: daemon down/);
-  expect(registry()).toBe(lines.dead + "\n");
+  expect(await recover(o)).toBe(3); // nonzero: one leftover stays unproved
+  expect(registry()).toBe(lines.dead + "\n"); // the unreadable one stays, the other is gone
+  expect(logged.join("\n")).toContain(
+    `recover: left ${unreadable.slice(0, 12)}: docker container inspect: daemon down`
+  );
 });
 
 test("C2: a stop during recover starts no further removal", async () => {
@@ -962,6 +990,8 @@ test("B1: an MCP Apps job reaches the model only through its proxy, with the hos
   expect(run).not.toContain(UPSTREAM_KEY);
   expect(run).not.toContain("ANTHROPIC");
   expect(calls()).toContain("proxy dir mode 700");
+  // D1: the inner socket's private folder is in the job folder, beside the mounted ones.
+  expect(calls()).toContain("job folder: group passwd proxy stage xum-bugbash-proxy-X ");
   expect(calls()).toContain('"usage":');
   expect(requests).toHaveLength(1);
   expect(requests[0].headers["x-api-key"]).toBe(UPSTREAM_KEY);
@@ -1244,6 +1274,11 @@ test("B2: unknown cleanup outranks a stop, and a stop outranks a proxy fault", (
   expect(exitFor({ code: 0, cleanup: "removed", ...fault })).toBe(5);
   expect(() => exitFor({ error: new Refusal("x"), cleanup: "none" })).toThrow(Refusal);
   expect(exitFor({ code: 7, cleanup: "removed" })).toBe(7);
+  // e2e's own 3 moves to 6; the precedence above still applies to it.
+  expect(exitFor({ code: 3, cleanup: "removed" })).toBe(6);
+  expect(exitFor({ code: 3, cleanup: "unknown: x" })).toBe(3);
+  expect(() => exitFor({ code: 3, cleanup: "removed", stopped: "SIGINT" })).toThrow(Stopped);
+  expect(exitFor({ code: 3, cleanup: "removed", ...fault })).toBe(5);
 });
 
 test("B1: a repro job gets no proxy and no explorer model, whatever the host sets", async () => {

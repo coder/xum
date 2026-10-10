@@ -183,18 +183,27 @@ export class Session {
    * Every job container of one checkout, of any owner, by its checkout label (#5882). It
    * removes nothing: a launch logs the list, and only recover() removes from it.
    */
-  async listJobs(checkout: string): Promise<{ id: string; job: Job }[]> {
+  /**
+   * The job containers of a checkout. One that cannot be inspected comes back with its `error`
+   * and no job: the caller reports it and never removes it (its owner is unknown).
+   */
+  async listJobs(
+    checkout: string
+  ): Promise<({ id: string; job: Job } | { id: string; error: string })[]> {
     if (!/^[0-9a-f]{12}$/.test(checkout)) throw new Refusal(`bad checkout ID ${checkout}`);
     const filter = ["--filter", `label=xum.bugbash.checkout=${checkout}`];
     const ps = await this.#must(["ps", "-aq", "--no-trunc", ...filter], 15_000);
-    const found: { id: string; job: Job }[] = [];
+    const found: ({ id: string; job: Job } | { id: string; error: string })[] = [];
     for (const id of ps.stdout.split("\n").filter((line) => line !== "")) {
       if (!/^[0-9a-f]{64}$/.test(id)) throw new Refusal(`docker ps: unexpected ID ${id}`);
       const args = ["container", "inspect", "--format", INSPECT, id];
       const look = await this.#job("docker", args, this.#client!, 15_000);
-      // Removed since the list: nothing to report. Any other failure hides a container: refuse.
+      // Removed since the list: nothing to report. Any other failure is reported, not skipped.
       if (!look.ok && look.error.includes("No such container")) continue;
-      if (!look.ok) throw new Refusal(`docker container inspect: ${look.error}`);
+      if (!look.ok) {
+        found.push({ id, error: `docker container inspect: ${look.error}` });
+        continue;
+      }
       // The label filter picked the checkout; removeJob() checks all three again before a removal.
       const [name, owner] = look.stdout.replace(/^\//, "").split("|");
       found.push({ id, job: { name, owner, checkout } });

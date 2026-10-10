@@ -6,9 +6,9 @@
  * and the app that it drives can run commands on this host.
  *
  * Exact-step repros keep running on the host as before: `e2e run` and `e2e list` with
- * e2e.config.ts. That config holds no explorer model during the pause, so an `agent.*` step in a
- * repro fails with MODEL_UNAVAILABLE before any model request (e2e has no default model and no
- * env fallback).
+ * e2e.config.ts. Outside a sandboxed `e2e explore` that config's agents hold no model
+ * (sandbox/explorerModel.ts), so an `agent.*` step in a repro fails with MODEL_UNAVAILABLE
+ * before any model request (e2e has no default model and no env fallback).
  *
  * The pause has no override: no env var or flag turns it off. Model-driven runs pass only
  * inside the bug-bash sandbox with a provider proxy for the job (sandbox/inContainer.ts):

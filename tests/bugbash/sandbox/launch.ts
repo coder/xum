@@ -23,8 +23,9 @@
  * on the host. There is no host fallback.
  * Exit codes: the job's code, 2 refused, 3 the container state is unknown after cleanup, 4 the
  * evidence is incomplete, 5 the proxy reported a fault (a call cost more than its bound, or a
- * call outlived close()), 130 or 143 when SIGINT or SIGTERM stopped it. Exit 3 outranks a stop,
- * and a stop outranks 5.
+ * call outlived close()), 6 the job itself exited 3 (e2e's infrastructure error, moved so that 3
+ * means only an unknown container), 130 or 143 when SIGINT or SIGTERM stopped it. Exit 3
+ * outranks a stop, and a stop outranks 5.
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -153,6 +154,7 @@ export async function probeApp(
     fs.chmodSync(dir, 0o700);
     const proxy = await startProxy({
       socketPath: path.join(dir, "sock"),
+      privateParent: dir, // the probe's own folder, mounted nowhere
       upstream: job.upstream,
       job: { models: [model] },
       ledger,
@@ -194,9 +196,13 @@ function ownerLabel(): string {
  * namespace, and a PID that is gone, a zombie (it exited and waits for its parent), or now has
  * another start time (a reused PID). Anything that
  * cannot be checked from here (another boot, another namespace, a malformed label, an
- * unreadable /proc entry) is "cannot tell", and recover() leaves it.
+ * unreadable /proc entry, a gone PID under a /proc mount with `hidepid` or an unknown mount
+ * policy) is "cannot tell", and recover() leaves it.
  */
-export function ownerState(owner: string): "dead" | "alive" | "cannot tell" {
+export function ownerState(
+  owner: string,
+  mountinfo: () => string = () => fs.readFileSync("/proc/self/mountinfo", "utf8")
+): "dead" | "alive" | "cannot tell" {
   const parts = owner.split(":");
   if (parts.length !== 4 || !/^\d+$/.test(parts[2]) || !/^\d+$/.test(parts[3]))
     return "cannot tell";
@@ -204,10 +210,33 @@ export function ownerState(owner: string): "dead" | "alive" | "cannot tell" {
   if (boot !== bootId() || pidns !== pidNamespace()) return "cannot tell";
   try {
     const stat = procStat(pid);
-    return stat != null && !/^[ZX]$/.test(stat[0]) && stat[19] === start ? "alive" : "dead";
+    // With hidepid, another user's live launcher has no /proc entry either: a missing entry
+    // proves nothing unless /proc shows every process.
+    if (stat == null) return procShowsAll(mountinfo) ? "dead" : "cannot tell";
+    return !/^[ZX]$/.test(stat[0]) && stat[19] === start ? "alive" : "dead";
   } catch {
     return "cannot tell";
   }
+}
+
+/**
+ * Whether the /proc mount shows every process: no `hidepid`, or `hidepid=0`/`off`. False when
+ * the mount cannot be read or found, so an unknown policy never proves a launcher dead.
+ */
+function procShowsAll(mountinfo: () => string): boolean {
+  let text: string;
+  try {
+    text = mountinfo();
+  } catch {
+    return false;
+  }
+  // mountinfo: "<id> <parent> <dev> <root> <mount point> <options> ... - <fstype> <source> <super options>"
+  const line = text.split("\n").find((l) => l.split(" ")[4] === "/proc" && l.includes(" - proc "));
+  if (line == null) return false;
+  // "- proc <source> <super options>"
+  const superOptions = line.slice(line.indexOf(" - proc ") + 1).split(" ")[3] ?? "";
+  const hidepid = /(?:^|,)hidepid=([^,]*)/.exec(superOptions)?.[1];
+  return hidepid == null || hidepid === "0" || hidepid === "off";
 }
 
 /**
@@ -226,7 +255,14 @@ export async function recover(o: LaunchOptions & { log?: (line: string) => void 
   let failure: { error: unknown } | undefined;
   try {
     say(`recover: docker endpoint ${await session.connect()}, checkout ${checkout}`);
-    for (const { id, job } of await session.listJobs(checkout)) {
+    for (const entry of await session.listJobs(checkout)) {
+      // Unknown ownership never authorizes a removal: report it, go on, and exit nonzero.
+      if ("error" in entry) {
+        say(`recover: left ${entry.id.slice(0, 12)}: ${entry.error}`);
+        unproved += 1;
+        continue;
+      }
+      const { id, job } = entry;
       const owner = ownerState(job.owner);
       const named = jobName.test(job.name);
       if (owner !== "dead" || !named) {
@@ -283,13 +319,16 @@ export interface JobOutcome {
   proxyFault?: string;
 }
 
+/** e2e's own exit 3 (its infrastructure error) as a launcher code: 3 means an unknown container. */
+export const JOB_EXIT_3 = 6;
+
 /** The one precedence rule: unknown cleanup (3), then a stop, then a proxy fault (5). */
 export function exitFor(outcome: JobOutcome): number {
   if (outcome.cleanup.startsWith("unknown")) return 3;
   if (outcome.stopped != null) throw new Stopped(outcome.stopped);
   if (outcome.proxyFault != null) return 5;
   if ("error" in outcome) throw outcome.error;
-  return outcome.code!;
+  return outcome.code === 3 ? JOB_EXIT_3 : outcome.code!;
 }
 
 /** Runs the job and returns the launcher's exit code. Refusal and Stopped are thrown. */
@@ -370,8 +409,12 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     // Leftovers of crashed launches (#5882) are only listed here, first, so a launch that fails
     // later (a long or failed pull) still shows them. recover removes the dead ones.
     await session.connect();
-    for (const { job } of await session.listJobs(checkout))
-      log(`leftover: ${job.name} owner ${ownerState(job.owner)} (make bug-bash-sandbox-recover)`);
+    for (const entry of await session.listJobs(checkout))
+      log(
+        "error" in entry
+          ? `leftover: ${entry.id.slice(0, 12)} cannot be inspected (${entry.error})`
+          : `leftover: ${entry.job.name} owner ${ownerState(entry.job.owner)} (make bug-bash-sandbox-recover)`
+      );
     const image = await session.ensureImage();
     fs.mkdirSync(path.dirname(jobDir), { recursive: true, mode: 0o700 });
     fs.mkdirSync(jobDir, { mode: 0o700 }); // EEXIST: not this job's folder, so cleanup keeps it
@@ -401,6 +444,8 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       ledger = o.ledger ?? new Ledger(driven.budgetUsd);
       proxy = await startProxy({
         socketPath: path.join(proxyDir, "sock"),
+        // The job folder: not mounted (only stage/ and proxy/ are), and one place to clean up.
+        privateParent: jobDir,
         upstream: driven.upstream,
         // The explorer, and in real mode the app too: nothing else.
         job: { models: [...new Set([driven.model, ...(ai.mode === "real" ? [ai.model] : [])])] },
