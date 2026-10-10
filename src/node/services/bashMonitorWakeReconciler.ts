@@ -99,7 +99,11 @@ export interface BashMonitorWakeReconcilerRegistry {
   ): Promise<void> | void;
 }
 
-export type BashMonitorWakeDispatchOutcome = "in-flight" | "deferred";
+/**
+ * "refused": the wake was refused for good (a plugin message.send.before block refuses the same
+ * wake again), so its signals are consumed without a delivered row instead of redispatched.
+ */
+export type BashMonitorWakeDispatchOutcome = "in-flight" | "deferred" | "refused";
 
 export interface BashMonitorWakeDispatch {
   ownerWorkspaceId: string;
@@ -598,6 +602,7 @@ export class BashMonitorWakeReconciler {
         onDeferred: async () => this.defer(ownerWorkspaceId, dispatch),
       });
       if (outcome === "deferred") await this.defer(ownerWorkspaceId, dispatch);
+      else if (outcome === "refused") await this.refuse(ownerWorkspaceId, dispatch);
       else await this.settle(ownerWorkspaceId, dispatch);
     } catch (error) {
       await this.locks.withLock(ownerWorkspaceId, () => {
@@ -614,6 +619,21 @@ export class BashMonitorWakeReconciler {
       const state = this.state(ownerWorkspaceId);
       if (state.dispatch === dispatch && !dispatch.accepted) state.dispatch = undefined;
       return Promise.resolve();
+    });
+  }
+  /**
+   * Consume a refused wake's signals like an accepted one (watermarks + cleanup) but without
+   * claiming delivery: no row exists. Output that arrives later still wakes. A failed consumption
+   * throws into the reconcile retry backoff.
+   */
+  private async refuse(ownerWorkspaceId: string, dispatch: DispatchState): Promise<void> {
+    await this.locks.withLock(ownerWorkspaceId, async () => {
+      const state = this.state(ownerWorkspaceId);
+      if (state.dispatch !== dispatch || dispatch.accepted) return;
+      state.dispatch = undefined;
+      const watermarks = await this.readWatermarks(ownerWorkspaceId);
+      await this.advanceWatermarks(ownerWorkspaceId, watermarks, dispatch.signals);
+      await this.cleanup(dispatch.signals);
     });
   }
   private async settle(ownerWorkspaceId: string, dispatch: DispatchState): Promise<void> {

@@ -3307,6 +3307,9 @@ export class WorkspaceService
       }
     }
     if (!result.success && !accepted) {
+      // A plugin refuses the same wake again: consume it instead of retrying after idle, which
+      // would loop at once on an idle workspace. The block's transcript error records it.
+      if (result.error.type === "plugin_blocked") return { outcome: "refused", result };
       if (!(await this.sessions.get(ownerWorkspaceId)?.isAutomaticSendBlocked())) {
         this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
       }

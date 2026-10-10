@@ -5427,6 +5427,12 @@ export class AgentSession {
             uiVisible: true,
           }
         );
+        // The generated compaction request is a compaction send too: plugin hooks see it, and
+        // Xum ignores their outcome (see runPluginSendHooks).
+        await this.aiService.runMessageSendBefore?.(this.workspaceId, {
+          text: autoCompactionRequest.messageText,
+          origin: "compaction",
+        });
 
         if (this.coordinator.admissionBlocked || isAdmissionStale())
           return refuseBeforeAcceptance(
@@ -12372,9 +12378,11 @@ export class AgentSession {
       // ran was refused under the history lock. Removed record ids never come back, so leaving
       // the handoff on the summary would only fail again on every startup: drop it, then report
       // the failure like any other dispatch failure.
+      // A plugin refuses the same follow-up again on every retry, so it is dropped the same way.
       if (
-        sendResult.error.type === "unknown" &&
-        sendResult.error.raw === PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+        (sendResult.error.type === "unknown" &&
+          sendResult.error.raw === PLAN_REVIEW_FEEDBACK_STALE_MESSAGE) ||
+        sendResult.error.type === "plugin_blocked"
       ) {
         await this.clearPendingFollowUpFromSummary(lastMessage);
       }

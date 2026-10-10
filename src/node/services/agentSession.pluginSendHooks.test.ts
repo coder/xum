@@ -5,7 +5,11 @@
  */
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import assert from "node:assert";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type CompactionFollowUpRequest,
+  type MuxMessage,
+} from "@/common/types/message";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import type { MessageSendHookOutcome, MessageSendOrigin } from "./events/eventSpine";
 import type { CompactionMonitor } from "./compactionMonitor";
@@ -189,10 +193,14 @@ describe("on-send compaction follow-up", () => {
     const result = await h.session.sendMessage("my token is abc", options);
     expect(result.success).toBe(true);
 
-    // The compaction request row is Xum's own; only the user's message ran the hooks.
-    expect(calls).toEqual([{ text: "my token is abc", origin: "user" }]);
+    // The user's message ran the hooks once; the generated compaction request is shown to them
+    // as a compaction send, and its outcome (this fake rewrites everything) is ignored.
     const rows = await userRows(h);
     expect(rows).toHaveLength(1);
+    expect(calls).toEqual([
+      { text: "my token is abc", origin: "user" },
+      { text: textOf(rows[0]), origin: "compaction" },
+    ]);
     const muxMetadata = rows[0]?.metadata?.muxMetadata;
     assert(muxMetadata?.type === "compaction-request");
     expect(muxMetadata.parsed.followUpContent).toMatchObject({
@@ -202,7 +210,10 @@ describe("on-send compaction follow-up", () => {
     });
   });
 
-  async function seedHandoff(h: AgentSessionHarness, pendingFollowUp: object): Promise<void> {
+  async function seedHandoff(
+    h: AgentSessionHarness,
+    pendingFollowUp: CompactionFollowUpRequest
+  ): Promise<void> {
     for (const row of [
       createMuxMessage("u0", "user", "original question"),
       createMuxMessage("a0", "assistant", "original answer"),
@@ -237,6 +248,24 @@ describe("on-send compaction follow-up", () => {
       plugin: "redactor",
       originalText: "my token is abc",
     });
+  });
+
+  test("a blocked follow-up is dropped instead of retried on every recovery", async () => {
+    const { h, calls } = await setup(blockAll);
+    setOnSendCompaction(h, false);
+    await seedHandoff(h, { text: "then deploy", model: options.model, agentId: "exec" });
+
+    await h.session.dispatchPendingCompactionFollowUpIfNeeded().catch(() => false);
+    expect(calls).toHaveLength(1);
+    const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(history.success);
+    const summary = history.data.find((row) => row.id === "summary");
+    const muxMetadata = summary?.metadata?.muxMetadata;
+    assert(muxMetadata?.type === "compaction-summary");
+    expect(muxMetadata.pendingFollowUp).toBeUndefined();
+
+    await h.session.dispatchPendingCompactionFollowUpIfNeeded().catch(() => false);
+    expect(calls).toHaveLength(1);
   });
 
   test("a follow-up the hooks never saw (manual /compact) runs them as a system send", async () => {
