@@ -448,6 +448,7 @@ function buildUserDisplayedMessages(options: {
       compactionRequest,
       reviews: muxMeta?.reviews,
       artifactInteraction: toArtifactInteractionDisplay(muxMeta?.artifactInteraction),
+      pluginRewrite: message.metadata?.pluginRewrite,
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
       // Only genuine machine rows get collapsed; corrupted metadata must not hide human input.
       contextBudgetWarning:

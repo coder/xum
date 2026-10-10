@@ -1,5 +1,11 @@
 import { createAssistantMessageId } from "@/node/services/utils/messageIds";
-import { eventSpine, type RequestAssemblySnapshot } from "./events/eventSpine";
+import {
+  eventSpine,
+  type MessageSendContext,
+  type MessageSendHookOutcome,
+  type MessageSendOrigin,
+  type RequestAssemblySnapshot,
+} from "./events/eventSpine";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import * as path from "path";
 import { EventEmitter } from "events";
@@ -494,8 +500,49 @@ export class AIService extends EventEmitter {
       metadata: metadata.data,
       hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
       journal: this.durableEventJournalFor(workspaceId),
+      history: this.historyService,
     });
     return Ok(eventSpine.captureRequestAssembly(workspaceId));
+  }
+
+  /**
+   * Run the plugin `message.send.before` chain for one new message. Loads the
+   * workspace's lazy hooks first (same setup as request building). Fail-soft:
+   * any failure means "no change", so a broken plugin system never blocks a send.
+   */
+  async runMessageSendBefore(
+    workspaceId: string,
+    input: { text: string; origin: MessageSendOrigin }
+  ): Promise<MessageSendHookOutcome> {
+    try {
+      const metadata = await this.getWorkspaceMetadata(workspaceId);
+      if (!metadata.success) return { kind: "none" };
+      const runtimeContext = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+      if (!runtimeContext.success) return { kind: "none" };
+      await prepareWorkspaceRequestHooks({
+        config: this.config,
+        metadata: metadata.data,
+        hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
+        journal: this.durableEventJournalFor(workspaceId),
+        history: this.historyService,
+      });
+      if (!eventSpine.hasMiddleware("message.send")) return { kind: "none" };
+      const ctx: MessageSendContext = { workspaceId, origin: input.origin, text: input.text };
+      await eventSpine.run("message.send", ctx);
+      if (ctx.blocked != null) {
+        return { kind: "blocked", pluginName: ctx.blocked.pluginName, reason: ctx.blocked.reason };
+      }
+      if (ctx.rewrittenBy != null && ctx.text !== input.text) {
+        return { kind: "rewritten", text: ctx.text, pluginName: ctx.rewrittenBy };
+      }
+      return { kind: "none" };
+    } catch (error) {
+      log.warn("Plugin message.send.before failed; sending the message unchanged", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return { kind: "none" };
+    }
   }
 
   releaseMockStreamStartGate(workspaceId: string): void {

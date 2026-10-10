@@ -10,6 +10,11 @@ import { EDIT_HISTORY_CHANGED_MESSAGE } from "@/constants/transcriptBarrier";
 const getProviderDisplayName = (provider: string): string =>
   PROVIDER_DISPLAY_NAMES[provider as ProviderName] ?? provider;
 
+/** Shared wording for a send a plugin `message.send.before` hook refused. */
+export function formatPluginBlockedMessage(plugin: string, reason: string): string {
+  return `Plugin ${plugin} blocked this message: ${reason}`;
+}
+
 export interface FormattedError {
   message: string;
   resolutionHint?: string; // e.g., "Open Settings → Providers and add an API key"
@@ -100,6 +105,9 @@ export function formatSendMessageError(error: SendMessageError): FormattedError 
     case "plan_review_feedback_edit_blocked":
     case "session_tape_replay":
       return { message: error.message };
+
+    case "plugin_blocked":
+      return { message: formatPluginBlockedMessage(error.plugin, error.reason) };
 
     case "unknown": {
       const raw = typeof error.raw === "string" ? error.raw.trim() : "";

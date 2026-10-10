@@ -104,6 +104,7 @@ export class ContinuousStrategy {
           workspaceId: this.host.workspaceId,
           config: this.deps.config,
           aiService: this.deps.aiService,
+          historyService: this.deps.historyService,
           sessionUsageService: this.deps.sessionUsageService,
           head,
           receiptRows,

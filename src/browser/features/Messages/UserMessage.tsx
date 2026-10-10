@@ -31,6 +31,8 @@ import {
   type EditingMessageState,
 } from "@/browser/utils/chatEditing";
 import { useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { Button } from "@/browser/components/Button/Button";
+import type { PluginRewriteRecord } from "@/common/types/message";
 import {
   Bot,
   ChevronLeft,
@@ -49,6 +51,36 @@ function base64ToBlob(dataBase64: string, mediaType: string): Blob {
   }
   return new Blob([bytes], { type: mediaType });
 }
+
+/**
+ * "Changed by plugin" note under a message a plugin message.send.before hook rewrote. The
+ * original is behind a toggle (not a hover tooltip) so touch screens can open it too.
+ */
+const PluginRewriteNote: React.FC<{ rewrite: PluginRewriteRecord }> = (props) => {
+  const [showOriginal, setShowOriginal] = React.useState(false);
+  return (
+    <div className="text-muted mt-2 text-[11px]">
+      <div className="flex flex-wrap items-center gap-x-2">
+        <span className="min-w-0 break-words">Changed by plugin {props.rewrite.plugin}</span>
+        <Button
+          type="button"
+          variant="link"
+          size="xs"
+          className="h-auto px-0"
+          aria-expanded={showOriginal}
+          onClick={() => setShowOriginal((open) => !open)}
+        >
+          {showOriginal ? "Hide original" : "Show original"}
+        </Button>
+      </div>
+      {showOriginal && (
+        <div className="border-border-medium text-foreground/80 mt-1 border-l-2 pl-2 break-words whitespace-pre-wrap">
+          {props.rewrite.originalText}
+        </div>
+      )}
+    </div>
+  );
+};
 
 /** Navigation info for navigating between user messages */
 export interface UserMessageNavigation {
@@ -342,6 +374,7 @@ export const UserMessage: React.FC<UserMessageProps> = ({
       variant="user"
     >
       {renderedContent}
+      {message.pluginRewrite != null && <PluginRewriteNote rewrite={message.pluginRewrite} />}
     </MessageWindow>
   );
 };

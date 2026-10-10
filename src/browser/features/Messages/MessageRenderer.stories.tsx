@@ -1046,6 +1046,52 @@ export const AgentPeerMessagesPhone390: AppStory = {
   },
 };
 
+/**
+ * A message a plugin message.send.before hook rewrote: the "Changed by plugin" note opens the
+ * submitted original. Snapshotted at phone and laptop width (the note wraps on phones).
+ */
+export const PluginRewrittenMessage: AppStory = {
+  parameters: {
+    ...appMeta.parameters,
+    pixel: { matrix: { viewports: ["phone", "laptop"] } },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        return setupSimpleChatStory({
+          workspaceId: "ws-plugin-rewrite",
+          messages: [
+            createUserMessage(
+              "msg-1",
+              "Rotate the API key stored in [redacted] and update the deploy config.",
+              {
+                historySequence: 1,
+                timestamp: STABLE_TIMESTAMP - 60000,
+                pluginRewrite: {
+                  plugin: "secret-redactor",
+                  originalText:
+                    "Rotate the API key stored in sk-live-1234 and update the deploy config.",
+                },
+              }
+            ),
+            createAssistantMessage("msg-2", "I'll rotate the key and update the config.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 55000,
+            }),
+          ],
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("Changed by plugin secret-redactor");
+    await userEvent.click(await canvas.findByRole("button", { name: "Show original" }));
+    await canvas.findByText(/sk-live-1234/);
+  },
+};
+
 /** Streaming/working state with pending tool call */
 export const Streaming: AppStory = {
   render: () => (
