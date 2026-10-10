@@ -296,6 +296,8 @@ export type TelemetryCommandType =
   | "fork"
   | "side"
   | "vim"
+  | "fast"
+  | "ultrafast"
   | "model"
   | "mode"
   | "plan"

@@ -109,6 +109,20 @@ import {
   TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
 } from "@/constants/transcriptBarrier";
 
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
+import { DEFAULT_ROUTE_PRIORITY, resolveRoute } from "@/common/routing";
+import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
+import {
+  applyFastModeToggle,
+  getFastModeProvider,
+  isFastModeActive,
+  isUltrafastModeActive,
+  ultrafastModeAvailable,
+} from "@/browser/utils/fastModeServiceTier";
+
+// Provider preferences are global: serialize slash toggles even across composers.
+let speedModeToggleInFlight = false;
+
 const BUILT_IN_MODEL_SET = new Set<string>(Object.values(KNOWN_MODELS).map((model) => model.id));
 
 export interface ForkOptions {
@@ -759,6 +773,83 @@ export async function processSlashCommand(
             message: error instanceof Error ? error.message : "Failed to update setting",
           }),
         ]);
+      }
+    });
+  }
+
+  if (parsed.type === "speed-mode-toggle") {
+    if (!client) return notConnected();
+    if (speedModeToggleInFlight) return complete("restore");
+    trackCommandUsed(parsed.mode);
+    return phase([{ type: "clear-input" }], async () => {
+      if (speedModeToggleInFlight) return complete("restore-if-empty");
+      speedModeToggleInFlight = true;
+      const store = getProvidersConfigStore();
+      const label = parsed.mode === "fast" ? "Fast" : "Ultrafast";
+      try {
+        // Slash toggles use the same provider preference and restore target as the selector,
+        // not a one-shot send override. Use the selected model, including creation composers.
+        const model = env.sendMessageOptions.model;
+        const providersConfig = await client.providers.getConfig();
+        const routeConfig = getAppConfigStore().getSnapshot() ?? (await client.config.getConfig());
+        const { isGatewayModelAccessible, resolveGatewayModelId } =
+          createGatewayRouting(providersConfig);
+        const route = resolveRoute(
+          normalizeToCanonical(model),
+          routeConfig.routePriority ?? DEFAULT_ROUTE_PRIORITY,
+          routeConfig.routeOverrides ?? {},
+          (provider) =>
+            providersConfig[provider]?.isConfigured === true &&
+            providersConfig[provider]?.isEnabled !== false,
+          isGatewayModelAccessible,
+          resolveGatewayModelId
+        );
+        const availability = {
+          providersConfig,
+          resolvedRouteProvider:
+            route.routeProvider === route.origin ? "direct" : route.routeProvider,
+        };
+        const provider = getFastModeProvider(model, availability);
+        if (
+          provider == null ||
+          (parsed.mode === "ultrafast" && !ultrafastModeAvailable(model, availability))
+        ) {
+          throw new Error(
+            `${label} mode is not available for ${model} on its current provider route and wire format.`
+          );
+        }
+        const patch = await applyFastModeToggle(
+          client.providers,
+          provider,
+          providersConfig[provider],
+          parsed.mode === "fast" ? "priority" : "ultrafast"
+        );
+        if (!patch) throw new Error(`Failed to toggle ${label} mode`);
+        store.updateOptimistically(provider, patch);
+        if (store.getConfig() == null) await store.refresh();
+        const updatedConfig = { ...providersConfig[provider], ...patch };
+        const enabled =
+          parsed.mode === "fast"
+            ? isFastModeActive(provider, updatedConfig)
+            : isUltrafastModeActive(updatedConfig);
+        return complete("consume", [
+          showToast({
+            id: Date.now().toString(),
+            type: "success",
+            message: `${label} mode ${enabled ? "enabled" : "disabled"}`,
+          }),
+        ]);
+      } catch (error) {
+        await store.refresh();
+        return complete("restore-if-empty", [
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: error instanceof Error ? error.message : `Failed to toggle ${label} mode`,
+          }),
+        ]);
+      } finally {
+        speedModeToggleInFlight = false;
       }
     });
   }

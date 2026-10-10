@@ -43,6 +43,16 @@ describe("getSlashCommandSuggestions", () => {
     expect(getSlashCommandSuggestions("")).toEqual([]);
   });
 
+  it.each(["workspace", "creation"] as const)(
+    "suggests speed toggles in %s composers",
+    (variant) => {
+      for (const mode of ["fast", "ultrafast"]) {
+        const suggestions = getSlashCommandSuggestions(`/${mode.slice(0, 2)}`, { variant });
+        expect(suggestions.map((suggestion) => suggestion.replacement)).toContain(`/${mode}`);
+      }
+    }
+  );
+
   it("filters workspace-only commands in creation mode", () => {
     const suggestions = getSlashCommandSuggestions("/", { variant: "creation" });
     const labels = suggestions.map((s) => s.display);

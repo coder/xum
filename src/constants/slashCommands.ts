@@ -56,12 +56,16 @@ export const WORKSPACE_ONLY_COMMAND_TYPES: ReadonlySet<string> = new Set(
 export const SIDE_CHAT_DISALLOWED_COMMAND_TYPES: ReadonlySet<string> = new Set([
   ...WORKSPACE_ONLY_COMMAND_TYPES,
   "idle-compaction",
+  // Speed toggles change provider-wide preferences, not just the ephemeral side chat.
+  "speed-mode-toggle",
 ]);
 
 /** Include invalid/missing-argument parses so they get the same side-chat gate. */
 export const SIDE_CHAT_DISALLOWED_COMMAND_KEYS: ReadonlySet<string> = new Set([
   ...WORKSPACE_ONLY_COMMAND_KEYS,
   "idle",
+  "fast",
+  "ultrafast",
   "workflow",
   "goal",
 ]);
