@@ -19,6 +19,7 @@ import type {
   ArtifactVersion,
   PinnedArtifactFile,
 } from "@/common/orpc/schemas/artifacts";
+import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import type { McpAppToolCallResult, McpAppView } from "@/common/orpc/schemas/mcpApps";
 import type { APIClient } from "@/browser/contexts/API";
 import { createMockReviewStateApi } from "./reviewState";
@@ -2103,6 +2104,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }) => {
           mcpOverrides.set(input.workspaceId, input.overrides);
           return Promise.resolve({ success: true, data: undefined });
+        },
+        // The composer lists MCP prompts for slash suggestions; without this, typing "/" in a
+        // story crashed the chat pane (#5991). Stories configure no MCP servers, so none exist.
+        prompts: {
+          list: (_input: { workspaceId: string }) => Promise.resolve<MCPPromptDescriptor[]>([]),
         },
       },
       getFileCompletions: (input: { workspaceId: string; query: string; limit?: number }) => {
