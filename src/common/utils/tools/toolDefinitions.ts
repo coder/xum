@@ -220,7 +220,7 @@ export const AskUserQuestionToolResultSchema = z.union([
 export const HeartbeatToolActionSchema = z.enum(["get", "set", "unset"]);
 export const HeartbeatToolArgsSchema = z
   .object({
-    action: HeartbeatToolActionSchema,
+    action: HeartbeatToolActionSchema.describe("Operation to perform."),
     enabled: z.boolean().nullish().describe("New settings default to true."),
     intervalMs: z
       .number()
@@ -382,7 +382,7 @@ export function buildTaskToolDescription(
     `${getTaskRuntimeVisibilityGuidance(runtimeMode)}${sharedIsolation ? ' isolation: "none" shares this checkout instead.' : ""}`,
     [
       "Spawning:",
-      '- agentId picks the agent (subagent_type is a deprecated alias). title: a short reusable role name (e.g. Reviewer), not the assignment; for kind="workspace", a normal chat title, and agentId picks its mode (default exec; no internal agents).',
+      '- agentId picks the agent (subagent_type is a deprecated alias); for kind="workspace" it picks the mode (default exec; no internal agents).',
       "- Brief: Task / Background / Scope / Starting points / Acceptance / Deliverables / Constraints. Children share your system instructions (AGENTS.md read from their checkout) but not your plan file or goal: put objectives, criteria and deliverables in the prompt; skip shared instructions.",
       "- run_in_background=false (preferred for one task) waits for the report (one per child with n); on timeout the task keeps running. true returns at once and wakes you when it settles; use it for parallel tasks.",
       "- Never call task_await in the same parallel tool batch as task; use the IDs task returns.",
@@ -523,7 +523,12 @@ const taskToolBaseShape = {
   prompt: z.string().min(1),
   // Persistent children appear alongside normal chats, so a short role label stays friendly and
   // reusable across follow-up assignments instead of reading like another task-specific chat title.
-  title: z.string().min(1),
+  title: z
+    .string()
+    .min(1)
+    .describe(
+      'A short reusable role name (e.g. Reviewer), not the assignment; for kind="workspace", a normal chat title.'
+    ),
   run_in_background: z.boolean().nullish().default(false),
   n: TaskToolBestOfCountSchema.nullish().describe("Best-of count; omit for a single task."),
   workspace: WorkspaceTaskTargetSchema.nullish().describe(
@@ -2522,7 +2527,9 @@ export const TOOL_DEFINITIONS = {
         return obj;
       },
       z.object({
-        command: z.enum(["view", "create", "str_replace", "insert", "delete", "rename"]),
+        command: z
+          .enum(["view", "create", "str_replace", "insert", "delete", "rename"])
+          .describe("The memory operation to perform."),
         path: z
           .string()
           .nullish()
@@ -2664,7 +2671,7 @@ export const TOOL_DEFINITIONS = {
       "The user may be using this machine: avoid destructive or irreversible actions (deleting data, purchases, sending messages) unless asked.",
     schema: z
       .object({
-        action: z.enum(COMPUTER_USE_ACTIONS),
+        action: z.enum(COMPUTER_USE_ACTIONS).describe("The action to perform."),
         x: z
           .number()
           .int()
@@ -2716,7 +2723,7 @@ export const TOOL_DEFINITIONS = {
       "Read a Xum config file, secrets redacted: 'providers' (~/.xum/providers.jsonc, API providers) or 'config' (~/.xum/config.json, app settings).",
     schema: z
       .object({
-        file: XumConfigFileSchema,
+        file: XumConfigFileSchema.describe("Which configuration file to read"),
         path: ConfigMutationPathSchema.nullish().describe(
           "Path segments of a nested value; default: the whole file."
         ),
@@ -2728,7 +2735,7 @@ export const TOOL_DEFINITIONS = {
       "Apply set/delete operations to a Xum config file ('providers': ~/.xum/providers.jsonc, 'config': ~/.xum/config.json); the whole document is validated before writing.",
     schema: z
       .object({
-        file: XumConfigFileSchema,
+        file: XumConfigFileSchema.describe("Which configuration file to write"),
         operations: ConfigOperationsSchema,
         confirm: z.boolean().describe("Must be true; ask the user for confirmation first."),
       })
@@ -2790,7 +2797,7 @@ export const TOOL_DEFINITIONS = {
           .min(1)
           .nullish()
           .describe("Path inside the skill directory; default SKILL.md"),
-        content: z.string().min(1),
+        content: z.string().min(1).describe("File content to write"),
       })
       .strict(),
   },
@@ -2799,7 +2806,7 @@ export const TOOL_DEFINITIONS = {
       "Delete a skill file or a whole skill directory from .xum/skills/ (project workspace) or ~/.xum/skills/ (system workspace).",
     schema: z
       .object({
-        name: SkillNameSchema,
+        name: SkillNameSchema.describe("Skill name to delete"),
         target: z
           .enum(["file", "skill"])
           .nullish()
@@ -2820,7 +2827,7 @@ export const TOOL_DEFINITIONS = {
       "Preview a skill with skills_catalog_read before installing.",
     schema: z
       .object({
-        query: z.string(),
+        query: z.string().describe("Search query to find skills in the catalog"),
         limit: z.number().int().min(1).max(50).nullish().describe("Max results (default 10)"),
       })
       .strict(),
@@ -3081,7 +3088,10 @@ export const TOOL_DEFINITIONS = {
     schema: z
       .object({
         description: z.string().min(1).max(300).describe("What happened, in one plain sentence."),
-        category: z.enum(["picked_up", "milestone", "decision", "blocker", "handoff"]).nullish(),
+        category: z
+          .enum(["picked_up", "milestone", "decision", "blocker", "handoff"])
+          .nullish()
+          .describe("Optional event category."),
       })
       .strict(),
   },
@@ -3112,7 +3122,7 @@ export const TOOL_DEFINITIONS = {
       "Read-only: only the artifact tool's pin or the user changes the shelf.",
     schema: z
       .object({
-        scope: z.enum(["project", "global"]),
+        scope: z.enum(["project", "global"]).describe("Shelf to read from."),
         path: z.string().describe("Entry `name` from artifact_list."),
       })
       .strict(),
@@ -3203,7 +3213,7 @@ export const TOOL_DEFINITIONS = {
       todos: z.array(
         z.object({
           content: z.string().describe("Task text"),
-          status: z.enum(["pending", "in_progress", "completed"]),
+          status: z.enum(["pending", "in_progress", "completed"]).describe("Task status"),
         })
       ),
     }),
@@ -3219,7 +3229,9 @@ export const TOOL_DEFINITIONS = {
       "operation 'replace' overwrites the flagged set, 'add' appends (deduplicating exact path:range). Clear the set with 'replace' and empty hunks when review is no longer needed.",
     schema: z
       .object({
-        operation: z.enum(["add", "replace"]),
+        operation: z
+          .enum(["add", "replace"])
+          .describe("'replace' overwrites the assisted set; 'add' appends to it."),
         hunks: z.array(
           z
             .object({
@@ -3287,8 +3299,11 @@ export const TOOL_DEFINITIONS = {
       "Alias columns for readable results; use ORDER BY and LIMIT when exploring and DuckDB date helpers (date_trunc, CAST(... AS DATE), intervals) for time series.\n\n" +
       `Tables:\n${compactTableSchema(CREATE_EVENTS_TABLE_SQL)}\n${compactTableSchema(CREATE_DELEGATION_ROLLUPS_TABLE_SQL)}`,
     schema: z.object({
-      sql: z.string().min(1),
-      visualization: z.enum(["table", "bar", "line", "pie", "area", "stacked_bar"]).nullish(),
+      sql: z.string().min(1).describe("DuckDB SQL query to execute"),
+      visualization: z
+        .enum(["table", "bar", "line", "pie", "area", "stacked_bar"])
+        .nullish()
+        .describe("Optional visualization type for rendering the query result"),
       title: z.string().nullish().describe("Chart title"),
       x_axis: z.string().nullish().describe("X axis column"),
       y_axis: z.array(z.string()).nullish().describe("Y axis column(s)"),
