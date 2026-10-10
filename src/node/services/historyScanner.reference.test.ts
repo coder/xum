@@ -332,7 +332,7 @@ function expectedKept(labels: readonly Label[], skip: number): number[] {
 describe("findProviderHistoryStart against the reference rule", () => {
   let dir: string;
   beforeAll(async () => {
-    dir = await fs.mkdtemp(path.join(os.tmpdir(), "history-locator-formal-"));
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "history-locator-repro-"));
   });
   afterAll(async () => {
     await fs.rm(dir, { recursive: true, force: true });

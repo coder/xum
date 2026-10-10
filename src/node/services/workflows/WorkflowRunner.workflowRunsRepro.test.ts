@@ -3,10 +3,10 @@
  * leaves a workflow run no recovery path can finish; its passing control moves the crash point past
  * the write the bug needs. A fixed finding's repro is a plain `test`.
  *
- * Run: bun test ./src/node/services/workflows/WorkflowRunner.workflowRunsFormalRepro.test.ts
+ * Run: bun test ./src/node/services/workflows/WorkflowRunner.workflowRunsRepro.test.ts
  *
  * The step-reservation and interrupt cases use a real process exit at the crash point
- * (workflowRunsFormalRepro.testHarness.ts, one `bun` process per backend lifetime), and so does
+ * (workflowRunsRepro.testHarness.ts, one `bun` process per backend lifetime), and so does
  * the run-start case (the restart is a WorkflowService in this process on the same store).
  */
 import * as fs from "node:fs/promises";
@@ -21,9 +21,9 @@ import {
   PENDING_WORKSPACE_ID,
   pendingRunBackend,
   pendingRunScript,
-} from "./workflowRunsFormalRepro.testHarness";
+} from "./workflowRunsRepro.testHarness";
 
-const FIXTURE = path.join(import.meta.dir, "workflowRunsFormalRepro.testHarness.ts");
+const FIXTURE = path.join(import.meta.dir, "workflowRunsRepro.testHarness.ts");
 
 async function runFixture(args: string[]): Promise<Record<string, unknown>> {
   const child = Bun.spawn([process.execPath, FIXTURE, ...args], {
@@ -53,9 +53,9 @@ function lastFinishedOr(
 /** The run's journal status as the next backend reads it (the fixture's Xum root). */
 async function runStatus(rootPath: string): Promise<string> {
   const store = new WorkflowRunStore({
-    sessionDir: path.join(new Config(rootPath).sessionsDir, "parentformal1"),
+    sessionDir: path.join(new Config(rootPath).sessionsDir, "parentrepro1"),
   });
-  return (await store.getRun("wfr_formal_repro")).status;
+  return (await store.getRun("wfr_repro")).status;
 }
 
 const FINISHED = {
@@ -69,7 +69,7 @@ describe("workflow runs: crash during a workflow step (cross-process)", () => {
   let root: DisposableTempDir;
 
   beforeEach(() => {
-    root = new DisposableTempDir("workflow-runs-formal-repro");
+    root = new DisposableTempDir("workflow-runs-repro");
   });
   afterEach(() => {
     root[Symbol.dispose]();
@@ -208,7 +208,7 @@ describe("workflow runs: crash while starting a workflow run", () => {
   // and no runner. Recovery now adopts a pending run once its starter process is provably gone; the
   // backend that dies here is a real process.
   test("a crash before the first running status no longer leaves the run pending forever", async () => {
-    using tmp = new DisposableTempDir("workflow-runs-formal-pending");
+    using tmp = new DisposableTempDir("workflow-runs-repro-pending");
     const crashed = await runFixture(["start-crash", tmp.path, "onRunCreated"]);
     expect(crashed.status).toBe("pending");
     expect(
@@ -226,7 +226,7 @@ describe("workflow runs: crash while starting a workflow run", () => {
   }, 60_000);
 
   test("control: a crash after the running status is recovered and completes", async () => {
-    using tmp = new DisposableTempDir("workflow-runs-formal-running");
+    using tmp = new DisposableTempDir("workflow-runs-repro-running");
     const crashed = await runFixture(["start-crash", tmp.path, "onBackgroundRunCreated"]);
     expect(crashed.status).toBe("running");
 
@@ -243,7 +243,7 @@ describe("workflow runs: crash while starting a workflow run", () => {
   // (once this process is gone) would adopt; the caller saw the failure, so the start settles it
   // as interrupted.
   test("control: a start that fails before running is interrupted, not adopted", async () => {
-    using tmp = new DisposableTempDir("workflow-runs-formal-failed-start");
+    using tmp = new DisposableTempDir("workflow-runs-repro-failed-start");
     const starting = pendingRunBackend(tmp.path, "runner-starting");
     let thrown: unknown;
     try {
@@ -275,7 +275,7 @@ describe("workflow runs: crash while starting a workflow run", () => {
   // fenced and idempotent, so it is retried; without the retry the run stayed pending and a later
   // backend adopted a run whose start the caller saw fail.
   test("a failed start whose cleanup write fails once is still interrupted", async () => {
-    using tmp = new DisposableTempDir("workflow-runs-formal-failed-cleanup");
+    using tmp = new DisposableTempDir("workflow-runs-repro-failed-cleanup");
     const store = new WorkflowRunStore({ sessionDir: tmp.path });
     // Short lease timings so the retry comes after ~100 ms.
     const starting = pendingRunBackend(tmp.path, "runner-starting", 200);
@@ -310,7 +310,7 @@ describe("workflow runs: crash while starting a workflow run", () => {
   // the field, which a root CI user would not hit) is not a legacy run without starter evidence:
   // recovery checks again later instead of leaving the run pending.
   test("a pending run whose starter record is briefly unreadable is adopted on retry", async () => {
-    using tmp = new DisposableTempDir("workflow-runs-formal-starter-unreadable");
+    using tmp = new DisposableTempDir("workflow-runs-repro-starter-unreadable");
     const crashed = await runFixture(["start-crash", tmp.path, "onRunCreated"]);
     expect(crashed.status).toBe("pending");
     const starterFile = path.join(tmp.path, "workflows", PENDING_RUN_ID, "starter.json");
@@ -335,7 +335,7 @@ describe("workflow runs: crash while starting a workflow run", () => {
   // The failed-start cleanup must not interrupt a runner that took the lease meanwhile (an explicit
   // workflow_resume of the pending run while the start was failing).
   test("control: a failed start leaves a run whose lease another runner holds alone", async () => {
-    using tmp = new DisposableTempDir("workflow-runs-formal-failed-start-leased");
+    using tmp = new DisposableTempDir("workflow-runs-repro-failed-start-leased");
     const store = new WorkflowRunStore({ sessionDir: tmp.path });
     let thrown: unknown;
     try {
@@ -359,7 +359,7 @@ describe("workflow runs: crash while starting a workflow run", () => {
   // A scan that finds the starter alive checks again later: the starter can still crash before its
   // first running status, and nothing else re-runs the scan.
   test("control: a pending run whose starter crashes after a scan is adopted on retry", async () => {
-    using tmp = new DisposableTempDir("workflow-runs-formal-starter-dies-later");
+    using tmp = new DisposableTempDir("workflow-runs-repro-starter-dies-later");
     const child = Bun.spawn([process.execPath, FIXTURE, "start-park", tmp.path], {
       stdout: "pipe",
       stderr: "pipe",
@@ -392,7 +392,7 @@ describe("workflow runs: crash while starting a workflow run", () => {
   // The recovery must not race a starter that is alive: a start parked between createRun and its
   // first running status in this process keeps the run pending, and recovery leaves it alone.
   test("control: a pending run whose start is still in progress is not adopted", async () => {
-    using tmp = new DisposableTempDir("workflow-runs-formal-live-start");
+    using tmp = new DisposableTempDir("workflow-runs-repro-live-start");
     const reachedCreated = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const starting = pendingRunBackend(tmp.path, "runner-starting").startWorkflowInBackground({

@@ -53,7 +53,7 @@ async function addWorkspace(config: Config, workspaceId: string): Promise<void> 
 }
 
 describe("workspace goals: goal continuation races (WorkspaceGoalService)", () => {
-  const workspaceId = "goal-formal-repro";
+  const workspaceId = "goal-repro";
   let config: Config;
   let historyService: HistoryService;
   let cleanup: () => Promise<void>;
@@ -130,7 +130,7 @@ describe("workspace goals: goal continuation races (WorkspaceGoalService)", () =
 });
 
 describe("workspace goals: heartbeat races", () => {
-  const workspaceId = "heartbeat-formal-repro";
+  const workspaceId = "heartbeat-repro";
   let config: Config;
   let historyService: HistoryService;
   let cleanup: () => Promise<void>;

@@ -67,7 +67,7 @@ describe("SSH2 pool", () => {
       });
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ssh-pool-formal-"));
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ssh-pool-repro-"));
     const identityFile = path.join(tempDir, "id_ecdsa");
     await fs.writeFile(identityFile, newPrivateKey(), { mode: 0o600 });
     config = {
@@ -174,7 +174,7 @@ describe.skipIf(process.platform === "win32")("OpenSSH pool", () => {
     // another host and is refused: ssh passes that exit 255 and stderr through.
     // HOST_GOES_DOWN takes the host down during the command: from then on every ssh call,
     // the probe included, is refused with exit 255.
-    dir = await fs.mkdtemp(path.join(os.tmpdir(), "openssh-pool-formal-"));
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "openssh-pool-repro-"));
     await fs.writeFile(
       path.join(dir, "ssh"),
       [
@@ -184,7 +184,7 @@ describe.skipIf(process.platform === "win32")("OpenSSH pool", () => {
         'case "$last" in',
         '  *HOST_GOES_DOWN*) : > "$down" ;;',
         "esac",
-        'if [ -e "$down" ]; then echo "ssh: connect to host formal-host port 22: Connection refused" >&2; exit 255; fi',
+        'if [ -e "$down" ]; then echo "ssh: connect to host repro-host port 22: Connection refused" >&2; exit 255; fi',
         'case "$last" in',
         "  *NESTED_SSH_REFUSED*) echo 'git@other-host: Permission denied (publickey).' >&2; exit 255 ;;",
         "  *USER_EXIT_1*) exit 1 ;;",
@@ -207,7 +207,7 @@ describe.skipIf(process.platform === "win32")("OpenSSH pool", () => {
   /** Runs one user command over a fresh host key, then reports what the pool recorded. */
   async function runUserCommand(command: string) {
     const config: SSHRuntimeConfig = {
-      host: `formal-host-${++hostCounter}`,
+      host: `repro-host-${++hostCounter}`,
       srcBaseDir: "/remote/src",
     };
     const transport = createSSHTransport(config, false);

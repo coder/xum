@@ -46,7 +46,7 @@ describe("plan storage", () => {
   };
 
   beforeEach(async () => {
-    gitHome = await fs.mkdtemp(path.join(os.tmpdir(), "plan-storage-formal-git-"));
+    gitHome = await fs.mkdtemp(path.join(os.tmpdir(), "plan-storage-repro-git-"));
     await fs.writeFile(path.join(gitHome, "gitconfig"), "");
     process.env.GIT_CONFIG_GLOBAL = path.join(gitHome, "gitconfig");
     process.env.GIT_CONFIG_NOSYSTEM = "1";
@@ -440,8 +440,8 @@ describe("plan storage", () => {
         return undefined;
       }
     };
-    const bare = sshEndpoint("formal-box.invalid");
-    const qualified = sshEndpoint(`${user}@formal-box.invalid`);
+    const bare = sshEndpoint("repro-box.invalid");
+    const qualified = sshEndpoint(`${user}@repro-box.invalid`);
     const sshConfigSplitsSpellings =
       bare !== undefined && qualified !== undefined && bare !== qualified;
 
@@ -449,14 +449,14 @@ describe("plan storage", () => {
       "two spellings of one SSH endpoint share plan storage",
       () => {
         // Target assertion.
-        expect(
-          sharesPlanStorage(ssh("formal-box.invalid"), ssh(`${user}@formal-box.invalid`))
-        ).toBe(true);
+        expect(sharesPlanStorage(ssh("repro-box.invalid"), ssh(`${user}@repro-box.invalid`))).toBe(
+          true
+        );
       }
     );
 
     test("control: one spelling shares plan storage", () => {
-      expect(sharesPlanStorage(ssh("formal-box.invalid"), ssh("formal-box.invalid"))).toBe(true);
+      expect(sharesPlanStorage(ssh("repro-box.invalid"), ssh("repro-box.invalid"))).toBe(true);
     });
   });
 
@@ -467,7 +467,7 @@ describe("plan storage", () => {
   describe("a full clear in one installation never deletes another installation's plan on a shared SSH host (#5174)", () => {
     const sshConfig: RuntimeConfig = {
       type: "ssh",
-      host: "formal-box.invalid",
+      host: "repro-box.invalid",
       srcBaseDir: "~/xum",
     };
     // The other installation's workspace: the same local project path and workspace name as this

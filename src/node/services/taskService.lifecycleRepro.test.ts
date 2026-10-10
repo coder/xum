@@ -3,7 +3,7 @@
  * behavior: a `test.failing` still fails at that assertion on the current code, a fixed finding's
  * repro is a plain `test`; each control shows the guard the bug slipped past.
  *
- * Run: bun test ./src/node/services/taskService.lifecycleFormalRepro.test.ts
+ * Run: bun test ./src/node/services/taskService.lifecycleRepro.test.ts
  */
 import * as path from "path";
 import { EventEmitter } from "events";

@@ -3,7 +3,7 @@
  * asserts a documented peer-message bound (src/constants/agentMessaging.ts)
  * that the code broke before the fix.
  *
- * Run: bun test ./src/node/services/taskService.peerLimitsFormalRepro.test.ts
+ * Run: bun test ./src/node/services/taskService.peerLimitsRepro.test.ts
  *
  * Gates are bounded (they give up after GATE_MS and continue): the fixed code
  * changes the call sequence, and a gate that is never released must not hang.

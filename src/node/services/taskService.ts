@@ -10349,7 +10349,7 @@ export class TaskService implements AgentTaskIntegration {
    * task_message_parent, waits behind an in-flight task_send_message to that target, and the
    * reverse, for as long as that send's admission and dispatch take. The wait is what lets the
    * later send see the earlier one's rate slot, duplicate entry and queue position. The
-   * cross-route tests in taskService.peerLimitsFormalRepro.test.ts pin it for
+   * cross-route tests in taskService.peerLimitsRepro.test.ts pin it for
    * task_message_sibling behind task_send_message: the family send must not be admitted before
    * the peer send's delivery is recorded. task_message_parent takes the same lock.
    */

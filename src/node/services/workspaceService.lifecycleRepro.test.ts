@@ -91,7 +91,7 @@ describe("workspace lifecycle", () => {
   };
 
   beforeEach(async () => {
-    gitHome = await fs.mkdtemp(path.join(os.tmpdir(), "lifecycle-formal-git-"));
+    gitHome = await fs.mkdtemp(path.join(os.tmpdir(), "lifecycle-repro-git-"));
     await fs.writeFile(path.join(gitHome, "gitconfig"), "");
     process.env.GIT_CONFIG_GLOBAL = path.join(gitHome, "gitconfig");
     process.env.GIT_CONFIG_NOSYSTEM = "1";

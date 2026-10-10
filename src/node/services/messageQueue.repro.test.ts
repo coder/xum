@@ -171,7 +171,7 @@ describe("sends to an idle session holding queued work keep user order", () => {
   // so the user's NEXT message went straight to AgentSession.sendMessage and ran before the
   // earlier queued one.
   test("a later user message never starts a turn before an earlier queued one", async () => {
-    const workspaceId = "formal-mq-user-order";
+    const workspaceId = "repro-mq-user-order";
     const { ws, h, decision, readUserTexts, cleanup } = await createIdleSessionWithHeldEntry(
       workspaceId,
       { message: "first", internal: {} }
@@ -196,7 +196,7 @@ describe("sends to an idle session holding queued work keep user order", () => {
   // preflight sends, so its service call has no disposal drain; it overtakes the held hidden
   // turn-end entry and must start now, not when the unrelated decision resolves.
   test("a promoted wake queued ahead of a held hidden entry starts without waiting", async () => {
-    const workspaceId = "formal-mq-idle-drain";
+    const workspaceId = "repro-mq-idle-drain";
     const { ws, h, readUserTexts, cleanup } = await createIdleSessionWithHeldEntry(
       workspaceId,
       { message: "held peer message", internal: hidden },
@@ -231,7 +231,7 @@ describe("sends to an idle session holding queued work keep user order", () => {
   // cleared: before such sends queued behind the held work, it went direct and the session
   // refused it visibly.
   test("a user send deciding during a Stop cascade is refused or retained, never dropped", async () => {
-    const workspaceId = "formal-mq-stop-during-send";
+    const workspaceId = "repro-mq-stop-during-send";
     const { ws, stop, readUserTexts, retained, cleanup } = await createIdleSessionWithHeldEntry(
       workspaceId,
       { message: "first", internal: {} }
@@ -277,7 +277,7 @@ describe("sends to an idle session holding queued work keep user order", () => {
   // held work, this send started its turn directly, so its row was in history when the cascade
   // aborted that turn.
   test("a Stop cascade hands a queued user message back instead of dropping it", async () => {
-    const workspaceId = "formal-mq-stop-after-queue";
+    const workspaceId = "repro-mq-stop-after-queue";
     const { ws, h, stop, decision, readUserTexts, retained, cleanup } =
       await createIdleSessionWithHeldEntry(workspaceId, { message: "first", internal: {} });
     try {

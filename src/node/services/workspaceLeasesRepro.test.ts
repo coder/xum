@@ -48,7 +48,7 @@ import { FileChangeTracker } from "@/node/services/utils/fileChangeTracker";
 // refused afterwards, but the command had already run. Fixed: preparation confirms the lease first.
 
 describe("turn preparation vs another backend's structural mutation", () => {
-  const workspaceId = "ws-lease-formal";
+  const workspaceId = "ws-lease-repro";
   const sendOptions = {
     model: "openai:gpt-4o",
     agentId: "exec",
@@ -337,14 +337,14 @@ describe("turn preparation vs another backend's structural mutation", () => {
 // #4918: two backends, O owns the init, R replays it.
 
 describe("#4918: init replay by another backend", () => {
-  const workspaceId = "ws-init-formal";
+  const workspaceId = "ws-init-repro";
   let tempDir: string;
   let owner: InitStateManager;
   let ownerConfig: Config;
   let replayer: InitStateManager;
 
   beforeEach(async () => {
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "init-lease-formal-"));
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "init-lease-repro-"));
     await fs.mkdir(path.join(tempDir, "sessions"), { recursive: true });
     ownerConfig = new Config(tempDir);
     owner = new InitStateManager(ownerConfig);

@@ -1,5 +1,5 @@
 /**
- * Cross-process fixture for WorkflowRunner.workflowRunsFormalRepro.test.ts.
+ * Cross-process fixture for WorkflowRunner.workflowRunsRepro.test.ts.
  * Each invocation is one backend process on the Xum root given as argv[3]; a phase that models a
  * crash ends the process with process.exit at the crash point, so nothing after it runs:
  *   reserve-crash <root>    the step's started checkpoint is written (onTaskReserved), then the
@@ -57,8 +57,8 @@ import { WorkflowService } from "./WorkflowService";
 import type { WorkflowArchiveAdmissionGuard } from "./workflowArchiveAdmission";
 import type { ResolvedWorkflowScript } from "./workflowScriptResolver";
 
-const RUN_ID = "wfr_formal_repro";
-const PARENT_ID = "parentformal1";
+const RUN_ID = "wfr_repro";
+const PARENT_ID = "parentrepro1";
 const STEP_ID = "summarize";
 const SOURCE = `export default function workflow({ agent }) {
   const summary = agent("Summarize durable workflows", { id: "${STEP_ID}" });
@@ -415,8 +415,8 @@ async function resume(root: string, recover: boolean) {
 
 /** Archive gate of a workspace that is neither archived nor being archived. */
 const ADMIT_ALL: WorkflowArchiveAdmissionGuard = { getWorkflowArchiveRefusal: () => null };
-export const PENDING_WORKSPACE_ID = "workspace-formal";
-export const PENDING_RUN_ID = "wfr_formal_pending";
+export const PENDING_WORKSPACE_ID = "workspace-repro";
+export const PENDING_RUN_ID = "wfr_repro_pending";
 const PENDING_SOURCE = `export default function workflow() {\n  return { reportMarkdown: "done" };\n}\n`;
 
 export function pendingRunScript(): ResolvedWorkflowScript {

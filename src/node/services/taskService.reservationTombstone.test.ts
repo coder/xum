@@ -17,7 +17,7 @@ import {
 /**
  * A resuming workflow runner tombstones a
  * checkpointed child ID that has no task row before replacing it, so a stalled reservation's late
- * commit refuses (cross-process: WorkflowRunner.workflowRunsFormalRepro.test.ts). These cover the
+ * commit refuses (cross-process: WorkflowRunner.workflowRunsRepro.test.ts). These cover the
  * two cases where the tombstone must be refused, because a commit has landed or still may land.
  */
 const PARENT_ID = "parenttomb01";

@@ -36,7 +36,7 @@ import type { DraftScope } from "@/common/orpc/schemas/drafts";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
-const OBJECTIVE = "ship the formal composer model";
+const OBJECTIVE = "ship the composer change";
 
 async function setupCreationView() {
   const env = getSharedEnv();
@@ -101,7 +101,7 @@ describeIntegration("composer drafts: /goal in a creation composer", () => {
     const before = new Set(workspaceIdsOf(env, projectPath));
     const setGoal = jest.spyOn(env.services.workspaceGoalService, "setGoal").mockResolvedValue({
       success: false,
-      error: { type: "invalid_transition", message: "formal repro: goal refused" },
+      error: { type: "invalid_transition", message: "repro: goal refused" },
     });
     try {
       await chat.send(`/goal ${OBJECTIVE}`);

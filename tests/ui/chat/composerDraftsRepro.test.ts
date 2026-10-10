@@ -71,7 +71,7 @@ function holdSendReplies(
 const refused = () =>
   Promise.resolve({
     success: false as const,
-    error: { type: "unknown" as const, raw: "formal repro: send refused" },
+    error: { type: "unknown" as const, raw: "repro: send refused" },
   });
 
 describe("composer text across a failed send", () => {
@@ -80,7 +80,7 @@ describe("composer text across a failed send", () => {
   });
 
   test("a failed send keeps text another window typed while it was in flight", async () => {
-    const app = await createAppHarness({ branchPrefix: "formal-send-typed" });
+    const app = await createAppHarness({ branchPrefix: "repro-send-typed" });
     const held = holdSendReplies(app, () => refused());
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
@@ -101,7 +101,7 @@ describe("composer text across a failed send", () => {
 
       held.release();
       await waitFor(
-        () => expect(app.view.container.textContent ?? "").toContain("formal repro: send refused"),
+        () => expect(app.view.container.textContent ?? "").toContain("repro: send refused"),
         WAIT
       );
       await waitFor(() => expect(getDraftStore().getView(scope).text).not.toBe(""), WAIT);
@@ -117,7 +117,7 @@ describe("composer text across a failed send", () => {
   }, 120_000);
 
   test("control: a failed send with no typing restores the sent text", async () => {
-    const app = await createAppHarness({ branchPrefix: "formal-send-restore" });
+    const app = await createAppHarness({ branchPrefix: "repro-send-restore" });
     try {
       const held = holdSendReplies(app, () => refused());
       await app.chat.send("first message");
@@ -131,7 +131,7 @@ describe("composer text across a failed send", () => {
   }, 120_000);
 
   test("text of a send still being prepared stays durable until accepted", async () => {
-    const app = await createAppHarness({ branchPrefix: "formal-send-pending" });
+    const app = await createAppHarness({ branchPrefix: "repro-send-pending" });
     const held = holdSendReplies(app, (realSend, args) => realSend(...args));
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
@@ -154,7 +154,7 @@ describe("composer text across a failed send", () => {
   }, 120_000);
 
   test("control: once the send is accepted the message is in the transcript", async () => {
-    const app = await createAppHarness({ branchPrefix: "formal-send-accepted-control" });
+    const app = await createAppHarness({ branchPrefix: "repro-send-accepted-control" });
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
       await app.chat.send("first message");
@@ -168,10 +168,10 @@ describe("composer text across a failed send", () => {
   }, 120_000);
 
   test("a reply lost after the backend accepted does not bring the text back", async () => {
-    const app = await createAppHarness({ branchPrefix: "formal-send-accepted" });
+    const app = await createAppHarness({ branchPrefix: "repro-send-accepted" });
     const held = holdSendReplies(app, async (realSend, args) => {
       await realSend(...args);
-      throw new Error("formal repro: reply lost after acceptance");
+      throw new Error("repro: reply lost after acceptance");
     });
     try {
       const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
@@ -233,13 +233,13 @@ describe("a failed edit's put-back", () => {
 
   async function expectRefused(app: AppHarness) {
     await waitFor(
-      () => expect(app.view.container.textContent ?? "").toContain("formal repro: send refused"),
+      () => expect(app.view.container.textContent ?? "").toContain("repro: send refused"),
       WAIT
     );
   }
 
   test("does not show the edit's text twice when another window saved it meanwhile", async () => {
-    const app = await createAppHarness({ branchPrefix: "formal-edit-restore-dup" });
+    const app = await createAppHarness({ branchPrefix: "repro-edit-restore-dup" });
     const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
     const textarea = await startEdit(app, scope).catch(async (error: unknown) => {
       await app.dispose();
@@ -272,7 +272,7 @@ describe("a failed edit's put-back", () => {
   }, 120_000);
 
   test("keeps the staged copy of an attachment another window saved again as pending", async () => {
-    const app = await createAppHarness({ branchPrefix: "formal-edit-restore-staged" });
+    const app = await createAppHarness({ branchPrefix: "repro-edit-restore-staged" });
     const scope: DraftScope = { kind: "workspace", workspaceId: app.workspaceId };
     const textarea = await startEdit(app, scope).catch(async (error: unknown) => {
       await app.dispose();

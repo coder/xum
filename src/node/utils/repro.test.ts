@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { expectReproFailure } from "./formalRepro.testHarness";
+import { expectReproFailure } from "./repro.testHarness";
 
 async function outcome(repro: () => unknown): Promise<string> {
   try {

@@ -10,7 +10,7 @@
  * WorkspaceService.remove takes before it marks the row); the second backend is a second
  * TaskService on its own Config over the same root.
  *
- * Run: bun test ./src/node/services/taskService.taskLaunchFormalRepro.test.ts
+ * Run: bun test ./src/node/services/taskService.taskLaunchRepro.test.ts
  */
 import { EventEmitter } from "events";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";

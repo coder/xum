@@ -3,7 +3,7 @@
  * the protocol's documented invariant; both were `test.failing` against the
  * pre-fix code and now pass.
  *
- * Run: bun test ./src/node/utils/concurrency/fileLock.formalRepro.test.ts
+ * Run: bun test ./src/node/utils/concurrency/fileLock.repro.test.ts
  *
  * Every choreography gate below is bounded (it gives up and continues after
  * GATE_MS): the fix changed the syscall sequence the gates were written
@@ -53,7 +53,7 @@ function deadPid(): number {
 // the emptied path before the restore. Fixed: a dead guard is reclaimed
 // under its own guard by re-read + rename, never plain-unlinked.
 test("a dead reclaim guard never lets two holders own the lock at once (stale-guard double-remove)", async () => {
-  using tmp = new DisposableTempDir("file-lock-formal");
+  using tmp = new DisposableTempDir("file-lock-repro");
   const lockPath = path.join(tmp.path, "x.lock");
   const guardPath = `${lockPath}.reclaim`;
   const dead = deadPid();
@@ -165,7 +165,7 @@ test("a dead reclaim guard never lets two holders own the lock at once (stale-gu
 // matching birth, so every other process refused it until this process
 // exited. Fixed: release retries the unlink (bounded), like crossProcessLock.
 test("a transiently failing release unlink leaves no lock that siblings refuse", async () => {
-  using tmp = new DisposableTempDir("file-lock-formal");
+  using tmp = new DisposableTempDir("file-lock-repro");
   const lockPath = path.join(tmp.path, "x.lock");
   const handle = await acquireProcessFileLock({ lockPath, timeoutMs: 500, label: "test" });
   const realUnlink = fs.unlink;

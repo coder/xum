@@ -10,7 +10,7 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
-import { expectReproFailure } from "@/node/utils/formalRepro.testHarness";
+import { expectReproFailure } from "@/node/utils/repro.testHarness";
 import * as backgroundProcessExecutor from "./backgroundProcessExecutor";
 import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
 import { BackgroundProcessManager, SPAWN_NAME_LOCK_FILENAME } from "./backgroundProcessManager";
@@ -31,7 +31,7 @@ const cleanups: Array<() => PromiseLike<unknown>> = [];
 
 /** A workspace id no other test (or concurrent run on this host) uses: records live in /tmp. */
 function uniqueWorkspace(tag: string): string {
-  const id = `formal-bg-${tag}-${randomUUID().slice(0, 8)}`;
+  const id = `repro-bg-${tag}-${randomUUID().slice(0, 8)}`;
   workspaceDirs.push(localBgWorkspaceDir(id));
   return id;
 }
@@ -68,7 +68,7 @@ const exists = (file: string) =>
   );
 
 async function tempDir(tag: string): Promise<string> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), `formal-bg-${tag}-`));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), `repro-bg-${tag}-`));
   cleanups.push(() => fs.rm(dir, { recursive: true, force: true }));
   return dir;
 }
@@ -151,14 +151,14 @@ describe("terminating a background process that already exited", () => {
 // the same seal as migrations (#4967) and stay pending until registered.
 
 describe("a background spawn in flight during workspace removal", () => {
-  const projectPath = "/tmp/proj-formal-bg";
+  const projectPath = "/tmp/proj-repro-bg";
 
   async function removalHarness(ws: string) {
     const harness = await createWorkspaceServiceHarness();
     cleanups.push(() => harness[Symbol.asyncDispose]());
     await saveWorkspaces(harness.config, projectPath, [
       projectWorkspace(projectPath, `${ws}-checkout`, ws, {
-        runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src-formal-bg" },
+        runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src-repro-bg" },
       }),
     ]);
     return harness;
@@ -240,8 +240,8 @@ describe("archive and this backend's own background process", () => {
     const ws = uniqueWorkspace("archive");
     const harness = await createWorkspaceServiceHarness();
     cleanups.push(() => harness[Symbol.asyncDispose]());
-    await saveWorkspaces(harness.config, "/tmp/proj-formal-bg-archive", [
-      projectWorkspace("/tmp/proj-formal-bg-archive", `${ws}-checkout`, ws, {
+    await saveWorkspaces(harness.config, "/tmp/proj-repro-bg-archive", [
+      projectWorkspace("/tmp/proj-repro-bg-archive", `${ws}-checkout`, ws, {
         runtimeConfig: { type: "local" },
       }),
     ]);

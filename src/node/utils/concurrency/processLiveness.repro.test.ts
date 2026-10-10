@@ -13,7 +13,7 @@ import {
   type HolderEvidence,
   type ProcessIdentity,
 } from "./processLiveness";
-import { expectReproFailure } from "../formalRepro.testHarness";
+import { expectReproFailure } from "../repro.testHarness";
 
 // Checks the real judgeHolder against two TypeScript reference judgments.
 //
@@ -312,7 +312,7 @@ function deadPid(): number {
 
 /** True when acquireCrossProcessLock takes `record`'s lock within a short timeout. */
 async function crossProcessLockTakes(record: Record<string, unknown>): Promise<boolean> {
-  const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "liveness-formal-"));
+  const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "liveness-repro-"));
   const lockPath = path.join(dir, "test.lock");
   try {
     await fsPromises.writeFile(lockPath, JSON.stringify({ acquiredAt: Date.now(), ...record }));
