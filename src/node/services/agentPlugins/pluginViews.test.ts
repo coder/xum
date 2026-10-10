@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { log } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0, type AgentPluginViewContribution } from "./manifest";
 import { AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0, createAgentPluginsMcpProvider } from "./mcpConfig";
@@ -98,6 +99,31 @@ describe("plugin views", () => {
       context: { projectRoot: checkout, projectKey: checkout },
     });
     expect(views.some((entry) => entry.pluginName === "review-bot")).toBe(false);
+  });
+
+  test("a view whose server is missing is hidden with a warning that names the server", () => {
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    try {
+      const entries = attachPluginViewServers(
+        [
+          {
+            pluginViewId: "0123456789abcdef/settings",
+            pluginName: "review-bot",
+            title: "Settings",
+            serverName: "setings",
+            serverKey: "plugin:0123456789abcdef:setings",
+            resourceUri: "ui://p/settings",
+          },
+        ],
+        {},
+        {}
+      );
+      expect(entries).toEqual([]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain("'setings'");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test("a server key that is not a plugin server never binds a view", () => {

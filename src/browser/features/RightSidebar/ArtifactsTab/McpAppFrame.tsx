@@ -192,6 +192,8 @@ export function McpAppFrame(props: {
   const toolCallId = view.kind === "plugin" ? null : view.toolCallId;
   const resourceUri = view.kind === "plugin" ? null : view.resourceUri;
   const pluginViewId = view.kind === "plugin" ? view.pluginViewId : null;
+  // A disabled server's error clears once the re-listed view reports it enabled.
+  const pluginServerEnabled = view.kind === "plugin" ? view.enabled : null;
 
   useEffect(() => {
     if (!api) return;
@@ -223,7 +225,16 @@ export function McpAppFrame(props: {
         }
       });
     return () => controller.abort();
-  }, [api, workspaceId, viewKey, toolCallId, serverName, resourceUri, pluginViewId]);
+  }, [
+    api,
+    workspaceId,
+    viewKey,
+    toolCallId,
+    serverName,
+    resourceUri,
+    pluginViewId,
+    pluginServerEnabled,
+  ]);
 
   const current = loaded?.viewKey === viewKey ? loaded : null;
   const grant = current?.view ? grantMcpAppCsp(current.view.csp, { allowCdn }) : null;
@@ -238,9 +249,12 @@ export function McpAppFrame(props: {
   const { navigatedRef } = guard;
   // The result record binds the view to the call that produced it (server, server-local tool
   // name, sanitized arguments); the card's display values are only a fallback without one.
-  // A plugin view is bound to its plugin's server key from listPluginViews.
+  // A plugin view is bound to the server the backend read it from (`pluginServerKey`): the
+  // manifest can re-point a view between the listing and the open, and calls must follow it.
   const boundServerName =
-    view.kind === "plugin" ? view.serverKey : (current?.view?.invocation?.serverName ?? serverName);
+    view.kind === "plugin"
+      ? (current?.view?.pluginServerKey ?? view.serverKey)
+      : (current?.view?.invocation?.serverName ?? serverName);
 
   // Values the long-lived host reads at message time.
   const latest = useRef({ theme, view, result: current?.view ?? null });

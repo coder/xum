@@ -12,6 +12,7 @@
  */
 import type { MCPServerInfo, WorkspaceMCPOverrides } from "@/common/types/mcp";
 import assert from "@/common/utils/assert";
+import { log } from "@/node/services/log";
 import { discoverWorkspaceAgentPlugins } from "./discovery";
 import {
   buildPluginServerKey,
@@ -97,7 +98,14 @@ export function attachPluginViewServers(
     const server = Object.hasOwn(servers, view.serverKey) ? servers[view.serverKey] : undefined;
     // Only the plugin's own server: a global or repo server cannot share the reserved key,
     // but check provenance anyway so a view never binds to a non-plugin server.
-    if (server?.plugin === undefined) continue;
+    if (server?.plugin === undefined) {
+      // The manifest passed validation, but its server is unknown, invalid or not consented:
+      // say why the view is missing instead of dropping it silently.
+      log.warn(
+        `Plugin view '${view.pluginViewId}' of '${view.pluginName}' is hidden: server '${view.serverName}' is not an available server of this plugin`
+      );
+      continue;
+    }
     const enabled =
       enabledSet.has(view.serverKey) || (!disabledSet.has(view.serverKey) && !server.disabled);
     entries.push({ ...view, enabled });

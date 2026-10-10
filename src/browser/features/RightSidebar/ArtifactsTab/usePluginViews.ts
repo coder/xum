@@ -13,8 +13,8 @@ export interface WorkspacePluginViews {
 /**
  * The plugin views (`contributes.views`) of a workspace, for the command palette and the
  * Artifacts picker. Re-listed when the workspace changes, after a plugin install, update or
- * removal, and after this workspace's MCP configuration is saved (a view's `enabled` flag
- * follows its server). Listing is best effort: on failure the workspace shows no plugin views.
+ * removal, and after this workspace's MCP configuration is saved or a global MCP server is
+ * toggled (a view's `enabled` flag follows its server). Listing is best effort: on failure the workspace shows no plugin views.
  * Opening a view still re-checks the server in the backend.
  */
 export function usePluginViews(
@@ -29,7 +29,9 @@ export function usePluginViews(
   useEffect(
     () =>
       subscribeWorkspaceMcpOverridesSaved((savedWorkspaceId) => {
-        if (savedWorkspaceId === workspaceId) setMutationTick((tick) => tick + 1);
+        if (savedWorkspaceId === null || savedWorkspaceId === workspaceId) {
+          setMutationTick((tick) => tick + 1);
+        }
       }),
     [workspaceId]
   );

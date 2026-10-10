@@ -105,10 +105,16 @@ async function getPluginAppView(
       signal !== undefined ? { signal } : undefined
     );
     // No tool call opened this view, so there is no result or invocation to bind to; the
-    // frame binds its tools/call to the plugin's server key from listPluginViews.
+    // frame binds its tools/call to the server key it was read from.
     return {
       success: true,
-      data: { ...resource, resultAvailable: false, result: null, invocation: null },
+      data: {
+        ...resource,
+        resultAvailable: false,
+        result: null,
+        invocation: null,
+        pluginServerKey: view.serverKey,
+      },
     };
   } catch (error) {
     return { success: false, error: getErrorMessage(error) };
@@ -169,6 +175,7 @@ export async function getMcpAppView(
                 arguments: record.arguments,
               }
             : null,
+        pluginServerKey: null,
       },
     };
   } catch (error) {

@@ -3,7 +3,7 @@ import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
@@ -35,10 +35,13 @@ const PLUGIN_VIEW: McpAppPluginViewRef = {
   pluginName: "review-bot",
   serverName: "settings",
   serverKey: "plugin:0123456789abcdef:settings",
+  enabled: true,
 };
 
 let getViewRequests: unknown[] = [];
 let invocation: McpAppView["invocation"] = null;
+/** The server key the backend reports for a plugin view (the manifest can re-point it). */
+let pluginServerKey = "plugin:0123456789abcdef:settings";
 let viewCsp: McpAppView["csp"] = {};
 let toolCalls: Array<{
   serverName: string;
@@ -63,6 +66,7 @@ function Wrapper(props: { children: ReactNode }) {
             resultAvailable: !plugin,
             result: plugin ? null : { content: [] },
             invocation: plugin ? null : invocation,
+            pluginServerKey: plugin ? pluginServerKey : null,
           },
         });
       },
@@ -87,9 +91,11 @@ function Wrapper(props: { children: ReactNode }) {
       },
     },
   };
+  // One client per mount: a new client on every render would refetch the view on rerender.
+  const [client] = useState(() => createTestApiClient(api));
   return (
     <ThemeProvider forcedTheme="dark">
-      <APIProvider client={createTestApiClient(api)}>{props.children}</APIProvider>
+      <APIProvider client={client}>{props.children}</APIProvider>
     </ThemeProvider>
   );
 }
@@ -144,6 +150,7 @@ describe("McpAppFrame", () => {
     cleanupDom = installDom();
     window.localStorage.clear();
     invocation = null;
+    pluginServerKey = "plugin:0123456789abcdef:settings";
     viewCsp = {};
     toolCalls = [];
     getViewRequests = [];
@@ -233,6 +240,37 @@ describe("McpAppFrame", () => {
     // Messages are handled in order: initialized came before the call, so nothing tool-shaped
     // was sent for it.
     expect(posted.filter((m) => m.method?.startsWith("ui/notifications/tool-"))).toEqual([]);
+  });
+
+  test("a plugin view calls the server the backend read it from, not the listed one", async () => {
+    // The manifest re-pointed the view to another server after the palette listed it.
+    pluginServerKey = "plugin:0123456789abcdef:settings-v2";
+    const view = render(<McpAppFrame workspaceId="ws" view={PLUGIN_VIEW} />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "save_settings", arguments: {} },
+    });
+    await waitFor(() => expect(toolCalls).toHaveLength(1));
+    expect(toolCalls[0].serverName).toBe("plugin:0123456789abcdef:settings-v2");
+  });
+
+  test("a plugin view refetches once its server is enabled", async () => {
+    const view = render(
+      <McpAppFrame workspaceId="ws" view={{ ...PLUGIN_VIEW, enabled: false }} />,
+      {
+        wrapper: Wrapper,
+      }
+    );
+    await waitFor(() => expect(getViewRequests).toHaveLength(1));
+    view.rerender(<McpAppFrame workspaceId="ws" view={{ ...PLUGIN_VIEW, enabled: true }} />);
+    await waitFor(() => expect(getViewRequests).toHaveLength(2));
+    // An equal ref does not refetch.
+    view.rerender(<McpAppFrame workspaceId="ws" view={{ ...PLUGIN_VIEW, enabled: true }} />);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(getViewRequests).toHaveLength(2);
   });
 
   test("a cancelled call's view is told whether it failed or was interrupted", async () => {
@@ -491,6 +529,7 @@ describe("McpAppFrame host strips", () => {
     cleanupDom = installDom();
     window.localStorage.clear();
     invocation = null;
+    pluginServerKey = "plugin:0123456789abcdef:settings";
     viewCsp = {};
     toolCalls = [];
     getViewRequests = [];

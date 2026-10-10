@@ -39,7 +39,7 @@ export interface McpAppViewRef {
  * maps that ID to the plugin's server and ui:// resource. `serverKey` (from listPluginViews)
  * is the view's own server for its tools/call.
  */
-export interface McpAppPluginViewRef extends Omit<McpAppPluginView, "enabled"> {
+export interface McpAppPluginViewRef extends McpAppPluginView {
   kind: "plugin";
 }
 
@@ -54,6 +54,8 @@ export function pluginViewRef(view: McpAppPluginView): McpAppPluginViewRef {
     pluginName: view.pluginName,
     serverName: view.serverName,
     serverKey: view.serverKey,
+    // Kept so an open frame refetches after the user enables the view's server.
+    enabled: view.enabled,
   };
 }
 
