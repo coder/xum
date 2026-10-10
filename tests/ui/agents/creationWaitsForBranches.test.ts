@@ -16,13 +16,7 @@ import {
 } from "../../ipc/sendMessageTestHelpers";
 
 import { renderApp } from "../renderReviewPanel";
-import {
-  addProjectViaUI,
-  cleanupView,
-  openProjectCreationView,
-  setupTestDom,
-  waitForLatestDraftId,
-} from "../helpers";
+import { addProjectViaUI, cleanupView, setupTestDom, waitForLatestDraftId } from "../helpers";
 import { ChatHarness } from "../harness";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -121,6 +115,36 @@ function runInitButton(container: HTMLElement): Promise<HTMLButtonElement> {
   );
 }
 
+/**
+ * Opens the project's creation view without waiting for its branch list: the shared
+ * openProjectCreationView helper waits for the branch selector, which these tests hold back.
+ */
+async function openCreationViewWhileBranchesLoad(
+  view: ReturnType<typeof renderApp>,
+  projectPath: string
+): Promise<void> {
+  await view.waitForReady();
+  const projectRow = await waitFor(
+    () => {
+      const row = view.container.querySelector(
+        `[data-project-path="${projectPath}"][aria-controls]`
+      );
+      if (!row) throw new Error("Project not found in sidebar");
+      return row;
+    },
+    { timeout: 10_000 }
+  );
+  fireEvent.click(projectRow);
+  await waitFor(
+    () => {
+      if (!view.container.querySelector('textarea[aria-label="Message"]')) {
+        throw new Error("Project creation page not rendered");
+      }
+    },
+    { timeout: 10_000 }
+  );
+}
+
 async function openCreationViewWithHeldBranches(options?: {
   showAgentsInitBanner?: boolean;
   apiClient?: ReturnType<typeof getSharedEnv>["orpc"];
@@ -132,7 +156,7 @@ async function openCreationViewWithHeldBranches(options?: {
   if (options?.showAgentsInitBanner) updatePersistedState(getAgentsInitNudgeKey(projectPath), true);
   // Held before the creation view mounts: its first listBranches call is the one that matters.
   const held = holdBranchList(env);
-  await openProjectCreationView(view, projectPath);
+  await openCreationViewWhileBranchesLoad(view, projectPath);
   await waitFor(() => expect(held.spy).toHaveBeenCalled(), { timeout: 10_000 });
   const draftId = await waitForLatestDraftId(projectPath);
   const scope: DraftScope = { kind: "creation", projectPath, draftId };
