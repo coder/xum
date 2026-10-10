@@ -187,8 +187,9 @@ export function createHistoryMessageEvidence(
       const key = frame.key!.prefix;
       if (shape && Object.hasOwn(shape, key) && key.length === frame.key!.length)
         frame.fields.set(key, item);
-      else if (strict.has(frame.context) && key !== "__proto__")
-        frame.fields.set("", { value: null });
+      // zod >= 4.5 `.strict()` reports an own `__proto__` key (JSON.parse makes one) as
+      // unrecognized, so it fails the row like any other extra key.
+      else if (strict.has(frame.context)) frame.fields.set("", { value: null });
     }
   };
   return {
