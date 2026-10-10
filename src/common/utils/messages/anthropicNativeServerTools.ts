@@ -1,6 +1,7 @@
 import type { MuxMessage } from "@/common/types/message";
 import type { DynamicToolPart } from "@/common/types/toolParts";
 import { ANTHROPIC_NATIVE_SERVER_TOOL_MAX_ROW_CIPHERTEXT_CHARS } from "@/constants/anthropicServerTools";
+import { sanitizeStringForProviderOutput } from "@/common/utils/providerOutputSanitization";
 import { stripEncryptedContent } from "./stripEncryptedContent";
 
 /**
@@ -30,11 +31,22 @@ function isReplayableWebSearchResult(item: unknown): boolean {
   const result = item as Record<string, unknown>;
   return (
     result.type === "web_search_result" &&
-    typeof result.url === "string" &&
+    isVerbatimSafe(result.url) &&
     typeof result.encryptedContent === "string" &&
-    (result.title === null || typeof result.title === "string") &&
-    (result.pageAge == null || typeof result.pageAge === "string")
+    (result.title === null || isVerbatimSafe(result.title)) &&
+    (result.pageAge == null || isVerbatimSafe(result.pageAge))
   );
+}
+
+/**
+ * Native replay sends the result back exactly as the API returned it, so the request skips the
+ * generic provider-output sanitizer for it (applyToolOutputRedaction). A field that sanitizer
+ * would rewrite (too long, control text) cannot replay natively: the part replays as the client
+ * pair, sanitized, and the receipt keeps the thinking after it out. The ciphertext is opaque and
+ * exempt.
+ */
+function isVerbatimSafe(value: unknown): boolean {
+  return typeof value === "string" && sanitizeStringForProviderOutput(value) === value;
 }
 
 /**
@@ -116,19 +128,25 @@ export function projectAnthropicServerTools(
   native: boolean
 ): AnthropicServerToolProjection {
   let demotedBeforeThinking = false;
+  // Preserved thinking binds a thinking block to everything before it, earlier rows included,
+  // so one demotion strips thinking that follows it anywhere later in the request.
+  let demoted = false;
   const projected = messages.map((message) => {
+    if (message.role !== "assistant") return message;
     // Most rows hold no server tool: return them as is, with no new parts array (perf).
-    if (message.role !== "assistant" || !message.parts.some(isProviderExecutedTool)) {
+    if (!message.parts.some(isProviderExecutedTool)) {
+      if (demoted && message.parts.some((part) => part.type === "reasoning")) {
+        demotedBeforeThinking = true;
+      }
       return message;
     }
     let changed = false;
-    let demotedInRow = false;
     const parts = message.parts.map((part) => {
-      if (part.type === "reasoning" && demotedInRow) demotedBeforeThinking = true;
+      if (part.type === "reasoning" && demoted) demotedBeforeThinking = true;
       if (part.type !== "dynamic-tool" || part.providerExecuted !== true) return part;
       if (native && isNativeAnthropicReplayable(part)) return part;
       changed = true;
-      demotedInRow = true;
+      demoted = true;
       return demote(part);
     });
     return changed ? { ...message, parts } : message;
