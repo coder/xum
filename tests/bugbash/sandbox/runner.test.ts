@@ -978,6 +978,21 @@ test("B1: a proxied call that costs more than its bound fails the job (exit 5)",
   expectNothingLeft();
 });
 
+test("B1: a call record that cannot be written fails the job (exit 5)", async () => {
+  const append = spyOn(fs, "appendFileSync").mockImplementation((file) => {
+    if (String(file).endsWith(".proxy.jsonl"))
+      throw Object.assign(new Error(`ENOSPC: ${String(file)}`), { code: "ENOSPC" });
+  });
+  try {
+    const { code, logged } = await mcpLaunch({ RUN: "proxycall" });
+    expect(code).toBe(5);
+    expect(logged.join("\n")).toContain("a call record was not written (ENOSPC)");
+  } finally {
+    append.mockRestore();
+  }
+  expectNothingLeft();
+});
+
 test("B1: a stop after a bound miss still ends with the stop, not exit 5", async () => {
   const stop = new AbortController();
   // The signal lands after the job and the proxy close, while cleanup runs.

@@ -223,12 +223,22 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
   let ledger: Ledger | undefined;
   // The stop hook and the normal end share one close. Its rejection is a bound miss.
   let closing: Promise<string | undefined> | undefined;
+  // A call record that could not be written (a full disk): the proxy record is incomplete, so
+  // the job must not look successful. The errno code only: the message can hold the path.
+  let recordFault: string | undefined;
+  const record = (entry: object) => {
+    try {
+      fs.appendFileSync(records, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+    } catch (error) {
+      recordFault ??= `proxy: a call record was not written (${(error as NodeJS.ErrnoException).code ?? "error"})`;
+    }
+  };
   // Nothing is cached before the proxy exists, so a stop during the staging cannot skip a close.
   const closeProxy = () =>
     proxy == null
       ? Promise.resolve(undefined)
       : (closing ??= proxy.close().then(
-          () => undefined,
+          () => recordFault,
           (error: Error) => error.message
         ));
   session.onStop(closeProxy);
@@ -271,7 +281,7 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
         upstream: driven.upstream,
         job: { models: [driven.model] }, // the app AI is the mock: only the explorer calls
         ledger,
-        log: (entry) => fs.appendFileSync(records, `${JSON.stringify(entry)}\n`, { mode: 0o600 }),
+        log: record,
       });
       proxyMount.push(...bind(proxyDir, PROXY_DIR));
     }
