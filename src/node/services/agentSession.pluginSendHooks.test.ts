@@ -11,6 +11,7 @@ import {
   type MuxMessage,
 } from "@/common/types/message";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import { computeSendDigest } from "./sendIds";
 import type { MessageSendHookOutcome, MessageSendOrigin } from "./events/eventSpine";
 import type { CompactionMonitor } from "./compactionMonitor";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
@@ -139,6 +140,26 @@ describe("message.send.before outcomes", () => {
     expect(streamed).toEqual([]);
     // A direct user send shows the reason in the composer, not as a transcript error.
     expect(h.events.some((event) => event.type === "stream-error")).toBe(false);
+  });
+
+  test("a retried send whose ids history already holds succeeds despite a block", async () => {
+    const { h, streamed } = await setup(blockAll);
+    const sendId = "client-send-1";
+    const digest = computeSendDigest({ message: "deploy to prod" });
+    // The first try was accepted (its row holds the id), but its response was lost.
+    const accepted = createMuxMessage("u1", "user", "deploy to prod", {
+      sendIds: [sendId],
+      sendDigests: { [sendId]: digest },
+    });
+    assert((await h.historyService.appendToHistory(workspaceId, accepted)).success);
+
+    const result = await h.session.sendMessage("deploy to prod", options, {
+      sendIdentities: [{ id: sendId, digest }],
+    });
+
+    expect(result.success).toBe(true);
+    expect((await userRows(h)).map((row) => row.id)).toEqual(["u1"]);
+    expect(streamed).toEqual([]);
   });
 
   test("an automatic send that is blocked reports the reason in the transcript", async () => {

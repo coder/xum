@@ -1063,4 +1063,27 @@ describe("Agent skill snapshot association", () => {
       },
     });
   });
+
+  it("shows the plugin-rewritten text instead of the submitted slash command", () => {
+    const aggregator = createAggregator();
+    const command = "/pull-requests open it";
+    const invocation = createMuxMessage("rewritten-invoke", "user", "/pull-requests OPEN IT", {
+      historySequence: 1,
+      timestamp: 0,
+      pluginRewrite: { plugin: "shouter", originalText: command },
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: command,
+        commandPrefix: "/pull-requests",
+        skillName: "pull-requests",
+        scope: "project",
+      },
+    });
+
+    aggregator.loadHistoricalMessages([invocation]);
+
+    const message = getSingleDisplayedUserMessage(aggregator);
+    expect(message.content).toBe("/pull-requests OPEN IT");
+    expect(message.pluginRewrite).toEqual({ plugin: "shouter", originalText: command });
+  });
 });
