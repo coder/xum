@@ -138,7 +138,7 @@ describe("selectHotMemories", () => {
     const maxSelectionAttempts = Math.min(3, MEMORY_HOT_SET_MAX_SELECTION_ATTEMPTS);
     const candidates = Array.from({ length: maxSelectionAttempts + 5 }, (_, i) =>
       candidate({
-        path: `/memories/global/oversized-${i}.md`,
+        path: `/memories/global/binary-${i}.md`,
         accessCount: maxSelectionAttempts + 5 - i,
         lastAccessedAt: NOW,
       })
@@ -148,9 +148,9 @@ describe("selectHotMemories", () => {
       candidates,
       readFile: () => {
         readCount += 1;
-        return Promise.resolve("facts");
+        // Read but rejected (binary): a rejected candidate still uses an attempt.
+        return Promise.resolve("\u0000");
       },
-      maxBlockBytes: 1,
       maxSelectionAttempts,
       now: NOW,
     });

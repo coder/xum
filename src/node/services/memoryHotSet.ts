@@ -108,18 +108,15 @@ export async function selectHotMemories(args: {
   pinnedOnly?: boolean;
   now?: number;
   maxItemBytes?: number;
-  maxBlockBytes?: number;
   maxItems?: number;
   maxSelectionAttempts?: number;
 }): Promise<MemoryHotSetItem[]> {
   const now = args.now ?? Date.now();
   const maxItemBytes = args.maxItemBytes ?? MEMORY_HOT_SET_MAX_ITEM_BYTES;
-  const maxBlockBytes = args.maxBlockBytes ?? MEMORY_HOT_SET_MAX_BLOCK_BYTES;
   const maxItems = args.maxItems ?? MEMORY_HOT_SET_MAX_ITEMS;
   const maxSelectionAttempts = args.maxSelectionAttempts ?? MEMORY_HOT_SET_MAX_SELECTION_ATTEMPTS;
   for (const [name, value] of Object.entries({
     maxItemBytes,
-    maxBlockBytes,
     maxItems,
     maxSelectionAttempts,
   })) {
@@ -144,7 +141,10 @@ export async function selectHotMemories(args: {
     const item = { path: candidate.path, pinned: candidate.pinned, truncated, content: text };
     // The budget applies to the exact injected <hot_memories> block, so
     // wrapper and truncation-marker overhead cannot exceed it near the boundary.
-    if (Buffer.byteLength(formatHotMemoriesBlock([...items, item]), "utf-8") > maxBlockBytes) {
+    if (
+      Buffer.byteLength(formatHotMemoriesBlock([...items, item]), "utf-8") >
+      MEMORY_HOT_SET_MAX_BLOCK_BYTES
+    ) {
       continue;
     }
     items.push(item);
