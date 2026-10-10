@@ -22,6 +22,56 @@ import { Refusal, Stopped } from "./runner";
 const ROOT = fs.realpathSync(path.resolve(import.meta.dir, "../../.."));
 const DIR = path.join(ROOT, "tests/bugbash");
 
+/**
+ * Every check selfCheck.ts makes, by name. A container that reports fewer (it stopped early, or a
+ * check was dropped) or other names fails: a partial report must never pass. Add a new check in
+ * selfCheck.ts here too.
+ */
+export const CONTAINER_CHECKS = [
+  "uid is the launcher's and not root",
+  "no capabilities",
+  "no new privileges",
+  "seccomp filter",
+  "same kernel as the launcher",
+  "read-only /",
+  "read-only /repo/src",
+  "read-only /repo/node_modules",
+  "read-only /repo/dist",
+  "empty writable home",
+  "no host home under /home",
+  "no /var/run/docker.sock",
+  "no /run/docker.sock",
+  "no /root/.docker",
+  "the proxy is a unix socket",
+  "the proxy mount is read-only",
+  "loopback only",
+  "no IPv4 route",
+  "closed loopback port refuses",
+  "no route to the Docker bridge",
+  "no route to the internet",
+  "no DNS",
+  "no credential env names",
+  "allowed call passes",
+  "refuses P1 another route",
+  "refuses P2 an unknown beta",
+  "refuses P3 another model",
+  "refuses P4 a server tool",
+  "refuses P4 mcp_servers",
+  "refuses P5 a URL image",
+  "the app server has every kill switch",
+];
+
+/** The expected names that are missing, and the names that are unexpected or repeated. */
+export function checkSet(names: string[], expected: readonly string[] = CONTAINER_CHECKS) {
+  const seen = new Set<string>();
+  const unexpected: string[] = [];
+  for (const name of names) {
+    if (expected.includes(name) && !seen.has(name)) seen.add(name);
+    else unexpected.push(name);
+  }
+  return { missing: expected.filter((n) => !seen.has(n)), unexpected };
+}
+
 export async function runSelfCheck(
   stop: AbortSignal,
   say: (line: string) => void
@@ -76,7 +126,14 @@ export async function runSelfCheck(
           .split("\n")
           .map((l) => JSON.parse(l) as { name: string; ok: boolean; detail: string })
       : [];
-    check("the container's checks came back", inner.length > 0, `${inner.length} checks`);
+    const { missing, unexpected } = checkSet(inner.map((c) => c.name));
+    check(
+      "the container reported every check",
+      missing.length === 0 && unexpected.length === 0,
+      `${inner.length} of ${CONTAINER_CHECKS.length}` +
+        (missing.length ? `, missing: ${missing.join("; ")}` : "") +
+        (unexpected.length ? `, unexpected: ${unexpected.join("; ")}` : "")
+    );
     for (const c of inner) check(`container: ${c.name}`, c.ok, c.detail);
     const bodies = upstream.requests.map((r) => r.body);
     const allowed = bodies.filter((b) => b.includes("selfcheck-allowed")).length;

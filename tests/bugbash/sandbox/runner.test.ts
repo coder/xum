@@ -9,6 +9,7 @@ import { exitFor, launch, launchJob, ownerState, probeApp, recover } from "./lau
 import * as proxyModule from "./proxy";
 import { Ledger } from "./proxyPolicy";
 import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
+import { checkSet, CONTAINER_CHECKS } from "./selfCheckRun";
 
 // Each test runs the real build.sh in a throwaway git repo and a fake `docker` on PATH. The
 // runner gives docker a stripped env, so the fake reads its answers from bin/fake.env.
@@ -1434,4 +1435,18 @@ test("the command line refuses an ambient BUGBASH_AI_RESOLVED=real before any do
   expect(cli.status).toBe(2);
   expect(calls()).toBe("");
   expect(fs.existsSync(path.join(dir, output))).toBe(false);
+});
+
+test("D2: the self-check fails on a partial or unknown container report", () => {
+  expect(checkSet([...CONTAINER_CHECKS])).toEqual({ missing: [], unexpected: [] });
+  // A report that stops early (the last check missing) names what is missing.
+  const partial = CONTAINER_CHECKS.slice(0, -1);
+  expect(checkSet(partial)).toEqual({ missing: [CONTAINER_CHECKS.at(-1)!], unexpected: [] });
+  expect(checkSet([])).toEqual({ missing: [...CONTAINER_CHECKS], unexpected: [] });
+  // A repeated or unknown name cannot stand in for a missing one.
+  const [first, second] = CONTAINER_CHECKS;
+  expect(checkSet([first, first, ...CONTAINER_CHECKS.slice(2), "made up"])).toEqual({
+    missing: [second],
+    unexpected: [first, "made up"],
+  });
 });
