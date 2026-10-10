@@ -153,7 +153,7 @@ export function exactStepRefusal(
 
 // `e2e explore` (make bug-bash, run.ts): one charter goal and these options only. The two
 // configs are the bug-bash ones; both give the agents a model only in a model-driven sandbox job.
-const EXPLORE_CONFIGS = ["e2e.config.ts", "e2e.mcpapps.config.ts"];
+export const EXPLORE_CONFIGS = ["e2e.config.ts", "e2e.mcpapps.config.ts"];
 const EXPLORE_VALUES: Record<string, RegExp> = {
   "--config": /^e2e(\.mcpapps)?\.config\.ts$/,
   "--target": /^[a-z0-9-]+$/,

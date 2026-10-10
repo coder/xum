@@ -122,6 +122,32 @@ test("B2: a stopped run exits with the signal, and a refused launch exits 2", as
   expect(await runBugBash([...charters("a")], ENV, live, refused.deps)).toBe(2);
 });
 
+test("B2: a charter that exits 130 on its own fails the run", async () => {
+  const { deps } = fakeLaunch(() => ({ code: 130, cleanup: "removed" }));
+  const stop = new AbortController().signal;
+  expect(await runBugBash([...charters("a")], ENV, stop, deps)).toBe(130);
+});
+
+test("B2: a config other than the two bug-bash ones refuses (exit 2) before any job or folder", async () => {
+  const { deps, calls, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  const stop = new AbortController().signal;
+  // An existing file, so only the sandbox's config allowlist refuses it.
+  const args = [...charters("a"), "--config", path.join(import.meta.dir, "run.ts")];
+  expect(await runBugBash(args, ENV, stop, deps)).toBe(2);
+  expect(calls).toHaveLength(0);
+  expect(lines.join("\n")).toMatch(/only e2e\.config\.ts or e2e\.mcpapps\.config\.ts run/);
+  expect(lines.some((line) => line.includes(" -> "))).toBe(false);
+  // The MCP Apps config still runs.
+  const mcp = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  const mcpArgs = [
+    ...charters("a"),
+    "--config",
+    path.join(import.meta.dir, "e2e.mcpapps.config.ts"),
+  ];
+  expect(await runBugBash(mcpArgs, ENV, stop, mcp.deps)).toBe(0);
+  expect(mcp.calls[0].args).toContain("e2e.mcpapps.config.ts");
+});
+
 test.each([
   ["the real app AI", { BUGBASH_AI: "real" }, /only the mock app AI/],
   ["auto", { BUGBASH_AI: "auto" }, /only the mock app AI/],

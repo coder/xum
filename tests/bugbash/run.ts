@@ -13,8 +13,9 @@
  *        bun tests/bugbash/run.ts [--charters <file>] [--only <slug,...>] [--parallel 8]
  *          [--max-steps 6]
  * --charters: a branch-specific charter file (same format), instead of tests/bugbash/charters.txt.
- * --config: another e2e config, such as e2e.mcpapps.config.ts (its seed and explorer context);
- *   default e2e.config.ts. Paths are relative to the current directory.
+ * --config: e2e.mcpapps.config.ts (its seed and explorer context) instead of the default
+ *   e2e.config.ts. No other config runs in the sandbox (sandbox/inputs.ts exploreRefusal).
+ *   Paths are relative to the current directory.
  *
  * Models: BUGBASH_MODELS, comma-separated `anthropic:<model>`, default Opus 5.5 and Sonnet 5.5.
  * In a three-model comparison (2026-10) these two found 14 of 15 distinct bugs and overlapped on
@@ -38,6 +39,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
+import { EXPLORE_CONFIGS } from "./sandbox/inputs";
 import { type JobOutcome, launchJob, modelJob } from "./sandbox/launch";
 import { Ledger } from "./sandbox/proxyPolicy";
 import { Refusal } from "./sandbox/runner";
@@ -283,6 +285,11 @@ export async function runBugBash(
       ? path.relative(projectDir, path.resolve(values.config))
       : "e2e.config.ts";
   assert(fs.existsSync(path.join(projectDir, config)), `--config not found: ${config}`);
+  // The launcher runs only the two bug-bash configs: refuse another one here, before any folder.
+  if (!EXPLORE_CONFIGS.includes(config)) {
+    err(`make bug-bash: --config ${config}: only ${EXPLORE_CONFIGS.join(" or ")} run (#5714)`);
+    return 2;
+  }
 
   let charters = readCharters(
     values.charters != null ? path.resolve(values.charters) : path.join(projectDir, "charters.txt")
@@ -411,7 +418,8 @@ export async function runBugBash(
   if (unknownCleanup) return 3;
   if (stop.aborted) return stop.reason === "SIGTERM" ? 143 : 130;
   if (fault != null) return 5;
-  return Math.max(0, ...failures.filter((code) => code !== 130));
+  // No run-level stop and no halt came, so a charter's 130 is its own failure: keep it.
+  return Math.max(0, ...failures);
 }
 
 if (import.meta.main) {
