@@ -800,6 +800,54 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
+  test("dragging the handle far right collapses into the overview card, which reopens Review", async () => {
+    const { view, sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      seedLayout(["costs"]);
+    });
+
+    try {
+      const resizeHandle = await findRequiredElement(
+        sidebar,
+        '[class*="cursor-col-resize"]',
+        "Resize handle not found"
+      );
+      const widthBeforeDrag = getSidebarWidth(sidebar);
+
+      // Moving the handle right by the sidebar's whole width asks for a 0px sidebar, far past
+      // the snap point, so the sidebar collapses instead of holding at its minimum width.
+      fireEvent.mouseDown(resizeHandle, { clientX: 800 });
+      fireEvent.mouseMove(document, { clientX: 800 + widthBeforeDrag });
+      fireEvent.mouseUp(document);
+
+      const card = await waitFor(() => {
+        const element = view.container.querySelector<HTMLElement>(RIGHT_SIDEBAR_SELECTOR);
+        if (!element) throw new Error("Collapsed sidebar not found");
+        if (element.querySelector('[role="tablist"]')) {
+          throw new Error("Sidebar should collapse when dragged past the snap point");
+        }
+        return element;
+      });
+
+      // The card's Changes row reopens the sidebar on Review, at the width it had before the drag.
+      fireEvent.click(within(card).getByRole("button", { name: /Changes/ }));
+      const expanded = await findRequiredElement(
+        view.container,
+        RIGHT_SIDEBAR_SELECTOR,
+        "RightSidebar not found after expand"
+      );
+      await waitFor(() => {
+        const reviewTab = expanded.querySelector('[role="tab"][aria-controls*="review"]');
+        if (reviewTab?.getAttribute("aria-selected") !== "true") {
+          throw new Error("Review tab should be selected after expanding from the card");
+        }
+      });
+      expect(getSidebarWidth(expanded)).toBe(widthBeforeDrag);
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
   test("split layout renders multiple panes with separate tablists", async () => {
     // Set up a split layout with two panes (top: costs, bottom: review)
     const splitLayout: RightSidebarLayoutState = {

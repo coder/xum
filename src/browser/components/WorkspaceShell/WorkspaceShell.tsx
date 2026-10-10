@@ -4,13 +4,14 @@ import { cn } from "@/common/lib/utils";
 import { LazyFeature } from "../LazyFeature/LazyFeature";
 import {
   LEFT_SIDEBAR_WIDTH_KEY,
+  RIGHT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getReviewImmersiveKey,
 } from "@/common/constants/storage";
 import { useResizableSidebar } from "@/browser/hooks/useResizableSidebar";
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { RightSidebar } from "@/browser/features/RightSidebar/RightSidebar";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { PopoverError } from "../PopoverError/PopoverError";
@@ -166,6 +167,11 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
     minWidth: RIGHT_SIDEBAR_MIN_WIDTH_PX,
     maxWidth: effectiveMaxWidthPx,
     storageKey: RIGHT_SIDEBAR_WIDTH_KEY,
+    // Like Codex desktop: dragging the handle far enough right collapses the sidebar into its
+    // overview card (and back out reopens it). RightSidebar listens to the same persisted key.
+    onDragCollapseChange: (collapsed) => {
+      updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, collapsed);
+    },
   });
 
   const { width: sidebarWidth, isResizing, startResize } = sidebar;

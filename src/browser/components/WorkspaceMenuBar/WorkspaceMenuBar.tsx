@@ -762,7 +762,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       className={cn(
         "bg-sidebar border-border-light flex items-center justify-between border-b px-2",
         isDesktop ? DESKTOP_TITLEBAR_HEIGHT_CLASS : "h-8",
-        rightSidebarCollapsed && "titlebar-safe-right-minus-sidebar titlebar-safe-right-gutter-2",
+        // A collapsed right sidebar floats below the header, so the header reaches the window's
+        // right edge and must clear the titlebar overlay controls itself.
+        rightSidebarCollapsed && "titlebar-safe-right titlebar-safe-right-gutter-2",
         // In desktop mode, make header draggable for window movement
         isDesktop && "titlebar-drag",
         // Keep header visible when iOS keyboard opens and causes scroll
