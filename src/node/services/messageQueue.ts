@@ -507,8 +507,7 @@ export class MessageQueue {
    * Hidden tool-end and withdrawn entries between the two stay ahead (FIFO): a live hidden
    * tool-end entry there dispatches first and cuts on its own, and a withdrawn one cuts nothing.
    * Stopping at such an entry instead (the earlier trailing-run rule) left a promoted report
-   * behind a hidden turn-end entry whenever a hidden tool-end or withdrawn entry followed it
-   * (formal/message-queue, invariant PromotedNotBlockedByHidden).
+   * behind a hidden turn-end entry whenever a hidden tool-end or withdrawn entry followed it.
    */
   private promotedToolEndInsertIndex(): number {
     let floor = this.entries.length;
@@ -742,10 +741,10 @@ export class MessageQueue {
       return undefined;
     }
 
-    // An id already queued is not queued twice (ComposerSends Enqueue): the queued copy carries
-    // it, and its row accepts it once. Any other overlap with queued ids (another payload, or a
-    // re-send that is only partly queued) is queued on its own, never batched into a row with
-    // the other copy: the in-lock check at its publication then refuses it whole, held.
+    // An id already queued is not queued twice: the queued copy carries it, and its row accepts it
+    // once. Any other overlap with queued ids (another payload, or a re-send that is only partly
+    // queued) is queued on its own, never batched into a row with the other copy: the in-lock check
+    // at its publication then refuses it whole, held.
     const incomingSendIds = internal?.sendIdentities ?? [];
     const queuedDigests = new Map(
       this.entries.flatMap((queued) => queued.sendIdentities.map((x) => [x.id, x.digest] as const))

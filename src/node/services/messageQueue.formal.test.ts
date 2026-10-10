@@ -1,7 +1,6 @@
 /**
- * Deterministic regression tests for the violations found by the TLA+ model in
- * formal/message-queue/ (run formal/message-queue/check.sh). Each test states the correct
- * contract; the model's mutant configs keep the pre-fix behaviour as a counterexample.
+ * Deterministic regression tests for ordering and promotion violations in the message queue.
+ * Each test states the correct contract that the pre-fix behaviour broke.
  */
 import { describe, expect, spyOn, test } from "bun:test";
 import type { SendMessageOptions } from "@/common/orpc/types";
@@ -19,7 +18,7 @@ const options: SendMessageOptions = { model: TEST_MODEL, agentId: "exec" };
 // Background sends (peer messages, monitor wakes, sub-agent reports) are hidden and sealed.
 const hidden = { synthetic: true, agentInitiated: true, sealed: true };
 
-describe("promoteAheadOfHiddenTurnEnd (MQ_promoted.cfg, invariant PromotedNotBlockedByHidden)", () => {
+describe("promoteAheadOfHiddenTurnEnd: hidden entries never block a promoted entry", () => {
   // The promotion used to stop at the first tool-end predecessor, assuming it would cut the
   // stream anyway. A hidden tool-end entry that itself sits behind a hidden turn-end entry cuts
   // nothing, so the promoted report waited for the turn to end.
@@ -59,7 +58,7 @@ describe("promoteAheadOfHiddenTurnEnd (MQ_promoted.cfg, invariant PromotedNotBlo
   });
 });
 
-describe("removeByDedupeKeyPrefix (found while modelling; not a TLA+ invariant)", () => {
+describe("removeByDedupeKeyPrefix", () => {
   // Removal used to pair messages[i] with [...dedupeKeys][i], which holds only when every add in
   // the entry carried a key. Latent: every prefix-removed key is sent with
   // removableQueueDedupeKey, which seals its entry to one message.
@@ -75,7 +74,7 @@ describe("removeByDedupeKeyPrefix (found while modelling; not a TLA+ invariant)"
   });
 });
 
-describe("sends to an idle session holding queued work (MQ_userorder.cfg, invariant UserOrder)", () => {
+describe("sends to an idle session holding queued work keep user order", () => {
   /**
    * A real session behind WorkspaceService.sendMessage whose queue head answers the report
    * decision with `decision.current`. It holds at the drain of the turn that just ended, which
@@ -229,7 +228,8 @@ describe("sends to an idle session holding queued work (MQ_userorder.cfg, invari
   // A Stop cascade latches the workspace, then clears its queue once (TaskService
   // runWorkspaceStopCleanup, Phase B). A user send that passed sendMessage's entry barrier before
   // the latch and decides queue-or-send after it must not queue behind the held entry only to be
-  // cleared: before F2 it went direct and the session refused it visibly.
+  // cleared: before such sends queued behind the held work, it went direct and the session
+  // refused it visibly.
   test("a user send deciding during a Stop cascade is refused or retained, never dropped", async () => {
     const workspaceId = "formal-mq-stop-during-send";
     const { ws, stop, readUserTexts, retained, cleanup } = await createIdleSessionWithHeldEntry(
@@ -273,8 +273,9 @@ describe("sends to an idle session holding queued work (MQ_userorder.cfg, invari
   }, 30_000);
 
   // Input queued before the Stop must not run after it, but it is still the user's: the cascade
-  // hands it back (held input) instead of discarding it. Before F2 this send started its turn
-  // directly, so its row was in history when the cascade aborted that turn.
+  // hands it back (held input) instead of discarding it. Before such sends queued behind the
+  // held work, this send started its turn directly, so its row was in history when the cascade
+  // aborted that turn.
   test("a Stop cascade hands a queued user message back instead of dropping it", async () => {
     const workspaceId = "formal-mq-stop-after-queue";
     const { ws, h, stop, decision, readUserTexts, retained, cleanup } =

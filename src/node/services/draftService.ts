@@ -107,9 +107,9 @@ interface IndexEntry {
  * A draft file's content. `text` and `attachments` are the legacy fields an older build reads as
  * the whole draft: `text` = buildLegacyDraftText(pendingSends, visible text), and `attachments`
  * holds the retained ones (in entry order) before the visible ones. `pendingSends` is the
- * idempotent-send bookkeeping (ComposerSends.tla FixRenderer); an older build drops it on its
- * next write, which leaves everything visible (never lost). Only this service builds `text`;
- * clients see and edit the visible part (DraftSummary, DraftUpdateInput).
+ * idempotent-send bookkeeping; an older build drops it on its next write, which leaves everything
+ * visible (never lost). Only this service builds `text`; clients see and edit the visible part
+ * (DraftSummary, DraftUpdateInput).
  */
 interface StoredDraft {
   text: string;
@@ -606,11 +606,11 @@ export class DraftService extends EventEmitter {
   }
 
   /**
-   * Idempotent sends: the one draft write before a composer send (ComposerSends.tla Send). The
-   * sent text leaves the visible text (removeSentText, computed here so another window's newer
-   * visible edits stay) and is retained in the legacy text with the attachments; the entry keeps
-   * the exact request for retries. Idempotent by send id: a repeat with the same send changes
-   * nothing but its receiver; a different payload under a known id is refused.
+   * Idempotent sends: the one draft write before a composer send. The sent text leaves the visible
+   * text (removeSentText, computed here so another window's newer visible edits stay) and is
+   * retained in the legacy text with the attachments; the entry keeps the exact request for
+   * retries. Idempotent by send id: a repeat with the same send changes nothing but its receiver; a
+   * different payload under a known id is refused.
    */
   async beginSend(
     input: DraftBeginSendInput,
@@ -669,8 +669,8 @@ export class DraftService extends EventEmitter {
   }
 
   /**
-   * A retry's receiver rewrite (ComposerSends Retry: the draft write before the re-send). Never
-   * recreates an entry that was resolved meanwhile: `present` is false and the retry stops.
+   * A retry's receiver rewrite (the draft write before the re-send). Never recreates an entry that
+   * was resolved meanwhile: `present` is false and the retry stops.
    */
   async setSendReceiver(
     input: DraftSetSendReceiverInput
@@ -698,12 +698,12 @@ export class DraftService extends EventEmitter {
   }
 
   /**
-   * Apply the receiver's answers (ComposerSends Lookup), under the draft lock. An answer applies
-   * only while its entry still exists and still names the receiver that was asked: another
-   * window may have resolved it, or a retry may have sent it to another receiver since.
-   * Accepted: the entry, its retained text and its attachments go. Not accepted: the entry goes
-   * and its text and attachments become visible again (retained texts first, in entry order).
-   * Pending or unknown: kept. Never infers acceptance from anything but the answer.
+   * Apply the receiver's answers, under the draft lock. An answer applies only while its entry
+   * still exists and still names the receiver that was asked: another window may have resolved it,
+   * or a retry may have sent it to another receiver since. Accepted: the entry, its retained text
+   * and its attachments go. Not accepted: the entry goes and its text and attachments become
+   * visible again (retained texts first, in entry order). Pending or unknown: kept. Never infers
+   * acceptance from anything but the answer.
    */
   async applySendStatuses(
     scope: Extract<DraftScope, { kind: "workspace" }>,

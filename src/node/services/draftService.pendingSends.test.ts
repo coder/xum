@@ -1,7 +1,7 @@
 /**
- * Idempotent sends in the draft file (formal/composer-drafts/ComposerSends.tla, FixRenderer):
- * pending sends keep their text and attachments in the legacy fields until the backend answers
- * for their ids. The service is real (real files); only the receiver's answers are scripted.
+ * Idempotent sends in the draft file: pending sends keep their text and attachments in the legacy
+ * fields until the backend answers for their ids. The service is real (real files); only the
+ * receiver's answers are scripted.
  */
 import * as fs from "fs/promises";
 import * as path from "path";

@@ -1,21 +1,20 @@
 /**
- * Repros of composer-draft counterexamples found by the TLA+ model in formal/composer-drafts/
- * (ComposerDrafts.tla; run formal/composer-drafts/check.sh). The backend is real; only
+ * Deterministic repros of composer-draft races around a send. The backend is real; only
  * WorkspaceService.sendMessage is wrapped to hold or fail its reply.
  *
- * D1 (MC_send_restore, #5226 item 12, fixed): a failed send used to put the whole pre-send draft
- * back (`setDraft(preSendDraft)`, ChatInput), replacing text that reached the composer while the
- * send was in flight (another window's edit, a restore). The restore now merges the failed text
- * before the current text.
+ * Fixed (#5226 item 12): a failed send used to put the whole pre-send draft back
+ * (`setDraft(preSendDraft)`, ChatInput), replacing text that reached the composer while the send
+ * was in flight (another window's edit, a restore). The restore now merges the failed text before
+ * the current text.
  *
- * D4 (MC_quit_during_send, fixed by idempotent sends): the optimistic clear used to be saved to
- * the backend draft by the normal debounce while the send was still being prepared. If the app
- * quit in that window, the text existed nowhere durable. The send now keeps its text in the
- * draft file (retained under a pending-send entry) until the backend answers for its id.
+ * Fixed by idempotent sends: the optimistic clear used to be saved to the backend draft by the
+ * normal debounce while the send was still being prepared. If the app quit in that window, the text
+ * existed nowhere durable. The send now keeps its text in the draft file (retained under a
+ * pending-send entry) until the backend answers for its id.
  *
- * D2 (MC_send_restore, fixed by idempotent sends): when the backend accepted the message but the
- * RPC then failed, the restore put the sent text back next to the message already in the
- * transcript. The composer now asks the backend about the send's id instead.
+ * Fixed by idempotent sends: when the backend accepted the message but the RPC then failed, the
+ * restore put the sent text back next to the message already in the transcript. The composer now
+ * asks the backend about the send's id instead.
  */
 import "../dom";
 jest.mock("lottie-react", () => ({
@@ -75,12 +74,12 @@ const refused = () =>
     error: { type: "unknown" as const, raw: "formal repro: send refused" },
   });
 
-describe("formal/composer-drafts: composer text across a failed send", () => {
+describe("composer text across a failed send", () => {
   beforeAll(async () => {
     await preloadTestModules();
   });
 
-  test("a failed send keeps text another window typed while it was in flight (D1)", async () => {
+  test("a failed send keeps text another window typed while it was in flight", async () => {
     const app = await createAppHarness({ branchPrefix: "formal-send-typed" });
     const held = holdSendReplies(app, () => refused());
     try {
@@ -131,7 +130,7 @@ describe("formal/composer-drafts: composer text across a failed send", () => {
     }
   }, 120_000);
 
-  test("text of a send still being prepared stays durable until accepted (D4)", async () => {
+  test("text of a send still being prepared stays durable until accepted", async () => {
     const app = await createAppHarness({ branchPrefix: "formal-send-pending" });
     const held = holdSendReplies(app, (realSend, args) => realSend(...args));
     try {
@@ -168,7 +167,7 @@ describe("formal/composer-drafts: composer text across a failed send", () => {
     }
   }, 120_000);
 
-  test("a reply lost after the backend accepted does not bring the text back (D2)", async () => {
+  test("a reply lost after the backend accepted does not bring the text back", async () => {
     const app = await createAppHarness({ branchPrefix: "formal-send-accepted" });
     const held = holdSendReplies(app, async (realSend, args) => {
       await realSend(...args);
@@ -204,7 +203,7 @@ describe("formal/composer-drafts: composer text across a failed send", () => {
  * and puts what it took back when it fails. Edits write the shared workspace draft (#5571), so
  * another window that still holds the edit can save it again while the send is in flight.
  */
-describe("formal/composer-drafts: a failed edit's put-back", () => {
+describe("a failed edit's put-back", () => {
   beforeAll(async () => {
     await preloadTestModules();
   });

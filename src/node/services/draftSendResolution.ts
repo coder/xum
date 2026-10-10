@@ -6,13 +6,12 @@ import type { WorkspaceService } from "@/node/services/workspaceService";
 const LOOKUP_BATCH = 100;
 
 /**
- * drafts.resolveSends (ComposerSends.tla Lookup): ask the receiver about every pending send of a
- * workspace draft, then apply the final answers under the draft lock. The lookups run OUTSIDE the
- * draft lock (getSendStatus takes the history lock: no nested draft/history locks), grouped by
- * the receiver each entry names; DraftService.applySendStatuses rechecks under the lock that each
- * entry still exists and still names the receiver that was asked. Idempotent: two windows may
- * resolve the same draft at once. A failed lookup applies nothing and rejects (the client keeps
- * the entries unresolved and retries).
+ * drafts.resolveSends: ask the receiver about every pending send of a workspace draft, then apply
+ * the final answers under the draft lock. The lookups run OUTSIDE the draft lock (getSendStatus
+ * takes the history lock: no nested draft/history locks), grouped by the receiver each entry names;
+ * DraftService.applySendStatuses rechecks under the lock that each entry still exists and still
+ * names the receiver that was asked. Idempotent: two windows may resolve the same draft at once. A
+ * failed lookup applies nothing and rejects (the client keeps the entries unresolved and retries).
  */
 export async function resolveDraftSends(
   services: { draftService: DraftService; workspaceService: WorkspaceService },

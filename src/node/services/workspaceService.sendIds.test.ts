@@ -36,7 +36,7 @@ import { WorkspaceService } from "@/node/services/workspaceService";
 
 /**
  * Idempotent sends end to end through the real WorkspaceService + AgentSession + MessageQueue +
- * HistoryService (only the AI stream mocked). H1: a held Retry whose first try left a durable
+ * HistoryService (only the AI stream mocked). A held Retry whose first try left a durable
  * row and then failed must find that row ("already accepted"), add no second row, and drop the
  * held entry -- also for a client that sends no ids (the backend mints them).
  */
@@ -230,7 +230,7 @@ describe("idempotent sends (real host)", () => {
     };
   }
 
-  test("H1: a held Retry whose first try left a durable row then failed finds it, adds no row, and drops the entry (ID-less client)", async () => {
+  test("a held Retry whose first try left a durable row then failed finds it, adds no row, and drops the entry (ID-less client)", async () => {
     const h = await createStack();
     await h.startBusyTurn("first");
     // The client sends no id: the backend mints one, and the queued entry keeps it.
@@ -264,7 +264,7 @@ describe("idempotent sends (real host)", () => {
     expect((await h.userRows()).filter((row) => row.text === "follow-up")).toHaveLength(1);
   });
 
-  test("H1 under the lock: a held Retry whose lookup answered 'not on a row' still adds no second row", async () => {
+  test("under the lock: a held Retry whose lookup answered 'not on a row' still adds no second row", async () => {
     const h = await createStack();
     await h.startBusyTurn("first");
     expect(await h.workspaceService.sendMessage(workspaceId, "follow-up", sendOptions)).toEqual(
@@ -441,7 +441,7 @@ describe("idempotent sends (real host)", () => {
     ]);
   });
 
-  // Task launch briefs (U4 in formal/task-launch): an automatic send carries only the ids its
+  // Task launch briefs: an automatic send carries only the ids its
   // caller supplies, and its row keeps them, also when the send returns Err after that row became
   // durable. Only that row tells the launch's caller the brief reached history.
   test("an automatic send stamps the ids its caller supplies, also when it fails after its row is durable", async () => {

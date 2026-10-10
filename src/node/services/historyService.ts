@@ -239,7 +239,7 @@ function tailCutChangesProviderContext(removedMessages: MuxMessage[]): boolean {
  * consumed (see leavesCompactionFollowUpPending). A cut that removes that proof and exposes the
  * summary again must retire the handoff in the same locked write, or startup recovery (or a
  * sibling backend) re-sends an already-dispatched follow-up, e.g. after the user edits it and
- * the edited row never lands (formal/compaction, TLC case C1). Returns the retained-row sanitizer.
+ * the edited row never lands. Returns the retained-row sanitizer.
  */
 function retireReexposedCompactionFollowUp(
   retained: readonly MuxMessage[],
@@ -3033,9 +3033,9 @@ export class HistoryService {
     // The lazy read path recovers under an earlier hold of the lock and then re-acquires
     // it to rotate; a foreign backend can truncate and crash in that gap (marker +
     // tombstone, no archive). Appending would then create an archive that the next
-    // recovery cannot match to the marker, so recovery deletes it with the rotated rows
-    // (TLA+ formal/history-crash ArchiveSwap A2 vs A3). Rolling back first restores the
-    // tombstoned archive, and rotation appends to it. Two stats when there is nothing to do.
+    // recovery cannot match to the marker, so recovery deletes it with the rotated rows.
+    // Rolling back first restores the tombstoned archive, and rotation appends to it. Two
+    // stats when there is nothing to do.
     // The artifact probe is part of recovery: a failed stat must not pass as a rotation error.
     try {
       if (await this.truncateRecoveryArtifactsPresent(workspaceId)) {

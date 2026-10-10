@@ -109,7 +109,7 @@ export interface DraftView {
   payloadsLoaded: boolean;
   /**
    * Pending sends whose acceptance is unresolved (the receiver answered unknown, or the lookup or
-   * send failed): the composer stays in its sending state (ComposerSends FixRenderer).
+   * send failed): the composer stays in its sending state.
    */
   unresolvedSendCount: number;
 }
@@ -135,7 +135,7 @@ interface SendTracking {
   /**
    * Sends this window has a request in flight for (from beginSend until its reply): never looked
    * up from here, since a lookup before the request reaches the receiver makes the receiver
-   * refuse it for good (ComposerSends Register).
+   * refuse it for good.
    */
   issuing: Set<string>;
   /**
@@ -901,11 +901,10 @@ export class DraftStore {
   }
 
   /**
-   * Idempotent sends (ComposerSends.tla FixRenderer): the one durable draft write before a
-   * workspace composer send. The sent text leaves the visible text and, with the sent
-   * attachments, stays in the draft (retained, hidden) under a pending-send entry until the
-   * backend answers for the id (resolveSends). Rejects when the write fails: then nothing was
-   * taken, and the caller must not send.
+   * Idempotent sends: the one durable draft write before a workspace composer send. The sent text
+   * leaves the visible text and, with the sent attachments, stays in the draft (retained, hidden)
+   * under a pending-send entry until the backend answers for the id (resolveSends). Rejects when
+   * the write fails: then nothing was taken, and the caller must not send.
    */
   async beginSend(
     scope: Extract<DraftScope, { kind: "workspace" }>,
@@ -1228,11 +1227,11 @@ export class DraftStore {
   }
 
   /**
-   * Bounded automatic retries with backoff (ComposerSends Retry): "failed" looks up again;
-   * "unknown" (a receiver that is not this connection's) first moves the entry to the current
-   * receiver, then re-sends the same id with the same request. "pending" waits. When the batch
-   * runs out, the entries keep their text, attachments and id and the composer stays sending
-   * until a trigger (triggerSendResolution) starts a new batch. Stop aborts the batch.
+   * Bounded automatic retries with backoff: "failed" looks up again; "unknown" (a receiver that is
+   * not this connection's) first moves the entry to the current receiver, then re-sends the same id
+   * with the same request. "pending" waits. When the batch runs out, the entries keep their text,
+   * attachments and id and the composer stays sending until a trigger (triggerSendResolution)
+   * starts a new batch. Stop aborts the batch.
    */
   private scheduleSendRetry(
     scope: Extract<DraftScope, { kind: "workspace" }>,
@@ -1494,8 +1493,8 @@ export class DraftStore {
         } else if (send.undone === true) {
           // The merge hides a send the backend still holds, so this window no longer shows a send
           // it undid: it is an ordinary pending send again, and the stored state decides about it
-          // once it settles (ComposerSendMerge.tla: in sync, `undone` is empty). Kept undone, a
-          // later write would speak for text this window no longer shows and drop it on return.
+          // once it settles (in sync, `undone` is empty). Kept undone, a later write would speak
+          // for text this window no longer shows and drop it on return.
           entry.basisSends.set(sendId, { ...send, undone: false });
         }
       }

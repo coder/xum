@@ -1,8 +1,7 @@
 /**
- * DraftStore's idempotent-send coordinator (formal/composer-drafts/ComposerSends.tla, FixRenderer):
- * resolution, automatic retries, Stop, and two windows. The drafts are a real DraftService (real
- * files) and resolution is the real drafts.resolveSends; only the receiver (getSendStatus and
- * sendMessage) is scripted.
+ * DraftStore's idempotent-send coordinator: resolution, automatic retries, Stop, and two windows.
+ * The drafts are a real DraftService (real files) and resolution is the real drafts.resolveSends;
+ * only the receiver (getSendStatus and sendMessage) is scripted.
  */
 import * as fs from "fs/promises";
 import * as path from "path";

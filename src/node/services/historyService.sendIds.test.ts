@@ -10,11 +10,10 @@ import { computeSendDigest, type SendIdDecision, type SendIdentity } from "./sen
 import { createTestHistoryService } from "./testHistoryService";
 
 /**
- * The in-lock send id check of HistoryService.acceptCompactionReplacement (idempotent sends,
- * formal/composer-drafts ComposerSends.tla, MCS_pr1a): a row on disk is the only acceptance
- * evidence, read fresh under the write lock, so no second row is ever appended for an id a row
- * already carries -- across services sharing one session dir, across rotation into the
- * archive, and for a line the history readers drop.
+ * The in-lock send id check of HistoryService.acceptCompactionReplacement (idempotent sends):
+ * a row on disk is the only acceptance evidence, read fresh under the write lock, so no second
+ * row is ever appended for an id a row already carries -- across services sharing one session
+ * dir, across rotation into the archive, and for a line the history readers drop.
  */
 const workspaceId = "send-ids";
 

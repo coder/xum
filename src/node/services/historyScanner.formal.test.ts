@@ -11,19 +11,18 @@ import { createMuxMessage } from "@/common/types/message";
 import { findProviderHistoryStart, hasRawResetMarker, readProviderHistory } from "./historyScanner";
 import { mulberry32 } from "./historyScanner.generator.testHarness";
 
-// Bridge from the Lean model in formal/history-locator to the real provider locator.
+// Checks the real provider locator against a TypeScript reference implementation of its rule.
 //
-// Each generated row carries the label the model uses (HistoryLocator/Spec.lean): its class, the
-// reset tokens it holds and whether its own text holds the whole marker. `specCut` below is a
-// line-by-line port of the model's rule (evs + pick). The property is Scanner.lean's
-// `locate_eq_spec`: on rows that satisfy the model's assumptions, findProviderHistoryStart keeps
-// exactly the rows the rule keeps, for every skip, with chunk edges (64 KiB from EOF) moved
+// Each generated row carries a label: its class, the reset tokens it holds and whether its own text
+// holds the whole marker. `specCut` below is the reference rule (events + decidingEvent), used as
+// the oracle. The property: on rows that satisfy the rule's assumptions, findProviderHistoryStart
+// keeps exactly the rows the rule keeps, for every skip, with chunk edges (64 KiB from EOF) moved
 // through the interesting rows. Unlike historyScanner.differential.test.ts, whose oracle is a
 // frozen copy of the same algorithm, the expected answer here never runs the production
 // recognizers.
 //
-// The cases at the end pin fixed findings F1-F3, where the production locator used to break the
-// rule on inputs outside the model's assumptions.
+// The cases at the end pin three fixed findings, where the production locator used to break the
+// rule on inputs outside its assumptions.
 
 type Tok = "key" | "colon" | "value";
 type Kind = "plain" | "boundary" | "resetMarker" | "resetFloor" | "unreadable";
@@ -40,7 +39,7 @@ interface GenRow {
   label: Label | null; // null: empty row
 }
 
-// ── Port of the Lean rule (Spec.lean: runToks, RunEvidence, evs, pick) ─────────────────────
+// ── Reference rule (runEvidence, events, decidingEvent) ───────────────────────────────────
 
 const MARKER: readonly Tok[] = ["key", "colon", "value"];
 function isSubsequence(pattern: readonly Tok[], text: readonly Tok[]): boolean {
@@ -330,7 +329,7 @@ function expectedKept(labels: readonly Label[], skip: number): number[] {
   return labels.map((_, i) => i).filter((i) => cut === null || n - 1 - i < cut);
 }
 
-describe("findProviderHistoryStart against the Lean rule", () => {
+describe("findProviderHistoryStart against the reference rule", () => {
   let dir: string;
   beforeAll(async () => {
     dir = await fs.mkdtemp(path.join(os.tmpdir(), "history-locator-formal-"));
@@ -412,7 +411,7 @@ describe("findProviderHistoryStart against the Lean rule", () => {
   }, 120_000);
 });
 
-// ── Fixed findings (outside the model's assumptions) ────────────────────────────────────────
+// ── Fixed findings (outside the rule's assumptions) ─────────────────────────────────────────
 //
 // Each case: an older public-looking row "old", a reset-evidence row (or boundary), a newer row
 // "new". The rule keeps only rows newer than the floor, so the provider must never see "old".
@@ -439,23 +438,23 @@ describe("provider history privacy findings", () => {
   // A NUL inside the key: hasRawResetMarker removes it; the reverse token probe used not to.
   const nulKeyMarker = '{"metadata":{"context\u0000BoundaryKind":"reset"},broken ';
 
-  // F1: oversized rows are never classified, so only the reverse token probe saw them, and it did
+  // Oversized rows are never classified, so only the reverse token probe saw them, and it did
   // not remove separators inside a token. The same row under SESSION_HISTORY_MAX_LINE_BYTES is a
   // floor via classifyHistoryScanRow; oversized rows now also stream through the raw probe.
-  test("F1 control: a reset key split by a separator floors a normal-size unreadable row", async () => {
+  test("control: a reset key split by a separator floors a normal-size unreadable row", async () => {
     expect(
       await providerIds([message("old"), nulKeyMarker + "x".repeat(100), message("new")])
     ).toEqual(["new"]);
   });
-  test("F1: the same reset evidence in an oversized unreadable row floors the read", async () => {
+  test("the same reset evidence in an oversized unreadable row floors the read", async () => {
     expect(await providerIds([message("old"), nulKeyMarker + pad, message("new")])).toEqual([
       "new",
     ]);
   });
 
-  // F2: a marker fragmented over rows is matched by concatenating unreadable rows without their
+  // A marker fragmented over rows is matched by concatenating unreadable rows without their
   // LF; a CR (CRLF) or space before the LF used to stay inside the token.
-  test("F2 control: a reset value split by LF across unreadable rows floors the read", async () => {
+  test("control: a reset value split by LF across unreadable rows floors the read", async () => {
     expect(
       await providerIds([
         message("old"),
@@ -469,7 +468,7 @@ describe("provider history privacy findings", () => {
     ["CR", "\r"],
     ["space", " "],
   ] as const) {
-    test(`F2: a reset value split by ${name} plus LF across unreadable rows floors the read`, async () => {
+    test(`a reset value split by ${name} plus LF across unreadable rows floors the read`, async () => {
       expect(
         await providerIds([
           message("old"),
@@ -481,7 +480,7 @@ describe("provider history privacy findings", () => {
     });
   }
 
-  // F3: an oversized compaction boundary used to be recovered only when its raw bytes held the
+  // An oversized compaction boundary used to be recovered only when its raw bytes held the
   // compact needle '"compactionBoundary":true'. A normal-size boundary is recognized after
   // JSON.parse, so an escaped key or a space works there.
   const boundary = (text: string) =>
@@ -496,7 +495,7 @@ describe("provider history privacy findings", () => {
     row.replace('"compactionBoundary":true', '"compaction\\u0042oundary":true');
   const spaced = (row: string) =>
     row.replace('"compactionBoundary":true', '"compactionBoundary": true');
-  test("F3 control: an escaped-key boundary starts the epoch at normal size and compact oversized", async () => {
+  test("control: an escaped-key boundary starts the epoch at normal size and compact oversized", async () => {
     expect(
       await providerIds([message("old"), escapedKey(boundary("summary")), message("new")])
     ).toEqual(["boundary", "new"]);
@@ -509,17 +508,17 @@ describe("provider history privacy findings", () => {
     ["escaped key", escapedKey],
     ["space after the colon", spaced],
   ] as const) {
-    test(`F3: an oversized compaction boundary with ${name} starts the epoch`, async () => {
+    test(`an oversized compaction boundary with ${name} starts the epoch`, async () => {
       expect(await providerIds([message("old"), shape(boundary(pad)), message("new")])).toEqual([
         "boundary",
         "new",
       ]);
     });
   }
-  // Properties behind F1-F3: random spellings of the evidence, with the 64 KiB chunk edge (counted
-  // from EOF) moved through it so escapes, UTF-8 sequences and tokens straddle segments. The
-  // expected floor is hasRawResetMarker itself: whatever the classifier would floor at normal size
-  // must floor oversized or fragmented.
+  // Properties behind the three fixes: random spellings of the evidence, with the 64 KiB chunk edge
+  // (counted from EOF) moved through it so escapes, UTF-8 sequences and tokens straddle segments.
+  // The expected floor is hasRawResetMarker itself: whatever the classifier would floor at normal
+  // size must floor oversized or fragmented.
   const RAW_SEPARATORS = [" ", "\t", "\r", "\u0000", "\u0085", "\u00a0", "\u2028", "\ufeff"];
   const ESCAPED_SEPARATORS = ["\\u0020", "\\x09", "\\U001f", "\\X7F", "\\u0000"];
   const DECOYS = ["é", "€", "𝄞", "q", "\\", '"'];
@@ -574,7 +573,7 @@ describe("provider history privacy findings", () => {
   const widestEscapedMarker = [...SESSION_HISTORY_RESET_NEEDLE]
     .map((c) => escapeUnits(c).join("\\u0020"))
     .join("\\u0020");
-  test("F1 property: an oversized row with its own raw reset marker floors the read", async () => {
+  test("property: an oversized row with its own raw reset marker floors the read", async () => {
     let floors = 0;
     for (let seed = 1; seed <= 60; seed++) {
       const random = mulberry32(seed);
@@ -624,7 +623,7 @@ describe("provider history privacy findings", () => {
     expect(misses).toEqual([]);
   }, 120_000);
 
-  test("F2 property: a raw reset marker fragmented over unreadable rows floors the read", async () => {
+  test("property: a raw reset marker fragmented over unreadable rows floors the read", async () => {
     let floors = 0;
     for (let seed = 1; seed <= 300; seed++) {
       const random = mulberry32(seed);
@@ -704,7 +703,7 @@ describe("provider history privacy findings", () => {
     expect(keeps).toBeGreaterThanOrEqual(3);
   }, 120_000);
 
-  test("F3 property: an oversized compaction boundary in any JSON spelling starts the epoch", async () => {
+  test("property: an oversized compaction boundary in any JSON spelling starts the epoch", async () => {
     const whitespace = ["", "", " ", "\t", "\r", " \t "];
     for (let seed = 1; seed <= 30; seed++) {
       const random = mulberry32(seed);
