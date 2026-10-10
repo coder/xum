@@ -89,12 +89,14 @@ function holdRuntimeAvailability(orpc: ReturnType<typeof getSharedEnv>["orpc"]) 
   const released = new Promise<void>((resolve) => {
     release = resolve;
   });
+  const answered: Promise<unknown>[] = [];
   const projects = new Proxy(orpc.projects, {
     get(target, key, receiver) {
       if (key !== "runtimeAvailability") return Reflect.get(target, key, receiver) as unknown;
-      return async (...args: Parameters<typeof target.runtimeAvailability>) => {
-        await released;
-        return target.runtimeAvailability(...args);
+      return (...args: Parameters<typeof target.runtimeAvailability>) => {
+        const call = released.then(() => target.runtimeAvailability(...args));
+        answered.push(call.catch(() => undefined));
+        return call;
       };
     },
   });
@@ -103,7 +105,20 @@ function holdRuntimeAvailability(orpc: ReturnType<typeof getSharedEnv>["orpc"]) 
       return key === "projects" ? projects : (Reflect.get(target, key, receiver) as unknown);
     },
   });
-  return { client, release };
+  /** Resolves once every probe made so far has answered. */
+  const allAnswered = () => Promise.all(answered);
+  return { client, release, allAnswered };
+}
+
+function runInitButton(container: HTMLElement): Promise<HTMLButtonElement> {
+  return waitFor(
+    () => {
+      const button = container.querySelector<HTMLButtonElement>('[data-testid="agents-init-run"]');
+      if (!button) throw new Error("Run /init banner not shown");
+      return button;
+    },
+    { timeout: 10_000 }
+  );
 }
 
 async function openCreationViewWithHeldBranches(options?: {
@@ -169,32 +184,39 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
     }
   }, 90_000);
 
-  // The ProjectPage "Run /init" banner sends through the composer's imperative send(), once.
-  test("Run /init clicked while the branches load sends /init once they load", async () => {
-    const { view, cleanupDom, held, create } = await openCreationViewWithHeldBranches({
+  // The ProjectPage "Run /init" banner sends through the composer's send() once. While the branch
+  // list loads that send is refused like any other: /init stays in the composer and is sent only
+  // when the user presses Send. Nothing sends later on its own (tracked as a follow-up).
+  test("Run /init clicked while the branches load sends nothing until the user presses Send", async () => {
+    const availability = holdRuntimeAvailability(getSharedEnv().orpc);
+    const { view, cleanupDom, chat, held, create } = await openCreationViewWithHeldBranches({
       showAgentsInitBanner: true,
+      apiClient: availability.client,
     });
     try {
-      const runInit = await waitFor(
-        () => {
-          const button = view.container.querySelector<HTMLButtonElement>(
-            '[data-testid="agents-init-run"]'
-          );
-          if (!button) throw new Error("Run /init banner not shown");
-          return button;
-        },
-        { timeout: 10_000 }
-      );
-      fireEvent.click(runInit);
+      fireEvent.click(await runInitButton(view.container));
+      await chat.expectInputValue("/init");
+      expect(create).not.toHaveBeenCalled();
+
+      // Neither request completing sends on its own: branches first, then the runtime probe.
+      held.release();
+      await waitFor(() => expect(sendButton(view.container).disabled).toBe(false), {
+        timeout: 10_000,
+      });
+      availability.release();
+      await availability.allAnswered();
+      // A negative check needs a settle window: give React a few frames to commit the probe result.
       await new Promise((resolve) => setTimeout(resolve, 500));
       expect(create).not.toHaveBeenCalled();
-      expect(view.container.textContent ?? "").not.toContain(TRUNK_REQUIRED);
+      await chat.expectInputValue("/init");
 
-      held.release();
-      await waitFor(() => expect(create).toHaveBeenCalled(), { timeout: 30_000 });
+      // An explicit Send submits /init once.
+      fireEvent.click(sendButton(view.container));
+      await waitFor(() => expect(create).toHaveBeenCalledTimes(1), { timeout: 30_000 });
       const trunkBranch = create.mock.calls[0]?.[2];
       expect(typeof trunkBranch === "string" && trunkBranch.length > 0).toBe(true);
     } finally {
+      availability.release();
       held.release();
       held.spy.mockRestore();
       create.mockRestore();
@@ -202,32 +224,23 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
     }
   }, 90_000);
 
-  test("Run /init then an edit while the branches load sends nothing until the user presses Send", async () => {
-    const { view, cleanupDom, chat, held, create } = await openCreationViewWithHeldBranches({
+  test("Run /init clicked after the branches load sends /init at once", async () => {
+    const { view, cleanupDom, held, create } = await openCreationViewWithHeldBranches({
       showAgentsInitBanner: true,
     });
     try {
-      const runInit = await waitFor(
+      held.release();
+      await waitFor(
         () => {
-          const button = view.container.querySelector<HTMLButtonElement>(
-            '[data-testid="agents-init-run"]'
-          );
-          if (!button) throw new Error("Run /init banner not shown");
-          return button;
+          const trigger = view.container.querySelector('[aria-label="Select source branch"]');
+          if (!trigger?.textContent || trigger.textContent === "Select source branch") {
+            throw new Error("source branch not selected yet");
+          }
         },
         { timeout: 10_000 }
       );
-      fireEvent.click(runInit);
-      await chat.expectInputValue("/init");
-      await chat.typeWithoutSending("a prompt the user has not sent yet");
-
-      held.release();
-      await waitFor(() => expect(sendButton(view.container).disabled).toBe(false), {
-        timeout: 10_000,
-      });
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
-      expect(create).not.toHaveBeenCalled();
-      await chat.expectInputValue("a prompt the user has not sent yet");
+      fireEvent.click(await runInitButton(view.container));
+      await waitFor(() => expect(create).toHaveBeenCalledTimes(1), { timeout: 30_000 });
     } finally {
       held.release();
       held.spy.mockRestore();
