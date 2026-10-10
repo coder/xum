@@ -1326,11 +1326,7 @@ describe("MemoryService", () => {
         if (!result.success) expect(result.error).toContain("ws-child was removed");
       }
       expect(await fixture.service.listIndexEntries(ownerCtx)).toEqual([]);
-      expect(
-        await fixture.service.listHotMemories(ownerCtx, {
-          countTokens: (text) => Promise.resolve(text.length),
-        })
-      ).toEqual([]);
+      expect(await fixture.service.listHotMemories(ownerCtx)).toEqual([]);
       expect(
         await fsPromises.readFile(
           path.join(fixture.config.sessionsDir, "ws-owner", "memory", "n.md"),
@@ -1421,9 +1417,7 @@ describe("MemoryService", () => {
 
       // Hot-set reads happen after the index enumeration passed: the
       // tombstone landing before the file read drops the item.
-      const hotBefore = await fixture.service.listHotMemories(fixture.ctx, {
-        countTokens: (text) => Promise.resolve(text.length),
-      });
+      const hotBefore = await fixture.service.listHotMemories(fixture.ctx);
       expect(hotBefore.some((item) => item.path === "/memories/workspace/n.md")).toBe(true);
       // Interleaving: the tombstone lands after listIndexEntries built the
       // candidate list and before the hot-set file reads.
@@ -1437,9 +1431,7 @@ describe("MemoryService", () => {
         }
       );
       try {
-        const hot = await fixture.service.listHotMemories(fixture.ctx, {
-          countTokens: (text) => Promise.resolve(text.length),
-        });
+        const hot = await fixture.service.listHotMemories(fixture.ctx);
         expect(hot.some((item) => item.path === "/memories/workspace/n.md")).toBe(false);
         // The ACTING workspace is the one removed: nothing is served to it,
         // global notes included (a removed child's redirected run surveys
@@ -1449,22 +1441,6 @@ describe("MemoryService", () => {
         listIndex.mockRestore();
         await untombstone();
       }
-      // Selection keeps awaiting token counts after the file reads: a
-      // tombstone landing there still withholds the workspace items.
-      let counted = 0;
-      const hotAfterCount = await fixture.service.listHotMemories(fixture.ctx, {
-        countTokens: async (text) => {
-          if (counted++ === 0) {
-            await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
-            await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
-          }
-          return text.length;
-        },
-      });
-      expect(counted).toBeGreaterThan(0);
-      expect(hotAfterCount.some((item) => item.path === "/memories/workspace/n.md")).toBe(false);
-      expect(hotAfterCount.some((item) => item.path === "/memories/global/g.md")).toBe(false);
-      await untombstone();
     });
 
     it("refuses a pin toggle once the owner it was bound to is tombstoned", async () => {
@@ -4728,22 +4704,47 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
     });
 
-    it("withholds an already selected global hot item when the tombstone lands during token counting", async () => {
+    it("withholds an already selected global hot item when the tombstone lands during a later read", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
-      // Only a global note: no workspace item is ever selected, so a guard
+      // Only global notes: no workspace item is ever selected, so a guard
       // conditioned on workspace items would never run.
       await fixture.service.create(fixture.ctx, "/memories/global/g.md", "global", "agent");
       await fixture.service.setPinned(fixture.ctx, "/memories/global/g.md", true);
+      await fixture.service.create(fixture.ctx, "/memories/global/h.md", "later", "agent");
       const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-child");
-      const hot = await fixture.service.listHotMemories(fixture.ctx, {
-        countTokens: async (text) => {
+      // The index also reads h.md (description prefix): arm only once the
+      // candidate list is built, so the per-candidate selection reads trip it.
+      let armed = false;
+      const originalList = fixture.service.listIndexEntries.bind(fixture.service);
+      const listIndex = spyOn(fixture.service, "listIndexEntries").mockImplementationOnce(
+        async (ctx) => {
+          const result = await originalList(ctx);
+          armed = true;
+          return result;
+        }
+      );
+      const realOpen = fsPromises.open.bind(fsPromises);
+      // g.md (pinned) is selected first; the tombstone lands while h.md is read.
+      const open = spyOn(fsPromises, "open").mockImplementation((async (
+        p: Parameters<typeof fsPromises.open>[0],
+        ...rest: unknown[]
+      ) => {
+        if (armed && String(p).endsWith(`${path.sep}h.md`)) {
+          armed = false;
           await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
           await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
-          return text.length;
-        },
-      });
-      expect(hot).toEqual([]);
+        }
+        return (realOpen as (...args: unknown[]) => unknown)(p, ...rest);
+      }) as never);
+      try {
+        expect(await fixture.service.listHotMemories(fixture.ctx)).toEqual([]);
+        // Tripped during selection (the trigger is armed only after the index).
+        expect(await fsPromises.readFile(tombstonePath, "utf-8")).toContain("ws-child");
+      } finally {
+        open.mockRestore();
+        listIndex.mockRestore();
+      }
     });
 
     it("never probes a sibling receipt that names a path outside the owner store", async () => {
@@ -5311,9 +5312,7 @@ describe("MemoryService", () => {
       );
       await fixture.metaService.setPinned("global:pinned.md", true);
 
-      const items = await fixture.service.listHotMemories(fixture.ctx, {
-        countTokens: () => Promise.resolve(1),
-      });
+      const items = await fixture.service.listHotMemories(fixture.ctx);
       const paths = items.map((item) => item.path);
       expect(paths[0]).toBe("/memories/global/pinned.md");
       expect(paths).toContain("/memories/global/used.md");
@@ -5327,7 +5326,7 @@ describe("MemoryService", () => {
     it("preloading hot memories does not itself count as a use", async () => {
       using fixture = await createFixture();
       await fixture.service.create(fixture.ctx, "/memories/global/a.md", "v1", "agent");
-      await fixture.service.listHotMemories(fixture.ctx, { countTokens: () => Promise.resolve(1) });
+      await fixture.service.listHotMemories(fixture.ctx);
       expect((await fixture.metaService.getEntries()).get("global:a.md")?.accessCount).toBe(1);
     });
   });

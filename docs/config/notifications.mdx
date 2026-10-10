@@ -92,24 +92,16 @@ The `notify` tool definition from source:
 ```typescript
 notify: {
     description:
-      "Send a system notification to the user. Use this to alert the user about important events that require their attention, such as long-running task completion, errors requiring intervention, or questions. " +
-      "Notifications appear as OS-native notifications (macOS Notification Center, Windows Toast, Linux). " +
-      "Infer whether to send notifications from user instructions. If no instructions provided, reserve notifications for major wins or blocking issues. Do not use for routine progress updates — keep the todo list current instead.",
+      "Send an OS notification about an event needing the user's attention (long task done, error needing intervention, question). " +
+      "Follow the user's notification instructions; without any, notify only for major wins or blockers, never routine progress (keep the todo list current instead).",
     schema: z
       .object({
-        title: z
-          .string()
-          .min(1)
-          .max(64)
-          .describe("Short notification title (max 64 chars). Should be concise and actionable."),
+        title: z.string().min(1).max(64).describe("Concise, actionable title."),
         message: z
           .string()
           .max(200)
           .nullish()
-          .describe(
-            "Optional notification body with more details (max 200 chars). " +
-              "Keep it brief - users may only see a preview."
-          ),
+          .describe("Brief body; users may only see a preview."),
       })
       .strict(),
   },

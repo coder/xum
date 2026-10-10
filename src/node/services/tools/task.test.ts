@@ -53,26 +53,18 @@ function expectGroupedQueuedOrRunningTaskToolResult(
 const unusedTaskService = {} as unknown as TaskService;
 
 describe("task tool", () => {
-  it("uses runtime-aware description for local runtimes", () => {
-    using tempDir = new TestTempDir("test-task-tool-local-description");
+  // Local children share the parent's directory; forked runtimes only see committed state.
+  it.each([
+    ["local", "share your working directory"],
+    ["worktree", "commit changes the child must see"],
+  ] as const)("gives %s runtimes their own visibility guidance", (runtime, guidance) => {
+    using tempDir = new TestTempDir(`test-task-tool-${runtime}-description`);
     const tool = createTaskTool({
       ...createTestToolConfig(tempDir.path),
-      xumEnv: { MUX_RUNTIME: "local" },
+      xumEnv: { MUX_RUNTIME: runtime },
     });
 
-    expect(tool.description).toContain("share the same working directory as the parent");
-    expect(tool.description).toContain("can see uncommitted changes");
-  });
-
-  it("uses runtime-aware description for worktree runtimes", () => {
-    using tempDir = new TestTempDir("test-task-tool-worktree-description");
-    const tool = createTaskTool({
-      ...createTestToolConfig(tempDir.path),
-      xumEnv: { MUX_RUNTIME: "worktree" },
-    });
-
-    expect(tool.description).toContain("forked workspace based on committed state");
-    expect(tool.description).toContain("Uncommitted changes from the parent are not available");
+    expect(tool.description).toContain(guidance);
   });
 
   // The advertised inputSchema is the raw (strict) Zod schema. A `.strict()` schema that omits

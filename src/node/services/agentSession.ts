@@ -1409,8 +1409,7 @@ export class AgentSession {
   /**
    * Cached memory session context (memory experiment): index snapshot for
    * the memory tool description plus an optional hot-memories block, keyed by
-   * model because the hot set is token-budgeted with the active model's
-   * tokenizer. Index-only entries can be upgraded once final tool policy keeps
+   * model. Index-only entries can be upgraded once final tool policy keeps
    * the memory tool.
    *
    * Frozen per context window (#5248, user-requested prompt-cache stability):
@@ -12368,8 +12367,8 @@ export class AgentSession {
    *
    * Computed lazily on the first stream for each model. The first pass is
    * index-only so final tool policy can strip memory without paying hot-set
-   * tokenization cost; if memory survives policy, the cache is upgraded with
-   * the token-budgeted hot block. Compaction clears the cache. Invoked by
+   * file reads; if memory survives policy, the cache is upgraded with the
+   * byte-budgeted hot block. Compaction clears the cache. Invoked by
    * AIService.streamMessage after runtime.ensureReady(): caching before the
    * runtime is started (stopped Docker/remote workspace) would pin an
    * empty/partial context for the whole segment.

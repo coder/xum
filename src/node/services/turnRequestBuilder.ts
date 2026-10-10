@@ -332,8 +332,7 @@ export interface StreamMessageOptions {
   /**
    * Resolver for the session-segment memory context (memory experiment):
    * index snapshot for the memory tool description + hot-memories block.
-   * AgentSession caches the result per model/session segment because hot-memory
-   * selection is token-budgeted with the active model tokenizer. A callback
+   * AgentSession caches the result per model/session segment. A callback
    * (not a pre-resolved value) because it must be computed after
    * runtime.ensureReady(): project-scope listing on a
    * stopped Docker/remote workspace would otherwise cache an empty/partial
@@ -1534,7 +1533,7 @@ export class TurnRequestBuilder {
     const claudeSkillsCompatExperimentEnabled = this.dependencies.isClaudeSkillsCompatEnabled();
     // Once final tool policy keeps the memory tool, upgrade the index-only
     // memory context (resolved pre-policy with includeHotMemories: false) to
-    // the token-budgeted hot block for the model that will actually stream.
+    // the byte-budgeted hot block for the model that will actually stream.
     // Returns the unchanged pre-policy `memoryContext` reference when hot
     // preloading is off or the memory tool was stripped, so callers can use
     // identity comparison to decide whether the system prompt must be rebuilt.

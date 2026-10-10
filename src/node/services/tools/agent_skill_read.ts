@@ -3,10 +3,24 @@ import { tool } from "ai";
 import type { AgentSkillReadToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import { AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS } from "@/common/constants/toolLimits";
 import { SkillNameSchema } from "@/common/orpc/schemas";
 import { getErrorMessage } from "@/common/utils/errors";
 import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+
+/** Single-line skill description for the index, cut with an ellipsis past the cap. */
+function formatSkillIndexDescription(description: string): string {
+  const singleLine = description.replace(/\s+/g, " ").trim();
+  if (singleLine.length <= AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS) {
+    return singleLine;
+  }
+  let end = AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS - 1;
+  // A lone high surrogate would make providers reject every request carrying this tool block.
+  const last = singleLine.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${singleLine.slice(0, end).trimEnd()}…`;
+}
 
 /**
  * Build dynamic agent_skill_read tool description with available skills.
@@ -29,7 +43,7 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
   const omitted = skills.length - shown.length;
 
   const skillLines = shown.map((skill) => {
-    const line = `- ${skill.name}: ${skill.description} (scope: ${skill.scope})`;
+    const line = `- ${skill.name}: ${formatSkillIndexDescription(skill.description)} (scope: ${skill.scope})`;
     // whenToUse (when_to_use/when-to-use frontmatter) is extra model-facing guidance;
     // keep it on the same index line to stay token-lean.
     return skill.whenToUse == null ? line : `${line} When to use: ${skill.whenToUse}`;
@@ -38,9 +52,7 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
     skillLines.push(`(+${omitted} more not shown)`);
   }
 
-  const usageHint = `\nTo read referenced files inside a skill directory:\n- agent_skill_read_file({ name: "<skill-name>", filePath: "references/whatever.txt" })`;
-
-  return `${baseDescription}\n\nAvailable skills:\n${skillLines.join("\n")}${usageHint}`;
+  return `${baseDescription}\n\nAvailable skills:\n${skillLines.join("\n")}`;
 }
 
 /**
