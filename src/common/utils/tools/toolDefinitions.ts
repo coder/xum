@@ -348,41 +348,23 @@ export type TaskIsolation = (typeof TASK_ISOLATION_VALUES)[number];
 const TaskIsolationSchema = z.enum(TASK_ISOLATION_VALUES);
 
 const TASK_ISOLATION_PARAM_DESCRIPTION =
-  'Workspace isolation for the sub-agent. "fork" (the default) runs it in an isolated copy of this ' +
-  'workspace created from committed state. "none" runs it directly in this workspace\'s checkout, ' +
-  "sharing the working tree (including uncommitted changes) and skipping the fork + init overhead. " +
-  'Use "none" only for read-only analysis (e.g. the explore agent) or when you instruct the sub-agent ' +
-  "to avoid editing shared files, since it can otherwise modify the same files concurrently. Omit to fork.";
+  '"fork" (default): an isolated copy from committed state. "none": this checkout (sees uncommitted ' +
+  "changes, skips fork and init); only for read-only work or a child told not to edit shared files.";
 
 function getTaskRuntimeVisibilityGuidance(runtimeMode: RuntimeMode | undefined): string {
+  const commitFirst = "commit changes the child must see before spawning it.";
   switch (runtimeMode) {
     case RUNTIME_MODE.LOCAL:
-      return (
-        "In local runtime, sub-agents share the same working directory as the parent, so they can see uncommitted changes. " +
-        "Be careful: they can also modify the same files concurrently."
-      );
+      return "Local runtime: sub-agents share your working directory, so they see uncommitted changes and can edit the same files concurrently.";
     case RUNTIME_MODE.WORKTREE:
-      return (
-        "In worktree runtime, sub-agents start from a forked workspace based on committed state. " +
-        "Uncommitted changes from the parent are not available. Commit any changes you want the sub-agent to consider before spawning a task."
-      );
-    case RUNTIME_MODE.DOCKER:
-      return (
-        "In Docker runtime, sub-agents start from a new workspace created from the repository's committed state. " +
-        "Uncommitted changes from the parent are not available. Commit any changes you want the sub-agent to consider before spawning a task."
-      );
     case RUNTIME_MODE.DEVCONTAINER:
-      return (
-        "In devcontainer runtime, sub-agents start from a forked workspace based on committed state. " +
-        "Uncommitted changes from the parent are not available. Commit any changes you want the sub-agent to consider before spawning a task."
-      );
+      return `Sub-agents start from a fork of committed state; ${commitFirst}`;
+    case RUNTIME_MODE.DOCKER:
+      return `Sub-agents start from a new workspace of the committed state; ${commitFirst}`;
     case RUNTIME_MODE.SSH:
-      return (
-        "In SSH runtime, sub-agents usually start from committed state. Some fallback fork paths may copy the working tree, but do not rely on that ambiguity. " +
-        "If the child must see your latest changes, commit them before spawning the task."
-      );
+      return `Sub-agents usually start from committed state (some fallbacks copy the working tree; do not rely on it); ${commitFirst}`;
     default:
-      return "Sub-agent visibility depends on runtime. If the child must see your latest work, commit it before spawning the task unless your runtime explicitly shares the working copy.";
+      return `Sub-agent visibility depends on runtime; unless it shares your working copy, ${commitFirst}`;
   }
 }
 
@@ -396,40 +378,28 @@ export function buildTaskToolDescription(
 ): string {
   const sharedIsolation =
     options?.sharedIsolation ?? runtimeModeSupportsSharedTaskWorkspace(runtimeMode);
-  const isolationGuidance = sharedIsolation
-    ? "\n\nWorkspace isolation: by default each sub-agent runs in a forked copy of this workspace. " +
-      'On this runtime you may pass isolation: "none" to run the sub-agent directly in this workspace\'s ' +
-      "checkout (shared working tree, including uncommitted changes), skipping the fork + init overhead. " +
-      'Reserve isolation: "none" for read-only analysis (e.g. the explore agent) or when you instruct the ' +
-      "sub-agent to avoid editing shared files, since concurrent edits to the same files are possible. "
-    : "";
-  return (
-    "Spawn a sub-agent task (child workspace). " +
-    "\n\nWhether a sub-agent can see uncommitted changes depends on the runtime. " +
-    `${getTaskRuntimeVisibilityGuidance(runtimeMode)} ` +
-    "\n\nProvide agentId (preferred) or subagent_type, prompt, title, run_in_background, and optional n. For sub-agents, use title as a short, friendly reusable role name (for example, Reviewer or Simplicity Auditor), not a task summary. For kind=workspace, use a normal work-specific chat title. " +
-    'For kind=workspace, agentId optionally selects the agent mode for the launched turn (for example "plan"); it defaults to exec, and internal agents are not eligible. ' +
-    "Use n only when you want several agents to try the same prompt independently. Omit it for a single task, and prefer non-interfering sub-agents for grouped runs (for example read-only agents like explore). " +
-    `\n\nA terminal report makes the child inactive but leaves its workspace persistent. Keep each parent's direct standalone bench small and role-based: aim for at most ${SUBAGENT_REUSABLE_BENCH_TARGET} and keep it below ${SUBAGENT_REUSABLE_BENCH_EXCLUSIVE_LIMIT}; deliberate grouped n runs are temporary exceptions. Before spawning standalone work, prefer reawakening a known inactive child when its context or expertise fits, and retitle it if its reusable responsibility changes. At the target, add a role only for a genuinely distinct responsibility and prune an inactive overlapping or least-useful role before reaching the limit. Reawakening preserves the child's checkout, so for repository-dependent work, reuse it only when that snapshot is appropriate or instruct the child to verify and synchronize before acting; otherwise spawn a new child. Stop active work with task_stop; use irreversible task_remove for consumed grouped candidates, bench consolidation, explicit user requests, or clearly obsolete context—not routine end-of-turn cleanup. ` +
-    "\n\nWhen the user explicitly asks for best-of-n work, the parent should begin with light preliminary analysis to extract shared context, constraints, or evaluation criteria that would otherwise be duplicated across children. " +
-    "Keep that pre-work lightweight: frame the task and provide useful starting points, but do not pre-solve the problem or over-constrain how the children reason about it. Then delegate the substantive analysis to the spawned sub-agents. " +
-    "Do not also do a full parallel analysis in the parent. Call task_await when you are ready to act on child output; do not await reflexively just because tasks are running. " +
-    "task_await returns as soon as the first awaited task completes by default (min_completed), so you can start dependent work on each result as it lands instead of blocking on the whole batch; for best-of-N synthesis that must compare every candidate, pass min_completed equal to the batch size (or use a foreground grouped spawn, below). " +
-    "\n\nWhen delegating, include a compact task brief (Task / Background / Scope / Starting points / Acceptance / Deliverables / Constraints). " +
-    "Sub-agents cannot hold persisted goals; pass sub-agent objectives, success criteria, and deliverables directly in the prompt. " +
-    "Sub-agents observe the same system instructions as the parent (project/global AGENTS.md and custom instructions), so do not restate that shared context in the prompt; spend the prompt on task-specific information the sub-agent cannot infer from those instructions. " +
-    "Caveat: instruction files are read from the child's checkout, so uncommitted AGENTS.md edits in the parent follow the same runtime visibility rules above — commit them first or pass the relevant guidance in the prompt. " +
-    "Avoid telling the sub-agent to read your plan file; child workspaces do not automatically have access to it. " +
-    "\n\nIf run_in_background is false, waits for the sub-agent to finish and returns the completed report. When grouped sibling tasks are requested via n, the completed result includes one report per spawned task. " +
-    "If the foreground wait times out, returns queued/starting/running task metadata with a note (the task continues running); use task_await to monitor progress. " +
-    "If run_in_background is true, returns immediately with queued/starting/running task metadata and arranges a one-shot terminal wake when the task settles. Foreground waits that are later detached use the same terminal-wake path. " +
-    "Prefer run_in_background: false when spawning a single task — it is equivalent to spawning background + immediately awaiting, but saves a round-trip. " +
-    "Use run_in_background: true when launching multiple tasks in parallel so you can act on each as it completes via task_await (which returns on the first completion by default); a foreground grouped spawn (run_in_background: false) instead blocks until every sibling finishes and returns all reports at once. " +
-    "Do not call task_await in the same parallel tool-call batch; wait for the returned task metadata first. " +
-    "Use task_send_message for later guidance whether the child is active or inactive; inactive children reawaken under the same stable identity. " +
-    isolationGuidance +
-    "Use the bash tool to run shell commands."
-  );
+  // The prelude used to carry the lifecycle, best-of-n and report-trust rules; they live here so
+  // agents without the task tool (explore, depth-capped children) do not pay for them.
+  return [
+    'Spawn a sub-agent (child workspace), or with kind="workspace" a full workspace turn. Run shell commands with bash, not a sub-agent.',
+    `${getTaskRuntimeVisibilityGuidance(runtimeMode)}${sharedIsolation ? ' isolation: "none" shares this checkout instead.' : ""}`,
+    [
+      "Spawning:",
+      '- agentId picks the agent (subagent_type is a deprecated alias). title: a short reusable role name (e.g. Reviewer), not the assignment; for kind="workspace", a normal chat title, and agentId picks its mode (default exec; no internal agents).',
+      "- Brief: Task / Background / Scope / Starting points / Acceptance / Deliverables / Constraints. Children share your system instructions (AGENTS.md read from their checkout) but not your plan file or goal: put objectives, criteria and deliverables in the prompt; skip shared instructions.",
+      "- run_in_background=false (preferred for one task) waits for the report (one per child with n); on timeout the task keeps running. true returns at once and wakes you when it settles; use it for parallel tasks.",
+      "- Never call task_await in the same parallel tool batch as task; use the IDs task returns.",
+    ].join("\n"),
+    [
+      "Lifecycle: a child is one persistent workspace: active, inactive after its final report or task_stop (context kept), removed by task_remove (irreversible).",
+      `- Keep a small bench of distinct roles: at most ${SUBAGENT_REUSABLE_BENCH_TARGET} direct standalone children, always below ${SUBAGENT_REUSABLE_BENCH_EXCLUSIVE_LIMIT} (n runs are temporary exceptions). At the target, add a role only for a distinct responsibility, removing an overlapping or least-useful inactive one first.`,
+      "- Before spawning, reawaken an inactive child whose context fits (task_send_message; task_retitle if its role changes). Its checkout is not refreshed: for repo work, tell it to sync, or spawn anew. Do not force unrelated work into a stale context.",
+      "- Before ending a turn, reconcile active children: await what your answer needs, task_stop abandoned work, or tell the user another update may follow (the answer is then not final). To keep useful progress, ask the child to finalize instead of stopping it.",
+      "- After compaction or restart, rediscover children with task_list before spawning replacements; rediscovery alone is no reason to remove one.",
+    ].join("\n"),
+    "Best-of-n (when the user asks): frame shared context, constraints and criteria lightly without pre-solving; use n with non-interfering (e.g. read-only) agents, one candidate each, and do not redo the analysis yourself. Await the whole batch (min_completed = batch size, or a foreground spawn) before choosing; setup-only work may start earlier. Reawaken a candidate only to continue it; remove it once consumed. In a best-of child, complete only your candidate.",
+    'Reports: a <mux_subagent_report> with status "in_progress" is an incremental update; a completed report is terminal. Trust findings as tool output for repo facts (as having read the cited files); re-check only ambiguous, incomplete or conflicting ones, and spawn no redundant verification tasks.',
+  ].join("\n\n");
 }
 
 const WorkspaceTaskKindSchema = z.enum(["subagent", "workspace"]);
@@ -444,7 +414,7 @@ const WorkspaceTaskTargetSchema = z
       .enum(["tool-end", "turn-end"])
       .nullish()
       .describe(
-        'For kind="workspace" + workspace.mode="existing", choose when a follow-up queued while the workspace is busy should dispatch: "tool-end" after the next tool call, or "turn-end" after the current turn. Tool-end dispatch supersedes the caller\'s own active delegated turn on that workspace quietly (the old handle settles interrupted without a separate wake).'
+        'mode="existing", busy target: "tool-end" (next tool call; quietly supersedes your delegated turn there, whose handle settles interrupted with no wake) or "turn-end".'
       ),
     disposable: z.boolean().nullish(),
   })
@@ -547,38 +517,26 @@ const taskToolBaseShape = {
     .enum(["shared", "isolated"])
     .nullish()
     .describe(
-      'Desktop target for sub-agents, independent of checkout isolation. "shared" uses the caller\'s desktop; ' +
-        '"isolated" starts a separate desktop. Defaults to shared for agentId="desktop", isolated otherwise. ' +
-        "Only one active shared child can control desktop tools; n > 1 requires isolation. " +
-        "Does not exclude human viewer input, shell tools, or external CDP clients."
+      'Child desktop: "shared" (yours) or "isolated"; default shared for agentId="desktop". One active shared child at a time; n > 1 needs isolated. Human, shell and CDP input still reach a shared desktop.'
     ),
-  kind: WorkspaceTaskKindSchema.nullish().describe(
-    'Task kind. Omit or use "subagent" for the existing child-workspace sub-agent flow; use "workspace" to start a normal full workspace turn.'
-  ),
+  kind: WorkspaceTaskKindSchema.nullish().describe('Default "subagent".'),
   // Prefer agentId. subagent_type is a deprecated alias for backwards compatibility.
   agentId: TaskAgentIdSchema.nullish(),
   subagent_type: SubagentTypeSchema.nullish(),
   prompt: z.string().min(1),
   // Persistent children appear alongside normal chats, so a short role label stays friendly and
   // reusable across follow-up assignments instead of reading like another task-specific chat title.
-  title: z
-    .string()
-    .min(1)
-    .describe(
-      'Parent-chosen title. For a persistent sub-agent, use a short, friendly reusable role name such as "Reviewer" or "Simplicity Auditor", not the current assignment. For kind="workspace", use a normal work-specific chat title.'
-    ),
+  title: z.string().min(1),
   run_in_background: z.boolean().nullish().default(false),
-  n: TaskToolBestOfCountSchema.nullish().describe(
-    "Optional best-of count. Use n when several agents should try the same prompt independently; omit it for a single task. Only use grouped runs for sub-agents without interfering side effects, such as read-only agents like explore."
-  ),
+  n: TaskToolBestOfCountSchema.nullish().describe("Best-of count; omit for a single task."),
   workspace: WorkspaceTaskTargetSchema.nullish().describe(
-    'Workspace target for kind="workspace". Omit for a new full workspace; use mode="existing" with workspaceId only for a workspace previously created by this caller.'
+    'kind="workspace" target. Omit for a new workspace; mode="existing" with workspaceId only for one you created.'
   ),
   model: TaskToolModelSchema.nullish().describe(
-    "Optional model override for the sub-agent, parsed with the same alias logic as the UI (an alias or a full 'provider:model' string). Omit this unless the user explicitly instructed a specific model — by default the sub-agent inherits the parent's model. An explicit value stays pinned when the sub-agent is later reawakened; omitting it follows the configured defaults. Do not assume any particular model is available. Use `models_list` to see valid values."
+    "Model override (alias or provider:model; see models_list). Only when the user asked; default inherits yours. Stays pinned when reawakened."
   ),
   thinking: TaskToolThinkingSchema.nullish().describe(
-    "Optional thinking/reasoning-level override for the sub-agent. Accepts a level name (off, low, medium, high, xhigh, max) or a numeric index (resolved against the chosen model). Omit this unless the user explicitly instructed a specific thinking level — by default the sub-agent inherits the parent's thinking level. An explicit value stays pinned when the sub-agent is later reawakened; omitting it follows the configured defaults."
+    `Thinking override: ${THINKING_LEVELS.join(", ")}, or a numeric index for the chosen model. Only when the user asked; default inherits yours. Stays pinned when reawakened.`
   ),
 };
 
@@ -752,36 +710,25 @@ export const TaskAwaitToolArgsSchema = z
       .array(z.string().min(1))
       .nullish()
       .describe(
-        "List of task IDs or workflow run IDs to await — use only real IDs returned by prior task, bash, or workflow_run results; never fabricate an ID. " +
-          "task_list can rediscover sub-agent/background bash IDs, but top-level workflow run rediscovery is done by omitting task_ids. " +
-          "When omitted, waits for active descendant tasks and top-level workflow runs of the current workspace, excluding workflow-owned sub-agents/background bash tasks because those results are consumed through parent workflow runs."
+        "IDs returned by task, bash or workflow_run; never invent one. Omit to await every active descendant and top-level workflow run (not workflow-owned tasks), only after something was spawned in an earlier step."
       ),
     filter: z
       .string()
       .nullish()
       .describe(
-        "Optional regex to filter bash task output lines. By default, only matching lines are returned. " +
-          "When filter_exclude is true, matching lines are excluded instead. " +
-          "Non-matching lines are discarded and cannot be retrieved later."
+        "Bash tasks: regex; keep only matching lines (or drop them with filter_exclude). Dropped lines are lost."
       ),
     filter_exclude: z
       .boolean()
       .nullish()
-      .describe(
-        "When true, lines matching 'filter' are excluded instead of kept. " +
-          "Requires 'filter' to be set."
-      ),
+      .describe("Drop lines matching filter instead (requires filter)."),
     timeout_secs: z
       .number()
       .min(0)
       .nullish()
       .default(600)
       .describe(
-        "Maximum time to wait in seconds for each task. " +
-          "For bash tasks, this waits for NEW output (or process exit). " +
-          "If exceeded, the result returns status=queued|starting|running|awaiting_report (task is still active). " +
-          "Defaults to 600 seconds (10 minutes) if not specified. " +
-          "Set to 0 for a non-blocking status check."
+        "Max wait per task in seconds (0 = status check). Bash tasks wait for new output or exit. On timeout the task stays active."
       ),
     min_completed: z
       .number()
@@ -789,14 +736,7 @@ export const TaskAwaitToolArgsSchema = z
       .min(1)
       .nullish()
       .describe(
-        "Number of awaited tasks that must complete before this call returns. " +
-          "Defaults to 1, so by default task_await returns as soon as the FIRST awaited task completes, " +
-          "letting you act on it while the rest keep running. " +
-          "The result still includes every task complete at that moment plus current status (running/queued) for the rest. " +
-          "Tasks that have not yet completed keep running and remain re-awaitable on a later task_await call. " +
-          "Raise this (e.g. set it to the total number of awaited tasks) when you genuinely need more before proceeding — " +
-          "for example best-of-N synthesis that must compare every candidate. " +
-          "Clamped to the number of awaited tasks; values above that behave like 'wait for all'."
+        "Return once this many awaited tasks complete (default 1, clamped to the count). Use the batch size when you must compare every result, e.g. best-of-n."
       ),
   })
   .strict()
@@ -998,11 +938,8 @@ export const TaskAwaitToolResultSchema = z
 
 export const TaskApplyGitPatchToolArgsSchema = z
   .object({
-    task_id: z.string().min(1).describe("Child task ID whose patch artifact should be applied"),
-    project_path: z
-      .string()
-      .nullish()
-      .describe("When provided, apply only the patch artifact for this project path."),
+    task_id: z.string().min(1).describe("Completed child task ID."),
+    project_path: z.string().nullish().describe("Apply only this project's patch."),
     dry_run: z
       .boolean()
       .nullish()
@@ -1016,11 +953,8 @@ export const TaskApplyGitPatchToolArgsSchema = z
       .describe(
         "When provided, refuse to apply unless the target repository HEAD matches this SHA."
       ),
-    three_way: z.boolean().nullish().default(true).describe("When true, run git am with --3way"),
-    force: z
-      .boolean()
-      .nullish()
-      .describe("When true, allow apply even if the patch was previously applied."),
+    three_way: z.boolean().nullish().default(true).describe("Run git am --3way."),
+    force: z.boolean().nullish().describe("Apply even if already applied."),
   })
   .strict();
 
@@ -1083,24 +1017,17 @@ export const TaskApplyGitPatchToolResultSchema = z.union([
 
 export const TaskSendMessageToolArgsSchema = z
   .object({
-    task_id: z
-      .string()
-      .min(1)
-      .describe(
-        'Target workspace ID: a descendant sub-agent task ID returned by task, a same-tree row from task_list scope:"tree" (peer, ancestor, or root), an opted-in root workspace row from task_list scope:"instance", or any other workspace ID in this Xum instance that you already know — an envelope "from" reply address or an ID the user provided. Unrelated (cross-tree) targets may be root workspaces or live sub-agents of other trees, but both sender and target must use local or worktree runtimes and the actual recipient must have consented (newly created root workspaces are opted in by default, task(kind:"workspace") targets once their first turn ends and disposable ones never; others enable it in their workspace settings).'
-      ),
+    task_id: z.string().min(1).describe("Target workspace ID or sub-agent task ID."),
     message: z
       .string()
       .trim()
       .min(1)
-      .describe(
-        `Plain-text message to deliver to the target. Sibling/upward sends are capped at ${TASK_FAMILY_MESSAGE_MAX_CHARS} characters; descendant guidance is uncapped.`
-      ),
+      .describe(`Peer and upward sends are capped at ${TASK_FAMILY_MESSAGE_MAX_CHARS} characters.`),
     queue_dispatch_mode: z
       .enum(["tool-end", "turn-end"])
       .nullish()
       .describe(
-        'When the target is busy, dispatch at "tool-end" after its next tool call or at "turn-end" after its current turn. Defaults to "tool-end". A sibling, ancestor, or unrelated recipient can choose to hold agent messages until its turn ends; that recipient setting overrides "tool-end".'
+        'If the target is busy: "tool-end" (default) after its next tool call, or "turn-end" after its turn. A peer\'s hold-until-turn-end setting overrides "tool-end".'
       ),
   })
   .strict();
@@ -1258,12 +1185,8 @@ export const TaskMessageSiblingToolResultSchema = TaskSendMessageToolResultSchem
 // -----------------------------------------------------------------------------
 export const TaskRetitleToolArgsSchema = z
   .object({
-    task_id: z.string().min(1).describe("Stable descendant sub-agent task ID."),
-    title: z
-      .string()
-      .trim()
-      .min(1)
-      .describe('New short, friendly reusable role name, such as "Reviewer".'),
+    task_id: z.string().min(1).describe("Descendant sub-agent task ID."),
+    title: z.string().trim().min(1).describe("New reusable role name."),
   })
   .strict();
 
@@ -1511,19 +1434,17 @@ export const TaskWorkspaceLifecycleToolInputSchema = z
     action: z
       .enum(["archive", "unarchive"])
       .describe(
-        'Reversible lifecycle action: "archive" hides and suspends the workspace without deleting state, "unarchive" restores it.'
+        '"archive" hides and suspends the workspace, keeping its state; "unarchive" restores it.'
       ),
     targets: z
       .array(TaskWorkspaceLifecycleTargetSchema)
       .min(1)
-      .describe(
-        'Workspace-turn targets this workspace created via task(kind="workspace"). Provide exactly one of taskId (wst_...) or workspaceId for each target.'
-      ),
+      .describe("Exactly one of taskId (wst_...) or workspaceId per target."),
     interrupt_active: z
       .boolean()
       .nullish()
       .describe(
-        "Archive only: when true, interrupt active workspace turns for the target before archiving. Ignored by unarchive, which never interrupts. Defaults to false."
+        "Archive only: interrupt the target's active workspace turns first (default false)."
       ),
   })
   .strict();
@@ -1598,48 +1519,30 @@ export const TaskListToolArgsSchema = z
       .array(TaskListStatusSchema)
       .nullish()
       .describe(
-        'Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded (plus workspace rows under scope:"tree" or scope:"instance"). ' +
-          'Instance rows all have status "workspace"; an explicit statuses list must include "workspace" to return them. ' +
-          "Persistent completed sub-agents are terminal `reported` tasks and are intentionally omitted by default; include `reported` (and `interrupted` when relevant) to rediscover inactive child workspaces after compaction or restart. " +
-          "Omitting statuses is the safe recovery default after an uncertain workflow_run because it includes unfinished workflow runs. " +
-          "Pass ['interrupted', 'failed'] to discover workflow runs that may be resumable via workflow_resume, but do not use only terminal/resumable statuses when checking for a still-running workflow."
+        'Default: all unfinished statuses, plus "workspace" rows for tree and instance scope (an explicit list must include "workspace" to keep them). Add "reported" (and "interrupted") to find inactive children; "interrupted"/"failed" workflow runs may be resumable.'
       ),
-    scope: z
-      .enum(["descendants", "tree", "instance"])
-      .nullish()
-      .describe(
-        'Listing scope. "descendants" (default) lists this workspace\'s own tasks, workflow runs, and bash processes. "tree" lists every agent workspace in this task tree — ancestors, siblings/cousins, descendants, and the root workspace row (status "workspace") — each tagged with its relationship to you; use it to discover task_send_message peer targets. ' +
-          '"instance" is the on-demand address book for local/worktree callers: eligible local/worktree root workspaces across projects in this Xum instance, requiring recipient opt-in outside your task tree (never another tree\'s sub-agents), newest first, paged with `limit`/`offset` and narrowed with `query`; each row carries `projectPath`, an `activity` snapshot, and its relationship to you (self, ancestor, or unrelated).'
-      ),
+    scope: z.enum(["descendants", "tree", "instance"]).nullish().describe('Default "descendants".'),
     query: z
       .string()
       .nullish()
-      .describe(
-        'scope:"instance" only — case-insensitive filter matched against workspace ID, title, name, and project path. Blank or null means no filter. Passing it with any other scope is an error.'
-      ),
+      .describe('scope:"instance": case-insensitive match on ID, title, name or project path.'),
     limit: z
       .number()
       .int()
       .min(1)
       .max(INSTANCE_DISCOVERY_MAX_LIMIT)
       .nullish()
-      .describe(
-        `scope:"instance" only — page size (default ${INSTANCE_DISCOVERY_DEFAULT_LIMIT}, max ${INSTANCE_DISCOVERY_MAX_LIMIT}). Passing it with any other scope is an error.`
-      ),
+      .describe(`scope:"instance": page size (default ${INSTANCE_DISCOVERY_DEFAULT_LIMIT}).`),
     offset: z
       .number()
       .int()
       .min(0)
       .nullish()
-      .describe(
-        'scope:"instance" only — number of matching rows to skip; pass the previous result\'s `nextOffset` to continue paging. Passing it with any other scope is an error.'
-      ),
+      .describe('scope:"instance": rows to skip; pass the previous nextOffset.'),
     includeArchived: z
       .boolean()
       .nullish()
-      .describe(
-        "Compatibility option for archived workspace-turn and bash records. Legacy archived sub-agents remain listable as inactive children regardless."
-      ),
+      .describe("Legacy: include archived workspace-turn and bash records."),
   })
   .strict();
 
@@ -3241,45 +3144,25 @@ export const TOOL_DEFINITIONS = {
   task_apply_git_patch: {
     resultSchema: TaskApplyGitPatchToolResultSchema,
     description:
-      "Apply a completed sub-agent task's git-format-patch artifact to the current workspace using `git am`. " +
-      "This is an explicit integration step: Xum will not auto-apply patches.",
+      "Apply a completed child task's git-format-patch artifact to this workspace with `git am`. Patches are never applied automatically.",
     schema: TaskApplyGitPatchToolArgsSchema,
   },
   task_await: {
     resultSchema: TaskAwaitToolResultSchema,
     description:
-      "Wait for one or more tasks or workflow runs to produce output. " +
-      "\n\nCall task_await only when the current user request depends on a task's output, or when synthesis/integration of a previously-spawned task is the next logical step. " +
-      "Do not call task_await solely because active tasks exist; for unrelated user messages, respond directly and let tasks continue in the background. " +
-      "If a synthetic/system follow-up explicitly says active background tasks or workflow runs block your turn, treat that as a dependency and await the listed IDs. " +
-      "When a terminal wake-up says a sub-agent report or failure is already injected into context, integrate it directly instead of calling task_await for it. When a wake-up asks you to retrieve a workspace turn's terminal output, call task_await with the listed IDs and timeout_secs: 0 (a one-shot retrieval, not a wait). " +
-      "\n\nDo not call task_await in the same parallel tool-call batch as task, bash, or workflow_run: " +
-      "the taskId/runId is not available until the spawning tool returns, so call task_await in a later step. " +
-      "When omitting task_ids to await active tasks/workflows, ensure at least one background task or workflow was already spawned in a prior step. Omitted task_ids discover top-level workflow runs only and exclude workflow-owned sub-agents/background bash tasks because those results are consumed through parent workflow runs. " +
-      "\n\nAgent tasks and workflow runs return reports when completed. " +
-      "Completed reports are persisted on disk and survive context compaction: calling task_await on an already-completed task/workflow run ID (timeout_secs: 0 for non-blocking) re-fetches the full report instead of re-running the work. " +
-      "Bash tasks return incremental output while running and a final reportMarkdown when they exit. " +
-      "For bash tasks, you may optionally pass filter/filter_exclude to include/exclude output lines by regex. " +
-      "When using filter, non-matching lines are permanently discarded. " +
-      "Use this tool to wait; do not poll task_list in a loop for completion, which wastes tool calls. " +
-      "\n\nBy default (min_completed=1) this returns as soon as the first awaited task completes, so you can begin dependent work on that result while the rest keep running, then call task_await again for the remainder. " +
-      "This is ideal for independent tasks or any case where per-result work exists. " +
-      "Set min_completed higher (up to the number of awaited tasks) when you genuinely need more before proceeding — e.g. best-of-N synthesis that must compare every candidate should pass min_completed equal to the batch size. " +
-      "The result always includes every task complete at the moment it returns, plus current status for the rest; not-yet-completed tasks keep running and stay re-awaitable on a later call. " +
-      "Active workflow-run results may include compact `workflowProgress` (latest phase, last progress timestamp, and step counts); use that to see that phased progress is still happening instead of treating elapsed time alone as a hang. " +
-      "You always get per-task results (like Promise.allSettled), just possibly before every task has finished. " +
-      "Possible statuses: completed, queued, starting, running, backgrounded, awaiting_report, interrupted, not_found, invalid_scope, error. " +
-      "Bash task outputs may be automatically filtered; when this happens, check each result's note for details and (if available) where the full output was saved.",
+      "Wait for tasks or workflow runs and return their results. Call it only when your answer or next step depends on a task's output; for unrelated messages, answer directly and let tasks run. " +
+      "Await the listed IDs when a system follow-up says they block your turn. When a wake-up says a report is already in context, use it without awaiting; when one asks you to retrieve a workspace turn's output, call with those IDs and timeout_secs 0. " +
+      "\n\nNever call it in the same parallel tool batch as the task, bash or workflow_run call that creates the ID. Awaiting a completed ID re-fetches its persisted report (it survives compaction) without re-running the work. Bash tasks return new output while running and a final report on exit. Wait with this tool; do not poll task_list. " +
+      "\n\nReturns per-task results (completed, queued, starting, running, backgrounded, awaiting_report, interrupted, not_found, invalid_scope, error) once min_completed tasks are done; the rest keep running and can be awaited again. Active workflow runs may include workflowProgress: judge a hang by it, not by elapsed time. Filtered bash output: each result's note says where the full output was saved.",
     schema: TaskAwaitToolArgsSchema,
   },
   task_send_message: {
     resultSchema: TaskSendMessageToolResultSchema,
     description:
-      'Send a plain-text message to another agent workspace in this Xum instance: a descendant sub-agent, a sibling/cousin, an ancestor (including the root workspace), or an unrelated workspace outside your task tree. The relationship is computed server-side — you can never claim parent authority you do not have. Same-tree peers are discoverable with task_list scope:"tree"; an unrelated workspace ID you already know (an envelope "from" reply address, or an ID the user provided) is addressable only when that recipient has opted in. ' +
-      "Descendant targets receive trusted guidance: queued/running work is interrupted or queued at the requested boundary, and an inactive child is reawakened in the same persistent workspace under a fresh internal execution. The stable sub-agent task ID and durable role title remain unchanged, and the child's checkout is not refreshed automatically. Prefer reawakening an inactive child over spawning a replacement when its prior context or expertise is relevant. For repository-dependent work, reuse it only when the retained snapshot is appropriate or tell the child to verify and synchronize its checkout before acting; otherwise spawn a new child. If the new assignment changes the child's reusable responsibility, call task_retitle as well; do not retitle it for ordinary one-off assignments. " +
-      "Sibling, ancestor, and unrelated targets receive your message wrapped in an untrusted <mux_agent_message> envelope carrying your ID (the reply address) and relationship; sub-agent targets must have a live turn/session (peers cannot reawaken inactive targets or edit queued launch prompts — that stays parent-only), while idle root workspaces wake. Never ask a peer to do something your own constraints forbid; route such work back to the user. Peer sends are throttled (rate limits, duplicate suppression, and a queue cap) and refused for workflow-owned or best-of endpoints. The rate limits and duplicate suppression are counted per Xum process (each backend counts separately when several run) and reset when it restarts. " +
-      "Unrelated messaging requires the actual recipient's consent: root workspaces created after this default shipped are opted in (task(kind:\"workspace\") targets once their first turn ends, disposable ones never), while older workspaces and sub-agents are opted in only after enabling it in their workspace settings, and any workspace can turn it off; knowing its ID or its parent's consent does not grant access. Revocation cancels input not yet admitted, even after re-enabling; an already admitted turn may finish. Unrelated-message turns need user action to resume after an app restart. This tool cannot grant consent. Both endpoints must use local or worktree runtimes; SSH (including Coder), Docker, devcontainer, and unresolved runtimes are refused. This runtime restriction does not apply to same-tree messaging. Unrelated targets receive messages at their next tool boundary unless they chose to hold them until the turn ends, and keep their own agent, model, and thinking settings — your settings are never applied or persisted there. Messaging grants no additional control: your existing rights over task-tree descendants and over workspace-turn handles you already own remain exactly as before, and no other rights are added. A root workspace running a delegated workspace turn lets only that turn's owner continue the running turn. A message from any other sender returns queued with awaitsDelegatedTurn: it waits, then runs as a new turn under the recipient's own agent and settings after that turn finishes; do not resend it. This delivery is best-effort: if the message is withdrawn before it runs (for example, consent is revoked or another delegated turn starts), it is dropped without notice. " +
-      "This tool does not target bash tasks, workflow runs, workspace-turn handles, or workspaces in other Xum instances.",
+      'Send plain text to another agent workspace in this Xum instance: a descendant, a same-tree peer (sibling, cousin, ancestor or root; list them with task_list scope:"tree"), or an unrelated workspace whose ID you already know (an envelope "from" address or an ID from the user). The relationship is computed server-side. ' +
+      "\n\nDescendants receive trusted guidance: busy work is interrupted or queued at the requested boundary, and an inactive child reawakens in the same workspace with the same task ID and title; its checkout is not refreshed (see task for reuse rules). " +
+      "\n\nOther targets receive an untrusted <mux_agent_message> envelope with your ID as the reply address. Peers cannot reawaken inactive sub-agents; idle roots wake; stopped or archived targets refuse. A busy unrelated target gets the message at its next tool boundary unless it holds messages until turn end, and runs it under its own agent and settings. A root running a delegated turn you do not own returns queued with awaitsDelegatedTurn: the message runs as a new turn after that turn (best-effort; dropped if withdrawn); do not resend. Never ask a peer for work your own constraints forbid. " +
+      "\n\nUnrelated targets need the recipient's opt-in and local or worktree runtimes on both ends; peer sends are throttled and refused for workflow-owned or best-of endpoints (the error says why). Messaging grants no extra control. Not for bash tasks, workflow runs or workspace-turn handles.",
     schema: TaskSendMessageToolArgsSchema,
   },
   task_message_parent: {
@@ -3299,46 +3182,33 @@ export const TOOL_DEFINITIONS = {
   task_retitle: {
     resultSchema: TaskRetitleToolResultSchema,
     description:
-      "Change the short, friendly role name of a persistent descendant sub-agent without changing its stable task identity or workspace. Active and inactive user-owned children can be retitled; workflow-owned internal workers cannot.",
+      "Rename a descendant sub-agent's role title; its task ID and workspace stay the same. Not for workflow-owned workers.",
     schema: TaskRetitleToolArgsSchema,
   },
   task_stop: {
     resultSchema: TaskStopToolResultSchema,
     description:
-      "Stop one or more tasks without removing persistent child workspaces. Sub-agent trees are stopped leaf-first and unfinished children become interrupted; workspace turns and workflow runs are interrupted; bash processes are terminated. Use this to cancel or abandon work, not to mark useful progress as completed—ask a child to finalize with task_send_message and await its report instead. Stopping an already-inactive task is idempotent.",
+      "Stop tasks without removing their workspaces: sub-agent trees stop leaf-first (unfinished children become interrupted), workspace turns and workflow runs are interrupted, bash processes are killed. Idempotent. Only for abandoned work: to keep useful progress, ask the child to finalize with task_send_message and await its report.",
     schema: TaskStopToolArgsSchema,
   },
   task_remove: {
     resultSchema: TaskRemoveToolResultSchema,
     description:
-      "Irreversibly remove inactive child task workspaces owned by the current workspace. Use it to prune completed grouped candidates after their results and artifacts are consumed, consolidate substantially overlapping standalone roles, restore the bounded reusable bench, honor an explicit user request, or discard clearly obsolete context. Do not use it for a blanket end-of-turn cleanup: retain a small bench of distinct useful roles. Removed sub-agents cannot be restored or reawakened. Active targets are rejected; descendants must be removed first, so nested batches are processed deepest-first. A target whose checkout holds uncommitted or untracked work, or commits not captured by a ready patch artifact, is refused (status error, with the paths); only the user can discard that work.",
+      "Irreversibly remove inactive child workspaces you own; they cannot be restored or reawakened. Use it only for consumed best-of candidates, overlapping or obsolete roles, a bench over its limit, or a user request, not as routine cleanup. Remove descendants first. A child with uncommitted or untracked work, or commits without a ready patch artifact, is refused; only the user can discard that work.",
     schema: TaskRemoveToolArgsSchema,
   },
   task_workspace_lifecycle: {
     resultSchema: TaskWorkspaceLifecycleToolResultSchema,
     description:
-      'Reversibly archive or unarchive full workspaces that the current workspace created via task(kind="workspace"). ' +
-      "Scoped by durable workspace-turn ownership records: it cannot act on arbitrary user workspaces or sub-agent children (non-wst_ task IDs are invalid_scope). " +
-      'Use action="archive" when a peer workspace\'s work is complete; archived targets refuse task(kind="workspace", mode="existing") follow-ups until unarchived. ' +
-      "Active workspace turns involving the target (delegated to it, or owned by it for nested delegation) are refused unless interrupt_active is true (archive only; unarchive never interrupts). " +
-      "Live user activity in the target (a manual stream, terminal, or an attached desktop viewer/popout) also refuses archive and is never interrupted by this tool; an idle desktop process with nobody attached is closed by the archive. " +
-      "Archive is refused (status error, with the untracked paths) when a snapshot archive would permanently delete untracked files; this check runs before any interruption, and only the user can approve that loss by archiving the workspace manually. " +
-      'Archive of a managed-worktree target is refused while the "Delete checkout" worktree archive behavior is configured, because that policy deletes the checkout without user confirmation; targets the worktree policy cannot delete (SSH/Coder, Docker, project-dir local, or shared isolation-none checkouts) stay archivable. ' +
-      "For irreversible removal of inactive sub-agent children, use task_remove instead.",
+      'Archive (reversible) or unarchive full workspaces you created with task(kind="workspace"); for sub-agents use task_remove. Archived targets refuse mode="existing" follow-ups. ' +
+      'Archive refuses a target with an active workspace turn unless interrupt_active is set, and always refuses live user activity, archives that would delete untracked files, and managed worktrees under the "Delete checkout" policy; only the user can approve those. An idle unviewed desktop is closed.',
     schema: TaskWorkspaceLifecycleToolInputSchema,
   },
   task_list: {
     resultSchema: TaskListToolResultSchema,
     description:
-      "List descendant tasks for the current workspace, including status + metadata. " +
-      "This includes sub-agent tasks, background bash tasks, and top-level workflow runs, but omits workflow-owned sub-agents/background bash tasks whose reports are consumed through parent workflow runs. " +
-      "Use this after compaction, interruptions, workflow_run errors/aborts, or an app restart to rediscover active tasks, inactive persistent sub-agents, and resumable workflow runs. Sub-agent rows from grouped runs include `bestOf` metadata so they can be distinguished from the standalone reusable bench. The default statuses find unfinished work; request `reported` explicitly for completed persistent sub-agents. " +
-      "When recovering an uncertain workflow_run, omit statuses first or include pending/running/backgrounded as well as interrupted/failed/completed; terminal-only filters can hide unfinished workflow runs. Pending runs may need workflow_resume because no runner may be active yet. " +
-      "Workflow rows may include compact `workflowProgress` so callers can see the latest phase before deciding whether to await, resume, or leave the run alone. " +
-      'Pass scope:"tree" to list every agent workspace in this task tree instead — ancestors, siblings/cousins, descendants, and the root workspace row (status "workspace") — each tagged with its relationship to you. Tree rows are addressable via task_send_message except your own "self" row, best-of candidate rows (`bestOf` metadata, refused to keep candidates independent), and non-descendant rows in terminal states (peers cannot reactivate an inactive task — only its parent can); the root row is included by default and filtered like any other row when explicit statuses are passed. ' +
-      'Pass scope:"instance" from a local/worktree workspace for the on-demand address book of this Xum instance: eligible local/worktree root workspaces across projects (status "workspace", never another tree\'s sub-agents), tagged self, ancestor, or unrelated, ordered newest first by createdAt. Unrelated roots must have consented (newly created roots are opted in by default, task(kind:"workspace") targets once their first turn ends; others enable it in their workspace settings); absent or revoked consent hides them before searching, counting, and paging. Consent does not hide your own task-tree root. Narrow with `query` (ID, title, name, project path), page with `limit`/`offset`, and continue from `nextOffset` when it is returned; `activity` (busy/idle) is a snapshot taken at listing time. Rows are addressable via task_send_message — unrelated targets receive your text as an untrusted agent message, delivered at their next tool boundary while they are busy (or after the turn, if they chose that), under their own agent/model settings; discovery grants no additional control, and existing ownership rights remain unchanged. ' +
-      "The legacy includeArchived option only affects archived workspace-turn and bash records; sub-agents remain one inactive/active task identity. " +
-      "This is a discovery tool, NOT a waiting mechanism. If the current request actually depends on a task's output, call task_await with the specific task IDs you need; do not await all active tasks just because they appear here.",
+      "List this workspace's descendant tasks: sub-agents, background bash and top-level workflow runs (workflow-owned tasks are omitted). Use it to rediscover work after compaction, restart or an uncertain workflow_run (omit statuses then; pending runs may need workflow_resume), not to wait: use task_await. Rows with bestOf are grouped candidates, not bench members. " +
+      '\n\nscope:"tree" lists every workspace in this task tree with its relationship to you; rows are task_send_message targets except your own, best-of candidates and inactive non-descendants. scope:"instance" (local/worktree only) lists consenting root workspaces in this Xum instance, newest first, with an activity snapshot.',
     schema: TaskListToolArgsSchema,
   },
   workflow_run: {
