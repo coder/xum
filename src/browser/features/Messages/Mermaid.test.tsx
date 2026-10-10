@@ -89,7 +89,7 @@ describe("Mermaid layout stability", () => {
     );
     // Same outer frame before and after the chunk loads, so nothing shifts.
     const loaded = view.container.querySelector<HTMLElement>(".mermaid-container");
-    expect(loaded?.parentElement?.style.cssText).toBe(pendingFrameStyle!);
+    expect(loaded?.parentElement?.style.cssText).toBe(pendingFrameStyle);
     expect(loaded?.style.minHeight).toBe("300px");
   });
 

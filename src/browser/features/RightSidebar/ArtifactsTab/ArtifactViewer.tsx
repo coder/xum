@@ -1,6 +1,7 @@
-import type React from "react";
+import React from "react";
 import { Check, Copy, Download, ExternalLink } from "lucide-react";
-import { Mermaid } from "@/browser/features/Messages/Mermaid";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
+import { MermaidPendingFrame } from "@/browser/features/Messages/MermaidPendingFrame";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
@@ -19,6 +20,12 @@ import { Notice, NoteBar } from "./SourceText";
 import type { ArtifactAnnotationPick } from "./artifactAnnotation";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { useAgentBrowserAvailable } from "./useAgentBrowserAvailable";
+
+// Lazy so the `mermaid` package stays off the first load (T3, #5971): diagrams render only
+// when an artifact or message contains one.
+const Mermaid = React.lazy(() =>
+  import("@/browser/features/Messages/Mermaid").then((m) => ({ default: m.Mermaid }))
+);
 
 // Every renderer here goes through React elements, so artifact content (agent-written,
 // therefore untrusted) is always escaped. HTML and SVG only ever render inside
@@ -192,7 +199,9 @@ export function ArtifactViewer(props: {
     case "mermaid":
       return (
         <div className="p-3">
-          <Mermaid chart={result.content} />
+          <LazyFeature name="Diagram" fallback={<MermaidPendingFrame />}>
+            <Mermaid chart={result.content} />
+          </LazyFeature>
         </div>
       );
     case "diff":
