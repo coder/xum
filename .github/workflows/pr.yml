@@ -82,6 +82,9 @@ jobs:
               - 'bun.lock'
               - 'tsconfig*.json'
               - 'vite*.ts'
+              # index.html defines the first-load roots, so the first-load budget check
+              # (Smoke / Server) must run when it changes.
+              - 'index.html'
               - 'Makefile'
               - 'electron-builder.yml'
               # Pixel's default matrix and the Storybook config decide which snapshots exist,
