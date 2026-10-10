@@ -498,10 +498,12 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
           {props.projectBadgeName != null && (
             // The badge width cap can truncate hierarchical "Parent / Sub"
             // names, so the shared tooltip keeps the full label reachable.
+            // text-foreground: the badge tint is the project color at 12.5% alpha, so full-strength
+            // text reaches WCAG AA on every color in every theme; text-secondary did not (#5978).
             <TooltipIfPresent tooltip={props.projectBadgeName}>
               <span
                 data-testid={`workspace-project-badge-draft-${draft.draftId}`}
-                className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+                className="text-foreground max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
                 style={
                   props.projectBadgeColor != null
                     ? {
@@ -1358,10 +1360,11 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 {props.projectBadgeName != null && (
                   // The badge width cap can truncate hierarchical "Parent / Sub"
                   // names, so the shared tooltip keeps the full label reachable.
+                  // text-foreground reaches WCAG AA on every project tint (#5978), as on drafts.
                   <TooltipIfPresent tooltip={props.projectBadgeName}>
                     <span
                       data-testid={`workspace-project-badge-${workspaceId}`}
-                      className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+                      className="text-foreground max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
                       style={
                         props.projectBadgeColor != null
                           ? {
