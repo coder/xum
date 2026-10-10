@@ -31,7 +31,7 @@ export function AgentsInitBanner(props: AgentsInitBannerProps) {
         <button
           type="button"
           onClick={() => void props.onRunInit()}
-          className="bg-accent hover:bg-accent/80 text-accent-foreground inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors"
+          className="bg-accent hover:bg-accent-button-hover text-accent-foreground inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors"
           data-testid="agents-init-run"
         >
           Run /init

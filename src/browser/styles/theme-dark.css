@@ -232,6 +232,9 @@
     --color-accent: hsl(207 100% 40%); /* #007acc - VS Code blue */
     --color-accent-hover: hsl(207 100% 45%); /* #1177bb - accent hover */
     --color-accent-dark: hsl(207 100% 37%); /* #0e639c - darker accent */
+    /* Hover background of primary (bg-accent + text-accent-foreground) buttons. A theme whose
+       accent text is dark (flexoki-dark) overrides it with a lighter color (#6022). */
+    --color-accent-button-hover: var(--color-accent-dark);
     --color-accent-darker: hsl(202 100% 23%); /* #094771 - even darker accent */
     --color-accent-light: hsl(198 100% 65%); /* #4db8ff - lighter accent */
     --color-accent-foreground: hsl(0 0% 100%); /* readable text/icons on accent surfaces */

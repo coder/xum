@@ -214,7 +214,7 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
           </div>
           <button
             onClick={isLastStep ? onDismiss : onNext}
-            className="bg-accent text-accent-foreground rounded px-3 py-1.5 text-xs font-medium transition-colors hover:opacity-90"
+            className="bg-accent text-accent-foreground hover:bg-accent-button-hover rounded px-3 py-1.5 text-xs font-medium transition-colors"
           >
             {isLastStep ? "Done" : "Next"}
           </button>

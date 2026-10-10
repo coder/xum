@@ -17,7 +17,7 @@ import {
 const BTN_BASE =
   "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:cursor-default disabled:opacity-50";
 const BTN_DEFAULT = `${BTN_BASE} border-border bg-surface-secondary text-foreground hover:bg-hover`;
-const BTN_ACCENT = `${BTN_BASE} border-accent bg-accent text-white hover:opacity-90`;
+const BTN_ACCENT = `${BTN_BASE} border-accent bg-accent text-accent-foreground hover:bg-accent-button-hover`;
 
 function isInlineWorkflowPath(scriptPath: string): boolean {
   return scriptPath.startsWith("inline://");

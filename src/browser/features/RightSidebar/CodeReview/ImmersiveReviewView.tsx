@@ -2398,7 +2398,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
                     <button
                       type="button"
                       onClick={onExit}
-                      className="bg-accent hover:bg-accent/80 text-accent-foreground inline-flex items-center rounded-md px-3 py-1.5 text-xs font-medium transition-colors"
+                      className="bg-accent hover:bg-accent-button-hover text-accent-foreground inline-flex items-center rounded-md px-3 py-1.5 text-xs font-medium transition-colors"
                     >
                       Return to chat
                     </button>

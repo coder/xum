@@ -713,6 +713,9 @@
   --color-accent: #4385be;
   --color-accent-hover: color-mix(in srgb, var(--color-accent), white 12%);
   --color-accent-dark: color-mix(in srgb, var(--color-accent), black 18%);
+  /* This theme's accent text is near-black, so a darker hover would lower contrast (3.49:1).
+     The primary-button hover goes lighter instead: 5.9:1 with --color-accent-foreground (#6022). */
+  --color-accent-button-hover: color-mix(in srgb, var(--color-accent), white 12%);
   --color-accent-darker: color-mix(in srgb, var(--color-accent), black 28%);
   --color-accent-light: color-mix(in srgb, var(--color-accent), white 22%);
   --color-accent-foreground: #100f0f; /* maintain WCAG contrast against lighter Flexoki dark accent */

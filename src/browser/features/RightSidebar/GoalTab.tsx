@@ -675,7 +675,7 @@ export function GoalTab(props: GoalTabProps) {
               {props.isChildWorkspace !== true && (
                 <button
                   type="button"
-                  className="bg-accent text-accent-foreground hover:bg-accent-dark inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm"
+                  className="bg-accent text-accent-foreground hover:bg-accent-button-hover inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm"
                   aria-label="Archive goal"
                   onClick={() => {
                     // Route through `archiveGoal` so the goal lands in the
