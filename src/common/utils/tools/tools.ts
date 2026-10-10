@@ -976,6 +976,15 @@ export async function getToolsForModel(
     ...computerUseTools,
   };
 
+  // Tool hooks (.xum/tool_pre, .xum/tool_post) can run only here (trusted project). A
+  // provider-native tool runs on the provider, so no hook can gate it. While hooks can run,
+  // fetch goes through Xum's hook-wrapped client web_fetch instead of native fetch
+  // (Anthropic web_fetch_20250910, Google url_context), so every fetch is gated, including
+  // after a hook is added mid-turn: withHooks finds hook files again on each call. User
+  // decision (#5840, Option A): trusted projects lose native fetch even with no hook file.
+  // Native web search has no client version and stays unhooked.
+  const hooksCanRun = deriveToolHookConfig(config) !== null;
+
   // Try to add provider-specific web search tools if available
   // Lazy-load providers to avoid loading all AI SDKs at startup
   let allTools = { ...baseTools, ...(mcpTools ?? {}) };
@@ -991,17 +1000,8 @@ export async function getToolsForModel(
         // Known limitations when the native override is active:
         // - Cannot reach private/localhost URLs (Anthropic's servers can't see workspace network).
         // - Not bridgeable in the PTC sandbox because provider-native tools have no execute().
-        // - Tool hooks (.xum/tool_pre/.xum/tool_post) are skipped because withHooks() returns
-        //   early when execute() is absent — same limitation as web_search (provider-native).
-        //
-        // Claude Haiku keeps the client fetcher even on 4.6+ (Haiku 5.5): moving the
-        // `haiku` alias from 4.5 to 5.5 must not silently drop tool_pre/tool_post
-        // enforcement (e.g. egress checks) on web_fetch for users of that alias. Remove
-        // this carve-out once native tools honor hooks (#5840).
-        if (
-          supportsAnthropicNativeWebFetch(capabilityModelId) &&
-          !/(?:^|\.)claude-haiku-/.test(capabilityModelId.toLowerCase())
-        ) {
+        // - Tool hooks are skipped (no execute()), so it is used only where hooks cannot run.
+        if (supportsAnthropicNativeWebFetch(capabilityModelId) && !hooksCanRun) {
           allTools = {
             ...baseTools,
             ...(mcpTools ?? {}),
@@ -1078,7 +1078,8 @@ export async function getToolsForModel(
             // Google exposes native Search and URL Context as provider-executed tools for
             // Gemini 3+. These coexist with Xum function tools in the standard streaming API.
             google_search: google.tools.googleSearch({}) as Tool,
-            url_context: google.tools.urlContext({}) as Tool,
+            // URL Context fetches on Google's side, past tool hooks; client web_fetch covers it.
+            ...(!hooksCanRun && { url_context: google.tools.urlContext({}) as Tool }),
           };
         }
         break;

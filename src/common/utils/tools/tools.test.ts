@@ -948,50 +948,102 @@ describe("getToolsForModel", () => {
     expect(tools.web_fetch).toBeDefined();
   });
 
-  // Haiku 5.5 supports Anthropic's native web_fetch, but provider tools skip
-  // tool_pre/tool_post hooks. Moving the `haiku` alias from 4.5 must not drop a
-  // user's hook enforcement, so Haiku keeps the hook-wrapped client fetcher.
-  test("keeps tool_pre enforcement on web_fetch for Claude Haiku 5.5", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-tools-hook-"));
-    try {
-      const hookDir = path.join(tempDir, ".xum");
-      await fs.mkdir(hookDir, { recursive: true });
-      await fs.writeFile(
-        path.join(hookDir, "tool_pre"),
-        '#!/bin/bash\necho "egress blocked" >&2\nexit 1\n'
-      );
-      await fs.chmod(path.join(hookDir, "tool_pre"), 0o755);
-      const toolsFor = (model: string) =>
-        getToolsForModel(
-          model,
-          {
-            cwd: tempDir,
-            runtime: new LocalRuntime(tempDir),
-            runtimeTempDir: tempDir,
-            workspaceId: "ws-1",
-            trusted: true,
-          },
-          "ws-1",
-          createInitStateManager()
-        );
-
-      const haikuFetch = (await toolsFor("anthropic:claude-haiku-5-5")).web_fetch;
-      if (haikuFetch.execute == null) {
-        throw new Error("Expected Haiku 5.5 to keep the client web_fetch tool");
-      }
-      const result = (await haikuFetch.execute(
-        { url: "http://127.0.0.1:9/" },
-        { toolCallId: "call-1", messages: [], context: undefined }
-      )) as { error?: string };
-      expect(result.error).toContain("egress blocked");
-
-      // Other Claude 4.6+ models still get the provider-native tool (hooks skipped).
-      expect((await toolsFor("anthropic:claude-sonnet-5-5")).web_fetch).toMatchObject({
-        type: "provider",
-        id: "anthropic.web_fetch_20250910",
-      });
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
+  // #5840: provider-native fetch runs on the provider, past tool hooks. Where hooks can run
+  // (trusted projects), fetch must go through the hook-wrapped client web_fetch.
+  describe("tool hooks gate web fetch", () => {
+    const BLOCKED_URL = "http://127.0.0.1:9/";
+    interface FetchResult {
+      success?: boolean;
+      error?: string;
     }
+
+    async function withProject(run: (dir: string) => Promise<void>) {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-tools-hook-"));
+      try {
+        await fs.mkdir(path.join(dir, ".xum"), { recursive: true });
+        await run(dir);
+      } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    }
+
+    async function writePreHook(dir: string, script: string) {
+      const hookPath = path.join(dir, ".xum", "tool_pre");
+      await fs.writeFile(hookPath, `#!/bin/bash\n${script}\n`);
+      await fs.chmod(hookPath, 0o755);
+    }
+
+    const toolsFor = (model: string, dir: string, trusted: boolean) =>
+      getToolsForModel(
+        model,
+        {
+          cwd: dir,
+          runtime: new LocalRuntime(dir),
+          runtimeTempDir: dir,
+          workspaceId: "ws-1",
+          trusted,
+        },
+        "ws-1",
+        createInitStateManager()
+      );
+
+    async function fetchWith(tool: Tool | undefined): Promise<FetchResult> {
+      if (tool?.execute == null) throw new Error("Expected the client web_fetch tool");
+      return (await tool.execute(
+        { url: BLOCKED_URL },
+        { toolCallId: "call-1", messages: [], context: undefined }
+      )) as FetchResult;
+    }
+
+    test("a blocking tool_pre hook denies Claude 4.6+ fetches", async () => {
+      await withProject(async (dir) => {
+        await writePreHook(dir, 'echo "egress blocked" >&2\nexit 1');
+        for (const model of ["anthropic:claude-sonnet-5-5", "anthropic:claude-haiku-5-5"]) {
+          const result = await fetchWith((await toolsFor(model, dir, true)).web_fetch);
+          expect({ model, error: result.error }).toEqual({ model, error: "egress blocked" });
+        }
+      });
+    });
+
+    test("an allowing tool_pre hook lets the fetch run", async () => {
+      await withProject(async (dir) => {
+        await writePreHook(dir, "exit 0");
+        const tools = await toolsFor("anthropic:claude-sonnet-5-5", dir, true);
+        // The client tool itself ran: it refuses loopback targets after the hook allowed it.
+        expect((await fetchWith(tools.web_fetch)).error).toContain("Blocked URL");
+      });
+    });
+
+    test("a hook added between two invocations gates the second", async () => {
+      await withProject(async (dir) => {
+        const tools = await toolsFor("anthropic:claude-sonnet-5-5", dir, true);
+        expect((await fetchWith(tools.web_fetch)).error).toContain("Blocked URL");
+        await writePreHook(dir, 'echo "egress blocked" >&2\nexit 1');
+        expect((await fetchWith(tools.web_fetch)).error).toBe("egress blocked");
+      });
+    });
+
+    test("trusted projects drop Google URL Context but keep native search", async () => {
+      await withProject(async (dir) => {
+        const tools = await toolsFor("google:gemini-3.5-flash", dir, true);
+        expect(tools.url_context).toBeUndefined();
+        expect(tools.google_search).toBeDefined();
+        expect(tools.web_fetch?.execute).toBeDefined();
+      });
+    });
+
+    test("untrusted projects keep the provider-native fetch tools", async () => {
+      await withProject(async (dir) => {
+        // Hooks never run in untrusted projects, so a hook file changes nothing.
+        await writePreHook(dir, 'echo "egress blocked" >&2\nexit 1');
+        for (const model of ["anthropic:claude-sonnet-5-5", "anthropic:claude-haiku-5-5"]) {
+          expect((await toolsFor(model, dir, false)).web_fetch).toMatchObject({
+            type: "provider",
+            id: "anthropic.web_fetch_20250910",
+          });
+        }
+        expect((await toolsFor("google:gemini-3.5-flash", dir, false)).url_context).toBeDefined();
+      });
+    });
   });
 });
