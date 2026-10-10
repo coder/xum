@@ -5439,6 +5439,7 @@ describe("ProviderModelFactory Ollama tool schemas", () => {
           outer: { type: "object", properties: { inner: { type: ["string", "null"] } } },
           list: { type: "array", items: { type: ["integer", "null"], minimum: 0 } },
           single: { type: ["boolean"] },
+          both: { type: ["string", "null"], anyOf: [{ minLength: 1 }, { const: null }] },
         },
       }),
     });
@@ -5455,6 +5456,10 @@ describe("ProviderModelFactory Ollama tool schemas", () => {
           items: { anyOf: [{ type: "integer" }, { type: "null" }], minimum: 0 },
         },
         single: { type: "boolean" },
+        both: {
+          anyOf: [{ minLength: 1 }, { const: null }],
+          allOf: [{ anyOf: [{ type: "string" }, { type: "null" }] }],
+        },
       },
     });
   });
@@ -5478,6 +5483,11 @@ describe("ProviderModelFactory Ollama tool schemas", () => {
         count: { type: "integer" },
         mode: { enum: ["a", "b"] },
         maybe: { anyOf: [{ type: "string" }, { type: "null" }] },
+        // Data under these keywords can look like a schema but must arrive as sent.
+        literal: { const: { type: ["a", "b"] } },
+        choice: { enum: [{ type: ["a", "b"] }] },
+        defaulted: { type: "object", default: { type: ["x", "null"] } },
+        sample: { type: "object", examples: [{ type: ["y", "z"] }] },
       },
       required: ["name"],
     };
