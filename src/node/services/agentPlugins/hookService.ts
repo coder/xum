@@ -119,6 +119,15 @@ export interface EnsureWorkspaceHooksArgs {
   history: Pick<HistoryService, "getLastMessages" | "readPartial">;
 }
 
+/** Insert `state` into `states`, keeping them sorted by discovery index. */
+function insertByDiscoveryIndex(
+  states: LoadedPluginHookState[],
+  state: LoadedPluginHookState
+): void {
+  const at = states.findIndex((other) => other.discoveryIndex > state.discoveryIndex);
+  states.splice(at === -1 ? states.length : at, 0, state);
+}
+
 /** One discovered plugin with a hooks.js, plus its pinned source snapshot. */
 interface DiscoveredHookPlugin {
   plugin: AgentPluginInfo;
@@ -138,6 +147,12 @@ interface LoadedPluginHookState {
   source: string;
   mountOptions: AcquireMountOptions;
   hookNames: PluginHookPoint[];
+  /**
+   * Position in discovery order. Used as the spine registration `order` and
+   * to keep `states` sorted, so a plugin loaded later by the retry path still
+   * runs at its discovery position instead of after its siblings.
+   */
+  discoveryIndex: number;
   /** Set at teardown so in-flight invocations stop re-creating dropped mounts. */
   disposed: boolean;
 }
@@ -256,11 +271,11 @@ export class AgentPluginHookService {
         if (line === undefined || !existing.failedLines.has(line)) {
           continue;
         }
-        const loaded = await this.loadCandidateLocked(candidate, args);
+        const loaded = await this.loadCandidateLocked(candidate, candidateIndex, args);
         if (loaded === null) {
           continue;
         }
-        existing.states.push(loaded.state);
+        insertByDiscoveryIndex(existing.states, loaded.state);
         existing.unregisters.push(...loaded.unregisters);
         existing.failedLines.delete(line);
       }
@@ -275,7 +290,7 @@ export class AgentPluginHookService {
     const states: LoadedPluginHookState[] = [];
     const failedLines = new Set<string>();
     for (const [candidateIndex, candidate] of discovered.entries()) {
-      const loaded = await this.loadCandidateLocked(candidate, args);
+      const loaded = await this.loadCandidateLocked(candidate, candidateIndex, args);
       if (loaded === null) {
         // Failure isolation: one broken plugin never affects siblings. The
         // recorded line makes the unchanged-fingerprint path above retry it
@@ -315,6 +330,7 @@ export class AgentPluginHookService {
    */
   private async loadCandidateLocked(
     candidate: DiscoveredHookPlugin,
+    discoveryIndex: number,
     args: EnsureWorkspaceHooksArgs
   ): Promise<{ state: LoadedPluginHookState; unregisters: Array<() => void> } | null> {
     const plugin = candidate.plugin;
@@ -338,6 +354,7 @@ export class AgentPluginHookService {
         bridgeKey: `plugin-hooks:${sha256Hex(candidate.source)}`,
       },
       hookNames: [],
+      discoveryIndex,
       disposed: false,
     };
 
@@ -457,25 +474,36 @@ export class AgentPluginHookService {
     state: LoadedPluginHookState,
     args: EnsureWorkspaceHooksArgs
   ): () => void {
+    // Discovery index as the spine order: the spine sorts by order before
+    // registration sequence, so a plugin retried on a later send still runs
+    // at its discovery position (the documented chain order). Indexes are
+    // >= 0, the same as the default order of built-in middleware such as the
+    // shell tool hooks, which registered first and so keep running first.
+    const order = state.discoveryIndex;
     switch (hookName) {
       case "tool.execute.before":
-        return this.spine.useBefore("tool.execute", (ctx) =>
-          this.runToolExecuteBefore(ctx, state, args.workspaceId)
+        return this.spine.useBefore(
+          "tool.execute",
+          (ctx) => this.runToolExecuteBefore(ctx, state, args.workspaceId),
+          { order }
         );
       case "tool.execute.after":
-        return this.spine.useAfter("tool.execute", (ctx) =>
-          this.runToolExecuteAfter(ctx, state, args.workspaceId)
+        return this.spine.useAfter(
+          "tool.execute",
+          (ctx) => this.runToolExecuteAfter(ctx, state, args.workspaceId),
+          { order }
         );
       case "request.assemble":
         return this.spine.useRequestContext((ctx) => this.runRequestAssemble(ctx, state, args), {
           workspaceId: args.workspaceId,
+          order,
         });
       case "message.send.before":
         // useBefore: a block set by this plugin skips every later plugin.
         return this.spine.useBefore(
           "message.send",
           (ctx) => this.runMessageSendBefore(ctx, state, args.workspaceId),
-          { workspaceId: args.workspaceId }
+          { workspaceId: args.workspaceId, order }
         );
       case "turn.end":
         // Dispatched by the registration's single stream.end subscription

@@ -429,7 +429,11 @@ function buildUserDisplayedMessages(options: {
       type: "user",
       id: message.id,
       historyId: message.id,
-      content: rawCommand ?? partsContent,
+      // A plugin rewrite replaced the saved text, so rawCommand (the submitted
+      // slash command) no longer matches what was sent. Show the sent text;
+      // the rewrite note shows what was submitted.
+      content:
+        message.metadata?.pluginRewrite != null ? partsContent : (rawCommand ?? partsContent),
       commandPrefix: muxMeta?.commandPrefix,
       fileParts: fileParts.length > 0 ? fileParts : undefined,
       historySequence,

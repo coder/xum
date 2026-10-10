@@ -1191,6 +1191,46 @@ describe("message.send.before", () => {
     expect(ctx.blocked).toBeUndefined();
   });
 
+  test("a plugin retried after a failed load keeps its discovery position", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "a-signer",
+      `({ "message.send.before": (input) => ({ text: input.text + " [a]" }) })`
+    );
+    await writeHookPlugin(
+      harness.container,
+      "b-shouter",
+      `({ "message.send.before": (input) => ({ text: input.text.toUpperCase() }) })`
+    );
+
+    // First reconcile: only the earlier plugin's mount load fails.
+    const realWithPersistentMount = SandboxHostService.prototype.withPersistentMount.bind(
+      harness.sandboxHost
+    );
+    const mountSpy = spyOn(harness.sandboxHost, "withPersistentMount").mockImplementation(function <
+      T,
+    >(
+      options: Parameters<typeof realWithPersistentMount>[0],
+      fn: (mount: SandboxMount) => Promise<T>
+    ): Promise<T> {
+      return String(options.scopeKey).includes("a-signer")
+        ? Promise.reject(new Error("transient sandbox failure"))
+        : realWithPersistentMount(options, fn);
+    });
+    await harness.ensure();
+    mountSpy.mockRestore();
+
+    // Second reconcile retries "a-signer". It registers after "b-shouter" but
+    // must still run first: A appends, then B upper-cases A's text.
+    await harness.ensure();
+    const ctx = makeSendCtx("fix the bug");
+    await harness.spine.run("message.send", ctx);
+
+    expect(ctx.text).toBe("FIX THE BUG [A]");
+    expect(ctx.rewrittenBy).toBe("b-shouter");
+  });
+
   test("the first block ends the chain and its reason is capped", async () => {
     const harness = await createHarness();
     await writeHookPlugin(

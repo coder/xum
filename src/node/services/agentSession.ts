@@ -4723,6 +4723,16 @@ export class AgentSession {
         createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
       );
     if (pluginSend.kind === "blocked") {
+      // A client retry of an accepted send (same send ids after a lost response) runs the hooks
+      // again. Its block must not report failure for a message history already holds: the
+      // accepted row wins. History is read only on a block, so ordinary sends pay nothing; the
+      // publication's in-lock check stays the authority for every other outcome.
+      if (sendIdentities.length > 0) {
+        const known = await this.historyService.decideSendIds(this.workspaceId, sendIdentities);
+        if (known.success && this.settleKnownSendIds(known.data, attempt)?.success === true) {
+          return Ok(undefined);
+        }
+      }
       const blockedError: SendMessageError = {
         type: "plugin_blocked",
         plugin: pluginSend.pluginName,
