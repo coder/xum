@@ -38,4 +38,32 @@ describeIntegration("Settings modal shortcuts", () => {
       await app.dispose();
     }
   }, 60_000);
+
+  // The first open matters: the lazy-loaded Settings page mounts already open, so the opener must
+  // be recorded outside it, or this first close leaves focus on the body.
+  test("closing the first shortcut-opened settings returns focus to the opener", async () => {
+    const app = await createAppHarness({ branchPrefix: "settings-focus", aiMode: "none" });
+    try {
+      const doc = app.view.container.ownerDocument;
+      const body = within(doc.body);
+      const user = userEvent.setup({ document: doc });
+      const composer = await within(app.view.container).findByRole("textbox", { name: "Message" });
+      await user.click(composer);
+      expect(doc.activeElement).toBe(composer);
+
+      await user.keyboard("{Control>},{/Control}");
+      const dialog = await body.findByRole("dialog", { name: "Settings" }, { timeout: 10_000 });
+      // Radix can drop an Escape pressed right after mount (see SettingsPage.stories.tsx), so press
+      // again while the dialog is still open.
+      await waitFor(async () => {
+        if (dialog.isConnected && dialog.getAttribute("data-state") === "open") {
+          await user.keyboard("{Escape}");
+        }
+        expect(body.queryByRole("dialog", { name: "Settings" })).toBeNull();
+      });
+      await waitFor(() => expect(doc.activeElement).toBe(composer));
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
 });
