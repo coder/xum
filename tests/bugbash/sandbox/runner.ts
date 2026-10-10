@@ -178,7 +178,9 @@ export class Session {
       if (!/^[0-9a-f]{64}$/.test(id)) throw new Refusal(`docker ps: unexpected ID ${id}`);
       const args = ["container", "inspect", "--format", INSPECT, id];
       const look = await this.#job("docker", args, this.#client!, 15_000);
-      if (!look.ok) continue; // removed since the list: nothing to report
+      // Removed since the list: nothing to report. Any other failure hides a container: refuse.
+      if (!look.ok && look.error.includes("No such container")) continue;
+      if (!look.ok) throw new Refusal(`docker container inspect: ${look.error}`);
       // The label filter picked the checkout; removeJob() checks all three again before a removal.
       const [name, owner] = look.stdout.replace(/^\//, "").split("|");
       found.push({ id, job: { name, owner, checkout } });

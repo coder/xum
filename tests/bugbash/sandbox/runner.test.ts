@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -27,6 +27,7 @@ case "$1" in
     if [ "$PULL" = orphan ]; then (trap '' TERM; exec sleep 60) >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; sleep 30; fi
     if [ "$PULL" = group ]; then sleep 60 >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; trap '' TERM; wait $!; fi
     if [ "$PULL" = swap ]; then rm -r "$SWAP"; ln -s / "$SWAP"; fi
+    if [ "$PULL" = fail ]; then echo "pull failed" >&2; exit 1; fi
     # Exits at once and leaves a member in its group (cleanup item 7).
     if [ "$PULL" = leave ]; then (trap '' TERM; exec sleep 60) >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; fi ;;
   image) echo "{\\"org.xum.bugbash.inputs\\":\\"$LABEL\\"}" ;;
@@ -724,6 +725,94 @@ test("C2: recover reports a removal it cannot prove (exit 3)", async () => {
     log: () => undefined,
   };
   expect(await recover(o)).toBe(3);
+});
+
+test("C2: a zombie launcher counts as dead", async () => {
+  // `sleep 0` exits at once, and its parent then execs `sleep 30`, which never reaps it.
+  const parent = spawn("sh", ["-c", "sleep 0 & echo $!; exec sleep 30"], {
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  try {
+    const pid = Number(
+      await new Promise<string>((resolve) =>
+        parent.stdout.once("data", (d: Buffer) => resolve(d.toString()))
+      )
+    );
+    while (!/\) Z /.test(stat(pid))) await Bun.sleep(10);
+    const { boot, pidns } = self();
+    expect(ownerState(`${boot}:${pidns}:${pid}:${procStart(pid)}`)).toBe("dead");
+  } finally {
+    parent.kill("SIGKILL");
+  }
+});
+
+test("C2: a launch lists the leftovers even when the image pull fails", async () => {
+  const { lines } = leftovers();
+  const logged: string[] = [];
+  const error = spyOn(console, "error").mockImplementation(
+    (line: string) => void logged.push(line)
+  );
+  try {
+    const result = await launchIn({ IMAGES: "", PULL: "fail" }, new AbortController(), HOST_ENV, [
+      lines.dead,
+    ]).catch((e: unknown) => e);
+    expect(result).toBeInstanceOf(Refusal);
+  } finally {
+    error.mockRestore();
+  }
+  expect(
+    logged.some((line) => line.includes(`leftover: ${lines.dead.split(" ")[1]} owner dead`))
+  ).toBe(true);
+});
+
+test("C2: recover refuses when a listed container cannot be inspected", async () => {
+  const { lines } = leftovers();
+  fs.writeFileSync(path.join(bin, "containers"), lines.dead + "\n");
+  fake({ INSPECT_RC: "1" });
+  const real = fs.realpathSync(root);
+  const o = {
+    root: real,
+    cwd: real,
+    env: {},
+    stop: new AbortController().signal,
+    log: () => undefined,
+  };
+  expect(await failure(recover(o))).toThrow(/docker container inspect: daemon down/);
+  expect(registry()).toBe(lines.dead + "\n");
+});
+
+test("C2: a stop during recover starts no further removal", async () => {
+  const { lines } = leftovers();
+  const second = lines.dead.replace(/^\w+/, "f".repeat(64)).replace("aaaaa1", "aaaaaf");
+  fs.writeFileSync(path.join(bin, "containers"), [lines.dead, second].join("\n") + "\n");
+  fake();
+  const real = fs.realpathSync(root);
+  const stop = new AbortController();
+  const log = (line: string) => line.endsWith(" removed") && stop.abort("SIGTERM");
+  const o = { root: real, cwd: real, env: {}, stop: stop.signal, log };
+  expect(await recover(o).catch((e: unknown) => e)).toEqual(new Stopped("SIGTERM"));
+  expect(registry()).toBe(second + "\n"); // the first removal finished, the second never started
+});
+
+test("C2: recover reports an unknown cleanup state (exit 3)", async () => {
+  fs.writeFileSync(path.join(bin, "containers"), "");
+  fake();
+  const real = fs.realpathSync(root);
+  const cleanup = spyOn(Session.prototype, "cleanup").mockResolvedValue(
+    "unknown: process groups 1 still run"
+  );
+  try {
+    const o = {
+      root: real,
+      cwd: real,
+      env: {},
+      stop: new AbortController().signal,
+      log: () => undefined,
+    };
+    expect(await recover(o)).toBe(3);
+  } finally {
+    cleanup.mockRestore();
+  }
 });
 
 test("a signal during the synchronous staging starts no container", async () => {

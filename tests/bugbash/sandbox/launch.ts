@@ -33,11 +33,14 @@ const bootId = () => fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").
 const pidNamespace = () => fs.readlinkSync("/proc/self/ns/pid").replace(/\D/g, "");
 /** The checkout label: the first 12 hex of the sha256 of its real path. Job names hold 6. */
 const checkoutId = (root: string) => sha(root).slice(0, 12);
-/** Field 22 of /proc/<pid>/stat (start time in clock ticks). Undefined when the PID is gone. */
-function startTime(pid: string): string | undefined {
+/**
+ * The fields of /proc/<pid>/stat after the command name: [0] the state, [19] the start time in
+ * clock ticks. Undefined when the PID is gone.
+ */
+function procStat(pid: string): string[] | undefined {
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
@@ -64,12 +67,13 @@ function bind(src: string, dst: string): string[] {
 
 /** boot id : PID namespace : PID : start time of this launcher. ownerState() reads it. */
 function ownerLabel(): string {
-  return `${bootId()}:${pidNamespace()}:${process.pid}:${startTime(String(process.pid))}`;
+  return `${bootId()}:${pidNamespace()}:${process.pid}:${procStat(String(process.pid))?.[19]}`;
 }
 
 /**
  * Whether the launcher named by an owner label still runs. "dead" needs this boot and this PID
- * namespace, and a PID that is gone or now has another start time (a reused PID). Anything that
+ * namespace, and a PID that is gone, a zombie (it exited and waits for its parent), or now has
+ * another start time (a reused PID). Anything that
  * cannot be checked from here (another boot, another namespace, a malformed label, an
  * unreadable /proc entry) is "cannot tell", and recover() leaves it.
  */
@@ -80,7 +84,8 @@ export function ownerState(owner: string): "dead" | "alive" | "cannot tell" {
   const [boot, pidns, pid, start] = parts;
   if (boot !== bootId() || pidns !== pidNamespace()) return "cannot tell";
   try {
-    return startTime(pid) === start ? "alive" : "dead";
+    const stat = procStat(pid);
+    return stat != null && !/^[ZX]$/.test(stat[0]) && stat[19] === start ? "alive" : "dead";
   } catch {
     return "cannot tell";
   }
@@ -99,6 +104,7 @@ export async function recover(o: LaunchOptions & { log?: (line: string) => void 
   const checkout = checkoutId(o.root);
   const jobName = new RegExp(`^xbb-${checkout.slice(0, 6)}-[0-9a-f]{6}$`);
   let unproved = 0;
+  let failure: { error: unknown } | undefined;
   try {
     say(`recover: docker endpoint ${await session.connect()}, checkout ${checkout}`);
     for (const { id, job } of await session.listJobs(checkout)) {
@@ -108,13 +114,21 @@ export async function recover(o: LaunchOptions & { log?: (line: string) => void 
         say(`recover: left ${job.name}: owner ${owner}${named ? "" : ", not a job name"}`);
         continue;
       }
+      // A removal that started finishes (cleanup commands ignore a stop); no new one starts.
+      if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
       const state = await session.removeJob(id, job);
       say(`recover: ${job.name} ${state}`);
       if (state !== "removed") unproved += 1;
     }
-  } finally {
-    await session.cleanup();
+  } catch (error) {
+    failure = { error };
   }
+  const state = await session.cleanup();
+  if (state.startsWith("unknown")) {
+    say(`recover: cleanup ${state}`);
+    return 3;
+  }
+  if (failure) throw failure.error;
   return unproved > 0 ? 3 : 0;
 }
 
@@ -154,10 +168,12 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
   let made = false;
 
   const run = async (): Promise<number> => {
-    const image = await session.ensureImage();
-    // Leftovers of crashed launches (#5882) are only listed here; recover removes dead ones.
+    // Leftovers of crashed launches (#5882) are only listed here, first, so a launch that fails
+    // later (a long or failed pull) still shows them. recover removes the dead ones.
+    await session.connect();
     for (const { job } of await session.listJobs(checkout))
       log(`leftover: ${job.name} owner ${ownerState(job.owner)} (make bug-bash-sandbox-recover)`);
+    const image = await session.ensureImage();
     fs.mkdirSync(path.dirname(jobDir), { recursive: true, mode: 0o700 });
     fs.mkdirSync(jobDir, { mode: 0o700 }); // EEXIST: not this job's folder, so cleanup keeps it
     made = true;
