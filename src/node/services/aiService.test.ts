@@ -2938,7 +2938,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     };
     spyOn(service, "getWorkspaceMetadata").mockResolvedValue({ success: true, data: metadata });
     spyOn(memoryService, "listHotMemories").mockImplementation(() => {
-      throw new Error("tokenizer failed");
+      throw new Error("selection failed");
     });
 
     const context = await service.buildMemorySessionContext(workspaceId, "openai:gpt-5.2");
@@ -2948,6 +2948,51 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     ]);
     expect(context?.hotMemoriesBlock).toBeNull();
   });
+
+  it.each([
+    { kind: "root", parentWorkspaceId: undefined, preloadsUsed: true },
+    { kind: "sub-agent", parentWorkspaceId: "parent-workspace", preloadsUsed: false },
+  ])(
+    "preloads hot memories for a $kind workspace",
+    async ({ kind, parentWorkspaceId, preloadsUsed }) => {
+      using xumHome = new DisposableTempDir(`ai-service-hot-memories-${kind}`);
+      const globalRoot = path.join(xumHome.path, "memory", "global");
+      await fs.mkdir(globalRoot, { recursive: true });
+      await fs.writeFile(path.join(globalRoot, "pinned.md"), "pinned facts");
+      await fs.writeFile(path.join(globalRoot, "used.md"), "used facts");
+      const metaService = new MemoryMetaService(xumHome.path);
+      await metaService.setPinned("global:pinned.md", true);
+      await metaService.recordAccess("global:used.md", { write: true });
+
+      const experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHome.path),
+        xumHome: xumHome.path,
+      });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (experimentId) =>
+          experimentId === EXPERIMENT_IDS.MEMORY || experimentId === EXPERIMENT_IDS.MEMORY_HOT_SET
+      );
+      const { config, service } = createBasicAIService(xumHome.path, { experimentsService });
+      service.turnRequestBuilderBindings.memoryService = new MemoryService(config, metaService);
+      const workspaceId = `workspace-hot-memories-${kind}`;
+      spyOn(service, "getWorkspaceMetadata").mockResolvedValue({
+        success: true,
+        data: createLocalWorkspaceMetadata(workspaceId, path.join(xumHome.path, "project"), {
+          parentWorkspaceId,
+        }),
+      });
+
+      const context = await service.buildMemorySessionContext(workspaceId, "openai:gpt-5.2");
+
+      // Sub-agents keep the full index; only the preloaded block drops auto-hot files.
+      expect(context?.indexEntries.map((entry) => entry.path)).toEqual([
+        "/memories/global/pinned.md",
+        "/memories/global/used.md",
+      ]);
+      expect(context?.hotMemoriesBlock).toContain("pinned facts");
+      expect(context?.hotMemoriesBlock?.includes("used facts")).toBe(preloadsUsed);
+    }
+  );
 
   it("resolves the memory context only after the runtime is ready", async () => {
     using xumHome = new DisposableTempDir("ai-service-hot-memories-after-ready");

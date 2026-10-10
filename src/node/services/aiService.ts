@@ -90,7 +90,6 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
-import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
 import { isMockAiMode } from "./mock/mockAiMode";
 import { ProviderModelFactory } from "./providerModelFactory";
@@ -258,7 +257,9 @@ export class AIService extends EventEmitter {
    */
   async buildMemorySessionContext(
     workspaceId: string,
-    modelString: string,
+    // The byte-budgeted context no longer depends on the model; the parameter
+    // keeps AgentSession's per-model cache contract unchanged.
+    _modelString: string,
     options?: {
       includeHotMemories?: boolean;
     }
@@ -290,18 +291,16 @@ export class AIService extends EventEmitter {
         this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) === true
       ) {
         try {
-          const metadataModel = resolveModelForMetadata(
-            modelString,
-            this.providerService.getConfig()
-          );
-          const tokenizer = await getTokenizerForModel(modelString, metadataModel);
+          // Sub-agents preload pinned files only: auto-hot files mirror the
+          // parent's usage, and every child would otherwise pay for the same
+          // block again. The index and on-demand reads stay available.
           const items = await this.turnRequestBuilderBindings.memoryService.listHotMemories(ctx, {
-            countTokens: (text) => tokenizer.countTokens(text),
+            pinnedOnly: metadata.parentWorkspaceId != null,
           });
           hotMemoriesBlock = items.length === 0 ? null : formatHotMemoriesBlock(items);
         } catch (error) {
           // Hot preloading is best-effort context. Preserve the pull-based
-          // memory index when tokenizer setup or ranked selection fails.
+          // memory index when ranked selection fails.
           log.warn("Failed to build hot memories; continuing with memory index only", {
             workspaceId,
             error,
