@@ -2,11 +2,21 @@
 
 type Rgba = [number, number, number, number];
 
-/** Resolve any computed CSS color (rgb, oklab, color-mix) to sRGB 0-255 + alpha 0-1. */
+/**
+ * Resolve any computed CSS color (rgb, oklab, color-mix) to sRGB 0-255 + alpha 0-1. Throws on a
+ * color the canvas cannot parse: canvas keeps its previous fillStyle for an invalid value, which
+ * would otherwise be measured as that color and hide the bug (#6006).
+ */
 function toRgba(color: string): Rgba {
   const ctx = document.createElement("canvas").getContext("2d", { willReadFrequently: true });
   if (!ctx) throw new Error("2D canvas unavailable");
+  // A valid color gives the same fillStyle after either start value; an invalid one keeps it.
+  ctx.fillStyle = "#000000";
   ctx.fillStyle = color;
+  const afterBlack = ctx.fillStyle;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillStyle = color;
+  if (ctx.fillStyle !== afterBlack) throw new Error(`unparsable color "${color}"`);
   ctx.fillRect(0, 0, 1, 1);
   const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
   return [r, g, b, a / 255];
