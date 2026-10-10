@@ -14,16 +14,20 @@ import {
 } from "@/browser/utils/rightSidebarLayout";
 import { useExperimentGatedTab } from "./useExperimentGatedTab";
 
-// The user's saved layout [..., artifacts, goal] with Artifacts selected.
+// The user's saved layout [costs, review, artifacts, goal] with Artifacts selected.
 function savedLayout(): RightSidebarLayoutState {
-  const layout = getDefaultRightSidebarLayoutState("costs");
-  if (layout.root.type !== "tabset") throw new Error("default layout must be one tabset");
-  const tabs = [
-    ...layout.root.tabs.filter((tab) => tab !== "artifacts" && tab !== "goal"),
-    "artifacts" as const,
-    "goal" as const,
-  ];
-  return { ...layout, root: { ...layout.root, tabs, activeTab: "artifacts" } };
+  return {
+    version: 1,
+    openTabsOnly: true,
+    nextId: 2,
+    focusedTabsetId: "tabset-1",
+    root: {
+      type: "tabset",
+      id: "tabset-1",
+      tabs: ["costs", "review", "artifacts", "goal"],
+      activeTab: "artifacts",
+    },
+  };
 }
 
 function describeLayout(layout: RightSidebarLayoutState): string {
@@ -32,12 +36,14 @@ function describeLayout(layout: RightSidebarLayoutState): string {
     : "split";
 }
 
-function LayoutProbe() {
-  const [layout, setLayout] = React.useState<RightSidebarLayoutState>(savedLayout);
+function LayoutProbe(props: { initialLayout?: () => RightSidebarLayoutState }) {
+  const [layout, setLayout] = React.useState<RightSidebarLayoutState>(
+    props.initialLayout ?? savedLayout
+  );
   useExperimentGatedTab({
     tab: "artifacts",
     experimentId: EXPERIMENT_IDS.ARTIFACTS,
-    initialActiveTab: "costs",
+    initialActiveTab: undefined,
     setLayoutRaw: setLayout,
   });
   return <div data-testid="layout">{describeLayout(layout)}</div>;
@@ -71,6 +77,14 @@ describe("useExperimentGatedTab", () => {
     act(() => setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true));
 
     expect(view.getByTestId("layout").textContent).toBe(SAVED);
+  });
+
+  test("does not add the tab when the flag is on: the New tab launcher offers it", () => {
+    const fresh = () => getDefaultRightSidebarLayoutState();
+    const view = render(<LayoutProbe initialLayout={fresh} />);
+    act(() => setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true));
+
+    expect(view.getByTestId("layout").textContent).toBe(describeLayout(fresh()));
   });
 
   test("removes the tab once the loaded flag is off", async () => {

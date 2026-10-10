@@ -361,7 +361,7 @@ import {
   type HeartbeatContextMode,
   type HeartbeatSchedulePolicy,
 } from "@/constants/heartbeat";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { SIDE_CHAT_INITIAL_TITLE, WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_KIND,
@@ -14611,7 +14611,10 @@ export class WorkspaceService
       const metadata: FrontendWorkspaceMetadata = {
         id: newWorkspaceId,
         name,
-        title: `Side chat: ${parentMetadata.title ?? parentMetadata.name}`,
+        title: SIDE_CHAT_INITIAL_TITLE,
+        // Inherited history is context, not the side conversation's topic. The regular pending
+        // title flow uses its first accepted user message, without the copied parent messages.
+        pendingAutoTitle: true,
         projectName: parentMetadata.projectName,
         projectPath,
         projects: parentMetadata.projects,

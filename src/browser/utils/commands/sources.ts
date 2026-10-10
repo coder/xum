@@ -46,6 +46,7 @@ import {
   getTabConfig,
   type BaseTabType,
 } from "@/browser/features/RightSidebar/Tabs/tabConfig";
+import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import {
   getEffectiveSlotKeybind,
   getLayoutsConfigOrDefault,
@@ -54,8 +55,8 @@ import {
 import { formatProjectHierarchyLabel, getTopLevelProjectEntries } from "@/common/utils/subProjects";
 import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLayouts";
 import {
-  addToolToFocusedTabset,
   hasTab,
+  openToolFromNewTab,
   selectTabInTabset,
   setFocusedTabset,
   splitFocusedTabset,
@@ -192,11 +193,12 @@ export interface BuildSourcesParams {
   // Layout slots
   layoutPresets?: LayoutPresetsConfig | null;
   onApplyLayoutSlot?: (workspaceId: string, slot: LayoutSlotNumber) => void;
+  /** Errs with a user-facing message when the layout cannot be saved. */
   onCaptureLayoutSlot?: (
     workspaceId: string,
     slot: LayoutSlotNumber,
     name: string
-  ) => Promise<void>;
+  ) => Promise<Result<void>>;
   onClearTimingStats?: (workspaceId: string) => void;
 }
 
@@ -300,13 +302,23 @@ const findFirstTerminalSessionTab = (
 };
 
 /**
+ * Whether right-sidebar commands have a visible sidebar to act on. Narrow layouts hide the
+ * sidebar entirely, so opening tabs there would produce no visible result (the keyboard
+ * shortcuts refuse for the same reason). Without a DOM (command-source unit tests) there is no
+ * layout to check.
+ */
+function isRightSidebarShown(): boolean {
+  return typeof HTMLElement === "undefined" || !isWorkspaceRightSidebarHidden(document.body);
+}
+
+/**
  * Build a "Hide/Show <Name>" command for a config-defined tab.
  *
  * Each command-source factory is re-invoked per palette render, so the
  * Hide/Show title is up-to-date without any explicit subscription wiring.
  *
- * This is secondary discoverability only; default visibility is controlled by
- * `inDefaultLayout` in `tabConfig.ts` and enforced by the layout migration.
+ * This is secondary discoverability only; the New tab launcher is the primary way to open
+ * tools, and every tab can be closed from the strip.
  */
 function buildToggleTabCommand(
   workspaceId: string,
@@ -320,6 +332,7 @@ function buildToggleTabCommand(
     title: `${visible ? "Hide" : "Show"} ${reg.name}`,
     section: navigationSection,
     keywords: reg.paletteKeywords ?? [tabId],
+    visible: isRightSidebarShown,
     run: () => {
       updateRightSidebarLayout(workspaceId, (s) => toggleTab(s, tabId as TabType));
       if (!visible) {
@@ -849,15 +862,14 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     if (wsId) {
       const canReviewDiffs = hasWorkspaceRepository(p.workspaceMetadata.get(wsId));
       list.push(
-        // Generic per-tab "Hide/Show <Name>" commands are only for optional tabs.
-        // Default-layout tabs (Stats/Review/Instructions) are auto-restored by
-        // the layout migration, so exposing hide commands for them would be a
-        // no-op and obscure the fact that they are meant to be visible by default.
+        // "Hide/Show <Name>" for every tool: no tab is re-added automatically anymore, so
+        // hiding any of them sticks. Experiment-gated tabs are left out (their panel only
+        // exists while the experiment is on), as is Review without a repository.
         ...getOrderedBaseTabIds()
-          .filter((tabId) => {
-            const config = getTabConfig(tabId);
-            return config.inDefaultLayout !== true && config.featureFlag == null;
-          })
+          .filter(
+            (tabId) =>
+              getTabConfig(tabId).featureFlag == null && (canReviewDiffs || tabId !== "review")
+          )
           .map((tabId) => buildToggleTabCommand(wsId, tabId, section.navigation)),
         {
           id: CommandIds.navOpenLogFile(),
@@ -937,6 +949,20 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           run: () => updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical")),
         },
         {
+          id: CommandIds.navRightSidebarNewTab(),
+          title: "Right Sidebar: New Tab",
+          section: section.navigation,
+          shortcutHint: formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB),
+          keywords: ["new tab", "launcher", "tools", "open"],
+          visible: isRightSidebarShown,
+          // The sidebar opens it, as for "+" and the shortcut, so the launcher also takes focus.
+          run: () => {
+            window.dispatchEvent(
+              createCustomEvent(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, { workspaceId: wsId })
+            );
+          },
+        },
+        {
           id: CommandIds.navRightSidebarAddTool(),
           title: "Right Sidebar: Add Tool…",
           section: section.navigation,
@@ -991,7 +1017,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 return;
               }
 
-              updateRightSidebarLayout(wsId, (s) => addToolToFocusedTabset(s, tool));
+              // Same as picking the tool in the focused pane's New tab: it takes the New tab's
+              // place, or is selected where it is already open.
+              updateRightSidebarLayout(wsId, (s) => openToolFromNewTab(s, s.focusedTabsetId, tool));
               // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
               // opens the Stats dialog instead; with the sidebar visible it ignores the event.
               // "costs" is the Stats tab's id.
@@ -1059,7 +1087,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               },
             ],
             onSubmit: async (vals) => {
-              await p.onCaptureLayoutSlot?.(selected.workspaceId, slot, vals.name.trim());
+              const result = await p.onCaptureLayoutSlot?.(
+                selected.workspaceId,
+                slot,
+                vals.name.trim()
+              );
+              // The palette has already closed and ignores the submit promise, so a toast is the
+              // only way the user learns the capture was refused.
+              if (result && !result.success) {
+                showCommandFeedbackToast({ type: "error", message: result.error });
+              }
             },
           },
         });

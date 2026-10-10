@@ -3,6 +3,7 @@ import { GlobalWindow } from "happy-dom";
 import {
   isMac,
   matchesKeybind,
+  matchesNewSidebarTabKeybind,
   isKeybindDeprecated,
   KEYBINDS,
   paneHandlesKeyEvent,
@@ -34,6 +35,21 @@ function createEvent(overrides: Partial<KeyboardEvent> = {}): KeyboardEvent {
     ...overrides,
   } as KeyboardEvent;
 }
+
+describe("NEW_SIDEBAR_TAB keybind", () => {
+  test("matches Ctrl+Alt+N but not the same chord produced by AltGr", () => {
+    globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+    const chord = { key: "n", code: "KeyN", ctrlKey: true, altKey: true };
+
+    expect(matchesNewSidebarTabKeybind(createEvent(chord))).toBe(true);
+    // AltGr reports Ctrl+Alt on Windows/Linux layouts, where AltGr+N types a character.
+    expect(
+      matchesNewSidebarTabKeybind(
+        createEvent({ ...chord, getModifierState: (key: string) => key === "AltGraph" })
+      )
+    ).toBe(false);
+  });
+});
 
 describe("COPY_MARKDOWN keybind", () => {
   test("accepts M without modifiers and rejects modified keys", () => {
@@ -356,6 +372,7 @@ describe("global keybind collisions", () => {
     "FOCUS_BACKGROUND_PROCESSES",
     "FOCUS_CHAT",
     "CLOSE_TAB",
+    "NEW_SIDEBAR_TAB",
     "OPEN_TIMELINE_DIALOG",
     "OPEN_STATS_DIALOG",
     "OPEN_ARTIFACTS_TAB",

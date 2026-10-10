@@ -510,6 +510,22 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
   };
 
+  /** Open a tool from the right sidebar's New tab launcher ("+" first adds/shows the New tab). */
+  async function openFromNewTab(toolName: string): Promise<void> {
+    const addButton = page
+      .getByRole("complementary", { name: "Workspace insights" })
+      .getByRole("button", { name: "New tab", exact: true })
+      .first();
+    await expect(addButton).toBeVisible();
+    await addButton.click();
+    const row = page
+      .getByRole("complementary", { name: "Workspace insights" })
+      .getByRole("tabpanel")
+      .getByRole("button", { name: toolName, exact: true });
+    await expect(row).toBeVisible();
+    await row.click();
+  }
+
   const metaSidebar = {
     async expectVisible(): Promise<void> {
       await expect(page.getByRole("complementary", { name: "Workspace insights" })).toBeVisible();
@@ -517,6 +533,10 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
 
     async selectTab(label: string): Promise<void> {
       const tab = page.getByRole("tab", { name: label });
+      // The strip shows only opened tabs; open a missing tool from a New tab's launcher.
+      if (!(await tab.isVisible())) {
+        await openFromNewTab(label);
+      }
       await expect(tab).toBeVisible();
       await tab.click();
       const selected = await tab.getAttribute("aria-selected");
@@ -526,19 +546,13 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
 
     async addTerminal(): Promise<void> {
-      // Click the sidebar's "+" button to add a new terminal tab. The workspace header has a
-      // second "New terminal" button, so scope the lookup to the sidebar. The button sits next to
-      // the tablist, not inside it: a tablist may hold only tabs (#5951).
-      const addButton = page
-        .getByRole("complementary", { name: "Workspace insights" })
-        .getByRole("button", { name: "New terminal" });
-      await expect(addButton).toBeVisible();
-      await addButton.click();
+      // The sidebar's "+" opens a New tab; its launcher's Terminal row creates the terminal.
+      await openFromNewTab("Terminal");
       // Wait for a terminal tab to appear (name may be "Terminal" or include cwd path)
-      // and be selected. Use a locator that matches tabs containing "Terminal" or terminal icon.
+      // and be selected. Only terminal tabs have a "Close terminal" button.
       const terminalTab = page
         .locator('[role="tab"]')
-        .filter({ has: page.locator("svg") })
+        .filter({ has: page.getByRole("button", { name: "Close terminal" }) })
         .last();
       await expect(terminalTab).toBeVisible({ timeout: 5000 });
       await expect(terminalTab).toHaveAttribute("aria-selected", "true");

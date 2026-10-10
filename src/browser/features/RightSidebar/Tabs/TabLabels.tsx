@@ -18,6 +18,7 @@ import {
   Target,
   ListTree,
   MessagesSquare,
+  Plus,
   Terminal as TerminalIcon,
   Workflow,
   X,
@@ -26,6 +27,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/To
 import { getTerminalTabFallbackName } from "@/browser/types/rightSidebar";
 import { type ReviewStats } from "./registry";
 import { useAPI } from "@/browser/contexts/API";
+import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAdditionalSystemContextSnapshot } from "@/browser/utils/additionalSystemContextStore";
 import {
@@ -39,6 +41,7 @@ import {
 } from "@/browser/stores/WorkspaceStore";
 import { goalActiveMode, isGoalPendingPersistence } from "@/common/types/goal";
 import { sumUsageHistory, type ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
+import { SIDE_CHAT_INITIAL_TITLE } from "@/constants/workspaceDefaults";
 
 interface StatsTabLabelProps {
   workspaceId: string;
@@ -347,17 +350,36 @@ export const InstructionsTabLabel: React.FC<InstructionsTabLabelProps> = ({ work
   );
 };
 
-/** /side chat tab label: closing the tab discards the side chat. */
-export const SideChatTabLabel: React.FC<{ onClose: () => void }> = (props) => {
+/** Label of the New tab (the tool launcher). */
+export function NewTabLabel() {
   return (
-    <span className="inline-flex items-center gap-1">
+    <span className="inline-flex min-w-0 items-center gap-1">
+      <Plus className="h-3 w-3 shrink-0" />
+      <span className="truncate">New tab</span>
+    </span>
+  );
+}
+
+/** Shared by the label and its outer tooltip; title updates stay at the leaves of the strip. */
+export function SideChatTabTitle(props: { workspaceId: string }) {
+  const metadata = useOptionalWorkspaceMetadata();
+  const title = metadata?.workspaceMetadata.get(props.workspaceId)?.title?.trim();
+  return <>{title != null && title.length > 0 ? title : SIDE_CHAT_INITIAL_TITLE}</>;
+}
+
+/** /side chats use their live chat title, just like regular chats; closing discards the chat. */
+export const SideChatTabLabel: React.FC<{ workspaceId: string; onClose: () => void }> = (props) => {
+  return (
+    <span className="inline-flex min-w-0 items-center gap-1">
       <MessagesSquare className="h-3 w-3 shrink-0" />
-      <span>Side chat</span>
+      <span className="min-w-0 truncate">
+        <SideChatTabTitle workspaceId={props.workspaceId} />
+      </span>
       <Tooltip>
         <TooltipTrigger asChild>
           <button
             type="button"
-            className="text-muted hover:text-destructive -my-0.5 rounded p-0.5 transition-colors"
+            className="text-muted hover:text-destructive -my-0.5 shrink-0 rounded p-0.5 transition-colors"
             onClick={(e) => {
               e.stopPropagation();
               props.onClose();
@@ -396,14 +418,14 @@ export const TerminalTabLabel: React.FC<TerminalTabLabelProps> = ({
   const displayName = dynamicTitle ?? getTerminalTabFallbackName(terminalIndex);
 
   return (
-    <span className="inline-flex items-center gap-1">
+    <span className="inline-flex min-w-0 items-center gap-1">
       <TerminalIcon className="h-3 w-3 shrink-0" />
       <span className="max-w-[20ch] min-w-0 truncate">{displayName}</span>
       <Tooltip>
         <TooltipTrigger asChild>
           <button
             type="button"
-            className="text-muted hover:text-foreground -my-0.5 rounded p-0.5 transition-colors"
+            className="text-muted hover:text-foreground -my-0.5 shrink-0 rounded p-0.5 transition-colors"
             onClick={(e) => {
               e.stopPropagation();
               onPopOut();
@@ -419,7 +441,7 @@ export const TerminalTabLabel: React.FC<TerminalTabLabelProps> = ({
         <TooltipTrigger asChild>
           <button
             type="button"
-            className="text-muted hover:text-destructive -my-0.5 rounded p-0.5 transition-colors"
+            className="text-muted hover:text-destructive -my-0.5 shrink-0 rounded p-0.5 transition-colors"
             onClick={(e) => {
               e.stopPropagation();
               onClose();

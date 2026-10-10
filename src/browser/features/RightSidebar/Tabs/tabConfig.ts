@@ -17,9 +17,9 @@ export interface TabConfig {
   keepAlive?: boolean;
   /** Optional feature/experiment flag required to show this tab. */
   featureFlag?: string;
-  /** Whether the tab should appear in default layouts for new/existing workspaces. */
-  inDefaultLayout?: boolean;
-  /** Sort order in the default layout & Add-Tool picker. */
+  /** One plain line shown under the name in the New tab launcher. */
+  description: string;
+  /** Sort order in the New tab launcher & Add-Tool picker. */
   defaultOrder: number;
   /** Optional palette keywords to improve fuzzy search in the command palette. */
   paletteKeywords?: string[];
@@ -27,47 +27,49 @@ export interface TabConfig {
 
 const TAB_CONFIG_DEF = {
   costs: {
+    description: "Token usage, cost, and timing for this chat",
     name: "Stats",
     contentClassName: "overflow-y-auto p-[15px]",
-    inDefaultLayout: true,
     defaultOrder: 10,
     paletteKeywords: ["cost", "stats", "tokens", "timing"],
   },
   review: {
+    description: "Review the changes in this workspace",
     name: "Review",
     contentClassName: "overflow-y-auto p-0",
-    inDefaultLayout: true,
     defaultOrder: 20,
     paletteKeywords: ["review", "diff", "code review"],
   },
   instructions: {
+    description: "AGENTS.md files and extra context sent to the agent",
     name: "Instructions",
     contentClassName: "overflow-hidden p-0",
-    inDefaultLayout: true,
     defaultOrder: 30,
     paletteKeywords: ["agents", "agents.md", "claude.md", "instructions", "prompt", "context"],
   },
   goal: {
+    description: "Give the agent a goal and track its progress",
     name: "Goal",
     contentClassName: "overflow-y-auto p-0",
     defaultOrder: 35,
     paletteKeywords: ["goal", "target", "objective"],
   },
   workflows: {
+    description: "Workflow runs started from this chat",
     name: "Workflows",
     contentClassName: "overflow-y-auto p-[15px]",
-    inDefaultLayout: true,
     defaultOrder: 36,
     paletteKeywords: ["workflow", "workflows", "orchestration", "agents", "run"],
   },
   timeline: {
+    description: "Notable events in this chat",
     name: "Timeline",
     contentClassName: "overflow-hidden p-0",
-    inDefaultLayout: true,
     defaultOrder: 37,
     paletteKeywords: ["timeline", "events", "history", "activity"],
   },
   artifacts: {
+    description: "Files and app views to preview next to the chat",
     name: "Artifacts",
     contentClassName: "overflow-hidden p-0",
     featureFlag: EXPERIMENT_IDS.ARTIFACTS,
@@ -75,6 +77,7 @@ const TAB_CONFIG_DEF = {
     paletteKeywords: ["artifacts", "files", "report", "preview", "scratch"],
   },
   memory: {
+    description: "What the agent remembers across chats",
     name: "Memory",
     contentClassName: "overflow-hidden p-0",
     featureFlag: EXPERIMENT_IDS.MEMORY,
@@ -82,6 +85,7 @@ const TAB_CONFIG_DEF = {
     paletteKeywords: ["memory", "memories", "remember"],
   },
   desktop: {
+    description: "See and control the workspace desktop",
     name: "Desktop",
     contentClassName: "overflow-hidden p-0",
     featureFlag: EXPERIMENT_IDS.PORTABLE_DESKTOP,
@@ -89,6 +93,7 @@ const TAB_CONFIG_DEF = {
     paletteKeywords: ["desktop", "vnc", "screen"],
   },
   browser: {
+    description: "Watch and drive the agent browser",
     name: "Browser",
     contentClassName: "overflow-hidden p-0",
     keepAlive: false,
@@ -97,12 +102,14 @@ const TAB_CONFIG_DEF = {
     paletteKeywords: ["browser", "web"],
   },
   output: {
+    description: "Application logs",
     name: "Output",
     contentClassName: "overflow-hidden p-0",
     defaultOrder: 60,
     paletteKeywords: ["log", "logs", "output"],
   },
   debug: {
+    description: "Raw requests sent to the model provider",
     name: "Debug",
     contentClassName: "overflow-y-auto p-0",
     defaultOrder: 70,
@@ -126,13 +133,6 @@ export function isBaseTabId(value: unknown): value is BaseTabType {
 
 export function getTabConfig(id: BaseTabType): TabConfig {
   return TAB_CONFIG[id];
-}
-
-/** Default-layout tab ids in canonical order (used for new workspaces & migration). */
-export function getDefaultLayoutTabIds(): BaseTabType[] {
-  return BASE_TAB_IDS.filter((id) => TAB_CONFIG[id].inDefaultLayout === true).sort(
-    (a, b) => TAB_CONFIG[a].defaultOrder - TAB_CONFIG[b].defaultOrder
-  );
 }
 
 /** All static tabs ordered by defaultOrder (used by Add-Tool picker). */

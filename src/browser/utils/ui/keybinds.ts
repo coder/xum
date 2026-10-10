@@ -51,6 +51,19 @@ export function isMac(): boolean {
  * Check if a keyboard event matches a keybind definition.
  * On macOS, ctrl in the definition defaults to matching Ctrl or Cmd unless overridden.
  */
+/**
+ * AltGr is commonly reported as Ctrl+Alt (Windows and many Linux layouts) and types characters
+ * (e.g. AltGr+N), so Ctrl+Alt shortcuts must not claim AltGr input.
+ */
+export function isAltGraphPressed(event: React.KeyboardEvent | KeyboardEvent): boolean {
+  return typeof event.getModifierState === "function" && event.getModifierState("AltGraph");
+}
+
+/** NEW_SIDEBAR_TAB is a Ctrl/Cmd+Alt chord, so it ignores AltGr input (see isAltGraphPressed). */
+export function matchesNewSidebarTabKeybind(event: React.KeyboardEvent | KeyboardEvent): boolean {
+  return !isAltGraphPressed(event) && matchesKeybind(event, KEYBINDS.NEW_SIDEBAR_TAB);
+}
+
 export function matchesKeybind(
   event: React.KeyboardEvent | KeyboardEvent,
   keybind: Keybind
@@ -525,7 +538,14 @@ export const KEYBINDS = {
   // macOS: Cmd+I, Win/Linux: Ctrl+I
   FOCUS_CHAT: { key: "I", ctrl: true },
 
-  /** Close current tab in right sidebar (if closeable - currently only terminal tabs) */
+  /** Open (or show) a New tab, the tool launcher, in the focused right-sidebar pane */
+  // macOS: Cmd+Option+N, Win/Linux: Ctrl+Alt+N. "New" mnemonic without Ctrl/Cmd+N (new
+  // workspace) or Ctrl/Cmd+Shift+N (new scratch chat). Ctrl/Cmd+Alt+T would mirror
+  // OPEN_TERMINAL, but GNOME/Ubuntu reserve Ctrl+Alt+T for a system terminal. Matched by
+  // `code` because Option+N is a dead key on macOS (event.key is "Dead").
+  NEW_SIDEBAR_TAB: { key: "n", code: "KeyN", ctrl: true, alt: true },
+
+  /** Close the active tab of the focused right-sidebar pane */
   // macOS: Cmd+W (matches Ghostty), Win/Linux: Ctrl+W
   CLOSE_TAB: { key: "w", ctrl: true, macCtrlBehavior: "command" },
 

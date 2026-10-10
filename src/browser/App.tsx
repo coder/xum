@@ -132,6 +132,7 @@ import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen"
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { markAppShellReady } from "@/browser/utils/perf/appShellReady";
+import { Err, Ok } from "@/common/types/result";
 
 function RootRouteShell(props: {
   leftSidebarCollapsed: boolean;
@@ -1010,9 +1011,11 @@ function AppInner() {
     },
     onCaptureLayoutSlot: async (workspaceId, slot, name) => {
       try {
-        await saveCurrentWorkspaceToSlot(workspaceId, slot, name);
+        const result = await saveCurrentWorkspaceToSlot(workspaceId, slot, name);
+        // A refused capture (nothing saveable open) reaches the palette, which shows it.
+        return result.success ? Ok(undefined) : Err(result.error);
       } catch {
-        // Best-effort only.
+        return Err("Failed to save layout.");
       }
     },
     onClearTimingStats: (workspaceId: string) => workspaceStore.clearTimingStats(workspaceId),

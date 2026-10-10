@@ -1,5 +1,4 @@
-import { isTabType, type TabType } from "@/browser/types/rightSidebar";
-import { getDefaultLayoutTabIds } from "@/browser/features/RightSidebar/Tabs/tabConfig";
+import { isNewTab, isTabType, NEW_TAB, type TabType } from "@/browser/types/rightSidebar";
 
 export type RightSidebarLayoutNode =
   | {
@@ -15,6 +14,8 @@ export type RightSidebarLayoutNode =
       tabs: TabType[];
       activeTab: TabType;
     };
+
+type TabsetNode = Extract<RightSidebarLayoutNode, { type: "tabset" }>;
 
 function isLayoutNode(value: unknown): value is RightSidebarLayoutNode {
   if (!value || typeof value !== "object") return false;
@@ -41,7 +42,14 @@ function isLayoutNode(value: unknown): value is RightSidebarLayoutNode {
   return false;
 }
 
-export function isRightSidebarLayoutState(value: unknown): value is RightSidebarLayoutState {
+/** A persisted layout: legacy ones lack the `openTabsOnly` marker (parse migrates them). */
+type PersistedRightSidebarLayoutState = Omit<RightSidebarLayoutState, "openTabsOnly"> & {
+  openTabsOnly?: unknown;
+};
+
+export function isRightSidebarLayoutState(
+  value: unknown
+): value is PersistedRightSidebarLayoutState {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   if (v.version !== 1) return false;
@@ -50,36 +58,48 @@ export function isRightSidebarLayoutState(value: unknown): value is RightSidebar
   if (!isLayoutNode(v.root)) return false;
   return findTabset(v.root, v.focusedTabsetId) !== null;
 }
+
+/**
+ * `openTabsOnly`: the strip holds only tabs that were opened (by the user or a real event),
+ * plus at most one "New tab" per tabset. Layouts without it come from builds that re-injected
+ * every default tool on each parse, and get migrated once.
+ *
+ * Still `version: 1` with a marker field instead of a version bump, so a downgraded build
+ * keeps reading the layout (its validator requires version 1 and ignores unknown keys) instead
+ * of resetting the user's splits and tab order. Older builds do reject a layout that contains
+ * the "new" tab type (their isTabType does not know it) and fall back to their default.
+ */
 export interface RightSidebarLayoutState {
   version: 1;
+  openTabsOnly: true;
   nextId: number;
   focusedTabsetId: string;
   root: RightSidebarLayoutNode;
 }
 
-export function getDefaultRightSidebarLayoutState(activeTab: TabType): RightSidebarLayoutState {
-  // Default tabs come from the registry's `inDefaultLayout` flag — no
-  // hardcoded list to keep in sync. Adding a tab to the default layout is a
-  // one-line metadata change in `Tabs/tabConfig.ts`.
-  const defaultTabs: TabType[] = [...getDefaultLayoutTabIds()];
-  const tabs = defaultTabs.includes(activeTab) ? defaultTabs : [...defaultTabs, activeTab];
-
+/**
+ * A single tabset. With no requested tool it holds just the "New tab" launcher, which guides
+ * the user to the tools instead of showing every tool as an idle tab.
+ */
+export function getDefaultRightSidebarLayoutState(activeTab?: TabType): RightSidebarLayoutState {
+  const tab = activeTab ?? NEW_TAB;
   return {
     version: 1,
+    openTabsOnly: true,
     nextId: 2,
     focusedTabsetId: "tabset-1",
     root: {
       type: "tabset",
       id: "tabset-1",
-      tabs,
-      activeTab,
+      tabs: [tab],
+      activeTab: tab,
     },
   };
 }
 
 export function parseRightSidebarLayoutState(
   raw: unknown,
-  activeTabFallback: TabType
+  activeTabFallback?: TabType
 ): RightSidebarLayoutState {
   // Pre-parse migration: strip removed static tabs from raw data before validation.
   // Must run before isRightSidebarLayoutState since isTabType rejects legacy tabs.
@@ -90,51 +110,70 @@ export function parseRightSidebarLayoutState(
     }
   }
 
-  if (isRightSidebarLayoutState(raw)) {
-    // Post-validation migration: auto-add any registry-declared `inDefaultLayout`
-    // tabs that the persisted layout is missing. This means newly-introduced
-    // default tabs (e.g., the Instructions tab) appear for existing users
-    // automatically — no user action, no extra bookkeeping in this module.
-    return ensureDefaultLayoutTabs(raw);
+  if (!isRightSidebarLayoutState(raw)) {
+    return getDefaultRightSidebarLayoutState(activeTabFallback);
   }
 
-  return getDefaultRightSidebarLayoutState(activeTabFallback);
+  if (raw.openTabsOnly !== true) {
+    return {
+      ...raw,
+      openTabsOnly: true,
+      root: mapTabsets(raw.root, migrateLegacyTabset),
+    };
+  }
+
+  // Marked layouts are used as-is; only repair invalid tabsets (empty, duplicate New tabs, a
+  // stale activeTab). Returns the same object when nothing changed so the persist-back effect
+  // in RightSidebar settles instead of rewriting storage on every render.
+  const marked = raw as RightSidebarLayoutState;
+  const root = mapTabsets(marked.root, normalizeTabset);
+  return root === marked.root ? marked : { ...marked, root };
 }
 
 /**
- * Ensure every `inDefaultLayout: true` tab from the registry is present in
- * `state`. Missing tabs are appended to the first tabset (the natural
- * upper-left landing spot) without changing the active tab. Already-present
- * tabs are left where the user moved them.
+ * Tabs the legacy runtime added by itself: parse re-injected the default tools (Stats, Review,
+ * Instructions, Workflows, Timeline) and the sidebar auto-added Goal and the setting- or
+ * experiment-gated tools. In a legacy layout these say nothing about what the user opened.
+ * Anything else (Output, terminals, side chats) was opened on purpose and is kept.
  */
-function ensureDefaultLayoutTabs(state: RightSidebarLayoutState): RightSidebarLayoutState {
-  const required = getDefaultLayoutTabIds();
-  if (required.length === 0) return state;
+const LEGACY_AUTO_ADDED_TABS: ReadonlySet<TabType> = new Set<TabType>([
+  "costs",
+  "review",
+  "instructions",
+  "workflows",
+  "timeline",
+  "goal",
+  "debug",
+  "desktop",
+  "browser",
+  "memory",
+  "artifacts",
+]);
 
-  const present = new Set<TabType>(collectAllTabs(state.root));
-  const missing: TabType[] = required.filter((tab) => !present.has(tab));
-  if (missing.length === 0) return state;
-
-  const firstTabsetId = findFirstTabsetId(state.root);
-  if (!firstTabsetId) return state;
-
-  const root = appendTabsToTabset(state.root, firstTabsetId, missing);
-  return root === state.root ? state : { ...state, root };
+/** Drop auto-added tabs, except the one the user was looking at. */
+function migrateLegacyTabset(node: TabsetNode): TabsetNode {
+  const kept = node.tabs.filter(
+    (tab) => !LEGACY_AUTO_ADDED_TABS.has(tab) || tab === node.activeTab
+  );
+  return normalizeTabset({ ...node, tabs: kept });
 }
 
-/** Append tabs to the named tabset, returning a new tree (or the original if unchanged). */
-function appendTabsToTabset(
-  node: RightSidebarLayoutNode,
-  tabsetId: string,
-  tabs: TabType[]
-): RightSidebarLayoutNode {
-  if (node.type === "tabset") {
-    if (node.id !== tabsetId) return node;
-    return { ...node, tabs: [...node.tabs, ...tabs] };
-  }
+/** Non-empty tabs, at most one New tab, and an activeTab that is one of the tabs. */
+function normalizeTabset(node: TabsetNode): TabsetNode {
+  let tabs = node.tabs.filter((tab, index) => !isNewTab(tab) || node.tabs.indexOf(tab) === index);
+  if (tabs.length === 0) tabs = [NEW_TAB];
+  const activeTab = tabs.includes(node.activeTab) ? node.activeTab : tabs[0];
+  if (tabs.length === node.tabs.length && activeTab === node.activeTab) return node;
+  return { ...node, tabs, activeTab };
+}
 
-  const left = appendTabsToTabset(node.children[0], tabsetId, tabs);
-  const right = appendTabsToTabset(node.children[1], tabsetId, tabs);
+function mapTabsets(
+  node: RightSidebarLayoutNode,
+  fn: (tabset: TabsetNode) => TabsetNode
+): RightSidebarLayoutNode {
+  if (node.type === "tabset") return fn(node);
+  const left = mapTabsets(node.children[0], fn);
+  const right = mapTabsets(node.children[1], fn);
   if (left === node.children[0] && right === node.children[1]) return node;
   return { ...node, children: [left, right] };
 }
@@ -152,13 +191,13 @@ function stripRemovedStaticTabs(node: Record<string, unknown>): void {
         (typeof tab === "string" && tab.startsWith("file:"));
       const filtered = (node.tabs as unknown[]).filter((tab) => !isRemovedTab(tab));
       if (filtered.length !== (node.tabs as unknown[]).length) {
-        // Ensure at least one tab remains — a removed-only tabset becomes ["costs"].
-        node.tabs = filtered.length > 0 ? filtered : ["costs"];
+        // A removed-only tabset becomes the New tab, like any other emptied tabset.
+        node.tabs = filtered.length > 0 ? filtered : [NEW_TAB];
       }
       if (isRemovedTab(node.activeTab)) {
         node.activeTab = (node.tabs as unknown[]).includes("costs")
           ? "costs"
-          : ((node.tabs as unknown[])[0] ?? "costs");
+          : ((node.tabs as unknown[])[0] ?? NEW_TAB);
       }
     }
     return;
@@ -171,7 +210,6 @@ function stripRemovedStaticTabs(node: Record<string, unknown>): void {
     }
   }
 }
-
 export function findTabset(
   root: RightSidebarLayoutNode,
   tabsetId: string
@@ -241,7 +279,8 @@ export function removeTabEverywhere(
     return state;
   }
   if (!nextRoot) {
-    return getDefaultRightSidebarLayoutState("costs");
+    // Never an empty strip: closing the last tab leaves the New tab behind.
+    return getDefaultRightSidebarLayoutState();
   }
 
   const focusedExists = findTabset(nextRoot, state.focusedTabsetId) !== null;
@@ -255,6 +294,27 @@ export function removeTabEverywhere(
     focusedTabsetId,
   };
 }
+/**
+ * Add (or re-select) a tab in a tabset. Opening a tool where the New tab is the only tab, or
+ * the one being looked at, replaces it in place: the New tab is a launcher, and leaving it
+ * beside the tool it launched would add an idle tab to the strip.
+ */
+function insertTab(ts: TabsetNode, tab: TabType, activate: boolean): TabsetNode {
+  if (ts.tabs.includes(tab)) {
+    return activate && ts.activeTab !== tab ? { ...ts, activeTab: tab } : ts;
+  }
+  const newIndex = ts.tabs.findIndex(isNewTab);
+  const replacesNewTab =
+    !isNewTab(tab) &&
+    newIndex !== -1 &&
+    (ts.tabs.length === 1 || (activate && isNewTab(ts.activeTab)));
+  if (replacesNewTab) {
+    const tabs = ts.tabs.map((t, index) => (index === newIndex ? tab : t));
+    return { ...ts, tabs, activeTab: activate || isNewTab(ts.activeTab) ? tab : ts.activeTab };
+  }
+  return { ...ts, tabs: [...ts.tabs, tab], activeTab: activate ? tab : ts.activeTab };
+}
+
 function updateNode(
   node: RightSidebarLayoutNode,
   tabsetId: string,
@@ -298,10 +358,7 @@ export function selectTabInTabset(
 
   return {
     ...state,
-    root: updateNode(state.root, tabsetId, (ts) => {
-      const tabs = ts.tabs.includes(tab) ? ts.tabs : [...ts.tabs, tab];
-      return { ...ts, tabs, activeTab: tab };
-    }),
+    root: updateNode(state.root, tabsetId, (ts) => insertTab(ts, tab, true)),
   };
 }
 
@@ -359,10 +416,7 @@ export function selectTabInFocusedTabset(
 
   return {
     ...state,
-    root: updateNode(state.root, focused.id, (ts) => {
-      const tabs = ts.tabs.includes(tab) ? ts.tabs : [...ts.tabs, tab];
-      return { ...ts, tabs, activeTab: tab };
-    }),
+    root: updateNode(state.root, focused.id, (ts) => insertTab(ts, tab, true)),
   };
 }
 
@@ -378,13 +432,6 @@ export function splitFocusedTabset(
   const splitAlloc = allocId(state, "split");
   const tabsetAlloc = allocId({ ...state, nextId: splitAlloc.nextId }, "tabset");
 
-  const fallbackTab: TabType =
-    focused.activeTab === "terminal"
-      ? "costs"
-      : focused.activeTab === "costs"
-        ? "terminal"
-        : "terminal";
-
   let left: Extract<RightSidebarLayoutNode, { type: "tabset" }> = focused;
   let right: Extract<RightSidebarLayoutNode, { type: "tabset" }>;
   const newFocusedId = tabsetAlloc.id;
@@ -392,7 +439,7 @@ export function splitFocusedTabset(
   if (focused.tabs.length > 1) {
     const moved = focused.activeTab;
     const remaining = focused.tabs.filter((t) => t !== moved);
-    const oldActive = remaining[0] ?? "costs";
+    const oldActive = remaining[0] ?? NEW_TAB;
 
     left = {
       ...focused,
@@ -407,12 +454,13 @@ export function splitFocusedTabset(
       activeTab: moved,
     };
   } else {
-    // Avoid empty tabsets: keep the current tabset intact and spawn a useful default neighbor.
+    // Avoid empty tabsets: keep the current tabset intact and give the new pane a New tab,
+    // so the user picks what it shows.
     right = {
       type: "tabset",
       id: tabsetAlloc.id,
-      tabs: [fallbackTab],
-      activeTab: fallbackTab,
+      tabs: [NEW_TAB],
+      activeTab: NEW_TAB,
     };
   }
 
@@ -488,7 +536,9 @@ export function collectAllTabsWithTabset(
   node: RightSidebarLayoutNode
 ): Array<{ tab: TabType; tabsetId: string }> {
   if (node.type === "tabset") {
-    return node.tabs.map((tab) => ({ tab, tabsetId: node.id }));
+    // New tabs are launchers, not tools: they get no Ctrl/Cmd+number slot and are never the
+    // target of select-or-add lookups (a layout may hold one per tabset).
+    return node.tabs.filter((tab) => !isNewTab(tab)).map((tab) => ({ tab, tabsetId: node.id }));
   }
   return [
     ...collectAllTabsWithTabset(node.children[0]),
@@ -539,27 +589,11 @@ export function addTabToFocusedTabset(
     return state;
   }
 
-  // Already has the tab - just activate if requested
-  if (focused.tabs.includes(tab)) {
-    if (activate && focused.activeTab !== tab) {
-      return {
-        ...state,
-        root: updateNode(state.root, focused.id, (ts) => ({
-          ...ts,
-          activeTab: tab,
-        })),
-      };
-    }
-    return state;
-  }
-
+  const next = insertTab(focused, tab, activate);
+  if (next === focused) return state;
   return {
     ...state,
-    root: updateNode(state.root, focused.id, (ts) => ({
-      ...ts,
-      tabs: [...ts.tabs, tab],
-      activeTab: activate ? tab : ts.activeTab,
-    })),
+    root: updateNode(state.root, focused.id, () => next),
   };
 }
 
@@ -576,6 +610,151 @@ export function selectOrAddTab(
   }
 
   return addTabToFocusedTabset(state, tab);
+}
+
+/** Show the tabset's New tab, adding it (at the end) when the tabset has none. */
+export function addNewTabToTabset(
+  state: RightSidebarLayoutState,
+  tabsetId: string
+): RightSidebarLayoutState {
+  const target = findTabset(state.root, tabsetId);
+  if (target?.type !== "tabset") return state;
+  return selectTabInTabset(setFocusedTabset(state, tabsetId), tabsetId, NEW_TAB);
+}
+
+/**
+ * Open a tool from a tabset's New tab (the launcher). The tool replaces the New tab in place
+ * and is selected; a tool already open is selected where it is (this tabset first) and the
+ * New tab goes away. If the tabset no longer exists, the tool opens in the focused pane.
+ */
+export function openToolFromNewTab(
+  state: RightSidebarLayoutState,
+  tabsetId: string,
+  tool: TabType
+): RightSidebarLayoutState {
+  if (isNewTab(tool)) return state;
+  const target = findTabset(state.root, tabsetId);
+  if (target?.type !== "tabset") {
+    // The launcher's pane closed before the tool arrived (a terminal opens only once its
+    // session exists): open it in the focused (or first) pane rather than dropping it, which
+    // would leave a live session with no tab.
+    const fallbackId =
+      findTabset(state.root, state.focusedTabsetId) !== null
+        ? state.focusedTabsetId
+        : findFirstTabsetId(state.root);
+    return fallbackId == null ? state : selectOrAddTab(setFocusedTabset(state, fallbackId), tool);
+  }
+
+  // A copy in this tabset wins over one elsewhere (a tool can sit in several panes, e.g. after
+  // a drag); a depth-first search alone could pick an earlier pane and move focus away.
+  const existing = target.tabs.includes(tool)
+    ? { tab: tool, tabsetId }
+    : collectAllTabsWithTabset(state.root).find((t) => t.tab === tool);
+  if (existing) {
+    // In another tabset, closing the New tab may collapse its (now pointless) pane.
+    const next =
+      existing.tabsetId === tabsetId
+        ? removeTabFromTabset(state, tabsetId, NEW_TAB)
+        : closeTabInTabset(state, tabsetId, NEW_TAB);
+    return selectTabInTabset(setFocusedTabset(next, existing.tabsetId), existing.tabsetId, tool);
+  }
+
+  const newIndex = target.tabs.findIndex(isNewTab);
+  const tabs =
+    newIndex === -1
+      ? [...target.tabs, tool]
+      : target.tabs.map((t, index) => (index === newIndex ? tool : t));
+  return {
+    ...setFocusedTabset(state, tabsetId),
+    root: updateNode(state.root, tabsetId, (ts) => ({ ...ts, tabs, activeTab: tool })),
+  };
+}
+
+/**
+ * Remove a tab from one tabset, keeping the tabset (a lone tab becomes the New tab) instead
+ * of collapsing the pane. Used when the New tab hands its place to a tool in the same tabset.
+ */
+function removeTabFromTabset(
+  state: RightSidebarLayoutState,
+  tabsetId: string,
+  tab: TabType
+): RightSidebarLayoutState {
+  const target = findTabset(state.root, tabsetId);
+  if (target?.type !== "tabset" || !target.tabs.includes(tab)) return state;
+  const root = updateNode(state.root, tabsetId, (ts) => {
+    const oldIndex = ts.tabs.indexOf(tab);
+    const tabs = ts.tabs.filter((t) => t !== tab);
+    if (tabs.length === 0) return { ...ts, tabs: [NEW_TAB], activeTab: NEW_TAB };
+    const activeTab =
+      ts.activeTab === tab ? tabs[Math.min(oldIndex, tabs.length - 1)] : ts.activeTab;
+    return { ...ts, tabs, activeTab };
+  });
+  return { ...state, root };
+}
+
+/**
+ * Close one tab of one tabset (the strip's X, middle-click, Close Tab shortcut). A tabset left
+ * empty collapses into its sibling; when it was the last tabset, the New tab takes its place.
+ * Closing the New tab when it is the only tab of the layout does nothing.
+ *
+ * Scoped to a tabset (unlike removeTabEverywhere) because each tabset may hold its own New tab.
+ */
+export function closeTabInTabset(
+  state: RightSidebarLayoutState,
+  tabsetId: string,
+  tab: TabType
+): RightSidebarLayoutState {
+  const target = findTabset(state.root, tabsetId);
+  if (target?.type !== "tabset" || !target.tabs.includes(tab)) return state;
+
+  if (target.tabs.length > 1) {
+    return removeTabFromTabset(state, tabsetId, tab);
+  }
+
+  if (state.root.type === "tabset") {
+    // The only pane: leave the New tab (a no-op when that is what is being closed).
+    return isNewTab(tab) ? state : getDefaultRightSidebarLayoutState();
+  }
+
+  const root = removeTabsetNode(state.root, tabsetId);
+  if (root === null) return getDefaultRightSidebarLayoutState();
+  const focusedTabsetId =
+    findTabset(root, state.focusedTabsetId) !== null
+      ? state.focusedTabsetId
+      : (findFirstTabsetId(root) ?? "tabset-1");
+  return { ...state, root, focusedTabsetId };
+}
+
+/**
+ * The tab shown where `tab` was, after closing it turned `prev` into `next`: the pane's new
+ * active tab, or the focused pane's when the pane itself closed. Null when `tab` was not on
+ * screen (not its pane's active tab), so closing it reveals nothing.
+ */
+export function getTabRevealedByClose(
+  prev: RightSidebarLayoutState,
+  next: RightSidebarLayoutState,
+  tabsetId: string,
+  tab: TabType
+): TabType | null {
+  const before = findTabset(prev.root, tabsetId);
+  if (before?.type !== "tabset" || before.activeTab !== tab) return null;
+  const after = findTabset(next.root, tabsetId);
+  if (after?.type === "tabset") return after.activeTab;
+  return getFocusedActiveTab(next, NEW_TAB);
+}
+
+/** Drop a tabset from the tree, promoting its sibling in place of their split. */
+function removeTabsetNode(
+  node: RightSidebarLayoutNode,
+  tabsetId: string
+): RightSidebarLayoutNode | null {
+  if (node.type === "tabset") return node.id === tabsetId ? null : node;
+  const left = removeTabsetNode(node.children[0], tabsetId);
+  const right = removeTabsetNode(node.children[1], tabsetId);
+  if (!left) return right;
+  if (!right) return left;
+  if (left === node.children[0] && right === node.children[1]) return node;
+  return { ...node, children: [left, right] };
 }
 
 /**
@@ -623,9 +802,8 @@ export function moveTabToTabset(
         return { ...node, tabs: newTabs, activeTab: newActiveTab };
       }
       if (node.id === targetTabsetId) {
-        // Add tab to target (avoid duplicates)
-        const newTabs = target.tabs.includes(tab) ? target.tabs : [...target.tabs, tab];
-        return { ...node, tabs: newTabs, activeTab: tab };
+        // Add tab to target (avoids duplicates; replaces a lone New tab)
+        return insertTab(node, tab, true);
       }
       return node;
     }
@@ -674,10 +852,6 @@ export function moveTabToTabset(
 }
 
 export type TabDockEdge = "left" | "right" | "top" | "bottom";
-
-function getFallbackTabForEmptyTabset(movedTab: TabType): TabType {
-  return movedTab === "terminal" ? "costs" : movedTab === "costs" ? "terminal" : "terminal";
-}
 
 /**
  * Create a new split adjacent to a target tabset and dock a dragged tab into it.
@@ -731,8 +905,8 @@ export function dockTabToEdge(
         // When dragging out of this tabset, remove the tab before splitting.
         if (sourceTabsetId === targetTabsetId) {
           const remaining = node.tabs.filter((t) => t !== tab);
-          const fallbackTab = getFallbackTabForEmptyTabset(tab);
-          const nextTabs = remaining.length > 0 ? remaining : [fallbackTab];
+          // Dragging out the last tab leaves a New tab behind instead of an empty pane.
+          const nextTabs = remaining.length > 0 ? remaining : [NEW_TAB];
           const nextActiveTab =
             node.activeTab === tab || !nextTabs.includes(node.activeTab)
               ? nextTabs[0]

@@ -2,6 +2,9 @@ import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { getReviewDiffBaseKey } from "@/common/constants/storage";
 import { THINKING_LEVEL_OFF } from "@/common/types/thinking";
 
+/** Displayed until the side conversation's first user message supplies its own title. */
+export const SIDE_CHAT_INITIAL_TITLE = "New chat";
+
 /**
  * Storage key helpers for persisted settings.
  */

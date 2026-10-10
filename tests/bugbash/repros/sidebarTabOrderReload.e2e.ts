@@ -13,9 +13,21 @@ test(
     await browser.setViewport({ width: 1440, height: 900 });
     await openPlayground(app, screen, browser);
     const tablist = screen.getByRole("tablist", "Sidebar views");
+    // The strip shows only opened tabs: open Artifacts, then Goal after it, from New tabs.
+    for (const tool of ["Artifacts", "Goal"]) {
+      // The launcher button is a sibling of the tablist so the list owns only tabs.
+      await screen
+        .getByRole("complementary", "Workspace insights")
+        .getByRole("button", "New tab")
+        .tap();
+      await screen
+        .getByRole("tabpanel", /^New tab/)
+        .getByRole("button", tool)
+        .tap();
+    }
     const artifactsTab = tablist.getByRole("tab", /^Artifacts/);
     await expect(artifactsTab).toBeVisible({ timeout: 15_000 });
-    // The seeded order has Goal after Artifacts, so moving Artifacts to the end shows.
+    // Goal sits after Artifacts, so moving Artifacts to the end shows.
     const saved = await tablist.getByRole("tab").allTextContents();
     expect(saved.findIndex((tab) => tab.startsWith("Artifacts"))).toBeLessThan(saved.length - 1);
 

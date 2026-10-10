@@ -141,6 +141,7 @@ const DESKTOP_ONLY_CLASSES = new Set([
   "titlebar-safe-right-gutter-2",
   "titlebar-safe-right-gutter-3",
   "titlebar-safe-right-minus-sidebar",
+  "titlebar-safe-right-capped",
   // Mobile app shell: these rules live in the desktop shell's (max-width: 768px) and
   // (pointer: coarse) media blocks (sidebar overlay, sticky header). The webview has no app shell
   // and does not bundle these components.
@@ -290,7 +291,10 @@ describe("webview stylesheet", () => {
   // Pixel never emulates a coarse pointer, so this static contract is what keeps the webview's
   // touch targets (VS Code on touch-primary devices) equal to the desktop's.
   test("gives buttons the desktop's coarse-pointer touch targets", async () => {
-    const expected = { "min-height": `${MOBILE_TOUCH_TARGET_PX}px`, "min-width": `${MOBILE_TOUCH_TARGET_PX}px` };
+    const expected = {
+      "min-height": `${MOBILE_TOUCH_TARGET_PX}px`,
+      "min-width": `${MOBILE_TOUCH_TARGET_PX}px`,
+    };
     expect(coarseTouchTargets(await loadDesktopCss())).toEqual(expected);
     expect(coarseTouchTargets(await loadWebviewCss())).toEqual(expected);
   }, 30_000);

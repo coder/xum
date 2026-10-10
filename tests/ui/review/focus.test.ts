@@ -35,6 +35,10 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
       try {
         await setupWorkspaceView(view, metadata, workspaceId);
 
+        // The strip holds only opened tabs: open Stats, then Review (tabs 1 and 2).
+        await view.selectTab("costs");
+        await view.selectTab("review");
+
         // Ensure focus starts outside the review panel.
         await view.selectTab("costs");
         const costsTab = view.container.querySelector<HTMLElement>(
@@ -43,7 +47,7 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
         expect(costsTab).not.toBeNull();
         costsTab?.focus();
 
-        // Trigger the tab shortcut for the 2nd right-sidebar tab (default: Review).
+        // Trigger the tab shortcut for the 2nd right-sidebar tab (Review).
         // Use ctrlKey so this works regardless of OS detection (matchesKeybind treats
         // Ctrl/Cmd as equivalent on macOS).
         fireEvent.keyDown(window, { key: "2", ctrlKey: true });

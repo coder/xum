@@ -1251,6 +1251,30 @@ function handleClearCommand(
  * the sidebar is hidden (narrow viewports) it takes over the chat view instead, like Codex, and
  * leaving it discards it (useDiscardSideChatOnLeave).
  */
+export async function openSideChat(options: {
+  api: RouterClient<AppRouter>;
+  workspaceId: string;
+  /** Replace this launcher's New tab; slash commands simply add a tab. */
+  tabsetId?: string;
+}): Promise<void> {
+  const result = await options.api.workspace.createSideChat({
+    parentWorkspaceId: options.workspaceId,
+  });
+  if (!result.success) throw new Error(result.error);
+  // Both entry points inherit the same settings without submitting or modifying the main draft.
+  copyWorkspaceStorage(options.workspaceId, result.metadata.id);
+  const openTab = new CustomEvent(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, {
+    detail: {
+      workspaceId: options.workspaceId,
+      sideChatWorkspaceId: result.metadata.id,
+      tabsetId: options.tabsetId,
+    },
+    cancelable: true,
+  });
+  // A hidden sidebar leaves this unclaimed, so narrow layouts still open the full-screen chat.
+  if (window.dispatchEvent(openTab)) dispatchWorkspaceSwitch(result.metadata);
+}
+
 function handleSideCommand(env: WorkspaceCommandEnv): CommandResult {
   return phase([{ type: "clear-input" }, { type: "set-sending", sending: true }], async () => {
     const failed = (message: string) =>
@@ -1259,23 +1283,7 @@ function handleSideCommand(env: WorkspaceCommandEnv): CommandResult {
         { type: "set-sending", sending: false },
       ]);
     try {
-      const result = await env.api.workspace.createSideChat({
-        parentWorkspaceId: env.workspaceId,
-      });
-      if (!result.success) {
-        return failed(result.error);
-      }
-      const sideWorkspaceId = result.metadata.id;
-      // Same model/agent/thinking settings as the main chat, like a fork.
-      copyWorkspaceStorage(env.workspaceId, sideWorkspaceId);
-      const openTab = new CustomEvent(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, {
-        detail: { workspaceId: env.workspaceId, sideChatWorkspaceId: sideWorkspaceId },
-        cancelable: true,
-      });
-      // dispatchEvent returns false once the sidebar claimed the event (showed the tab).
-      if (window.dispatchEvent(openTab)) {
-        dispatchWorkspaceSwitch(result.metadata);
-      }
+      await openSideChat({ api: env.api, workspaceId: env.workspaceId });
       trackCommandUsed("side");
       return complete("consume", [{ type: "set-sending", sending: false }]);
     } catch (error) {

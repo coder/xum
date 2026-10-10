@@ -12,8 +12,13 @@ import { expect, userEvent, waitFor, within } from "@storybook/test";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { getReviewImmersiveKey, RIGHT_SIDEBAR_WIDTH_KEY } from "@/common/constants/storage";
+import {
+  getReviewImmersiveKey,
+  getRightSidebarLayoutKey,
+  RIGHT_SIDEBAR_WIDTH_KEY,
+} from "@/common/constants/storage";
 import type { ProjectConfig } from "@/node/config";
+import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 
@@ -104,20 +109,18 @@ async function expectSeededPageAudits(canvasElement: HTMLElement) {
   await expect(nonTabChildren).toEqual([]);
   const tabStrip = tablist.parentElement;
   if (!tabStrip) throw new Error("Tab strip not rendered");
-  const addTerminal = within(tabStrip).getByRole("button", { name: "New terminal" });
+  const addTab = within(tabStrip).getByRole("button", { name: "New tab" });
+  // The launcher replaces direct terminal creation but must remain outside the tablist.
   // The sidebar fades in, so wait for it before checking visibility.
-  await waitFor(() => expect(addTerminal).toBeVisible());
+  await waitFor(() => expect(addTab).toBeVisible());
   // The tablist renders its own box: Safari has dropped the role of `display: contents`
   // elements, which have no client rects (#5962).
   await expect(tablist.getClientRects().length).toBeGreaterThan(0);
-  // "+" stays right after the last tab, in the same row, when the tabs wrap.
-  const tabs = within(tablist).getAllByRole("tab");
-  const lastTab = tabs[tabs.length - 1].getBoundingClientRect();
-  const add = addTerminal.getBoundingClientRect();
-  await expect(Math.abs(add.left - (lastTab.right + TAB_GAP_PX))).toBeLessThan(1);
-  await expect(
-    Math.abs(add.top + add.height / 2 - (lastTab.top + lastTab.height / 2))
-  ).toBeLessThan(1);
+  // The launcher stays beside the scrolling row, not after an offscreen last tab.
+  const row = tablist.getBoundingClientRect();
+  const add = addTab.getBoundingClientRect();
+  await expect(Math.abs(add.left - (row.right + TAB_GAP_PX))).toBeLessThan(1);
+  await expect(Math.abs(add.top + add.height / 2 - (row.top + row.height / 2))).toBeLessThan(1);
 
   // button-name: icon-only and combobox triggers need a name of their own.
   await expect(await canvas.findByRole("button", { name: "Open in editor" })).toBeVisible();
@@ -149,8 +152,8 @@ export const Dark = contractStory("dark");
 
 /**
  * Narrowest right sidebar (#5962). The right sidebar is hidden at phone width, so its narrowest
- * real layout is the minimum sidebar width. The tabs and "+" flow inline there, so the strip must
- * wrap without overflow and keep "+" after the last tab: in the same row, or first in the next.
+ * real layout is the minimum sidebar width. Open tabs scroll within one row while "+" stays
+ * visible beside it; neither the row nor the launcher may overflow the sidebar.
  */
 const NARROW_SIDEBAR_WIDTH_PX = 300;
 
@@ -160,8 +163,22 @@ const narrowSidebarStory = (theme: ThemeMode): AppStory => ({
   render: () => (
     <AppWithMocks
       setup={() => {
+        const client = renderSeededClient();
         updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, NARROW_SIDEBAR_WIDTH_PX);
-        return renderSeededClient();
+        // Fresh workspaces have only a launcher; seed enough opened tools to exercise overflow.
+        updatePersistedState<RightSidebarLayoutState>(getRightSidebarLayoutKey("ws-a11y-seeded"), {
+          version: 1,
+          openTabsOnly: true,
+          nextId: 2,
+          focusedTabsetId: "tabset-1",
+          root: {
+            type: "tabset",
+            id: "tabset-1",
+            tabs: ["costs", "review", "instructions", "terminal", "output", "new"],
+            activeTab: "new",
+          },
+        });
+        return client;
       }}
     />
   ),
@@ -178,27 +195,26 @@ const narrowSidebarStory = (theme: ThemeMode): AppStory => ({
     );
     await expect(tablist.getClientRects().length).toBeGreaterThan(0);
     const tabs = within(tablist).getAllByRole("tab");
-    const addTerminal = within(sidebar).getByRole("button", { name: "New terminal" });
-    await waitFor(() => expect(addTerminal).toBeVisible());
+    const addTab = within(sidebar).getByRole("button", { name: "New tab" });
+    await waitFor(() => expect(addTab).toBeVisible());
     const bounds = sidebar.getBoundingClientRect();
-    const rows = new Set<number>();
-    for (const element of [...tabs, addTerminal]) {
+    for (const element of [tablist, addTab]) {
       const rect = element.getBoundingClientRect();
       await expect(rect.left).toBeGreaterThanOrEqual(bounds.left);
       await expect(rect.right).toBeLessThanOrEqual(bounds.right);
-      rows.add(Math.round(rect.top + rect.height / 2));
     }
-    // At this width the strip wraps, which is the case the inline flow exists for.
-    await expect(rows.size).toBeGreaterThan(1);
-    const lastTab = tabs[tabs.length - 1].getBoundingClientRect();
-    const add = addTerminal.getBoundingClientRect();
-    const sameRow = Math.abs(add.top + add.height / 2 - (lastTab.top + lastTab.height / 2)) < 1;
-    if (sameRow) {
-      await expect(Math.abs(add.left - (lastTab.right + TAB_GAP_PX))).toBeLessThan(1);
-    } else {
-      await expect(add.top).toBeGreaterThanOrEqual(lastTab.bottom);
-      await expect(Math.abs(add.left - tabs[0].getBoundingClientRect().left)).toBeLessThan(1);
-    }
+    await expect(tablist.scrollWidth).toBeGreaterThan(tablist.clientWidth);
+    const rows = new Set(
+      [...tabs, addTab].map((element) => {
+        const rect = element.getBoundingClientRect();
+        return Math.round(rect.top + rect.height / 2);
+      })
+    );
+    await expect(rows.size).toBe(1);
+    await expect(tablist).not.toContainElement(addTab);
+    const row = tablist.getBoundingClientRect();
+    const add = addTab.getBoundingClientRect();
+    await expect(Math.abs(add.left - (row.right + TAB_GAP_PX))).toBeLessThan(1);
   },
 });
 

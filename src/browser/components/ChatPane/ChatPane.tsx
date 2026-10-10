@@ -172,6 +172,8 @@ export type ChatPaneContentProps = Omit<
    * the page's main chat, so the touch-device header spacer does not apply.
    */
   embedded?: boolean;
+  /** Let an explicitly opened embedded chat claim focus when its composer mounts. */
+  onChatInputReady?: (api: ChatInputAPI) => void;
 };
 
 type ReviewsState = ReturnType<typeof useReviews>;
@@ -917,9 +919,10 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     setPendingTimelineReveal(null);
   }, [workspaceId]);
 
-  const handleChatInputReady = useCallback((api: ChatInputAPI) => {
+  const handleChatInputReady = (api: ChatInputAPI) => {
     chatInputAPI.current = api;
-  }, []);
+    props.onChatInputReady?.(api);
+  };
 
   // Handler for review notes from Code Review tab - adds review (starts attached)
   // Depend only on addReview (not whole reviews object) to keep callback stable

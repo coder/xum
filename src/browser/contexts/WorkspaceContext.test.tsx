@@ -991,6 +991,7 @@ describe("WorkspaceContext", () => {
       const terminalTitlesKey = getTerminalTitlesKey(workspaceId);
       const persistedLayout: RightSidebarLayoutState = {
         version: 1,
+        openTabsOnly: true,
         nextId: 2,
         focusedTabsetId: "tabset-1",
         root: {
@@ -1022,16 +1023,8 @@ describe("WorkspaceContext", () => {
         throw new Error("Expected cleaned right sidebar layout to be a tabset");
       }
 
-      // Default-layout tabs such as Instructions are restored by the
-      // right-sidebar layout migration, but the archived terminal tab and title
-      // must be stripped.
-      expect(cleanedLayout.root.tabs).toEqual([
-        "costs",
-        "review",
-        "instructions",
-        "workflows",
-        "timeline",
-      ]);
+      // The archived terminal tab and title are stripped; the other open tabs stay.
+      expect(cleanedLayout.root.tabs).toEqual(["costs", "review"]);
       expect(cleanedLayout.root.activeTab).not.toBe("terminal:t1");
       expect(cleanedLayout.root.tabs).toContain(cleanedLayout.root.activeTab);
       expect(
@@ -1045,6 +1038,7 @@ describe("WorkspaceContext", () => {
       const terminalTitlesKey = getTerminalTitlesKey(workspaceId);
       const persistedLayout: RightSidebarLayoutState = {
         version: 1,
+        openTabsOnly: true,
         nextId: 2,
         focusedTabsetId: "tabset-1",
         root: {
@@ -1194,6 +1188,7 @@ describe("WorkspaceContext", () => {
     const terminalTitlesKey = getTerminalTitlesKey(workspaceId);
     const persistedLayout: RightSidebarLayoutState = {
       version: 1,
+      openTabsOnly: true,
       nextId: 2,
       focusedTabsetId: "tabset-1",
       root: {

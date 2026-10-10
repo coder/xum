@@ -8,7 +8,8 @@ import {
 } from "@/common/constants/stagedAttachments";
 import { createMuxMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { Err } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
+import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { Config } from "@/node/config";
 import { getSelfIdentity } from "@/node/utils/concurrency/processLiveness";
@@ -17,6 +18,7 @@ import { createTestProject, saveWorkspaces } from "./taskService.testHarness";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import type { WorkspaceServiceHarness } from "./workspaceService.testHarness";
 import {
+  createDeferred,
   createWorkspaceServiceHarness,
   createWorkspaceServiceForTest,
   withTempMuxRoot,
@@ -99,6 +101,46 @@ describe("WorkspaceService.createSideChat", () => {
     expect(metadata?.sideChatParentWorkspaceId).toBe(parentId);
     expect(metadata?.taskIsolation).toBe("none");
     expect(sideChatIdsOf(parentId)).toEqual([sideChatId]);
+  });
+
+  test("titles the side conversation from its first message, not the inherited history", async () => {
+    const sideChatId = await createSideChatOk(parentId);
+    expect((await config.getWorkspaceMetadataById(sideChatId))?.pendingAutoTitle).toBe(true);
+    const generatedTitle = "Why the cache misses";
+    const generated = createDeferred<void>();
+    const listener = (event: { workspaceId: string; metadata: { title?: string } | null }) => {
+      if (event.workspaceId === sideChatId && event.metadata?.title === generatedTitle) {
+        generated.resolve();
+      }
+    };
+    harness.service.on("metadata", listener);
+    const generator = spyOn(workspaceTitleGenerator, "generateWorkspaceIdentity").mockResolvedValue(
+      Ok({ name: "cache-misses", title: generatedTitle, modelUsed: "openai:gpt-4o-mini" })
+    );
+    const send = spyOn(
+      harness.service.getOrCreateSession(sideChatId),
+      "sendMessage"
+    ).mockResolvedValue(Ok(undefined));
+    try {
+      const message = "Why does the cache miss on every request?";
+      const result = await harness.service.sendMessage(sideChatId, message, {
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+      });
+      expect(result.success).toBe(true);
+      await generated.promise;
+      expect(generator).toHaveBeenCalledTimes(1);
+      expect(generator.mock.calls[0]?.[0]).toBe(message);
+      expect(await config.getWorkspaceMetadataById(sideChatId)).toMatchObject({
+        title: generatedTitle,
+        pendingAutoTitle: undefined,
+      });
+      expect(await historyIds(parentId)).toEqual(["parent-u1", "parent-a1"]);
+    } finally {
+      harness.service.off("metadata", listener);
+      generator.mockRestore();
+      send.mockRestore();
+    }
   });
 
   test("multiple side chats keep independent histories and can be closed individually", async () => {
