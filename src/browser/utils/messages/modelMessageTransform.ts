@@ -333,7 +333,11 @@ function splitMixedContentMessages(messages: ModelMessage[]): ModelMessage[] {
       continue;
     }
 
-    const toolCallParts = assistantMsg.content.filter((c) => c.type === "tool-call");
+    // A provider-executed call carries its result inline in this message (Anthropic
+    // server_tool_use + web_search_tool_result, #5887): it stays with the content around it.
+    const isClientToolCall = (part: (typeof assistantMsg.content)[number]) =>
+      part.type === "tool-call" && part.providerExecuted !== true;
+    const toolCallParts = assistantMsg.content.filter(isClientToolCall);
 
     if (toolCallParts.length === 0) {
       result.push(msg);
@@ -355,7 +359,7 @@ function splitMixedContentMessages(messages: ModelMessage[]): ModelMessage[] {
     let currentGroup: { type: "text" | "tool-call"; parts: ContentArray } | null = null;
 
     for (const part of assistantMsg.content) {
-      const partType = part.type === "tool-call" ? "tool-call" : "text";
+      const partType = isClientToolCall(part) ? "tool-call" : "text";
 
       // eslint-disable-next-line @typescript-eslint/prefer-optional-chain
       if (!currentGroup || currentGroup.type !== partType) {
@@ -1139,7 +1143,12 @@ function ensureAnthropicThinkingBeforeToolCalls(messages: ModelMessage[]): Model
     // interleaved thinking, text can sit between two thinking blocks, and moving a block
     // edits the prefix every later block is bound to (#5887). Preserved thinking: "send it
     // back unchanged ... in the order received".
-    if (!hasToolCall || content[0]?.type === "reasoning") {
+    // The same holds for a message that opens with a natively replayed server tool (#5887): the
+    // API itself started the response with server_tool_use, and the thinking after the search is
+    // bound to it.
+    const opensWithServerTool =
+      content[0]?.type === "tool-call" && content[0].providerExecuted === true;
+    if (!hasToolCall || content[0]?.type === "reasoning" || opensWithServerTool) {
       result.push(msg);
       continue;
     }
@@ -1321,7 +1330,9 @@ export function validateAnthropicCompliance(messages: ModelMessage[]): {
 
       // Track any tool calls in this message
       for (const content of assistantMsg.content) {
-        if (content.type === "tool-call") {
+        // A provider-executed call (Anthropic server tool, #5887) carries its result in the
+        // same assistant message and needs no tool message after it.
+        if (content.type === "tool-call" && content.providerExecuted !== true) {
           pendingToolCalls.set(content.toolCallId, i);
         }
       }

@@ -38,6 +38,7 @@ import {
 } from "@/common/utils/tools/toolCatalog";
 import { applyCacheControl, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { findLatestContextBoundaryIndex } from "@/common/utils/messages/compactionBoundary";
+import { projectAnthropicServerTools } from "@/common/utils/messages/anthropicNativeServerTools";
 import { log } from "./log";
 
 /** Options for the full message preparation pipeline. */
@@ -83,6 +84,12 @@ export interface PrepareMessagesOptions {
    * filter pass the rows from before it (#5886).
    */
   replayReceiptMessages?: MuxMessage[];
+  /**
+   * False: send Anthropic server tools as the client pair even on the Anthropic wire. For
+   * requests that declare no server tool (the headless compaction summary), where native
+   * blocks are not proven to be accepted (#5887).
+   */
+  nativeServerToolReplay?: boolean;
 }
 
 /**
@@ -129,6 +136,7 @@ export async function prepareMessagesForProvider(
     workspaceId,
     deferLoadingToolNames,
     replayReceiptMessages,
+    nativeServerToolReplay,
   } = opts;
 
   // --- XumMessage-level transforms ---
@@ -191,11 +199,19 @@ export async function prepareMessagesForProvider(
   // providerMetadata, the only field convertToModelMessages forwards to the request.
   const messagesWithReasoningReplay = attachReasoningReplayMetadata(messagesWithSdkSafeFileParts);
 
+  // #5887: Anthropic server tools replay natively only on the Anthropic wire; other wires
+  // (whose converters drop Anthropic provider-executed calls) get the client pair. Request-only:
+  // history keeps the native identity and ciphertext.
+  const serverTools = projectAnthropicServerTools(
+    messagesWithReasoningReplay,
+    providerForMessages === "anthropic" && nativeServerToolReplay !== false
+  );
+
   // --- Convert to ModelMessage format ---
 
   // Type assertion needed because XumMessage has custom tool parts for interrupted tools
   // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument
-  const rawModelMessages = await convertToModelMessages(messagesWithReasoningReplay as any, {
+  const rawModelMessages = await convertToModelMessages(serverTools.messages as any, {
     // Drop unfinished tool calls (input-streaming/input-available) so downstream
     // transforms only see tool calls that actually produced outputs.
     ignoreIncompleteToolCalls: true,
@@ -234,9 +250,12 @@ export async function prepareMessagesForProvider(
   // the next turn would 400 and pay the repair again. Keep them out for the rest of the
   // context segment. Same strip as the one-request repair (stripReasoningReplay), which also
   // covers adaptive thinking, where transformModelMessages ignores anthropicStripReasoning.
+  // A demoted server tool with thinking after it (#5887) strips the same way: that thinking is
+  // bound to native blocks this request does not send.
   const segmentMessages =
     providerForMessages === "anthropic" &&
-    hasAnthropicReplayReceipt(replayReceiptMessages ?? messagesWithSentinel)
+    (serverTools.demotedBeforeThinking ||
+      hasAnthropicReplayReceipt(replayReceiptMessages ?? messagesWithSentinel))
       ? stripReasoningReplay(transformedMessages, "anthropic")
       : transformedMessages;
 
