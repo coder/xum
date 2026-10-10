@@ -11,7 +11,9 @@ import type { HistoryRowDescriptor, HistoryRowToken } from "./historyRowScanner"
 import { createHistoryStringEvidence, createHistoryNumberEvidence } from "./historyScalarEvidence";
 
 const INVALID = Symbol("invalid history projection");
-const STRING_PREFIX = WorkflowScriptDescriptorSchema.shape.description.maxLength! + 1;
+// zod >= 4.5 bounds string length in code points. A code point takes at most two UTF-16
+// units, so this many units always hold one code point past the largest bound.
+const STRING_PREFIX = 2 * (WorkflowScriptDescriptorSchema.shape.description.maxLength! + 1);
 type StringFacts = ReturnType<ReturnType<typeof createHistoryStringEvidence>["finish"]>;
 interface Value {
   value: unknown;
