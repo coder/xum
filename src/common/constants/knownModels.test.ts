@@ -39,6 +39,7 @@ describe("Known Models Integration", () => {
     ["luna", /^openai:gpt-[\d.]+-luna$/],
     ["astra", /^openai:gpt-[\d.]+-astra$/],
     ["gemini", /^google:gemini-.*pro/],
+    ["argon", /^google:gemini-4-argon/],
     ["gemini-flash", /^google:gemini-.*flash/],
     ["grok", /^xai:grok-/],
     ["deepseek", /^deepseek:deepseek-.*pro/],
