@@ -3,15 +3,24 @@ import * as aiSdk from "ai";
 import { tool, type Tool } from "ai";
 import { z } from "zod";
 import { createAnthropic } from "@ai-sdk/anthropic";
+import { createOpenAI } from "@ai-sdk/openai";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { assemblePromptPayload } from "./turnContextAssembler";
-import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
+import {
+  createStreamManagerForTests,
+  engineInternals,
+  fakeStreamText,
+} from "./streamManager.testHarness";
 import {
   appendPartialAssistantForTests,
+  createTestLanguageModel,
   historyService,
   installStreamManagerTestHistory,
   runTurnForTests,
+  scriptedStreamText,
+  STOP_FINISH,
+  TEST_USAGE,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
@@ -424,6 +433,169 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
       const next = await nextTurnBody(crashed, scripted);
       expect(thinkingTypes(next)).toEqual([]);
       expectPairedTools(next);
+    });
+
+    test("a provider-executed tool before reasoning on the OpenAI wire writes no receipt", async () => {
+      const workspaceId = "preserved-thinking-openai-server-tool";
+      // OpenAI Responses: web_search_call, then a reasoning summary, then the answer. The
+      // receipt is Anthropic-only (it strips the `anthropic` replay namespace).
+      const events = [
+        {
+          type: "response.created",
+          response: { id: "resp_1", created_at: 1, model: "gpt-5.2" },
+        },
+        {
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { type: "web_search_call", id: "ws_1", status: "in_progress" },
+        },
+        {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: {
+            type: "web_search_call",
+            id: "ws_1",
+            status: "completed",
+            action: { type: "search", query: "xum" },
+          },
+        },
+        {
+          type: "response.output_item.added",
+          output_index: 1,
+          item: { type: "reasoning", id: "rs_1", encrypted_content: null },
+        },
+        {
+          type: "response.reasoning_summary_part.added",
+          item_id: "rs_1",
+          output_index: 1,
+          summary_index: 0,
+        },
+        {
+          type: "response.reasoning_summary_text.delta",
+          item_id: "rs_1",
+          output_index: 1,
+          summary_index: 0,
+          delta: "read",
+        },
+        {
+          type: "response.output_item.done",
+          output_index: 1,
+          item: { type: "reasoning", id: "rs_1", encrypted_content: null },
+        },
+        {
+          type: "response.output_item.added",
+          output_index: 2,
+          item: { type: "message", id: "msg_1" },
+        },
+        { type: "response.output_text.delta", item_id: "msg_1", output_index: 2, delta: "found" },
+        {
+          type: "response.output_item.done",
+          output_index: 2,
+          item: { type: "message", id: "msg_1" },
+        },
+        {
+          type: "response.completed",
+          response: { usage: { input_tokens: 10, output_tokens: 3 } },
+        },
+      ];
+      const openai = createOpenAI({
+        apiKey: "test-key",
+        fetch: Object.assign(() => Promise.resolve(sse(events)), {
+          preconnect: fetch.preconnect.bind(fetch),
+        }),
+      });
+      const seeded = await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-1", "user", "search", { historySequence: 0 })
+      );
+      if (!seeded.success) throw new Error(seeded.error);
+      const streamManager = createStreamManagerForTests(historyService, {
+        streamText: fakeStreamText((options) => aiSdk.streamText(options)),
+      });
+      const { messageId } = await runTurnForTests(streamManager, {
+        workspaceId,
+        model: openai.responses("gpt-5.2"),
+        modelString: "openai:gpt-5.2",
+        messages: [{ role: "user", content: "search" }],
+        // Same cast as production (src/common/utils/tools/tools.ts).
+        tools: { web_search: openai.tools.webSearch({}) as Tool },
+      });
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const row = history.data.find((message) => message.id === messageId);
+      // The trigger shape is present: reasoning after a provider-executed tool part.
+      const parts = row?.parts ?? [];
+      const toolIndex = parts.findIndex(
+        (part) => part.type === "dynamic-tool" && part.toolName === "web_search"
+      );
+      expect(toolIndex).toBeGreaterThanOrEqual(0);
+      expect(parts.slice(toolIndex + 1).some((part) => part.type === "reasoning")).toBe(true);
+      expect(row?.metadata?.anthropicThinkingReplay).toBeUndefined();
+    });
+
+    test("a dropped server-tool part costs at most one parts scan, not one per delta", async () => {
+      const workspaceId = "preserved-thinking-server-tool-dropped";
+      const deltas = 50;
+      let scans = 0;
+      let streamInfo: { parts: unknown[] } | undefined;
+      // The script below reads the manager lazily, after construction.
+      const streamManager: ReturnType<typeof createStreamManagerForTests> =
+        createStreamManagerForTests(historyService, {
+          streamText: scriptedStreamText([
+            {
+              chunks: [
+                { type: "start-step" },
+                {
+                  type: "tool-call",
+                  toolCallId: "srvtoolu_1",
+                  toolName: "web_search",
+                  input: { query: "xum" },
+                  providerExecuted: true,
+                },
+                {
+                  type: "tool-result",
+                  toolCallId: "srvtoolu_1",
+                  toolName: "web_search",
+                  output: [],
+                  providerExecuted: true,
+                },
+                // A retry that does not preserve parts drops the server-tool part, while
+                // the turn keeps its record of the server-tool call.
+                async () => {
+                  const internals = engineInternals(streamManager);
+                  streamInfo = internals.workspaceStreams.get(workspaceId) as { parts: unknown[] };
+                  await internals.resetStreamStateForRetry(workspaceId, streamInfo, {
+                    preserveParts: false,
+                  });
+                  const parts = streamInfo.parts;
+                  // Count full scans of the parts array from here on.
+                  parts.some = (...args: Parameters<typeof parts.some>) => {
+                    scans += 1;
+                    return Array.prototype.some.apply(parts, args);
+                  };
+                },
+                ...Array.from({ length: deltas }, () => ({ type: "reasoning-delta", text: "r" })),
+                { type: "finish-step", usage: TEST_USAGE },
+                STOP_FINISH,
+              ],
+            },
+          ]),
+        });
+      const { messageId } = await runTurnForTests(streamManager, {
+        workspaceId,
+        model: createTestLanguageModel("claude-opus-5-5", "anthropic.messages"),
+        modelString: "anthropic:claude-opus-5-5",
+      });
+
+      expect(streamInfo).toBeDefined();
+      expect(scans).toBeLessThanOrEqual(1);
+      // Nothing in the committed row follows a server tool, so replay stays on.
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const row = history.data.find((message) => message.id === messageId);
+      expect(row?.parts.some((part) => part.type === "dynamic-tool")).toBe(false);
+      expect(row?.metadata?.anthropicThinkingReplay).toBeUndefined();
     });
 
     test("a server tool with no thinking after it keeps thinking replay on", async () => {

@@ -2204,7 +2204,13 @@ export class StreamManager {
     const followsServerTool = streamInfo.parts.some(
       (part) => part.type === "dynamic-tool" && serverToolIds.has(part.toolCallId)
     );
-    if (!followsServerTool) return;
+    if (!followsServerTool) {
+      // Every recorded server tool's part is gone. The tool-call case records an ID and
+      // stores its part before any later reasoning, so the IDs are stale: drop them, or
+      // every later reasoning delta would scan all parts again (perf).
+      streamInfo.anthropicServerToolCallIds = undefined;
+      return;
+    }
     streamInfo.initialMetadata = { ...streamInfo.initialMetadata, anthropicThinkingReplay: "off" };
   }
 
