@@ -6,6 +6,7 @@ import { APIProvider } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
 import {
   publishGlobalMcpEnablementChanged,
+  publishProjectTrustChanged,
   publishWorkspaceMcpOverridesSaved,
 } from "@/browser/utils/workspaceMcpMutations";
 import type { McpAppPluginView } from "@/common/orpc/schemas/mcpApps";
@@ -63,5 +64,34 @@ describe("usePluginViews", () => {
     act(() => publishGlobalMcpEnablementChanged());
     await waitFor(() => expect(result.current?.views[0]?.enabled).toBe(false));
     expect(calls).toBe(3);
+  });
+
+  test("after a trust change the old list is gone until the fresh one arrives", async () => {
+    let release: (() => void) | null = null;
+    let calls = 0;
+    const client = createTestApiClient({
+      mcpApps: {
+        listPluginViews: () => {
+          calls += 1;
+          if (calls === 1) return Promise.resolve({ success: true as const, data: [view(true)] });
+          // The re-list after the trust change waits until the test releases it.
+          return new Promise((resolve) => {
+            release = () => resolve({ success: true as const, data: [] });
+          });
+        },
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const { result } = renderHook(() => usePluginViews("ws-1", true), { wrapper });
+    await waitFor(() => expect(result.current?.views).toHaveLength(1));
+
+    act(() => publishProjectTrustChanged());
+    // Stale entries never outlive the change, even while discovery runs.
+    expect(result.current).toBeNull();
+    await waitFor(() => expect(release).not.toBeNull());
+    act(() => release?.());
+    await waitFor(() => expect(result.current?.views).toEqual([]));
   });
 });

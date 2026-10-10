@@ -7,6 +7,12 @@ import type { McpAppPluginView } from "@/common/orpc/schemas/mcpApps";
 /** A workspace's plugin views; the workspace ID keeps a stale list from showing elsewhere. */
 export interface WorkspacePluginViews {
   workspaceId: string;
+  /**
+   * Bumps on every invalidation (plugin install/update/removal, MCP enablement, project trust).
+   * A list is returned only for the current generation, so after an invalidation the caller sees
+   * null until the fresh list arrives: stale entries and frames never outlive the change.
+   */
+  generation: number;
   views: readonly McpAppPluginView[];
 }
 
@@ -43,13 +49,22 @@ export function usePluginViews(
       .listPluginViews({ workspaceId }, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
-        setLoaded({ workspaceId, views: result.success ? result.data : [] });
+        setLoaded({
+          workspaceId,
+          generation: mutationTick,
+          views: result.success ? result.data : [],
+        });
       })
       .catch(() => {
-        if (!controller.signal.aborted) setLoaded({ workspaceId, views: [] });
+        // A failed listing shows no views; it never revives an older list.
+        if (!controller.signal.aborted) {
+          setLoaded({ workspaceId, generation: mutationTick, views: [] });
+        }
       });
     return () => controller.abort();
   }, [api, workspaceId, enabled, mutationTick]);
 
-  return enabled && loaded?.workspaceId === workspaceId ? loaded : null;
+  return enabled && loaded?.workspaceId === workspaceId && loaded.generation === mutationTick
+    ? loaded
+    : null;
 }

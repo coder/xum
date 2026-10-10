@@ -60,19 +60,12 @@ export function pluginViewRef(view: McpAppPluginView): McpAppPluginViewRef {
 }
 
 /**
- * Plugin views for the picker: the listed ones (listPluginViews), then opened ones the list
- * lacks (opened from a palette list that has since been refreshed), each once.
+ * Plugin views for the picker: only the current listing (listPluginViews). A view the fresh
+ * list lacks (uninstalled, trust revoked, server gone) is not kept from an older open, so its
+ * frame unmounts instead of running stale content.
  */
-export function pluginViewEntries(
-  listed: readonly McpAppPluginView[],
-  opened: readonly McpAppViewEntry[]
-): McpAppPluginViewRef[] {
-  const entries = listed.map(pluginViewRef);
-  const known = new Set(entries.map(mcpAppViewKey));
-  for (const view of opened) {
-    if (view.kind === "plugin" && !known.has(mcpAppViewKey(view))) entries.push(view);
-  }
-  return entries;
+export function pluginViewEntries(listed: readonly McpAppPluginView[]): McpAppPluginViewRef[] {
+  return listed.map(pluginViewRef);
 }
 
 /** Longest argument summary shown next to a view's label. */

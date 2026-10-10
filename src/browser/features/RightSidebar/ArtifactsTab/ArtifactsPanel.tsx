@@ -58,6 +58,7 @@ import { McpAppFrame } from "./McpAppFrame";
 import {
   appViewPickerDetails,
   mcpAppViewKey,
+  MCP_PLUGIN_VIEW_SELECTION_PREFIX,
   pluginViewEntries,
   useMcpAppViews,
   type McpAppViewEntry,
@@ -340,10 +341,8 @@ export function ArtifactsPanel(props: {
   const toolViews = openedViews.filter((view): view is McpAppViewRef => view.kind !== "plugin");
   // Plugin views (contributes.views) are listed even before one is opened, like transcript
   // views; the panel only renders with the Artifacts experiment on, which gates them.
-  const pluginViews = pluginViewEntries(
-    usePluginViews(props.workspaceId, true)?.views ?? [],
-    openedViews
-  );
+  const pluginList = usePluginViews(props.workspaceId, true);
+  const pluginViews = pluginViewEntries(pluginList?.views ?? []);
   const appViews: McpAppViewEntry[] = [...toolViews, ...pluginViews];
   const appViewDetails = appViewPickerDetails(toolViews);
   const selectedApp = appViews.find((view) => mcpAppViewKey(view) === selectedPath) ?? null;
@@ -463,7 +462,9 @@ export function ArtifactsPanel(props: {
   const waitingForPinned =
     selectedPath != null &&
     ((selectedScope === "pinned" && pinned == null) ||
-      (selectedScope === "shelf" && shelf == null));
+      (selectedScope === "shelf" && shelf == null) ||
+      // A plugin view waits for its (re)listing instead of falling back to a file.
+      (pluginList == null && selectedPath.startsWith(MCP_PLUGIN_VIEW_SELECTION_PREFIX)));
 
   const selected =
     selectedApp != null || waitingForPinned
@@ -945,8 +946,9 @@ export function ArtifactsPanel(props: {
   const viewerBody =
     selectedApp != null ? (
       <McpAppFrame
-        // Reload remounts the view, so it re-fetches its resource and result.
-        key={`${mcpAppViewKey(selectedApp)}\u0000${reloadTick}`}
+        // Reload remounts the view, so it re-fetches its resource and result. A plugin view also
+        // remounts for each new listing generation (plugin updated, trust or enablement changed).
+        key={`${mcpAppViewKey(selectedApp)}\u0000${reloadTick}\u0000${selectedApp.kind === "plugin" ? (pluginList?.generation ?? "") : ""}`}
         workspaceId={props.workspaceId}
         view={selectedApp}
       />
