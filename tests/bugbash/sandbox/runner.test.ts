@@ -738,7 +738,7 @@ test("C2: a zombie launcher counts as dead", async () => {
         parent.stdout.once("data", (d: Buffer) => resolve(d.toString()))
       )
     );
-    while (!/\) Z /.test(stat(pid))) await Bun.sleep(10);
+    while (!stat(pid).includes(") Z ")) await Bun.sleep(10);
     const { boot, pidns } = self();
     expect(ownerState(`${boot}:${pidns}:${pid}:${procStart(pid)}`)).toBe("dead");
   } finally {
