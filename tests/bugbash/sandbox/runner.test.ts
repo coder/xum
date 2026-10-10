@@ -5,7 +5,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { startFakeUpstream } from "./fakeUpstream";
-import { exitFor, launch, launchJob, ownerState, recover } from "./launch";
+import { exitFor, launch, launchJob, ownerState, probeApp, recover } from "./launch";
 import * as proxyModule from "./proxy";
 import { Ledger } from "./proxyPolicy";
 import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
@@ -1142,6 +1142,37 @@ test.each([
   expect((outcome as Error).message).toMatch(message);
   expect(calls()).toBe("");
 });
+
+test("B3: the app AI probe has a short deadline and ends at once on a stop", async () => {
+  const upstream = await startFakeUpstream();
+  try {
+    upstream.setMode("stall"); // accepts the request, never answers
+    const job = {
+      model: "claude-sonnet-5-5",
+      budgetUsd: 1,
+      upstream: { baseUrl: upstream.baseUrl, apiKey: UPSTREAM_KEY },
+    };
+    let started = Date.now();
+    const late = await probeApp(
+      job,
+      "claude-haiku-4-5",
+      new Ledger(1),
+      new AbortController().signal,
+      300
+    );
+    expect(late.status).not.toBe(200); // a silent upstream is unavailable, after the deadline
+    expect(Date.now() - started).toBeLessThan(5_000);
+    const stop = new AbortController();
+    started = Date.now();
+    const probe = probeApp(job, "claude-haiku-4-5", new Ledger(1), stop.signal, 60_000);
+    while (upstream.requests.length < 2) await Bun.sleep(10);
+    stop.abort("SIGINT");
+    expect((await probe).status).not.toBe(200);
+    expect(Date.now() - started).toBeLessThan(5_000); // not the 60 s deadline
+  } finally {
+    await upstream.close();
+  }
+}, 20_000);
 
 test("B3: the run's stop after another job's fault aborts this job's in-flight call", async () => {
   // run.ts stops every job's signal when one job reports a fault. This job's call is still

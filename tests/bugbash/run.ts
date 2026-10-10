@@ -359,12 +359,19 @@ export async function runBugBash(
     }
     let status: number;
     try {
-      ({ status, records: probeRecords } = await (deps.probeApp ?? probeApp)(job0!, id, ledger));
+      ({ status, records: probeRecords } = await (deps.probeApp ?? probeApp)(
+        job0!,
+        id,
+        ledger,
+        stop
+      ));
     } catch (error) {
       // The probe's own proxy fault (a bound miss): the cost model is wrong.
       err(`make bug-bash: probe: ${error instanceof Error ? error.message : String(error)}`);
       return 5;
     }
+    // A stop during the probe ends the run here, before any folder or job.
+    if (stop.aborted) return stop.reason === "SIGTERM" ? 143 : 130;
     const unavailable = status === 429 || status >= 500;
     if (status === 200) runAi = { mode: "real", reason: `${appModel} answered the probe` };
     else if (requested === "auto" && unavailable)

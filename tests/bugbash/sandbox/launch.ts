@@ -131,6 +131,8 @@ export function modelJob(env: NodeJS.ProcessEnv): ModelJob {
 }
 
 const usd = (nanoUsd: number) => `$${(nanoUsd / 1e9).toFixed(4)}`;
+/** The app AI probe's deadline: aiMode.ts's probe timeout. */
+const PROBE_MS = 10_000;
 
 /**
  * run.ts's app AI probe (aiMode.ts semantics): one `max_tokens: 1` call to the app model through
@@ -138,7 +140,13 @@ const usd = (nanoUsd: number) => `$${(nanoUsd / 1e9).toFixed(4)}`;
  * or the budget. Returns the HTTP status (502 when the upstream failed) and the call records.
  * Rejects when the proxy reports a fault (a bound miss).
  */
-export async function probeApp(job: ModelJob, model: string, ledger: Ledger) {
+export async function probeApp(
+  job: ModelJob,
+  model: string,
+  ledger: Ledger,
+  stop: AbortSignal,
+  deadlineMs = PROBE_MS
+) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-probe-"));
   const records: object[] = [];
   try {
@@ -148,12 +156,20 @@ export async function probeApp(job: ModelJob, model: string, ledger: Ledger) {
       upstream: job.upstream,
       job: { models: [model] },
       ledger,
+      // aiMode.ts's probe timeout, not the 10-minute call deadline: a silent upstream counts as
+      // unavailable (502) after this.
+      deadlineMs,
       log: (entry) => records.push(entry),
     });
     let status: number;
+    // A stop (SIGINT, SIGTERM) closes the proxy, which aborts the probe call at once.
+    const onStop = () => void proxy.close().catch(() => undefined);
+    stop.addEventListener("abort", onStop, { once: true });
     try {
+      if (stop.aborted) onStop();
       status = (await proxy.probe(model).catch(() => ({ status: 502 }))).status;
     } finally {
+      stop.removeEventListener("abort", onStop);
       await proxy.close();
     }
     return { status, records };

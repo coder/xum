@@ -226,6 +226,18 @@ test.each([
   expect(probes).toHaveLength("BUGBASH_AI" in over && over.BUGBASH_AI === "mock" ? 0 : 1);
 });
 
+test("B3: a stop during the app AI probe ends the run before any job", async () => {
+  const stop = new AbortController();
+  const { deps, calls } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  deps.probeApp = (_job, _model, _ledger, signal) => {
+    expect(signal).toBe(stop.signal); // the run's stop reaches the probe
+    stop.abort("SIGINT");
+    return Promise.resolve({ status: 502, records: [] });
+  };
+  expect(await runBugBash([...charters("a")], ENV, stop.signal, deps)).toBe(130);
+  expect(calls).toHaveLength(0);
+});
+
 test("B3: a proxy fault in the probe stops the run before any job (exit 5)", async () => {
   const { deps, calls } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
   deps.probeApp = () => Promise.reject(new Error("proxy: 1 call(s) cost more"));
