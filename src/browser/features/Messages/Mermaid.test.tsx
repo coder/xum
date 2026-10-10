@@ -67,6 +67,32 @@ describe("Mermaid layout stability", () => {
     mermaidRender.mockClear();
   });
 
+  // React.lazy caches the resolved module for the whole process, so this must stay the first
+  // markdown mermaid render: later renders mount Mermaid synchronously (e.g. under `--rerun-each`).
+  test("markdown shows the pending diagram frame until the Mermaid chunk loads", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownRenderer content={"```mermaid\ngraph TD\nA-->B\n```"} />
+      </ThemeProvider>
+    );
+
+    // The chunk has not loaded yet: no zoom controls, but the same box Mermaid reserves.
+    const pending = view.container.querySelector<HTMLElement>(".mermaid-container");
+    expect(view.queryAllByRole("button")).toHaveLength(0);
+    expect(pending?.style.minHeight).toBe("300px");
+    expect(pending?.textContent).toBe("Rendering diagram...");
+    const pendingFrameStyle = pending?.parentElement?.style.cssText;
+
+    expect(await view.findByRole("button", { name: "⤢" })).toBeTruthy();
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg")).not.toBeNull()
+    );
+    // Same outer frame before and after the chunk loads, so nothing shifts.
+    const loaded = view.container.querySelector<HTMLElement>(".mermaid-container");
+    expect(loaded?.parentElement?.style.cssText).toBe(pendingFrameStyle);
+    expect(loaded?.style.minHeight).toBe("300px");
+  });
+
   test("copies a selected textless diagram and excludes diagram controls", async () => {
     const chart = "graph TD\nA-->B";
     const view = render(

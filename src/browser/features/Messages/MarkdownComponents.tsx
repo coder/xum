@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import React, { useContext, useEffect, useRef, useState } from "react";
 import { Play } from "lucide-react";
-import { Mermaid } from "./Mermaid";
+import { MermaidPendingFrame } from "./MermaidPendingFrame";
 import { useOptionalMessageListContext } from "./MessageListContext";
 import { StreamingContext } from "./StreamingContext";
 import {
@@ -15,6 +15,11 @@ import { resolveBrowserLocalhostProxyTemplate } from "@/browser/utils/browserLoc
 import { normalizeLocalhostProxyUrl } from "@/common/utils/localhostProxyUrl";
 import { InlineSkillPreviewContext } from "./InlineSkillPreviewContext";
 import { INTERNAL_INLINE_SKILL_HREF_PREFIX } from "./inlineSkillMarkdown";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
+
+// Lazy so the `mermaid` package stays off the first load (T3, #5971): diagrams render only
+// when a message contains one.
+const Mermaid = React.lazy(() => import("./Mermaid").then((m) => ({ default: m.Mermaid })));
 
 interface CodeProps {
   node?: unknown;
@@ -494,7 +499,11 @@ export const markdownComponents = {
 
     // Handle mermaid diagrams specially
     if (!isInline && language === "mermaid") {
-      return <Mermaid chart={childString} />;
+      return (
+        <LazyFeature name="Diagram" fallback={<MermaidPendingFrame />}>
+          <Mermaid chart={childString} />
+        </LazyFeature>
+      );
     }
 
     // Code blocks with language - use async Shiki highlighting

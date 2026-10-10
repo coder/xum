@@ -18,6 +18,7 @@ import * as path from "path";
 export const FIRST_LOAD_FORBIDDEN_SOURCES: readonly string[] = [
   "node_modules/lottie-web/",
   "node_modules/ghostty-web/",
+  "node_modules/mermaid/",
 ];
 
 function fail(message: string): never {
