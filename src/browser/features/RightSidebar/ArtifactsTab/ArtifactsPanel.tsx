@@ -1400,8 +1400,10 @@ export function ArtifactsPanel(props: {
     body = withAppPicker(
       <div className="text-muted p-4 text-xs leading-relaxed">{listing.reason}</div>
     );
-  } else if (selected == null && !waitingForPinned && appViews.length === 0) {
-    body = (
+  } else if (selected == null && !waitingForPinned) {
+    // Listed plugin views exist before (and after) any is open, so nothing may be selected
+    // while the picker has entries: keep the picker and show the empty state, not a blank body.
+    body = withAppPicker(
       <div className="text-muted p-4 text-xs leading-relaxed">
         No artifacts yet. Files the agent writes to{" "}
         <code className="text-foreground">$XUM_SCRATCH_DIR/artifacts/</code> appear here.
