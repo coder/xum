@@ -2625,6 +2625,42 @@ describe("Config", () => {
         review: { defaultBaseByProject: { "/repo/a": "main" } },
       });
     });
+
+    // zod >= 4.5 strips `__proto__` keys in object and record parsers. JSON.parse makes
+    // such a key an own property, so a hand-edited config.json can carry one. Lenient
+    // loading must still drop only the bad entries and must not adopt the key as a
+    // prototype (no inherited project defaults, no polluted Object.prototype).
+    it("drops __proto__ keys and invalid entries from persisted preference records", () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        `{
+          "projects": [],
+          "userPreferences": {
+            "__proto__": { "polluted": true },
+            "ai": {
+              "projectDefaults": {
+                "__proto__": { "agentId": "plan" },
+                "/repo": { "agentId": "exec" }
+              },
+              "autoCompactionThresholdByModel": { "__proto__": 70, "openai:gpt-4.1": 75, "bad": 101 }
+            }
+          }
+        }`
+      );
+
+      const preferences = config.loadConfigOrDefault().userPreferences;
+
+      expect(preferences).toEqual({
+        ai: {
+          projectDefaults: { "/repo": { agentId: "exec" } },
+          autoCompactionThresholdByModel: { "openai:gpt-4.1": 75 },
+        },
+      });
+      const projectDefaults = preferences?.ai?.projectDefaults;
+      expect(projectDefaults && Object.getPrototypeOf(projectDefaults)).toBe(Object.prototype);
+      expect(Object.keys(projectDefaults ?? {})).toEqual(["/repo"]);
+      expect(Object.prototype).not.toHaveProperty("polluted");
+    });
   });
 
   it.each([

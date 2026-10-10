@@ -352,6 +352,48 @@ describe("WorkflowRunStore", () => {
     expect(completed?.result?.structuredOutput).toEqual({ ok: true });
   });
 
+  // zod >= 4.5 rejects minute-precision datetimes with a zone ("...T00:01Z"), which
+  // zod 4.4 accepted. Xum writes journal timestamps with toISOString (always with
+  // seconds), so such a line can only come from a hand edit or another writer. The
+  // loader keeps its self-healing contract: it skips that line and the run stays
+  // readable with every other event and step.
+  test("skips journal lines whose timestamps lack seconds and keeps the run readable", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-minute-precision");
+    const store = await createStore(tmp.path);
+    const runDir = path.join(tmp.path, "workflows", "wfr_123");
+
+    await store.appendEvent("wfr_123", {
+      sequence: 1,
+      type: "phase",
+      at: new Date("2026-05-29T00:00:01Z").toISOString(),
+      name: "scope",
+    });
+    await fs.appendFile(
+      path.join(runDir, "events.jsonl"),
+      [
+        { sequence: 2, type: "log", at: "2026-05-29T00:01Z", message: "minute precision" },
+        { sequence: 3, type: "log", at: "2026-05-29T00:02:00+02:00", message: "offset" },
+      ]
+        .map((event) => `${JSON.stringify(event)}\n`)
+        .join("")
+    );
+    await fs.appendFile(
+      path.join(runDir, "steps.jsonl"),
+      `${JSON.stringify({
+        stepId: "minute-step",
+        inputHash: "input:2",
+        status: "started",
+        startedAt: "2026-05-29T00:01Z",
+      })}\n`
+    );
+
+    const run = await store.getRun("wfr_123");
+
+    expect(run.events.map((event) => event.sequence)).toEqual([1, 3]);
+    expect(run.steps).toEqual([]);
+    expect(run.updatedAt).toBe("2026-05-29T00:02:00+02:00");
+  });
+
   test("rejects duplicate or out-of-order event sequence numbers", async () => {
     using tmp = new DisposableTempDir("workflow-runs");
     const store = await createStore(tmp.path);
