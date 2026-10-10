@@ -7,6 +7,7 @@
 
 import "../dom";
 import { fireEvent, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness } from "../harness";
@@ -90,5 +91,38 @@ describe("Analytics modal", () => {
     // 120s total (like focus/undo): CI runners under merge-queue load inflate wall
     // clock enough that the 60s budget covering harness setup + interactions was
     // exceeded at 66s (merge-queue run 32719185534) on a PR that never touched this area.
+  }, 120_000);
+
+  // The first open matters: a lazy-loaded dashboard mounts already open, so the opener must be
+  // recorded outside it, or this first close leaves focus on the body.
+  test("closing the first shortcut-opened analytics returns focus to the opener", async () => {
+    const app = await createAppHarness({ branchPrefix: "analytics-focus", aiMode: "none" });
+    try {
+      const doc = app.view.container.ownerDocument;
+      const body = within(doc.body);
+      const user = userEvent.setup({ document: doc });
+      const composer = await within(app.view.container).findByRole("textbox", { name: "Message" });
+      // Compare a label, not the nodes: printing a DOM-node mismatch fails in this environment.
+      const focused = () =>
+        doc.activeElement === composer ? "opener" : doc.activeElement?.tagName;
+      await user.click(composer);
+      expect(focused()).toBe("opener");
+
+      await user.keyboard("{Control>}{Shift>}Y{/Shift}{/Control}");
+      const dialog = await body.findByRole("dialog", { name: "Analytics" }, { timeout: 30_000 });
+      // Radix can drop an Escape pressed right after mount, so press again while still open.
+      await waitFor(
+        async () => {
+          if (dialog.isConnected && dialog.getAttribute("data-state") === "open") {
+            await user.keyboard("{Escape}");
+          }
+          expect(body.queryByRole("dialog", { name: "Analytics" })).toBeNull();
+        },
+        { timeout: 30_000 }
+      );
+      await waitFor(() => expect(focused()).toBe("opener"));
+    } finally {
+      await app.dispose();
+    }
   }, 120_000);
 });
