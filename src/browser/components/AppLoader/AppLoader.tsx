@@ -100,18 +100,27 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
     );
   }
 
+  // #6017: these startup screens are the whole page, so each sits in the page's one main
+  // landmark. LoadingScreen and StartupConnectionError stay landmark-free because
+  // UpdateRestartOverlay shows LoadingScreen above the App, which has its own main.
   if (apiState.status === "error") {
-    return <StartupConnectionError error={apiState.error} onRetry={apiState.retry} />;
+    return (
+      <main>
+        <StartupConnectionError error={apiState.error} onRetry={apiState.retry} />
+      </main>
+    );
   }
 
   return (
-    <LoadingScreen
-      statusText={
-        apiState.status === "reconnecting"
-          ? `Reconnecting to backend (attempt ${apiState.attempt})...`
-          : "Loading preferences"
-      }
-    />
+    <main>
+      <LoadingScreen
+        statusText={
+          apiState.status === "reconnecting"
+            ? `Reconnecting to backend (attempt ${apiState.attempt})...`
+            : "Loading preferences"
+        }
+      />
+    </main>
   );
 }
 
@@ -260,7 +269,9 @@ function AppLoaderInner() {
   return (
     <AnimatePresence mode="wait">
       {!initialLoadComplete ? (
-        <motion.div
+        // #6017: the loading screen is the whole page, so it is the page's main landmark until the
+        // App (with its own main) replaces it. mode="wait" keeps the two from overlapping.
+        <motion.main
           key="loading"
           initial={{ opacity: 1 }}
           exit={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, y: -20 }}
@@ -278,7 +289,7 @@ function AppLoaderInner() {
               }
             />
           )}
-        </motion.div>
+        </motion.main>
       ) : (
         <motion.div
           key="app"
