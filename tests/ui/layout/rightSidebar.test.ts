@@ -290,6 +290,52 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
+  // Panels other than Costs and Review are lazy-loaded (T3, #5971): a persisted non-Costs active
+  // tab must still render its panel once its chunk arrives, without any user action.
+  test("a persisted non-Costs active tab renders its panel after load", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() =>
+      seedLayout(["costs", "instructions"], "instructions")
+    );
+
+    try {
+      const panel = await findSidebarPanel(sidebar, "instructions");
+      await waitFor(
+        () =>
+          expect(within(panel).getByRole("button", { name: "Refresh instructions" })).toBeTruthy(),
+        { timeout: 10_000 }
+      );
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  // Opening a tool from the New tab keeps keyboard users in the replacement tab. The panel is
+  // lazy-loaded, so its body arrives after the tab: focus must still land on the tab, not on body.
+  test("opening Instructions from the New tab moves keyboard focus to its tab", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() =>
+      seedLayout(["costs", "new"], "new")
+    );
+
+    try {
+      const launcher = await findSidebarPanel(sidebar, "-panel-new");
+      fireEvent.click(within(launcher).getByRole("button", { name: "Instructions" }));
+
+      const tab = await findSidebarTab(sidebar, "instructions");
+      const panel = await findSidebarPanel(sidebar, "instructions");
+      await waitFor(
+        () => {
+          const active = sidebar.ownerDocument.activeElement;
+          // Report a label, not the node: printing a DOM-node mismatch fails in this environment.
+          expect(active === tab ? "instructions tab" : active?.tagName).toBe("instructions tab");
+          expect(within(panel).getByRole("button", { name: "Refresh instructions" })).toBeTruthy();
+        },
+        { timeout: 10_000 }
+      );
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
   test("offers the browser in the New tab when the experiment is enabled, without opening it", async () => {
     await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.AGENT_BROWSER, enabled: true });
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
