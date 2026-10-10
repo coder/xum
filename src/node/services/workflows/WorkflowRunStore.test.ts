@@ -352,12 +352,11 @@ describe("WorkflowRunStore", () => {
     expect(completed?.result?.structuredOutput).toEqual({ ok: true });
   });
 
-  // zod >= 4.5 rejects minute-precision datetimes with a zone ("...T00:01Z"), which
-  // zod 4.4 accepted. Xum writes journal timestamps with toISOString (always with
-  // seconds), so such a line can only come from a hand edit or another writer. The
-  // loader keeps its self-healing contract: it skips that line and the run stays
-  // readable with every other event and step.
-  test("skips journal lines whose timestamps lack seconds and keeps the run readable", async () => {
+  // zod >= 4.5 rejects minute-precision datetimes with a zone ("...T00:01Z") unless the schema
+  // allows them, and zod 4.4 accepted them. Xum writes toISOString (always with seconds), but a
+  // persisted record from a hand edit or another writer must stay readable: an unreadable
+  // run.json also makes createRunIfAbsent treat the run as half-created and delete it.
+  test("keeps minute-precision journal lines readable", async () => {
     using tmp = new DisposableTempDir("workflow-runs-minute-precision");
     const store = await createStore(tmp.path);
     const runDir = path.join(tmp.path, "workflows", "wfr_123");
@@ -372,7 +371,7 @@ describe("WorkflowRunStore", () => {
       path.join(runDir, "events.jsonl"),
       [
         { sequence: 2, type: "log", at: "2026-05-29T00:01Z", message: "minute precision" },
-        { sequence: 3, type: "log", at: "2026-05-29T00:02:00+02:00", message: "offset" },
+        { sequence: 3, type: "log", at: "2026-05-29T00:02+02:00", message: "offset" },
       ]
         .map((event) => `${JSON.stringify(event)}\n`)
         .join("")
@@ -389,9 +388,48 @@ describe("WorkflowRunStore", () => {
 
     const run = await store.getRun("wfr_123");
 
-    expect(run.events.map((event) => event.sequence)).toEqual([1, 3]);
-    expect(run.steps).toEqual([]);
-    expect(run.updatedAt).toBe("2026-05-29T00:02:00+02:00");
+    expect(run.events.map((event) => event.sequence)).toEqual([1, 2, 3]);
+    expect(run.steps.map((step) => step.startedAt)).toEqual(["2026-05-29T00:01Z"]);
+    expect(run.updatedAt).toBe("2026-05-29T00:02+02:00");
+  });
+
+  test("keeps a run.json with minute-precision timestamps readable and in place", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-minute-precision-run");
+    const store = new WorkflowRunStore({ sessionDir: tmp.path });
+    const input = {
+      id: "wfr_child_minute",
+      workspaceId: "workspace-1",
+      workflow: definition,
+      source: source,
+      args: { topic: "nested" },
+      parentWorkflow: { runId: "wfr_parent", stepId: "child", inputHash: "hash:child", depth: 0 },
+      now: "2026-05-29T00:00:00.000Z",
+    };
+    await store.createRunIfAbsent(input);
+    await store.appendEvent("wfr_child_minute", {
+      sequence: 1,
+      type: "log",
+      at: "2026-05-29T00:00:01.000Z",
+      message: "kept",
+    });
+    const runFile = path.join(tmp.path, "workflows", "wfr_child_minute", "run.json");
+    const raw = JSON.parse(await fs.readFile(runFile, "utf-8")) as Record<string, unknown>;
+    await fs.writeFile(
+      runFile,
+      JSON.stringify({ ...raw, createdAt: "2026-05-29T00:00Z", updatedAt: "2026-05-29T00:01Z" })
+    );
+
+    await expect(store.getRun("wfr_child_minute")).resolves.toMatchObject({
+      createdAt: "2026-05-29T00:00Z",
+    });
+    await expect(store.getRunStatusSnapshot("wfr_child_minute")).resolves.toMatchObject({
+      id: "wfr_child_minute",
+    });
+    const again = await store.createRunIfAbsent(input);
+    expect(again.events.map((event) => event.type === "log" && event.message)).toEqual(["kept"]);
+    await expect(
+      fs.readFile(path.join(tmp.path, "workflows", "wfr_child_minute", "events.jsonl"), "utf-8")
+    ).resolves.toContain('"kept"');
   });
 
   test("rejects duplicate or out-of-order event sequence numbers", async () => {
