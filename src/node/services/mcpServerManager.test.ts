@@ -8710,6 +8710,38 @@ describe("prepareStdioLaunch", () => {
     expect(await fs.readdir(tmp.path)).toEqual(["plugin-data"]);
   });
 
+  test("tells plugin servers their workspace; other servers get no extra env", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-workspace-env");
+    const dataPath = path.join(tmp.path, "plugin-data", "abc123");
+    const plugin = {
+      pluginName: "demo",
+      serverName: "srv",
+      sourceScope: "global" as const,
+      sourceLocation: ".mux/plugins/demo",
+    };
+
+    const launch = await prepareStdioLaunch(
+      {
+        transport: "stdio",
+        command: "bunx",
+        args: [],
+        // A plugin's own mcp.json must not be able to name another workspace.
+        env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: dataPath, XUM_WORKSPACE_ID: "spoofed" },
+        disabled: false,
+        plugin,
+      },
+      { workspaceId: "ws-1" }
+    );
+    expect(launch.env?.XUM_WORKSPACE_ID).toBe("ws-1");
+    expect(launch.env?.PLUGIN_DATA).toBe(dataPath);
+
+    const userServer = await prepareStdioLaunch(
+      { transport: "stdio", command: "bunx -y some-server", disabled: false },
+      { workspaceId: "ws-1" }
+    );
+    expect(userServer.env).toBeUndefined();
+  });
+
   test("creates a nested PLUGIN_DATA cwd recursively before launch", async () => {
     using tmp = new DisposableTempDir("mcp-plugin-data-nested");
     const dataPath = path.join(tmp.path, "plugin-data", "abc123");

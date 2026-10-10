@@ -17,6 +17,10 @@
  *   mutation, so "model-visible ⟹ logged" holds and the replay harness can
  *   attribute the prompt bytes.
  *
+ * Every hook input carries `settings`: JSON the plugin's own MCP server saved
+ * in its PLUGIN_DATA directory (for example from an MCP Apps settings view),
+ * or null. Views only save data; this reviewed hooks.js decides what it does.
+ *
  * Failure posture (self-healing doctrine): a crashing, timing-out, or
  * malformed hook never breaks the turn — log, skip, continue. Only explicit
  * denials from `tool.execute.before` surface to the model.
@@ -54,6 +58,8 @@ import {
   type AgentPluginInfo,
 } from "./discovery";
 import { readMutationEpochToken, STAGING_DIR_NAME } from "./journals";
+import { getPluginDataPath, resolvePluginInstanceId } from "./mcpConfig";
+import { readPluginHookState } from "./pluginHookState";
 import {
   buildHookInvokeScript,
   buildHookLoadScript,
@@ -86,6 +92,8 @@ export interface EnsureWorkspaceHooksArgs {
   xumHome: string;
   /** Host checkout root for project containers; omit for off-host workspaces. */
   projectRoot?: string;
+  /** Project identity for project-plugin instance IDs (same as the plugin MCP provider). */
+  projectKey?: string;
   projectTrusted: boolean;
 }
 
@@ -94,12 +102,16 @@ interface DiscoveredHookPlugin {
   plugin: AgentPluginInfo;
   source: string;
   grants: CapabilityGrants;
+  /** The plugin instance's PLUGIN_DATA directory (hook settings live here). */
+  dataPath: string;
 }
 
 /** Host-side state for one loaded plugin hook mount. */
 interface LoadedPluginHookState {
   pluginName: string;
   grants: CapabilityGrants;
+  /** PLUGIN_DATA of this plugin instance; read for `settings` before each call. */
+  dataPath: string;
   /** Pinned hooks.js source; re-evaluated when the mount is rebuilt. */
   source: string;
   mountOptions: AcquireMountOptions;
@@ -201,7 +213,7 @@ export class AgentPluginHookService {
     const fingerprintLines = discovered.map(
       (candidate) =>
         `${candidate.plugin.scope}|${candidate.plugin.containerPath}|${candidate.plugin.dirName}|` +
-        `${sha256Hex(candidate.source)}|${JSON.stringify(candidate.grants)}`
+        `${sha256Hex(candidate.source)}|${JSON.stringify(candidate.grants)}|${candidate.dataPath}`
     );
     const fingerprint = fingerprintLines.join("\n");
 
@@ -284,6 +296,7 @@ export class AgentPluginHookService {
     const state: LoadedPluginHookState = {
       pluginName: plugin.name,
       grants: candidate.grants,
+      dataPath: candidate.dataPath,
       source: candidate.source,
       mountOptions: {
         lifetime: "persistent",
@@ -365,7 +378,18 @@ export class AgentPluginHookService {
         log.warn(`Agent plugin hooks: failed to read ${plugin.hooksPath}; skipping`, { error });
         continue;
       }
-      result.push({ plugin, source, grants: resolvePluginHookGrants(plugin.manifest) });
+      // Same instance ID as the plugin's MCP servers, so hooks read the
+      // PLUGIN_DATA directory those servers write.
+      const instanceId = resolvePluginInstanceId(plugin, {
+        projectRoot: args.projectRoot,
+        projectKey: args.projectKey,
+      });
+      result.push({
+        plugin,
+        source,
+        grants: resolvePluginHookGrants(plugin.manifest),
+        dataPath: getPluginDataPath(args.xumHome, instanceId),
+      });
     }
     return result;
   }
@@ -616,7 +640,9 @@ export class AgentPluginHookService {
       return null;
     }
     try {
-      const inputJson = JSON.stringify(input);
+      // Every hook point gets the plugin's saved settings (see pluginHookState.ts).
+      const settings = await readPluginHookState(state.dataPath, workspaceId);
+      const inputJson = JSON.stringify({ ...input, settings });
       assert(typeof inputJson === "string", "hook input must be JSON-serializable");
       const evalResult = await this.sandboxHost.withPersistentMount(
         state.mountOptions,
