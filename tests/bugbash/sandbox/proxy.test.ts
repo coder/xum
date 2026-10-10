@@ -181,6 +181,8 @@ test.each([
   ["the proxy closes mid-call", "[fake:hang]", "close"],
   ["the upstream answers 529", "[fake:529]", ""],
   ["the response exceeds 32 MiB", "[fake:huge]", ""],
+  ["a delta lowers a count of message_start", "[fake:lowered]", ""],
+  ["a delta nulls a count", "[fake:nulled]", ""],
 ])("keeps the full reservation when %s (P7)", async (_name, marker, action) => {
   // Only the stall case may reach the deadline: the others must end without it.
   const deadlineMs = marker === "[fake:stall]" ? 300 : 60_000;
@@ -326,10 +328,21 @@ test("refuses a fifth concurrent call, and a call that does not fit the budget, 
   expect(poor.ledger.totals()).toMatchObject({ refused: 1, spentNanoUsd: 0 });
 });
 
+test("refusals beyond the first 20 are counted per category, not logged", async () => {
+  const { socketPath, records, proxy } = await setup();
+  for (let i = 0; i < 30; i++) await send(socketPath, body("hi"), { path: `/x${i}` });
+  for (let i = 0; i < 5; i++) await send(socketPath, body("hi", { [`key${i}`]: 1 }));
+  expect(records).toHaveLength(20);
+  // The quoted key names are the container's: they never become categories.
+  expect(proxy.stats().refusedBy).toEqual({ "route: not allowed": 30, "body: key": 5 });
+  expect(proxy.stats().refused).toBe(35);
+});
+
 test("after close() the socket refuses connections and the upstream sees nothing new (P8)", async () => {
   const { socketPath, fake, proxy } = await setup();
   expect((await send(socketPath, body("hi"))).status).toBe(200);
   await proxy.close();
+  expect(fs.existsSync(socketPath)).toBe(false); // no socket file left in the job folder
   const after = await send(socketPath, body("hi")).then(
     () => "answered",
     () => "refused"

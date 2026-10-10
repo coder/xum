@@ -33,6 +33,11 @@ const MAX_IN_FLIGHT = 4;
 const MAX_CONNECTIONS = 16;
 const DEADLINE_MS = 10 * 60_000;
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+/**
+ * Refusals cost the container nothing, so it can send them without end. The first ones are
+ * logged in full; after that only their count per category grows (stats().refusedBy).
+ */
+const LOGGED_REFUSALS = 20;
 const RESPONSE_HEADERS = /^(content-type|request-id|retry-after|anthropic-ratelimit-[a-z0-9-]+)$/;
 
 /** One line per call for the launcher log. */
@@ -63,6 +68,8 @@ export interface ProxyOptions {
 class SseUsage {
   usage: Record<string, unknown> = {};
   stopped = false;
+  /** A delta lowered or nulled a count of message_start: the shape changed, so do not settle. */
+  lowered = false;
   #decoder = new TextDecoder();
   #line = "";
 
@@ -78,7 +85,15 @@ class SseUsage {
         continue; // an unreadable event cannot settle the call: no message_stop follows it
       }
       if (event.type === "message_start") this.usage = { ...event.message?.usage };
-      if (event.type === "message_delta") this.usage = { ...this.usage, ...event.usage };
+      if (event.type === "message_delta") {
+        // Delta counts are cumulative, so one below its message_start value is a shape change.
+        for (const [key, value] of Object.entries(event.usage ?? {})) {
+          const before = this.usage[key];
+          if (value == null || (typeof before === "number" && Number(value) < before))
+            this.lowered = true;
+        }
+        this.usage = { ...this.usage, ...event.usage };
+      }
       // An error after message_stop is impossible; one before it leaves `stopped` false.
       if (event.type === "message_stop") this.stopped = true;
     }
@@ -93,7 +108,22 @@ export async function startProxy(options: ProxyOptions) {
   const deadlineMs = options.deadlineMs ?? DEADLINE_MS;
   const calls = new Set<{ abort: AbortController; done: Promise<void> }>();
   const counts = { refused: 0, settled: 0, kept: 0, boundExceeded: 0 };
+  /**
+   * Refusals per category: the reason up to its first quoted (container-chosen) name, so the
+   * keys come from the fixed reason texts of this file and proxyPolicy.ts and stay few.
+   */
+  const refusedBy: Record<string, number> = {};
+  const record = (entry: CallRecord) => {
+    counts[entry.outcome] += 1;
+    if (entry.outcome === "refused") {
+      const category = (entry.reason ?? "").split('"')[0].trim();
+      refusedBy[category] = (refusedBy[category] ?? 0) + 1;
+      if (counts.refused > LOGGED_REFUSALS) return;
+    }
+    options.log(entry);
+  };
   let closed = false;
+  let listening: Promise<unknown> = Promise.resolve();
 
   async function handle(
     req: http.IncomingMessage,
@@ -101,10 +131,7 @@ export async function startProxy(options: ProxyOptions) {
     abort: AbortController
   ) {
     const started = Date.now();
-    const log = (record: Omit<CallRecord, "ms">) => {
-      counts[record.outcome] += 1;
-      options.log({ ...record, ms: Date.now() - started });
-    };
+    const log = (entry: Omit<CallRecord, "ms">) => record({ ...entry, ms: Date.now() - started });
     const reply = (status: number, reason: string) => replyError(res, status, reason);
     const refuse = (status: number, reason: string, model?: string) => {
       if (!res.headersSent && !res.destroyed) reply(status, reason);
@@ -177,7 +204,7 @@ export async function startProxy(options: ProxyOptions) {
       // end() to a client that went away.
       res.end();
       if (status !== 200 || abort.signal.aborted) return;
-      if (sse) usage = parser.stopped ? parser.usage : undefined;
+      if (sse) usage = parser.stopped && !parser.lowered ? parser.usage : undefined;
       else usage = (JSON.parse(Buffer.concat(json).toString()) as { usage?: unknown }).usage;
     } catch {
       // Fixed texts only: fetch errors can name the upstream host and other details.
@@ -204,8 +231,7 @@ export async function startProxy(options: ProxyOptions) {
     if (closed) return res.destroy(); // a kept-alive connection after close()
     const refuse = (status: number, reason: string) => {
       replyError(res, status, reason);
-      counts.refused += 1;
-      options.log({ outcome: "refused", status, reason, ms: 0 });
+      record({ outcome: "refused", status, reason, ms: 0 });
     };
     // P1: an exact match, so a query string or any other path refuses.
     if (req.method !== "POST" || req.url !== PROXY_PATH) return refuse(404, "route: not allowed");
@@ -281,13 +307,16 @@ export async function startProxy(options: ProxyOptions) {
     async close() {
       if (!closed) {
         closed = true;
-        front.close();
-        server.close();
-        fs.rmSync(inner, { recursive: true, force: true });
+        // The close callbacks run once the socket files are gone (Bun and Node remove them).
+        listening = Promise.all(
+          [front, server].map((listener) => new Promise((done) => listener.close(done)))
+        );
       }
       for (const call of calls) call.abort.abort();
       for (const outer of pipes) outer.emit("close");
       await Promise.allSettled([...calls].map((call) => call.done));
+      await listening;
+      fs.rmSync(inner, { recursive: true, force: true });
       if (counts.boundExceeded > 0) {
         throw new Error(
           `proxy: ${counts.boundExceeded} call(s) cost more than their reserved bound; fix maxCostNanoUsd in proxyPolicy.ts`
@@ -321,7 +350,7 @@ export async function startProxy(options: ProxyOptions) {
         req.end(JSON.stringify({ model, max_tokens: 1, messages }));
       });
     },
-    stats: () => ({ ...counts, inFlight: calls.size }),
+    stats: () => ({ ...counts, inFlight: calls.size, refusedBy: { ...refusedBy } }),
   };
 }
 

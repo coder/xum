@@ -9,6 +9,8 @@
  * `stream: true` request gets a complete SSE stream and any other request a JSON message.
  * `mode` applies a misbehavior to requests without a marker (the proxy's probe sends none).
  * `[fake:cut]` on a JSON request sends the headers and part of the body, then drops.
+ * `[fake:lowered]` and `[fake:nulled]` end a stream normally, but its message_delta lowers or
+ * nulls a count that message_start reported.
  */
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -103,7 +105,12 @@ function finish(res: http.ServerResponse, mode: string | undefined) {
   res.write(
     sse("message_delta", {
       delta: { stop_reason: "end_turn" },
-      usage: { output_tokens: FAKE_USAGE.output_tokens },
+      usage: {
+        output_tokens: FAKE_USAGE.output_tokens,
+        ...(mode === "lowered" && { input_tokens: 1 }),
+        // 0 in message_start, so only the null itself is wrong here.
+        ...(mode === "nulled" && { cache_creation_input_tokens: null }),
+      },
     })
   );
   if (mode === "cut") return res.destroy();
