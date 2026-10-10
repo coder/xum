@@ -339,6 +339,7 @@ interface RightSidebarTabsetNodeProps {
   onLauncherAutoFocusConsumed: () => void;
   /** Handler to close a terminal tab */
   onCloseTerminal: (tab: TabType) => void;
+  onSideChatInputReady: React.ComponentProps<typeof SideChatPanel>["onInputReady"];
   /** Handler to close a /side chat tab (discards the side chat) */
   onCloseSideChat: (tab: TabType) => void;
   /** Handler to remove a terminal tab after the session exits */
@@ -687,6 +688,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           >
             <SideChatPanel
               key={activeSideChatWorkspaceId}
+              onInputReady={props.onSideChatInputReady}
               sideChatWorkspaceId={activeSideChatWorkspaceId}
             />
           </div>
@@ -1259,7 +1261,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
   }, [setCollapsed, setLayout, workspaceId]);
 
-  const [launcherToolToFocus, setLauncherToolToFocus] = React.useState<TabType | null>(null);
+  const [tabToFocus, setTabToFocus] = React.useState<TabType | null>(null);
   const sidebarContainerRef = React.useRef<HTMLDivElement>(null);
 
   // /side chat tabs. Side chats this sidebar just opened whose metadata has not arrived yet, so
@@ -1283,7 +1285,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
           ? selectOrAddTab(prev, tab)
           : openToolFromNewTab(prev, detail.tabsetId, tab)
       );
-      if (detail.tabsetId != null) setLauncherToolToFocus(tab);
+      // Both /side and the launcher hand typing to the new chat once its composer is ready.
+      setTabToFocus(tab);
     };
     window.addEventListener(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, handleOpenSideChatTab);
     return () =>
@@ -1799,14 +1802,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   );
 
   React.useEffect(() => {
-    if (launcherToolToFocus == null) return;
+    if (tabToFocus == null || getSideChatTabWorkspaceId(tabToFocus) != null) return;
     // The launcher button has unmounted. Keep keyboard users in the replacement tab rather
     // than dropping focus on body; tools with their own focus target retain that behavior.
-    document
-      .getElementById(`${baseId}-${layout.focusedTabsetId}-tab-${launcherToolToFocus}`)
-      ?.focus();
-    setLauncherToolToFocus(null);
-  }, [baseId, launcherToolToFocus, layout.focusedTabsetId]);
+    document.getElementById(`${baseId}-${layout.focusedTabsetId}-tab-${tabToFocus}`)?.focus();
+    setTabToFocus(null);
+  }, [baseId, tabToFocus, layout.focusedTabsetId]);
 
   const sideChatCreationPending = React.useRef(false);
   const [creatingSideChat, setCreatingSideChat] = React.useState(false);
@@ -1835,7 +1836,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       // take focus because the user just picked them.
       if (tool === "review") _setFocusTrigger((prev) => prev + 1);
       if (tool === "artifacts") setAutoFocusArtifacts(true);
-      if (tool !== "review" && tool !== "artifacts") setLauncherToolToFocus(tool);
+      if (tool !== "review" && tool !== "artifacts") setTabToFocus(tool);
       setLayout((prev) => openToolFromNewTab(prev, tabsetId, tool));
     },
     [setLayout]
@@ -2139,6 +2140,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         launcherAutoFocusTabsetId={launcherAutoFocusTabsetId}
         onLauncherAutoFocusConsumed={() => setLauncherAutoFocusTabsetId(null)}
         onCloseTerminal={handleCloseTerminal}
+        onSideChatInputReady={(id, api) => {
+          if (tabToFocus !== makeSideChatTabType(id)) return;
+          api.focus();
+          setTabToFocus(null);
+        }}
         onCloseSideChat={handleCloseSideChat}
         onTerminalExit={removeTerminalTab}
         terminalTitles={terminalTitles}

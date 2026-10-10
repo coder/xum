@@ -1,3 +1,4 @@
+import type { ChatInputAPI } from "@/browser/features/ChatInput/types";
 import { ChatPaneContent } from "@/browser/components/ChatPane/ChatPane";
 import { WorkspaceModeAISync } from "@/browser/components/WorkspaceModeAISync/WorkspaceModeAISync";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
@@ -10,6 +11,7 @@ import { usePinnedWorkspaceChat } from "@/browser/stores/WorkspaceStore";
 import { SIDE_CHAT_PANE_ATTR } from "@/browser/utils/ui/keybinds";
 
 interface SideChatPanelProps {
+  onInputReady: (workspaceId: string, api: ChatInputAPI) => void;
   sideChatWorkspaceId: string;
 }
 
@@ -50,6 +52,7 @@ export function SideChatPanel(props: SideChatPanelProps) {
           <ThinkingProvider workspaceId={metadata.id}>
             <BackgroundBashProvider workspaceId={metadata.id}>
               <ChatPaneContent
+                onChatInputReady={(api) => props.onInputReady(metadata.id, api)}
                 embedded
                 workspaceId={metadata.id}
                 projectPath={metadata.projectPath}

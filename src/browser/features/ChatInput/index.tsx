@@ -2987,9 +2987,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       });
     };
     await runWithFinally(runWorkspaceSend, () => {
-      // Always restore focus at the end
+      // /side may have handed focus to another composer while this command completed.
+      // Keep that handoff instead of pulling typing back into the main chat.
       setTimeout(() => {
-        inputRef.current?.focus();
+        if (paneHandlesKeyEvent(paneScope, document.activeElement)) inputRef.current?.focus();
       }, 0);
     });
   };

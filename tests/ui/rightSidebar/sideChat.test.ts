@@ -180,10 +180,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
           expect(pane.querySelector('[role="tab"][id$="-tab-new"]')).toBeNull();
           const tab = pane.querySelector(`[role="tab"][id$="-tab-side:${firstId}"]`);
           expect(tab).not.toBeNull();
-          expect(
-            document.activeElement === tab ||
-              getSidePane(app, firstId)?.contains(document.activeElement)
-          ).toBe(true);
+          expect(document.activeElement === getSideComposer(app, firstId)).toBe(true);
         },
         { timeout: 10_000 }
       );
@@ -268,6 +265,59 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       expect(isStreaming(id)).toBe(false);
     } finally {
       create.mockRestore();
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test.each(["/side", "/btw"])(
+    "%s focuses the new side-chat composer once it is ready",
+    async (command) => {
+      const app = await createAppHarness({ branchPrefix: "side-chat-focus" });
+      try {
+        await sendFrom(() => getMainComposer(app), app.workspaceId, command);
+        const id = await waitForSideChatId(app);
+        await waitFor(
+          () => {
+            expect(getMainComposer(app).disabled).toBe(false);
+            expect(document.activeElement === getSideComposer(app, id)).toBe(true);
+          },
+          { timeout: 10_000 }
+        );
+        expect(decodeURIComponent(window.location.pathname)).toBe(`/workspace/${app.workspaceId}`);
+
+        // Opening requests focus once, not every time metadata or the side draft changes.
+        const mainComposer = getMainComposer(app);
+        mainComposer.focus();
+        act(() => getDraftStore().setText({ kind: "workspace", workspaceId: id }, "Side draft"));
+        await waitFor(() => expect(getSideComposer(app, id).value).toBe("Side draft"));
+        expect(document.activeElement === mainComposer).toBe(true);
+        expect(mainComposer.value).toBe("");
+      } finally {
+        await app.dispose();
+      }
+    },
+    90_000
+  );
+
+  test("/side focuses the full-screen composer when the sidebar is responsively hidden", async () => {
+    const app = await createAppHarness({ branchPrefix: "side-focus-narrow" });
+    try {
+      const sidebar = app.view.container.querySelector<HTMLElement>(
+        '[aria-label="Workspace insights"]'
+      )!;
+      // happy-dom cannot evaluate responsive CSS; model the narrow layout's computed display.
+      sidebar.style.display = "none";
+      await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
+      const id = await waitForSideChatId(app);
+      await waitFor(
+        () => {
+          expect(decodeURIComponent(window.location.pathname)).toBe(`/workspace/${id}`);
+          expect(document.activeElement === getMainComposer(app)).toBe(true);
+        },
+        { timeout: 10_000 }
+      );
+      expect(getSidePane(app)).toBeNull();
+    } finally {
       await app.dispose();
     }
   }, 90_000);
