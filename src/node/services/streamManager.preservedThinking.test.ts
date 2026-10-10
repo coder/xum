@@ -420,6 +420,41 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
       expect(JSON.stringify(next)).toContain("done");
     });
 
+    test("a response that opens with a native search replays in the API's order", async () => {
+      // The shape a live Opus 5.5 run returned (#5887): server_tool_use, its result, then
+      // signed thinking, then text, with no thinking before the search. The thinking is bound to
+      // the search before it, so the replay must not move it to the front of the message.
+      const workspaceId = "preserved-thinking-search-first";
+      const searchFirst = () =>
+        sse([
+          messageStart,
+          ...webSearchBlocks(0, searchResults),
+          ...thinkingBlock(2, "read", "sig-read"),
+          { type: "content_block_start", index: 3, content_block: { type: "text", text: "" } },
+          { type: "content_block_delta", index: 3, delta: { type: "text_delta", text: "found" } },
+          { type: "content_block_stop", index: 3 },
+          {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 1 },
+          },
+          { type: "message_stop" },
+        ]);
+      const scripted = await runServerToolTurn(workspaceId, searchFirst, []);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const row = history.data.find((message) => message.id === scripted.messageId);
+      expect(row?.metadata?.anthropicThinkingReplay).toBeUndefined();
+
+      const next = await nextTurnBody(workspaceId, scripted);
+      expect(firstAssistantBlocks(next).map((block) => block.type)).toEqual([
+        "server_tool_use",
+        "web_search_tool_result",
+        "thinking",
+        "text",
+      ]);
+    });
+
     test("a search whose result opens the next step is stored as the client pair", async () => {
       // Claude called web_search and a client tool in one parallel group: the response ends
       // after both calls, and the API runs the search at the start of the next step

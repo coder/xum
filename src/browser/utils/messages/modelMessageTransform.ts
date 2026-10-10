@@ -1143,7 +1143,12 @@ function ensureAnthropicThinkingBeforeToolCalls(messages: ModelMessage[]): Model
     // interleaved thinking, text can sit between two thinking blocks, and moving a block
     // edits the prefix every later block is bound to (#5887). Preserved thinking: "send it
     // back unchanged ... in the order received".
-    if (!hasToolCall || content[0]?.type === "reasoning") {
+    // The same holds for a message that opens with a natively replayed server tool (#5887): the
+    // API itself started the response with server_tool_use, and the thinking after the search is
+    // bound to it.
+    const opensWithServerTool =
+      content[0]?.type === "tool-call" && content[0].providerExecuted === true;
+    if (!hasToolCall || content[0]?.type === "reasoning" || opensWithServerTool) {
       result.push(msg);
       continue;
     }
