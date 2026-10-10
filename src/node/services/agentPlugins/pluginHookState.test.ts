@@ -101,6 +101,12 @@ describe("readPluginHookState", () => {
     await writeGlobal(dataPath, JSON.stringify({ a: 1, b: 1 }));
     await writeWorkspace(dataPath, "my.app-feature 2", JSON.stringify({ b: 2 }));
     expect(await readPluginHookState(dataPath, "my.app-feature 2")).toEqual({ a: 1, b: 2 });
+    // Legacy IDs join two basenames and can be long; any name the filesystem allows works.
+    const longId = "p".repeat(120) + "-" + "w".repeat(120);
+    await writeWorkspace(dataPath, longId, JSON.stringify({ b: 3 }));
+    expect(await readPluginHookState(dataPath, longId)).toEqual({ a: 1, b: 3 });
+    // Too long for any file system: no such file can exist, so the global settings apply.
+    expect(await readPluginHookState(dataPath, "x".repeat(600))).toEqual({ a: 1, b: 1 });
     for (const unsafe of ["../evil", "a/b", "a\\b", "a\u0000b", ""]) {
       expect(await readPluginHookState(dataPath, unsafe)).toEqual({ a: 1, b: 1 });
     }

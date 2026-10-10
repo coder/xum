@@ -34,14 +34,13 @@ export const PLUGIN_WORKSPACE_ID_ENV = "XUM_WORKSPACE_ID";
  * workspaces keep legacy `${project}-${workspace}` IDs that can hold dots or spaces, and the
  * plugin server receives that exact ID in XUM_WORKSPACE_ID. Path separators, NUL and control
  * characters are refused (`${id}.json` can never be `.` or `..`), and the read below also
- * checks containment.
+ * checks containment. No length cap: a name too long for the filesystem cannot be written by
+ * the server either, and the read treats ENAMETOOLONG like a missing file.
  */
-const MAX_WORKSPACE_ID_FILE_CHARS = 200;
 
 function isSafeWorkspaceIdFileName(workspaceId: string): boolean {
   return (
     workspaceId.length > 0 &&
-    workspaceId.length <= MAX_WORKSPACE_ID_FILE_CHARS &&
     // eslint-disable-next-line no-control-regex -- NUL and control characters are the point
     !/[/\\\u0000-\u001f\u007f]/.test(workspaceId)
   );
@@ -105,7 +104,7 @@ async function readStateFile(root: string, filePath: string): Promise<unknown> {
     });
     return JSON.parse(content) as unknown;
   } catch (error) {
-    if (!hasErrorCode(error, "ENOENT")) {
+    if (!hasErrorCode(error, "ENOENT") && !hasErrorCode(error, "ENAMETOOLONG")) {
       log.warn(`Plugin hook settings: ignoring ${filePath}`, { error: String(error) });
     }
     return null;
