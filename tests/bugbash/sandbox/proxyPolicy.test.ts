@@ -153,6 +153,7 @@ const refusedBodies: Record<string, unknown[]> = {
     content({ type: "document", source: { type: "url", url: "https://x" } }),
     content({ type: "server_tool_use", id: "s", name: "web_search" }),
     content({ type: "tool_result", tool_use_id: "t", content: [{ type: "tool_result" }] }),
+    { ...minimal, system: [{ type: "document", source: { type: "url", url: "https://x" } }] },
   ],
   "model: not allowed": [
     { ...minimal, model: "claude-fable-5-1" },
@@ -199,6 +200,15 @@ const refusedHeaders: [string, string[]][] = [
 test.each(refusedHeaders)("refuses with %s: %j", (reason, raw) => {
   const result = check(minimal, raw);
   expect(!result.ok && result.reason).toStartWith(reason);
+});
+
+test("refuses a priced model that is not on the job's list (P3)", () => {
+  const haikuOnly = { models: ["claude-haiku-4-5"] };
+  expect(
+    checkRequest(haikuOnly, headers, encode({ ...minimal, model: "claude-haiku-4-5" })).ok
+  ).toBe(true);
+  const result = checkRequest(haikuOnly, headers, encode(minimal)); // claude-sonnet-5-5
+  expect(!result.ok && result.reason).toBe("model: not allowed");
 });
 
 test("forwards only the allowed headers, and passes thinking that fits and chunked bodies", () => {

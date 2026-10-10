@@ -40,7 +40,12 @@ async function setup(options: { capUsd?: number; deadlineMs?: number } = {}) {
       waiters.splice(0).forEach((wake) => wake());
     },
   });
-  cleanups.push(() => proxy.close());
+  // The bound-miss test expects close() to reject; every other test must close cleanly.
+  cleanups.push(() =>
+    proxy.close().catch((error: unknown) => {
+      if (proxy.stats().boundExceeded === 0) throw error;
+    })
+  );
   /** Resolves once `count` calls have their record. */
   const recorded = async (count: number) => {
     while (records.length < count) await new Promise<void>((wake) => waiters.push(wake));
@@ -214,6 +219,18 @@ test("the deadline also bounds a request whose body never completes", async () =
   socket.destroy();
   expect(record).toMatchObject({ outcome: "refused", status: 499 });
   expect(fake.requests).toHaveLength(0);
+});
+
+test("close() rejects when a call cost more than its bound, so the job fails", async () => {
+  const { socketPath, proxy, records } = await setup();
+  expect((await send(socketPath, body("[fake:overbill]"))).status).toBe(200);
+  expect(records[0]).toMatchObject({ outcome: "settled", boundExceeded: true });
+  expect(proxy.stats().boundExceeded).toBe(1);
+  const closed = await proxy.close().then(
+    () => "",
+    (error: Error) => error.message
+  );
+  expect(closed).toContain("1 call(s) cost more than their reserved bound");
 });
 
 test("refuses a fifth concurrent call, and a call that does not fit the budget, before the upstream", async () => {

@@ -26,6 +26,8 @@ const RESPONSE_HEADERS = /^(content-type|request-id|retry-after|anthropic-rateli
 /** One line per call for the launcher log. */
 export interface CallRecord {
   outcome: "refused" | "settled" | "kept";
+  /** The settled usage cost more than the reservation: the cost model is wrong. */
+  boundExceeded?: true;
   status: number;
   model?: string;
   reason?: string;
@@ -78,7 +80,7 @@ export async function startProxy(options: ProxyOptions) {
   }
   const deadlineMs = options.deadlineMs ?? DEADLINE_MS;
   const calls = new Set<{ abort: AbortController; done: Promise<void> }>();
-  const counts = { refused: 0, settled: 0, kept: 0 };
+  const counts = { refused: 0, settled: 0, kept: 0, boundExceeded: 0 };
   let closed = false;
 
   async function handle(
@@ -176,8 +178,12 @@ export async function startProxy(options: ProxyOptions) {
         options.ledger.keep(id);
         log({ outcome: "kept", ...record });
       } else {
+        // settle() is synchronous, so the counter delta belongs to this call alone.
+        const misses = options.ledger.totals().boundExceeded;
         options.ledger.settle(id, usage); // unreadable usage keeps the reservation (proxyPolicy.ts)
-        log({ outcome: "settled", ...record });
+        const exceeded = options.ledger.totals().boundExceeded > misses;
+        if (exceeded) counts.boundExceeded += 1;
+        log({ outcome: "settled", ...record, ...(exceeded && { boundExceeded: true }) });
       }
     }
   }
@@ -217,7 +223,11 @@ export async function startProxy(options: ProxyOptions) {
   fs.chmodSync(options.socketPath, 0o600);
 
   return {
-    /** Stops the listener, aborts every call and returns after each one is counted. Idempotent. */
+    /**
+     * Stops the listener, aborts every call and returns after each one is counted. Idempotent.
+     * Rejects when a call of this job cost more than its bound: the cost model is wrong, so the
+     * job must fail loudly even though the ledger stayed under its cap.
+     */
     async close() {
       if (!closed) {
         closed = true;
@@ -225,6 +235,11 @@ export async function startProxy(options: ProxyOptions) {
       }
       for (const call of calls) call.abort.abort();
       await Promise.allSettled([...calls].map((call) => call.done));
+      if (counts.boundExceeded > 0) {
+        throw new Error(
+          `proxy: ${counts.boundExceeded} call(s) cost more than their reserved bound; fix maxCostNanoUsd in proxyPolicy.ts`
+        );
+      }
     },
     /** The app AI mode probe (`max_tokens: 1`) through the same policy, ledger and upstream. */
     probe(model: string): Promise<{ status: number }> {

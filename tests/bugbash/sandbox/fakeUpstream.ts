@@ -5,7 +5,7 @@
  * `[fake:redirect]` (a 307 to /redirected), `[fake:529]` (overloaded), `[fake:cut]` (the
  * connection drops before message_stop), `[fake:nostop]` (the stream ends cleanly without it), `[fake:hang]` (the stream starts and never ends), `[fake:slow]` (the stream pauses 300 ms after
  * message_start), `[fake:stall]`
- * (no answer at all), `[fake:huge]` (a stream above the proxy's response cap). Otherwise a
+ * (no answer at all), `[fake:overbill]` (a JSON answer whose usage exceeds any small bound), `[fake:huge]` (a stream above the proxy's response cap). Otherwise a
  * `stream: true` request gets a complete SSE stream and any other request a JSON message.
  */
 import * as http from "node:http";
@@ -54,7 +54,7 @@ export async function startFakeUpstream() {
           ...message,
           content: [{ type: "text", text: "ok" }],
           stop_reason: "end_turn",
-          usage: FAKE_USAGE,
+          usage: mode === "overbill" ? { ...FAKE_USAGE, input_tokens: 1_000_000 } : FAKE_USAGE,
         };
         return res
           .writeHead(200, { ...headers, "content-type": "application/json" })
