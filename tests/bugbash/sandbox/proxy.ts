@@ -10,15 +10,24 @@
  * response: a JSON body with `usage`, or an SSE stream through `message_stop`. Every other outcome
  * keeps the full reservation. `close()` aborts every call and returns only after each one is
  * counted (P8). Records and refusal texts carry no body, header value or key (P9).
+ *
+ * A `net` front owns the job's socket and pipes each connection to the HTTP server, which listens
+ * on a socket in a private folder of its own. Bun 1.3.12's node:http server never reports a
+ * connection whose request headers do not complete, so only the front can bound those: at most
+ * MAX_CONNECTIONS, each destroyed after twice the deadline without a byte, all by close().
  */
 import { once } from "node:events";
 import * as fs from "node:fs";
 import * as http from "node:http";
+import * as net from "node:net";
+import * as os from "node:os";
 import * as path from "node:path";
 import { checkRequest, MAX_BODY_BYTES, type JobPolicy, type Ledger } from "./proxyPolicy";
 
 export const PROXY_PATH = "/anthropic/v1/messages";
 const MAX_IN_FLIGHT = 4;
+/** Open connections per job, idle ones included. Each one beyond this is destroyed at once. */
+const MAX_CONNECTIONS = 16;
 const DEADLINE_MS = 10 * 60_000;
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 const RESPONSE_HEADERS = /^(content-type|request-id|retry-after|anthropic-ratelimit-[a-z0-9-]+)$/;
@@ -216,11 +225,46 @@ export async function startProxy(options: ProxyOptions) {
     });
     calls.add(call);
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(options.socketPath, resolve);
+  // Not in the job folder: the container must reach the HTTP server only through the front.
+  const inner = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-proxy-"));
+  const innerPath = path.join(inner, "http.sock");
+  const pipes = new Set<net.Socket>();
+  const front = net.createServer((outer) => {
+    // Deferred: Bun 1.3.12 ignores a destroy() inside the connection handler itself.
+    if (closed || pipes.size >= MAX_CONNECTIONS) return void setImmediate(() => outer.destroy());
+    const peer = net.connect(innerPath);
+    let idle: ReturnType<typeof setTimeout> | undefined;
+    const end = () => {
+      clearTimeout(idle);
+      pipes.delete(outer);
+      outer.destroy();
+      peer.destroy();
+    };
+    const touch = () => {
+      clearTimeout(idle);
+      // Twice the call deadline, so a call's own deadline answers first (a 502, not a cut).
+      idle = setTimeout(end, 2 * deadlineMs);
+    };
+    pipes.add(outer);
+    touch();
+    for (const [from, to] of [
+      [outer, peer],
+      [peer, outer],
+    ] as const) {
+      from.on("data", touch).on("close", end).on("error", end);
+      from.pipe(to);
+    }
   });
-  fs.chmodSync(options.socketPath, 0o600);
+  for (const [listener, socketPath] of [
+    [server, innerPath],
+    [front, options.socketPath],
+  ] as const) {
+    await new Promise<void>((resolve, reject) => {
+      listener.once("error", reject);
+      listener.listen(socketPath, resolve);
+    });
+    fs.chmodSync(socketPath, 0o600);
+  }
 
   return {
     /**
@@ -231,9 +275,12 @@ export async function startProxy(options: ProxyOptions) {
     async close() {
       if (!closed) {
         closed = true;
+        front.close();
         server.close();
+        fs.rmSync(inner, { recursive: true, force: true });
       }
       for (const call of calls) call.abort.abort();
+      for (const outer of pipes) outer.emit("close");
       await Promise.allSettled([...calls].map((call) => call.done));
       if (counts.boundExceeded > 0) {
         throw new Error(
@@ -249,8 +296,19 @@ export async function startProxy(options: ProxyOptions) {
         const req = http.request(
           { socketPath: options.socketPath, method: "POST", path: PROXY_PATH, headers },
           (res) => {
-            res.resume();
-            res.on("end", () => resolve({ status: res.statusCode ?? 0 }));
+            let text = "";
+            res.on("data", (chunk: Buffer) => (text += chunk.toString()));
+            // A response cut after its headers can end early or look complete (Bun), so only a
+            // whole JSON body counts as an answer.
+            const settle = () => {
+              try {
+                JSON.parse(text);
+                resolve({ status: res.statusCode ?? 0 });
+              } catch {
+                reject(new Error("probe: the response ended early"));
+              }
+            };
+            res.on("end", settle).on("close", settle).on("error", settle);
           }
         );
         req.on("error", reject);

@@ -7,6 +7,8 @@
  * message_start), `[fake:stall]`
  * (no answer at all), `[fake:overbill]` (a JSON answer whose usage exceeds any small bound), `[fake:huge]` (a stream above the proxy's response cap). Otherwise a
  * `stream: true` request gets a complete SSE stream and any other request a JSON message.
+ * `mode` applies a misbehavior to requests without a marker (the proxy's probe sends none).
+ * `[fake:cut]` on a JSON request sends the headers and part of the body, then drops.
  */
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -30,13 +32,14 @@ const sse = (type: string, data: object) =>
 
 export async function startFakeUpstream() {
   const requests: FakeRequest[] = [];
+  const state: { mode?: string } = {};
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
       const body = Buffer.concat(chunks).toString();
       requests.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers, body });
-      const mode = /\[fake:(\w+)\]/.exec(body)?.[1];
+      const mode = /\[fake:(\w+)\]/.exec(body)?.[1] ?? state.mode;
       const parsed = JSON.parse(body || "{}") as { model?: string; stream?: boolean };
       const model = parsed.model ?? "claude-haiku-4-5";
       const headers = { "request-id": "req_fake", "x-fake-internal": "dropped by the proxy" };
@@ -49,6 +52,10 @@ export async function startFakeUpstream() {
           .end(JSON.stringify(error));
       }
       const message = { id: "msg_fake", type: "message", role: "assistant", model };
+      if (parsed.stream !== true && mode === "cut") {
+        res.writeHead(200, { ...headers, "content-type": "application/json" });
+        return res.write('{"id":"msg_fake"', () => res.destroy());
+      }
       if (parsed.stream !== true) {
         const reply = {
           ...message,
@@ -76,6 +83,7 @@ export async function startFakeUpstream() {
   return {
     baseUrl: `http://127.0.0.1:${port}`,
     requests,
+    setMode: (mode?: string) => (state.mode = mode),
     close: () => {
       server.closeAllConnections();
       return new Promise<void>((resolve) => server.close(() => resolve()));

@@ -221,6 +221,51 @@ test("the deadline also bounds a request whose body never completes", async () =
   expect(fake.requests).toHaveLength(0);
 });
 
+test("a connection that never completes its headers is bounded, counted and closed", async () => {
+  const { socketPath, proxy } = await setup({ deadlineMs: 300 });
+  const open = () =>
+    new Promise<{ closed: Promise<number>; isClosed: () => boolean }>((resolve) => {
+      let done = false;
+      const socket = net.connect(socketPath, () => {
+        socket.write(`POST ${PROXY_PATH} HTTP/1.1\r\nhost: x\r\n`); // headers never end
+        const started = Date.now();
+        const closed = new Promise<number>((settle) =>
+          socket.on("close", () => {
+            done = true;
+            settle(Date.now() - started);
+          })
+        );
+        resolve({ closed, isClosed: () => done });
+      });
+      socket.on("error", () => undefined);
+    });
+  // A half-open connection ends after twice the deadline without a byte.
+  expect(await (await open()).closed).toBeGreaterThanOrEqual(550);
+  // Connections beyond the limit are destroyed at once; close() destroys the rest.
+  const held = [];
+  for (let i = 0; i < 16; i++) held.push(await open());
+  const extra = await open();
+  expect(await extra.closed).toBeLessThan(300);
+  expect(held.some((h) => h.isClosed())).toBe(false);
+  const closing = Date.now();
+  await proxy.close();
+  await Promise.all(held.map((h) => h.closed));
+  expect(Date.now() - closing).toBeLessThan(200); // close(), not their idle deadline
+});
+
+test.each(["cut", "stall"])(
+  "probe() settles without a 200 when the upstream answer is %s",
+  async (mode) => {
+    const { fake, proxy } = await setup({ deadlineMs: 300 });
+    fake.setMode(mode);
+    const probe = await proxy.probe(MODEL).then(
+      (result) => `status ${result.status}`,
+      (error: Error) => error.message
+    );
+    expect(probe).not.toBe("status 200");
+  }
+);
+
 test("close() rejects when a call cost more than its bound, so the job fails", async () => {
   const { socketPath, proxy, records } = await setup();
   expect((await send(socketPath, body("[fake:overbill]"))).status).toBe(200);
