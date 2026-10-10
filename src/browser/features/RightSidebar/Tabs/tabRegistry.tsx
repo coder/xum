@@ -29,16 +29,11 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { ErrorBoundary } from "@/browser/components/ErrorBoundary/ErrorBoundary";
-import { InstructionsTab } from "@/browser/components/InstructionsTab/InstructionsTab";
-import { OutputTab } from "@/browser/components/OutputTab/OutputTab";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 import { StatsContainer } from "@/browser/features/RightSidebar/StatsContainer";
 import { ReviewPanel } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
-import { DesktopPanel } from "@/browser/features/desktop/DesktopPanel";
-import { BrowserTab } from "@/browser/features/RightSidebar/BrowserTab";
-import { DevToolsTab } from "@/browser/features/RightSidebar/DevToolsTab";
-import { GoalTab, type GoalCreateIntent } from "@/browser/features/RightSidebar/GoalTab";
-import { MemoryTab } from "@/browser/features/RightSidebar/Memory/MemoryTab";
-import { WorkflowsTab } from "@/browser/features/RightSidebar/Workflows/WorkflowsTab";
+import type { GoalCreateIntent } from "@/browser/features/RightSidebar/GoalTab";
+// Timeline and Artifacts stay eager: TimelineDialog and ArtifactsDialog import them statically.
 import { TimelinePanel } from "@/browser/features/RightSidebar/Timeline/TimelinePanel";
 import { ArtifactsPanel } from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsPanel";
 import type { GoalSnapshot, GoalStatus } from "@/common/types/goal";
@@ -60,6 +55,46 @@ import {
 } from "./TabLabels";
 
 export { isBaseTabId, type BaseTabType } from "./tabConfig";
+
+/**
+ * A panel that stays off the first load until its tab first renders (T3, #5971). Costs (the default
+ * tab) and Review stay eager: Review's module also holds the always-mounted stats reporter.
+ */
+function lazyPanel<P extends object>(name: string, load: () => Promise<React.ComponentType<P>>) {
+  const Panel = React.lazy(async () => ({ default: await load() }));
+  return function LazyPanel(props: React.PropsWithRef<P> & React.JSX.IntrinsicAttributes) {
+    return (
+      <LazyFeature name={name}>
+        <Panel {...props} />
+      </LazyFeature>
+    );
+  };
+}
+
+const InstructionsTab = lazyPanel("Instructions", () =>
+  import("@/browser/components/InstructionsTab/InstructionsTab").then((m) => m.InstructionsTab)
+);
+const OutputTab = lazyPanel("Output", () =>
+  import("@/browser/components/OutputTab/OutputTab").then((m) => m.OutputTab)
+);
+const DesktopPanel = lazyPanel("Desktop", () =>
+  import("@/browser/features/desktop/DesktopPanel").then((m) => m.DesktopPanel)
+);
+const BrowserTab = lazyPanel("Browser", () =>
+  import("@/browser/features/RightSidebar/BrowserTab").then((m) => m.BrowserTab)
+);
+const DevToolsTab = lazyPanel("Debug", () =>
+  import("@/browser/features/RightSidebar/DevToolsTab").then((m) => m.DevToolsTab)
+);
+const GoalTab = lazyPanel("Goal", () =>
+  import("@/browser/features/RightSidebar/GoalTab").then((m) => m.GoalTab)
+);
+const MemoryTab = lazyPanel("Memory", () =>
+  import("@/browser/features/RightSidebar/Memory/MemoryTab").then((m) => m.MemoryTab)
+);
+const WorkflowsTab = lazyPanel("Workflows", () =>
+  import("@/browser/features/RightSidebar/Workflows/WorkflowsTab").then((m) => m.WorkflowsTab)
+);
 
 /** Stats reported by ReviewPanel for tab display (kept local to the registry). */
 export interface ReviewStats {

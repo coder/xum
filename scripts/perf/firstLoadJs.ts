@@ -22,6 +22,7 @@ export const FIRST_LOAD_FORBIDDEN_SOURCES: readonly string[] = [
   "features/Settings/Sections/ProvidersSection",
   "node_modules/@shikijs/langs/",
   "node_modules/recharts/",
+  "features/desktop/DesktopPanel",
 ];
 
 function fail(message: string): never {

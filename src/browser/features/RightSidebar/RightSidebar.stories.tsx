@@ -1440,7 +1440,10 @@ export const OutputTabEmpty: Story = {
   ),
   play: async ({ canvasElement }) => {
     const output = await within(canvasElement).findByRole("tabpanel", { name: /^output/i });
-    await expect(within(output).getByRole("button", { name: "Delete output logs" })).toBeVisible();
+    // The Output panel is lazy-loaded: its body arrives after the tabpanel.
+    await expect(
+      await within(output).findByRole("button", { name: "Delete output logs" })
+    ).toBeVisible();
     await expect(output.querySelector(".overflow-y-auto")).toBeEmptyDOMElement();
   },
 };
@@ -1641,7 +1644,10 @@ export const NewTabLauncherNarrow: Story = {
 
     const output = await canvas.findByRole("tabpanel", { name: /^output/i });
     await expect(output).toBeVisible();
-    await expect(within(output).getByRole("button", { name: "Delete output logs" })).toBeVisible();
+    // The Output panel is lazy-loaded: its body arrives after the tabpanel.
+    await expect(
+      await within(output).findByRole("button", { name: "Delete output logs" })
+    ).toBeVisible();
     await expect(output.querySelector(".overflow-y-auto")).toBeEmptyDOMElement();
     // Both states must share one capture, not merely exist off-screen or in a hidden tab.
     const outputRect = output.getBoundingClientRect();
