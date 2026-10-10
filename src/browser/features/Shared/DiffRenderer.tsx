@@ -21,6 +21,7 @@ import {
   type HighlightedChunk,
 } from "@/browser/utils/highlighting/highlightDiffChunk";
 import { LRUCache } from "lru-cache";
+import { DIFF_ADDED_TEXT_COLOR, DIFF_REMOVED_TEXT_COLOR } from "@/constants/diffColors";
 import {
   highlightSearchMatches,
   type SearchHighlightConfig,
@@ -151,15 +152,13 @@ const doesLineMatchReviewRange = (
   return matchesOld || matchesNew;
 };
 
-// The +/- signs mix 40% of the text color into success/danger: darker in light themes, lighter in
-// dark ones. That reaches WCAG AA (4.5:1) on the line tints and under the review-range highlight
-// in all four themes (#5985); 35% left light "+" at 4.26:1 under the highlight.
+// The +/- signs use the shared AA-tuned added/removed text colors (#5985).
 const getIndicatorColor = (type: DiffLineType): string => {
   switch (type) {
     case "add":
-      return "color-mix(in srgb, var(--color-success), var(--color-text) 40%)";
+      return DIFF_ADDED_TEXT_COLOR;
     case "remove":
-      return "color-mix(in srgb, var(--color-danger), var(--color-text) 40%)";
+      return DIFF_REMOVED_TEXT_COLOR;
     default:
       return "transparent";
   }
