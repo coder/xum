@@ -1,4 +1,5 @@
 import { X } from "lucide-react";
+import React from "react";
 
 import {
   Dialog,
@@ -7,12 +8,19 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/browser/components/Dialog/Dialog";
-import { TerminalView } from "@/browser/components/TerminalView/TerminalView";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { TerminalRouterProvider } from "@/browser/terminal/TerminalRouterContext";
 import { hideTerminalDialog, useTerminalDialogSession } from "@/browser/utils/terminalDialogStore";
 import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+
+// Code-split (T3, #5971): ghostty-web inlines its WASM, so keep it off the first load.
+const TerminalView = React.lazy(() =>
+  import("@/browser/components/TerminalView/TerminalView").then((m) => ({
+    default: m.TerminalView,
+  }))
+);
 
 /**
  * The pop-out terminal of iOS Home Screen web apps, which have no second window to open
@@ -72,17 +80,19 @@ export function TerminalDialog() {
         <div className="min-h-0 flex-1">
           {/* A pop-out router keeps the session out of the sidebar's restored tabs. */}
           <TerminalRouterProvider popout>
-            <TerminalView
-              key={session.sessionId}
-              workspaceId={session.workspaceId}
-              sessionId={session.sessionId}
-              initialTitle={session.initialTitle}
-              visible={true}
-              setDocumentTitle={false}
-              workspaceName={metadata?.name ?? ""}
-              projectName={metadata?.projectName ?? ""}
-              onExit={() => hideTerminalDialog(session.sessionId)}
-            />
+            <LazyFeature name="Terminal" fallback={<div className="h-full w-full" />}>
+              <TerminalView
+                key={session.sessionId}
+                workspaceId={session.workspaceId}
+                sessionId={session.sessionId}
+                initialTitle={session.initialTitle}
+                visible={true}
+                setDocumentTitle={false}
+                workspaceName={metadata?.name ?? ""}
+                projectName={metadata?.projectName ?? ""}
+                onExit={() => hideTerminalDialog(session.sessionId)}
+              />
+            </LazyFeature>
           </TerminalRouterProvider>
         </div>
       </DialogContent>
