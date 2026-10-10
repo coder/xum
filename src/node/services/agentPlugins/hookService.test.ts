@@ -492,6 +492,8 @@ describe("AgentPluginHookService", () => {
         expect(ensure).toHaveBeenCalledTimes(1);
         expect(ensure.mock.calls[0][0]).toMatchObject({
           projectRoot: h.config.rootDir,
+          // Project plugin instance IDs (and so PLUGIN_DATA) hash the project key, not the checkout.
+          projectKey: h.config.rootDir,
           projectTrusted: false,
         });
         if (mode !== "enabled") {

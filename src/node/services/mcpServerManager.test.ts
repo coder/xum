@@ -797,6 +797,28 @@ describe("MCPServerManager", () => {
     }
   );
 
+  test("a named Test connection tells a plugin stdio server its workspace", async () => {
+    using tmp = new DisposableTempDir("mcp-named-test-workspace");
+    await componentFixture(tmp.path);
+    const exec = mock((_command: string, _options: { env?: Record<string, string> }) =>
+      Promise.reject(new Error("launch reached"))
+    );
+    const runtime = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      exec,
+    } as unknown as Runtime);
+    try {
+      await manager.test({
+        projectPath: tmp.path,
+        name: "plugin:instance:keep",
+        workspaceId: "ws-7",
+      });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec.mock.calls[0]?.[1].env?.XUM_WORKSPACE_ID).toBe("ws-7");
+    } finally {
+      runtime.mockRestore();
+    }
+  });
+
   /** Leave only `key` configured, so a serve's launch fences belong to it alone. */
   const onlyServer = (configs: Record<string, MCPServerInfo>, key: string, info = configs[key]) => {
     for (const name of Object.keys(configs)) delete configs[name];

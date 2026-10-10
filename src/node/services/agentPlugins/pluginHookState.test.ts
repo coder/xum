@@ -87,6 +87,25 @@ describe("readPluginHookState", () => {
     expect(await readPluginHookState(dataPath, "ws-a")).toBeNull();
   });
 
+  test("a named pipe in place of the settings file never blocks the read", async () => {
+    const dataPath = await makeDataDir();
+    const fifo = path.join(dataPath, PLUGIN_HOOK_STATE_FILE);
+    const made = Bun.spawnSync(["mkfifo", fifo]);
+    if (made.exitCode !== 0) return; // no mkfifo on this platform
+    // Without the regular-file check, open() waits for a writer and this test times out.
+    expect(await readPluginHookState(dataPath, "ws-a")).toBeNull();
+  });
+
+  test("legacy workspace IDs with dots and spaces keep their workspace file", async () => {
+    const dataPath = await makeDataDir();
+    await writeGlobal(dataPath, JSON.stringify({ a: 1, b: 1 }));
+    await writeWorkspace(dataPath, "my.app-feature 2", JSON.stringify({ b: 2 }));
+    expect(await readPluginHookState(dataPath, "my.app-feature 2")).toEqual({ a: 1, b: 2 });
+    for (const unsafe of ["../evil", "a/b", "a\\b", "a\u0000b", ""]) {
+      expect(await readPluginHookState(dataPath, unsafe)).toEqual({ a: 1, b: 1 });
+    }
+  });
+
   test("a data directory that does not exist yet reads as no settings", async () => {
     const dataPath = await makeDataDir();
     expect(await readPluginHookState(path.join(dataPath, "missing"), "ws-a")).toBeNull();
