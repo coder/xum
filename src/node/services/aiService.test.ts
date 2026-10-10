@@ -4169,6 +4169,129 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
   });
 
+  // Every new workspace and sub-agent pays the Xum-owned tool block and system
+  // prompt before its first message, and writes it to the prompt cache. These
+  // ceilings stop that fixed cost from creeping back; raise one only on purpose.
+  describe("first-request size budget", () => {
+    const SCENARIOS = [
+      {
+        label: "root exec",
+        agentId: "exec",
+        overrides: {},
+        toolChars: 78_034,
+        systemChars: 13_251,
+      },
+      {
+        label: "explore sub-agent",
+        agentId: "explore",
+        overrides: { parentWorkspaceId: "parent-workspace", agentId: "explore" },
+        toolChars: 41_859,
+        systemChars: 12_096,
+      },
+      {
+        label: "exec sub-agent",
+        agentId: "exec",
+        overrides: { parentWorkspaceId: "parent-workspace", agentId: "exec" },
+        toolChars: 71_143,
+        systemChars: 15_107,
+      },
+    ];
+
+    it.each(SCENARIOS)(
+      "keeps the $label tool block and system prompt within budget",
+      async ({ agentId, overrides, toolChars, systemChars }) => {
+        using xumHome = new DisposableTempDir("ai-service-size-budget");
+        const projectPath = path.join(xumHome.path, "project");
+        await fs.mkdir(projectPath, { recursive: true });
+        const workspaceId = "workspace-size-budget";
+        await writeMainConfig(xumHome.path, { agentHeartbeatsEnabled: true });
+        // Memory on with an empty index; built-in agents and skills only; no MCP.
+        const experimentsService = new ExperimentsService({
+          telemetryService: new TelemetryService(xumHome.path),
+          xumHome: xumHome.path,
+        });
+        spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+          (id) =>
+            id === EXPERIMENT_IDS.MEMORY ||
+            id === EXPERIMENT_IDS.TOKEN_BUDGET ||
+            id === EXPERIMENT_IDS.ARTIFACTS
+        );
+        const harness = createHarness(
+          xumHome.path,
+          createLocalWorkspaceMetadata(workspaceId, projectPath, overrides),
+          { useRequestedModelString: true, experimentsService }
+        );
+        const bindings = harness.service.turnRequestBuilderBindings;
+        bindings.memoryService = new MemoryService(
+          harness.config,
+          new MemoryMetaService(xumHome.path)
+        );
+        // Present in every real workspace; only their tools' descriptions are measured.
+        bindings.taskService = {} as unknown as NonNullable<typeof bindings.taskService>;
+        bindings.workflowArchiveAdmission = {} as unknown as NonNullable<
+          typeof bindings.workflowArchiveAdmission
+        >;
+        bindings.timelineService = {} as unknown as NonNullable<typeof bindings.timelineService>;
+        bindings.workspaceHeartbeatService = {} as unknown as NonNullable<
+          typeof bindings.workspaceHeartbeatService
+        >;
+        harness.getToolsForModelSpy.mockImplementation(realGetToolsForModel);
+        spyOn(agentResolution, "resolveAgentForStream").mockRestore();
+        spyOn(turnContextAssembler, "buildStreamSystemContext").mockRestore();
+        spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
+        spyOn(systemMessageModule, "extractToolInstructionsFromSources").mockRestore();
+        const goalService = {
+          getGoal: mock(() => Promise.resolve(null)),
+        } as unknown as WorkspaceGoalService;
+
+        const result = await harness.service.streamMessage({
+          messages: [createMuxMessage("latest-user", "user", "hello")],
+          workspaceId,
+          modelString: KNOWN_MODELS.SONNET.id,
+          thinkingLevel: "off",
+          agentId,
+          workspaceGoalService: goalService,
+        });
+        expect(result.success).toBe(true);
+        const request = harness.startStreamCalls.at(-1)!;
+
+        // Wire size per tool: name, description and input schema as sent.
+        const perTool = Object.entries(request.tools ?? {})
+          .filter(([, t]) => t.providerOptions?.anthropic?.deferLoading !== true)
+          .map(([name, t]) => ({
+            name,
+            chars:
+              name.length +
+              (t.description ?? "").length +
+              JSON.stringify(t.type === "provider" ? t.args : asSchema(t.inputSchema).jsonSchema)
+                .length,
+          }))
+          .sort((a, b) => b.chars - a.chars);
+        const measuredToolChars = perTool.reduce((sum, t) => sum + t.chars, 0);
+        // The fixture has no user instructions or memories, so every system row is Xum-owned.
+        const measuredSystemChars = request.messages
+          .filter((message) => message.role === "system")
+          .reduce(
+            (sum, message) =>
+              sum +
+              (typeof message.content === "string"
+                ? message.content.length
+                : JSON.stringify(message.content).length),
+            0
+          );
+        if (measuredToolChars > toolChars || measuredSystemChars > systemChars) {
+          throw new Error(
+            [
+              `tools ${measuredToolChars} chars (budget ${toolChars})`,
+              `system ${measuredSystemChars} chars (budget ${systemChars})`,
+              ...perTool.map((t) => `  ${t.name}: ${t.chars}`),
+            ].join("\n")
+          );
+        }
+      }
+    );
+  });
+
   describe("Auto-routed tier model that cannot be built", () => {
     const TIER_MODEL = "openai:gpt-5.2";
     const COMPOSER_MODEL = "anthropic:claude-sonnet-4-5";
