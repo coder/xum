@@ -721,6 +721,11 @@ test("D1: under hidepid (or an unknown /proc policy) a gone PID cannot tell", ()
   for (const hidden of ["rw,hidepid=2", "rw,hidepid=invisible", "rw,gid=4,hidepid=1"])
     expect(ownerState(gone, proc(hidden))).toBe("cannot tell");
   expect(ownerState(gone, () => "22 1 0:21 / /sys rw - sysfs sysfs rw\n")).toBe("cannot tell");
+  // Two /proc mounts: the later one is in effect, whichever way round.
+  const stacked = (first: string, last: string) => () =>
+    `${proc(first)()}1990 1907 0:180 / /proc rw,nosuid - proc proc ${last}\n`;
+  expect(ownerState(gone, stacked("rw", "rw,hidepid=2"))).toBe("cannot tell");
+  expect(ownerState(gone, stacked("rw,hidepid=2", "rw"))).toBe("dead");
   expect(
     ownerState(gone, () => {
       throw new Error("EACCES");
@@ -1115,6 +1120,25 @@ test("B2: an explore job spends from the run's ledger and writes its output to t
   }
 });
 
+async function selfCheckLaunch(over: Record<string, string>, args: string[]) {
+  const upstream = await startFakeUpstream();
+  try {
+    const cwd = prepare(over);
+    const env = {
+      ...HOST_ENV,
+      BUGBASH_BUDGET_USD: "1",
+      ANTHROPIC_API_KEY: UPSTREAM_KEY,
+      ANTHROPIC_BASE_URL: `${upstream.baseUrl}/v1`,
+      BUGBASH_MODEL: "anthropic:claude-haiku-4-5",
+    };
+    const o = { root: fs.realpathSync(root), cwd, env, stop: new AbortController().signal };
+    const outcome = await launchJob(args, { ...o, log: () => undefined }).catch((e: unknown) => e);
+    return { outcome };
+  } finally {
+    await upstream.close();
+  }
+}
+
 async function exploreLaunch(
   over: Record<string, string>,
   env: Record<string, string | undefined>
@@ -1279,6 +1303,35 @@ test("B3: a call that outlives close() fails the job (exit 5), and the job leave
     start.mockRestore();
   }
   expectNothingLeft(); // the container, the job folder with its socket, the client folder
+});
+
+test.each([
+  ["an extra argument", ["self-check", "--output", ".e2e/s", "--grep", "x"]],
+  ["an unknown fixture", ["self-check", "--export-fixture", "symlink", "--output", ".e2e/s"]],
+  [
+    "a fixture after the output",
+    ["self-check", "--output", ".e2e/s", "--export-fixture", "oversize"],
+  ],
+  ["no output", ["self-check"]],
+])("D2: a self-check with %s refuses before any docker command", async (_name, args) => {
+  const { outcome } = await selfCheckLaunch({}, args);
+  expect(outcome).toBeInstanceOf(Refusal);
+  expect(calls()).toBe("");
+});
+
+test("D2: the self-check runs only its fixed command, with the fixture before it and the host uid", async () => {
+  const args = ["self-check", "--export-fixture", "traversal", "--output", ".e2e/s"];
+  const { outcome } = await selfCheckLaunch({}, args);
+  expect(outcome).toMatchObject({ code: 7, cleanup: "removed" });
+  const run = calls()
+    .split("\n")
+    .find((line) => line.startsWith("run "))!;
+  expect(run).toMatch(
+    / sandbox\/entry\.ts --export \.e2e\/s --export-fixture traversal -- bun sandbox\/selfCheck\.ts \.e2e\/s /
+  );
+  expect(run).toContain(`--env BUGBASH_HOST_UID=${process.getuid!()}`);
+  expect(run).toContain("--env BUGBASH_MODEL_DRIVEN=1"); // proxied, like a model-driven job
+  expect(run).not.toContain("e2e/dist/cli/bin.js");
 });
 
 test("B2: unknown cleanup outranks a stop, and a stop outranks a proxy fault", () => {

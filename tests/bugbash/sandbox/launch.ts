@@ -4,6 +4,8 @@
  *   bun sandbox/launch.ts -- run --config e2e.config.ts --output .e2e/<folder> [e2e args...]
  *   bun sandbox/launch.ts -- run --config e2e.mcpapps.config.ts --output .e2e/<folder> [...]
  *   bun sandbox/launch.ts -- explore "<goal>" --config e2e.config.ts --output .e2e/<folder> [...]
+ *   bun sandbox/launch.ts -- self-check [--export-fixture traversal|oversize] --output .e2e/<folder>
+ *     (selfCheckRun.ts, `make bug-bash-sandbox-check`, against a fake upstream)
  *   bun sandbox/launch.ts --recover   (make bug-bash-sandbox-recover; see recover())
  *
  * The container runs the e2e CLI, Chromium and the seeded app with the pinned image (runner.ts).
@@ -231,7 +233,11 @@ function procShowsAll(mountinfo: () => string): boolean {
     return false;
   }
   // mountinfo: "<id> <parent> <dev> <root> <mount point> <options> ... - <fstype> <source> <super options>"
-  const line = text.split("\n").find((l) => l.split(" ")[4] === "/proc" && l.includes(" - proc "));
+  // The last /proc line is the mount in effect: a later mount on /proc hides the earlier ones.
+  const lines = text
+    .split("\n")
+    .filter((l) => l.split(" ")[4] === "/proc" && l.includes(" - proc "));
+  const line = lines.at(-1);
   if (line == null) return false;
   // "- proc <source> <super options>"
   const superOptions = line.slice(line.indexOf(" - proc ") + 1).split(" ")[3] ?? "";
@@ -340,12 +346,35 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
   return exitFor(await launchJob(args, o));
 }
 
+/** Export fixtures of the self-check: each makes entry.ts send one frame the host must refuse. */
+const EXPORT_FIXTURES = ["traversal", "oversize"];
+
+/**
+ * The self-check job's fixed form: `self-check [--export-fixture <name>] --output .e2e/<dir>`.
+ * Its command is fixed too (`bun sandbox/selfCheck.ts`): no other argument, flag or command.
+ */
+function selfCheckRefusal(args: string[]): string | null {
+  const [kind, ...rest] = args;
+  if (kind !== "self-check") return "not a self-check";
+  const fixture = rest[0] === "--export-fixture" ? rest[1] : undefined;
+  const tail = fixture === undefined ? rest : rest.slice(2);
+  if (fixture !== undefined && !EXPORT_FIXTURES.includes(fixture))
+    return `--export-fixture must be ${EXPORT_FIXTURES.join(" or ")}`;
+  if (tail.length !== 2 || tail[0] !== "--output")
+    return "self-check takes only --output .e2e/<folder>";
+  return null;
+}
+
 /** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
 export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
   const log = o.log ?? logLine;
   const dir = path.join(o.root, "tests/bugbash");
   const mcpApps = exactStepRefusal(args, o.cwd, dir, MCP_APPS_CONFIG) == null;
-  if (args[0] === "explore") {
+  const selfCheck = args[0] === "self-check";
+  if (selfCheck) {
+    const notSelfCheck = selfCheckRefusal(args);
+    if (notSelfCheck != null) throw new Refusal(`${notSelfCheck} (#5714)`);
+  } else if (args[0] === "explore") {
     const notExplore = exploreRefusal(args, o.cwd, dir);
     if (notExplore != null) throw new Refusal(`${notExplore}: not one explore charter (#5714)`);
   } else if (!mcpApps) {
@@ -357,7 +386,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   }
   // First, before any docker command and before the container env exists.
   const ai = appAi(o.env, args[0] === "explore");
-  const driven = mcpApps || args[0] === "explore" ? modelJob(o.env) : undefined;
+  const driven = mcpApps || selfCheck || args[0] === "explore" ? modelJob(o.env) : undefined;
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -431,7 +460,12 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     const passwd = `root:x:0:0::/root:/usr/sbin/nologin\nbugbash:x:${uid}:${gid}::/home/bugbash:/bin/sh\n`;
     fs.writeFileSync(path.join(jobDir, "passwd"), passwd);
     fs.writeFileSync(path.join(jobDir, "group"), `root:x:0:\nbugbash:x:${gid}:\n`);
-    const host = { BUGBASH_HOST_BOOT: bootId(), BUGBASH_HOST_NONCE: nonce };
+    // The self-check compares its own uid with this one.
+    const host = {
+      BUGBASH_HOST_BOOT: bootId(),
+      BUGBASH_HOST_NONCE: nonce,
+      BUGBASH_HOST_UID: String(uid),
+    };
     const drivenEnv = driven && {
       BUGBASH_MODEL: `anthropic:${driven.model}`,
       BUGBASH_MODEL_DRIVEN: "1",
@@ -469,15 +503,18 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       ...bind(path.join(jobDir, "passwd"), "/etc/passwd"), ...bind(path.join(jobDir, "group"), "/etc/group"),
       ...Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
       "--workdir", "/repo/tests/bugbash", "--entrypoint", "bun"];
+    const fixture = selfCheck && args[1] === "--export-fixture" ? args[2] : undefined;
+    const jobCommand = selfCheck
+      ? ["bun", "sandbox/selfCheck.ts", output]
+      : ["node", "../../node_modules/e2e/dist/cli/bin.js", ...args];
     const command: [string, ...string[]] = [
       image,
       "sandbox/entry.ts",
       "--export",
       output,
+      ...(fixture !== undefined ? ["--export-fixture", fixture] : []),
       "--",
-      "node",
-      "../../node_modules/e2e/dist/cli/bin.js",
-      ...args,
+      ...jobCommand,
     ];
     // A signal during the synchronous staging runs its handler only at the next turn of the
     // event loop. This yield lets it run, so own() throws and no container starts (measured).

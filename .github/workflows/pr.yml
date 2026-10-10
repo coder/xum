@@ -415,6 +415,27 @@ jobs:
           BUGBASH_REPROS: "0"
         run: make test-e2e PLAYWRIGHT_ARGS="tests/e2e/scenarios/windowLifecycle.spec.ts"
 
+  bugbash-sandbox:
+    # The bug-bash sandbox (#5714, #5931): its self-check (isolation, proxy and export refusals,
+    # against a fake upstream) and the repros of fixed bugs through its launcher, on the mock app
+    # AI. No secrets and no model. The launcher pulls the pinned image by digest without
+    # credentials, and exits nonzero on a refusal, a failed check or a container left `unknown`.
+    # E2E shard 1 still runs the same repros on the host until this job proves stable.
+    name: Test / Bug-bash sandbox
+    needs: [changes]
+    if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
+    timeout-minutes: 30
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-xum
+      - name: Sandbox self-check
+        run: make bug-bash-sandbox-check
+      - name: Repros in the sandbox
+        run: make test-bugbash-repros-sandbox
+
   test-windows:
     name: Test / Windows
     needs: [changes]
@@ -708,6 +729,7 @@ jobs:
       - test-storybook
       - test-windows
       - test-e2e
+      - bugbash-sandbox
       - smoke-server
       - smoke-docker
       - build-linux

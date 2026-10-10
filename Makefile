@@ -91,7 +91,7 @@ include fmt.mk
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck static-check static-check-full
-.PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover
+.PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
 .PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
@@ -237,6 +237,16 @@ bugbash-sandbox-image: ## Build the bug-bash sandbox image locally (linux/amd64)
 
 bugbash-sandbox-publish: ## Workflow only: build and push the bug-bash sandbox image, print its image.json record
 	@./tests/bugbash/sandbox/build.sh --push
+
+# The sandbox self-check (tests/bugbash/sandbox/selfCheckRun.ts, #5714): three jobs through the real
+# launcher against a fake upstream, so it costs nothing and needs no key. CI runs it (bugbash-sandbox).
+bug-bash-sandbox-check: build-main build-renderer build-static ## Check the bug-bash sandbox's isolation, proxy and export on this host ($$0, fake upstream)
+	@cd tests/bugbash && bun sandbox/selfCheckRun.ts
+
+# The repros of fixed bugs through the sandbox launcher, all on the mock app AI (the launcher gives
+# exact-step runs no model). CI's bugbash-sandbox job runs this.
+test-bugbash-repros-sandbox: build-main build-renderer build-static ## Bug-bash repros of fixed bugs in the bug-bash sandbox, mock app AI (no key, no model)
+	@cd tests/bugbash && BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="sandbox repros" bun sandbox/launch.ts -- run --config e2e.config.ts --exclude-tag known-failure --output .e2e/repros-sandbox-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(BUGBASH_REPRO_ARGS)
 
 # Every sandbox launch lists the job containers that crashed launches of this checkout left
 # (#5882). This removes the ones whose launcher is gone, by ID, and lists the rest.
