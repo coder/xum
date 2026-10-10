@@ -1,4 +1,4 @@
-import { useEffect, useState, type ComponentType } from "react";
+import { lazy, useEffect, useState, type ComponentType } from "react";
 import {
   AlertTriangle,
   AreaChart as AreaChartIcon,
@@ -7,6 +7,7 @@ import {
   PieChart as PieChartIcon,
   Table,
 } from "lucide-react";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { useSavedQueries } from "@/browser/hooks/useAnalytics";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -32,7 +33,6 @@ import {
   useToolExpansion,
 } from "../Shared/toolUtils";
 import { inferAxes, inferChartType } from "./chartHeuristics";
-import { DynamicChart } from "./DynamicChart";
 import { ResultTable } from "./ResultTable";
 import type {
   AnalyticsQueryArgs,
@@ -41,6 +41,11 @@ import type {
   ChartType,
   DrillDownContext,
 } from "./types";
+
+// Lazy so `recharts` stays off the first load (T3, #5971): charts render only in analytics cards.
+const DynamicChart = lazy(() =>
+  import("./DynamicChart").then((m) => ({ default: m.DynamicChart }))
+);
 
 interface AnalyticsQueryToolCallProps {
   args: AnalyticsQueryArgs;
@@ -271,13 +276,18 @@ export function AnalyticsQueryToolCall(props: AnalyticsQueryToolCallProps): JSX.
                   chartType={effectiveChartType}
                 />
               ) : (
-                <DynamicChart
-                  chartType={effectiveChartType}
-                  data={successResult.rows}
-                  xAxis={axes.xAxis}
-                  yAxes={axes.yAxes}
-                  onDrillDown={handleDrillDown}
-                />
+                // The fallback reserves the chart's own 300px box, so the chunk's arrival does not
+                // shift the card. Only DynamicChart's rare "Not enough structured data" notice is
+                // shorter, so that case shifts once.
+                <LazyFeature name="Chart" fallback={<div className="h-[300px] w-full" />}>
+                  <DynamicChart
+                    chartType={effectiveChartType}
+                    data={successResult.rows}
+                    xAxis={axes.xAxis}
+                    yAxes={axes.yAxes}
+                    onDrillDown={handleDrillDown}
+                  />
+                </LazyFeature>
               )}
 
               <button

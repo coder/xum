@@ -8,7 +8,6 @@ import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getArtifactImageMimeType } from "@/common/utils/artifactKind";
 import { formatBytes } from "@/common/utils/formatBytes";
 import { downloadArtifact, openArtifactInNewWindow } from "./artifactDownload";
-import { CanvasArtifact } from "./CanvasArtifact";
 import { CodeArtifact } from "./CodeArtifact";
 import { CsvArtifact } from "./CsvArtifact";
 import { DiffArtifact } from "./DiffArtifact";
@@ -25,6 +24,10 @@ import { useAgentBrowserAvailable } from "./useAgentBrowserAvailable";
 // when an artifact or message contains one.
 const Mermaid = React.lazy(() =>
   import("@/browser/features/Messages/Mermaid").then((m) => ({ default: m.Mermaid }))
+);
+// Lazy so `recharts` stays off the first load (T3, #5971): canvases render only when opened.
+const CanvasArtifact = React.lazy(() =>
+  import("./CanvasArtifact").then((m) => ({ default: m.CanvasArtifact }))
 );
 
 // Every renderer here goes through React elements, so artifact content (agent-written,
@@ -210,13 +213,15 @@ export function ArtifactViewer(props: {
       return <PdfArtifact result={result} />;
     case "canvas":
       return (
-        <CanvasArtifact
-          content={result.content}
-          path={result.path}
-          workspaceId={assetWorkspaceId}
-          interactions={props.interactions}
-          reloadToken={props.reloadToken}
-        />
+        <LazyFeature name="Canvas">
+          <CanvasArtifact
+            content={result.content}
+            path={result.path}
+            workspaceId={assetWorkspaceId}
+            interactions={props.interactions}
+            reloadToken={props.reloadToken}
+          />
+        </LazyFeature>
       );
     case "text":
       return <CodeArtifact content={result.content} path={result.path} />;
