@@ -355,32 +355,33 @@ export function useCreationWorkspace({
     let mounted = true;
     setBranchesLoaded(false);
     setRuntimeAvailabilityState({ status: "loading" });
-    const doLoad = async () => {
+    // Both requests run at once and settle independently. Send waits for the branch list (#6033),
+    // so it must not also wait for the runtime probe (Docker, Podman, devcontainer CLI), which can
+    // take several seconds after the branches are ready.
+    const loadBranches = async () => {
       try {
-        // Use allSettled so failures are independent - branches can load even if availability fails
-        const [branchResult, availabilityResult] = await Promise.allSettled([
-          api.projects.listBranches({ projectPath }),
-          api.projects.runtimeAvailability({ projectPath }),
-        ]);
+        const result = await api.projects.listBranches({ projectPath });
         if (!mounted) return;
-        if (branchResult.status === "fulfilled") {
-          setBranches(branchResult.value.branches);
-          setRecommendedTrunk(branchResult.value.recommendedTrunk);
-        } else {
-          console.error("Failed to load branches:", branchResult.reason);
-        }
-        if (availabilityResult.status === "fulfilled") {
-          setRuntimeAvailabilityState({ status: "loaded", data: availabilityResult.value });
-        } else {
-          setRuntimeAvailabilityState({ status: "failed" });
-        }
+        setBranches(result.branches);
+        setRecommendedTrunk(result.recommendedTrunk);
+      } catch (error) {
+        console.error("Failed to load branches:", error);
       } finally {
         if (mounted) {
           setBranchesLoaded(true);
         }
       }
     };
-    void doLoad();
+    const loadRuntimeAvailability = async () => {
+      try {
+        const data = await api.projects.runtimeAvailability({ projectPath });
+        if (mounted) setRuntimeAvailabilityState({ status: "loaded", data });
+      } catch {
+        if (mounted) setRuntimeAvailabilityState({ status: "failed" });
+      }
+    };
+    void loadBranches();
+    void loadRuntimeAvailability();
     return () => {
       mounted = false;
     };

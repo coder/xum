@@ -80,10 +80,39 @@ function holdBranchList(env: ReturnType<typeof getSharedEnv>) {
   return { spy, release };
 }
 
-async function openCreationViewWithHeldBranches(options?: { showAgentsInitBanner?: boolean }) {
+/**
+ * The app's API client, with projects.runtimeAvailability held until release(). The router calls
+ * a module function for it, so the renderer's client is the seam (the backend has no service).
+ */
+function holdRuntimeAvailability(orpc: ReturnType<typeof getSharedEnv>["orpc"]) {
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const projects = new Proxy(orpc.projects, {
+    get(target, key, receiver) {
+      if (key !== "runtimeAvailability") return Reflect.get(target, key, receiver) as unknown;
+      return async (...args: Parameters<typeof target.runtimeAvailability>) => {
+        await released;
+        return target.runtimeAvailability(...args);
+      };
+    },
+  });
+  const client = new Proxy(orpc, {
+    get(target, key, receiver) {
+      return key === "projects" ? projects : (Reflect.get(target, key, receiver) as unknown);
+    },
+  });
+  return { client, release };
+}
+
+async function openCreationViewWithHeldBranches(options?: {
+  showAgentsInitBanner?: boolean;
+  apiClient?: ReturnType<typeof getSharedEnv>["orpc"];
+}) {
   const env = getSharedEnv();
   const cleanupDom = setupTestDom();
-  const view = renderApp({ apiClient: env.orpc });
+  const view = renderApp({ apiClient: options?.apiClient ?? env.orpc });
   const projectPath = await addProjectViaUI(view, getSharedRepoPath());
   if (options?.showAgentsInitBanner) updatePersistedState(getAgentsInitNudgeKey(projectPath), true);
   // Held before the creation view mounts: its first listBranches call is the one that matters.
@@ -200,6 +229,34 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
       expect(create).not.toHaveBeenCalled();
       await chat.expectInputValue("a prompt the user has not sent yet");
     } finally {
+      held.release();
+      held.spy.mockRestore();
+      create.mockRestore();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  // Runtime availability probes Docker, Podman and the devcontainer CLI with multi-second
+  // timeouts. Send waits for the branch list only, not for that probe.
+  test("a worktree workspace can be sent once the branches load, while the runtime probe is still pending", async () => {
+    const availability = holdRuntimeAvailability(getSharedEnv().orpc);
+    const { view, cleanupDom, chat, held, create } = await openCreationViewWithHeldBranches({
+      apiClient: availability.client,
+    });
+    try {
+      await chat.typeWithoutSending("hello before the runtime probe finishes");
+      await waitFor(() => expect(sendButton(view.container).disabled).toBe(true));
+
+      held.release();
+      await waitFor(() => expect(sendButton(view.container).disabled).toBe(false), {
+        timeout: 10_000,
+      });
+      fireEvent.click(sendButton(view.container));
+      await waitFor(() => expect(create).toHaveBeenCalled(), { timeout: 30_000 });
+      const trunkBranch = create.mock.calls[0]?.[2];
+      expect(typeof trunkBranch === "string" && trunkBranch.length > 0).toBe(true);
+    } finally {
+      availability.release();
       held.release();
       held.spy.mockRestore();
       create.mockRestore();
