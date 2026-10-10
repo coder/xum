@@ -4171,29 +4171,31 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
   // Every new workspace and sub-agent pays the Xum-owned tool block and system
   // prompt before its first message, and writes it to the prompt cache. These
-  // ceilings stop that fixed cost from creeping back; raise one only on purpose.
+  // ceilings (measured size + ~5%) stop that fixed cost from creeping back; raise one only on
+  // purpose. Fixture: built-in agents and skills, memory on with an empty index, no MCP, no
+  // user instructions, so every system row is Xum-owned.
   describe("first-request size budget", () => {
     const SCENARIOS = [
       {
         label: "root exec",
         agentId: "exec",
         overrides: {},
-        toolChars: 78_034,
-        systemChars: 13_251,
+        toolChars: 47_100,
+        systemChars: 7_100,
       },
       {
         label: "explore sub-agent",
         agentId: "explore",
         overrides: { parentWorkspaceId: "parent-workspace", agentId: "explore" },
-        toolChars: 41_859,
-        systemChars: 12_096,
+        toolChars: 26_800,
+        systemChars: 6_500,
       },
       {
         label: "exec sub-agent",
         agentId: "exec",
         overrides: { parentWorkspaceId: "parent-workspace", agentId: "exec" },
-        toolChars: 71_143,
-        systemChars: 15_107,
+        toolChars: 42_900,
+        systemChars: 8_900,
       },
     ];
 
@@ -4268,7 +4270,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           }))
           .sort((a, b) => b.chars - a.chars);
         const measuredToolChars = perTool.reduce((sum, t) => sum + t.chars, 0);
-        // The fixture has no user instructions or memories, so every system row is Xum-owned.
         const measuredSystemChars = request.messages
           .filter((message) => message.role === "system")
           .reduce(
