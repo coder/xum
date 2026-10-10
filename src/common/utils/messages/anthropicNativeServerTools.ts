@@ -32,18 +32,19 @@ function isReplayableWebSearchResult(item: unknown): boolean {
   return (
     result.type === "web_search_result" &&
     isVerbatimSafe(result.url) &&
-    typeof result.encryptedContent === "string" &&
+    isVerbatimSafe(result.encryptedContent) &&
     (result.title === null || isVerbatimSafe(result.title)) &&
-    (result.pageAge == null || isVerbatimSafe(result.pageAge))
+    // Present as a string or null: the SDK's replay schema rejects a missing pageAge.
+    (result.pageAge === null || isVerbatimSafe(result.pageAge))
   );
 }
 
 /**
- * Native replay sends the result back exactly as the API returned it, so the request skips the
- * generic provider-output sanitizer for it (applyToolOutputRedaction). A field that sanitizer
- * would rewrite (too long, control text) cannot replay natively: the part replays as the client
- * pair, sanitized, and the receipt keeps the thinking after it out. The ciphertext is opaque and
- * exempt.
+ * Native replay must send the result back exactly as the API returned it, but every request
+ * still runs the generic provider-output sanitizer (applyToolOutputRedaction), in this build and
+ * in older ones that read the same stored rows. So only fields that sanitizer leaves unchanged
+ * (at most 12,000 chars, no control text) can replay natively, the ciphertext included. Any other
+ * result replays as the client pair, and the receipt keeps the thinking after it out.
  */
 function isVerbatimSafe(value: unknown): boolean {
   return typeof value === "string" && sanitizeStringForProviderOutput(value) === value;

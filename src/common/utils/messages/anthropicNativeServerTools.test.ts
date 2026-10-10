@@ -28,6 +28,13 @@ function webSearchPart(id: string, ciphertextLengths: number[]): DynamicToolPart
   };
 }
 
+/** Ciphertext lengths of at most 12,000 chars (the generic sanitizer bound) that add up to `total`. */
+function chunks(total: number): number[] {
+  const out: number[] = [];
+  for (let left = total; left > 0; left -= 12_000) out.push(Math.min(left, 12_000));
+  return out;
+}
+
 function hasCiphertext(part: DynamicToolPart): boolean {
   return part.state === "output-available" && JSON.stringify(part.output).includes("eee");
 }
@@ -52,7 +59,7 @@ describe("toStoredServerToolPart ciphertext bound (#5887)", () => {
   test("keeps native replay when the row's summed ciphertext is at the limit", () => {
     // Three results over two calls: the bound sums every result of every search in the row.
     const row = storeRow([
-      webSearchPart("srvtoolu_1", [limit - 30, 10]),
+      webSearchPart("srvtoolu_1", [...chunks(limit - 30), 10]),
       webSearchPart("srvtoolu_2", [20]),
     ]);
     expect(row.map((part) => part.providerExecuted)).toEqual([true, true]);
@@ -62,7 +69,7 @@ describe("toStoredServerToolPart ciphertext bound (#5887)", () => {
 
   test("stores the search that crosses the limit as the client pair without ciphertext", () => {
     const row = storeRow([
-      webSearchPart("srvtoolu_1", [limit - 30, 10]),
+      webSearchPart("srvtoolu_1", [...chunks(limit - 30), 10]),
       webSearchPart("srvtoolu_2", [21]),
       // A later small search still fits: only the ciphertext kept counts.
       webSearchPart("srvtoolu_3", [20]),
@@ -86,6 +93,30 @@ describe("isNativeAnthropicReplayable fields (#5887)", () => {
 
   test("a plain title replays natively", () => {
     expect(isNativeAnthropicReplayable(withTitle("Xum"))).toBe(true);
+  });
+
+  function withResult(fields: Record<string, unknown>): DynamicToolPart {
+    const part = webSearchPart("srvtoolu_1", [10]);
+    if (part.state !== "output-available" || !Array.isArray(part.output)) throw new Error("setup");
+    return { ...part, output: [{ ...(part.output[0] as object), ...fields }] };
+  }
+
+  test("ciphertext the sanitizer would rewrite does not replay natively", () => {
+    // Older builds still run the sanitizer on stored native rows: only unchanged bytes are safe.
+    expect(isNativeAnthropicReplayable(withResult({ encryptedContent: "e".repeat(12_000) }))).toBe(
+      true
+    );
+    expect(isNativeAnthropicReplayable(withResult({ encryptedContent: "e".repeat(12_001) }))).toBe(
+      false
+    );
+  });
+
+  test("a result without pageAge does not replay natively", () => {
+    // The SDK's replay schema requires pageAge as a string or null: undefined throws.
+    const part = withResult({});
+    if (part.state !== "output-available" || !Array.isArray(part.output)) throw new Error("setup");
+    const { pageAge: _dropped, ...withoutPageAge } = part.output[0] as Record<string, unknown>;
+    expect(isNativeAnthropicReplayable({ ...part, output: [withoutPageAge] })).toBe(false);
   });
 
   test("a title the sanitizer would rewrite does not", () => {

@@ -3,7 +3,6 @@
  * Produces a cloned array safe for sending to providers without touching persisted history/UI.
  */
 import type { MuxMessage, MuxToolPart } from "@/common/types/message";
-import { isNativeAnthropicReplayable } from "@/common/utils/messages/anthropicNativeServerTools";
 import { sanitizeUnknownForProviderOutput } from "@/common/utils/providerOutputSanitization";
 import { stripToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 import { stripWorkflowRunRecordForModel } from "@/common/utils/workflowRunMessages";
@@ -99,13 +98,9 @@ export function applyToolOutputRedaction(messages: MuxMessage[]): MuxMessage[] {
         providerPart.toolName,
         stripToolOutputUiOnly(providerPart.output)
       );
-      // #5887: a natively replayed Anthropic web search goes back exactly as the API returned
-      // it, because the signed thinking after it is bound to those bytes. Real ciphertext
-      // exceeds the generic string bound, and the predicate admits only fields the sanitizer
-      // would leave unchanged.
-      const sanitizedOutput = isNativeAnthropicReplayable(providerPart)
-        ? providerPart.output
-        : sanitizeUnknownForProviderOutput(stripLegacyImageToolOutputForModel(outputWithoutUiOnly));
+      const sanitizedOutput = sanitizeUnknownForProviderOutput(
+        stripLegacyImageToolOutputForModel(outputWithoutUiOnly)
+      );
       const nestedCalls = providerPart.nestedCalls?.map((nestedCall) => {
         if (nestedCall.state !== "output-available") {
           return nestedCall;

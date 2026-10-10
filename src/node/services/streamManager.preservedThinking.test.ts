@@ -1190,7 +1190,11 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
           content_block: {
             type: "web_search_tool_result",
             tool_use_id: id,
-            content: [{ ...searchResults[0], encrypted_content: ciphertext }],
+            // One result holds at most 12,000 chars (the generic sanitizer bound).
+            content: Array.from({ length: Math.ceil(ciphertext.length / 12_000) }, (_, i) => ({
+              ...searchResults[0],
+              encrypted_content: ciphertext.slice(i * 12_000, (i + 1) * 12_000),
+            })),
           },
         },
         { type: "content_block_stop", index: index + 1 },
@@ -1233,11 +1237,11 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
       expect(row?.metadata?.anthropicThinkingReplay).toBe("off");
     });
 
-    test("a native search replays its ciphertext byte for byte, however long", async () => {
-      // Real encrypted_content values can exceed the generic provider-output string bound.
-      // The signed thinking after the search is bound to the exact ciphertext.
+    test("a native search replays its ciphertext byte for byte", async () => {
+      // The signed thinking after the search is bound to the exact ciphertext. 12,000 chars is
+      // the longest value the generic provider-output sanitizer leaves unchanged.
       const workspaceId = "preserved-thinking-long-ciphertext";
-      const ciphertext = "c".repeat(30_000);
+      const ciphertext = "c".repeat(12_000);
       const scripted = scriptedAnthropicModel([textResponse]);
       const row = createMuxMessage("assistant-1", "assistant", "", { historySequence: 1 }, [
         {
