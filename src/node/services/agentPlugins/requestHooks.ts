@@ -13,7 +13,7 @@ export async function prepareWorkspaceRequestHooks(args: {
   metadata: WorkspaceMetadata;
   hostCheckoutRoot: string | null;
   journal: DurableEventJournal;
-  history: Pick<HistoryService, "getLastMessages">;
+  history: Pick<HistoryService, "getLastMessages" | "readPartial">;
 }): Promise<void> {
   const pluginContext = args.hostCheckoutRoot
     ? resolveAgentPluginsMcpContext(args.metadata, args.hostCheckoutRoot)

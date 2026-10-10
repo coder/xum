@@ -52,7 +52,7 @@ export async function summarizeContinuousCompaction(args: {
   config: Config;
   aiService: AgentSessionAIService;
   /** turn.end plugin hooks read finished turns through it (see EnsureWorkspaceHooksArgs). */
-  historyService: Pick<HistoryService, "getLastMessages">;
+  historyService: Pick<HistoryService, "getLastMessages" | "readPartial">;
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   head: MuxMessage[];
   /**
