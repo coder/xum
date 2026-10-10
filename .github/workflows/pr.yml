@@ -82,6 +82,9 @@ jobs:
               - 'bun.lock'
               - 'tsconfig*.json'
               - 'vite*.ts'
+              # index.html defines the first-load roots, so the first-load budget check
+              # (Smoke / Server) must run when it changes.
+              - 'index.html'
               - 'Makefile'
               - 'electron-builder.yml'
               # Pixel's default matrix and the Storybook config decide which snapshots exist,
@@ -470,6 +473,8 @@ jobs:
       - uses: ./.github/actions/setup-xum
       - run: ./scripts/generate-npm-shrinkwrap.sh
       - run: make build
+      # First-load JS budget (T3, #5971): reuses this build, so it adds no build.
+      - run: make check-first-load-js
       - run: make check-startup-imports-runtime
       - name: Pack npm package
         id: pack

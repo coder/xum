@@ -1,0 +1,11 @@
+{
+  "comment": [
+    "First-load budget for `make check-first-load-js` (scripts/perf/firstLoadJs.ts --budget), run in CI after `make build`. The totals are index.html plus its statically reachable module JS.",
+    "The check fails when first-load brotli bytes grow more than 2% over brBytes, or raw bytes more than 100 KiB over rawBytes.",
+    "A smaller first load never fails, so a PR that shrinks it needs no update here.",
+    "If a PR grows the first load on purpose, the perf owner updates the recorded value in that same PR.",
+    "Recorded from a clean `make build` of main ea19a44101 with Bun 1.3.12."
+  ],
+  "rawBytes": 5134092,
+  "brBytes": 1219205
+}
