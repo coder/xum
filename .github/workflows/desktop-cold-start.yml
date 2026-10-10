@@ -1,0 +1,46 @@
+name: Desktop Cold Start
+# Desktop cold-start A/B (T3 #5971). The runner script comes from the head tree, so head_sha must
+# contain scripts/perf/desktopColdStart.ts. Use base_sha == head_sha for an A/A run.
+on:
+  workflow_dispatch:
+    inputs:
+      base_sha: { description: "Base commit (40-hex SHA)", required: true, type: string }
+      head_sha: { description: "Head commit (40-hex SHA)", required: true, type: string }
+      pairs: { description: "Launch pairs", required: false, type: string, default: "20" }
+permissions:
+  contents: read
+jobs:
+  cold-start:
+    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env: # Inputs reach shell steps only through env (no template expansion inside run:).
+      BASE_SHA: ${{ inputs.base_sha }}
+      HEAD_SHA: ${{ inputs.head_sha }}
+      PAIRS: ${{ inputs.pairs }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "SHAs must be 40-char lowercase hex"; exit 1; }
+          [[ "$PAIRS" =~ ^([2-9]|[1-9][0-9]+)$ ]] || { echo "pairs must be an integer >= 2"; exit 1; }
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-xum
+      - name: Install xvfb
+        run: command -v xvfb-run >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y xvfb; }
+      - name: Build head (workspace root) and base ($RUNNER_TEMP/base) trees
+        run: |
+          make build
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
+          cd "$RUNNER_TEMP/base" && bun install --frozen-lockfile && make build
+      - name: Run cold-start A/B
+        env: { ELECTRON_DISABLE_SANDBOX: 1 }
+        run: xvfb-run -a node --import tsx scripts/perf/desktopColdStart.ts --base "$RUNNER_TEMP/base" --head "$GITHUB_WORKSPACE" --pairs "$PAIRS" --json > cold-start.json
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: always()
+        with:
+          name: desktop-cold-start-${{ github.run_id }}
+          path: cold-start.json
+          if-no-files-found: error
