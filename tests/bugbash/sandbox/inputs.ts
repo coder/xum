@@ -151,6 +151,47 @@ export function exactStepRefusal(
   return null;
 }
 
+// `e2e explore` (make bug-bash, run.ts): one charter goal and these options only. The two
+// configs are the bug-bash ones; both give the agents a model only in a model-driven sandbox job.
+export const EXPLORE_CONFIGS = ["e2e.config.ts", "e2e.mcpapps.config.ts"];
+const EXPLORE_VALUES: Record<string, RegExp> = {
+  "--config": /^e2e(\.mcpapps)?\.config\.ts$/,
+  "--target": /^[a-z0-9-]+$/,
+  "--agent": /^[a-z0-9-]+$/,
+  "--output": /^\.e2e\//,
+  "--max-steps": /^([1-9]|1[0-2])$/,
+  "--reporter": /^(list|markdown)(,(list|markdown))*$/,
+};
+
+/** Why these e2e args are not one `e2e explore` charter run, or null. */
+export function exploreRefusal(args: string[], cwd: string, dir: string): string | null {
+  if (args[0] !== "explore") return `${JSON.stringify(args[0] ?? "")} is not \`e2e explore\``;
+  const goals: string[] = [];
+  const configs: string[] = [];
+  for (let i = 1; i < args.length; i++) {
+    if (args[i] === "--video=on") continue;
+    if (!args[i].startsWith("-")) {
+      goals.push(args[i]);
+      continue;
+    }
+    const [name, inline] = args[i].split(/=(.*)/s, 2);
+    const pattern = EXPLORE_VALUES[name] as RegExp | undefined;
+    if (pattern == null) return `the argument ${JSON.stringify(args[i])}`;
+    const value = inline ?? args[++i];
+    if (value == null || !pattern.test(value))
+      return `${name} has the value ${JSON.stringify(value ?? "")}`;
+    if (name === "--config") configs.push(value);
+  }
+  if (goals.length !== 1 || goals[0].trim() === "")
+    return `explore needs one charter goal, got ${goals.length}`;
+  if (configs.length !== 1 || !EXPLORE_CONFIGS.includes(configs[0]))
+    return `--config must be given once as ${EXPLORE_CONFIGS.join(" or ")}`;
+  if (fs.realpathSync(cwd) !== fs.realpathSync(dir)) return `the cwd must be ${dir}, got ${cwd}`;
+  if (fs.lstatSync(path.join(dir, configs[0]), { throwIfNoEntry: false })?.isFile() !== true)
+    return `${dir}/${configs[0]} is not a regular file (a symlink?)`;
+  return null;
+}
+
 /** The one `--output .e2e/<folder>` of the e2e args. The export comes back to that folder only. */
 export function outputDir(args: string[]): string {
   const values = args.flatMap((arg, i) =>

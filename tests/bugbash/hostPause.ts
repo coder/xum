@@ -10,11 +10,14 @@
  * repro fails with MODEL_UNAVAILABLE before any model request (e2e has no default model and no
  * env fallback).
  *
- * The pause has no override: no env var or flag turns it off. It ends when the sandbox lands.
+ * The pause has no override: no env var or flag turns it off. Model-driven runs pass only
+ * inside the bug-bash sandbox with a provider proxy for the job (sandbox/inContainer.ts):
+ * `e2e explore` there (`make bug-bash`, run.ts), and the MCP Apps suite (mcpapps/hostPause.ts).
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { modelDrivenSandbox } from "./sandbox/inContainer";
 
 /** Why `what` must not run, or null when it may run. During the pause it never may. */
 export function modelDrivenRefusal(what: string): string | null {
@@ -42,19 +45,31 @@ const real = (file: string | undefined) => {
   }
 };
 
+/** The e2e command (`run`, `explore`, ...) of an e2e CLI process, or undefined. */
+export function e2eCommand(argv: readonly string[] = process.argv): string | undefined {
+  const main = real(argv[1]);
+  if (main == null || main !== real(E2E_CLI)) return undefined;
+  return argv.slice(2).find((arg) => !arg.startsWith("-"));
+}
+
 /**
  * Why the e2e process that loads a bug-bash config must stop, or null. Every e2e command loads
  * the config in its own process before it starts an app, a browser or a model, so this check
  * runs first. Fail closed: a config loaded by anything other than the e2e CLI or its worker
- * (another script, `import()` from a tool) is refused too.
+ * (another script, `import()` from a tool) is refused too. `env` and `root` are for tests.
  */
-export function e2eCommandRefusal(argv: readonly string[] = process.argv): string | null {
+export function e2eCommandRefusal(
+  argv: readonly string[] = process.argv,
+  env: NodeJS.ProcessEnv = process.env,
+  root = "/"
+): string | null {
   const main = real(argv[1]);
   // A worker gets no args. Only a CLI run that passed this check forks one.
   if (main != null && main === real(E2E_WORKER)) return null;
   if (main == null || main !== real(E2E_CLI))
     return modelDrivenRefusal(`a bug-bash e2e config loaded by ${argv[1] ?? "an unknown script"}`);
-  const command = argv.slice(2).find((arg) => !arg.startsWith("-"));
+  const command = e2eCommand(argv);
   if (command != null && EXACT_STEP_COMMANDS.includes(command)) return null;
+  if (command === "explore" && modelDrivenSandbox(env, root)) return null;
   return modelDrivenRefusal(`e2e ${command ?? "(no command)"}`);
 }

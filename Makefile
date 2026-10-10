@@ -219,9 +219,12 @@ dev-desktop-sandbox: ## Start an isolated Electron dev instance (fresh XUM_ROOT 
 dev-server-sandbox: ## Start an isolated dev-server instance (fresh XUM_ROOT + free ports)
 	@bun scripts/dev-server-sandbox.ts $(DEV_SERVER_SANDBOX_ARGS)
 
-# bug-bash is paused on the host (tests/bugbash/hostPause.ts, #5714): a model picks its actions.
-# Its recipe refuses at once, so it builds nothing first.
-bug-bash: ## Agent bug bash: e2e explore charters x models (paused on the host until the sandbox lands, #5714)
+# bug-bash runs each e2e explore charter in its own bug-bash sandbox container (tests/bugbash/run.ts,
+# #5714): a model picks its actions, so it never runs on the host. The explorers reach their models
+# through a provider proxy per job, so the host needs BUGBASH_BUDGET_USD (one list-price cap for
+# the run) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. The app AI is the mock (run.ts refuses
+# another BUGBASH_AI). The containers mount dist/.
+bug-bash: build-main build-renderer build-static ## Agent bug bash in the bug-bash sandbox: e2e explore charters x models (needs BUGBASH_BUDGET_USD)
 	@bun tests/bugbash/run.ts $(BUGBASH_ARGS)
 
 # The bug-bash sandbox image (tests/bugbash/sandbox/build.sh, #5714). Each prints one value on

@@ -99,6 +99,7 @@ export class Session {
   #owned: Job | null = null;
   readonly #graceMs: number;
   readonly #hookMs: number;
+  readonly #stderr: number | "inherit";
   readonly #log: (line: string) => void;
   #hooks: (() => unknown)[] = [];
   /** The `docker run` client, once spawned. A stop never signals it: it closes its stdin. */
@@ -114,6 +115,8 @@ export class Session {
       root?: string;
       graceMs?: number;
       hookMs?: number;
+      /** A file descriptor for the `docker run` client's stderr (the job's output). */
+      stderr?: number;
       log?: (line: string) => void;
       /** Injection point: runner.test.ts records the group signals; production uses killGroup. */
       signalGroup?: (group: number, signal: NodeJS.Signals) => void;
@@ -123,6 +126,7 @@ export class Session {
     this.#root = options.root ?? ROOT;
     this.#graceMs = options.graceMs ?? GRACE_MS;
     this.#hookMs = options.hookMs ?? HOOK_MS;
+    this.#stderr = options.stderr ?? "inherit";
     this.#log = options.log ?? ((line) => console.error(`sandbox ${line}`));
     if (stop.aborted) this.#stop(String(stop.reason));
     else stop.addEventListener("abort", () => this.#stop(String(stop.reason)), { once: true });
@@ -486,7 +490,7 @@ export class Session {
     const stdio =
       stream == null
         ? (["ignore", "pipe", "pipe"] as const)
-        : (["pipe", "pipe", "inherit"] as const);
+        : (["pipe", "pipe", this.#stderr] as const);
     const child = spawn(cmd, args, { env, stdio: [...stdio], detached: true });
     let stdout = "";
     let stderr = "";

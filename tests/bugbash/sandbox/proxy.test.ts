@@ -26,6 +26,7 @@ async function setup(options: { capUsd?: number; deadlineMs?: number } = {}) {
   cleanups.push(fake.close);
   const ledger = new Ledger(options.capUsd ?? 1);
   const records: CallRecord[] = [];
+  const faults: string[] = [];
   const waiters: (() => void)[] = [];
   const socketPath = path.join(dir, "proxy.sock");
   const proxy = await startProxy({
@@ -34,6 +35,7 @@ async function setup(options: { capUsd?: number; deadlineMs?: number } = {}) {
     job: { models: [MODEL] },
     ledger,
     deadlineMs: options.deadlineMs,
+    onFault: (reason) => faults.push(reason),
     log: (record) => {
       records.push(record);
       outputs.push(JSON.stringify(record));
@@ -51,7 +53,7 @@ async function setup(options: { capUsd?: number; deadlineMs?: number } = {}) {
     while (records.length < count) await new Promise<void>((wake) => waiters.push(wake));
     return records;
   };
-  return { dir, socketPath, fake, ledger, proxy, records, recorded };
+  return { dir, socketPath, fake, ledger, proxy, records, recorded, faults };
 }
 
 const body = (text: string, extra: object = {}) =>
@@ -301,9 +303,10 @@ test.each(["cut", "stall"])(
 );
 
 test("close() rejects when a call cost more than its bound, so the job fails", async () => {
-  const { socketPath, proxy, records } = await setup();
+  const { socketPath, proxy, records, faults } = await setup();
   expect((await send(socketPath, body("[fake:overbill]"))).status).toBe(200);
   expect(records[0]).toMatchObject({ outcome: "settled", boundExceeded: true });
+  expect(faults).toEqual(["proxy: a call cost more than its reserved bound"]); // before close()
   expect(proxy.stats().boundExceeded).toBe(1);
   const closed = await proxy.close().then(
     () => "",

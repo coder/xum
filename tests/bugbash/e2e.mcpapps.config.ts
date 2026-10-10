@@ -12,23 +12,12 @@
  */
 // First import: the pause refuses before e2e.config.ts runs (mcpapps/hostPause.ts).
 import "./mcpapps/hostPause";
-import { createAnthropic } from "@ai-sdk/anthropic";
 import type { E2EConfig } from "e2e";
 import base from "./e2e.config";
-import { PROXY_BASE_URL } from "./sandbox/inContainer";
+import { proxyModel } from "./sandbox/explorerModel";
 
-/**
- * The explorer model, set by the launcher. The proxy holds the provider key and allows only
- * this job's models (sandbox/proxy.ts), so the key here is a placeholder the proxy drops.
- */
-function explorerModel() {
-  const spec = process.env.BUGBASH_MODEL ?? "";
-  const [provider, id] = spec.split(/:(.*)/s, 2);
-  if (provider !== "anthropic" || !id)
-    throw new Error(`BUGBASH_MODEL must be anthropic:<model> in the sandbox, got "${spec}"`);
-  return createAnthropic({ baseURL: PROXY_BASE_URL, apiKey: "bugbash-sandbox-placeholder" })(id);
-}
-const model = explorerModel();
+// Every command with this config is model-driven (`run` too), so it always gets the model.
+const model = proxyModel();
 
 const mcpContext = [
   "MCP Apps setup for this run: the 'Bug bash playground' chat already holds MCP tool calls from",

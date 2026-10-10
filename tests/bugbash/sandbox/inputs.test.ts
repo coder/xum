@@ -7,6 +7,7 @@ import {
   checkMountSource,
   containerEnv,
   exactStepRefusal,
+  exploreRefusal,
   jobEnv,
   outputDir,
   stage,
@@ -147,6 +148,36 @@ test("only an exact-step `e2e run` with the repro config passes", () => {
   fs.rmSync(path.join(dir, "e2e.config.ts"));
   fs.symlinkSync(path.join(outside, "secret"), path.join(dir, "e2e.config.ts"));
   expect(exactStepRefusal(ok, dir, dir)).toContain("not a regular file");
+});
+
+test("B2: only one explore charter with the bug-bash configs and run.ts's options passes", () => {
+  const dir = path.join(root, "tests/bugbash");
+  fs.mkdirSync(dir, { recursive: true });
+  for (const config of ["e2e.config.ts", "e2e.mcpapps.config.ts"])
+    fs.writeFileSync(path.join(dir, config), "export default {}");
+  // prettier-ignore
+  const ok = ["explore", "find bugs in the composer", "--config", "e2e.config.ts", "--target", "web",
+    "--agent", "keyboard", "--output", ".e2e/bugbash/r/m/composer", "--max-steps", "6", "--video=on",
+    "--reporter", "list,markdown"];
+  expect(exploreRefusal(ok, dir, dir)).toBeNull();
+  const swap = (from: string, to: string[]) => {
+    const i = ok.indexOf(from);
+    return [...ok.slice(0, i), ...to, ...ok.slice(i + 1)];
+  };
+  for (const args of [
+    ["run", ...ok.slice(1)],
+    [...ok, "a second goal"],
+    ok.filter((arg) => arg !== "find bugs in the composer"),
+    swap("e2e.config.ts", ["other.config.ts"]),
+    [...ok, "--config", "e2e.config.ts"],
+    swap("6", ["13"]),
+    swap("keyboard", ["../x"]),
+    [...ok, "--workers", "4"],
+    [...ok, "--video=off"],
+    [...ok, "--"],
+  ])
+    expect(exploreRefusal(args, dir, dir)).not.toBeNull();
+  expect(exploreRefusal(ok, root, dir)).toContain("the cwd must be");
 });
 
 test("the output folder is one plain .e2e/<folder>", () => {
