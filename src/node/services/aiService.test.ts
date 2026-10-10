@@ -4199,10 +4199,23 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       },
     ];
 
+    // Global instructions, agents and skills resolve through XUM_ROOT and the
+    // home directory. Each test points both at its fixture so a developer's own
+    // ~/.xum and ~/.agents files cannot count against the budget.
+    const hostEnv = { XUM_ROOT: process.env.XUM_ROOT, HOME: process.env.HOME };
+    afterEach(() => {
+      for (const [key, value] of Object.entries(hostEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    });
+
     it.each(SCENARIOS)(
       "keeps the $label tool block and system prompt within budget",
       async ({ agentId, overrides, toolChars, systemChars }) => {
         using xumHome = new DisposableTempDir("ai-service-size-budget");
+        process.env.XUM_ROOT = xumHome.path;
+        process.env.HOME = xumHome.path;
         const projectPath = path.join(xumHome.path, "project");
         await fs.mkdir(projectPath, { recursive: true });
         const workspaceId = "workspace-size-budget";
