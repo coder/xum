@@ -53,6 +53,7 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import type { AgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import { isMutationEpochUnreadable } from "@/node/services/agentPlugins/journals";
+import { PLUGIN_WORKSPACE_ID_ENV } from "@/node/services/agentPlugins/pluginHookState";
 import { SecretsStore, type Config } from "@/node/config";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import { secretsToRecord } from "@/common/types/secrets";
@@ -930,11 +931,17 @@ async function mkdirSelfHealing(target: string): Promise<void> {
  * shell syntax. Legacy entries (no `args`) keep raw shell-string behavior.
  *
  * For Agent Plugin servers this also creates the `PLUGIN_DATA` directory,
- * which the spec requires to exist before the subprocess launches (§9.1).
+ * which the spec requires to exist before the subprocess launches (§9.1), and
+ * sets `XUM_WORKSPACE_ID` when a workspace starts the server. Each workspace
+ * runs its own server process, so a plugin server can save per-workspace hook
+ * settings (see agentPlugins/pluginHookState.ts).
  *
  * Exported for tests.
  */
-export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<StdioLaunch> {
+export async function prepareStdioLaunch(
+  info: MCPStdioServerInfo,
+  options?: { workspaceId?: string }
+): Promise<StdioLaunch> {
   const command =
     info.args !== undefined ? [info.command, ...info.args].map(shellQuote).join(" ") : info.command;
 
@@ -962,10 +969,15 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
     }
   }
 
+  // Set after the configured env so a plugin's mcp.json cannot name another workspace.
+  const env =
+    info.plugin !== undefined && options?.workspaceId != null
+      ? { ...info.env, [PLUGIN_WORKSPACE_ID_ENV]: options.workspaceId }
+      : info.env;
   return {
     command,
     ...(info.cwd !== undefined ? { cwd: info.cwd } : {}),
-    ...(info.env !== undefined ? { env: info.env } : {}),
+    ...(env !== undefined ? { env } : {}),
   };
 }
 
@@ -1607,6 +1619,8 @@ interface MCPServerTestOptions {
   projectSecrets?: Record<string, string>;
   /** Agent Plugins discovery context for named-server lookups (null = no plugin servers). */
   agentPlugins?: AgentPluginsMcpContext | null;
+  /** Workspace that requested the test: plugin stdio servers get it as XUM_WORKSPACE_ID. */
+  workspaceId?: string;
 }
 
 export class MCPServerManager {
@@ -5188,6 +5202,12 @@ export class MCPServerManager {
         headers: input.headers,
         projectSecrets,
         agentPlugins,
+        // Only a workspace ID whose plugin context resolved (known workspace, same project)
+        // reaches the server as XUM_WORKSPACE_ID: a raw, padded or mismatched ID would make a
+        // plugin save settings under a file the intended workspace's hooks never read.
+        ...(agentPlugins != null && input.workspaceId != null
+          ? { workspaceId: input.workspaceId.trim() }
+          : {}),
       });
     } catch (error) {
       // Preparation (secrets, plugin context, config listing) can reject before test() runs.
@@ -5269,7 +5289,7 @@ export class MCPServerManager {
         }
       };
       if (server.transport === "stdio") {
-        const launch = await prepareStdioLaunch(server);
+        const launch = await prepareStdioLaunch(server, { workspaceId: options.workspaceId });
         return testNamedServer({ transport: "stdio", ...launch });
       }
 
@@ -6368,7 +6388,7 @@ export class MCPServerManager {
   ): Promise<{ instance: MCPServerInstance; prior: PriorDiscovery } | null> {
     {
       log.debug("[MCP] Spawning stdio server", { name });
-      const launch = await prepareStdioLaunch(info);
+      const launch = await prepareStdioLaunch(info, { workspaceId });
       // Lets the transport's close() kill a server that ignores stdin EOF (#4760).
       const processAbort = new AbortController();
       // #4857: the server runs in the checkout, so another backend sharing this Xum root must

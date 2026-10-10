@@ -193,6 +193,28 @@ describe("MCPServerManager", () => {
     }
   });
 
+  test("testForApi tells the server only a workspace ID whose plugin context resolved", async () => {
+    using tmp = new DisposableTempDir("mcp-api-workspace-id");
+    const config = new Config(tmp.path);
+    const apiConfigService = new MCPConfigService(config);
+    spyOn(apiConfigService, "listServers").mockResolvedValue({});
+    const resolve = spyOn(apiConfigService, "resolveWorkspaceAgentPluginsContext");
+    const apiManager = new MCPServerManager(apiConfigService, { config });
+    const testServer = spyOn(apiManager, "test").mockResolvedValue({ success: true, tools: [] });
+    try {
+      // Known workspace of this project (padding trimmed, as the resolver does).
+      resolve.mockResolvedValueOnce({ projectRoot: tmp.path, projectKey: "key" });
+      await apiManager.testForApi({ name: "plugin:i:s", workspaceId: " ws-7 " });
+      expect(testServer.mock.calls[0]?.[0].workspaceId).toBe("ws-7");
+      // Unknown, stale or other-project workspace: the resolver rejects it, so no ID is sent.
+      resolve.mockResolvedValueOnce(undefined);
+      await apiManager.testForApi({ name: "plugin:i:s", workspaceId: "ws-other" });
+      expect(testServer.mock.calls[1]?.[0]).not.toHaveProperty("workspaceId");
+    } finally {
+      apiManager.dispose();
+    }
+  });
+
   test("testForApi resolves project trust from config before delegating", async () => {
     for (const trusted of [true, false]) {
       using tmp = new DisposableTempDir(`mcp-api-trust-${trusted}`);
@@ -796,6 +818,28 @@ describe("MCPServerManager", () => {
       }
     }
   );
+
+  test("a named Test connection tells a plugin stdio server its workspace", async () => {
+    using tmp = new DisposableTempDir("mcp-named-test-workspace");
+    await componentFixture(tmp.path);
+    const exec = mock((_command: string, _options: { env?: Record<string, string> }) =>
+      Promise.reject(new Error("launch reached"))
+    );
+    const runtime = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      exec,
+    } as unknown as Runtime);
+    try {
+      await manager.test({
+        projectPath: tmp.path,
+        name: "plugin:instance:keep",
+        workspaceId: "ws-7",
+      });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec.mock.calls[0]?.[1].env?.XUM_WORKSPACE_ID).toBe("ws-7");
+    } finally {
+      runtime.mockRestore();
+    }
+  });
 
   /** Leave only `key` configured, so a serve's launch fences belong to it alone. */
   const onlyServer = (configs: Record<string, MCPServerInfo>, key: string, info = configs[key]) => {
@@ -8708,6 +8752,38 @@ describe("prepareStdioLaunch", () => {
     expect(launch.env?.PLUGIN_DATA).toBe(dataPath);
     // Plugin-root cwd is shipped plugin content: never created by launch.
     expect(await fs.readdir(tmp.path)).toEqual(["plugin-data"]);
+  });
+
+  test("tells plugin servers their workspace; other servers get no extra env", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-workspace-env");
+    const dataPath = path.join(tmp.path, "plugin-data", "abc123");
+    const plugin = {
+      pluginName: "demo",
+      serverName: "srv",
+      sourceScope: "global" as const,
+      sourceLocation: ".mux/plugins/demo",
+    };
+
+    const launch = await prepareStdioLaunch(
+      {
+        transport: "stdio",
+        command: "bunx",
+        args: [],
+        // A plugin's own mcp.json must not be able to name another workspace.
+        env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: dataPath, XUM_WORKSPACE_ID: "spoofed" },
+        disabled: false,
+        plugin,
+      },
+      { workspaceId: "ws-1" }
+    );
+    expect(launch.env?.XUM_WORKSPACE_ID).toBe("ws-1");
+    expect(launch.env?.PLUGIN_DATA).toBe(dataPath);
+
+    const userServer = await prepareStdioLaunch(
+      { transport: "stdio", command: "bunx -y some-server", disabled: false },
+      { workspaceId: "ws-1" }
+    );
+    expect(userServer.env).toBeUndefined();
   });
 
   test("creates a nested PLUGIN_DATA cwd recursively before launch", async () => {
