@@ -1,3 +1,5 @@
+import { isNonWorkspaceScopeId } from "@/common/constants/storage";
+import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import type { APIClient } from "@/browser/contexts/API";
 import type {
   FastModePreviousServiceTier,
@@ -40,6 +42,32 @@ export interface FastModeAvailabilityOptions {
 }
 
 type ProviderConfigWriter = Pick<APIClient["providers"], "setProviderConfig">;
+
+/**
+ * OpenAI speed belongs to this chat, just like reasoning. Keep the pending pick for
+ * the next send and nudge an active turn without changing any other chat's default.
+ * Creation scopes have no active turn yet; their first send carries the same choice.
+ */
+export function setWorkspaceServiceTier(
+  api: APIClient | null | undefined,
+  scopeId: string,
+  serviceTier: ServiceTier
+): void {
+  markAiSelectionIntent(scopeId, "serviceTier", serviceTier);
+  if (api != null && !isNonWorkspaceScopeId(scopeId)) {
+    api.workspace.setActiveTurnServiceTier({ workspaceId: scopeId, serviceTier }).catch(() => {
+      // Best-effort: a transient IPC failure must not discard the next-send pick.
+    });
+  }
+}
+
+/** Turning a premium tier off must not re-inherit a premium provider default. */
+export function toggleServiceTier(
+  current: ServiceTier | undefined,
+  target: PremiumServiceTier
+): ServiceTier {
+  return current === target ? "default" : target;
+}
 
 /** Return the provider preference whose priority tier powers Fast mode on this route. */
 export function getFastModeProvider(

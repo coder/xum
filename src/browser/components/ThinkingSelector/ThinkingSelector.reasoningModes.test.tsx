@@ -8,6 +8,7 @@ import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig
 import * as ActualTooltipModule from "@/browser/components/Tooltip/Tooltip";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { OpenAIReasoningMode } from "@/common/types/thinking";
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { installDom } from "../../../../tests/ui/dom";
 
 // Capture before installing module mocks; mock.restore() does not undo them.
@@ -76,6 +77,7 @@ function StatefulSelector(props: {
   modelCapabilitiesDeferred?: boolean;
 }) {
   const [mode, setMode] = useState<OpenAIReasoningMode>(props.initialMode ?? "standard");
+  const [serviceTier, setServiceTier] = useState<ServiceTier>();
   return (
     <ThinkingSelectorControl
       modelString={props.modelString}
@@ -84,6 +86,8 @@ function StatefulSelector(props: {
       onThinkingLevelChange={() => undefined}
       reasoningMode={mode}
       onReasoningModeChange={setMode}
+      serviceTier={serviceTier}
+      onServiceTierChange={setServiceTier}
     />
   );
 }
@@ -116,6 +120,29 @@ describe("ThinkingSelector reasoning modes", () => {
     cleanup();
     cleanupDom?.();
     cleanupDom = null;
+  });
+
+  test("OpenAI speed updates locally and turning it off overrides a premium provider default", () => {
+    providersConfig = {
+      openai: { ...directOpenAIConfig(true).openai, serviceTier: "priority" },
+    };
+    const view = renderSelector(<StatefulSelector modelString="openai:gpt-6-astra" />);
+    const fast = view.container.querySelector<HTMLButtonElement>(
+      '[data-component="FastModeToggle"]'
+    )!;
+    const ultrafast = view.container.querySelector<HTMLButtonElement>(
+      '[data-component="UltrafastModeToggle"]'
+    )!;
+    expect(fast.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(fast);
+    expect(fast.getAttribute("aria-pressed")).toBe("false");
+    expect(providersConfig.openai?.serviceTier).toBe("priority");
+    fireEvent.click(ultrafast);
+    expect(ultrafast.getAttribute("aria-pressed")).toBe("true");
+    expect(fast.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(fast);
+    expect(fast.getAttribute("aria-pressed")).toBe("true");
+    expect(ultrafast.getAttribute("aria-pressed")).toBe("false");
   });
 
   test.each([

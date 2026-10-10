@@ -1,3 +1,5 @@
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
+import { setWorkspaceServiceTier } from "@/browser/utils/fastModeServiceTier";
 import type { ReactNode } from "react";
 import React, { createContext, useCallback, useContext, useEffect } from "react";
 import {
@@ -30,6 +32,8 @@ interface ThinkingContextType {
   /** OpenAI pro reasoning-mode toggle; sibling of thinkingLevel (orthogonal on the wire). */
   reasoningMode: OpenAIReasoningMode;
   setReasoningMode: (mode: OpenAIReasoningMode) => void;
+  serviceTier: ServiceTier | undefined;
+  setServiceTier: (tier: ServiceTier) => void;
 }
 
 const ThinkingContext = createContext<ThinkingContextType | undefined>(undefined);
@@ -56,7 +60,7 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   const defaultsScopeId = workspaceId != null ? GLOBAL_SCOPE_ID : scopeId;
   const agentContext = useOptionalAgent();
   const selection = useWorkspaceAiSelection(
-    workspaceId ?? "",
+    scopeId,
     agentContext?.agentId,
     agentContext && new Map(agentContext.agents.map((agent) => [agent.id, agent.base]))
   );
@@ -72,6 +76,9 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
   // useWorkspaceAiSelection re-renders this provider when a creation scope's pick changes.
   const reasoningMode =
     workspaceId != null ? selection.reasoningMode : getWorkspaceAiSelection(scopeId).reasoningMode;
+
+  const serviceTier = selection.serviceTier;
+  const setServiceTier = (tier: ServiceTier) => setWorkspaceServiceTier(api, scopeId, tier);
 
   // A workspace pick stays in memory until a user message sends it.
   const setThinkingLevel = useCallback(
@@ -149,7 +156,14 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
 
   return (
     <ThinkingContext.Provider
-      value={{ thinkingLevel, setThinkingLevel, reasoningMode, setReasoningMode }}
+      value={{
+        thinkingLevel,
+        setThinkingLevel,
+        reasoningMode,
+        setReasoningMode,
+        serviceTier,
+        setServiceTier,
+      }}
     >
       {props.children}
     </ThinkingContext.Provider>

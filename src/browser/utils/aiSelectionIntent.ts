@@ -1,3 +1,4 @@
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 /**
  * Renderer-local record of deliberate AI picks (model / thinking / reasoning) made in a
  * workspace's composer before the next send. Picker changes stay local until a message
@@ -219,12 +220,19 @@ export function setAutoRoutingPick(
 export function handOffCreationAiSelection(
   workspaceId: string,
   agentId: string,
-  selection: { reasoningMode: string; autoRouting?: Record<AutoRoutingDimension, boolean> }
+  selection: {
+    reasoningMode: string;
+    serviceTier?: ServiceTier;
+    autoRouting?: Record<AutoRoutingDimension, boolean>;
+  }
 ): void {
   const key = scopeKey(workspaceId, agentId);
   pendingByScope.set(key, {
     ...pendingByScope.get(key),
     reasoningMode: { value: selection.reasoningMode, token: nextToken++, sent: true },
+    ...(selection.serviceTier != null
+      ? { serviceTier: { value: selection.serviceTier, token: nextToken++, sent: true as const } }
+      : {}),
   });
   const autoRouting = selection.autoRouting;
   if (autoRouting != null) {
@@ -304,7 +312,12 @@ export function getPendingAiSelection(
 export function getAiSelectionIntentForSend(
   workspaceId: string,
   agentId: string,
-  sent: { model?: string; thinkingLevel?: string; reasoningMode?: string }
+  sent: {
+    model?: string;
+    thinkingLevel?: string;
+    reasoningMode?: string;
+    serviceTier?: ServiceTier;
+  }
 ): PreparedAiSelection {
   const pending = pendingByScope.get(scopeKey(workspaceId, agentId));
   const intent: AiSelectionIntent = {};
@@ -314,7 +327,7 @@ export function getAiSelectionIntentForSend(
     attachedTokens.agentId = agentPick.token;
   }
   if (pending != null) {
-    for (const field of ["model", "thinkingLevel", "reasoningMode"] as const) {
+    for (const field of ["model", "thinkingLevel", "reasoningMode", "serviceTier"] as const) {
       const selection = pending[field];
       if (selection == null || comparable(field, sent[field]) !== selection.value) continue;
       intent[field] = true;
@@ -341,6 +354,7 @@ export function getAiSelectionIntentForSendOptions(
     model?: string;
     thinkingLevel?: string;
     reasoningMode?: string;
+    serviceTier?: ServiceTier;
     skipAiSettingsPersistence?: boolean;
     autoModelRouting?: boolean;
     autoThinkingLevel?: boolean;
@@ -417,7 +431,7 @@ export function consumeAiSelectionIntent(
     return;
   }
   const next = { ...pending };
-  for (const field of ["model", "thinkingLevel", "reasoningMode"] as const) {
+  for (const field of ["model", "thinkingLevel", "reasoningMode", "serviceTier"] as const) {
     const selection = next[field];
     if (selection == null || selection.token !== attachedTokens[field]) continue;
     if (savedChanged || isSavedPick(workspaceId, agentId, field, selection.value)) {

@@ -1,5 +1,6 @@
 import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { z } from "zod";
+import { ServiceTierSchema } from "../../config/schemas/providersConfig";
 import { MCPToolCallDisplaySchema } from "./mcp";
 import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
@@ -1011,6 +1012,7 @@ export const SendMessageOptionsSchema = z.object({
   thinkingLevel: ThinkingLevelSchema.optional(),
   /** OpenAI reasoning mode (pro toggle); inert for models without pro-mode support. */
   reasoningMode: OpenAIReasoningModeSchema.optional(),
+  serviceTier: ServiceTierSchema.optional(),
   model: z.string("No model specified"),
   toolPolicy: ToolPolicySchema.optional(),
   additionalSystemInstructions: z.string().optional(),
@@ -1047,6 +1049,7 @@ export const SendMessageOptionsSchema = z.object({
       model: z.literal(true).optional(),
       thinkingLevel: z.literal(true).optional(),
       reasoningMode: z.literal(true).optional(),
+      serviceTier: z.literal(true).optional(),
     })
     .optional(),
   /**

@@ -1,8 +1,5 @@
 import { expect, userEvent, waitFor, within } from "@storybook/test";
-import {
-  FastModePreviousServiceTierSchema,
-  ServiceTierSchema,
-} from "@/common/config/schemas/providersConfig";
+import { getPendingAiSelection } from "@/browser/utils/aiSelectionIntent";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import assert from "@/common/utils/assert";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
@@ -18,7 +15,7 @@ const phoneViewport = { name: "Phone", styles: { width: "390px", height: "844px"
 function setupGatewayFastMode() {
   collapseLeftSidebar();
   // An unconfigured provider still exposes preferences.
-  let providersConfig: ProvidersConfigMap = {
+  const providersConfig: ProvidersConfigMap = {
     coder: {
       apiKeySet: false,
       isEnabled: true,
@@ -34,34 +31,12 @@ function setupGatewayFastMode() {
     routePriority: ["coder"],
     providersConfig,
   });
-  // Coder supplies credentials; Fast only writes OpenAI's shared tier preference.
-  // Keep reads stateful so refreshing configuration cannot silently undo the toggle.
-  client.providers.getConfig = () => Promise.resolve(providersConfig);
-  client.providers.setProviderConfig = ({ provider, keyPath, value }) => {
-    assert(provider === "openai", "Coder Fast must write the upstream OpenAI preference");
-    const [key] = keyPath;
-    assert(
-      keyPath.length === 1 && (key === "serviceTier" || key === "fastModePreviousServiceTier"),
-      "Fast must only change the tier and its restore target"
-    );
-    const parsed =
-      value === ""
-        ? undefined
-        : key === "serviceTier"
-          ? ServiceTierSchema.parse(value)
-          : FastModePreviousServiceTierSchema.parse(value);
-    providersConfig = {
-      ...providersConfig,
-      openai: {
-        ...providersConfig.openai,
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: false,
-        [key]: parsed,
-      },
-    };
-    return Promise.resolve({ success: true, data: undefined });
+  // Coder supplies credentials, but speed is still this chat's choice, never global config.
+  client.providers.setProviderConfig = () => {
+    throw new Error("Chat speed must not write provider config");
   };
+  client.workspace.setActiveTurnServiceTier = () =>
+    Promise.resolve({ success: true, data: { accepted: false } });
   return client;
 }
 
@@ -106,6 +81,7 @@ export const Desktop: AppStory = {
     await waitFor(async () => {
       await expect(fast).toBeEnabled();
       await expect(fast).toHaveAttribute("aria-pressed", "false");
+      await expect(getPendingAiSelection(workspaceId, "exec", "serviceTier")).toBe("default");
       await expect(trigger).toHaveAccessibleName("Thinking: high");
       await expect(within(trigger).queryByLabelText("Fast mode enabled")).not.toBeInTheDocument();
     });

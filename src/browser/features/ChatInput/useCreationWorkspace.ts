@@ -1,3 +1,4 @@
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { createElement, useState, useEffect, useCallback, useRef } from "react";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type {
@@ -123,7 +124,8 @@ function syncCreationPreferences(
   projectPath: string,
   workspaceId: string,
   agentId: string,
-  reasoningMode: string
+  reasoningMode: string,
+  serviceTier?: ServiceTier
 ): void {
   // Without the experiment the composer offers no Auto, so the creation scope has no choice.
   const experiments = getAppConfigStore().getSnapshot()?.experiments;
@@ -132,6 +134,7 @@ function syncCreationPreferences(
   // hold no reasoning mode.
   handOffCreationAiSelection(workspaceId, agentId, {
     reasoningMode,
+    serviceTier,
     ...(experiments?.[EXPERIMENT_IDS.AUTO_MODEL_ROUTING] === true
       ? {
           autoRouting: {
@@ -603,6 +606,7 @@ export function useCreationWorkspace({
               model: settings.model,
               thinkingLevel: settings.thinkingLevel,
               reasoningMode: settings.reasoningMode,
+              serviceTier: sendMessageOptions.serviceTier,
               // The Auto choices the first send would save: an initial /goal sends no message.
               autoModelRouting: sendMessageOptions.autoModelRouting,
               autoThinkingLevel: sendMessageOptions.autoThinkingLevel,
@@ -648,7 +652,13 @@ export function useCreationWorkspace({
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).
-        syncCreationPreferences(projectPath, metadata.id, creationAgentId, settings.reasoningMode);
+        syncCreationPreferences(
+          projectPath,
+          metadata.id,
+          creationAgentId,
+          settings.reasoningMode,
+          sendMessageOptions.serviceTier
+        );
 
         // Switch to the workspace immediately after creation unless the user navigated away
         // from the draft that initiated the creation (avoid yanking focus to the new workspace).

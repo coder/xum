@@ -47,11 +47,11 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const { agentId, agents } = useAgent();
   const { options: providerOptions } = useProviderOptions();
 
-  const baseModel = useWorkspaceAiSelection(
+  const { model: baseModel, serviceTier } = useWorkspaceAiSelection(
     workspaceId,
     agentId,
     new Map(agents.map((agent) => [agent.id, agent.base]))
-  ).model;
+  );
 
   const [autoModelRouting] = useAutoRoutingSelection(workspaceId, "model");
   const [autoThinkingLevel] = useAutoRoutingSelection(workspaceId, "thinkingLevel");
@@ -60,6 +60,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
     agentId,
     thinkingLevel,
     reasoningMode,
+    serviceTier,
     model: baseModel,
     providerOptions,
     autoModelRouting,

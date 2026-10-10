@@ -1817,6 +1817,14 @@ export const workspace = {
     }),
     output: ResultSchema(z.object({ accepted: z.boolean() }), z.string()),
   },
+  // OpenAI speed changes apply to the next model step of the active turn, like thinking.
+  setActiveTurnServiceTier: {
+    input: z.object({
+      workspaceId: z.string(),
+      serviceTier: ServiceTierSchema,
+    }),
+    output: ResultSchema(z.object({ accepted: z.boolean() }), z.string()),
+  },
   preflightArchive: {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(ArchivePreflightResultSchema, z.string()),

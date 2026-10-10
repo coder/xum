@@ -62,6 +62,7 @@ type PreservedSendOptions = Pick<
   SendMessageOptions,
   | "thinkingLevel"
   | "reasoningMode"
+  | "serviceTier"
   | "additionalSystemInstructions"
   | "providerOptions"
   | "disableWorkspaceAgents"
@@ -81,6 +82,7 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
   return {
     ...(options.thinkingLevel !== undefined ? { thinkingLevel: options.thinkingLevel } : {}),
     ...(options.reasoningMode !== undefined ? { reasoningMode: options.reasoningMode } : {}),
+    ...(options.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
     ...(options.additionalSystemInstructions !== undefined
       ? { additionalSystemInstructions: options.additionalSystemInstructions }
       : {}),
@@ -109,6 +111,7 @@ export type StartupRetrySendOptions = Pick<
   | "agentId"
   | "thinkingLevel"
   | "reasoningMode"
+  | "serviceTier"
   | "toolPolicy"
   | "additionalSystemInstructions"
   | "maxOutputTokens"
@@ -159,6 +162,7 @@ export function pickStartupRetrySendOptions(
     agentId: options.agentId,
     thinkingLevel: options.thinkingLevel,
     reasoningMode: options.reasoningMode,
+    serviceTier: options.serviceTier,
     toolPolicy: options.toolPolicy,
     additionalSystemInstructions: options.additionalSystemInstructions,
     maxOutputTokens: options.maxOutputTokens,
