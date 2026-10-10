@@ -5,6 +5,7 @@ import { z } from "zod";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { Ok } from "@/common/types/result";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { assemblePromptPayload } from "./turnContextAssembler";
 import {
@@ -17,6 +18,7 @@ import {
   createTestLanguageModel,
   historyService,
   installStreamManagerTestHistory,
+  REFUSAL_FINISH,
   runTurnForTests,
   scriptedStreamText,
   STOP_FINISH,
@@ -595,6 +597,76 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
       if (!history.success) throw new Error(history.error);
       const row = history.data.find((message) => message.id === messageId);
       expect(row?.parts.some((part) => part.type === "dynamic-tool")).toBe(false);
+      expect(row?.metadata?.anthropicThinkingReplay).toBeUndefined();
+    });
+
+    test("reasoning from a non-Anthropic refusal fallback writes no receipt", async () => {
+      const workspaceId = "preserved-thinking-server-tool-fallback";
+      const streamManager = createStreamManagerForTests(historyService, {
+        streamText: scriptedStreamText([
+          {
+            // The Anthropic attempt runs a server tool, then refuses: the parts stay.
+            chunks: [
+              { type: "start-step" },
+              {
+                type: "tool-call",
+                toolCallId: "srvtoolu_1",
+                toolName: "web_search",
+                input: { query: "xum" },
+                providerExecuted: true,
+              },
+              {
+                type: "tool-result",
+                toolCallId: "srvtoolu_1",
+                toolName: "web_search",
+                output: [],
+                providerExecuted: true,
+              },
+              REFUSAL_FINISH,
+            ],
+          },
+          {
+            // The OpenAI fallback reasons: that reasoning is not bound to an Anthropic prefix.
+            chunks: [
+              { type: "start-step" },
+              { type: "reasoning-delta", text: "fallback thinking" },
+              { type: "text-delta", text: "answer" },
+              { type: "finish-step", usage: TEST_USAGE },
+              STOP_FINISH,
+            ],
+          },
+        ]),
+      });
+      const { messageId } = await runTurnForTests(streamManager, {
+        workspaceId,
+        model: createTestLanguageModel("claude-opus-5-5", "anthropic.messages"),
+        modelString: "anthropic:claude-opus-5-5",
+        modelFallback: {
+          chain: ["openai:gpt-5.2"],
+          prepare: (modelString) =>
+            Promise.resolve(
+              Ok({
+                model: createTestLanguageModel("gpt-5.2", "openai.responses"),
+                modelString,
+                messages: [],
+                system: "system",
+                tools: undefined,
+                thinkingLevel: "high" as const,
+              })
+            ),
+        },
+      });
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const row = history.data.find((message) => message.id === messageId);
+      // The fallback did run after the server tool, and its reasoning is in the row.
+      const parts = row?.parts ?? [];
+      const toolIndex = parts.findIndex(
+        (part) => part.type === "dynamic-tool" && part.toolCallId === "srvtoolu_1"
+      );
+      expect(toolIndex).toBeGreaterThanOrEqual(0);
+      expect(parts.slice(toolIndex + 1).some((part) => part.type === "reasoning")).toBe(true);
       expect(row?.metadata?.anthropicThinkingReplay).toBeUndefined();
     });
 

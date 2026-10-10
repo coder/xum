@@ -2200,6 +2200,9 @@ export class StreamManager {
     if (serverToolIds == null || streamInfo.initialMetadata?.anthropicThinkingReplay === "off") {
       return;
     }
+    // Only Anthropic reasoning is bound to the native prefix: a refusal fallback to another
+    // provider keeps the parts (and the IDs) but its reasoning replays nothing Anthropic.
+    if (!isAnthropicMessagesModel(streamInfo.request.model)) return;
     // Read the parts, not only the ID set: a retry that drops parts drops the server tool too.
     const followsServerTool = streamInfo.parts.some(
       (part) => part.type === "dynamic-tool" && serverToolIds.has(part.toolCallId)
