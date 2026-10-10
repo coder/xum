@@ -1229,6 +1229,9 @@ export class AgentPluginInstallService {
    *   specific component set, so additions are gated. Their bodies were never
    *   part of the preview (they load on explicit invocation), so content
    *   changes ride the normal tree replacement.
+   * - views (id → title, server, ui:// resource): the preview listed each
+   *   view, and a view decides which server a palette entry talks to, so an
+   *   added or changed view is gated like a changed hook.
    */
   private async capabilitySurface(
     plugin: AgentPluginInfo,
@@ -1244,8 +1247,17 @@ export class AgentPluginInstallService {
     skills: Map<string, { fingerprint: string; display: string }>;
     agents: Map<string, string>;
     components: Set<string>;
+    /** viewId → JSON fingerprint of title, server and resource (also what the review shows). */
+    views: Map<string, string>;
   }> {
     const hook = this.collectHook(plugin);
+    const views = new Map<string, string>();
+    for (const view of plugin.manifest.contributes?.views ?? []) {
+      views.set(
+        view.id,
+        JSON.stringify({ title: view.title, server: view.server, resourceUri: view.resourceUri })
+      );
+    }
     const skills = new Map<string, { fingerprint: string; display: string }>();
     for (const skill of await this.collectSkills(plugin, warnings)) {
       // EVERY model-visible advertisement field: description, whenToUse
@@ -1312,7 +1324,7 @@ export class AgentPluginInstallService {
         });
       }
     }
-    return { hook, servers, skills, agents, components };
+    return { hook, servers, skills, agents, components, views };
   }
 
   /**
@@ -1425,6 +1437,18 @@ export class AgentPluginInstallService {
       } else if (currentFingerprint !== fingerprint) {
         changes.push({
           summary: `changes the definition of agent ${agentName}`,
+          before: currentFingerprint,
+          after: fingerprint,
+        });
+      }
+    }
+    for (const [viewId, fingerprint] of staged.views) {
+      const currentFingerprint = current?.views.get(viewId);
+      if (currentFingerprint === undefined) {
+        changes.push({ summary: `adds view ${viewId}`, after: fingerprint });
+      } else if (currentFingerprint !== fingerprint) {
+        changes.push({
+          summary: `changes view ${viewId}`,
           before: currentFingerprint,
           after: fingerprint,
         });
@@ -1820,6 +1844,12 @@ export class AgentPluginInstallService {
         name: command.name,
         ...(command.description !== undefined ? { description: command.description } : {}),
       }));
+      const views = (plugin.manifest.contributes?.views ?? []).map((view) => ({
+        id: view.id,
+        title: view.title,
+        server: view.server,
+        resourceUri: view.resourceUri,
+      }));
 
       if (resolved.refType === "tag" && sha !== resolved.sha) {
         warnings.push(
@@ -1843,6 +1873,7 @@ export class AgentPluginInstallService {
         agents,
         workflows,
         slashCommands,
+        views,
         warnings,
         targetPath: shortenHome(targetPath),
       };

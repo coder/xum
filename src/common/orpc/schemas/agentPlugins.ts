@@ -54,6 +54,15 @@ export const AgentPluginPreviewSlashCommandSchema = z.object({
   description: z.string().optional(),
 });
 
+/** MCP Apps view declared by the manifest (`contributes.views`), opened from the palette. */
+export const AgentPluginPreviewViewSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  /** Server in the plugin's mcp.json the view is read from. */
+  server: z.string(),
+  resourceUri: z.string(),
+});
+
 /** Manifest metadata surfaced in the consent preview (UI-safe projection of plugin.json). */
 export const AgentPluginManifestSummarySchema = z.object({
   name: z.string(),
@@ -84,6 +93,8 @@ export const AgentPluginInstallPreviewSchema = z.object({
   workflows: z.array(z.string()),
   /** Composer slash commands the manifest contributes. */
   slashCommands: z.array(AgentPluginPreviewSlashCommandSchema),
+  /** MCP Apps views the manifest contributes (opened from the command palette). */
+  views: z.array(AgentPluginPreviewViewSchema),
   /** Manifest warnings + component diagnostics from validating the staged clone. */
   warnings: z.array(z.string()),
   /** Final install directory (~/.mux/plugins/<name>). */

@@ -21,6 +21,7 @@ import {
   type AgentPluginsMcpContext,
 } from "./mcpConfig";
 import { collectPluginSlashCommands } from "./slashCommands";
+import { attachPluginViewServers, discoverPluginViews, type PluginViewEntry } from "./pluginViews";
 
 async function resolveWorkspaceAgentPluginsMcpContext(
   context: ORPCContext,
@@ -258,4 +259,44 @@ export async function getWorkspacePluginComposition(
         agentPlugins,
       }),
   });
+}
+
+/**
+ * The workspace's plugin views (MCP Apps views from `contributes.views`), each bound to its
+ * own plugin's server key and marked enabled or not. Off-host and multi-project workspaces
+ * have no plugin servers, so they have no plugin views (resolveAgentPluginsMcpContext).
+ * `enabled` is a hint for the palette and the frame's error: the MCP server manager still
+ * refuses to read from a server the workspace has not enabled.
+ */
+export async function listWorkspacePluginViews(
+  context: ORPCContext,
+  workspaceId: string,
+  signal?: AbortSignal
+): Promise<PluginViewEntry[]> {
+  await context.initStateManager.waitForInit(workspaceId, signal);
+  const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
+  if (!metadataResult.success) throw new Error(metadataResult.error);
+  const metadata = metadataResult.data;
+  const runtimeResult = context.aiService.createWorkspaceRuntimeContext(workspaceId, metadata);
+  if (!runtimeResult.success) throw new Error(formatSendMessageError(runtimeResult.error).message);
+  const { hostCheckoutRoot } = runtimeResult.data;
+  const agentPlugins = hostCheckoutRoot
+    ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
+    : null;
+  if (agentPlugins?.projectRoot === undefined) return [];
+  const projectTrusted = isWorkspaceProjectTrusted(context.config, metadata);
+  const views = await discoverPluginViews({
+    xumHome: context.config.rootDir,
+    projectTrusted,
+    context: { ...agentPlugins, projectRoot: agentPlugins.projectRoot },
+  });
+  if (views.length === 0) return [];
+  const [servers, { overrides }] = await Promise.all([
+    context.mcpConfigService.listServers(metadata.projectPath, projectTrusted, { agentPlugins }),
+    context.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId, {
+      timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
+      ...(signal !== undefined ? { signal } : {}),
+    }),
+  ]);
+  return attachPluginViewServers(views, servers, overrides);
 }

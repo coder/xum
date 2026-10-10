@@ -56,6 +56,7 @@ export const CommandIds = {
   navOpenLogFile: () => "nav:open-log-file" as const,
   navOpenArtifacts: () => "nav:open-artifacts" as const,
   navOpenFileAsArtifact: () => "nav:open-file-as-artifact" as const,
+  navOpenPluginView: (pluginViewId: string) => `nav:open-plugin-view:${pluginViewId}` as const,
 
   // Goal commands
   goalSetObjective: () => "goal:set-objective" as const,

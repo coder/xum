@@ -42,12 +42,42 @@ export const McpAppViewSchema = z.object({
 });
 export type McpAppView = z.infer<typeof McpAppViewSchema>;
 
-export const McpAppViewRequestSchema = z.object({
-  workspaceId: z.string().min(1),
-  toolCallId: z.string().min(1),
-  serverName: z.string().min(1),
-  resourceUri: z.string().refine(isMcpAppResourceUri, "resourceUri must be a ui:// URI"),
+/**
+ * Open a view. "tool": the view a tool call declared, bound to that call's result record.
+ * "plugin": a view a plugin declares in its manifest (`contributes.views`). The renderer sends
+ * only the plugin view ID; the backend maps it to the plugin's own server and ui:// resource,
+ * so a plugin view request can never name an arbitrary server or resource. A plugin view has
+ * no tool call: its response has resultAvailable false and invocation null.
+ */
+export const McpAppViewRequestSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("tool"),
+    workspaceId: z.string().min(1),
+    toolCallId: z.string().min(1),
+    serverName: z.string().min(1),
+    resourceUri: z.string().refine(isMcpAppResourceUri, "resourceUri must be a ui:// URI"),
+  }),
+  z.object({
+    kind: z.literal("plugin"),
+    workspaceId: z.string().min(1),
+    /** `<instanceId>/<viewId>` from listPluginViews. */
+    pluginViewId: z.string().min(1).max(128),
+  }),
+]);
+
+/** A plugin view the workspace can open (listPluginViews). */
+export const McpAppPluginViewSchema = z.object({
+  pluginViewId: z.string().min(1),
+  title: z.string(),
+  pluginName: z.string(),
+  /** The server's name in the plugin's mcp.json (display only). */
+  serverName: z.string(),
+  /** The view's own server key: its tools/call target. */
+  serverKey: z.string().min(1),
+  /** Plugin servers start disabled: the view opens only once the workspace enables its server. */
+  enabled: z.boolean(),
 });
+export type McpAppPluginView = z.infer<typeof McpAppPluginViewSchema>;
 
 export const McpAppToolCallRequestSchema = z.object({
   workspaceId: z.string().min(1),

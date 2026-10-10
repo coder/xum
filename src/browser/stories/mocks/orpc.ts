@@ -20,7 +20,11 @@ import type {
   PinnedArtifactFile,
 } from "@/common/orpc/schemas/artifacts";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
-import type { McpAppToolCallResult, McpAppView } from "@/common/orpc/schemas/mcpApps";
+import type {
+  McpAppPluginView,
+  McpAppToolCallResult,
+  McpAppView,
+} from "@/common/orpc/schemas/mcpApps";
 import type { APIClient } from "@/browser/contexts/API";
 import { createMockReviewStateApi } from "./reviewState";
 import { createMockDraftsApi } from "./drafts";
@@ -239,9 +243,13 @@ export interface MockORPCClientOptions {
     /** Persisted window.xum.state per artifact path (artifacts.getState); default null. */
     states?: Record<string, unknown>;
   };
-  /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
+  /**
+   * MCP Apps views: mcpApps.getView by tool call ID (or plugin view ID), mcpApps.callTool per
+   * request, mcpApps.listPluginViews from `pluginViews`.
+   */
   mcpApps?: {
     views: Record<string, McpAppView>;
+    pluginViews?: McpAppPluginView[];
     callTool?: (input: { toolName: string; consented: boolean }) => McpAppToolCallResult;
   };
   /** Initial updater status for update.onStatus (About dialog stories). */
@@ -2350,14 +2358,30 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         Promise.resolve({ success: true as const, data: { id: "story-interaction" } }),
     },
     mcpApps: {
-      getView: (input: { toolCallId: string }) => {
-        const view = mcpApps?.views[input.toolCallId];
+      getView: (
+        input: { kind: "tool"; toolCallId: string } | { kind: "plugin"; pluginViewId: string }
+      ) => {
+        const id = input.kind === "plugin" ? input.pluginViewId : input.toolCallId;
+        // Mirrors the backend: a plugin view whose server is disabled does not open.
+        const disabled =
+          input.kind === "plugin"
+            ? mcpApps?.pluginViews?.find((v) => v.pluginViewId === id && !v.enabled)
+            : undefined;
+        if (disabled) {
+          return Promise.resolve({
+            success: false as const,
+            error: `Enable the ${disabled.serverName} server for this workspace to open this view (Workspace MCP settings).`,
+          });
+        }
+        const view = mcpApps?.views[id];
         return Promise.resolve(
           view
             ? { success: true as const, data: view }
-            : { success: false as const, error: `No view for ${input.toolCallId}` }
+            : { success: false as const, error: `No view for ${id}` }
         );
       },
+      listPluginViews: () =>
+        Promise.resolve({ success: true as const, data: mcpApps?.pluginViews ?? [] }),
       callTool: (input: { toolName: string; consented: boolean }) =>
         Promise.resolve({
           success: true as const,

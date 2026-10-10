@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { ORPCContext } from "@/node/orpc/context";
 import type { McpAppResultRecord } from "./mcpAppResultStore";
-import { getMcpAppView } from "./mcpAppsOperations";
+import type { PluginViewEntry } from "./agentPlugins/pluginViews";
+import {
+  getMcpAppView,
+  listMcpAppPluginViews,
+  pluginViewServerDisabledError,
+  type McpAppViewDeps,
+} from "./mcpAppsOperations";
 
 const RECORD: McpAppResultRecord = {
   version: 1,
@@ -31,6 +37,7 @@ function context(record: McpAppResultRecord | null, warm = true) {
 }
 
 const request = (overrides: Partial<{ serverName: string; resourceUri: string }> = {}) => ({
+  kind: "tool" as const,
   workspaceId: "ws",
   toolCallId: "call-1",
   serverName: "charts",
@@ -38,7 +45,11 @@ const request = (overrides: Partial<{ serverName: string; resourceUri: string }>
   ...overrides,
 });
 
-const noWarm = () => Promise.reject(new Error("servers are already started"));
+const noWarmFn = () => Promise.reject(new Error("servers are already started"));
+const noWarm: McpAppViewDeps = {
+  warmServers: noWarmFn,
+  listPluginViews: () => Promise.reject(new Error("tool views never list plugin views")),
+};
 
 describe("getMcpAppView", () => {
   test("starts the workspace's servers first when nothing has since the backend started", async () => {
@@ -46,9 +57,12 @@ describe("getMcpAppView", () => {
     // could not start the server and every persisted view failed with "not connected".
     const { ctx, reads } = context(RECORD, false);
     const order: string[] = [];
-    const result = await getMcpAppView(ctx, request(), undefined, (workspaceId) => {
-      order.push(`warm:${workspaceId}:reads=${reads.length}`);
-      return Promise.resolve([]);
+    const result = await getMcpAppView(ctx, request(), undefined, {
+      ...noWarm,
+      warmServers: (workspaceId) => {
+        order.push(`warm:${workspaceId}:reads=${reads.length}`);
+        return Promise.resolve([]);
+      },
     });
     expect(result.success).toBe(true);
     expect(order).toEqual(["warm:ws:reads=0"]);
@@ -100,5 +114,98 @@ describe("getMcpAppView", () => {
     if (!result.success) throw new Error(result.error);
     expect(result.data.invocation).toBeNull();
     expect(result.data.resultAvailable).toBe(false);
+  });
+});
+
+const PLUGIN_VIEW: PluginViewEntry = {
+  pluginViewId: "0123456789abcdef/settings",
+  pluginName: "review-bot",
+  title: "Review settings",
+  serverName: "settings",
+  serverKey: "plugin:0123456789abcdef:settings",
+  resourceUri: "ui://review/settings",
+  enabled: true,
+};
+
+const pluginDeps = (views: PluginViewEntry[]): McpAppViewDeps => ({
+  warmServers: noWarmFn,
+  listPluginViews: () => Promise.resolve(views),
+});
+
+describe("getMcpAppView for plugin views", () => {
+  const pluginRequest = (pluginViewId: string) => ({
+    kind: "plugin" as const,
+    workspaceId: "ws",
+    pluginViewId,
+  });
+
+  test("reads the view from the plugin's own server, with no tool result", async () => {
+    const { ctx, reads } = context(null);
+    const result = await getMcpAppView(
+      ctx,
+      pluginRequest(PLUGIN_VIEW.pluginViewId),
+      undefined,
+      pluginDeps([PLUGIN_VIEW])
+    );
+    if (!result.success) throw new Error(result.error);
+    expect(reads).toEqual([
+      { serverName: "plugin:0123456789abcdef:settings", uri: "ui://review/settings" },
+    ]);
+    expect(result.data.resultAvailable).toBe(false);
+    expect(result.data.result).toBeNull();
+    expect(result.data.invocation).toBeNull();
+  });
+
+  test("refuses unknown and foreign IDs without contacting any server", async () => {
+    // Another plugin's instance with the same view ID, an unknown view of this plugin, and a
+    // server key in place of a view ID: none is in the workspace's discovered list.
+    for (const id of [
+      "fedcba9876543210/settings",
+      "0123456789abcdef/other",
+      "plugin:0123456789abcdef:settings",
+    ]) {
+      const { ctx, reads } = context(null);
+      const result = await getMcpAppView(
+        ctx,
+        pluginRequest(id),
+        undefined,
+        pluginDeps([PLUGIN_VIEW])
+      );
+      expect(result).toEqual({
+        success: false,
+        error: "This plugin view is not available in this workspace",
+      });
+      expect(reads).toEqual([]);
+    }
+  });
+
+  test("a disabled server gives the enable-the-server error", async () => {
+    const { ctx, reads } = context(null);
+    const result = await getMcpAppView(
+      ctx,
+      pluginRequest(PLUGIN_VIEW.pluginViewId),
+      undefined,
+      pluginDeps([{ ...PLUGIN_VIEW, enabled: false }])
+    );
+    expect(result).toEqual({ success: false, error: pluginViewServerDisabledError("settings") });
+    expect(reads).toEqual([]);
+  });
+
+  test("listPluginViews keeps the resource URI in the backend", async () => {
+    const { ctx } = context(null);
+    const result = await listMcpAppPluginViews(ctx, { workspaceId: "ws" }, undefined, () =>
+      Promise.resolve([PLUGIN_VIEW])
+    );
+    if (!result.success) throw new Error(result.error);
+    expect(result.data).toEqual([
+      {
+        pluginViewId: PLUGIN_VIEW.pluginViewId,
+        title: "Review settings",
+        pluginName: "review-bot",
+        serverName: "settings",
+        serverKey: "plugin:0123456789abcdef:settings",
+        enabled: true,
+      },
+    ]);
   });
 });

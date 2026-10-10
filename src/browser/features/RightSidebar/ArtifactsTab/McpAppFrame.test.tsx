@@ -13,7 +13,7 @@ import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
-import type { McpAppViewRef } from "./mcpAppViewsStore";
+import type { McpAppPluginViewRef, McpAppViewRef } from "./mcpAppViewsStore";
 
 // The card's display values: the aggregated tool name and the pre-sanitization arguments.
 const VIEW: McpAppViewRef = {
@@ -27,6 +27,17 @@ const VIEW: McpAppViewRef = {
   failed: false,
 };
 
+// A plugin view (contributes.views): no tool call, bound to its plugin's server key.
+const PLUGIN_VIEW: McpAppPluginViewRef = {
+  kind: "plugin",
+  pluginViewId: "0123456789abcdef/settings",
+  title: "Review settings",
+  pluginName: "review-bot",
+  serverName: "settings",
+  serverKey: "plugin:0123456789abcdef:settings",
+};
+
+let getViewRequests: unknown[] = [];
 let invocation: McpAppView["invocation"] = null;
 let viewCsp: McpAppView["csp"] = {};
 let toolCalls: Array<{
@@ -39,16 +50,19 @@ let toolCalls: Array<{
 function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
     mcpApps: {
-      getView: () => {
+      getView: (input: { kind: "tool" | "plugin" }) => {
+        getViewRequests.push(input);
+        // The backend's plugin view shape: no tool call, so no result and no invocation.
+        const plugin = input.kind === "plugin";
         return Promise.resolve({
           success: true as const,
           data: {
             html: "<p>view</p>",
             csp: viewCsp,
             prefersBorder: null,
-            resultAvailable: true,
-            result: { content: [] },
-            invocation,
+            resultAvailable: !plugin,
+            result: plugin ? null : { content: [] },
+            invocation: plugin ? null : invocation,
           },
         });
       },
@@ -132,6 +146,7 @@ describe("McpAppFrame", () => {
     invocation = null;
     viewCsp = {};
     toolCalls = [];
+    getViewRequests = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
   });
@@ -183,6 +198,41 @@ describe("McpAppFrame", () => {
     });
     await waitFor(() => expect(toolCalls).toHaveLength(1));
     expect(toolCalls[0].serverName).toBe("charts-recorded");
+  });
+
+  test("a plugin view opens by its ID alone, without tool notifications, bound to its server", async () => {
+    const view = render(<McpAppFrame workspaceId="ws" view={PLUGIN_VIEW} />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const posted = capturePosted(frame);
+    // The renderer names no server or resource for a plugin view.
+    expect(getViewRequests).toEqual([
+      { kind: "plugin", workspaceId: "ws", pluginViewId: "0123456789abcdef/settings" },
+    ]);
+    expect(view.container.textContent).toContain("Review settings from plugin review-bot");
+    expect(view.container.textContent).not.toContain("Result no longer available");
+
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "ui/initialize",
+      params: { appInfo: { name: "v" }, protocolVersion: "2026-01-26" },
+    });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    const init = posted.find((m) => m.id === 1)?.result as { hostContext: object };
+    expect(init.hostContext).not.toHaveProperty("toolInfo");
+
+    postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "save_settings", arguments: {} },
+    });
+    await waitFor(() => expect(toolCalls).toHaveLength(1));
+    expect(toolCalls[0].serverName).toBe("plugin:0123456789abcdef:settings");
+    // Messages are handled in order: initialized came before the call, so nothing tool-shaped
+    // was sent for it.
+    expect(posted.filter((m) => m.method?.startsWith("ui/notifications/tool-"))).toEqual([]);
   });
 
   test("a cancelled call's view is told whether it failed or was interrupted", async () => {
@@ -443,6 +493,7 @@ describe("McpAppFrame host strips", () => {
     invocation = null;
     viewCsp = {};
     toolCalls = [];
+    getViewRequests = [];
     // Desktop mode: the preload bridge exists (isDesktopMode).
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
   });

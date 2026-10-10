@@ -27,6 +27,7 @@ export const AGENT_PLUGIN_SCHEMA_ID_1_0_0 =
 
 // Name grammar shared with the install registry schema (see the module's doc comment).
 import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
+import { isMcpAppResourceUri } from "@/common/utils/mcpApps";
 
 export { isValidAgentPluginName };
 
@@ -50,11 +51,39 @@ export interface AgentPluginSlashCommandContribution {
   expansion: string;
 }
 
+/** View IDs share the slash-command grammar (kebab-case, 1-64 chars). */
+const VIEW_TITLE_MAX_LENGTH = 64;
+const VIEW_SERVER_MAX_LENGTH = 128;
+// Each view is one palette entry and one picker row; bound the count so one
+// manifest cannot flood the command palette.
+export const MAX_PLUGIN_VIEWS = 16;
+// Titles and server names are shown in the palette, picker and install
+// preview: control and format characters (bidi overrides) could disguise them.
+const CONTROL_OR_FORMAT_CHARS = /[\p{Cc}\p{Cf}]/u;
+
+/**
+ * An MCP Apps view the user opens from the command palette without a tool
+ * call. `server` names an entry in this plugin's own mcp.json; the view's
+ * ui:// resource is read from that server, and its tools/call stays bound to
+ * it. Views get no new host power: they are ordinary MCP Apps views.
+ */
+export interface AgentPluginViewContribution {
+  /** Kebab-case, unique within the plugin. */
+  id: string;
+  /** Palette and picker label (1-64 chars). */
+  title: string;
+  /** Key in this plugin's mcp.json `mcpServers`. */
+  server: string;
+  /** The view resource; must be a ui:// URI. */
+  resourceUri: string;
+}
+
 /**
  * Mux `contributes` block: path members override the conventional component
  * locations (skills/, mcp.json, agents/, workflows/, hooks.js) with a safe
  * relative path inside the plugin root; `slashCommands` declares data-driven
- * chat commands that have no on-disk convention.
+ * chat commands and `views` declares MCP Apps views (neither has an on-disk
+ * convention).
  */
 export interface AgentPluginContributes {
   skills?: string;
@@ -63,10 +92,11 @@ export interface AgentPluginContributes {
   workflows?: string;
   hooks?: string;
   slashCommands?: AgentPluginSlashCommandContribution[];
+  views?: AgentPluginViewContribution[];
 }
 
 const CONTRIBUTES_PATH_KEYS = ["skills", "mcp", "agents", "workflows", "hooks"] as const;
-const CONTRIBUTES_KEYS = new Set<string>([...CONTRIBUTES_PATH_KEYS, "slashCommands"]);
+const CONTRIBUTES_KEYS = new Set<string>([...CONTRIBUTES_PATH_KEYS, "slashCommands", "views"]);
 
 /**
  * A contributes path must stay a plain relative path. Realpath containment is
@@ -142,6 +172,77 @@ function parseSlashCommandContributions(
   return commands;
 }
 
+function isDisplaySafeText(value: unknown, maxLength: number): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= maxLength &&
+    !CONTROL_OR_FORMAT_CHARS.test(value)
+  );
+}
+
+function parseViewContributions(
+  raw: unknown,
+  warnings: string[]
+): AgentPluginViewContribution[] | undefined {
+  if (!Array.isArray(raw)) {
+    warnings.push("'contributes.views' must be an array; ignoring");
+    return undefined;
+  }
+
+  const views: AgentPluginViewContribution[] = [];
+  const seenIds = new Set<string>();
+  for (const entry of raw) {
+    if (!isPlainObject(entry)) {
+      warnings.push("'contributes.views' entries must be objects; ignoring an entry");
+      continue;
+    }
+    const { id, title, server, resourceUri } = entry;
+    if (
+      typeof id !== "string" ||
+      id.length > SLASH_COMMAND_NAME_MAX_LENGTH ||
+      !SLASH_COMMAND_NAME_PATTERN.test(id)
+    ) {
+      warnings.push(
+        "'contributes.views[].id' must be 1-64 kebab-case characters; ignoring an entry"
+      );
+      continue;
+    }
+    if (!isDisplaySafeText(title, VIEW_TITLE_MAX_LENGTH)) {
+      warnings.push(
+        `'contributes.views[].title' for '${id}' must be 1-${VIEW_TITLE_MAX_LENGTH} printable characters; ignoring the entry`
+      );
+      continue;
+    }
+    if (!isDisplaySafeText(server, VIEW_SERVER_MAX_LENGTH)) {
+      warnings.push(
+        `'contributes.views[].server' for '${id}' must name a server in this plugin's mcp.json; ignoring the entry`
+      );
+      continue;
+    }
+    if (!isMcpAppResourceUri(resourceUri)) {
+      warnings.push(
+        `'contributes.views[].resourceUri' for '${id}' must be a ui:// URI; ignoring the entry`
+      );
+      continue;
+    }
+    if (seenIds.has(id)) {
+      warnings.push(`Duplicate contributed view '${id}'; first declaration wins`);
+      continue;
+    }
+    if (views.length >= MAX_PLUGIN_VIEWS) {
+      warnings.push(
+        `'contributes.views' declares more than ${MAX_PLUGIN_VIEWS} views; ignoring the rest`
+      );
+      break;
+    }
+    seenIds.add(id);
+    views.push({ id, title, server, resourceUri });
+  }
+
+  return views;
+}
+
 function parseContributes(raw: unknown, warnings: string[]): AgentPluginContributes | undefined {
   if (raw === undefined) {
     return undefined;
@@ -177,6 +278,13 @@ function parseContributes(raw: unknown, warnings: string[]): AgentPluginContribu
     const commands = parseSlashCommandContributions(raw.slashCommands, warnings);
     if (commands !== undefined) {
       contributes.slashCommands = commands;
+    }
+  }
+
+  if (raw.views !== undefined) {
+    const views = parseViewContributions(raw.views, warnings);
+    if (views !== undefined) {
+      contributes.views = views;
     }
   }
 

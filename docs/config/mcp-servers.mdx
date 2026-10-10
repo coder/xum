@@ -65,6 +65,30 @@ MCP servers declared in an [Agent Plugin's](https://agent-plugins.org) `mcp.json
 
 Stdio plugin servers launch with the spec's `PLUGIN_ROOT` and `PLUGIN_DATA` environment variables; per-plugin data directories live under `~/.xum/plugin-data/`.
 
+### Plugin views
+
+A plugin can declare [MCP Apps](/workspaces/artifacts#apps-from-mcp-servers) views in `plugin.json`, for example a settings page for its hooks. You open a view from the command palette (**Open plugin view: …**) or the Artifacts picker without a tool call. Views need the Artifacts experiment.
+
+```json
+{
+  "contributes": {
+    "views": [
+      {
+        "id": "settings",
+        "title": "Review settings",
+        "server": "settings",
+        "resourceUri": "ui://review/settings"
+      }
+    ]
+  }
+}
+```
+
+- `id` is kebab-case and unique in the plugin. `title` has at most 64 characters. A plugin declares at most 16 views.
+- `server` names a server in the plugin's own `mcp.json`. `resourceUri` must be a `ui://` URI. Xum ignores invalid entries with a warning.
+- The view reads from and calls only that server, with the same rules as other MCP Apps views. Enable the server for the workspace first: a view whose server is disabled shows which server to enable.
+- The install preview lists every view. An update that adds or changes a view needs a new consent.
+
 **Settings → Plugins** installs plugins from git into `~/.xum/plugins` (paste a git URL or `owner/repo[@ref]`); the exact location derives from the active Xum home (a legacy `~/.mux` home keeps working) and is shown in the section. Before anything is written, a consent preview lists the plugin's manifest, every skill, and every MCP server command line. Installs are pinned to the resolved commit; update checks compare the tracked branch or tag against the pinned commit and never auto-apply. Applying an update replaces the plugin directory wholesale — local edits to a managed plugin directory are discarded — and restarts that plugin's running MCP servers. Uninstalling removes the directory, the registry entry, and the plugin's global enablement and per-workspace server overrides, but keeps `~/.xum/plugin-data/` unless you opt in to deleting it.
 
 ## Tool search
