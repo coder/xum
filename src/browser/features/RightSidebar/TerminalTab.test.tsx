@@ -27,10 +27,16 @@ void mock.module("@/browser/components/TerminalView/TerminalView", () => ({
 }));
 
 function renderTab(tabType: `terminal:${string}` | "terminal") {
+  const metadata: FrontendWorkspaceMetadata = {
+    id: "ws-1",
+    name: "feature",
+    projectName: "app",
+    projectPath: "/tmp/app",
+    namedWorkspacePath: "/tmp/app/feature",
+    runtimeConfig: { type: "local" },
+  };
   const workspaceContext = {
-    workspaceMetadata: new Map([
-      ["ws-1", { id: "ws-1", name: "feature", projectName: "app" } as FrontendWorkspaceMetadata],
-    ]),
+    workspaceMetadata: new Map([["ws-1", metadata]]),
     loading: false,
     loaded: true,
     loadError: null,
