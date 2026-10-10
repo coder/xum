@@ -83,6 +83,8 @@ async function main(): Promise<void> {
   const tree = { base: path.resolve(values.base), head: path.resolve(values.head) };
   const bin = { base: electronFor(tree.base), head: electronFor(tree.head) };
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "xum-cold-start-"));
+  // An exit handler, not `finally`: Playwright can reject outside our await and crash the process.
+  process.on("exit", () => fs.rmSync(tmp, { recursive: true, force: true }));
   const [root, seed] = [path.join(tmp, "root"), path.join(tmp, "seed")];
   // Enumerating process.env yields only strings. setXumE2EEnv also replaces XUM_ROOT / MUX_ROOT.
   const env = { ...process.env, NODE_ENV: "production" } as Record<string, string>;
@@ -105,21 +107,17 @@ async function main(): Promise<void> {
     }
   };
   const launches: Launch[] = [];
-  try {
-    prepareDemoProject(root);
-    fs.cpSync(root, seed, { recursive: true });
-    for (const [index, { arm, pair }] of launchPlan(pairs, warmups).entries()) {
-      fs.rmSync(root, { recursive: true, force: true });
-      fs.cpSync(seed, root, { recursive: true });
-      // No retries: retrying failed launches would bias the sample.
-      const result = await launchOnce(arm).catch((error: unknown) => {
-        throw new Error(`launch ${index} (${arm}) failed: ${String(error)}`);
-      });
-      launches.push({ index, arm, pair, warmup: pair === null, ...result });
-      console.error(`launch ${index} ${arm} ${pair ?? "warmup"}: ${result.markMs.toFixed(1)} ms`);
-    }
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+  prepareDemoProject(root);
+  fs.cpSync(root, seed, { recursive: true });
+  for (const [index, { arm, pair }] of launchPlan(pairs, warmups).entries()) {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.cpSync(seed, root, { recursive: true });
+    // No retries: retrying failed launches would bias the sample.
+    const result = await launchOnce(arm).catch((error: unknown) => {
+      throw new Error(`launch ${index} (${arm}) failed: ${String(error)}`);
+    });
+    launches.push({ index, arm, pair, warmup: pair === null, ...result });
+    console.error(`launch ${index} ${arm} ${pair ?? "warmup"}: ${result.markMs.toFixed(1)} ms`);
   }
 
   // launchPlan visits pairs in increasing order, so index i of each arm is pair i.
@@ -147,7 +145,7 @@ async function main(): Promise<void> {
   out(`median mark ms: base ${median(base).toFixed(1)}, head ${median(head).toFixed(1)}`);
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : error);
     process.exit(1);
