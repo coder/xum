@@ -18,6 +18,10 @@ const ROOT = fs.realpathSync(path.resolve(import.meta.dir, "../../.."));
 export const IMAGE = "ghcr.io/coder/xum-bugbash-sandbox";
 /** How long a child gets after SIGTERM before SIGKILL. */
 const KILL_AFTER_MS = 5_000;
+/** How long the `docker run` client gets to exit after its lifeline (stdin) closed. */
+const GRACE_MS = 60_000;
+/** A short option, or a flag that names, labels or tracks the container: runJob() sets those. */
+const CALLER_FLAG = /^(-[^-]|--(name|label|label-file|cidfile)(=|$))/;
 
 export class Refusal extends Error {}
 /** The session stopped (a signal, or cleanup started) before this command could finish. */
@@ -79,10 +83,23 @@ export class Session {
   #clientDir: string | null = null;
   #cleanup: Promise<CleanupState> | null = null;
   #owned: Job | null = null;
+  readonly #graceMs: number;
+  readonly #log: (line: string) => void;
+  #hooks: (() => unknown)[] = [];
+  /** The `docker run` client, once spawned. A stop never signals it: it closes its stdin. */
+  #runClient: ChildProcess | null = null;
+  /** Settles once the stop hooks ran and the lifeline closed. */
+  #ending: Promise<void> | null = null;
+  #cleaning = false;
 
   /** The entry point aborts `stop` from its SIGINT and SIGTERM handlers. */
-  constructor(stop: AbortSignal, options: { root?: string } = {}) {
+  constructor(
+    stop: AbortSignal,
+    options: { root?: string; graceMs?: number; log?: (line: string) => void } = {}
+  ) {
     this.#root = options.root ?? ROOT;
+    this.#graceMs = options.graceMs ?? GRACE_MS;
+    this.#log = options.log ?? ((line) => console.error(`sandbox ${line}`));
     if (stop.aborted) this.#stop(String(stop.reason));
     else stop.addEventListener("abort", () => this.#stop(String(stop.reason)), { once: true });
   }
@@ -128,27 +145,46 @@ export class Session {
     this.#owned = Object.freeze({ name: job.name, owner: job.owner, checkout: job.checkout });
   }
 
+  /** Runs `fn` first on a stop, before the lifeline closes (B1: the provider proxy's close). */
+  onStop(fn: () => unknown): void {
+    this.#hooks.push(fn);
+  }
+
+  /** Stops the session from inside, e.g. when the export receiver refused a frame. */
+  stop(reason: string): void {
+    this.#stop(reason);
+  }
+
   /**
-   * Runs the owned job's container: `docker run --name <job> --label …` and then `args`. Its
-   * stdin is the lifeline: entry.ts stops the job on EOF, so it ends when this process dies. Its
-   * stdout goes to `receive`, its stderr to ours. A stop or the timeout ends the docker client,
-   * and cleanup() removes the container.
+   * Runs the owned job's container: `docker run --name <job> --label … --cidfile …` and then
+   * `args`. Its stdin is the lifeline: entry.ts stops the job on EOF, and the container also
+   * gets EOF when this process dies. Its stdout goes to `receive`, its stderr to ours. A stop or
+   * the timeout closes the lifeline; the client is killed only if it outlives the grace period.
+   * cleanup() then removes the container by the ID that the CLI wrote to the cidfile.
    */
   async runJob<T>(args: string[], receive: (out: Readable) => Promise<T>, timeoutMs: number) {
     const job = this.#owned;
     if (job == null) throw new Error("runJob() needs own() first");
     if (this.#stopped != null) throw new Stopped(this.#stopped);
+    const flag = args.find((arg) => CALLER_FLAG.test(arg));
+    if (flag != null) throw new Refusal(`runJob() sets ${flag} itself; use long options`);
     // prettier-ignore
     const named = ["run", "--name", job.name, "--label", `xum.bugbash.owner=${job.owner}`,
-      "--label", `xum.bugbash.checkout=${job.checkout}`, ...args];
+      "--label", `xum.bugbash.checkout=${job.checkout}`, "--cidfile", this.#cidFile(), ...args];
     const received: Promise<T>[] = [];
     const r = await this.#spawn("docker", named, this.#client!, timeoutMs, (child) => {
+      this.#runClient = child;
       child.stdin?.on("error", () => undefined); // EPIPE once the container is gone
       const p = receive(child.stdout!);
       p.catch(() => undefined); // handled: the await below rethrows it
       received.push(p);
     });
     return { code: r.code, received: await received[0] };
+  }
+
+  /** In the private client folder (0700), which cleanup removes. The CLI refuses an existing one. */
+  #cidFile(): string {
+    return path.join(this.#clientDir!, "job.cid");
   }
 
   /**
@@ -163,9 +199,13 @@ export class Session {
 
   async #runCleanup(): Promise<CleanupState> {
     this.#stop("cleanup");
+    // From here a stop only logs: cleanup commands must finish (#5930 item 3).
+    this.#cleaning = true;
+    await this.#ending;
     await Promise.all(this.#children.values());
-    // The SIGKILL of #stop() comes after KILL_AFTER_MS, so the groups end by then.
-    const left = await this.#groupsGone(KILL_AFTER_MS + 2_000);
+    // Every child closed. A group that still has a member gets SIGKILL now (#5930 item 2).
+    for (const group of this.#groups) this.#signal(group, "SIGKILL");
+    const left = await this.#groupsGone(2_000);
     // own() needs a client, so an owned job always has one.
     const state = this.#owned == null ? "none" : await this.#removeContainer(this.#owned);
     if (this.#clientDir != null) fs.rmSync(this.#clientDir, { recursive: true, force: true });
@@ -173,30 +213,78 @@ export class Session {
     return state;
   }
 
+  /**
+   * The container is gone only when a known ID is no longer found. The ID comes from the
+   * cidfile (the create finished), or else from a match by name and both labels. Without either,
+   * a spawned `docker run` leaves the state unknown: its create may still finish in the daemon.
+   * Cleanup commands still run after a stop, so they bypass #job().
+   */
   async #removeContainer(job: Job): Promise<CleanupState> {
+    const cid = this.#clientDir == null ? "" : this.#cidFile();
+    const written = fs.existsSync(cid) ? fs.readFileSync(cid, "utf8").trim() : "";
+    if (written !== "" && !/^[0-9a-f]{64}$/.test(written)) return "unknown: a malformed cidfile";
+    if (written !== "") return this.#removeById(written, job, "the cidfile");
     // prettier-ignore
     const filters = ["--filter", `name=^/${job.name}$`, "--filter", `label=xum.bugbash.owner=${job.owner}`,
       "--filter", `label=xum.bugbash.checkout=${job.checkout}`];
-    // Cleanup commands still run after a stop, so they bypass #job().
-    const find = () =>
-      this.#spawn("docker", ["ps", "-aq", "--no-trunc", ...filters], this.#client!, 15_000);
-    const found = await find();
+    const ps = ["ps", "-aq", "--no-trunc", ...filters];
+    const found = await this.#spawn("docker", ps, this.#client!, 15_000);
     if (!found.ok) return `unknown: ${found.error}`;
-    if (found.stdout === "") return "removed";
-    await this.#spawn("docker", ["rm", "-f", ...found.stdout.split("\n")], this.#client!, 30_000);
-    const after = await find();
-    if (!after.ok) return `unknown: ${after.error}`;
-    return after.stdout === "" ? "removed" : `unknown: still present: ${after.stdout}`;
+    if (found.stdout !== "")
+      return this.#removeById(found.stdout.split("\n")[0], job, "name and labels");
+    if (this.#runClient != null) return "unknown: `docker run` left no container ID";
+    return "removed"; // no `docker run` ran, so no container of this job can exist
+  }
+
+  /** Removes the container `id` only when its name and both labels are this job's. */
+  async #removeById(id: string, job: Job, source: string): Promise<CleanupState> {
+    const format = `{{.Name}}|{{index .Config.Labels "xum.bugbash.owner"}}|{{index .Config.Labels "xum.bugbash.checkout"}}`;
+    const inspect = () =>
+      this.#spawn(
+        "docker",
+        ["container", "inspect", "--format", format, id],
+        this.#client!,
+        15_000
+      );
+    const short = id.slice(0, 12);
+    this.#log(`${job.name} cleanup: container ${short}, ID from ${source}`);
+    let look = await inspect();
+    if (!look.ok && look.error.includes("No such container")) return "removed";
+    if (!look.ok) return `unknown: ${look.error}`;
+    if (look.stdout !== `/${job.name}|${job.owner}|${job.checkout}`)
+      return `unknown: container ${short} has another name or labels; left in place`;
+    await this.#spawn("docker", ["rm", "-f", id], this.#client!, 30_000);
+    look = await inspect();
+    if (!look.ok && look.error.includes("No such container")) return "removed";
+    return `unknown: container ${short} ${look.ok ? "is still present" : look.error}`;
   }
 
   #stop(reason: string) {
+    if (this.#cleaning) return this.#log(`stop (${reason}) during cleanup: cleanup goes on`);
     this.#stopped ??= reason;
-    // Only the groups of this moment: cleanup commands start later and must finish.
-    const victims = [...this.#groups];
+    // Only the groups of this moment: cleanup commands start later and must finish. Never the
+    // `docker run` client: a signal there can cut the create between the daemon and the cidfile.
+    const victims = [...this.#groups].filter((group) => group !== this.#runClient?.pid);
     for (const group of victims) this.#signal(group, "SIGTERM");
     setTimeout(() => {
       for (const group of victims) this.#signal(group, "SIGKILL");
     }, KILL_AFTER_MS).unref();
+    this.#ending ??= this.#endJob();
+  }
+
+  /** The stop hooks first, then the lifeline; SIGKILL only for a client past the grace period. */
+  async #endJob() {
+    await Promise.allSettled(this.#hooks.splice(0).map(async (fn) => fn()));
+    const client = this.#runClient;
+    if (client == null || client.exitCode != null || client.signalCode != null) return;
+    client.stdin?.end();
+    const pid = client.pid;
+    const timer = setTimeout(() => {
+      this.#log(`docker run did not exit ${this.#graceMs} ms after its lifeline closed: SIGKILL`);
+      if (pid != null) this.#signal(pid, "SIGKILL");
+    }, this.#graceMs);
+    timer.unref();
+    client.once("close", () => clearTimeout(timer));
   }
 
   /**
@@ -310,8 +398,10 @@ export class Session {
     child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
     const group = child.pid;
     if (group != null) this.#groups.add(group);
+    // The job's deadline closes its lifeline like a stop. Other commands get SIGKILL.
     const timer = setTimeout(() => {
-      if (group != null) this.#signal(group, "SIGKILL");
+      if (stream != null) this.#stop("deadline");
+      else if (group != null) this.#signal(group, "SIGKILL");
     }, timeoutMs);
     const result = new Promise<Result>((resolve) => {
       const done = (code: number | null, signal: NodeJS.Signals | null, why: string) => {
