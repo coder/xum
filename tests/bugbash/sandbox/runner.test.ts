@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { launch } from "./launch";
-import { readImageLock, Refusal, Session, Stopped } from "./runner";
+import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
 
 // Each test runs the real build.sh in a throwaway git repo and a fake `docker` on PATH. The
 // runner gives docker a stripped env, so the fake reads its answers from bin/fake.env.
@@ -13,6 +13,7 @@ const DIGEST = `sha256:${"61".repeat(32)}`;
 const REF = `ghcr.io/coder/xum-bugbash-sandbox@${DIGEST}`;
 const FAKE = `#!/bin/sh
 bin=$(dirname "$0"); . "$bin/fake.env"
+unregister() { awk -v id="$1" '$1!=id' "$bin/containers" > "$bin/c.tmp"; mv "$bin/c.tmp" "$bin/containers"; }
 echo "$* [home=\${HOME-} cfg=\${DOCKER_CONFIG-}]" >> "$bin/calls.log"
 case "$1" in
   context) if [ "\${CONTEXT-}" = hang ]; then trap '' TERM; exec sleep 30; fi; echo "$HOST" ;;
@@ -24,7 +25,9 @@ case "$1" in
     # The leader ends on SIGTERM, but its grandchild ignores it and holds no pipe (#5878 review).
     if [ "$PULL" = orphan ]; then (trap '' TERM; exec sleep 60) >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; sleep 30; fi
     if [ "$PULL" = group ]; then sleep 60 >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; trap '' TERM; wait $!; fi
-    if [ "$PULL" = swap ]; then rm -r "$SWAP"; ln -s / "$SWAP"; fi ;;
+    if [ "$PULL" = swap ]; then rm -r "$SWAP"; ln -s / "$SWAP"; fi
+    # Exits at once and leaves a member in its group (cleanup item 7).
+    if [ "$PULL" = leave ]; then (trap '' TERM; exec sleep 60) >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; fi ;;
   image) echo "{\\"org.xum.bugbash.inputs\\":\\"$LABEL\\"}" ;;
   # Lines of bin/containers: id name owner checkout. ps prints the ids that match every filter.
   ps) [ "$PS_RC" = 0 ] || exit 1
@@ -35,12 +38,29 @@ case "$1" in
       label=xum.bugbash.checkout=*) c=\${a#label=xum.bugbash.checkout=} ;;
     esac; done
     awk -v n="$n" -v o="$o" -v c="$c" '$2==n && $3==o && $4==c {print $1}' "$bin/containers" ;;
-  # launch.ts: the container registers itself, and only cleanup removes it.
-  run) p=""; for a in "$@"; do case "$p" in --name) n=$a ;; --label) l="\${l-} \${a#*=}" ;; esac; p=$a; done
-    echo "ctr $n$l" >> "$bin/containers"
-    if [ "$RUN" = hang ]; then exec sleep 30; fi
-    printf '{"p":"app.log","n":2}\nok'; [ "$RUN" = cut ] || printf '{"end":true}\n'; exit 7 ;;
-  rm) shift 2; for id in "$@"; do awk -v id="$id" '$1!=id' "$bin/containers" > "$bin/c.tmp"; mv "$bin/c.tmp" "$bin/containers"; done ;;
+  # Like \`docker run --rm --cidfile\`: the create registers the container and writes its ID,
+  # and the container ends on stdin EOF (the lifeline). Modes that keep the registry line model
+  # a container the daemon has not removed yet, so only cleanup removes it.
+  run) p=""; for a in "$@"; do case "$p" in --name) n=$a ;; --label) l="\${l-} \${a#*=}" ;; --cidfile) cid=$a ;; esac; p=$a; done
+    id=$(printf '%064x' $$)
+    if [ "$RUN" = die ]; then echo "create failed" >&2; exit 125; fi
+    if [ "$RUN" = slowcreate ]; then sleep 1; fi
+    if [ "$RUN" = swap ]; then echo "$id xbb-other other:pid abc" >> "$bin/containers"; else echo "$id $n$l" >> "$bin/containers"; fi
+    echo "$id" > "$cid"; echo "created $id" >> "$bin/calls.log"
+    case "$RUN" in
+      stuck) trap '' TERM; exec sleep 30 ;;
+      slowcreate|swap) cat >/dev/null; exit 0 ;;
+      hang) cat >/dev/null; echo "stdin closed" >> "$bin/calls.log"; unregister "$id"; exit 0 ;;
+      badframe) printf 'not a frame\n'; cat >/dev/null; unregister "$id"; exit 0 ;;
+    esac
+    printf '{"p":"app.log","n":2}\nok'; [ "$RUN" = cut ] || printf '{"end":true}\n'
+    [ "$RUN" = linger ] || unregister "$id"; exit 7 ;;
+  # container inspect --format <name|owner|checkout> <id>
+  container) [ "$INSPECT_RC" = 0 ] || { echo "daemon down" >&2; exit 1; }
+    for id in "$@"; do :; done
+    awk -v id="$id" '$1==id {print "/" $2 "|" $3 "|" $4; f=1} END {exit !f}' "$bin/containers" ||
+      { echo "Error response from daemon: No such container: $id" >&2; exit 1; } ;;
+  rm) shift 2; [ "\${RM-}" = slow ] && sleep 1; for id in "$@"; do unregister "$id"; done ;;
   *) exit 9 ;;
 esac
 `;
@@ -108,6 +128,7 @@ function fake(over: Record<string, string> = {}) {
     PULL: "ok",
     LABEL: key,
     PS_RC: "0",
+    INSPECT_RC: "0",
     RUN: "ok",
     ...over,
   };
@@ -132,8 +153,8 @@ const failure = (p: Promise<unknown>) =>
   );
 // Every session gets cleaned up, so no private client folder stays behind.
 const sessions: Session[] = [];
-const session = (stop = new AbortController()) => {
-  const s = new Session(stop.signal, { root });
+const session = (stop = new AbortController(), graceMs?: number) => {
+  const s = new Session(stop.signal, { root, graceMs, log: () => undefined });
   sessions.push(s);
   return s;
 };
@@ -320,6 +341,181 @@ test("#5877 item 4: a stop during the endpoint lookup leaves no private client f
   expect(fs.readdirSync(tmp)).toEqual([]);
 }, 15_000);
 
+// Cleanup of the job container (#5930, plan PR C): the Session API with the fake `docker run`.
+const registry = () => fs.readFileSync(path.join(bin, "containers"), "utf8");
+const drain = (out: NodeJS.ReadableStream) =>
+  new Promise<void>((resolve) => out.on("data", () => undefined).on("end", resolve));
+async function jobSession(over: Record<string, string>, graceMs?: number) {
+  fake({ IMAGES: "sha256:abc", ...over });
+  const stop = new AbortController();
+  const s = session(stop, graceMs);
+  await s.ensureImage();
+  s.own(JOB);
+  const job = s.runJob(["--rm", "img"], drain, 60_000);
+  job.catch(() => undefined);
+  while (!calls().includes("run ")) await Bun.sleep(20);
+  return { s, stop, job };
+}
+
+test("C1: a stop during the create never signals `docker run`; cleanup removes the ID", async () => {
+  const { s, stop, job } = await jobSession({ RUN: "slowcreate" });
+  stop.abort("SIGTERM");
+  await job;
+  const id = /created (\w+)/.exec(calls())![1];
+  expect(await s.cleanup()).toBe("removed");
+  expect(calls()).toContain(`rm -f ${id}`);
+  expect(registry()).not.toContain(id);
+});
+
+test("C2: a client that ignores the lifeline is killed after the grace period", async () => {
+  const { s, stop, job } = await jobSession({ RUN: "stuck" }, 300);
+  while (!calls().includes("created ")) await Bun.sleep(20);
+  stop.abort("SIGTERM");
+  const started = Date.now();
+  await job;
+  expect(Date.now() - started).toBeLessThan(4_000); // the grace, not the 5 s TERM-to-KILL
+  expect(await s.cleanup()).toBe("removed");
+  expect(registry()).toBe("");
+});
+
+test.each([
+  ["no container", "", "unknown"],
+  ["a container with our name and labels", "c1 xbb-1 boot:pid abc\n", "removed"],
+  ["a foreign container with our name", "c2 xbb-1 other:pid abc\n", "unknown"],
+])("C3: `docker run` dies before the cidfile, %s", async (_name, present, state) => {
+  fs.writeFileSync(path.join(bin, "containers"), present);
+  const { s, job } = await jobSession({ RUN: "die" });
+  expect((await job).code).toBe(125);
+  expect(await s.cleanup()).toStartWith(state);
+  expect(registry()).toBe(present.startsWith("c1") ? "" : present);
+});
+
+test.each([
+  ["inspect fails", { RUN: "linger", INSPECT_RC: "1" }],
+  ["the cidfile names a container with other labels", { RUN: "swap" }],
+])("C5/C6: %s: the container stays, state unknown", async (_name, over) => {
+  const { s, stop, job } = await jobSession(over);
+  stop.abort("SIGTERM");
+  await job;
+  const id = /created (\w+)/.exec(calls())![1];
+  expect(await s.cleanup()).toStartWith("unknown");
+  expect(registry()).toContain(id);
+  expect(calls()).not.toContain("rm -f");
+});
+
+test("C7: a member that no leader vouched for gets no signal; the state is unknown", async () => {
+  fake({ PULL: "leave" });
+  const s = session();
+  await s.ensureImage();
+  s.own(JOB);
+  const grandchild = Number(fs.readFileSync(path.join(bin, "grandchild.pid"), "utf8"));
+  try {
+    expect(alive(grandchild)).toBe(true);
+    // Its leader exited before any check saw it, so it may be a stranger in a reused group.
+    expect(await s.cleanup()).toStartWith("unknown: process groups");
+    expect(alive(grandchild)).toBe(true);
+  } finally {
+    process.kill(grandchild, "SIGKILL");
+  }
+});
+
+test("a tracked group whose members all exited is never signalled (its ID can be reused)", async () => {
+  fake({ PULL: "leave" });
+  const signals: string[] = [];
+  const s = new Session(new AbortController().signal, {
+    root,
+    log: () => undefined,
+    signalGroup: (group, signal) => signals.push(`${group} ${signal}`),
+  });
+  sessions.push(s);
+  await s.ensureImage();
+  // The group of `pull` is still tracked: its member outlived the leader. Now it exits too.
+  const grandchild = Number(fs.readFileSync(path.join(bin, "grandchild.pid"), "utf8"));
+  process.kill(grandchild, "SIGKILL");
+  while (fs.existsSync(`/proc/${grandchild}`) && !/\) [ZX] /.test(stat(grandchild)))
+    await Bun.sleep(10);
+  expect(await s.cleanup()).toBe("none");
+  expect(signals).toEqual([]);
+});
+const stat = (pid: number) => {
+  try {
+    return fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch {
+    return "";
+  }
+};
+
+test("groupState tells our group from an emptied or reused group ID", () => {
+  const proc = path.join(root, "proc");
+  // pid (comm) state ppid pgrp, then fields up to the start time (field 22).
+  const proc_ = (pid: number, state: string, pgrp: number, start: number) => {
+    fs.mkdirSync(path.join(proc, String(pid)), { recursive: true });
+    const rest = Array.from({ length: 16 }, () => "0").join(" ");
+    fs.writeFileSync(
+      path.join(proc, String(pid), "stat"),
+      `${pid} (a b) ${state} 1 ${pgrp} ${rest} ${start} 0\n`
+    );
+  };
+  fs.mkdirSync(proc);
+  fs.writeFileSync(path.join(proc, "uptime"), "1 1\n"); // not a pid: skipped
+  const known = new Set<string>();
+  const state = () => groupState(100, "500", known, proc);
+  const gone = (pid: number) => fs.rmSync(path.join(proc, String(pid)), { recursive: true });
+  expect(state()).toBe("none");
+  proc_(101, "S", 100, 600); // a member, but no leader ever vouched for it
+  expect(state()).toBe("unproved");
+  proc_(100, "S", 100, 500); // our leader, by its start time: its members become known
+  expect(state()).toBe("ours");
+  expect([...known].sort()).toEqual(["100:500", "101:600"]);
+  gone(100); // the leader exited; its known member stays ours
+  expect(state()).toBe("ours");
+  proc_(102, "S", 100, 700); // a member that no leader vouched for
+  expect(state()).toBe("unproved");
+  gone(101);
+  gone(102);
+  proc_(100, "S", 100, 900); // our group emptied, and another process got its ID
+  expect(state()).toBe("reused");
+  proc_(100, "Z", 100, 900); // that leader exited and waits for its parent; its child stays
+  proc_(103, "S", 100, 950);
+  expect(state()).toBe("reused");
+  gone(100); // that leader is reaped: only the stranger's child is left
+  expect(state()).toBe("unproved");
+  gone(103);
+  proc_(100, "Z", 100, 500); // only our own zombie leader
+  expect(state()).toBe("none");
+  proc_(104, "S", 100, 960); // our zombie leader still vouches for a live member
+  expect(state()).toBe("ours");
+});
+
+test.each([
+  ["--name", "x"],
+  ["--label", "a=b"],
+  ["--label-file", "f"],
+  ["--cidfile", "f"],
+  ["-l", "a=b"],
+])("C9: the caller flag %s refuses before `docker run`", async (name, value) => {
+  fake({ IMAGES: "sha256:abc" });
+  const s = session();
+  await s.ensureImage();
+  s.own(JOB);
+  expect(await failure(s.runJob([name, value, "img"], drain, 1_000))).toThrow(Refusal);
+  expect(calls()).not.toContain("run ");
+});
+
+test("C11: the stop hooks finish before the lifeline closes", async () => {
+  const { s, stop, job } = await jobSession({ RUN: "hang" });
+  s.onStop(async () => {
+    await Bun.sleep(200);
+    fs.appendFileSync(path.join(bin, "calls.log"), "hook done\n");
+  });
+  stop.abort("SIGTERM");
+  await job;
+  const log = calls();
+  expect(log.indexOf("hook done")).toBeGreaterThan(-1);
+  expect(log.indexOf("hook done")).toBeLessThan(log.indexOf("stdin closed"));
+  expect(await s.cleanup()).toBe("removed");
+});
+
 // launch.ts, with the same fake docker: a checkout with a repro config and both mount sources.
 const ARGS = ["run", "--config", "e2e.config.ts", "--output", ".e2e/r"];
 const HOST_ENV = { BUGBASH_AI: "mock", ANTHROPIC_API_KEY: "sk-secret", BUGBASH_APP_LOG: "/x.log" };
@@ -352,16 +548,16 @@ test("a repro job runs in the locked-down container; the export comes back; clea
   const run = calls()
     .split("\n")
     .find((line) => line.startsWith("run "))!;
-  for (const flag of ["--network none", "--read-only", "--cap-drop ALL", "-i --init"])
+  for (const flag of ["--network none", "--read-only", "--cap-drop ALL", "--interactive --init"])
     expect(run).toContain(flag);
   const real = fs.realpathSync(root);
   expect(run).toContain(
     `--mount type=bind,src=${real}/node_modules,dst=/repo/node_modules,readonly`
   );
   // The app log stays in the export folder; no host credential and no host log path pass.
-  expect(run).toContain("-e BUGBASH_APP_LOG=.e2e/r/app.log");
-  expect(run).toContain("-e BUGBASH_CONTAINER=1");
-  expect(run).toContain("-e BUGBASH_AI_RESOLVED=mock");
+  expect(run).toContain("--env BUGBASH_APP_LOG=.e2e/r/app.log");
+  expect(run).toContain("--env BUGBASH_CONTAINER=1");
+  expect(run).toContain("--env BUGBASH_AI_RESOLVED=mock");
   expect(run).not.toMatch(/sk-secret|\/x\.log/);
   expectNothingLeft();
 });
@@ -372,7 +568,7 @@ test("an export without its end frame is incomplete evidence (exit 4)", async ()
 });
 
 test("an unknown container state after cleanup outranks the job's result (exit 3)", async () => {
-  expect(await launchIn({ PS_RC: "1" })).toBe(3);
+  expect(await launchIn({ RUN: "linger", INSPECT_RC: "1" })).toBe(3);
 });
 
 test.each([
@@ -394,6 +590,22 @@ test.each([
   },
   15_000
 );
+
+test("C4: a refused export frame ends the job at once, not at the deadline", async () => {
+  const started = Date.now();
+  expect(await launchIn({ RUN: "badframe" })).toBe(4);
+  expect(Date.now() - started).toBeLessThan(10_000);
+  expectNothingLeft();
+});
+
+test("C8: a stop during cleanup does not cut `docker rm`; the stop decides the exit", async () => {
+  const stop = new AbortController();
+  const pending = launchIn({ RUN: "linger", RM: "slow" }, stop);
+  while (!calls().includes("rm -f ")) await Bun.sleep(20);
+  stop.abort("SIGTERM");
+  expect(await pending.catch((e: unknown) => e)).toEqual(new Stopped("SIGTERM"));
+  expectNothingLeft();
+}, 15_000);
 
 test("a signal during the synchronous staging starts no container", async () => {
   const stop = new AbortController();
