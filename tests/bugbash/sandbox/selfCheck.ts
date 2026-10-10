@@ -246,7 +246,10 @@ async function appSwitchesCheck() {
     let healthy = false;
     for (let i = 0; i < 120 && !healthy && !gone(); i++) {
       await new Promise((done) => setTimeout(done, 1_000));
-      healthy = await fetch(`http://127.0.0.1:${port}/health`).then(
+      // Bounded, as startApp.ts's probes: a server that accepts and never answers must not hang.
+      healthy = await fetch(`http://127.0.0.1:${port}/health`, {
+        signal: AbortSignal.timeout(2_000),
+      }).then(
         (r) => r.ok,
         () => false
       );

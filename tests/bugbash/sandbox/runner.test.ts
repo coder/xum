@@ -9,7 +9,7 @@ import { exitFor, launch, launchJob, ownerState, probeApp, recover } from "./lau
 import * as proxyModule from "./proxy";
 import { Ledger } from "./proxyPolicy";
 import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
-import { checkSet, CONTAINER_CHECKS } from "./selfCheckRun";
+import { checkSet, CONTAINER_CHECKS, runSelfCheck } from "./selfCheckRun";
 
 // Each test runs the real build.sh in a throwaway git repo and a fake `docker` on PATH. The
 // runner gives docker a stripped env, so the fake reads its answers from bin/fake.env.
@@ -1449,4 +1449,38 @@ test("D2: the self-check fails on a partial or unknown container report", () => 
     missing: [second],
     unexpected: [first, "made up"],
   });
+});
+
+test("D2: a stopped self-check job ends the run with Stopped and starts no other job", async () => {
+  const launched: string[][] = [];
+  const launch = async (args: string[]) => {
+    launched.push(args);
+    return { cleanup: "removed", stopped: "SIGTERM" } as const;
+  };
+  const run = runSelfCheck(new AbortController().signal, () => {}, launch);
+  expect(await run.catch((e: unknown) => e)).toEqual(new Stopped("SIGTERM"));
+  expect(launched).toHaveLength(1);
+});
+
+test("D2: the self-check checks the upstream for every job, the fixtures too", async () => {
+  const lines: string[] = [];
+  const launch = async (args: string[], o: { env: NodeJS.ProcessEnv }) => {
+    // Each job's container makes its one allowed call. The traversal job also lets one
+    // forbidden call through, which only a per-job check of the fixture job can see.
+    const post = (marker: string) =>
+      fetch(`${o.env.ANTHROPIC_BASE_URL}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ model: "m", messages: [{ role: "user", content: marker }] }),
+      }).then((r) => r.text());
+    await post("selfcheck-allowed");
+    if (args.includes("traversal")) await post("selfcheck-forbidden");
+    return { cleanup: "removed", code: 0 } as const;
+  };
+  expect(await runSelfCheck(new AbortController().signal, (l) => lines.push(l), launch)).toBe(1);
+  const fails = lines.filter((l) => l.includes("the upstream"));
+  expect(fails.filter((l) => l.startsWith("self-check FAIL"))).toEqual([
+    "self-check FAIL: traversal: the upstream saw no forbidden call (1)",
+    "self-check FAIL: traversal: the upstream saw nothing else (2 requests)",
+  ]);
+  expect(fails.filter((l) => l.startsWith("self-check pass"))).toHaveLength(10);
 });

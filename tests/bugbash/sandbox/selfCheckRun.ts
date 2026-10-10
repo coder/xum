@@ -5,8 +5,8 @@
  *
  * 1. The self-check (selfCheck.ts) in the container: identity, privileges, read-only mounts, no
  *    network, no host paths or credentials, the app's kill switches, one allowed proxy call and
- *    the P1 to P5 refusals. Then, here: the fake upstream saw exactly the allowed call, and none
- *    of the forbidden ones (a refusal response alone does not prove that).
+ *    the P1 to P5 refusals. Then, here, for every job: the fake upstream saw exactly its allowed
+ *    call, and none of the forbidden ones (a refusal response alone does not prove that).
  * 2. and 3. Export fixtures: the container sends a path out of its folder, then a size past the
  *    export cap. The host receiver must refuse each with its own reason, write nothing outside
  *    the output folder, and still remove the container.
@@ -74,7 +74,8 @@ export function checkSet(names: string[], expected: readonly string[] = CONTAINE
 
 export async function runSelfCheck(
   stop: AbortSignal,
-  say: (line: string) => void
+  say: (line: string) => void,
+  launch: typeof launchJob = launchJob
 ): Promise<number> {
   const upstream = await startFakeUpstream();
   const results: { name: string; ok: boolean; detail: string }[] = [];
@@ -97,7 +98,8 @@ export async function runSelfCheck(
     const job = async (extra: string[], name: string) => {
       const output = `.e2e/self-check-${stamp}-${name}`;
       const lines: string[] = [];
-      const outcome: JobOutcome = await launchJob(["self-check", ...extra, "--output", output], {
+      const before = upstream.requests.length;
+      const outcome: JobOutcome = await launch(["self-check", ...extra, "--output", output], {
         root: ROOT,
         cwd: DIR,
         env,
@@ -107,6 +109,27 @@ export async function runSelfCheck(
           say(`sandbox ${line}`);
         },
       });
+      // A stop ends the run as it ends any launcher job (130 or 143), with no further job. An
+      // unknown cleanup outranks it (exitFor's rule): the checks below report that one.
+      if (outcome.stopped != null && !outcome.cleanup.startsWith("unknown"))
+        throw new Stopped(outcome.stopped);
+      // Every job runs the whole selfCheck.ts (the fixtures swap only its export), so each one
+      // makes one allowed call and the P1 to P5 probes: check the upstream per job.
+      const bodies = upstream.requests.slice(before).map((r) => r.body);
+      const allowed = bodies.filter((b) => b.includes("selfcheck-allowed")).length;
+      const forbidden = bodies.filter((b) => b.includes("selfcheck-forbidden")).length;
+      check(`${name}: the upstream saw the allowed call once`, allowed === 1, `${allowed}`);
+      check(`${name}: the upstream saw no forbidden call`, forbidden === 0, `${forbidden}`);
+      check(
+        `${name}: the upstream saw nothing else`,
+        bodies.length === allowed,
+        `${bodies.length} requests`
+      );
+      check(
+        `${name}: the provider key never reached the upstream request body`,
+        bodies.every((b) => !b.includes("selfcheck-fake-key")),
+        "body scan"
+      );
       return { outcome, lines: lines.join("\n"), dest: path.join(DIR, output) };
     };
 
@@ -135,21 +158,6 @@ export async function runSelfCheck(
         (unexpected.length ? `, unexpected: ${unexpected.join("; ")}` : "")
     );
     for (const c of inner) check(`container: ${c.name}`, c.ok, c.detail);
-    const bodies = upstream.requests.map((r) => r.body);
-    const allowed = bodies.filter((b) => b.includes("selfcheck-allowed")).length;
-    const forbidden = bodies.filter((b) => b.includes("selfcheck-forbidden")).length;
-    check("the upstream saw the allowed call once", allowed === 1, `${allowed}`);
-    check("the upstream saw no forbidden call", forbidden === 0, `${forbidden}`);
-    check(
-      "the upstream saw nothing else",
-      upstream.requests.length === allowed,
-      `${upstream.requests.length} requests`
-    );
-    check(
-      "the provider key never reached the upstream request body",
-      bodies.every((b) => !b.includes("selfcheck-fake-key")),
-      "body scan"
-    );
 
     // 2. and 3. The export fixtures.
     for (const [fixture, reason] of [
