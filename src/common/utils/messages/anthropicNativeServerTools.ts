@@ -1,5 +1,6 @@
 import type { MuxMessage } from "@/common/types/message";
 import type { DynamicToolPart } from "@/common/types/toolParts";
+import { ANTHROPIC_NATIVE_SERVER_TOOL_MAX_CIPHERTEXT_CHARS } from "@/constants/anthropicServerTools";
 import { stripEncryptedContent } from "./stripEncryptedContent";
 
 /**
@@ -41,11 +42,37 @@ function isReplayableWebSearchResult(item: unknown): boolean {
  * ciphertext) only when history can replay it natively. Everything else is stored exactly as
  * before #5887: a client pair without ciphertext. Older builds read these rows too: their SDK
  * would throw on a flagged result it cannot validate, so the flag never outlives the check.
+ *
+ * Two more cases are stored demoted, and the stream-time receipt then keeps the thinking after
+ * them out:
+ * - `resultFollowsCall` false: other parts arrived between the call and its result. The API
+ *   does this when Claude calls a client tool in the same parallel group: the response ends
+ *   after both calls, and the server tool's result opens the next step. One stored part cannot
+ *   replay the call and the result at their two positions, and moving them changes the prefix
+ *   the later thinking is bound to.
+ * - Ciphertext above ANTHROPIC_NATIVE_SERVER_TOOL_MAX_CIPHERTEXT_CHARS (row size bound).
  */
-export function toStoredServerToolPart(part: DynamicToolPart): DynamicToolPart {
+export function toStoredServerToolPart(
+  part: DynamicToolPart,
+  options: { resultFollowsCall: boolean }
+): DynamicToolPart {
   if (part.providerExecuted !== true || part.state !== "output-available") return part;
   const titled = withNullTitles(part);
-  return isNativeAnthropicReplayable(titled) ? titled : demote(part);
+  const native =
+    options.resultFollowsCall &&
+    isNativeAnthropicReplayable(titled) &&
+    ciphertextChars(part.output) <= ANTHROPIC_NATIVE_SERVER_TOOL_MAX_CIPHERTEXT_CHARS;
+  return native ? titled : demote(part);
+}
+
+/** Total encryptedContent length of a replayable web_search output (an array of results). */
+function ciphertextChars(output: unknown): number {
+  if (!Array.isArray(output)) return 0;
+  let total = 0;
+  for (const item of output as Array<{ encryptedContent?: unknown }>) {
+    if (typeof item.encryptedContent === "string") total += item.encryptedContent.length;
+  }
+  return total;
 }
 
 export interface AnthropicServerToolProjection {
@@ -72,7 +99,10 @@ export function projectAnthropicServerTools(
 ): AnthropicServerToolProjection {
   let demotedBeforeThinking = false;
   const projected = messages.map((message) => {
-    if (message.role !== "assistant") return message;
+    // Most rows hold no server tool: return them as is, with no new parts array (perf).
+    if (message.role !== "assistant" || !message.parts.some(isProviderExecutedTool)) {
+      return message;
+    }
     let changed = false;
     let demotedInRow = false;
     const parts = message.parts.map((part) => {
@@ -86,6 +116,10 @@ export function projectAnthropicServerTools(
     return changed ? { ...message, parts } : message;
   });
   return { messages: projected, demotedBeforeThinking };
+}
+
+function isProviderExecutedTool(part: MuxMessage["parts"][number]): boolean {
+  return part.type === "dynamic-tool" && part.providerExecuted === true;
 }
 
 function demote(part: DynamicToolPart): DynamicToolPart {

@@ -3551,18 +3551,27 @@ export class StreamManager {
       ? this.toolCallDisplayRegistry.take(streamInfo.executionScope, toolCallId)
       : undefined;
 
+    // The output the renderer receives: the stored one, so ciphertext the stored part dropped
+    // never crosses IPC either.
+    let emittedOutput = output;
     if (existingPartIndex !== -1) {
       const existingPart = streamInfo.parts[existingPartIndex];
       if (existingPart.type === "dynamic-tool") {
         // A provider-executed part keeps its native identity only when history can replay
         // it natively (#5887); any other result is stored as the client pair it was before.
-        streamInfo.parts[existingPartIndex] = toStoredServerToolPart({
-          ...existingPart,
-          ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
-          ...(mcpServer ? { mcpServer } : {}),
-          state: "output-available" as const,
-          output,
-        });
+        const stored = toStoredServerToolPart(
+          {
+            ...existingPart,
+            ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
+            ...(mcpServer ? { mcpServer } : {}),
+            state: "output-available" as const,
+            output,
+          },
+          // Nothing arrived between the call and its result (see toStoredServerToolPart).
+          { resultFollowsCall: existingPartIndex === streamInfo.parts.length - 1 }
+        );
+        streamInfo.parts[existingPartIndex] = stored;
+        if (stored.state === "output-available") emittedOutput = stored.output;
       }
     } else {
       // Fallback: if the matching tool-call part is missing, still persist output so the UI
@@ -3605,7 +3614,7 @@ export class StreamManager {
       messageId: streamInfo.messageId,
       toolCallId,
       toolName,
-      result: output,
+      result: emittedOutput,
       ...(mcpServer ? { mcpServer } : {}),
       ...(providerExecuted === true ? { providerExecuted: true } : {}),
       timestamp: completionTimestamp,

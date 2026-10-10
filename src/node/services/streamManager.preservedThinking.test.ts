@@ -8,6 +8,7 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { assemblePromptPayload } from "./turnContextAssembler";
+import type { TurnEngineEvent } from "./streamManager";
 import {
   createStreamManagerForTests,
   engineInternals,
@@ -286,8 +287,13 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
         execute: () => Promise.resolve("/tmp"),
       });
 
-    async function runServerToolTurn(workspaceId: string, first: () => Response) {
-      const scripted = scriptedAnthropicModel([first, textResponse, textResponse]);
+    async function runServerToolTurn(
+      workspaceId: string,
+      first: () => Response,
+      // The turn's later steps; the last textResponse answers the next turn's request.
+      rest: Array<() => Response> = [textResponse]
+    ) {
+      const scripted = scriptedAnthropicModel([first, ...rest, textResponse]);
       const tools = {
         // Same cast as production (src/common/utils/tools/tools.ts).
         web_search: scripted.provider.tools.webSearch_20250305({ maxUses: 5 }) as Tool,
@@ -298,8 +304,12 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
         createMuxMessage("user-1", "user", "search", { historySequence: 0 })
       );
       if (!seeded.success) throw new Error(seeded.error);
+      const events: TurnEngineEvent[] = [];
       const streamManager = createStreamManagerForTests(historyService, {
         streamText: fakeStreamText((options) => aiSdk.streamText(options)),
+        eventSink: (event) => {
+          events.push(event);
+        },
       });
       const { messageId } = await runTurnForTests(streamManager, {
         workspaceId,
@@ -308,7 +318,7 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
         messages: [{ role: "user", content: "search" }],
         tools,
       });
-      return { ...scripted, tools, messageId };
+      return { ...scripted, tools, messageId, events };
     }
 
     /** The next turn's request body, rebuilt from committed history the production way. */
@@ -407,6 +417,97 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
       expect(thinkingTypes(next)).toEqual([]);
       expectPairedTools(next);
       expect(JSON.stringify(next)).toContain("done");
+    });
+
+    test("a search whose result opens the next step is stored as the client pair", async () => {
+      // Claude called web_search and a client tool in one parallel group: the response ends
+      // after both calls, and the API runs the search at the start of the next step
+      // (platform.claude.com/docs/en/agents-and-tools/tool-use/server-tools). One stored part
+      // cannot replay the call and its result at their two positions, so the search is stored
+      // as the client pair and the thinking after it is kept out (receipt).
+      const workspaceId = "preserved-thinking-split-server-tool";
+      const parallelCalls = () =>
+        sse([
+          messageStart,
+          ...thinkingBlock(0, "plan", "sig-plan"),
+          {
+            type: "content_block_start",
+            index: 1,
+            content_block: {
+              type: "server_tool_use",
+              id: "srvtoolu_1",
+              name: "web_search",
+              input: { query: "xum" },
+            },
+          },
+          { type: "content_block_stop", index: 1 },
+          {
+            type: "content_block_start",
+            index: 2,
+            content_block: { type: "tool_use", id: "toolu_2", name: "bash", input: {} },
+          },
+          {
+            type: "content_block_delta",
+            index: 2,
+            delta: { type: "input_json_delta", partial_json: '{"script":"pwd"}' },
+          },
+          { type: "content_block_stop", index: 2 },
+          {
+            type: "message_delta",
+            delta: { stop_reason: "tool_use" },
+            usage: { output_tokens: 5 },
+          },
+          { type: "message_stop" },
+        ]);
+      const resultThenThinking = () =>
+        sse([
+          messageStart,
+          {
+            type: "content_block_start",
+            index: 0,
+            content_block: {
+              type: "web_search_tool_result",
+              tool_use_id: "srvtoolu_1",
+              content: searchResults,
+            },
+          },
+          { type: "content_block_stop", index: 0 },
+          ...thinkingBlock(1, "read", "sig-read"),
+          { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } },
+          { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "done" } },
+          { type: "content_block_stop", index: 2 },
+          {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 1 },
+          },
+          { type: "message_stop" },
+        ]);
+      const scripted = await runServerToolTurn(workspaceId, parallelCalls, [resultThenThinking]);
+      expect(scripted.bodies).toHaveLength(2);
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const row = history.data.find((message) => message.id === scripted.messageId);
+      expect(row?.metadata?.partial).not.toBe(true);
+      expect(row?.metadata?.anthropicThinkingReplay).toBe("off");
+      const search = row?.parts.find(
+        (part) => part.type === "dynamic-tool" && part.toolCallId === "srvtoolu_1"
+      );
+      expect(search?.type === "dynamic-tool" && search.state).toBe("output-available");
+      expect(search?.type === "dynamic-tool" && search.providerExecuted).toBeFalsy();
+      expect(JSON.stringify(search)).not.toContain("enc-1");
+      // The renderer gets the stored output: the dropped ciphertext does not cross IPC.
+      const searchEnd = scripted.events.find(
+        (event) => event.type === "tool-call-end" && event.toolCallId === "srvtoolu_1"
+      );
+      expect(searchEnd).toBeDefined();
+      expect(JSON.stringify(searchEnd)).not.toContain("enc-1");
+
+      const next = await nextTurnBody(workspaceId, scripted);
+      expect(thinkingTypes(next)).toEqual([]);
+      expectPairedTools(next);
+      expect(JSON.stringify(next)).not.toContain("server_tool_use");
     });
 
     test("the first partial that holds the bound thinking carries the receipt through a crash", async () => {

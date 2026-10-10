@@ -1325,7 +1325,9 @@ export function validateAnthropicCompliance(messages: ModelMessage[]): {
 
       // Track any tool calls in this message
       for (const content of assistantMsg.content) {
-        if (content.type === "tool-call") {
+        // A provider-executed call (Anthropic server tool, #5887) carries its result in the
+        // same assistant message and needs no tool message after it.
+        if (content.type === "tool-call" && content.providerExecuted !== true) {
           pendingToolCalls.set(content.toolCallId, i);
         }
       }
