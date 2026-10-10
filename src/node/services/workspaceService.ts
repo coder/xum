@@ -8879,8 +8879,7 @@ export class WorkspaceService
   }
 
   async getInfo(workspaceId: string): Promise<FrontendWorkspaceMetadata | null> {
-    const allMetadata = await this.config.getAllWorkspaceMetadata();
-    const found = allMetadata.find((metadata) => metadata.id === workspaceId) ?? null;
+    const found = await this.config.findWorkspaceMetadata(workspaceId);
     if (found && !this.shouldExposeWorkspaceMetadata(found)) {
       return null;
     }
@@ -13578,8 +13577,7 @@ export class WorkspaceService
     }
 
     if (options?.emitMetadata !== false) {
-      const allMetadata = await this.config.getAllWorkspaceMetadata();
-      const updatedMetadata = allMetadata.find((m) => m.id === workspaceId) ?? null;
+      const updatedMetadata = await this.config.findWorkspaceMetadata(workspaceId);
       const enrichedMetadata = this.enrichMaybeFrontendMetadata(updatedMetadata);
 
       const session = this.sessions.get(workspaceId);

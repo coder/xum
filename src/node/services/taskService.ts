@@ -5419,8 +5419,7 @@ export class TaskService implements AgentTaskIntegration {
   async emitWorkspaceMetadata(workspaceId: string): Promise<void> {
     assert(workspaceId.length > 0, "emitWorkspaceMetadata: workspaceId must be non-empty");
 
-    const allMetadata = await this.config.getAllWorkspaceMetadata();
-    const metadata = allMetadata.find((m) => m.id === workspaceId) ?? null;
+    const metadata = await this.config.findWorkspaceMetadata(workspaceId);
     this.workspaceService.emit("metadata", { workspaceId, metadata });
   }
 

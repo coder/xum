@@ -118,6 +118,19 @@ export async function prepareBench(
     packages: "external",
     metafile: true,
     logLevel: "error",
+    // App sources compile to CommonJS, and some read `__filename`, `__dirname` or `require` at
+    // module scope (src/node/utils/main/workerPool.ts). An ESM bundle has no such bindings, so
+    // define them for the bundle file.
+    banner: {
+      js: [
+        'import { createRequire as __benchCreateRequire } from "node:module";',
+        'import { dirname as __benchDirname } from "node:path";',
+        'import { fileURLToPath as __benchFileURLToPath } from "node:url";',
+        "const __filename = __benchFileURLToPath(import.meta.url);",
+        "const __dirname = __benchDirname(__filename);",
+        "const require = __benchCreateRequire(import.meta.url);",
+      ].join("\n"),
+    },
   });
   for (const [input, info] of Object.entries(result.metafile.inputs)) {
     const bunImport = info.imports.find((imported) => imported.path.startsWith("bun:"));

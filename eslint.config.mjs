@@ -2620,8 +2620,10 @@ export default defineConfig([
     // Test/story/mock files and shared test support (harnesses/utils named
     // per repo convention: *.testHarness.ts, test[A-Z]*.ts): casting partial
     // doubles through `unknown` is the standard mocking idiom, so the
-    // chained-assertion ban is production-only.
+    // chained-assertion ban is production-only. Microbenchmarks (*.bench.ts)
+    // never ship either and stub services the same way.
     files: [
+      "**/*.bench.ts",
       "**/*.test.ts",
       "**/*.test.tsx",
       "**/*.stories.ts",
