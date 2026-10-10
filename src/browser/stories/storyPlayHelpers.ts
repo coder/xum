@@ -7,11 +7,28 @@ import { userEvent, waitFor, within } from "@storybook/test";
 export async function openSettingsDialog(canvasElement: HTMLElement): Promise<HTMLElement> {
   const canvas = within(canvasElement);
   await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
-  return within(canvasElement.ownerDocument.body).findByRole(
+  return findSettingsDialog(canvasElement.ownerDocument);
+}
+
+/**
+ * Find the open Settings dialog once it takes clicks. Settings is lazy-loaded, so its first open
+ * commits when the chunk arrives, not inside the opening event. Radix's modal layer then sets
+ * `pointer-events: none` on the body in an effect and sets `auto` on the dialog one render later,
+ * so a click right after the dialog appears can hit `pointer-events: none`.
+ */
+export async function findSettingsDialog(doc: Document = document): Promise<HTMLElement> {
+  const dialog = await within(doc.body).findByRole(
     "dialog",
     { name: "Settings" },
     { timeout: 10000 }
   );
+  // Inline `auto` is Radix's own signal that this modal layer is registered and on top.
+  await waitFor(() => {
+    if (dialog.style.pointerEvents !== "auto") {
+      throw new Error("Settings dialog does not take pointer events yet");
+    }
+  });
+  return dialog;
 }
 
 export function getSettingsDialog(): HTMLElement {

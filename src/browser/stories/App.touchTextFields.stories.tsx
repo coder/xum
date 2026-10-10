@@ -16,6 +16,7 @@ import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { expandLeftSidebar, expandProjects } from "./helpers/uiState";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
+import { findSettingsDialog } from "./storyPlayHelpers";
 
 export default {
   ...appMeta,
@@ -142,7 +143,7 @@ export const Contract: AppStory = {
     await userEvent.keyboard("{Escape}");
 
     await userEvent.keyboard("{Control>},{/Control}");
-    const settings = within(await body.findByRole("dialog", { name: "Settings" }));
+    const settings = within(await findSettingsDialog());
     await userEvent.click(await settings.findByRole("button", { name: "Models" }));
     const filter = await settings.findByRole("textbox", { name: "Filter models" });
     await expect(filter.matches(rules.fieldSelector)).toBe(true);
