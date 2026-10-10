@@ -38,6 +38,7 @@ module.exports = {
   testPathIgnorePatterns: [
     "<rootDir>/tests/ui/storybook/",
     "<rootDir>/tests/ui/domIsolation\\.test\\.ts",
+    "<rootDir>/tests/bunEachTableGc\\.test\\.ts",
     "<rootDir>/tests/bugbash/",
   ],
   // Avoid haste module collision with vscode extension
