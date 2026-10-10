@@ -728,8 +728,9 @@ test("C2: recover reports a removal it cannot prove (exit 3)", async () => {
 });
 
 test("C2: a zombie launcher counts as dead", async () => {
-  // `sleep 0` exits at once, and its parent then execs `sleep 30`, which never reaps it.
-  const parent = spawn("sh", ["-c", "sleep 0 & echo $!; exec sleep 30"], {
+  // The child exits only after its parent shell became `sleep 30`, which never reaps it. (A
+  // child that exits at once can be reaped by the shell before the exec.)
+  const parent = spawn("sh", ["-c", "(sleep 0.3) & echo $!; exec sleep 30"], {
     stdio: ["ignore", "pipe", "ignore"],
   });
   try {
@@ -738,7 +739,8 @@ test("C2: a zombie launcher counts as dead", async () => {
         parent.stdout.once("data", (d: Buffer) => resolve(d.toString()))
       )
     );
-    while (!stat(pid).includes(") Z ")) await Bun.sleep(10);
+    for (let i = 0; i < 500 && !stat(pid).includes(") Z "); i++) await Bun.sleep(10);
+    expect(stat(pid)).toContain(") Z "); // a bounded wait: no hang if the zombie never shows
     const { boot, pidns } = self();
     expect(ownerState(`${boot}:${pidns}:${pid}:${procStart(pid)}`)).toBe("dead");
   } finally {
