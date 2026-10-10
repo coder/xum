@@ -2319,7 +2319,9 @@ export function buildMemoryToolDescription(options: { sessionScope: boolean }): 
     (options.sessionScope
       ? `- ${SESSION_MEMORY_VIRTUAL_DIR}: your own checkpoint, not shared with parent or sub-agents; survives context windows, deleted with this workspace, writable even when other scopes are read-only\n`
       : "") +
-    "Commands: view(path, offset?, limit?): directory to 2 levels without dotfiles, or file with line numbers (offset is 1-based); create(path, file_text): fails if the file exists, so delete first to overwrite; str_replace(path, old_str, new_str): old_str must be unique; insert(path, insert_line, insert_text): 0 = top; delete(path): recursive; rename(old_path, new_path): same scope.\n" +
+    // Per-field usage lives in the parameter descriptions, which the hook env-var reference
+    // (docs/hooks/tools.mdx) is generated from; this line keeps only command behavior.
+    "Commands: view (a directory to 2 levels without dotfiles, or a file with line numbers), create (fails if the file exists, so delete first to overwrite), str_replace, insert, delete (recursive), rename. Each field names the commands that use it.\n" +
     "Files are Markdown; a one-line frontmatter `description:` appears in the index."
   );
 }
@@ -2521,16 +2523,32 @@ export const TOOL_DEFINITIONS = {
       },
       z.object({
         command: z.enum(["view", "create", "str_replace", "insert", "delete", "rename"]),
-        path: z.string().nullish(),
-        file_text: z.string().nullish(),
-        old_str: z.string().nullish(),
-        new_str: z.string().nullish(),
-        insert_line: z.number().int().nonnegative().nullish(),
-        insert_text: z.string().nullish(),
-        old_path: z.string().nullish(),
-        new_path: z.string().nullish(),
-        offset: z.number().int().positive().nullish(),
-        limit: z.number().int().positive().nullish(),
+        path: z
+          .string()
+          .nullish()
+          .describe("Virtual path, e.g. /memories/global/notes.md; every command except rename"),
+        file_text: z.string().nullish().describe("create: full file contents"),
+        old_str: z
+          .string()
+          .nullish()
+          .describe("str_replace: exact text to replace; must be unique in the file"),
+        new_str: z.string().nullish().describe("str_replace: replacement text"),
+        insert_line: z
+          .number()
+          .int()
+          .nonnegative()
+          .nullish()
+          .describe("insert: line to insert after (0 = top)"),
+        insert_text: z.string().nullish().describe("insert: text to insert"),
+        old_path: z.string().nullish().describe("rename: current path"),
+        new_path: z.string().nullish().describe("rename: new path in the same scope"),
+        offset: z
+          .number()
+          .int()
+          .positive()
+          .nullish()
+          .describe("view on a file: 1-based start line"),
+        limit: z.number().int().positive().nullish().describe("view on a file: number of lines"),
       })
     ),
   },
