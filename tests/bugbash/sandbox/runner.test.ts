@@ -403,18 +403,20 @@ test.each([
   expect(calls()).not.toContain("rm -f");
 });
 
-test("C7: a group member left by a finished command is killed; the state is not unknown", async () => {
+test("C7: a member that no leader vouched for gets no signal; the state is unknown", async () => {
   fake({ PULL: "leave" });
   const s = session();
   await s.ensureImage();
   s.own(JOB);
   const grandchild = Number(fs.readFileSync(path.join(bin, "grandchild.pid"), "utf8"));
-  expect(alive(grandchild)).toBe(true);
-  const started = Date.now();
-  expect(await s.cleanup()).toBe("removed");
-  expect(alive(grandchild)).toBe(false);
-  // It ignores SIGTERM: cleanup kills it at once instead of waiting for the 5 s TERM-to-KILL.
-  expect(Date.now() - started).toBeLessThan(3_000);
+  try {
+    expect(alive(grandchild)).toBe(true);
+    // Its leader exited before any check saw it, so it may be a stranger in a reused group.
+    expect(await s.cleanup()).toStartWith("unknown: process groups");
+    expect(alive(grandchild)).toBe(true);
+  } finally {
+    process.kill(grandchild, "SIGKILL");
+  }
 });
 
 test("a tracked group whose members all exited is never signalled (its ID can be reused)", async () => {
@@ -456,16 +458,33 @@ test("groupState tells our group from an emptied or reused group ID", () => {
   };
   fs.mkdirSync(proc);
   fs.writeFileSync(path.join(proc, "uptime"), "1 1\n"); // not a pid: skipped
-  expect(groupState(100, "500", proc)).toBe("none");
-  proc_(101, "S", 100, 600); // a member that outlived its leader
-  expect(groupState(100, "500", proc)).toBe("ours");
-  proc_(100, "S", 100, 500); // our leader, by its start time
-  expect(groupState(100, "500", proc)).toBe("ours");
-  fs.rmSync(path.join(proc, "101"), { recursive: true });
-  proc_(100, "S", 100, 900); // another process leads a group with our old ID
-  expect(groupState(100, "500", proc)).toBe("reused");
-  proc_(100, "Z", 100, 500); // only a zombie left
-  expect(groupState(100, "500", proc)).toBe("none");
+  const known = new Set<string>();
+  const state = () => groupState(100, "500", known, proc);
+  const gone = (pid: number) => fs.rmSync(path.join(proc, String(pid)), { recursive: true });
+  expect(state()).toBe("none");
+  proc_(101, "S", 100, 600); // a member, but no leader ever vouched for it
+  expect(state()).toBe("unproved");
+  proc_(100, "S", 100, 500); // our leader, by its start time: its members become known
+  expect(state()).toBe("ours");
+  expect([...known].sort()).toEqual(["100:500", "101:600"]);
+  gone(100); // the leader exited; its known member stays ours
+  expect(state()).toBe("ours");
+  proc_(102, "S", 100, 700); // a member that no leader vouched for
+  expect(state()).toBe("unproved");
+  gone(101);
+  gone(102);
+  proc_(100, "S", 100, 900); // our group emptied, and another process got its ID
+  expect(state()).toBe("reused");
+  proc_(100, "Z", 100, 900); // that leader exited and waits for its parent; its child stays
+  proc_(103, "S", 100, 950);
+  expect(state()).toBe("reused");
+  gone(100); // that leader is reaped: only the stranger's child is left
+  expect(state()).toBe("unproved");
+  gone(103);
+  proc_(100, "Z", 100, 500); // only our own zombie leader
+  expect(state()).toBe("none");
+  proc_(104, "S", 100, 960); // our zombie leader still vouches for a live member
+  expect(state()).toBe("ours");
 });
 
 test.each([

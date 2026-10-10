@@ -80,6 +80,8 @@ export class Session {
   readonly #groups = new Set<number>();
   /** The start time of each group's leader, read right after its spawn (see groupState). */
   readonly #leaders = new Map<number, string | undefined>();
+  /** Per group, the members (`pid:start`) seen while its own leader still ran (groupState). */
+  readonly #members = new Map<number, Set<string>>();
   readonly #signalGroup: (group: number, signal: NodeJS.Signals) => void;
   #stopped: string | null = null;
   #client: Record<string, string> | null = null;
@@ -307,11 +309,19 @@ export class Session {
     this.#signalGroup(group, signal);
   }
 
-  /** Whether a tracked group is still ours. One that is not stops being tracked. */
+  /**
+   * Whether a tracked group is still ours. An empty or reused one stops being tracked. An
+   * unproved one stays tracked but gets no signal, so cleanup reports it as unknown.
+   */
   #ours(group: number): boolean {
-    if (groupState(group, this.#leaders.get(group)) === "ours") return true;
+    const known = this.#members.get(group) ?? new Set<string>();
+    this.#members.set(group, known);
+    const state = groupState(group, this.#leaders.get(group), known);
+    if (state === "ours") return true;
+    if (state === "unproved") return false;
     this.#groups.delete(group);
     this.#leaders.delete(group);
+    this.#members.delete(group);
     return false;
   }
 
@@ -471,26 +481,37 @@ function readStat(pid: string, proc: string): string[] | undefined {
 const startTime = (pid: string, proc = "/proc") => readStat(pid, proc)?.[19];
 
 /**
- * Whether the process group `group` is still the one this session started. "none": no live
- * (non-zombie) process has that group ID. "reused": a live process leads a group with that ID,
- * but it is not the leader that this session spawned (another start time), so the ID was freed
- * and given to someone else: Linux reuses a group ID only after the group emptied. "ours":
- * live members, and either our own leader or no leader at all (the leader exited and members
- * stayed). The check reads /proc right before each signal; a reuse inside that short window
- * would need the group to empty and its ID to come round again in between.
+ * Whether the process group `group` is still the one this session started. Linux gives a group
+ * ID to a new process only after the old group emptied, and a group whose leader exited has no
+ * process left that names its creator, so ownership is proved in two ways only:
+ * - "ours", with our leader: the process with the group's ID is the leader this session
+ *   spawned (same start time; it may be a zombie that the runtime has not reaped). Its live
+ *   members are added to `known`.
+ * - "ours", without a leader: every live member is in `known`, seen while our leader ran.
+ * "reused": another process (also a zombie) has the group's ID as its PID. "none": no live
+ * (non-zombie) member. "unproved": live members, no leader, and one of them unknown: maybe our
+ * leader's late child, maybe a stranger in a reused group. It never gets a signal. The check
+ * reads /proc right before each signal, so a reuse would have to fall into that short window.
  */
 export function groupState(
   group: number,
   leaderStart: string | undefined,
+  known: Set<string>,
   proc = "/proc"
-): "ours" | "none" | "reused" {
-  let members = 0;
+): "ours" | "none" | "reused" | "unproved" {
+  const members: string[] = [];
+  let leader = false;
   for (const pid of fs.readdirSync(proc)) {
     if (!/^\d+$/.test(pid)) continue;
     const fields = readStat(pid, proc);
-    if (fields?.[2] !== String(group) || /^[ZX]$/.test(fields[0])) continue;
-    if (pid === String(group) && fields[19] !== leaderStart) return "reused";
-    members += 1;
+    if (fields?.[2] !== String(group)) continue;
+    if (pid === String(group)) {
+      if (leaderStart == null || fields[19] !== leaderStart) return "reused";
+      leader = true;
+    }
+    if (!/^[ZX]$/.test(fields[0])) members.push(`${pid}:${fields[19]}`);
   }
-  return members > 0 ? "ours" : "none";
+  if (members.length === 0) return "none";
+  if (leader) for (const member of members) known.add(member);
+  return leader || members.every((member) => known.has(member)) ? "ours" : "unproved";
 }
