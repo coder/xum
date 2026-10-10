@@ -15,7 +15,7 @@ import {
   useAnalyticsTokensByModel,
   useSavedQueries,
 } from "@/browser/hooks/useAnalytics";
-import { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
+import type { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { ToggleGroup } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { Button } from "@/browser/components/Button/Button";
@@ -95,9 +95,10 @@ function getBrowserTimeZone(): string {
  * Analytics renders as a route-backed modal over the page it was opened from (like Settings), so
  * the chat underneath stays mounted and keeps its draft and scroll position.
  */
-export function AnalyticsDashboard() {
+// The caller owns the focus-return hook: this dashboard is lazy-loaded and first mounts already
+// open, so it cannot record the opener itself (see LazyAnalyticsDashboard).
+export function AnalyticsDashboard(props: { focusReturn: ReturnType<typeof useModalFocusReturn> }) {
   const { isAnalyticsOpen, navigateFromAnalytics } = useRouter();
-  const focusReturn = useModalFocusReturn(isAnalyticsOpen);
 
   return (
     <Dialog open={isAnalyticsOpen} onOpenChange={(open) => !open && navigateFromAnalytics()}>
@@ -110,8 +111,8 @@ export function AnalyticsDashboard() {
         // <select> (the autofocused project filter) still lets Escape close the dialog.
         allowEditableEscape
         aria-describedby={undefined}
-        onOpenAutoFocus={focusReturn.onOpenAutoFocus}
-        onCloseAutoFocus={focusReturn.onCloseAutoFocus}
+        onOpenAutoFocus={props.focusReturn.onOpenAutoFocus}
+        onCloseAutoFocus={props.focusReturn.onCloseAutoFocus}
         className="max-md:ios-standalone:top-px max-md:ios-standalone:h-[calc(100%-1px)] top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:rounded-lg md:border"
       >
         {/* Mounted only while open, so closed analytics issues no queries. */}

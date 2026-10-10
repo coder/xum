@@ -100,7 +100,7 @@ import { ConfirmDialogProvider, useConfirmDialog } from "./contexts/ConfirmDialo
 import { confirmAndRemoveSubagent } from "@/browser/utils/subagentRemoval";
 import { AboutDialog } from "./features/About/AboutDialog";
 import { LazySettingsPage } from "@/browser/features/Settings/LazySettingsPage";
-import { AnalyticsDashboard } from "@/browser/features/Analytics/AnalyticsDashboard";
+import { LazyAnalyticsDashboard } from "@/browser/features/Analytics/LazyAnalyticsDashboard";
 import { MuxGatewaySessionExpiredDialog } from "./components/MuxGatewaySessionExpiredDialog/MuxGatewaySessionExpiredDialog";
 import { SshPromptDialog } from "./components/SshPromptDialog/SshPromptDialog";
 import { TerminalDialog } from "./components/TerminalView/TerminalDialog";
@@ -1536,7 +1536,7 @@ function AppInner() {
         <WorkspaceActiveGoalsWarningToast />
         <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />
         {/* Before SettingsPage so settings opened from analytics stacks above it. */}
-        <AnalyticsDashboard />
+        <LazyAnalyticsDashboard />
         <LazySettingsPage />
         <PopoverError
           error={paletteRemoveError.error}
