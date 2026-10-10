@@ -284,6 +284,12 @@ async function seed(
     });
     // Before the workspace exists, so the seeded workspace starts on the app model.
     await api(base, "config/updateModelPreferences", { defaultModel: ai.model });
+    // Naming and the sidebar status try the configured naming model first, then Xum's built-in
+    // small models (NAME_GEN_PREFERRED_MODELS). In the sandbox the proxy allows only the app
+    // model, so those built-ins are refused there: pin naming to the app model too.
+    await api(base, "config/updateAgentAiDefaults", {
+      agentAiDefaults: { name_workspace: { modelString: ai.model } },
+    });
   } else {
     // The composer refuses to send without a configured provider. Mock AI never calls it, and
     // the dead loopback port keeps any stray background call from leaving the machine. The

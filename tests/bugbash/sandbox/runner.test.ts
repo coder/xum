@@ -1143,6 +1143,41 @@ test.each([
   expect(calls()).toBe("");
 });
 
+test("B3: the run's stop after another job's fault aborts this job's in-flight call", async () => {
+  // run.ts stops every job's signal when one job reports a fault. This job's call is still
+  // waiting on the upstream: the stop must abort it, keep its reservation and end the job.
+  const upstream = await startFakeUpstream();
+  try {
+    const cwd = prepare({ RUN: "proxycall", CALL: "[fake:stall]" });
+    const ledger = new Ledger(1);
+    const stop = new AbortController();
+    const env = {
+      ...HOST_ENV,
+      BUGBASH_BUDGET_USD: "1",
+      ANTHROPIC_API_KEY: UPSTREAM_KEY,
+      ANTHROPIC_BASE_URL: `${upstream.baseUrl}/v1`,
+      BUGBASH_MODEL: "anthropic:claude-sonnet-5-5",
+    };
+    const o = { root: fs.realpathSync(root), cwd, env, ledger, log: () => undefined };
+    const job = launchJob(EXPLORE_ARGS, { ...o, stop: stop.signal });
+    while (upstream.requests.length === 0) await Bun.sleep(10);
+    expect(ledger.totals().reservedNanoUsd).toBeGreaterThan(0); // in flight
+    const started = Date.now();
+    stop.abort("proxy fault");
+    const outcome = await job;
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(outcome).toMatchObject({ stopped: "proxy fault", cleanup: "removed" });
+    const records = fs.readFileSync(path.join(cwd, ".e2e/x.proxy.jsonl"), "utf8");
+    expect(records).toContain('"outcome":"kept"');
+    expect(records).toContain("aborted");
+    expect(ledger.totals()).toMatchObject({ reservedNanoUsd: 0 });
+    expect(ledger.totals().spentNanoUsd).toBeGreaterThan(0); // the full reservation stays spent
+    expectNothingLeft();
+  } finally {
+    await upstream.close();
+  }
+}, 20_000);
+
 test("B3: a call that outlives close() fails the job (exit 5), and the job leaves nothing", async () => {
   // The real close() aborts every call first, so a call that stays open past CLOSE_MS is a proxy
   // bug: a stand-in proxy plays it. The launcher process then exits, which ends the call.
