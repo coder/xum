@@ -1481,7 +1481,14 @@ function AppInner() {
                 // Keep a lightweight loading shell while WorkspaceContext validates or
                 // self-heals stale `/workspace/:id` routes. Restoring a path alone is not
                 // enough; we only render AIView once metadata hydration confirms it exists.
-                <LoadingScreen statusText="Opening workspace..." />
+                // `main`: this screen replaces the workspace page, so it carries the page's one
+                // `main` landmark (Lighthouse landmark-one-main, #5998). LoadingScreen itself stays
+                // landmark-free, because the boot path in AppLoader shares it. The same direction
+                // rule as the parent (`mobile-layout`: a row on desktop, a column on phones), so
+                // the 100vw/100dvh loader shrinks to the same space it had without the wrapper.
+                <main className="mobile-layout flex min-w-0 flex-1 overflow-hidden">
+                  <LoadingScreen statusText="Opening workspace..." />
+                </main>
               ) : (
                 // If metadata never hydrated for the routed workspace, avoid trapping the user
                 // on a permanent spinner. Show the same non-blocking root shell while the route

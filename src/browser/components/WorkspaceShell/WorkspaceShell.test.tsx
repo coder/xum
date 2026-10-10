@@ -301,6 +301,12 @@ describe("WorkspaceShell loading placeholders", () => {
 
     expect(view.getByText("Loading workspace...")).toBeTruthy();
     expect(await view.findByTestId("lottie-animation")).toBeTruthy();
+    // Lighthouse landmark-one-main (#5998): the placeholder replaces ChatPane, whose `main` it
+    // must take over. The full-App stories cannot reach this state with the real store, because
+    // a story's pending onChat keeps the transcript hydrating, which keeps ChatPane mounted.
+    const mains = view.getAllByRole("main");
+    expect(mains).toHaveLength(1);
+    expect(mains[0].textContent).toContain("Loading workspace...");
   });
 
   // A narrow window with a mouse: the CSS hides the sidebar, but no coarse-pointer query matches.

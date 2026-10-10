@@ -91,7 +91,9 @@ const WorkspacePlaceholder: React.FC<{
   className?: string;
   showAnimation?: boolean;
 }> = (props) => (
-  <div
+  // `main`: the placeholder stands in for ChatPane, which holds the page's `main` landmark. Each
+  // page needs exactly one (Lighthouse landmark-one-main, #5998).
+  <main
     className={cn(
       "relative flex flex-1 flex-row bg-surface-primary text-light overflow-x-auto overflow-y-hidden [@media(max-width:768px)]:flex-col",
       props.className
@@ -115,7 +117,7 @@ const WorkspacePlaceholder: React.FC<{
       <h3 className="m-0 mb-2.5 text-base font-medium">{props.title}</h3>
       {props.description && <p className="m-0 text-[13px]">{props.description}</p>}
     </div>
-  </div>
+  </main>
 );
 
 export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
