@@ -171,8 +171,13 @@ const APP_ENV_VARS = [
   "BUGBASH_AI_REASON",
   "BUGBASH_APP_MODEL",
   "BUGBASH_SCENARIO",
-  // A model-driven sandbox job: startApp.ts turns off agent tools, terminals and automation.
+  // A model-driven sandbox job: startApp.ts turns off agent tools, terminals and automation, and
+  // the real app AI talks to the job's proxy. The last three let aiMode.ts check that it is one
+  // (sandbox/inContainer.ts modelDrivenSandbox).
   "BUGBASH_MODEL_DRIVEN",
+  "BUGBASH_CONTAINER",
+  "BUGBASH_HOST_BOOT",
+  "BUGBASH_HOST_NONCE",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_BASE_URL",
   "OPENAI_API_KEY",

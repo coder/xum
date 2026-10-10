@@ -30,9 +30,14 @@ if (args[0] !== "--export" || args[2] !== "--" || args.length < 4) {
   process.exit(2);
 }
 const exportDir = args[1];
-// The launcher sets the mock mode. Any other mode would need a provider key, which never enters.
-if (process.env.BUGBASH_AI_RESOLVED !== "mock") {
-  console.error("sandbox entry: only the mock app AI runs in the sandbox, so the job does not run");
+// The launcher sets the mode. No provider key ever enters, so the real app AI runs only in a
+// model-driven job, through its proxy (aiMode.ts); the proxy socket is checked below.
+const resolvedAi = process.env.BUGBASH_AI_RESOLVED;
+const modelDriven = process.env.BUGBASH_MODEL_DRIVEN === "1";
+if (resolvedAi !== "mock" && !(resolvedAi === "real" && modelDriven)) {
+  console.error(
+    "sandbox entry: the real app AI runs only in a model-driven job, so this does not run"
+  );
   process.exit(2);
 }
 const boot = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
@@ -42,7 +47,7 @@ if (boot !== process.env.BUGBASH_HOST_BOOT || nonce !== process.env.BUGBASH_HOST
   process.exit(2);
 }
 const [command, ...commandArgs] = args.slice(3);
-if (process.env.BUGBASH_MODEL_DRIVEN === "1") {
+if (modelDriven) {
   if (!modelDrivenSandbox()) {
     console.error("sandbox entry: a model-driven job without its proxy socket does not run");
     process.exit(2);

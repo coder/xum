@@ -43,6 +43,7 @@ import * as net from "net";
 import * as os from "os";
 import * as path from "path";
 import { type AiMode, AiModeError, resolveAiMode } from "./aiMode";
+import { proxySocketMounted, sandboxShaped } from "./sandbox/inContainer";
 import { startFakeProvider } from "./fakeProvider";
 import { seedMcpChat, writeMcpConfig } from "./mcpapps/seed";
 
@@ -135,6 +136,31 @@ function failIfExited(child: ChildProcess): void {
   if (child.exitCode != null || child.signalCode != null) {
     fail(`seed server exited early (${child.exitCode ?? child.signalCode})`);
   }
+}
+
+const SWITCHES = [
+  "XUM_DISABLE_AGENT_TOOLS",
+  "XUM_DISABLE_TERMINALS",
+  "XUM_DISABLE_PROJECT_AUTOMATION",
+] as const;
+
+/**
+ * Why the app server must not start, or null: a guard behind the `command.env` pass-through
+ * (B1 lost BUGBASH_MODEL_DRIVEN there once). A sandbox container with a mounted proxy socket is a
+ * model-driven job, so it needs the marker, and a model-driven job needs all three switches.
+ * The container check reads only the filesystem, not the env that could have been dropped.
+ */
+export function modelDrivenGuard(
+  serverEnv: NodeJS.ProcessEnv,
+  env: NodeJS.ProcessEnv = process.env,
+  root = "/"
+): string | null {
+  const modelDriven = env.BUGBASH_MODEL_DRIVEN === "1";
+  if (!modelDriven && sandboxShaped(root) && proxySocketMounted(root))
+    return "a sandbox job with a provider proxy, but BUGBASH_MODEL_DRIVEN did not reach the app";
+  const off = SWITCHES.filter((name) => serverEnv[name] !== "1");
+  if (modelDriven && off.length > 0) return `a model-driven job without ${off.join(", ")}`;
+  return null;
 }
 
 /** The mode and kill-switch env of the app server. */
@@ -390,6 +416,8 @@ async function main(): Promise<void> {
     // Git inside the app must not read or write the user's real ~/.gitconfig.
     GIT_CONFIG_GLOBAL: path.join(home, ".gitconfig"),
   };
+  const unguarded = modelDrivenGuard(env);
+  if (unguarded != null) fail(`${unguarded}: the app does not start`);
 
   // e2e stops the app with a signal, possibly while seeding: pass it to whichever server runs.
   let current: ChildProcess | null = null;

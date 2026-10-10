@@ -11,15 +11,16 @@
  * read-only dist/ and node_modules/ (inputs.ts). Its output folder, the app log included, comes
  * back on its stdout as an export stream (exportStream.ts).
  *
- * Three job kinds run, all with the mock app AI. An exact-step repro run gets no model. The MCP
+ * Three job kinds run, with the mock app AI unless run.ts resolved the real one for explore. An exact-step repro run gets no model. The MCP
  * Apps suite and an `e2e explore` charter (run.ts, `make bug-bash`) are model-driven: their
  * explorer reaches BUGBASH_MODEL (default Sonnet 5.5) only through a provider proxy (proxy.ts)
  * that this process runs for the job, on a unix socket that the container gets read-only. The
  * provider key stays here, and BUGBASH_BUDGET_USD caps the spend at list price (not a billing
  * cap: the upstream key's own limit is the backstop); run.ts shares one budget across its jobs.
- * The proxy writes one record per call to `<output>.proxy.jsonl` on the host only. The real app
- * AI comes in a later step of #5714, and the host pause still refuses every model-driven run on
- * the host. There is no host fallback.
+ * The proxy writes one record per call to `<output>.proxy.jsonl` on the host only. In an explore
+ * job with the real app AI (run.ts resolves it with probeApp()), the app reaches
+ * BUGBASH_APP_MODEL through the same proxy. The host pause still refuses every model-driven run
+ * on the host. There is no host fallback.
  * Exit codes: the job's code, 2 refused, 3 the container state is unknown after cleanup, 4 the
  * evidence is incomplete, 5 the proxy reported a fault (a call cost more than its bound, or a
  * call outlived close()), 130 or 143 when SIGINT or SIGTERM stopped it. Exit 3 outranks a stop,
@@ -37,6 +38,7 @@ import { Ledger, priced } from "./proxyPolicy";
 // prettier-ignore
 import { checkMountSource, containerEnv, exactStepRefusal, exploreRefusal, jobEnv, outputDir, plainFolders, stage } from "./inputs";
 import { type CleanupState, Refusal, Session, Stopped } from "./runner";
+import { DEFAULT_APP_MODEL } from "../aiMode";
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dir, "../../.."));
 const DEADLINE_MS = 30 * 60_000;
@@ -61,21 +63,39 @@ function procStat(pid: string): string[] | undefined {
 }
 
 /**
- * Only the mock app AI runs until the provider proxy (#5714): no provider key enters the
- * sandbox, so a real mode could not work, and it must never start a job. Both mode names must be
- * mock or unset, and one must be mock: an ambient BUGBASH_AI_RESOLVED=real (aiMode.ts) refuses.
+ * Only the mock app AI runs in the sandbox, except in an `e2e explore` job whose caller (run.ts)
+ * resolved the real app AI on the host (BUGBASH_AI_RESOLVED=real): that job's app reaches
+ * BUGBASH_APP_MODEL through the job's proxy (aiMode.ts), and no key enters. Otherwise both mode
+ * names must be mock or unset, and one must be mock: an ambient BUGBASH_AI_RESOLVED=real refuses.
  */
-function mockOnly(env: NodeJS.ProcessEnv): boolean {
+type AppAi = { mode: "mock" } | { mode: "real"; model: string; reason: string };
+function appAi(env: NodeJS.ProcessEnv, explore: boolean): AppAi {
   const modes = [env.BUGBASH_AI, env.BUGBASH_AI_RESOLVED];
-  return modes.includes("mock") && modes.every((mode) => mode == null || mode === "mock");
+  if (modes.includes("mock") && modes.every((mode) => mode == null || mode === "mock"))
+    return { mode: "mock" };
+  if (!explore || env.BUGBASH_AI_RESOLVED !== "real" || !["real", "auto", undefined].includes(env.BUGBASH_AI))
+    throw new Refusal(
+      "only the mock app AI runs here (#5714): set BUGBASH_AI=mock, or run make bug-bash for the real one"
+    ); // prettier-ignore
+  const spec = env.BUGBASH_APP_MODEL ?? DEFAULT_APP_MODEL;
+  const [provider, model] = spec.split(/:(.*)/s, 2);
+  if (provider !== "anthropic" || !model || !priced(model))
+    throw new Refusal(
+      `BUGBASH_APP_MODEL ${JSON.stringify(spec)}: only a priced anthropic:<model> runs here`
+    );
+  return { mode: "real", model, reason: env.BUGBASH_AI_REASON ?? "resolved by the caller" };
 }
-/** The container always gets the mock mode, whatever else the host env holds. */
-const MOCK = { BUGBASH_AI: "mock", BUGBASH_AI_RESOLVED: "mock" };
+/** The container's mode env, whatever else the host env holds. */
+const modeEnv = (ai: AppAi): Record<string, string> =>
+  ai.mode === "mock"
+    ? { BUGBASH_AI: "mock", BUGBASH_AI_RESOLVED: "mock" }
+    : { BUGBASH_AI: "real", BUGBASH_AI_RESOLVED: "real", BUGBASH_AI_REASON: ai.reason,
+        BUGBASH_APP_MODEL: `anthropic:${ai.model}` }; // prettier-ignore
 const MCP_APPS_CONFIG = "e2e.mcpapps.config.ts";
 const MCP_APPS_MODEL = "anthropic:claude-sonnet-5-5";
 
 /** The explorer model, the spend cap and the upstream of a model-driven job. */
-interface ModelJob {
+export interface ModelJob {
   model: string;
   budgetUsd: number;
   upstream: { baseUrl: string; apiKey: string };
@@ -111,6 +131,36 @@ export function modelJob(env: NodeJS.ProcessEnv): ModelJob {
 }
 
 const usd = (nanoUsd: number) => `$${(nanoUsd / 1e9).toFixed(4)}`;
+
+/**
+ * run.ts's app AI probe (aiMode.ts semantics): one `max_tokens: 1` call to the app model through
+ * a proxy of its own, with the run's ledger (P7), so even the probe never goes around the policy
+ * or the budget. Returns the HTTP status (502 when the upstream failed) and the call records.
+ * Rejects when the proxy reports a fault (a bound miss).
+ */
+export async function probeApp(job: ModelJob, model: string, ledger: Ledger) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-probe-"));
+  const records: object[] = [];
+  try {
+    fs.chmodSync(dir, 0o700);
+    const proxy = await startProxy({
+      socketPath: path.join(dir, "sock"),
+      upstream: job.upstream,
+      job: { models: [model] },
+      ledger,
+      log: (entry) => records.push(entry),
+    });
+    let status: number;
+    try {
+      status = (await proxy.probe(model).catch(() => ({ status: 502 }))).status;
+    } finally {
+      await proxy.close();
+    }
+    return { status, records };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 // --mount, not -v: a missing source fails instead of creating an empty folder.
 function bind(src: string, dst: string): string[] {
@@ -247,8 +297,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       );
   }
   // First, before any docker command and before the container env exists.
-  if (!mockOnly(o.env))
-    throw new Refusal("only the mock app AI runs in the sandbox (#5714): set BUGBASH_AI=mock");
+  const ai = appAi(o.env, args[0] === "explore");
   const driven = mcpApps || args[0] === "explore" ? modelJob(o.env) : undefined;
   const output = outputDir(args);
   const dest = path.join(dir, output);
@@ -324,7 +373,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       BUGBASH_MODEL: `anthropic:${driven.model}`,
       BUGBASH_MODEL_DRIVEN: "1",
     };
-    const env = containerEnv(o.env, { ...jobEnv(output), ...host, ...MOCK, ...drivenEnv });
+    const env = containerEnv(o.env, { ...jobEnv(output), ...host, ...modeEnv(ai), ...drivenEnv });
     plainFolders(dir, path.dirname(output), true);
     const proxyMount: string[] = [];
     if (driven) {
@@ -337,7 +386,8 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       proxy = await startProxy({
         socketPath: path.join(proxyDir, "sock"),
         upstream: driven.upstream,
-        job: { models: [driven.model] }, // the app AI is the mock: only the explorer calls
+        // The explorer, and in real mode the app too: nothing else.
+        job: { models: [...new Set([driven.model, ...(ai.mode === "real" ? [ai.model] : [])])] },
         ledger,
         log: record,
         onFault: fault,
@@ -370,7 +420,8 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     session.own({ name, owner: ownerLabel(), checkout });
     const budget = o.ledger ? "the run's budget" : `budget $${driven?.budgetUsd.toFixed(2)}`;
     const via = driven ? `proxy for anthropic:${driven.model} (${budget}), ` : "";
-    log(`${name} starts: --network none, ${via}mock app AI, launcher pid ${process.pid}`);
+    const app = ai.mode === "real" ? `real app AI anthropic:${ai.model}` : "mock app AI";
+    log(`${name} starts: --network none, ${via}${app}, launcher pid ${process.pid}`);
     // A refused frame ends the job at once: the container would otherwise block on a full pipe
     // until the deadline (#5930 item 4).
     const receive = async (out: Readable) => {

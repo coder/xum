@@ -15,7 +15,12 @@
  * The probe runs once: run.ts and the Makefile resolve the mode, then pass the result to every app
  * start as BUGBASH_AI_RESOLVED (`real` or `mock`) and BUGBASH_AI_REASON, so one run never mixes
  * modes by accident.
+ *
+ * In the bug-bash sandbox (#5714) no key and no base URL enter the container: a resolved `real`
+ * there means the job's provider proxy (sandbox/inContainer.ts), with a placeholder key that the
+ * proxy drops. run.ts probes through that proxy on the host (sandbox/launch.ts appProbe).
  */
+import { modelDrivenSandbox, PROXY_BASE_URL } from "./sandbox/inContainer";
 
 export type AiMode =
   | { mode: "mock"; reason: string }
@@ -118,14 +123,30 @@ async function probe(settings: RealSettings): Promise<ProbeResult> {
   }
 }
 
-/** Resolves the mode once; throws AiModeError when the run must stop. */
-export async function resolveAiMode(env: Env = process.env): Promise<AiMode> {
+/** The app's settings in a model-driven sandbox job: the proxy, never a key (Anthropic only). */
+function sandboxSettings(env: Env): RealSettings {
+  const model = env.BUGBASH_APP_MODEL ?? DEFAULT_APP_MODEL;
+  if (!/^anthropic:\S+$/.test(model))
+    throw new AiModeError(
+      `in the sandbox BUGBASH_APP_MODEL must be anthropic:<model>, got "${model}"`
+    );
+  return {
+    provider: "anthropic",
+    model,
+    apiKey: "bugbash-sandbox-placeholder",
+    baseUrl: PROXY_BASE_URL,
+  };
+}
+
+/** Resolves the mode once; throws AiModeError when the run must stop. `root` is for tests. */
+export async function resolveAiMode(env: Env = process.env, root = "/"): Promise<AiMode> {
   const resolved = env.BUGBASH_AI_RESOLVED;
   if (resolved != null) {
     const reason = env.BUGBASH_AI_REASON ?? "resolved by the caller";
     if (resolved === "mock") return { mode: "mock", reason };
     if (resolved !== "real")
       throw new AiModeError(`BUGBASH_AI_RESOLVED must be real or mock, got "${resolved}"`);
+    if (modelDrivenSandbox(env, root)) return { mode: "real", reason, ...sandboxSettings(env) };
     const settings = appSettings(env);
     if ("missing" in settings)
       throw new AiModeError(`BUGBASH_AI_RESOLVED=real but ${settings.missing} is not set`);
