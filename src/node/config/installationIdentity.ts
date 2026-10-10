@@ -15,7 +15,7 @@ import { fsyncParentDirectory } from "@/node/utils/writeFileAtomic";
  * root per identity. A moved root keeps it; a copy that stays usable next to the original must
  * get a fresh one before it accesses remote plans (docs/agents/plan-mode.mdx). The migration
  * flag and lock are local to a root, so two roots with one identity can restore each other's
- * cleared plans (formal/plan-storage MC_mig_boundary_shared_uuid). Xum does not detect copies:
+ * cleared plans. Xum does not detect copies:
  * path or host fingerprints would misclassify moves.
  */
 export const INSTALLATION_ID_FILE = "installation_id";

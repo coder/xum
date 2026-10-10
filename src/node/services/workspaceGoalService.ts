@@ -615,7 +615,7 @@ export class WorkspaceGoalService {
   private pendingContinuationCandidates = new Map<string, PendingGoalContinuationCandidate>();
   private continuationReRequestTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /**
-   * G4 (#5461): automatic resumes after terminal stream errors in the current failure episode,
+   * Automatic resumes (#5461) after terminal stream errors in the current failure episode,
    * per workspace and goal. In memory on purpose: a successful stream end, a goal activation or a
    * restart starts a new episode (restart recovery re-arms active goals anyway).
    */
@@ -626,7 +626,7 @@ export class WorkspaceGoalService {
   /** Bumped synchronously by cancelStreamErrorResume (an auto-retry opt-out). */
   private readonly streamErrorResumeCancelGenerations = new Map<string, number>();
   private readonly streamSuccessGenerations = new Map<string, number>();
-  /** Workspaces whose last continuation check stopped on queued user input (G4). */
+  /** Workspaces whose last continuation check stopped on queued user input. */
   private readonly continuationsBlockedByUserInput = new Set<string>();
   /** The kickoff candidate each workspace last dispatched (see retireKickoffFiredByFailedTurn). */
   private readonly firedKickoffCandidates = new Map<string, PendingGoalContinuationCandidate>();
@@ -1872,7 +1872,7 @@ export class WorkspaceGoalService {
   }
 
   /**
-   * A stream ended normally: the next terminal stream error starts a new resume episode (G4), and
+   * A stream ended normally: the next terminal stream error starts a new resume episode, and
    * a resume armed by an earlier error is stale. The successful stream's own end owns the
    * continuation (stream-end hook or owed advancement), so drop it.
    */
@@ -1889,7 +1889,7 @@ export class WorkspaceGoalService {
   }
 
   /**
-   * AgentSession's wake-up path found nothing left blocking goal advancement (G4): if the last
+   * AgentSession's wake-up path found nothing left blocking goal advancement: if the last
    * eligibility check stopped on queued user input (`queued_user_input` keeps the candidate and
    * schedules no retry), re-request that dispatch. Once per block: the flag is consumed here and
    * cleared by every new check. Arms nothing; eligibility decides.
@@ -1913,7 +1913,7 @@ export class WorkspaceGoalService {
   }
 
   /**
-   * Terminal-error settlement for a goal turn (G4): the kickoff candidate it fired stays installed
+   * Terminal-error settlement for a goal turn: the kickoff candidate it fired stays installed
    * until a stream end replaces it, so retire it now. Otherwise a later unrelated stream end would
    * re-dispatch the failed work even when the user opted out of automatic retries. Only that exact
    * candidate (by identity) is retired: a kickoff armed meanwhile by an explicit user action (a
@@ -1955,7 +1955,7 @@ export class WorkspaceGoalService {
   }
 
   /**
-   * Goal advancement after automatic work ended without driving the goal (G4, #5461, decided in
+   * Goal advancement after automatic work ended without driving the goal (#5461, decided in
    * issuecomment-5956324581). One contract for both entry points: an eligible active goal does
    * not stay idle after automatic work ends or is abandoned. Never armed when a later or
    * stronger intent wins: the goal is not `active` (paused by the user or an agent, complete, or
@@ -2630,7 +2630,7 @@ export class WorkspaceGoalService {
         if (await this.refusedForUnavailableAgent(workspaceId, goal, candidate)) {
           return;
         }
-        // Before the send: its turn can fail before the send resolves (G4 kickoff retirement).
+        // Before the send: its turn can fail before the send resolves (kickoff retirement).
         if (candidate.source === "kickoff") this.firedKickoffCandidates.set(workspaceId, candidate);
         const accepted = await this.goalContinuationBridge?.executeGoalContinuation({
           workspaceId,
@@ -2788,12 +2788,12 @@ export class WorkspaceGoalService {
       // Drop only the candidate this check captured: the awaits below (isWorkspaceStreaming,
       // readGoalFile, normalizeGoalLimits) let a goal replacement arm a fresh kickoff
       // candidate whose dispatch queues behind this one. A delete by key would strand
-      // that goal (formal/workspace-goals G1).
+      // that goal.
       if (decision.kind === "stop" && decision.dropCandidate && candidate != null) {
         this.deletePendingCandidateIfStillSame(workspaceId, candidate);
       }
       // No retry is scheduled for this stop: AgentSession's wake-up path re-requests the dispatch
-      // once the user input is gone (wakeContinuationBlockedByUserInput, G4).
+      // once the user input is gone (wakeContinuationBlockedByUserInput).
       if (
         decision.kind === "stop" &&
         decision.reason === "queued_user_input" &&
@@ -4673,7 +4673,7 @@ export class WorkspaceGoalService {
    *      attribution path does not produce a continuation-origin stream.
    */
   /**
-   * A pending error resume (G4) never blocks the budget wrap-up: the limit makes the resume moot,
+   * A pending error resume never blocks the budget wrap-up: the limit makes the resume moot,
    * and the wrap-up replaces it.
    */
   private hasCandidateBlockingBudgetWrapup(workspaceId: string): boolean {

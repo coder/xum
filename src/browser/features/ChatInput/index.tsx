@@ -2608,7 +2608,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       }
       // What this send took out of the composer, until it settles. A failed send puts it back
       // merged with what the composer holds by then, never replacing it: text another window
-      // typed or a restore put in meanwhile stays (D1 in formal/composer-drafts/, #5226 item 12).
+      // typed or a restore put in meanwhile stays (#5226 item 12).
       // Null when the send failed before taking anything (nothing to put back) or succeeded.
       let taken: { text: string } | null = null;
       const putBackTaken = () => {
@@ -2785,14 +2785,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           return;
         }
 
-        // Idempotent sends (formal/composer-drafts/ComposerSends.tla, FixRenderer): every send
-        // carries an id minted here; a retry reuses it with the same request, so the backend
-        // never appends it twice. Not covered (they carry no client id; the backend mints one):
-        // chatCommands.ts sends (/compact and friends) and the creation flow.
+        // Idempotent sends: every send carries an id minted here; a retry reuses it with the same
+        // request, so the backend never appends it twice. Not covered (they carry no client id; the
+        // backend mints one): chatCommands.ts sends (/compact and friends) and the creation flow.
         const sendId = createSendId();
         // An edit keeps today's put-back: its pre-edit draft lives only in memory, so it gets no
         // pending-send entry. Every other send keeps its text and attachments in the durable
-        // draft until the backend answers for its id (D2, D4, D5).
+        // draft until the backend answers for its id.
         const tracksSend = editMessageForSend == null;
         const sendScope = { kind: "workspace" as const, workspaceId: props.workspaceId };
         if (tracksSend) {
@@ -2870,7 +2869,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         } catch (error) {
           thrown = error;
         }
-        // A failed reply does not mean the backend did not take the message (D2): only the
+        // A failed reply does not mean the backend did not take the message: only the
         // backend's answer for the id decides. Never inferred from the transcript text.
         let accepted = result?.success === true;
         if (tracksSend) {

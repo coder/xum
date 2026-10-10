@@ -1067,7 +1067,7 @@ describe("MessageQueue", () => {
       expect(ahead()).toBe(true);
 
       // An uncorrelated tool-end entry behind the heartbeat cuts nothing, so the report overtakes
-      // it too (formal/message-queue, PromotedNotBlockedByHidden).
+      // it too.
       queue.add("unrelated tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden);
       expect(ahead()).toBe(true);
     });

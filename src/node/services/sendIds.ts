@@ -11,11 +11,11 @@ import { isErrnoWithCode } from "@/node/utils/fs";
 import { isReadableHistoryMessage } from "./historyScanner";
 
 /**
- * Idempotent sends (formal/composer-drafts/ComposerSends.tla, MCS_pr1a): every manual send
- * carries an id (the client's, or one WorkspaceService mints), and a retry of the same input
- * reuses it. The user row that accepts a send carries its id (metadata.sendIds), so a row on
- * disk is the only acceptance evidence. HistoryService checks the ids under its cross-process
- * write lock right before the append and never appends a second row for an id a row holds.
+ * Idempotent sends: every manual send carries an id (the client's, or one WorkspaceService mints),
+ * and a retry of the same input reuses it. The user row that accepts a send carries its id
+ * (metadata.sendIds), so a row on disk is the only acceptance evidence. HistoryService checks the
+ * ids under its cross-process write lock right before the append and never appends a second row for
+ * an id a row holds.
  */
 export interface SendIdentity {
   id: string;

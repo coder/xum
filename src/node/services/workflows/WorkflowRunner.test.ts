@@ -152,9 +152,9 @@ describe("WorkflowRunner", () => {
     expect(lifecycle).toEqual(["agent", "ended"]);
   });
 
-  // W10 (formal/workflow-runs MC_mut_nohold): an interrupt terminates the children before it
-  // writes "interrupted", so the aborted runner's lease is the only fence against another runner
-  // until then. It must stay held and fresh past staleLeaseMs, and go only after the hold settles.
+  // An interrupt terminates the children before it writes "interrupted", so the aborted runner's
+  // lease is the only fence against another runner until then. It must stay held and fresh past
+  // staleLeaseMs, and go only after the hold settles.
   test("an interrupt's lease hold keeps the aborted runner's lease renewed until it settles", async () => {
     using tmp = new DisposableTempDir("workflow-runner-lease-hold");
     const store = await createRunStore(tmp.path);

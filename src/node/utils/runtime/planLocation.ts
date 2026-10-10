@@ -121,10 +121,10 @@ async function withMigrationLock<T>(
 }
 
 /**
- * Mark an SSH row migrated before a clear or a removal deletes its scoped plan, under the
- * migration lock: a migration that started earlier re-checks the flag under that lock, so it can
- * no longer copy a legacy plan back in after the delete (formal/plan-storage/PlanMigration.tla,
- * ClearRetire). No-op for rows already migrated and for non-SSH rows.
+ * Mark an SSH row migrated before a clear or a removal deletes its scoped plan, under the migration
+ * lock: a migration that started earlier re-checks the flag under that lock, so it can no longer
+ * copy a legacy plan back in after the delete. No-op for rows already migrated and for non-SSH
+ * rows.
  */
 export async function markRemotePlanMigratedForDeletion(
   config: PlanLocationConfig,
@@ -162,11 +162,10 @@ const MIGRATION_EXIT = {
  * workspace's own plan at plans/<workspace id>.md is copied in; the shared pre-#5174 path
  * plans/<project>/<name>.md only when `imp=1` (the user's explicit import, Option B: another
  * installation may own that file). The copy: write a temp file, fsync it, hard-link it into place
- * (never replacing a plan that appeared meanwhile), fsync the directories. Only then may the
- * caller set the row flag, so a power cut can leave no scoped file or the whole plan, never an
- * empty one shadowing the legacy plan (PlanMigration.tla mutants retireBeforeSync,
- * syncAfterLink). Legacy files are never moved, deleted or written: another installation, or an
- * older build of this one, may still use them.
+ * (never replacing a plan that appeared meanwhile), fsync the directories. Only then may the caller
+ * set the row flag, so a power cut can leave no scoped file or the whole plan, never an empty one
+ * shadowing the legacy plan. Legacy files are never moved, deleted or written: another
+ * installation, or an older build of this one, may still use them.
  *
  * GNU and uutils `sync FILE...` fsync the named files and directories; a sync without file
  * arguments (busybox) flushes everything, which is slower but just as durable.
@@ -203,13 +202,12 @@ type MigrationOutcome = "copied" | "scopedExists" | "noLegacy" | "sharedOnly" | 
 
 /**
  * Migrate an SSH row's plan into its installation-scoped path (see migrateRemotePlanScript), then
- * set the row flag, after which every read uses the scoped path only: a missing scoped plan, or
- * an identity reset that starts an empty namespace, never brings a legacy file back
- * (PlanMigration.tla NoReactivation). Under the migration lock with the flag re-checked, so a
- * clear that marked the row first wins.
+ * set the row flag, after which every read uses the scoped path only: a missing scoped plan, or an
+ * identity reset that starts an empty namespace, never brings a legacy file back. Under the
+ * migration lock with the flag re-checked, so a clear that marked the row first wins.
  *
  * Automatic (`importShared` false): a row whose only legacy plan is the shared path imports
- * nothing and stays unmigrated, so the user can still import it (Option B, NoAutoShared). The row
+ * nothing and stays unmigrated, so the user can still import it (Option B). The row
  * reads its scoped path only; its first plan write there migrates it ("scopedExists").
  */
 async function migrateRemotePlan(

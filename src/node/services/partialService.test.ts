@@ -509,9 +509,8 @@ describe("HistoryService partial persistence - Legacy compatibility", () => {
 });
 
 // A partial is only ever committed onto its own placeholder row (matched by message id AND
-// historySequence). Crash-model findings F1/F2 (formal/history-crash): a partial whose turn an
-// edit truncation removed must be retired, never resurrected, fail forever, or overwrite a newer
-// row that reused its sequence.
+// historySequence). A partial whose turn an edit truncation removed must be retired, never
+// resurrected, fail forever, or overwrite a newer row that reused its sequence.
 describe("HistoryService partial persistence - Orphaned partials", () => {
   let config: Config;
   let a: HistoryService;
@@ -682,7 +681,7 @@ describe("HistoryService partial persistence - Orphaned partials", () => {
       );
     }
 
-    /** F2: a foreign edit discards A's turn and A's next delta recreates its partial. */
+    /** A foreign edit discards A's turn and A's next delta recreates its partial. */
     async function discardTurnAndRecreatePartial(workspaceId: string): Promise<HistoryService> {
       const b = new HistoryService(config);
       const partial = await startTurn(a, workspaceId, "u0", "a0");

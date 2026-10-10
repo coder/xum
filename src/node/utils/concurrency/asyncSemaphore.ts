@@ -24,9 +24,9 @@ export class AsyncSemaphore {
       this.active += 1;
       return this.newSlot();
     }
-    // releaseSlot() hands its slot straight to the first waiter
-    // (formal/primitives/AsyncSemaphore.tla): a woken waiter that re-checked in a later
-    // microtask could lose the slot to a caller in between and re-queue at the tail.
+    // releaseSlot() hands its slot straight to the first waiter: a woken waiter that
+    // re-checked in a later microtask could lose the slot to a caller in between and re-queue
+    // at the tail.
     return await new Promise<AsyncSemaphoreSlot>((resolve) => this.queue.push(resolve));
   }
 

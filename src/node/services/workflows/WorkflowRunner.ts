@@ -374,11 +374,11 @@ export interface WorkflowTaskAdapter {
 
 /**
  * Lets an interrupt keep this runner's lease (still renewed) until the interrupt has written the
- * run's durable "interrupted" status (WorkflowService.interruptRunTree, W10 in
- * formal/workflow-runs). The interrupt terminates the run's children BEFORE that write, so in
- * between the run still reads `running`; the held lease is what keeps crash recovery in any
- * backend from starting another runner, whose new children the interrupt would never stop.
- * Synchronous on both sides, so a hold is granted exactly when the runner will wait for it.
+ * run's durable "interrupted" status (WorkflowService.interruptRunTree). The interrupt terminates
+ * the run's children BEFORE that write, so in between the run still reads `running`; the held lease
+ * is what keeps crash recovery in any backend from starting another runner, whose new children the
+ * interrupt would never stop. Synchronous on both sides, so a hold is granted exactly when the
+ * runner will wait for it.
  */
 export class WorkflowRunnerLeaseHold {
   private closed = false;
@@ -3340,7 +3340,7 @@ export class WorkflowRunner {
       case "indeterminate": {
         let reason = outcome.reason;
         if (outcome.code === "no-record") {
-          // W8: the started checkpoint names a child no backend published (and this process
+          // The started checkpoint names a child no backend published (and this process
           // owns no attempt for it): its reserving backend died, or is stalled, before the
           // publishing commit. Tombstone the ID first, so that late commit can never land, then
           // run the step fresh. Unfenced replacement could publish two children (see

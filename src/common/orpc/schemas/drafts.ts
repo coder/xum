@@ -78,10 +78,10 @@ export const DraftSchema = z.object({
 });
 
 /**
- * Idempotent sends (formal/composer-drafts/ComposerSends.tla, FixRenderer): a workspace composer
- * send whose acceptance is not settled yet. The draft keeps its text and attachments (retained in
- * the legacy `text`/`attachments` fields, hidden from the composer) until the backend answers for
- * its id: accepted drops them, not accepted makes them visible again.
+ * Idempotent sends: a workspace composer send whose acceptance is not settled yet. The draft keeps
+ * its text and attachments (retained in the legacy `text`/`attachments` fields, hidden from the
+ * composer) until the backend answers for its id: accepted drops them, not accepted makes them
+ * visible again.
  */
 export const PendingSendSchema = z.object({
   sendId: SendIdSchema,
@@ -201,7 +201,10 @@ export const DraftSetSendReceiverOutputSchema = z.object({
 
 export const DraftResolveSendsInputSchema = z.object({
   scope: WorkspaceDraftScopeSchema,
-  /** Ids this client has a send request in flight for: not looked up (see ComposerSends). */
+  /**
+   * Ids this client has a send request in flight for: not looked up (a lookup before the request
+   * reaches the receiver makes it refuse the send).
+   */
   exceptSendIds: z.array(z.string()).optional(),
 });
 

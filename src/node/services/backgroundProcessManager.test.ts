@@ -449,7 +449,7 @@ describe("BackgroundProcessManager", () => {
 
     it("gives concurrent same-name spawns from two backends distinct directories on a non-host runtime", async () => {
       // No cross-backend lock serialises non-host runtimes: the atomic mkdir claim must pick
-      // exactly one winner per directory (#4889, BgSpawnName MC_name_remote).
+      // exactly one winner per directory (#4889).
       const other = new BackgroundProcessManager(bgOutputDir);
       const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
       try {

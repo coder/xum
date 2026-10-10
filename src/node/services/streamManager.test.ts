@@ -401,7 +401,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     }
   );
 
-  // #5331 item 3 (formal/history-crash F4): partial.json has one key per workspace, which is
+  // #5331 item 3: partial.json has one key per workspace, which is
   // safe only while one stream at a time writes it. Starting a replacement stream must wait
   // until every partial write of the stream it replaces has settled.
   test("a replacement stream never writes partial.json while the replaced stream's write is in flight", async () => {

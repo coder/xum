@@ -563,7 +563,7 @@ export interface TaskCreateResult {
 /**
  * `sendId`: the brief send's id (idempotent sends, see sendIds.ts), persisted on the row as
  * taskPromptSendId before the send. The row that accepts the brief carries it, so a reawakening
- * prepends a kept taskPrompt only while no history row does (U4 in formal/task-launch).
+ * prepends a kept taskPrompt only while no history row does.
  */
 type TaskLaunchStart =
   | { kind: "sendMessage"; prompt: string; sendId: string }
@@ -4477,14 +4477,13 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * W8 (formal/workflow-runs MC_norecord): a workflow step's started checkpoint is written in
-   * createMany's onTaskReserved, BEFORE commitReservations publishes the child's row. A crash in
-   * between leaves a checkpoint naming a task that never existed. Replacing it outright is unsafe:
-   * the reserving backend may only be stalled (lease expired, process alive), and its late commit
-   * would then publish a second child for the step, or re-run a step the replacement already
-   * recorded (MC_two_stall_naive). So the replacing runner first tombstones the ID on the parent's
-   * row; commitReservations checks the tombstone inside its own config write and refuses, which
-   * makes "replace" and "late commit" mutually exclusive (MC_two_stall_fixed).
+   * A workflow step's started checkpoint is written in createMany's onTaskReserved, BEFORE
+   * commitReservations publishes the child's row. A crash in between leaves a checkpoint naming a
+   * task that never existed. Replacing it outright is unsafe: the reserving backend may only be
+   * stalled (lease expired, process alive), and its late commit would then publish a second child
+   * for the step, or re-run a step the replacement already recorded. So the replacing runner first
+   * tombstones the ID on the parent's row; commitReservations checks the tombstone inside its own
+   * config write and refuses, which makes "replace" and "late commit" mutually exclusive.
    *
    * Granted only while a strict read shows no row for the task (checked inside the same write) and
    * this process owns no attempt for it (an own reservation may still be before its commit).
@@ -5572,7 +5571,7 @@ export class TaskService implements AgentTaskIntegration {
     // A task that another live backend is still running holds a use lease on its workspace there
     // (a turn, init hook, MCP server, command, terminal or editor). Leave it to that backend in
     // every pass below: re-driving it here would start a duplicate execution (#4801). A launch
-    // holds a "launch" lease from before its row becomes `starting` (U3 in formal/task-launch), so
+    // holds a "launch" lease from before its row becomes `starting`, so
     // a `starting` row in startupConfig whose launch still runs is skipped too: its lease was
     // published before this scan. Idle windows (between turns, waiting on descendants) hold no
     // lease, so this backend can still take such a task over by rotation; the attempt-bound CAS
@@ -6171,7 +6170,7 @@ export class TaskService implements AgentTaskIntegration {
 
   /**
    * Whether a readable history row (archive included) carries the brief's send id with the
-   * brief's payload, read under the history write lock (U4 in formal/task-launch). The row is the
+   * brief's payload, read under the history write lock. The row is the
    * only acceptance evidence: a send's result and its onAccepted callback both miss a send whose
    * rows became durable before it failed. Only that proof drops the kept prompt. A line that names
    * the id but cannot be read back (providers never see it), a row with another payload, or a
@@ -7404,7 +7403,7 @@ export class TaskService implements AgentTaskIntegration {
     // Only a published row can name a successor attempt. A missing row was unpublished by a
     // removal and no writer re-admits a row that no longer exists, so its checkout is the
     // removal's: delete it. Counting a missing row as superseded leaked the checkout a fork made
-    // while the removal ran (U2 in formal/task-launch). A row a removal only marked
+    // while the removal ran. A row a removal only marked
     // (pendingRemoval) is still retained below: a removal can abort and release its marker while
     // the delete runs, and another backend could then reawaken the row. No live removal can mark
     // the row while a launch prepares it (the launch lease, see startReservedAgentTask), so such
@@ -7602,11 +7601,11 @@ export class TaskService implements AgentTaskIntegration {
 
   /**
    * The gate before reusing or forking the task's checkout: only this plan's own `starting` row.
-   * A row another writer re-admitted under a new attempt is that writer's to prepare (U3: the
+   * A row another writer re-admitted under a new attempt is that writer's to prepare (the
    * gate used to check only the status, so two launches could prepare one checkout). A row a
    * removal marked is refused (throws, as the admission would): with the launch lease held no
    * live removal can have marked it, so this is a marker a crashed or failed removal left behind,
-   * and the launch must not fork a checkout under it (U2).
+   * and the launch must not fork a checkout under it.
    */
   private mayMaterializeTaskWorkspace(
     plan: TaskLaunchPlan,
@@ -7842,8 +7841,8 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * The launch holds a "launch" use lease on the task's workspace until it settles
-   * (formal/task-launch, U2 and U3). The reservation (createMany, or the queue drain's CAS) takes
+   * The launch holds a "launch" use lease on the task's workspace until it settles.
+   * The reservation (createMany, or the queue drain's CAS) takes
    * it before the row becomes `starting` and hands it over in the plan; a plan without one
    * takes it here. Each side publishes, then checks the other (see WorkspaceUseLeases): a removal
    * (or another structural mutator) publishes its gate, then refuses this lease, in this process
@@ -8182,7 +8181,7 @@ export class TaskService implements AgentTaskIntegration {
       // launch, the user can Stop the task, or a removal can mark it. Nothing aborts an init
       // started after that: a cancel and a Stop never do, and a removal aborts only the init
       // already running at its mark. So recheck all four right before starting the init (the
-      // abort signal alone misses the Stop and the removal). Model: formal/task-launch, U1.
+      // abort signal alone misses the Stop and the removal).
       if (plan.abortSignal?.aborted) {
         await cancelMaterializedLaunch();
         return;
@@ -8307,7 +8306,7 @@ export class TaskService implements AgentTaskIntegration {
             agentInitiated: true,
             turnAdmission: admission.token,
             admissionStale: () => admission.token.admissionStale(),
-            // The row that accepts the brief carries its id (U4): only that row, never this
+            // The row that accepts the brief carries its id: only that row, never this
             // send's result or callbacks, proves the brief reached history. A send can make its
             // rows durable and still return Err (a Stop makes its admission stale), and a Stop can
             // land after an Ok before `running`; both keep taskPrompt. Minted for this launch
@@ -9504,16 +9503,16 @@ export class TaskService implements AgentTaskIntegration {
           message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
         });
       }
-      // A Stop of the task or an ancestor that ran to completion during the awaits above (L1 in
-      // formal/task-lifecycle): the cascade found nothing live on the idle child and already
-      // released its latch, so only the epochs show it. The reawakening must lose.
+      // A Stop of the task or an ancestor that ran to completion during the awaits above: the
+      // cascade found nothing live on the idle child and already released its latch, so only the
+      // epochs show it. The reawakening must lose.
       if (params.stopFence != null && this.reawakeningOvertakenByStop(params.stopFence)) {
         log.debug("Sub-agent reactivation refused: overtaken by a stop", { taskId });
         return Err({ code: "send_failed" as const, message: SEND_ADMISSION_STALE_MESSAGE });
       }
       // A manual resume (reawakenInterruptedTask, which holds neither the event nor the tree
       // lock) may have published and started its own attempt since the caller found the child
-      // inactive: rotating it would supersede that live turn and drop its report (L2).
+      // inactive: rotating it would supersede that live turn and drop its report.
       if (this.hasLiveReawakening(taskId)) {
         return Err({
           code: "send_failed" as const,
@@ -9734,7 +9733,7 @@ export class TaskService implements AgentTaskIntegration {
         message: prompt,
         queueDispatchMode: "tool-end",
         sendMessage: send,
-        // No Stop fence (unlike task_send_message, L1): the wake is the child's own monitor
+        // No Stop fence (unlike task_send_message): the wake is the child's own monitor
         // output, not a turn of the stopped tree. A user's tree Stop retires the attention a
         // descendant owed when the cascade latched it (#5377), and new monitor input stays
         // automatic after a Stop (AgentSession.isAutomaticSendBlocked), so a wake overlapping a
@@ -9771,7 +9770,7 @@ export class TaskService implements AgentTaskIntegration {
     options?: TrustedDescendantMessageOptions
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     // Before the first await: a Stop of the child or any ancestor (the sender's included) that
-    // lands while this send is suspended overtakes a reawakening it decides on (L1).
+    // lands while this send is suspended overtakes a reawakening it decides on.
     const stopFence = this.captureReawakeningStopFence(taskId);
     const messageLabel = options?.messageLabel ?? "Updated guidance from parent";
     // Keep the labeled message explicit in the child transcript so it cannot be confused
@@ -9859,7 +9858,7 @@ export class TaskService implements AgentTaskIntegration {
     // workspaceEventLocks). The reverse nesting deadlocked against reported-task cleanup.
     return this.workspaceEventLocks.withLock(taskId, async () =>
       this.withTaskTreeLifecycleLock(taskId, async () => {
-        // A brief history already holds is not prepended again on reawakening (U4); the
+        // A brief history already holds is not prepended again on reawakening; the
         // reactivation reads the kept brief from the row after this. Awaited before the row read
         // below, so the inactive decision and reactivateInactiveAgentTask see the same row.
         await this.dropKeptTaskPromptAlreadyInHistory(taskId);
@@ -10343,14 +10342,14 @@ export class TaskService implements AgentTaskIntegration {
    * throttles, so both routes must also hold one lock from admission through dispatch: with
    * separate locks a family
    * send admitted while a peer send was in flight passed the same rate slot, duplicate check and
-   * queue position (formal/peer-limits, MC_cross_route). The broker's delivery lock is the one
+   * queue position. The broker's delivery lock is the one
    * the family route holds; it is taken before the event lock, the family route's nesting (its
    * sibling dispatch takes the event lock inside it).
    * The resulting per-target FIFO is intended (#5334): a family send to a target, including
    * task_message_parent, waits behind an in-flight task_send_message to that target, and the
    * reverse, for as long as that send's admission and dispatch take. The wait is what lets the
    * later send see the earlier one's rate slot, duplicate entry and queue position. The
-   * cross-route tests in taskService.peerLimitsFormalRepro.test.ts pin it for
+   * cross-route tests in taskService.peerLimitsRepro.test.ts pin it for
    * task_message_sibling behind task_send_message: the family send must not be admitted before
    * the peer send's delivery is recorded. task_message_parent takes the same lock.
    */
@@ -10586,7 +10585,7 @@ export class TaskService implements AgentTaskIntegration {
         const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
         // A send that resolved a correlation continues that turn only while it is registered:
         // once it settled (for example by a read of its handle, which does not take this lock),
-        // the correlation is stale and must not reach the session (finding F3).
+        // the correlation is stale and must not reach the session.
         if (live == null) {
           return delegatedTurnCorrelation != null && delegatedTurnCorrelation !== "unresolved"
             ? delegatedRootStartingRefusal
@@ -10802,7 +10801,7 @@ export class TaskService implements AgentTaskIntegration {
           : undefined;
       // Only its owner continues a root's delegated turn (#4997): a non-owner's message waits for
       // it, so it never needs the correlation, and must not carry it if the turn settles before
-      // the admission gates look again (finding F3). Reawakened agent-task children are continued
+      // the admission gates look again. Reawakened agent-task children are continued
       // by any peer.
       const workspaceTurnMuxMetadata =
         targetIsAgentTask || resolvedTurnMuxMetadata?.ownerWorkspaceId === senderWorkspaceId
@@ -11009,7 +11008,7 @@ export class TaskService implements AgentTaskIntegration {
         // A user Stop since this attempt was admitted refuses it, even when the stop landed after
         // the refusing gate (the final gate awaits its rollback before onCanceled parks). The
         // Stop already dropped the parked list, and the flush takes a new target stop baseline,
-        // so a message parked now would run after the Stop once the user resumes (finding F1).
+        // so a message parked now would run after the Stop once the user resumes.
         if ((this.workspaceUserStopEpochs.get(targetId) ?? 0) !== capturedUserStopEpoch) {
           admissionRefusal = interruptedRefusal;
           return;
@@ -11737,7 +11736,7 @@ export class TaskService implements AgentTaskIntegration {
    * `onStopsReleased`: once every latched descendant's Stop released (its settlement receipt is
    * durable or failed) or the cleanup deadline passed, and before the archival and queue work
    * below (which has no deadline). A workflow interrupt writes the run's "interrupted" status
-   * there (W10, WorkflowService.interruptRunTree): a receipt still being written when the
+   * there (WorkflowService.interruptRunTree): a receipt still being written when the
    * backend dies would leave the child indeterminate on every resume. Its error is rethrown
    * after that work.
    */
@@ -16855,7 +16854,7 @@ export class TaskService implements AgentTaskIntegration {
           launchLease = await workspaceUseLeasesFor(this.config).hold(taskId, "launch");
         } catch (error) {
           // A lease that cannot be written (lock I/O) leaves the task queued too: launching it
-          // unleased would let another backend's startup recovery requeue it mid-launch (U3).
+          // unleased would let another backend's startup recovery requeue it mid-launch.
           log[error instanceof WorkspaceMutationInProgressError ? "debug" : "warn"](
             "TaskService.maybeStartQueuedTasks: no launch lease; task left queued",
             { taskId, error: getErrorMessage(error) }
@@ -17233,7 +17232,7 @@ export class TaskService implements AgentTaskIntegration {
       }
       // A parent's reactivation leaves the status `interrupted` while its fresh attempt launches
       // and runs, so the row alone reads resumable: rotating that live attempt would supersede the
-      // continuation and drop its report (L2 in formal/task-lifecycle). The user's send loses and
+      // continuation and drop its report. The user's send loses and
       // can retry; once the continuation streams, sends queue behind it instead of reaching here.
       if (this.hasLiveReawakening(workspaceId)) {
         log.debug("markInterruptedTaskRunning refused: another reawakening is live", {

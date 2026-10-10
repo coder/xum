@@ -1,10 +1,9 @@
 /**
- * Idempotent composer sends (formal/composer-drafts/ComposerSends.tla, FixRenderer; D2, D4, D5):
- * every send carries a renderer-minted id, its text stays in the durable draft (retained under a
- * pending-send entry) until the backend answers for the id, and only that answer removes it
- * (accepted) or shows it again (not accepted). The backend is real; WorkspaceService.sendMessage
- * is wrapped only to hold or fail one reply. A second DraftStore plays a reloaded renderer (or a
- * second window) on the same backend.
+ * Idempotent composer sends: every send carries a renderer-minted id, its text stays in the durable
+ * draft (retained under a pending-send entry) until the backend answers for the id, and only that
+ * answer removes it (accepted) or shows it again (not accepted). The backend is real;
+ * WorkspaceService.sendMessage is wrapped only to hold or fail one reply. A second DraftStore plays
+ * a reloaded renderer (or a second window) on the same backend.
  */
 import "../dom";
 jest.mock("lottie-react", () => ({
@@ -108,7 +107,7 @@ describe("idempotent composer sends", () => {
     for (const store of reloaded.splice(0)) store.setClient(null);
   });
 
-  test("a send accepted before an Err reply is not put back (D2)", async () => {
+  test("a send accepted before an Err reply is not put back", async () => {
     const app = await createAppHarness({ branchPrefix: "send-ids-accepted-err" });
     const held = holdFirstSend(app, async (realSend, args) => {
       await realSend(...args);
@@ -132,7 +131,7 @@ describe("idempotent composer sends", () => {
     }
   }, 120_000);
 
-  test("a reload before the send reached the backend shows its text again, once (D4)", async () => {
+  test("a reload before the send reached the backend shows its text again, once", async () => {
     const app = await createAppHarness({ branchPrefix: "send-ids-reload-unsent" });
     const held = holdFirstSend(app, (realSend, args) => realSend(...args));
     try {
@@ -159,7 +158,7 @@ describe("idempotent composer sends", () => {
     }
   }, 120_000);
 
-  test("a reload after the backend accepted removes the retained text (D4)", async () => {
+  test("a reload after the backend accepted removes the retained text", async () => {
     const app = await createAppHarness({ branchPrefix: "send-ids-reload-accepted" });
     let releaseReply: () => void = () => undefined;
     const replyGate = new Promise<void>((resolve) => {
@@ -229,7 +228,7 @@ describe("idempotent composer sends", () => {
     }
   }, 120_000);
 
-  test("a restart after the row was written but before removal removes it on load (D5)", async () => {
+  test("a restart after the row was written but before removal removes it on load", async () => {
     const app = await createAppHarness({ branchPrefix: "send-ids-restart" });
     const draftService = app.env.services.draftService;
     // The process dies between the row and the draft removal: no answer is applied.

@@ -854,7 +854,7 @@ export class WorktreeManager {
     // ours. Without a map entry or a checkout nothing does: a removal retry is exactly that state
     // (the first attempt removed the checkout and dropped the entry, then deregistration or a
     // later runtime step failed), and `git branch -D <name>` would delete an unrelated user
-    // branch named like the workspace directory (formal/workspace-lifecycle F2).
+    // branch named like the workspace directory.
     const allowWorkspaceNameFallback =
       !branchName &&
       !isInPlace &&

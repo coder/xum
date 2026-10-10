@@ -703,10 +703,10 @@ export function useCreationWorkspace({
         }
 
         // An initial /goal sends no user message, so nothing durable holds its input until the
-        // command accepts it (formal/composer-drafts D3). Move the typed command into the new
-        // workspace's draft first (before any text already there, as a restore merges) and
-        // clear the creation draft only once the backend confirmed that write. On a failed save
-        // the creation draft stays, and the store keeps retrying the workspace draft.
+        // command accepts it. Move the typed command into the new workspace's draft first (before
+        // any text already there, as a restore merges) and clear the creation draft only once the
+        // backend confirmed that write. On a failed save the creation draft stays, and the store
+        // keeps retrying the workspace draft.
         const workspaceDraftScope = { kind: "workspace" as const, workspaceId: metadata.id };
         let creationDraftHandedOff = true;
         if (initialSlashCommand) {

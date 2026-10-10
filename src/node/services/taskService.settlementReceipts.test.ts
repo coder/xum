@@ -877,7 +877,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
     ).toBe(false);
   });
 
-  // W10 (formal/workflow-runs): a workflow interrupt writes the run's "interrupted" status in
+  // A workflow interrupt writes the run's "interrupted" status in
   // onStopsReleased, so the stopped child's receipt must be durable by then, and the cleanup
   // tail (metadata, archival, queue), which has no deadline, must not run before it.
   test("onStopsReleased runs once a stopped child's receipt is durable, before the cleanup tail", async () => {

@@ -2142,7 +2142,7 @@ describe("WorktreeManager.deleteWorkspace", () => {
 
     try {
       const { projectPath, manager, initLogger } = fixture;
-      // A removal retry (formal/workspace-lifecycle F2): the first attempt removed the checkout of
+      // A removal retry: the first attempt removed the checkout of
       // "feature/x" (directory feature-x) and dropped its map entry, then deregistration failed.
       const createResult = await manager.createWorkspace({
         projectPath,

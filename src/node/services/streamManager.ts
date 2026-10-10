@@ -5291,7 +5291,7 @@ export class StreamManager {
               } else {
                 // On successful completion, partial.json becomes stale and must be removed.
                 // Only this stream's own partial: the row just written covers nothing else
-                // (the order formal/history-crash/HistoryPartial.tla checks as crash-safe).
+                // (row first, then the partial delete: the crash-safe order).
                 const deleteResult = await this.historyService.deletePartialIfMessageIdMatches(
                   workspaceId,
                   streamInfo.messageId

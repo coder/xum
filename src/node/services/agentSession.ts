@@ -407,7 +407,7 @@ interface AutoRetryResumeRequest {
  * (never sourced from IPC) and rides to the request builder as stream provenance.
  */
 /**
- * The ended turn's options for a goal advancement (G4). A heartbeat turn's options are the
+ * The ended turn's options for a goal advancement. A heartbeat turn's options are the
  * heartbeat's, not the goal's: drop them so the goal loop uses the goal's own options.
  */
 function goalAdvancementSendOptions(
@@ -1016,8 +1016,8 @@ interface SendMessageInternalOptions {
  * Re-verifies a follow-up's handoff on full history under the write lock, right before its row
  * lands: the same summary (id and sequence) must still carry pendingFollowUp and be followed only
  * by rows that leave it pending. dispatchPendingFollowUp reads the handoff without the lock, so a
- * sibling backend's dispatch (or any other row) can consume it in between (formal/compaction,
- * TLC case C2); appending anyway would run the follow-up twice.
+ * sibling backend's dispatch (or any other row) can consume it in between; appending anyway would
+ * run the follow-up twice.
  */
 function checkCompactionFollowUpStillPending(
   summary: MuxMessage,
@@ -1133,7 +1133,7 @@ export class AgentSession {
    * User sends between sendMessage entry and their own PREPARING claim (or exit). The turn
    * coordinator stays idle through that preflight, so isBusy() cannot see these sends; an
    * auto-retry admitted then would move the turn and the send would be refused as a context
-   * mutation (formal/stream-retry, NoStaleRetry). Automatic resumes defer while this is set.
+   * mutation. Automatic resumes defer while this is set.
    */
   private manualSendsInPreflight = 0;
   private readonly onTurnSuperseded?: (previous: symbol, next: symbol) => void;
@@ -1339,7 +1339,7 @@ export class AgentSession {
   // The preference file may not reflect memory after a failed write (see persistAutoRetryState).
   private autoRetryStateUnrecorded = false;
   /**
-   * The one goal advancement this session still owes (G4), whatever its origin:
+   * The one goal advancement this session still owes, whatever its origin:
    * - `abandoned`: a turn left the goal continuation to queued automatic work
    *   (oweGoalAdvancementToQueuedWork), which may never stream.
    * - `stream_error`: a terminal stream error that RetryManager does not retry
@@ -4160,7 +4160,7 @@ export class AgentSession {
     this.activePreparations++;
     this.activeSendAttempts.add(attempt);
     // Start (not await) the turn's use lease: preparation keeps its synchronous startup, and
-    // prepareMessage / streamWithHistory confirm it before they touch the checkout (L1).
+    // prepareMessage / streamWithHistory confirm it before they touch the checkout.
     this.beginTurnUseLease();
     try {
       const result = await run();
@@ -4542,13 +4542,13 @@ export class AgentSession {
     if (!frontier.success) return Err(createUnknownSendMessageError(frontier.error));
     attempt.admissionCapture = frontier.data;
 
-    // L1 (formal/workspace-leases, MC_lease_turn_fixed): confirm the turn's use lease before
-    // anything below can touch the checkout (@file reads, skill dynamic-context commands,
-    // rollover's runtime readiness and workspace path). completePreparation only starts the
-    // hold so that its synchronous startup is kept; this await follows the frontier read. A send
-    // refused by another backend's rename, removal or archive fails here, before the edit
-    // truncation or any publication, like WorkspaceService.sendMessage's in-process refusal.
-    // A send the caller already canceled keeps its canceled outcome instead of the refusal.
+    // Confirm the turn's use lease before anything below can touch the checkout (@file reads, skill
+    // dynamic-context commands, rollover's runtime readiness and workspace path).
+    // completePreparation only starts the hold so that its synchronous startup is kept; this await
+    // follows the frontier read. A send refused by another backend's rename, removal or archive
+    // fails here, before the edit truncation or any publication, like
+    // WorkspaceService.sendMessage's in-process refusal. A send the caller already canceled keeps
+    // its canceled outcome instead of the refusal.
     const leaseRefusal = await this.confirmTurnUseLease();
     if (await cancelBeforeAcceptance()) {
       return Ok(undefined);
@@ -6024,9 +6024,9 @@ export class AgentSession {
     // so a straggler reschedule self-abandons instead of replaying the
     // discarded context.
     // An auto-retry (deferToManualSend) also defers to a user send still in its preflight, where
-    // the coordinator is idle: admitting now would move the turn and the send would be refused
-    // (formal/stream-retry MC_fixed). retryActiveStream reschedules a deferred retry; the send's
-    // acceptance cancels it, and a refused send leaves it scheduled.
+    // the coordinator is idle: admitting now would move the turn and the send would be refused.
+    // retryActiveStream reschedules a deferred retry; the send's acceptance cancels it, and a
+    // refused send leaves it scheduled.
     if (
       this.coordinator.admissionBlocked ||
       this.coordinator.closing ||
@@ -6125,7 +6125,7 @@ export class AgentSession {
     if (enabled) {
       return this.applyAutoRetryEnabled(enabled, options);
     }
-    // An opt-out also cancels a goal resume after a terminal error (G4): synchronously, before
+    // An opt-out also cancels a goal resume after a terminal error: synchronously, before
     // the awaits below, so a resume armed meanwhile sees its fence move.
     this.workspaceGoalService?.cancelStreamErrorResume(this.workspaceId);
     this.autoRetryOptOutsInFlight += 1;
@@ -6145,7 +6145,7 @@ export class AgentSession {
     this.retryManager.setEnabled(enabled);
     if (!enabled) {
       this.retryManager.cancel();
-      // A cancelled retry was a blocker of the pending goal advancement (G4).
+      // A cancelled retry was a blocker of the pending goal advancement.
       this.reevaluateGoalAdvancement();
     }
 
@@ -6239,7 +6239,7 @@ export class AgentSession {
     );
     // Abandon (not a silent cancel) so a retry countdown shown for a kept tail ends in the UI.
     this.retryManager.abandon("context_changed");
-    // A cancelled retry was a blocker of the pending goal advancement (G4).
+    // A cancelled retry was a blocker of the pending goal advancement.
     this.reevaluateGoalAdvancement();
     this.setAutoRetryResumeState(undefined);
     this.lastUsageState = undefined;
@@ -6927,7 +6927,7 @@ export class AgentSession {
   }
 
   /**
-   * Whether this workspace's heartbeat is still set and enabled (formal/workspace-goals G2b).
+   * Whether this workspace's heartbeat is still set and enabled.
    * Resolves legacy id-less rows by path, as WorkspaceService does. Strict: throws when config
    * cannot be read, so no caller treats a read failure as "turned off".
    */
@@ -8044,7 +8044,7 @@ export class AgentSession {
       await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
       if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
         return { success: false, error, failureHandled: true };
-      // This failure has no stream error event, so handleStreamError's G4 settlement never runs:
+      // This failure has no stream error event, so handleStreamError's goal settlement never runs:
       // settle here, or a non-retryable runtime_not_ready leaves an active goal stranded and its
       // failed kickoff installed (#5546). The hand-over waits for this preparation's idle.
       await this.recordGoalAdvancementAfterStreamError(failureType, failedContext);
@@ -8232,7 +8232,7 @@ export class AgentSession {
       // abort or append failure therefore re-detects the same change (nothing is
       // dropped), while a successful append cannot produce a duplicate row.
       // Fresh candidates already fix the admitted rows; detect later edits on the next request.
-      // #4476/L1: file-change detection and post-compaction attachments read the checkout, so the
+      // #4476: file-change detection and post-compaction attachments read the checkout, so the
       // turn use lease is confirmed first (resumes and retries reach here without prepareMessage).
       // A refused lease skips those reads (and the [CONTINUE] sentinel append) and fails below,
       // where the request's user row and compaction request are known, so the refusal keeps its
@@ -9363,7 +9363,7 @@ export class AgentSession {
 
   /**
    * The user's own manual input is queued or dispatching. Only automatic queued work owes the
-   * goal advancement (G4): a manual entry runs as the user's turn, and one refused at its dispatch
+   * goal advancement: a manual entry runs as the user's turn, and one refused at its dispatch
    * becomes held input the user must resend or discard, which the goal must not advance over.
    */
   private queuedWorkHasUserInput(): boolean {
@@ -9371,7 +9371,7 @@ export class AgentSession {
   }
 
   /**
-   * User input the goal never advances over (G4): queued or held input, or the user's dequeued
+   * User input the goal never advances over: queued or held input, or the user's dequeued
    * manual send still preparing (it leaves the queue before it publishes, and a failed
    * preparation restores it to the composer).
    */
@@ -9383,7 +9383,7 @@ export class AgentSession {
 
   /**
    * Record that the goal continuation this turn would request at its end is owed by queued work
-   * instead (G4). The fence is sampled now, so a Stop, pause, completion or replacement before
+   * instead. The fence is sampled now, so a Stop, pause, completion or replacement before
    * the queued work settles wins over the owed advancement.
    */
   private oweGoalAdvancementToQueuedWork(turnOptions: SendMessageOptions | undefined): void {
@@ -9399,7 +9399,7 @@ export class AgentSession {
   }
 
   /**
-   * The one wake-up path for goal advancement (G4), whatever its origin. Every blocker re-runs it
+   * The one wake-up path for goal advancement, whatever its origin. Every blocker re-runs it
    * when it clears: the idle transition (a turn, preparation or retried send ended), a queue
    * mutation (entry dequeued, refused, withdrawn or removed, including TaskService withdrawals),
    * held-input removal, and an auto-retry cancellation. While anything blocks, it does nothing.
@@ -9441,7 +9441,7 @@ export class AgentSession {
   }
 
   /**
-   * G4 (#5461): terminal-error settlement. Unconditional first step: a goal turn that failed
+   * Terminal-error settlement (#5461). Unconditional first step: a goal turn that failed
    * retires the kickoff candidate it fired, before any early return below, so no later stream end
    * can re-dispatch failed work (an auto-retry opt-out must not be revived by an unrelated turn).
    * Then, after an error that RetryManager does not retry (non-retryable, such as authentication
@@ -9699,7 +9699,7 @@ export class AgentSession {
       return;
     this.retryManager.handleStreamSuccess();
     // A stream that ended normally proves the provider recovered: the next terminal error starts a
-    // new goal resume episode, whatever path (queued successor or stream-end hook) follows (G4).
+    // new goal resume episode, whatever path (queued successor or stream-end hook) follows.
     this.workspaceGoalService?.resetStreamErrorResumeEpisode(this.workspaceId);
     await this.clearStartupAutoRetryAbandon();
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
@@ -9873,7 +9873,7 @@ export class AgentSession {
         queuedWorkIsAutomatic
       ) {
         // The queued turn continues the goal at its own stream end; if it never streams, the
-        // continuation is still owed (abandoned automatic work, G4).
+        // continuation is still owed (abandoned automatic work).
         this.oweGoalAdvancementToQueuedWork(activeStreamOptions);
       }
       if (
@@ -10349,7 +10349,7 @@ export class AgentSession {
     // Abandon (not a silent cancel): a partial truncation keeps the interrupted tail, and the
     // renderer would otherwise keep that tail's countdown on "Retrying… (attempt N)".
     this.retryManager.abandon("context_changed");
-    // A cancelled retry was a blocker of the pending goal advancement (G4).
+    // A cancelled retry was a blocker of the pending goal advancement.
     this.reevaluateGoalAdvancement();
     this.setAutoRetryResumeState(undefined);
     const deleteResult = await this.historyService.deletePartial(this.workspaceId);
@@ -11319,7 +11319,7 @@ export class AgentSession {
     if (remaining.length === this.heldInputs.length) return false;
     this.heldInputs = remaining;
     this.emitChatEvent(this.heldInputsChangedEvent());
-    // Held input blocks goal advancement and defers every goal continuation (G4).
+    // Held input blocks goal advancement and defers every goal continuation.
     this.reevaluateGoalAdvancement();
     return true;
   }
@@ -11329,7 +11329,7 @@ export class AgentSession {
     // (TaskService deferral reconciliation) read the receipt for this notification.
     this.settleWithdrawnQueueCutReceipts();
     this.emitChatEvent(this.queuedMessageChangedEvent());
-    // A queue mutation may remove the last blocker of goal advancement (G4): a withdrawn, refused
+    // A queue mutation may remove the last blocker of goal advancement: a withdrawn, refused
     // or removed entry never streams, so its turn end never re-evaluates.
     this.reevaluateGoalAdvancement();
   }
@@ -11879,11 +11879,10 @@ export class AgentSession {
       return false;
     }
 
-    // A heartbeat's compact or reset handoff persists its heartbeat turn here. A heartbeat
-    // turned off since it fired must not start that turn, now or at startup recovery
-    // (formal/workspace-goals G2b): drop the handoff, keep the fold. An unreadable config fails
-    // closed: no turn starts, the handoff stays, and the read is retried (#5548). Re-checked at
-    // the send's admission gates below.
+    // A heartbeat's compact or reset handoff persists its heartbeat turn here. A heartbeat turned
+    // off since it fired must not start that turn, now or at startup recovery: drop the handoff,
+    // keep the fold. An unreadable config fails closed: no turn starts, the handoff stays, and the
+    // read is retried (#5548). Re-checked at the send's admission gates below.
     const isHeartbeatFollowUp = muxMeta.pendingFollowUp.muxMetadata?.type === "heartbeat-request";
     const heartbeatState = (): "on" | "off" | "unreadable" => {
       try {
@@ -13043,7 +13042,7 @@ export class AgentSession {
   async appendHeartbeatContextResetBoundary(params: {
     boundaryText: string;
     pendingFollowUp: CompactionFollowUpRequest;
-    /** True once the heartbeat firing must not start (unset, disabled, or a stale slot): no boundary publishes then (G2b). */
+    /** True once the heartbeat firing must not start (unset, disabled, or a stale slot): no boundary publishes then. */
     heartbeatOff?: () => boolean;
   }): Promise<Result<{ summaryMessageId: string }, string>> {
     this.assertNotDisposed("appendHeartbeatContextResetBoundary");
