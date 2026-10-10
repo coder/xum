@@ -1482,6 +1482,37 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
       expect(await nextTurnThinking(workspaceId)).toEqual([]);
     });
 
+    test("a crash after the receipt reached the row keeps it on the next commit", async () => {
+      const workspaceId = "anthropic-receipt-crash-after-row";
+      await seedEarlierTurn(workspaceId);
+      // commitPartial already wrote the receipt to the row, then crashed before
+      // deleting the errored partial.
+      const placeholder = await historyService.appendToHistory(workspaceId, {
+        id: "repaired-turn",
+        role: "assistant",
+        metadata: { historySequence: 3, partial: true, anthropicThinkingReplay: "off" },
+        parts: [],
+      });
+      if (!placeholder.success) throw new Error(placeholder.error);
+      const written = await historyService.writePartial(workspaceId, {
+        id: "repaired-turn",
+        role: "assistant",
+        metadata: {
+          historySequence: 3,
+          partial: true,
+          anthropicThinkingReplay: "off",
+          error: "rejected again",
+          errorType: "reasoning_rejected",
+        },
+        parts: [],
+      });
+      if (!written.success) throw new Error(written.error);
+      const committed = await historyService.commitPartial(workspaceId);
+      if (!committed.success) throw new Error(committed.error);
+
+      expect(await nextTurnThinking(workspaceId)).toEqual([]);
+    });
+
     test("without a receipt, an empty failed turn still leaves no row", async () => {
       const workspaceId = "anthropic-no-receipt-failed-turn";
       await seedEarlierTurn(workspaceId);

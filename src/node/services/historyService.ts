@@ -3543,7 +3543,10 @@ export class HistoryService {
         hadErrorMetadata &&
         !commitWorthy &&
         !hasDurableRefusalMetadata &&
-        (existingMessage.parts?.length ?? 0) === 0;
+        (existingMessage.parts?.length ?? 0) === 0 &&
+        // A row that already holds the replay receipt keeps it (a crash after the receipt
+        // write, before this partial was deleted, #5886).
+        existingMessage.metadata?.anthropicThinkingReplay !== "off";
 
       // #5886: the Anthropic thinking-repair receipt (MuxMetadata.anthropicThinkingReplay)
       // must outlive a turn that produced no output, or the next turn replays the removed
