@@ -40,6 +40,11 @@ import {
   openArtifactsTab,
   pinAndOpenArtifact,
 } from "@/browser/features/RightSidebar/ArtifactsTab/openArtifact";
+import {
+  openMcpAppView,
+  pluginViewRef,
+} from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+import type { WorkspacePluginViews } from "@/browser/features/RightSidebar/ArtifactsTab/usePluginViews";
 import { isTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
   getOrderedBaseTabIds,
@@ -156,8 +161,10 @@ export interface BuildSourcesParams {
   onStartWorkspaceCreation: (projectPath: string) => void;
   onStartMultiProjectWorkspaceCreation: () => void;
   multiProjectWorkspacesEnabled: boolean;
-  /** artifacts experiment: gates "Open Artifacts" and "Open File as Artifact…". */
+  /** artifacts experiment: gates "Open Artifacts", "Open File as Artifact…" and plugin views. */
   artifactsEnabled?: boolean;
+  /** The selected workspace's plugin views (contributes.views); null until listed. */
+  pluginViews?: WorkspacePluginViews | null;
   /** perfFlightRecorder experiment: gates "Report slowness". */
   perfFlightRecorderEnabled?: boolean;
   /** sessionTapes experiment: gates "Save open session tapes" and "Reveal session tapes folder". */
@@ -919,6 +926,18 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                   },
                 },
               },
+              // Plugin views open in the Artifacts tab without a tool call. A view whose
+              // server is disabled still opens: its frame says which server to enable.
+              ...(p.pluginViews?.workspaceId === wsId ? p.pluginViews.views : []).map((view) => ({
+                id: CommandIds.navOpenPluginView(view.pluginViewId),
+                title: `Open plugin view: ${view.title}`,
+                subtitle: view.enabled
+                  ? `from ${view.pluginName}`
+                  : `from ${view.pluginName} · enable the ${view.serverName} server first`,
+                section: section.navigation,
+                keywords: ["plugin", "view", "app", view.pluginName],
+                run: () => openMcpAppView(wsId, pluginViewRef(view)),
+              })),
             ]
           : []),
         {

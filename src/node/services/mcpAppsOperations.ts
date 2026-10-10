@@ -6,6 +6,7 @@ import { ORPCError } from "@orpc/server";
 import type { z } from "zod";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
+  McpAppPluginView,
   McpAppToolCallRequestSchema,
   McpAppToolCallResult,
   McpAppView,
@@ -14,6 +15,7 @@ import type {
 import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ORPCContext } from "@/node/orpc/context";
+import type { PluginViewEntry } from "./agentPlugins/pluginViews";
 import { displayConnectionKey } from "./mcpServerIdentity";
 
 type McpAppsContext = Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
@@ -27,19 +29,100 @@ function assertMcpAppsEnabled(context: McpAppsContext): void {
   }
 }
 
-export async function getMcpAppView(
-  context: McpAppsContext,
-  input: z.infer<typeof McpAppViewRequestSchema>,
-  signal: AbortSignal | undefined,
+/** Resolves a workspace's plugin views from a fresh discovery (listWorkspacePluginViews). */
+export type ListPluginViews = (
+  workspaceId: string,
+  signal: AbortSignal | undefined
+) => Promise<PluginViewEntry[]>;
+
+export interface McpAppViewDeps {
   /**
    * Starts the workspace's MCP servers the way prompt discovery does (resolving runtime, trust,
    * overrides and secrets). Needed when no send or discovery ran since the backend started, e.g.
    * reopening a persisted view after a restart: the manager has no request options to start
    * servers from and every read would fail with "not connected".
    */
-  warmServers: (workspaceId: string, signal: AbortSignal | undefined) => Promise<unknown>
+  warmServers: (workspaceId: string, signal: AbortSignal | undefined) => Promise<unknown>;
+  listPluginViews: ListPluginViews;
+}
+
+export async function listMcpAppPluginViews(
+  context: McpAppsContext,
+  input: { workspaceId: string },
+  signal: AbortSignal | undefined,
+  listPluginViews: ListPluginViews
+): Promise<Result<McpAppPluginView[], string>> {
+  assertMcpAppsEnabled(context);
+  try {
+    const views = await listPluginViews(input.workspaceId, signal);
+    return {
+      success: true,
+      // The resource URI stays in the backend: the renderer opens a view by its ID only.
+      data: views.map((view) => ({
+        pluginViewId: view.pluginViewId,
+        title: view.title,
+        pluginName: view.pluginName,
+        serverName: view.serverName,
+        serverKey: view.serverKey,
+        enabled: view.enabled,
+      })),
+    };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+/** The message a disabled plugin view server shows in the view's frame. */
+export function pluginViewServerDisabledError(serverName: string): string {
+  return `Enable the ${serverName} server for this workspace to open this view (Workspace MCP settings).`;
+}
+
+async function getPluginAppView(
+  context: McpAppsContext,
+  input: Extract<z.infer<typeof McpAppViewRequestSchema>, { kind: "plugin" }>,
+  signal: AbortSignal | undefined,
+  deps: McpAppViewDeps
+): Promise<Result<McpAppView, string>> {
+  try {
+    // Exact match against a fresh discovery: an unknown ID, another workspace's plugin, or a
+    // view whose server the plugin no longer has is refused before any server is contacted.
+    const view = (await deps.listPluginViews(input.workspaceId, signal)).find(
+      (candidate) => candidate.pluginViewId === input.pluginViewId
+    );
+    if (view === undefined) {
+      return { success: false, error: "This plugin view is not available in this workspace" };
+    }
+    if (!view.enabled) {
+      return { success: false, error: pluginViewServerDisabledError(view.serverName) };
+    }
+    if (!context.mcpServerManager.hasWorkspaceRequestOptions(input.workspaceId)) {
+      await deps.warmServers(input.workspaceId, signal);
+    }
+    const resource = await context.mcpServerManager.readMcpAppResource(
+      input.workspaceId,
+      view.serverKey,
+      view.resourceUri,
+      signal !== undefined ? { signal } : undefined
+    );
+    // No tool call opened this view, so there is no result or invocation to bind to; the
+    // frame binds its tools/call to the plugin's server key from listPluginViews.
+    return {
+      success: true,
+      data: { ...resource, resultAvailable: false, result: null, invocation: null },
+    };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function getMcpAppView(
+  context: McpAppsContext,
+  input: z.infer<typeof McpAppViewRequestSchema>,
+  signal: AbortSignal | undefined,
+  deps: McpAppViewDeps
 ): Promise<Result<McpAppView, string>> {
   assertMcpAppsEnabled(context);
+  if (input.kind === "plugin") return getPluginAppView(context, input, signal, deps);
   const record = await context.mcpServerManager.getMcpAppResult(
     input.workspaceId,
     input.toolCallId
@@ -63,7 +146,7 @@ export async function getMcpAppView(
   }
   try {
     if (!context.mcpServerManager.hasWorkspaceRequestOptions(input.workspaceId)) {
-      await warmServers(input.workspaceId, signal);
+      await deps.warmServers(input.workspaceId, signal);
     }
     const resource = await context.mcpServerManager.readMcpAppResource(
       input.workspaceId,

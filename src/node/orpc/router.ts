@@ -29,6 +29,7 @@ import {
   getWorkspacePluginComposition,
   listWorkspaceMcpPrompts,
   listWorkspacePluginSlashCommands,
+  listWorkspacePluginViews,
   setWorkspaceMcpOverrides,
 } from "@/node/services/agentPlugins/workspacePluginOperations";
 import { handlerGen } from "@orpc/experimental-effect";
@@ -50,7 +51,11 @@ import {
   sendInteractionRoute,
   setStateRoute,
 } from "@/node/services/artifactInteractions";
-import { callMcpAppTool, getMcpAppView } from "@/node/services/mcpAppsOperations";
+import {
+  callMcpAppTool,
+  getMcpAppView,
+  listMcpAppPluginViews,
+} from "@/node/services/mcpAppsOperations";
 import {
   listArtifactVersions,
   readArtifactVersion,
@@ -1689,14 +1694,25 @@ export const router = (authToken?: string) => {
         .input(schemas.mcpApps.getView.input)
         .output(schemas.mcpApps.getView.output)
         .handler(({ context, input, signal }) =>
-          getMcpAppView(context, input, signal, (workspaceId, warmSignal) =>
-            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
-          )
+          getMcpAppView(context, input, signal, {
+            warmServers: (workspaceId, warmSignal) =>
+              listWorkspaceMcpPrompts(context, workspaceId, warmSignal),
+            listPluginViews: (workspaceId, listSignal) =>
+              listWorkspacePluginViews(context, workspaceId, listSignal),
+          })
         ),
       callTool: t
         .input(schemas.mcpApps.callTool.input)
         .output(schemas.mcpApps.callTool.output)
         .handler(({ context, input, signal }) => callMcpAppTool(context, input, signal)),
+      listPluginViews: t
+        .input(schemas.mcpApps.listPluginViews.input)
+        .output(schemas.mcpApps.listPluginViews.output)
+        .handler(({ context, input, signal }) =>
+          listMcpAppPluginViews(context, input, signal, (workspaceId, listSignal) =>
+            listWorkspacePluginViews(context, workspaceId, listSignal)
+          )
+        ),
     },
     // Memory handlers run Effect generators via handlerGen (client aborts
     // interrupt the fiber); the wire contracts are unchanged.

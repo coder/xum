@@ -242,6 +242,58 @@ describe("validatePluginManifest", () => {
     expect(result.warnings.length).toBeGreaterThanOrEqual(6);
   });
 
+  test("valid views load; invalid view entries are dropped with warnings", () => {
+    const settings = {
+      id: "settings",
+      title: "Review settings",
+      server: "settings-server",
+      resourceUri: "ui://review/settings",
+    };
+    const result = validatePluginManifest(
+      minimalManifest({
+        contributes: {
+          views: [
+            settings,
+            "not-an-object",
+            { ...settings, id: "Bad Id" },
+            { ...settings, id: "no-title", title: "" },
+            { ...settings, id: "long-title", title: "x".repeat(65) },
+            // A bidi override would disguise the palette label.
+            { ...settings, id: "bidi-title", title: "Settings\u202Eexe" },
+            { ...settings, id: "no-server", server: undefined },
+            { ...settings, id: "https-view", resourceUri: "https://example.com/view.html" },
+            { ...settings, title: "Duplicate loses" },
+          ],
+        },
+      })
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected ok");
+    expect(result.manifest.contributes?.views).toEqual([settings]);
+    expect(result.warnings).toHaveLength(8);
+    expect(result.warnings.some((w) => w.includes("must be a ui:// URI"))).toBe(true);
+  });
+
+  test("views beyond the cap are ignored and a non-array views member warns", () => {
+    const views = Array.from({ length: 20 }, (_, i) => ({
+      id: `view-${i}`,
+      title: `View ${i}`,
+      server: "s",
+      resourceUri: `ui://p/${i}`,
+    }));
+    const capped = validatePluginManifest(minimalManifest({ contributes: { views } }));
+    if (!capped.ok) throw new Error("expected ok");
+    expect(capped.manifest.contributes?.views?.map((view) => view.id)).toEqual(
+      views.slice(0, 16).map((view) => view.id)
+    );
+    expect(capped.warnings.some((w) => w.includes("more than 16 views"))).toBe(true);
+
+    const notArray = validatePluginManifest(minimalManifest({ contributes: { views: {} } }));
+    if (!notArray.ok) throw new Error("expected ok");
+    expect(notArray.manifest.contributes?.views).toBeUndefined();
+    expect(notArray.warnings).toEqual(["'contributes.views' must be an array; ignoring"]);
+  });
+
   test("rejects non-object documents as invalid-manifest", () => {
     for (const raw of [null, "string", 42, ["array"], true]) {
       const result = validatePluginManifest(raw);

@@ -87,7 +87,8 @@ export interface McpAppHostContext {
   locale: string;
   timeZone: string;
   platform: "desktop" | "web" | "mobile";
-  toolInfo: { id: string; tool: { name: string; title?: string } };
+  /** Omitted for a view no tool call opened (plugin views); the spec makes it optional. */
+  toolInfo?: { id: string; tool: { name: string; title?: string } };
 }
 
 export interface McpAppHostOptions {

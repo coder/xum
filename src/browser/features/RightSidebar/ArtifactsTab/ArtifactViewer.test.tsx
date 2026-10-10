@@ -44,6 +44,8 @@ let readRequests: string[] = [];
 
 function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
+    // The panel lists plugin views on mount; these tests have none.
+    mcpApps: { listPluginViews: () => Promise.resolve({ success: true as const, data: [] }) },
     artifacts: {
       // No versions or pinned files: these tests cover the live renderers.
       getState: () =>

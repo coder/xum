@@ -314,6 +314,14 @@ export const AddPluginConsentPreview: Story = {
             agents: ["grill-master.md"],
             workflows: ["grill-report.js"],
             slashCommands: [{ name: "grill", description: "Grill the current plan" }],
+            views: [
+              {
+                id: "settings",
+                title: "Grill settings",
+                server: "grill-db",
+                resourceUri: "ui://grill/settings",
+              },
+            ],
             warnings: ["Unknown top-level field 'hooks' ignored"],
             targetPath: "~/.mux/plugins/grill",
           },
@@ -382,6 +390,7 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
             agents: [],
             workflows: [],
             slashCommands: [],
+            views: [],
             warnings: [],
             targetPath: `~/.mux/plugins/${MAX_LENGTH_NAME}`,
           },

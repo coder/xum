@@ -578,9 +578,9 @@ const AddPluginPanel: React.FC<{
             {selected.skills.length + selected.mcpServers.length === 0
               ? "No skills or MCP servers selected. "
               : ""}
-            Selection does not affect agents, workflows, slash commands, or hooks below: these
-            remain part of the install, even when neither group is selected. Skipped files stay on
-            disk; this is not a filesystem sandbox.
+            Selection does not affect agents, workflows, slash commands, views, or hooks below:
+            these remain part of the install, even when neither group is selected. Skipped files
+            stay on disk; this is not a filesystem sandbox.
           </p>
 
           {preview.agents.length > 0 && (
@@ -627,6 +627,28 @@ const AddPluginPanel: React.FC<{
                     {command.description && (
                       <span className="text-muted"> — {command.description}</span>
                     )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {preview.views.length > 0 && (
+            <div>
+              <h4 className="text-foreground mb-1 text-xs font-medium">
+                Views ({preview.views.length})
+              </h4>
+              {/* Palette entries: each names the plugin server its view talks to. */}
+              <ul className="space-y-1">
+                {preview.views.map((view) => (
+                  <li key={view.id} className="text-xs break-words">
+                    <span className="text-foreground">{view.title}</span>
+                    <span className="text-muted">
+                      {" "}
+                      — opens from the command palette; served by{" "}
+                      <span className="font-mono break-all">{view.server}</span> (
+                      <span className="font-mono break-all">{view.resourceUri}</span>)
+                    </span>
                   </li>
                 ))}
               </ul>

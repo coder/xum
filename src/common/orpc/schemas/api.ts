@@ -74,6 +74,7 @@ import {
 } from "./artifacts";
 import { ResultSchema } from "./result";
 import {
+  McpAppPluginViewSchema,
   McpAppToolCallRequestSchema,
   McpAppToolCallResultSchema,
   McpAppViewRequestSchema,
@@ -1483,6 +1484,11 @@ export const mcpApps = {
   callTool: {
     input: McpAppToolCallRequestSchema,
     output: ResultSchema(McpAppToolCallResultSchema, z.string()),
+  },
+  /** Views the workspace's plugins declare (contributes.views), with their servers' state. */
+  listPluginViews: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: ResultSchema(z.array(McpAppPluginViewSchema), z.string()),
   },
 };
 

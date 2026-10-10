@@ -18,7 +18,7 @@ import {
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
-import { closeMcpAppView, type McpAppViewRef } from "./mcpAppViewsStore";
+import { closeMcpAppView, mcpAppViewKey, type McpAppViewEntry } from "./mcpAppViewsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
@@ -71,7 +71,8 @@ function consentArgsJson(args: Record<string, unknown>): string | null {
 }
 
 interface Loaded {
-  toolCallId: string;
+  /** mcpAppViewKey of the view this load belongs to. */
+  viewKey: string;
   view: McpAppView | null;
   error: string | null;
 }
@@ -100,11 +101,20 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
   }
 }
 
-function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
+function McpAppViewHeader(props: { view: McpAppViewEntry; onClose: () => void }) {
   return (
     <div className="border-border-light flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-[11px]">
       <span className="text-muted min-w-0 flex-1 truncate">
-        App view from <span className="text-foreground">{props.serverName}</span>
+        {props.view.kind === "plugin" ? (
+          <>
+            <span className="text-foreground">{props.view.title}</span> from plugin{" "}
+            <span className="text-foreground">{props.view.pluginName}</span>
+          </>
+        ) : (
+          <>
+            App view from <span className="text-foreground">{props.view.serverName}</span>
+          </>
+        )}
       </span>
       <TooltipIfPresent tooltip="Close view">
         <button
@@ -150,7 +160,12 @@ function inlineMaxHeight(): number {
 
 export function McpAppFrame(props: {
   workspaceId: string;
-  view: McpAppViewRef;
+  /**
+   * A tool call's view, or a plugin view (contributes.views) opened without a tool call. A
+   * plugin view has no tool input, result or toolInfo: the host omits all three (the spec
+   * makes toolInfo optional), and its tools/call goes to the plugin's own server.
+   */
+  view: McpAppViewEntry;
   variant?: McpAppFrameVariant;
 }) {
   const inline = props.variant === "inline";
@@ -169,30 +184,48 @@ export function McpAppFrame(props: {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const hostRef = useRef<McpAppHost | null>(null);
   const { workspaceId, view } = props;
-  const { toolCallId, serverName, resourceUri } = view;
+  const viewKey = mcpAppViewKey(view);
+  // Display form of the view's server (consent prompts, the frame title). Tool cards carry the
+  // sanitized connection key; a plugin view shows its mcp.json server name.
+  const serverName = view.serverName;
+  // Primitive inputs of the view request, so a re-render with an equal ref does not refetch.
+  const toolCallId = view.kind === "plugin" ? null : view.toolCallId;
+  const resourceUri = view.kind === "plugin" ? null : view.resourceUri;
+  const pluginViewId = view.kind === "plugin" ? view.pluginViewId : null;
 
   useEffect(() => {
     if (!api) return;
     const controller = new AbortController();
+    // A plugin view is named by its ID only: the backend picks its server and resource.
+    const request =
+      pluginViewId != null
+        ? { kind: "plugin" as const, workspaceId, pluginViewId }
+        : {
+            kind: "tool" as const,
+            workspaceId,
+            toolCallId: toolCallId ?? "",
+            serverName,
+            resourceUri: resourceUri ?? "",
+          };
     api.mcpApps
-      .getView({ workspaceId, toolCallId, serverName, resourceUri }, { signal: controller.signal })
+      .getView(request, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
         setLoaded(
           result.success
-            ? { toolCallId, view: result.data, error: null }
-            : { toolCallId, view: null, error: result.error }
+            ? { viewKey, view: result.data, error: null }
+            : { viewKey, view: null, error: result.error }
         );
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) {
-          setLoaded({ toolCallId, view: null, error: getErrorMessage(error) });
+          setLoaded({ viewKey, view: null, error: getErrorMessage(error) });
         }
       });
     return () => controller.abort();
-  }, [api, workspaceId, toolCallId, serverName, resourceUri]);
+  }, [api, workspaceId, viewKey, toolCallId, serverName, resourceUri, pluginViewId]);
 
-  const current = loaded?.toolCallId === toolCallId ? loaded : null;
+  const current = loaded?.viewKey === viewKey ? loaded : null;
   const grant = current?.view ? grantMcpAppCsp(current.view.csp, { allowCdn }) : null;
   const srcDoc =
     current?.view && grant
@@ -205,7 +238,9 @@ export function McpAppFrame(props: {
   const { navigatedRef } = guard;
   // The result record binds the view to the call that produced it (server, server-local tool
   // name, sanitized arguments); the card's display values are only a fallback without one.
-  const boundServerName = current?.view?.invocation?.serverName ?? serverName;
+  // A plugin view is bound to its plugin's server key from listPluginViews.
+  const boundServerName =
+    view.kind === "plugin" ? view.serverKey : (current?.view?.invocation?.serverName ?? serverName);
 
   // Values the long-lived host reads at message time.
   const latest = useRef({ theme, view, result: current?.view ?? null });
@@ -228,13 +263,17 @@ export function McpAppFrame(props: {
       locale: navigator.language,
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       platform: hostPlatform(),
-      toolInfo: {
-        id: latest.current.view.toolCallId,
-        tool: {
-          name: latest.current.result?.invocation?.toolName ?? latest.current.view.toolName,
-          title: latest.current.view.label,
-        },
-      },
+      ...(latest.current.view.kind === "plugin"
+        ? {}
+        : {
+            toolInfo: {
+              id: latest.current.view.toolCallId,
+              tool: {
+                name: latest.current.result?.invocation?.toolName ?? latest.current.view.toolName,
+                title: latest.current.view.label,
+              },
+            },
+          }),
     });
     const host = createMcpAppHost({
       // Shown in consent prompts: the card's sanitized display key, never the raw bound key
@@ -280,6 +319,8 @@ export function McpAppFrame(props: {
       },
       onInitialized: () => {
         const { view: currentView, result } = latest.current;
+        // No tool call opened a plugin view: there is no input, result or cancellation to send.
+        if (currentView.kind === "plugin") return;
         host.sendToolInput(
           result?.invocation != null ? result.invocation.arguments : currentView.arguments
         );
@@ -333,12 +374,10 @@ export function McpAppFrame(props: {
 
   const close = async () => {
     await hostRef.current?.teardown("closed");
-    closeMcpAppView(workspaceId, toolCallId);
+    closeMcpAppView(workspaceId, view);
   };
 
-  const header = inline ? null : (
-    <McpAppViewHeader serverName={serverName} onClose={() => void close()} />
-  );
+  const header = inline ? null : <McpAppViewHeader view={view} onClose={() => void close()} />;
 
   if (current == null) return <Notice>Loading…</Notice>;
   if (current.view == null || srcDoc == null || grant == null) {
@@ -354,7 +393,7 @@ export function McpAppFrame(props: {
   return (
     <div className={inline ? "flex flex-col" : "flex h-full min-h-0 flex-col"}>
       {header}
-      {!current.view.resultAvailable && !view.cancelled && (
+      {view.kind !== "plugin" && !current.view.resultAvailable && !view.cancelled && (
         <NoteBar>Result no longer available. The view shows the tool input only.</NoteBar>
       )}
       {grant.notGranted.length > 0 && (
@@ -413,7 +452,11 @@ export function McpAppFrame(props: {
           <iframe
             key={guard.frameKey}
             ref={frameRef}
-            title={`${view.label} (${serverName})`}
+            title={
+              view.kind === "plugin"
+                ? `${view.title} (${view.pluginName})`
+                : `${view.label} (${serverName})`
+            }
             sandbox={ARTIFACT_IFRAME_SANDBOX}
             referrerPolicy="no-referrer"
             srcDoc={srcDoc}

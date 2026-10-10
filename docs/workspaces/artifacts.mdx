@@ -133,6 +133,8 @@ When the workspace has an active goal, Xum keeps `goal.status.html` up to date i
 
 MCP servers that support [MCP Apps](https://github.com/modelcontextprotocol/ext-apps) can return a small interface with a tool result. Open it with **Open in Artifacts** on the tool card. It appears under **App views** in the picker.
 
+Agent Plugins can also declare views that open without a tool call. They appear under **Plugin views** in the picker and in the command palette. See [Plugin views](/config/mcp-servers#plugin-views).
+
 - The app asks before it calls a tool that the agent can also call, before it opens a link, and before it inserts text into your message.
 - It cannot reach domains it did not declare, and only declared domains that are on the CDN list below.
 - If the project or workspace limits which MCP tools are allowed, the app can call only tools on that list, including tools meant only for the app.

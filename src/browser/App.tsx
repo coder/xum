@@ -57,6 +57,7 @@ import {
 } from "@/constants/layout";
 import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
 import { buildCoreSources, type BuildSourcesParams } from "./utils/commands/sources";
+import { usePluginViews } from "./features/RightSidebar/ArtifactsTab/usePluginViews";
 
 import {
   getTopLevelProjectEntries,
@@ -247,6 +248,8 @@ function AppInner() {
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  // Plugin views are MCP Apps views, so the Artifacts experiment gates them too.
+  const pluginViews = usePluginViews(selectedWorkspace?.workspaceId ?? null, artifactsEnabled);
   const sessionTapesEnabled = useExperimentValue(EXPERIMENT_IDS.SESSION_TAPES);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const perfFlightRecorderEnabled = useExperimentValue(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER);
@@ -990,6 +993,7 @@ function AppInner() {
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
     artifactsEnabled,
+    pluginViews,
     perfFlightRecorderEnabled,
     sessionTapesEnabled,
     onArchiveMergedWorkspacesInProject: archiveMergedWorkspacesInProjectFromPalette,
