@@ -176,6 +176,17 @@ export async function openProjectCreationView(
     },
     { timeout: 10_000 }
   );
+  // The page renders its composer before the branch list loads, and until then the trunk branch
+  // is empty, so a send that fast is refused for a worktree runtime ("Trunk branch is required").
+  // A slow host reaches that state (#6016): wait for the branch selector, as a user would.
+  await waitFor(
+    () => {
+      if (!view.container.querySelector('[aria-label="Select source branch"]')) {
+        throw new Error("Source branches not loaded");
+      }
+    },
+    { timeout: 30_000 }
+  );
 }
 
 /**
