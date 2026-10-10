@@ -198,6 +198,9 @@ export async function startProxy(options: ProxyOptions) {
     // never reports that (no 'close', writes still succeed; Bun 1.4.2 does), so there the call
     // runs on to its upstream end, its deadline or close(), and holds its slot until then.
     // Bun.serve does report it, but it drops duplicate headers, which P2 must see.
+    // Removal trigger: the Bun bump that #4958 blocks. With it, make proxy.test.ts's "a client
+    // that goes away" test strict again (the call aborts and keeps its full reservation) and
+    // run it on the new Bun. On this host Bun 1.3.13 still misses the disconnect; 1.4.2 sees it.
     res.on("close", () => res.writableFinished || abort.abort());
     abort.signal.addEventListener("abort", () => res.destroy(), { once: true });
     const call = { abort, done: Promise.resolve() };
