@@ -5,6 +5,7 @@ import { describe, it, expect } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
+import { AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS } from "@/common/constants/toolLimits";
 const GLOBAL_WORKSPACE_ID = "workspace-global";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { createAgentSkillReadTool } from "./agent_skill_read";
@@ -387,36 +388,62 @@ describe("agent_skill_read", () => {
     }
   });
 
-  it("appends whenToUse guidance only for skills that carry it in the description index", () => {
-    using tempDir = new TestTempDir("test-agent-skill-read-when-to-use");
-    const baseConfig = createTestToolConfig(tempDir.path);
-
+  function skillIndexLines(
+    availableSkills: NonNullable<Parameters<typeof createAgentSkillReadTool>[0]["availableSkills"]>
+  ): string[] {
+    using tempDir = new TestTempDir("test-agent-skill-read-index");
     const tool = createAgentSkillReadTool({
-      ...baseConfig,
-      availableSkills: [
-        {
-          name: "with-guidance",
-          description: "Skill carrying extra guidance",
-          scope: "global",
-          whenToUse: "only when triaging incoming issues",
-        },
-        {
-          name: "without-guidance",
-          description: "Skill without extra guidance",
-          scope: "global",
-        },
-      ],
+      ...createTestToolConfig(tempDir.path),
+      availableSkills,
     });
-
     // The ai SDK types `description` as string | dynamic-function; the factory always
     // builds a static string.
     const description = typeof tool.description === "string" ? tool.description : "";
-    const lines = description.split("\n");
+    return description.split("\n");
+  }
+
+  it("appends whenToUse guidance only for skills that carry it in the description index", () => {
+    const lines = skillIndexLines([
+      {
+        name: "with-guidance",
+        description: "Skill carrying extra guidance",
+        scope: "global",
+        whenToUse: "only when triaging incoming issues",
+      },
+      {
+        name: "without-guidance",
+        description: "Skill without extra guidance",
+        scope: "global",
+      },
+    ]);
     const withLine = lines.find((line) => line.startsWith("- with-guidance:"));
     const withoutLine = lines.find((line) => line.startsWith("- without-guidance:"));
 
     expect(withLine).toContain("only when triaging incoming issues");
     expect(withoutLine).toBeDefined();
     expect(withoutLine).not.toContain("When to use:");
+  });
+
+  it("keeps each index description on one line within the length cap", () => {
+    const lines = skillIndexLines([
+      {
+        name: "long",
+        description: "x".repeat(AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS + 50),
+        scope: "global",
+      },
+      { name: "short", description: "Short description", scope: "global" },
+      { name: "multi-line", description: "First line\n  second   line", scope: "global" },
+    ]);
+    const descriptionOf = (name: string) =>
+      lines
+        .find((line) => line.startsWith(`- ${name}: `))
+        ?.slice(`- ${name}: `.length)
+        .replace(/ \(scope: global\)$/, "");
+
+    const long = descriptionOf("long");
+    expect(long).toHaveLength(AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS);
+    expect(long?.endsWith("…")).toBe(true);
+    expect(descriptionOf("short")).toBe("Short description");
+    expect(descriptionOf("multi-line")).toBe("First line second line");
   });
 });

@@ -58,3 +58,7 @@ export const MCP_PROMPT_MAX_DESCRIPTION_CHARS = 500;
 // slash invocation binds tokens positionally. This also bounds descriptor and
 // hint construction.
 export const MCP_PROMPT_MAX_ARGUMENTS = 64;
+
+// Per-skill description cap in the agent_skill_read index: skill frontmatter allows long
+// descriptions, and every workspace pays the index before its first message.
+export const AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS = 280;
