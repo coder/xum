@@ -237,7 +237,12 @@ export const EvaluationAdmissionSchema = z.object({
     configFingerprint: z.string(),
   }),
   timeoutMs: z.number().int().positive(),
-  attemptDeadlineAt: z.string().datetime({ offset: true }),
+  // Persisted in workflow step records, so it accepts the same minute-precision form as the
+  // other workflow timestamps (IsoDateTimeSchema in orpc/schemas/workflow.ts).
+  attemptDeadlineAt: z.union([
+    z.iso.datetime({ offset: true }),
+    z.iso.datetime({ offset: true, precision: -1 }),
+  ]),
   providerOptions: EvaluationProviderOptionsSchema.optional(),
   stateSha256: z.string(),
   stateBytes: z.number().int().nonnegative(),

@@ -37,7 +37,15 @@ export const WorkflowRunStatusSchema = z.enum([
   "failed",
 ]);
 
-const IsoDateTimeSchema = z.string().datetime({ offset: true });
+// zod >= 4.5 rejects minute-precision datetimes with a zone ("2026-05-29T00:01Z"), which zod
+// 4.4 accepted. Writers use toISOString (always with seconds), but persisted run.json and
+// journal records from before or from other writers must stay readable: an unreadable run.json
+// makes createRunIfAbsent treat the run as half-created and delete it. This is zod's
+// documented union for accepting both precisions.
+const IsoDateTimeSchema = z.union([
+  z.iso.datetime({ offset: true }),
+  z.iso.datetime({ offset: true, precision: -1 }),
+]);
 export const JsonValueSchema: z.ZodType<unknown> = z.lazy(() =>
   z.union([
     z.string(),

@@ -11,7 +11,9 @@ import type { HistoryRowDescriptor, HistoryRowToken } from "./historyRowScanner"
 import { createHistoryStringEvidence, createHistoryNumberEvidence } from "./historyScalarEvidence";
 
 const INVALID = Symbol("invalid history projection");
-const STRING_PREFIX = WorkflowScriptDescriptorSchema.shape.description.maxLength! + 1;
+// zod >= 4.5 bounds string length in code points. A code point takes at most two UTF-16
+// units, so this many units always hold one code point past the largest bound.
+const STRING_PREFIX = 2 * (WorkflowScriptDescriptorSchema.shape.description.maxLength! + 1);
 type StringFacts = ReturnType<ReturnType<typeof createHistoryStringEvidence>["finish"]>;
 interface Value {
   value: unknown;
@@ -187,8 +189,9 @@ export function createHistoryMessageEvidence(
       const key = frame.key!.prefix;
       if (shape && Object.hasOwn(shape, key) && key.length === frame.key!.length)
         frame.fields.set(key, item);
-      else if (strict.has(frame.context) && key !== "__proto__")
-        frame.fields.set("", { value: null });
+      // zod >= 4.5 `.strict()` reports an own `__proto__` key (JSON.parse makes one) as
+      // unrecognized, so it fails the row like any other extra key.
+      else if (strict.has(frame.context)) frame.fields.set("", { value: null });
     }
   };
   return {
