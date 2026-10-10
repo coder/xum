@@ -147,17 +147,28 @@ const expectedBlocks = [
   { type: "tool_use", id: "toolu_1", name: "bash", input: { script: "pwd" } },
 ];
 
-/**
- * One step with a server tool between thinking blocks (#5887): thinking "plan",
- * server_tool_use web_search, web_search_tool_result, thinking "read", client tool_use.
- */
-const serverToolResponse = () =>
-  sse([
-    messageStart,
-    ...thinkingBlock(0, "plan", "sig-plan"),
+/** A successful web search result block's content, as the API returns it. */
+const searchResults = [
+  {
+    type: "web_search_result",
+    url: "https://example.com/xum",
+    title: "Xum",
+    encrypted_content: "enc-1",
+    page_age: null,
+  },
+];
+/** A failed web search: history does not replay it natively (#5887 scope). */
+const searchError = { type: "web_search_tool_result_error", error_code: "unavailable" };
+
+/** The SDK's stream output for a failed search: a server tool history does not replay natively. */
+const nonNativeSearchOutput = { type: "web_search_tool_result_error", errorCode: "unavailable" };
+
+/** server_tool_use web_search at `index`, then its web_search_tool_result at `index + 1`. */
+function webSearchBlocks(index: number, content: unknown): unknown[] {
+  return [
     {
       type: "content_block_start",
-      index: 1,
+      index,
       content_block: {
         type: "server_tool_use",
         id: "srvtoolu_1",
@@ -165,40 +176,42 @@ const serverToolResponse = () =>
         input: { query: "xum" },
       },
     },
-    { type: "content_block_stop", index: 1 },
+    { type: "content_block_stop", index },
     {
       type: "content_block_start",
-      index: 2,
-      content_block: {
-        type: "web_search_tool_result",
-        tool_use_id: "srvtoolu_1",
-        content: [
-          {
-            type: "web_search_result",
-            url: "https://example.com/xum",
-            title: "Xum",
-            encrypted_content: "enc-1",
-            page_age: null,
-          },
-        ],
+      index: index + 1,
+      content_block: { type: "web_search_tool_result", tool_use_id: "srvtoolu_1", content },
+    },
+    { type: "content_block_stop", index: index + 1 },
+  ];
+}
+
+/**
+ * One step with a server tool between thinking blocks (#5887): thinking "plan",
+ * server_tool_use web_search, web_search_tool_result, thinking "read", client tool_use.
+ */
+const serverToolResponse =
+  (content: unknown = searchResults) =>
+  () =>
+    sse([
+      messageStart,
+      ...thinkingBlock(0, "plan", "sig-plan"),
+      ...webSearchBlocks(1, content),
+      ...thinkingBlock(3, "read", "sig-read"),
+      {
+        type: "content_block_start",
+        index: 4,
+        content_block: { type: "tool_use", id: "toolu_2", name: "bash", input: {} },
       },
-    },
-    { type: "content_block_stop", index: 2 },
-    ...thinkingBlock(3, "read", "sig-read"),
-    {
-      type: "content_block_start",
-      index: 4,
-      content_block: { type: "tool_use", id: "toolu_2", name: "bash", input: {} },
-    },
-    {
-      type: "content_block_delta",
-      index: 4,
-      delta: { type: "input_json_delta", partial_json: '{"script":"pwd"}' },
-    },
-    { type: "content_block_stop", index: 4 },
-    { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } },
-    { type: "message_stop" },
-  ]);
+      {
+        type: "content_block_delta",
+        index: 4,
+        delta: { type: "input_json_delta", partial_json: '{"script":"pwd"}' },
+      },
+      { type: "content_block_stop", index: 4 },
+      { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } },
+      { type: "message_stop" },
+    ]);
 
 describe("StreamManager - Anthropic preserved thinking replay", () => {
   test("replays every thinking block from history as the API returned it", async () => {
@@ -259,14 +272,14 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
     expect(firstAssistantBlocks(bodies[2])).toEqual(expectedBlocks);
   });
 
-  describe("server tool between thinking blocks (#5887, containment)", () => {
-    // Xum stores an Anthropic server tool (web_search) as a client tool call without its
-    // encrypted results, so history replays it as a tool_use/tool_result pair instead of
-    // the API's server_tool_use + web_search_tool_result blocks. Thinking after the server
-    // tool is bound to a prefix Xum never sends again. Until native replay exists, such a
-    // turn writes the thinking-replay receipt, and later requests in the context segment
-    // send no thinking (removing all thinking blocks is valid per the preserved-thinking
-    // docs). A scripted fixture proves the drift and the strip, not upstream acceptance.
+  describe("server tool between thinking blocks (#5887)", () => {
+    // History replays a successful Anthropic web_search natively (server_tool_use +
+    // web_search_tool_result, ciphertext included), so the thinking after it stays valid.
+    // Any other server tool (a failed search here) replays as a client tool_use/tool_result
+    // pair: thinking after it is bound to a prefix Xum never sends again, so such a turn
+    // writes the thinking-replay receipt and later requests in the context segment send no
+    // thinking (removing all thinking blocks is valid per the preserved-thinking docs).
+    // A scripted fixture proves the request shape, not upstream acceptance.
     const bashTool = () =>
       tool({
         inputSchema: z.object({ script: z.string() }),
@@ -364,9 +377,9 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
       expect(uses).toBeGreaterThan(0);
     }
 
-    test("a server tool before thinking turns thinking replay off for the segment", async () => {
+    test("a non-native server tool before thinking turns thinking replay off for the segment", async () => {
       const workspaceId = "preserved-thinking-server-tool";
-      const scripted = await runServerToolTurn(workspaceId, serverToolResponse);
+      const scripted = await runServerToolTurn(workspaceId, serverToolResponse(searchError));
 
       // The SDK's own in-turn replay keeps the API's block order, native result included:
       // that is the prefix the "read" signature is bound to.
@@ -383,6 +396,12 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
       const row = history.data.find((message) => message.id === scripted.messageId);
       expect(row?.metadata?.partial).not.toBe(true);
       expect(row?.metadata?.anthropicThinkingReplay).toBe("off");
+      // Stored as the client pair it was before native replay: an older build's SDK would
+      // throw on a flagged result it cannot validate.
+      const search = row?.parts.find(
+        (part) => part.type === "dynamic-tool" && part.toolCallId === "srvtoolu_1"
+      );
+      expect(search?.type === "dynamic-tool" && search.providerExecuted).toBeFalsy();
 
       const next = await nextTurnBody(workspaceId, scripted);
       expect(thinkingTypes(next)).toEqual([]);
@@ -402,7 +421,7 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
       );
       let scripted: Awaited<ReturnType<typeof runServerToolTurn>>;
       try {
-        scripted = await runServerToolTurn(workspaceId, serverToolResponse);
+        scripted = await runServerToolTurn(workspaceId, serverToolResponse(searchError));
       } finally {
         writePartial.mockRestore();
       }
@@ -559,7 +578,7 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
                   type: "tool-result",
                   toolCallId: "srvtoolu_1",
                   toolName: "web_search",
-                  output: [],
+                  output: nonNativeSearchOutput,
                   providerExecuted: true,
                 },
                 // A retry that does not preserve parts drops the server-tool part, while
@@ -619,7 +638,7 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
                 type: "tool-result",
                 toolCallId: "srvtoolu_1",
                 toolName: "web_search",
-                output: [],
+                output: nonNativeSearchOutput,
                 providerExecuted: true,
               },
               REFUSAL_FINISH,
@@ -697,7 +716,7 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
                   type: "tool-result",
                   toolCallId: "srvtoolu_1",
                   toolName: "web_search",
-                  output: [],
+                  output: nonNativeSearchOutput,
                   providerExecuted: true,
                 },
                 { type: "reasoning-delta", text: "read" },
@@ -720,6 +739,390 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
         modelString: "anthropic:claude-opus-5-5",
       });
       expect(seen).toEqual([undefined, "off"]);
+    });
+
+    test("replays a successful web search natively, in place, and writes no receipt", async () => {
+      const workspaceId = "preserved-thinking-native-search";
+      const scripted = await runServerToolTurn(workspaceId, serverToolResponse());
+      // The SDK's in-turn replay is the reference: the API's block order, ciphertext included.
+      const reference = firstAssistantBlocks(scripted.bodies[1]);
+      expect(reference.map((block) => block.type)).toEqual([
+        "thinking",
+        "server_tool_use",
+        "web_search_tool_result",
+        "thinking",
+        "tool_use",
+      ]);
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const row = history.data.find((message) => message.id === scripted.messageId);
+      expect(row?.metadata?.anthropicThinkingReplay).toBeUndefined();
+      const search = row?.parts.find(
+        (part) => part.type === "dynamic-tool" && part.toolCallId === "srvtoolu_1"
+      );
+      expect(search?.type === "dynamic-tool" && search.providerExecuted).toBe(true);
+      expect(JSON.stringify(search)).toContain("enc-1");
+
+      // Each thinking signature binds to everything before it: the next turn sends the same
+      // blocks, so the "read" thinking stays valid and nothing is stripped.
+      const next = await nextTurnBody(workspaceId, scripted);
+      expect(firstAssistantBlocks(next)).toEqual(reference);
+      expect(thinkingTypes(next)).toEqual(["thinking", "thinking"]);
+    });
+
+    test("a search result with a null title replays natively without failing the request", async () => {
+      // The SDK stream omits a null title, but its replay schema requires the key.
+      const workspaceId = "preserved-thinking-null-title";
+      const untitled = [{ ...searchResults[0], title: null }];
+      const scripted = await runServerToolTurn(workspaceId, () =>
+        sse([
+          messageStart,
+          ...thinkingBlock(0, "plan", "sig-plan"),
+          ...webSearchBlocks(1, untitled),
+          ...thinkingBlock(3, "read", "sig-read"),
+          { type: "content_block_start", index: 4, content_block: { type: "text", text: "" } },
+          { type: "content_block_delta", index: 4, delta: { type: "text_delta", text: "found" } },
+          { type: "content_block_stop", index: 4 },
+          {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 3 },
+          },
+          { type: "message_stop" },
+        ])
+      );
+      // Stored with the null the API returned, so any reader's SDK can validate it.
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const search = history.data
+        .find((message) => message.id === scripted.messageId)
+        ?.parts.find((part) => part.type === "dynamic-tool" && part.toolCallId === "srvtoolu_1");
+      expect(
+        search?.type === "dynamic-tool" && search.state === "output-available" && search.output
+      ).toEqual([
+        {
+          type: "web_search_result",
+          url: "https://example.com/xum",
+          title: null,
+          pageAge: null,
+          encryptedContent: "enc-1",
+        },
+      ]);
+      const next = await nextTurnBody(workspaceId, scripted);
+      const result = firstAssistantBlocks(next).find(
+        (block) => block.type === "web_search_tool_result"
+      );
+      expect(result?.content).toEqual([
+        {
+          type: "web_search_result",
+          url: "https://example.com/xum",
+          title: null,
+          encrypted_content: "enc-1",
+          page_age: null,
+        },
+      ]);
+    });
+
+    test("three turns resend each request's blocks unchanged, so the cached prefix holds", async () => {
+      // Prompt caching reuses the longest unchanged prefix (system, tools, then messages).
+      // Each request must equal the previous one plus the previous reply, as the API returned
+      // it, plus the new user turn. cache_control is checked on its own: Xum moves the message
+      // breakpoint to the newest block on every request, which changes the JSON, not content.
+      const workspaceId = "preserved-thinking-cache-prefix";
+      const thinkingText = (n: number) => () =>
+        sse([
+          messageStart,
+          ...thinkingBlock(0, `t${n}`, `sig-t${n}`),
+          { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+          {
+            type: "content_block_delta",
+            index: 1,
+            delta: { type: "text_delta", text: `answer ${n}` },
+          },
+          { type: "content_block_stop", index: 1 },
+          {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 1 },
+          },
+          { type: "message_stop" },
+        ]);
+      const searchThenText = () =>
+        sse([
+          messageStart,
+          ...thinkingBlock(0, "plan", "sig-plan"),
+          ...webSearchBlocks(1, searchResults),
+          ...thinkingBlock(3, "read", "sig-read"),
+          { type: "content_block_start", index: 4, content_block: { type: "text", text: "" } },
+          { type: "content_block_delta", index: 4, delta: { type: "text_delta", text: "found" } },
+          { type: "content_block_stop", index: 4 },
+          {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn" },
+            usage: { output_tokens: 3 },
+          },
+          { type: "message_stop" },
+        ]);
+      // What the API returned on each turn, in request-block form.
+      const replies = [
+        [
+          { type: "thinking", thinking: "plan", signature: "sig-plan" },
+          {
+            type: "server_tool_use",
+            id: "srvtoolu_1",
+            name: "web_search",
+            input: { query: "xum" },
+          },
+          {
+            type: "web_search_tool_result",
+            tool_use_id: "srvtoolu_1",
+            content: [
+              {
+                type: "web_search_result",
+                url: "https://example.com/xum",
+                title: "Xum",
+                encrypted_content: "enc-1",
+                page_age: null,
+              },
+            ],
+          },
+          { type: "thinking", thinking: "read", signature: "sig-read" },
+          { type: "text", text: "found" },
+        ],
+        [
+          { type: "thinking", thinking: "t2", signature: "sig-t2" },
+          { type: "text", text: "answer 2" },
+        ],
+      ];
+      const scripted = scriptedAnthropicModel([searchThenText, thinkingText(2), thinkingText(3)]);
+      const tools = {
+        web_search: scripted.provider.tools.webSearch_20250305({ maxUses: 5 }) as Tool,
+      };
+      const streamManager = createStreamManagerForTests(historyService, {
+        streamText: fakeStreamText((options) => aiSdk.streamText(options)),
+      });
+      for (const [turn, text] of ["search", "next 2", "next 3"].entries()) {
+        const appended = await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage(`user-${turn}`, "user", text, { historySequence: turn * 2 })
+        );
+        if (!appended.success) throw new Error(appended.error);
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!history.success) throw new Error(history.error);
+        const payload = await assemblePromptPayload({
+          history: history.data,
+          systemMessage: "system",
+          modelString: "anthropic:claude-opus-5-5",
+          providerForMessages: "anthropic",
+          effectiveThinkingLevel: "high",
+          effectiveAgentId: "exec",
+          toolNamesForSentinel: [],
+          workspaceId,
+        });
+        await runTurnForTests(streamManager, {
+          workspaceId,
+          messageId: `assistant-${turn}`,
+          historySequence: turn * 2 + 1,
+          model: scripted.model,
+          modelString: "anthropic:claude-opus-5-5",
+          messages: payload.messages.filter((message) => message.role !== "system"),
+          tools,
+        });
+      }
+
+      const bodies = scripted.bodies as unknown as Array<Record<string, unknown>>;
+      expect(bodies).toHaveLength(3);
+      const withoutCacheControl = (value: unknown): unknown =>
+        JSON.parse(
+          JSON.stringify(value, (key, item: unknown) =>
+            key === "cache_control" ? undefined : item
+          )
+        );
+      const cacheControlPaths = (value: unknown, path = ""): string[] => {
+        if (Array.isArray(value))
+          return value.flatMap((item, i) => cacheControlPaths(item, `${path}[${i}]`));
+        if (typeof value !== "object" || value === null) return [];
+        return Object.entries(value).flatMap(([key, item]) =>
+          key === "cache_control" ? [path] : cacheControlPaths(item, `${path}.${key}`)
+        );
+      };
+      for (let turn = 1; turn < bodies.length; turn++) {
+        const previous = bodies[turn - 1];
+        const current = bodies[turn];
+        const previousMessages = previous.messages as unknown[];
+        const currentMessages = current.messages as unknown[];
+        expect(withoutCacheControl(current.system)).toEqual(withoutCacheControl(previous.system));
+        expect(withoutCacheControl(current.tools)).toEqual(withoutCacheControl(previous.tools));
+        expect(withoutCacheControl(currentMessages.slice(0, previousMessages.length))).toEqual(
+          withoutCacheControl(previousMessages)
+        );
+        expect(withoutCacheControl(currentMessages[previousMessages.length])).toEqual({
+          role: "assistant",
+          content: replies[turn - 1],
+        });
+        expect(currentMessages).toHaveLength(previousMessages.length + 2);
+      }
+      // The breakpoints: system and tools keep theirs; the message breakpoint sits on the
+      // newest block only.
+      const breakpoints = bodies.map((body) => cacheControlPaths(body));
+      const lastBlock = (body: Record<string, unknown>) => {
+        const messages = body.messages as Array<{ content: unknown[] }>;
+        return `.messages[${messages.length - 1}].content[${messages.at(-1)!.content.length - 1}]`;
+      };
+      for (const [index, paths] of breakpoints.entries()) {
+        const messagePaths = paths.filter((path) => path.startsWith(".messages"));
+        expect(messagePaths).toEqual([lastBlock(bodies[index])]);
+        expect(paths.filter((path) => !path.startsWith(".messages"))).toEqual(
+          breakpoints[0].filter((path) => !path.startsWith(".messages"))
+        );
+      }
+    });
+
+    test("another provider's request gets the search as a client pair, without the ciphertext", async () => {
+      const workspaceId = "preserved-thinking-native-to-openai";
+      const scripted = await runServerToolTurn(workspaceId, serverToolResponse());
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const messages = await prepareMessagesForProvider({
+        messagesWithSentinel: [
+          ...history.data,
+          createMuxMessage("user-2", "user", "next", { historySequence: 2 }),
+        ],
+        effectiveAgentId: "exec",
+        toolNamesForSentinel: [],
+        providerForMessages: "openai",
+        effectiveThinkingLevel: "high",
+        modelString: "openai:gpt-5.2",
+        workspaceId,
+      });
+      expect(scripted.messageId).toBeDefined();
+      const parts = messages.flatMap((message) =>
+        Array.isArray(message.content) ? (message.content as Array<Record<string, unknown>>) : []
+      );
+      // The OpenAI converter drops provider-executed calls it did not run: the pair keeps the
+      // search in the transcript.
+      expect(parts.filter((part) => part.providerExecuted === true)).toEqual([]);
+      expect(
+        parts.filter((part) => part.type === "tool-call" && part.toolName === "web_search")
+      ).toHaveLength(1);
+      expect(
+        parts.filter((part) => part.type === "tool-result" && part.toolName === "web_search")
+      ).toHaveLength(1);
+      expect(JSON.stringify(messages)).not.toContain("enc-1");
+    });
+
+    test("a native row that lost its ciphertext replays as a client pair, with no thinking", async () => {
+      // Without the ciphertext the SDK refuses to build the native block (no request at all),
+      // and the thinking after it is bound to native blocks that are not sent.
+      const workspaceId = "preserved-thinking-incomplete-native";
+      const scripted = scriptedAnthropicModel([textResponse]);
+      const row = createMuxMessage("assistant-1", "assistant", "", { historySequence: 1 }, [
+        {
+          type: "reasoning",
+          text: "plan",
+          providerOptions: { anthropic: { signature: "sig-plan" } },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: "srvtoolu_1",
+          toolName: "web_search",
+          state: "output-available",
+          input: { query: "xum" },
+          providerExecuted: true,
+          output: [
+            {
+              type: "web_search_result",
+              url: "https://example.com/xum",
+              title: "Xum",
+              pageAge: null,
+            },
+          ],
+        },
+        {
+          type: "reasoning",
+          text: "read",
+          providerOptions: { anthropic: { signature: "sig-read" } },
+        },
+        { type: "text", text: "found" },
+      ]);
+      const messages = await prepareMessagesForProvider({
+        messagesWithSentinel: [
+          createMuxMessage("user-1", "user", "search", { historySequence: 0 }),
+          row,
+          createMuxMessage("user-2", "user", "next", { historySequence: 2 }),
+        ],
+        effectiveAgentId: "exec",
+        toolNamesForSentinel: [],
+        providerForMessages: "anthropic",
+        effectiveThinkingLevel: "high",
+        modelString: "anthropic:claude-opus-5-5",
+        workspaceId,
+      });
+      const replay = aiSdk.streamText({
+        model: scripted.model,
+        messages,
+        tools: { web_search: scripted.provider.tools.webSearch_20250305({ maxUses: 5 }) as Tool },
+        maxRetries: 0,
+      });
+      await replay.consumeStream();
+      expect(scripted.bodies).toHaveLength(1);
+      const body = scripted.bodies[0];
+      expect(thinkingTypes(body)).toEqual([]);
+      expectPairedTools(body);
+      expect(JSON.stringify(body)).toContain("found");
+    });
+
+    test("a client-pair row from before native replay keeps today's request shape", async () => {
+      const workspaceId = "preserved-thinking-legacy-row";
+      const scripted = scriptedAnthropicModel([textResponse]);
+      const legacy = createMuxMessage("assistant-1", "assistant", "", { historySequence: 1 }, [
+        {
+          type: "reasoning",
+          text: "plan",
+          providerOptions: { anthropic: { signature: "sig-plan" } },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: "srvtoolu_1",
+          toolName: "web_search",
+          state: "output-available",
+          input: { query: "xum" },
+          output: [
+            {
+              type: "web_search_result",
+              url: "https://example.com/xum",
+              title: "Xum",
+              pageAge: null,
+            },
+          ],
+        },
+        {
+          type: "reasoning",
+          text: "read",
+          providerOptions: { anthropic: { signature: "sig-read" } },
+        },
+        { type: "text", text: "found" },
+      ]);
+      const messages = await prepareMessagesForProvider({
+        messagesWithSentinel: [
+          createMuxMessage("user-1", "user", "search", { historySequence: 0 }),
+          legacy,
+          createMuxMessage("user-2", "user", "next", { historySequence: 2 }),
+        ],
+        effectiveAgentId: "exec",
+        toolNamesForSentinel: [],
+        providerForMessages: "anthropic",
+        effectiveThinkingLevel: "high",
+        modelString: "anthropic:claude-opus-5-5",
+        workspaceId,
+      });
+      const replay = aiSdk.streamText({ model: scripted.model, messages, maxRetries: 0 });
+      await replay.consumeStream();
+      const body = scripted.bodies[0];
+      // As on main: a client pair, and the thinking is still sent (no receipt, no native part).
+      expectPairedTools(body);
+      expect(thinkingTypes(body)).toEqual(["thinking", "thinking"]);
     });
 
     test("a server tool with no thinking after it keeps thinking replay on", async () => {

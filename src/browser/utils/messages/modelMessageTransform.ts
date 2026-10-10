@@ -333,7 +333,11 @@ function splitMixedContentMessages(messages: ModelMessage[]): ModelMessage[] {
       continue;
     }
 
-    const toolCallParts = assistantMsg.content.filter((c) => c.type === "tool-call");
+    // A provider-executed call carries its result inline in this message (Anthropic
+    // server_tool_use + web_search_tool_result, #5887): it stays with the content around it.
+    const isClientToolCall = (part: (typeof assistantMsg.content)[number]) =>
+      part.type === "tool-call" && part.providerExecuted !== true;
+    const toolCallParts = assistantMsg.content.filter(isClientToolCall);
 
     if (toolCallParts.length === 0) {
       result.push(msg);
@@ -355,7 +359,7 @@ function splitMixedContentMessages(messages: ModelMessage[]): ModelMessage[] {
     let currentGroup: { type: "text" | "tool-call"; parts: ContentArray } | null = null;
 
     for (const part of assistantMsg.content) {
-      const partType = part.type === "tool-call" ? "tool-call" : "text";
+      const partType = isClientToolCall(part) ? "tool-call" : "text";
 
       // eslint-disable-next-line @typescript-eslint/prefer-optional-chain
       if (!currentGroup || currentGroup.type !== partType) {

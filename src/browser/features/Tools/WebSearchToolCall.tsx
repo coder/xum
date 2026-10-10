@@ -17,6 +17,7 @@ import {
   type ToolStatus,
 } from "./Shared/toolUtils";
 import { JsonHighlight } from "./Shared/HighlightedCode";
+import { stripEncryptedContent } from "@/common/utils/messages/stripEncryptedContent";
 
 interface WebSearchToolCallProps {
   args: { query?: string }; // Anthropic puts query in args
@@ -102,7 +103,9 @@ export const WebSearchToolCall: React.FC<WebSearchToolCallProps> = ({
             <DetailSection>
               <DetailLabel>Results</DetailLabel>
               <div className="bg-code-bg max-h-[300px] overflow-y-auto rounded px-3 py-2 text-[12px]">
-                <JsonHighlight value={result} />
+                {/* Anthropic results keep their ciphertext for native replay (#5887): it is
+                    opaque and large, so the transcript shows the rest. */}
+                <JsonHighlight value={stripEncryptedContent(result)} />
               </div>
             </DetailSection>
           )}
