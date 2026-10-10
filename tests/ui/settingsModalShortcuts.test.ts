@@ -49,7 +49,8 @@ describeIntegration("Settings modal shortcuts", () => {
       const user = userEvent.setup({ document: doc });
       const composer = await within(app.view.container).findByRole("textbox", { name: "Message" });
       // Compare a label, not the nodes: printing a DOM-node mismatch fails in this environment.
-      const focused = () => (doc.activeElement === composer ? "opener" : doc.activeElement?.tagName);
+      const focused = () =>
+        doc.activeElement === composer ? "opener" : doc.activeElement?.tagName;
       await user.click(composer);
       expect(focused()).toBe("opener");
 

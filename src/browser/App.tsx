@@ -99,7 +99,7 @@ import { AboutDialogProvider, useAboutDialog } from "./contexts/AboutDialogConte
 import { ConfirmDialogProvider, useConfirmDialog } from "./contexts/ConfirmDialogContext";
 import { confirmAndRemoveSubagent } from "@/browser/utils/subagentRemoval";
 import { AboutDialog } from "./features/About/AboutDialog";
-import { SettingsPage } from "@/browser/features/Settings/SettingsPage";
+import { LazySettingsPage } from "@/browser/features/Settings/LazySettingsPage";
 import { AnalyticsDashboard } from "@/browser/features/Analytics/AnalyticsDashboard";
 import { MuxGatewaySessionExpiredDialog } from "./components/MuxGatewaySessionExpiredDialog/MuxGatewaySessionExpiredDialog";
 import { SshPromptDialog } from "./components/SshPromptDialog/SshPromptDialog";
@@ -1534,7 +1534,7 @@ function AppInner() {
         <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />
         {/* Before SettingsPage so settings opened from analytics stacks above it. */}
         <AnalyticsDashboard />
-        <SettingsPage />
+        <LazySettingsPage />
         <PopoverError
           error={paletteRemoveError.error}
           prefix="Failed to remove workspace"

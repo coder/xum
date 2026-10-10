@@ -24,7 +24,7 @@ import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useOnboardingPause } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
+import type { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { GeneralSection } from "./Sections/GeneralSection";
 import { TasksSection } from "./Sections/TasksSection";
@@ -204,12 +204,13 @@ export function getSettingsSectionRedirect(
   return null;
 }
 
-export function SettingsPage() {
+// The caller owns the focus-return hook: this page is lazy-loaded and first mounts already open,
+// so it cannot record the opener itself (see LazySettingsPage).
+export function SettingsPage(props: { focusReturn: ReturnType<typeof useModalFocusReturn> }) {
   const { isOpen, close, activeSection, setActiveSection } = useSettings();
   const onboardingPause = useOnboardingPause();
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const remoteConnectionAvailable = window.api?.remoteConnection != null;
-  const focusReturn = useModalFocusReturn(isOpen);
 
   // Redirect restored links when an experiment or desktop bridge is unavailable.
   useEffect(() => {
@@ -244,8 +245,8 @@ export function SettingsPage() {
         showCloseButton={false}
         allowEditableEscape
         aria-describedby={undefined}
-        onOpenAutoFocus={focusReturn.onOpenAutoFocus}
-        onCloseAutoFocus={focusReturn.onCloseAutoFocus}
+        onOpenAutoFocus={props.focusReturn.onOpenAutoFocus}
+        onCloseAutoFocus={props.focusReturn.onCloseAutoFocus}
         className="max-md:ios-standalone:top-px max-md:ios-standalone:h-[calc(100%-1px)] top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:flex-row md:rounded-lg md:border"
       >
         <div className="border-border-medium flex min-w-0 shrink-0 flex-col border-b md:w-48 md:border-r md:border-b-0">
