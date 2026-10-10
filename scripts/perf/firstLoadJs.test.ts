@@ -74,4 +74,91 @@ describe("firstLoadJs", () => {
     expect(noMap.exitCode).toBe(2);
     expect(noMap.stderr).toContain("deep-EEEEEEEE.js has no source map");
   });
+
+  describe("--budget", () => {
+    const BUDGET_FILE = path.join(import.meta.dir, "firstLoadBudget.json");
+
+    async function totals() {
+      const { exitCode, stdout, stderr } = await runScript([dir, "--json"]);
+      expect(exitCode, stderr).toBe(0);
+      return (JSON.parse(stdout) as { totals: { rawBytes: number; brBytes: number } }).totals;
+    }
+
+    async function writeBudget(budget: unknown) {
+      const file = path.join(dir, "budget.json");
+      await fs.writeFile(file, typeof budget === "string" ? budget : JSON.stringify(budget));
+      return file;
+    }
+
+    test("passes at or under the recorded values and fails on brotli growth over 2%", async () => {
+      const { rawBytes, brBytes } = await totals();
+      const exact = await runScript([dir, "--budget", await writeBudget({ rawBytes, brBytes })]);
+      expect(exact.exitCode, exact.stderr).toBe(0);
+      // A smaller first load never fails, so shrinking needs no budget update.
+      const shrunk = { rawBytes: rawBytes * 2, brBytes: brBytes * 2 };
+      expect((await runScript([dir, "--budget", await writeBudget(shrunk)])).exitCode).toBe(0);
+      // The committed budget file must stay valid; this fixture is far under it.
+      const committed = await runScript([dir, "--budget", BUDGET_FILE]);
+      expect(committed.exitCode, committed.stderr).toBe(0);
+
+      const budgetFile = await writeBudget({ rawBytes, brBytes: Math.floor(brBytes / 1.03) });
+      const grown = await runScript([dir, "--budget", budgetFile]);
+      expect(grown.exitCode).toBe(1);
+      expect(grown.stderr).toContain(budgetFile);
+      // The message names the new value, the budget key and the budget file.
+      expect(grown.stderr).toContain(String(brBytes));
+      expect(grown.stderr).toContain("brBytes");
+      expect(grown.stderr).not.toContain("rawBytes");
+    });
+
+    test("fails when raw grows more than 100 KiB, even with brotli unchanged", async () => {
+      // main has a .br sibling, so padding it grows raw bytes only.
+      await fs.writeFile(path.join(dir, "main-AAAAAAAA.js.br"), "x".repeat(7));
+      const before = await totals();
+      const padded = 100 * 1024 + 1;
+      await fs.appendFile(path.join(dir, "main-AAAAAAAA.js"), `\n/*${"x".repeat(padded - 5)}*/`);
+      const after = await totals();
+      expect(after.rawBytes - before.rawBytes).toBe(padded);
+
+      const recorded = { rawBytes: before.rawBytes, brBytes: after.brBytes };
+      const grown = await runScript([dir, "--budget", await writeBudget(recorded)]);
+      expect(grown.exitCode).toBe(1);
+      expect(grown.stderr).toContain(String(after.rawBytes));
+      expect(grown.stderr).toContain("rawBytes");
+      expect(grown.stderr).not.toContain("brBytes");
+      // Exactly 100 KiB of growth is still within budget.
+      const edge = { rawBytes: after.rawBytes - 100 * 1024, brBytes: after.brBytes };
+      expect((await runScript([dir, "--budget", await writeBudget(edge)])).exitCode).toBe(0);
+    });
+
+    test("a forbidden module fails even when the bytes are under budget", async () => {
+      const budgetFile = await writeBudget(await totals());
+      const result = await runScript([
+        dir,
+        "--budget",
+        budgetFile,
+        "--forbid",
+        "node_modules/shared-dep/",
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("forbidden on first load");
+    });
+
+    test("an unusable budget file exits 2", async () => {
+      const { rawBytes, brBytes } = await totals();
+      for (const budget of [
+        "{ not json",
+        "null",
+        { rawBytes },
+        { rawBytes, brBytes: -1 },
+        { rawBytes: "1000", brBytes },
+        { rawBytes: 1.5, brBytes },
+      ]) {
+        const result = await runScript([dir, "--budget", await writeBudget(budget)]);
+        expect(result.exitCode, JSON.stringify(budget)).toBe(2);
+      }
+      expect((await runScript([dir, "--budget", path.join(dir, "missing.json")])).exitCode).toBe(2);
+      expect((await runScript([dir, "--budget"])).exitCode).toBe(2);
+    });
+  });
 });
