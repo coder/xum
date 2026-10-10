@@ -3,7 +3,8 @@
  * workspace with a short chat. The play checks the same facts with role queries, in a real
  * browser so the toggle's hit area is measured. Contrast is a separate decision (#5950). The
  * phone stories cover the main landmark at 390 px (#5956). The landmark stories at the end cover
- * the layouts without a chat pane: immersive review and the pages with no workspace (#5969).
+ * the layouts without a chat pane: immersive review and the pages with no workspace (#5969),
+ * and the shell's "No Workspace Selected" placeholder (#5998).
  */
 
 import { expect, userEvent, waitFor, within } from "@storybook/test";
@@ -270,7 +271,7 @@ interface LandmarkLayout {
 }
 
 const LANDMARK_LAYOUTS: Record<
-  "ImmersiveReview" | "RootPage" | "ProjectPage" | "ScratchPage",
+  "ImmersiveReview" | "RootPage" | "ProjectPage" | "ScratchPage" | "NoWorkspaceSelected",
   LandmarkLayout
 > = {
   ImmersiveReview: {
@@ -346,6 +347,24 @@ const LANDMARK_LAYOUTS: Record<
       return body.findByRole("textbox", { name: "Message" });
     },
   },
+  // A workspace without a name shows the shell's "No Workspace Selected" placeholder.
+  NoWorkspaceSelected: {
+    setup: () =>
+      setupSimpleChatStory({
+        workspaceId: "ws-a11y-unnamed",
+        workspaceName: "",
+        projectName: "xum",
+        projectPath: PROJECT_PATH,
+        messages: [
+          createUserMessage("msg-1", "Hello", {
+            historySequence: 1,
+            timestamp: STABLE_TIMESTAMP - 60_000,
+          }),
+        ],
+      }),
+    open: (canvasElement) =>
+      within(canvasElement).findByText("No Workspace Selected", {}, { timeout: 15_000 }),
+  },
 };
 
 const landmarkStory = (
@@ -380,3 +399,5 @@ export const ProjectPageLandmark = landmarkStory("ProjectPage", "desktop");
 export const ProjectPageLandmarkPhone = landmarkStory("ProjectPage", "phone");
 export const ScratchPageLandmark = landmarkStory("ScratchPage", "desktop");
 export const ScratchPageLandmarkPhone = landmarkStory("ScratchPage", "phone");
+export const NoWorkspaceSelectedLandmark = landmarkStory("NoWorkspaceSelected", "desktop");
+export const NoWorkspaceSelectedLandmarkPhone = landmarkStory("NoWorkspaceSelected", "phone");
