@@ -63,9 +63,9 @@ describe("plugin views", () => {
       ...context,
       trusted: true,
     });
-    const settingsKey = views[0]?.serverKey;
-    expect(settingsKey).toBe(`plugin:${views[0]?.pluginViewId.split("/")[0]}:settings`);
-    expect(Object.keys(servers)).toContain(settingsKey!);
+    const settingsKey = views[0].serverKey;
+    expect(settingsKey).toBe(`plugin:${views[0].pluginViewId.split("/")[0]}:settings`);
+    expect(Object.keys(servers)).toContain(settingsKey);
 
     // Default-disabled: listed, but not enabled until the workspace enables the server.
     const attached = attachPluginViewServers(views, servers, {});
@@ -73,12 +73,12 @@ describe("plugin views", () => {
       ["settings", false],
     ]);
     expect(
-      attachPluginViewServers(views, servers, { enabledServers: [settingsKey!] })[0]?.enabled
+      attachPluginViewServers(views, servers, { enabledServers: [settingsKey] })[0]?.enabled
     ).toBe(true);
     expect(
       attachPluginViewServers(views, servers, {
-        enabledServers: [settingsKey!],
-        disabledServers: [settingsKey!],
+        enabledServers: [settingsKey],
+        disabledServers: [settingsKey],
       })[0]?.enabled
     ).toBe(true);
   });
