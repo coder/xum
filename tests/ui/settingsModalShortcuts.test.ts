@@ -48,8 +48,10 @@ describeIntegration("Settings modal shortcuts", () => {
       const body = within(doc.body);
       const user = userEvent.setup({ document: doc });
       const composer = await within(app.view.container).findByRole("textbox", { name: "Message" });
+      // Compare a label, not the nodes: printing a DOM-node mismatch fails in this environment.
+      const focused = () => (doc.activeElement === composer ? "opener" : doc.activeElement?.tagName);
       await user.click(composer);
-      expect(doc.activeElement).toBe(composer);
+      expect(focused()).toBe("opener");
 
       await user.keyboard("{Control>},{/Control}");
       const dialog = await body.findByRole("dialog", { name: "Settings" }, { timeout: 10_000 });
@@ -61,7 +63,7 @@ describeIntegration("Settings modal shortcuts", () => {
         }
         expect(body.queryByRole("dialog", { name: "Settings" })).toBeNull();
       });
-      await waitFor(() => expect(doc.activeElement).toBe(composer));
+      await waitFor(() => expect(focused()).toBe("opener"));
     } finally {
       await app.dispose();
     }
