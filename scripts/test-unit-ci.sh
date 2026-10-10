@@ -76,6 +76,9 @@ isolated_unit_tests=(
   # (document/window set to undefined, a replaced baseline window), which would
   # perturb later suites in a shared process.
   ./tests/ui/domIsolation.test.ts
+  # Spawns a bun child that forces the Bun 1.3.12 test.each GC window (#6020); bun-only, so
+  # Jest skips it.
+  ./tests/bunEachTableGc.test.ts
 )
 
 # One process per file rather than one shared isolated process. Sharing it still
