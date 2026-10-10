@@ -291,7 +291,7 @@ describe("WorkspaceShell loading placeholders", () => {
     expect(secondChatPane.textContent).toContain("workspace-2");
   });
 
-  it("renders loading animation during non-hydrating workspace loading", () => {
+  it("renders loading animation during non-hydrating workspace loading", async () => {
     workspaceState = {
       loading: true,
       isHydratingTranscript: false,
@@ -300,7 +300,7 @@ describe("WorkspaceShell loading placeholders", () => {
     const view = render(<WorkspaceShell {...defaultProps} />);
 
     expect(view.getByText("Loading workspace...")).toBeTruthy();
-    expect(view.getByTestId("lottie-animation")).toBeTruthy();
+    expect(await view.findByTestId("lottie-animation")).toBeTruthy();
   });
 
   // A narrow window with a mouse: the CSS hides the sidebar, but no coarse-pointer query matches.
