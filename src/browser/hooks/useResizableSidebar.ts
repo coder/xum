@@ -47,6 +47,12 @@ interface UseResizableSidebarOptions {
   storageKey: string;
   /** Which side of the viewport the sidebar is on. Impacts drag direction. */
   side?: ResizableSidebarSide;
+  /**
+   * Opt in to drag-to-collapse. Dragging the handle far past the minimum width snaps the
+   * sidebar closed, and dragging back out within the same gesture reopens it. Called only when
+   * the snapped state flips during a drag, so callers can persist it directly.
+   */
+  onDragCollapseChange?: (collapsed: boolean) => void;
 }
 
 interface UseResizableSidebarResult {
@@ -81,6 +87,31 @@ export function resolveInitialResizableSidebarWidth(args: {
   return Math.max(args.minWidth, Math.min(effectiveMaxWidth, parsedWidth));
 }
 
+/**
+ * A drag snaps the sidebar closed once the pointer would make it narrower than this fraction of
+ * `minWidth` (VS Code's sash snap rule). Between this point and `minWidth` the sidebar holds at
+ * its minimum, which gives the drag a short "detent" before it collapses.
+ */
+const DRAG_COLLAPSE_SNAP_RATIO = 0.5;
+
+type ResizeDragResult = { collapsed: true } | { collapsed: false; width: number };
+
+/** Maps the unclamped width a drag asks for to a clamped width or a snapped-closed sidebar. */
+function resolveResizeDrag(args: {
+  rawWidth: number;
+  minWidth: number;
+  maxWidth: number;
+  collapsible: boolean;
+}): ResizeDragResult {
+  if (args.collapsible && args.rawWidth < args.minWidth * DRAG_COLLAPSE_SNAP_RATIO) {
+    return { collapsed: true };
+  }
+  return {
+    collapsed: false,
+    width: Math.max(args.minWidth, Math.min(args.maxWidth, args.rawWidth)),
+  };
+}
+
 export function useResizableSidebar({
   enabled,
   defaultWidth,
@@ -89,6 +120,7 @@ export function useResizableSidebar({
   getMaxWidthPx,
   storageKey,
   side = "right",
+  onDragCollapseChange,
 }: UseResizableSidebarOptions): UseResizableSidebarResult {
   // Load persisted width from localStorage on mount
   // Always load persisted value regardless of enabled flag to maintain size across workspace switches
@@ -126,11 +158,18 @@ export function useResizableSidebar({
   // Refs to track drag state without causing re-renders
   const startXRef = useRef<number>(0); // Mouse X position when drag started
   const startWidthRef = useRef<number>(0); // Sidebar width when drag started
+  // Whether the current drag has snapped the sidebar closed; reset on every drag start.
+  const dragCollapsedRef = useRef(false);
 
   const getMaxWidthPxRef = useRef(getMaxWidthPx);
   useEffect(() => {
     getMaxWidthPxRef.current = getMaxWidthPx;
   }, [getMaxWidthPx]);
+
+  const onDragCollapseChangeRef = useRef(onDragCollapseChange);
+  useEffect(() => {
+    onDragCollapseChangeRef.current = onDragCollapseChange;
+  }, [onDragCollapseChange]);
 
   const resolveMaxWidthPx = useCallback(() => {
     const candidate = getMaxWidthPxRef.current?.();
@@ -223,10 +262,21 @@ export function useResizableSidebar({
       const deltaX =
         side === "right" ? startXRef.current - e.clientX : e.clientX - startXRef.current;
 
-      const maxWidthPx = resolveMaxWidthPx();
-      const newWidth = Math.max(minWidth, Math.min(maxWidthPx, startWidthRef.current + deltaX));
+      const result = resolveResizeDrag({
+        rawWidth: startWidthRef.current + deltaX,
+        minWidth,
+        maxWidth: resolveMaxWidthPx(),
+        collapsible: onDragCollapseChangeRef.current != null,
+      });
 
-      setWidth(newWidth);
+      if (result.collapsed !== dragCollapsedRef.current) {
+        dragCollapsedRef.current = result.collapsed;
+        onDragCollapseChangeRef.current?.(result.collapsed);
+      }
+
+      // While snapped closed, keep the pre-drag width so reopening the sidebar later restores
+      // the size the user had, not the clamped minimum the drag passed through.
+      setWidth(result.collapsed ? startWidthRef.current : result.width);
     },
     [isResizing, minWidth, side, resolveMaxWidthPx]
   );
@@ -273,6 +323,7 @@ export function useResizableSidebar({
       setIsResizing(true);
       startXRef.current = e.clientX;
       startWidthRef.current = width;
+      dragCollapsedRef.current = false;
     },
     [enabled, width]
   );

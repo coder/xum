@@ -142,6 +142,7 @@ import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
 import { SideChatPanel } from "./SideChatPanel";
 import { NewTabLauncher } from "./NewTabLauncher";
+import { RightSidebarOverview } from "./RightSidebarOverview";
 import { getOrderedBaseTabIds } from "./Tabs/tabConfig";
 import { useExperimentGatedTab } from "./useExperimentGatedTab";
 
@@ -149,9 +150,7 @@ interface SidebarContainerProps {
   collapsed: boolean;
   /** Custom width from drag-resize (unified across all tabs) */
   customWidth?: number;
-  /** Whether actively dragging resize handle (disables transition) */
-  isResizing?: boolean;
-  /** Whether running in Electron desktop mode (hides border when collapsed) */
+  /** Whether running in Electron desktop mode (taller header, so the collapsed card sits lower) */
   isDesktop?: boolean;
   /** Hide + inactivate sidebar while immersive review overlay is active. */
   immersiveHidden?: boolean;
@@ -166,14 +165,17 @@ interface SidebarContainerProps {
  * SidebarContainer - Main sidebar wrapper with dynamic width
  *
  * Width priority (first match wins):
- * 1. collapsed (20px) - Shows collapse button only
+ * 1. collapsed - A bounded floating overview card (fixed width, content height) over the chat's
+ *    top-right corner instead of a full-height rail, so the chat keeps the whole width
  * 2. customWidth - From drag-resize (unified width from AIView)
  * 3. default (400px) - Fallback when no custom width set
+ *
+ * The collapsed card stays this same element (landmark, container ref, responsive-hide class) so
+ * shortcut handlers and visibility checks treat both forms alike.
  */
 const SidebarContainer: React.FC<SidebarContainerProps> = ({
   collapsed,
   customWidth,
-  isResizing,
   isDesktop,
   immersiveHidden = false,
   containerRef,
@@ -181,7 +183,7 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
   role,
   "aria-label": ariaLabel,
 }) => {
-  const width = collapsed ? "20px" : customWidth ? `${customWidth}px` : "400px";
+  const width = customWidth ? `${customWidth}px` : "400px";
 
   React.useEffect(() => {
     const container = containerRef.current;
@@ -205,19 +207,26 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
       ref={containerRef}
       aria-hidden={immersiveHidden || undefined}
       className={cn(
-        "bg-surface-primary border-l border-border-light flex flex-col overflow-hidden flex-shrink-0",
+        "border-border-light flex flex-col",
         // Hide on mobile touch devices - too narrow for useful interaction
         "mobile-hide-right-sidebar",
         // Immersive review renders its own full-screen overlay, so hiding the underlying
         // sidebar container cuts layout/paint cost without discarding its React state.
         immersiveHidden && "hidden",
-        !isResizing && "transition-[width] duration-200",
-        collapsed && "sticky right-0 z-10 shadow-[-2px_0_4px_rgba(0,0,0,0.2)]",
-        // In desktop mode, hide the left border when collapsed to avoid
-        // visual separation in the titlebar area (overlay buttons zone)
-        isDesktop && collapsed && "border-l-0"
+        collapsed
+          ? [
+              // Positioned against WorkspaceShell, just below the chat header (h-9 on
+              // desktop, h-8 otherwise). The height cap keeps the card clear of the composer
+              // on short windows; overflowing content scrolls inside the card.
+              "bg-surface-secondary absolute right-3 z-10 w-64 overflow-x-hidden overflow-y-auto rounded-lg border shadow-lg",
+              "max-h-[min(32rem,calc(100%-12rem))]",
+              isDesktop ? "top-12" : "top-11",
+            ]
+          : // No width transition: expanding swaps the floating card for the docked panel, and
+            // animating the width between those two layouts reads as the card stretching.
+            "bg-surface-primary flex-shrink-0 overflow-hidden border-l"
       )}
-      style={{ width, maxWidth: "100%" }}
+      style={collapsed ? undefined : { width, maxWidth: "100%" }}
       role={role}
       aria-label={ariaLabel}
     >
@@ -1811,7 +1820,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   const sideChatCreationPending = React.useRef(false);
   const [creatingSideChat, setCreatingSideChat] = React.useState(false);
-  const handleOpenSideChatFromNewTab = (tabsetId: string) => {
+  // A side chat cannot start another side chat.
+  const canStartSideChat = currentWorkspaceMetadata?.sideChatParentWorkspaceId == null;
+  // `tabsetId`: the New tab launcher that asked, replaced by the chat. Without it (the collapsed
+  // overview card) the chat opens like /side does, as a tab in the focused pane.
+  const handleStartSideChat = (tabsetId?: string) => {
     if (api == null || sideChatCreationPending.current) return;
     // Lock before React commits the disabled row so rapid clicks cannot create duplicates.
     sideChatCreationPending.current = true;
@@ -1828,6 +1841,19 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         sideChatCreationPending.current = false;
         setCreatingSideChat(false);
       });
+  };
+
+  // Rows of the collapsed overview card reopen the sidebar on the tab they summarize.
+  const handleOpenTabFromOverview = (tab: TabType) => {
+    setCollapsed(false);
+    if (tab === "review") {
+      // Also focuses the Review panel, so its keyboard navigation works right away.
+      selectOrOpenReviewTab();
+      return;
+    }
+    setLayout((prev) => selectOrAddTab(prev, tab));
+    // Side chats hand typing to their composer once it is ready; other tabs focus their tab.
+    setTabToFocus(tab);
   };
 
   const handleOpenToolFromNewTab = React.useCallback(
@@ -2128,11 +2154,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         onAddNewTab={handleAddNewTab}
         onOpenToolFromNewTab={handleOpenToolFromNewTab}
         onOpenTerminalFromNewTab={handleOpenTerminalFromNewTab}
-        onOpenSideChatFromNewTab={
-          currentWorkspaceMetadata?.sideChatParentWorkspaceId != null
-            ? undefined
-            : handleOpenSideChatFromNewTab
-        }
+        onOpenSideChatFromNewTab={canStartSideChat ? handleStartSideChat : undefined}
         creatingSideChat={creatingSideChat}
         onCloseTab={closeNonTerminalTab}
         isOnlyTabset={layout.root.type === "tabset"}
@@ -2180,7 +2202,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       />
       <SidebarContainer
         collapsed={collapsed}
-        isResizing={isResizing}
         isDesktop={isDesktopMode()}
         immersiveHidden={immersiveHidden}
         containerRef={sidebarContainerRef}
@@ -2213,10 +2234,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
           </div>
         )}
         {collapsed && (
-          <SidebarCollapseButton
-            collapsed={collapsed}
-            onToggle={() => setCollapsed(!collapsed)}
-            side="right"
+          <RightSidebarOverview
+            workspaceId={workspaceId}
+            onExpand={() => setCollapsed(false)}
+            onOpenTab={handleOpenTabFromOverview}
+            onNewSideChat={canStartSideChat ? () => handleStartSideChat() : undefined}
+            creatingSideChat={creatingSideChat}
           />
         )}
       </SidebarContainer>
