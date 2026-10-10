@@ -385,6 +385,13 @@ export const electronTest = base.extend<ElectronFixtures>({
     const window = await app.firstWindow();
     await window.waitForLoadState("domcontentloaded");
     await window.setViewportSize({ width: 1600, height: 900 });
+    // Perf scenarios measure workspace operations after an app reload, as they did before #5916
+    // removed the tutorial reload. Without it they time the first page load and race startup work
+    // (nightly workspace-open first message doubled; chat typing saw transcript re-renders).
+    if (getXumE2EEnv("E2E_RUN_PERF") === "1") {
+      await window.reload();
+      await window.waitForLoadState("domcontentloaded");
+    }
 
     window.on("console", (msg) => {
       console.log(`[renderer:${msg.type()}]`, msg.text());
