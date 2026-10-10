@@ -103,9 +103,11 @@ const splitDiffLines = (diff: string): string[] => {
 };
 
 // Line number color - brighter for changed lines, dimmed for context.
+// Context numbers stay dimmer than changed ones but reach WCAG AA (4.5:1) in every theme (#5985):
+// plain --color-muted is 4.47:1 on flexoki-light's code background, so mix in some text color.
 const getLineNumberColor = (type: DiffLineType): string => {
   return type === "context"
-    ? "color-mix(in srgb, var(--color-muted) 40%, transparent)"
+    ? "color-mix(in srgb, var(--color-muted), var(--color-text) 15%)"
     : "var(--color-text)";
 };
 
@@ -149,12 +151,15 @@ const doesLineMatchReviewRange = (
   return matchesOld || matchesNew;
 };
 
+// The +/- signs mix 40% of the text color into success/danger: darker in light themes, lighter in
+// dark ones. That reaches WCAG AA (4.5:1) on the line tints and under the review-range highlight
+// in all four themes (#5985); 35% left light "+" at 4.26:1 under the highlight.
 const getIndicatorColor = (type: DiffLineType): string => {
   switch (type) {
     case "add":
-      return "var(--color-success)";
+      return "color-mix(in srgb, var(--color-success), var(--color-text) 40%)";
     case "remove":
-      return "var(--color-danger)";
+      return "color-mix(in srgb, var(--color-danger), var(--color-text) 40%)";
     default:
       return "transparent";
   }
