@@ -9,9 +9,11 @@ const SettingsPage = lazy(() =>
 );
 
 /**
- * Mounts the lazy Settings page on its first open, then keeps it mounted so the dialog's close
- * animation still plays. Focus history is recorded here, from app start: the page mounts already
- * open, so it never saw the opener and the first close would drop focus on the body.
+ * Mounts the lazy Settings page on its first open, then keeps it mounted as before this split,
+ * so reopening does not remount it and an exit animation could still run. (Today the dialog's
+ * animate-out classes produce no CSS: no animation plugin is imported.) Focus history is recorded
+ * here, from app start: the page mounts already open, so it never saw the opener and the first
+ * close would drop focus on the body.
  */
 export function LazySettingsPage() {
   const { isOpen } = useSettings();
