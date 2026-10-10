@@ -138,7 +138,8 @@ function RootRouteShell(props: {
   onToggleLeftSidebarCollapsed: () => void;
 }) {
   return (
-    <div className="bg-surface-primary flex flex-1 flex-col overflow-hidden">
+    // The page has no chat pane here, so the shell is its one `main` landmark (#5969).
+    <main className="bg-surface-primary flex flex-1 flex-col overflow-hidden">
       {props.leftSidebarCollapsed ? (
         <div
           className={`bg-sidebar border-border-light flex shrink-0 items-center border-b px-4 py-2 ${isDesktopMode() ? "titlebar-drag" : ""}`}
@@ -158,7 +159,7 @@ function RootRouteShell(props: {
             surface, below WCAG AA for text-sm (#5948). */}
         <p className="text-content-secondary text-sm">Select or add a project to get started.</p>
       </div>
-    </div>
+    </main>
   );
 }
 

@@ -319,7 +319,7 @@ function findReviewHunkId(review: Review, fileHunks: DiffHunk[]): string | null 
 }
 
 export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) => {
-  const containerRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const notesSidebarRef = useRef<HTMLDivElement>(null);
   const hunkJumpScrollBlockRef = useRef<ScrollLogicalPosition>("center");
@@ -2072,7 +2072,9 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           : "empty";
 
   return (
-    <div
+    // While immersive review is open the chat pane (and its `main`) is hidden and inert, so this
+    // view is the page's one `main` landmark (landmark-one-main, #5969).
+    <main
       ref={containerRef}
       tabIndex={isTouchExperience ? -1 : 0}
       className="flex h-full flex-col overflow-hidden outline-none"
@@ -2650,6 +2652,6 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           </div>
         </>
       )}
-    </div>
+    </main>
   );
 };

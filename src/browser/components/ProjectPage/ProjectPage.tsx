@@ -316,7 +316,8 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
     <AgentProvider projectPath={projectPath}>
       <ThinkingProvider projectPath={projectPath}>
         {/* Flex container to fill parent space */}
-        <div className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
+        {/* No workspace is open, so this page is the one `main` landmark (#5969). */}
+        <main className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
           {/* Draggable header bar - matches WorkspaceMenuBar for consistency */}
           <div
             className={cn(
@@ -403,7 +404,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
               projectName={projectName}
             />
           </div>
-        </div>
+        </main>
       </ThinkingProvider>
     </AgentProvider>
   );

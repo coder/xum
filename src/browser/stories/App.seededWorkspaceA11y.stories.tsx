@@ -2,19 +2,23 @@
  * Seeded workspace page (#5951): the ARIA and target-size audits that Lighthouse failed on a
  * workspace with a short chat. The play checks the same facts with role queries, in a real
  * browser so the toggle's hit area is measured. Contrast is a separate decision (#5950). The
- * phone stories cover the main landmark at 390 px (#5956).
+ * phone stories cover the main landmark at 390 px (#5956). The landmark stories at the end cover
+ * the layouts without a chat pane: immersive review and the pages with no workspace (#5969).
  */
 
-import { expect, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { RIGHT_SIDEBAR_WIDTH_KEY } from "@/common/constants/storage";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import { getReviewImmersiveKey, RIGHT_SIDEBAR_WIDTH_KEY } from "@/common/constants/storage";
+import type { ProjectConfig } from "@/node/config";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
-import { expandLeftSidebar, expandRightSidebar } from "./helpers/uiState";
+import { expandLeftSidebar, expandProjects, expandRightSidebar } from "./helpers/uiState";
+import { createMockORPCClient } from "./mocks/orpc";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 
@@ -226,3 +230,153 @@ const phoneStory = (theme: ThemeMode): AppStory => ({
 
 export const PhoneLight = phoneStory("light");
 export const PhoneDark = phoneStory("dark");
+
+/**
+ * Layouts without a chat pane (#5969): immersive review hides the chat, and the root, project and
+ * scratch pages have no workspace. Each still needs exactly one `main` landmark, holding its
+ * primary content and none of the sidebars. Where a footer exists it stays outside `main`.
+ */
+async function expectOneMainHolding(canvasElement: HTMLElement, content: HTMLElement) {
+  const canvas = within(canvasElement);
+  const mains = canvas.getAllByRole("main");
+  await expect(mains).toHaveLength(1);
+  await expect(mains[0]).toContainElement(content);
+  const main = within(mains[0]);
+  await expect(main.queryByRole("navigation", { name: "Projects" })).toBeNull();
+  await expect(main.queryByRole("complementary", { name: "Workspace insights" })).toBeNull();
+  await expect(main.queryByRole("contentinfo")).toBeNull();
+}
+
+const REVIEW_WORKSPACE_ID = "ws-a11y-review";
+const REVIEW_DIFF = `diff --git a/src/a11y/landmarks.ts b/src/a11y/landmarks.ts
+index 1111111..2222222 100644
+--- a/src/a11y/landmarks.ts
++++ b/src/a11y/landmarks.ts
+@@ -1,3 +1,4 @@
+ export const LANDMARKS = ["main"];
++export const ONE_MAIN = true;
+ export const VERSION = 1;
+`;
+const REVIEW_NUMSTAT = "1\t0\tsrc/a11y/landmarks.ts";
+
+const PROJECT_PATH = "/home/user/projects/xum";
+
+type LayoutPlay = (canvasElement: HTMLElement, layout: "desktop" | "phone") => Promise<HTMLElement>;
+
+interface LandmarkLayout {
+  setup: () => ReturnType<typeof createMockORPCClient>;
+  /** Opens the layout and returns an element of its primary content. */
+  open: LayoutPlay;
+}
+
+const LANDMARK_LAYOUTS: Record<
+  "ImmersiveReview" | "RootPage" | "ProjectPage" | "ScratchPage",
+  LandmarkLayout
+> = {
+  ImmersiveReview: {
+    setup: () => {
+      const client = setupSimpleChatStory({
+        workspaceId: REVIEW_WORKSPACE_ID,
+        workspaceName: "a11y-review",
+        projectName: "xum",
+        projectPath: PROJECT_PATH,
+        messages: [
+          createUserMessage("msg-1", "Review the change", {
+            historySequence: 1,
+            timestamp: STABLE_TIMESTAMP - 60_000,
+          }),
+        ],
+        gitDiff: { diffOutput: REVIEW_DIFF, numstatOutput: REVIEW_NUMSTAT },
+      });
+      expandRightSidebar();
+      // Immersive mode is persisted per workspace, so start each story with the chat showing.
+      updatePersistedState(getReviewImmersiveKey(REVIEW_WORKSPACE_ID), false);
+      return client;
+    },
+    open: async (canvasElement, layout) => {
+      const canvas = within(canvasElement);
+      await canvas.findByRole("textbox", { name: "Message" }, { timeout: 15_000 });
+      window.dispatchEvent(
+        createCustomEvent(
+          layout === "phone"
+            ? CUSTOM_EVENTS.OPEN_TOUCH_REVIEW_IMMERSIVE
+            : CUSTOM_EVENTS.OPEN_REVIEW_IMMERSIVE,
+          { workspaceId: REVIEW_WORKSPACE_ID }
+        )
+      );
+      return canvas.findByTestId("immersive-review-view", {}, { timeout: 10_000 });
+    },
+  },
+  RootPage: {
+    setup: () => createMockORPCClient({}),
+    open: (canvasElement) =>
+      within(canvasElement).findByText(
+        "Select or add a project to get started.",
+        {},
+        { timeout: 15_000 }
+      ),
+  },
+  ProjectPage: {
+    setup: () => {
+      expandLeftSidebar();
+      expandProjects([PROJECT_PATH]);
+      return createMockORPCClient({
+        projects: new Map<string, ProjectConfig>([[PROJECT_PATH, { workspaces: [] }]]),
+        workspaces: [],
+      });
+    },
+    open: async (canvasElement) => {
+      const body = within(canvasElement.ownerDocument.body);
+      await userEvent.click(
+        await body.findByRole("button", { name: "Create workspace in xum" }, { timeout: 15_000 })
+      );
+      return body.findByRole("textbox", { name: "Message" });
+    },
+  },
+  ScratchPage: {
+    setup: () => {
+      expandLeftSidebar();
+      return createMockORPCClient({});
+    },
+    open: async (canvasElement) => {
+      const body = within(canvasElement.ownerDocument.body);
+      await userEvent.click(
+        await body.findByRole("button", { name: "New scratch chat" }, { timeout: 15_000 })
+      );
+      return body.findByRole("textbox", { name: "Message" });
+    },
+  },
+};
+
+const landmarkStory = (
+  name: keyof typeof LANDMARK_LAYOUTS,
+  layout: "desktop" | "phone"
+): AppStory => ({
+  ...(layout === "phone"
+    ? {
+        globals: { viewport: { value: "mobile2", isRotated: false } },
+        decorators: [
+          (Story) => (
+            <div style={{ width: PHONE_WIDTH_PX, height: 844, overflow: "hidden" }}>
+              <Story />
+            </div>
+          ),
+        ],
+      }
+    : {}),
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={LANDMARK_LAYOUTS[name].setup} />,
+  play: async ({ canvasElement }) => {
+    const content = await LANDMARK_LAYOUTS[name].open(canvasElement, layout);
+    await waitFor(() => expectOneMainHolding(canvasElement, content));
+  },
+});
+
+export const ImmersiveReviewLandmark = landmarkStory("ImmersiveReview", "desktop");
+export const ImmersiveReviewLandmarkPhone = landmarkStory("ImmersiveReview", "phone");
+export const RootPageLandmark = landmarkStory("RootPage", "desktop");
+export const RootPageLandmarkPhone = landmarkStory("RootPage", "phone");
+export const ProjectPageLandmark = landmarkStory("ProjectPage", "desktop");
+export const ProjectPageLandmarkPhone = landmarkStory("ProjectPage", "phone");
+export const ScratchPageLandmark = landmarkStory("ScratchPage", "desktop");
+export const ScratchPageLandmarkPhone = landmarkStory("ScratchPage", "phone");
