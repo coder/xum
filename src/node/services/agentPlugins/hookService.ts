@@ -631,17 +631,20 @@ export class AgentPluginHookService {
     if (state.disposed) {
       return null;
     }
-    if (await this.retireIfEpochStale(workspaceId)) {
-      return null;
-    }
-    if (state.disposed) {
-      // Re-check: the epoch validation above may have awaited; a concurrent
-      // teardown could have disposed this state in the meantime.
-      return null;
-    }
     try {
-      // Every hook point gets the plugin's saved settings (see pluginHookState.ts).
+      // Every hook point gets the plugin's saved settings (see pluginHookState.ts). Read them
+      // BEFORE the revocation checks below: an uninstall or teardown that lands during this
+      // read must stop the call, or withPersistentMount would recreate the dropped mount and
+      // run the removed hook once more.
       const settings = await readPluginHookState(state.dataPath, workspaceId);
+      if (await this.retireIfEpochStale(workspaceId)) {
+        return null;
+      }
+      if (state.disposed) {
+        // Re-check: the epoch validation above may have awaited; a concurrent
+        // teardown could have disposed this state in the meantime.
+        return null;
+      }
       const inputJson = JSON.stringify({ ...input, settings });
       assert(typeof inputJson === "string", "hook input must be JSON-serializable");
       const evalResult = await this.sandboxHost.withPersistentMount(
