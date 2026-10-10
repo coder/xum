@@ -20,6 +20,8 @@ export const IMAGE = "ghcr.io/coder/xum-bugbash-sandbox";
 const KILL_AFTER_MS = 5_000;
 /** How long the `docker run` client gets to exit after its lifeline (stdin) closed. */
 const GRACE_MS = 60_000;
+/** How long one stop hook gets before the lifeline closes anyway: a hung hook must not block it. */
+const HOOK_MS = 10_000;
 /** A short option, or a flag that names, labels or tracks the container: runJob() sets those. */
 const CALLER_FLAG = /^(-[^-]|--(name|label|label-file|cidfile)(=|$))/;
 
@@ -91,6 +93,7 @@ export class Session {
   #cleanup: Promise<CleanupState> | null = null;
   #owned: Job | null = null;
   readonly #graceMs: number;
+  readonly #hookMs: number;
   readonly #log: (line: string) => void;
   #hooks: (() => unknown)[] = [];
   /** The `docker run` client, once spawned. A stop never signals it: it closes its stdin. */
@@ -105,6 +108,7 @@ export class Session {
     options: {
       root?: string;
       graceMs?: number;
+      hookMs?: number;
       log?: (line: string) => void;
       /** Injection point: runner.test.ts records the group signals; production uses killGroup. */
       signalGroup?: (group: number, signal: NodeJS.Signals) => void;
@@ -113,6 +117,7 @@ export class Session {
     this.#signalGroup = options.signalGroup ?? killGroup;
     this.#root = options.root ?? ROOT;
     this.#graceMs = options.graceMs ?? GRACE_MS;
+    this.#hookMs = options.hookMs ?? HOOK_MS;
     this.#log = options.log ?? ((line) => console.error(`sandbox ${line}`));
     if (stop.aborted) this.#stop(String(stop.reason));
     else stop.addEventListener("abort", () => this.#stop(String(stop.reason)), { once: true });
@@ -322,7 +327,7 @@ export class Session {
 
   /** The stop hooks first, then the lifeline; SIGKILL only for a client past the grace period. */
   async #endJob() {
-    await Promise.allSettled(this.#hooks.splice(0).map(async (fn) => fn()));
+    await Promise.allSettled(this.#hooks.splice(0).map((fn) => this.#bounded(fn)));
     const client = this.#runClient;
     if (client == null || client.exitCode != null || client.signalCode != null) return;
     client.stdin?.end();
@@ -333,6 +338,22 @@ export class Session {
     }, this.#graceMs);
     timer.unref();
     client.once("close", () => clearTimeout(timer));
+  }
+
+  /** Runs one stop hook, but waits at most #hookMs for it. */
+  async #bounded(fn: () => unknown) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        this.#log(`a stop hook did not settle in ${this.#hookMs} ms: the lifeline closes anyway`);
+        resolve();
+      }, this.#hookMs);
+    });
+    try {
+      await Promise.race([(async () => fn())(), late]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

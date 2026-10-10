@@ -518,6 +518,25 @@ test("C11: the stop hooks finish before the lifeline closes", async () => {
   expect(await s.cleanup()).toBe("removed");
 });
 
+test("C11: a stop hook that never settles still lets the lifeline close and cleanup finish", async () => {
+  fake({ IMAGES: "sha256:abc", RUN: "hang" });
+  const stop = new AbortController();
+  const logged: string[] = [];
+  const s = new Session(stop.signal, { root, hookMs: 100, log: (line) => logged.push(line) });
+  sessions.push(s);
+  await s.ensureImage();
+  s.own(JOB);
+  const job = s.runJob(["--rm", "img"], drain, 60_000);
+  job.catch(() => undefined);
+  while (!calls().includes("run ")) await Bun.sleep(20);
+  s.onStop(() => new Promise(() => undefined));
+  stop.abort("SIGTERM");
+  await job.catch(() => undefined);
+  expect(calls()).toContain("stdin closed");
+  expect(logged.some((line) => line.includes("did not settle in 100 ms"))).toBe(true);
+  expect(await s.cleanup()).toBe("removed");
+});
+
 // launch.ts, with the same fake docker: a checkout with a repro config and both mount sources.
 const ARGS = ["run", "--config", "e2e.config.ts", "--output", ".e2e/r"];
 const HOST_ENV = { BUGBASH_AI: "mock", ANTHROPIC_API_KEY: "sk-secret", BUGBASH_APP_LOG: "/x.log" };
@@ -728,9 +747,12 @@ test("C2: recover reports a removal it cannot prove (exit 3)", async () => {
 });
 
 test("C2: a zombie launcher counts as dead", async () => {
-  // The child exits only after its parent shell became `sleep 30`, which never reaps it. (A
-  // child that exits at once can be reaped by the shell before the exec.)
-  const parent = spawn("sh", ["-c", "(sleep 0.3) & echo $!; exec sleep 30"], {
+  // A handshake, not a delay: the child blocks on a FIFO, and the test releases it only after the
+  // parent shell has become `sleep 30` (which never reaps it). A timed child can exit while the
+  // shell still runs and be reaped before the exec on a loaded host.
+  const fifo = path.join(root, "release");
+  expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+  const parent = spawn("sh", ["-c", '(read _ < "$1") & echo $!; exec sleep 30', "sh", fifo], {
     stdio: ["ignore", "pipe", "ignore"],
   });
   try {
@@ -739,8 +761,23 @@ test("C2: a zombie launcher counts as dead", async () => {
         parent.stdout.once("data", (d: Buffer) => resolve(d.toString()))
       )
     );
+    const comm = () => /\(([^)]*)\)/.exec(stat(parent.pid!))?.[1];
+    for (let i = 0; i < 500 && comm() !== "sleep"; i++) await Bun.sleep(10);
+    expect(comm()).toBe("sleep"); // bounded waits: no hang if a step never happens
+    // O_NONBLOCK: the open fails (ENXIO) instead of blocking while the child has not opened it.
+    let fd = -1;
+    for (let i = 0; i < 500 && fd < 0; i++) {
+      try {
+        fd = fs.openSync(fifo, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+      } catch {
+        await Bun.sleep(10);
+      }
+    }
+    expect(fd).toBeGreaterThanOrEqual(0);
+    fs.writeSync(fd, "go\n");
+    fs.closeSync(fd);
     for (let i = 0; i < 500 && !stat(pid).includes(") Z "); i++) await Bun.sleep(10);
-    expect(stat(pid)).toContain(") Z "); // a bounded wait: no hang if the zombie never shows
+    expect(stat(pid)).toContain(") Z ");
     const { boot, pidns } = self();
     expect(ownerState(`${boot}:${pidns}:${pid}:${procStart(pid)}`)).toBe("dead");
   } finally {
