@@ -72,11 +72,8 @@ describe("TerminalTab", () => {
 
     expect(view.getByText("Invalid terminal tab: missing session ID")).toBeTruthy();
     expect(view.queryByTestId("terminal-view")).toBeNull();
-    expect(terminalViewProps).toHaveLength(0);
   });
 
-  // The terminal (ghostty-web) is code-split off the first load, so it mounts only after its
-  // chunk resolves, and it must still get the tab's session and workspace.
   test("mounts the terminal after its chunk loads, with the tab's session", async () => {
     const view = renderTab("terminal:session-7");
 

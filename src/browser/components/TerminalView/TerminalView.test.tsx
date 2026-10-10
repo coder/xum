@@ -218,9 +218,8 @@ describe("TerminalView", () => {
     expect(secondOnExit.mock.calls[0]?.[0]).toBe(7);
   });
 
-  // The container stays visibility:hidden ("Connecting...") until the first screen state. A
-  // browser drops focus from a hidden element, so autofocus must wait for it (T3, #5971: the
-  // lazy terminal mounts with autoFocus already set and used to give up focus here).
+  // The container stays visibility:hidden ("Connecting...") until the first screen state, and a
+  // browser drops focus from a hidden element, so autofocus must wait for it (T3, #5971).
   test("keeps autofocus pending until the terminal shows its first screen", async () => {
     // The focus path checks `instanceof HTMLTextAreaElement`; installDom does not expose it.
     const previousTextArea = globalThis.HTMLTextAreaElement;
