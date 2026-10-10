@@ -473,6 +473,7 @@ describe("AgentPluginHookService", () => {
           aiService: h.aiService,
           sessionUsageService: { recordHeadlessUsage: record },
           head: [createMuxMessage("head", "user", "Summarize the investigation")],
+          receiptRows: [],
           signal: controller.signal,
           context: {
             enabled: true,

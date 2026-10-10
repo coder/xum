@@ -44,6 +44,8 @@ interface StreamSnapshot {
   parts: MuxMessage["parts"];
   stepStartIndices: readonly number[];
   currentStepStartIndex: number;
+  // The live turn's Anthropic thinking-repair receipt can exist only in memory (#5996).
+  initialMetadata?: { anthropicThinkingReplay?: "off" };
 }
 interface Dependencies {
   workspaceId: string;
@@ -70,7 +72,10 @@ interface Dependencies {
   summarize(
     head: MuxMessage[],
     signal: AbortSignal,
-    context: ContinuousCompactionContext
+    context: ContinuousCompactionContext,
+    // The whole segment, for the thinking-repair receipt: it can sit in the retained tail
+    // while the head holds signed thinking it says must stay out (#5996).
+    receiptRows: MuxMessage[]
   ): Promise<{ text: string; model: string } | null>;
   fastApply(
     apply: (pendingFollowUp?: CompactionFollowUpRequest) => Promise<boolean>
@@ -330,7 +335,13 @@ export class ContinuousCompactor {
       rows[index] = {
         ...rows[index],
         parts: structuredClone(live.parts),
-        metadata: { ...rows[index].metadata, stepStartPartIndices: [...live.stepStartIndices] },
+        metadata: {
+          ...rows[index].metadata,
+          stepStartPartIndices: [...live.stepStartIndices],
+          ...(live.initialMetadata?.anthropicThinkingReplay === "off"
+            ? { anthropicThinkingReplay: "off" as const }
+            : {}),
+        },
       };
     }
     return rows;
@@ -390,7 +401,7 @@ export class ContinuousCompactor {
       headEnd: { id: headEnd.id, sequence: headEnd.metadata.historySequence },
       headFingerprint: fingerprint(cut.head),
     };
-    const summary = await this.deps.summarize(cut.head, job.abort.signal, context);
+    const summary = await this.deps.summarize(cut.head, job.abort.signal, context, rows);
     if (!summary || job.generation !== this.generation || job.abort.signal.aborted) return;
     assert(summary.text.trim().length > 0, "Continuous summarizer returned empty text");
     const staged = { ...stagedBase, ...summary, attachmentTokens: context.attachmentTokens ?? 0 };

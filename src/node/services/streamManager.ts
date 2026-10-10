@@ -1110,7 +1110,7 @@ export interface ActiveStreamInfo {
   parts: CompletedMessagePart[];
   currentStepStartIndex: number;
   stepStartIndices: number[];
-  initialMetadata?: { systemMessageTokens?: number };
+  initialMetadata?: { systemMessageTokens?: number; anthropicThinkingReplay?: "off" };
   toolCompletionTimestamps: Map<string, number>;
   muxMetadata?: unknown;
 }
@@ -6811,7 +6811,11 @@ export class StreamManager {
         parts: streamInfo.parts,
         currentStepStartIndex: streamInfo.currentStepStartIndex,
         stepStartIndices: streamInfo.stepStartIndices.slice(),
-        initialMetadata: { systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens },
+        initialMetadata: {
+          systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
+          // Continuous compaction reads the running turn's receipt from here (#5996).
+          anthropicThinkingReplay: streamInfo.initialMetadata?.anthropicThinkingReplay,
+        },
         // Correlation metadata for delegated work (e.g. workspace-turn
         // continuations); lets TaskService match a live continuation stream
         // to its still-open workspace-turn handle.
