@@ -244,7 +244,8 @@ function procShowsAll(mountinfo: () => string): boolean {
  * launcher is dead. It needs the job name pattern and a dead owner (ownerState), and it removes
  * by ID after the same name and label check as cleanup. It lists every other container and
  * leaves it. The owner label names a launcher, not the daemon, so this runs only on purpose,
- * and it prints the Docker endpoint first. Exit 3 when a removal cannot be proved.
+ * and it prints the Docker endpoint first. Exit 3 when a removal cannot be proved, or a
+ * leftover's owner cannot be told.
  */
 export async function recover(o: LaunchOptions & { log?: (line: string) => void }) {
   const say = o.log ?? logLine;
@@ -267,6 +268,9 @@ export async function recover(o: LaunchOptions & { log?: (line: string) => void 
       const named = jobName.test(job.name);
       if (owner !== "dead" || !named) {
         say(`recover: left ${job.name}: owner ${owner}${named ? "" : ", not a job name"}`);
+        // An owner it cannot tell needs the manual check (docs/AGENTS.md), so the run is not
+        // clean: exit 3. A live launcher's container is not a leftover to fix.
+        if (owner === "cannot tell") unproved += 1;
         continue;
       }
       // A removal that started finishes (cleanup commands ignore a stop); no new one starts.

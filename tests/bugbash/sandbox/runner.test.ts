@@ -769,7 +769,8 @@ test("C2: recover removes only dead owners of this checkout with a job name, by 
   const real = fs.realpathSync(root);
   const logged: string[] = [];
   const o = { root: real, cwd: real, env: {}, stop: new AbortController().signal };
-  expect(await recover({ ...o, log: (line) => logged.push(line) })).toBe(0);
+  // Exit 3: otherPidns and otherBoot stay with an owner it cannot tell (the manual check).
+  expect(await recover({ ...o, log: (line) => logged.push(line) })).toBe(3);
   const left = [
     lines.live,
     lines.otherPidns,
@@ -784,6 +785,21 @@ test("C2: recover removes only dead owners of this checkout with a job name, by 
   expect([...(calls().match(/^rm -f \w+/gm) ?? [])]).toEqual(ids.map((id) => `rm -f ${id}`));
   expect(calls()).not.toMatch(/^(images|pull|image |run )/m);
   expect(fs.readdirSync(tmp)).toEqual([]);
+});
+
+test("D1: recover exits 3 for an owner it cannot tell, and 0 for a live launcher", async () => {
+  const { lines } = leftovers();
+  const real = fs.realpathSync(root);
+  const o = { root: real, cwd: real, env: {}, stop: new AbortController().signal, log: () => {} };
+  for (const [line, code] of [
+    [lines.otherBoot, 3],
+    [lines.live, 0],
+  ] as const) {
+    fs.writeFileSync(path.join(bin, "containers"), line + "\n");
+    fake();
+    expect(await recover(o)).toBe(code);
+    expect(registry().trim()).toBe(line); // left either way
+  }
 });
 
 test("C2: recover reports a removal it cannot prove (exit 3)", async () => {
