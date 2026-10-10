@@ -15,6 +15,7 @@ import {
   type TurnStreamHandle,
 } from "@/node/services/streamManager";
 import { log } from "@/node/services/log";
+import { eventSpine } from "@/node/services/events/eventSpine";
 import type {
   MockAssistantEvent,
   MockStreamErrorEvent,
@@ -169,6 +170,16 @@ interface ActiveStream {
   lastEventTimestamp: number;
 }
 
+/**
+ * Mock streams bypass StreamManager, which emits the spine's stream.end on every terminal
+ * outcome. Mirror it on each mock terminal (completion, error, abort), before the completion
+ * settles as StreamManager does, so spine observers such as plugin turn.end hooks also run in
+ * mock mode.
+ */
+function emitSpineStreamEnd(workspaceId: string, messageId: string): void {
+  eventSpine.emit("stream.end", { workspaceId, messageId });
+}
+
 export class MockAiStreamPlayer {
   private readonly streamStartGates = new Map<string, StreamStartGate>();
   private readonly releasedStreamStartGates = new Set<string>();
@@ -297,6 +308,7 @@ export class MockAiStreamPlayer {
         this.deps.aiService.emit("stream-abort", streamAbort);
       } finally {
         if (this.activeStreams.get(workspaceId) === active) this.activeStreams.delete(workspaceId);
+        emitSpineStreamEnd(workspaceId, active.messageId);
         active.settleCompletion({ status: "aborted", abortReason, streamAbort });
       }
     })()
@@ -1023,6 +1035,7 @@ export class MockAiStreamPlayer {
           this.deps.aiService.emit("error", createErrorEvent(workspaceId, streamError));
         } finally {
           this.cleanup(workspaceId);
+          emitSpineStreamEnd(workspaceId, active.messageId);
           active.settleCompletion(active.terminalCompletion);
         }
         break;
@@ -1093,6 +1106,7 @@ export class MockAiStreamPlayer {
           this.deps.aiService.emit("stream-end", payload);
         } finally {
           this.cleanup(workspaceId);
+          emitSpineStreamEnd(workspaceId, active.messageId);
           active.settleCompletion(active.terminalCompletion);
         }
         break;

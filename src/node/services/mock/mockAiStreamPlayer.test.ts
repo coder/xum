@@ -8,6 +8,7 @@ import type { AIService } from "@/node/services/aiService";
 import type { StreamDeltaEvent, StreamEndEvent, StreamStartEvent } from "@/common/types/stream";
 import { buildMockStreamEventsFromReply } from "./mockAiStreamAdapter";
 import { createTestHistoryService } from "../testHistoryService";
+import { eventSpine } from "../events/eventSpine";
 
 function readWorkspaceId(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object") return undefined;
@@ -803,6 +804,38 @@ describe("MockAiStreamPlayer", () => {
       thinkingLevel: "high",
       muxMetadata,
     });
+  });
+
+  test.each([
+    ["completion", "[mock:list-languages] List 3 programming languages", "completed"],
+    ["error", "[mock:error:context] Trigger context error", "failed"],
+    ["abort", "[force] keep streaming", "aborted"],
+  ] as const)("emits the spine stream.end once on %s", async (_kind, prompt, status) => {
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+    const workspaceId = `workspace-spine-end-${status}`;
+    const ended: Array<{ workspaceId: string; messageId: string }> = [];
+    const unsubscribe = eventSpine.subscribe("stream.end", (payload) => {
+      if (payload.workspaceId === workspaceId) ended.push(payload);
+    });
+    try {
+      if (status === "aborted") {
+        aiServiceStub.once("stream-delta", () => void player.stop(workspaceId));
+      }
+      const user = createMuxMessage("user-spine-end", "user", prompt, { timestamp: Date.now() });
+      const playResult = await player.play([user], workspaceId);
+      if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+      const completion = await playResult.data.completion;
+      expect(completion.status).toBe(status);
+      expect(ended).toHaveLength(1);
+      expect(ended[0]?.messageId).toBeTruthy();
+    } finally {
+      unsubscribe();
+    }
   });
 
   test("stop prevents queued stream events from emitting", async () => {
