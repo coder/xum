@@ -2041,6 +2041,42 @@ describe("AgentPluginInstallService", () => {
     expect(broken.warnings.some((warning) => warning.startsWith("skills/greet:"))).toBe(true);
   });
 
+  test("the preview lists contributed views and a changed view list needs fresh consent", async () => {
+    const writeViews = async (version: string, views: Array<Record<string, string>>) => {
+      await writePluginFixture(remoteDir, { version });
+      await fsPromises.writeFile(
+        path.join(remoteDir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "demo-plugin",
+          version,
+          description: "Demo plugin",
+          contributes: { views },
+        })
+      );
+      return commitAll(remoteDir, `views at ${version}`);
+    };
+    const settings = { id: "settings", title: "Settings", server: "echo", resourceUri: "ui://e/s" };
+    await writeViews("1.0.0", [settings]);
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.views).toEqual([settings]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // Pointing an existing view at another resource is gated like a changed hook.
+    await writeViews("1.1.0", [{ ...settings, resourceUri: "ui://e/other" }]);
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/changes view settings/);
+    // A new view is gated too.
+    await writeViews("1.2.0", [
+      settings,
+      { id: "dash", title: "Dash", server: "echo", resourceUri: "ui://e/d" },
+    ]);
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/adds view dash/);
+
+    // Removing a view needs no re-consent.
+    const head = await writeViews("2.0.0", []);
+    expect((await service.update({ name: "demo-plugin" })).lockedSha).toBe(head);
+  });
+
   test("update accepts an env property reordering as capability-neutral", async () => {
     // env is an unordered map: a mere property reordering upstream spawns an
     // identical environment and must not be rejected as a capability change

@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import type { McpAppPluginView } from "@/common/orpc/schemas/mcpApps";
 import type { DisplayedMessage } from "@/common/types/message";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
@@ -17,6 +18,8 @@ import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
  * whenever a view mounts; listing a view never calls the tool again.
  */
 export interface McpAppViewRef {
+  /** Optional so tool card refs stay unchanged; plugin views set "plugin". */
+  kind?: "tool";
   toolCallId: string;
   serverName: string;
   resourceUri: string;
@@ -28,6 +31,41 @@ export interface McpAppViewRef {
   cancelled: boolean;
   /** The call returned an error (a subset of `cancelled`). */
   failed: boolean;
+}
+
+/**
+ * A view a plugin declares in its manifest (`contributes.views`), opened from the command
+ * palette without a tool call. The renderer knows it only by its plugin view ID: the backend
+ * maps that ID to the plugin's server and ui:// resource. `serverKey` (from listPluginViews)
+ * is the view's own server for its tools/call.
+ */
+export interface McpAppPluginViewRef extends McpAppPluginView {
+  kind: "plugin";
+}
+
+/** Any view the Artifacts tab can show. */
+export type McpAppViewEntry = McpAppViewRef | McpAppPluginViewRef;
+
+export function pluginViewRef(view: McpAppPluginView): McpAppPluginViewRef {
+  return {
+    kind: "plugin",
+    pluginViewId: view.pluginViewId,
+    title: view.title,
+    pluginName: view.pluginName,
+    serverName: view.serverName,
+    serverKey: view.serverKey,
+    // Kept so an open frame refetches after the user enables the view's server.
+    enabled: view.enabled,
+  };
+}
+
+/**
+ * Plugin views for the picker: only the current listing (listPluginViews). A view the fresh
+ * list lacks (uninstalled, trust revoked, server gone) is not kept from an older open, so its
+ * frame unmounts instead of running stale content.
+ */
+export function pluginViewEntries(listed: readonly McpAppPluginView[]): McpAppPluginViewRef[] {
+  return listed.map(pluginViewRef);
 }
 
 /** Longest argument summary shown next to a view's label. */
@@ -75,13 +113,23 @@ export function appViewPickerDetails(views: readonly McpAppViewRef[]): string[] 
 
 /** Artifacts picker value for an app view; file paths never start with this prefix. */
 export const MCP_APP_SELECTION_PREFIX = "mcp-app:";
+/** Picker value prefix for a plugin view: a different prefix, so no tool call ID can collide. */
+export const MCP_PLUGIN_VIEW_SELECTION_PREFIX = "mcp-plugin-view:";
 
 export function mcpAppSelectionKey(toolCallId: string): string {
   return `${MCP_APP_SELECTION_PREFIX}${toolCallId}`;
 }
 
-const EMPTY: readonly McpAppViewRef[] = [];
-const viewsByWorkspace = new Map<string, readonly McpAppViewRef[]>();
+/** A view's identity: its picker value, unique across tool and plugin views. */
+export function mcpAppViewKey(view: McpAppViewEntry): string {
+  return view.kind === "plugin"
+    ? `${MCP_PLUGIN_VIEW_SELECTION_PREFIX}${view.pluginViewId}`
+    : mcpAppSelectionKey(view.toolCallId);
+}
+
+const EMPTY: readonly McpAppViewEntry[] = [];
+const EMPTY_TRANSCRIPT: readonly McpAppViewRef[] = [];
+const viewsByWorkspace = new Map<string, readonly McpAppViewEntry[]>();
 const listeners = new Set<() => void>();
 
 function emit() {
@@ -93,7 +141,7 @@ function subscribe(listener: () => void) {
   return () => listeners.delete(listener);
 }
 
-export function getMcpAppViews(workspaceId: string): readonly McpAppViewRef[] {
+export function getMcpAppViews(workspaceId: string): readonly McpAppViewEntry[] {
   return viewsByWorkspace.get(workspaceId) ?? EMPTY;
 }
 
@@ -195,15 +243,16 @@ function transcriptViews(
 /** Transcript views first (newest first), then opened views the loaded transcript lacks. */
 function mergeViews(
   fromTranscript: readonly McpAppViewRef[],
-  opened: readonly McpAppViewRef[]
-): readonly McpAppViewRef[] {
+  opened: readonly McpAppViewEntry[]
+): readonly McpAppViewEntry[] {
   if (opened.length === 0) return fromTranscript;
-  const known = new Set(fromTranscript.map((view) => view.toolCallId));
-  const extra = opened.filter((view) => !known.has(view.toolCallId));
+  const known = new Set(fromTranscript.map(mcpAppViewKey));
+  const extra = opened.filter((view) => !known.has(mcpAppViewKey(view)));
   return extra.length === 0 ? fromTranscript : [...fromTranscript, ...extra];
 }
 
-export function useMcpAppViews(workspaceId: string): readonly McpAppViewRef[] {
+/** Tool views from the transcript plus opened views (tool and plugin), each once. */
+export function useMcpAppViews(workspaceId: string): readonly McpAppViewEntry[] {
   const store = useWorkspaceStoreRaw();
   const opened = useSyncExternalStore(subscribe, () => getMcpAppViews(workspaceId));
   const fromTranscript = useSyncExternalStore(
@@ -213,7 +262,7 @@ export function useMcpAppViews(workspaceId: string): readonly McpAppViewRef[] {
         return transcriptViews(workspaceId, store.getWorkspaceState(workspaceId).messages);
       }
       lastTranscriptViews.delete(workspaceId);
-      return EMPTY;
+      return EMPTY_TRANSCRIPT;
     }
   );
   return mergeViews(fromTranscript, opened);
@@ -223,17 +272,14 @@ export function useMcpAppViews(workspaceId: string): readonly McpAppViewRef[] {
  * Add (or refresh) a view, select it in the Artifacts tab, and ask the layout to reveal the
  * tab (OPEN_MCP_APP_VIEW).
  */
-export function openMcpAppView(workspaceId: string, view: McpAppViewRef) {
-  const current = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== view.toolCallId);
+export function openMcpAppView(workspaceId: string, view: McpAppViewEntry) {
+  const key = mcpAppViewKey(view);
+  const current = getMcpAppViews(workspaceId).filter((v) => mcpAppViewKey(v) !== key);
   viewsByWorkspace.set(workspaceId, [view, ...current]);
   emit();
-  writeArtifactSelection(workspaceId, {
-    scope: "artifact",
-    path: mcpAppSelectionKey(view.toolCallId),
-    version: null,
-  });
+  writeArtifactSelection(workspaceId, { scope: "artifact", path: key, version: null });
   window.dispatchEvent(
-    createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: view.toolCallId })
+    createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, viewKey: key })
   );
 }
 
@@ -241,12 +287,13 @@ export function openMcpAppView(workspaceId: string, view: McpAppViewRef) {
  * Close a view: the panel returns to its files. A view from the transcript stays in the
  * picker (it can be reopened); an opened-only view leaves it.
  */
-export function closeMcpAppView(workspaceId: string, toolCallId: string) {
-  const next = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== toolCallId);
+export function closeMcpAppView(workspaceId: string, view: McpAppViewEntry) {
+  const key = mcpAppViewKey(view);
+  const next = getMcpAppViews(workspaceId).filter((v) => mcpAppViewKey(v) !== key);
   if (next.length === 0) viewsByWorkspace.delete(workspaceId);
   else viewsByWorkspace.set(workspaceId, next);
   emit();
-  if (readArtifactSelection(workspaceId).path === mcpAppSelectionKey(toolCallId)) {
+  if (readArtifactSelection(workspaceId).path === key) {
     writeArtifactSelection(workspaceId, { scope: "artifact", path: null, version: null });
   }
 }

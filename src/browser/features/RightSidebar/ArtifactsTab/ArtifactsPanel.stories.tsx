@@ -13,7 +13,7 @@ import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { writeArtifactSelection } from "./artifactSelection";
 import { ArtifactViewer } from "./ArtifactViewer";
-import { openMcpAppView } from "./mcpAppViewsStore";
+import { openMcpAppView, pluginViewRef } from "./mcpAppViewsStore";
 
 /**
  * Desktop and browser mode differ only in what the frame may navigate to (the desktop app
@@ -1099,6 +1099,7 @@ function renderMcpAppView(html: string = MCP_APP_VIEW_HTML) {
               prefersBorder: null,
               resultAvailable: true,
               result: { content: [{ type: "text", text: "Berlin: 18°C, light rain" }] },
+              pluginServerKey: null,
               invocation: {
                 serverName: "weather",
                 toolName: "show_weather",
@@ -1159,5 +1160,83 @@ export const McpAppViewNavigateAway: Story = {
     const canvas = within(canvasElement);
     await canvas.findByText(/This artifact navigated away/, undefined, { timeout: 10000 });
     await expect(canvas.queryByTestId("mcp-app-frame")).toBeNull();
+  },
+};
+
+const PLUGIN_VIEW = {
+  pluginViewId: "0123456789abcdef/settings",
+  title: "Review settings",
+  pluginName: "review-bot",
+  serverName: "settings",
+  serverKey: "plugin:0123456789abcdef:settings",
+  enabled: true,
+};
+
+const PLUGIN_VIEW_HTML = `<!doctype html>
+<html><body style="font-family: sans-serif; margin: 12px">
+  <h3 style="margin: 0 0 8px">Review settings</h3>
+  <label><input type="checkbox" checked /> Block pushes without tests</label>
+</body></html>`;
+
+/** A plugin view (contributes.views) opened from the palette: no tool call, no result. */
+function renderPluginView(enabled: boolean) {
+  const listed = { ...PLUGIN_VIEW, enabled };
+  openMcpAppView(WORKSPACE_ID, pluginViewRef(listed));
+  return (
+    <APIProvider
+      client={createMockORPCClient({
+        artifacts: { listing: listingFor(FILES), files: FILES },
+        mcpApps: {
+          pluginViews: [listed],
+          views: {
+            [PLUGIN_VIEW.pluginViewId]: {
+              html: PLUGIN_VIEW_HTML,
+              csp: {},
+              prefersBorder: null,
+              resultAvailable: false,
+              result: null,
+              pluginServerKey: PLUGIN_VIEW.serverKey,
+              invocation: null,
+            },
+          },
+        },
+      })}
+    >
+      <DesktopApiStub>
+        <div className="bg-background flex h-screen justify-end">
+          <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
+            <ArtifactsPanel workspaceId={WORKSPACE_ID} />
+          </div>
+        </div>
+      </DesktopApiStub>
+    </APIProvider>
+  );
+}
+
+const playPluginView = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement);
+  await canvas.findByTestId("mcp-app-frame");
+  await canvas.findByText(/from plugin/);
+  // A plugin view has no tool result, so the missing-result note never shows.
+  await expect(canvas.queryByText(/Result no longer available/)).toBeNull();
+};
+
+export const PluginViewLaptop: Story = {
+  ...LAPTOP,
+  render: () => renderPluginView(true),
+  play: ({ canvasElement }) => playPluginView(canvasElement),
+};
+export const PluginViewPhone: Story = {
+  ...PHONE,
+  render: () => renderPluginView(true),
+  play: ({ canvasElement }) => playPluginView(canvasElement),
+};
+// Plugin servers start disabled: the frame says which server to enable.
+export const PluginViewServerDisabled: Story = {
+  ...PHONE,
+  render: () => renderPluginView(false),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText(/Enable the settings server for this workspace/);
   },
 };

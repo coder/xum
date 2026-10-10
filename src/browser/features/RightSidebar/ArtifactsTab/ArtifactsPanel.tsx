@@ -55,7 +55,16 @@ import { useArtifactInteractions } from "./useArtifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { createCappedMemory, useCappedMemory } from "./cappedMemory";
 import { McpAppFrame } from "./McpAppFrame";
-import { appViewPickerDetails, mcpAppSelectionKey, useMcpAppViews } from "./mcpAppViewsStore";
+import {
+  appViewPickerDetails,
+  mcpAppViewKey,
+  MCP_PLUGIN_VIEW_SELECTION_PREFIX,
+  pluginViewEntries,
+  useMcpAppViews,
+  type McpAppViewEntry,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
+import { usePluginViews } from "./usePluginViews";
 import {
   type ArtifactSelection,
   type ArtifactSelectionScope,
@@ -328,10 +337,15 @@ export function ArtifactsPanel(props: {
   } = useArtifactSelection(props.workspaceId);
   const setSelection = (next: Partial<ArtifactSelection>) =>
     writeArtifactSelection(props.workspaceId, next);
-  const appViews = useMcpAppViews(props.workspaceId);
-  const appViewDetails = appViewPickerDetails(appViews);
-  const selectedApp =
-    appViews.find((view) => mcpAppSelectionKey(view.toolCallId) === selectedPath) ?? null;
+  const openedViews = useMcpAppViews(props.workspaceId);
+  const toolViews = openedViews.filter((view): view is McpAppViewRef => view.kind !== "plugin");
+  // Plugin views (contributes.views) are listed even before one is opened, like transcript
+  // views; the panel only renders with the Artifacts experiment on, which gates them.
+  const pluginList = usePluginViews(props.workspaceId, true);
+  const pluginViews = pluginViewEntries(pluginList?.views ?? []);
+  const appViews: McpAppViewEntry[] = [...toolViews, ...pluginViews];
+  const appViewDetails = appViewPickerDetails(toolViews);
+  const selectedApp = appViews.find((view) => mcpAppViewKey(view) === selectedPath) ?? null;
 
   const select = (next: { scope: ArtifactSelectionScope; path: string | null }) => {
     setActionError(null);
@@ -448,7 +462,9 @@ export function ArtifactsPanel(props: {
   const waitingForPinned =
     selectedPath != null &&
     ((selectedScope === "pinned" && pinned == null) ||
-      (selectedScope === "shelf" && shelf == null));
+      (selectedScope === "shelf" && shelf == null) ||
+      // A plugin view waits for its (re)listing instead of falling back to a file.
+      (pluginList == null && selectedPath.startsWith(MCP_PLUGIN_VIEW_SELECTION_PREFIX)));
 
   const selected =
     selectedApp != null || waitingForPinned
@@ -681,17 +697,14 @@ export function ArtifactsPanel(props: {
   options.push(
     ...shelfEntries.map((entry) => ({ scope: "shelf" as const, path: shelfSelectionPath(entry) })),
     // App views come last, as in the picker.
-    ...appViews.map((view) => ({
-      scope: "artifact" as const,
-      path: mcpAppSelectionKey(view.toolCallId),
-    }))
+    ...appViews.map((view) => ({ scope: "artifact" as const, path: mcpAppViewKey(view) }))
   );
 
   const selectRelative = (offset: number) => {
     if (options.length === 0) return;
     const current =
       selectedApp != null
-        ? { scope: "artifact" as const, path: mcpAppSelectionKey(selectedApp.toolCallId) }
+        ? { scope: "artifact" as const, path: mcpAppViewKey(selectedApp) }
         : selected;
     const index = current
       ? options.findIndex((o) => o.scope === current.scope && o.path === current.path)
@@ -933,8 +946,9 @@ export function ArtifactsPanel(props: {
   const viewerBody =
     selectedApp != null ? (
       <McpAppFrame
-        // Reload remounts the view, so it re-fetches its resource and result.
-        key={`${selectedApp.toolCallId}\u0000${reloadTick}`}
+        // Reload remounts the view, so it re-fetches its resource and result. A plugin view also
+        // remounts for each new listing generation (plugin updated, trust or enablement changed).
+        key={`${mcpAppViewKey(selectedApp)}\u0000${reloadTick}\u0000${selectedApp.kind === "plugin" ? (pluginList?.generation ?? "") : ""}`}
         workspaceId={props.workspaceId}
         view={selectedApp}
       />
@@ -1058,14 +1072,14 @@ export function ArtifactsPanel(props: {
       <ArtifactPickerSelect
         value={
           selectedApp
-            ? mcpAppSelectionKey(selectedApp.toolCallId)
+            ? mcpAppViewKey(selectedApp)
             : selected
               ? pickerValue(selected.scope, selected.path)
               : ""
         }
         onToggleOtherFiles={() => setOtherFilesExpanded(!otherFilesExpanded)}
         onValueChange={(value) => {
-          if (appViews.some((view) => mcpAppSelectionKey(view.toolCallId) === value)) {
+          if (appViews.some((view) => mcpAppViewKey(view) === value)) {
             select({ scope: "artifact", path: value });
             return;
           }
@@ -1150,15 +1164,11 @@ export function ArtifactsPanel(props: {
               ))}
             </SelectGroup>
           )}
-          {appViews.length > 0 && (
+          {toolViews.length > 0 && (
             <SelectGroup>
               <SelectLabel>App views</SelectLabel>
-              {appViews.map((view, index) => (
-                <SelectItem
-                  key={view.toolCallId}
-                  value={mcpAppSelectionKey(view.toolCallId)}
-                  className="text-xs"
-                >
+              {toolViews.map((view, index) => (
+                <SelectItem key={view.toolCallId} value={mcpAppViewKey(view)} className="text-xs">
                   {/* Several calls of one tool share a label: the arguments and the outcome
                       tell them apart. */}
                   <span className="flex min-w-0 items-center gap-2">
@@ -1168,6 +1178,21 @@ export function ArtifactsPanel(props: {
                     {/* The detail gives way first; long names truncate too. */}
                     <span className="text-muted min-w-0 shrink-[3] truncate text-[10px]">
                       {appViewDetails[index]}
+                    </span>
+                  </span>
+                </SelectItem>
+              ))}
+            </SelectGroup>
+          )}
+          {pluginViews.length > 0 && (
+            <SelectGroup>
+              <SelectLabel>Plugin views</SelectLabel>
+              {pluginViews.map((view) => (
+                <SelectItem key={view.pluginViewId} value={mcpAppViewKey(view)} className="text-xs">
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className="min-w-0 truncate">{view.title}</span>
+                    <span className="text-muted min-w-0 shrink-[3] truncate text-[10px]">
+                      {view.pluginName}
                     </span>
                   </span>
                 </SelectItem>
@@ -1375,8 +1400,10 @@ export function ArtifactsPanel(props: {
     body = withAppPicker(
       <div className="text-muted p-4 text-xs leading-relaxed">{listing.reason}</div>
     );
-  } else if (selected == null && !waitingForPinned && appViews.length === 0) {
-    body = (
+  } else if (selected == null && !waitingForPinned) {
+    // Listed plugin views exist before (and after) any is open, so nothing may be selected
+    // while the picker has entries: keep the picker and show the empty state, not a blank body.
+    body = withAppPicker(
       <div className="text-muted p-4 text-xs leading-relaxed">
         No artifacts yet. Files the agent writes to{" "}
         <code className="text-foreground">$XUM_SCRATCH_DIR/artifacts/</code> appear here.

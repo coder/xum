@@ -287,7 +287,8 @@ export interface CustomEventPayloads {
   };
   [CUSTOM_EVENTS.OPEN_MCP_APP_VIEW]: {
     workspaceId: string;
-    toolCallId: string;
+    /** The view's picker value (mcpAppViewKey): a tool call's view or a plugin view. */
+    viewKey: string;
   };
   [CUSTOM_EVENTS.OPEN_STATS_DIALOG]: {
     workspaceId: string;

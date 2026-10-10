@@ -3,6 +3,7 @@ import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
@@ -11,6 +12,7 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { DisplayedMessage } from "@/common/types/message";
+import type { McpAppPluginView } from "@/common/orpc/schemas/mcpApps";
 import type { ReviewStateDelta, ReviewStateEvent } from "@/common/orpc/schemas/reviewState";
 import { applyReviewStateDelta } from "@/common/utils/reviewState";
 import type {
@@ -32,6 +34,7 @@ import {
   appViewPickerDetails,
   closeMcpAppView,
   openMcpAppView,
+  pluginViewRef,
   type McpAppViewRef,
 } from "./mcpAppViewsStore";
 import { openArtifact } from "./openArtifact";
@@ -67,6 +70,8 @@ function createFakeArtifactsApi(
     versionFiles?: Record<string, ArtifactReadResult>;
     pinned?: PinnedArtifactFile[];
     pinnedFiles?: Record<string, ArtifactReadResult>;
+    /** mcpApps.listPluginViews result (default: none). */
+    pluginViews?: McpAppPluginView[];
     /** Makes `list` fail with this error. */
     listError?: string;
     /** Makes `listVersions` fail with this error. */
@@ -181,6 +186,10 @@ function createFakeArtifactsApi(
             : { success: false as const, error: `Artifact not found: ${input.path}` }
         );
       },
+    },
+    mcpApps: {
+      listPluginViews: () =>
+        Promise.resolve({ success: true as const, data: extra.pluginViews ?? [] }),
     },
   };
   return { api, state };
@@ -841,6 +850,7 @@ describe("ArtifactsPanel", () => {
     );
     let getViewCalls = 0;
     fake.api.mcpApps = {
+      ...fake.api.mcpApps,
       getView: () => {
         getViewCalls += 1;
         return Promise.resolve({
@@ -851,12 +861,13 @@ describe("ArtifactsPanel", () => {
             prefersBorder: null,
             resultAvailable: false,
             result: null,
+            pluginServerKey: null,
             invocation: null,
           },
         });
       },
     };
-    openMcpAppView("ws-app-reload", {
+    const reloadRef = {
       toolCallId: "call-1",
       serverName: "charts",
       resourceUri: "ui://charts/view",
@@ -865,7 +876,8 @@ describe("ArtifactsPanel", () => {
       arguments: {},
       cancelled: false,
       failed: false,
-    });
+    };
+    openMcpAppView("ws-app-reload", reloadRef);
     try {
       const view = render(<ArtifactsPanel workspaceId="ws-app-reload" />, {
         wrapper: (props: { children: ReactNode }) => (
@@ -879,7 +891,7 @@ describe("ArtifactsPanel", () => {
       fireEvent.click(view.getByRole("button", { name: "Reload artifact" }));
       await waitFor(() => expect(getViewCalls).toBe(2));
     } finally {
-      closeMcpAppView("ws-app-reload", "call-1");
+      closeMcpAppView("ws-app-reload", reloadRef);
     }
   });
 
@@ -893,6 +905,7 @@ describe("ArtifactsPanel", () => {
       list: () => Promise.resolve({ success: false as const, error: "Listing failed" }),
     };
     fake.api.mcpApps = {
+      ...fake.api.mcpApps,
       getView: () => Promise.resolve({ success: false as const, error: "No view" }),
     };
     const ref = (toolCallId: string, label: string) => ({
@@ -920,8 +933,139 @@ describe("ArtifactsPanel", () => {
       expect(await view.findByText("Listing failed")).toBeTruthy();
       expect(view.getByRole("combobox", { name: "Artifact" })).toBeTruthy();
     } finally {
-      closeMcpAppView("ws-app-close", "call-a");
-      closeMcpAppView("ws-app-close", "call-b");
+      closeMcpAppView("ws-app-close", ref("call-a", "First view"));
+      closeMcpAppView("ws-app-close", ref("call-b", "Second view"));
+    }
+  });
+
+  test("lists plugin views before any is opened and opens one by its ID", async () => {
+    fake = createFakeArtifactsApi(
+      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      {},
+      {
+        pluginViews: [
+          {
+            pluginViewId: "0123456789abcdef/settings",
+            title: "Review settings",
+            pluginName: "review-bot",
+            serverName: "settings",
+            serverKey: "plugin:0123456789abcdef:settings",
+            enabled: false,
+          },
+        ],
+      }
+    );
+    const requests: unknown[] = [];
+    fake.api.mcpApps = {
+      ...fake.api.mcpApps,
+      getView: (input: unknown) => {
+        requests.push(input);
+        return Promise.resolve({
+          success: false as const,
+          error: "Enable the settings server for this workspace to open this view.",
+        });
+      },
+    };
+    writeArtifactSelection("ws-plugin-view", { path: "mcp-plugin-view:0123456789abcdef/settings" });
+    const view = render(<ArtifactsPanel workspaceId="ws-plugin-view" />, {
+      wrapper: (props: { children: ReactNode }) => (
+        <ThemeProvider forcedTheme="dark">
+          <ApiWrapper>{props.children}</ApiWrapper>
+        </ThemeProvider>
+      ),
+    });
+    // The listed view resolves the selection; the frame shows the backend's error.
+    expect(await view.findByText(/Enable the settings server/)).toBeTruthy();
+    expect(view.container.textContent).toContain("Review settings from plugin review-bot");
+    expect(requests).toEqual([
+      { kind: "plugin", workspaceId: "ws-plugin-view", pluginViewId: "0123456789abcdef/settings" },
+    ]);
+  });
+
+  test("with only plugin views and nothing selected, the empty state shows under the picker", async () => {
+    fake = createFakeArtifactsApi(
+      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      {},
+      {
+        pluginViews: [
+          {
+            pluginViewId: "0123456789abcdef/settings",
+            title: "Review settings",
+            pluginName: "review-bot",
+            serverName: "settings",
+            serverKey: "plugin:0123456789abcdef:settings",
+            enabled: true,
+          },
+        ],
+      }
+    );
+    const view = render(<ArtifactsPanel workspaceId="ws-plugin-empty" />, {
+      wrapper: (props: { children: ReactNode }) => (
+        <ThemeProvider forcedTheme="dark">
+          <ApiWrapper>{props.children}</ApiWrapper>
+        </ThemeProvider>
+      ),
+    });
+    // The picker stays (once the plugin list arrives), so the listed view is one click away.
+    expect(await view.findByLabelText("Artifact")).toBeTruthy();
+    expect(view.container.textContent).toContain("No artifacts yet");
+  });
+
+  test("a plugin view the fresh listing lacks (uninstalled, trust revoked) unmounts", async () => {
+    const listed = {
+      pluginViewId: "0123456789abcdef/settings",
+      title: "Review settings",
+      pluginName: "review-bot",
+      serverName: "settings",
+      serverKey: "plugin:0123456789abcdef:settings",
+      enabled: true,
+    };
+    fake = createFakeArtifactsApi(
+      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      {},
+      { pluginViews: [listed] }
+    );
+    let views = [listed];
+    fake.api.mcpApps = {
+      ...fake.api.mcpApps,
+      listPluginViews: () => Promise.resolve({ success: true as const, data: views }),
+      getView: () =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            html: "<p>settings view</p>",
+            csp: {},
+            prefersBorder: null,
+            resultAvailable: false,
+            result: null,
+            invocation: null,
+            pluginServerKey: listed.serverKey,
+          },
+        }),
+    };
+    // Opened from the palette, so the view store holds it too.
+    const opened = pluginViewRef(listed);
+    openMcpAppView("ws-plugin-gone", opened);
+    try {
+      const view = render(<ArtifactsPanel workspaceId="ws-plugin-gone" />, {
+        wrapper: (props: { children: ReactNode }) => (
+          <ThemeProvider forcedTheme="dark">
+            <ApiWrapper>{props.children}</ApiWrapper>
+          </ThemeProvider>
+        ),
+      });
+      expect(await view.findByTestId("mcp-app-frame")).toBeTruthy();
+
+      // The user revokes the project's trust in Settings → Security.
+      views = [];
+      act(() => publishProjectTrustChanged());
+      await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());
+      // The earlier open does not keep the view alive.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+      expect(view.container.textContent).not.toContain("Review settings from plugin review-bot");
+    } finally {
+      closeMcpAppView("ws-plugin-gone", opened);
     }
   });
 
@@ -936,6 +1080,7 @@ describe("ArtifactsPanel", () => {
       { "report.md": textFile("report.md", "markdown", "# Report") }
     );
     fake.api.mcpApps = {
+      ...fake.api.mcpApps,
       getView: () =>
         Promise.resolve({
           success: true as const,
@@ -945,6 +1090,7 @@ describe("ArtifactsPanel", () => {
             prefersBorder: null,
             resultAvailable: true,
             result: { content: [] },
+            pluginServerKey: null,
             invocation: null,
           },
         }),

@@ -1,4 +1,5 @@
 import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
+import { publishGlobalMcpEnablementChanged } from "@/browser/utils/workspaceMcpMutations";
 import { getOwn } from "@/common/utils/getOwn";
 import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
@@ -993,6 +994,7 @@ export const MCPSettingsSection: React.FC = () => {
           name,
           enabled,
         });
+        if (result.success) publishGlobalMcpEnablementChanged();
         if (!result.success) {
           // Revert on error
           setServers((prev) => ({

@@ -42,6 +42,8 @@ let sendGate: Promise<void> | null = null;
 
 function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
+    // The panel lists plugin views on mount; these tests have none.
+    mcpApps: { listPluginViews: () => Promise.resolve({ success: true as const, data: [] }) },
     artifacts: {
       list: () =>
         Promise.resolve({

@@ -8,6 +8,7 @@ import type {
   RuntimeAvailabilityStatus,
 } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
+import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import { handOffCreationAiSelection } from "@/browser/utils/aiSelectionIntent";
@@ -984,6 +985,7 @@ export function useCreationWorkspace({
               projectPath: trustPrompt.projectPath,
               trusted: true,
             });
+            publishProjectTrustChanged();
             // Trust persisted — resolve immediately. Refresh is best-effort
             // so a transient failure doesn't block workspace creation.
             trustPrompt.resolve(true);

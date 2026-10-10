@@ -2136,6 +2136,45 @@ test("artifact palette commands follow the experiment and pin the typed path", a
   }
 });
 
+test("plugin views get one palette entry each, for the selected workspace only", async () => {
+  const pluginViews = {
+    workspaceId: "w1",
+    generation: 0,
+    views: [
+      {
+        pluginViewId: "0123456789abcdef/settings",
+        title: "Review settings",
+        pluginName: "review-bot",
+        serverName: "settings",
+        serverKey: "plugin:0123456789abcdef:settings",
+        enabled: false,
+      },
+    ],
+  };
+  const id = CommandIds.navOpenPluginView("0123456789abcdef/settings");
+  // The Artifacts experiment gates plugin views, and a list for another workspace never shows.
+  expect(getActions({ pluginViews }).some((a) => a.id === id)).toBe(false);
+  expect(
+    getActions({ artifactsEnabled: true, pluginViews: { ...pluginViews, workspaceId: "w2" } }).some(
+      (a) => a.id === id
+    )
+  ).toBe(false);
+
+  await withTestWindow(async () => {
+    const action = getActions({ artifactsEnabled: true, pluginViews }).find((a) => a.id === id);
+    expect(action?.title).toBe("Open plugin view: Review settings");
+    expect(action?.subtitle).toContain("enable the settings server first");
+    const opened: unknown[] = [];
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, (event) =>
+      opened.push((event as CustomEvent).detail)
+    );
+    await action?.run();
+    expect(opened).toEqual([
+      { workspaceId: "w1", viewKey: "mcp-plugin-view:0123456789abcdef/settings" },
+    ]);
+  });
+});
+
 test("Report slowness exists only with the flight recorder experiment and toasts its outcome", async () => {
   await withTestWindow(async () => {
     const id = CommandIds.perfReportSlowness();
