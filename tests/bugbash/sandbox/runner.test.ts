@@ -1462,6 +1462,18 @@ test("D2: a stopped self-check job ends the run with Stopped and starts no other
   expect(launched).toHaveLength(1);
 });
 
+test("D2: an unknown cleanup ends the self-check with exit 3, even with a stop", async () => {
+  for (const stopped of ["SIGTERM", undefined]) {
+    let launches = 0;
+    const launch = async () => {
+      launches += 1;
+      return { cleanup: "unknown: inspect failed", stopped } as const;
+    };
+    expect(await runSelfCheck(new AbortController().signal, () => {}, launch)).toBe(3);
+    expect(launches).toBe(1);
+  }
+});
+
 test("D2: the self-check checks the upstream for every job, the fixtures too", async () => {
   const lines: string[] = [];
   const launch = async (args: string[], o: { env: NodeJS.ProcessEnv }) => {

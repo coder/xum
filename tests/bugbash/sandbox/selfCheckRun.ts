@@ -11,7 +11,8 @@
  *    export cap. The host receiver must refuse each with its own reason, write nothing outside
  *    the output folder, and still remove the container.
  *
- * Prints one line per check and exits 0 only when all pass, 2 when the launcher refuses.
+ * Prints one line per check and exits 0 only when all pass, 2 when the launcher refuses, and 3
+ * when a container's state is unknown after cleanup (that outranks a stop, as in exitFor()).
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -21,6 +22,9 @@ import { Refusal, Stopped } from "./runner";
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dir, "../../.."));
 const DIR = path.join(ROOT, "tests/bugbash");
+
+/** A job whose container state is unknown after cleanup: the run ends at once with exit 3. */
+class UnknownCleanup extends Error {}
 
 /**
  * Every check selfCheck.ts makes, by name. A container that reports fewer (it stopped early, or a
@@ -109,10 +113,11 @@ export async function runSelfCheck(
           say(`sandbox ${line}`);
         },
       });
-      // A stop ends the run as it ends any launcher job (130 or 143), with no further job. An
-      // unknown cleanup outranks it (exitFor's rule): the checks below report that one.
-      if (outcome.stopped != null && !outcome.cleanup.startsWith("unknown"))
-        throw new Stopped(outcome.stopped);
+      // exitFor()'s rule: an unknown cleanup (exit 3) outranks a stop (130 or 143). Either one
+      // ends the run here, so no further job starts.
+      if (outcome.cleanup.startsWith("unknown"))
+        throw new UnknownCleanup(`${name}: ${outcome.cleanup}`);
+      if (outcome.stopped != null) throw new Stopped(outcome.stopped);
       // Every job runs the whole selfCheck.ts (the fixtures swap only its export), so each one
       // makes one allowed call and the P1 to P5 probes: check the upstream per job.
       const bodies = upstream.requests.slice(before).map((r) => r.body);
@@ -183,6 +188,10 @@ export async function runSelfCheck(
         "no escape file"
       );
     }
+  } catch (error) {
+    if (!(error instanceof UnknownCleanup)) throw error;
+    say(`self-check: a container's state is unknown after cleanup (${error.message})`);
+    return 3;
   } finally {
     await upstream.close();
   }
