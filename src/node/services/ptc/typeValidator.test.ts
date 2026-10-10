@@ -7,6 +7,7 @@ import type { Tool } from "ai";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { findBundledTypeScriptLibDir, validateTypes } from "./typeValidator";
 import { generateXumTypes } from "./typeGenerator";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 
 /**
  * Create a mock tool with the given schema.
@@ -987,6 +988,38 @@ mux.file_read({ path: "wrong" });`,
     `,
       xumTypes
     );
+    expect(result.valid).toBe(true);
+  });
+});
+
+// zod >= 4.5 emits closed tuples as `prefixItems` + `items: false` in its default
+// draft-2020-12 output. json-schema-to-typescript reads only draft-7 tuples, so the
+// attach_file result `value` (a tuple union) became `never[]` and valid guest code
+// that inspects the parts failed to typecheck.
+describe("attach_file result types (real tool definition)", () => {
+  test("guest code can read the parts of a content result", async () => {
+    const attachFile = TOOL_DEFINITIONS.attach_file;
+    const types = await generateXumTypes({
+      attach_file: {
+        description: attachFile.description,
+        inputSchema: attachFile.schema,
+        execute: () => Promise.resolve({ success: true }),
+      } as unknown as Tool,
+    });
+    const result = validateTypes(
+      `
+      const r = xum.attach_file({ path: "/tmp/a.png" });
+      const texts = [];
+      if ("value" in r && r.type === "content") {
+        for (const part of r.value) {
+          if (part.type === "text") texts.push(part.text);
+        }
+      }
+      return texts;
+    `,
+      types
+    );
+    expect(result.errors.map((e) => e.message)).toEqual([]);
     expect(result.valid).toBe(true);
   });
 });
