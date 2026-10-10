@@ -119,6 +119,8 @@ test("forwards a JSON and a streamed call with only the host key, and settles th
   // Response headers are allowlisted: request-id passes, the fake's internal header does not.
   expect(stream.headers["request-id"]).toBe("req_fake");
   expect(stream.headers["x-fake-internal"]).toBeUndefined();
+  // One call per connection for a client that behaves, so the connection limit never cuts a call.
+  expect([json.headers.connection, stream.headers.connection]).toEqual(["close", "close"]);
   expect(fake.requests).toHaveLength(2);
   for (const request of fake.requests) {
     expect(request.url).toBe("/v1/messages");
@@ -228,6 +230,9 @@ test("a connection that never completes its headers is bounded, counted and clos
       let done = false;
       const socket = net.connect(socketPath, () => {
         socket.write(`POST ${PROXY_PATH} HTTP/1.1\r\nhost: x\r\n`); // headers never end
+        // One more header byte every 50 ms: no byte resets the connection's limit.
+        const trickle = setInterval(() => socket.write("x"), 50);
+        socket.on("close", () => clearInterval(trickle));
         const started = Date.now();
         const closed = new Promise<number>((settle) =>
           socket.on("close", () => {
@@ -239,8 +244,10 @@ test("a connection that never completes its headers is bounded, counted and clos
       });
       socket.on("error", () => undefined);
     });
-  // A half-open connection ends after twice the deadline without a byte.
-  expect(await (await open()).closed).toBeGreaterThanOrEqual(550);
+  // A half-open connection ends twice the call deadline after it was accepted.
+  const first = await (await open()).closed;
+  expect(first).toBeGreaterThanOrEqual(550);
+  expect(first).toBeLessThan(1_500);
   // Connections beyond the limit are destroyed at once; close() destroys the rest.
   const held = [];
   for (let i = 0; i < 16; i++) held.push(await open());
@@ -251,6 +258,31 @@ test("a connection that never completes its headers is bounded, counted and clos
   await proxy.close();
   await Promise.all(held.map((h) => h.closed));
   expect(Date.now() - closing).toBeLessThan(200); // close(), not their idle deadline
+});
+
+test("a failed start closes what it started and leaves no private folder", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-proxy-"));
+  fs.chmodSync(dir, 0o700);
+  cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const before = fs
+    .readdirSync(os.tmpdir())
+    .filter((name) => name.startsWith("xum-bugbash-proxy-"));
+  // A unix socket path is limited to 108 bytes, so the job socket cannot bind.
+  const socketPath = path.join(dir, "x".repeat(120));
+  const options = {
+    socketPath,
+    upstream: { baseUrl: "http://127.0.0.1:9", apiKey: KEY },
+    job: { models: [MODEL] },
+    ledger: new Ledger(1),
+    log: () => undefined,
+  };
+  const failed = await startProxy(options).then(
+    () => "started",
+    () => "failed"
+  );
+  expect(failed).toBe("failed");
+  const after = fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith("xum-bugbash-proxy-"));
+  expect(after.sort()).toEqual(before.sort());
 });
 
 test.each(["cut", "stall"])(

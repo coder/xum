@@ -14,7 +14,10 @@
  * A `net` front owns the job's socket and pipes each connection to the HTTP server, which listens
  * on a socket in a private folder of its own. Bun 1.3.12's node:http server never reports a
  * connection whose request headers do not complete, so only the front can bound those: at most
- * MAX_CONNECTIONS, each destroyed after twice the deadline without a byte, all by close().
+ * MAX_CONNECTIONS, each destroyed twice the call deadline after it was accepted (an absolute
+ * limit that no byte resets), and all destroyed by close(). Every response says
+ * `connection: close`, so a client that behaves opens a new connection per call and never meets
+ * that limit inside a call.
  */
 import { once } from "node:events";
 import * as fs from "node:fs";
@@ -153,7 +156,7 @@ export async function startProxy(options: ProxyOptions) {
       }
       status = upstream.status;
       const headers = [...upstream.headers].filter(([name]) => RESPONSE_HEADERS.test(name));
-      res.writeHead(status, Object.fromEntries(headers));
+      res.writeHead(status, { ...Object.fromEntries(headers), connection: "close" });
       const sse = upstream.headers.get("content-type")?.startsWith("text/event-stream") ?? false;
       const parser = new SseUsage();
       const json: Uint8Array[] = [];
@@ -233,37 +236,40 @@ export async function startProxy(options: ProxyOptions) {
     // Deferred: Bun 1.3.12 ignores a destroy() inside the connection handler itself.
     if (closed || pipes.size >= MAX_CONNECTIONS) return void setImmediate(() => outer.destroy());
     const peer = net.connect(innerPath);
-    let idle: ReturnType<typeof setTimeout> | undefined;
+    // Twice the call deadline, so the call deadline of a request sent at once answers first.
+    const lifetime = setTimeout(() => end(), 2 * deadlineMs);
     const end = () => {
-      clearTimeout(idle);
+      clearTimeout(lifetime);
       pipes.delete(outer);
       outer.destroy();
       peer.destroy();
     };
-    const touch = () => {
-      clearTimeout(idle);
-      // Twice the call deadline, so a call's own deadline answers first (a 502, not a cut).
-      idle = setTimeout(end, 2 * deadlineMs);
-    };
     pipes.add(outer);
-    touch();
     for (const [from, to] of [
       [outer, peer],
       [peer, outer],
     ] as const) {
-      from.on("data", touch).on("close", end).on("error", end);
+      from.on("close", end).on("error", end);
       from.pipe(to);
     }
   });
-  for (const [listener, socketPath] of [
-    [server, innerPath],
-    [front, options.socketPath],
-  ] as const) {
-    await new Promise<void>((resolve, reject) => {
-      listener.once("error", reject);
-      listener.listen(socketPath, resolve);
-    });
-    fs.chmodSync(socketPath, 0o600);
+  try {
+    for (const [listener, socketPath] of [
+      [server, innerPath],
+      [front, options.socketPath],
+    ] as const) {
+      await new Promise<void>((resolve, reject) => {
+        listener.once("error", reject);
+        listener.listen(socketPath, resolve);
+      });
+      fs.chmodSync(socketPath, 0o600);
+    }
+  } catch (error) {
+    // No handle exists yet, so nobody else can close what already started.
+    closed = true;
+    for (const listener of [front, server]) if (listener.listening) listener.close();
+    fs.rmSync(inner, { recursive: true, force: true });
+    throw error;
   }
 
   return {
@@ -321,7 +327,8 @@ export async function startProxy(options: ProxyOptions) {
 
 function replyError(res: http.ServerResponse, status: number, message: string) {
   const error = { type: "error", error: { type: "bugbash_proxy_error", message } };
-  res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(error));
+  const headers = { "content-type": "application/json", connection: "close" };
+  res.writeHead(status, headers).end(JSON.stringify(error));
 }
 
 /** Rejects when the call aborts, so the deadline and close() bound every wait. */
