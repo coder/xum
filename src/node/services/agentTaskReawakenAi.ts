@@ -12,6 +12,7 @@
  * No service dependencies: TaskService and WorkspaceTurnManager both import it.
  */
 
+import { ServiceTierSchema, type ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   taskAiPinsToLayer,
@@ -61,6 +62,7 @@ export interface AgentTaskTurnAiSnapshot {
   thinkingLevel: ThinkingLevel;
   /** Selected reasoning mode; "standard" when nothing configures one. */
   reasoningMode: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
 }
 
 /** Transient commit payload handed from TaskService to createWorkspaceTurn. */
@@ -212,6 +214,7 @@ export function buildParentAiSettingsFallbacks(
       model: settings.model,
       thinkingLevel: coerceThinkingLevel(settings.thinkingLevel),
       reasoningMode: coerceOpenAIReasoningMode(settings.reasoningMode),
+      serviceTier: ServiceTierSchema.safeParse(settings.serviceTier).data,
     });
   };
   const normalizedTarget = normalizeAgentId(targetAgentId, "");
@@ -270,6 +273,8 @@ export function planReawakenAi(params: {
       bucket != null
         ? (coerceOpenAIReasoningMode(bucket.reasoningMode) ?? "standard")
         : coerceOpenAIReasoningMode(child.aiSettings?.reasoningMode),
+    serviceTier: ServiceTierSchema.safeParse(bucket?.serviceTier ?? child.aiSettings?.serviceTier)
+      .data,
   };
   const pinsLayer = taskAiPinsToLayer(child.taskAiPins);
   const layers = prepared?.layers ?? null;
@@ -304,6 +309,9 @@ export function planReawakenAi(params: {
     canonicalModel: resolved.effective.model,
     thinkingLevel: resolved.effective.thinkingLevel,
     reasoningMode: resolved.selected.reasoningMode ?? "standard",
+    ...(resolved.selected.serviceTier != null
+      ? { serviceTier: resolved.selected.serviceTier }
+      : {}),
   };
   assert(snapshot.taskModelString.length > 0, "planReawakenAi: resolved model must be non-empty");
   return { kind: "resolved", snapshot, inputsKey, usedDefinitionLayers: layers != null };
@@ -325,6 +333,7 @@ export function applyAgentTaskTurnAiSnapshot(
     model: snapshot.canonicalModel,
     thinkingLevel: snapshot.thinkingLevel,
     reasoningMode: snapshot.reasoningMode,
+    ...(snapshot.serviceTier != null ? { serviceTier: snapshot.serviceTier } : {}),
   };
   const previous = workspace.aiSettingsByAgent?.[snapshot.agentId];
   workspace.aiSettingsByAgent = {
@@ -333,6 +342,7 @@ export function applyAgentTaskTurnAiSnapshot(
       model: bucketModel,
       thinkingLevel: snapshot.thinkingLevel,
       reasoningMode: snapshot.reasoningMode,
+      ...(snapshot.serviceTier != null ? { serviceTier: snapshot.serviceTier } : {}),
       // The snapshot has no Auto choices; the child's composer keeps them for its next sends.
       ...(previous?.autoModelRouting === true ? { autoModelRouting: true } : {}),
       ...(previous?.autoThinkingLevel === true ? { autoThinkingLevel: true } : {}),

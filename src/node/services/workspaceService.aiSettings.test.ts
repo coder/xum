@@ -1,4 +1,5 @@
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
+import { ProvidersConfigStore } from "@/node/config";
 import type { WorkspaceService } from "./workspaceService";
 import type { AgentSession } from "./agentSession";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -92,6 +93,7 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
             agentId,
             model: "openai:gpt-5.2",
             thinkingLevel: "high",
+            serviceTier: "priority",
             autoModelRouting: true,
             autoThinkingLevel: true,
             ...(skip ? { skipAiSettingsPersistence: true } : {}),
@@ -124,6 +126,7 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
                   [agentId]: {
                     model: "openai:gpt-5.2",
                     thinkingLevel: "high",
+                    serviceTier: "priority",
                     autoModelRouting: true,
                     autoThinkingLevel: true,
                   },
@@ -235,6 +238,7 @@ describe("WorkspaceService sendMessage AI selection pins", () => {
     });
     const fakeSession = {
       ...createCompactionAdmissionMocks(),
+      setActiveTurnServiceTier: mock((_tier: string) => ({ accepted: true })),
       isBusy: mock(() => entry.busy === true),
       hasQueuedMessages: mock(() => false),
       hasQueuedOrDispatchingEntry: mock(() => false),
@@ -393,6 +397,48 @@ describe("WorkspaceService sendMessage AI selection pins", () => {
     }
   });
 
+  test("live speed updates forward only to the existing session without saving an unsent pick", async () => {
+    const fixture = await setupPinFixture(CHILD);
+    try {
+      const before = fixture.readEntry();
+      expect(
+        fixture.workspaceService.setActiveTurnServiceTier(` ${fixture.workspaceId} `, "priority")
+      ).toEqual(Ok({ accepted: true }));
+      expect(fixture.fakeSession.setActiveTurnServiceTier).toHaveBeenCalledWith("priority");
+      expect(fixture.readEntry()).toEqual(before);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  test("a speed pick persists on send and pins only the selected task agent", async () => {
+    const fixture = await setupPinFixture(CHILD);
+    try {
+      expect(fixture.readEntry()?.aiSettingsByAgent?.exec?.serviceTier).toBeUndefined();
+      const result = await fixture.workspaceService.sendMessage(fixture.workspaceId, "hi", {
+        agentId: "exec",
+        model: GPT,
+        thinkingLevel: "high",
+        serviceTier: "priority",
+        aiSelectionIntent: { serviceTier: true },
+      });
+      expect(result.success).toBe(true);
+      expect(fixture.readEntry()?.aiSettingsByAgent?.exec?.serviceTier).toBe("priority");
+      expect(fixture.readEntry()?.taskAiPins).toEqual({ serviceTier: "priority" });
+
+      // A later client omitting speed must not erase the saved pick or its pin.
+      await fixture.workspaceService.sendMessage(fixture.workspaceId, "again", {
+        agentId: "exec",
+        model: GPT,
+        thinkingLevel: "medium",
+      });
+      expect(fixture.readEntry()?.aiSettingsByAgent?.exec?.serviceTier).toBe("priority");
+      expect(fixture.readEntry()?.taskAiPins).toEqual({ serviceTier: "priority" });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   test("repeating the same pinned send writes nothing new", async () => {
     const fixture = await setupPinFixture(CHILD);
     try {
@@ -475,6 +521,90 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
       .loadConfigOrDefault()
       .projects.get(projectPath)
       ?.workspaces.find((workspace) => workspace.id === "ws");
+
+  test.each([false, true])(
+    "speed updates merge within one chat and agent (Auto=%s)",
+    async (auto) => {
+      autoRoutingEnabled = auto;
+      const settings = {
+        model: "openai:gpt-5.2",
+        thinkingLevel: "high" as const,
+        serviceTier: "flex" as const,
+      };
+      await saveWorkspaces(harness.config, projectPath, [
+        {
+          id: "ws",
+          path: workspacePath,
+          name: "ws",
+          aiSettingsByAgent: { exec: settings, plan: settings },
+        },
+        {
+          id: "other-chat",
+          path: "/tmp/proj/other-chat",
+          name: "other-chat",
+          aiSettingsByAgent: { exec: settings },
+        },
+      ]);
+      const providers = new ProvidersConfigStore(harness.config.rootDir);
+      providers.saveProvidersConfig({ openai: { serviceTier: "flex" } });
+      const providerFingerprint = providers.getProvidersFileFingerprint();
+      const before = harness.config.loadConfigOrDefault();
+      const { projects: _beforeProjects, ...globalBefore } = before;
+      const otherBefore = before.projects
+        .get(projectPath)
+        ?.workspaces.find((w) => w.id === "other-chat");
+      const svc = workspaceService as unknown as {
+        maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
+      };
+
+      await svc.maybePersistAISettingsFromOptions("ws", {
+        ...settings,
+        agentId: "exec",
+        serviceTier: "priority",
+      });
+      expect(readEntry()?.aiSettingsByAgent?.exec?.serviceTier).toBe("priority");
+      expect(readEntry()?.aiSettingsByAgent?.plan).toEqual(settings);
+
+      // Model/reasoning-only updates preserve speed, but an explicit Standard pick replaces it.
+      expect(
+        (
+          await workspaceService.updateAgentAISettings("ws", "exec", {
+            model: settings.model,
+            thinkingLevel: "medium",
+          })
+        ).success
+      ).toBe(true);
+      expect(readEntry()?.aiSettingsByAgent?.exec?.serviceTier).toBe("priority");
+      expect(
+        (
+          await workspaceService.updateAgentAISettings("ws", "exec", {
+            ...settings,
+            serviceTier: "default",
+          })
+        ).success
+      ).toBe(true);
+      expect(readEntry()?.aiSettingsByAgent?.exec?.serviceTier).toBe("default");
+      const after = harness.config.loadConfigOrDefault();
+      const { projects: _afterProjects, ...globalAfter } = after;
+      expect(providers.getProvidersFileFingerprint()).toBe(providerFingerprint);
+      expect(globalAfter).toEqual(globalBefore);
+      expect(
+        after.projects.get(projectPath)?.workspaces.find((w) => w.id === "other-chat")
+      ).toEqual(otherBefore);
+    }
+  );
+
+  test("live speed updates do not create a session or write saved settings", () => {
+    const editConfig = spyOn(harness.config, "editConfig");
+    try {
+      expect(workspaceService.setActiveTurnServiceTier("ws", "priority")).toEqual(
+        Ok({ accepted: false })
+      );
+      expect(editConfig).not.toHaveBeenCalled();
+    } finally {
+      editConfig.mockRestore();
+    }
+  });
 
   test("refuses unpriced model persistence for budgeted active goals", async () => {
     workspaceService.setWorkspaceGoalService({

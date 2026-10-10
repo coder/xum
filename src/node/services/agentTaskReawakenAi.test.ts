@@ -203,6 +203,27 @@ describe("planReawakenAi", () => {
   });
 });
 
+it("reawakens with the child's pinned speed and commits it without changing its parent", () => {
+  const config = makeConfig({
+    child: { taskAiPins: { serviceTier: "priority" } },
+    parent: {
+      agentId: "exec",
+      aiSettingsByAgent: {
+        exec: { model: "openai:gpt-5.2", thinkingLevel: "high", serviceTier: "flex" },
+      },
+    },
+  });
+  const entries = config.projects.get(PROJECT)!.workspaces;
+  const parentBefore = structuredClone(entries[0]);
+  const result = plan(config);
+  if (result.kind !== "resolved") throw new Error(`unexpected ${result.kind}`);
+  expect(result.snapshot.serviceTier).toBe("priority");
+  applyAgentTaskTurnAiSnapshot(entries[1], result.snapshot);
+  expect(entries[1].aiSettings?.serviceTier).toBe("priority");
+  expect(entries[1].aiSettingsByAgent?.exec.serviceTier).toBe("priority");
+  expect(entries[0]).toEqual(parentBefore);
+});
+
 describe("applyAgentTaskTurnAiSnapshot", () => {
   it("writes aiSettings, the active bucket, and the task fields", () => {
     const workspace: Workspace = {

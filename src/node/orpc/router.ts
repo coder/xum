@@ -1910,6 +1910,12 @@ export const router = (authToken?: string) => {
             input.thinkingLevel
           )
         ),
+      setActiveTurnServiceTier: t
+        .input(schemas.workspace.setActiveTurnServiceTier.input)
+        .output(schemas.workspace.setActiveTurnServiceTier.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.setActiveTurnServiceTier(input.workspaceId, input.serviceTier)
+        ),
       updateTitle: t
         .input(schemas.workspace.updateTitle.input)
         .output(schemas.workspace.updateTitle.output)

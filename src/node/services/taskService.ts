@@ -1,3 +1,4 @@
+import { ServiceTierSchema, type ServiceTier } from "@/common/config/schemas/providersConfig";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { randomUUID } from "node:crypto";
 import {
@@ -1330,12 +1331,18 @@ function rowSupersedes(
  */
 function buildTaskTurnSendOptions(
   workspace: WorkspaceConfigEntry
-): Pick<SendMessageOptions, "model" | "agentId" | "thinkingLevel" | "reasoningMode"> {
+): Pick<
+  SendMessageOptions,
+  "model" | "agentId" | "thinkingLevel" | "reasoningMode" | "serviceTier"
+> {
   return {
     model: workspace.taskModelString ?? defaultModel,
     agentId: resolveTaskAgentIdForResume(workspace),
     thinkingLevel: workspace.taskThinkingLevel,
     reasoningMode: coerceOpenAIReasoningMode(workspace.aiSettings?.reasoningMode),
+    serviceTier: ServiceTierSchema.safeParse(
+      resolveWorkspaceAISettings(workspace, resolveTaskAgentIdForResume(workspace))?.serviceTier
+    ).data,
   };
 }
 
@@ -5247,6 +5254,7 @@ export class TaskService implements AgentTaskIntegration {
     agentId: string;
     thinkingLevel?: ThinkingLevel;
     reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
   }> {
     // 1) Try stream-end hint metadata (available in handleStreamEnd path)
     // Compaction is internal bookkeeping, not an identity for resuming user work.
@@ -5302,6 +5310,7 @@ export class TaskService implements AgentTaskIntegration {
               model: workspace.aiSettings.model,
               thinkingLevel: workspace.aiSettings.thinkingLevel,
               reasoningMode: coerceOpenAIReasoningMode(workspace.aiSettings.reasoningMode),
+              serviceTier: ServiceTierSchema.safeParse(workspace.aiSettings.serviceTier).data,
             },
           ]
         : undefined,
@@ -5311,6 +5320,9 @@ export class TaskService implements AgentTaskIntegration {
       model: resolved.selected.model,
       agentId,
       thinkingLevel: resolved.selected.thinkingLevel,
+      ...(resolved.selected.serviceTier != null
+        ? { serviceTier: resolved.selected.serviceTier }
+        : {}),
       ...(resolved.selected.reasoningMode != null
         ? { reasoningMode: resolved.selected.reasoningMode }
         : {}),
@@ -5843,6 +5855,9 @@ export class TaskService implements AgentTaskIntegration {
         agentId,
         thinkingLevel: task.taskThinkingLevel,
         reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
+        serviceTier: ServiceTierSchema.safeParse(
+          resolveWorkspaceAISettings(task, agentId)?.serviceTier
+        ).data,
       };
       if (pendingGuidance.length > 0) {
         let sendResult: Result<void, SendMessageError> = Ok(undefined);
@@ -9996,6 +10011,7 @@ export class TaskService implements AgentTaskIntegration {
             agentId: activeAgentId,
             thinkingLevel: activeAiSettings?.thinkingLevel ?? entry.workspace.taskThinkingLevel,
             reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
+            serviceTier: ServiceTierSchema.safeParse(activeAiSettings?.serviceTier).data,
             queueDispatchMode,
             ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
           },
@@ -10828,6 +10844,7 @@ export class TaskService implements AgentTaskIntegration {
           agentId: resumeOptions.agentId,
           thinkingLevel: resumeOptions.thinkingLevel,
           reasoningMode: resumeOptions.reasoningMode,
+          serviceTier: resumeOptions.serviceTier,
           muxMetadata: triggerMuxMetadata,
         };
       } else if (unrelatedRoot || awaitedDelegatedTurn != null) {
@@ -10866,6 +10883,7 @@ export class TaskService implements AgentTaskIntegration {
           agentId: activeAgentId,
           thinkingLevel: activeAiSettings?.thinkingLevel ?? targetEntry.workspace.taskThinkingLevel,
           reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
+          serviceTier: ServiceTierSchema.safeParse(activeAiSettings?.serviceTier).data,
           muxMetadata: triggerMuxMetadata,
         };
       }
@@ -13759,6 +13777,7 @@ export class TaskService implements AgentTaskIntegration {
       agentId: resumeOptions.agentId,
       thinkingLevel: resumeOptions.thinkingLevel,
       reasoningMode: resumeOptions.reasoningMode,
+      serviceTier: resumeOptions.serviceTier,
       ...(wakeRestrictions.toolPolicy != null ? { toolPolicy: wakeRestrictions.toolPolicy } : {}),
       ...(wakeRestrictions.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
       ...(effectiveStrictPin != null ? { strictAgentResolution: effectiveStrictPin } : {}),
@@ -14189,6 +14208,7 @@ export class TaskService implements AgentTaskIntegration {
         agentId: resumeOptions.agentId,
         thinkingLevel: resumeOptions.thinkingLevel,
         reasoningMode: resumeOptions.reasoningMode,
+        serviceTier: resumeOptions.serviceTier,
         ...(queueDispatchMode != null ? { queueDispatchMode } : {}),
         ...(params.sendRestrictions?.toolPolicy != null
           ? { toolPolicy: params.sendRestrictions.toolPolicy }
@@ -14418,6 +14438,9 @@ export class TaskService implements AgentTaskIntegration {
         agentId,
         thinkingLevel: freshEntry.workspace.taskThinkingLevel,
         reasoningMode: coerceOpenAIReasoningMode(freshEntry.workspace.aiSettings?.reasoningMode),
+        serviceTier: ServiceTierSchema.safeParse(
+          resolveWorkspaceAISettings(freshEntry.workspace, agentId)?.serviceTier
+        ).data,
         ...(completionKind === "propose_plan"
           ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
           : {}),
@@ -17729,6 +17752,9 @@ export class TaskService implements AgentTaskIntegration {
         agentId,
         thinkingLevel: entry.workspace.taskThinkingLevel,
         reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
+        serviceTier: ServiceTierSchema.safeParse(
+          resolveWorkspaceAISettings(entry.workspace, agentId)?.serviceTier
+        ).data,
       },
       {
         acceptanceOrigin: "automatic",
@@ -18008,6 +18034,7 @@ export class TaskService implements AgentTaskIntegration {
         agentId: resumeOptions.agentId,
         thinkingLevel: resumeOptions.thinkingLevel,
         reasoningMode: resumeOptions.reasoningMode,
+        serviceTier: resumeOptions.serviceTier,
         ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
       };
       // Admission classification: in-owner auto-resume continues the same attempt (no rotation).

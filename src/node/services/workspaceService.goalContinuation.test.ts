@@ -319,6 +319,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         retrySendOptions: {
           model: "anthropic:claude-opus-4-6",
           agentId: "plan",
+          serviceTier: "priority",
           strictAgentResolution: true,
           agentInitiated: true,
         },
@@ -362,6 +363,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         strictAgentResolution: true,
         skipAiSettingsPersistence: true,
       });
+      expect(options?.serviceTier).toBe("priority");
       expect(options && "agentInitiated" in options).toBe(false);
       expect(options?.muxMetadata).toBeUndefined();
     });
@@ -511,6 +513,57 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
     test("returns null when the workspace is not found in config", async () => {
       const service = await makeServiceWithConfig();
       expect(await service.getGoalContinuationKickoffSendOptions("ws-unknown")).toBeNull();
+    });
+
+    test("automatic turns retain the selected agent's saved speed without borrowing another chat", async () => {
+      const service = await makeServiceWithConfig({
+        projects: new Map([
+          [
+            "/tmp/proj",
+            {
+              workspaces: [
+                {
+                  id: "speed-chat",
+                  path: "/tmp/proj/speed-chat",
+                  agentId: "exec",
+                  aiSettingsByAgent: {
+                    exec: {
+                      model: "openai:gpt-5.2",
+                      thinkingLevel: "high",
+                      serviceTier: "priority",
+                    },
+                    plan: { model: "openai:gpt-5.2", thinkingLevel: "high", serviceTier: "flex" },
+                    compact: {
+                      model: "openai:gpt-5.2",
+                      thinkingLevel: "high",
+                      serviceTier: "default",
+                    },
+                  },
+                },
+                { id: "other-chat", path: "/tmp/proj/other-chat" },
+              ],
+            },
+          ],
+        ]),
+      });
+      const internal = service as unknown as {
+        buildIdleCompactionSendOptions(workspaceId: string): Promise<SendMessageOptions>;
+        buildHeartbeatSendOptions(
+          workspaceId: string
+        ): Promise<{ sendOptions: SendMessageOptions }>;
+      };
+      expect((await service.getGoalContinuationKickoffSendOptions("speed-chat"))?.serviceTier).toBe(
+        "priority"
+      );
+      expect((await internal.buildHeartbeatSendOptions("speed-chat")).sendOptions.serviceTier).toBe(
+        "priority"
+      );
+      expect((await internal.buildIdleCompactionSendOptions("speed-chat")).serviceTier).toBe(
+        "default"
+      );
+      expect(
+        (await service.getGoalContinuationKickoffSendOptions("other-chat"))?.serviceTier
+      ).toBeUndefined();
     });
 
     test("prefers per-workspace agent model over workspace default and globals", async () => {

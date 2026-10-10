@@ -2,6 +2,7 @@ import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessage
 import { removeRuntimeScratchDir } from "@/node/runtime/runtimeScratchDir";
 import type { ContextManagementService } from "./contextManagement/contextManagementService";
 import type { CompactionReplacementCapture } from "./compactionCancellation";
+import { ServiceTierSchema, type ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { RestartBlocker } from "@/common/orpc/types";
 import { CompactionPendingState } from "./compactionPendingState";
 import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
@@ -647,19 +648,21 @@ type WorkspaceHeartbeatSettingsUpdate = Omit<Partial<WorkspaceHeartbeatSettings>
 };
 type WorkspaceGoalDefaultsOverride = z.infer<typeof WorkspaceGoalDefaultsOverrideSchema>;
 
-// Optional fields the update omits keep their stored value: older clients omit reasoningMode,
+// Optional fields the update omits keep their stored value: older clients omit reasoning/speed,
 // and only sends and workspace creation carry the auto-routing flags.
 function mergeAgentAISettings(
   prev: WorkspaceAgentAISettings | undefined,
   next: WorkspaceAgentAISettings
 ): WorkspaceAgentAISettings {
   const reasoningMode = next.reasoningMode ?? prev?.reasoningMode;
+  const serviceTier = next.serviceTier ?? prev?.serviceTier;
   const autoModelRouting = next.autoModelRouting ?? prev?.autoModelRouting;
   const autoThinkingLevel = next.autoThinkingLevel ?? prev?.autoThinkingLevel;
   return {
     model: next.model,
     thinkingLevel: next.thinkingLevel,
     ...(reasoningMode != null ? { reasoningMode } : {}),
+    ...(serviceTier != null ? { serviceTier } : {}),
     ...(autoModelRouting === true ? { autoModelRouting } : {}),
     ...(autoThinkingLevel === true ? { autoThinkingLevel } : {}),
   };
@@ -2228,6 +2231,7 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
   agentId: true,
   thinkingLevel: true,
   reasoningMode: true,
+  serviceTier: true,
   toolPolicy: true,
   additionalSystemInstructions: true,
   maxOutputTokens: true,
@@ -13312,6 +13316,7 @@ export class WorkspaceService
       model,
       thinkingLevel: aiSettings.thinkingLevel,
       ...(aiSettings.reasoningMode != null ? { reasoningMode: aiSettings.reasoningMode } : {}),
+      ...(aiSettings.serviceTier != null ? { serviceTier: aiSettings.serviceTier } : {}),
       ...(aiSettings.autoModelRouting != null
         ? { autoModelRouting: aiSettings.autoModelRouting }
         : {}),
@@ -13361,17 +13366,25 @@ export class WorkspaceService
     // reasoningMode is optional: old clients omit it and the persist path then
     // preserves any previously stored value instead of wiping it.
     const reasoningMode = options?.reasoningMode;
+    // Speed belongs to this chat/agent, not provider-wide defaults. Older clients leave it alone.
+    const serviceTier = options?.serviceTier;
 
     // Clients hide Auto while the experiment is off, so such a send carries no Auto choice
     // and the merge keeps the saved ones.
     if (!this.isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING)) {
-      return { model, thinkingLevel, ...(reasoningMode != null ? { reasoningMode } : {}) };
+      return {
+        model,
+        thinkingLevel,
+        ...(reasoningMode != null ? { reasoningMode } : {}),
+        ...(serviceTier != null ? { serviceTier } : {}),
+      };
     }
 
     return {
       model,
       thinkingLevel,
       ...(reasoningMode != null ? { reasoningMode } : {}),
+      ...(serviceTier != null ? { serviceTier } : {}),
       // Clients send the auto-routing flags only when on, so an absent flag means off.
       autoModelRouting: options?.savedAutoRouting?.model ?? options?.autoModelRouting === true,
       autoThinkingLevel:
@@ -13682,6 +13695,19 @@ export class WorkspaceService
       return Ok(session.setActiveTurnThinkingLevel(level));
     } catch (error) {
       return Err(`Failed to set active-turn thinking level: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /** Live speed changes stay turn-local; only a subsequent user send saves the chat preference. */
+  setActiveTurnServiceTier(
+    workspaceId: string,
+    serviceTier: ServiceTier
+  ): Result<{ accepted: boolean }, string> {
+    try {
+      const session = this.sessions.get(workspaceId.trim());
+      return Ok(session?.setActiveTurnServiceTier(serviceTier) ?? { accepted: false });
+    } catch (error) {
+      return Err(`Failed to set active-turn service tier: ${getErrorMessage(error)}`);
     }
   }
 
@@ -21008,6 +21034,7 @@ export class WorkspaceService
               model: workspaceEntry.aiSettings.model,
               thinkingLevel: coerceThinkingLevel(workspaceEntry.aiSettings.thinkingLevel),
               reasoningMode: coerceOpenAIReasoningMode(workspaceEntry.aiSettings.reasoningMode),
+              serviceTier: ServiceTierSchema.safeParse(workspaceEntry.aiSettings.serviceTier).data,
             },
           ]
         : undefined,
@@ -21021,6 +21048,9 @@ export class WorkspaceService
       thinkingLevel: resolved.selected.thinkingLevel,
       ...(resolved.selected.reasoningMode != null
         ? { reasoningMode: resolved.selected.reasoningMode }
+        : {}),
+      ...(resolved.selected.serviceTier != null
+        ? { serviceTier: resolved.selected.serviceTier }
         : {}),
     };
   }
@@ -21270,6 +21300,7 @@ export class WorkspaceService
                 model: execAgentSettings.model,
                 thinkingLevel: coerceThinkingLevel(execAgentSettings.thinkingLevel),
                 reasoningMode: coerceOpenAIReasoningMode(execAgentSettings.reasoningMode),
+                serviceTier: ServiceTierSchema.safeParse(execAgentSettings.serviceTier).data,
               },
             ]
           : []),
@@ -21291,6 +21322,9 @@ export class WorkspaceService
       thinkingLevel: resolved.effective.thinkingLevel,
       ...(resolved.selected.reasoningMode != null
         ? { reasoningMode: resolved.selected.reasoningMode }
+        : {}),
+      ...(resolved.selected.serviceTier != null
+        ? { serviceTier: resolved.selected.serviceTier }
         : {}),
       maxOutputTokens: undefined,
       // Disable all tools during compaction - regex .* matches all tool names.
@@ -21783,6 +21817,8 @@ export class WorkspaceService
                 model: workspaceEntry.aiSettings.model,
                 thinkingLevel: coerceThinkingLevel(workspaceEntry.aiSettings.thinkingLevel),
                 reasoningMode: coerceOpenAIReasoningMode(workspaceEntry.aiSettings.reasoningMode),
+                serviceTier: ServiceTierSchema.safeParse(workspaceEntry.aiSettings.serviceTier)
+                  .data,
               },
             ]
           : []),
@@ -21805,6 +21841,9 @@ export class WorkspaceService
         thinkingLevel: resolved.effective.thinkingLevel,
         ...(resolved.selected.reasoningMode != null
           ? { reasoningMode: resolved.selected.reasoningMode }
+          : {}),
+        ...(resolved.selected.serviceTier != null
+          ? { serviceTier: resolved.selected.serviceTier }
           : {}),
         maxOutputTokens: undefined,
         // Heartbeats should not mutate persisted workspace AI defaults.
