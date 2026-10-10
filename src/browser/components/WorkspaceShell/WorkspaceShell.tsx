@@ -264,6 +264,11 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
     minWidth: RIGHT_SIDEBAR_MIN_WIDTH_PX,
     maxWidth: effectiveMaxWidthPx,
     storageKey: RIGHT_SIDEBAR_WIDTH_KEY,
+    // Like Codex desktop: dragging the handle far enough right collapses the sidebar into its
+    // overview card (and back out reopens it). RightSidebar listens to the same persisted key.
+    onDragCollapseChange: (collapsed) => {
+      updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, collapsed);
+    },
   });
 
   const { width: sidebarWidth, isResizing, startResize } = sidebar;
