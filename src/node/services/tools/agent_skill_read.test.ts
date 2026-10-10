@@ -445,4 +445,16 @@ describe("agent_skill_read", () => {
     expect(descriptionOf("short")).toBe("Short description");
     expect(descriptionOf("multi-line")).toBe("First line second line");
   });
+
+  it("does not split a surrogate pair at the length cap", () => {
+    // Providers reject a request body whose strings hold a lone surrogate, and the index sits in
+    // every request's tool block.
+    const prefix = "x".repeat(AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS - 2);
+    const lines = skillIndexLines([
+      { name: "emoji", description: `${prefix}\u{1F642} and more`, scope: "global" },
+    ]);
+
+    // The pair straddles the cut, so it is dropped whole instead of keeping its high half.
+    expect(lines).toContain(`- emoji: ${prefix}… (scope: global)`);
+  });
 });

@@ -15,7 +15,11 @@ function formatSkillIndexDescription(description: string): string {
   if (singleLine.length <= AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS) {
     return singleLine;
   }
-  return `${singleLine.slice(0, AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS - 1).trimEnd()}…`;
+  let end = AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS - 1;
+  // A lone high surrogate would make providers reject every request carrying this tool block.
+  const last = singleLine.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${singleLine.slice(0, end).trimEnd()}…`;
 }
 
 /**
