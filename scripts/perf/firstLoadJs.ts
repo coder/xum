@@ -9,6 +9,9 @@
  *
  * Usage: bun scripts/perf/firstLoadJs.ts [distDir] [--json] [--forbid <substring>]...
  *   [--budget <file>]
+ * The totals also count index.html itself (T3 PR8), so growth of its inline boot script or
+ * markup is measured. Before PR8 the totals were module JS only (9.1 KiB less on main).
+ * External classic `<script src>` files are not followed; index.html has none today.
  * `--budget` (T3 PR8, `make check-first-load-js` in CI) also fails when the first load grows
  * over the recorded values in that file: brotli by more than 2%, raw by more than 100 KiB.
  * Exit codes: 0 ok, 1 a forbidden source is on the first load or a budget is exceeded,
@@ -192,7 +195,8 @@ function main(argv: string[]): void {
   const relative = (file: string) => path.relative(distDir, file).replaceAll("\\", "/");
 
   const code = firstLoadFiles(distDir);
-  const files = [...code.keys()].map((file) => {
+  // index.html is measured but not scanned for forbidden sources: it has no source map.
+  const files = [path.join(distDir, "index.html"), ...code.keys()].map((file) => {
     const rawBytes = fs.statSync(file).size;
     const [brBytes, br] = servedSize(file, ".br", rawBytes);
     const [gzipBytes, gzip] = servedSize(file, ".gz", rawBytes);
