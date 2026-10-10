@@ -104,6 +104,12 @@ test.each([
     { BUGBASH_AI: "mock" },
   ],
   ["e2e run, MCP Apps", e2e("run", "--config", "e2e.mcpapps.config.ts"), { BUGBASH_AI: "mock" }],
+  [
+    // The sandbox env names alone do not pass: this host has no docker-init and no proxy socket.
+    "e2e run, MCP Apps, sandbox env on the host",
+    e2e("run", "--config", "e2e.mcpapps.config.ts"),
+    { BUGBASH_AI: "mock", BUGBASH_CONTAINER: "1", BUGBASH_MODEL_DRIVEN: "1" },
+  ],
   // No app AI mode: e2e.config.ts would throw its own error first, without the pause.
   ["e2e list, MCP Apps, no app AI mode", e2e("list", "--config", "e2e.mcpapps.config.ts"), {}],
   [

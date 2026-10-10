@@ -11,7 +11,13 @@
  * `[fake:cut]` on a JSON request sends the headers and part of the body, then drops.
  * `[fake:lowered]` and `[fake:nulled]` end a stream normally, but its message_delta lowers or
  * nulls a count that message_start reported.
+ *
+ * As a command (the zero-cost transport check of the sandbox, plan section 9):
+ *   bun sandbox/fakeUpstream.ts --port 0 --record <calls.jsonl>
+ * prints `listening on 127.0.0.1:<port>` and appends one line per request: the model, the body
+ * keys, the betas and the tool and message counts, never the text.
  */
+import * as fs from "node:fs";
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -32,7 +38,7 @@ export interface FakeRequest {
 const sse = (type: string, data: object) =>
   `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
 
-export async function startFakeUpstream() {
+export async function startFakeUpstream(port = 0, onRequest?: (request: FakeRequest) => void) {
   const requests: FakeRequest[] = [];
   const state: { mode?: string } = {};
   const server = http.createServer((req, res) => {
@@ -40,7 +46,9 @@ export async function startFakeUpstream() {
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
       const body = Buffer.concat(chunks).toString();
-      requests.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers, body });
+      const request = { method: req.method ?? "", url: req.url ?? "", headers: req.headers, body };
+      requests.push(request);
+      onRequest?.(request);
       const mode = /\[fake:(\w+)\]/.exec(body)?.[1] ?? state.mode;
       const parsed = JSON.parse(body || "{}") as { model?: string; stream?: boolean };
       const model = parsed.model ?? "claude-haiku-4-5";
@@ -80,10 +88,10 @@ export async function startFakeUpstream() {
       finish(res, mode);
     });
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const { port } = server.address() as AddressInfo;
+  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
   return {
-    baseUrl: `http://127.0.0.1:${port}`,
+    baseUrl: `http://127.0.0.1:${address.port}`,
     requests,
     setMode: (mode?: string) => (state.mode = mode),
     close: () => {
@@ -116,4 +124,29 @@ function finish(res: http.ServerResponse, mode: string | undefined) {
   if (mode === "cut") return res.destroy();
   if (mode === "nostop") return res.end();
   res.end(sse("message_stop", {}));
+}
+
+if (import.meta.main) {
+  const flag = (name: string) => process.argv[process.argv.indexOf(name) + 1];
+  const record = flag("--record");
+  if (!process.argv.includes("--record") || record == null) throw new Error("--record <file>");
+  const fake = await startFakeUpstream(Number(flag("--port") ?? 0), (request) => {
+    let body: Record<string, unknown> = {};
+    try {
+      body = JSON.parse(request.body) as typeof body;
+    } catch {
+      // recorded as an empty key list
+    }
+    const line = {
+      url: request.url,
+      model: body.model,
+      keys: Object.keys(body).sort(),
+      betas: request.headers["anthropic-beta"] ?? null,
+      stream: body.stream === true,
+      tools: Array.isArray(body.tools) ? body.tools.length : 0,
+      messages: Array.isArray(body.messages) ? body.messages.length : 0,
+    };
+    fs.appendFileSync(record, `${JSON.stringify(line)}\n`);
+  });
+  console.log(`listening on ${fake.baseUrl.replace("http://", "")}`);
 }

@@ -4,6 +4,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { startFakeUpstream } from "./fakeUpstream";
 import { launch, ownerState, recover } from "./launch";
 import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
 
@@ -54,6 +55,12 @@ case "$1" in
       slowcreate|swap) cat >/dev/null; exit 0 ;;
       hang) cat >/dev/null; echo "stdin closed" >> "$bin/calls.log"; unregister "$id"; exit 0 ;;
       badframe) printf 'not a frame\n'; cat >/dev/null; unregister "$id"; exit 0 ;;
+      # One model call through the job's proxy socket, like the container's forwarder makes.
+      proxycall) for a in "$@"; do case "$a" in *dst=/repo/.sandbox-proxy,readonly) psrc=\${a#type=bind,src=}; psrc=\${psrc%%,*} ;; esac; done
+        echo "proxy dir mode $(stat -c %a "$psrc")" >> "$bin/calls.log"
+        curl -s --unix-socket "$psrc/sock" -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
+          -d '{"model":"claude-sonnet-5-5","max_tokens":10,"messages":[{"role":"user","content":"'"$CALL"'"}]}' \\
+          http://proxy/anthropic/v1/messages >> "$bin/calls.log"; echo >> "$bin/calls.log" ;;
     esac
     printf '{"p":"app.log","n":2}\nok'; [ "$RUN" = cut ] || printf '{"end":true}\n'
     [ "$RUN" = linger ] || unregister "$id"; exit 7 ;;
@@ -132,6 +139,7 @@ function fake(over: Record<string, string> = {}) {
     PS_RC: "0",
     INSPECT_RC: "0",
     RUN: "ok",
+    CALL: "hi",
     ...over,
   };
   fs.writeFileSync(
@@ -546,21 +554,26 @@ function launchIn(
   env: Record<string, string> = HOST_ENV,
   leftovers: string[] = []
 ) {
+  const cwd = prepare(over, leftovers);
+  return launch(ARGS, { root: fs.realpathSync(root), cwd, env, stop: stop.signal });
+}
+/** The checkout with both configs and both mount sources, and the fake's answers. */
+function prepare(over: Record<string, string> = {}, leftovers: string[] = []) {
   const real = fs.realpathSync(root);
   fs.mkdirSync(path.join(real, "tests/bugbash"), { recursive: true });
   fs.writeFileSync(path.join(real, "tests/bugbash/e2e.config.ts"), "export default {}");
   for (const dir of ["dist", "node_modules"])
     fs.mkdirSync(path.join(real, dir), { recursive: true });
   fs.writeFileSync(path.join(bin, "containers"), [...FOREIGN, ...leftovers].join("\n") + "\n");
+  fs.writeFileSync(path.join(real, "tests/bugbash/e2e.mcpapps.config.ts"), "export default {}");
   fake({ IMAGES: "sha256:abc", SWAP: path.join(real, "node_modules"), ...over });
-  const cwd = path.join(real, "tests/bugbash");
-  return launch(ARGS, { root: real, cwd, env, stop: stop.signal });
+  return path.join(real, "tests/bugbash");
 }
 /** Nothing of a job stays: no container, no job folder, no private client folder, no image rm. */
 function expectNothingLeft() {
   expect(fs.readFileSync(path.join(bin, "containers"), "utf8").trim().split("\n")).toEqual(FOREIGN);
   const left = fs.readdirSync(tmp, { recursive: true }).map(String);
-  expect(left.filter((p) => /xbb-|xum-bugbash-docker/.test(p))).toEqual([]);
+  expect(left.filter((p) => /xbb-|xum-bugbash-(docker|proxy)/.test(p))).toEqual([]);
   expect(calls()).not.toMatch(/^(rmi|image rm|image prune|system prune)/m);
 }
 
@@ -852,6 +865,103 @@ test("C2: recover reports an unknown cleanup state (exit 3)", async () => {
   } finally {
     cleanup.mockRestore();
   }
+});
+
+// The MCP Apps suite (plan PR B1): model-driven, through a proxy for the job.
+const MCP_ARGS = ["run", "--config", "e2e.mcpapps.config.ts", "--output", ".e2e/m"];
+const UPSTREAM_KEY = "sk-host-upstream-key-for-the-launch-test";
+async function mcpLaunch(over: Record<string, string>, env: Record<string, string> = {}) {
+  const upstream = await startFakeUpstream();
+  try {
+    const host = {
+      ...HOST_ENV,
+      BUGBASH_BUDGET_USD: "1",
+      ANTHROPIC_API_KEY: UPSTREAM_KEY,
+      ANTHROPIC_BASE_URL: `${upstream.baseUrl}/v1`,
+      ...env,
+    };
+    const logged: string[] = [];
+    const error = spyOn(console, "error").mockImplementation(
+      (line: string) => void logged.push(line)
+    );
+    try {
+      const cwd = prepare(over);
+      const options = { root: fs.realpathSync(root), cwd, env: host };
+      const stop = new AbortController().signal;
+      const code = await launch(MCP_ARGS, { ...options, stop }).catch((e: unknown) => e);
+      return {
+        code,
+        logged,
+        requests: upstream.requests,
+        records: path.join(cwd, ".e2e/m.proxy.jsonl"),
+      };
+    } finally {
+      error.mockRestore();
+    }
+  } finally {
+    await upstream.close();
+  }
+}
+
+test.each([
+  ["no budget", { BUGBASH_BUDGET_USD: "" }, /BUGBASH_BUDGET_USD/],
+  ["a budget that is not a number", { BUGBASH_BUDGET_USD: "1e9" }, /BUGBASH_BUDGET_USD/],
+  ["no key", { ANTHROPIC_API_KEY: "" }, /ANTHROPIC_API_KEY/],
+  ["no base URL", { ANTHROPIC_BASE_URL: "" }, /ANTHROPIC_BASE_URL/],
+  ["an OpenAI explorer model", { BUGBASH_MODEL: "openai:gpt-6.1-sol" }, /only anthropic/],
+  ["the bash-ai-proxy scenario", { BUGBASH_SCENARIO: "bash-ai-proxy" }, /BUGBASH_SCENARIO/],
+  ["the real app AI", { BUGBASH_AI: "real" }, /only the mock app AI/],
+])("B1: the MCP Apps suite refuses %s before any docker command", async (_name, env, message) => {
+  const { code } = await mcpLaunch({}, env);
+  expect(code).toBeInstanceOf(Refusal);
+  expect((code as Error).message).toMatch(message);
+  expect((code as Error).message).not.toContain(UPSTREAM_KEY);
+  expect(calls()).toBe("");
+});
+
+test("B1: an MCP Apps job reaches the model only through its proxy, with the host key", async () => {
+  const { code, logged, requests, records } = await mcpLaunch({ RUN: "proxycall" });
+  expect(code).toBe(7); // the fake job's own exit code
+  const run = calls()
+    .split("\n")
+    .find((line) => line.startsWith("run "))!;
+  expect(run).toMatch(/--mount type=bind,src=\S+\/proxy,dst=\/repo\/\.sandbox-proxy,readonly/);
+  expect(run).toContain("--env BUGBASH_MODEL=anthropic:claude-sonnet-5-5");
+  expect(run).toContain("--env BUGBASH_MODEL_DRIVEN=1");
+  expect(run).not.toContain(UPSTREAM_KEY);
+  expect(run).not.toContain("ANTHROPIC");
+  expect(calls()).toContain("proxy dir mode 700");
+  expect(calls()).toContain('"usage":');
+  expect(requests).toHaveLength(1);
+  expect(requests[0].headers["x-api-key"]).toBe(UPSTREAM_KEY);
+  const lines = fs.readFileSync(records, "utf8").trim().split("\n");
+  expect(lines.map((line) => (JSON.parse(line) as { outcome: string }).outcome)).toEqual([
+    "settled",
+  ]);
+  expect(fs.statSync(records).mode & 0o777).toBe(0o600);
+  expect(logged.join("\n")).toMatch(/proxy for anthropic:claude-sonnet-5-5 \(budget \$1\.00\)/);
+  expect(logged.join("\n")).toMatch(
+    /proxy: 1 settled, 0 kept in full, 0 refused \{\}, \$0\.\d+ of \$1\.0000/
+  );
+  expect(logged.join("\n")).not.toContain(UPSTREAM_KEY);
+  expectNothingLeft(); // the job folder with the proxy socket is gone too
+});
+
+test("B1: a proxied call that costs more than its bound fails the job (exit 5)", async () => {
+  const { code, logged } = await mcpLaunch({ RUN: "proxycall", CALL: "[fake:overbill]" });
+  expect(code).toBe(5);
+  expect(logged.join("\n")).toContain("cost more than their reserved bound");
+  expectNothingLeft();
+});
+
+test("B1: a repro job gets no proxy and no explorer model, whatever the host sets", async () => {
+  expect(
+    await launchIn({}, new AbortController(), { ...HOST_ENV, BUGBASH_MODEL: "anthropic:x" })
+  ).toBe(7);
+  const run = calls()
+    .split("\n")
+    .find((line) => line.startsWith("run "))!;
+  expect(run).not.toMatch(/sandbox-proxy|BUGBASH_MODEL/);
 });
 
 test("a signal during the synchronous staging starts no container", async () => {

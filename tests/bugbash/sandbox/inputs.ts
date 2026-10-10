@@ -19,8 +19,9 @@ import { Refusal } from "./runner";
 export const INPUTS = ["src", "tests/bugbash", "tsconfig.json", "package.json"];
 /** The host env names that e2e.config.ts and startApp.ts read. No other host value passes. */
 // Not BUGBASH_AI_REASON: after a failed probe it holds the provider URL and response text.
-const PASS_ENV = ["BUGBASH_AI", "BUGBASH_AI_RESOLVED", "BUGBASH_APP_MODEL", "BUGBASH_MODEL",
-  "BUGBASH_EFFORT", "BUGBASH_SCENARIO", "E2E_TELEMETRY_DISABLED"]; // prettier-ignore
+// Not BUGBASH_MODEL: the launcher sets it per job kind, and only for a model-driven job.
+const PASS_ENV = ["BUGBASH_AI", "BUGBASH_AI_RESOLVED", "BUGBASH_APP_MODEL", "BUGBASH_EFFORT",
+  "BUGBASH_SCENARIO", "E2E_TELEMETRY_DISABLED"]; // prettier-ignore
 // Any name that looks like a credential, anywhere in it (AWS_SECRET_ACCESS_KEY, GH_TOKEN), or a
 // PAT: a backstop behind the allowlist, so it may also refuse a harmless name.
 const CREDENTIAL = /SECRET|PASSWORD|TOKEN|KEY|CREDENTIAL|BASE_URL|(^|_)PAT$/i;
@@ -120,11 +121,17 @@ const RUN_VALUE_OPTIONS = ["--config", "--output", "--tag", "--exclude-tag", "--
 const RUN_FLAGS = ["--pass-with-no-tests", "--last-failed", "--debug"];
 
 /**
- * Why these e2e args are not an exact-step repro run, or null. Only `e2e run` with the repro
- * config passes: its tests are repros/**, and its agents hold no model (hostPause.ts). e2e
+ * Why these e2e args are not an `e2e run` with `config`, or null. With the default repro config
+ * its tests are repros/**, and its agents hold no model (hostPause.ts). The launcher also
+ * accepts the MCP Apps config, whose agents get a model only through the job's proxy. e2e
  * resolves --config from its cwd, so the cwd must be tests/bugbash and the config a regular file.
  */
-export function exactStepRefusal(args: string[], cwd: string, dir: string): string | null {
+export function exactStepRefusal(
+  args: string[],
+  cwd: string,
+  dir: string,
+  config = "e2e.config.ts"
+): string | null {
   if (args[0] !== "run") return `${JSON.stringify(args[0] ?? "")} is not \`e2e run\``;
   const configs: string[] = [];
   for (let i = 1; i < args.length; i++) {
@@ -136,11 +143,11 @@ export function exactStepRefusal(args: string[], cwd: string, dir: string): stri
       return `${name} needs a value, got ${JSON.stringify(value ?? "")}`;
     if (name === "--config") configs.push(value);
   }
-  if (configs.length !== 1 || configs[0] !== "e2e.config.ts")
-    return `--config must be given once as e2e.config.ts, got ${JSON.stringify(configs)}`;
+  if (configs.length !== 1 || configs[0] !== config)
+    return `--config must be given once as ${config}, got ${JSON.stringify(configs)}`;
   if (fs.realpathSync(cwd) !== fs.realpathSync(dir)) return `the cwd must be ${dir}, got ${cwd}`;
-  if (fs.lstatSync(path.join(dir, "e2e.config.ts"), { throwIfNoEntry: false })?.isFile() !== true)
-    return `${dir}/e2e.config.ts is not a regular file (a symlink?)`;
+  if (fs.lstatSync(path.join(dir, config), { throwIfNoEntry: false })?.isFile() !== true)
+    return `${dir}/${config} is not a regular file (a symlink?)`;
   return null;
 }
 

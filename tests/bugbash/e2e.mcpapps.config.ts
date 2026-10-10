@@ -6,12 +6,29 @@
  * --charters tests/bugbash/mcpapps/charters.txt"`.
  *
  * Paused on the host (hostPause.ts, #5714): the suite drives every flow with `agent.act`, so a
- * model picks its actions. Every e2e command with this config, also `run`, refuses as it loads.
+ * model picks its actions. Every e2e command with this config, also `run`, refuses as it loads,
+ * except inside the bug-bash sandbox with a provider proxy for the job (`make mcp-apps-e2e`).
+ * There the agents get BUGBASH_MODEL through that proxy, and the app AI stays the mock.
  */
 // First import: the pause refuses before e2e.config.ts runs (mcpapps/hostPause.ts).
 import "./mcpapps/hostPause";
+import { createAnthropic } from "@ai-sdk/anthropic";
 import type { E2EConfig } from "e2e";
 import base from "./e2e.config";
+import { PROXY_BASE_URL } from "./sandbox/inContainer";
+
+/**
+ * The explorer model, set by the launcher. The proxy holds the provider key and allows only
+ * this job's models (sandbox/proxy.ts), so the key here is a placeholder the proxy drops.
+ */
+function explorerModel() {
+  const spec = process.env.BUGBASH_MODEL ?? "";
+  const [provider, id] = spec.split(/:(.*)/s, 2);
+  if (provider !== "anthropic" || !id)
+    throw new Error(`BUGBASH_MODEL must be anthropic:<model> in the sandbox, got "${spec}"`);
+  return createAnthropic({ baseURL: PROXY_BASE_URL, apiKey: "bugbash-sandbox-placeholder" })(id);
+}
+const model = explorerModel();
 
 const mcpContext = [
   "MCP Apps setup for this run: the 'Bug bash playground' chat already holds MCP tool calls from",
@@ -27,12 +44,12 @@ const mcpContext = [
   "Tutorial popovers can cover controls: dismiss them with Skip.",
 ].join(" ");
 
-const agents = Object.fromEntries(
+const agents: E2EConfig["agents"] = Object.fromEntries(
   Object.entries(base.agents).map(([name, agent]) => [
     name,
-    { ...agent, context: `${agent.context} ${mcpContext}` },
+    { ...agent, model, context: `${agent.context} ${mcpContext}` },
   ])
-) as typeof base.agents;
+);
 
 const targets = base.targets.map((target) => ({
   ...target,

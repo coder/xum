@@ -137,6 +137,25 @@ function failIfExited(child: ChildProcess): void {
   }
 }
 
+/** The mode and kill-switch env of the app server. */
+export function appSwitches(
+  mode: "mock" | "real",
+  fakeProvider: boolean,
+  modelDriven: boolean
+): Record<string, string> {
+  // No agent tools and no terminal (AGENTS.md: not until the app runs in a sandbox). Project
+  // automation stays on: its kill switch also makes the bash AI proxy refuse every call, the
+  // fake's replies are fixed text, and the seeded demo repo has no hooks.
+  if (fakeProvider) return { XUM_DISABLE_AGENT_TOOLS: "1", XUM_DISABLE_TERMINALS: "1" };
+  const all = {
+    XUM_DISABLE_AGENT_TOOLS: "1",
+    XUM_DISABLE_TERMINALS: "1",
+    XUM_DISABLE_PROJECT_AUTOMATION: "1",
+  };
+  if (mode === "real") return all;
+  return { XUM_MOCK_AI: "1", ...(modelDriven && all) };
+}
+
 export async function waitForHealth(base: string, child: ChildProcess): Promise<void> {
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
@@ -346,6 +365,12 @@ async function main(): Promise<void> {
   if (scenario !== "" && ai.mode !== "mock") {
     fail("BUGBASH_SCENARIO=bash-ai-proxy replaces the mock: run it with BUGBASH_AI=mock");
   }
+  // A model-driven job (the sandbox launcher sets this): a model reads every reply and page, so
+  // the app gets all three switches in both AI modes. bash-ai-proxy needs project automation.
+  const modelDriven = process.env.BUGBASH_MODEL_DRIVEN === "1";
+  if (modelDriven && scenario !== "") {
+    fail("BUGBASH_SCENARIO=bash-ai-proxy needs project automation: not in a model-driven job");
+  }
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-"));
   const xumRoot = path.join(tempRoot, "xum");
   const fakeProvider = scenario === "bash-ai-proxy" ? await startFakeProvider(xumRoot) : undefined;
@@ -359,18 +384,7 @@ async function main(): Promise<void> {
     // Real mode: a real model answers in the app on this host. It gets no tools, and the explorer
     // gets no terminal or project init hooks, so injected text in a reply that the explorer
     // follows cannot run host commands through them (see the header).
-    ...(fakeProvider
-      ? // No agent tools and no terminal (AGENTS.md: not until the app runs in a sandbox).
-        // Project automation stays on: its kill switch also makes the proxy refuse every call,
-        // the fake's replies are fixed text, and the seeded demo repo has no hooks.
-        { XUM_DISABLE_AGENT_TOOLS: "1", XUM_DISABLE_TERMINALS: "1" }
-      : ai.mode === "mock"
-        ? { XUM_MOCK_AI: "1" }
-        : {
-            XUM_DISABLE_AGENT_TOOLS: "1",
-            XUM_DISABLE_TERMINALS: "1",
-            XUM_DISABLE_PROJECT_AUTOMATION: "1",
-          }),
+    ...appSwitches(ai.mode, fakeProvider != null, modelDriven),
     // Bug-bash clicks are not product usage.
     XUM_DISABLE_TELEMETRY: "1",
     // Git inside the app must not read or write the user's real ~/.gitconfig.
