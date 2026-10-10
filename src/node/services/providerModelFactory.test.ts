@@ -30,6 +30,7 @@ import {
 } from "@/common/utils/ai/providerOptions";
 import { Ok } from "@/common/types/result";
 import { TOOL_PAYLOAD_DEPTH_REJECTION } from "@/common/utils/tools/toolPayloadDepth";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import {
   ProviderModelFactory,
   buildAIProviderRequestHeaders,
@@ -5388,5 +5389,100 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
         });
       }
     );
+  });
+});
+
+describe("ProviderModelFactory Ollama tool schemas", () => {
+  // Ollama servers before v0.6.6 parse a tool schema `type` only as a string, so one `type`
+  // array fails the whole tool request. zod >= 4.5 emits nullable fields as type arrays, and
+  // MCP servers can send them in raw JSON Schema, so the request must carry `anyOf` instead.
+  const sendTools = async (tools: Record<string, Tool>): Promise<Record<string, unknown>> => {
+    let body: Record<string, unknown> | undefined;
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ ollama: { baseUrl: "http://127.0.0.1:11434/api" } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("ollama:qwen3:8b");
+        if (!result.success) throw new Error(result.error.type);
+        await generateText({ model: result.data, prompt: "hello", tools, maxRetries: 0 }).catch(
+          () => undefined
+        );
+        expect(calls).toHaveLength(1);
+        body = parseSentBody(calls[0]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    const sent = body?.tools as Array<{ function: { name: string; parameters: unknown } }>;
+    return Object.fromEntries(
+      sent.map((entry) => [entry.function.name, entry.function.parameters])
+    );
+  };
+  const rawTool = (schema: Record<string, unknown>) =>
+    tool({ inputSchema: jsonSchema<Record<string, unknown>>(schema) });
+  const typeArrayPaths = (node: unknown, at = "$"): string[] => {
+    if (Array.isArray(node))
+      return node.flatMap((item, index) => typeArrayPaths(item, `${at}[${index}]`));
+    if (node === null || typeof node !== "object") return [];
+    const own = Array.isArray((node as { type?: unknown }).type) ? [at] : [];
+    return own.concat(
+      Object.entries(node).flatMap(([key, value]) => typeArrayPaths(value, `${at}.${key}`))
+    );
+  };
+
+  it("rewrites nested nullable type arrays to anyOf", async () => {
+    const sent = await sendTools({
+      mcp_tool: rawTool({
+        type: "object",
+        properties: {
+          outer: { type: "object", properties: { inner: { type: ["string", "null"] } } },
+          list: { type: "array", items: { type: ["integer", "null"], minimum: 0 } },
+          single: { type: ["boolean"] },
+        },
+      }),
+    });
+
+    expect(sent.mcp_tool).toEqual({
+      type: "object",
+      properties: {
+        outer: {
+          type: "object",
+          properties: { inner: { anyOf: [{ type: "string" }, { type: "null" }] } },
+        },
+        list: {
+          type: "array",
+          items: { anyOf: [{ type: "integer" }, { type: "null" }], minimum: 0 },
+        },
+        single: { type: "boolean" },
+      },
+    });
+  });
+
+  it("sends real tool definitions without type arrays", async () => {
+    const sent = await sendTools({
+      session_history: tool({ inputSchema: TOOL_DEFINITIONS.session_history.schema }),
+    });
+
+    expect(typeArrayPaths(sent.session_history)).toEqual([]);
+    expect(
+      (sent.session_history as { properties: Record<string, unknown> }).properties.recent_first
+    ).toMatchObject({ anyOf: [{ type: "boolean" }, { type: "null" }] });
+  });
+
+  it("leaves schemas without type arrays unchanged", async () => {
+    const schema = {
+      type: "object",
+      properties: {
+        name: { type: "string", minLength: 1 },
+        count: { type: "integer" },
+        mode: { enum: ["a", "b"] },
+        maybe: { anyOf: [{ type: "string" }, { type: "null" }] },
+      },
+      required: ["name"],
+    };
+    const sent = await sendTools({ plain: rawTool(structuredClone(schema)) });
+
+    expect(sent.plain).toEqual(schema);
   });
 });

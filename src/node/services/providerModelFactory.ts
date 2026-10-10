@@ -2281,7 +2281,43 @@ export class ProviderModelFactory {
             // Use strict mode for better compatibility with Ollama API
             compatibility: "strict",
           });
-          return Ok(provider(modelId));
+          // Ollama servers before v0.6.6 (ollama/ollama#9434) parse a tool schema `type` only as
+          // a string, so one `type` array fails the whole request. zod >= 4.5 emits nullable
+          // fields as `type: [X, "null"]` and MCP schemas can carry arrays too, so rewrite each
+          // array to the equivalent `anyOf` here, where the final schema reaches the provider.
+          const typeArraysToAnyOf = (node: unknown): unknown => {
+            if (Array.isArray(node)) return node.map(typeArraysToAnyOf);
+            if (node === null || typeof node !== "object") return node;
+            const out = Object.fromEntries(
+              Object.entries(node).map(([key, value]) => [key, typeArraysToAnyOf(value)])
+            );
+            if (!Array.isArray(out.type) || out.anyOf !== undefined) return out;
+            const { type: types, ...rest } = out as { type: unknown[] };
+            if (types.length === 1) return { ...rest, type: types[0] };
+            return { ...rest, anyOf: types.map((type) => ({ type })) };
+          };
+          return Ok(
+            wrapLanguageModel({
+              model: provider(modelId),
+              middleware: {
+                specificationVersion: "v4",
+                transformParams: ({ params }) =>
+                  Promise.resolve({
+                    ...params,
+                    tools: params.tools?.map((tool) =>
+                      tool.type === "function"
+                        ? {
+                            ...tool,
+                            inputSchema: typeArraysToAnyOf(
+                              tool.inputSchema
+                            ) as typeof tool.inputSchema,
+                          }
+                        : tool
+                    ),
+                  }),
+              },
+            })
+          );
         }
 
         // Handle OpenRouter provider
