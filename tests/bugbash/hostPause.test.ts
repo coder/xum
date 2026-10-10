@@ -117,12 +117,6 @@ test.each([
     e2e("explore", "--config", "e2e.config.ts", "x"),
     { BUGBASH_AI_RESOLVED: "real" },
   ],
-  [
-    // Unguarded, run.ts probes the app model first (BUGBASH_AI=auto) and then starts e2e-node.
-    "run.ts (make bug-bash)",
-    [process.execPath, "run.ts", "--only", "composer"],
-    {},
-  ],
 ] as const)(
   "%s refuses before any app, e2e or model starts",
   async (_name, command, env) => {
@@ -147,3 +141,17 @@ test("control: exact-step repros still load and list", async () => {
   expect(r.output).toMatch(/^repros\/\S+\.e2e\.ts › /m);
   expect(r.output).not.toContain("#5714");
 });
+
+// run.ts runs no e2e on the host any more: each charter is a sandbox job (sandbox/launch.ts).
+// Without a budget it refuses before any job, e2e process or model request.
+test("run.ts (make bug-bash) without a budget refuses before any app, e2e or model starts", async () => {
+  const r = await run([process.execPath, "run.ts", "--only", "composer"], {
+    E2E_NODE: path.join(bin, "e2e-node"),
+  });
+  expect({ status: r.status, started: r.started, modelRequests }).toEqual({
+    status: 2,
+    started: "",
+    modelRequests: 0,
+  });
+  expect(r.output).toContain("BUGBASH_BUDGET_USD");
+}, 60_000);

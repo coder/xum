@@ -1,9 +1,13 @@
 /**
- * Agent bug bash: runs one TesterArmy `e2e explore` per charter and explorer model against
- * disposable Xum servers, then merges every explorer's findings into one Markdown file.
+ * Agent bug bash: runs one TesterArmy `e2e explore` per charter and explorer model, each in its
+ * own bug-bash sandbox container with a disposable Xum server (sandbox/launch.ts, #5714), then
+ * merges every explorer's findings into one Markdown file. No e2e process runs on the host: the
+ * host pause (hostPause.ts) still refuses `e2e explore` everywhere but in the sandbox.
  *
- * Paused on the host (hostPause.ts, #5714): it refuses with exit 2 before any probe, job or
- * child process starts.
+ * Each explorer reaches its model only through a provider proxy that the launcher runs for its
+ * job. One list-price budget (BUGBASH_BUDGET_USD, required) covers the whole run, and
+ * ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL stay on the host. A call that costs more than its
+ * bound stops the run (exit 5).
  *
  * Usage: make bug-bash [BUGBASH_ARGS="--only composer,settings --parallel 4 --max-steps 6"], or
  *        bun tests/bugbash/run.ts [--charters <file>] [--only <slug,...>] [--parallel 8]
@@ -12,7 +16,7 @@
  * --config: another e2e config, such as e2e.mcpapps.config.ts (its seed and explorer context);
  *   default e2e.config.ts. Paths are relative to the current directory.
  *
- * Models: BUGBASH_MODELS, comma-separated `<provider>:<model>`, default Opus 5.5 and Sonnet 5.5.
+ * Models: BUGBASH_MODELS, comma-separated `anthropic:<model>`, default Opus 5.5 and Sonnet 5.5.
  * In a three-model comparison (2026-10) these two found 14 of 15 distinct bugs and overlapped on
  * only 4, so the default runs both; GPT-6.1 Sol found 1. Every model runs every charter, all in
  * one pool of --parallel explorers. Reasoning: BUGBASH_EFFORT, default medium (e2e.config.ts).
@@ -23,25 +27,25 @@
  * verify each one with a failing repro test (`e2e guide bug-bash`, steps 5-6, and the bug-bash
  * project skill).
  *
- * App AI: BUGBASH_AI (auto, real or mock; default auto, see aiMode.ts). The run probes once and
- * gives every charter the same mode, except charters that name a `[mock:...]` prompt: those only
- * work against the mock, so they always run with it. findings.md records each charter's mode.
+ * App AI: only the mock in the sandbox for now (#5714): BUGBASH_AI must be unset or mock. The
+ * real app AI through the proxy is a later step.
  *
- * The e2e CLI needs Node.js 22.22.3+ or 24.8+ on PATH (or E2E_NODE=<path to node>).
- * Exit code: 0 when every charter ran (with or without findings), else the highest e2e setup or
- * infrastructure code (2, 3 or 4) among the charters.
+ * Exit code: 0 when every charter ran (with or without findings). Else, in this order: 3 when a
+ * container state is unknown after cleanup, 130 or 143 after SIGINT or SIGTERM, 5 after a proxy
+ * fault, and otherwise the highest code among the charters (2 refused or setup, 3, 4).
  */
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
-import { type AiMode, aiModeEnv, resolveAiMode } from "./aiMode";
-import { modelDrivenRefusal } from "./hostPause";
+import { type JobOutcome, launchJob, modelJob } from "./sandbox/launch";
+import { Ledger } from "./sandbox/proxyPolicy";
+import { Refusal } from "./sandbox/runner";
 
 const projectDir = import.meta.dir;
-const repoRoot = path.resolve(projectDir, "../..");
-const e2eBin = path.join(repoRoot, "node_modules/e2e/dist/cli/bin.js");
+// Real path: the launcher labels and stages the checkout by it.
+const repoRoot = fs.realpathSync(path.resolve(projectDir, "../.."));
+const APP_AI = { mode: "mock", reason: "the sandbox runs only the mock app AI (#5714)" };
 
 interface Charter {
   slug: string;
@@ -62,12 +66,10 @@ interface Finding {
 
 interface Job {
   charter: Charter;
-  /** `<provider>:<model>`, passed to e2e.config.ts as BUGBASH_MODEL. */
+  /** `anthropic:<model>`: the launcher passes it to the container as BUGBASH_MODEL. */
   model: string;
   /** Path-safe form of `model`: the per-model output directory. */
   modelDir: string;
-  /** The app's AI for this charter (the run's mode, or the mock for `[mock:...]` charters). */
-  ai: AiMode;
 }
 
 interface CharterResult {
@@ -97,100 +99,17 @@ function readCharters(file: string): Charter[] {
   return charters;
 }
 
-// e2e's own floor (docs: CLI reference). Older Node fails inside the runner with less clear errors.
-function checkNodeVersion(node: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(node, ["--version"], { stdio: ["ignore", "pipe", "inherit"] });
-    let out = "";
-    child.stdout.on("data", (chunk: Buffer) => (out += chunk.toString()));
-    child.once("error", reject);
-    child.once("exit", () => {
-      const [major, minor, patch] = out.trim().replace(/^v/, "").split(".").map(Number);
-      const ok =
-        major > 24 ||
-        (major === 24 && minor >= 8) ||
-        (major === 22 && (minor > 22 || (minor === 22 && patch >= 3)));
-      if (ok) resolve();
-      else
-        reject(
-          new Error(
-            `e2e needs Node.js 22.22.3+ or 24.8+, but ${node} is ${out.trim() || "unknown"}. ` +
-              "Put a newer node first on PATH or set E2E_NODE."
-          )
-        );
-    });
-  });
-}
-
 function outRelFor(job: Job, runRel: string): string {
   return `${runRel}/${job.modelDir}/${job.charter.slug}`;
 }
 
-// Explorers still running. A SIGINT or SIGTERM sent to this orchestrator alone (a CI timeout, a
-// task runner cancel) must stop them too, or explorers, their app servers and paid model calls
-// keep running after the run is gone.
-const activeExplorers = new Set<ChildProcess>();
-let stopSignal: NodeJS.Signals | null = null;
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.on(signal, () => {
-    stopSignal = signal;
-    for (const child of activeExplorers) child.kill(signal);
-  });
-}
-
-function runCharter(
-  node: string,
-  config: string,
-  job: Job,
-  runRel: string,
-  maxSteps: number
-): Promise<number> {
+/** The e2e args of one charter: the explore allowlist of the launcher (sandbox/inputs.ts). */
+function exploreArgs(config: string, job: Job, runRel: string, maxSteps: number): string[] {
   const { charter } = job;
-  const outRel = outRelFor(job, runRel);
-  const log = fs.openSync(path.join(projectDir, `${outRel}.log`), "w");
-  const args = [
-    e2eBin,
-    "explore",
-    charter.goal,
-    "--config",
-    config,
-    "--target",
-    charter.target,
-    "--agent",
-    charter.agent,
-    "--output",
-    outRel,
-    "--max-steps",
-    String(maxSteps),
-    "--video=on",
-    "--reporter",
-    "list,markdown",
-  ];
-  const child = spawn(node, args, {
-    cwd: projectDir,
-    stdio: ["ignore", log, log],
-    env: {
-      ...process.env,
-      // startApp.ts runs `node` and the e2e bin's children resolve it from PATH too.
-      PATH: `${path.dirname(node)}${path.delimiter}${process.env.PATH ?? ""}`,
-      BUGBASH_MODEL: job.model,
-      BUGBASH_APP_LOG: `${outRel}.app.log`,
-      ...aiModeEnv(job.ai),
-      E2E_TELEMETRY_DISABLED: "1",
-    },
-  });
-  activeExplorers.add(child);
-  return new Promise((resolve) => {
-    child.once("error", () => {
-      activeExplorers.delete(child);
-      resolve(4);
-    });
-    child.once("exit", (code, signal) => {
-      activeExplorers.delete(child);
-      fs.closeSync(log);
-      resolve(code ?? (signal ? 130 : 4));
-    });
-  });
+  // prettier-ignore
+  return ["explore", charter.goal, "--config", config, "--target", charter.target,
+    "--agent", charter.agent, "--output", outRelFor(job, runRel), "--max-steps", String(maxSteps),
+    "--video=on", "--reporter", "list,markdown"];
 }
 
 function readResult(job: Job, runRel: string, exitCode: number): CharterResult {
@@ -214,26 +133,50 @@ function readResult(job: Job, runRel: string, exitCode: number): CharterResult {
 const EXIT_MEANING: Record<number, string> = {
   0: "ran, no issues",
   1: "issues reported, or no step ran",
-  2: "setup error",
-  3: "infrastructure error",
-  4: "e2e internal error",
+  2: "setup error or refused",
+  3: "infrastructure error, or the container state is unknown",
+  4: "e2e internal error, or incomplete evidence",
+  5: "proxy fault",
   130: "interrupted",
 };
+
+/**
+ * One charter's code, with the launcher's precedence (sandbox/launch.ts exitFor): an unknown
+ * container state (3), then a stop (130), then a proxy fault (5), then a refusal (2) or an
+ * error (4), then the job's own code.
+ */
+function charterCode(outcome: JobOutcome): number {
+  if (outcome.cleanup.startsWith("unknown")) return 3;
+  if (outcome.stopped != null) return 130;
+  if (outcome.proxyFault != null) return 5;
+  if ("error" in outcome) return outcome.error instanceof Refusal ? 2 : 4;
+  return outcome.code!;
+}
+
+const usd = (nanoUsd: number) => `$${(nanoUsd / 1e9).toFixed(4)}`;
 
 function writeFindings(
   file: string,
   results: CharterResult[],
   models: string[],
   effort: string,
-  runAi: AiMode
+  ledger: Ledger
 ): void {
   const lines = ["# Bug bash findings", ""];
+  const { calls, refused, spentNanoUsd, capNanoUsd, tokens } = ledger.totals();
+  const perModel = Object.entries(tokens).map(
+    ([model, t]) =>
+      `\`${model}\` ${t.input} in, ${t.cacheWrite} cache write, ${t.cacheRead} cache read, ${t.output} out`
+  );
   lines.push(
     "Explorer claims, not confirmed bugs. Verify each with a failing repro test before reporting it.",
     "The same defect can appear once per model: merge those before triage.",
     "",
     `Explorer models: ${models.map((m) => `\`${m}\``).join(", ")}. Effort: \`${effort}\`.`,
-    `App AI: \`${runAi.mode}\` (${runAi.reason}); charters that name a \`[mock:...]\` prompt use the mock.`,
+    `App AI: \`${APP_AI.mode}\` (${APP_AI.reason}).`,
+    // List price from the reported usage, not the bill (sandbox/proxyPolicy.ts).
+    `Cost: ${calls} proxied calls, ${refused} refused by the budget, ${usd(spentNanoUsd)} of ` +
+      `${usd(capNanoUsd)} at list price. Tokens: ${perModel.join("; ") || "none"}.`,
     "",
     "| Model | Charter | Target | Agent | App AI | Exit | Ended | Issues | Warnings |",
     "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
@@ -243,7 +186,7 @@ function writeFindings(
     const meaning = EXIT_MEANING[r.exitCode] ?? "unknown";
     const { charter, model } = r.job;
     lines.push(
-      `| ${model} | ${charter.slug} | ${charter.target} | ${charter.agent} | ${r.job.ai.mode} | ${r.exitCode} (${meaning}) | ${r.ended} | ${issues} | ${r.findings.length - issues} |`
+      `| ${model} | ${charter.slug} | ${charter.target} | ${charter.agent} | ${APP_AI.mode} | ${r.exitCode} (${meaning}) | ${r.ended} | ${issues} | ${r.findings.length - issues} |`
     );
   }
   const all = results.flatMap((r) => r.findings.map((f) => ({ ...f, job: r.job })));
@@ -272,15 +215,15 @@ function modelDirName(model: string): string {
   return model.replace(/[^a-zA-Z0-9.-]+/g, "_");
 }
 
-function readModels(): string[] {
-  const raw = process.env.BUGBASH_MODELS ?? DEFAULT_MODELS.join(",");
+function readModels(env: NodeJS.ProcessEnv): string[] {
+  const raw = env.BUGBASH_MODELS ?? DEFAULT_MODELS.join(",");
   const models = raw
     .split(",")
     .map((m) => m.trim())
     .filter((m) => m !== "");
   assert(models.length > 0, "BUGBASH_MODELS is empty");
   for (const model of models) {
-    // e2e.config.ts validates the provider and model again inside each explorer.
+    // The launcher checks each model again (provider, price) before any docker command.
     assert(/^[a-z]+:\S+$/.test(model), `BUGBASH_MODELS entry must be <provider>:<model>: ${model}`);
   }
   assert(new Set(models).size === models.length, "BUGBASH_MODELS lists a model twice");
@@ -291,18 +234,40 @@ function readModels(): string[] {
   return models;
 }
 
-async function main(): Promise<void> {
-  const paused = modelDrivenRefusal("make bug-bash (tests/bugbash/run.ts)");
-  if (paused != null) {
-    console.error(paused);
-    process.exit(2);
-  }
+/** Injection point: run.test.ts passes a fake launcher; production runs the sandbox. */
+export interface RunDeps {
+  launchJob: typeof launchJob;
+  /** Progress lines (default stdout) and problems (default stderr). */
+  out?: (line: string) => void;
+  err?: (line: string) => void;
+}
+
+/**
+ * The whole run; returns its exit code. `stop` is aborted with the signal name by the entry
+ * point. Refuses (exit 2) before any folder, job or provider request when the run cannot work.
+ */
+export async function runBugBash(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  stop: AbortSignal,
+  deps: RunDeps = { launchJob }
+): Promise<number> {
+  const out = deps.out ?? ((line: string) => console.log(line));
+  const err = deps.err ?? ((line: string) => console.error(line));
+  // The real app AI needs the proxy's app route (a later step of #5714). Refuse it here, before
+  // anything, instead of running a "real" request with the mock.
+  for (const name of ["BUGBASH_AI", "BUGBASH_AI_RESOLVED"] as const)
+    if (env[name] != null && env[name] !== "mock") {
+      err(`make bug-bash: ${name}=${env[name]}: the sandbox runs only the mock app AI (#5714)`);
+      return 2;
+    }
   const { values } = parseArgs({
+    args: argv,
     options: {
       charters: { type: "string" },
       config: { type: "string" },
       only: { type: "string" },
-      // Total explorers at once across all models (4 per model by default).
+      // Total explorers (containers) at once across all models.
       parallel: { type: "string", default: "8" },
       "max-steps": { type: "string", default: "6" },
     },
@@ -329,27 +294,29 @@ async function main(): Promise<void> {
     charters = charters.filter((c) => wanted.includes(c.slug));
   }
   assert(charters.length > 0, "no charters selected");
+  // A [mock:...] prompt needs no special case any more: every charter runs with the mock.
 
-  const models = readModels();
+  const models = readModels(env);
   // Must match the default in e2e.config.ts; it only labels the output here.
-  const effort = process.env.BUGBASH_EFFORT ?? "medium";
+  const effort = env.BUGBASH_EFFORT ?? "medium";
   // The effort becomes part of the output path, so check it before any directory exists. The same
   // list as e2e.config.ts, which checks it again inside each explorer.
   assert(
     ["low", "medium", "high", "xhigh", "max"].includes(effort),
     `BUGBASH_EFFORT must be one of low, medium, high, xhigh, max, got "${effort}"`
   );
-  const node = process.env.E2E_NODE ?? "node";
-  await checkNodeVersion(node);
-  for (const built of ["dist/cli/index.js", "dist/index.html"]) {
-    assert(fs.existsSync(path.join(repoRoot, built)), `${built} is missing: run \`make build\``);
+  // Every model, the budget and the provider settings, before any folder or job (launch.ts).
+  let budgetUsd = 0;
+  try {
+    for (const model of models) budgetUsd = modelJob({ ...env, BUGBASH_MODEL: model }).budgetUsd;
+  } catch (error) {
+    if (!(error instanceof Refusal)) throw error;
+    err(`make bug-bash: ${error.message}`);
+    return 2;
   }
-  // One probe for the whole run (aiMode.ts). A rejected key stops the run here. Charters that
-  // name a [mock:...] prompt always use the mock, so a run of only those probes nothing.
-  const mockPin: AiMode = { mode: "mock", reason: "the charter names a [mock:...] prompt" };
-  const needsMock = (charter: Charter) => charter.goal.includes("[mock:");
-  const runAi = charters.every(needsMock) ? mockPin : await resolveAiMode();
-  console.log(`App AI: ${runAi.mode} (${runAi.reason})`);
+  // One budget for the whole run: every job's proxy reserves from it (sandbox/proxyPolicy.ts).
+  const ledger = new Ledger(budgetUsd);
+  out(`App AI: ${APP_AI.mode} (${APP_AI.reason})`);
 
   const runRel = `.e2e/bugbash/${new Date().toISOString().replace(/[:.]/g, "-")}-${effort}`;
   const runDir = path.join(projectDir, runRel);
@@ -359,43 +326,69 @@ async function main(): Promise<void> {
 
   // Interleave models, so every model starts while the pool is still filling.
   const jobs: Job[] = charters.flatMap((charter) =>
-    models.map((model) => ({
-      charter,
-      model,
-      modelDir: modelDirName(model),
-      ai: needsMock(charter) ? mockPin : runAi,
-    }))
+    models.map((model) => ({ charter, model, modelDir: modelDirName(model) }))
   );
   for (const modelDir of new Set(jobs.map((j) => j.modelDir))) {
     fs.mkdirSync(path.join(runDir, modelDir));
   }
-  console.log(
-    `Bug bash: ${charters.length} charter(s) x ${models.length} model(s) (${models.join(", ")}), effort ${effort}, ${parallel} at a time -> ${runDir}`
+  out(
+    `Bug bash: ${charters.length} charter(s) x ${models.length} model(s) (${models.join(", ")}), effort ${effort}, ${parallel} at a time, budget $${budgetUsd.toFixed(2)} -> ${runDir}`
   );
 
+  // A proxy fault (a call cost more than its bound) means the cost model is wrong: no new job
+  // starts, and the running ones stop. Each job's stop follows the run's.
+  const halt = new AbortController();
+  let fault: string | undefined;
+  let unknownCleanup = false;
   const results: CharterResult[] = [];
   let next = 0;
   async function worker(): Promise<void> {
-    // After a stop signal, start no new charter; the active ones are already being stopped.
-    while (next < jobs.length && stopSignal == null) {
+    while (next < jobs.length && !stop.aborted && !halt.signal.aborted) {
       const job = jobs[next++];
       const name = `${job.charter.slug} [${job.model}]`;
-      console.log(`  started  ${name} (${job.charter.target}, ${job.charter.agent})`);
-      const exitCode = await runCharter(node, config, job, runRel, maxSteps);
-      const result = readResult(job, runRel, exitCode);
+      const outRel = outRelFor(job, runRel);
+      out(`  started  ${name} (${job.charter.target}, ${job.charter.agent})`);
+      const fd = fs.openSync(path.join(projectDir, `${outRel}.log`), "w");
+      const jobStop = AbortSignal.any([stop, halt.signal]);
+      let outcome: JobOutcome;
+      try {
+        outcome = await deps.launchJob(exploreArgs(config, job, runRel, maxSteps), {
+          root: repoRoot,
+          cwd: projectDir,
+          env: { ...env, BUGBASH_AI: "mock", BUGBASH_MODEL: job.model },
+          stop: jobStop,
+          ledger,
+          log: (line) => fs.writeSync(fd, `sandbox ${line}\n`),
+          stderr: fd,
+        });
+      } catch (error) {
+        // A refusal before any docker command; anything else is a launcher bug.
+        const message = error instanceof Error ? error.message : String(error);
+        fs.writeSync(fd, `sandbox refused: ${message}\n`);
+        outcome = { error, cleanup: "none" };
+      } finally {
+        fs.closeSync(fd);
+      }
+      if (outcome.cleanup.startsWith("unknown")) unknownCleanup = true;
+      if (outcome.proxyFault != null && fault == null) {
+        fault = outcome.proxyFault;
+        err(`  ${name}: ${fault}. No new charter starts, and the running ones stop.`);
+        halt.abort("proxy fault");
+      }
+      const result = readResult(job, runRel, charterCode(outcome));
       // The app logs the mode it really started in. A mismatch means the mode never reached it
       // (e2e passes the app only `command.env`), so the charter tested something else: fail it.
-      const appLog = path.join(projectDir, `${outRelFor(job, runRel)}.app.log`);
+      const appLog = path.join(projectDir, outRel, "app.log");
       const started = fs.existsSync(appLog)
         ? /app AI: (real|mock)/.exec(fs.readFileSync(appLog, "utf8"))?.[1]
         : undefined;
-      if (started != null && started !== job.ai.mode) {
-        console.error(`  ${name}: app started with ${started} AI, expected ${job.ai.mode}`);
+      if (started != null && started !== APP_AI.mode) {
+        err(`  ${name}: app started with ${started} AI, expected ${APP_AI.mode}`);
         result.exitCode = Math.max(result.exitCode, 2);
       }
       results.push(result);
-      console.log(
-        `  finished ${name}: exit ${exitCode}, ${result.findings.length} finding(s), log ${path.join(projectDir, outRelFor(job, runRel))}.log`
+      out(
+        `  finished ${name}: exit ${result.exitCode}, ${result.findings.length} finding(s), log ${path.join(projectDir, outRel)}.log`
       );
     }
   }
@@ -403,17 +396,29 @@ async function main(): Promise<void> {
 
   results.sort((a, b) => jobs.indexOf(a.job) - jobs.indexOf(b.job));
   const findingsFile = path.join(runDir, "findings.md");
-  writeFindings(findingsFile, results, models, effort, runAi);
-  console.log(`Findings: ${findingsFile}`);
+  writeFindings(findingsFile, results, models, effort, ledger);
+  out(`Findings: ${findingsFile}`);
+  const { spentNanoUsd, capNanoUsd } = ledger.totals();
+  out(`Cost: ${usd(spentNanoUsd)} of ${usd(capNanoUsd)} at list price`);
   // Exit 1 means "issues reported" or "no step ran". Only the first is a finished charter: a
   // charter that explored nothing fails the run even when its exit code is 1.
   const failures = results.map((r) => (r.exitCode >= 2 ? r.exitCode : r.steps === 0 ? 1 : 0));
   for (const r of results.filter((r) => r.exitCode < 2 && r.steps === 0)) {
-    console.error(`  no exploration step ran: ${r.job.charter.slug} [${r.job.model}] (${r.ended})`);
+    err(`  no exploration step ran: ${r.job.charter.slug} [${r.job.model}] (${r.ended})`);
   }
-  // A stopped run is incomplete, whatever the finished charters reported.
-  if (stopSignal != null) process.exit(130);
-  process.exit(Math.max(0, ...failures));
+  // The launcher's precedence for the whole run: an unknown container state, then a stop (a
+  // stopped run is incomplete, whatever the finished charters reported), then a proxy fault.
+  if (unknownCleanup) return 3;
+  if (stop.aborted) return stop.reason === "SIGTERM" ? 143 : 130;
+  if (fault != null) return 5;
+  return Math.max(0, ...failures.filter((code) => code !== 130));
 }
 
-await main();
+if (import.meta.main) {
+  // A SIGINT or SIGTERM sent to this orchestrator alone (a CI timeout, a task runner cancel)
+  // must stop every job too, or containers and paid model calls keep running.
+  const controller = new AbortController();
+  for (const signal of ["SIGINT", "SIGTERM"] as const)
+    process.on(signal, () => controller.abort(signal));
+  process.exit(await runBugBash(process.argv.slice(2), process.env, controller.signal));
+}

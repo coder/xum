@@ -7,13 +7,16 @@
  *
  * `e2e explore` charters (`make bug-bash`) are paused on the host (hostPause.ts, #5714): this
  * config refuses every e2e command except `run` and `list` as it loads, before any app, browser
- * or model starts. Its agents keep their personas but hold no model, so an `agent.*` step in a
- * repro fails with MODEL_UNAVAILABLE before any model request. The sandbox work (#5714) brings
- * the explorer model (`BUGBASH_MODEL`, `BUGBASH_EFFORT`) back.
+ * or model starts. Only inside the bug-bash sandbox with a provider proxy for the job does
+ * `explore` pass, and only there do the agents get the explorer model (`BUGBASH_MODEL` through
+ * the proxy, sandbox/explorerModel.ts; reasoning `BUGBASH_EFFORT`). Everywhere else they keep
+ * their personas but hold no model, so an `agent.*` step in a repro fails with
+ * MODEL_UNAVAILABLE before any model request.
  */
 import type { E2EConfig } from "e2e";
 import { web } from "@e2e-dev/web";
 import { e2eCommandRefusal } from "./hostPause";
+import { explorerModel } from "./sandbox/explorerModel";
 
 // First, before anything else in this config runs.
 const paused = e2eCommandRefusal();
@@ -149,9 +152,11 @@ const context = scenario === "bash-ai-proxy" ? bashAiProxyContext : mockOrRealCo
 // Exploration steps need large per-step budgets (`e2e guide bug-bash`, step 1).
 // Only the active provider reads its key, so both can be set at once.
 const effort = explorerEffort();
-// No `model` during the host pause (hostPause.ts): explore is refused above, and an agent.* step
-// in a repro must find no model to call.
+// A model only for `e2e explore` in a model-driven sandbox job: an agent.* step in a repro must
+// find no model to call (hostPause.ts).
+const model = explorerModel();
 const persona = {
+  ...(model && { model }),
   maxSteps: 40,
   maxModelCalls: 40,
   context,
@@ -166,6 +171,8 @@ const APP_ENV_VARS = [
   "BUGBASH_AI_REASON",
   "BUGBASH_APP_MODEL",
   "BUGBASH_SCENARIO",
+  // A model-driven sandbox job: startApp.ts turns off agent tools, terminals and automation.
+  "BUGBASH_MODEL_DRIVEN",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_BASE_URL",
   "OPENAI_API_KEY",

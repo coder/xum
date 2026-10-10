@@ -4,6 +4,8 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { forwardToProxy, inSandbox, modelDrivenSandbox, PROXY_SOCKET } from "./inContainer";
+import { e2eCommandRefusal } from "../hostPause";
+import { explorerModel } from "./explorerModel";
 
 const cleanups: (() => unknown)[] = [];
 afterEach(async () => {
@@ -67,4 +69,31 @@ test("the forwarder passes bytes both ways and closes with its server", async ()
     socket.on("error", () => resolve("refused"));
   });
   expect(after).toBe("refused");
+});
+
+// B2: `e2e explore` with e2e.config.ts, inside a model-driven sandbox job only.
+const CLI = path.resolve(import.meta.dir, "../../../node_modules/e2e/dist/cli/bin.js");
+const DRIVEN = { ...SANDBOX_ENV, BUGBASH_MODEL: "anthropic:claude-sonnet-5-5" };
+
+test("e2e explore passes the host pause only in a model-driven sandbox job", async () => {
+  const root = await fakeRoot();
+  const explore = ["node", CLI, "explore", "--config", "e2e.config.ts", "find bugs"];
+  expect(e2eCommandRefusal(explore, DRIVEN, root)).toBeNull();
+  // The same command on this host, without the model-driven marker, or as another command.
+  expect(e2eCommandRefusal(explore, DRIVEN)).toContain("paused on this host");
+  expect(e2eCommandRefusal(explore, { BUGBASH_CONTAINER: "1" }, root)).toContain("paused");
+  expect(e2eCommandRefusal(["node", CLI, "mcp"], DRIVEN, root)).toContain("paused");
+});
+
+test("the agents get the proxy model for `e2e explore` in the sandbox, and never for `e2e run`", async () => {
+  const root = await fakeRoot();
+  const model = explorerModel(["node", CLI, "explore", "x"], DRIVEN, root);
+  expect(model?.modelId).toBe("claude-sonnet-5-5");
+  expect(explorerModel(["node", CLI, "run", "--config", "e2e.config.ts"], DRIVEN, root)).toBe(
+    undefined
+  );
+  expect(explorerModel(["node", CLI, "explore", "x"], DRIVEN)).toBeUndefined(); // this host
+  expect(() =>
+    explorerModel(["node", CLI, "explore", "x"], { ...DRIVEN, BUGBASH_MODEL: "openai:x" }, root)
+  ).toThrow(/anthropic/);
 });

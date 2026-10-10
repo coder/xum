@@ -3,6 +3,7 @@
  * Usage, from tests/bugbash, with BUGBASH_AI=mock:
  *   bun sandbox/launch.ts -- run --config e2e.config.ts --output .e2e/<folder> [e2e args...]
  *   bun sandbox/launch.ts -- run --config e2e.mcpapps.config.ts --output .e2e/<folder> [...]
+ *   bun sandbox/launch.ts -- explore "<goal>" --config e2e.config.ts --output .e2e/<folder> [...]
  *   bun sandbox/launch.ts --recover   (make bug-bash-sandbox-recover; see recover())
  *
  * The container runs the e2e CLI, Chromium and the seeded app with the pinned image (runner.ts).
@@ -10,14 +11,15 @@
  * read-only dist/ and node_modules/ (inputs.ts). Its output folder, the app log included, comes
  * back on its stdout as an export stream (exportStream.ts).
  *
- * Two job kinds run, both with the mock app AI. An exact-step repro run gets no model. The MCP
- * Apps suite is model-driven: its explorer reaches BUGBASH_MODEL (default Sonnet 5.5) only
- * through a provider proxy (proxy.ts) that this process runs for the job, on a unix socket that
- * the container gets read-only. The provider key stays here, and BUGBASH_BUDGET_USD caps the
- * spend at list price (not a billing cap: the upstream key's own limit is the backstop). The
- * proxy writes one record per call to `<output>.proxy.jsonl` on the host only. `e2e explore` and
- * the real app AI come in a later step of #5714, and the host pause still refuses every
- * model-driven run on the host. There is no host fallback.
+ * Three job kinds run, all with the mock app AI. An exact-step repro run gets no model. The MCP
+ * Apps suite and an `e2e explore` charter (run.ts, `make bug-bash`) are model-driven: their
+ * explorer reaches BUGBASH_MODEL (default Sonnet 5.5) only through a provider proxy (proxy.ts)
+ * that this process runs for the job, on a unix socket that the container gets read-only. The
+ * provider key stays here, and BUGBASH_BUDGET_USD caps the spend at list price (not a billing
+ * cap: the upstream key's own limit is the backstop); run.ts shares one budget across its jobs.
+ * The proxy writes one record per call to `<output>.proxy.jsonl` on the host only. The real app
+ * AI comes in a later step of #5714, and the host pause still refuses every model-driven run on
+ * the host. There is no host fallback.
  * Exit codes: the job's code, 2 refused, 3 the container state is unknown after cleanup, 4 the
  * evidence is incomplete, 5 the proxy reported a fault (a call cost more than its bound, or a
  * call outlived close()), 130 or 143 when SIGINT or SIGTERM stopped it. Exit 3 outranks a stop,
@@ -33,12 +35,12 @@ import { PROXY_DIR } from "./inContainer";
 import { startProxy } from "./proxy";
 import { Ledger, priced } from "./proxyPolicy";
 // prettier-ignore
-import { checkMountSource, containerEnv, exactStepRefusal, jobEnv, outputDir, plainFolders, stage } from "./inputs";
-import { Refusal, Session, Stopped } from "./runner";
+import { checkMountSource, containerEnv, exactStepRefusal, exploreRefusal, jobEnv, outputDir, plainFolders, stage } from "./inputs";
+import { type CleanupState, Refusal, Session, Stopped } from "./runner";
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dir, "../../.."));
 const DEADLINE_MS = 30 * 60_000;
-const log = (message: string) => console.error(`sandbox ${message}`);
+const logLine = (message: string) => console.error(`sandbox ${message}`);
 const sha = (text: string) => crypto.createHash("sha256").update(text).digest("hex");
 const bootId = () => fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
 const pidNamespace = () => fs.readlinkSync("/proc/self/ns/pid").replace(/\D/g, "");
@@ -83,7 +85,7 @@ interface ModelJob {
  * Reads a model-driven job from the host env, before any docker command. Refusal texts never
  * hold the key or the base URL.
  */
-function modelJob(env: NodeJS.ProcessEnv): ModelJob {
+export function modelJob(env: NodeJS.ProcessEnv): ModelJob {
   const spec = env.BUGBASH_MODEL ?? MCP_APPS_MODEL;
   const [provider, model] = spec.split(/:(.*)/s, 2);
   if (provider !== "anthropic" || !model)
@@ -150,7 +152,7 @@ export function ownerState(owner: string): "dead" | "alive" | "cannot tell" {
  * and it prints the Docker endpoint first. Exit 3 when a removal cannot be proved.
  */
 export async function recover(o: LaunchOptions & { log?: (line: string) => void }) {
-  const say = o.log ?? log;
+  const say = o.log ?? logLine;
   const session = new Session(o.stop, { root: o.root, log: say });
   const checkout = checkoutId(o.root);
   const jobName = new RegExp(`^xbb-${checkout.slice(0, 6)}-[0-9a-f]{6}$`);
@@ -190,19 +192,62 @@ export interface LaunchOptions {
   env: NodeJS.ProcessEnv;
   /** The entry point aborts it on SIGINT or SIGTERM, with the signal name as the reason. */
   stop: AbortSignal;
+  /** run.ts: one budget for all its jobs. Without it, a job's own from BUGBASH_BUDGET_USD. */
+  ledger?: Ledger;
+  /** Where the launcher's own lines go (run.ts: the charter's log). Default: stderr. */
+  log?: (line: string) => void;
+  /** A file descriptor for the container's stderr (the e2e output). Default: ours. */
+  stderr?: number;
+}
+
+/**
+ * How one job ended, every part kept apart. exitFor() turns it into the launcher's exit code;
+ * run.ts reads the parts. `error` is anything thrown after the preflight (a Refusal too).
+ */
+export interface JobOutcome {
+  /** The job's own exit code, or 4 when its evidence is incomplete. Unset: it did not end. */
+  code?: number;
+  error?: unknown;
+  cleanup: CleanupState;
+  /** The stop reason (SIGINT, SIGTERM), when a stop came before cleanup ended. */
+  stopped?: string;
+  /** The proxy's fault: a call cost more than its bound, or a call outlived close(). */
+  proxyFault?: string;
+}
+
+/** The one precedence rule: unknown cleanup (3), then a stop, then a proxy fault (5). */
+export function exitFor(outcome: JobOutcome): number {
+  if (outcome.cleanup.startsWith("unknown")) return 3;
+  if (outcome.stopped != null) throw new Stopped(outcome.stopped);
+  if (outcome.proxyFault != null) return 5;
+  if ("error" in outcome) throw outcome.error;
+  return outcome.code!;
 }
 
 /** Runs the job and returns the launcher's exit code. Refusal and Stopped are thrown. */
 export async function launch(args: string[], o: LaunchOptions): Promise<number> {
+  return exitFor(await launchJob(args, o));
+}
+
+/** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
+export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
+  const log = o.log ?? logLine;
   const dir = path.join(o.root, "tests/bugbash");
   const mcpApps = exactStepRefusal(args, o.cwd, dir, MCP_APPS_CONFIG) == null;
-  const notExact = mcpApps ? null : exactStepRefusal(args, o.cwd, dir);
-  if (notExact != null)
-    throw new Refusal(`${notExact}: only exact-step repros and the MCP Apps suite run (#5714)`);
+  if (args[0] === "explore") {
+    const notExplore = exploreRefusal(args, o.cwd, dir);
+    if (notExplore != null) throw new Refusal(`${notExplore}: not one explore charter (#5714)`);
+  } else if (!mcpApps) {
+    const notExact = exactStepRefusal(args, o.cwd, dir);
+    if (notExact != null)
+      throw new Refusal(
+        `${notExact}: only exact-step repros, the MCP Apps suite and explore charters run (#5714)`
+      );
+  }
   // First, before any docker command and before the container env exists.
   if (!mockOnly(o.env))
     throw new Refusal("only the mock app AI runs in the sandbox (#5714): set BUGBASH_AI=mock");
-  const driven = mcpApps ? modelJob(o.env) : undefined;
+  const driven = mcpApps || args[0] === "explore" ? modelJob(o.env) : undefined;
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -214,7 +259,7 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
       bind(checkMountSource(o.root, rel), `/repo/${rel}`)
     );
   mounts(); // before preflight, and again just before `docker run`
-  const session = new Session(o.stop, { root: o.root });
+  const session = new Session(o.stop, { root: o.root, log, stderr: o.stderr });
   const checkout = checkoutId(o.root);
   const name = `xbb-${checkout.slice(0, 6)}-${crypto.randomBytes(3).toString("hex")}`;
   const jobDir = path.join(os.tmpdir(), "xum-bugbash-sandbox", checkout, name);
@@ -275,7 +320,7 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
       const proxyDir = path.join(jobDir, "proxy");
       fs.mkdirSync(proxyDir, { mode: 0o700 });
       fs.mkdirSync(path.join(staged, path.relative("/repo", PROXY_DIR))); // its mount point
-      ledger = new Ledger(driven.budgetUsd);
+      ledger = o.ledger ?? new Ledger(driven.budgetUsd);
       proxy = await startProxy({
         socketPath: path.join(proxyDir, "sock"),
         upstream: driven.upstream,
@@ -309,9 +354,8 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
     // event loop. This yield lets it run, so own() throws and no container starts (measured).
     await new Promise((resolve) => setImmediate(resolve));
     session.own({ name, owner: ownerLabel(), checkout });
-    const via = driven
-      ? `proxy for anthropic:${driven.model} (budget $${driven.budgetUsd.toFixed(2)}), `
-      : "";
+    const budget = o.ledger ? "the run's budget" : `budget $${driven?.budgetUsd.toFixed(2)}`;
+    const via = driven ? `proxy for anthropic:${driven.model} (${budget}), ` : "";
     log(`${name} starts: --network none, ${via}mock app AI, launcher pid ${process.pid}`);
     // A refused frame ends the job at once: the container would otherwise block on a full pipe
     // until the deadline (#5930 item 4).
@@ -339,22 +383,25 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
   const missed = await closeProxy();
   if (proxy && ledger) {
     const { settled, kept, refused, refusedBy } = proxy.stats();
+    // A shared ledger's totals are the run's: run.ts reports them once.
     const { spentNanoUsd, capNanoUsd } = ledger.totals();
+    const spent = o.ledger ? "" : `, ${usd(spentNanoUsd)} of ${usd(capNanoUsd)} at list price`;
     log(
       `${name} proxy: ${settled} settled, ${kept} kept in full, ${refused} refused ` +
-        `${JSON.stringify(refusedBy)}, ${usd(spentNanoUsd)} of ${usd(capNanoUsd)} at list price`
+        `${JSON.stringify(refusedBy)}${spent}`
     );
   }
-  const state = await session.cleanup();
+  const cleanup = await session.cleanup();
   if (made) fs.rmSync(jobDir, { recursive: true, force: true });
-  log(`${name} cleanup: ${state}`);
+  log(`${name} cleanup: ${cleanup}`);
   if (missed != null) log(`${name} ${missed}`);
-  if (state.startsWith("unknown")) return 3;
-  // A stop seen before cleanup ended outranks a proxy fault, the job's result and an error.
-  if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
-  if (missed != null) return 5;
-  if (typeof result !== "number") throw result.error;
-  return result;
+  return {
+    ...(typeof result === "number" ? { code: result } : { error: result.error }),
+    cleanup,
+    // Read after cleanup: a stop seen before cleanup ended counts.
+    ...(o.stop.aborted && { stopped: String(o.stop.reason) }),
+    ...(missed != null && { proxyFault: missed }),
+  };
 }
 
 if (import.meta.main) {
@@ -370,10 +417,10 @@ if (import.meta.main) {
     (code) => process.exit(code),
     (error: unknown) => {
       if (error instanceof Stopped) {
-        log(error.message);
+        logLine(error.message);
         process.exit(error.reason === "SIGINT" ? 130 : 143);
       }
-      log(`refused: ${error instanceof Error ? error.message : String(error)}`);
+      logLine(`refused: ${error instanceof Error ? error.message : String(error)}`);
       process.exit(error instanceof Refusal ? 2 : 1);
     }
   );

@@ -5,7 +5,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { startFakeUpstream } from "./fakeUpstream";
-import { launch, ownerState, recover } from "./launch";
+import { exitFor, launch, launchJob, ownerState, recover } from "./launch";
+import { Ledger } from "./proxyPolicy";
 import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
 
 // Each test runs the real build.sh in a throwaway git repo and a fake `docker` on PATH. The
@@ -60,7 +61,8 @@ case "$1" in
         echo "proxy dir mode $(stat -c %a "$psrc")" >> "$bin/calls.log"
         curl -s --unix-socket "$psrc/sock" -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
           -d '{"model":"claude-sonnet-5-5","max_tokens":10,"messages":[{"role":"user","content":"'"$CALL"'"}]}' \\
-          http://proxy/anthropic/v1/messages >> "$bin/calls.log"; echo >> "$bin/calls.log" ;;
+          http://proxy/anthropic/v1/messages >> "$bin/calls.log"; echo >> "$bin/calls.log"
+        echo "job says hi" >&2 ;;
     esac
     printf '{"p":"app.log","n":2}\nok'; [ "$RUN" = cut ] || printf '{"end":true}\n'
     [ "$RUN" = linger ] || unregister "$id"; exit 7 ;;
@@ -1016,6 +1018,50 @@ test("B1: a stop after a bound miss still ends with the stop, not exit 5", async
   expectNothingLeft();
 });
 
+// B2: an `e2e explore` charter, as run.ts starts it.
+const EXPLORE_ARGS = ["explore", "find bugs", "--config", "e2e.config.ts", "--output", ".e2e/x"];
+test("B2: an explore job spends from the run's ledger and writes its output to the given fd", async () => {
+  const upstream = await startFakeUpstream();
+  try {
+    const cwd = prepare({ RUN: "proxycall" });
+    const ledger = new Ledger(1);
+    const logFile = path.join(root, "charter.log");
+    const fd = fs.openSync(logFile, "w");
+    const lines: string[] = [];
+    const env = {
+      ...HOST_ENV,
+      BUGBASH_BUDGET_USD: "1",
+      ANTHROPIC_API_KEY: UPSTREAM_KEY,
+      ANTHROPIC_BASE_URL: `${upstream.baseUrl}/v1`,
+      BUGBASH_MODEL: "anthropic:claude-sonnet-5-5",
+    };
+    const stop = new AbortController().signal;
+    const o = { root: fs.realpathSync(root), cwd, env, stop, ledger, stderr: fd };
+    const outcome = await launchJob(EXPLORE_ARGS, { ...o, log: (line) => lines.push(line) });
+    fs.closeSync(fd);
+    expect(outcome).toEqual({ code: 7, cleanup: "removed" });
+    expect(ledger.totals().calls).toBe(1); // the run's ledger, not one of the job's own
+    expect(upstream.requests).toHaveLength(1);
+    expect(lines.join("\n")).toContain("(the run's budget)");
+    expect(lines.join("\n")).not.toContain("at list price"); // run.ts reports the run totals once
+    expect(fs.readFileSync(logFile, "utf8")).toContain("job says hi");
+    expectNothingLeft();
+  } finally {
+    await upstream.close();
+  }
+});
+
+test("B2: unknown cleanup outranks a stop, and a stop outranks a proxy fault", () => {
+  const fault = { proxyFault: "proxy: 1 call(s) cost more" };
+  expect(exitFor({ code: 0, cleanup: "unknown: x", stopped: "SIGINT", ...fault })).toBe(3);
+  expect(() => exitFor({ code: 0, cleanup: "removed", stopped: "SIGTERM", ...fault })).toThrow(
+    Stopped
+  );
+  expect(exitFor({ code: 0, cleanup: "removed", ...fault })).toBe(5);
+  expect(() => exitFor({ error: new Refusal("x"), cleanup: "none" })).toThrow(Refusal);
+  expect(exitFor({ code: 7, cleanup: "removed" })).toBe(7);
+});
+
 test("B1: a repro job gets no proxy and no explorer model, whatever the host sets", async () => {
   expect(
     await launchIn({}, new AbortController(), { ...HOST_ENV, BUGBASH_MODEL: "anthropic:x" })
@@ -1051,7 +1097,8 @@ test("a mount source that becomes a symlink before `docker run` refuses; nothing
 });
 
 test.each([
-  ["`e2e explore`", ["explore", "--config", "e2e.config.ts"], /not `e2e run`/],
+  ["`e2e explore` without a goal", ["explore", "--config", "e2e.config.ts"], /one charter goal/],
+  ["`e2e mcp`", ["mcp"], /not `e2e run`/],
   ["an existing output folder", ARGS, /exists: remove it first/],
 ])("%s refuses before any docker command", async (_name, args, message) => {
   fs.mkdirSync(path.join(root, "tests/bugbash/.e2e/r"), { recursive: true });
