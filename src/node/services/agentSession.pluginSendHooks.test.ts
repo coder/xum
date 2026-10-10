@@ -109,6 +109,24 @@ describe("message.send.before outcomes", () => {
     expect(textOf(requestUser)).toBe("FIX THE BUG");
   });
 
+  test("an admission that goes stale while the hook runs wins over the hook's block", async () => {
+    let stale = false;
+    const { h } = await setup(() => {
+      // e.g. the goal became budget_limited while the plugin was deciding.
+      stale = true;
+      return blockAll();
+    });
+    const result = await h.session.sendMessage("Continue the goal", options, {
+      synthetic: true,
+      admissionStale: () => stale,
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    // The stale refusal, not a permanent plugin block that the caller would settle as final.
+    expect(result.error.type).not.toBe("plugin_blocked");
+    expect(await userRows(h)).toEqual([]);
+  });
+
   test("a block returns plugin_blocked and writes no row", async () => {
     const { h, streamed } = await setup(blockAll);
 

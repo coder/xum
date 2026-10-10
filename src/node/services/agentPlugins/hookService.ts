@@ -116,7 +116,7 @@ export interface EnsureWorkspaceHooksArgs {
   projectKey?: string;
   projectTrusted: boolean;
   /** History reader for turn.end (reads the finished turn's reply once per event). */
-  history: Pick<HistoryService, "getLastMessages">;
+  history: Pick<HistoryService, "getLastMessages" | "readPartial">;
 }
 
 /** One discovered plugin with a hooks.js, plus its pinned source snapshot. */
@@ -850,9 +850,12 @@ function annotateResult(result: unknown, annotation: string, pluginName: string)
  * step, not the reply). Null when no row with text was saved (for example an
  * abort before any text) or history cannot be read. Cut to
  * TURN_END_TEXT_MAX_CHARS.
+ *
+ * An interrupted stream (Escape, soft abort) emits stream.end before its
+ * partial reply is committed to history, so the partial row is the fallback.
  */
 async function readTurnEndText(
-  history: Pick<HistoryService, "getLastMessages">,
+  history: Pick<HistoryService, "getLastMessages" | "readPartial">,
   workspaceId: string,
   messageId: string
 ): Promise<string | null> {
@@ -868,7 +871,15 @@ async function readTurnEndText(
     log.debug("Agent plugin hooks: turn.end history read threw", { error });
     return null;
   }
-  const message = rows.findLast((row) => row.id === messageId && row.role === "assistant");
+  let message = rows.findLast((row) => row.id === messageId && row.role === "assistant");
+  if (message === undefined) {
+    try {
+      const partial = await history.readPartial(workspaceId);
+      if (partial?.id === messageId && partial.role === "assistant") message = partial;
+    } catch (error) {
+      log.debug("Agent plugin hooks: turn.end partial read threw", { error });
+    }
+  }
   if (message === undefined) {
     return null;
   }

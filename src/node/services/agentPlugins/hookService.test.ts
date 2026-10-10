@@ -1335,6 +1335,23 @@ describe("turn.end", () => {
     ]);
   });
 
+  test("an interrupted turn delivers the partial reply that is not committed yet", async () => {
+    const spine = new SettlingSpine();
+    const harness = await createHarness({ spine });
+    await writeHookPlugin(harness.container, "recorder", RECORDER);
+    await harness.ensure();
+    // Escape after text streamed: stream.end fires before the partial is committed.
+    const partial = createMuxMessage("assistant-3", "assistant", "Half an answer");
+    expect((await harness.history.writePartial(WORKSPACE_ID, partial)).success).toBe(true);
+
+    spine.emit("stream.end", { workspaceId: WORKSPACE_ID, messageId: "assistant-3" });
+    await spine.settle();
+
+    expect(await readSeen(harness)).toEqual([
+      [{ workspaceId: WORKSPACE_ID, messageId: "assistant-3", text: "Half an answer" }],
+    ]);
+  });
+
   test("history is read once per finished turn for all plugins", async () => {
     const spine = new SettlingSpine();
     const harness = await createHarness({ spine });

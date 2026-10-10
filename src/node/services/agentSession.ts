@@ -4715,6 +4715,13 @@ export class AgentSession {
     if (await cancelBeforeAcceptance()) {
       return Ok(undefined);
     }
+    // The hooks can take seconds: recheck admission before acting on their outcome. A send whose
+    // admission went stale meanwhile (for example a goal that became budget_limited) must get the
+    // stale refusal, not a permanent plugin block, or its caller settles the wrong outcome.
+    if (isAdmissionStale())
+      return refuseBeforeAcceptance(
+        createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+      );
     if (pluginSend.kind === "blocked") {
       const blockedError: SendMessageError = {
         type: "plugin_blocked",
@@ -4729,11 +4736,6 @@ export class AgentSession {
       }
       return refuseBeforeAcceptance(blockedError);
     }
-    // The hooks can take seconds: recheck admission before anything uses the result.
-    if (isAdmissionStale())
-      return refuseBeforeAcceptance(
-        createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
-      );
     const pluginRewrite = pluginSend.rewrite;
     message = pluginSend.text;
 
