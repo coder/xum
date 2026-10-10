@@ -10,7 +10,7 @@
  *   ({
  *     "tool.execute.before": async (input) => ({ deny: "..." }),
  *     "request.assemble": (input) => ({ context: "..." }),
- *     "message.send.before": (input) => ({ text: input.text.trim() }), // or { block: "why" }
+ *     "message.send.before": (input) => ({ text: input.text.trim() }), // or { deny: "why" }
  *     "turn.end": (input) => {}, // observes input.text; the output is ignored
  *   })
  *
