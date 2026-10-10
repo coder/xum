@@ -9,7 +9,8 @@
  * message kinds, the selected right-sidebar tab (#5965) and the selected Stats pill.
  *
  * The review diff's gutter (+ and − signs, line numbers) is checked in all four themes, on the
- * line tints and under the review-range highlight (#5985).
+ * line tints and under the review-range highlight (#5985). The light code stories seed the same
+ * review, so their tokens are also checked under that highlight (#6006).
  *
  * The dark code stories check every syntax-highlighted token, and every min-dark replacement
  * color, in dark and flexoki-dark on the code block, the diff tints and the review-range
@@ -393,6 +394,12 @@ const shikiTokens = (root: HTMLElement) =>
       /^color:#[0-9a-f]{6}/i.test(span.getAttribute("style") ?? "") && span.textContent?.trim()
   );
 
+/** Whether `token` is in a review diff cell painted with the review-range highlight gradient. */
+const isOnReviewHighlight = (token: HTMLElement) => {
+  const cell = token.closest<HTMLElement>("[data-diff-indicator] ~ span");
+  return cell != null && getComputedStyle(cell).backgroundImage !== "none";
+};
+
 const selectedTab = (root: HTMLElement) => [
   ...root.querySelectorAll<HTMLElement>('[role="tab"][aria-selected="true"]'),
 ];
@@ -412,6 +419,11 @@ async function expectCodeReadable(canvasElement: HTMLElement, theme: ThemeMode) 
       if (!tokens.some((token) => token.element.closest(`[style*="${tint}"]`))) {
         throw new Error(`no highlighted token on a ${tint} diff line yet`);
       }
+    }
+    // The seeded review highlights diff lines; tokens there sit on the darkest light
+    // backgrounds, so at least one must be measured (#6006).
+    if (!tokens.some((token) => isOnReviewHighlight(token.element))) {
+      throw new Error("no highlighted token on a review-highlighted line yet");
     }
   });
   const inlineCode = await findTexts("inline code", 2, () =>
@@ -489,7 +501,8 @@ async function expectDiffGutterReadable(canvasElement: HTMLElement) {
 const codeStory = (theme: ThemeMode): AppStory => ({
   globals: { theme },
   parameters: lightContract,
-  render: () => <AppWithMocks setup={() => setupCodeWorkspace("review")} />,
+  // With the seeded review, tokens also sit under the review-range highlight (#6006).
+  render: () => <AppWithMocks setup={() => setupCodeWorkspace("review", true)} />,
   play: async ({ canvasElement }) => {
     await expectCodeReadable(canvasElement, theme);
   },
@@ -518,11 +531,9 @@ async function expectDarkCodeReadable(canvasElement: HTMLElement) {
   await within(canvasElement).findByText("Renamed", { exact: false }, { timeout: 15_000 });
   const tokens = await findTexts("highlighted token", 8, () => shikiTokens(canvasElement));
   await waitFor(() => {
-    const highlighted = tokens.some((token) => {
-      const cell = token.element.closest<HTMLElement>("[data-diff-indicator] ~ span");
-      return cell != null && getComputedStyle(cell).backgroundImage !== "none";
-    });
-    if (!highlighted) throw new Error("no highlighted token on a review-highlighted line yet");
+    if (!tokens.some((token) => isOnReviewHighlight(token.element))) {
+      throw new Error("no highlighted token on a review-highlighted line yet");
+    }
   });
   await expectReadable(tokens);
 
