@@ -1483,9 +1483,10 @@ function AppInner() {
                 // enough; we only render AIView once metadata hydration confirms it exists.
                 // `main`: this screen replaces the workspace page, so it carries the page's one
                 // `main` landmark (Lighthouse landmark-one-main, #5998). LoadingScreen itself stays
-                // landmark-free, because the boot path in AppLoader shares it. A row flex like the
-                // parent, so the 100vw loader still shrinks to the space beside the sidebar.
-                <main className="flex min-w-0 flex-1 overflow-hidden">
+                // landmark-free, because the boot path in AppLoader shares it. The same direction
+                // rule as the parent (`mobile-layout`: a row on desktop, a column on phones), so
+                // the 100vw/100dvh loader shrinks to the same space it had without the wrapper.
+                <main className="mobile-layout flex min-w-0 flex-1 overflow-hidden">
                   <LoadingScreen statusText="Opening workspace..." />
                 </main>
               ) : (
