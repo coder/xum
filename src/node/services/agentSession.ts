@@ -737,7 +737,7 @@ interface AgentSessionActiveStreamInfo {
   >;
   stepStartIndices?: readonly number[];
   currentStepStartIndex?: number;
-  initialMetadata?: { systemMessageTokens?: number };
+  initialMetadata?: { systemMessageTokens?: number; anthropicThinkingReplay?: "off" };
   toolCompletionTimestamps: Map<string, number>;
 }
 

@@ -1589,6 +1589,8 @@ describe("AgentSession continuous compaction wiring", () => {
         head: [
           createMuxMessage("head", "user", "Preserve the root cause and the failed approaches"),
         ],
+        // No receipt anywhere in these fixtures unless a test passes its own segment rows.
+        receiptRows: [],
         signal: new AbortController().signal,
         context: { enabled: true, model, contextWindowTokens: 128_000, thresholdPercent: 70 },
         baseOptions: sendOptions,
@@ -1796,6 +1798,61 @@ describe("AgentSession continuous compaction wiring", () => {
       effort: "low",
     });
     expect(JSON.stringify(requests[0].prompt)).toContain("earlier thinking");
+  });
+
+  test("a receipt in the retained tail keeps the head's Anthropic thinking out of the summary (#5996)", async () => {
+    const { h, args } = await summarySetup();
+    const opus = "anthropic:claude-opus-5-5";
+    const requests: LanguageModelV3CallOptions[] = [];
+    const sdkModel = new MockLanguageModelV3({
+      doStream: (request) => {
+        requests.push(request);
+        return Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) });
+      },
+    });
+    const anthropicConfig = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({ anthropic: anthropicConfig });
+    spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok({
+        ...pinnedSummaryModel(sdkModel, opus),
+        wireProviderName: "anthropic",
+        optionsRouteProvider: "anthropic" as const,
+        optionsProvidersConfig: { anthropic: anthropicConfig },
+      })
+    );
+    const signedHead: MuxMessage = {
+      id: "assistant-signed",
+      role: "assistant",
+      metadata: { thinkingLevel: "high" },
+      parts: [
+        {
+          type: "reasoning",
+          text: "removed thinking",
+          providerOptions: { anthropic: { signature: "sig-removed" } },
+        },
+        { type: "text", text: "earlier answer" },
+      ],
+    };
+    const head = [...args.head, signedHead, createMuxMessage("next", "user", "next step")];
+    const tailReceipt = createMuxMessage("tail-answer", "assistant", "repaired answer", {
+      anthropicThinkingReplay: "off",
+    });
+    const summarize = (receiptRows: MuxMessage[]) =>
+      summarizeContinuousCompaction({
+        ...args,
+        head,
+        receiptRows,
+        compactOptions: { ...args.compactOptions, model: opus, thinkingLevel: "high" },
+      });
+
+    // Control: the head alone holds no receipt, so its thinking is sent.
+    await summarize(head);
+    expect(JSON.stringify(requests[0].prompt)).toContain("removed thinking");
+
+    await summarize([...head, tailReceipt]);
+    const prompt = JSON.stringify(requests[1].prompt);
+    expect(prompt).not.toContain("removed thinking");
+    expect(prompt).toContain("earlier answer");
   });
 
   test("a Sonnet 5.5 'off' summary ignores a higher-effort turn before the context boundary", async () => {

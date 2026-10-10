@@ -670,6 +670,58 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
       expect(row?.metadata?.anthropicThinkingReplay).toBeUndefined();
     });
 
+    test("the running turn exposes its receipt to continuous compaction (#5996)", async () => {
+      const workspaceId = "preserved-thinking-server-tool-live";
+      const seen: Array<"off" | undefined> = [];
+      const streamManager: ReturnType<typeof createStreamManagerForTests> =
+        createStreamManagerForTests(historyService, {
+          streamText: scriptedStreamText([
+            {
+              chunks: [
+                { type: "start-step" },
+                () => {
+                  seen.push(
+                    streamManager.getStreamInfo(workspaceId)?.initialMetadata
+                      ?.anthropicThinkingReplay
+                  );
+                  return Promise.resolve();
+                },
+                {
+                  type: "tool-call",
+                  toolCallId: "srvtoolu_1",
+                  toolName: "web_search",
+                  input: { query: "xum" },
+                  providerExecuted: true,
+                },
+                {
+                  type: "tool-result",
+                  toolCallId: "srvtoolu_1",
+                  toolName: "web_search",
+                  output: [],
+                  providerExecuted: true,
+                },
+                { type: "reasoning-delta", text: "read" },
+                () => {
+                  seen.push(
+                    streamManager.getStreamInfo(workspaceId)?.initialMetadata
+                      ?.anthropicThinkingReplay
+                  );
+                  return Promise.resolve();
+                },
+                { type: "finish-step", usage: TEST_USAGE },
+                STOP_FINISH,
+              ],
+            },
+          ]),
+        });
+      await runTurnForTests(streamManager, {
+        workspaceId,
+        model: createTestLanguageModel("claude-opus-5-5", "anthropic.messages"),
+        modelString: "anthropic:claude-opus-5-5",
+      });
+      expect(seen).toEqual([undefined, "off"]);
+    });
+
     test("a server tool with no thinking after it keeps thinking replay on", async () => {
       const workspaceId = "preserved-thinking-server-tool-last";
       // thinking "plan", server tool, then the answer: no block is bound to the native prefix.

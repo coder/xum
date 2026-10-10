@@ -93,7 +93,7 @@ export class ContinuousStrategy {
         const attachments = await this.buildContinuousCompactionAttachments(head);
         return { ...prepared, attachments };
       },
-      summarize: (head, signal, context: SessionCompactionContext) => {
+      summarize: (head, signal, context: SessionCompactionContext, receiptRows) => {
         const baseOptions = context.sendOptions ?? { model: context.model, agentId: "exec" };
         const request = this.host.buildAutoCompactionRequest({
           baseOptions,
@@ -106,6 +106,7 @@ export class ContinuousStrategy {
           aiService: this.deps.aiService,
           sessionUsageService: this.deps.sessionUsageService,
           head,
+          receiptRows,
           signal,
           context,
           baseOptions,
