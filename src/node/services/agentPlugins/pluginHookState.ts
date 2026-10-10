@@ -29,8 +29,23 @@ export const PLUGIN_HOOK_STATE_MAX_BYTES = 64 * 1024;
 /** Env var that tells a plugin stdio server which workspace it serves. */
 export const PLUGIN_WORKSPACE_ID_ENV = "XUM_WORKSPACE_ID";
 
-/** A workspace ID is used as a file name; anything else must not reach a path. */
-const SAFE_WORKSPACE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+/**
+ * A workspace ID becomes a file name. Any single path segment is accepted: migrated
+ * workspaces keep legacy `${project}-${workspace}` IDs that can hold dots or spaces, and the
+ * plugin server receives that exact ID in XUM_WORKSPACE_ID. Path separators, NUL and control
+ * characters are refused (`${id}.json` can never be `.` or `..`), and the read below also
+ * checks containment.
+ */
+const MAX_WORKSPACE_ID_FILE_CHARS = 200;
+
+function isSafeWorkspaceIdFileName(workspaceId: string): boolean {
+  return (
+    workspaceId.length > 0 &&
+    workspaceId.length <= MAX_WORKSPACE_ID_FILE_CHARS &&
+    // eslint-disable-next-line no-control-regex -- NUL and control characters are the point
+    !/[/\\\u0000-\u001f\u007f]/.test(workspaceId)
+  );
+}
 
 /**
  * Merged settings for one workspace, or null when neither file is usable.
@@ -50,7 +65,7 @@ export async function readPluginHookState(dataPath: string, workspaceId: string)
     return null;
   }
   const globalState = await readStateFile(root, path.join(root, PLUGIN_HOOK_STATE_FILE));
-  if (!SAFE_WORKSPACE_ID_PATTERN.test(workspaceId)) {
+  if (!isSafeWorkspaceIdFileName(workspaceId)) {
     log.debug("Plugin hook settings: workspace ID is not a safe file name; using global only", {
       workspaceId,
     });
@@ -74,6 +89,14 @@ export function mergePluginHookState(globalState: unknown, workspaceState: unkno
 /** null for any unusable file; JSON `null` content also reads as "no settings". */
 async function readStateFile(root: string, filePath: string): Promise<unknown> {
   try {
+    // open() on a FIFO or device blocks until a writer appears, and this read runs before
+    // the hook deadline starts: only regular files may reach the open below. (A swap after
+    // this stat is caught by the dev/ino check inside readPluginFileWithinRootCapped once
+    // the open returns; only the plugin's own server can write this folder.)
+    if (!(await fsPromises.stat(filePath)).isFile()) {
+      log.warn(`Plugin hook settings: ignoring ${filePath}: not a regular file`);
+      return null;
+    }
     const { content } = await readPluginFileWithinRootCapped({
       filePath,
       pluginRoot: root,

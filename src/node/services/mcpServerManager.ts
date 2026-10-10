@@ -1619,6 +1619,8 @@ interface MCPServerTestOptions {
   projectSecrets?: Record<string, string>;
   /** Agent Plugins discovery context for named-server lookups (null = no plugin servers). */
   agentPlugins?: AgentPluginsMcpContext | null;
+  /** Workspace that requested the test: plugin stdio servers get it as XUM_WORKSPACE_ID. */
+  workspaceId?: string;
 }
 
 export class MCPServerManager {
@@ -5200,6 +5202,7 @@ export class MCPServerManager {
         headers: input.headers,
         projectSecrets,
         agentPlugins,
+        ...(input.workspaceId != null ? { workspaceId: input.workspaceId } : {}),
       });
     } catch (error) {
       // Preparation (secrets, plugin context, config listing) can reject before test() runs.
@@ -5281,7 +5284,7 @@ export class MCPServerManager {
         }
       };
       if (server.transport === "stdio") {
-        const launch = await prepareStdioLaunch(server);
+        const launch = await prepareStdioLaunch(server, { workspaceId: options.workspaceId });
         return testNamedServer({ transport: "stdio", ...launch });
       }
 
