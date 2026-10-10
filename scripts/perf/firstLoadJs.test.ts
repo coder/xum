@@ -78,6 +78,18 @@ describe("firstLoadJs", () => {
     expect(noMap.stderr).toContain("deep-EEEEEEEE.js has no source map");
   });
 
+  test("a classic external script exits 2, because the graph does not measure it", async () => {
+    const html = path.join(dir, "index.html");
+    await fs.writeFile(path.join(dir, "classic.js"), "window.__classic = true;");
+    const original = await fs.readFile(html, "utf-8");
+    const classicTag = '<script src="./classic.js"></script>';
+    await fs.writeFile(html, original.replace("</head>", `${classicTag}</head>`));
+    const classic = await runScript([dir]);
+    expect(classic.exitCode).toBe(2);
+    expect(classic.stderr).toContain("./classic.js");
+    await fs.writeFile(html, original);
+  });
+
   describe("--budget", () => {
     const BUDGET_FILE = path.join(import.meta.dir, "firstLoadBudget.json");
 

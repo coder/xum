@@ -11,7 +11,7 @@
  *   [--budget <file>]
  * The totals also count index.html itself (T3 PR8), so growth of its inline boot script or
  * markup is measured. Before PR8 the totals were module JS only (9.1 KiB less on main).
- * External classic `<script src>` files are not followed; index.html has none today.
+ * An external classic `<script src>` exits 2: the graph does not measure it (index.html has none).
  * `--budget` (T3 PR8, `make check-first-load-js` in CI) also fails when the first load grows
  * over the recorded values in that file: brotli by more than 2%, raw by more than 100 KiB.
  * Exit codes: 0 ok, 1 a forbidden source is on the first load or a budget is exceeded,
@@ -83,6 +83,9 @@ function htmlRoots(distDir: string): string[] {
       ? attrs.get("type") === "module"
       : attrs.get("rel")?.toLowerCase().split(/\s+/).includes("modulepreload") === true;
     const href = attrs.get(isScript ? "src" : "href");
+    if (isScript && !isRoot && href != null) {
+      fail(`index.html loads classic script ${href}, which first-load totals cannot measure`);
+    }
     if (!isRoot || href == null) continue; // inline boot scripts, stylesheets, icons
     // vite `base: "./"` writes `./main-<hash>.js`; a leading `/` means the dist root.
     const target = href.startsWith("/") ? path.join(distDir, href) : path.resolve(distDir, href);
