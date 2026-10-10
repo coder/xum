@@ -250,7 +250,9 @@ export function TerminalView({
   }, [autoFocus]);
 
   useEffect(() => {
-    if (!autoFocus || !visible || !terminalReady || autoFocusConsumedRef.current) {
+    // Wait for the first screen: until then the container is visibility:hidden, so focus taken
+    // now does not last, yet the check below would already consume autoFocus (T3, #5971).
+    if (!autoFocus || !visible || !terminalReady || isLoading || autoFocusConsumedRef.current) {
       return;
     }
 
@@ -296,7 +298,7 @@ export function TerminalView({
       cancelled = true;
       cancelAnimationFrame(rafId);
     };
-  }, [autoFocus, visible, terminalReady, consumeAutoFocus]);
+  }, [autoFocus, visible, terminalReady, isLoading, consumeAutoFocus]);
 
   // Reset loading state when session changes
   useEffect(() => {
