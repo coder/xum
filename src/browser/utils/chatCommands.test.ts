@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, test, beforeEach, mock, spyOn } from "bun:test";
-import type { HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
+import type {
+  HistoryEditPrecondition,
+  ProvidersConfigMap,
+  SendMessageOptions,
+} from "@/common/orpc/types";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { MODEL_KEY_MAX_CHARS } from "@/common/constants/storage";
 import {
   createNewWorkspace,
@@ -434,6 +439,148 @@ describe("processSlashCommand clear results", () => {
     );
     expectDisposition(hard.result, "consume");
     expect(hard.result.actions).toEqual([]);
+  });
+});
+
+describe("processSlashCommand speed toggles", () => {
+  const store = getProvidersConfigStore();
+  let config: ProvidersConfigMap;
+
+  beforeEach(() => {
+    const provider = { apiKeySet: true, isEnabled: true, isConfigured: true, models: [] };
+    config = {
+      openai: { ...provider, serviceTier: "flex" },
+      anthropic: { ...provider },
+      xai: { ...provider },
+      openrouter: { ...provider },
+    };
+    // Pin routing/cache state without opening app-wide backend subscriptions in these unit tests.
+    spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({ routePriority: ["direct"] });
+    spyOn(store, "getConfig").mockImplementation(() => config);
+    spyOn(store, "refresh").mockResolvedValue(undefined);
+    spyOn(store, "updateOptimistically").mockImplementation((provider, patch) => {
+      config = { ...config, [provider]: { ...config[provider], ...patch } };
+    });
+  });
+
+  afterEach(() => mock.restore());
+
+  function setup(model = "openai:gpt-6-astra") {
+    const setProviderConfig = mock(() =>
+      Promise.resolve({ success: true as const, data: undefined })
+    );
+    const getConfig = mock(() => Promise.resolve(config));
+    const api = createTestApiClient({ providers: { getConfig, setProviderConfig } });
+    const env = createEnv({ api, sendMessageOptions: { ...sendMessageOptions, model } });
+    const run = async (command: string, overrides: Partial<SlashCommandEnv> = {}) =>
+      finishCommand(await processSlashCommand(parseCommand(command), { ...env, ...overrides }));
+    return { run, setProviderConfig, getConfig };
+  }
+
+  test.each(["workspace", "creation"] as const)(
+    "switches tiers and restores the original preference in %s",
+    async (variant) => {
+      const { run, setProviderConfig } = setup();
+      for (const [command, tier] of [
+        ["/fast", "priority"],
+        ["/ultrafast", "ultrafast"],
+        ["/ultrafast", "flex"],
+        ["/fast", "priority"],
+        ["/fast", "flex"],
+      ] as const) {
+        const { batches, result } = await run(command, {
+          variant,
+          currentModel: "google:gemini-3-pro",
+        });
+        expectDisposition(result, "consume");
+        expect(batches[0]).toContainEqual({ type: "clear-input" });
+        expect(setProviderConfig).toHaveBeenCalledWith({
+          provider: "openai",
+          keyPath: ["serviceTier"],
+          value: tier,
+        });
+        expect(config.openai.serviceTier).toBe(tier);
+        expect(config.openai.fastModePreviousServiceTier).toBe(
+          tier === "flex" ? undefined : "flex"
+        );
+      }
+    }
+  );
+
+  test.each([
+    ["anthropic:claude-opus-5-5", "anthropic", "speed", "fast"],
+    ["xai:grok-4.7", "xai", "serviceTier", "priority"],
+  ])("uses the native preference for %s", async (model, provider, key, value) => {
+    const { run, setProviderConfig } = setup(model);
+    expectDisposition((await run("/fast")).result, "consume");
+    expect(setProviderConfig).toHaveBeenCalledWith({ provider, keyPath: [key], value });
+    expectDisposition((await run("/fast")).result, "consume");
+    expect(setProviderConfig).toHaveBeenLastCalledWith({
+      provider,
+      keyPath: [key === "speed" ? key : "fastModePreviousServiceTier"],
+      value: "",
+    });
+  });
+
+  test.each([
+    ["/fast", "google:gemini-3-pro"],
+    ["/ultrafast", "openrouter:openai/gpt-6-astra"],
+    ["/ultrafast", "openai:gpt-6-luna"],
+    ["/ultrafast", "anthropic:claude-opus-5-5"],
+    ["/ultrafast", "xai:grok-4.7"],
+  ])("rejects %s for unsupported model/route %s without writing", async (command, model) => {
+    const { run, setProviderConfig } = setup(model);
+    const { result } = await run(command);
+    expectDisposition(result, "restore-if-empty");
+    const toast = result.actions.find((action) => action.type === "show-toast");
+    expect(toast?.toast.type).toBe("error");
+    expect(setProviderConfig).not.toHaveBeenCalled();
+  });
+
+  test("honors route overrides and wire format restrictions", async () => {
+    const { run, setProviderConfig } = setup();
+    spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({
+      routeOverrides: { "openai:gpt-6-astra": "openrouter" },
+    });
+    expectDisposition((await run("/ultrafast")).result, "restore-if-empty");
+    spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({ routePriority: ["direct"] });
+    config.openai.wireFormat = "chatCompletions";
+    expectDisposition((await run("/ultrafast")).result, "restore-if-empty");
+    expect(setProviderConfig).not.toHaveBeenCalled();
+  });
+
+  test("refreshes after a failed write and releases the toggle guard", async () => {
+    const { run, setProviderConfig } = setup();
+    setProviderConfig.mockRejectedValueOnce(new Error("write failed"));
+    expectDisposition((await run("/fast")).result, "restore-if-empty");
+    expect(store.refresh).toHaveBeenCalledTimes(1);
+    expect(store.updateOptimistically).not.toHaveBeenCalled();
+    expectDisposition((await run("/fast")).result, "consume");
+  });
+
+  test("rejects disconnected, side-chat, and invalid commands before reading config", async () => {
+    const { run, getConfig } = setup();
+    for (const command of ["/fast", "/ultrafast"]) {
+      expectDisposition((await run(command, { api: null })).result, "restore");
+      expectDisposition((await run(command, { isSideChat: true })).result, "restore");
+      expectDisposition((await run(`${command} on`)).result, "restore");
+    }
+    expect(getConfig).not.toHaveBeenCalled();
+  });
+
+  test("does not race duplicate submissions while provider config loads", async () => {
+    const { run, getConfig, setProviderConfig } = setup();
+    const pending = Promise.withResolvers<ProvidersConfigMap>();
+    getConfig.mockReturnValueOnce(pending.promise);
+    const first = run("/fast");
+    // Let the command's lazy phase enter its config read before submitting again.
+    await Promise.resolve();
+    const second = await run("/ultrafast");
+    expectDisposition(second.result, "restore");
+    expect(setProviderConfig).not.toHaveBeenCalled();
+    pending.resolve(config);
+    expectDisposition((await first).result, "consume");
+    expect(config.openai.serviceTier).toBe("priority");
   });
 });
 

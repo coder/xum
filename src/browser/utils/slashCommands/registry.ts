@@ -269,6 +269,25 @@ const modelCommandDefinition: SlashCommandDefinition = {
   },
 };
 
+const speedModeCommandDefinitions: SlashCommandDefinition[] = (["fast", "ultrafast"] as const).map(
+  (mode) => ({
+    key: mode,
+    description: `Toggle ${mode === "fast" ? "Fast" : "Ultrafast"} mode (faster responses at higher cost)`,
+    appendSpace: false,
+    handler: ({ cleanRemainingTokens }): ParsedCommand => {
+      if (cleanRemainingTokens.length > 0) {
+        return {
+          type: "command-invalid-args",
+          command: mode,
+          input: cleanRemainingTokens.join(" "),
+          usage: `/${mode}`,
+        };
+      }
+      return { type: "speed-mode-toggle", mode };
+    },
+  })
+);
+
 const vimCommandDefinition: SlashCommandDefinition = {
   key: "vim",
   description: "Toggle Vim mode for the chat input",
@@ -724,6 +743,7 @@ export const SLASH_COMMAND_DEFINITIONS: readonly SlashCommandDefinition[] = [
   sideCommandDefinition,
   btwCommandDefinition,
   vimCommandDefinition,
+  ...speedModeCommandDefinitions,
   idleCommandDefinition,
   heartbeatCommandDefinition,
   goalCommandDefinition,

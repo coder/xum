@@ -14,6 +14,8 @@ describe("commandBypassesTranscriptBarrier", () => {
       "/goal clear",
       "/model gpt-5",
       "/vim",
+      "/fast",
+      "/ultrafast",
       "/plan",
     ]) {
       expect(commandBypassesTranscriptBarrier(parseCommand(input))).toBe(true);

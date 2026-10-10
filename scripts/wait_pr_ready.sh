@@ -330,7 +330,7 @@ while true; do
     if CODEX_COMMENTS_OUT=$("$CHECK_CODEX_COMMENTS_SCRIPT" "$PR_NUMBER" 2>&1); then
       echo ""
       echo ""
-      echo "🎉 PR #$PR_NUMBER is ready: Codex approved, ${CODER_AGENTS_READY_SUMMARY}, non-visual-review checks passed, and no unresolved Codex comments remain."
+      echo "🎉 PR #$PR_NUMBER is ready: Codex gate passed, ${CODER_AGENTS_READY_SUMMARY}, non-visual-review checks passed, and no unresolved Codex comments remain."
       exit 0
     fi
 

@@ -34,6 +34,7 @@ export type ParsedCommand =
   | { type: "side" }
   | { type: "new"; startMessage?: string }
   | { type: "vim-toggle" }
+  | { type: "speed-mode-toggle"; mode: "fast" | "ultrafast" }
   | { type: "plan-show" }
   | { type: "plan-open" }
   | { type: "workflow-run"; scriptPath: string; argsText?: string }
