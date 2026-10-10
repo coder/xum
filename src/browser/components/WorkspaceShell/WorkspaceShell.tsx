@@ -1,7 +1,7 @@
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
 import React, { useCallback, useRef } from "react";
 import { cn } from "@/common/lib/utils";
-import { LoadingAnimation } from "../LoadingAnimation/LoadingAnimation";
+import { LazyFeature } from "../LazyFeature/LazyFeature";
 import {
   LEFT_SIDEBAR_WIDTH_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
@@ -79,6 +79,12 @@ interface WorkspaceShellProps {
   isInitializing?: boolean;
 }
 
+// lottie-web calls direct `eval`, which stops esbuild from minifying top-level names in any
+// chunk that holds it, so keep it off the first load (T3, #5971).
+const LoadingAnimation = React.lazy(() =>
+  import("../LoadingAnimation/LoadingAnimation").then((m) => ({ default: m.LoadingAnimation }))
+);
+
 const WorkspacePlaceholder: React.FC<{
   title: string;
   description?: string;
@@ -97,7 +103,15 @@ const WorkspacePlaceholder: React.FC<{
     </div>
 
     <div className="text-placeholder flex h-full flex-1 flex-col items-center justify-center text-center">
-      {props.showAnimation && <LoadingAnimation className="mb-4" />}
+      {props.showAnimation && (
+        <LazyFeature
+          name="Loading animation"
+          // Reserves the Lottie SVG's box (419x98 at 150 px wide) so nothing shifts on arrival.
+          fallback={<div aria-hidden="true" className="mb-4 aspect-[419/98] w-[150px]" />}
+        >
+          <LoadingAnimation className="mb-4" />
+        </LazyFeature>
+      )}
       <h3 className="m-0 mb-2.5 text-base font-medium">{props.title}</h3>
       {props.description && <p className="m-0 text-[13px]">{props.description}</p>}
     </div>

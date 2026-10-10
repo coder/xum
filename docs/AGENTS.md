@@ -188,6 +188,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 ## Module Imports
 
 - Use static `import` statements at the top; resolve circular dependencies by extracting shared modules, inverting dependencies, or using DI. Dynamic `await import()` is not an acceptable workaround.
+- Exception: code-split a feature boundary with a module-top-level `React.lazy(() => import(...))` wrapped in `LazyFeature`, and keep the open condition outside the lazy module. This is not a circular-dependency workaround.
 
 ## Workspace Identity
 
