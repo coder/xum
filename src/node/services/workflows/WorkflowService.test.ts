@@ -460,9 +460,8 @@ export default function workflow() { return { reportMarkdown: "done" }; }
     await expect(terminal.promise).resolves.toBe("interrupted");
   });
 
-  // W10 (formal/workflow-runs): the children are terminated while the run still reads running
-  // and the aborted runner still holds its lease; "interrupted" is written last, even when
-  // stopping a child fails.
+  // The children are terminated while the run still reads running and the aborted runner still
+  // holds its lease; "interrupted" is written last, even when stopping a child fails.
   describe("interrupting a run with an active runner", () => {
     function interruptibleService(
       runStore: WorkflowRunStore,

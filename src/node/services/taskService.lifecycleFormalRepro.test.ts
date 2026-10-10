@@ -1,8 +1,7 @@
 /**
- * Deterministic repros of counterexamples found by the TLA+ model in formal/task-lifecycle/
- * (TaskLifecycle.tla; run formal/task-lifecycle/check.sh). Each repro asserts the behavior the
- * model's invariant requires: a `test.failing` still fails at that assertion on the current code,
- * a fixed finding's repro is a plain `test`; each control shows the guard the bug slipped past.
+ * Deterministic repros of races in the sub-agent task lifecycle. Each repro asserts the correct
+ * behavior: a `test.failing` still fails at that assertion on the current code, a fixed finding's
+ * repro is a plain `test`; each control shows the guard the bug slipped past.
  *
  * Run: bun test ./src/node/services/taskService.lifecycleFormalRepro.test.ts
  */
@@ -50,7 +49,7 @@ const ROOT = "lifecycle-root";
 const PARENT = "lifecycle-parent";
 const CHILD = "lifecycle-child";
 
-describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
+describe("task lifecycle races (TaskService)", () => {
   let rootDir: string;
   beforeEach(async () => {
     rootDir = await createTaskServiceTestRoot();
@@ -138,8 +137,7 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
     return { config, taskService, internals, lineage, admitted, attemptId };
   }
 
-  // Model: MC_L1_nested.cfg, invariant NoAutoStartAfterStop (finding L1).
-  test("L1: a reawakening suspended across a completed tree Stop does not start the child", async () => {
+  test("a reawakening suspended across a completed tree Stop does not start the child", async () => {
     const s = await setUp("reported");
     // The user hard-Stops R while P's task_send_message reawakening of C awaits its lineage
     // evaluation (taskService.ts 8723). R's interruptStream marks R interrupted and runs the
@@ -164,9 +162,9 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
     expect(s.admitted).toEqual([]);
   });
 
-  // Control for L1: while the cascade still holds C's latch, the same reawakening is refused
+  // Control: while the cascade still holds C's latch, the same reawakening is refused
   // under the mutex (taskService.ts 8733).
-  test("L1 control: a reawakening that meets the cascade's held latch is refused", async () => {
+  test("control: a reawakening that meets the cascade's held latch is refused", async () => {
     const s = await setUp("reported");
     const cleanupInternals = s.taskService as unknown as {
       runWorkspaceStopCleanup: (...args: unknown[]) => Promise<unknown>;
@@ -201,8 +199,7 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
     await cascade;
   });
 
-  // Model: MC_L2_manual_react.cfg, invariant NoLostReport (finding L2).
-  test("L2: a manual resume does not rotate the attempt of a live reawakened continuation", async () => {
+  test("a manual resume does not rotate the attempt of a live reawakened continuation", async () => {
     const s = await setUp("interrupted");
     const manualLineage = Promise.withResolvers<void>();
     let lineageCalls = 0;
@@ -264,10 +261,10 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
     expect(s.attemptId()).not.toBe(before);
   });
 
-  // The reverse interleaving of L2 (MC_L2_fixed.cfg: ReactCommit rechecks that C is still
-  // inactive): the user's resume wins while P's reawakening is between its caller's inactive
-  // check and its row refresh; P must not rotate the attempt the user's turn is bound to.
-  test("L2 reverse: a reawakening does not rotate the attempt of a live manual resume", async () => {
+  // The reverse interleaving (the reactivation's commit rechecks that C is still inactive): the
+  // user's resume wins while P's reawakening is between its caller's inactive check and its row
+  // refresh; P must not rotate the attempt the user's turn is bound to.
+  test("reverse: a reawakening does not rotate the attempt of a live manual resume", async () => {
     const s = await setUp("interrupted");
     const internals = s.taskService as unknown as {
       unarchiveAgentTaskAncestry: (...args: unknown[]) => Promise<unknown>;
@@ -303,7 +300,7 @@ describe("task lifecycle: formal-model counterexamples (TaskService)", () => {
   });
 });
 
-describe("task lifecycle: formal-model counterexamples (WorkspaceService resume)", () => {
+describe("task lifecycle races (WorkspaceService resume)", () => {
   const workspaceId = "lifecycle-resumed-task";
   const rootWorkspaceId = "lifecycle-resumed-root";
   const successorAttemptId = "att_00000000000000f2";
@@ -486,9 +483,8 @@ describe("task lifecycle: formal-model counterexamples (WorkspaceService resume)
     return { service, taskService, row, setRemovalMarker, reawakenedId: () => reawakenedId };
   }
 
-  // Model: MC_L3_removal.cfg, invariant RunningIsLive (finding L3); the fix is MC_L3_fixed.
   for (const entry of ["sendMessage", "resumeStream"] as const) {
-    test(`L3: a resume refused at the admission fence restores the task it set running (${entry})`, async () => {
+    test(`a resume refused at the admission fence restores the task it set running (${entry})`, async () => {
       const s = await createTaskFixture();
       const result =
         entry === "sendMessage"
@@ -513,7 +509,7 @@ describe("task lifecycle: formal-model counterexamples (WorkspaceService resume)
   }
 
   // The rollback is bound to the attempt this resume committed: a successor never reverts.
-  test("L3: a resume refused as stale leaves a successor attempt running", async () => {
+  test("a resume refused as stale leaves a successor attempt running", async () => {
     const s = await createTaskFixture("successor");
     const result = await s.service.sendMessage(workspaceId, "continue", { model, agentId: "exec" });
     expect(result.success).toBe(false);
@@ -522,8 +518,8 @@ describe("task lifecycle: formal-model counterexamples (WorkspaceService resume)
     expect(s.row()).toMatchObject({ taskStatus: "running", taskAttemptId: successorAttemptId });
   });
 
-  // Control for L3: a refusal after the fence (the session's) does restore.
-  test("L3 control: a resume refused by the session restores the task", async () => {
+  // Control: a refusal after the fence (the session's) does restore.
+  test("control: a resume refused by the session restores the task", async () => {
     const { service, session: agentSession } = await createFixture();
     const { fake, restoreInterruptedTaskAfterResumeFailure } = resumedIntegration(undefined);
     service.setAgentTaskIntegration(fake);

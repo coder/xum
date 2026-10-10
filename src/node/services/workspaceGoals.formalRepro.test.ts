@@ -1,7 +1,6 @@
-// Deterministic repros for the G1, G2 and G2b counterexamples TLC finds in
-// formal/workspace-goals/ (WorkspaceGoals.tla, check.sh). All are fixed: each test fails at its
-// "Target assertion" with its fix reverted. Each paired control runs the same harness without the
-// racing step.
+// Deterministic repros of races in goal continuation and heartbeat delivery. All are fixed: each
+// test fails at its "Target assertion" with its fix reverted. Each paired control runs the same
+// harness without the racing step.
 import { promises as fsPromises } from "node:fs";
 import * as path from "path";
 import assert from "@/common/utils/assert";
@@ -53,7 +52,7 @@ async function addWorkspace(config: Config, workspaceId: string): Promise<void> 
   });
 }
 
-describe("workspace goals: formal-model counterexamples (WorkspaceGoalService)", () => {
+describe("workspace goals: goal continuation races (WorkspaceGoalService)", () => {
   const workspaceId = "goal-formal-repro";
   let config: Config;
   let historyService: HistoryService;
@@ -101,7 +100,7 @@ describe("workspace goals: formal-model counterexamples (WorkspaceGoalService)",
     return setGoalOk(service, { workspaceId, objective });
   }
 
-  test("G1: a stale eligibility check does not drop the replacement goal's kickoff candidate", async () => {
+  test("a stale eligibility check does not drop the replacement goal's kickoff candidate", async () => {
     await setGoalOk(service, { workspaceId, objective: "Goal A" });
     // A dispatch of goal A's kickoff candidate is mid-check (awaiting isWorkspaceStreaming).
     const release = gateNextSnapshotRead();
@@ -122,7 +121,7 @@ describe("workspace goals: formal-model counterexamples (WorkspaceGoalService)",
     expect(next).toMatchObject({ goal: { goalId: goalB.goalId } });
   });
 
-  test("G1 control: a replacement that lands before the check kicks off the new goal", async () => {
+  test("control: a replacement that lands before the check kicks off the new goal", async () => {
     await setGoalOk(service, { workspaceId, objective: "Goal A" });
     const goalB = await replaceGoal("Goal B");
     const next = await service.checkGoalContinuationEligibility(workspaceId, Date.now());
@@ -130,7 +129,7 @@ describe("workspace goals: formal-model counterexamples (WorkspaceGoalService)",
   });
 });
 
-describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
+describe("workspace goals: heartbeat races", () => {
   const workspaceId = "heartbeat-formal-repro";
   let config: Config;
   let historyService: HistoryService;
@@ -253,7 +252,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
 
   /**
    * The goal service's two stream-end hooks, stubbed: the turn's own stream-end continuation and
-   * the advancement owed by queued automatic work that never streamed (G4). Either one advances
+   * the advancement owed by queued automatic work that never streamed. Either one advances
    * an active goal; the count says how many times the session asked.
    */
   function goalAdvancementRequests() {
@@ -419,7 +418,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
   for (const whenBusy of ["turn-end", "tool-end"] as const) {
     for (const via of ["busy", "busy-race"] as const) {
       for (const change of turnOffChanges) {
-        test(`G2: a ${whenBusy} heartbeat queued while ${via} does not run after ${change}, and the goal still advances`, async () => {
+        test(`a ${whenBusy} heartbeat queued while ${via} does not run after ${change}, and the goal still advances`, async () => {
           const advancement = goalAdvancementRequests();
           const s = await sessionWithQueuedHeartbeat(whenBusy, { via, goals: advancement.goals });
           try {
@@ -439,7 +438,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
             expect(skipReasons).toEqual(["heartbeat_disabled"]);
             // The heartbeat held the goal's stream-end slot; with it gone the goal advances once:
             // through the turn's own stream end when the heartbeat was dropped before it, or the
-            // G4 wake path when the drain refused it (the test times out otherwise).
+            // goal wake-up path when the drain refused it (the test times out otherwise).
             await advancement.requested;
             expect(advancement.count()).toBe(1);
           } finally {
@@ -448,7 +447,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
         });
       }
 
-      test(`G2: a second ${whenBusy} firing while a heartbeat is queued (${via}) is recorded as skipped`, async () => {
+      test(`a second ${whenBusy} firing while a heartbeat is queued (${via}) is recorded as skipped`, async () => {
         const s = await sessionWithQueuedHeartbeat(whenBusy, { via });
         try {
           // The pending heartbeat owns the next turn: the new firing consumes its slot quietly.
@@ -461,7 +460,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
         }
       });
 
-      test(`G2 control: a ${whenBusy} heartbeat queued while ${via} runs at its drain point while enabled`, async () => {
+      test(`control: a ${whenBusy} heartbeat queued while ${via} runs at its drain point while enabled`, async () => {
         const s = await sessionWithQueuedHeartbeat(whenBusy, { via });
         try {
           await s.reachDrainPoint();
@@ -571,13 +570,13 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     return Promise.resolve();
   }
 
-  test("G2b: a reset heartbeat publishes no boundary when it is turned off during the reset's own awaits", async () => {
+  test("a reset heartbeat publishes no boundary when it is turned off during the reset's own awaits", async () => {
     const effects = await dispatchIdleHeartbeat("reset", turnOffDuringResetAppend);
     // Target assertion: no reset boundary is published for a heartbeat turned off meanwhile.
     expect(effects.any).toBe(0);
   });
 
-  test("G2b: a reset heartbeat's follow-up turn does not run after the heartbeat is turned off past the boundary", async () => {
+  test("a reset heartbeat's follow-up turn does not run after the heartbeat is turned off past the boundary", async () => {
     const effects = await dispatchIdleHeartbeat("reset", (session) => {
       // The boundary is published with the heartbeat's follow-up turn on it; the heartbeat is
       // turned off before that follow-up dispatches (startup recovery takes the same path).
@@ -599,7 +598,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     expect(await pendingHeartbeatHandoffs()).toBe(0);
   });
 
-  test("G2b: a reset heartbeat's follow-up survives an unreadable config", async () => {
+  test("a reset heartbeat's follow-up survives an unreadable config", async () => {
     await dispatchIdleHeartbeat("reset", (session) => {
       // Config becomes unreadable while the boundary's follow-up dispatches: strict reads throw,
       // lenient reads see the empty default.
@@ -803,7 +802,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
   }
 
   for (const contextMode of ["normal", "compact"] as const) {
-    test(`G2b: a ${contextMode} heartbeat turned off during its send's own awaits starts nothing`, async () => {
+    test(`a ${contextMode} heartbeat turned off during its send's own awaits starts nothing`, async () => {
       const effects = await dispatchIdleHeartbeat(contextMode, () => {
         // Past executeHeartbeat's own checks: the send's admission gates must refuse it.
         const original = workspaceService.sendMessage.bind(workspaceService);
@@ -819,7 +818,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     });
   }
 
-  test("G2b: a reset heartbeat's follow-up turned off during its send's own awaits is refused and cleared", async () => {
+  test("a reset heartbeat's follow-up turned off during its send's own awaits is refused and cleared", async () => {
     const effects = await dispatchIdleHeartbeat("reset", (session) => {
       // Past the follow-up's pre-send check: only its send's admission gates can refuse it.
       const original = session.sendMessage.bind(session);
@@ -861,7 +860,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     }
   }
 
-  test("G2b: a heartbeat failure after its turn started still propagates when the heartbeat was turned off meanwhile", async () => {
+  test("a heartbeat failure after its turn started still propagates when the heartbeat was turned off meanwhile", async () => {
     const error = await executeNormalHeartbeatWith((original) => async (...args) => {
       // The send is accepted (its turn starts), then the user turns the heartbeat off, and the
       // stream fails afterwards.
@@ -875,7 +874,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     expect(heartbeatEvents).toEqual(["heartbeat.dispatched"]);
   });
 
-  test("G2b: a heartbeat failure the off probe did not cause still propagates", async () => {
+  test("a heartbeat failure the off probe did not cause still propagates", async () => {
     const error = await executeNormalHeartbeatWith(() => async () => {
       // Turned off, but the send fails for another reason before any admission gate runs.
       const changed = await turnOff.disable();
@@ -966,7 +965,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
   }
 
   for (const identity of ["replacement", "legacy"] as const) {
-    test(`G2b: the heartbeat settings lookup ${identity === "replacement" ? "does not match a replacement workspace at the same path" : "still resolves a legacy entry without an ID"}`, async () => {
+    test(`the heartbeat settings lookup ${identity === "replacement" ? "does not match a replacement workspace at the same path" : "still resolves a legacy entry without an ID"}`, async () => {
       await reassignEntryAtSamePath(identity);
       // Target assertion: only this workspace's own entry (or its legacy id-less entry) counts.
       expect(workspaceService.getHeartbeatSettings(workspaceId)?.enabled === true).toBe(
@@ -974,7 +973,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       );
     });
 
-    test(`G2b: a reset heartbeat's follow-up ${identity === "replacement" ? "is dropped when a replacement workspace took its path" : "still runs for a legacy entry without an ID"}`, async () => {
+    test(`a reset heartbeat's follow-up ${identity === "replacement" ? "is dropped when a replacement workspace took its path" : "still runs for a legacy entry without an ID"}`, async () => {
       const effects = await dispatchIdleHeartbeat("reset", (session) => {
         const original = session.dispatchPendingCompactionFollowUpIfNeeded.bind(session);
         spyOn(session, "dispatchPendingCompactionFollowUpIfNeeded").mockImplementationOnce(
@@ -999,7 +998,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
     "during the reset's own awaits": turnOffDuringResetAppend,
   } as const;
   for (const [when, between] of Object.entries(lateTurnOffs)) {
-    test(`G2b: a heartbeat turned off ${when} is recorded as skipped, not dispatched`, async () => {
+    test(`a heartbeat turned off ${when} is recorded as skipped, not dispatched`, async () => {
       const effects = await dispatchIdleHeartbeat("reset", between);
       expect(effects.any).toBe(0);
       expect(recorded("heartbeat.skipped")).toHaveLength(1);
@@ -1010,7 +1009,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
 
   for (const contextMode of ["normal", "compact", "reset"] as const) {
     for (const change of ["unset", "disable"] as const) {
-      test(`G2b: a ${contextMode} heartbeat dispatch does nothing after the heartbeat was ${change === "unset" ? "unset" : "disabled"} after its eligibility check`, async () => {
+      test(`a ${contextMode} heartbeat dispatch does nothing after the heartbeat was ${change === "unset" ? "unset" : "disabled"} after its eligibility check`, async () => {
         // The heartbeat is turned off after HeartbeatService's eligibility check built the
         // payload and before the dispatcher runs it.
         let preflightReads: { mock: { calls: unknown[] } } | undefined;
@@ -1027,7 +1026,7 @@ describe("workspace goals: formal-model counterexamples (heartbeats)", () => {
       });
     }
 
-    test(`G2b control: a ${contextMode} heartbeat dispatch runs while the heartbeat is enabled`, async () => {
+    test(`control: a ${contextMode} heartbeat dispatch runs while the heartbeat is enabled`, async () => {
       // reset also dispatches its follow-up heartbeat turn, so only the branch count is exact.
       // The heartbeat's foreground send resolves only after its turn's stream completes.
       const original = workspaceService.sendMessage.bind(workspaceService);

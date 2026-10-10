@@ -1,14 +1,13 @@
 /**
- * Deterministic repros of the violations found by the TLA+ model in formal/task-launch/
- * (TaskLaunch.tla; run formal/task-launch/check.sh): the first launch of a sub-agent task,
- * startReservedAgentTask (taskService.ts). U1, U2, U3 and U4 are fixed: each test states the
+ * Deterministic repros of races in the first launch of a sub-agent task,
+ * startReservedAgentTask (taskService.ts). All of them are fixed: each test states the
  * correct contract and failed at its target assertion before its fix. Each control runs the same
  * steps on the path the code already handled.
  *
  * The launch runs for real; only the checkout materialization (a fake runtime, or a fake fork),
  * the init hook (runBackgroundInit) and the WorkspaceHost (createWorkspaceServiceMocks) are
  * stand-ins. The removal is its first step, the task workspace's mutation gate (what
- * WorkspaceService.remove takes before it marks the row); the second backend (U3) is a second
+ * WorkspaceService.remove takes before it marks the row); the second backend is a second
  * TaskService on its own Config over the same root.
  *
  * Run: bun test ./src/node/services/taskService.taskLaunchFormalRepro.test.ts
@@ -59,7 +58,7 @@ interface Internals {
   materializeReservedTaskWorkspace: (...args: unknown[]) => Promise<unknown>;
 }
 
-describe("task launch: formal-model counterexamples (formal/task-launch)", () => {
+describe("task launch races", () => {
   let rootDir: string;
   beforeEach(async () => {
     rootDir = await createTaskServiceTestRoot();
@@ -203,11 +202,11 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
       abortSignal != null ? { abortSignal } : {}
     );
 
-  // MC_cancel / MC_stop (U1, fixed), invariant NoInitAfterCancel: the parent's cancel, a Stop or a
-  // removal mark lands while the launch awaits the sanitize/secrets step. Nothing aborts an init
-  // started after that, so the launch rechecks all of them before it starts the init. The Stop
-  // and removal cases fail a recheck of the abort signal alone (MC_mut_recheck_abort_only).
-  describe("a launch cancelled before its init starts leaves no init running (U1)", () => {
+  // The parent's cancel, a Stop or a removal mark lands while the launch awaits the
+  // sanitize/secrets step. Nothing aborts an init started after that, so the launch rechecks all
+  // of them before it starts the init. The Stop and removal cases fail a recheck of the abort
+  // signal alone.
+  describe("a launch cancelled before its init starts leaves no init running", () => {
     test("cancel during the sanitize/secrets window", async () => {
       const controller = new AbortController();
       const s = await setUp({ sanitize: () => controller.abort() });
@@ -396,14 +395,14 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
     }
   });
 
-  // MC_remove (U2), invariant RemovedRowLeavesNoCheckout: a removal unpublishes the row while the
-  // launch forks, or marks it (pendingRemoval) and deletes the checkout before the fork recreates
-  // it. Before the fix, cleanupMaterializedTaskWorkspace counted a missing row as "re-admitted by
-  // another writer" (undefined !== owned), so the checkout the fork made was never deleted. The
-  // marked row is not deleted by the launch (the removal can abort and release its marker
-  // mid-delete): the removal and the launch exclude each other instead (#5531). The launch holds
-  // a lease the removal's mutation gate refuses, and the fork gate refuses a leftover marker.
-  describe("a checkout forked after its row was removed is deleted (U2)", () => {
+  // A removal unpublishes the row while the launch forks, or marks it (pendingRemoval) and deletes
+  // the checkout before the fork recreates it. Before the fix, cleanupMaterializedTaskWorkspace
+  // counted a missing row as "re-admitted by another writer" (undefined !== owned), so the checkout
+  // the fork made was never deleted. The marked row is not deleted by the launch (the removal can
+  // abort and release its marker mid-delete): the removal and the launch exclude each other instead
+  // (#5531). The launch holds a lease the removal's mutation gate refuses, and the fork gate
+  // refuses a leftover marker.
+  describe("a checkout forked after its row was removed is deleted", () => {
     test("removal while the launch forks", async () => {
       const s = await setUp({
         // What WorkspaceService.remove's last config write does: the row is gone.
@@ -588,12 +587,11 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
     });
   });
 
-  // MC_two_backends (U3), invariants OneMaterializer, CleanupNeverTouchesSuccessor and
-  // PromptSentOnce: a second backend starts up on the same root while the launch prepares the
-  // checkout. Its startup recovery requeued every `starting` row no backend held a use lease on,
-  // and preparation held none, so it relaunched the task: two launches prepared one checkout and
-  // could both send the brief. The launch lease is published before the row becomes `starting`.
-  describe("a second backend's startup leaves a launch being prepared alone (U3)", () => {
+  // A second backend starts up on the same root while the launch prepares the checkout. Its startup
+  // recovery requeued every `starting` row no backend held a use lease on, and preparation held
+  // none, so it relaunched the task: two launches prepared one checkout and could both send the
+  // brief. The launch lease is published before the row becomes `starting`.
+  describe("a second backend's startup leaves a launch being prepared alone", () => {
     async function backendB() {
       const configB = await createTestConfig(rootDir);
       const { workspaceService } = createWorkspaceServiceMocks();
@@ -648,13 +646,13 @@ describe("task launch: formal-model counterexamples (formal/task-launch)", () =>
     });
   });
 
-  // MC_prompt (U4, fixed), invariant PromptSentOnce: the launch's send accepts the brief into
-  // history, then either fails (path A: agentSession returns Err once its rows are durable when a
-  // Stop makes its admission stale) or a Stop lands before the `running` write (path B). Both keep
-  // taskPrompt (only `running` clears it). The parent's reawakening prepended that kept prompt, so
-  // the child got its brief twice. Now the brief send carries the id the row keeps
-  // (taskPromptSendId), and the reawakening drops a kept prompt whose id a history row carries.
-  describe("the initial brief reaches the child once (U4)", () => {
+  // The launch's send accepts the brief into history, then either fails (path A: agentSession
+  // returns Err once its rows are durable when a Stop makes its admission stale) or a Stop lands
+  // before the `running` write (path B). Both keep taskPrompt (only `running` clears it). The
+  // parent's reawakening prepended that kept prompt, so the child got its brief twice. Now the
+  // brief send carries the id the row keeps (taskPromptSendId), and the reawakening drops a kept
+  // prompt whose id a history row carries.
+  describe("the initial brief reaches the child once", () => {
     type LaunchSend = "accept-then-fail" | "accept" | "accept-then-stop";
 
     /** `idOnly`: the brief's row names its id without a digest, so it proves no payload. */

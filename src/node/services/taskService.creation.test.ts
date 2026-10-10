@@ -1281,7 +1281,7 @@ describe("TaskService", () => {
     expect(acceptedStarting?.taskPrompt).toBeUndefined();
   }, 20_000);
 
-  // U4 (formal/task-launch): a row with a brief send id is recovered by that id alone. A user row
+  // A row with a brief send id is recovered by that id alone. A user row
   // without it (a manual message) does not prove the brief; the brief's own row does.
   test("startup recovery decides a stale starting brief by its send id", async () => {
     const config = await createTestConfig(rootDir);

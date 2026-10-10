@@ -1,15 +1,12 @@
 /**
- * Repro of a composer-draft counterexample found by the TLA+ model in formal/composer-drafts/
- * (ComposerDrafts.tla, config MC_creation; run formal/composer-drafts/check.sh).
- *
- * D3: `/goal <objective>` typed into a creation composer creates the workspace first, then runs the
- * goal command in it (useCreationWorkspace.handleSend). The creation draft is deleted as soon as
- * the workspace exists (`clearPendingDraft`, before the command runs). When the command does not
- * consume its input (handleGoalCommand returns "restore": setGoal refused or threw, or a budget on
- * an unpriced model), creation used to return `{ success: false }` without moving the text
- * anywhere, so the objective the user typed was gone: not in any draft, not a goal, not in the
- * transcript. Creation now saves the typed command in the new workspace's draft before it runs
- * the command, and takes it out only once the command accepted it.
+ * Repro of a composer-draft bug: `/goal <objective>` typed into a creation composer creates the
+ * workspace first, then runs the goal command in it (useCreationWorkspace.handleSend). The creation
+ * draft is deleted as soon as the workspace exists (`clearPendingDraft`, before the command runs).
+ * When the command does not consume its input (handleGoalCommand returns "restore": setGoal refused
+ * or threw, or a budget on an unpriced model), creation used to return `{ success: false }` without
+ * moving the text anywhere, so the objective the user typed was gone: not in any draft, not a goal,
+ * not in the transcript. Creation now saves the typed command in the new workspace's draft before
+ * it runs the command, and takes it out only once the command accepted it.
  */
 
 import "../dom";
@@ -90,7 +87,7 @@ async function whereTheObjectiveLives(
   return found;
 }
 
-describeIntegration("formal/composer-drafts: /goal in a creation composer", () => {
+describeIntegration("composer drafts: /goal in a creation composer", () => {
   beforeAll(async () => {
     await createSharedRepo();
   });
@@ -120,7 +117,7 @@ describeIntegration("formal/composer-drafts: /goal in a creation composer", () =
       await Promise.allSettled(setGoal.mock.results.map((result): unknown => result.value));
 
       // The creation handler finishes after setGoal settles, with no signal of its own: poll
-      // until the objective shows up (a fix) or the wait runs out (D3). Only the "not yet"
+      // until the objective shows up (a fix) or the wait runs out (the bug). Only the "not yet"
       // outcome is swallowed; a failing lookup still fails the repro elsewhere.
       let found: string[] = [];
       await waitFor(

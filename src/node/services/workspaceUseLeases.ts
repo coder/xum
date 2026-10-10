@@ -34,7 +34,7 @@ import {
  */
 // "unarchive" is held by a keep-mode unarchive from before its commit until it finishes (#4871).
 // "launch" is held by a sub-agent task's launch from before its row becomes `starting` until the
-// launch settles (formal/task-launch U2/U3): no structural mutator ignores it, so a removal never
+// launch settles: no structural mutator ignores it, so a removal never
 // deletes a checkout a launch is preparing, and another backend's startup recovery leaves the
 // preparing task alone.
 export type WorkspaceUseKind =

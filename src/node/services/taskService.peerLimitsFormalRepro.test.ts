@@ -1,8 +1,7 @@
 /**
- * Deterministic repros of counterexamples found by the TLA+ model in
- * formal/peer-limits/ (PeerLimits.tla; run formal/peer-limits/check.sh). Each
- * test asserts a documented peer-message bound (src/constants/agentMessaging.ts)
- * that the code broke before the fix (MC_*_fixed configs model the fixed code).
+ * Deterministic repros of races that broke the peer-message limits. Each test
+ * asserts a documented peer-message bound (src/constants/agentMessaging.ts)
+ * that the code broke before the fix.
  *
  * Run: bun test ./src/node/services/taskService.peerLimitsFormalRepro.test.ts
  *
@@ -75,7 +74,7 @@ function isPeerRouteCall(internal: SendInternal | undefined): boolean {
   return internal?.queueDedupeKey?.startsWith("agent-msg:") === true;
 }
 
-describe("peer-message limits (formal/peer-limits repros)", () => {
+describe("peer-message limits", () => {
   let rootDir: string;
   beforeEach(async () => {
     rootDir = await createTaskServiceTestRoot();
@@ -108,11 +107,10 @@ describe("peer-message limits (formal/peer-limits repros)", () => {
     return config;
   }
 
-  // Model: MC_peer_fail_after_rows, PairRate/TargetRate. The peer route charged the
-  // rate slot only after a successful sendMessage. A delivery can persist its payload
-  // row and still fail — the family route documents and tests exactly this ("failed
-  // family deliveries still consume the rate limit") — so a task_send_message loop
-  // against such a target landed rows without limit. Fixed: it charges at admission.
+  // The peer route charged the rate slot only after a successful sendMessage. A delivery can
+  // persist its payload row and still fail — the family route documents and tests exactly this
+  // ("failed family deliveries still consume the rate limit") — so a task_send_message loop against
+  // such a target landed rows without limit. Fixed: it charges at admission.
   test("a failing task_send_message delivery that persisted its row consumes the pair rate limit", async () => {
     const config = await siblingTree();
     let rowsLanded = 0;
@@ -135,11 +133,10 @@ describe("peer-message limits (formal/peer-limits repros)", () => {
     expect(rowsLanded).toBeLessThanOrEqual(PEER_MESSAGE_RATE_LIMIT_MAX);
   });
 
-  // Model: MC_cross_route, PairRate (also TargetRate, Dedupe, QueueCap). The family route
-  // admitted under broker.withDeliveryLock but the peer route only under workspaceEventLocks,
-  // and the peer route charged only after its sendMessage returned. A family send admitted in
-  // that window saw the in-flight peer send's slot as free. Fixed: both routes share
-  // withPeerAdmissionLock and charge at admission.
+  // The family route admitted under broker.withDeliveryLock but the peer route only under
+  // workspaceEventLocks, and the peer route charged only after its sendMessage returned. A family
+  // send admitted in that window saw the in-flight peer send's slot as free. Fixed: both routes
+  // share withPeerAdmissionLock and charge at admission.
   test("task_send_message and task_message_sibling cannot together exceed the pair rate limit", async () => {
     const config = await siblingTree();
     const peerInFlight = deferred();
@@ -197,7 +194,7 @@ describe("peer-message limits (formal/peer-limits repros)", () => {
     expect(rowsLanded).toBeLessThanOrEqual(PEER_MESSAGE_RATE_LIMIT_MAX);
   });
 
-  // Model: MC_cross_route, Dedupe. Charging at admission alone closes the rate gap above; the
+  // Charging at admission alone closes the rate gap above; the
   // duplicate check (and the queue cap) also needs both routes to hold one lock from admission
   // until the delivery is recorded. A family send admitted while an identical peer send is in
   // flight passed the duplicate check.
@@ -247,7 +244,7 @@ describe("peer-message limits (formal/peer-limits repros)", () => {
     expect(rowsLanded).toBe(1);
   });
 
-  // Model: MC_peer_delegated, QueueCap. flushParkedPeerSends shifted the next waiting message
+  // flushParkedPeerSends shifted the next waiting message
   // before its retry took the target's lock, and the retry skips admission. A fresh send holding
   // the lock meanwhile counted one message too few (queued + parked) and was admitted past the
   // cap. Fixed: the retry leaves the parked list only under the target's admission lock.

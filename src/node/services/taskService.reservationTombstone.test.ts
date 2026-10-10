@@ -15,7 +15,7 @@ import {
 } from "@/node/services/taskService.testHarness";
 
 /**
- * W8 (formal/workflow-runs MC_two_stall_fixed): a resuming workflow runner tombstones a
+ * A resuming workflow runner tombstones a
  * checkpointed child ID that has no task row before replacing it, so a stalled reservation's late
  * commit refuses (cross-process: WorkflowRunner.workflowRunsFormalRepro.test.ts). These cover the
  * two cases where the tombstone must be refused, because a commit has landed or still may land.

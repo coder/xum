@@ -344,18 +344,18 @@ export class WorkflowService {
   }
 
   /**
-   * W10 (formal/workflow-runs): the durable "interrupted" status ends the run for every recovery
-   * path, so children it has not stopped yet are stranded if the backend dies first. The
-   * restart's startup prepass then interrupts them without a settlement receipt (it cannot prove
-   * their attempts' process is gone), and resuming the run classifies them indeterminate forever.
-   * So when this process's active runner holds the lease (holdActiveRunnerLeases, or
-   * `heldRunIds` from the caller that took the holds), stop the children first, while they are
-   * still this process's own attempts and settle with receipts, then the nested workflow runs the
-   * same way, and write "interrupted" last. The held leases fence other runners meanwhile; a
-   * crash in between leaves a running run whose children ended with receipts, which crash
-   * recovery replaces. Without a hold (no runner here, or it is already exiting) keep the old
-   * order: "interrupted" first is then the only fence. `onStatusWritten` fires right after this
-   * run's status write, before the best-effort cleanup that follows it.
+   * The durable "interrupted" status ends the run for every recovery path, so children it has not
+   * stopped yet are stranded if the backend dies first. The restart's startup prepass then
+   * interrupts them without a settlement receipt (it cannot prove their attempts' process is gone),
+   * and resuming the run classifies them indeterminate forever. So when this process's active
+   * runner holds the lease (holdActiveRunnerLeases, or `heldRunIds` from the caller that took the
+   * holds), stop the children first, while they are still this process's own attempts and settle
+   * with receipts, then the nested workflow runs the same way, and write "interrupted" last. The
+   * held leases fence other runners meanwhile; a crash in between leaves a running run whose
+   * children ended with receipts, which crash recovery replaces. Without a hold (no runner here, or
+   * it is already exiting) keep the old order: "interrupted" first is then the only fence.
+   * `onStatusWritten` fires right after this run's status write, before the best-effort cleanup
+   * that follows it.
    */
   private async interruptRunTree(
     input: { workspaceId: string; runId: string },
@@ -922,7 +922,7 @@ export class WorkflowService {
     if (run.status !== "pending" || run.parentWorkflow != null) {
       return null;
     }
-    // W7: createRun writes `pending` and the starter writes the first `running` later, so a
+    // createRun writes `pending` and the starter writes the first `running` later, so a
     // starter that died in between leaves a pending run with no lease and no runner. Adopt it
     // only on positive proof that the creating process is dead (judgeHolder); a legacy run
     // without starter evidence is left to an explicit workflow_resume.

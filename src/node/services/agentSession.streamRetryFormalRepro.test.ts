@@ -7,7 +7,7 @@ import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
 import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 
-// Deterministic code repros for the TLA+ model in formal/stream-retry/ (see its check.sh).
+// Deterministic code repros of a stream auto-retry racing a manual send's preflight.
 // Each repro failed at its single target assertion before its fix; each control shows the
 // setup reaches the code path under test.
 
@@ -65,14 +65,14 @@ async function sendHeldInPreflight(h: Awaited<ReturnType<typeof retryPending>>) 
 }
 
 // ---------------------------------------------------------------------------------------------
-// R1 (StreamRetry.tla, MC_faithful, NoStaleRetry): a manual send captures the coordinator's turn
-// id at entry (agentSession.ts sendMessage) and cancels the pending auto-retry only once it is
-// accepted into history; its coordinator.prepare comes later still. The coordinator is idle
-// through that preflight. Before the fix, a backoff that ended then admitted the retry's
-// resumeStream, the turn id moved, and the user's send was refused as "retired". Fixed as
-// MC_fixed: a user send blocks automatic admission from its entry (manualSendsInPreflight).
+// A manual send captures the coordinator's turn id at entry (agentSession.ts sendMessage) and
+// cancels the pending auto-retry only once it is accepted into history; its coordinator.prepare
+// comes later still. The coordinator is idle through that preflight. Before the fix, a backoff that
+// ended then admitted the retry's resumeStream, the turn id moved, and the user's send was refused
+// as "retired". The fix: a user send blocks automatic admission from its entry
+// (manualSendsInPreflight).
 
-test("R1 control: a manual send during backoff succeeds when the backoff outlasts its preflight", async () => {
+test("control: a manual send during backoff succeeds when the backoff outlasts its preflight", async () => {
   const h = await retryPending("stream-retry-r1-control");
   try {
     const held = await sendHeldInPreflight(h);
@@ -84,7 +84,7 @@ test("R1 control: a manual send during backoff succeeds when the backoff outlast
   }
 });
 
-test("R1: an auto-retry whose backoff ends during a manual send's preflight does not refuse the send", async () => {
+test("an auto-retry whose backoff ends during a manual send's preflight does not refuse the send", async () => {
   const h = await retryPending("stream-retry-r1");
   let held: Awaited<ReturnType<typeof sendHeldInPreflight>> | undefined;
   try {
@@ -132,7 +132,7 @@ test("R1: an auto-retry whose backoff ends during a manual send's preflight does
   }
 });
 
-test("R1 recovery: a send refused in its preflight leaves the deferred retry to run", async () => {
+test("recovery: a send refused in its preflight leaves the deferred retry to run", async () => {
   const h = await retryPending("stream-retry-r1-refused");
   try {
     const internal = h.session as unknown as { confirmTurnUseLease(): Promise<unknown> };
@@ -172,7 +172,7 @@ test("R1 recovery: a send refused in its preflight leaves the deferred retry to 
   }
 });
 
-test("R1 service preflight: the auto-retry defers while WorkspaceService holds a user send", async () => {
+test("service preflight: the auto-retry defers while WorkspaceService holds a user send", async () => {
   let servicePreflight = true;
   const h = await retryPending("stream-retry-r1-service", {
     hasExternalManualSendPreflight: () => servicePreflight,
@@ -204,7 +204,7 @@ test("R1 service preflight: the auto-retry defers while WorkspaceService holds a
   }
 });
 
-test("R1 scope: only the auto-retry defers; other automatic resumes still start", async () => {
+test("scope: only the auto-retry defers; other automatic resumes still start", async () => {
   // A task start or terminal-attention drain resumes with origin "automatic" and must not wait
   // for a user send (its own WorkspaceService preflight ticket would otherwise veto it).
   const h = await retryPending("stream-retry-r1-scope", {

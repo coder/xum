@@ -1,15 +1,13 @@
 /**
- * Deterministic repros of counterexamples found by the TLA+ model in formal/workflow-runs/
- * (WorkflowRuns.tla; run formal/workflow-runs/check.sh). Each `test.failing` is a crash that
- * leaves a workflow run no recovery path can finish (the model's Terminates property); its
- * passing control moves the crash point past the write the bug needs. A fixed finding's repro
- * is a plain `test`.
+ * Deterministic repros of crashes that strand a workflow run. Each `test.failing` is a crash that
+ * leaves a workflow run no recovery path can finish; its passing control moves the crash point past
+ * the write the bug needs. A fixed finding's repro is a plain `test`.
  *
  * Run: bun test ./src/node/services/workflows/WorkflowRunner.workflowRunsFormalRepro.test.ts
  *
- * W8 and W10 use a real process exit at the crash point (workflowRunsFormalRepro.testHarness.ts,
- * one `bun` process per backend lifetime), and so does W7 (the restart is a WorkflowService in this
- * process on the same store).
+ * The step-reservation and interrupt cases use a real process exit at the crash point
+ * (workflowRunsFormalRepro.testHarness.ts, one `bun` process per backend lifetime), and so does
+ * the run-start case (the restart is a WorkflowService in this process on the same store).
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -67,7 +65,7 @@ const FINISHED = {
   journalStatus: "completed",
 };
 
-describe("formal/workflow-runs: crash during a workflow step (cross-process)", () => {
+describe("workflow runs: crash during a workflow step (cross-process)", () => {
   let root: DisposableTempDir;
 
   beforeEach(() => {
@@ -77,10 +75,10 @@ describe("formal/workflow-runs: crash during a workflow step (cross-process)", (
     root[Symbol.dispose]();
   });
 
-  // W8 (MC_norecord): onTaskReserved writes the started checkpoint before commitReservations
-  // publishes the child's row. A crash in between leaves a started step naming a task that never
-  // existed. The resuming runner tombstones the ID on the parent's row
-  // (TaskService.tombstoneUnpublishedReservation) and runs the step fresh.
+  // onTaskReserved writes the started checkpoint before commitReservations publishes the child's
+  // row. A crash in between leaves a started step naming a task that never existed. The resuming
+  // runner tombstones the ID on the parent's row (TaskService.tombstoneUnpublishedReservation) and
+  // runs the step fresh.
   test("a crash between the started checkpoint and the commit is resolved by a fresh child", async () => {
     const crashed = await runFixture(["reserve-crash", root.path]);
     expect(crashed).toMatchObject({ childId: "priorchild01" });
@@ -92,10 +90,10 @@ describe("formal/workflow-runs: crash during a workflow step (cross-process)", (
     expect(lastFinishedOr(first, second)).toMatchObject(FINISHED);
   }, 60_000);
 
-  // Why W8 needs the tombstone (MC_two_stall_naive vs MC_two_stall_fixed): the reserving backend
-  // may be stalled, not dead. The resume replaces its unpublished child and finishes the run;
-  // when the stalled backend then reaches its commit, the tombstone makes that commit refuse, so
-  // the step never gets a second child.
+  // Why the fresh child needs the tombstone: the reserving backend may be stalled, not dead. The
+  // resume replaces its unpublished child and finishes the run; when the stalled backend then
+  // reaches its commit, the tombstone makes that commit refuse, so the step never gets a second
+  // child.
   test("a stalled backend's late commit is refused after the tombstone", async () => {
     const stalledChild = Bun.spawn([process.execPath, FIXTURE, "reserve-stall", root.path], {
       stdout: "pipe",
@@ -137,14 +135,14 @@ describe("formal/workflow-runs: crash during a workflow step (cross-process)", (
     expect(resumed).toMatchObject(FINISHED);
   }, 60_000);
 
-  // W10 (MC_prepass; fixed, MC_fixed): interruptRunTree wrote "interrupted" before it
-  // terminated the run's children. After a crash in between, the restarted backend's startup
-  // prepass interrupts the orphaned child because its run is inactive
-  // (interruptTaskRecoveryForInactiveWorkflowOwner) but writes no settlement receipt (only an
-  // owning process can, persistOwnedAttemptSettlement). Without a receipt a prior-process attempt
-  // classifies as indeterminate (readUnownedSettlementProof), so resuming the interrupted run never
-  // got past that step, and a Stop of the interrupted child was a no-op. The fix terminates the
-  // children first, under the active runner's held lease, and writes "interrupted" last.
+  // interruptRunTree wrote "interrupted" before it terminated the run's children. After a crash in
+  // between, the restarted backend's startup prepass interrupts the orphaned child because its run
+  // is inactive (interruptTaskRecoveryForInactiveWorkflowOwner) but writes no settlement receipt
+  // (only an owning process can, persistOwnedAttemptSettlement). Without a receipt a prior-process
+  // attempt classifies as indeterminate (readUnownedSettlementProof), so resuming the interrupted
+  // run never got past that step, and a Stop of the interrupted child was a no-op. The fix
+  // terminates the children first, under the active runner's held lease, and writes "interrupted"
+  // last.
   test("a crash right after the interrupted status is written is resolved by resuming", async () => {
     await runFixture(["interrupt-crash", root.path, "after"]);
     expect(await runStatus(root.path)).toBe("interrupted");
@@ -202,13 +200,13 @@ async function waitForStatus(sessionDir: string, status: string): Promise<string
   return current;
 }
 
-describe("formal/workflow-runs: crash while starting a workflow run", () => {
-  // W7 (MC_pending): createRun writes a pending run; the first "running" status comes later
-  // (startWorkflowInBackground at WorkflowService.ts:561, the runner at WorkflowRunner.ts:686 for
-  // a foreground start). Crash recovery resumed only running/backgrounded runs, so a run whose
-  // backend died in between stayed pending forever: listed as active, never started, with no
-  // lease and no runner. Recovery now adopts a pending run once its starter process is provably
-  // gone; the backend that dies here is a real process.
+describe("workflow runs: crash while starting a workflow run", () => {
+  // createRun writes a pending run; the first "running" status comes later
+  // (startWorkflowInBackground at WorkflowService.ts:561, the runner at WorkflowRunner.ts:686 for a
+  // foreground start). Crash recovery resumed only running/backgrounded runs, so a run whose
+  // backend died in between stayed pending forever: listed as active, never started, with no lease
+  // and no runner. Recovery now adopts a pending run once its starter process is provably gone; the
+  // backend that dies here is a real process.
   test("a crash before the first running status no longer leaves the run pending forever", async () => {
     using tmp = new DisposableTempDir("workflow-runs-formal-pending");
     const crashed = await runFixture(["start-crash", tmp.path, "onRunCreated"]);

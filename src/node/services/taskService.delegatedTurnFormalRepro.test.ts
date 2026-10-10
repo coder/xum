@@ -17,10 +17,10 @@ import {
   startWorkspaceTurnForTest,
 } from "@/node/services/taskService.shared.testHarness";
 
-// Deterministic repros of counterexamples found by the TLA+ model in formal/delegated-turns/
-// (see the header of formal/delegated-turns/check.sh). Each test asserts the correct behavior;
-// each failed before its fix (#5277 by #5303, #5261 by #5308, F1-F3 by #5311, F4 by the stop latch
-// taken inside interruptWorkspaceTurn's publication lock).
+// Deterministic repros of races in delegated-turn peer delivery. Each test asserts the correct
+// behavior; each failed before its fix (#5277 by #5303, #5261 by #5308, the Stop, stale
+// correlation and failed reservation cases by #5311, the interrupt gap by the stop latch taken
+// inside interruptWorkspaceTurn's publication lock).
 //
 // The real TaskService and WorkspaceTurnManager run; only WorkspaceHost.sendMessage is scripted.
 // For a peer send it replays AgentSession's final admission gate (agentSession.ts 5413-5422):
@@ -40,7 +40,7 @@ function isPeerSend(args: SendArgs): boolean {
   return meta?.type === "agent-peer-message" || meta?.agentPeerMessageTrigger != null;
 }
 
-describe("delegated-turn peer delivery: formal-model counterexamples", () => {
+describe("delegated-turn peer delivery races", () => {
   let rootDir: string;
   beforeEach(async () => {
     rootDir = await createTaskServiceTestRoot();
@@ -191,7 +191,6 @@ describe("delegated-turn peer delivery: formal-model counterexamples", () => {
     };
   }
 
-  // Model: MC_5277.cfg, invariant NoDeliveryIntoReplacement.
   test("#5277: a replacement turn registered during the rollback does not become the awaited turn", async () => {
     const s = await setUp();
     await streamEnd(s.taskService, workspaceTurnStreamEndEvent(s.parentId, "msg_done", "Done"));
@@ -211,8 +210,7 @@ describe("delegated-turn peer delivery: formal-model counterexamples", () => {
     expect(s.peerSends).toHaveLength(0);
   });
 
-  // Model: MC_F1_StopPark.cfg, invariant UserStopRespected (finding F1).
-  test("F1: a user Stop during the rollback drops the message that parks after it", async () => {
+  test("a user Stop during the rollback drops the message that parks after it", async () => {
     const s = await setUp();
     await streamEnd(s.taskService, workspaceTurnStreamEndEvent(s.parentId, "msg_done", "Done"));
     let releaseStopLatch: (() => void) | undefined;
@@ -240,7 +238,6 @@ describe("delegated-turn peer delivery: formal-model counterexamples", () => {
     expect(s.peerSends).toHaveLength(0);
   });
 
-  // Model: MC_5261.cfg, invariant NoOrphanedTurn.
   test("#5261: a withdrawn correlated continuation does not leave the delegated turn running", async () => {
     let continuationQueued = false;
     const s = await setUp({
@@ -286,7 +283,7 @@ describe("delegated-turn peer delivery: formal-model counterexamples", () => {
     expect(s.peerSends).toHaveLength(1);
   });
 
-  // Model: MC_Search.cfg (Fix5261 settles once the target is idle).
+  // The #5261 fix settles once the target is idle.
   test("#5261: a continuation refused at the final gate settles the turn once the session is idle", async () => {
     let continuationQueued = false;
     let preparing = false;
@@ -329,7 +326,7 @@ describe("delegated-turn peer delivery: formal-model counterexamples", () => {
     expect(s.registrations.get(TARGET_ID)).toBeUndefined();
   });
 
-  // Model: MC_Search.cfg (a stream end is queued on the event lock before the target is idle).
+  // A stream end is queued on the event lock before the target is idle.
   test("#5261: the settlement does not overtake a newer correlated stream end", async () => {
     let continuationQueued = false;
     const s = await setUp({
@@ -369,8 +366,7 @@ describe("delegated-turn peer delivery: formal-model counterexamples", () => {
     expect(record?.messageId).toBe("msg_newer");
   });
 
-  // Model: MC_F3_StaleCorr.cfg, invariant NonOwnerNeverCorrelated (finding F3).
-  test("F3: a send whose correlation's registration is gone is refused, not dispatched", async () => {
+  test("a send whose correlation's registration is gone is refused, not dispatched", async () => {
     const s = await setUp();
     s.scripts.push(async (args) => {
       const internal: Internal | undefined = args[3];
@@ -386,8 +382,7 @@ describe("delegated-turn peer delivery: formal-model counterexamples", () => {
     expect(s.peerSends).toHaveLength(0);
   });
 
-  // Model: MC_F2_RegReplace.cfg, invariant NonOwnerNeverCorrelated (finding F2).
-  test("F2: a failed reservation does not unregister the running delegated turn", async () => {
+  test("a failed reservation does not unregister the running delegated turn", async () => {
     // Turn A's stream is still running.
     const s = await setUp({ isStreaming: mock(() => true) });
     expect(s.registrations.get(TARGET_ID)?.handleId).toBe(HANDLE_ID);
@@ -420,7 +415,7 @@ describe("delegated-turn peer delivery: formal-model counterexamples", () => {
     expect(s.peerSends).toHaveLength(0);
   });
 
-  test("F2: a synchronous busy refusal enqueues no terminal wake", async () => {
+  test("a synchronous busy refusal enqueues no terminal wake", async () => {
     const s = await setUp({ isStreaming: mock(() => true) });
     // As above: the running turn becomes busy while B persists its handle.
     let busy = false;
@@ -443,10 +438,10 @@ describe("delegated-turn peer delivery: formal-model counterexamples", () => {
     expect(second.success).toBe(false);
     expect(enqueued).not.toHaveBeenCalled();
   });
-  // Model: MC_F4_InterruptGap.cfg, invariant OwnerStopRespected (finding F4, #5433 until fixed).
-  // interruptWorkspaceTurn writes `interrupted` inside the publication lock. Before the fix it
-  // bumped the stop epoch and latched only after awaiting the lock's release, so an owner message
-  // at its final admission gate in that window passed the gate. The fix latches inside the lock.
+  // The interrupt gap (#5433): interruptWorkspaceTurn writes `interrupted` inside the publication
+  // lock. Before the fix it bumped the stop epoch and latched only after awaiting the lock's
+  // release, so an owner message at its final admission gate in that window passed the gate. The
+  // fix latches inside the lock.
   async function admissionStaleAfterInterrupt(phase: "published" | "latched") {
     const s = await setUp();
     const store = workspaceTurnManagerInternals(s.taskService).taskHandleStore;
@@ -494,13 +489,13 @@ describe("delegated-turn peer delivery: formal-model counterexamples", () => {
     return { stale, statusInGap };
   }
 
-  test("F4: an owner message at its final gate is stale once the owner's interrupt is published", async () => {
+  test("an owner message at its final gate is stale once the owner's interrupt is published", async () => {
     const gap = await admissionStaleAfterInterrupt("published");
     expect(gap.statusInGap).toBe("interrupted");
     expect(gap.stale).toBe(true);
   });
 
-  test("F4 control: an owner message at its final gate is stale once the interrupt latched", async () => {
+  test("control: an owner message at its final gate is stale once the interrupt latched", async () => {
     const latched = await admissionStaleAfterInterrupt("latched");
     expect(latched.statusInGap).toBe("interrupted");
     expect(latched.stale).toBe(true);

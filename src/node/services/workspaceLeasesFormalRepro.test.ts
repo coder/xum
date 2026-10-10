@@ -36,19 +36,18 @@ import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks"
 import { SessionFileManager } from "@/node/utils/sessionFile";
 import { FileChangeTracker } from "@/node/services/utils/fileChangeTracker";
 
-// Deterministic code repros for the TLA+ model in formal/workspace-leases/ (see its check.sh).
-// Each `test.failing` reproduces a violation TLC found and fails at its target assertion; each
+// Deterministic code repros of races between workspace use leases and other backends' structural
+// mutations. Each `test.failing` reproduces a violation and fails at its target assertion; each
 // plain test is the passing control that shows the setup reaches the code path under test.
 // A fixed repro is a plain test that fails at its target assertion when its fix is reverted.
 
 // ---------------------------------------------------------------------------------------------
-// L1 (MC_lease_turn, NoTouchDuringMutation): the turn lease is begun without await in
-// completePreparation. It used to be confirmed only before the provider started, so
-// prepareMessage ran its checkout work (here a skill's dynamic-context command) while another
-// backend's structural mutation gate was live; the send was refused afterwards, but the command
-// had already run. Fixed (MC_lease_turn_fixed): preparation confirms the lease first.
+// The turn lease is begun without await in completePreparation. It used to be confirmed only
+// before the provider started, so prepareMessage ran its checkout work (here a skill's
+// dynamic-context command) while another backend's structural mutation gate was live; the send was
+// refused afterwards, but the command had already run. Fixed: preparation confirms the lease first.
 
-describe("L1: turn preparation vs another backend's structural mutation", () => {
+describe("turn preparation vs another backend's structural mutation", () => {
   const workspaceId = "ws-lease-formal";
   const sendOptions = {
     model: "openai:gpt-4o",
@@ -141,8 +140,8 @@ describe("L1: turn preparation vs another backend's structural mutation", () => 
     }
   });
 
-  // MC_lease_turn_rename_one: the same backend's rename does not ignore its own turn lease, but a
-  // turn AgentSession starts itself bypasses WorkspaceService's in-process renamingWorkspaces check.
+  // The same backend's rename does not ignore its own turn lease, but a turn AgentSession starts
+  // itself bypasses WorkspaceService's in-process renamingWorkspaces check.
   test("a send refused by this backend's own rename does not run checkout commands first", async () => {
     const { b, touched, streamMessage } = await setup();
     try {
@@ -335,7 +334,7 @@ describe("L1: turn preparation vs another backend's structural mutation", () => 
 });
 
 // ---------------------------------------------------------------------------------------------
-// #4918 (InitReplay.tla, MC_init_faithful): two backends, O owns the init, R replays it.
+// #4918: two backends, O owns the init, R replays it.
 
 describe("#4918: init replay by another backend", () => {
   const workspaceId = "ws-init-formal";
@@ -436,9 +435,8 @@ describe("#4918: init replay by another backend", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// #4928 (ArchiveCascade.tla, MC_cascade_two_backends; fixed: MC_cascade_fixed): A archives a
-// parent and its sub-agents; B creates a sub-agent under that parent after A's last check for
-// active descendants.
+// #4928: A archives a parent and its sub-agents; B creates a sub-agent under that parent after A's
+// last check for active descendants.
 
 describe("#4928: sub-agent creation under a parent another backend is archiving", () => {
   const realCreateRuntime = runtimeFactory.createRuntime;

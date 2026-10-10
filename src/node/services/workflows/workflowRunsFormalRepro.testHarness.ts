@@ -1,9 +1,9 @@
 /**
- * Cross-process fixture for WorkflowRunner.workflowRunsFormalRepro.test.ts (formal/workflow-runs).
+ * Cross-process fixture for WorkflowRunner.workflowRunsFormalRepro.test.ts.
  * Each invocation is one backend process on the Xum root given as argv[3]; a phase that models a
  * crash ends the process with process.exit at the crash point, so nothing after it runs:
  *   reserve-crash <root>    the step's started checkpoint is written (onTaskReserved), then the
- *                           backend dies before commitReservations publishes the child (W8)
+ *                           backend dies before commitReservations publishes the child
  *   reserve-stop <root>     control: the child is published and stopped (receipt) before exit
  *   reserve-stall <root>    a stalled (not dead) backend: after the started checkpoint it writes
  *                           <root>/stalled and waits for <root>/release before its commit, then
@@ -12,7 +12,7 @@
  *                           a real WorkflowService runs the workflow; while its child is mid-turn
  *                           ("running") WorkflowService.interruptRun interrupts the run, and the
  *                           backend dies right after (or right before) the run's "interrupted"
- *                           status write lands (W10)
+ *                           status write lands
  *   interrupt-nested-crash <root>
  *                           as interrupt-crash after, but the run's agent runs in a nested
  *                           workflow run; the backend dies right after the PARENT's status write
@@ -21,7 +21,7 @@
  *                           workflow resume (interrupted runs allowed); prints what it did
  *   start-crash <sessionDir> onRunCreated|onBackgroundRunCreated
  *                           startWorkflowInBackground dies at that callback: before the first
- *                           running status (W7) or, as a control, after it
+ *                           running status or, as a control, after it
  *   start-park <sessionDir>  startWorkflowInBackground parks in onRunCreated (a live starter)
  *                           until the test kills the process
  *   resume-nested <root>    a fresh backend: TaskService startup recovery, then a WorkflowService
@@ -231,11 +231,11 @@ async function resumeNested(root: string) {
 }
 
 /**
- * W10 through the production entry points: WorkflowService starts the run (its runner registers
- * at lease acquisition, as in the app), the child's turn is streaming, and interruptRun is
- * called. The backend dies right after the run's "interrupted" status is durable (`after`), or
- * right before that write (`before`). Whether the children are terminated by then is exactly
- * what the interrupt's order decides.
+ * The interrupt crash through the production entry points: WorkflowService starts the run (its
+ * runner registers at lease acquisition, as in the app), the child's turn is streaming, and
+ * interruptRun is called. The backend dies right after the run's "interrupted" status is durable
+ * (`after`), or right before that write (`before`). Whether the children are terminated by then is
+ * exactly what the interrupt's order decides.
  */
 async function interruptCrash(
   root: string,
@@ -430,7 +430,7 @@ export function pendingRunScript(): ResolvedWorkflowScript {
   };
 }
 
-/** One backend's WorkflowService for the W7 scenario (no agent steps). */
+/** One backend's WorkflowService for the run-start crash scenario (no agent steps). */
 export function pendingRunBackend(
   sessionDir: string,
   runnerId: string,

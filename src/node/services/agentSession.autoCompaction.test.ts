@@ -457,7 +457,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     ).not.toHaveProperty("taskTurnKind");
   });
 
-  // Task launch briefs (U4 in formal/task-launch): a launch skips on-send compaction, so its brief
+  // Task launch briefs: a launch skips on-send compaction, so its brief
   // is published as its own row carrying the brief's id, never folded into a compaction follow-up
   // that is dispatched later without it.
   test("an automatic send that skips on-send compaction publishes its own row with its send ids", async () => {
