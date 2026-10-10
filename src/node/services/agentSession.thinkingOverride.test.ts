@@ -7,6 +7,85 @@ import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
 
 const MODEL = "anthropic:claude-sonnet-4-5";
 
+describe("AgentSession.setActiveTurnServiceTier", () => {
+  it("isolates live speed picks, preserves thinking, and retires the pick with the turn", async () => {
+    let activeA: StreamMessageOptions | undefined;
+    let aSession: {
+      setActiveTurnServiceTier: (tier: "default" | "ultrafast") => { accepted: boolean };
+    };
+    const b = await createAgentSessionHarness({
+      workspaceId: "speed-chat-b",
+      aiServiceOverrides: {
+        streamMessage: (opts: StreamMessageOptions) => {
+          // A is still streaming while B starts. Changing A must not change B's
+          // next-call holder or either chat's independent reasoning preference.
+          expect(opts.muxProviderOptions?.openai?.serviceTier).toBe("flex");
+          expect(aSession.setActiveTurnServiceTier("ultrafast")).toEqual({ accepted: true });
+          expect(aSession.setActiveTurnServiceTier("default")).toEqual({ accepted: true });
+          expect(activeA?.activeTurnThinkingOverride?.serviceTier).toBe("default");
+          expect(activeA?.activeTurnThinkingOverride?.pending).toBe("high");
+          expect(opts.activeTurnThinkingOverride?.serviceTier).toBeUndefined();
+          expect(opts.activeTurnThinkingOverride?.manual).toBeUndefined();
+          return Promise.resolve(Ok(createStartedTurnHandle(b.session.closingSignal)));
+        },
+      },
+    });
+    let turn = 0;
+    const a = await createAgentSessionHarness({
+      workspaceId: "speed-chat-a",
+      aiServiceOverrides: {
+        streamMessage: async (opts: StreamMessageOptions) => {
+          if (turn++ === 0) {
+            activeA = opts;
+            expect(opts.muxProviderOptions?.openai?.serviceTier).toBe("default");
+            expect(opts.activeTurnThinkingOverride?.serviceTier).toBe("priority");
+            expect(opts.activeTurnThinkingOverride?.manual).toBeUndefined();
+            expect(a.session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: true });
+            const sent = await b.session.sendMessage("B", {
+              model: "openai:gpt-6-astra",
+              agentId: "exec",
+              serviceTier: "flex",
+            });
+            expect(sent.success).toBe(true);
+          } else {
+            expect(opts.activeTurnThinkingOverride).not.toBe(activeA?.activeTurnThinkingOverride);
+            expect(opts.activeTurnThinkingOverride?.serviceTier).toBeUndefined();
+          }
+          return Ok(createStartedTurnHandle(a.session.closingSignal));
+        },
+      },
+    });
+    aSession = a.session;
+    try {
+      expect(a.session.setActiveTurnServiceTier("priority")).toEqual({ accepted: false });
+      const sent = await a.session.sendMessage(
+        "A",
+        {
+          model: "openai:gpt-6-astra",
+          agentId: "exec",
+          serviceTier: "default",
+          providerOptions: { openai: { serviceTier: "priority" } },
+        },
+        {
+          onAccepted: () => {
+            expect(a.session.setActiveTurnServiceTier("priority")).toEqual({ accepted: true });
+          },
+        }
+      );
+      expect(sent.success).toBe(true);
+      await Promise.all([a.session.waitForIdle(), b.session.waitForIdle()]);
+      expect(a.session.setActiveTurnServiceTier("priority")).toEqual({ accepted: false });
+      expect(
+        (await a.session.sendMessage("again", { model: MODEL, agentId: "exec" })).success
+      ).toBe(true);
+      await a.session.waitForIdle();
+    } finally {
+      await Promise.all([a.session.dispose(), b.session.dispose()]);
+      await Promise.all([a.cleanup(), b.cleanup()]);
+    }
+  });
+});
+
 describe("AgentSession.setActiveTurnThinkingLevel", () => {
   it("reports accepted:false while idle (persisted settings cover the next turn)", async () => {
     const { session, cleanup } = await createAgentSessionHarness({

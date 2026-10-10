@@ -1182,7 +1182,12 @@ export class TurnRequestBuilder {
         options.rawModelString,
         preliminaryThinkingLevel,
         effectiveMuxProviderOptions,
-        { agentInitiated, workspaceId, providersConfig: providersConfigSnapshot }
+        {
+          agentInitiated,
+          workspaceId,
+          providersConfig: providersConfigSnapshot,
+          getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier,
+        }
       );
       if (options.recordTiming) {
         recordStartupPhaseTiming("resolveAndCreateModelMs", resolveAndCreateModelStartedAt);

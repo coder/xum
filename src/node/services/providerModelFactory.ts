@@ -53,7 +53,11 @@ import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
 import { ProvidersConfigStore } from "@/node/config";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { ServiceTierSchema, type XAIServiceTier } from "@/common/config/schemas/providersConfig";
+import {
+  ServiceTierSchema,
+  type ServiceTier,
+  type XAIServiceTier,
+} from "@/common/config/schemas/providersConfig";
 import {
   OpenAICyberAccessProgramSchema,
   type OpenAICyberAccessProgram,
@@ -297,7 +301,8 @@ function injectProviderOptionsDefaults(
     doGenerate: (options: never) => unknown;
   },
   namespace: string,
-  defaults: Record<string, unknown>
+  defaults: Record<string, unknown>,
+  liveOverrides?: () => Record<string, unknown>
 ): void {
   interface CallOptions {
     providerOptions?: Record<string, unknown>;
@@ -310,6 +315,8 @@ function injectProviderOptionsDefaults(
       [namespace]: {
         ...defaults,
         ...(options.providerOptions?.[namespace] as Record<string, unknown> | undefined),
+        // A chat-local speed change supersedes its already-prepared request options.
+        ...liveOverrides?.(),
       },
     },
   });
@@ -1463,6 +1470,8 @@ interface CreateModelOptions {
   agentInitiated?: boolean;
   workspaceId?: string;
   routeContext?: RouteContext;
+  /** Chat-local override, sampled at the next model call without changing other chats or routing. */
+  getServiceTierOverride?: () => ServiceTier | undefined;
   /**
    * Providers-config snapshot to create the model from. Passed by
    * resolveAndCreateModel so routing, the returned coderWire snapshot,
@@ -1648,15 +1657,18 @@ export class ProviderModelFactory {
   private createModelCoreEffect(
     modelString: string,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: {
-      agentInitiated?: boolean;
-      routeContext?: RouteContext;
-      providersConfig?: ProvidersConfig;
-    }
+    opts?: CreateModelOptions
   ): Effect.Effect<Result<LanguageModel, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
-    let serviceTierDefault: { namespace: string; option: string; value: string } | undefined;
+    let serviceTierDefault:
+      | {
+          namespace: string;
+          option: string;
+          value?: ServiceTier;
+          liveOverrides?: () => Record<string, unknown>;
+        }
+      | undefined;
     let anthropicFastModePinned = false;
     // The explicit annotation restores the contextual typing the old async
     // signature provided, so the wire-error literals below stay narrowed.
@@ -1787,6 +1799,27 @@ export class ProviderModelFactory {
           };
         } else if (muxProviderOptions?.openai) {
           delete muxProviderOptions.openai.serviceTier;
+        }
+
+        if (serviceTierAvailable && opts?.getServiceTierOverride) {
+          // The API can change tier between calls, not inside an in-flight response.
+          // Read only this turn's override; global preference edits must not affect
+          // another ongoing chat. Keep capabilities pinned to this model's route.
+          serviceTierDefault ??= { namespace: "openai", option: "serviceTier" };
+          const tierOptions = serviceTierDefault;
+          tierOptions.liveOverrides = () => {
+            const tier = opts.getServiceTierOverride?.();
+            if (tier == null) return {};
+            return {
+              [tierOptions.option]: openaiModelSupportsServiceTier(
+                modelString,
+                tier,
+                serviceTierRouteOptions
+              )
+                ? tier
+                : undefined,
+            };
+          };
         }
 
         // Anthropic Fast mode is a first-party-API-only beta. Pin it at creation
@@ -2921,9 +2954,12 @@ export class ProviderModelFactory {
         if (result.success && serviceTierDefault && typeof result.data !== "string") {
           // Headless callers may never rebuild providerOptions. Pin the validated
           // creation-time tier on both model methods, without rereading config.
-          injectProviderOptionsDefaults(result.data, serviceTierDefault.namespace, {
-            [serviceTierDefault.option]: serviceTierDefault.value,
-          });
+          injectProviderOptionsDefaults(
+            result.data,
+            serviceTierDefault.namespace,
+            { [serviceTierDefault.option]: serviceTierDefault.value },
+            serviceTierDefault.liveOverrides
+          );
         }
         if (result.success && anthropicFastModePinned && typeof result.data !== "string") {
           // @ai-sdk/anthropic adds the fast-mode beta header for this option.
@@ -3286,7 +3322,7 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel | undefined,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "providersConfig">
+    opts?: Omit<CreateModelOptions, "routeContext">
   ): Promise<Result<ResolveAndCreateModelResult, SendMessageError>> {
     return Effect.runPromise(
       this.resolveAndCreateModelEffect(modelString, thinkingLevel, muxProviderOptions, opts)
@@ -3297,7 +3333,7 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel | undefined,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "providersConfig">
+    opts?: Omit<CreateModelOptions, "routeContext">
   ): Effect.Effect<Result<ResolveAndCreateModelResult, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
