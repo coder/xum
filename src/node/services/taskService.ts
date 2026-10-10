@@ -1340,6 +1340,7 @@ function buildTaskTurnSendOptions(
     agentId: resolveTaskAgentIdForResume(workspace),
     thinkingLevel: workspace.taskThinkingLevel,
     reasoningMode: coerceOpenAIReasoningMode(workspace.aiSettings?.reasoningMode),
+    // A chat send updates the agent bucket, not the task's creation-time root settings.
     serviceTier: ServiceTierSchema.safeParse(
       resolveWorkspaceAISettings(workspace, resolveTaskAgentIdForResume(workspace))?.serviceTier
     ).data,
