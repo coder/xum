@@ -44,12 +44,15 @@ import { looksLikeRawJsonObject } from "./compactionHandler";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import type { SessionUsageService } from "./sessionUsageService";
+import type { HistoryService } from "./historyService";
 
 /** A headless compact-agent call: no workspace stream or compaction request row. */
 export async function summarizeContinuousCompaction(args: {
   workspaceId: string;
   config: Config;
   aiService: AgentSessionAIService;
+  /** turn.end plugin hooks read finished turns through it (see EnsureWorkspaceHooksArgs). */
+  historyService: Pick<HistoryService, "getLastMessages">;
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   head: MuxMessage[];
   /**
@@ -101,6 +104,7 @@ export async function summarizeContinuousCompaction(args: {
     projectRoot: pluginContext?.projectRoot,
     projectKey: pluginContext?.projectKey,
     projectTrusted: isWorkspaceProjectTrusted(args.config, metadata.data),
+    history: args.historyService,
   });
   args.signal.throwIfAborted();
   const agent = await resolveAgentForStream({

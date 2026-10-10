@@ -1586,6 +1586,7 @@ describe("AgentSession continuous compaction wiring", () => {
         workspaceId,
         config: h.config,
         aiService: h.aiService,
+        historyService: h.historyService,
         head: [
           createMuxMessage("head", "user", "Preserve the root cause and the failed approaches"),
         ],

@@ -1196,7 +1196,8 @@ export class AgentPluginInstallService {
   /**
    * Executable hooks.js disclosure for the consent preview: hooks load
    * automatically before request assembly and can observe/rewrite/block tool
-   * calls, so installing one without disclosure would consent to less than
+   * calls and outgoing messages and read finished replies, so installing one
+   * without disclosure would consent to less than
    * what activates. toolGrants mirrors resolvePluginHookGrants — the exact
    * grants the runtime will honor.
    */

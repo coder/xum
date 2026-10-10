@@ -16,6 +16,14 @@
  *   context is materialized as a durable `hook-context` row BEFORE the request
  *   mutation, so "model-visible ⟹ logged" holds and the replay harness can
  *   attribute the prompt bytes.
+ * - `message.send.before`: sees every new message before Xum saves it (input
+ *   `text` + `origin`) and may rewrite the text (`{ text }`) or block the send
+ *   (`{ block: reason }`). Plugins run in discovery order; each sees the
+ *   previous plugin's text and the first block ends the chain. AgentSession
+ *   ignores the outcome for compaction requests.
+ * - `turn.end`: observes each finished turn (`messageId` + the last reply
+ *   text, or null when none was saved). Output is ignored and the stream
+ *   never waits for it.
  *
  * Every hook input carries `settings`: JSON the plugin's own MCP server saved
  * in its PLUGIN_DATA directory (for example from an MCP Apps settings view),
@@ -36,9 +44,13 @@ import type { DurableEventJournal } from "@/node/utils/journal/durableEventJourn
 import {
   eventSpine,
   type EventSpine,
+  type MessageSendContext,
+  type ObserverEventMap,
   type RequestContextOnly,
   type ToolExecuteContext,
 } from "@/node/services/events/eventSpine";
+import type { HistoryService } from "@/node/services/historyService";
+import type { MuxMessage } from "@/common/types/message";
 import { log } from "@/node/services/log";
 import {
   sandboxHostService,
@@ -77,6 +89,14 @@ const HOOK_CONTEXT_INLINE_MAX_CHARS = 4_096;
 const HOOK_CONTEXT_MAX_CHARS = 64 * 1024;
 /** Tool results larger than this (as JSON) are omitted from tool.execute.after input. */
 const HOOK_RESULT_INPUT_MAX_CHARS = 256 * 1024;
+/** message.send.before block reasons are cut to this length (shown to the user). */
+const MESSAGE_SEND_BLOCK_REASON_MAX_CHARS = 500;
+/** message.send.before rewrites longer than this are dropped (the previous text is kept). */
+const MESSAGE_SEND_REWRITE_MAX_CHARS = 32_000;
+/** turn.end reply text is cut to this length. */
+const TURN_END_TEXT_MAX_CHARS = 16 * 1024;
+/** Rows read from the history tail to find the finished turn's assistant row. */
+const TURN_END_HISTORY_TAIL_ROWS = 8;
 
 function sha256Hex(text: string): string {
   return crypto.createHash("sha256").update(text, "utf-8").digest("hex");
@@ -95,6 +115,8 @@ export interface EnsureWorkspaceHooksArgs {
   /** Project identity for project-plugin instance IDs (same as the plugin MCP provider). */
   projectKey?: string;
   projectTrusted: boolean;
+  /** History reader for turn.end (reads the finished turn's reply once per event). */
+  history: Pick<HistoryService, "getLastMessages">;
 }
 
 /** One discovered plugin with a hooks.js, plus its pinned source snapshot. */
@@ -269,14 +291,21 @@ export class AgentPluginHookService {
       unregisters.push(...loaded.unregisters);
     }
 
-    this.registrations.set(args.workspaceId, {
+    const registration: WorkspaceHookRegistration = {
       fingerprint,
       unregisters,
       states,
       failedLines,
       epochStagingRoot,
       epochToken,
-    });
+    };
+    // One turn.end subscription per registration (not per plugin), so each
+    // finished turn reads history once for all plugins. It reads `states` at
+    // dispatch time, so plugins loaded later by the retry path are included.
+    unregisters.push(
+      this.spine.subscribe("stream.end", (payload) => this.runTurnEnd(payload, registration, args))
+    );
+    this.registrations.set(args.workspaceId, registration);
   }
 
   /**
@@ -441,6 +470,17 @@ export class AgentPluginHookService {
         return this.spine.useRequestContext((ctx) => this.runRequestAssemble(ctx, state, args), {
           workspaceId: args.workspaceId,
         });
+      case "message.send.before":
+        // useBefore: a block set by this plugin skips every later plugin.
+        return this.spine.useBefore(
+          "message.send",
+          (ctx) => this.runMessageSendBefore(ctx, state, args.workspaceId),
+          { workspaceId: args.workspaceId }
+        );
+      case "turn.end":
+        // Dispatched by the registration's single stream.end subscription
+        // (see ensureWorkspaceHooks), which reads history once per event.
+        return () => undefined;
     }
   }
 
@@ -581,6 +621,79 @@ export class AgentPluginHookService {
       return;
     }
     ctx.systemMessage = `${ctx.systemMessage}\n\n${context}`;
+  }
+
+  private async runMessageSendBefore(
+    ctx: MessageSendContext,
+    state: LoadedPluginHookState,
+    workspaceId: string
+  ): Promise<void> {
+    if (ctx.workspaceId !== workspaceId) {
+      return;
+    }
+    const output = await this.invokeHook(workspaceId, state, "message.send.before", {
+      workspaceId,
+      text: ctx.text,
+      origin: ctx.origin,
+    });
+    if (output === null) {
+      return;
+    }
+    const block = output.block;
+    if (typeof block === "string" && block.trim().length > 0) {
+      ctx.blocked = {
+        pluginName: state.pluginName,
+        reason: block.trim().slice(0, MESSAGE_SEND_BLOCK_REASON_MAX_CHARS),
+      };
+      return;
+    }
+    if (!Object.hasOwn(output, "text")) {
+      return;
+    }
+    // Invalid or empty rewrites change nothing: a broken hook must not erase
+    // or truncate what the user wrote.
+    const text = output.text;
+    if (typeof text !== "string" || text.trim().length === 0) {
+      log.warn(
+        `Agent plugin hooks: '${state.pluginName}' message.send.before returned an empty or non-string text; keeping the message`
+      );
+      return;
+    }
+    if (text.length > MESSAGE_SEND_REWRITE_MAX_CHARS) {
+      log.warn(
+        `Agent plugin hooks: '${state.pluginName}' message.send.before rewrite exceeds ${MESSAGE_SEND_REWRITE_MAX_CHARS} chars; keeping the message`
+      );
+      return;
+    }
+    if (text !== ctx.text) {
+      ctx.text = text;
+      ctx.rewrittenBy = state.pluginName;
+    }
+  }
+
+  private async runTurnEnd(
+    payload: ObserverEventMap["stream.end"],
+    registration: WorkspaceHookRegistration,
+    args: EnsureWorkspaceHooksArgs
+  ): Promise<void> {
+    if (payload.workspaceId !== args.workspaceId) {
+      return;
+    }
+    const states = registration.states.filter(
+      (state) => !state.disposed && state.hookNames.includes("turn.end")
+    );
+    if (states.length === 0) {
+      return;
+    }
+    const text = await readTurnEndText(args.history, args.workspaceId, payload.messageId);
+    for (const state of states) {
+      // Output is ignored; invokeHook never throws.
+      await this.invokeHook(args.workspaceId, state, "turn.end", {
+        workspaceId: args.workspaceId,
+        messageId: payload.messageId,
+        text,
+      });
+    }
   }
 
   // --- invocation ---
@@ -729,6 +842,57 @@ function annotateResult(result: unknown, annotation: string, pluginName: string)
   }
   log.debug(`Agent plugin hooks: '${pluginName}' annotation skipped (non-object tool result)`);
   return result;
+}
+
+/**
+ * The finished turn's last reply: the last run of adjacent text parts of the
+ * turn's assistant row (text before a later tool call is an intermediate
+ * step, not the reply). Null when no row with text was saved (for example an
+ * abort before any text) or history cannot be read. Cut to
+ * TURN_END_TEXT_MAX_CHARS.
+ */
+async function readTurnEndText(
+  history: Pick<HistoryService, "getLastMessages">,
+  workspaceId: string,
+  messageId: string
+): Promise<string | null> {
+  let rows: MuxMessage[];
+  try {
+    const result = await history.getLastMessages(workspaceId, TURN_END_HISTORY_TAIL_ROWS);
+    if (!result.success) {
+      log.debug("Agent plugin hooks: turn.end could not read history", { error: result.error });
+      return null;
+    }
+    rows = result.data;
+  } catch (error) {
+    log.debug("Agent plugin hooks: turn.end history read threw", { error });
+    return null;
+  }
+  const message = rows.findLast((row) => row.id === messageId && row.role === "assistant");
+  if (message === undefined) {
+    return null;
+  }
+  let lastRun = "";
+  let currentRun = "";
+  let inRun = false;
+  for (const part of message.parts) {
+    if (part.type === "text") {
+      currentRun = inRun ? currentRun + part.text : part.text;
+      inRun = true;
+      continue;
+    }
+    if (inRun && currentRun.trim().length > 0) {
+      lastRun = currentRun;
+    }
+    inRun = false;
+  }
+  if (inRun && currentRun.trim().length > 0) {
+    lastRun = currentRun;
+  }
+  if (lastRun.length === 0) {
+    return null;
+  }
+  return lastRun.slice(0, TURN_END_TEXT_MAX_CHARS);
 }
 
 /**

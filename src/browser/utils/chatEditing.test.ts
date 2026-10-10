@@ -113,6 +113,17 @@ describe("canEditDisplayedUserMessage", () => {
     ).toBe(true);
   });
 
+  test("editing a plugin-rewritten message loads what the user submitted", () => {
+    const pending = buildPendingFromDisplayed(
+      userMessage({
+        content: "FIX THE BUG",
+        pluginRewrite: { plugin: "shout", originalText: "fix the bug" },
+      })
+    );
+
+    expect(pending.content).toBe("fix the bug");
+  });
+
   test("restores staged files as attachments when editing sent messages", () => {
     const content = appendStagedAttachmentNotice("Inspect this archive.", [STAGED_ATTACHMENT]);
 

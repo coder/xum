@@ -662,8 +662,9 @@ const AddPluginPanel: React.FC<{
               <p className="text-xs">
                 <span className="text-foreground font-mono break-all">{preview.hook.path}</span>{" "}
                 <span className="text-muted">
-                  — runs sandboxed on every agent request and can observe, rewrite, or block tool
-                  calls
+                  — runs sandboxed on every agent request. It can read, rewrite, or block every
+                  message before it is sent, read each finished reply, and observe, rewrite, or
+                  block tool calls
                   {preview.hook.toolGrants.length > 0
                     ? ` for: ${preview.hook.toolGrants.join(", ")}`
                     : " (no tool visibility granted)"}

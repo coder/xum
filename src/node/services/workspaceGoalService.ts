@@ -239,6 +239,14 @@ export interface ChildGoalResumeHooks {
   getTurnModel(workspaceId: string): string | null;
 }
 
+/**
+ * A continuation the same dispatch would hit again (for example a plugin message.send.before
+ * block): the goal settles instead of re-requesting the dispatch every second.
+ */
+export interface GoalContinuationRefusal {
+  refused: string;
+}
+
 export interface GoalContinuationRuntimeBridge {
   hasActiveDescendantTasks(workspaceId: string): boolean;
   getRuntimeState(workspaceId: string): GoalContinuationRuntimeState;
@@ -259,7 +267,7 @@ export interface GoalContinuationRuntimeBridge {
      * boundary as fresh active evidence.
      */
     admissionStale?: () => boolean;
-  }): Promise<boolean>;
+  }): Promise<boolean | GoalContinuationRefusal>;
   /**
    * Build default SendMessageOptions for a kickoff continuation that is armed
    * outside of a stream-end (e.g. when the user resumes a paused goal on an
@@ -2571,6 +2579,10 @@ export class WorkspaceGoalService {
             },
           });
           if (accepted !== true) {
+            if (typeof accepted === "object") {
+              await this.settleRefusedContinuation(workspaceId, goal, candidate, accepted.refused);
+              return;
+            }
             this.scheduleContinuationReRequest(workspaceId, Date.now() + 1_000);
             return;
           }
@@ -2647,6 +2659,10 @@ export class WorkspaceGoalService {
             (this.goalIdentityGenerations.get(workspaceId) ?? 0) !== identityGenerationAtDispatch,
         });
         if (accepted !== true) {
+          if (typeof accepted === "object") {
+            await this.settleRefusedContinuation(workspaceId, goal, candidate, accepted.refused);
+            return;
+          }
           this.scheduleContinuationReRequest(workspaceId, Date.now() + 1_000);
           return;
         }
@@ -2689,16 +2705,30 @@ export class WorkspaceGoalService {
     if (reason == null) {
       return false;
     }
-    if (!isCurrent()) {
-      return true;
+    await this.settleRefusedContinuation(workspaceId, goal, candidate, reason);
+    return true;
+  }
+
+  /**
+   * Settle a goal whose continuation was refused for a reason the next dispatch would hit again
+   * (unavailable agent, plugin block): pause it (see pauseForUnavailableAgent) instead of
+   * re-requesting the dispatch in a loop.
+   */
+  private async settleRefusedContinuation(
+    workspaceId: string,
+    goal: GoalRecordV1,
+    candidate: PendingGoalContinuationCandidate,
+    reason: string
+  ): Promise<void> {
+    if (this.pendingContinuationCandidates.get(workspaceId) !== candidate) {
+      return;
     }
     // Disk before memory: a pause that failed to persist keeps the candidate and retries.
     if (!(await this.pauseForUnavailableAgent(workspaceId, goal, reason))) {
       this.scheduleContinuationReRequest(workspaceId, Date.now() + 1_000);
-      return true;
+      return;
     }
     this.deletePendingCandidateIfStillSame(workspaceId, candidate);
-    return true;
   }
 
   /**
