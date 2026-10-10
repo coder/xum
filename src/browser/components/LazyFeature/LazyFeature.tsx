@@ -28,9 +28,9 @@ function ReloadFallback(props: { name: string }) {
  * module, so a closed feature never fetches its chunk.
  *
  * Why a Reload fallback: in browser mode a tab opened before a server upgrade asks for an old
- * hashed chunk. The SPA fallback answers with `index.html`, so `import()` rejects. `React.lazy`
- * caches the rejection, so ErrorBoundary's "Reset" cannot recover; only a page reload fetches
- * the new entry. Electron loads chunks from its installed files, so it is not expected to hit this.
+ * hashed chunk that the server no longer has, so `import()` rejects. `React.lazy` caches the
+ * rejection, so ErrorBoundary's "Reset" cannot recover; only a page reload fetches the new entry.
+ * Electron loads chunks from its installed files, so it is not expected to hit this.
  */
 export function LazyFeature(props: LazyFeatureProps) {
   return (
