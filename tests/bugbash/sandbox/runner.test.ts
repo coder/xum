@@ -60,7 +60,7 @@ case "$1" in
       # One model call through the job's proxy socket, like the container's forwarder makes.
       proxycall) for a in "$@"; do case "$a" in *dst=/repo/.sandbox-proxy,readonly) psrc=\${a#type=bind,src=}; psrc=\${psrc%%,*} ;; esac; done
         echo "proxy dir mode $(stat -c %a "$psrc")" >> "$bin/calls.log"
-        echo "job folder: $(ls "$(dirname "$psrc")" | sed 's/xum-bugbash-proxy-.*/xum-bugbash-proxy-X/' | sort | tr '\n' ' ')" >> "$bin/calls.log"
+        echo "job folder: $(ls "$(dirname "$psrc")" | sed 's/^h-.*/h-X/' | sort | tr '\n' ' ')" >> "$bin/calls.log"
         curl -s --unix-socket "$psrc/sock" -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
           -d '{"model":"'"$CALLMODEL"'","max_tokens":10,"messages":[{"role":"user","content":"'"$CALL"'"}]}' \\
           http://proxy/anthropic/v1/messages >> "$bin/calls.log"; echo >> "$bin/calls.log"
@@ -991,7 +991,7 @@ test("B1: an MCP Apps job reaches the model only through its proxy, with the hos
   expect(run).not.toContain("ANTHROPIC");
   expect(calls()).toContain("proxy dir mode 700");
   // D1: the inner socket's private folder is in the job folder, beside the mounted ones.
-  expect(calls()).toContain("job folder: group passwd proxy stage xum-bugbash-proxy-X ");
+  expect(calls()).toContain("job folder: group h-X passwd proxy stage ");
   expect(calls()).toContain('"usage":');
   expect(requests).toHaveLength(1);
   expect(requests[0].headers["x-api-key"]).toBe(UPSTREAM_KEY);

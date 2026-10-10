@@ -279,10 +279,16 @@ export async function startProxy(options: ProxyOptions) {
     calls.add(call);
   });
   // Not in a mounted folder: the container must reach the HTTP server only through the front.
+  // A unix socket path holds at most 107 bytes on Linux. Bun 1.3.12 binds longer ones (measured),
+  // but Node binds a cut-off path without an error. In a privateParent the names are short:
+  // `<parent>/h-XXXXXX/s` is as long as the launcher's `<job folder>/proxy/sock`, so the inner
+  // socket never needs a longer path than the job socket (a long TMPDIR, such as a CI runner's).
   const inner = fs.mkdtempSync(
-    path.join(options.privateParent ?? os.tmpdir(), "xum-bugbash-proxy-")
+    options.privateParent == null
+      ? path.join(os.tmpdir(), "xum-bugbash-proxy-")
+      : path.join(options.privateParent, "h-")
   );
-  const innerPath = path.join(inner, "http.sock");
+  const innerPath = path.join(inner, "s");
   const pipes = new Set<net.Socket>();
   const front = net.createServer((outer) => {
     // Deferred: Bun 1.3.12 ignores a destroy() inside the connection handler itself.
