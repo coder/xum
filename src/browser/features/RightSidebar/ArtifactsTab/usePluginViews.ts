@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
+import { subscribeWorkspaceMcpOverridesSaved } from "@/browser/utils/workspaceMcpMutations";
 import type { McpAppPluginView } from "@/common/orpc/schemas/mcpApps";
 
 /** A workspace's plugin views; the workspace ID keeps a stale list from showing elsewhere. */
@@ -11,9 +12,10 @@ export interface WorkspacePluginViews {
 
 /**
  * The plugin views (`contributes.views`) of a workspace, for the command palette and the
- * Artifacts picker. Re-listed when the workspace changes and after a plugin install, update
- * or removal. Listing is best effort: on failure the workspace shows no plugin views. The
- * `enabled` flag can go stale; opening a view re-checks it in the backend.
+ * Artifacts picker. Re-listed when the workspace changes, after a plugin install, update or
+ * removal, and after this workspace's MCP configuration is saved (a view's `enabled` flag
+ * follows its server). Listing is best effort: on failure the workspace shows no plugin views.
+ * Opening a view still re-checks the server in the backend.
  */
 export function usePluginViews(
   workspaceId: string | null,
@@ -24,6 +26,13 @@ export function usePluginViews(
   const [mutationTick, setMutationTick] = useState(0);
 
   useEffect(() => subscribeAgentPluginsMutated(() => setMutationTick((tick) => tick + 1)), []);
+  useEffect(
+    () =>
+      subscribeWorkspaceMcpOverridesSaved((savedWorkspaceId) => {
+        if (savedWorkspaceId === workspaceId) setMutationTick((tick) => tick + 1);
+      }),
+    [workspaceId]
+  );
 
   useEffect(() => {
     if (!api || workspaceId == null || !enabled) return;
