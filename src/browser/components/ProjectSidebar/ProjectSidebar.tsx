@@ -2636,9 +2636,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                       </TooltipTrigger>
                       <TooltipContent>Add project</TooltipContent>
                     </Tooltip>
+                    {/* text-muted at rest and the foreground on hover: text-secondary missed WCAG
+                        AA in the dark themes, and on the hover background in every theme (#6010). */}
                     <button
                       onClick={handleAddFlatWorkspace}
-                      className="text-secondary hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
+                      className="text-muted hover:text-foreground hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
                     >
                       <SquarePen className="h-3.5 w-3.5" strokeWidth={1.8} />
                       <span>New chat</span>
