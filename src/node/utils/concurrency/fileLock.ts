@@ -1,6 +1,6 @@
 /**
  * Cross-process filesystem lock (extracted from the journal kit's append
- * lock so the durable-event blob lock can share one proven protocol).
+ * lock so the durable-event blob lock can share one protocol).
  *
  * Protocol:
  * - Lock birth is atomic-with-content: the token (`pid:nonce`) is fully
@@ -30,8 +30,8 @@
  *   (judged, then re-read and claimed by rename under ITS own guard,
  *   `<guard>.reclaim`), never plain-unlinked: an unconditional unlink of a
  *   guard judged stale could remove a fresh guard a live reclaimer linked
- *   after the judgment, admitting two reclaimers and then two owners
- *   (formal/filelock MC_stale_guard). Nesting is bounded by
+ *   after the judgment, admitting two reclaimers and then two owners.
+ *   Nesting is bounded by
  *   MAX_RECLAIM_DEPTH; beyond it reclamation refuses (fails closed).
  * - Release is ownership-verified: a mismatched token means the lock was
  *   reclaimed and re-acquired by someone else; leave it alone. The
@@ -425,8 +425,8 @@ async function lockLeaseExpired(lockPath: string): Promise<boolean> {
  * judgment as locks) is reclaimed like a dead lock, one level up (see the
  * module doc), so it cannot deadlock reclamation. It is never
  * plain-unlinked: POSIX cannot compare-and-unlink, and a guard linked by a
- * live reclaimer after our judgment would be removed (formal/filelock
- * MC_stale_guard: two reclaimers inside, then two owners).
+ * live reclaimer after our judgment would be removed (two reclaimers inside,
+ * then two owners).
  */
 async function withReclaimGuard(
   lockPath: string,
@@ -569,8 +569,8 @@ async function removeGraveyard(graveyard: string, label: string): Promise<void> 
  * Release only if we still own the lock (a raced reclaim may have replaced
  * it). Check-then-unlink is safe without a compare-and-swap (see the module
  * doc). A failing read or unlink is retried, bounded: a record left behind
- * reads as live to every sibling until this process exits (formal/filelock
- * MC_release_fault), and the caller retires the token right after.
+ * reads as live to every sibling until this process exits, and the caller
+ * retires the token right after.
  */
 async function releaseFileLock(lockPath: string, token: string, label: string): Promise<void> {
   for (let attempt = 1; attempt <= FILE_LOCK_RELEASE_ATTEMPTS; attempt++) {

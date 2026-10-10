@@ -11,8 +11,8 @@ import { SSHRuntime } from "./SSHRuntime";
 import { sshConnectionPool, type SSHRuntimeConfig } from "./sshConnectionPool";
 import { createSSHTransport } from "./transports";
 
-// Repros for the formal/ssh-pool models (SSH2Pool.tla, OpenSSHPool.tla). Every finding
-// (F1-F3) is fixed: each is a plain test that guards its fix, next to a passing control.
+// Repros of known SSH2 and OpenSSH pool findings. Every finding is fixed: each is a plain
+// test that guards its fix, next to a passing control.
 // No real network: an in-process ssh2 server on 127.0.0.1, or a PATH-shimmed `ssh`.
 
 const IDLE_MS = 150;
@@ -25,12 +25,12 @@ async function waitUntil(done: () => boolean, timeoutMs: number): Promise<void> 
   while (!done() && Date.now() < deadline) await sleep(10);
 }
 
-describe("SSH2 pool (SSH2Pool.tla)", () => {
+describe("SSH2 pool", () => {
   let server: Server;
   let config: SSHRuntimeConfig;
   let tempDir: string;
   let serverOpen: number;
-  /** Every accepted connection, so teardown can close a leaked one (F1). */
+  /** Every accepted connection, so teardown can close a leaked one. */
   let serverConns: Set<Connection>;
   /** How long the server takes to open a session channel. */
   let sessionOpenDelayMs: number;
@@ -82,15 +82,15 @@ describe("SSH2 pool (SSH2Pool.tla)", () => {
   afterEach(async () => {
     ssh2ConnectionPool.setIdleTimeoutMsForTests(undefined);
     ssh2ConnectionPool.clearAllHealthForTests();
-    // server.close() alone stops accepting but leaves open connections (F1 leaks one that the
-    // pool no longer tracks): end them all and wait until the server has fully closed.
+    // server.close() alone stops accepting but leaves open connections (the late-close repro leaks
+    // one that the pool no longer tracks): end them all and wait until the server has fully closed.
     for (const conn of serverConns) conn.end();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
   /**
-   * F1 (MC_ssh2_faithful NoLeak): the pool idle-closes connection 1, a new acquire opens
+   * The pool idle-closes connection 1, a new acquire opens
    * connection 2, then connection 1's own "end"/"close" events arrive. Its onClose handler
    * deleted connections[key] without checking that the entry was still its own, so it dropped
    * connection 2 from the map; closeIdleConnection then never closed connection 2. Fixed: the
@@ -126,18 +126,18 @@ describe("SSH2 pool (SSH2Pool.tla)", () => {
     await waitUntil(() => serverOpen === 0, IDLE_MS * 10);
   }
 
-  test("F1 control: an idle close whose events arrive at once leaves no connection open", async () => {
+  test("control: an idle close whose events arrive at once leaves no connection open", async () => {
     await idleCloseThenReconnect(false);
     expect(serverOpen).toBe(0);
   });
 
-  test("F1: a late close of an idle-closed client does not leak the next connection", async () => {
+  test("a late close of an idle-closed client does not leak the next connection", async () => {
     await idleCloseThenReconnect(true);
     expect(serverOpen).toBe(0);
   });
 
   /**
-   * F2 (MC_ssh2_fix_close NoUseAfterClose): acquire restarts the idle timer, but the exec
+   * Acquire restarts the idle timer, but the exec
    * counted as an open channel only once ssh2's exec callback ran. A channel open slower
    * than the idle window (IDLE_TIMEOUT_MS in production) let closeIdleConnection end the client
    * under the pending exec, which then failed as a transport error. Fixed: the exec holds a
@@ -153,17 +153,17 @@ describe("SSH2 pool (SSH2Pool.tla)", () => {
     );
   }
 
-  test("F2 control: an exec whose channel opens within the idle window runs", async () => {
+  test("control: an exec whose channel opens within the idle window runs", async () => {
     expect(await execWithSlowChannelOpen(IDLE_MS * 20)).toBe("done");
   });
 
-  test("F2: the idle timer waits for an exec whose channel is still opening", async () => {
+  test("the idle timer waits for an exec whose channel is still opening", async () => {
     expect(await execWithSlowChannelOpen(IDLE_MS)).toBe("done");
   });
 });
 
 // The fake `ssh` is a POSIX shell script; Windows process resolution cannot run it.
-describe.skipIf(process.platform === "win32")("OpenSSH pool (OpenSSHPool.tla)", () => {
+describe.skipIf(process.platform === "win32")("OpenSSH pool", () => {
   let dir: string;
   let originalPath: string | undefined;
   let hostCounter = 0;
@@ -225,7 +225,7 @@ describe.skipIf(process.platform === "win32")("OpenSSH pool (OpenSSHPool.tla)", 
     };
   }
 
-  test("F3 control: a user command that exits 1 leaves the host healthy", async () => {
+  test("control: a user command that exits 1 leaves the host healthy", async () => {
     const outcome = await runUserCommand("false # USER_EXIT_1");
     expect(outcome.exitCode).toBe(1);
     expect(outcome.status).toBe("healthy");
@@ -233,17 +233,17 @@ describe.skipIf(process.platform === "win32")("OpenSSH pool (OpenSSHPool.tla)", 
   });
 
   /**
-   * F3 (MC_openssh_faithful NoFalseBackoff): OpenSSHTransport.onExit read every exit 255
+   * OpenSSHTransport.onExit read every exit 255
    * as a connection failure, so a user command's own 255 put a reachable host into backoff.
-   * Fixed (MC_openssh_fixed): an exec's 255 only forces a re-probe.
+   * Fixed: an exec's 255 only forces a re-probe.
    */
-  test("F3: a user command's own exit 255 marks a reachable host unhealthy", async () => {
+  test("a user command's own exit 255 marks a reachable host unhealthy", async () => {
     const outcome = await runUserCommand("ssh other-host # NESTED_SSH_REFUSED");
     expect(outcome.exitCode).toBe(255);
     expect(outcome.status).toBe("healthy");
   });
 
-  test("F3 control: an exit 255 from a host that went down still backs off after the re-probe", async () => {
+  test("control: an exit 255 from a host that went down still backs off after the re-probe", async () => {
     const outcome = await runUserCommand("true # HOST_GOES_DOWN");
     expect(outcome.exitCode).toBe(255);
     expect(outcome.status).toBe("unhealthy");
@@ -252,12 +252,12 @@ describe.skipIf(process.platform === "win32")("OpenSSH pool (OpenSSHPool.tla)", 
   });
 
   /**
-   * F3 (MC_openssh_faithful NoFalsePermanent): the backoff error repeated the user command's
+   * The backoff error repeated the user command's
    * stderr after "Last error:", and isPermanentSSHFailure matched "Permission denied (" in
    * it: the next acquire failed as a permanent auth failure (no retry) on a host whose keys
    * are fine. Fixed: the command's stderr is never recorded as the pool's last error.
    */
-  test("F3: the next acquire reports the user command's stderr as a permanent SSH failure", async () => {
+  test("the next acquire reports the user command's stderr as a permanent SSH failure", async () => {
     const outcome = await runUserCommand("ssh other-host # NESTED_SSH_REFUSED");
     expect(isPermanentSSHFailure(outcome.nextAcquire)).toBe(false);
   });

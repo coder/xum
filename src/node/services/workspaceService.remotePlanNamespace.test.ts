@@ -3,7 +3,7 @@
  * SSH host used to share ~/.mux/plans/<project basename>/<name>.md, and a clear in one deleted the
  * other's plan. A row from an older build migrates once (planLocation.ts migrateRemotePlan): its
  * own plans/<id>.md plan is copied into the scoped path, legacy files stay untouched, and the row
- * flag then keeps every read on the scoped path (formal/plan-storage/PlanMigration.tla).
+ * flag then keeps every read on the scoped path.
  *
  * A LocalRuntime stands in for the SSH host (its plan home is the temp root's ~/.xum), so plan
  * files, the remote `rm` and the migration script are real files and real shell commands.

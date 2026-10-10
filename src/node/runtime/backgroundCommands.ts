@@ -134,10 +134,9 @@ export function buildSpawnCommand(options: SpawnCommandOptions): string {
  *
  * The command never overwrites an exit_code file: it publishes 143/137 only when no file exists
  * (`[ -e ]`, then noclobber `set -C` so the create is O_EXCL). A code the wrapper's EXIT trap
- * wrote (a natural exit, or 143 from its TERM trap) always wins (formal/background-processes, B1
- * NaturalExitPreserved).
+ * wrote (a natural exit, or 143 from its TERM trap) always wins.
  *
- * Still open (B1, #5481): the command signals the group without knowing whether the process
+ * Still open (#5481): the command signals the group without knowing whether the process
  * already exited. The caller's in-memory status follows a natural exit only when something polls
  * it, so a stop after an unobserved exit still signals the group, whose PGID may by then belong
  * to an unrelated group. The exit_code file is not used to decide this: the script runs in the

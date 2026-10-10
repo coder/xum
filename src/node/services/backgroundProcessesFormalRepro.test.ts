@@ -21,10 +21,10 @@ import { createBashTool } from "./tools/bash";
 import { createTestToolConfig, mockToolCallOptions } from "./tools/testHelpers";
 import { createWorkspaceServiceHarness } from "./workspaceService.testHarness";
 
-// Deterministic code repros for the TLA+ model in formal/background-processes/ (see its
-// check.sh). Each repro wraps its body in expectReproFailure, so it passes only while it fails at
-// its "Target assertion" (a fix makes it fail: then turn it into a plain test); each plain test
-// is the passing control that shows the setup reaches the code path.
+// Deterministic code repros of background-process findings. Each repro wraps its body in
+// expectReproFailure, so it passes only while it fails at its "Target assertion" (a fix makes it
+// fail: then turn it into a plain test); each plain test is the passing control that shows the
+// setup reaches the code path.
 
 const workspaceDirs: string[] = [];
 const cleanups: Array<() => PromiseLike<unknown>> = [];
@@ -74,13 +74,13 @@ async function tempDir(tag: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// B1 (BgTerminate.tla, MC_term_one_caller): terminate() trusts the in-memory status, which only
+// terminate() trusts the in-memory status, which only
 // follows a natural exit when something polls it. The kill command then signals the dead
 // process group (its PGID may already belong to another group) and overwrites the exit code
 // the wrapper's trap wrote with 143. Fixed: the exit code survives (noclobber publish). Still
 // open (#5481): the stop still signals the group.
 
-describe("B1: terminating a background process that already exited", () => {
+describe("terminating a background process that already exited", () => {
   async function spawnExited(tag: string) {
     const manager = new BackgroundProcessManager(await tempDir(`${tag}-root`));
     const ws = uniqueWorkspace(tag);
@@ -145,12 +145,12 @@ describe("B1: terminating a background process that already exited", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// B2 (BgCleanup.tla, MC_cleanup_spawn_remove): spawn() checked no seal and was no pending entry,
+// spawn() checked no seal and was no pending entry,
 // so a run_in_background spawn in flight when removal's cleanup() listed the processes
 // registered afterwards and ran while the checkout was deleted. Fixed: spawns are admitted under
-// the same seal as migrations (#4967) and stay pending until registered (MC_cleanup_fixed).
+// the same seal as migrations (#4967) and stay pending until registered.
 
-describe("B2: a background spawn in flight during workspace removal", () => {
+describe("a background spawn in flight during workspace removal", () => {
   const projectPath = "/tmp/proj-formal-bg";
 
   async function removalHarness(ws: string) {
@@ -229,13 +229,13 @@ describe("B2: a background spawn in flight during workspace removal", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// B3 (BgCleanup.tla, MC_cleanup_archive): archiveUnlocked stopped the stream, terminals and MCP
+// archiveUnlocked stopped the stream, terminals and MCP
 // servers but never this backend's background processes, although ARCHIVE_OWN_ACTIVITY_POLICY's
 // comment says it does and the model-facing refusal says archiving "would terminate" them.
 // Fixed: archive seals the workspace and runs cleanup() before its hooks and any deletion, and
-// again after the stream stop (MC_cleanup_archive_fixed).
+// again after the stream stop.
 
-describe("B3: archive and this backend's own background process", () => {
+describe("archive and this backend's own background process", () => {
   test("archiving a workspace stops its running background process", async () => {
     const ws = uniqueWorkspace("archive");
     const harness = await createWorkspaceServiceHarness();
@@ -261,7 +261,7 @@ describe("B3: archive and this backend's own background process", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
-// B4 (BgGateEvidence.tla, MC_gate_migrated_ostmp): a command sent to the background kept its
+// A command sent to the background kept its
 // record under path.join(os.tmpdir(), "mux-bashes") (di/layers/core.ts), while another backend's
 // structural-mutation gate scanned only localBgWorkspaceDir (/tmp/mux-bashes/<ws>). On macOS
 // os.tmpdir() is /var/folders/... (and on Linux it follows TMPDIR), so the other backend saw no
@@ -269,7 +269,7 @@ describe("B3: archive and this backend's own background process", () => {
 // writers, the name lock and scanners, plus a scan of the old os.tmpdir() root for upgrades.
 // Downgrades stay safe: an older gate scans /tmp/mux-bashes, where new builds now migrate.
 
-describe("B4: another backend's evidence of a command sent to the background", () => {
+describe("another backend's evidence of a command sent to the background", () => {
   /** The manager exactly as production wires it (BackgroundProcessManagerLive). */
   function productionManager(): BackgroundProcessManager {
     return Effect.runSync(
@@ -352,10 +352,10 @@ describe("B4: another backend's evidence of a command sent to the background", (
 });
 
 // ---------------------------------------------------------------------------------------------
-// #4889 (BgSpawnName.tla, MC_name_remote_serial): on runtimes whose records are not host-local
+// #4889: on runtimes whose records are not host-local
 // (SSH/Coder, Docker, devcontainer, multi-project) a settled record dir was free to another
 // backend, which reinitialised it while its first owner still tracked it (#4882 on the host).
-// Fixed: the name is claimed with an atomic mkdir on the runtime (MC_name_remote_fixed).
+// Fixed: the name is claimed with an atomic mkdir on the runtime.
 
 /** Delegates to a real LocalRuntime but is not a LocalBaseRuntime: the manager's remote path. */
 function remoteLike(base: LocalRuntime): Runtime {
@@ -407,7 +407,7 @@ describe("#4889: same-name spawns from two backends on a non-host runtime", () =
 });
 
 // ---------------------------------------------------------------------------------------------
-// #5465 case 1 (BgCleanup.tla, MC_cleanup_refused_join_timeout): a migration refused by a
+// #5465 case 1: a migration refused by a
 // cleanup's seal (or one that fails) unregisters the foreground entry, aborts the command and
 // waits at most 5 s for its exit. A command whose exit that join does not see keeps running with
 // no manager entry and no record, so the removal waiting on the migration goes on to delete its

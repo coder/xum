@@ -1,9 +1,8 @@
 /**
- * Deterministic repros of the violations found by the TLA+ model in formal/workspace-lifecycle/
- * (run formal/workspace-lifecycle/check.sh). Each `test.failing` states the CORRECT contract and
- * fails today at its last assertion; its passing control runs the same steps on the path the code
- * already handles. When a fix lands the failing test starts passing, bun reports it, and the fix
- * should flip it to a plain `test`.
+ * Deterministic repros of workspace lifecycle violations. Each `test.failing` states the CORRECT
+ * contract and fails today at its last assertion; its passing control runs the same steps on the
+ * path the code already handles. When a fix lands the failing test starts passing, bun reports it,
+ * and the fix should flip it to a plain `test`.
  *
  * Real Config, real git worktrees (an isolated GIT_CONFIG_GLOBAL), the default harness otherwise.
  */
@@ -79,7 +78,7 @@ function failConfigPublish() {
   }) as typeof cjsFs.rename);
 }
 
-describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
+describe("workspace lifecycle", () => {
   let harness: WorkspaceServiceHarness;
   let service: WorkspaceService;
   let projectPath: string;
@@ -140,11 +139,11 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
       { awaitMaterialization: true }
     );
 
-  // F1 (MC_lock_fault, NoOrphanCheckout; fixed). create() and fork() take the cross-process
+  // Fixed. create() and fork() take the cross-process
   // registration lock after runtime.createWorkspace made the worktree and branch. Its timeout used
   // to land in the outer catch with no rollback armed, leaving both behind; it now undoes the
   // creation like a failed registration write, keeping a branch the creation only reused.
-  describe("F1: registration lock failure after the checkout exists", () => {
+  describe("registration lock failure after the checkout exists", () => {
     const failRegistrationLock = () => {
       const realAcquire = crossProcessLock.acquireCrossProcessLock;
       spyOn(crossProcessLock, "acquireCrossProcessLock").mockImplementation((options) =>
@@ -225,13 +224,13 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
     });
   });
 
-  // F2 (MC_remove_retry, UserBranchSafe). A removal whose deregistration fails (:8083-8110)
+  // A removal whose deregistration fails (:8083-8110)
   // keeps the row after runtime.deleteWorkspace already removed the worktree and the branch-map
   // entry (WorktreeManager.ts:852). The retry finds no map entry and falls back to the workspace
   // name as the branch name (WorktreeManager.ts:837, :1084): `git branch -D feature-x`.
   // Fixed: the fallback now needs git to still register the checkout on that branch. The
   // multi-project non-forced removal reaches the same state when a later project's delete fails.
-  describe("F2: removal retry after a failed deregistration", () => {
+  describe("removal retry after a failed deregistration", () => {
     async function createOnSanitizedBranch(): Promise<string> {
       userBranchWithOwnCommit(projectPath, "feature-x"); // the user's own, unrelated branch
       const created = await createWorktree("feature/x");
@@ -310,11 +309,11 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
     });
   });
 
-  // F3 (MC_multi_p2fail, UserBranchSafe; fixed). When a later project's createWorkspace fails,
+  // Fixed. When a later project's createWorkspace fails,
   // createMultiProject rolls back with rollbackCreatedWorkspaces() (forced = false), whose
   // keepBranch used to be `forced && !createdBranch`: false, so `git branch -d` removed a merged
   // user branch the first project merely reused. Every rollback now keeps such a branch.
-  describe("F3: multi-project rollback after a later project fails", () => {
+  describe("multi-project rollback after a later project fails", () => {
     const createMulti = () =>
       service.createMultiProject(
         [
@@ -351,12 +350,12 @@ describe("workspace lifecycle (formal/workspace-lifecycle)", () => {
     });
   });
 
-  // F4 (MC_multi_meta, FailedNoGrant; fixed). createMultiProject used to mint unrelated-workspace
+  // Fixed. createMultiProject used to mint unrelated-workspace
   // consent in the registration write itself, before the metadata read that can still fail. A
   // peer that discovered the consented row in that window started work there, so the rollback
   // kept the in-use row and the creation reported an error with consent granted. The write now
   // only marks the default pending, and the grant waits for publication, as in create().
-  describe("F4: multi-project metadata read failure after a peer found the row", () => {
+  describe("multi-project metadata read failure after a peer found the row", () => {
     const multiRow = () =>
       harness.config
         .loadConfigOrDefault()

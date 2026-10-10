@@ -15,18 +15,18 @@ import {
 } from "./processLiveness";
 import { expectReproFailure } from "../formalRepro.testHarness";
 
-// Bridge from the Lean model in formal/process-liveness to the real judgeHolder.
+// Checks the real judgeHolder against two TypeScript reference judgments.
 //
-// `tsModel` transcribes ProcessLiveness/TsJudge.lean (tsJudge) and `specModel` transcribes
-// ProcessLiveness/Spec.lean (specJudge), both over the same abstract evidence. The exhaustive
+// `tsModel` is a reference implementation of judgeHolder's branches and `specModel` is an
+// oracle of the intended judgment, both over the same abstract evidence. The exhaustive
 // case set drives the REAL judgeHolder (kill(pid, 0) is stubbed per case; start times are real
 // /proc reads of real pids) and checks:
-// 1. the Lean transcription of the TS branches matches the real function on every case;
-// 2. the real function disagrees with the proven spec only in the classified findings.
+// 1. the reference implementation of the TS branches matches the real function on every case;
+// 2. the real function disagrees with the oracle only in the classified findings.
 // The `expectReproFailure` cases at the end are minimal repros of those findings, each next to
 // a passing control. Make each a plain test (and drop its KNOWN_DISAGREEMENTS class) once fixed.
 //
-// Linux only: start times come from /proc, which the model's Linux cases need.
+// Linux only: start times come from /proc, which the Linux cases need.
 
 type KillOutcome = "alive" | "eperm" | "esrch" | "other";
 type Birth = { ticks: string } | { other: string } | null;
@@ -54,7 +54,7 @@ const birthEq = (current: string, birth: NonNullable<Birth>) =>
   "ticks" in birth && birth.ticks === current;
 const differs = (a: string | null, b: string | null) => a !== null && b !== null && a !== b;
 
-/** ProcessLiveness/TsJudge.lean tsJudge (true = dead). */
+/** Reference implementation of judgeHolder's branches (true = dead). */
 function tsModel(e: Evidence): boolean {
   const rest = (r: AbstractRecord, linuxDomain: boolean) => {
     if (e.pid === e.selfPid) return !e.ownTokenLive;
@@ -78,7 +78,7 @@ function tsModel(e: Evidence): boolean {
   return rest(r, false);
 }
 
-/** ProcessLiveness/Spec.lean specJudge (true = dead). */
+/** Oracle of the intended judgment (true = dead). */
 function specModel(e: Evidence): boolean {
   const p = e.self.platform;
   const r = e.record;
@@ -103,23 +103,23 @@ function specModel(e: Evidence): boolean {
   return e.kill === "esrch";
 }
 
-/** The confirmed findings: which real-vs-spec disagreements each one explains. */
+/** The confirmed findings: which real-vs-oracle disagreements each one explains. */
 // A (fixed): a machine-id mismatch was judged a retired domain even when boot id and PID
 // namespace proved the same domain. judgeHolder no longer reads the machine id, so it has no
 // class here and any regression shows up as an unexplained disagreement.
 const KNOWN_DISAGREEMENTS: Record<string, (e: Evidence) => boolean> = {
   // B1, B2, B3 are deferred (#4480); the classes are disjoint.
   // B1: legacy records skip the domain checks on Linux (TS dead on ESRCH or a start-time
-  // mismatch, spec refuses: missing evidence).
+  // mismatch, the oracle refuses: missing evidence).
   B1: (e) => e.record === null && e.self.platform === "linux",
   // B2: a Linux observer that cannot read its own boot id or namespace skips the domain checks
-  // (TS dead on ESRCH, spec refuses).
+  // (TS dead on ESRCH, the oracle refuses).
   B2: (e) =>
     e.record !== null &&
     e.self.platform === "linux" &&
     (e.self.bootId === null || e.self.pidNs === null),
   // B3: a macOS/Windows observer refuses a record that names a Linux boot id or namespace,
-  // while the same record without them is reclaimed (TS refuses, spec dead on ESRCH).
+  // while the same record without them is reclaimed (TS refuses, the oracle dead on ESRCH).
   B3: (e) =>
     e.record !== null &&
     e.self.platform !== "linux" &&
@@ -219,10 +219,10 @@ function* cases(): Generator<Evidence> {
 
 const describeLinux = process.platform === "linux" ? describe : describe.skip;
 
-describeLinux("judgeHolder against the Lean model", () => {
+describeLinux("judgeHolder against the reference judgments", () => {
   afterEach(() => setSelfIdentityForTests(undefined));
 
-  test("the Lean transcription of the TS branches matches judgeHolder on every case", () => {
+  test("the reference implementation of the TS branches matches judgeHolder on every case", () => {
     const mismatches: string[] = [];
     const reasons = new Set<string>();
     let total = 0;
@@ -238,7 +238,7 @@ describeLinux("judgeHolder against the Lean model", () => {
     expect(reasons.size).toBe(9);
   });
 
-  test("judgeHolder disagrees with the proven spec only in the classified findings", () => {
+  test("judgeHolder disagrees with the oracle only in the classified findings", () => {
     const unexplained: string[] = [];
     const seen = new Map<string, number>();
     for (const e of cases()) {

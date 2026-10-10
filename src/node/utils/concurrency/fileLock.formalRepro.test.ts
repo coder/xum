@@ -1,8 +1,7 @@
 /**
- * Deterministic repros of counterexamples found by the TLA+ model in
- * formal/filelock/ (FileLock.tla; run formal/filelock/check.sh). Each test
- * asserts the protocol's documented invariant; both were `test.failing`
- * against the pre-fix code and now pass.
+ * Deterministic repros of two file-lock protocol races. Each test asserts
+ * the protocol's documented invariant; both were `test.failing` against the
+ * pre-fix code and now pass.
  *
  * Run: bun test ./src/node/utils/concurrency/fileLock.formalRepro.test.ts
  *
@@ -47,8 +46,7 @@ function deadPid(): number {
   return child.pid;
 }
 
-// Model: MC_stale_guard, invariant MutualExclusion (and CommitExclusion,
-// NoReclaimFromLiveHolder). Pre-fix root cause: withReclaimGuard's
+// Pre-fix root cause: withReclaimGuard's
 // unconditional unlink of a judged-stale guard could remove a guard that a
 // live reclaimer linked after the judgment, so two reclaimers ran the guarded
 // section at once; one displaced a fresh owner and a third acquirer claimed
@@ -161,7 +159,7 @@ test("a dead reclaim guard never lets two holders own the lock at once (stale-gu
   await using _after = await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "D" });
 }, 15_000);
 
-// Model: MC_release_fault, invariant NoOrphanLock. Pre-fix, releaseFileLock
+// Pre-fix, releaseFileLock
 // made one unlink attempt and only logged a failure; the dispose path then
 // retired the token. The record stayed on disk naming a live pid with a
 // matching birth, so every other process refused it until this process

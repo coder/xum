@@ -257,7 +257,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(entry?.archivedAt).toBeUndefined();
   });
 
-  // B3: archive stops this backend's background processes before its hooks stop the runtime or
+  // Archive stops this backend's background processes before its hooks stop the runtime or
   // delete the checkout, and keeps new spawns and fg->bg migrations refused until it settles.
   test("stops background processes before its hooks and refuses spawns until it settles", async () => {
     const manager = harness.backgroundProcessManager;
@@ -299,7 +299,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(migration.admitted).toBe(true);
   });
 
-  // B3 (BgCleanup.tla, MC_cleanup_archive_fixed): a foreground command of the still-running stream
+  // A foreground command of the still-running stream
   // whose migration the archive's seal refused is being killed when the stream stops; the cleanup
   // after the stream stop waits for it, so the checkout deletion cannot run under it.
   test("waits for a migration refused during the archive before deleting the checkout", async () => {

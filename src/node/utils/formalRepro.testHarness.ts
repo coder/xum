@@ -1,7 +1,7 @@
 import { stripVTControlCharacters } from "node:util";
 
 /**
- * Runs a formal-model repro that must still fail, and only at its target assertion.
+ * Runs a repro of a known finding that must still fail, and only at its target assertion.
  * `test.failing` passes on any thrown error, so a repro broken by a typo or a changed fixture
  * still looked like it reproduced its finding (#5399). This passes only when `repro` throws
  * the expect() mismatch in `target`; once the finding is fixed it fails, so the repro becomes

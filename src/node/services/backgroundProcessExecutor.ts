@@ -538,8 +538,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
    */
   terminate(): Promise<void> {
     // Memoized synchronously, before the first await: concurrent callers (task_stop and the
-    // timeout timer, cleanup) share one kill sequence instead of each running their own
-    // (formal/background-processes, B1 OneKillSequence).
+    // timeout timer, cleanup) share one kill sequence instead of each running their own.
     this.termination ??= this.runTerminate();
     return this.termination;
   }

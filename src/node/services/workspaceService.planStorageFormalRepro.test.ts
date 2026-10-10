@@ -1,10 +1,9 @@
 /**
- * Deterministic repros of the violations found by the TLA+ model in formal/plan-storage/
- * (run formal/plan-storage/check.sh). Each repro states the CORRECT contract and fails today at
- * its "Target assertion"; `expectReproFailure` passes only on that exact mismatch, so a repro
- * broken elsewhere (a fixture, a mock) fails instead of passing as a bare `test.failing` would.
- * Its passing control runs the same steps on the path the code already handles. When a fix lands
- * the repro fails with "repro passed", and the fix unwraps it into a plain test.
+ * Deterministic repros of plan storage violations. Each repro states the CORRECT contract and fails
+ * today at its "Target assertion"; `expectReproFailure` passes only on that exact mismatch, so a
+ * repro broken elsewhere (a fixture, a mock) fails instead of passing as a bare `test.failing`
+ * would. Its passing control runs the same steps on the path the code already handles. When a fix
+ * lands the repro fails with "repro passed", and the fix unwraps it into a plain test.
  *
  * Plans live at plans/<project basename>/<workspace name>.md: the projects below are a/project and
  * b/project, so local workspaces of both share plans/project/. Real Config, real git repositories
@@ -35,7 +34,7 @@ import {
   type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
 
-describe("plan storage (formal/plan-storage)", () => {
+describe("plan storage", () => {
   let harness: WorkspaceServiceHarness;
   let service: WorkspaceService;
   let projectA: string;
@@ -117,7 +116,7 @@ describe("plan storage (formal/plan-storage)", () => {
   const createLocal = (projectPath: string, branchName: string) =>
     service.create(projectPath, branchName, "main", undefined, { type: "local" });
 
-  // MC_create_race (#5181): create() checks the plan-directory names before its awaits and its
+  // #5181: create() checks the plan-directory names before its awaits and its
   // registration write does not re-check them, so two creates of one name in same-basename
   // projects both register (a local runtime has no checkout directory to collide on).
   describe("create re-checks the plan-directory names when it registers (#5181)", () => {
@@ -166,7 +165,7 @@ describe("plan storage (formal/plan-storage)", () => {
     });
   });
 
-  // MC_fork_race (#5175): fork() copies the plan before its registration write; the loser of two
+  // #5175: fork() copies the plan before its registration write; the loser of two
   // forks to one name keeps its copy (copiedPlanPath := undefined), which overwrote the winner's
   // live plan.
   describe("a fork that loses the name leaves the winner's plan alone (#5175)", () => {
@@ -223,7 +222,7 @@ describe("plan storage (formal/plan-storage)", () => {
     });
   });
 
-  // MC_rename_race: rename() checks the new name before its awaits, its config write does not
+  // rename() checks the new name before its awaits, its config write does not
   // re-check it, and movePlanFile's `mv` overwrites the target. A create that takes the name in
   // between keeps a row whose plan the rename then replaces.
   describe("a rename onto a name a concurrent create took leaves that workspace's plan alone", () => {
@@ -369,7 +368,7 @@ describe("plan storage (formal/plan-storage)", () => {
     });
   });
 
-  // MC_seeded_clear: once two live rows share one plan path (the races above, #5174, #5180), a
+  // Once two live rows share one plan path (the races above, #5174, #5180), a
   // removal keeps the path (its sharing guard) but a full clear deletes it unguarded.
   describe("a full clear never deletes another live workspace's plan", () => {
     const seedSharedRows = async (root: string) => {
@@ -378,7 +377,7 @@ describe("plan storage (formal/plan-storage)", () => {
       return writePlan(root, "twin", "# A's live plan\n");
     };
 
-    // Both entry points delete the plan through deletePlanFilesForWorkspace (the model's clear).
+    // Both entry points delete the plan through deletePlanFilesForWorkspace.
     const clearKeepsOtherPlan = (clear: () => ReturnType<WorkspaceService["truncateHistory"]>) =>
       withTempMuxRoot(async (root) => {
         const twinPlan = await seedSharedRows(root);
@@ -418,7 +417,7 @@ describe("plan storage (formal/plan-storage)", () => {
     });
   });
 
-  // MC_alias (#5180): sharesPlanStorage compares raw SSH host strings. With no ssh_config entry
+  // #5180: sharesPlanStorage compares raw SSH host strings. With no ssh_config entry
   // for the host, `box` and `<current user>@box` are one endpoint and one remote home, so one
   // ~/.mux/plans directory, yet the guards treat them as separate storage.
   describe("sharesPlanStorage compares SSH endpoints, not host spellings (#5180)", () => {
@@ -461,7 +460,7 @@ describe("plan storage (formal/plan-storage)", () => {
     });
   });
 
-  // MC_two_installs (#5174): an SSH runtime keeps plans in ~/.mux on the host whatever the local
+  // #5174: an SSH runtime keeps plans in ~/.mux on the host whatever the local
   // installation, and every guard reads only its own installation's config. Two installations with
   // the same project on one host get distinct remote checkouts (distinct srcBaseDirs) but one plan
   // path, and a clear in one deletes the other's live plan.
@@ -546,9 +545,9 @@ describe("plan storage (formal/plan-storage)", () => {
   });
 });
 
-// NoBlockedRead: sendMessage awaits FileChangeTracker.getChangedAttachments (agentSession), which
-// stats each tracked path and readFile()s it when its mtime moved. A FIFO at a tracked path (the
-// plan file, or any file the agent read) has no writer, so that read never returns.
+// sendMessage awaits FileChangeTracker.getChangedAttachments (agentSession), which stats each
+// tracked path and readFile()s it when its mtime moved. A FIFO at a tracked path (the plan file, or
+// any file the agent read) has no writer, so that read never returns.
 // POSIX only: Windows has no mkfifo.
 describe.skipIf(process.platform === "win32")(
   "send-path change detection never blocks on a non-regular file",

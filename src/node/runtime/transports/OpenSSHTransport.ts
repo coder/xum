@@ -120,7 +120,7 @@ export class OpenSSHTransport implements SSHTransport {
       process,
       onExit: (exitCode, stderr) => {
         if (this.isConnectionFailure(exitCode, stderr)) {
-          // F3 (formal/ssh-pool, MC_openssh_fixed): ssh exits 255 both when the connection
+          // ssh exits 255 both when the connection
           // fails and when the remote command itself exits 255 (a nested `ssh` that is
           // refused, `exit(-1)`), and the two look the same here. Ask for a re-probe instead
           // of a backoff: only the probe can tell, and its failure sets the backoff and the

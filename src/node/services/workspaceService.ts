@@ -4400,7 +4400,7 @@ export class WorkspaceService
     // unarchive.
     await this.mcpServerManager?.stopServers(workspaceId);
 
-    // B3: archiveUnlocked already stopped this workspace's background processes before its hooks
+    // archiveUnlocked already stopped this workspace's background processes before its hooks
     // and keeps the workspace sealed. A foreground command of the stream stopped above whose
     // migration the seal refused meanwhile is still being killed: cleanup() waits for it (and
     // stops anything else), so it cannot outlive the checkout. Same order as removal: stream
@@ -7664,7 +7664,7 @@ export class WorkspaceService
       // disposal at scope exit (after deregistration or its rollback) is safe
       // since a late renewal of a retained terminal marker is meaningless.
       using _tombstoneLease = startRemovalTombstoneLease(this.config.rootDir, workspaceId);
-      // #4967, B2: background cleanup() below refuses new fg→bg migrations and background spawns
+      // #4967: background cleanup() below refuses new fg→bg migrations and background spawns
       // only while it runs, and the checkout is deleted after it returns. Keep them refused until
       // this removal settles: a failed removal keeps the workspace, which can then background
       // commands again.
@@ -8990,7 +8990,7 @@ export class WorkspaceService
   }
 
   /**
-   * Whether this workspace's heartbeat is unset or disabled now (formal/workspace-goals G2, G2b).
+   * Whether this workspace's heartbeat is unset or disabled now.
    * HeartbeatService checks eligibility before its dispatcher's awaits, and a busy firing then
    * waits in the session queue for a tool or turn boundary, so the heartbeat can be turned off
    * before its turn starts. Reads config, not process memory, so a change made by another backend
@@ -9003,7 +9003,7 @@ export class WorkspaceService
   }
 
   /**
-   * Drop a heartbeat queued behind a busy turn once the heartbeat is turned off (G2): the model can
+   * Drop a heartbeat queued behind a busy turn once the heartbeat is turned off: the model can
    * unset its own heartbeat mid-turn, and a tool-end heartbeat would otherwise soft-stop that turn
    * at its next tool boundary only to be refused at the drain. The queue mutation re-runs the
    * session's goal-advancement wake path (G4), so a goal continuation the heartbeat displaced is
@@ -12379,9 +12379,9 @@ export class WorkspaceService
         }
       }
 
-      // B3: archive stops this backend's own background processes (ARCHIVE_OWN_ACTIVITY_POLICY)
+      // Archive stops this backend's own background processes (ARCHIVE_OWN_ACTIVITY_POLICY)
       // before the hooks below stop the runtime and before any checkout deletion, and keeps new
-      // spawns and fg->bg migrations refused until it settles (B2: a spawn waiting for its
+      // spawns and fg->bg migrations refused until it settles (a spawn waiting for its
       // record name is pending, so cleanup() waits for it). A cleanup that throws fails the
       // archive in the catch below, before anything is persisted or deleted. Like a failing
       // hook, a failed archive leaves the processes stopped: recoverable, unlike a process
@@ -12512,7 +12512,7 @@ export class WorkspaceService
       }
 
       // Set when post-persistence teardown failed: the archive stays successful (archivedAt is
-      // durable), but the afterArchive hooks, which delete the checkout, are skipped (B3).
+      // durable), but the afterArchive hooks, which delete the checkout, are skipped.
       let liveActivityStopFailed = false;
       if (!needsSnapshotCapture) {
         try {
@@ -15594,9 +15594,9 @@ export class WorkspaceService
    * Revert the interrupted->running transition a manual resume committed when the task-attempt
    * fence refuses (or marks stale) its turn before the session ever saw it, e.g. a removal's
    * pendingRemoval marker landing between the reawaken and the fence. Without this the row stayed
-   * `running` with an owned attempt and no turn (finding L3, formal/task-lifecycle
-   * MC_L3_removal). restoreInterruptedTaskAfterResumeFailure only reverts a row that is still
-   * `running` under exactly `attemptId`, so a newer attempt, a Stop or a report is never touched.
+   * `running` with an owned attempt and no turn. restoreInterruptedTaskAfterResumeFailure only
+   * reverts a row that is still `running` under exactly `attemptId`, so a newer attempt, a Stop
+   * or a report is never touched.
    */
   private async restoreTaskAfterRefusedResume(
     workspaceId: string,
@@ -15618,12 +15618,11 @@ export class WorkspaceService
   }
 
   /**
-   * Send entry for idempotent sends (formal/composer-drafts/ComposerSends.tla, MCS_pr1a). A
-   * person's manual send gets its id here: the client's `options.sendId`, a re-send's own ids
-   * (held Retry), or a fresh one, so ID-less clients still get a stable id for held entries. The
-   * row that accepts the send carries the ids; HistoryService refuses a second row for a known
-   * id under its write lock. Automatic and synthetic sends carry none (their rows stay
-   * rollback-eligible).
+   * Send entry for idempotent sends. A person's manual send gets its id here: the client's
+   * `options.sendId`, a re-send's own ids (held Retry), or a fresh one, so ID-less clients still
+   * get a stable id for held entries. The row that accepts the send carries the ids; HistoryService
+   * refuses a second row for a known id under its write lock. Automatic and synthetic sends carry
+   * none (their rows stay rollback-eligible).
    */
   async sendMessage(
     workspaceId: string,
@@ -15655,7 +15654,7 @@ export class WorkspaceService
         : { id: `${MINTED_SEND_ID_PREFIX}${crypto.randomUUID()}`, digest, unpublished: true },
     ];
     const key = workspaceId.trim();
-    // A late arrival of an id this receiver answered "not accepted" (ComposerSends Register): the
+    // A late arrival of an id this receiver answered "not accepted": the
     // client shows its content again, so appending it now would duplicate it. Checked and the
     // ids registered as running in one synchronous block, so getSendStatus sees one or the other.
     const refused = this.refusedSendIds.get(key);
@@ -15685,7 +15684,7 @@ export class WorkspaceService
   }
 
   /**
-   * Receiver lookup for idempotent sends (ComposerSends Lookup), per id:
+   * Receiver lookup for idempotent sends, per id:
    * - "accepted": a readable history row carries the id with its payload digest;
    * - "pending": this process still runs, queues or holds it (it may still be accepted here);
    * - "not-accepted": this process is the receiver (`receiverId` absent or ours) and holds it
@@ -16193,7 +16192,7 @@ export class WorkspaceService
       // An idle session can still hold queued work: a report-decision hold (see
       // TurnAdmissionToken.resolveDispatch) leaves its entry queued with no turn running. A send
       // started directly here would run before that entry, so queue behind it; the queue then
-      // dispatches both in order (formal/message-queue, invariant UserOrder).
+      // dispatches both in order.
       const hasEarlierPreflight = sessionInvisiblePreflight.hasEarlierPreflight();
       const queuesBehindIdleQueue = !session.isBusy() && session.hasQueuedMessages();
       const shouldQueue =
@@ -16493,7 +16492,7 @@ export class WorkspaceService
       // Bind the obligation after the rescue above (a manual resume publishes a fresh attempt the
       // send must be admitted under — exactly that one) and before the session's admission awaits.
       // A refusal here never reaches the session, whose failure paths below restore the rescue,
-      // so restore it on this path too (L3).
+      // so restore it on this path too.
       {
         const admitted = admitTaskTurn(reawakenedAttemptId);
         const refusal: Result<void, SendMessageError> | undefined = !admitted.success
@@ -16893,7 +16892,7 @@ export class WorkspaceService
           ...(reawaken?.kind === "reawakened" ? { expectedAttemptId: reawaken.attemptId } : {}),
         });
         if (admission?.kind === "refused") {
-          // Same as sendMessage: a fence refusal never reaches the session, so restore here (L3).
+          // Same as sendMessage: a fence refusal never reaches the session, so restore here.
           if (resumedInterruptedTask) {
             await this.restoreTaskAfterRefusedResume(
               workspaceId,
@@ -18024,9 +18023,9 @@ export class WorkspaceService
    * Deletes the plan, and for local and container rows its legacy-by-id path. An SSH row's legacy
    * files are never deleted (#5174): the shared one may be another installation's plan, and both
    * stay for older builds. A full clear (`markMigrated`) first marks an SSH row migrated, under
-   * the migration lock, so no migration copies a legacy plan back in after the delete
-   * (PlanMigration.tla ClearRetire). Never undone: a delete that fails afterwards leaves the row
-   * migrated, which can only hide a legacy file, never revive a cleared plan.
+   * the migration lock, so no migration copies a legacy plan back in after the delete. Never
+   * undone: a delete that fails afterwards leaves the row migrated, which can only hide a legacy
+   * file, never revive a cleared plan.
    */
   private async deletePlanFilesOfMetadata(
     workspaceId: string,
@@ -21308,7 +21307,7 @@ export class WorkspaceService
    * Throws on failure so HeartbeatService can log and continue with the next workspace.
    *
    * A heartbeat unset or disabled after HeartbeatService's
-   * eligibility check (formal/workspace-goals G2b) starts nothing: its probe refuses it at every
+   * eligibility check starts nothing: its probe refuses it at every
    * delivery branch's admission gates, and the timeline records it as skipped. The timeline
    * records heartbeat.dispatched when the send is accepted (for a queued heartbeat, at its drain).
    * A slot that HeartbeatService reports stale (`slotStale`, a cadence edit after it fired) is
@@ -21476,7 +21475,7 @@ export class WorkspaceService
         const appendResult = await session.appendHeartbeatContextResetBoundary({
           boundaryText: HEARTBEAT_RESET_BOUNDARY_MESSAGE,
           pendingFollowUp: heartbeatRequest.followUp,
-          // Re-checked across the append's awaits, up to the boundary's publication (G2b).
+          // Re-checked across the append's awaits, up to the boundary's publication.
           heartbeatOff: heartbeatRequest.firingStale,
         });
         if (!appendResult.success) {
@@ -21621,7 +21620,7 @@ export class WorkspaceService
         yieldToQueuedMessages: true,
         // Re-checked at the enqueue point and again when the queue drains, so a heartbeat turned
         // off meanwhile (here, by another backend, or before dropQueuedHeartbeat ran) never
-        // starts (G2). A refusal at the drain re-runs the goal-advancement wake path (G4).
+        // starts. A refusal at the drain re-runs the goal-advancement wake path (G4).
         admissionStale: heartbeatRequest.firingStale,
         onAccepted: heartbeatRequest.onAccepted,
       }
@@ -21662,7 +21661,7 @@ export class WorkspaceService
         ...(whenBusy === "skip"
           ? { requireIdle: true }
           : { queueDedupeKey: HEARTBEAT_QUEUE_DEDUPE_KEY, yieldToQueuedMessages: true }),
-        // Turned off during the send's own awaits, or while queued on a busy race (G2, G2b).
+        // Turned off during the send's own awaits, or while queued on a busy race.
         admissionStale: heartbeatRequest.firingStale,
         onAccepted: heartbeatRequest.onAccepted,
       }

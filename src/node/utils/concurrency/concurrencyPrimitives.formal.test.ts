@@ -1,7 +1,6 @@
 /**
- * Deterministic regression tests for the violations the TLA+ models in formal/primitives/
- * found in the pre-handoff primitives (run formal/primitives/check.sh). Each test states the
- * contract the fixed code now keeps.
+ * Deterministic regression tests for the FIFO violations found in the pre-handoff primitives.
+ * Each test states the contract the fixed code now keeps.
  *
  * Only microtask order matters: `settle()` drains every queued microtask and nothing
  * depends on wall-clock time.
@@ -14,7 +13,7 @@ function settle(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-describe("AsyncSemaphore (formal/primitives/AsyncSemaphore.tla, AsyncSemaphore_fifo.cfg)", () => {
+describe("AsyncSemaphore", () => {
   // The docstring promises that further acquirers wait FIFO. When releaseSlot() freed the slot
   // and the woken waiter only re-checked in a later microtask, a caller in between took the slot
   // and the waiter re-queued at the TAIL; releaseSlot() now hands the slot to the waiter.
@@ -41,8 +40,8 @@ describe("AsyncSemaphore (formal/primitives/AsyncSemaphore.tla, AsyncSemaphore_f
   });
 });
 
-describe("AsyncMutex (formal/primitives/AsyncMutex.tla)", () => {
-  // AsyncMutex_fifo.cfg: same mechanism as above; release() now hands the lock to the waiter.
+describe("AsyncMutex", () => {
+  // Same mechanism as above: release() now hands the lock to the waiter.
   test("queued waiters get the lock in arrival order", async () => {
     const mutex = new AsyncMutex();
     const order: string[] = [];
@@ -64,8 +63,8 @@ describe("AsyncMutex (formal/primitives/AsyncMutex.tla)", () => {
     expect(order).toEqual(["first", "barger", "second"]);
   });
 
-  // AsyncMutex_double.cfg: without a per-handle released flag, disposing a handle twice cleared
-  // `locked` while the next holder still held the lock. A second dispose is now a no-op.
+  // Without a per-handle released flag, disposing a handle twice cleared `locked` while the next
+  // holder still held the lock. A second dispose is now a no-op.
   test("disposing a handle twice never frees a lock held by someone else", async () => {
     const mutex = new AsyncMutex();
     const first = await mutex.acquire();

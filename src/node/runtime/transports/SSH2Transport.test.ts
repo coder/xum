@@ -238,7 +238,7 @@ describe("SSH2 pool channel tracking (#4876)", () => {
 
 describe("SSH2 pool channel slots while a channel opens", () => {
   // The idle timer must see an exec or shell from the request on, not from ssh2's
-  // callback (formal/ssh-pool F2), and every way the open can end must free the slot.
+  // callback, and every way the open can end must free the slot.
   type OpenCallback = (err?: Error, stream?: FakeClientChannel) => void;
 
   function fakeEntry(open: (callback: OpenCallback) => void) {
