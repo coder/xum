@@ -2139,6 +2139,7 @@ test("artifact palette commands follow the experiment and pin the typed path", a
 test("plugin views get one palette entry each, for the selected workspace only", async () => {
   const pluginViews = {
     workspaceId: "w1",
+    generation: 0,
     views: [
       {
         pluginViewId: "0123456789abcdef/settings",
