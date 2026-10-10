@@ -470,6 +470,8 @@ jobs:
       - uses: ./.github/actions/setup-xum
       - run: ./scripts/generate-npm-shrinkwrap.sh
       - run: make build
+      # First-load JS budget (T3, #5971): reuses this build, so it adds no build.
+      - run: make check-first-load-js
       - run: make check-startup-imports-runtime
       - name: Pack npm package
         id: pack

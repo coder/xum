@@ -97,7 +97,7 @@ include fmt.mk
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal bench bench-compare first-load-js bug-bash mcp-apps-e2e
+.PHONY: benchmark-terminal bench bench-compare first-load-js bug-bash mcp-apps-e2e check-first-load-js
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -770,6 +770,9 @@ bench-compare: node_modules/.installed src/version.ts ## Compare *.bench.ts resu
 
 first-load-js: ## Report first-load JS bytes of dist/ (run make build-renderer first)
 	@bun scripts/perf/firstLoadJs.ts dist
+
+check-first-load-js: ## Fail when first-load JS of dist/ is over scripts/perf/firstLoadBudget.json or loads a must-stay-lazy module (run make build-renderer first)
+	@bun scripts/perf/firstLoadJs.ts dist --budget scripts/perf/firstLoadBudget.json
 
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.

@@ -8,7 +8,11 @@
  * `xum server` sends those bytes. It skips files under 1 KiB, which are then sent raw.
  *
  * Usage: bun scripts/perf/firstLoadJs.ts [distDir] [--json] [--forbid <substring>]...
- * Exit codes: 0 ok, 1 a forbidden source is on the first load, 2 unusable input.
+ *   [--budget <file>]
+ * `--budget` (T3 PR8, `make check-first-load-js` in CI) also fails when the first load grows
+ * over the recorded values in that file: brotli by more than 2%, raw by more than 100 KiB.
+ * Exit codes: 0 ok, 1 a forbidden source is on the first load or a budget is exceeded,
+ * 2 unusable input.
  */
 import * as fs from "fs";
 import * as path from "path";
@@ -22,8 +26,27 @@ export const FIRST_LOAD_FORBIDDEN_SOURCES: readonly string[] = [
   "features/Settings/Sections/ProvidersSection",
   "node_modules/@shikijs/langs/",
   "node_modules/recharts/",
+  // Right-sidebar panels made lazy by PR7. Timeline and Artifacts stay eager: TimelineDialog
+  // and ArtifactsDialog import them statically.
   "features/desktop/DesktopPanel",
+  "components/InstructionsTab/InstructionsTab",
+  "components/OutputTab/OutputTab",
+  "features/RightSidebar/BrowserTab/BrowserTab",
+  "features/RightSidebar/DevToolsTab/DevToolsTab",
+  "features/RightSidebar/GoalTab",
+  "features/RightSidebar/Memory/MemoryTab",
+  "features/RightSidebar/Workflows/WorkflowsTab",
 ];
+
+// Growth allowed over the recorded budget before `--budget` fails. A smaller first load never
+// fails, so a PR that shrinks it needs no budget update.
+const BUDGET_BR_GROWTH = 0.02;
+const BUDGET_RAW_GROWTH_BYTES = 100 * 1024;
+
+interface FirstLoadBudget {
+  rawBytes: number;
+  brBytes: number;
+}
 
 function fail(message: string): never {
   console.error(`firstLoadJs: ${message}`);
@@ -101,6 +124,50 @@ function servedSize(file: string, extension: string, rawBytes: number): [number,
   return sibling?.isFile() ? [sibling.size, true] : [rawBytes, false];
 }
 
+function readBudget(file: string): FirstLoadBudget {
+  let budget: unknown;
+  try {
+    budget = JSON.parse(fs.readFileSync(file, "utf-8"));
+  } catch (error) {
+    fail(`cannot read budget ${file}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const isBytes = (value: unknown) => Number.isSafeInteger(value) && (value as number) > 0;
+  if (
+    typeof budget !== "object" ||
+    budget === null ||
+    !isBytes((budget as Partial<FirstLoadBudget>).rawBytes) ||
+    !isBytes((budget as Partial<FirstLoadBudget>).brBytes)
+  ) {
+    fail(`${file} must be a JSON object with positive integer rawBytes and brBytes`);
+  }
+  const { rawBytes, brBytes } = budget as FirstLoadBudget;
+  return { rawBytes, brBytes };
+}
+
+/** Compares totals with the budget file; over-budget messages say how to update the budget. */
+function checkBudget(
+  totals: FirstLoadBudget,
+  file: string
+): Array<{ over: boolean; text: string }> {
+  const budget = readBudget(file);
+  const checks = [
+    ["brBytes", "brotli", Math.floor(budget.brBytes * (1 + BUDGET_BR_GROWTH)), "+2%"],
+    ["rawBytes", "raw", budget.rawBytes + BUDGET_RAW_GROWTH_BYTES, "+100 KiB"],
+  ] as const;
+  return checks.map(([key, name, limit, growth]) => {
+    const over = totals[key] > limit;
+    const limitText = `budget of ${limit} bytes (${key} ${budget[key]} in ${file}, ${growth})`;
+    return over
+      ? {
+          over,
+          text:
+            `first-load ${name} is ${totals[key]} bytes, over the ${limitText}. If this growth ` +
+            `is intended, the perf owner updates ${key} in ${file} in the PR that causes it.`,
+        }
+      : { over, text: `first-load ${name} ${totals[key]} bytes is within the ${limitText}` };
+  });
+}
+
 const KIB = new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 
 /** A right-aligned table cell; `*` marks a file served raw for lack of a precompressed sibling. */
@@ -111,11 +178,13 @@ function kib(bytes: number, precompressed = true): string {
 function main(argv: string[]): void {
   let distArg: string | undefined;
   let json = false;
+  let budgetFile: string | undefined;
   const patterns = [...FIRST_LOAD_FORBIDDEN_SOURCES];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--json") json = true;
     else if (arg === "--forbid" && /^[^-]/.test(argv[i + 1] ?? "")) patterns.push(argv[++i]);
+    else if (arg === "--budget" && /^[^-]/.test(argv[i + 1] ?? "")) budgetFile = argv[++i];
     else if (arg.startsWith("-") || distArg != null) fail(`bad or incomplete argument ${arg}`);
     else distArg = arg;
   }
@@ -162,10 +231,15 @@ function main(argv: string[]): void {
     }
   }
 
+  const budgetChecks = budgetFile == null ? [] : checkBudget(totals, budgetFile);
   for (const v of violations) {
     console.error(`forbidden on first load: ${v.file} has ${v.source} (matches "${v.pattern}")`);
   }
-  if (violations.length > 0) process.exit(1);
+  for (const check of budgetChecks) {
+    if (check.over) console.error(check.text);
+    else if (!json) console.log(check.text);
+  }
+  if (violations.length > 0 || budgetChecks.some((c) => c.over)) process.exit(1);
 }
 
 if (import.meta.main) {
