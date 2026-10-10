@@ -74,6 +74,8 @@ describe("TerminalTab", () => {
     expect(view.queryByTestId("terminal-view")).toBeNull();
   });
 
+  // React.lazy caches the resolved module, so this must be the first valid-tab render in the
+  // process: later renders mount TerminalView synchronously (e.g. under `--rerun-each`).
   test("mounts the terminal after its chunk loads, with the tab's session", async () => {
     const view = renderTab("terminal:session-7");
 
