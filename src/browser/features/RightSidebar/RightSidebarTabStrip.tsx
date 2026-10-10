@@ -169,7 +169,9 @@ const TabCloseButton: React.FC<{
   <button
     type="button"
     className={cn(
-      "text-muted hover:text-foreground absolute right-1 top-1/2 flex -translate-y-1/2 items-center justify-center rounded p-0.5 [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:min-w-11",
+      // Touch grows the X to a 44px target. Its fill would then paint a 44px grey square beside
+      // every unselected tab label, so touch keeps the larger target but drops the fill.
+      "text-muted hover:text-foreground absolute right-1 top-1/2 flex -translate-y-1/2 items-center justify-center rounded p-0.5 [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:min-w-11 [@media(pointer:coarse)]:bg-transparent",
       props.selected
         ? "bg-hover"
         : "bg-hover invisible group-focus-within:visible group-hover:visible [@media(pointer:coarse)]:visible"

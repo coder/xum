@@ -13,21 +13,7 @@
  */
 
 import React from "react";
-import {
-  AppWindow,
-  Brain,
-  BugPlay,
-  ChartColumn,
-  FileText,
-  GitCompare,
-  Globe,
-  ListTree,
-  Monitor,
-  ScrollText,
-  Target,
-  Workflow,
-  type LucideIcon,
-} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { ErrorBoundary } from "@/browser/components/ErrorBoundary/ErrorBoundary";
 import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 import { StatsContainer } from "@/browser/features/RightSidebar/StatsContainer";
@@ -39,6 +25,7 @@ import { ArtifactsPanel } from "@/browser/features/RightSidebar/ArtifactsTab/Art
 import type { GoalSnapshot, GoalStatus } from "@/common/types/goal";
 import type { ReviewNoteData } from "@/common/types/review";
 import { BASE_TAB_IDS, TAB_CONFIG, type BaseTabType, type TabConfig } from "./tabConfig";
+import { TAB_ICONS } from "./tabIcons";
 import {
   BrowserTabLabel,
   DebugTabLabel,
@@ -168,7 +155,6 @@ export interface TabRegistration extends TabConfig {
 
 const TAB_RENDERERS = {
   costs: {
-    Icon: ChartColumn,
     Label: ({ workspaceId }) => <StatsTabLabel workspaceId={workspaceId} />,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Stats tab">
@@ -177,7 +163,6 @@ const TAB_RENDERERS = {
     ),
   },
   review: {
-    Icon: GitCompare,
     Label: ({ reviewStats }) => <ReviewTabLabel reviewStats={reviewStats} />,
     renderPanel: (ctx) => (
       <ReviewPanel
@@ -197,12 +182,10 @@ const TAB_RENDERERS = {
     ),
   },
   instructions: {
-    Icon: FileText,
     Label: ({ workspaceId }) => <InstructionsTabLabel workspaceId={workspaceId} />,
     renderPanel: (ctx) => <InstructionsTab workspaceId={ctx.workspaceId} />,
   },
   goal: {
-    Icon: Target,
     Label: ({ workspaceId }) => <GoalTabLabel workspaceId={workspaceId} />,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Goal tab">
@@ -222,7 +205,6 @@ const TAB_RENDERERS = {
     ),
   },
   timeline: {
-    Icon: ListTree,
     Label: TimelineTabLabel,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Timeline tab">
@@ -231,7 +213,6 @@ const TAB_RENDERERS = {
     ),
   },
   artifacts: {
-    Icon: AppWindow,
     Label: ArtifactsTabLabel,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Artifacts tab">
@@ -244,12 +225,10 @@ const TAB_RENDERERS = {
     ),
   },
   memory: {
-    Icon: Brain,
     Label: MemoryTabLabel,
     renderPanel: (ctx) => <MemoryTab workspaceId={ctx.workspaceId} />,
   },
   workflows: {
-    Icon: Workflow,
     Label: ({ workspaceId }) => <WorkflowsTabLabel workspaceId={workspaceId} />,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Workflows tab">
@@ -258,7 +237,6 @@ const TAB_RENDERERS = {
     ),
   },
   desktop: {
-    Icon: Monitor,
     Label: DesktopTabLabel,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Desktop tab">
@@ -267,7 +245,6 @@ const TAB_RENDERERS = {
     ),
   },
   browser: {
-    Icon: Globe,
     Label: BrowserTabLabel,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Browser tab">
@@ -276,12 +253,10 @@ const TAB_RENDERERS = {
     ),
   },
   output: {
-    Icon: ScrollText,
     Label: OutputTabLabel,
     renderPanel: (ctx) => <OutputTab workspaceId={ctx.workspaceId} />,
   },
   debug: {
-    Icon: BugPlay,
     Label: DebugTabLabel,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Debug tab">
@@ -292,7 +267,6 @@ const TAB_RENDERERS = {
 } satisfies Record<
   BaseTabType,
   {
-    Icon: LucideIcon;
     Label: React.ComponentType<TabLabelContext>;
     renderPanel: (ctx: TabPanelContext) => React.ReactNode;
   }
@@ -300,5 +274,5 @@ const TAB_RENDERERS = {
 
 /** Public UI registry indexed by tab id. */
 export const TAB_REGISTRY: Record<BaseTabType, TabRegistration> = Object.fromEntries(
-  BASE_TAB_IDS.map((id) => [id, { ...TAB_CONFIG[id], ...TAB_RENDERERS[id] }])
+  BASE_TAB_IDS.map((id) => [id, { ...TAB_CONFIG[id], Icon: TAB_ICONS[id], ...TAB_RENDERERS[id] }])
 ) as Record<BaseTabType, TabRegistration>;
