@@ -173,6 +173,40 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
     }
   }, 90_000);
 
+  test("Run /init then an edit while the branches load sends nothing until the user presses Send", async () => {
+    const { view, cleanupDom, chat, held, create } = await openCreationViewWithHeldBranches({
+      showAgentsInitBanner: true,
+    });
+    try {
+      const runInit = await waitFor(
+        () => {
+          const button = view.container.querySelector<HTMLButtonElement>(
+            '[data-testid="agents-init-run"]'
+          );
+          if (!button) throw new Error("Run /init banner not shown");
+          return button;
+        },
+        { timeout: 10_000 }
+      );
+      fireEvent.click(runInit);
+      await chat.expectInputValue("/init");
+      await chat.typeWithoutSending("a prompt the user has not sent yet");
+
+      held.release();
+      await waitFor(() => expect(sendButton(view.container).disabled).toBe(false), {
+        timeout: 10_000,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(create).not.toHaveBeenCalled();
+      await chat.expectInputValue("a prompt the user has not sent yet");
+    } finally {
+      held.release();
+      held.spy.mockRestore();
+      create.mockRestore();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
   test("a local workspace can be sent while the branches are still loading", async () => {
     const { view, cleanupDom, chat, held, create } = await openCreationViewWithHeldBranches();
     try {
