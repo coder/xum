@@ -287,6 +287,13 @@ test("remote app popups and blob attachments retain isolation and close on disco
   remoteServer,
 }) => {
   await page.waitForFunction(() => Boolean(window.api?.remoteConnection));
+  // The local window shows itself late, on ready-to-show. Under Xvfb with no window manager,
+  // that show() takes focus from a remote popup, and the popup's clipboard write needs focus
+  // (#5993). Wait for it once here: it shows only once, so both popups below keep their focus.
+  const localWindow = await app.browserWindow(page);
+  await expect
+    .poll(() => localWindow.evaluate((window: BrowserWindow) => window.isVisible()))
+    .toBe(true);
   const base = remoteServer.url + "/@user/workspace/apps/xum/";
   const opened = app.waitForEvent("window");
   await page.evaluate((url) => window.api!.remoteConnection!.connect(url), base);
