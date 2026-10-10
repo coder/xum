@@ -13,7 +13,7 @@ import { historyWriteLockPath, removeSessionDirUnderMemoryLocks } from "./worksp
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { readFile, writeFile } from "node:fs/promises";
 import assert from "@/common/utils/assert";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import {
   ContinuousCompactionJournalSchema,
   type ContinuousCompactionJournal,
@@ -932,6 +932,50 @@ describe("continuous prefix prepareStep and journal", () => {
       expect(JSON.stringify(actual)).not.toContain("UI-only workflow content");
     }
   );
+
+  it("prefix replay honors a thinking-repair receipt on an empty kept row (#5886)", async () => {
+    const journal = journalFixture();
+    journal.preparation.modelString = "anthropic:claude-opus-5-5";
+    journal.preparation.effectiveThinkingLevel = "high";
+    const signed = createMuxMessage("signed", "assistant", "", undefined, [
+      {
+        type: "reasoning",
+        text: "removed thinking",
+        providerOptions: { anthropic: { signature: "sig-removed" } },
+      },
+      { type: "text", text: "kept answer" },
+    ]);
+    // A repaired turn that failed before output: commitPartial kept only its receipt.
+    const receiptOnly: MuxMessage = {
+      id: "repaired-no-output",
+      role: "assistant",
+      metadata: { anthropicThinkingReplay: "off" },
+      parts: [],
+    };
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("user-1", "user", "first"),
+      signed,
+      createMuxMessage("user-2", "user", "second"),
+      receiptOnly,
+      createMuxMessage("user-3", "user", "third"),
+    ];
+    const { deferLoadingToolNames: _deferred, ...preparation } = journal.preparation;
+    const expected = await assemblePromptPayload({
+      ...preparation,
+      workspaceId,
+      history: journal.prefixSourceRows,
+      systemMessage: "",
+      postCompactionAttachments: journal.postCompactionAttachments,
+    });
+    const actual = (await rebuildContinuousPrefix(journal, workspaceId)).filter(
+      (message) => message.role !== "system"
+    );
+    expect(actual).toEqual(expected.messages.filter((message) => message.role !== "system"));
+    const serialized = JSON.stringify(actual);
+    expect(serialized).toContain("kept answer");
+    expect(serialized).not.toContain("removed thinking");
+  });
 
   it("prefix replay keeps native tool search results as tool references (#5262)", async () => {
     const journal = journalFixture();

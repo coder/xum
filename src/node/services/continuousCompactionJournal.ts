@@ -82,6 +82,7 @@ export async function rebuildContinuousPrefix(
     ),
     workspaceId,
     messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
+    replayReceiptMessages: prepared.activeContextMessages,
     postCompactionAttachments: journal.postCompactionAttachments,
     deferLoadingToolNames: deferred,
   });
