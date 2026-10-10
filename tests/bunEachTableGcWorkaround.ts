@@ -31,18 +31,18 @@ if (Bun.version === AFFECTED_BUN_VERSION) {
   registrarPrototype.each = each;
 
   // An unexpected prototype shape must fail startup, not silently drop the protection.
+  // No `.only` entries: with CI set, Bun throws on any `.only` access, so this check
+  // would fail every CI run. CI tests cannot reach `.only.each` either.
   const registrars: Record<string, { each: unknown }> = {
     test,
     it,
     describe,
-    "test.only": test.only,
     "test.skip": test.skip,
     "test.todo": test.todo,
     "test.if(true)": test.if(true),
     "test.skipIf(false)": test.skipIf(false),
     "test.todoIf(false)": test.todoIf(false),
     "it.skipIf(false)": it.skipIf(false),
-    "describe.only": describe.only,
     "describe.skip": describe.skip,
     "describe.skipIf(false)": describe.skipIf(false),
   };
