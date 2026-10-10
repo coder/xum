@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { describe, it, expect, afterEach, mock, spyOn } from "bun:test";
 
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
-import { AIService } from "./aiService";
+import { AIService, type StreamMessageOptions } from "./aiService";
 import { discoverAvailableSubagentsForToolContext } from "./turnContextAssembler";
 import {
   normalizeAnthropicBaseURL,
@@ -44,7 +44,7 @@ import {
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
-import { asSchema, jsonSchema, tool, type LanguageModel, type Tool } from "ai";
+import { asSchema, generateText, jsonSchema, tool, type LanguageModel, type Tool } from "ai";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { ModelMessage } from "@/common/types/message";
 import { WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE } from "@/common/utils/workflowRunMessages";
@@ -1899,6 +1899,57 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       tokenBudget: true,
       memory: true,
     });
+  });
+
+  it("preserves the chat speed across unsupported attempts and later live changes", async () => {
+    using xumHome = new DisposableTempDir("ai-service-chat-speed-fallback");
+    const sourceModel = KNOWN_MODELS.SONNET.id;
+    const fallbackModel = KNOWN_MODELS.GPT.id;
+    await writeMainConfig(xumHome.path, {
+      modelFallbacks: { [sourceModel]: { models: [fallbackModel] } },
+    });
+    const metadata = createLocalWorkspaceMetadata("chat-speed-fallback", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      anthropic: { apiKey: "test-key" },
+      openai: { apiKey: "test-key", serviceTier: "priority" },
+    });
+    harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
+    const bodies: Array<{ service_tier?: string }> = [];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+      Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+        if (typeof init?.body !== "string") throw new Error("Expected serialized request body");
+        bodies.push(JSON.parse(init.body) as { service_tier?: string });
+        // Only inspect serialized requests; never contact a provider.
+        return Promise.resolve(new Response("{}", { status: 400 }));
+      }, globalThis.fetch)
+    );
+    try {
+      const holder: NonNullable<StreamMessageOptions["activeTurnThinkingOverride"]> = {};
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: sourceModel,
+        thinkingLevel: "off",
+        muxProviderOptions: { openai: { serviceTier: "default" } },
+        activeTurnThinkingOverride: holder,
+      });
+      expect(result.success).toBe(true);
+      const fallback = await harness.startStreamCalls[0].modelFallback!.prepare(fallbackModel);
+      if (!fallback.success) throw new Error("Expected prepared fallback");
+      const send = () =>
+        generateText({ model: fallback.data.model, prompt: "continue", maxRetries: 0 }).catch(
+          () => undefined
+        );
+      await send();
+      expect(bodies.at(-1)?.service_tier).toBe("default");
+      holder.serviceTier = "flex";
+      await send();
+      expect(bodies.at(-1)?.service_tier).toBe("flex");
+      expect(bodies).toHaveLength(2);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it("prepares fallback system context with the fallback model's hot memories", async () => {

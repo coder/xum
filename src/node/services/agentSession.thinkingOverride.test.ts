@@ -10,9 +10,6 @@ const MODEL = "anthropic:claude-sonnet-4-5";
 describe("AgentSession.setActiveTurnServiceTier", () => {
   it("isolates live speed picks, preserves thinking, and retires the pick with the turn", async () => {
     let activeA: StreamMessageOptions | undefined;
-    let aSession: {
-      setActiveTurnServiceTier: (tier: "default" | "ultrafast") => { accepted: boolean };
-    };
     const b = await createAgentSessionHarness({
       workspaceId: "speed-chat-b",
       aiServiceOverrides: {
@@ -55,7 +52,7 @@ describe("AgentSession.setActiveTurnServiceTier", () => {
         },
       },
     });
-    aSession = a.session;
+    const aSession = a.session;
     try {
       expect(a.session.setActiveTurnServiceTier("priority")).toEqual({ accepted: false });
       const sent = await a.session.sendMessage(

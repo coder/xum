@@ -1049,6 +1049,9 @@ export class TurnRequestBuilder {
     // Mode (plan|exec|compact) is derived from the selected agent definition.
     const effectiveMuxProviderOptions: MuxProviderOptions = muxProviderOptions ?? {};
     const userOpenAIWireFormat = effectiveMuxProviderOptions.openai?.wireFormat;
+    // A non-OpenAI attempt strips unsupported options from this mutable object.
+    // Preserve the chat's choice so an OpenAI fallback cannot re-inherit a global tier.
+    const userServiceTier = effectiveMuxProviderOptions.openai?.serviceTier;
 
     const resolveToolsIdentity = (
       raw: string,
@@ -1186,7 +1189,7 @@ export class TurnRequestBuilder {
           agentInitiated,
           workspaceId,
           providersConfig: providersConfigSnapshot,
-          getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier,
+          getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier ?? userServiceTier,
         }
       );
       if (options.recordTiming) {

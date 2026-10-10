@@ -1666,7 +1666,7 @@ export class ProviderModelFactory {
           namespace: string;
           option: string;
           value?: ServiceTier;
-          liveOverrides?: () => Record<string, unknown>;
+          liveOverrides?: () => Record<string, ServiceTier | undefined>;
         }
       | undefined;
     let anthropicFastModePinned = false;
@@ -2717,6 +2717,10 @@ export class ProviderModelFactory {
           }
 
           const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
+          // Apply the live pick after translating Copilot's public options; otherwise
+          // their stale tier would overwrite the new OpenAI-wire value.
+          const liveTierOverrides = serviceTierDefault?.liveOverrides;
+          if (serviceTierDefault) serviceTierDefault.liveOverrides = undefined;
           const providerOptionsNamespace = resolveProviderOptionsNamespaceKey(
             "openai",
             "github-copilot"
@@ -2743,6 +2747,7 @@ export class ProviderModelFactory {
                       openai: {
                         ...params.providerOptions?.openai,
                         ...params.providerOptions?.[providerOptionsNamespace],
+                        ...liveTierOverrides?.(),
                       },
                     },
                   }),

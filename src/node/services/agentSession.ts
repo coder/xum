@@ -2099,8 +2099,9 @@ export class AgentSession {
       return;
     }
 
+    const serviceTier = this.coordinator.thinkingOverride?.serviceTier;
     this.lastAutoRetryResumeRequest = {
-      options,
+      options: serviceTier != null ? { ...options, serviceTier } : options,
       ...(requestAssemblySnapshot ? { requestAssemblySnapshot } : {}),
       ...(contextBudgetRetried === true ? { contextBudgetRetried: true } : {}),
       ...(agentInitiated === true ? { agentInitiated: true } : {}),
@@ -10428,6 +10429,10 @@ export class AgentSession {
     const holder = this.coordinator.thinkingOverride;
     if (!holder) return { accepted: false };
     holder.serviceTier = serviceTier;
+    const retryRequest = this.lastAutoRetryResumeRequest;
+    if (retryRequest) {
+      retryRequest.options = { ...retryRequest.options, serviceTier };
+    }
     // Recovery/compaction may start a fresh request after this holder is retired.
     const context = this.activeStreamContext;
     if (context?.options) {
