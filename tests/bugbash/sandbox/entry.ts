@@ -8,13 +8,21 @@
  *
  * Before the job starts, it checks that the daemon runs on the launcher's host: the same kernel
  * (boot id) and the same files (a nonce that the launcher wrote into the staged copy).
+ *
+ * A model-driven job (BUGBASH_MODEL_DRIVEN=1) also needs the job's provider proxy socket, and it
+ * gets a TCP forwarder to it on 127.0.0.1 (inContainer.ts). The app AI stays the mock.
  */
 import { spawn } from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import { writeExport } from "./exportStream";
+import { forwardToProxy, inSandbox, modelDrivenSandbox } from "./inContainer";
 
-assertInSandbox(); // first: on a host, kill(-1) below hits every process of this user
+// First: on a host, kill(-1) below hits every process of this user.
+if (!inSandbox()) {
+  console.error("sandbox entry: not in the bug-bash sandbox, so it refuses to run");
+  process.exit(2);
+}
 
 const args = process.argv.slice(2);
 if (args[0] !== "--export" || args[2] !== "--" || args.length < 4) {
@@ -34,6 +42,13 @@ if (boot !== process.env.BUGBASH_HOST_BOOT || nonce !== process.env.BUGBASH_HOST
   process.exit(2);
 }
 const [command, ...commandArgs] = args.slice(3);
+if (process.env.BUGBASH_MODEL_DRIVEN === "1") {
+  if (!modelDrivenSandbox()) {
+    console.error("sandbox entry: a model-driven job without its proxy socket does not run");
+    process.exit(2);
+  }
+  await forwardToProxy(); // ends with this process, after the export
+}
 
 /** Linux skips PID 1 and the caller. When this process exits, docker-init exits too. */
 function killAllOthers(): void {
@@ -90,15 +105,3 @@ job.on("error", (error) => {
 job.on("exit", (code, signal) =>
   done(code ?? (signal != null ? 128 + os.constants.signals[signal] : 1))
 );
-
-function assertInSandbox(): void {
-  const init = fs.readFileSync("/proc/1/cmdline", "utf8");
-  const ok =
-    process.env.BUGBASH_CONTAINER === "1" &&
-    init.startsWith("/sbin/docker-init\0") &&
-    fs.readdirSync("/sys/class/net").join() === "lo";
-  if (!ok) {
-    console.error("sandbox entry: not in the bug-bash sandbox, so it refuses to run");
-    process.exit(2);
-  }
-}

@@ -181,6 +181,8 @@ test.each([
   ["the proxy closes mid-call", "[fake:hang]", "close"],
   ["the upstream answers 529", "[fake:529]", ""],
   ["the response exceeds 32 MiB", "[fake:huge]", ""],
+  ["a delta lowers a count of message_start", "[fake:lowered]", ""],
+  ["a delta nulls a count", "[fake:nulled]", ""],
 ])("keeps the full reservation when %s (P7)", async (_name, marker, action) => {
   // Only the stall case may reach the deadline: the others must end without it.
   const deadlineMs = marker === "[fake:stall]" ? 300 : 60_000;
@@ -326,10 +328,53 @@ test("refuses a fifth concurrent call, and a call that does not fit the budget, 
   expect(poor.ledger.totals()).toMatchObject({ refused: 1, spentNanoUsd: 0 });
 });
 
+test("close() settles at once with calls stuck at every stage, and keeps their reservations", async () => {
+  const { socketPath, fake, ledger, proxy, recorded } = await setup();
+  // Upstream silent before its headers, a stream that never ends, and a client that never
+  // reads a big answer (the proxy waits on drain). Plus a connection that never sends headers.
+  const stream = { stream: true };
+  const stuck = ["[fake:stall]", "[fake:hang]"].map((text) => send(socketPath, body(text, stream)));
+  const unread = new Promise<void>((resolve) => {
+    const req = http.request(
+      { socketPath, method: "POST", path: PROXY_PATH, headers: HEADERS },
+      (res) => {
+        res.pause();
+        res.on("close", resolve);
+      }
+    );
+    req.on("error", () => resolve());
+    req.end(body("[fake:huge]", stream));
+  });
+  const idle = net.connect(socketPath);
+  idle.on("error", () => undefined);
+  while (fake.requests.length < 3 || proxy.stats().inFlight < 3) await Bun.sleep(5);
+  const started = Date.now();
+  await proxy.close();
+  expect(Date.now() - started).toBeLessThan(2_000); // CLOSE_MS (5 s) is the hard bound
+  const records = await recorded(3);
+  expect(records.map((record) => record.outcome)).toEqual(["kept", "kept", "kept"]);
+  const { reservedNanoUsd, spentNanoUsd } = ledger.totals();
+  expect(reservedNanoUsd).toBe(0);
+  expect(spentNanoUsd).toBe(records.reduce((sum, record) => sum + record.reservedNanoUsd!, 0));
+  await Promise.allSettled([...stuck, unread]);
+  idle.destroy();
+});
+
+test("refusals beyond the first 20 are counted per category, not logged", async () => {
+  const { socketPath, records, proxy } = await setup();
+  for (let i = 0; i < 30; i++) await send(socketPath, body("hi"), { path: `/x${i}` });
+  for (let i = 0; i < 5; i++) await send(socketPath, body("hi", { [`key${i}`]: 1 }));
+  expect(records).toHaveLength(20);
+  // The quoted key names are the container's: they never become categories.
+  expect(proxy.stats().refusedBy).toEqual({ "route: not allowed": 30, "body: key": 5 });
+  expect(proxy.stats().refused).toBe(35);
+});
+
 test("after close() the socket refuses connections and the upstream sees nothing new (P8)", async () => {
   const { socketPath, fake, proxy } = await setup();
   expect((await send(socketPath, body("hi"))).status).toBe(200);
   await proxy.close();
+  expect(fs.existsSync(socketPath)).toBe(false); // no socket file left in the job folder
   const after = await send(socketPath, body("hi")).then(
     () => "answered",
     () => "refused"
