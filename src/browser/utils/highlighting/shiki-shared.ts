@@ -12,7 +12,7 @@ export const SHIKI_LIGHT_THEME = "min-light";
  * backgrounds the app renders: `--color-code-bg` in light and flexoki-light, and the review
  * diff's green and red line tints over it (#5980). Same hue, lower lightness, chosen for at
  * least 4.6:1 on the darkest of those (the flexoki-light removed-line tint).
- * Keyed by theme name, so Shiki applies them only to min-light; min-dark keeps its colors.
+ * Keyed by theme name, so Shiki applies each map only to its theme.
  * Keys must be lowercase: Shiki lowercases a color before the lookup.
  */
 export const SHIKI_COLOR_REPLACEMENTS: Record<string, Record<string, string>> = {
@@ -25,6 +25,20 @@ export const SHIKI_COLOR_REPLACEMENTS: Record<string, Record<string, string>> = 
     "#cd3131": "#c02e2e", // error token
     "#316bcd": "#2d63be", // info token
     "#cd9731": "#82601f", // warning token
+  },
+  /**
+   * Lighter replacements for min-dark colors that miss WCAG AA on the dark code backgrounds:
+   * `--color-code-bg` in dark and flexoki-dark, the review diff's line tints and the review-range
+   * highlight over them (#5983). Same hue, higher lightness, chosen for at least 4.6:1 on the
+   * lightest of those (the flexoki-dark added line under the review highlight). The debug token
+   * also drops saturation, so it stays a muted purple instead of a bright magenta.
+   */
+  [SHIKI_DARK_THEME]: {
+    "#6b737c": "#90979f", // comment
+    "#1976d2": "#4b9bea", // markdown inline link
+    "#316bcd": "#6e97dc", // info token
+    "#cd3131": "#df7a7a", // error token
+    "#800080": "#c77dc7", // debug token
   },
 };
 
