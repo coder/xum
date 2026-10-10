@@ -230,6 +230,13 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
    * persists it instead of classifying (and billing) again.
    */
   autoModelRouting?: AutoModelRoutingRecord;
+  /**
+   * The diverted send already ran the plugin `message.send.before` hooks, so
+   * `text` is their result: the redispatch must not run them a second time.
+   */
+  pluginSendHooksApplied?: true;
+  /** Rewrite attribution of the diverted send, restored on the redispatched row. */
+  pluginRewrite?: PluginRewriteRecord;
 }
 
 /**
@@ -999,6 +1006,12 @@ export function hasTokenUsage(
   );
 }
 
+/** Attribution for a user message a plugin `message.send.before` hook rewrote. */
+export interface PluginRewriteRecord {
+  plugin: string;
+  originalText: string;
+}
+
 /**
  * Record of a model-fallback chain application. `requestedModel` is the model
  * originally asked for; `refusedModels` lists every model that refused, in
@@ -1162,6 +1175,12 @@ export interface MuxMetadata {
    * reconciliation.
    */
   taskTurnKind?: TaskTurnKind;
+  /**
+   * A plugin's `message.send.before` hook rewrote this user row: the row's text
+   * is the rewrite, and `originalText` is what was submitted. The original is
+   * display/edit-only and is never sent to the model.
+   */
+  pluginRewrite?: PluginRewriteRecord;
 
   /**
    * ACP-only correlation id propagated through stream events so prompt() can
@@ -1357,6 +1376,8 @@ export type DisplayedMessage =
       reviews?: ReviewNoteDataForDisplay[];
       /** Message sent from an artifact (from muxMetadata); drives the "from artifact" pill. */
       artifactInteraction?: ArtifactInteractionMetadata;
+      /** A plugin rewrote this message before it was saved (see MuxMetadata.pluginRewrite). */
+      pluginRewrite?: PluginRewriteRecord;
       /** Present when this synthetic turn is a background bash monitor wake-up. */
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];

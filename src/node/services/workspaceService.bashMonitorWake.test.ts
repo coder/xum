@@ -396,6 +396,28 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("a wake a plugin blocks is consumed instead of retried after idle", async () => {
+    const h = await createActiveWakeHarness();
+    const acknowledged = spyOn(h.backgroundProcessManager, "acknowledgeMonitorWake");
+    // A plugin message.send.before hook refuses this wake every time it is sent.
+    const hook = mock(() =>
+      Promise.resolve({ kind: "blocked" as const, pluginName: "guard", reason: "no wakes" })
+    );
+    h.aiService.runMessageSendBefore = hook;
+    try {
+      await h.addAttention(7);
+      expect(hook).toHaveBeenCalledTimes(1);
+      expect(h.requests).toHaveLength(0);
+      expect(acknowledged).toHaveBeenCalledTimes(2);
+      expect(h.internal.pendingBashMonitorWakeIdleWaitsByOwner.has(h.workspaceId)).toBe(false);
+
+      await h.reconciler.reconcile(h.workspaceId);
+      expect(hook).toHaveBeenCalledTimes(1);
+    } finally {
+      await h.finish();
+    }
+  });
+
   test("malformed wake metadata in history neither stalls nor consumes an outstanding wake", async () => {
     const h = await createActiveWakeHarness();
     try {

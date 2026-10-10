@@ -57,6 +57,7 @@ const NON_RETRYABLE_STREAM_ERRORS = [
   "agent_resolution", // Strict explicit-agent contract failure - deterministic, retrying reproduces it
   "reasoning_rejected", // In-stream repair failed or was unsafe; repeating the same input cannot recover
   "session_tape_replay", // The tape cannot be served; a retry is refused again
+  "plugin_blocked", // The plugin refuses the same message again
 ] as const satisfies readonly StreamErrorType[];
 
 const NON_RETRYABLE_STREAM_ERROR_SET = new Set<string>(NON_RETRYABLE_STREAM_ERRORS);
@@ -93,6 +94,7 @@ export function isNonRetryableSendError(error: { type: string }): boolean {
     case "context_budget_blocked":
     case "plan_review_feedback_edit_blocked": // Feedback rows never become editable
     case "session_tape_replay": // Replay mode refuses every turn until the process restarts
+    case "plugin_blocked": // The plugin refuses the same message again; never auto-retried
       return true;
     case "runtime_start_failed": // Runtime is starting - transient, worth retrying
     case "unknown":

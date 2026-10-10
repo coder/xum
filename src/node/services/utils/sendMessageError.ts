@@ -5,7 +5,10 @@ import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import type { StreamErrorMessage } from "@/common/orpc/types";
 import { PROVIDER_DISPLAY_NAMES, type ProviderName } from "@/common/constants/providers";
 import { createAssistantMessageId } from "./messageIds";
-import { formatSendMessageError as formatSendMessageErrorForDisplay } from "@/common/utils/errors/formatSendError";
+import {
+  formatPluginBlockedMessage,
+  formatSendMessageError as formatSendMessageErrorForDisplay,
+} from "@/common/utils/errors/formatSendError";
 
 const getProviderDisplayName = (provider: string): string =>
   PROVIDER_DISPLAY_NAMES[provider as ProviderName] ?? provider;
@@ -135,6 +138,11 @@ export const formatSendMessageError = (
       return { message: error.message, errorType: "unknown" };
     case "session_tape_replay":
       return { message: error.message, errorType: "session_tape_replay" };
+    case "plugin_blocked":
+      return {
+        message: formatPluginBlockedMessage(error.plugin, error.reason),
+        errorType: "plugin_blocked",
+      };
   }
 };
 

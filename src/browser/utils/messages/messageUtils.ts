@@ -18,7 +18,10 @@ export interface EditableUserMessageDraftContent {
 export function getEditableUserMessageDraftContent(
   message: Extract<DisplayedMessage, { type: "user" }>
 ): EditableUserMessageDraftContent {
-  const parsed = parseStagedAttachmentNotice(message.content);
+  // A plugin-rewritten message edits what the user submitted, not the plugin's rewrite.
+  const parsed = parseStagedAttachmentNotice(
+    message.pluginRewrite?.originalText ?? message.content
+  );
   return {
     text: stripRenderedReviews(parsed.text, message.reviews),
     stagedAttachments: displayStagedAttachmentsToChatAttachments(

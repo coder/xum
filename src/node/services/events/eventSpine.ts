@@ -109,10 +109,34 @@ export interface CompactionPrepareContext {
   readonly reason: "on-send" | "mid-stream" | "continuous-eager";
 }
 
+/**
+ * Why Xum is sending a message (plugin `message.send.before` input). Derived by
+ * AgentSession from the send's own provenance signals.
+ */
+export type MessageSendOrigin = "user" | "task" | "goal" | "plan-review" | "compaction" | "system";
+
+export interface MessageSendContext {
+  readonly workspaceId: string;
+  readonly origin: MessageSendOrigin;
+  /** Mutable: the text Xum saves and sends. Each middleware sees the previous one's rewrite. */
+  text: string;
+  /** Plugin that last rewrote `text` (attribution for the saved row). */
+  rewrittenBy?: string;
+  /** Set to refuse the send; the rest of the chain is skipped (first block wins). */
+  blocked?: { pluginName: string; reason: string };
+}
+
+/** Result of the plugin `message.send.before` chain for one message. */
+export type MessageSendHookOutcome =
+  | { kind: "none" }
+  | { kind: "rewritten"; text: string; pluginName: string }
+  | { kind: "blocked"; pluginName: string; reason: string };
+
 export interface WaterfallPointMap {
   "tool.execute": ToolExecuteContext;
   "request.assemble": RequestAssembleContext;
   "compaction.prepare": CompactionPrepareContext;
+  "message.send": MessageSendContext;
 }
 
 export type WaterfallNext = () => Promise<void>;
@@ -131,7 +155,7 @@ interface Registration {
   preservesToolset: boolean;
 }
 
-/** Duck-check for contexts that support blocking (currently tool.execute). */
+/** Duck-check for contexts that support blocking (tool.execute, message.send). */
 function isBlocked(ctx: unknown): boolean {
   return (
     typeof ctx === "object" &&

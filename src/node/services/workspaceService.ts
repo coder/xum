@@ -397,9 +397,11 @@ import type {
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type {
+  GoalContinuationRefusal,
   GoalContinuationRuntimeState,
   WorkspaceGoalService,
 } from "@/node/services/workspaceGoalService";
+import { formatPluginBlockedMessage } from "@/common/utils/errors/formatSendError";
 import { AutoModelRouter } from "@/node/services/autoModelRouter";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "@/node/services/timelineRecorder";
 import type {
@@ -3305,6 +3307,9 @@ export class WorkspaceService
       }
     }
     if (!result.success && !accepted) {
+      // A plugin refuses the same wake again: consume it instead of retrying after idle, which
+      // would loop at once on an idle workspace. The block's transcript error records it.
+      if (result.error.type === "plugin_blocked") return { outcome: "refused", result };
       if (!(await this.sessions.get(ownerWorkspaceId)?.isAutomaticSendBlocked())) {
         this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
       }
@@ -21059,7 +21064,7 @@ export class WorkspaceService
     goalId?: string;
     options: SendMessageOptions;
     admissionStale?: () => boolean;
-  }): Promise<boolean> {
+  }): Promise<boolean | GoalContinuationRefusal> {
     assert(input.workspaceId.trim().length > 0, "executeGoalContinuation requires workspaceId");
     assert(input.message.trim().length > 0, "executeGoalContinuation requires message");
 
@@ -21114,6 +21119,12 @@ export class WorkspaceService
         workspaceId: input.workspaceId,
         error: sendResult.error,
       });
+      // A plugin refuses the same continuation again: the goal pauses instead of re-requesting.
+      if (sendResult.error.type === "plugin_blocked") {
+        return {
+          refused: formatPluginBlockedMessage(sendResult.error.plugin, sendResult.error.reason),
+        };
+      }
       return false;
     }
     // Accepted, then canceled before streaming, yet the send returned Ok: no stream runs.

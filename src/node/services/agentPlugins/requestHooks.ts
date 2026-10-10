@@ -2,6 +2,7 @@ import * as path from "node:path";
 import type { Config } from "@/node/config";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import type { HistoryService } from "@/node/services/historyService";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { agentPluginHookService } from "./hookService";
 import { resolveAgentPluginsMcpContext } from "./mcpConfig";
@@ -12,6 +13,7 @@ export async function prepareWorkspaceRequestHooks(args: {
   metadata: WorkspaceMetadata;
   hostCheckoutRoot: string | null;
   journal: DurableEventJournal;
+  history: Pick<HistoryService, "getLastMessages" | "readPartial">;
 }): Promise<void> {
   const pluginContext = args.hostCheckoutRoot
     ? resolveAgentPluginsMcpContext(args.metadata, args.hostCheckoutRoot)
@@ -24,5 +26,6 @@ export async function prepareWorkspaceRequestHooks(args: {
     projectRoot: pluginContext?.projectRoot,
     projectKey: pluginContext?.projectKey,
     projectTrusted: isWorkspaceProjectTrusted(args.config, args.metadata),
+    history: args.history,
   });
 }

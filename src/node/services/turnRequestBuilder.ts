@@ -1698,6 +1698,7 @@ export class TurnRequestBuilder {
         metadata,
         hostCheckoutRoot,
         journal: this.dependencies.durableEventJournalFor(workspaceId),
+        history: this.dependencies.historyService,
       });
     }
 

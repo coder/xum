@@ -10,6 +10,8 @@
  *   ({
  *     "tool.execute.before": async (input) => ({ deny: "..." }),
  *     "request.assemble": (input) => ({ context: "..." }),
+ *     "message.send.before": (input) => ({ text: input.text.trim() }), // or { deny: "why" }
+ *     "turn.end": (input) => {}, // observes input.text; the output is ignored
  *   })
  *
  * Asyncify constraint (see the docs in src/node/services/ptc/quickjsRuntime.ts):
@@ -31,11 +33,13 @@ import assert from "node:assert";
 import { LEAST_PRIVILEGE_GRANTS, type CapabilityGrants } from "@/common/types/capabilityGrants";
 import type { AgentPluginManifest } from "./manifest";
 
-/** The three hook points supported by Tier-1 plugin hooks. */
+/** The hook points supported by Tier-1 plugin hooks (see hookService.ts for each contract). */
 export const PLUGIN_HOOK_POINTS = [
   "tool.execute.before",
   "tool.execute.after",
   "request.assemble",
+  "message.send.before",
+  "turn.end",
 ] as const;
 
 export type PluginHookPoint = (typeof PLUGIN_HOOK_POINTS)[number];

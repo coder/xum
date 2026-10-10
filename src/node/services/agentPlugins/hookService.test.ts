@@ -25,10 +25,13 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import {
   EventSpine,
   eventSpine,
+  type MessageSendContext,
+  type ObserverEventMap,
   type RequestAssembleContext,
   type ToolExecuteContext,
 } from "@/node/services/events/eventSpine";
 import { HistoryService } from "@/node/services/historyService";
+import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { SandboxHostService, type SandboxMount } from "@/node/services/sandbox/sandboxHostService";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
@@ -64,6 +67,9 @@ interface Harness {
   sandboxHost: SandboxHostService;
   journal: DurableEventJournal;
   service: AgentPluginHookService;
+  /** Real HistoryService (turn.end reads finished turns through it). */
+  history: HistoryService;
+  historyCleanup: () => Promise<void>;
   ensure(overrides?: { journal?: DurableEventJournal }): Promise<void>;
 }
 
@@ -89,6 +95,7 @@ async function createHarness(opts?: {
     // machine can never leak into the test.
     computeContainers: () => [{ path: container, scope: "global" }],
   });
+  const testHistory = await createTestHistoryService();
   const harness: Harness = {
     tmp,
     container,
@@ -97,6 +104,8 @@ async function createHarness(opts?: {
     sandboxHost,
     journal,
     service,
+    history: testHistory.historyService,
+    historyCleanup: testHistory.cleanup,
     ensure: (overrides) =>
       service.ensureWorkspaceHooks({
         workspaceId: WORKSPACE_ID,
@@ -104,6 +113,7 @@ async function createHarness(opts?: {
         journal: overrides?.journal ?? journal,
         xumHome: tmp.path,
         projectTrusted: false,
+        history: testHistory.historyService,
       }),
   };
   harnesses.push(harness);
@@ -114,6 +124,7 @@ afterEach(async () => {
   for (const harness of harnesses.splice(0, harnesses.length)) {
     await harness.service.disposeWorkspace(WORKSPACE_ID);
     harness.sandboxHost.disposeAll();
+    await harness.historyCleanup();
     harness.tmp[Symbol.dispose]();
   }
 });
@@ -309,6 +320,7 @@ describe("AgentPluginHookService", () => {
         sessionDir: harness.sessionDir,
         journal: harness.journal,
         xumHome: harness.tmp.path,
+        history: harness.history,
         projectRoot: project,
         projectTrusted: true,
       });
@@ -473,6 +485,7 @@ describe("AgentPluginHookService", () => {
           workspaceId: WORKSPACE_ID,
           config: h.config,
           aiService: h.aiService,
+          historyService: h.historyService,
           sessionUsageService: { recordHeadlessUsage: record },
           head: [createMuxMessage("head", "user", "Summarize the investigation")],
           receiptRows: [],
@@ -548,6 +561,7 @@ describe("AgentPluginHookService", () => {
             metadata,
             hostCheckoutRoot: h.config.rootDir,
             journal: sharedDurableEventJournal(path.join(h.config.sessionsDir, workspaceId)),
+            history: h.historyService,
           });
           return Ok(eventSpine.captureRequestAssembly(workspaceId));
         },
@@ -1035,6 +1049,7 @@ describe("replay determinism with hooks active", () => {
       journal: fixtureCtx.journal,
       xumHome: harness.tmp.path,
       projectTrusted: false,
+      history: harness.history,
     });
 
     // Assemble the request the way aiService does: hooks mutate the system
@@ -1125,5 +1140,279 @@ describe("epoch-based hook retirement", () => {
     const reensured = makeToolCtx("dangerous_tool", { a: 3 });
     await runTool(harness.spine, reensured);
     expect(blockedError(reensured)).toContain("blocked by hook");
+  });
+});
+
+/** Spine that keeps each async observer's promise, so a test can await turn.end deterministically. */
+class SettlingSpine extends EventSpine {
+  readonly pending: Array<Promise<unknown>> = [];
+  override subscribe<K extends keyof ObserverEventMap>(
+    event: K,
+    listener: (payload: ObserverEventMap[K]) => unknown
+  ): () => void {
+    return super.subscribe(event, (payload) => {
+      const result = listener(payload);
+      if (result instanceof Promise) this.pending.push(result);
+      return result;
+    });
+  }
+  async settle(): Promise<void> {
+    await Promise.all(this.pending.splice(0, this.pending.length));
+  }
+}
+
+function makeSendCtx(
+  text: string,
+  origin: MessageSendContext["origin"] = "user"
+): MessageSendContext {
+  return { workspaceId: WORKSPACE_ID, origin, text };
+}
+
+describe("message.send.before", () => {
+  test("plugins run in discovery order and each sees the previous plugin's text", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "a-signer",
+      `({ "message.send.before": (input) => ({ text: input.text + " [a:" + input.origin + "]" }) })`
+    );
+    await writeHookPlugin(
+      harness.container,
+      "b-shouter",
+      `({ "message.send.before": (input) => ({ text: input.text.toUpperCase() }) })`
+    );
+    await harness.ensure();
+
+    const ctx = makeSendCtx("fix the bug", "task");
+    await harness.spine.run("message.send", ctx);
+
+    expect(ctx.text).toBe("FIX THE BUG [A:TASK]");
+    expect(ctx.rewrittenBy).toBe("b-shouter");
+    expect(ctx.blocked).toBeUndefined();
+  });
+
+  test("a plugin retried after a failed load keeps its discovery position", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "a-signer",
+      `({ "message.send.before": (input) => ({ text: input.text + " [a]" }) })`
+    );
+    await writeHookPlugin(
+      harness.container,
+      "b-shouter",
+      `({ "message.send.before": (input) => ({ text: input.text.toUpperCase() }) })`
+    );
+
+    // First reconcile: only the earlier plugin's mount load fails.
+    const realWithPersistentMount = SandboxHostService.prototype.withPersistentMount.bind(
+      harness.sandboxHost
+    );
+    const mountSpy = spyOn(harness.sandboxHost, "withPersistentMount").mockImplementation(function <
+      T,
+    >(
+      options: Parameters<typeof realWithPersistentMount>[0],
+      fn: (mount: SandboxMount) => Promise<T>
+    ): Promise<T> {
+      return String(options.scopeKey).includes("a-signer")
+        ? Promise.reject(new Error("transient sandbox failure"))
+        : realWithPersistentMount(options, fn);
+    });
+    await harness.ensure();
+    mountSpy.mockRestore();
+
+    // Second reconcile retries "a-signer". It registers after "b-shouter" but
+    // must still run first: A appends, then B upper-cases A's text.
+    await harness.ensure();
+    const ctx = makeSendCtx("fix the bug");
+    await harness.spine.run("message.send", ctx);
+
+    expect(ctx.text).toBe("FIX THE BUG [A]");
+    expect(ctx.rewrittenBy).toBe("b-shouter");
+  });
+
+  test("the first block ends the chain and its reason is capped", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "a-guard",
+      `({ "message.send.before": (input) =>
+          input.text.includes("secret") ? { deny: "  " + "x".repeat(600) + "  " } : undefined })`
+    );
+    await writeHookPlugin(
+      harness.container,
+      "b-rewriter",
+      `({ "message.send.before": () => ({ text: "rewritten after a block" }) })`
+    );
+    await harness.ensure();
+
+    const blocked = makeSendCtx("my secret is 42");
+    await harness.spine.run("message.send", blocked);
+    expect(blocked.blocked).toEqual({ pluginName: "a-guard", reason: "x".repeat(500) });
+    expect(blocked.text).toBe("my secret is 42");
+    expect(blocked.rewrittenBy).toBeUndefined();
+
+    // Without a block the later plugin still runs.
+    const allowed = makeSendCtx("hello");
+    await harness.spine.run("message.send", allowed);
+    expect(allowed.text).toBe("rewritten after a block");
+    expect(allowed.rewrittenBy).toBe("b-rewriter");
+  });
+
+  test("throwing, empty, non-string and oversized outputs change nothing", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "a-thrower",
+      `({ "message.send.before": () => { throw new Error("boom"); } })`
+    );
+    await writeHookPlugin(
+      harness.container,
+      "b-empty",
+      `({ "message.send.before": () => ({ text: "  " }) })`
+    );
+    await writeHookPlugin(
+      harness.container,
+      "c-number",
+      `({ "message.send.before": () => ({ text: 42 }) })`
+    );
+    await writeHookPlugin(
+      harness.container,
+      "d-huge",
+      `({ "message.send.before": () => ({ text: "y".repeat(32001) }) })`
+    );
+    await writeHookPlugin(
+      harness.container,
+      "e-blank-block",
+      `({ "message.send.before": () => ({ deny: " " }) })`
+    );
+    await harness.ensure();
+
+    const ctx = makeSendCtx("keep me");
+    await harness.spine.run("message.send", ctx);
+    expect(ctx).toEqual(makeSendCtx("keep me"));
+  });
+
+  test("a hook that times out changes nothing", async () => {
+    const harness = await createHarness({ hookTimeoutMs: 250 });
+    await writeHookPlugin(
+      harness.container,
+      "spinner",
+      `({ "message.send.before": () => { while (true) {} } })`
+    );
+    await harness.ensure();
+
+    const ctx = makeSendCtx("keep me");
+    await harness.spine.run("message.send", ctx);
+    expect(ctx).toEqual(makeSendCtx("keep me"));
+  });
+});
+
+describe("turn.end", () => {
+  // turn.end records each input in guest state; message.send.before appends it as a JSON line.
+  const RECORDER = `({
+    "turn.end": (input) => {
+      globalThis.seen = (globalThis.seen || []).concat([
+        { workspaceId: input.workspaceId, messageId: input.messageId, text: input.text },
+      ]);
+      return { text: "turn.end output is ignored" };
+    },
+    "message.send.before": (input) => ({
+      text: input.text + "\\n" + JSON.stringify(globalThis.seen || []),
+    }),
+  })`;
+
+  /** What each recorder plugin saw, in discovery order. */
+  async function readSeen(harness: Harness): Promise<unknown[]> {
+    const ctx = makeSendCtx("read");
+    await harness.spine.run("message.send", ctx);
+    return ctx.text
+      .split("\n")
+      .slice(1)
+      .map((line) => JSON.parse(line) as unknown);
+  }
+
+  test("each finished turn delivers its last reply text, capped, or null when none was saved", async () => {
+    const spine = new SettlingSpine();
+    const harness = await createHarness({ spine });
+    await writeHookPlugin(harness.container, "recorder", RECORDER);
+    await harness.ensure();
+
+    const reply = createMuxMessage("assistant-1", "assistant", "");
+    reply.parts = [
+      { type: "text", text: "Let me check." },
+      {
+        type: "dynamic-tool",
+        toolCallId: "call-1",
+        toolName: "bash",
+        state: "output-available",
+        input: { script: "ls" },
+        output: { success: true },
+      },
+      { type: "text", text: "Done" },
+      { type: "text", text: "z".repeat(20_000) },
+    ];
+    for (const row of [createMuxMessage("user-1", "user", "Do it"), reply]) {
+      expect((await harness.history.appendToHistory(WORKSPACE_ID, row)).success).toBe(true);
+    }
+
+    spine.emit("stream.end", { workspaceId: WORKSPACE_ID, messageId: "assistant-1" });
+    // No row for this stream (for example an abort before any text).
+    spine.emit("stream.end", { workspaceId: WORKSPACE_ID, messageId: "assistant-missing" });
+    // Another workspace's turn is not delivered.
+    spine.emit("stream.end", { workspaceId: "other-workspace", messageId: "assistant-1" });
+    await spine.settle();
+
+    expect(await readSeen(harness)).toEqual([
+      [
+        {
+          workspaceId: WORKSPACE_ID,
+          messageId: "assistant-1",
+          text: ("Done" + "z".repeat(20_000)).slice(0, 16 * 1024),
+        },
+        { workspaceId: WORKSPACE_ID, messageId: "assistant-missing", text: null },
+      ],
+    ]);
+  });
+
+  test("an interrupted turn delivers the partial reply that is not committed yet", async () => {
+    const spine = new SettlingSpine();
+    const harness = await createHarness({ spine });
+    await writeHookPlugin(harness.container, "recorder", RECORDER);
+    await harness.ensure();
+    // Escape after text streamed: stream.end fires before the partial is committed.
+    const partial = createMuxMessage("assistant-3", "assistant", "Half an answer");
+    expect((await harness.history.writePartial(WORKSPACE_ID, partial)).success).toBe(true);
+
+    spine.emit("stream.end", { workspaceId: WORKSPACE_ID, messageId: "assistant-3" });
+    await spine.settle();
+
+    expect(await readSeen(harness)).toEqual([
+      [{ workspaceId: WORKSPACE_ID, messageId: "assistant-3", text: "Half an answer" }],
+    ]);
+  });
+
+  test("history is read once per finished turn for all plugins", async () => {
+    const spine = new SettlingSpine();
+    const harness = await createHarness({ spine });
+    await writeHookPlugin(harness.container, "a-recorder", RECORDER);
+    await writeHookPlugin(harness.container, "b-recorder", RECORDER);
+    await harness.ensure();
+    expect(
+      (
+        await harness.history.appendToHistory(
+          WORKSPACE_ID,
+          createMuxMessage("assistant-2", "assistant", "All set.")
+        )
+      ).success
+    ).toBe(true);
+    const reads = spyOn(harness.history, "getLastMessages");
+
+    spine.emit("stream.end", { workspaceId: WORKSPACE_ID, messageId: "assistant-2" });
+    await spine.settle();
+
+    expect(reads).toHaveBeenCalledTimes(1);
+    const seen = { workspaceId: WORKSPACE_ID, messageId: "assistant-2", text: "All set." };
+    expect(await readSeen(harness)).toEqual([[seen], [seen]]);
   });
 });

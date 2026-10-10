@@ -9,7 +9,7 @@ import { createTestHistoryService } from "./testHistoryService";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
-import { WorkspaceGoalService } from "./workspaceGoalService";
+import { WorkspaceGoalService, type GoalContinuationRuntimeBridge } from "./workspaceGoalService";
 import { IdleDispatcher } from "./idleDispatcher";
 import { waitForCondition } from "./testDispatchHelpers";
 import { Err, Ok } from "@/common/types/result";
@@ -256,7 +256,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
             return sendResultKind === "ok" ? Ok(undefined) : Err(error);
           }
         );
-        const settled: boolean[] = [];
+        const settled: Array<Awaited<ReturnType<typeof service.executeGoalContinuation>>> = [];
         const dispatcher = new IdleDispatcher();
         unregister = goalService.registerGoalContinuationConsumer(dispatcher, {
           hasActiveDescendantTasks: () => false,
@@ -968,7 +968,11 @@ describe("automatic goal turns whose selected agent is unavailable (#5402)", () 
     await selectAgent(selectedAgentId);
     const executed: Array<{ kind: string | undefined; options: SendMessageOptions }> = [];
     const skipped: string[] = [];
-    const goalService = (options?: { suppressKickoffContinuation?: boolean }) => {
+    const goalService = (options?: {
+      suppressKickoffContinuation?: boolean;
+      /** Runs instead of only recording the dispatch. */
+      execute?: GoalContinuationRuntimeBridge["executeGoalContinuation"];
+    }) => {
       const goals = new WorkspaceGoalService(
         config,
         historyService,
@@ -987,7 +991,7 @@ describe("automatic goal turns whose selected agent is unavailable (#5402)", () 
         getRuntimeState: (id) => service.getGoalContinuationRuntimeState(id),
         executeGoalContinuation: (input) => {
           executed.push({ kind: input.kind, options: input.options });
-          return Promise.resolve(true);
+          return options?.execute?.(input) ?? Promise.resolve(true);
         },
         getKickoffSendOptions: (id) => service.getGoalContinuationKickoffSendOptions(id),
         refuseUnavailableAgent: (id, options, isCurrent) =>
@@ -1060,6 +1064,20 @@ describe("automatic goal turns whose selected agent is unavailable (#5402)", () 
 
     expect(refusal).not.toBeNull();
     expect(replacedAtEmission).toEqual([false]);
+  });
+
+  test("a plugin-blocked continuation pauses the goal instead of re-requesting it", async () => {
+    const t = await setup("explore");
+    spyOn(t.service, "sendMessage").mockResolvedValue(
+      Err({ type: "plugin_blocked", plugin: "guard", reason: "no goal turns today" })
+    );
+    const goals = t.goalService({ execute: (input) => t.service.executeGoalContinuation(input) });
+
+    expect((await goals.setGoal({ workspaceId, objective: "Map callers" })).success).toBe(true);
+    await waitForCondition(() => t.skipped.length > 0, { timeoutMs: 3_000 });
+    expect((await goals.getGoal(workspaceId))?.status).toBe("paused");
+    expect(t.executed).toHaveLength(1);
+    expect(t.skipped).toEqual(["Plugin guard blocked this message: no goal turns today"]);
   });
 
   test("a hidden saved selection (explore) still continues", async () => {

@@ -21,7 +21,11 @@ import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { PreparedStreamMessage } from "./turnRequestBuilder";
-import type { RequestAssemblySnapshot } from "./events/eventSpine";
+import type {
+  MessageSendHookOutcome,
+  MessageSendOrigin,
+  RequestAssemblySnapshot,
+} from "./events/eventSpine";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import {
   isProviderEligibleMessage,
@@ -200,6 +204,7 @@ import {
   type MuxMessageMetadata,
   type MuxFilePart,
   type MuxMessage,
+  type PluginRewriteRecord,
   type StartupRetrySendOptions,
   type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
@@ -457,6 +462,48 @@ function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOp
   return streamOptions;
 }
 
+/**
+ * Origin a plugin `message.send.before` hook sees, derived from the send's own provenance
+ * (first match wins):
+ * - compaction: compaction-request metadata (manual /compact, idle, on-send, mid-stream).
+ * - plan-review: plan-review feedback metadata.
+ * - goal: goal-loop turns (goalKind / goalContinuation, sub-agent goal task turns).
+ * - task: TaskService task turns (taskTurnKind), delegated workspace turns, and automatic
+ *   agent-attributed rows that are not synthetic (sub-agent briefs).
+ * - system: every other synthetic or automatic send (auto-resume, compaction follow-ups,
+ *   bash-monitor wakes, workflow continuations, parent wakes with child reports, heartbeats).
+ * - user: everything else (typed messages, edits, queued user messages).
+ */
+function resolveMessageSendOrigin(
+  muxMetadata: unknown,
+  internal: SendMessageInternalOptions | undefined,
+  acceptanceOrigin: TurnAcceptanceOrigin
+): MessageSendOrigin {
+  if (isCompactionRequestMetadata(muxMetadata)) return "compaction";
+  if (carriesPlanReviewMetadata(muxMetadata)) return "plan-review";
+  const taskTurnKind = internal?.taskTurnKind;
+  if (
+    internal?.goalKind != null ||
+    internal?.goalContinuation === true ||
+    taskTurnKind === "goal_continuation" ||
+    taskTurnKind === "goal_budget_limit"
+  )
+    return "goal";
+  const metadataType =
+    typeof muxMetadata === "object" && muxMetadata !== null
+      ? (muxMetadata as { type?: unknown }).type
+      : undefined;
+  if (taskTurnKind != null || metadataType === "workspace-turn-task") return "task";
+  if (
+    acceptanceOrigin === "automatic" &&
+    internal?.agentInitiated === true &&
+    internal.synthetic !== true
+  )
+    return "task";
+  if (internal?.synthetic === true || acceptanceOrigin === "automatic") return "system";
+  return "user";
+}
+
 function getGoalStreamOriginKind(input: {
   isCompaction?: boolean;
   goalKind?: GoalSyntheticMessageKind;
@@ -467,6 +514,15 @@ function getGoalStreamOriginKind(input: {
   if (input.goalKind === GOAL_BUDGET_LIMIT_KIND) return "goal_budget_limit";
   if (input.agentInitiated === true) return "other";
   return "user";
+}
+
+/** Raw JSON boundary for a persisted follow-up's rewrite attribution; malformed means none. */
+function coercePluginRewrite(value: unknown): PluginRewriteRecord | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as { plugin?: unknown; originalText?: unknown };
+  return typeof record.plugin === "string" && typeof record.originalText === "string"
+    ? { plugin: record.plugin, originalText: record.originalText }
+    : undefined;
 }
 
 function coerceGoalSyntheticMessageKind(value: unknown): GoalSyntheticMessageKind | undefined {
@@ -802,6 +858,11 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   captureRequestAssemblySnapshot?(
     workspaceId: string
   ): Promise<Result<RequestAssemblySnapshot, SendMessageError>>;
+  /** Plugin message.send.before chain (AIService.runMessageSendBefore). Absent: no hooks. */
+  runMessageSendBefore?(
+    workspaceId: string,
+    input: { text: string; origin: MessageSendOrigin }
+  ): Promise<MessageSendHookOutcome>;
   resolveXumToolScopeForWorkspace?(
     metadata: WorkspaceMetadata,
     runtime: Runtime,
@@ -1010,6 +1071,12 @@ interface SendMessageInternalOptions {
    * under the history write lock at the trigger append (see checkCompactionFollowUpStillPending).
    */
   compactionFollowUpSummary?: MuxMessage;
+  /**
+   * This send's text already went through the plugin message.send.before hooks (an on-send
+   * compaction follow-up re-sending the diverted message): the hooks run once per message, so
+   * the session skips them and keeps the recorded rewrite attribution.
+   */
+  pluginSendHooksApplied?: { rewrite?: PluginRewriteRecord };
 }
 
 /**
@@ -4305,6 +4372,45 @@ export class AgentSession {
     }
   }
 
+  /**
+   * Run the plugin message.send.before chain once for this message. Compaction requests: the
+   * hooks see them, but Xum ignores block and rewrite (a refused or altered compaction prompt
+   * would break context management). A send that already ran the hooks (an on-send compaction
+   * follow-up) keeps its recorded result instead of running them again.
+   */
+  private async runPluginSendHooks(
+    message: string,
+    muxMetadata: unknown,
+    internal: SendMessageInternalOptions | undefined,
+    acceptanceOrigin: TurnAcceptanceOrigin
+  ): Promise<
+    | { kind: "send"; text: string; rewrite?: PluginRewriteRecord }
+    | { kind: "blocked"; pluginName: string; reason: string }
+  > {
+    if (internal?.pluginSendHooksApplied != null) {
+      return { kind: "send", text: message, rewrite: internal.pluginSendHooksApplied.rewrite };
+    }
+    if (this.aiService.runMessageSendBefore == null) {
+      return { kind: "send", text: message };
+    }
+    const origin = resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin);
+    const outcome = await this.aiService.runMessageSendBefore(this.workspaceId, {
+      text: message,
+      origin,
+    });
+    if (origin === "compaction" || outcome.kind === "none") {
+      return { kind: "send", text: message };
+    }
+    if (outcome.kind === "blocked") {
+      return outcome;
+    }
+    return {
+      kind: "send",
+      text: outcome.text,
+      rewrite: { plugin: outcome.pluginName, originalText: message },
+    };
+  }
+
   private async prepareMessage(
     message: string,
     options: (SendMessageOptions & { fileParts?: FilePart[] }) | undefined,
@@ -4596,6 +4702,52 @@ export class AgentSession {
       return refuseBeforeAcceptance(
         createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
       );
+
+    // Plugin message.send.before: before the pricing gate (its rejected-input row), routing,
+    // @file snapshots, edit truncation and every history write, so a block leaves history
+    // unchanged and every later step (and the saved row) uses the rewritten text.
+    const pluginSend = await this.runPluginSendHooks(
+      message,
+      options?.muxMetadata,
+      internal,
+      attempt.acceptanceOrigin
+    );
+    if (await cancelBeforeAcceptance()) {
+      return Ok(undefined);
+    }
+    // The hooks can take seconds: recheck admission before acting on their outcome. A send whose
+    // admission went stale meanwhile (for example a goal that became budget_limited) must get the
+    // stale refusal, not a permanent plugin block, or its caller settles the wrong outcome.
+    if (isAdmissionStale())
+      return refuseBeforeAcceptance(
+        createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+      );
+    if (pluginSend.kind === "blocked") {
+      // A client retry of an accepted send (same send ids after a lost response) runs the hooks
+      // again. Its block must not report failure for a message history already holds: the
+      // accepted row wins. History is read only on a block, so ordinary sends pay nothing; the
+      // publication's in-lock check stays the authority for every other outcome.
+      if (sendIdentities.length > 0) {
+        const known = await this.historyService.decideSendIds(this.workspaceId, sendIdentities);
+        if (known.success && this.settleKnownSendIds(known.data, attempt)?.success === true) {
+          return Ok(undefined);
+        }
+      }
+      const blockedError: SendMessageError = {
+        type: "plugin_blocked",
+        plugin: pluginSend.pluginName,
+        reason: pluginSend.reason,
+      };
+      // A direct user send shows the reason in its composer toast and keeps the draft. A queued
+      // or automatic send has no caller UI, so the reason goes into the transcript instead
+      // (queued user input is restored to the composer by completePreparation).
+      if (!isManualUserMessage || attempt.queued) {
+        this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(blockedError)));
+      }
+      return refuseBeforeAcceptance(blockedError);
+    }
+    const pluginRewrite = pluginSend.rewrite;
+    message = pluginSend.text;
 
     // Last-line-of-defence pricing gate: every dispatch path (initial sends,
     // sendQueuedMessages, dispatchPendingFollowUp,
@@ -5126,6 +5278,7 @@ export class AgentSession {
         // Persist the queue-entry authoring time so goal-safety reconciliation
         // can re-derive the pre-goal/post-goal distinction after a restart.
         ...(internal?.enqueuedAtMs != null ? { enqueuedAtMs: internal.enqueuedAtMs } : {}),
+        ...(pluginRewrite != null ? { pluginRewrite } : {}),
         // Auto-resume and other system-generated messages are synthetic + UI-visible
         ...(internal?.synthetic && {
           synthetic: true,
@@ -5252,6 +5405,9 @@ export class AgentSession {
         muxMetadata: typedMuxMetadata,
         // Pre-gate decision: the follow-up re-gates against the post-compaction context.
         autoModelRouting: routedOptions.autoModelRoutingRecord,
+        // `message` is already the hooks' result: the follow-up must not run them again.
+        pluginSendHooksApplied: true,
+        pluginRewrite,
         replacement: manualReplacement || automaticReplacement,
         cancelBeforeAcceptance,
       });
@@ -5283,6 +5439,12 @@ export class AgentSession {
             uiVisible: true,
           }
         );
+        // The generated compaction request is a compaction send too: plugin hooks see it, and
+        // Xum ignores their outcome (see runPluginSendHooks).
+        await this.aiService.runMessageSendBefore?.(this.workspaceId, {
+          text: autoCompactionRequest.messageText,
+          origin: "compaction",
+        });
 
         if (this.coordinator.admissionBlocked || isAdmissionStale())
           return refuseBeforeAcceptance(
@@ -12166,6 +12328,10 @@ export class AgentSession {
       admissionStale: followUpAdmissionStale,
       turnAdmission,
       compactionFollowUpSummary: lastMessage,
+      // The diverted send already ran the plugin hooks; `finalText` is their result.
+      ...(followUp.pluginSendHooksApplied === true
+        ? { pluginSendHooksApplied: { rewrite: coercePluginRewrite(followUp.pluginRewrite) } }
+        : {}),
     });
     if (!sendResult.success) {
       const heartbeatAfterSend = isHeartbeatFollowUp ? heartbeatState() : "on";
@@ -12224,9 +12390,11 @@ export class AgentSession {
       // ran was refused under the history lock. Removed record ids never come back, so leaving
       // the handoff on the summary would only fail again on every startup: drop it, then report
       // the failure like any other dispatch failure.
+      // A plugin refuses the same follow-up again on every retry, so it is dropped the same way.
       if (
-        sendResult.error.type === "unknown" &&
-        sendResult.error.raw === PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+        (sendResult.error.type === "unknown" &&
+          sendResult.error.raw === PLAN_REVIEW_FEEDBACK_STALE_MESSAGE) ||
+        sendResult.error.type === "plugin_blocked"
       ) {
         await this.clearPendingFollowUpFromSummary(lastMessage);
       }

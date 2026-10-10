@@ -56,7 +56,7 @@ describe("BashMonitorWakeReconciler", () => {
   let rows: BashMonitorRegistryRecord[];
   let deliveryState: BashMonitorWakeDeliveryState | undefined;
   let dispatches: BashMonitorWakeDispatch[];
-  let dispatchOutcome: "in-flight" | "deferred";
+  let dispatchOutcome: BashMonitorWakeDispatchOutcome;
   let acknowledged: Array<{ processId: string; matchedThroughOffset?: number }>;
   let removed: string[];
   let removedOwners: string[];
@@ -138,6 +138,20 @@ describe("BashMonitorWakeReconciler", () => {
     dispatchOutcome = "in-flight";
     await reconciler.reconcile(OWNER);
     expect(dispatches).toHaveLength(2);
+  });
+
+  test("a refused wake is consumed without a delivery and is not dispatched again", async () => {
+    live = [liveSnapshot()];
+    // A plugin message.send.before block refuses the same wake every time it is sent.
+    dispatchOutcome = "refused";
+
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
+    expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+
+    dispatchOutcome = "in-flight";
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
   });
 
   test("re-dispatches unchanged signals after a queued delivery is canceled", async () => {

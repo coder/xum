@@ -64,6 +64,7 @@ const STREAM_ERROR_TITLES: Record<StreamErrorType, string | null> = {
   agent_resolution: "Agent unavailable",
   reasoning_rejected: "Reasoning rejected",
   session_tape_replay: "Session replay refused",
+  plugin_blocked: "Blocked by plugin",
   unknown: "Stream error",
 };
 

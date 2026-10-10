@@ -429,7 +429,11 @@ function buildUserDisplayedMessages(options: {
       type: "user",
       id: message.id,
       historyId: message.id,
-      content: rawCommand ?? partsContent,
+      // A plugin rewrite replaced the saved text, so rawCommand (the submitted
+      // slash command) no longer matches what was sent. Show the sent text;
+      // the rewrite note shows what was submitted.
+      content:
+        message.metadata?.pluginRewrite != null ? partsContent : (rawCommand ?? partsContent),
       commandPrefix: muxMeta?.commandPrefix,
       fileParts: fileParts.length > 0 ? fileParts : undefined,
       historySequence,
@@ -448,6 +452,7 @@ function buildUserDisplayedMessages(options: {
       compactionRequest,
       reviews: muxMeta?.reviews,
       artifactInteraction: toArtifactInteractionDisplay(muxMeta?.artifactInteraction),
+      pluginRewrite: message.metadata?.pluginRewrite,
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
       // Only genuine machine rows get collapsed; corrupted metadata must not hide human input.
       contextBudgetWarning:
