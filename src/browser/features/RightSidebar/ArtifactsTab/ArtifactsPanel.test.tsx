@@ -982,6 +982,35 @@ describe("ArtifactsPanel", () => {
     ]);
   });
 
+  test("with only plugin views and nothing selected, the empty state shows under the picker", async () => {
+    fake = createFakeArtifactsApi(
+      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      {},
+      {
+        pluginViews: [
+          {
+            pluginViewId: "0123456789abcdef/settings",
+            title: "Review settings",
+            pluginName: "review-bot",
+            serverName: "settings",
+            serverKey: "plugin:0123456789abcdef:settings",
+            enabled: true,
+          },
+        ],
+      }
+    );
+    const view = render(<ArtifactsPanel workspaceId="ws-plugin-empty" />, {
+      wrapper: (props: { children: ReactNode }) => (
+        <ThemeProvider forcedTheme="dark">
+          <ApiWrapper>{props.children}</ApiWrapper>
+        </ThemeProvider>
+      ),
+    });
+    // The picker stays (once the plugin list arrives), so the listed view is one click away.
+    expect(await view.findByLabelText("Artifact")).toBeTruthy();
+    expect(view.container.textContent).toContain("No artifacts yet");
+  });
+
   test("a plugin view the fresh listing lacks (uninstalled, trust revoked) unmounts", async () => {
     const listed = {
       pluginViewId: "0123456789abcdef/settings",
