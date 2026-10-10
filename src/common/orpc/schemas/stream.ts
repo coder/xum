@@ -1,5 +1,6 @@
 import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { z } from "zod";
+import { stripClientPluginSendHookFields } from "@/common/utils/messages/pluginSendHookFields";
 import { MCPToolCallDisplaySchema } from "./mcp";
 import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
@@ -1032,7 +1033,9 @@ export const SendMessageOptionsSchema = z.object({
     .array(z.string())
     .optional()
     .meta({ description: "Tool names delegated back to ACP clients for this request" }),
-  muxMetadata: z.any().optional(), // Black box
+  // Black box, except two plugin-hook fields only Xum may set: a client-supplied
+  // "hooks already ran" flag on a compaction follow-up would skip message.send.before.
+  muxMetadata: z.any().transform(stripClientPluginSendHookFields).optional(),
   /**
    * When true, skip persisting AI settings (e.g., for one-shot or compaction sends).
    */
