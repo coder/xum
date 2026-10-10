@@ -239,9 +239,12 @@ async function appSwitchesCheck() {
     stdio: ["ignore", "ignore", "ignore"],
     env: { ...process.env, BUGBASH_APP_LOG: "/tmp/selfcheck-app.log" },
   });
+  // Subscribed at once: an app that dies during startup must end the check, not hang it.
+  const exited = new Promise((done) => app.once("exit", done));
+  const gone = () => app.exitCode != null || app.signalCode != null;
   try {
     let healthy = false;
-    for (let i = 0; i < 120 && !healthy; i++) {
+    for (let i = 0; i < 120 && !healthy && !gone(); i++) {
       await new Promise((done) => setTimeout(done, 1_000));
       healthy = await fetch(`http://127.0.0.1:${port}/health`).then(
         (r) => r.ok,
@@ -267,7 +270,9 @@ async function appSwitchesCheck() {
       "the app server has every kill switch",
       healthy && server != null && off.length === 0,
       !healthy
-        ? "app did not start"
+        ? gone()
+          ? `app exited during startup (${app.exitCode ?? app.signalCode})`
+          : "app did not start"
         : server == null
           ? "no server process"
           : off.length
@@ -275,8 +280,8 @@ async function appSwitchesCheck() {
             : "all three"
     );
   } finally {
-    app.kill("SIGTERM");
-    await new Promise((done) => app.once("exit", done));
+    if (!gone()) app.kill("SIGTERM");
+    await exited;
   }
 }
 await appSwitchesCheck();
