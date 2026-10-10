@@ -10,6 +10,10 @@
  *
  * The review diff's gutter (+ and − signs, line numbers) is checked in all four themes, on the
  * line tints and under the review-range highlight (#5985).
+ *
+ * The dark code stories check every syntax-highlighted token, and every min-dark replacement
+ * color, in dark and flexoki-dark on the code block, the diff tints and the review-range
+ * highlight (#5983).
  */
 
 import { expect, waitFor, within } from "@storybook/test";
@@ -26,6 +30,7 @@ import {
 } from "@/browser/stories/helpers/contrast";
 import {
   SHIKI_COLOR_REPLACEMENTS,
+  SHIKI_DARK_THEME,
   SHIKI_LIGHT_THEME,
 } from "@/browser/utils/highlighting/shiki-shared";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
@@ -405,6 +410,49 @@ const diffGutterStory = (theme: ThemeMode): AppStory => ({
     await expectDiffGutterReadable(canvasElement);
   },
 });
+
+/**
+ * Dark themes (#5983): every highlighted token in the code block and the review diff reaches
+ * 4.5:1, including tokens on a line under the review-range highlight. Every min-dark replacement
+ * color is also checked on each background a token really sits on, so a color this screen does
+ * not render (for example the debug token) is still proven.
+ */
+async function expectDarkCodeReadable(canvasElement: HTMLElement) {
+  await within(canvasElement).findByText("Renamed", { exact: false }, { timeout: 15_000 });
+  const tokens = await findTexts("highlighted token", 8, () => shikiTokens(canvasElement));
+  await waitFor(() => {
+    const highlighted = tokens.some((token) => {
+      const cell = token.element.closest<HTMLElement>("[data-diff-indicator] ~ span");
+      return cell != null && getComputedStyle(cell).backgroundImage !== "none";
+    });
+    if (!highlighted) throw new Error("no highlighted token on a review-highlighted line yet");
+  });
+  await expectReadable(tokens);
+
+  const replacements = Object.values(SHIKI_COLOR_REPLACEMENTS[SHIKI_DARK_THEME]);
+  await expectReadable(
+    tokens.flatMap((token) =>
+      replacements.map((color) => ({
+        element: token.element,
+        text: `${color} behind "${token.text}"`,
+        ratio: colorContrastOn(color, token.element),
+        label: "min-dark replacement",
+      }))
+    )
+  );
+}
+
+const darkCodeStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={() => setupCodeWorkspace("review", true)} />,
+  play: async ({ canvasElement }) => {
+    await expectDarkCodeReadable(canvasElement);
+  },
+});
+
+export const CodeDark = darkCodeStory("dark");
+export const CodeFlexokiDark = darkCodeStory("flexoki-dark");
 
 export const DiffGutterLight = diffGutterStory("light");
 export const DiffGutterFlexokiLight = diffGutterStory("flexoki-light");
