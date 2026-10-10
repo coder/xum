@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { launch } from "./launch";
+import { launch, ownerState, recover } from "./launch";
 import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
 
 // Each test runs the real build.sh in a throwaway git repo and a fake `docker` on PATH. The
@@ -26,6 +27,7 @@ case "$1" in
     if [ "$PULL" = orphan ]; then (trap '' TERM; exec sleep 60) >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; sleep 30; fi
     if [ "$PULL" = group ]; then sleep 60 >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; trap '' TERM; wait $!; fi
     if [ "$PULL" = swap ]; then rm -r "$SWAP"; ln -s / "$SWAP"; fi
+    if [ "$PULL" = fail ]; then echo "pull failed" >&2; exit 1; fi
     # Exits at once and leaves a member in its group (cleanup item 7).
     if [ "$PULL" = leave ]; then (trap '' TERM; exec sleep 60) >/dev/null 2>&1 & echo $! > "$bin/grandchild.pid"; fi ;;
   image) echo "{\\"org.xum.bugbash.inputs\\":\\"$LABEL\\"}" ;;
@@ -37,7 +39,7 @@ case "$1" in
       label=xum.bugbash.owner=*) o=\${a#label=xum.bugbash.owner=} ;;
       label=xum.bugbash.checkout=*) c=\${a#label=xum.bugbash.checkout=} ;;
     esac; done
-    awk -v n="$n" -v o="$o" -v c="$c" '$2==n && $3==o && $4==c {print $1}' "$bin/containers" ;;
+    awk -v n="$n" -v o="$o" -v c="$c" '(n=="" || $2==n) && (o=="" || $3==o) && (c=="" || $4==c) {print $1}' "$bin/containers" ;;
   # Like \`docker run --rm --cidfile\`: the create registers the container and writes its ID,
   # and the container ends on stdin EOF (the lifeline). Modes that keep the registry line model
   # a container the daemon has not removed yet, so only cleanup removes it.
@@ -60,7 +62,7 @@ case "$1" in
     for id in "$@"; do :; done
     awk -v id="$id" '$1==id {print "/" $2 "|" $3 "|" $4; f=1} END {exit !f}' "$bin/containers" ||
       { echo "Error response from daemon: No such container: $id" >&2; exit 1; } ;;
-  rm) shift 2; [ "\${RM-}" = slow ] && sleep 1; for id in "$@"; do unregister "$id"; done ;;
+  rm) shift 2; [ "\${RM-}" = slow ] && sleep 1; [ "\${RM-}" = noop ] && exit 0; for id in "$@"; do unregister "$id"; done ;;
   *) exit 9 ;;
 esac
 `;
@@ -516,20 +518,40 @@ test("C11: the stop hooks finish before the lifeline closes", async () => {
   expect(await s.cleanup()).toBe("removed");
 });
 
+test("C11: a stop hook that never settles still lets the lifeline close and cleanup finish", async () => {
+  fake({ IMAGES: "sha256:abc", RUN: "hang" });
+  const stop = new AbortController();
+  const logged: string[] = [];
+  const s = new Session(stop.signal, { root, hookMs: 100, log: (line) => logged.push(line) });
+  sessions.push(s);
+  await s.ensureImage();
+  s.own(JOB);
+  const job = s.runJob(["--rm", "img"], drain, 60_000);
+  job.catch(() => undefined);
+  while (!calls().includes("run ")) await Bun.sleep(20);
+  s.onStop(() => new Promise(() => undefined));
+  stop.abort("SIGTERM");
+  await job.catch(() => undefined);
+  expect(calls()).toContain("stdin closed");
+  expect(logged.some((line) => line.includes("did not settle in 100 ms"))).toBe(true);
+  expect(await s.cleanup()).toBe("removed");
+});
+
 // launch.ts, with the same fake docker: a checkout with a repro config and both mount sources.
 const ARGS = ["run", "--config", "e2e.config.ts", "--output", ".e2e/r"];
 const HOST_ENV = { BUGBASH_AI: "mock", ANTHROPIC_API_KEY: "sk-secret", BUGBASH_APP_LOG: "/x.log" };
 function launchIn(
   over: Record<string, string> = {},
   stop = new AbortController(),
-  env: Record<string, string> = HOST_ENV
+  env: Record<string, string> = HOST_ENV,
+  leftovers: string[] = []
 ) {
   const real = fs.realpathSync(root);
   fs.mkdirSync(path.join(real, "tests/bugbash"), { recursive: true });
   fs.writeFileSync(path.join(real, "tests/bugbash/e2e.config.ts"), "export default {}");
   for (const dir of ["dist", "node_modules"])
     fs.mkdirSync(path.join(real, dir), { recursive: true });
-  fs.writeFileSync(path.join(bin, "containers"), FOREIGN.join("\n") + "\n");
+  fs.writeFileSync(path.join(bin, "containers"), [...FOREIGN, ...leftovers].join("\n") + "\n");
   fake({ IMAGES: "sha256:abc", SWAP: path.join(real, "node_modules"), ...over });
   const cwd = path.join(real, "tests/bugbash");
   return launch(ARGS, { root: real, cwd, env, stop: stop.signal });
@@ -606,6 +628,231 @@ test("C8: a stop during cleanup does not cut `docker rm`; the stop decides the e
   expect(await pending.catch((e: unknown) => e)).toEqual(new Stopped("SIGTERM"));
   expectNothingLeft();
 }, 15_000);
+
+// Crash leftovers (#5882, plan PR C2). Owner labels are boot ID : PID namespace : PID : start.
+const procStart = (pid: number | string) => {
+  const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+  return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+};
+const self = () => ({
+  boot: fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(),
+  pidns: fs.readlinkSync("/proc/self/ns/pid").replace(/\D/g, ""),
+});
+/** A PID above the kernel's limit, so no process has it. */
+const NO_PID = Number(fs.readFileSync("/proc/sys/kernel/pid_max", "utf8")) + 1;
+function leftovers() {
+  const checkout = crypto
+    .createHash("sha256")
+    .update(fs.realpathSync(root))
+    .digest("hex")
+    .slice(0, 12);
+  const { boot, pidns } = self();
+  const id = (n: number) => n.toString(16).padStart(64, "0");
+  const name = (hex: string) => `xbb-${checkout.slice(0, 6)}-${hex}`;
+  const live = `${boot}:${pidns}:${process.pid}:${procStart(process.pid)}`;
+  const lines = {
+    dead: `${id(1)} ${name("aaaaa1")} ${boot}:${pidns}:${NO_PID}:1 ${checkout}`,
+    restarted: `${id(2)} ${name("aaaaa2")} ${boot}:${pidns}:${process.pid}:1 ${checkout}`,
+    live: `${id(3)} ${name("aaaaa3")} ${live} ${checkout}`,
+    otherPidns: `${id(4)} ${name("aaaaa4")} ${boot}:1:${NO_PID}:1 ${checkout}`,
+    otherBoot: `${id(5)} ${name("aaaaa5")} other-boot:${pidns}:${NO_PID}:1 ${checkout}`,
+    otherName: `${id(6)} xbb-other ${boot}:${pidns}:${NO_PID}:1 ${checkout}`,
+    otherCheckout: `${id(7)} ${name("aaaaa7")} ${boot}:${pidns}:${NO_PID}:1 ${"e".repeat(12)}`,
+  };
+  return { checkout, lines };
+}
+
+test("ownerState: dead, alive, or cannot tell", () => {
+  const { boot, pidns } = self();
+  expect(ownerState(`${boot}:${pidns}:${process.pid}:${procStart(process.pid)}`)).toBe("alive");
+  expect(ownerState(`${boot}:${pidns}:${NO_PID}:1`)).toBe("dead");
+  expect(ownerState(`${boot}:${pidns}:${process.pid}:1`)).toBe("dead"); // the PID was reused
+  for (const owner of [
+    `x:${pidns}:${NO_PID}:1`,
+    `${boot}:1:${NO_PID}:1`,
+    "garbage",
+    `${boot}:${pidns}:-1:1`,
+  ])
+    expect(ownerState(owner)).toBe("cannot tell");
+});
+
+test("C2: a launch lists the leftovers of its checkout and removes nothing", async () => {
+  const { lines } = leftovers();
+  const all = Object.values(lines);
+  const logged: string[] = [];
+  const error = spyOn(console, "error").mockImplementation(
+    (line: string) => void logged.push(line)
+  );
+  try {
+    expect(await launchIn({}, new AbortController(), HOST_ENV, all)).toBe(7);
+  } finally {
+    error.mockRestore();
+  }
+  const listed = logged.filter((line) => line.includes("leftover: "));
+  expect(
+    listed.map((line) => line.replace(/^sandbox leftover: (\S+) owner (.+?) \(.*$/, "$1 $2"))
+  ).toEqual(
+    [
+      lines.dead,
+      lines.restarted,
+      lines.live,
+      lines.otherPidns,
+      lines.otherBoot,
+      lines.otherName,
+    ].map(
+      (line, i) =>
+        `${line.split(" ")[1]} ${["dead", "dead", "alive", "cannot tell", "cannot tell", "dead"][i]}`
+    )
+  );
+  expect(registry().trim().split("\n")).toEqual([...FOREIGN, ...all]);
+});
+
+test("C2: recover removes only dead owners of this checkout with a job name, by ID", async () => {
+  const { lines } = leftovers();
+  fs.writeFileSync(path.join(bin, "containers"), Object.values(lines).join("\n") + "\n");
+  fake();
+  const real = fs.realpathSync(root);
+  const logged: string[] = [];
+  const o = { root: real, cwd: real, env: {}, stop: new AbortController().signal };
+  expect(await recover({ ...o, log: (line) => logged.push(line) })).toBe(0);
+  const left = [
+    lines.live,
+    lines.otherPidns,
+    lines.otherBoot,
+    lines.otherName,
+    lines.otherCheckout,
+  ];
+  expect(registry().trim().split("\n")).toEqual(left);
+  expect(logged[0]).toStartWith("recover: docker endpoint unix:///var/run/docker.sock");
+  // Removal is by ID only, after an inspect, and nothing is built or pulled.
+  const ids = [1, 2].map((n) => n.toString(16).padStart(64, "0"));
+  expect([...(calls().match(/^rm -f \w+/gm) ?? [])]).toEqual(ids.map((id) => `rm -f ${id}`));
+  expect(calls()).not.toMatch(/^(images|pull|image |run )/m);
+  expect(fs.readdirSync(tmp)).toEqual([]);
+});
+
+test("C2: recover reports a removal it cannot prove (exit 3)", async () => {
+  const { lines } = leftovers();
+  fs.writeFileSync(path.join(bin, "containers"), lines.dead + "\n");
+  fake({ RM: "noop" });
+  const real = fs.realpathSync(root);
+  const o = {
+    root: real,
+    cwd: real,
+    env: {},
+    stop: new AbortController().signal,
+    log: () => undefined,
+  };
+  expect(await recover(o)).toBe(3);
+});
+
+test("C2: a zombie launcher counts as dead", async () => {
+  // A handshake, not a delay: the child blocks on a FIFO, and the test releases it only after the
+  // parent shell has become `sleep 30` (which never reaps it). A timed child can exit while the
+  // shell still runs and be reaped before the exec on a loaded host.
+  const fifo = path.join(root, "release");
+  expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+  const parent = spawn("sh", ["-c", '(read _ < "$1") & echo $!; exec sleep 30', "sh", fifo], {
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  try {
+    const pid = Number(
+      await new Promise<string>((resolve) =>
+        parent.stdout.once("data", (d: Buffer) => resolve(d.toString()))
+      )
+    );
+    const comm = () => /\(([^)]*)\)/.exec(stat(parent.pid!))?.[1];
+    for (let i = 0; i < 500 && comm() !== "sleep"; i++) await Bun.sleep(10);
+    expect(comm()).toBe("sleep"); // bounded waits: no hang if a step never happens
+    // O_NONBLOCK: the open fails (ENXIO) instead of blocking while the child has not opened it.
+    let fd = -1;
+    for (let i = 0; i < 500 && fd < 0; i++) {
+      try {
+        fd = fs.openSync(fifo, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+      } catch {
+        await Bun.sleep(10);
+      }
+    }
+    expect(fd).toBeGreaterThanOrEqual(0);
+    fs.writeSync(fd, "go\n");
+    fs.closeSync(fd);
+    for (let i = 0; i < 500 && !stat(pid).includes(") Z "); i++) await Bun.sleep(10);
+    expect(stat(pid)).toContain(") Z ");
+    const { boot, pidns } = self();
+    expect(ownerState(`${boot}:${pidns}:${pid}:${procStart(pid)}`)).toBe("dead");
+  } finally {
+    parent.kill("SIGKILL");
+  }
+});
+
+test("C2: a launch lists the leftovers even when the image pull fails", async () => {
+  const { lines } = leftovers();
+  const logged: string[] = [];
+  const error = spyOn(console, "error").mockImplementation(
+    (line: string) => void logged.push(line)
+  );
+  try {
+    const result = await launchIn({ IMAGES: "", PULL: "fail" }, new AbortController(), HOST_ENV, [
+      lines.dead,
+    ]).catch((e: unknown) => e);
+    expect(result).toBeInstanceOf(Refusal);
+  } finally {
+    error.mockRestore();
+  }
+  expect(
+    logged.some((line) => line.includes(`leftover: ${lines.dead.split(" ")[1]} owner dead`))
+  ).toBe(true);
+});
+
+test("C2: recover refuses when a listed container cannot be inspected", async () => {
+  const { lines } = leftovers();
+  fs.writeFileSync(path.join(bin, "containers"), lines.dead + "\n");
+  fake({ INSPECT_RC: "1" });
+  const real = fs.realpathSync(root);
+  const o = {
+    root: real,
+    cwd: real,
+    env: {},
+    stop: new AbortController().signal,
+    log: () => undefined,
+  };
+  expect(await failure(recover(o))).toThrow(/docker container inspect: daemon down/);
+  expect(registry()).toBe(lines.dead + "\n");
+});
+
+test("C2: a stop during recover starts no further removal", async () => {
+  const { lines } = leftovers();
+  const second = lines.dead.replace(/^\w+/, "f".repeat(64)).replace("aaaaa1", "aaaaaf");
+  fs.writeFileSync(path.join(bin, "containers"), [lines.dead, second].join("\n") + "\n");
+  fake();
+  const real = fs.realpathSync(root);
+  const stop = new AbortController();
+  const log = (line: string) => line.endsWith(" removed") && stop.abort("SIGTERM");
+  const o = { root: real, cwd: real, env: {}, stop: stop.signal, log };
+  expect(await recover(o).catch((e: unknown) => e)).toEqual(new Stopped("SIGTERM"));
+  expect(registry()).toBe(second + "\n"); // the first removal finished, the second never started
+});
+
+test("C2: recover reports an unknown cleanup state (exit 3)", async () => {
+  fs.writeFileSync(path.join(bin, "containers"), "");
+  fake();
+  const real = fs.realpathSync(root);
+  const cleanup = spyOn(Session.prototype, "cleanup").mockResolvedValue(
+    "unknown: process groups 1 still run"
+  );
+  try {
+    const o = {
+      root: real,
+      cwd: real,
+      env: {},
+      stop: new AbortController().signal,
+      log: () => undefined,
+    };
+    expect(await recover(o)).toBe(3);
+  } finally {
+    cleanup.mockRestore();
+  }
+});
 
 test("a signal during the synchronous staging starts no container", async () => {
   const stop = new AbortController();

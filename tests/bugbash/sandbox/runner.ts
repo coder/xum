@@ -20,6 +20,8 @@ export const IMAGE = "ghcr.io/coder/xum-bugbash-sandbox";
 const KILL_AFTER_MS = 5_000;
 /** How long the `docker run` client gets to exit after its lifeline (stdin) closed. */
 const GRACE_MS = 60_000;
+/** How long one stop hook gets before the lifeline closes anyway: a hung hook must not block it. */
+const HOOK_MS = 10_000;
 /** A short option, or a flag that names, labels or tracks the container: runJob() sets those. */
 const CALLER_FLAG = /^(-[^-]|--(name|label|label-file|cidfile)(=|$))/;
 
@@ -67,6 +69,8 @@ export interface Job {
 }
 /** "none": the session owned no job, so no container can exist. */
 export type CleanupState = "none" | "removed" | `unknown: ${string}`;
+/** `docker container inspect` output: `/name|owner label|checkout label`. */
+const INSPECT = `{{.Name}}|{{index .Config.Labels "xum.bugbash.owner"}}|{{index .Config.Labels "xum.bugbash.checkout"}}`;
 /** The container name goes into a `name=^/…$` filter, which is a regex: no dots, no specials. */
 const CONTAINER_NAME = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
@@ -89,6 +93,7 @@ export class Session {
   #cleanup: Promise<CleanupState> | null = null;
   #owned: Job | null = null;
   readonly #graceMs: number;
+  readonly #hookMs: number;
   readonly #log: (line: string) => void;
   #hooks: (() => unknown)[] = [];
   /** The `docker run` client, once spawned. A stop never signals it: it closes its stdin. */
@@ -103,6 +108,7 @@ export class Session {
     options: {
       root?: string;
       graceMs?: number;
+      hookMs?: number;
       log?: (line: string) => void;
       /** Injection point: runner.test.ts records the group signals; production uses killGroup. */
       signalGroup?: (group: number, signal: NodeJS.Signals) => void;
@@ -111,6 +117,7 @@ export class Session {
     this.#signalGroup = options.signalGroup ?? killGroup;
     this.#root = options.root ?? ROOT;
     this.#graceMs = options.graceMs ?? GRACE_MS;
+    this.#hookMs = options.hookMs ?? HOOK_MS;
     this.#log = options.log ?? ((line) => console.error(`sandbox ${line}`));
     if (stop.aborted) this.#stop(String(stop.reason));
     else stop.addEventListener("abort", () => this.#stop(String(stop.reason)), { once: true });
@@ -155,6 +162,41 @@ export class Session {
       throw new Refusal(`bad container name ${JSON.stringify(job.name)}`);
     // A frozen copy: a later change to the caller's object cannot change what cleanup removes.
     this.#owned = Object.freeze({ name: job.name, owner: job.owner, checkout: job.checkout });
+  }
+
+  /** Connects to the local daemon as ensureImage() does, and returns the endpoint it uses. */
+  async connect(): Promise<string> {
+    await this.#connect();
+    return this.#client!.DOCKER_HOST;
+  }
+
+  /**
+   * Every job container of one checkout, of any owner, by its checkout label (#5882). It
+   * removes nothing: a launch logs the list, and only recover() removes from it.
+   */
+  async listJobs(checkout: string): Promise<{ id: string; job: Job }[]> {
+    if (!/^[0-9a-f]{12}$/.test(checkout)) throw new Refusal(`bad checkout ID ${checkout}`);
+    const filter = ["--filter", `label=xum.bugbash.checkout=${checkout}`];
+    const ps = await this.#must(["ps", "-aq", "--no-trunc", ...filter], 15_000);
+    const found: { id: string; job: Job }[] = [];
+    for (const id of ps.stdout.split("\n").filter((line) => line !== "")) {
+      if (!/^[0-9a-f]{64}$/.test(id)) throw new Refusal(`docker ps: unexpected ID ${id}`);
+      const args = ["container", "inspect", "--format", INSPECT, id];
+      const look = await this.#job("docker", args, this.#client!, 15_000);
+      // Removed since the list: nothing to report. Any other failure hides a container: refuse.
+      if (!look.ok && look.error.includes("No such container")) continue;
+      if (!look.ok) throw new Refusal(`docker container inspect: ${look.error}`);
+      // The label filter picked the checkout; removeJob() checks all three again before a removal.
+      const [name, owner] = look.stdout.replace(/^\//, "").split("|");
+      found.push({ id, job: { name, owner, checkout } });
+    }
+    return found;
+  }
+
+  /** Removes one listed container by ID, with the same name and label check as cleanup(). */
+  removeJob(id: string, job: Job): Promise<CleanupState> {
+    if (this.#owned != null) throw new Error("removeJob() is for a session without its own job");
+    return this.#removeById(id, job, "the leftover list");
   }
 
   /** Runs `fn` first on a stop, before the lifeline closes (B1: the provider proxy's close). */
@@ -250,11 +292,10 @@ export class Session {
 
   /** Removes the container `id` only when its name and both labels are this job's. */
   async #removeById(id: string, job: Job, source: string): Promise<CleanupState> {
-    const format = `{{.Name}}|{{index .Config.Labels "xum.bugbash.owner"}}|{{index .Config.Labels "xum.bugbash.checkout"}}`;
     const inspect = () =>
       this.#spawn(
         "docker",
-        ["container", "inspect", "--format", format, id],
+        ["container", "inspect", "--format", INSPECT, id],
         this.#client!,
         15_000
       );
@@ -286,7 +327,7 @@ export class Session {
 
   /** The stop hooks first, then the lifeline; SIGKILL only for a client past the grace period. */
   async #endJob() {
-    await Promise.allSettled(this.#hooks.splice(0).map(async (fn) => fn()));
+    await Promise.allSettled(this.#hooks.splice(0).map((fn) => this.#bounded(fn)));
     const client = this.#runClient;
     if (client == null || client.exitCode != null || client.signalCode != null) return;
     client.stdin?.end();
@@ -297,6 +338,22 @@ export class Session {
     }, this.#graceMs);
     timer.unref();
     client.once("close", () => clearTimeout(timer));
+  }
+
+  /** Runs one stop hook, but waits at most #hookMs for it. */
+  async #bounded(fn: () => unknown) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        this.#log(`a stop hook did not settle in ${this.#hookMs} ms: the lifeline closes anyway`);
+        resolve();
+      }, this.#hookMs);
+    });
+    try {
+      await Promise.race([(async () => fn())(), late]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
