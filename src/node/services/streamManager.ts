@@ -465,6 +465,8 @@ interface StepMessageTracker {
    * put the removed blocks back (preserved thinking).
    */
   anthropicThinkingStripped?: boolean;
+  /** True once this turn holds the Anthropic thinking-repair receipt (reads initialMetadata). */
+  hasAnthropicReplayReceipt?: () => boolean;
 }
 interface StreamRequestConfig {
   stopCause?: StreamStopCause;
@@ -3158,9 +3160,15 @@ export class StreamManager {
               appliedLevel,
               thinkingOverride
             );
+            // #5886: the rebuild reads history, which does not hold this turn's
+            // thinking-repair receipt yet. Keep the removed thinking out.
+            const receiptApplied =
+              stepTracker?.hasAnthropicReplayReceipt?.() === true
+                ? stripReasoningReplay(rebuilt, "anthropic")
+                : rebuilt;
             // Same per-step transforms the construction-time messages receive.
             rebuiltFirstStepMessages = dedupeNativeToolReferences(
-              await transformStepMessages(rebuilt)
+              await transformStepMessages(receiptApplied)
             );
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
@@ -3423,6 +3431,9 @@ export class StreamManager {
       cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
       cumulativeProviderMetadata: undefined,
     };
+    // Single source for same-turn rebuilds: the receipt lives on initialMetadata (#5886).
+    stepTracker.hasAnthropicReplayReceipt = () =>
+      streamInfo.initialMetadata?.anthropicThinkingReplay === "off";
 
     // Mid-turn thinking override: route applied levels into this stream's
     // metadata (partials, stream-end, final assistant message). Wired before
@@ -4181,7 +4192,11 @@ export class StreamManager {
     const nextRequest = this.buildStreamRequestConfig({
       model: prepared.data.model,
       modelString: prepared.data.modelString,
-      messages: prepared.data.messages,
+      // #5886: prepare() rebuilds from history, which does not hold this turn's
+      // thinking-repair receipt yet. Keep the removed thinking out.
+      messages: streamInfo.stepTracker.hasAnthropicReplayReceipt?.()
+        ? stripReasoningReplay(prepared.data.messages, "anthropic")
+        : prepared.data.messages,
       system: prepared.data.system,
       tools: prepared.data.tools,
       providerOptions: prepared.data.providerOptions,
@@ -5954,9 +5969,8 @@ export class StreamManager {
       // later block, so the next turns must keep it out (messagePipeline reads this
       // receipt). initialMetadata feeds the partial, error partial and final row alike
       // (as the model-fallback record does). Persist before the retry request goes out so
-      // a crash mid-retry cannot forget the strip. A step-0 repair has no parts yet, and
-      // commitPartial drops an empty partial, so a crash or a second rejection before any
-      // output loses the receipt: the next turn then pays one more retry (fail-safe).
+      // a crash mid-retry cannot forget the strip. A step-0 repair has no parts yet:
+      // commitPartial keeps the receipt on the empty row (#5886).
       streamInfo.initialMetadata = {
         ...streamInfo.initialMetadata,
         anthropicThinkingReplay: "off",

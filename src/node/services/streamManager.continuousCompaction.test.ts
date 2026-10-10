@@ -13,7 +13,7 @@ import { historyWriteLockPath, removeSessionDirUnderMemoryLocks } from "./worksp
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { readFile, writeFile } from "node:fs/promises";
 import assert from "@/common/utils/assert";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import {
   ContinuousCompactionJournalSchema,
   type ContinuousCompactionJournal,
@@ -933,6 +933,50 @@ describe("continuous prefix prepareStep and journal", () => {
     }
   );
 
+  it("prefix replay honors a thinking-repair receipt on an empty kept row (#5886)", async () => {
+    const journal = journalFixture();
+    journal.preparation.modelString = "anthropic:claude-opus-5-5";
+    journal.preparation.effectiveThinkingLevel = "high";
+    const signed = createMuxMessage("signed", "assistant", "", undefined, [
+      {
+        type: "reasoning",
+        text: "removed thinking",
+        providerOptions: { anthropic: { signature: "sig-removed" } },
+      },
+      { type: "text", text: "kept answer" },
+    ]);
+    // A repaired turn that failed before output: commitPartial kept only its receipt.
+    const receiptOnly: MuxMessage = {
+      id: "repaired-no-output",
+      role: "assistant",
+      metadata: { anthropicThinkingReplay: "off" },
+      parts: [],
+    };
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("user-1", "user", "first"),
+      signed,
+      createMuxMessage("user-2", "user", "second"),
+      receiptOnly,
+      createMuxMessage("user-3", "user", "third"),
+    ];
+    const { deferLoadingToolNames: _deferred, ...preparation } = journal.preparation;
+    const expected = await assemblePromptPayload({
+      ...preparation,
+      workspaceId,
+      history: journal.prefixSourceRows,
+      systemMessage: "",
+      postCompactionAttachments: journal.postCompactionAttachments,
+    });
+    const actual = (await rebuildContinuousPrefix(journal, workspaceId)).filter(
+      (message) => message.role !== "system"
+    );
+    expect(actual).toEqual(expected.messages.filter((message) => message.role !== "system"));
+    const serialized = JSON.stringify(actual);
+    expect(serialized).toContain("kept answer");
+    expect(serialized).not.toContain("removed thinking");
+  });
+
   it("prefix replay keeps native tool search results as tool references (#5262)", async () => {
     const journal = journalFixture();
     journal.preparation.deferLoadingToolNames = ["slack_send_message"];
@@ -1179,6 +1223,98 @@ describe("continuous prefix prepareStep and journal", () => {
       expect(swap.consumed).toBe(consumed ? true : undefined);
     });
   }
+
+  it("a fallback over a consumed prefix sends none of that prefix's thinking (#5886)", async () => {
+    const { swap } = await setup();
+    swap.journal.liveTailCopySpec.partIndex = 0;
+    // The swapped prefix predates the turn's thinking-repair receipt.
+    const systemCount = swap.prefix.filter((message) => message.role === "system").length;
+    swap.prefix = [
+      ...swap.prefix.slice(0, systemCount),
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "reasoning",
+            text: "removed prefix thinking",
+            providerOptions: { anthropic: { signature: "sig-removed" } },
+          },
+          { type: "text", text: "kept prefix answer" },
+        ],
+      },
+      ...swap.prefix.slice(systemCount),
+    ];
+    const nextModel = "anthropic:fallback-model";
+    const rebuilt = createMuxMessage("live", "assistant", "", { stepStartPartIndices: [0] });
+    rebuilt.parts = [
+      { type: "text", text: "retained step" },
+      {
+        type: "dynamic-tool",
+        toolCallId: "keep",
+        toolName: "bash",
+        state: "output-available",
+        input: {},
+        output: { success: true },
+      },
+      { type: "text", text: "refused response after swap" },
+    ];
+    const { deferLoadingToolNames: _deferred, ...preparation } = swap.journal.preparation;
+    const payload = await assemblePromptPayload({
+      ...preparation,
+      modelString: nextModel,
+      systemMessage: "Fresh fallback system",
+      workspaceId,
+      history: [createMuxMessage("prompt", "user", "original request"), rebuilt],
+    });
+    let firstFallbackStep: ai.ModelMessage[] | undefined;
+    const turn = await startLiveTurn({
+      requestOptions: {
+        initialMetadata: { anthropicThinkingReplay: "off" },
+        modelFallback: {
+          chain: [nextModel],
+          prepare: () =>
+            Promise.resolve({
+              success: true as const,
+              data: {
+                model,
+                modelString: nextModel,
+                messages: payload.messages,
+                system: payload.system,
+                tools: payload.tools,
+                thinkingLevel: "off" as const,
+              },
+            }),
+        },
+      },
+      attempts: [
+        async function* (options, manager) {
+          expect(manager.setPrefixSwap(workspaceId, swap)).toBe(true);
+          await prepareStepForTests(options, originalMessages);
+          yield { type: "start-step" };
+          yield { type: "text-delta", text: "retained step" };
+          yield { type: "finish-step", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+          yield { type: "finish", finishReason: "content-filter" };
+        },
+        async function* (options) {
+          // The messages the fallback's first provider request actually carries.
+          const step = await prepareStepForTests(options, options.messages ?? [], 0);
+          firstFallbackStep = step?.messages ?? options.messages;
+          yield* answer();
+        },
+      ],
+    });
+    await turn.completion;
+
+    expect(turn.calls).toHaveLength(2);
+    // The fallback request carries the swapped prefix as recorded (thinking included):
+    // prepareStep's prefix-swap guard (#5086) removes it before the provider call.
+    const requested = JSON.stringify(turn.calls[1]?.messages);
+    expect(requested).toContain("kept prefix answer");
+    expect(requested).toContain("removed prefix thinking");
+    const sent = JSON.stringify(firstFallbackStep);
+    expect(sent).toContain("kept prefix answer");
+    expect(sent).not.toContain("removed prefix thinking");
+  });
 
   for (const family of ["anthropic", "openai"]) {
     for (const mode of [

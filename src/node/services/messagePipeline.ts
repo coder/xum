@@ -77,6 +77,12 @@ export interface PrepareMessagesOptions {
    * become the same tool_reference output the live turn sent.
    */
   deferLoadingToolNames?: ReadonlySet<string>;
+  /**
+   * Rows searched for the Anthropic thinking-repair receipt; defaults to messagesWithSentinel.
+   * The empty-row filter drops a repaired turn that produced no output, so callers that
+   * filter pass the rows from before it (#5886).
+   */
+  replayReceiptMessages?: MuxMessage[];
 }
 
 /**
@@ -122,6 +128,7 @@ export async function prepareMessagesForProvider(
     anthropicCacheTtl,
     workspaceId,
     deferLoadingToolNames,
+    replayReceiptMessages,
   } = opts;
 
   // --- XumMessage-level transforms ---
@@ -228,7 +235,8 @@ export async function prepareMessagesForProvider(
   // context segment. Same strip as the one-request repair (stripReasoningReplay), which also
   // covers adaptive thinking, where transformModelMessages ignores anthropicStripReasoning.
   const segmentMessages =
-    providerForMessages === "anthropic" && hasAnthropicReplayReceipt(messagesWithSentinel)
+    providerForMessages === "anthropic" &&
+    hasAnthropicReplayReceipt(replayReceiptMessages ?? messagesWithSentinel)
       ? stripReasoningReplay(transformedMessages, "anthropic")
       : transformedMessages;
 

@@ -1,5 +1,5 @@
 import { describe, test, expect, spyOn } from "bun:test";
-import type { TurnEngineEvent } from "./streamManager";
+import type { TurnEngineEvent, TurnExecutionOptions } from "./streamManager";
 import * as aiSdk from "ai";
 import {
   APICallError,
@@ -12,7 +12,8 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import { OPENAI_RESPONSES_BASE_URL_HINT } from "./utils/openAIResponsesBaseUrlHint";
-import type { MuxMetadata } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
+import { assemblePromptPayload } from "./turnContextAssembler";
 import { log } from "./log";
 import {
   installStreamManagerTestHistory,
@@ -23,7 +24,9 @@ import {
   appendPartialAssistantForTests,
   createStreamResultForTests,
   prepareStepForTests,
+  REFUSAL_FINISH,
 } from "./streamManager.suite.testHarness";
+import { Ok } from "@/common/types/result";
 
 installStreamManagerTestHistory();
 
@@ -134,6 +137,7 @@ function createRecoveryHarness() {
     initialMetadata?: Partial<MuxMetadata>;
     /** SDK-reported total usage for every attempt of this turn. */
     streamUsage?: unknown;
+    requestOptions?: Partial<TurnExecutionOptions>;
   }) {
     const historySequence = input.historySequence ?? 1;
     const messageId = `${input.workspaceId}-${historySequence}`;
@@ -154,6 +158,7 @@ function createRecoveryHarness() {
         providerOptions: input.providerOptions,
         ...(input.initialMetadata != null ? { initialMetadata: input.initialMetadata } : {}),
         providedRuntimeTempDir: "",
+        ...input.requestOptions,
       })
     );
     if (!result.success) throw new Error(`Expected stream to start: ${JSON.stringify(result)}`);
@@ -1388,6 +1393,238 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
     expect(errorPartial?.metadata?.errorType).toBe("reasoning_rejected");
     // The failed retry already ran without thinking: the stored row keeps the receipt.
     expect(errorPartial?.metadata?.anthropicThinkingReplay).toBe("off");
+  });
+
+  // #5886: the receipt must survive a turn that produced no output, or the next turn
+  // puts the removed thinking back and pays one more 400.
+  describe("receipt on a turn without output", () => {
+    const signedEarlierTurn = (): MuxMessage =>
+      createMuxMessage("earlier-assistant", "assistant", "", { historySequence: 1 }, [
+        {
+          type: "reasoning",
+          text: "earlier thinking",
+          providerOptions: { anthropic: { signature: "sig-bound-to-old-prefix" } },
+        },
+        { type: "text", text: "earlier answer" },
+      ]);
+    async function seedEarlierTurn(workspaceId: string) {
+      for (const message of [
+        createMuxMessage("earlier-user", "user", "earlier", { historySequence: 0 }),
+        signedEarlierTurn(),
+        createMuxMessage("now-user", "user", "now", { historySequence: 2 }),
+      ]) {
+        const appended = await historyService.appendToHistory(workspaceId, message);
+        if (!appended.success) throw new Error(appended.error);
+      }
+    }
+    /** Thinking parts the next Anthropic turn would replay from the committed history. */
+    async function nextTurnThinking(workspaceId: string) {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const payload = await assemblePromptPayload({
+        history: [
+          ...history.data,
+          createMuxMessage("next-user", "user", "next", { historySequence: 4 }),
+        ],
+        systemMessage: "system",
+        modelString: "anthropic:claude-opus-5-5",
+        providerForMessages: "anthropic",
+        effectiveThinkingLevel: "medium",
+        effectiveAgentId: "exec",
+        toolNamesForSentinel: [],
+        workspaceId,
+      });
+      const serialized = JSON.stringify(payload.messages);
+      // The earlier answer itself must stay: only its thinking goes.
+      expect(serialized).toContain("earlier answer");
+      return payload.messages.flatMap((message) =>
+        message.role === "assistant" && Array.isArray(message.content)
+          ? message.content.filter((part) => part.type === "reasoning")
+          : []
+      );
+    }
+
+    test("a failed step-0 retry keeps the receipt through commitPartial", async () => {
+      const workspaceId = "anthropic-receipt-failed-retry";
+      await seedEarlierTurn(workspaceId);
+      const harness = createRecoveryHarness();
+      const { model } = scriptedAnthropicModel([rejection, rejection]);
+
+      await harness.run({
+        workspaceId,
+        historySequence: 3,
+        model,
+        messages: messages(),
+        attempts: [realSdkAttempt, realSdkAttempt],
+      });
+      expect(harness.errors()).toHaveLength(1);
+      const committed = await historyService.commitPartial(workspaceId);
+      if (!committed.success) throw new Error(committed.error);
+
+      expect(await nextTurnThinking(workspaceId)).toEqual([]);
+    });
+
+    test("a partial left by a crash after the repair keeps the receipt", async () => {
+      const workspaceId = "anthropic-receipt-crash";
+      await seedEarlierTurn(workspaceId);
+      await appendPartialAssistantForTests(workspaceId, "crashed-turn", 3);
+      // What flushPartialWrite left on disk before the retry request: no parts, no error.
+      const written = await historyService.writePartial(workspaceId, {
+        id: "crashed-turn",
+        role: "assistant",
+        metadata: { historySequence: 3, partial: true, anthropicThinkingReplay: "off" },
+        parts: [],
+      });
+      if (!written.success) throw new Error(written.error);
+      const committed = await historyService.commitPartial(workspaceId);
+      if (!committed.success) throw new Error(committed.error);
+
+      expect(await nextTurnThinking(workspaceId)).toEqual([]);
+    });
+
+    test("a crash after the receipt reached the row keeps it on the next commit", async () => {
+      const workspaceId = "anthropic-receipt-crash-after-row";
+      await seedEarlierTurn(workspaceId);
+      // commitPartial already wrote the receipt to the row, then crashed before
+      // deleting the errored partial.
+      const placeholder = await historyService.appendToHistory(workspaceId, {
+        id: "repaired-turn",
+        role: "assistant",
+        metadata: { historySequence: 3, partial: true, anthropicThinkingReplay: "off" },
+        parts: [],
+      });
+      if (!placeholder.success) throw new Error(placeholder.error);
+      const written = await historyService.writePartial(workspaceId, {
+        id: "repaired-turn",
+        role: "assistant",
+        metadata: {
+          historySequence: 3,
+          partial: true,
+          anthropicThinkingReplay: "off",
+          error: "rejected again",
+          errorType: "reasoning_rejected",
+        },
+        parts: [],
+      });
+      if (!written.success) throw new Error(written.error);
+      const committed = await historyService.commitPartial(workspaceId);
+      if (!committed.success) throw new Error(committed.error);
+
+      expect(await nextTurnThinking(workspaceId)).toEqual([]);
+    });
+
+    test("without a receipt, an empty failed turn still leaves no row", async () => {
+      const workspaceId = "anthropic-no-receipt-failed-turn";
+      await seedEarlierTurn(workspaceId);
+      await appendPartialAssistantForTests(workspaceId, "failed-turn", 3);
+      const written = await historyService.writePartial(workspaceId, {
+        id: "failed-turn",
+        role: "assistant",
+        metadata: { historySequence: 3, partial: true, error: "boom", errorType: "unknown" },
+        parts: [],
+      });
+      if (!written.success) throw new Error(written.error);
+      const committed = await historyService.commitPartial(workspaceId);
+      if (!committed.success) throw new Error(committed.error);
+
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data.map((message) => message.id)).not.toContain("failed-turn");
+      expect(await nextTurnThinking(workspaceId)).toHaveLength(1);
+    });
+  });
+
+  test("a step-0 thinking rebuild after the repair sends no thinking", async () => {
+    // #5886: the rebuild reads history, which does not hold this turn's receipt yet.
+    const thinkingOverrideState: NonNullable<TurnExecutionOptions["thinkingOverrideState"]> = {
+      applied: "medium",
+    };
+    const harness = createRecoveryHarness();
+    const { model, requestBlockTypes } = scriptedAnthropicModel([
+      () => {
+        // The user changes the thinking level while the rejected request is in flight.
+        thinkingOverrideState.pending = "high";
+        return rejection();
+      },
+      success,
+    ]);
+    const preparedSdkAttempt: Attempt = async function* (options) {
+      const prepared = await prepareStepForTests(options, options.messages ?? [], 0);
+      yield* aiSdk.streamText({
+        model: options.model,
+        messages: prepared?.messages ?? options.messages ?? [],
+        maxRetries: 0,
+      }).fullStream;
+    };
+
+    await harness.run({
+      workspaceId: "anthropic-receipt-rebuild",
+      model,
+      messages: messages(),
+      attempts: [preparedSdkAttempt, preparedSdkAttempt],
+      providerOptions: {},
+      requestOptions: {
+        thinkingOverrideState,
+        rebuildProviderOptionsForThinkingLevel: (level) => ({
+          effectiveLevel: level,
+          providerOptions: {},
+        }),
+        // History-based rebuild: still holds the earlier signed thinking.
+        rebuildFirstStepForThinkingLevel: () => Promise.resolve(messages()),
+      },
+    });
+
+    expect(harness.streamEnds()).toHaveLength(1);
+    expect(thinkingOverrideState.applied).toBe("high");
+    expect(requestBlockTypes).toHaveLength(2);
+    expect(requestBlockTypes[1]).not.toContain("thinking");
+    expect(requestBlockTypes[1]).toContain("tool_use");
+  });
+
+  test("a model fallback after the repair sends no thinking", async () => {
+    // #5886: prepare() rebuilds the fallback request from history, which does not hold
+    // this turn's receipt yet.
+    const harness = createRecoveryHarness();
+    const { model } = scriptedAnthropicModel([rejection]);
+    const refusedRetry: Attempt = async function* () {
+      await Promise.resolve();
+      yield { type: "start-step" };
+      yield { type: "finish-step", usage: TEST_USAGE, finishReason: "content-filter" };
+      yield REFUSAL_FINISH;
+    };
+    const fallbackModel = createTestLanguageModel("claude-sonnet-5", "anthropic.messages");
+
+    const { calls } = await harness.run({
+      workspaceId: "anthropic-receipt-fallback",
+      model,
+      modelString: "anthropic:claude-opus-5-5",
+      messages: messages(),
+      attempts: [realSdkAttempt, refusedRetry, textAttempt("fallback answer")],
+      requestOptions: {
+        modelFallback: {
+          chain: ["anthropic:claude-sonnet-5"],
+          prepare: (modelString) =>
+            Promise.resolve(
+              Ok({
+                model: fallbackModel,
+                modelString,
+                // History-based rebuild: still holds the earlier signed thinking.
+                messages: messages(),
+                system: "system",
+                tools: undefined,
+                thinkingLevel: "medium" as const,
+              })
+            ),
+        },
+      },
+    });
+
+    expect(calls).toHaveLength(3);
+    expect(calls[2]?.model).toBe(fallbackModel);
+    const fallbackParts = (calls[2]?.messages ?? []).flatMap((message) =>
+      message.role === "assistant" && Array.isArray(message.content) ? message.content : []
+    );
+    expect(fallbackParts.map((part) => part.type)).toEqual(["tool-call"]);
   });
 
   test("logs prefix-binding thinking drops for the step at info, without paths", async () => {

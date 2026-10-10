@@ -154,6 +154,7 @@ export async function summarizeContinuousCompaction(args: {
     );
     const messages = await prepareMessagesForProvider({
       messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
+      replayReceiptMessages: prepared.activeContextMessages,
       effectiveAgentId: "compact",
       toolNamesForSentinel: [],
       postCompactionAttachments: null,

@@ -3543,10 +3543,30 @@ export class HistoryService {
         hadErrorMetadata &&
         !commitWorthy &&
         !hasDurableRefusalMetadata &&
-        (existingMessage.parts?.length ?? 0) === 0;
+        (existingMessage.parts?.length ?? 0) === 0 &&
+        // A row that already holds the replay receipt keeps it (a crash after the receipt
+        // write, before this partial was deleted, #5886).
+        existingMessage.metadata?.anthropicThinkingReplay !== "off";
+
+      // #5886: the Anthropic thinking-repair receipt (MuxMetadata.anthropicThinkingReplay)
+      // must outlive a turn that produced no output, or the next turn replays the removed
+      // thinking and pays one more 400. Add only the receipt to the stored row: its parts
+      // stay as they are, and an empty row never reaches the provider or shows as a reply.
+      const keepsReplayReceipt =
+        !shouldCommit &&
+        partial.metadata?.anthropicThinkingReplay === "off" &&
+        existingMessage.metadata?.anthropicThinkingReplay !== "off";
 
       if (shouldCommit) {
         const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, partial);
+        if (!updateResult.success) {
+          return updateResult;
+        }
+      } else if (keepsReplayReceipt) {
+        const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, {
+          ...existingMessage,
+          metadata: { ...existingMessage.metadata, anthropicThinkingReplay: "off" },
+        });
         if (!updateResult.success) {
           return updateResult;
         }

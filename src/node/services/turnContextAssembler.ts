@@ -250,6 +250,7 @@ export async function assemblePromptPayload(
         ? tagUserRowsWithHistoryItemIds(prepared.providerRequestMessages)
         : prepared.providerRequestMessages
     ),
+    replayReceiptMessages: prepared.activeContextMessages,
     effectiveAgentId: options.effectiveAgentId,
     toolNamesForSentinel: options.toolNamesForSentinel,
     planContentForTransition: options.planContentForTransition,
