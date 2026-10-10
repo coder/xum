@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { getOwn } from "@/common/utils/getOwn";
 import { Server, Loader2 } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
+import { publishWorkspaceMcpOverridesSaved } from "@/browser/utils/workspaceMcpMutations";
 import { Switch } from "@/browser/components/Switch/Switch";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useAPI } from "@/browser/contexts/API";
@@ -280,6 +281,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
       if (!result.success) {
         setError(result.error);
       } else {
+        publishWorkspaceMcpOverridesSaved(workspaceId);
         onOpenChange(false);
       }
     } catch (err) {
