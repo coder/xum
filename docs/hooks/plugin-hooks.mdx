@@ -1,0 +1,151 @@
+---
+title: Plugin Hooks
+description: Run sandboxed JavaScript from an Agent Plugin on messages, requests, tool calls and finished turns
+---
+
+<Note>Plugin hooks are experimental. Expect breaking changes while we iterate.</Note>
+
+An [Agent Plugin](/agents/agent-skills#agent-plugins) can ship a `hooks.js` file. Xum loads it before a workspace's next request and calls its functions at five points. The functions run in a QuickJS sandbox: they have no file system, no network and no tool calls, and each call has a 5 second deadline. A hook that throws, times out or returns something invalid changes nothing.
+
+Project plugins load only in trusted projects. The install preview lists the hook file and the tools it can see.
+
+## Hook points
+
+`hooks.js` evaluates to an object. Each key is a hook point and each value is a function, sync or async. Every input also has `settings` (see [Settings from a plugin view](#settings-from-a-plugin-view)).
+
+| Hook point            | Input                                                       | Return                                      |
+| --------------------- | ----------------------------------------------------------- | ------------------------------------------- |
+| `message.send.before` | `workspaceId`, `text`, `origin`                             | `{ text }` to rewrite, `{ deny }` to block  |
+| `request.assemble`    | `workspaceId`, `modelString`                                | `{ context }` to add system prompt text     |
+| `tool.execute.before` | `workspaceId`, `toolName`, `args`, `cwd`                    | `{ args }` to rewrite, `{ deny }` to block  |
+| `tool.execute.after`  | `workspaceId`, `toolName`, `args`, `result`                 | `{ annotation }` to add text the model sees |
+| `turn.end`            | `workspaceId`, `messageId`, `text` (the last reply or null) | ignored                                     |
+
+```js
+({
+  "request.assemble": (input) => ({ context: "Prefer small, reviewable diffs." }),
+  "tool.execute.before": (input) =>
+    String((input.args && input.args.path) || "").endsWith(".env")
+      ? { deny: "Reading .env files is off." }
+      : undefined,
+});
+```
+
+- `tool.execute.*` hooks see only the tools the manifest lists in `extensions.mux.hooks.tools`. Without that list they see no tool calls.
+- `request.assemble` context is capped at 64 KB. Xum records it in the workspace's event journal before the request goes out.
+- `tool.execute.after` gets `resultOmitted: true` instead of `result` when the result is larger than 256 KB or not JSON.
+- `turn.end` text is the last reply of the turn, cut to 16,384 characters. Xum does not wait for the hook.
+- Module state persists between calls of one workspace until `hooks.js` changes. Do not use top-level `await`.
+
+## Messages
+
+`message.send.before` sees every new message before Xum saves it. Plugins run in discovery order: each one sees the text of the plugin before it, and the first `deny` stops the chain.
+
+- A rewrite (32,000 characters at most) is what the model sees and what Xum saves. The message shows **Changed by plugin &lt;name&gt;** with the original text, and **Edit** loads the original text.
+- A block saves nothing. A typed message stays in the composer, and Xum shows the reason (500 characters at most). An automatic send fails with the reason and is not retried in a loop: for example, a blocked goal continuation pauses the goal.
+- The hook sees compaction requests (origin `compaction`), but Xum ignores a rewrite or block of them. A message that waits for on-send compaction runs the hooks once.
+
+| `origin`      | Messages                                                    |
+| ------------- | ----------------------------------------------------------- |
+| `user`        | Typed and queued messages and edits                         |
+| `task`        | Sub-agent briefs and delegated workspace turns              |
+| `goal`        | Goal continuations                                          |
+| `plan-review` | Plan review feedback                                        |
+| `compaction`  | Compaction requests                                         |
+| `system`      | Auto-resume, wakes, heartbeats and other automatic messages |
+
+## Settings from a plugin view
+
+Hooks cannot store files. To make a hook configurable, ship a [plugin view](/config/mcp-servers#plugin-views) and let the plugin's own stdio MCP server save JSON into its data directory. Xum reads it before every hook call:
+
+```text
+~/.xum/plugin-data/<instanceId>/
+  hook-state.json                 every workspace
+  hook-state/<workspaceId>.json   one workspace; its top-level keys win
+```
+
+- The server finds the directory in `PLUGIN_DATA` and the workspace in `XUM_WORKSPACE_ID`. Each workspace runs its own server process.
+- Xum ignores a file larger than 64 KB, a file that is not JSON or not a regular file, and a link that leaves the directory. `settings` is `null` until the first save.
+- A save takes effect on the next hook call. Write a temporary file and rename it, so Xum never reads half a file.
+- Remote (HTTP) plugin servers have no data directory, so they cannot save settings.
+
+## Example: settings view plus hooks
+
+This plugin asks the model for British spelling and blocks `git push --force`. A settings view turns each rule on or off for one workspace or for every workspace.
+
+```text
+style-guard/
+  plugin.json   manifest, view, tool grant
+  mcp.json      the settings server
+  server.mjs    saves the settings into PLUGIN_DATA
+  view.html     the settings view
+  hooks.js      reads the settings
+```
+
+```json plugin.json
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "style-guard",
+  "contributes": {
+    "views": [
+      {
+        "id": "settings",
+        "title": "Style guard settings",
+        "server": "settings",
+        "resourceUri": "ui://style-guard/settings"
+      }
+    ]
+  },
+  "extensions": { "mux": { "hooks": { "tools": ["bash"] } } }
+}
+```
+
+```json mcp.json
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "settings": { "type": "stdio", "command": "node", "args": ["./server.mjs"] }
+  }
+}
+```
+
+```js hooks.js
+({
+  "request.assemble": (input) =>
+    input.settings && input.settings.britishSpelling
+      ? { context: "Use British spelling in all prose you write." }
+      : undefined,
+
+  "tool.execute.before": (input) => {
+    if (!input.settings || !input.settings.blockForcePush) return undefined;
+    const script = String((input.args && input.args.script) || "");
+    if (/\bgit\s+push\b[^\n]*(--force\b|--force-with-lease\b|\s-f\b)/.test(script)) {
+      return { deny: "Force pushes are off in Style guard settings." };
+    }
+    return undefined;
+  },
+});
+```
+
+The server answers MCP over stdio. Its two tools are app-only (`_meta.ui.visibility: ["app"]`), so the model never sees them and the view calls them without a confirmation. The part that matters for hooks is the save:
+
+```js server.mjs
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+
+const DATA = process.env.PLUGIN_DATA;
+const WORKSPACE = process.env.XUM_WORKSPACE_ID;
+
+// save_settings({ scope, settings }) from the view:
+function saveSettings(scope, settings) {
+  const file =
+    scope === "all" ? join(DATA, "hook-state.json") : join(DATA, "hook-state", `${WORKSPACE}.json`);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(`${file}.tmp`, JSON.stringify(settings));
+  renameSync(`${file}.tmp`, file);
+}
+```
+
+The view is an [MCP Apps](/workspaces/artifacts#apps-from-mcp-servers) page served as `ui://style-guard/settings`. It sends `ui/initialize`, then `tools/call` for `get_settings`, and calls `save_settings` when a checkbox changes.
+
+To try it, put the folder in `~/.xum/plugins/` or a trusted project's `.xum/plugins/`, enable the `settings` server for the workspace in the Workspace MCP dialog, and run **Open plugin view: Style guard settings** from the command palette.
