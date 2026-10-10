@@ -884,7 +884,11 @@ test("C2: recover reports an unknown cleanup state (exit 3)", async () => {
 // The MCP Apps suite (plan PR B1): model-driven, through a proxy for the job.
 const MCP_ARGS = ["run", "--config", "e2e.mcpapps.config.ts", "--output", ".e2e/m"];
 const UPSTREAM_KEY = "sk-host-upstream-key-for-the-launch-test";
-async function mcpLaunch(over: Record<string, string>, env: Record<string, string> = {}) {
+async function mcpLaunch(
+  over: Record<string, string>,
+  env: Record<string, string> = {},
+  stop = new AbortController()
+) {
   const upstream = await startFakeUpstream();
   try {
     const host = {
@@ -901,8 +905,9 @@ async function mcpLaunch(over: Record<string, string>, env: Record<string, strin
     try {
       const cwd = prepare(over);
       const options = { root: fs.realpathSync(root), cwd, env: host };
-      const stop = new AbortController().signal;
-      const code = await launch(MCP_ARGS, { ...options, stop }).catch((e: unknown) => e);
+      const code = await launch(MCP_ARGS, { ...options, stop: stop.signal }).catch(
+        (e: unknown) => e
+      );
       return {
         code,
         logged,
@@ -923,6 +928,11 @@ test.each([
   ["no key", { ANTHROPIC_API_KEY: "" }, /ANTHROPIC_API_KEY/],
   ["no base URL", { ANTHROPIC_BASE_URL: "" }, /ANTHROPIC_BASE_URL/],
   ["an OpenAI explorer model", { BUGBASH_MODEL: "openai:gpt-6.1-sol" }, /only anthropic/],
+  [
+    "an Anthropic model the proxy cannot price",
+    { BUGBASH_MODEL: "anthropic:claude-x-9" },
+    /no price/,
+  ],
   ["the bash-ai-proxy scenario", { BUGBASH_SCENARIO: "bash-ai-proxy" }, /BUGBASH_SCENARIO/],
   ["the real app AI", { BUGBASH_AI: "real" }, /only the mock app AI/],
 ])("B1: the MCP Apps suite refuses %s before any docker command", async (_name, env, message) => {
@@ -965,6 +975,29 @@ test("B1: a proxied call that costs more than its bound fails the job (exit 5)",
   const { code, logged } = await mcpLaunch({ RUN: "proxycall", CALL: "[fake:overbill]" });
   expect(code).toBe(5);
   expect(logged.join("\n")).toContain("cost more than their reserved bound");
+  expectNothingLeft();
+});
+
+test("B1: a stop after a bound miss still ends with the stop, not exit 5", async () => {
+  const stop = new AbortController();
+  // The signal lands after the job and the proxy close, while cleanup runs.
+  const cleanup = spyOn(Session.prototype, "cleanup");
+  cleanup.mockImplementation(function (this: Session) {
+    stop.abort("SIGINT");
+    cleanup.mockRestore(); // the real cleanup from here on
+    return this.cleanup();
+  });
+  try {
+    const { code, logged } = await mcpLaunch(
+      { RUN: "proxycall", CALL: "[fake:overbill]" },
+      {},
+      stop
+    );
+    expect(code).toBeInstanceOf(Stopped);
+    expect(logged.join("\n")).toContain("cost more than their reserved bound");
+  } finally {
+    cleanup.mockRestore();
+  }
   expectNothingLeft();
 });
 

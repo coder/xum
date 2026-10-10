@@ -38,6 +38,12 @@ const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
  * logged in full; after that only their count per category grows (stats().refusedBy).
  */
 const LOGGED_REFUSALS = 20;
+/**
+ * How long close() waits for the aborted calls and the listeners. The launcher's stop hook gets
+ * 10 s (runner.ts), so close() must settle before that. A call still open then is a proxy bug:
+ * close() rejects, and its reservation stays counted (Ledger: reserved).
+ */
+const CLOSE_MS = 5_000;
 const RESPONSE_HEADERS = /^(content-type|request-id|retry-after|anthropic-ratelimit-[a-z0-9-]+)$/;
 
 /** One line per call for the launcher log. */
@@ -314,9 +320,18 @@ export async function startProxy(options: ProxyOptions) {
       }
       for (const call of calls) call.abort.abort();
       for (const outer of pipes) outer.emit("close");
-      await Promise.allSettled([...calls].map((call) => call.done));
-      await listening;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<"late">((resolve) => {
+        timer = setTimeout(() => resolve("late"), CLOSE_MS);
+      });
+      const ended = Promise.all([Promise.allSettled([...calls].map((c) => c.done)), listening]);
+      const outcome = await Promise.race([ended, late]).finally(() => clearTimeout(timer));
       fs.rmSync(inner, { recursive: true, force: true });
+      if (outcome === "late") {
+        throw new Error(
+          `proxy: ${calls.size} call(s) still open ${CLOSE_MS} ms after close(); their reservations stay counted`
+        );
+      }
       if (counts.boundExceeded > 0) {
         throw new Error(
           `proxy: ${counts.boundExceeded} call(s) cost more than their reserved bound; fix maxCostNanoUsd in proxyPolicy.ts`

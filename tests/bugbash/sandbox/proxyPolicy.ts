@@ -51,6 +51,9 @@ const PRICES = new Map([
 ]);
 const VISUAL_TOKENS = 4784;
 
+/** Whether the proxy can price (and so bound) a call of this model. */
+export const priced = (model: string) => PRICES.has(model);
+
 export interface JobPolicy {
   /** Model IDs this job may call: its explorer model and the app model (P3). */
   models: readonly string[];

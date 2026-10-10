@@ -19,8 +19,9 @@
  * the real app AI come in a later step of #5714, and the host pause still refuses every
  * model-driven run on the host. There is no host fallback.
  * Exit codes: the job's code, 2 refused, 3 the container state is unknown after cleanup, 4 the
- * evidence is incomplete, 5 a proxied call cost more than its bound (the cost model is wrong),
- * 130 or 143 when SIGINT or SIGTERM stopped it.
+ * evidence is incomplete, 5 the proxy reported a fault (a call cost more than its bound, or a
+ * call outlived close()), 130 or 143 when SIGINT or SIGTERM stopped it. Exit 3 outranks a stop,
+ * and a stop outranks 5.
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -30,7 +31,7 @@ import type { Readable } from "node:stream";
 import { receiveExport } from "./exportStream";
 import { PROXY_DIR } from "./inContainer";
 import { startProxy } from "./proxy";
-import { Ledger } from "./proxyPolicy";
+import { Ledger, priced } from "./proxyPolicy";
 // prettier-ignore
 import { checkMountSource, containerEnv, exactStepRefusal, jobEnv, outputDir, plainFolders, stage } from "./inputs";
 import { Refusal, Session, Stopped } from "./runner";
@@ -87,6 +88,9 @@ function modelJob(env: NodeJS.ProcessEnv): ModelJob {
   const [provider, model] = spec.split(/:(.*)/s, 2);
   if (provider !== "anthropic" || !model)
     throw new Refusal(`BUGBASH_MODEL ${JSON.stringify(spec)}: only anthropic:<model> runs here`);
+  // The proxy refuses every call of a model it cannot price, so the job could only fail.
+  if (!priced(model))
+    throw new Refusal(`BUGBASH_MODEL ${JSON.stringify(spec)}: the proxy has no price for it`);
   const budget = env.BUGBASH_BUDGET_USD ?? "";
   if (!/^\d+(\.\d+)?$/.test(budget) || !(Number(budget) > 0))
     throw new Refusal("set BUGBASH_BUDGET_USD: the most this run may spend at list price, in $");
@@ -334,13 +338,11 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
   const state = await session.cleanup();
   if (made) fs.rmSync(jobDir, { recursive: true, force: true });
   log(`${name} cleanup: ${state}`);
+  if (missed != null) log(`${name} ${missed}`);
   if (state.startsWith("unknown")) return 3;
-  if (missed != null) {
-    log(`${name} ${missed}`);
-    return 5;
-  }
-  // A stop seen before cleanup ended outranks the job's result and an earlier error.
+  // A stop seen before cleanup ended outranks a proxy fault, the job's result and an error.
   if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
+  if (missed != null) return 5;
   if (typeof result !== "number") throw result.error;
   return result;
 }

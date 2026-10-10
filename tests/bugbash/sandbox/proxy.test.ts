@@ -328,6 +328,38 @@ test("refuses a fifth concurrent call, and a call that does not fit the budget, 
   expect(poor.ledger.totals()).toMatchObject({ refused: 1, spentNanoUsd: 0 });
 });
 
+test("close() settles at once with calls stuck at every stage, and keeps their reservations", async () => {
+  const { socketPath, fake, ledger, proxy, recorded } = await setup();
+  // Upstream silent before its headers, a stream that never ends, and a client that never
+  // reads a big answer (the proxy waits on drain). Plus a connection that never sends headers.
+  const stream = { stream: true };
+  const stuck = ["[fake:stall]", "[fake:hang]"].map((text) => send(socketPath, body(text, stream)));
+  const unread = new Promise<void>((resolve) => {
+    const req = http.request(
+      { socketPath, method: "POST", path: PROXY_PATH, headers: HEADERS },
+      (res) => {
+        res.pause();
+        res.on("close", resolve);
+      }
+    );
+    req.on("error", () => resolve());
+    req.end(body("[fake:huge]", stream));
+  });
+  const idle = net.connect(socketPath);
+  idle.on("error", () => undefined);
+  while (fake.requests.length < 3 || proxy.stats().inFlight < 3) await Bun.sleep(5);
+  const started = Date.now();
+  await proxy.close();
+  expect(Date.now() - started).toBeLessThan(2_000); // CLOSE_MS (5 s) is the hard bound
+  const records = await recorded(3);
+  expect(records.map((record) => record.outcome)).toEqual(["kept", "kept", "kept"]);
+  const { reservedNanoUsd, spentNanoUsd } = ledger.totals();
+  expect(reservedNanoUsd).toBe(0);
+  expect(spentNanoUsd).toBe(records.reduce((sum, record) => sum + record.reservedNanoUsd!, 0));
+  await Promise.allSettled([...stuck, unread]);
+  idle.destroy();
+});
+
 test("refusals beyond the first 20 are counted per category, not logged", async () => {
   const { socketPath, records, proxy } = await setup();
   for (let i = 0; i < 30; i++) await send(socketPath, body("hi"), { path: `/x${i}` });

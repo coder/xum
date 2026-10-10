@@ -266,7 +266,9 @@ test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash 
 # BUGBASH_BUDGET_USD (a list-price cap) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. Its seed
 # writes the MCP chat directly, so the app AI stays the mock. The container mounts dist/.
 mcp-apps-e2e: build-main build-renderer build-static ## MCP Apps e2e suite in the bug-bash sandbox (needs BUGBASH_BUDGET_USD)
-	@cd tests/bugbash && BUGBASH_AI=mock bun sandbox/launch.ts -- run --config e2e.mcpapps.config.ts --output .e2e/mcp-apps-$$(date -u +%Y%m%dT%H%M%SZ) $(MCP_APPS_E2E_ARGS)
+	@# The app AI is pinned to the mock, also over an exported BUGBASH_AI_RESOLVED. The shell PID
+	@# keeps two runs that start in the same second apart (their output and proxy record).
+	@cd tests/bugbash && BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="MCP Apps suite" bun sandbox/launch.ts -- run --config e2e.mcpapps.config.ts --output .e2e/mcp-apps-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(MCP_APPS_E2E_ARGS)
 
 rlm-eval: ## Run the RLM lever eval against a running dev-server sandbox (see scripts/rlm-eval/run.ts header)
 	@bun run scripts/rlm-eval/run.ts $(RLM_EVAL_ARGS)
