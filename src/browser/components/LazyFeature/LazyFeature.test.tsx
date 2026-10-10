@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import React from "react";
 import { installDom } from "../../../../tests/ui/dom";
@@ -40,7 +40,7 @@ describe("LazyFeature", () => {
     expect(view.getByTestId("pending")).toBeTruthy();
     expect(view.queryByTestId("lazy-content")).toBeNull();
 
-    await act(async () => lazy.settle.resolve());
+    lazy.settle.resolve();
 
     expect(await view.findByTestId("lazy-content")).toBeTruthy();
     expect(view.queryByTestId("pending")).toBeNull();
@@ -58,7 +58,7 @@ describe("LazyFeature", () => {
         </LazyFeature>
       );
 
-      await act(async () => lazy.settle.reject(new Error("Failed to fetch dynamic module")));
+      lazy.settle.reject(new Error("Failed to fetch dynamic module"));
 
       fireEvent.click(await view.findByRole("button", { name: "Reload" }));
       expect(reload).toHaveBeenCalledTimes(1);

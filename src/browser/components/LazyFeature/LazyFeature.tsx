@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import React, { Suspense } from "react";
+import { Suspense } from "react";
 import { Button } from "../Button/Button";
 import { ErrorBoundary } from "../ErrorBoundary/ErrorBoundary";
 
