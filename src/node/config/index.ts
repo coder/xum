@@ -86,6 +86,7 @@ import {
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
 import { sharesPlanDirectory } from "@/common/utils/planStorage";
+import { stableStringify } from "@/common/utils/stableStringify";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import {
   DelegatedCreationMarkSchema,
@@ -947,7 +948,9 @@ interface StoredProjectEntry {
 /**
  * Merge one group of aliases (stored keys that normalize to the same path), or return null when
  * a merge would have to choose between two different rows with the same id. Rows with distinct
- * ids are combined, and a byte-identical duplicate row is kept once. Project settings come from
+ * ids are combined, and a duplicate row is kept once. Rows are compared with their properties in
+ * sorted order: the same row written with another property order is a duplicate, not a conflict
+ * that would drop the earlier aliases' rows (#5929). Project settings come from
  * the last entry, as the previous `new Map(pairs)` loader did: a setting only an earlier alias
  * holds may be one the user cleared since. The project is trusted only when every alias was:
  * the canonical spelling says nothing about which alias the user trusted.
@@ -955,13 +958,13 @@ interface StoredProjectEntry {
 function mergeProjectAliases(group: StoredProjectEntry[]): ProjectConfig | null {
   const workspaces: ProjectConfig["workspaces"] = [];
   const rowJsonById = new Map<string, string>();
-  // Legacy rows without an id: a byte-identical copy in two aliases is one workspace. Keeping
+  // Legacy rows without an id: an identical copy in two aliases is one workspace. Keeping
   // both would let the id migration give both copies the same stable id.
   const idlessRowJson = new Set<string>();
   for (const { config } of group) {
     if (!Array.isArray(config.workspaces)) return null;
     for (const workspace of config.workspaces) {
-      const json = JSON.stringify(workspace);
+      const json = stableStringify(workspace);
       if (!workspace.id) {
         if (!idlessRowJson.has(json)) workspaces.push(workspace);
         idlessRowJson.add(json);

@@ -1037,6 +1037,73 @@ describe("Config", () => {
       ]);
     });
 
+    // #5929: the same row with its properties in another order is one row, not a conflict.
+    // Comparing rows as raw JSON text called it a conflict, and the group then kept only its
+    // last entry, dropping the rows that only an earlier alias held.
+    function reordered(source: StoredRow): StoredRow {
+      return Object.fromEntries(Object.entries(source).reverse()) as StoredRow;
+    }
+
+    for (const order of ["canonical first", "alias first"] as const) {
+      it(`keeps every row when a shared row only differs in property order (${order})`, async () => {
+        const same = row("ws-same");
+        const aliases: StoredPair[] = [
+          ["/home/u/repo", { workspaces: [same, row("ws-one")] }],
+          ["/home/u/repo/", { workspaces: [reordered(same), row("ws-two")] }],
+        ];
+        writeProjects(order === "canonical first" ? aliases : [aliases[1], aliases[0]]);
+
+        await flushConfigEdits();
+        const saved = readSavedProjects();
+        expect(saved.map(([key]) => key)).toEqual(["/home/u/repo"]);
+        const ids = saved[0][1].workspaces.map((workspace) => workspace.id);
+        expect([...ids].sort()).toEqual(["ws-one", "ws-same", "ws-two"]);
+        // The reload reads the merged file back unchanged.
+        config.loadConfigOrDefault();
+        await flushConfigEdits();
+        expect(readSavedProjects()).toEqual(saved);
+      });
+    }
+
+    it("keeps every row across three aliases that share a row in different property orders", async () => {
+      const same = row("ws-same");
+      writeProjects([
+        ["/home/u/repo", { workspaces: [same, row("ws-one")] }],
+        ["/home/u/repo/", { workspaces: [reordered(same), row("ws-two")] }],
+        ["/home/u/repo//", { workspaces: [{ ...same }, row("ws-three")] }],
+      ]);
+
+      const expectedIds = ["ws-one", "ws-same", "ws-three", "ws-two"];
+      const loaded = config.loadConfigOrDefault();
+      const ids = loaded.projects.get("/home/u/repo")?.workspaces.map((w) => w.id) ?? [];
+      expect([...ids].sort()).toEqual(expectedIds);
+      // One row per workspace id: the single-row metadata read agrees with the full build.
+      const all = await config.getAllWorkspaceMetadata();
+      expect(all.map((meta) => meta.id).sort()).toEqual(expectedIds);
+      const one = await config.findWorkspaceMetadata("ws-same");
+      expect(one).toEqual(all.find((meta) => meta.id === "ws-same") ?? null);
+    });
+
+    it("keeps one copy of a legacy row without an id that only differs in property order", () => {
+      const legacy = { name: "legacy", path: path.join(config.srcDir, "repo", "legacy") };
+      const other = { name: "other", path: path.join(config.srcDir, "repo", "other") };
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["/home/u/repo", { workspaces: [legacy] }],
+            ["/home/u/repo/", { workspaces: [{ path: legacy.path, name: legacy.name }, other] }],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.projects.get("/home/u/repo")?.workspaces.map((w) => w.name)).toEqual([
+        "legacy",
+        "other",
+      ]);
+    });
+
     // A conflicting group (two different rows with the same id) keeps
     // the loader's previous result: `new Map(stripped pairs)`, the last entry at the position of
     // the first. This oracle is that expression, so the test pins "no change" for conflicts
@@ -1067,6 +1134,22 @@ describe("Config", () => {
           ["/home/u/repo/", { workspaces: [row("ws-same", { title: "second" }), row("ws-two")] }],
           ["/home/u/other", { workspaces: [row("ws-other")] }],
           ["/home/u/repo", { workspaces: [row("ws-same", { title: "first" }), row("ws-one")] }],
+        ],
+      ],
+      [
+        // Two checkouts under one workspace id are a real conflict, not a property-order one.
+        "a same-id conflict on a different checkout path",
+        () => [
+          ["/home/u/repo", { workspaces: [row("ws-same"), row("ws-one")] }],
+          [
+            "/home/u/repo/",
+            {
+              workspaces: [
+                row("ws-same", { path: path.join(config.srcDir, "repo", "elsewhere") }),
+                row("ws-two"),
+              ],
+            },
+          ],
         ],
       ],
       [
