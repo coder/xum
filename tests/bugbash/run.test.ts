@@ -56,11 +56,11 @@ function fakeLaunch(outcome: (call: Call, index: number) => Promise<JobOutcome> 
   return { deps, calls, lines };
 }
 const until = (signal: AbortSignal): Promise<JobOutcome> =>
-  new Promise((resolve) =>
-    signal.addEventListener("abort", () =>
-      resolve({ code: 130, cleanup: "removed", stopped: String(signal.reason) })
-    )
-  );
+  new Promise((resolve) => {
+    const done = () => resolve({ code: 130, cleanup: "removed", stopped: String(signal.reason) });
+    if (signal.aborted) done();
+    else signal.addEventListener("abort", done);
+  });
 
 test("B2: every charter runs through the launcher with one shared ledger, none on the host", async () => {
   const spawn = spyOn(childProcess, "spawn");
@@ -96,6 +96,19 @@ test("B2: a proxy fault starts no new charter, stops the running one and exits 5
   const args = [...charters("a", "b", "c", "d"), "--parallel", "2"];
   expect(await runBugBash(args, ENV, stop, deps)).toBe(5);
   expect(calls).toHaveLength(2);
+});
+
+test("B2: a fault reported from inside a running job stops every running job at once", async () => {
+  const { deps, calls } = fakeLaunch(async (call, index) => {
+    if (index === 1) call.o.onProxyFault!("proxy: a call cost more than its reserved bound");
+    // Every job, the faulty one too, runs until its stop comes: only the halt ends them.
+    const outcome = await until(call.o.stop);
+    return { ...outcome, stopped: undefined, ...(index === 1 && { proxyFault: "x" }) };
+  });
+  const stop = new AbortController().signal;
+  const args = [...charters("a", "b", "c"), "--parallel", "2"];
+  expect(await runBugBash(args, ENV, stop, deps)).toBe(5);
+  expect(calls).toHaveLength(2); // the third never starts
 });
 
 test("B2: an unknown container state outranks the stop of the run", async () => {

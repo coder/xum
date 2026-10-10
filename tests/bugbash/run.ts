@@ -6,8 +6,8 @@
  *
  * Each explorer reaches its model only through a provider proxy that the launcher runs for its
  * job. One list-price budget (BUGBASH_BUDGET_USD, required) covers the whole run, and
- * ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL stay on the host. A call that costs more than its
- * bound stops the run (exit 5).
+ * ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL stay on the host. A proxy fault (a call that costs
+ * more than its bound, a call record that was not written) stops the run at once (exit 5).
  *
  * Usage: make bug-bash [BUGBASH_ARGS="--only composer,settings --parallel 4 --max-steps 6"], or
  *        bun tests/bugbash/run.ts [--charters <file>] [--only <slug,...>] [--parallel 8]
@@ -36,6 +36,7 @@
  * fault, and otherwise the highest code among the charters (2 refused or setup, 3, 4).
  */
 import assert from "node:assert/strict";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
@@ -325,7 +326,9 @@ export async function runBugBash(
   const ledger = new Ledger(budgetUsd);
   out(`App AI: ${APP_AI.mode} (${APP_AI.reason})`);
 
-  const runRel = `.e2e/bugbash/${new Date().toISOString().replace(/[:.]/g, "-")}-${effort}`;
+  // A random suffix: two runs in the same millisecond (run.test.ts runs several) get two folders.
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const runRel = `.e2e/bugbash/${stamp}-${crypto.randomBytes(3).toString("hex")}-${effort}`;
   const runDir = path.join(projectDir, runRel);
   fs.mkdirSync(path.dirname(runDir), { recursive: true });
   // Not recursive: a second bug bash started in the same millisecond fails here, not mid-run.
@@ -346,6 +349,12 @@ export async function runBugBash(
   // starts, and the running ones stop. Each job's stop follows the run's.
   const halt = new AbortController();
   let fault: string | undefined;
+  const onFault = (name: string, reason: string) => {
+    if (fault != null) return;
+    fault = reason;
+    err(`  ${name}: ${reason}. No new charter starts, and the running ones stop.`);
+    halt.abort("proxy fault");
+  };
   let unknownCleanup = false;
   const results: CharterResult[] = [];
   let next = 0;
@@ -367,6 +376,8 @@ export async function runBugBash(
           ledger,
           log: (line) => fs.writeSync(fd, `sandbox ${line}\n`),
           stderr: fd,
+          // At once, from inside the job: the other jobs must not keep spending until it ends.
+          onProxyFault: (reason) => onFault(name, reason),
         });
       } catch (error) {
         // A refusal before any docker command; anything else is a launcher bug.
@@ -377,11 +388,8 @@ export async function runBugBash(
         fs.closeSync(fd);
       }
       if (outcome.cleanup.startsWith("unknown")) unknownCleanup = true;
-      if (outcome.proxyFault != null && fault == null) {
-        fault = outcome.proxyFault;
-        err(`  ${name}: ${fault}. No new charter starts, and the running ones stop.`);
-        halt.abort("proxy fault");
-      }
+      // A fault that close() found (a call that outlived it) has no earlier signal.
+      if (outcome.proxyFault != null) onFault(name, outcome.proxyFault);
       const result = readResult(job, runRel, charterCode(outcome));
       // The app logs the mode it really started in. A mismatch means the mode never reached it
       // (e2e passes the app only `command.env`), so the charter tested something else: fail it.

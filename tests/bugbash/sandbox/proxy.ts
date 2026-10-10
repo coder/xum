@@ -68,6 +68,11 @@ export interface ProxyOptions {
   log: (record: CallRecord) => void;
   /** Per call, from the first request byte to the last response byte. */
   deadlineMs?: number;
+  /**
+   * Called at once when a call costs more than its bound: the cost model is wrong, so the caller
+   * stops its job (and run.ts its run) now, not after the job. close() still rejects.
+   */
+  onFault?: (reason: string) => void;
 }
 
 /** Reads `usage` from Anthropic SSE events: message_start, then cumulative message_delta. */
@@ -227,7 +232,10 @@ export async function startProxy(options: ProxyOptions) {
         const misses = options.ledger.totals().boundExceeded;
         options.ledger.settle(id, usage); // unreadable usage keeps the reservation (proxyPolicy.ts)
         const exceeded = options.ledger.totals().boundExceeded > misses;
-        if (exceeded) counts.boundExceeded += 1;
+        if (exceeded) {
+          counts.boundExceeded += 1;
+          options.onFault?.("proxy: a call cost more than its reserved bound");
+        }
         log({ outcome: "settled", ...record, ...(exceeded && { boundExceeded: true }) });
       }
     }

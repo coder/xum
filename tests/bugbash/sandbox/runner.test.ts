@@ -62,7 +62,9 @@ case "$1" in
         curl -s --unix-socket "$psrc/sock" -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
           -d '{"model":"claude-sonnet-5-5","max_tokens":10,"messages":[{"role":"user","content":"'"$CALL"'"}]}' \\
           http://proxy/anthropic/v1/messages >> "$bin/calls.log"; echo >> "$bin/calls.log"
-        echo "job says hi" >&2 ;;
+        echo "job says hi" >&2
+        # HANG=1: the job goes on after its call, until its lifeline closes.
+        if [ "$HANG" = 1 ]; then cat >/dev/null; echo "stdin closed" >> "$bin/calls.log"; fi ;;
     esac
     printf '{"p":"app.log","n":2}\nok'; [ "$RUN" = cut ] || printf '{"end":true}\n'
     [ "$RUN" = linger ] || unregister "$id"; exit 7 ;;
@@ -142,6 +144,7 @@ function fake(over: Record<string, string> = {}) {
     INSPECT_RC: "0",
     RUN: "ok",
     CALL: "hi",
+    HANG: "0",
     ...over,
   };
   fs.writeFileSync(
@@ -994,6 +997,19 @@ test("B1: a call record that cannot be written fails the job (exit 5)", async ()
   }
   expectNothingLeft();
 });
+
+test("B2: a bound miss stops the job at once, not when the job ends (exit 5)", async () => {
+  // Without the early stop this job would run until its 30-minute deadline.
+  const { code, logged } = await mcpLaunch({
+    RUN: "proxycall",
+    CALL: "[fake:overbill]",
+    HANG: "1",
+  });
+  expect(code).toBe(5);
+  expect(calls()).toContain("stdin closed");
+  expect(logged.join("\n")).toContain("cost more than its reserved bound: the job stops");
+  expectNothingLeft();
+}, 20_000);
 
 test("B1: a stop after a bound miss still ends with the stop, not exit 5", async () => {
   const stop = new AbortController();

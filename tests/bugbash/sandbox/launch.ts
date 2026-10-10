@@ -198,6 +198,8 @@ export interface LaunchOptions {
   log?: (line: string) => void;
   /** A file descriptor for the container's stderr (the e2e output). Default: ours. */
   stderr?: number;
+  /** Called once, at once, on the job's first proxy fault (run.ts stops its other jobs). */
+  onProxyFault?: (reason: string) => void;
 }
 
 /**
@@ -271,11 +273,22 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   // A call record that could not be written (a full disk): the proxy record is incomplete, so
   // the job must not look successful. The errno code only: the message can hold the path.
   let recordFault: string | undefined;
+  // The first proxy fault stops this job at once (its proxy closes with the lifeline), so no
+  // more paid calls go out on a wrong cost model or without a record.
+  let faulted = false;
+  const fault = (reason: string) => {
+    if (faulted) return;
+    faulted = true;
+    log(`${name} ${reason}: the job stops`);
+    session.stop("proxy fault");
+    o.onProxyFault?.(reason);
+  };
   const record = (entry: object) => {
     try {
       fs.appendFileSync(records, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
     } catch (error) {
       recordFault ??= `proxy: a call record was not written (${(error as NodeJS.ErrnoException).code ?? "error"})`;
+      fault(recordFault);
     }
   };
   // Nothing is cached before the proxy exists, so a stop during the staging cannot skip a close.
@@ -327,6 +340,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
         job: { models: [driven.model] }, // the app AI is the mock: only the explorer calls
         ledger,
         log: record,
+        onFault: fault,
       });
       proxyMount.push(...bind(proxyDir, PROXY_DIR));
     }
