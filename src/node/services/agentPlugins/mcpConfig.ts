@@ -729,12 +729,37 @@ export type AgentPluginsMcpProvider = (
 function computeProjectPluginInstanceId(args: {
   projectKey: string;
   projectRoot: string;
-  plugin: AgentPluginInfo;
+  plugin: Pick<AgentPluginInfo, "containerPath" | "dirName">;
 }): string {
   const relativeLocation = normalizeProjectMetadataIdentityPath(
     path.join(path.relative(args.projectRoot, args.plugin.containerPath), args.plugin.dirName)
   );
   return computePluginInstanceId(`${args.projectKey}\0${relativeLocation}`);
+}
+
+/**
+ * The one instance ID of a discovered plugin. Plugin MCP server keys,
+ * `PLUGIN_DATA` and plugin hook settings all use it, so every consumer must
+ * call this instead of hashing a path itself: a second hashing rule would
+ * make hooks read a different data directory than the plugin's server writes.
+ */
+export function resolvePluginInstanceId(
+  plugin: Pick<AgentPluginInfo, "scope" | "containerPath" | "dirName">,
+  ctx: AgentPluginsMcpContext
+): string {
+  if (plugin.scope === "project" && ctx.projectRoot !== undefined) {
+    return computeProjectPluginInstanceId({
+      projectKey: ctx.projectKey ?? ctx.projectRoot,
+      projectRoot: ctx.projectRoot,
+      plugin,
+    });
+  }
+  // Global scope: hash the LEXICAL installation location, not the canonical
+  // root. A symlinked plugin dir (e.g. a version-managed install) realpaths to
+  // a version-specific target, so hashing rootPath would rotate the server key
+  // and PLUGIN_DATA on every update, silently disabling workspace-enabled
+  // servers and orphaning their persistent data.
+  return computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName));
 }
 
 /**
@@ -763,7 +788,6 @@ export function createAgentPluginsMcpProvider(ctx: { xumHome: string }): AgentPl
         if (plugin.mcpConfigPath === undefined) {
           continue;
         }
-        let instanceId: string;
         if (plugin.scope === "project" && projectRoot !== undefined) {
           // Project plugin roots keep the repo-symlink posture of repo config:
           // the plugin root itself must stay inside the scanned checkout.
@@ -775,20 +799,11 @@ export function createAgentPluginsMcpProvider(ctx: { xumHome: string }): AgentPl
             );
             continue;
           }
-          instanceId = computeProjectPluginInstanceId({
-            projectKey: args.projectKey ?? projectRoot,
-            projectRoot,
-            plugin,
-          });
-        } else {
-          // Global scope: hash the LEXICAL installation location, not the
-          // canonical root. A symlinked plugin dir (e.g. a version-managed
-          // install) realpaths to a version-specific target, so hashing
-          // rootPath would rotate the server key and PLUGIN_DATA on every
-          // update, silently disabling workspace-enabled servers and
-          // orphaning their persistent data.
-          instanceId = computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName));
         }
+        const instanceId = resolvePluginInstanceId(plugin, {
+          projectRoot,
+          projectKey: args.projectKey,
+        });
         try {
           const { servers } = await loadPluginMcpServers(plugin, {
             xumHome: ctx.xumHome,

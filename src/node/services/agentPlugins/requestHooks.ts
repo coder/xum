@@ -22,6 +22,7 @@ export async function prepareWorkspaceRequestHooks(args: {
     journal: args.journal,
     xumHome: args.config.rootDir,
     projectRoot: pluginContext?.projectRoot,
+    projectKey: pluginContext?.projectKey,
     projectTrusted: isWorkspaceProjectTrusted(args.config, args.metadata),
   });
 }

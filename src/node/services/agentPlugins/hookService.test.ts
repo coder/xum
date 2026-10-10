@@ -47,6 +47,8 @@ import {
 } from "./hookService";
 import { bumpContainerMutationEpoch, STAGING_DIR_NAME } from "./journals";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0, createAgentPluginsMcpProvider } from "./mcpConfig";
+import { PLUGIN_HOOK_STATE_FILE, PLUGIN_HOOK_STATE_WORKSPACE_DIR } from "./pluginHookState";
 
 const WORKSPACE_ID = "plugin-hooks-test";
 
@@ -595,7 +597,7 @@ describe("AgentPluginHookService", () => {
         ).success
       ).toBe(true);
       expect(ensure).toHaveBeenCalledTimes(1);
-      expect(injected).toEqual(["base\n\nmodelString,workspaceId"]);
+      expect(injected).toEqual(["base\n\nmodelString,settings,workspaceId"]);
     } finally {
       ensure.mockRestore();
       await h.session.dispose();
@@ -680,6 +682,74 @@ describe("AgentPluginHookService", () => {
       placement: "system-prompt",
       text: "House rule: never commit secrets.",
     });
+  });
+
+  test("hooks read the settings their plugin's MCP server saves, on every call", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "style",
+      `({
+        "request.assemble": (input) =>
+          input.settings && input.settings.rule ? { context: "Rule: " + input.settings.rule } : undefined,
+        "tool.execute.before": (input) =>
+          input.settings && input.settings.blockBash ? { deny: "bash is off in settings" } : undefined,
+      })`,
+      { tools: ["bash"] }
+    );
+    await fs.writeFile(
+      path.join(harness.container, "style", "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: { settings: { type: "stdio", command: "node", args: ["./server.js"] } },
+      }),
+      "utf8"
+    );
+    // The folder the plugin's own server gets as PLUGIN_DATA (where its view saves settings).
+    const servers = await createAgentPluginsMcpProvider({ xumHome: harness.tmp.path })({
+      trusted: false,
+    });
+    const server = Object.values(servers).find((info) => info.plugin?.pluginName === "style");
+    const dataPath = server?.transport === "stdio" ? server.env?.PLUGIN_DATA : undefined;
+    expect(dataPath).toBeDefined();
+    await harness.ensure();
+
+    const assemble = async (): Promise<string> => {
+      const ctx: RequestAssembleContext = {
+        workspaceId: WORKSPACE_ID,
+        modelString: "anthropic:claude-sonnet-4-5",
+        systemMessage: "Base.",
+        tools: {},
+      };
+      await harness.spine.run("request.assemble", ctx);
+      return ctx.systemMessage;
+    };
+
+    // No settings saved yet: the hook gets null and adds nothing.
+    expect(await assemble()).toBe("Base.");
+
+    await fs.mkdir(path.join(dataPath!, PLUGIN_HOOK_STATE_WORKSPACE_DIR), { recursive: true });
+    await fs.writeFile(
+      path.join(dataPath!, PLUGIN_HOOK_STATE_FILE),
+      JSON.stringify({ rule: "British spelling", blockBash: true }),
+      "utf8"
+    );
+    // A save takes effect on the next request without a reload.
+    expect(await assemble()).toBe("Base.\n\nRule: British spelling");
+    const toolCtx = makeToolCtx("bash", { script: "ls" });
+    await runTool(harness.spine, toolCtx);
+    expect(blockedError(toolCtx)).toContain("bash is off in settings");
+
+    // This workspace's file overrides the global value, key by key.
+    await fs.writeFile(
+      path.join(dataPath!, PLUGIN_HOOK_STATE_WORKSPACE_DIR, `${WORKSPACE_ID}.json`),
+      JSON.stringify({ rule: "American spelling" }),
+      "utf8"
+    );
+    expect(await assemble()).toBe("Base.\n\nRule: American spelling");
+    const stillBlocked = makeToolCtx("bash", { script: "ls" });
+    await runTool(harness.spine, stillBlocked);
+    expect(stillBlocked.executed).toBe(false);
   });
 
   test("a denied capability is a catchable guest error", async () => {
