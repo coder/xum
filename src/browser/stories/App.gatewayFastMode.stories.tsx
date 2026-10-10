@@ -35,6 +35,9 @@ function setupGatewayFastMode() {
   client.providers.setProviderConfig = () => {
     throw new Error("Chat speed must not write provider config");
   };
+  client.workspace.sendMessage = () => {
+    throw new Error("Speed commands must not send a chat message");
+  };
   client.workspace.setActiveTurnServiceTier = () =>
     Promise.resolve({ success: true, data: { accepted: false } });
   return client;
@@ -51,6 +54,22 @@ export const Desktop: AppStory = {
     await waitForChatInputAutofocusDone(root);
     blurActiveElement();
     const trigger = canvas.getByRole("button", { name: /Thinking:/ });
+
+    const composer = canvas.getByRole("textbox", { name: "Message" });
+    for (const [command, tier, label] of [
+      ["/fast", "priority", "Thinking: high, fast mode"],
+      ["/ultrafast", "ultrafast", "Thinking: high, ultrafast mode"],
+      ["/ultrafast", "default", "Thinking: high"],
+    ] as const) {
+      await userEvent.type(composer, command);
+      await userEvent.click(canvas.getByRole("button", { name: "Send message" }));
+      await waitFor(async () => {
+        await expect(composer).toHaveValue("");
+        await expect(getPendingAiSelection(workspaceId, "exec", "serviceTier")).toBe(tier);
+        await expect(trigger).toHaveAccessibleName(label);
+      });
+    }
+    blurActiveElement();
 
     await userEvent.hover(trigger);
     const tooltip = await within(document.body).findByRole("tooltip");

@@ -69,6 +69,7 @@ import { copyWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import {
   consumeAiSelectionIntent,
   getAiSelectionIntentForSendOptions,
+  getWorkspaceAgentId,
   snapshotPendingAiSelection,
 } from "@/browser/utils/aiSelectionIntent";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
@@ -109,6 +110,8 @@ import {
   TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
 } from "@/constants/transcriptBarrier";
 
+import { getProjectScopeId, GLOBAL_SCOPE_ID } from "@/common/constants/storage";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { DEFAULT_ROUTE_PRIORITY, resolveRoute } from "@/common/routing";
 import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
@@ -117,10 +120,12 @@ import {
   getFastModeProvider,
   isFastModeActive,
   isUltrafastModeActive,
+  setWorkspaceServiceTier,
+  toggleServiceTier,
   ultrafastModeAvailable,
 } from "@/browser/utils/fastModeServiceTier";
 
-// Provider preferences are global: serialize slash toggles even across composers.
+// Non-OpenAI speed preferences remain global: serialize slash toggles while config loads.
 let speedModeToggleInFlight = false;
 
 const BUILT_IN_MODEL_SET = new Set<string>(Object.values(KNOWN_MODELS).map((model) => model.id));
@@ -241,6 +246,8 @@ export type CommandResult =
 
 export interface SlashCommandEnv {
   api: RouterClient<AppRouter> | null;
+  /** Composer's AI scope, which may be the owning project rather than a sub-project path. */
+  aiScopeId?: string;
   workspaceId?: string;
   variant: "workspace" | "creation";
   projectPath?: string | null;
@@ -780,6 +787,15 @@ export async function processSlashCommand(
   if (parsed.type === "speed-mode-toggle") {
     if (!client) return notConnected();
     if (speedModeToggleInFlight) return complete("restore");
+    const scopeId =
+      env.aiScopeId ??
+      (env.variant === "workspace"
+        ? env.workspaceId
+        : env.projectPath
+          ? getProjectScopeId(env.projectPath)
+          : GLOBAL_SCOPE_ID);
+    const selectedAgent = scopeId ? getWorkspaceAgentId(scopeId) : undefined;
+    const selectedModel = scopeId ? getWorkspaceAiSelection(scopeId).model : undefined;
     trackCommandUsed(parsed.mode);
     return phase([{ type: "clear-input" }], async () => {
       if (speedModeToggleInFlight) return complete("restore-if-empty");
@@ -787,8 +803,8 @@ export async function processSlashCommand(
       const store = getProvidersConfigStore();
       const label = parsed.mode === "fast" ? "Fast" : "Ultrafast";
       try {
-        // Slash toggles use the same provider preference and restore target as the selector,
-        // not a one-shot send override. Use the selected model, including creation composers.
+        // Use the selected model, including creation composers, and preserve the
+        // same route/model restrictions as the speed selector.
         const model = env.sendMessageOptions.model;
         const providersConfig = await client.providers.getConfig();
         const routeConfig = getAppConfigStore().getSnapshot() ?? (await client.config.getConfig());
@@ -818,20 +834,41 @@ export async function processSlashCommand(
             `${label} mode is not available for ${model} on its current provider route and wire format.`
           );
         }
-        const patch = await applyFastModeToggle(
-          client.providers,
-          provider,
-          providersConfig[provider],
-          parsed.mode === "fast" ? "priority" : "ultrafast"
-        );
-        if (!patch) throw new Error(`Failed to toggle ${label} mode`);
-        store.updateOptimistically(provider, patch);
-        if (store.getConfig() == null) await store.refresh();
-        const updatedConfig = { ...providersConfig[provider], ...patch };
-        const enabled =
-          parsed.mode === "fast"
-            ? isFastModeActive(provider, updatedConfig)
-            : isUltrafastModeActive(updatedConfig);
+        const targetTier = parsed.mode === "fast" ? "priority" : "ultrafast";
+        let enabled: boolean;
+        if (provider === "openai") {
+          if (!scopeId) throw new Error("Workspace ID required");
+          // Async capability loading must not apply an old command to a newly selected agent.
+          if (
+            (env.variant === "workspace" && env.isCurrent?.() === false) ||
+            getWorkspaceAgentId(scopeId) !== selectedAgent ||
+            getWorkspaceAiSelection(scopeId).model !== selectedModel
+          ) {
+            return complete("restore-if-empty");
+          }
+          // Share the picker/shortcut's pending choice and next-step nudge, not a
+          // provider-wide write. Read after awaits so an intervening pick is respected.
+          const currentTier =
+            getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier;
+          const tier = toggleServiceTier(currentTier, targetTier);
+          setWorkspaceServiceTier(client, scopeId, tier);
+          enabled = tier === targetTier;
+        } else {
+          const patch = await applyFastModeToggle(
+            client.providers,
+            provider,
+            providersConfig[provider],
+            targetTier
+          );
+          if (!patch) throw new Error(`Failed to toggle ${label} mode`);
+          store.updateOptimistically(provider, patch);
+          if (store.getConfig() == null) await store.refresh();
+          const updatedConfig = { ...providersConfig[provider], ...patch };
+          enabled =
+            parsed.mode === "fast"
+              ? isFastModeActive(provider, updatedConfig)
+              : isUltrafastModeActive(updatedConfig);
+        }
         return complete("consume", [
           showToast({
             id: Date.now().toString(),
