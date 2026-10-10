@@ -15,7 +15,7 @@ import * as path from "path";
 
 // Source-map path substrings never allowed on the first load. Later T3 PRs add the module
 // they make lazy (e.g. `node_modules/lottie-web/`) so it cannot come back.
-export const FIRST_LOAD_FORBIDDEN_SOURCES: readonly string[] = [];
+export const FIRST_LOAD_FORBIDDEN_SOURCES: readonly string[] = ["node_modules/lottie-web/"];
 
 function fail(message: string): never {
   console.error(`firstLoadJs: ${message}`);
