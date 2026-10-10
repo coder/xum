@@ -922,6 +922,11 @@ interface WorkspaceStreamInfo {
   // original start timestamp even after they gain output.
   toolCompletionTimestamps: Map<string, number>;
 
+  // Anthropic server tools (web_search, ...) called in this row (#5887). Xum stores them as
+  // client tool calls without their encrypted results, so history replays them as a
+  // tool_use/tool_result pair: thinking after one is bound to a prefix never sent again.
+  anthropicServerToolCallIds?: Set<string>;
+
   // Workflow tools can create the durable run before their stream part is stored. Keep the exact
   // attachment and apply it as soon as the matching dynamic-tool part lands.
   pendingWorkflowRunAttachments: Map<string, WorkflowRunToolAttachment>;
@@ -2141,6 +2146,7 @@ export class StreamManager {
         }
       }
       streamInfo.parts.push(partToPersist);
+      if (part.type === "reasoning") this.turnReplayOffAfterServerTool(streamInfo);
       if (pendingExecutionStart !== undefined && part.type === "dynamic-tool") {
         this.emitTurnEvent({
           type: "tool-call-execution-start",
@@ -2179,6 +2185,27 @@ export class StreamManager {
         void this.schedulePartialWrite(workspaceId, streamInfo);
       }
     }
+  }
+
+  /**
+   * #5887 containment: thinking that follows an Anthropic server tool in this row cannot
+   * replay as the API returned it (see anthropicServerToolCallIds). Write the same receipt
+   * as the signature repair, so later requests in the context segment send no thinking
+   * (removing every thinking block is valid; a gap or a put-back block is not). It rides
+   * on the partial write that stores this reasoning part (every reasoning append schedules
+   * one).
+   */
+  private turnReplayOffAfterServerTool(streamInfo: WorkspaceStreamInfo): void {
+    const serverToolIds = streamInfo.anthropicServerToolCallIds;
+    if (serverToolIds == null || streamInfo.initialMetadata?.anthropicThinkingReplay === "off") {
+      return;
+    }
+    // Read the parts, not only the ID set: a retry that drops parts drops the server tool too.
+    const followsServerTool = streamInfo.parts.some(
+      (part) => part.type === "dynamic-tool" && serverToolIds.has(part.toolCallId)
+    );
+    if (!followsServerTool) return;
+    streamInfo.initialMetadata = { ...streamInfo.initialMetadata, anthropicThinkingReplay: "off" };
   }
 
   private async cancelStreamSafely(
@@ -4724,6 +4751,12 @@ export class StreamManager {
                   toolName: part.toolName,
                   input: part.input,
                 });
+                if (
+                  part.providerExecuted === true &&
+                  isAnthropicMessagesModel(streamInfo.request.model)
+                ) {
+                  (streamInfo.anthropicServerToolCallIds ??= new Set()).add(part.toolCallId);
+                }
 
                 // Note: Tool availability is handled by the SDK, which emits tool-error events
                 // for unavailable tools. No need to check here.

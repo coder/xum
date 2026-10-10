@@ -977,6 +977,82 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(serialized).not.toContain("removed thinking");
   });
 
+  it("prefix replay keeps the thinking after a server tool out, tool pairs intact (#5887)", async () => {
+    const journal = journalFixture();
+    journal.preparation.modelString = "anthropic:claude-opus-5-5";
+    journal.preparation.effectiveThinkingLevel = "high";
+    // The row a server-tool turn commits (streamManager.preservedThinking.test.ts): the
+    // server tool stored as a client tool call, thinking after it, and the receipt.
+    const serverToolRow = createMuxMessage(
+      "server-tool-turn",
+      "assistant",
+      "",
+      { anthropicThinkingReplay: "off" },
+      [
+        {
+          type: "reasoning",
+          text: "plan",
+          providerOptions: { anthropic: { signature: "sig-plan" } },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: "srvtoolu_1",
+          toolName: "web_search",
+          state: "output-available",
+          input: { query: "xum" },
+          output: [
+            {
+              url: "https://example.com/xum",
+              title: "Xum",
+              pageAge: null,
+              type: "web_search_result",
+            },
+          ],
+        },
+        {
+          type: "reasoning",
+          text: "read",
+          providerOptions: { anthropic: { signature: "sig-read" } },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: "toolu_2",
+          toolName: "bash",
+          state: "output-available",
+          input: { script: "pwd" },
+          output: "/tmp",
+        },
+        { type: "text", text: "kept answer" },
+      ]
+    );
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("user-1", "user", "search"),
+      serverToolRow,
+      createMuxMessage("user-2", "user", "next"),
+    ];
+    const { deferLoadingToolNames: _deferred, ...preparation } = journal.preparation;
+    const expected = await assemblePromptPayload({
+      ...preparation,
+      workspaceId,
+      history: journal.prefixSourceRows,
+      systemMessage: "",
+      postCompactionAttachments: journal.postCompactionAttachments,
+    });
+    const actual = (await rebuildContinuousPrefix(journal, workspaceId)).filter(
+      (message) => message.role !== "system"
+    );
+    expect(actual).toEqual(expected.messages.filter((message) => message.role !== "system"));
+    const parts = actual.flatMap((message) =>
+      Array.isArray(message.content) ? (message.content as Array<{ type: string }>) : []
+    );
+    // No signed thinking is left (an unsigned placeholder never reaches the wire).
+    expect(JSON.stringify(actual)).not.toContain("sig-");
+    expect(parts.filter((part) => part.type === "tool-call")).toHaveLength(2);
+    expect(parts.filter((part) => part.type === "tool-result")).toHaveLength(2);
+    expect(JSON.stringify(actual)).toContain("kept answer");
+  });
+
   it("prefix replay keeps native tool search results as tool references (#5262)", async () => {
     const journal = journalFixture();
     journal.preparation.deferLoadingToolNames = ["slack_send_message"];
