@@ -30,6 +30,7 @@ import { DiffContainer, DiffRenderer, SelectableDiffRenderer } from "../Shared/D
 import { KebabMenu, type KebabMenuItem } from "@/browser/components/KebabMenu/KebabMenu";
 import { JsonHighlight } from "./Shared/HighlightedCode";
 import type { ReviewNoteData } from "@/common/types/review";
+import { DIFF_ADDED_TEXT_COLOR, DIFF_REMOVED_TEXT_COLOR } from "@/constants/diffColors";
 import { OpenAsArtifactButton } from "@/browser/features/RightSidebar/ArtifactsTab/OpenAsArtifactButton";
 
 type FileEditOperationArgs =
@@ -49,14 +50,11 @@ const LARGE_DIFF_PREVIEW_CHAR_THRESHOLD = 80_000;
 const LARGE_DIFF_PREVIEW_LINE_LIMIT = 240;
 
 // Header "+N" / "-N" colors. The raw success/danger tokens are below WCAG AA on the chat
-// background in the light themes and flexoki-dark (#6010). Module-level style objects, so each
-// render reuses them instead of allocating new inline objects.
-const ADDITIONS_STYLE = {
-  color: "color-mix(in srgb, var(--color-success), var(--color-text) 40%)",
-} as const;
-const DELETIONS_STYLE = {
-  color: "color-mix(in srgb, var(--color-danger), var(--color-text) 40%)",
-} as const;
+// background in the light themes and flexoki-dark (#6010), so the counts share the diff gutter's
+// AA-tuned colors. Module-level style objects, so each render reuses them instead of allocating
+// new inline objects.
+const ADDITIONS_STYLE = { color: DIFF_ADDED_TEXT_COLOR } as const;
+const DELETIONS_STYLE = { color: DIFF_REMOVED_TEXT_COLOR } as const;
 
 interface LargeDiffPreview {
   previewDiff: string;
@@ -292,7 +290,6 @@ export const FileEditToolCall: React.FC<FileEditToolCallProps> = ({
               title={diffLineDelta.title}
               aria-label={diffLineDelta.title}
             >
-              {/* Same mix as the diff gutter signs (DiffRenderer, #5985). */}
               <span style={ADDITIONS_STYLE}>{diffLineDelta.additionsLabel}</span>
               <span className="text-muted">, </span>
               <span style={DELETIONS_STYLE}>{diffLineDelta.deletionsLabel}</span>
