@@ -560,8 +560,8 @@ export interface BuildStreamSystemContextOptions {
   /**
    * Pre-rendered hot-memories block (pinned + frequently used memory files;
    * memory-hot-set sub-experiment). Computed and cached by AgentSession per
-   * model/session segment because selection is token-budgeted with the active
-   * tokenizer, so repeated turns stay byte-identical (prompt-cache-stable).
+   * model/session segment, so repeated turns stay byte-identical
+   * (prompt-cache-stable).
    */
   hotMemoriesBlock?: string;
   /** claude-skills-compat experiment: read Claude skills and global instructions (read-only). */

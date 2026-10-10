@@ -3,6 +3,7 @@ import * as path from "node:path";
 
 import { describe, it, expect } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
+import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 
 import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS } from "@/common/constants/toolLimits";
@@ -388,9 +389,7 @@ describe("agent_skill_read", () => {
     }
   });
 
-  function skillIndexLines(
-    availableSkills: NonNullable<Parameters<typeof createAgentSkillReadTool>[0]["availableSkills"]>
-  ): string[] {
+  function skillIndexLines(availableSkills: AgentSkillDescriptor[]): string[] {
     using tempDir = new TestTempDir("test-agent-skill-read-index");
     const tool = createAgentSkillReadTool({
       ...createTestToolConfig(tempDir.path),

@@ -375,8 +375,8 @@ export function buildTaskToolDescription(
 ): string {
   const sharedIsolation =
     options?.sharedIsolation ?? runtimeModeSupportsSharedTaskWorkspace(runtimeMode);
-  // The prelude used to carry the lifecycle, best-of-n and report-trust rules; they live here so
-  // agents without the task tool (explore, depth-capped children) do not pay for them.
+  // Lifecycle, best-of-n and report-trust rules live here, not in the prelude, so agents without
+  // the task tool (explore, depth-capped children) do not pay for them.
   return [
     'Spawn a sub-agent (child workspace), or with kind="workspace" a full workspace turn. Run shell commands with bash, not a sub-agent.',
     `${getTaskRuntimeVisibilityGuidance(runtimeMode)}${sharedIsolation ? ' isolation: "none" shares this checkout instead.' : ""}`,
@@ -1705,6 +1705,11 @@ export const AgentReportToolResultSchema = z.discriminatedUnion("success", [
     .strict(),
 ]);
 const FILE_TOOL_PATH = z.string().describe("File path (absolute or workspace-relative)");
+const SKILL_NAME_PARAM = SkillNameSchema.describe("Skill directory name");
+const FILE_LINE_RANGE_FIELDS = {
+  offset: z.number().int().positive().nullish().describe("1-based start line (default 1)"),
+  limit: z.number().int().positive().nullish().describe("Max lines from offset (default all)"),
+};
 
 /**
  * Zod preprocessor: normalizes legacy `file_path` / `filePath` keys to canonical `path`.
@@ -2402,13 +2407,7 @@ export const TOOL_DEFINITIONS = {
       normalizeFilePath,
       z.object({
         path: z.string().describe("File path (absolute or relative)"),
-        offset: z.number().int().positive().nullish().describe("1-based start line (default 1)"),
-        limit: z
-          .number()
-          .int()
-          .positive()
-          .nullish()
-          .describe("Max lines from offset (default all)"),
+        ...FILE_LINE_RANGE_FIELDS,
       })
     ),
   },
@@ -2723,7 +2722,7 @@ export const TOOL_DEFINITIONS = {
       "Load a skill's SKILL.md (frontmatter + body) by name; read its other files with agent_skill_read_file.",
     schema: z
       .object({
-        name: SkillNameSchema.describe("Skill directory name"),
+        name: SKILL_NAME_PARAM,
       })
       .strict(),
   },
@@ -2732,18 +2731,12 @@ export const TOOL_DEFINITIONS = {
     description: "Read a file in a skill directory, like file_read.",
     schema: z
       .object({
-        name: SkillNameSchema.describe("Skill directory name"),
+        name: SKILL_NAME_PARAM,
         filePath: z
           .string()
           .min(1)
           .describe("Path inside the skill directory (relative; no ~ or ..)"),
-        offset: z.number().int().positive().nullish().describe("1-based start line (default 1)"),
-        limit: z
-          .number()
-          .int()
-          .positive()
-          .nullish()
-          .describe("Max lines from offset (default all)"),
+        ...FILE_LINE_RANGE_FIELDS,
       })
       .strict(),
   },
@@ -2773,7 +2766,7 @@ export const TOOL_DEFINITIONS = {
       "SKILL.md content is validated as a skill definition, and frontmatter.name is set to name.",
     schema: z
       .object({
-        name: SkillNameSchema.describe("Skill directory name"),
+        name: SKILL_NAME_PARAM,
         filePath: z
           .string()
           .min(1)
