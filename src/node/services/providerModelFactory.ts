@@ -2281,7 +2281,54 @@ export class ProviderModelFactory {
             // Use strict mode for better compatibility with Ollama API
             compatibility: "strict",
           });
-          return Ok(provider(modelId));
+          // Ollama servers before v0.6.6 (ollama/ollama#9434) parse a tool schema `type` only as
+          // a string, so one `type` array fails the whole request. zod >= 4.5 emits nullable
+          // fields as `type: [X, "null"]` (MCP schemas can too), so send the equivalent `anyOf`.
+          // Recurse only into subschemas: const, enum, default and examples hold data.
+          const subschema =
+            /^(items|prefixItems|additionalItems|contains|additionalProperties|propertyNames|not|if|then|else|anyOf|allOf|oneOf|unevaluatedItems|unevaluatedProperties)$/;
+          const schemaMap = /^(properties|patternProperties|\$defs|definitions|dependentSchemas)$/;
+          const rewrite = (node: unknown, depth: "schema" | "map" = "schema"): unknown => {
+            if (Array.isArray(node)) return node.map((item) => rewrite(item));
+            if (node === null || typeof node !== "object") return node;
+            const entries = Object.entries(node as Record<string, unknown>).map(([key, value]) => {
+              if (depth === "map" || subschema.test(key)) return [key, rewrite(value)];
+              return [key, schemaMap.test(key) ? rewrite(value, "map") : value];
+            });
+            const out = Object.fromEntries(entries) as { type?: unknown; allOf?: unknown };
+            if (depth === "map" || !Array.isArray(out.type)) return out;
+            const { type: types, ...rest } = out as { type: unknown[]; allOf?: unknown };
+            if (types.length === 1) return { ...rest, type: types[0] };
+            const union = types.map((type) => ({ type }));
+            if (!("anyOf" in rest)) return { ...rest, anyOf: union };
+            // An existing anyOf is a separate constraint: the type union joins it via allOf.
+            return {
+              ...rest,
+              allOf: [
+                ...(Array.isArray(rest.allOf) ? (rest.allOf as unknown[]) : []),
+                { anyOf: union },
+              ],
+            };
+          };
+          return Ok(
+            wrapLanguageModel({
+              model: provider(modelId),
+              middleware: {
+                specificationVersion: "v4",
+                transformParams: ({ params }) => {
+                  const tools = params.tools?.map((tool) =>
+                    tool.type === "function"
+                      ? {
+                          ...tool,
+                          inputSchema: rewrite(tool.inputSchema) as typeof tool.inputSchema,
+                        }
+                      : tool
+                  );
+                  return Promise.resolve({ ...params, tools });
+                },
+              },
+            })
+          );
         }
 
         // Handle OpenRouter provider
