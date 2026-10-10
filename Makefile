@@ -91,7 +91,7 @@ include fmt.mk
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck static-check static-check-full
-.PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish
+.PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover
 .PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
@@ -234,6 +234,11 @@ bugbash-sandbox-image: ## Build the bug-bash sandbox image locally (linux/amd64)
 
 bugbash-sandbox-publish: ## Workflow only: build and push the bug-bash sandbox image, print its image.json record
 	@./tests/bugbash/sandbox/build.sh --push
+
+# Every sandbox launch lists the job containers that crashed launches of this checkout left
+# (#5882). This removes the ones whose launcher is gone, by ID, and lists the rest.
+bug-bash-sandbox-recover: ## Remove bug-bash sandbox containers of this checkout whose launcher is gone
+	@cd tests/bugbash && bun sandbox/launch.ts --recover
 
 # Bug-bash repro tests (tests/bugbash/repros/*.e2e.ts): exact UI steps, no model calls, against a
 # seeded `xum server` (tests/bugbash/startApp.ts). e2e needs Node.js 22.22.3+ or 24.8+ (E2E_NODE)

@@ -67,6 +67,8 @@ export interface Job {
 }
 /** "none": the session owned no job, so no container can exist. */
 export type CleanupState = "none" | "removed" | `unknown: ${string}`;
+/** `docker container inspect` output: `/name|owner label|checkout label`. */
+const INSPECT = `{{.Name}}|{{index .Config.Labels "xum.bugbash.owner"}}|{{index .Config.Labels "xum.bugbash.checkout"}}`;
 /** The container name goes into a `name=^/…$` filter, which is a regex: no dots, no specials. */
 const CONTAINER_NAME = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
@@ -155,6 +157,39 @@ export class Session {
       throw new Refusal(`bad container name ${JSON.stringify(job.name)}`);
     // A frozen copy: a later change to the caller's object cannot change what cleanup removes.
     this.#owned = Object.freeze({ name: job.name, owner: job.owner, checkout: job.checkout });
+  }
+
+  /** Connects to the local daemon as ensureImage() does, and returns the endpoint it uses. */
+  async connect(): Promise<string> {
+    await this.#connect();
+    return this.#client!.DOCKER_HOST;
+  }
+
+  /**
+   * Every job container of one checkout, of any owner, by its checkout label (#5882). It
+   * removes nothing: a launch logs the list, and only recover() removes from it.
+   */
+  async listJobs(checkout: string): Promise<{ id: string; job: Job }[]> {
+    if (!/^[0-9a-f]{12}$/.test(checkout)) throw new Refusal(`bad checkout ID ${checkout}`);
+    const filter = ["--filter", `label=xum.bugbash.checkout=${checkout}`];
+    const ps = await this.#must(["ps", "-aq", "--no-trunc", ...filter], 15_000);
+    const found: { id: string; job: Job }[] = [];
+    for (const id of ps.stdout.split("\n").filter((line) => line !== "")) {
+      if (!/^[0-9a-f]{64}$/.test(id)) throw new Refusal(`docker ps: unexpected ID ${id}`);
+      const args = ["container", "inspect", "--format", INSPECT, id];
+      const look = await this.#job("docker", args, this.#client!, 15_000);
+      if (!look.ok) continue; // removed since the list: nothing to report
+      // The label filter picked the checkout; removeJob() checks all three again before a removal.
+      const [name, owner] = look.stdout.replace(/^\//, "").split("|");
+      found.push({ id, job: { name, owner, checkout } });
+    }
+    return found;
+  }
+
+  /** Removes one listed container by ID, with the same name and label check as cleanup(). */
+  removeJob(id: string, job: Job): Promise<CleanupState> {
+    if (this.#owned != null) throw new Error("removeJob() is for a session without its own job");
+    return this.#removeById(id, job, "the leftover list");
   }
 
   /** Runs `fn` first on a stop, before the lifeline closes (B1: the provider proxy's close). */
@@ -250,11 +285,10 @@ export class Session {
 
   /** Removes the container `id` only when its name and both labels are this job's. */
   async #removeById(id: string, job: Job, source: string): Promise<CleanupState> {
-    const format = `{{.Name}}|{{index .Config.Labels "xum.bugbash.owner"}}|{{index .Config.Labels "xum.bugbash.checkout"}}`;
     const inspect = () =>
       this.#spawn(
         "docker",
-        ["container", "inspect", "--format", format, id],
+        ["container", "inspect", "--format", INSPECT, id],
         this.#client!,
         15_000
       );

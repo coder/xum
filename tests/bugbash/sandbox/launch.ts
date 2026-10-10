@@ -2,6 +2,7 @@
  * Runs one exact-step bug-bash e2e job in a disposable container: the bug-bash sandbox (#5714).
  * Usage, from tests/bugbash, with BUGBASH_AI=mock:
  *   bun sandbox/launch.ts -- run --config e2e.config.ts --output .e2e/<folder> [e2e args...]
+ *   bun sandbox/launch.ts --recover   (make bug-bash-sandbox-recover; see recover())
  *
  * The container runs the e2e CLI, Chromium and the seeded app with the pinned image (runner.ts).
  * It gets no network, no capabilities, a read-only root, copies of the git-listed inputs, and
@@ -29,6 +30,19 @@ const DEADLINE_MS = 30 * 60_000;
 const log = (message: string) => console.error(`sandbox ${message}`);
 const sha = (text: string) => crypto.createHash("sha256").update(text).digest("hex");
 const bootId = () => fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+const pidNamespace = () => fs.readlinkSync("/proc/self/ns/pid").replace(/\D/g, "");
+/** The checkout label: the first 12 hex of the sha256 of its real path. Job names hold 6. */
+const checkoutId = (root: string) => sha(root).slice(0, 12);
+/** Field 22 of /proc/<pid>/stat (start time in clock ticks). Undefined when the PID is gone. */
+function startTime(pid: string): string | undefined {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
 
 /**
  * Only the mock app AI runs until the provider proxy (#5714): no provider key enters the
@@ -48,12 +62,60 @@ function bind(src: string, dst: string): string[] {
   return ["--mount", `type=bind,src=${src},dst=${dst},readonly`];
 }
 
-/** boot id : PID namespace : PID : start time of this launcher. A later sweep reads it. */
+/** boot id : PID namespace : PID : start time of this launcher. ownerState() reads it. */
 function ownerLabel(): string {
-  const pidns = fs.readlinkSync("/proc/self/ns/pid").replace(/\D/g, "");
-  const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
-  const start = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
-  return `${bootId()}:${pidns}:${process.pid}:${start}`;
+  return `${bootId()}:${pidNamespace()}:${process.pid}:${startTime(String(process.pid))}`;
+}
+
+/**
+ * Whether the launcher named by an owner label still runs. "dead" needs this boot and this PID
+ * namespace, and a PID that is gone or now has another start time (a reused PID). Anything that
+ * cannot be checked from here (another boot, another namespace, a malformed label, an
+ * unreadable /proc entry) is "cannot tell", and recover() leaves it.
+ */
+export function ownerState(owner: string): "dead" | "alive" | "cannot tell" {
+  const parts = owner.split(":");
+  if (parts.length !== 4 || !/^\d+$/.test(parts[2]) || !/^\d+$/.test(parts[3]))
+    return "cannot tell";
+  const [boot, pidns, pid, start] = parts;
+  if (boot !== bootId() || pidns !== pidNamespace()) return "cannot tell";
+  try {
+    return startTime(pid) === start ? "alive" : "dead";
+  } catch {
+    return "cannot tell";
+  }
+}
+
+/**
+ * `make bug-bash-sandbox-recover` (#5882): removes the job containers of this checkout whose
+ * launcher is dead. It needs the job name pattern and a dead owner (ownerState), and it removes
+ * by ID after the same name and label check as cleanup. It lists every other container and
+ * leaves it. The owner label names a launcher, not the daemon, so this runs only on purpose,
+ * and it prints the Docker endpoint first. Exit 3 when a removal cannot be proved.
+ */
+export async function recover(o: LaunchOptions & { log?: (line: string) => void }) {
+  const say = o.log ?? log;
+  const session = new Session(o.stop, { root: o.root, log: say });
+  const checkout = checkoutId(o.root);
+  const jobName = new RegExp(`^xbb-${checkout.slice(0, 6)}-[0-9a-f]{6}$`);
+  let unproved = 0;
+  try {
+    say(`recover: docker endpoint ${await session.connect()}, checkout ${checkout}`);
+    for (const { id, job } of await session.listJobs(checkout)) {
+      const owner = ownerState(job.owner);
+      const named = jobName.test(job.name);
+      if (owner !== "dead" || !named) {
+        say(`recover: left ${job.name}: owner ${owner}${named ? "" : ", not a job name"}`);
+        continue;
+      }
+      const state = await session.removeJob(id, job);
+      say(`recover: ${job.name} ${state}`);
+      if (state !== "removed") unproved += 1;
+    }
+  } finally {
+    await session.cleanup();
+  }
+  return unproved > 0 ? 3 : 0;
 }
 
 export interface LaunchOptions {
@@ -86,13 +148,16 @@ export async function launch(args: string[], o: LaunchOptions): Promise<number> 
     );
   mounts(); // before preflight, and again just before `docker run`
   const session = new Session(o.stop, { root: o.root });
-  const checkout = sha(o.root).slice(0, 12);
+  const checkout = checkoutId(o.root);
   const name = `xbb-${checkout.slice(0, 6)}-${crypto.randomBytes(3).toString("hex")}`;
   const jobDir = path.join(os.tmpdir(), "xum-bugbash-sandbox", checkout, name);
   let made = false;
 
   const run = async (): Promise<number> => {
     const image = await session.ensureImage();
+    // Leftovers of crashed launches (#5882) are only listed here; recover removes dead ones.
+    for (const { job } of await session.listJobs(checkout))
+      log(`leftover: ${job.name} owner ${ownerState(job.owner)} (make bug-bash-sandbox-recover)`);
     fs.mkdirSync(path.dirname(jobDir), { recursive: true, mode: 0o700 });
     fs.mkdirSync(jobDir, { mode: 0o700 }); // EEXIST: not this job's folder, so cleanup keeps it
     made = true;
@@ -164,7 +229,8 @@ if (import.meta.main) {
   const given = process.argv.slice(2);
   const args = given[0] === "--" ? given.slice(1) : given;
   const options = { root: ROOT, cwd: process.cwd(), env: process.env, stop: controller.signal };
-  launch(args, options).then(
+  const recovering = args.length === 1 && args[0] === "--recover";
+  (recovering ? recover(options) : launch(args, options)).then(
     (code) => process.exit(code),
     (error: unknown) => {
       if (error instanceof Stopped) {
