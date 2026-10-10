@@ -4,7 +4,8 @@
  * browser so the toggle's hit area is measured. Contrast is a separate decision (#5950). The
  * phone stories cover the main landmark at 390 px (#5956). The landmark stories at the end cover
  * the layouts without a chat pane: immersive review and the pages with no workspace (#5969),
- * and the shell's "No Workspace Selected" placeholder (#5998).
+ * the shell's "No Workspace Selected" placeholder (#5998), and the "Loading Xum" startup screen
+ * (#6017).
  */
 
 import { expect, userEvent, waitFor, within } from "@storybook/test";
@@ -271,7 +272,12 @@ interface LandmarkLayout {
 }
 
 const LANDMARK_LAYOUTS: Record<
-  "ImmersiveReview" | "RootPage" | "ProjectPage" | "ScratchPage" | "NoWorkspaceSelected",
+  | "ImmersiveReview"
+  | "RootPage"
+  | "ProjectPage"
+  | "ScratchPage"
+  | "NoWorkspaceSelected"
+  | "LoadingXum",
   LandmarkLayout
 > = {
   ImmersiveReview: {
@@ -365,6 +371,19 @@ const LANDMARK_LAYOUTS: Record<
     open: (canvasElement) =>
       within(canvasElement).findByText("No Workspace Selected", {}, { timeout: 15_000 }),
   },
+  // A metadata stream that never opens keeps AppLoader on its "Loading Xum" screen (#6017).
+  LoadingXum: {
+    setup: () => {
+      const client = createMockORPCClient({});
+      client.workspace.onMetadata = () => new Promise<never>(() => undefined);
+      return client;
+    },
+    open: async (canvasElement) => {
+      const canvas = within(canvasElement);
+      await canvas.findByText(/Loading Xum/, {}, { timeout: 15_000 });
+      return canvas.getByRole("status");
+    },
+  },
 };
 
 const landmarkStory = (
@@ -401,3 +420,5 @@ export const ScratchPageLandmark = landmarkStory("ScratchPage", "desktop");
 export const ScratchPageLandmarkPhone = landmarkStory("ScratchPage", "phone");
 export const NoWorkspaceSelectedLandmark = landmarkStory("NoWorkspaceSelected", "desktop");
 export const NoWorkspaceSelectedLandmarkPhone = landmarkStory("NoWorkspaceSelected", "phone");
+export const LoadingXumLandmark = landmarkStory("LoadingXum", "desktop");
+export const LoadingXumLandmarkPhone = landmarkStory("LoadingXum", "phone");

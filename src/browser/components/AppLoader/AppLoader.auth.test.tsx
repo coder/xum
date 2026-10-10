@@ -31,7 +31,7 @@ restoreModulesAfterSuite([
 
 let cleanupDom: (() => void) | null = null;
 
-let apiStatus: "auth_required" | "connecting" | "error" = "auth_required";
+let apiStatus: "auth_required" | "connecting" | "reconnecting" | "error" = "auth_required";
 let apiError: string | null = "Authentication required";
 
 void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
@@ -74,6 +74,17 @@ void mock.module("@/browser/contexts/API", () => ({
         api: null,
         status: "error" as const,
         error: apiError ?? "Connection error",
+        authenticate: () => undefined,
+        retry: () => undefined,
+      };
+    }
+
+    if (apiStatus === "reconnecting") {
+      return {
+        api: null,
+        status: "reconnecting" as const,
+        attempt: 2,
+        error: null,
         authenticate: () => undefined,
         retry: () => undefined,
       };
@@ -181,5 +192,24 @@ describe("AppLoader", () => {
     await new Promise((resolve) => setTimeout(resolve, 2500));
     expect(getByText(/Loading preferences/)).toBeTruthy();
     expect(queryByText(/Loading Xum/)).toBeNull();
+  });
+
+  // #6017: each startup screen the gate shows is the whole page, so it must sit in the page's
+  // one main landmark (axe "landmark-one-main").
+  test.each([
+    ["connecting", "LoadingScreenMock", /Loading preferences/],
+    ["reconnecting", "LoadingScreenMock", /Reconnecting to backend/],
+    ["error", "StartupConnectionErrorMock", /Connection error/],
+  ] as const)("puts the gate's %s screen in exactly one main landmark", (status, testId, text) => {
+    apiStatus = status;
+    apiError = status === "error" ? "Connection error" : null;
+
+    const { getAllByRole, getByTestId } = render(<AppLoader />);
+
+    const mains = getAllByRole("main");
+    expect(mains).toHaveLength(1);
+    const screen = getByTestId(testId);
+    expect(screen.textContent).toMatch(text);
+    expect(mains[0].contains(screen)).toBe(true);
   });
 });
