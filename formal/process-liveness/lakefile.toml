@@ -1,5 +1,0 @@
-name = "process-liveness"
-defaultTargets = ["ProcessLiveness"]
-
-[[lean_lib]]
-name = "ProcessLiveness"
