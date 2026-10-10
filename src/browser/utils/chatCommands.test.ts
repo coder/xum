@@ -5,7 +5,15 @@ import type {
   SendMessageOptions,
 } from "@/common/orpc/types";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
-import { MODEL_KEY_MAX_CHARS } from "@/common/constants/storage";
+import { getProjectScopeId, MODEL_KEY_MAX_CHARS } from "@/common/constants/storage";
+import { getWorkspaceAiSelection } from "./workspaceAiSettingsSync";
+import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+  setWorkspaceAgentPick,
+  setWorkspaceAiMetadata,
+} from "./aiSelectionIntent";
+import { setWorkspaceServiceTier } from "./fastModeServiceTier";
 import {
   createNewWorkspace,
   executeCompaction,
@@ -443,6 +451,8 @@ describe("processSlashCommand clear results", () => {
 });
 
 describe("processSlashCommand speed toggles", () => {
+  beforeEach(() => resetAiSelectionIntentForTests());
+  afterEach(() => resetAiSelectionIntentForTests());
   const store = getProvidersConfigStore();
   let config: ProvidersConfigMap;
 
@@ -470,23 +480,31 @@ describe("processSlashCommand speed toggles", () => {
       Promise.resolve({ success: true as const, data: undefined })
     );
     const getConfig = mock(() => Promise.resolve(config));
-    const api = createTestApiClient({ providers: { getConfig, setProviderConfig } });
+    const setActiveTurnServiceTier = mock<
+      NonNullable<SlashCommandEnv["api"]>["workspace"]["setActiveTurnServiceTier"]
+    >(() => Promise.resolve({ success: true as const, data: { accepted: true } }));
+    const api = createTestApiClient({
+      providers: { getConfig, setProviderConfig },
+      workspace: { setActiveTurnServiceTier },
+    });
+    const sendMessage = spyOn(api.workspace, "sendMessage");
     const env = createEnv({ api, sendMessageOptions: { ...sendMessageOptions, model } });
     const run = async (command: string, overrides: Partial<SlashCommandEnv> = {}) =>
       finishCommand(await processSlashCommand(parseCommand(command), { ...env, ...overrides }));
-    return { run, setProviderConfig, getConfig };
+    return { run, setProviderConfig, getConfig, setActiveTurnServiceTier, sendMessage };
   }
 
   test.each(["workspace", "creation"] as const)(
-    "switches tiers and restores the original preference in %s",
+    "switches chat-local tiers without sending a message in %s",
     async (variant) => {
-      const { run, setProviderConfig } = setup();
+      const { run, setProviderConfig, setActiveTurnServiceTier, sendMessage } = setup();
+      const scopeId = variant === "workspace" ? "test-ws" : getProjectScopeId("/tmp/project");
       for (const [command, tier] of [
         ["/fast", "priority"],
         ["/ultrafast", "ultrafast"],
-        ["/ultrafast", "flex"],
+        ["/ultrafast", "default"],
         ["/fast", "priority"],
-        ["/fast", "flex"],
+        ["/fast", "default"],
       ] as const) {
         const { batches, result } = await run(command, {
           variant,
@@ -494,16 +512,104 @@ describe("processSlashCommand speed toggles", () => {
         });
         expectDisposition(result, "consume");
         expect(batches[0]).toContainEqual({ type: "clear-input" });
-        expect(setProviderConfig).toHaveBeenCalledWith({
-          provider: "openai",
-          keyPath: ["serviceTier"],
-          value: tier,
-        });
-        expect(config.openai.serviceTier).toBe(tier);
-        expect(config.openai.fastModePreviousServiceTier).toBe(
-          tier === "flex" ? undefined : "flex"
-        );
+        expect(getWorkspaceAiSelection(scopeId).serviceTier).toBe(tier);
+        expect(config.openai.serviceTier).toBe("flex");
+        expect(setProviderConfig).not.toHaveBeenCalled();
+        expect(sendMessage).not.toHaveBeenCalled();
+        if (variant === "workspace") {
+          expect(setActiveTurnServiceTier).toHaveBeenLastCalledWith({
+            workspaceId: "test-ws",
+            serviceTier: tier,
+          });
+        } else {
+          expect(setActiveTurnServiceTier).not.toHaveBeenCalled();
+        }
       }
+    }
+  );
+
+  test("shares picker selections without changing another chat or a premium global default", async () => {
+    const { run, setActiveTurnServiceTier, setProviderConfig } = setup();
+    config.openai.serviceTier = "priority";
+    const settings = { model: "openai:gpt-6-astra", thinkingLevel: "high" as const };
+    setWorkspaceAiMetadata("test-ws", {
+      aiSettingsByAgent: { exec: { ...settings, serviceTier: "default" } },
+    });
+    setWorkspaceAiMetadata("other-chat", {
+      aiSettingsByAgent: { exec: { ...settings, serviceTier: "ultrafast" } },
+    });
+    expectDisposition((await run("/fast")).result, "consume");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("priority");
+    // Same path as the picker; the slash handler must read it, not its old send-options snapshot.
+    setWorkspaceServiceTier(null, "test-ws", "ultrafast");
+    expectDisposition((await run("/ultrafast")).result, "consume");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("default");
+    expect(getWorkspaceAiSelection("other-chat").serviceTier).toBe("ultrafast");
+    expect(getWorkspaceAiSelection("test-ws", "plan").serviceTier).toBeUndefined();
+    expect(setActiveTurnServiceTier.mock.calls).toEqual([
+      [{ workspaceId: "test-ws", serviceTier: "priority" }],
+      [{ workspaceId: "test-ws", serviceTier: "default" }],
+    ]);
+    expect(setProviderConfig).not.toHaveBeenCalled();
+    expect(config.openai.serviceTier).toBe("priority");
+  });
+
+  test("uses the owning creation AI scope for sub-projects and sends no active-turn update", async () => {
+    const { run, setActiveTurnServiceTier, setProviderConfig } = setup();
+    const scopeId = getProjectScopeId("/tmp/project");
+    expectDisposition(
+      (
+        await run("/fast", {
+          variant: "creation",
+          workspaceId: undefined,
+          projectPath: "/tmp/project/sub-project",
+          aiScopeId: scopeId,
+          isCurrent: () => false, // The composer's existing callback is workspace-only.
+        })
+      ).result,
+      "consume"
+    );
+    expect(getWorkspaceAiSelection(scopeId).serviceTier).toBe("priority");
+    expect(
+      getWorkspaceAiSelection(getProjectScopeId("/tmp/project/sub-project")).serviceTier
+    ).toBeUndefined();
+    expect(setActiveTurnServiceTier).not.toHaveBeenCalled();
+    expect(setProviderConfig).not.toHaveBeenCalled();
+  });
+
+  test("respects a picker speed change while capabilities load", async () => {
+    const { run, getConfig, setActiveTurnServiceTier } = setup();
+    const pending = Promise.withResolvers<ProvidersConfigMap>();
+    getConfig.mockReturnValueOnce(pending.promise);
+    const command = run("/fast");
+    await Promise.resolve();
+    setWorkspaceServiceTier(null, "test-ws", "priority");
+    pending.resolve(config);
+    expectDisposition((await command).result, "consume");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("default");
+    expect(setActiveTurnServiceTier).toHaveBeenCalledWith({
+      workspaceId: "test-ws",
+      serviceTier: "default",
+    });
+  });
+
+  test.each(["agent", "model", "workspace"] as const)(
+    "does not apply to a changed %s after loading capabilities",
+    async (change) => {
+      const { run, getConfig, setActiveTurnServiceTier, setProviderConfig } = setup();
+      const pending = Promise.withResolvers<ProvidersConfigMap>();
+      getConfig.mockReturnValueOnce(pending.promise);
+      let current = true;
+      const command = run("/fast", { isCurrent: () => current });
+      await Promise.resolve();
+      if (change === "agent") setWorkspaceAgentPick("test-ws", "plan");
+      if (change === "model") markAiSelectionIntent("test-ws", "model", "google:gemini-3-pro");
+      if (change === "workspace") current = false;
+      pending.resolve(config);
+      expectDisposition((await command).result, "restore-if-empty");
+      expect(getWorkspaceAiSelection("test-ws").serviceTier).toBeUndefined();
+      expect(setActiveTurnServiceTier).not.toHaveBeenCalled();
+      expect(setProviderConfig).not.toHaveBeenCalled();
     }
   );
 
@@ -550,7 +656,7 @@ describe("processSlashCommand speed toggles", () => {
   });
 
   test("refreshes after a failed write and releases the toggle guard", async () => {
-    const { run, setProviderConfig } = setup();
+    const { run, setProviderConfig } = setup("xai:grok-4.7");
     setProviderConfig.mockRejectedValueOnce(new Error("write failed"));
     expectDisposition((await run("/fast")).result, "restore-if-empty");
     expect(store.refresh).toHaveBeenCalledTimes(1);
@@ -580,7 +686,9 @@ describe("processSlashCommand speed toggles", () => {
     expect(setProviderConfig).not.toHaveBeenCalled();
     pending.resolve(config);
     expectDisposition((await first).result, "consume");
-    expect(config.openai.serviceTier).toBe("priority");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("priority");
+    expect(config.openai.serviceTier).toBe("flex");
+    expect(setProviderConfig).not.toHaveBeenCalled();
   });
 });
 

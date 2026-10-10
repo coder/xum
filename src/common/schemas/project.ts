@@ -17,6 +17,7 @@ import {
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "@/common/types/thinking";
 import { BackgroundWorkAttentionPolicySchema } from "@/common/types/backgroundWorkAttention";
 import { z } from "zod";
+import { ServiceTierSchema } from "../config/schemas/providersConfig";
 
 import { RuntimeEnablementIdSchema } from "./ids";
 import { RuntimeEnablementOverridesSchema } from "./runtimeEnablement";
@@ -241,6 +242,7 @@ export const WorkspaceConfigSchema = z.object({
       model: z.string().optional(),
       thinkingLevel: ThinkingLevelSchema.optional(),
       reasoningMode: OpenAIReasoningModeSchema.optional(),
+      serviceTier: ServiceTierSchema.optional(),
     })
     .optional()
     .meta({

@@ -1,3 +1,4 @@
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
@@ -1771,12 +1772,14 @@ export class WorkspaceTurnManager {
     let model: string;
     let thinkingLevel: ThinkingLevel;
     let reasoningMode: OpenAIReasoningMode | undefined;
+    let serviceTier: ServiceTier | undefined;
     try {
       if (agentTaskAi != null) {
         // Reawakening: TaskService resolved current defaults + pins; do not re-freeze here.
         model = agentTaskAi.snapshot.taskModelString;
         thinkingLevel = agentTaskAi.snapshot.thinkingLevel;
         reasoningMode = agentTaskAi.snapshot.reasoningMode;
+        serviceTier = agentTaskAi.snapshot.serviceTier;
       } else {
         const resolved = await resolveNodeAgentAiSettings({
           agentId: workspaceTurnAgentId,
@@ -1812,6 +1815,7 @@ export class WorkspaceTurnManager {
         model = resolved.selected.model;
         thinkingLevel = resolved.selected.thinkingLevel;
         reasoningMode = resolved.selected.reasoningMode;
+        serviceTier = resolved.selected.serviceTier;
       }
     } catch (error) {
       if (error instanceof InvalidExplicitAiSettingError) {
@@ -2090,6 +2094,7 @@ export class WorkspaceTurnManager {
         agentId: workspaceTurnAgentId,
         ...(thinkingLevel != null ? { thinkingLevel } : {}),
         ...(reasoningMode != null ? { reasoningMode } : {}),
+        ...(serviceTier != null ? { serviceTier } : {}),
         muxMetadata: this.buildWorkspaceTurnMuxMetadata(record),
         ...(mode === "existing" ? { queueDispatchMode } : {}),
         // A per-turn agent override on an existing workspace must not overwrite the target's

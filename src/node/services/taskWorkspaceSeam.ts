@@ -1,3 +1,4 @@
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { SUBAGENT_FAILURE_FOOTER } from "@/common/utils/subagentFailureEnvelope";
 import type { StartupRecoveryState } from "./startupRecovery";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
@@ -72,6 +73,7 @@ export interface ResolvedWorkspaceAiSettings {
   thinkingLevel?: ThinkingLevel;
   /** OpenAI pro reasoning mode; per-workspace choice inherited by spawned tasks. */
   reasoningMode?: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
 }
 
 export type WorkspaceLifecycleResult = z.infer<typeof TaskWorkspaceLifecycleToolTargetResultSchema>;

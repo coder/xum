@@ -19,6 +19,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { CODEX_ENDPOINT, CODEX_OAUTH_ROUTED_HEADER } from "@/common/constants/codexOAuth";
@@ -3068,12 +3069,14 @@ describe("ProviderModelFactory Coder", () => {
     "github-copilot:gpt-6-astra",
     "github-copilot:gpt-5.4",
     "openai:gpt-6-astra",
+    "openai:gpt-6.1-sol",
+    "openai:gpt-6-luna",
     "openai:team-astra",
     "responses-proxy:team-astra",
     "openrouter:openai/team-astra",
     "mux-gateway:openai/team-astra",
     "responses-proxy:gpt-6-astra",
-  ])("pins and serializes the shared Fast tier through %s", async (modelString) => {
+  ])("pins Fast tiers and isolates live per-chat speed changes through %s", async (modelString) => {
     await withTempConfig(async (config, factory, oauth, store) => {
       saveCoderConfig(config, {
         models: [
@@ -3218,6 +3221,107 @@ describe("ProviderModelFactory Coder", () => {
               }
             }
           }
+        }
+
+        for (const pinnedTier of [undefined, "priority"] as const) {
+          store.saveProvidersConfig({
+            ...providersConfig,
+            openai: { ...providersConfig.openai, serviceTier: pinnedTier },
+          });
+          // Models can be prepared before a chat has selected a speed. Each
+          // callback must stay attached to its own holder, even when unset.
+          const chatA: { serviceTier?: ServiceTier } = {};
+          const chatB: { serviceTier?: ServiceTier } = {};
+          const modelA = await factory.createModel(modelString, undefined, {
+            getServiceTierOverride: () => chatA.serviceTier,
+          });
+          const modelB = await factory.resolveAndCreateModel(modelString, "off", undefined, {
+            getServiceTierOverride: () => chatB.serviceTier,
+          });
+          if (!modelA.success) throw new Error(modelA.error.type);
+          if (!modelB.success) throw new Error(modelB.error.type);
+
+          // Preference, credentials, aliases, instance types and wire edits
+          // must not be reloaded by existing chats when only A changes speed.
+          store.saveProvidersConfig({
+            openai: {
+              apiKey: "edited-key",
+              baseUrl: "https://edited.example.com/v1",
+              serviceTier: "flex",
+              wireFormat: "chatCompletions",
+            },
+          });
+          const staleOptions: Record<string, Record<string, string>> = modelString.startsWith(
+            "openrouter:"
+          )
+            ? { openrouter: { service_tier: "auto" } }
+            : modelString.startsWith("github-copilot:")
+              ? { "github-copilot": { serviceTier: "auto" } }
+              : { openai: { serviceTier: "auto" } };
+          const staleOptionsSnapshot = structuredClone(staleOptions);
+          const supportsUltrafast =
+            (modelString.startsWith("openai:") && !modelString.endsWith("gpt-6-luna")) ||
+            modelString.startsWith("responses-proxy:") ||
+            modelString.startsWith("coder:openai/") ||
+            modelString.startsWith("coder:prod-ai/");
+          let originalCall: CapturedFetchCall | undefined;
+          for (const tier of [
+            undefined,
+            "default",
+            "priority",
+            "ultrafast",
+            "default",
+            undefined,
+          ] as const) {
+            chatA.serviceTier = tier;
+            for (const stream of [false, true]) {
+              for (const { expected, ...request } of [
+                {
+                  model: modelA.data,
+                  expected:
+                    tier === "ultrafast" && !supportsUltrafast ? undefined : (tier ?? pinnedTier),
+                },
+                {
+                  model: modelA.data,
+                  providerOptions: staleOptions,
+                  expected:
+                    tier === "ultrafast" && !supportsUltrafast
+                      ? undefined
+                      : (tier ?? ("auto" as const)),
+                },
+                { model: modelB.data.model, expected: pinnedTier },
+              ]) {
+                const before = calls.length;
+                if (stream) {
+                  await streamText({ ...request, prompt: "hello", maxRetries: 0 }).consumeStream({
+                    onError: () => undefined,
+                  });
+                } else {
+                  await generateText({ ...request, prompt: "hello", maxRetries: 0 }).catch(
+                    () => undefined
+                  );
+                }
+                expect(calls.length).toBe(before + 1);
+                const call = calls[before];
+                const body = parseSentBody(call);
+                originalCall ??= call;
+                expect(call.url).toBe(originalCall.url);
+                expect(body.model).toBe(parseSentBody(originalCall).model);
+                expect(new Headers(call.init.headers).get("authorization")).toBe(
+                  new Headers(originalCall.init.headers).get("authorization")
+                );
+                if (modelString.startsWith("mux-gateway:")) {
+                  expect((body.providerOptions as MuxProviderOptions)?.openai?.serviceTier).toBe(
+                    expected
+                  );
+                } else {
+                  expect(body.service_tier).toBe(expected);
+                }
+              }
+            }
+          }
+          expect(chatB.serviceTier).toBeUndefined();
+          expect(staleOptions).toEqual(staleOptionsSnapshot);
         }
       } finally {
         fetchSpy.mockRestore();
@@ -3542,6 +3646,30 @@ describe("ProviderModelFactory Coder", () => {
             expect(hasLanguageModelCleanup(result.data.model)).toBe(false);
           }
           expect(parseSentBody(calls[before])).not.toHaveProperty("service_tier");
+
+          const chat: { serviceTier?: ServiceTier } = {};
+          const live = await factory.createModel(model, undefined, {
+            getServiceTierOverride: () => chat.serviceTier,
+          });
+          if (!live.success) throw new Error(live.error.type);
+          for (const tier of ["priority", "ultrafast", "default"] as const) {
+            chat.serviceTier = tier;
+            for (const stream of [false, true]) {
+              const liveBefore = calls.length;
+              const request = { model: live.data, prompt: "hello", maxRetries: 0 };
+              if (stream) {
+                await streamText(request).consumeStream({ onError: () => undefined });
+              } else {
+                await generateText(request).catch(() => undefined);
+              }
+              expect(calls.length).toBe(liveBefore + 1);
+              expect(calls[liveBefore].url).toBe(calls[before].url);
+              expect(parseSentBody(calls[liveBefore]).model).toBe(
+                parseSentBody(calls[before]).model
+              );
+              expect(parseSentBody(calls[liveBefore])).not.toHaveProperty("service_tier");
+            }
+          }
         }
       } finally {
         fetchSpy.mockRestore();
@@ -3919,6 +4047,127 @@ describe("ProviderModelFactory Coder", () => {
           `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/agents-google/v1/chat/completions`
         );
       } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("samples live per-chat speed between SDK tool steps without changing an active request", async () => {
+    await withTempConfig(async (config, factory, oauth, store) => {
+      saveCoderConfig(config, {
+        additionalProviders: [{ name: "chat-proxy", type: "openai-compat" }],
+        models: [{ id: "chat-proxy/team-astra", mappedToModel: "openai:gpt-6-astra" }],
+      });
+      store.saveProvidersConfig({
+        ...store.loadProvidersConfig(),
+        openai: { serviceTier: "priority" },
+      });
+      await saveRoutePriority(config, ["direct"]);
+      oauth.coderOauthService = stubCoderOauthService();
+      const chat: { serviceTier: ServiceTier } = { serviceTier: "default" };
+      const requestStarted = Promise.withResolvers<void>();
+      const releaseFirstRequest = Promise.withResolvers<void>();
+      const sse = (chunks: unknown[]) =>
+        new Response(
+          `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`,
+          {
+            headers: { "content-type": "text/event-stream" },
+          }
+        );
+      const responses = [
+        sse([
+          {
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  role: "assistant",
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "call_echo",
+                      type: "function",
+                      function: { name: "echo", arguments: '{"text":"hello"}' },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        ]),
+        sse([{ choices: [{ index: 0, delta: { content: "done" }, finish_reason: "stop" }] }]),
+      ];
+      const { calls, fakeFetch: capture } = createCapturingFetch();
+      const fakeFetch = Object.assign(async (...args: Parameters<typeof capture>) => {
+        await capture(...args);
+        const response = responses.shift();
+        if (!response) throw new Error("Unexpected extra model request");
+        if (calls.length === 1) {
+          requestStarted.resolve();
+          await releaseFirstRequest.promise;
+        }
+        return response;
+      }, capture);
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const model = await factory.resolveAndCreateModel(
+          "coder:chat-proxy/team-astra",
+          "off",
+          undefined,
+          {
+            getServiceTierOverride: () => chat.serviceTier,
+          }
+        );
+        if (!model.success) throw new Error(model.error.type);
+        const echoed: string[] = [];
+        const result = streamText({
+          model: model.data.model,
+          prompt: "echo hello",
+          providerOptions: { openai: { serviceTier: "flex" } },
+          maxRetries: 0,
+          tools: {
+            echo: tool({
+              inputSchema: z.object({ text: z.string() }),
+              execute: ({ text }) => {
+                echoed.push(text);
+                return Promise.resolve(text);
+              },
+            }),
+          },
+          stopWhen: stepCountIs(2),
+        });
+        const text = result.text;
+        await requestStarted.promise;
+        const firstBody = calls[0].init.body;
+        // The selector changes while the first request is still awaiting its
+        // response. Only the next SDK step may observe the new chat value.
+        chat.serviceTier = "priority";
+        store.saveProvidersConfig({ openai: { serviceTier: "auto" } });
+        releaseFirstRequest.resolve();
+
+        expect(await text).toBe("done");
+        expect(echoed).toEqual(["hello"]);
+        expect(calls).toHaveLength(2);
+        expect(calls[0].init.body).toBe(firstBody);
+        expect(calls.map((call) => parseSentBody(call).service_tier)).toEqual([
+          "default",
+          "priority",
+        ]);
+        for (const call of calls) {
+          expect(call.url).toBe(
+            `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/chat-proxy/v1/chat/completions`
+          );
+          expect(parseSentBody(call).model).toBe("team-astra");
+        }
+        const second = parseSentBody(calls[1]) as { messages: Array<Record<string, unknown>> };
+        expect(
+          second.messages
+            .filter((message) => message.role === "tool")
+            .map((message) => message.tool_call_id)
+        ).toEqual(["call_echo"]);
+      } finally {
+        releaseFirstRequest.resolve();
         fetchSpy.mockRestore();
       }
     });

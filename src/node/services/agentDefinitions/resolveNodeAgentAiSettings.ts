@@ -5,6 +5,7 @@
  * and cycle logging so the pure layer stays side-effect free.
  */
 
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type {
@@ -47,6 +48,7 @@ export interface ResolveNodeAgentAiSettingsParams {
     model?: string;
     thinkingLevel?: ParsedThinkingInput;
     reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
   };
   targetWorkspaceSettings?: AgentAiSettingsLayerValues;
   parentWorkspaceExecSettings?: AgentAiSettingsLayerValues;

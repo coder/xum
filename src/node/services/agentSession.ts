@@ -180,6 +180,7 @@ import {
   lookupMinThinkingLevelOverride,
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
+import { ServiceTierSchema, type ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import {
   createMuxMessage,
@@ -2098,8 +2099,9 @@ export class AgentSession {
       return;
     }
 
+    const serviceTier = this.coordinator.thinkingOverride?.serviceTier;
     this.lastAutoRetryResumeRequest = {
-      options,
+      options: serviceTier != null ? { ...options, serviceTier } : options,
       ...(requestAssemblySnapshot ? { requestAssemblySnapshot } : {}),
       ...(contextBudgetRetried === true ? { contextBudgetRetried: true } : {}),
       ...(agentInitiated === true ? { agentInitiated: true } : {}),
@@ -2915,6 +2917,9 @@ export class AgentSession {
     );
     const agentSettingsReasoningMode = coerceOpenAIReasoningMode(agentSettings?.reasoningMode);
     const baseReasoningMode = persistedReasoningMode ?? agentSettingsReasoningMode;
+    const baseServiceTier = ServiceTierSchema.safeParse(
+      persistedRetrySendOptions?.serviceTier ?? agentSettings?.serviceTier
+    ).data;
 
     const persistedToolPolicy =
       lastUserMessage?.metadata?.toolPolicy ?? persistedRetrySendOptions?.toolPolicy;
@@ -2946,6 +2951,8 @@ export class AgentSession {
         // the per-model floor) at request time.
         thinkingLevel: requestedThinkingLevel,
         ...(requestedReasoningMode != null ? { reasoningMode: requestedReasoningMode } : {}),
+        serviceTier:
+          baseServiceTier ?? ServiceTierSchema.safeParse(compactSettings?.serviceTier).data,
         maxOutputTokens:
           typeof lastUserMuxMetadata.parsed.maxOutputTokens === "number"
             ? lastUserMuxMetadata.parsed.maxOutputTokens
@@ -3001,6 +3008,7 @@ export class AgentSession {
     if (baseReasoningMode) {
       retryRequest.reasoningMode = baseReasoningMode;
     }
+    if (baseServiceTier != null) retryRequest.serviceTier = baseServiceTier;
     if (persistedToolPolicy) {
       retryRequest.toolPolicy = persistedToolPolicy;
     }
@@ -6631,7 +6639,7 @@ export class AgentSession {
         additionalSystemContext: options?.additionalSystemContext,
         additionalSystemInstructions: options?.additionalSystemInstructions,
         maxOutputTokens: options?.maxOutputTokens,
-        muxProviderOptions: options?.providerOptions,
+        muxProviderOptions: this.getSendProviderOptions(options),
         agentInitiated,
         agentId: options?.agentId,
         acpPromptId:
@@ -7087,6 +7095,7 @@ export class AgentSession {
         model: params.baseOptions.model,
         thinkingLevel: coerceThinkingLevel(params.baseOptions.thinkingLevel),
         reasoningMode: coerceOpenAIReasoningMode(params.baseOptions.reasoningMode),
+        serviceTier: params.baseOptions.serviceTier,
       },
       providersConfig: this.getProvidersConfigSafe(),
       minThinkingLevelByModel: inputs.minThinkingLevelByModel,
@@ -7104,6 +7113,9 @@ export class AgentSession {
       // Effective (clamped) thinking: this internal request skips persistence,
       // so there is no user preference to preserve.
       thinkingLevel: resolved.effective.thinkingLevel,
+      ...(resolved.selected.serviceTier != null
+        ? { serviceTier: resolved.selected.serviceTier }
+        : {}),
       // Selected reasoning; the send path re-gates per model/route.
       ...(resolved.selected.reasoningMode != null
         ? { reasoningMode: resolved.selected.reasoningMode }
@@ -7663,6 +7675,16 @@ export class AgentSession {
     };
   }
 
+  private getSendProviderOptions(options: SendMessageOptions | undefined) {
+    // The chat's explicit Standard/Fast choice must win over provider-wide defaults.
+    return options?.serviceTier == null
+      ? options?.providerOptions
+      : {
+          ...options.providerOptions,
+          openai: { ...options.providerOptions?.openai, serviceTier: options.serviceTier },
+        };
+  }
+
   private normalizeGatewaySendOptions<T extends SendMessageOptions>(options: T): T {
     const normalizeModelSelection = (modelString: string): string => {
       const trimmedModelString = modelString.trim();
@@ -8139,7 +8161,10 @@ export class AgentSession {
         modelString,
         contextBudgetRetried,
         requestAssemblySnapshot,
-        options,
+        options:
+          options && activeTurnThinkingOverride?.serviceTier != null
+            ? { ...options, serviceTier: activeTurnThinkingOverride.serviceTier }
+            : options,
         ...(options?.autoModelRoutingRecord != null
           ? { autoModelRouting: options.autoModelRoutingRecord }
           : {}),
@@ -8489,7 +8514,7 @@ export class AgentSession {
         additionalSystemContext: options?.additionalSystemContext,
         additionalSystemInstructions: options?.additionalSystemInstructions,
         maxOutputTokens: options?.maxOutputTokens,
-        muxProviderOptions: options?.providerOptions,
+        muxProviderOptions: this.getSendProviderOptions(options),
         agentInitiated,
         agentId: options?.agentId,
         acpPromptId,
@@ -10398,6 +10423,24 @@ export class AgentSession {
     return { accepted: true };
   }
 
+  /** Speed changes belong to this chat and apply only to its next provider call. */
+  setActiveTurnServiceTier(serviceTier: ServiceTier): { accepted: boolean } {
+    this.assertNotDisposed("setActiveTurnServiceTier");
+    const holder = this.coordinator.thinkingOverride;
+    if (!holder) return { accepted: false };
+    holder.serviceTier = serviceTier;
+    const retryRequest = this.lastAutoRetryResumeRequest;
+    if (retryRequest) {
+      retryRequest.options = { ...retryRequest.options, serviceTier };
+    }
+    // Recovery/compaction may start a fresh request after this holder is retired.
+    const context = this.activeStreamContext;
+    if (context?.options) {
+      context.options = { ...context.options, serviceTier };
+    }
+    return { accepted: true };
+  }
+
   isPreparingTurn(): boolean {
     return this.coordinator.phase === "preparing";
   }
@@ -12097,6 +12140,7 @@ export class AgentSession {
         ? { autoModelRoutingRecord: persistedRoutingRecord.data }
         : {}),
       reasoningMode: followUp.reasoningMode,
+      serviceTier: ServiceTierSchema.safeParse(followUp.serviceTier).data,
       additionalSystemInstructions: followUp.additionalSystemInstructions,
       providerOptions: followUp.providerOptions,
       disableWorkspaceAgents: followUp.disableWorkspaceAgents,

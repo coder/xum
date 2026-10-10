@@ -20,7 +20,8 @@ import {
   getFastModeProvider,
   getFastModeUnavailableReason,
   isFastModeActive,
-  isUltrafastModeActive,
+  setWorkspaceServiceTier,
+  toggleServiceTier,
   type PremiumServiceTier,
   ultrafastModeAvailable,
 } from "./utils/fastModeServiceTier";
@@ -579,7 +580,10 @@ function AppInner() {
       providersConfig,
       resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
     });
-    return provider != null && isFastModeActive(provider, providersConfig[provider]);
+    return provider === "openai"
+      ? (getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier) ===
+          "priority"
+      : provider != null && isFastModeActive(provider, providersConfig[provider]);
   }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
 
   // Plain function: React Compiler handles memoization.
@@ -592,7 +596,9 @@ function AppInner() {
       ultrafastModeAvailable(model, {
         providersConfig,
         resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
-      }) && isUltrafastModeActive(providersConfig.openai)
+      }) &&
+      (getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier) ===
+        "ultrafast"
     );
   };
 
@@ -608,7 +614,7 @@ function AppInner() {
     computerUse.status?.supported === true &&
     (isWorktreeRuntime(selectedRuntimeConfig) || isLocalProjectRuntime(selectedRuntimeConfig));
 
-  // Fast and Ultrafast share one toggle path: they write the same provider tier preference.
+  // OpenAI speed is scoped to the chat; other providers retain their existing Fast preferences.
   const togglePremiumServiceTier = useCallback(
     async (targetServiceTier: PremiumServiceTier) => {
       const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
@@ -655,6 +661,12 @@ function AppInner() {
       }
 
       try {
+        if (provider === "openai") {
+          const current =
+            getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier;
+          setWorkspaceServiceTier(api, scopeId, toggleServiceTier(current, targetServiceTier));
+          return;
+        }
         const patch = await applyFastModeToggle(
           api.providers,
           provider,

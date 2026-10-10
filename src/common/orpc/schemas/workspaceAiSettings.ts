@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ServiceTierSchema } from "../../config/schemas/providersConfig";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 
 /**
@@ -14,6 +15,8 @@ export const WorkspaceAISettingsSchema = z.object({
   thinkingLevel: ThinkingLevelSchema.meta({
     description: "Thinking/reasoning effort level",
   }),
+  // OpenAI speed is a chat choice, not a provider-global mutation. Absence inherits the provider default.
+  serviceTier: ServiceTierSchema.optional(),
   // Optional so legacy persisted settings without the field parse unchanged.
   reasoningMode: OpenAIReasoningModeSchema.optional().meta({
     description:

@@ -1974,6 +1974,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const asyncCommandToken = ++asyncCommandTokenRef.current;
     const commandEnv: SlashCommandEnv = {
       api,
+      aiScopeId: sendOptionsScopeId,
       variant,
       workspaceId: commandWorkspaceId,
       projectPath: commandProjectPath,

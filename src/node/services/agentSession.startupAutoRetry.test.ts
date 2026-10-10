@@ -402,6 +402,44 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
+  test.each(["preparing", "streaming"] as const)(
+    "auto-retry retains a chat speed pick made while %s",
+    async (phase) => {
+      const clock = makeTestEffectRunner();
+      const { session, aiService, events, cleanup } = await createSessionBundle(
+        `speed-retry-${phase}`,
+        undefined,
+        { clock }
+      );
+      cleanups.push(() => clock.dispose(), cleanup);
+      spyOn(aiService, "streamMessage").mockImplementation(() => {
+        if (phase === "streaming") {
+          expect(session.setActiveTurnServiceTier("priority")).toEqual({ accepted: true });
+        }
+        return Promise.resolve(
+          Err({ type: "runtime_start_failed", message: "retry this request" })
+        );
+      });
+      const result = await session.sendMessage(
+        "continue",
+        { model: "openai:gpt-6-astra", agentId: "exec", serviceTier: "default" },
+        {
+          onAccepted: () => {
+            if (phase === "preparing") {
+              expect(session.setActiveTurnServiceTier("priority")).toEqual({ accepted: true });
+            }
+          },
+        }
+      );
+      expect(result.success).toBe(false);
+      const resume = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
+      await fireScheduledRetry(clock, events);
+      expect(resume).toHaveBeenCalledTimes(1);
+      expect(resume.mock.calls[0][0].serviceTier).toBe("priority");
+      await session.dispose();
+    }
+  );
+
   test("auto-retry abandons instead of resuming once the workspace is archived on disk", async () => {
     const workspaceId = "startup-retry-archived-before-timer";
     const clock = makeTestEffectRunner();

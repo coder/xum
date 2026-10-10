@@ -12,6 +12,7 @@
  * Node-runtime-local: carries a callback, so it does not belong in
  * src/common/types (never crosses IPC).
  */
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ModelMessage } from "ai";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { ThinkingLevel } from "@/common/types/thinking";
@@ -24,6 +25,11 @@ export interface LiveTurnRouting {
 }
 
 export interface ActiveTurnThinkingOverride {
+  /**
+   * Independent chat-local speed pick, read at each model invocation. Sharing the
+   * turn holder gives it the same admission/cleanup lifetime without touching Auto thinking.
+   */
+  serviceTier?: ServiceTier;
   /** Raw level requested mid-turn; consumed at the next prepareStep (incl. step 1). */
   pending?: ThinkingLevel;
   /**

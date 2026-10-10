@@ -1,3 +1,4 @@
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -7,6 +8,7 @@ export interface SendMessageOptionsInput {
   model: string;
   thinkingLevel: ThinkingLevel;
   reasoningMode: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
   agentId: string;
   providerOptions: MuxProviderOptions;
   /** Composer Auto selection; only real user sends set it (compaction/resume paths leave it unset). */
@@ -30,6 +32,7 @@ export function buildSendMessageOptions(input: SendMessageOptionsInput): SendMes
   return {
     thinkingLevel: input.thinkingLevel,
     reasoningMode: input.reasoningMode,
+    ...(input.serviceTier != null ? { serviceTier: input.serviceTier } : {}),
     model: input.model,
     agentId: input.agentId,
     providerOptions: input.providerOptions,

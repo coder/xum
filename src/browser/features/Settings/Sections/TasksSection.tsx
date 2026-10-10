@@ -343,8 +343,7 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
       <div className="space-y-1">
         <div className="text-muted text-xs">Reasoning</div>
         <div className="flex items-center gap-2">
-          {/* Shared composer picker so settings inherit the same features
-            (route-aware Pro mode, provider Fast mode) as the chat input. */}
+          {/* Reasoning defaults share the composer picker; speed remains a per-chat choice. */}
           <ThinkingSelectorControl
             modelString={props.effectiveModel}
             modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
@@ -355,6 +354,7 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
             reasoningModeInherited={props.reasoningModeInherited}
             onReasoningModeChange={props.onReasoningModeChange}
             allowReasoningModes={props.allowReasoningModes}
+            allowFastMode={false}
             variant="box"
             inheritOption={{
               label: inheritLabel,

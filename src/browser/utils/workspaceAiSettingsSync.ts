@@ -1,3 +1,4 @@
+import { ServiceTierSchema, type ServiceTier } from "@/common/config/schemas/providersConfig";
 import { useSyncExternalStore } from "react";
 import { normalizeModelPreference } from "@/browser/utils/messages/buildSendMessageOptions";
 import {
@@ -44,6 +45,7 @@ export interface WorkspaceAiSelection {
   model: string;
   thinkingLevel: ThinkingLevel;
   reasoningMode: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
 }
 
 interface WorkspaceAiSelectionInput {
@@ -91,6 +93,9 @@ function resolveWorkspaceAiSelection(input: WorkspaceAiSelectionInput): Workspac
     model: normalizeModelPreference(model, input.defaultModel),
     thinkingLevel,
     reasoningMode,
+    serviceTier:
+      ServiceTierSchema.safeParse(pick("serviceTier")).data ??
+      ServiceTierSchema.safeParse(saved?.serviceTier).data,
   };
 }
 
@@ -102,6 +107,9 @@ function resolveCreationScopeSelection(
   return {
     model: normalizeModelPreference(scoped.model, defaultModel),
     thinkingLevel: scoped.thinkingLevel ?? WORKSPACE_DEFAULTS.thinkingLevel,
+    serviceTier: ServiceTierSchema.safeParse(
+      getPendingAiSelection(scopeId, getWorkspaceAgentId(scopeId), "serviceTier")
+    ).data,
     // A creation scope's reasoning mode is only an unsent pick.
     reasoningMode:
       coerceOpenAIReasoningMode(

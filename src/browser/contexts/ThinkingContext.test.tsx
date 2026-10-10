@@ -2,7 +2,7 @@ import { GlobalWindow } from "happy-dom";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import React from "react";
-import { ThinkingProvider } from "./ThinkingContext";
+import { ThinkingProvider, useThinking } from "./ThinkingContext";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { AgentProvider, type AgentContextValue } from "@/browser/contexts/AgentContext";
 import { ProviderOptionsProvider } from "@/browser/contexts/ProviderOptionsContext";
@@ -104,6 +104,16 @@ const ReasoningModeComponent: React.FC = () => {
   return <div data-testid="reasoning-mode">{reasoningMode}</div>;
 };
 
+function ServiceTierComponent(props: { scopeId: string }) {
+  const { serviceTier, setServiceTier } = useThinking();
+  const options = useSendMessageOptions(props.scopeId);
+  return (
+    <button data-testid={props.scopeId} onClick={() => setServiceTier("ultrafast")}>
+      {serviceTier ?? "inherit"}:{options.serviceTier ?? "inherit"}
+    </button>
+  );
+}
+
 function renderWithAPI(children: React.ReactNode, preferences?: UserPreferences) {
   return render(
     <APIProvider
@@ -170,6 +180,47 @@ describe("ThinkingContext", () => {
       }, METADATA_WAIT_OPTIONS);
       cleanup();
     }
+  });
+
+  test("speed labels and send options stay scoped across two chats and creation", async () => {
+    const setActiveTurnServiceTier = mock(() =>
+      Promise.resolve({ success: true as const, data: { accepted: false } })
+    );
+    currentClientMock = { workspace: { setActiveTurnServiceTier } };
+    const creationScope = getProjectScopeId("/speed-creation");
+    seedWorkspace("speed-a", { model: "openai:gpt-6-astra", thinkingLevel: "high" });
+    seedWorkspace("speed-b", {
+      model: "openai:gpt-6-astra",
+      thinkingLevel: "high",
+      serviceTier: "default",
+    });
+    const view = renderWithAPI(
+      <ProviderOptionsProvider>
+        <AgentProvider value={agentContextValue}>
+          <ThinkingProvider workspaceId="speed-a">
+            <ServiceTierComponent scopeId="speed-a" />
+          </ThinkingProvider>
+          <ThinkingProvider workspaceId="speed-b">
+            <ServiceTierComponent scopeId="speed-b" />
+          </ThinkingProvider>
+          <ThinkingProvider projectPath="/speed-creation">
+            <ServiceTierComponent scopeId={creationScope} />
+          </ThinkingProvider>
+        </AgentProvider>
+      </ProviderOptionsProvider>
+    );
+    await waitFor(() => expect(view.getByTestId("speed-b").textContent).toBe("default:default"));
+    act(() => view.getByTestId("speed-a").click());
+    expect(view.getByTestId("speed-a").textContent).toBe("ultrafast:ultrafast");
+    expect(view.getByTestId("speed-b").textContent).toBe("default:default");
+    expect(view.getByTestId(creationScope).textContent).toBe("inherit:inherit");
+    act(() => view.getByTestId(creationScope).click());
+    expect(view.getByTestId(creationScope).textContent).toBe("ultrafast:ultrafast");
+    expect(setActiveTurnServiceTier).toHaveBeenCalledTimes(1);
+    expect(setActiveTurnServiceTier).toHaveBeenCalledWith({
+      workspaceId: "speed-a",
+      serviceTier: "ultrafast",
+    });
   });
 
   test("setting thinking keeps the pick in memory without a backend write", async () => {

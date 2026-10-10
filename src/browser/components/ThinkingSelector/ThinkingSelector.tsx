@@ -1,3 +1,5 @@
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
+import { useThinking } from "@/browser/contexts/ThinkingContext";
 import React, { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Route, Zap } from "lucide-react";
 import { UltrafastIcon } from "@/browser/components/icons/UltrafastIcon/UltrafastIcon";
@@ -13,7 +15,7 @@ import {
   applyFastModeToggle,
   getFastModeProvider,
   isFastModeActive,
-  isUltrafastModeActive,
+  toggleServiceTier,
   type PremiumServiceTier,
   ultrafastModeAvailable as getUltrafastModeAvailable,
 } from "@/browser/utils/fastModeServiceTier";
@@ -72,6 +74,8 @@ interface ThinkingSelectorControlProps {
   onThinkingLevelChange: (level: ThinkingLevel) => void;
   reasoningMode: OpenAIReasoningMode;
   onReasoningModeChange: (mode: OpenAIReasoningMode) => void;
+  serviceTier?: ServiceTier;
+  onServiceTierChange?: (tier: ServiceTier) => void;
   /** Some embedded clients cannot resolve route-aware provider options safely. Gates Pro and Cyber. */
   allowReasoningModes?: boolean;
   /** Some embedded clients do not expose provider configuration mutations. */
@@ -182,11 +186,13 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
     !reasoningModeInherited && proModeAvailable && props.reasoningMode === "pro";
   const cyberModeActive =
     !reasoningModeInherited && cyberModeAvailable && props.reasoningMode === "cyber";
+  const openaiServiceTier = props.serviceTier ?? providersConfig?.openai?.serviceTier;
   const fastModeActive =
-    fastModeProvider != null &&
-    isFastModeActive(fastModeProvider, providersConfig?.[fastModeProvider]);
-  const ultrafastModeActive =
-    ultrafastModeAvailable && isUltrafastModeActive(providersConfig?.openai);
+    fastModeProvider === "openai"
+      ? openaiServiceTier === "priority"
+      : fastModeProvider != null &&
+        isFastModeActive(fastModeProvider, providersConfig?.[fastModeProvider]);
+  const ultrafastModeActive = ultrafastModeAvailable && openaiServiceTier === "ultrafast";
   const hasMenu =
     allowed.length > 1 ||
     proModeAvailable ||
@@ -211,8 +217,13 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
   }, [isOpen]);
 
   const handleFastModeToggle = async (targetServiceTier: PremiumServiceTier = "priority") => {
-    if (!api || fastModeSaving || providersConfig == null || fastModeProvider == null) return;
+    if (fastModeSaving || providersConfig == null || fastModeProvider == null) return;
 
+    if (fastModeProvider === "openai") {
+      props.onServiceTierChange?.(toggleServiceTier(openaiServiceTier, targetServiceTier));
+      return;
+    }
+    if (!api) return;
     setFastModeSaving(true);
     try {
       const patch = await applyFastModeToggle(
@@ -599,6 +610,7 @@ interface ThinkingSelectorProps {
 export const ThinkingSelector: React.FC<ThinkingSelectorProps> = (props) => {
   const [thinkingLevel, setThinkingLevel] = useThinkingLevel();
   const [reasoningMode, setReasoningMode] = useReasoningMode();
+  const { serviceTier, setServiceTier } = useThinking();
 
   return (
     <ThinkingSelectorControl
@@ -607,6 +619,8 @@ export const ThinkingSelector: React.FC<ThinkingSelectorProps> = (props) => {
       onThinkingLevelChange={setThinkingLevel}
       reasoningMode={reasoningMode}
       onReasoningModeChange={setReasoningMode}
+      serviceTier={serviceTier}
+      onServiceTierChange={setServiceTier}
       allowReasoningModes={props.allowReasoningModes}
       allowFastMode={props.allowFastMode}
       autoRouting={props.autoRouting}
