@@ -849,21 +849,15 @@ body,
   }
 }
 
-@media (max-width: 768px) and (pointer: coarse) {
-  html {
-    -webkit-text-size-adjust: 100%;
-    touch-action: manipulation;
-  }
-
-  /* iOS Safari zooms the page when a text field below 16px gets focus (documented WebKit
-     behavior), and the viewport meta no longer blocks zoom (#5972). Components with inline font
-     sizes read this variable; it exists only here, so desktop sizes do not change. */
+/* iOS Safari zooms the page when a text field below 16px gets focus (documented WebKit behavior),
+   and the viewport meta no longer blocks zoom (#5972). Phones in portrait match the width branch.
+   Phones in landscape are wider than 768px, so the height branch covers them; short touch windows
+   and tablet split views below 500px tall match it too. Components with inline font sizes read the
+   variable, which exists only here, so desktop sizes do not change. */
+@media (pointer: coarse) and (max-width: 768px),
+  (pointer: coarse) and (orientation: landscape) and (max-height: 500px) {
   :root {
     --min-text-entry-font-size: 16px;
-  }
-
-  body {
-    font-size: 15px;
   }
 
   /* Raise text-entry fields to the minimum. This rule is outside Tailwind's layers, so it beats
@@ -885,6 +879,17 @@ body,
     [contenteditable="plaintext-only"]
   ):not(.text-lg, .text-xl, .text-2xl, .text-3xl) {
     font-size: var(--min-text-entry-font-size);
+  }
+}
+
+@media (max-width: 768px) and (pointer: coarse) {
+  html {
+    -webkit-text-size-adjust: 100%;
+    touch-action: manipulation;
+  }
+
+  body {
+    font-size: 15px;
   }
 
   .mobile-hide-shortcut-hints {
