@@ -5464,6 +5464,46 @@ describe("ProviderModelFactory Ollama tool schemas", () => {
     });
   });
 
+  // Old Ollama's OpenAI-compatible /v1 endpoint decodes tools into the same Go structs, so a
+  // custom openai-compatible provider pointed at it needs the same rewrite.
+  it("rewrites type arrays for custom openai-compatible providers", async () => {
+    let body: Record<string, unknown> | undefined;
+    await withTempConfig(async (config, factory) => {
+      saveLocalVllmConfig(config, { models: [LOCAL_VLLM_MODEL] });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel(`local-vllm:${LOCAL_VLLM_MODEL}`);
+        if (!result.success) throw new Error(result.error.type);
+        const tools = {
+          mcp_tool: rawTool({
+            type: "object",
+            properties: {
+              outer: { type: "object", properties: { inner: { type: ["string", "null"] } } },
+              list: { type: "array", items: { type: ["integer", "null"] } },
+            },
+          }),
+        };
+        await generateText({ model: result.data, prompt: "hello", tools, maxRetries: 0 }).catch(
+          () => undefined
+        );
+        expect(calls).toHaveLength(1);
+        body = parseSentBody(calls[0]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    const sent = body?.tools as Array<{ function: { parameters: unknown } }>;
+    expect(sent).toHaveLength(1);
+    expect(typeArrayPaths(sent[0].function.parameters)).toEqual([]);
+    expect(sent[0].function.parameters).toMatchObject({
+      properties: {
+        outer: { properties: { inner: { anyOf: [{ type: "string" }, { type: "null" }] } } },
+        list: { items: { anyOf: [{ type: "integer" }, { type: "null" }] } },
+      },
+    });
+  });
+
   it("sends real tool definitions without type arrays", async () => {
     const sent = await sendTools({
       session_history: tool({ inputSchema: TOOL_DEFINITIONS.session_history.schema }),
