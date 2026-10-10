@@ -1099,6 +1099,7 @@ function renderMcpAppView(html: string = MCP_APP_VIEW_HTML) {
               prefersBorder: null,
               resultAvailable: true,
               result: { content: [{ type: "text", text: "Berlin: 18°C, light rain" }] },
+              pluginServerKey: null,
               invocation: {
                 serverName: "weather",
                 toolName: "show_weather",
@@ -1194,6 +1195,7 @@ function renderPluginView(enabled: boolean) {
               prefersBorder: null,
               resultAvailable: false,
               result: null,
+              pluginServerKey: PLUGIN_VIEW.serverKey,
               invocation: null,
             },
           },

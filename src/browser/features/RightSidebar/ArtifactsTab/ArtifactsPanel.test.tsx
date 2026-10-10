@@ -859,6 +859,7 @@ describe("ArtifactsPanel", () => {
             prefersBorder: null,
             resultAvailable: false,
             result: null,
+            pluginServerKey: null,
             invocation: null,
           },
         });
@@ -1000,6 +1001,7 @@ describe("ArtifactsPanel", () => {
             prefersBorder: null,
             resultAvailable: true,
             result: { content: [] },
+            pluginServerKey: null,
             invocation: null,
           },
         }),

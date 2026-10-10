@@ -107,6 +107,7 @@ function renderMcpAppCall() {
               prefersBorder: true,
               resultAvailable: true,
               result: DICE_RESULT,
+              pluginServerKey: null,
               invocation: null,
             },
           },

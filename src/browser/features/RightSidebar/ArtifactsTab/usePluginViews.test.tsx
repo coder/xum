@@ -4,7 +4,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
-import { publishWorkspaceMcpOverridesSaved } from "@/browser/utils/workspaceMcpMutations";
+import {
+  publishGlobalMcpEnablementChanged,
+  publishWorkspaceMcpOverridesSaved,
+} from "@/browser/utils/workspaceMcpMutations";
 import type { McpAppPluginView } from "@/common/orpc/schemas/mcpApps";
 import { usePluginViews } from "./usePluginViews";
 
@@ -54,5 +57,11 @@ describe("usePluginViews", () => {
     act(() => publishWorkspaceMcpOverridesSaved("ws-1"));
     await waitFor(() => expect(result.current?.views[0]?.enabled).toBe(true));
     expect(calls).toBe(2);
+
+    // A global toggle in Settings → MCP can change every workspace's plugin servers.
+    serverEnabled = false;
+    act(() => publishGlobalMcpEnablementChanged());
+    await waitFor(() => expect(result.current?.views[0]?.enabled).toBe(false));
+    expect(calls).toBe(3);
   });
 });

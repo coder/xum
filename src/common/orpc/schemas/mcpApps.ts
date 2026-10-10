@@ -39,6 +39,11 @@ export const McpAppViewSchema = z.object({
       arguments: z.unknown(),
     })
     .nullable(),
+  /**
+   * Plugin views only: the plugin server key the view was read from, which the view's own
+   * tools/call must use. Null for tool-call views (they bind to `invocation`).
+   */
+  pluginServerKey: z.string().min(1).nullable(),
 });
 export type McpAppView = z.infer<typeof McpAppViewSchema>;
 

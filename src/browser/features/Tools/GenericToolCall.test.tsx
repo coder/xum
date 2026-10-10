@@ -117,6 +117,7 @@ describe("GenericToolCall MCP Apps view", () => {
               prefersBorder: null,
               resultAvailable: true,
               result: { content: [] },
+              pluginServerKey: null,
               invocation: null,
             },
           });
@@ -178,6 +179,7 @@ describe("GenericToolCall MCP Apps view", () => {
               prefersBorder: null,
               resultAvailable: true,
               result: { content: [] },
+              pluginServerKey: null,
               invocation: null,
             },
           });
