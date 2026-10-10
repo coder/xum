@@ -336,6 +336,9 @@ describe("MarkdownRenderer raw HTML handling", () => {
     expect(view.container.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(
       true
     );
+    // Only Xum's `code` override renders `.code-block-container`. This also guards the
+    // Streamdown grammar stub (src/vite/streamdownShikiLangsPlugin.ts): without the override,
+    // Streamdown's own CodeBlock would render code blocks, and its grammars are stubbed.
     expect(
       view.container.querySelector(".code-block-container")?.getAttribute("data-code-language")
     ).toBe("typescript");
