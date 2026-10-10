@@ -1197,7 +1197,7 @@ describe("message.send.before", () => {
       harness.container,
       "a-guard",
       `({ "message.send.before": (input) =>
-          input.text.includes("secret") ? { block: "  " + "x".repeat(600) + "  " } : undefined })`
+          input.text.includes("secret") ? { deny: "  " + "x".repeat(600) + "  " } : undefined })`
     );
     await writeHookPlugin(
       harness.container,
@@ -1244,7 +1244,7 @@ describe("message.send.before", () => {
     await writeHookPlugin(
       harness.container,
       "e-blank-block",
-      `({ "message.send.before": () => ({ block: " " }) })`
+      `({ "message.send.before": () => ({ deny: " " }) })`
     );
     await harness.ensure();
 

@@ -18,7 +18,7 @@
  *   attribute the prompt bytes.
  * - `message.send.before`: sees every new message before Xum saves it (input
  *   `text` + `origin`) and may rewrite the text (`{ text }`) or block the send
- *   (`{ block: reason }`). Plugins run in discovery order; each sees the
+ *   (`{ deny: reason }`, the same field tool.execute.before uses). Plugins run in discovery order; each sees the
  *   previous plugin's text and the first block ends the chain. AgentSession
  *   ignores the outcome for compaction requests.
  * - `turn.end`: observes each finished turn (`messageId` + the last reply
@@ -639,11 +639,11 @@ export class AgentPluginHookService {
     if (output === null) {
       return;
     }
-    const block = output.block;
-    if (typeof block === "string" && block.trim().length > 0) {
+    const deny = output.deny;
+    if (typeof deny === "string" && deny.trim().length > 0) {
       ctx.blocked = {
         pluginName: state.pluginName,
-        reason: block.trim().slice(0, MESSAGE_SEND_BLOCK_REASON_MAX_CHARS),
+        reason: deny.trim().slice(0, MESSAGE_SEND_BLOCK_REASON_MAX_CHARS),
       };
       return;
     }
