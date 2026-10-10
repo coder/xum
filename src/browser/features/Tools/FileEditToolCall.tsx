@@ -48,6 +48,16 @@ const LARGE_DIFF_PREVIEW_LINE_THRESHOLD = 600;
 const LARGE_DIFF_PREVIEW_CHAR_THRESHOLD = 80_000;
 const LARGE_DIFF_PREVIEW_LINE_LIMIT = 240;
 
+// Header "+N" / "-N" colors. The raw success/danger tokens are below WCAG AA on the chat
+// background in the light themes and flexoki-dark (#6010). Module-level style objects, so each
+// render reuses them instead of allocating new inline objects.
+const ADDITIONS_STYLE = {
+  color: "color-mix(in srgb, var(--color-success), var(--color-text) 40%)",
+} as const;
+const DELETIONS_STYLE = {
+  color: "color-mix(in srgb, var(--color-danger), var(--color-text) 40%)",
+} as const;
+
 interface LargeDiffPreview {
   previewDiff: string;
   totalLines: number;
@@ -282,9 +292,10 @@ export const FileEditToolCall: React.FC<FileEditToolCallProps> = ({
               title={diffLineDelta.title}
               aria-label={diffLineDelta.title}
             >
-              <span className="text-success">{diffLineDelta.additionsLabel}</span>
+              {/* Same mix as the diff gutter signs (DiffRenderer, #5985). */}
+              <span style={ADDITIONS_STYLE}>{diffLineDelta.additionsLabel}</span>
               <span className="text-muted">, </span>
-              <span className="text-danger">{diffLineDelta.deletionsLabel}</span>
+              <span style={DELETIONS_STYLE}>{diffLineDelta.deletionsLabel}</span>
             </span>
           )}
         </div>
