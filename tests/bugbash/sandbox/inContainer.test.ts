@@ -3,7 +3,13 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { forwardToProxy, inSandbox, modelDrivenSandbox, PROXY_SOCKET } from "./inContainer";
+import {
+  forwardToProxy,
+  inSandbox,
+  modelDrivenSandbox,
+  nonzeroCapSets,
+  PROXY_SOCKET,
+} from "./inContainer";
 import { e2eCommandRefusal } from "../hostPause";
 import { explorerModel } from "./explorerModel";
 import { AiModeError, resolveAiMode } from "../aiMode";
@@ -164,4 +170,23 @@ test("B3: a resolved real app AI in the sandbox talks to the proxy, never with a
   expect(await resolveAiMode(env, await fakeRoot({ socket: false }))).toMatchObject({
     apiKey: "sk-must-not-be-used",
   });
+});
+
+test("D2: no capabilities needs all five sets zero, not only CapEff", () => {
+  const status = (prm: string, amb = "0000000000000000") =>
+    `Name:\tbun\nCapInh:\t0000000000000000\nCapPrm:\t${prm}\nCapEff:\t0000000000000000\n` +
+    `CapBnd:\t0000000000000000\nCapAmb:\t${amb}\nNoNewPrivs:\t1\n`;
+  expect(nonzeroCapSets(status("0000000000000000"))).toEqual([]);
+  // CapEff is 0, but a permitted capability could be made effective again.
+  expect(nonzeroCapSets(status("0000000000000400"))).toEqual(["CapPrm 0000000000000400"]);
+  expect(nonzeroCapSets(status("0000000000000000", "0000000000002000"))).toEqual([
+    "CapAmb 0000000000002000",
+  ]);
+  // A set that is missing from the status text cannot prove anything.
+  expect(nonzeroCapSets("CapEff:\t0000000000000000\n")).toEqual([
+    "CapInh missing",
+    "CapPrm missing",
+    "CapBnd missing",
+    "CapAmb missing",
+  ]);
 });

@@ -12,7 +12,7 @@ import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
-import { PROXY_BASE_URL, PROXY_SOCKET } from "./inContainer";
+import { nonzeroCapSets, PROXY_BASE_URL, PROXY_SOCKET } from "./inContainer";
 
 interface Check {
   name: string;
@@ -72,7 +72,12 @@ check(
   uid !== 0 && String(uid) === process.env.BUGBASH_HOST_UID,
   `uid ${uid}`
 );
-check("no capabilities", /^0+$/.test(status("CapEff")), `CapEff ${status("CapEff")}`);
+const caps = nonzeroCapSets(read("/proc/self/status"));
+check(
+  "no capabilities",
+  caps.length === 0,
+  caps.length ? `nonzero: ${caps.join(", ")}` : "all five sets 0"
+);
 check("no new privileges", status("NoNewPrivs") === "1", `NoNewPrivs ${status("NoNewPrivs")}`);
 check("seccomp filter", status("Seccomp") === "2", `Seccomp ${status("Seccomp")}`);
 const boot = read("/proc/sys/kernel/random/boot_id").trim();

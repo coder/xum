@@ -9,7 +9,7 @@ import { exitFor, launch, launchJob, ownerState, probeApp, recover } from "./lau
 import * as proxyModule from "./proxy";
 import { Ledger } from "./proxyPolicy";
 import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
-import { checkSet, CONTAINER_CHECKS, runSelfCheck } from "./selfCheckRun";
+import { checkSet, CONTAINER_CHECKS, runSelfCheck, selfCheckExit } from "./selfCheckRun";
 
 // Each test runs the real build.sh in a throwaway git repo and a fake `docker` on PATH. The
 // runner gives docker a stripped env, so the fake reads its answers from bin/fake.env.
@@ -1495,4 +1495,16 @@ test("D2: the self-check checks the upstream for every job, the fixtures too", a
     "self-check FAIL: traversal: the upstream saw nothing else (2 requests)",
   ]);
   expect(fails.filter((l) => l.startsWith("self-check pass"))).toHaveLength(10);
+});
+
+test("D2: a launcher Refusal after the preflight exits 2 and starts no other job", async () => {
+  let launches = 0;
+  const launch = async () => {
+    launches += 1;
+    return { cleanup: "none", error: new Refusal("rootless Docker is not supported") } as const;
+  };
+  const lines: string[] = [];
+  expect(await selfCheckExit(new AbortController().signal, (l) => lines.push(l), launch)).toBe(2);
+  expect(launches).toBe(1);
+  expect(lines.at(-1)).toBe("self-check refused: rootless Docker is not supported");
 });

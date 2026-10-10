@@ -118,6 +118,9 @@ export async function runSelfCheck(
       if (outcome.cleanup.startsWith("unknown"))
         throw new UnknownCleanup(`${name}: ${outcome.cleanup}`);
       if (outcome.stopped != null) throw new Stopped(outcome.stopped);
+      // A Refusal (root, rootless Docker, Docker Desktop: Session refuses after the preflight)
+      // or another launcher error ends the run as it ends any job: exit 2 for a Refusal.
+      if ("error" in outcome) throw outcome.error;
       // Every job runs the whole selfCheck.ts (the fixtures swap only its export), so each one
       // makes one allowed call and the P1 to P5 probes: check the upstream per job.
       const bodies = upstream.requests.slice(before).map((r) => r.body);
@@ -200,18 +203,31 @@ export async function runSelfCheck(
   return failed === 0 ? 0 : 1;
 }
 
+/** The target's exit code: runSelfCheck's, 130 or 143 on a stop, 2 on a refusal, else 1. */
+export async function selfCheckExit(
+  stop: AbortSignal,
+  say: (line: string) => void,
+  launch: typeof launchJob = launchJob
+): Promise<number> {
+  try {
+    return await runSelfCheck(stop, say, launch);
+  } catch (error) {
+    if (error instanceof Stopped) return error.reason === "SIGINT" ? 130 : 143;
+    say(`self-check refused: ${error instanceof Error ? error.message : String(error)}`);
+    return error instanceof Refusal ? 2 : 1;
+  }
+}
+
 if (import.meta.main) {
   const controller = new AbortController();
   for (const signal of ["SIGINT", "SIGTERM"] as const)
     process.on(signal, () => controller.abort(signal));
-  runSelfCheck(controller.signal, (line) => console.error(line)).then(
+  selfCheckExit(controller.signal, (line) => console.error(line)).then(
     (code) => process.exit(code),
     (error: unknown) => {
-      if (error instanceof Stopped) process.exit(error.reason === "SIGINT" ? 130 : 143);
-      console.error(
-        `self-check refused: ${error instanceof Error ? error.message : String(error)}`
-      );
-      process.exit(error instanceof Refusal ? 2 : 1);
+      // selfCheckExit maps every error to a code; this is only a last resort (fail closed).
+      console.error(`self-check failed: ${String(error)}`);
+      process.exit(1);
     }
   );
 }
