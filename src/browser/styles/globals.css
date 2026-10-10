@@ -1004,6 +1004,26 @@ body,
   .mobile-hide-right-sidebar {
     display: none !important;
   }
+
+  /* Phones open the hidden sidebar's tools from the workspace menu, which shows the sidebar
+     itself full-screen (WorkspaceShell owns the state). Inside the hide rules only: once the
+     layout widens, the sidebar is back in its column. Below dialogs (z-1500) and popovers
+     (z-1600), so menus and dialogs opened from its panels still show above it. */
+  .mobile-hide-right-sidebar.right-sidebar-fullscreen {
+    display: flex !important;
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+    z-index: 1100 !important;
+    border-left: 0 !important;
+    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+      env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
+  }
+
+  .right-sidebar-fullscreen .right-sidebar-fullscreen-header {
+    display: flex;
+  }
 }
 
 /* Touch targets widen this button to 44px (see the coarse-pointer block above), so centering
@@ -1027,6 +1047,29 @@ body,
   .mobile-hide-right-sidebar {
     display: none !important;
   }
+
+  /* Same full-screen sidebar as in the narrow-viewport block above. */
+  .mobile-hide-right-sidebar.right-sidebar-fullscreen {
+    display: flex !important;
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+    z-index: 1100 !important;
+    border-left: 0 !important;
+    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+      env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
+  }
+
+  .right-sidebar-fullscreen .right-sidebar-fullscreen-header {
+    display: flex;
+  }
+}
+
+/* The full-screen sidebar's header exists only while that mode is on, and shows only inside
+   the hide rules above. RightSidebar reads display:none here as "the layout widened". */
+.right-sidebar-fullscreen-header {
+  display: none;
 }
 /*
  * iPadOS/iOS keyboard accessory bar fix

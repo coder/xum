@@ -7,6 +7,7 @@ import React, {
   useDeferredValue,
   useMemo,
 } from "react";
+import type { BaseTabType } from "@/browser/features/RightSidebar/Tabs/tabConfig";
 import { Lightbulb } from "lucide-react";
 import { SideChatBanner } from "@/browser/components/SideChatBanner/SideChatBanner";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
@@ -161,11 +162,23 @@ interface ChatPaneProps {
   onOpenTerminal: (options?: TerminalSessionCreateOptions) => void;
   /** Hide + inactivate chat pane while immersive review overlay is active. */
   immersiveHidden?: boolean;
+  /** Inactivate (but keep showing) the chat pane while the full-screen sidebar covers it. */
+  inactive?: boolean;
+  /** Phones: the right sidebar's tools, listed in the workspace menu (see WorkspaceShell). */
+  sidebarTools?: readonly BaseTabType[];
+  onOpenSidebarTool?: (tool: BaseTabType, returnFocusTo: HTMLElement | null) => void;
+  sidebarFullscreen?: boolean;
 }
 
 export type ChatPaneContentProps = Omit<
   ChatPaneProps,
-  "leftSidebarCollapsed" | "onToggleLeftSidebarCollapsed" | "immersiveHidden"
+  | "leftSidebarCollapsed"
+  | "onToggleLeftSidebarCollapsed"
+  | "immersiveHidden"
+  | "inactive"
+  | "sidebarTools"
+  | "onOpenSidebarTool"
+  | "sidebarFullscreen"
 > & {
   /**
    * Rendered inside another surface (the /side chat tab in the right sidebar) rather than as
@@ -241,6 +254,7 @@ function findTimelineRevealMessageIndex(
 export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   const workspaceId = props.workspaceId;
   const immersiveHidden = props.immersiveHidden ?? false;
+  const inert = immersiveHidden || props.inactive === true;
   const { workspaceMetadata } = useWorkspaceContext();
   const chatAreaRef = useRef<HTMLDivElement>(null);
 
@@ -250,7 +264,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
       return;
     }
 
-    if (immersiveHidden) {
+    if (inert) {
       chatPaneElement.setAttribute("inert", "");
     } else {
       chatPaneElement.removeAttribute("inert");
@@ -259,7 +273,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
     return () => {
       chatPaneElement.removeAttribute("inert");
     };
-  }, [immersiveHidden, workspaceId]);
+  }, [inert, workspaceId]);
 
   const meta = workspaceMetadata.get(workspaceId);
   const workspaceTitle = meta?.title ?? meta?.name ?? props.workspaceName;
@@ -295,6 +309,9 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
               namedWorkspacePath={props.namedWorkspacePath}
               runtimeConfig={props.runtimeConfig}
               onOpenTerminal={props.onOpenTerminal}
+              sidebarTools={props.sidebarTools}
+              onOpenSidebarTool={props.onOpenSidebarTool}
+              sidebarFullscreen={props.sidebarFullscreen}
             />
           </PerfRenderMarker>
 

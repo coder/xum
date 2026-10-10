@@ -8,8 +8,8 @@ import {
 } from "@/browser/utils/ui/keybinds";
 
 /**
- * Close an overlay (the narrow-screen sidebar drawer) on Escape, but only when nothing else
- * claimed the key.
+ * Close an overlay (the narrow-screen sidebar drawer, the full-screen right sidebar) on Escape,
+ * but only when nothing else claimed the key.
  *
  * The overlay does not own focus, so Escape usually arrives from somewhere else, often the
  * composer. A capture-phase listener took Escape from every popover, menu, dialog and edit mode
@@ -23,8 +23,10 @@ import {
  * while an overlay is open: one Escape never does both. When no overlay is open, no listener
  * exists and Escape behaves exactly as it does without this hook.
  *
- * Only one overlay uses this hook. Before a second one does, decide which of them answers
- * Escape: listeners run in registration order, not in visual order.
+ * Two overlays use this hook: the narrow-screen sidebar drawer and the full-screen right sidebar
+ * (WorkspaceShell). Listeners run in registration order, not in visual order, so when both are
+ * open the one opened first answers Escape. They rarely open together: the full-screen sidebar
+ * covers the button that opens the drawer.
  */
 let openOverlayCount = 0;
 

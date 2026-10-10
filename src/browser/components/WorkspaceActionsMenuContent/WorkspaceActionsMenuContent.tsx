@@ -6,7 +6,6 @@ import {
   GitBranch,
   HeartPulse,
   AppWindow,
-  History,
   Maximize2,
   MessagesSquare,
   Pencil,
@@ -16,6 +15,8 @@ import {
   Square,
 } from "lucide-react";
 import React from "react";
+import { TAB_CONFIG, type BaseTabType } from "@/browser/features/RightSidebar/Tabs/tabConfig";
+import { TAB_ICONS } from "@/browser/features/RightSidebar/Tabs/tabIcons";
 
 interface WorkspaceActionButtonProps {
   label: string;
@@ -65,6 +66,12 @@ interface WorkspaceActionsMenuContentProps {
   onEnterImmersiveReview?: (() => void) | null;
   /** Small-viewport action: open the timeline dialog (the right sidebar hosting the tab is hidden there). */
   onOpenTimeline?: (() => void) | null;
+  /**
+   * Small viewports only: the hidden right sidebar's tools, each opening the sidebar full-screen
+   * on that tool. Listed with the other views, not under a heading of their own.
+   */
+  sidebarTools?: readonly BaseTabType[] | null;
+  onOpenSidebarTool?: ((tool: BaseTabType) => void) | null;
   /** Small viewports only: the Artifacts dialog (the right sidebar is hidden there). */
   onOpenArtifacts?: (() => void) | null;
   /** Stats dialog; only set while the right sidebar (home of the Stats tab) is hidden. */
@@ -172,7 +179,7 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
           label="Timeline"
           shortcut={formatKeybind(KEYBINDS.OPEN_TIMELINE_DIALOG)}
           shortcutClassName={props.shortcutClassName}
-          icon={<History className="h-3 w-3 shrink-0" />}
+          icon={<TAB_ICONS.timeline className="h-3 w-3 shrink-0" />}
           onClick={(e) => {
             e.stopPropagation();
             props.onCloseMenu();
@@ -181,6 +188,23 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
           testId="workspace-timeline-button"
         />
       )}
+      {props.onOpenSidebarTool &&
+        props.sidebarTools?.map((tool) => {
+          const ToolIcon = TAB_ICONS[tool];
+          return (
+            <WorkspaceActionButton
+              key={tool}
+              label={TAB_CONFIG[tool].name}
+              icon={<ToolIcon className="h-3 w-3 shrink-0" />}
+              onClick={(e) => {
+                e.stopPropagation();
+                props.onCloseMenu();
+                props.onOpenSidebarTool?.(tool);
+              }}
+              testId={`workspace-sidebar-tool-${tool}`}
+            />
+          );
+        })}
       {props.onOpenStats && (
         <WorkspaceActionButton
           label="Stats"
