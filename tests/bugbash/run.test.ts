@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type RunDeps, runBugBash } from "./run";
 import type { JobOutcome, LaunchOptions } from "./sandbox/launch";
+import type { Ledger } from "./sandbox/proxyPolicy";
 import { Refusal } from "./sandbox/runner";
 
 // run.ts with a fake launcher: no container, no proxy, no model. The launcher's own tests
@@ -33,10 +34,19 @@ interface Call {
   o: LaunchOptions;
 }
 /** A launcher that writes a one-step report into the job's output and returns `outcome`. */
-function fakeLaunch(outcome: (call: Call, index: number) => Promise<JobOutcome> | JobOutcome) {
+function fakeLaunch(
+  outcome: (call: Call, index: number) => Promise<JobOutcome> | JobOutcome,
+  probeStatus = 502
+) {
   const calls: Call[] = [];
   const lines: string[] = [];
+  const probes: Ledger[] = [];
   const deps: RunDeps = {
+    // The app AI probe: 502 (the upstream failed) unless a test says otherwise.
+    probeApp: (_job, _model, ledger) => {
+      probes.push(ledger);
+      return Promise.resolve({ status: probeStatus, records: [{ outcome: "settled" }] });
+    },
     launchJob: async (args, o) => {
       const call = { args, o };
       calls.push(call);
@@ -53,7 +63,7 @@ function fakeLaunch(outcome: (call: Call, index: number) => Promise<JobOutcome> 
     },
     err: (line) => lines.push(line),
   };
-  return { deps, calls, lines };
+  return { deps, calls, lines, probes };
 }
 const until = (signal: AbortSignal): Promise<JobOutcome> =>
   new Promise((resolve) => {
@@ -75,6 +85,7 @@ test("B2: every charter runs through the launcher with one shared ledger, none o
       expect(args[0]).toBe("explore");
       expect(args[1]).toStartWith("look at");
       expect(o.env).toMatchObject({ BUGBASH_AI: "mock", BUGBASH_MODEL: ENV.BUGBASH_MODELS });
+      expect(o.env.BUGBASH_AI_RESOLVED).toBeUndefined();
     }
     expect(spawn).not.toHaveBeenCalled();
     const findings = lines.find((line) => line.startsWith("Findings: "))!.slice(10);
@@ -162,8 +173,9 @@ test("B2: a config other than the two bug-bash ones refuses (exit 2) before any 
 });
 
 test.each([
-  ["the real app AI", { BUGBASH_AI: "real" }, /only the mock app AI/],
-  ["auto", { BUGBASH_AI: "auto" }, /only the mock app AI/],
+  ["an unknown app AI mode", { BUGBASH_AI: "maybe" }, /auto, real or mock/],
+  ["a mode resolved elsewhere", { BUGBASH_AI_RESOLVED: "real" }, /unset BUGBASH_AI_RESOLVED/],
+  ["an unpriced app model", { BUGBASH_APP_MODEL: "anthropic:claude-x-9" }, /only a priced/],
   ["no budget", { BUGBASH_BUDGET_USD: "" }, /BUGBASH_BUDGET_USD/],
   ["no key", { ANTHROPIC_API_KEY: "" }, /ANTHROPIC_API_KEY/],
   ["an OpenAI model", { BUGBASH_MODELS: "openai:gpt-6.1-sol" }, /only anthropic/],
@@ -174,4 +186,62 @@ test.each([
   expect(calls).toHaveLength(0);
   expect(lines.join("\n")).toMatch(message);
   expect(lines.some((line) => line.includes(" -> "))).toBe(false); // no run folder
+});
+
+// B3: the real app AI, resolved once on the host through the run's budget.
+function chartersWithMock() {
+  const [flag, file] = charters("a");
+  fs.appendFileSync(file, "\nerrs|web|default|send '[mock:error] x' and read the error");
+  return [flag, file];
+}
+
+test("B3: a probe answered 200 gives every charter the real app AI, except [mock:...] ones", async () => {
+  const { deps, calls, probes } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }), 200);
+  const stop = new AbortController().signal;
+  expect(await runBugBash(chartersWithMock(), ENV, stop, deps)).toBe(0);
+  expect(probes).toHaveLength(1);
+  expect(probes[0]).toBe(calls[0].o.ledger!); // the probe spends from the run's one budget
+  const real = calls.find((c) => c.args[1].startsWith("look at"))!;
+  const mock = calls.find((c) => c.args[1].includes("[mock:"))!;
+  expect(real.o.env).toMatchObject({
+    BUGBASH_AI: "real",
+    BUGBASH_AI_RESOLVED: "real",
+    BUGBASH_APP_MODEL: "anthropic:claude-haiku-4-5",
+  });
+  expect(mock.o.env).toMatchObject({ BUGBASH_AI: "mock" });
+  expect(mock.o.env.BUGBASH_AI_RESOLVED).toBeUndefined();
+});
+
+test.each([
+  ["auto, upstream unavailable: the mock", {}, 502, 0],
+  ["real, upstream unavailable: refused", { BUGBASH_AI: "real" }, 502, 2],
+  ["auto, a rejected key: refused", {}, 401, 2],
+  ["mock: no probe", { BUGBASH_AI: "mock" }, 200, 0],
+])("B3: %s", async (_name, over, status, code) => {
+  const { deps, calls, probes } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }), status);
+  const stop = new AbortController().signal;
+  expect(await runBugBash([...charters("a")], { ...ENV, ...over }, stop, deps)).toBe(code);
+  if (code === 0) expect(calls[0].o.env.BUGBASH_AI).toBe("mock");
+  else expect(calls).toHaveLength(0);
+  expect(probes).toHaveLength("BUGBASH_AI" in over && over.BUGBASH_AI === "mock" ? 0 : 1);
+});
+
+test("B3: a stop during the app AI probe ends the run before any job", async () => {
+  const stop = new AbortController();
+  const { deps, calls } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  deps.probeApp = (_job, _model, _ledger, signal) => {
+    expect(signal).toBe(stop.signal); // the run's stop reaches the probe
+    stop.abort("SIGINT");
+    return Promise.resolve({ status: 502, records: [] });
+  };
+  expect(await runBugBash([...charters("a")], ENV, stop.signal, deps)).toBe(130);
+  expect(calls).toHaveLength(0);
+});
+
+test("B3: a proxy fault in the probe stops the run before any job (exit 5)", async () => {
+  const { deps, calls } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  deps.probeApp = () => Promise.reject(new Error("proxy: 1 call(s) cost more"));
+  const stop = new AbortController().signal;
+  expect(await runBugBash([...charters("a")], ENV, stop, deps)).toBe(5);
+  expect(calls).toHaveLength(0);
 });

@@ -28,8 +28,11 @@
  * verify each one with a failing repro test (`e2e guide bug-bash`, steps 5-6, and the bug-bash
  * project skill).
  *
- * App AI: only the mock in the sandbox for now (#5714): BUGBASH_AI must be unset or mock. The
- * real app AI through the proxy is a later step.
+ * App AI: BUGBASH_AI (auto, real or mock; default auto, see aiMode.ts). The run resolves it once,
+ * on the host: the probe goes through a proxy and the run's budget (sandbox/launch.ts probeApp),
+ * never straight to the provider. In real mode each job's app reaches BUGBASH_APP_MODEL (default
+ * Haiku 4.5, Anthropic only) through that job's proxy. Charters that name a `[mock:...]` prompt
+ * only work against the mock, so they always run with it. findings.md records each mode.
  *
  * Exit code: 0 when every charter ran (with or without findings). Else, in this order: 3 when a
  * container state is unknown after cleanup, 130 or 143 after SIGINT or SIGTERM, 5 after a proxy
@@ -40,15 +43,19 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
+import { DEFAULT_APP_MODEL } from "./aiMode";
 import { EXPLORE_CONFIGS } from "./sandbox/inputs";
-import { type JobOutcome, launchJob, modelJob } from "./sandbox/launch";
-import { Ledger } from "./sandbox/proxyPolicy";
+import { type JobOutcome, launchJob, type ModelJob, modelJob, probeApp } from "./sandbox/launch";
+import { Ledger, priced } from "./sandbox/proxyPolicy";
 import { Refusal } from "./sandbox/runner";
 
 const projectDir = import.meta.dir;
 // Real path: the launcher labels and stages the checkout by it.
 const repoRoot = fs.realpathSync(path.resolve(projectDir, "../.."));
-const APP_AI = { mode: "mock", reason: "the sandbox runs only the mock app AI (#5714)" };
+interface AppAi {
+  mode: "mock" | "real";
+  reason: string;
+}
 
 interface Charter {
   slug: string;
@@ -73,6 +80,8 @@ interface Job {
   model: string;
   /** Path-safe form of `model`: the per-model output directory. */
   modelDir: string;
+  /** The app's AI for this charter (the run's mode, or the mock for `[mock:...]` charters). */
+  ai: AppAi;
 }
 
 interface CharterResult {
@@ -163,7 +172,8 @@ function writeFindings(
   results: CharterResult[],
   models: string[],
   effort: string,
-  ledger: Ledger
+  ledger: Ledger,
+  runAi: AppAi
 ): void {
   const lines = ["# Bug bash findings", ""];
   const { calls, refused, spentNanoUsd, capNanoUsd, tokens } = ledger.totals();
@@ -176,7 +186,7 @@ function writeFindings(
     "The same defect can appear once per model: merge those before triage.",
     "",
     `Explorer models: ${models.map((m) => `\`${m}\``).join(", ")}. Effort: \`${effort}\`.`,
-    `App AI: \`${APP_AI.mode}\` (${APP_AI.reason}).`,
+    `App AI: \`${runAi.mode}\` (${runAi.reason}); charters that name a \`[mock:...]\` prompt use the mock.`,
     // List price from the reported usage, not the bill (sandbox/proxyPolicy.ts).
     `Cost: ${calls} proxied calls, ${refused} refused by the budget, ${usd(spentNanoUsd)} of ` +
       `${usd(capNanoUsd)} at list price. Tokens: ${perModel.join("; ") || "none"}.`,
@@ -189,7 +199,7 @@ function writeFindings(
     const meaning = EXIT_MEANING[r.exitCode] ?? "unknown";
     const { charter, model } = r.job;
     lines.push(
-      `| ${model} | ${charter.slug} | ${charter.target} | ${charter.agent} | ${APP_AI.mode} | ${r.exitCode} (${meaning}) | ${r.ended} | ${issues} | ${r.findings.length - issues} |`
+      `| ${model} | ${charter.slug} | ${charter.target} | ${charter.agent} | ${r.job.ai.mode} | ${r.exitCode} (${meaning}) | ${r.ended} | ${issues} | ${r.findings.length - issues} |`
     );
   }
   const all = results.flatMap((r) => r.findings.map((f) => ({ ...f, job: r.job })));
@@ -237,9 +247,18 @@ function readModels(env: NodeJS.ProcessEnv): string[] {
   return models;
 }
 
+/** A job's mode env for the launcher (sandbox/launch.ts appAi): resolved here, never by it. */
+function jobMode(ai: AppAi, appModel: string): Record<string, string | undefined> {
+  return ai.mode === "real"
+    ? { BUGBASH_AI: "real", BUGBASH_AI_RESOLVED: "real", BUGBASH_AI_REASON: ai.reason,
+        BUGBASH_APP_MODEL: appModel } // prettier-ignore
+    : { BUGBASH_AI: "mock", BUGBASH_AI_RESOLVED: undefined, BUGBASH_AI_REASON: ai.reason };
+}
+
 /** Injection point: run.test.ts passes a fake launcher; production runs the sandbox. */
 export interface RunDeps {
   launchJob: typeof launchJob;
+  probeApp?: typeof probeApp;
   /** Progress lines (default stdout) and problems (default stderr). */
   out?: (line: string) => void;
   err?: (line: string) => void;
@@ -257,13 +276,16 @@ export async function runBugBash(
 ): Promise<number> {
   const out = deps.out ?? ((line: string) => console.log(line));
   const err = deps.err ?? ((line: string) => console.error(line));
-  // The real app AI needs the proxy's app route (a later step of #5714). Refuse it here, before
-  // anything, instead of running a "real" request with the mock.
-  for (const name of ["BUGBASH_AI", "BUGBASH_AI_RESOLVED"] as const)
-    if (env[name] != null && env[name] !== "mock") {
-      err(`make bug-bash: ${name}=${env[name]}: the sandbox runs only the mock app AI (#5714)`);
-      return 2;
-    }
+  // The run resolves the app AI itself, through its budget: refuse a mode resolved elsewhere.
+  const requested = env.BUGBASH_AI ?? "auto";
+  if (!["auto", "real", "mock"].includes(requested)) {
+    err(`make bug-bash: BUGBASH_AI must be auto, real or mock, got "${requested}"`);
+    return 2;
+  }
+  if (env.BUGBASH_AI_RESOLVED != null && env.BUGBASH_AI_RESOLVED !== "mock") {
+    err("make bug-bash: unset BUGBASH_AI_RESOLVED: the run probes the app AI through its proxy");
+    return 2;
+  }
   const { values } = parseArgs({
     args: argv,
     options: {
@@ -302,7 +324,6 @@ export async function runBugBash(
     charters = charters.filter((c) => wanted.includes(c.slug));
   }
   assert(charters.length > 0, "no charters selected");
-  // A [mock:...] prompt needs no special case any more: every charter runs with the mock.
 
   const models = readModels(env);
   // Must match the default in e2e.config.ts; it only labels the output here.
@@ -314,17 +335,55 @@ export async function runBugBash(
     `BUGBASH_EFFORT must be one of low, medium, high, xhigh, max, got "${effort}"`
   );
   // Every model, the budget and the provider settings, before any folder or job (launch.ts).
-  let budgetUsd = 0;
+  let job0: ModelJob | undefined;
   try {
-    for (const model of models) budgetUsd = modelJob({ ...env, BUGBASH_MODEL: model }).budgetUsd;
+    for (const model of models) job0 = modelJob({ ...env, BUGBASH_MODEL: model });
   } catch (error) {
     if (!(error instanceof Refusal)) throw error;
     err(`make bug-bash: ${error.message}`);
     return 2;
   }
+  const budgetUsd = job0!.budgetUsd;
   // One budget for the whole run: every job's proxy reserves from it (sandbox/proxyPolicy.ts).
   const ledger = new Ledger(budgetUsd);
-  out(`App AI: ${APP_AI.mode} (${APP_AI.reason})`);
+  const mockPin: AppAi = { mode: "mock", reason: "the charter names a [mock:...] prompt" };
+  const needsMock = (charter: Charter) => charter.goal.includes("[mock:");
+  const appModel = env.BUGBASH_APP_MODEL ?? DEFAULT_APP_MODEL;
+  let runAi: AppAi = { mode: "mock", reason: "BUGBASH_AI=mock" };
+  let probeRecords: object[] = [];
+  if (requested !== "mock" && !charters.every(needsMock)) {
+    const [provider, id] = appModel.split(/:(.*)/s, 2);
+    if (provider !== "anthropic" || !id || !priced(id)) {
+      err(`make bug-bash: BUGBASH_APP_MODEL "${appModel}": only a priced anthropic:<model> runs`);
+      return 2;
+    }
+    let status: number;
+    try {
+      ({ status, records: probeRecords } = await (deps.probeApp ?? probeApp)(
+        job0!,
+        id,
+        ledger,
+        stop
+      ));
+    } catch (error) {
+      // The probe's own proxy fault (a bound miss): the cost model is wrong.
+      err(`make bug-bash: probe: ${error instanceof Error ? error.message : String(error)}`);
+      return 5;
+    }
+    // A stop during the probe ends the run here, before any folder or job.
+    if (stop.aborted) return stop.reason === "SIGTERM" ? 143 : 130;
+    const unavailable = status === 429 || status >= 500;
+    if (status === 200) runAi = { mode: "real", reason: `${appModel} answered the probe` };
+    else if (requested === "auto" && unavailable)
+      runAi = { mode: "mock", reason: `upstream unavailable (probe HTTP ${status})` };
+    else {
+      err(
+        `make bug-bash: ${appModel} probe failed (HTTP ${status}). Fix the key or base URL, or set BUGBASH_AI=mock.`
+      );
+      return 2;
+    }
+  }
+  out(`App AI: ${runAi.mode} (${runAi.reason})`);
 
   // A random suffix: two runs in the same millisecond (run.test.ts runs several) get two folders.
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -333,10 +392,21 @@ export async function runBugBash(
   fs.mkdirSync(path.dirname(runDir), { recursive: true });
   // Not recursive: a second bug bash started in the same millisecond fails here, not mid-run.
   fs.mkdirSync(runDir);
+  if (probeRecords.length > 0)
+    fs.writeFileSync(
+      path.join(runDir, "probe.proxy.jsonl"),
+      probeRecords.map((entry) => `${JSON.stringify(entry)}\n`).join(""),
+      { mode: 0o600 }
+    );
 
   // Interleave models, so every model starts while the pool is still filling.
   const jobs: Job[] = charters.flatMap((charter) =>
-    models.map((model) => ({ charter, model, modelDir: modelDirName(model) }))
+    models.map((model) => ({
+      charter,
+      model,
+      modelDir: modelDirName(model),
+      ai: needsMock(charter) ? mockPin : runAi,
+    }))
   );
   for (const modelDir of new Set(jobs.map((j) => j.modelDir))) {
     fs.mkdirSync(path.join(runDir, modelDir));
@@ -371,7 +441,7 @@ export async function runBugBash(
         outcome = await deps.launchJob(exploreArgs(config, job, runRel, maxSteps), {
           root: repoRoot,
           cwd: projectDir,
-          env: { ...env, BUGBASH_AI: "mock", BUGBASH_MODEL: job.model },
+          env: { ...env, ...jobMode(job.ai, appModel), BUGBASH_MODEL: job.model },
           stop: jobStop,
           ledger,
           log: (line) => fs.writeSync(fd, `sandbox ${line}\n`),
@@ -397,8 +467,8 @@ export async function runBugBash(
       const started = fs.existsSync(appLog)
         ? /app AI: (real|mock)/.exec(fs.readFileSync(appLog, "utf8"))?.[1]
         : undefined;
-      if (started != null && started !== APP_AI.mode) {
-        err(`  ${name}: app started with ${started} AI, expected ${APP_AI.mode}`);
+      if (started != null && started !== job.ai.mode) {
+        err(`  ${name}: app started with ${started} AI, expected ${job.ai.mode}`);
         result.exitCode = Math.max(result.exitCode, 2);
       }
       results.push(result);
@@ -411,7 +481,7 @@ export async function runBugBash(
 
   results.sort((a, b) => jobs.indexOf(a.job) - jobs.indexOf(b.job));
   const findingsFile = path.join(runDir, "findings.md");
-  writeFindings(findingsFile, results, models, effort, ledger);
+  writeFindings(findingsFile, results, models, effort, ledger, runAi);
   out(`Findings: ${findingsFile}`);
   const { spentNanoUsd, capNanoUsd } = ledger.totals();
   out(`Cost: ${usd(spentNanoUsd)} of ${usd(capNanoUsd)} at list price`);

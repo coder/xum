@@ -5,7 +5,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { startFakeUpstream } from "./fakeUpstream";
-import { exitFor, launch, launchJob, ownerState, recover } from "./launch";
+import { exitFor, launch, launchJob, ownerState, probeApp, recover } from "./launch";
+import * as proxyModule from "./proxy";
 import { Ledger } from "./proxyPolicy";
 import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
 
@@ -60,7 +61,7 @@ case "$1" in
       proxycall) for a in "$@"; do case "$a" in *dst=/repo/.sandbox-proxy,readonly) psrc=\${a#type=bind,src=}; psrc=\${psrc%%,*} ;; esac; done
         echo "proxy dir mode $(stat -c %a "$psrc")" >> "$bin/calls.log"
         curl -s --unix-socket "$psrc/sock" -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' \
-          -d '{"model":"claude-sonnet-5-5","max_tokens":10,"messages":[{"role":"user","content":"'"$CALL"'"}]}' \\
+          -d '{"model":"'"$CALLMODEL"'","max_tokens":10,"messages":[{"role":"user","content":"'"$CALL"'"}]}' \\
           http://proxy/anthropic/v1/messages >> "$bin/calls.log"; echo >> "$bin/calls.log"
         echo "job says hi" >&2
         # HANG=1: the job goes on after its call, until its lifeline closes.
@@ -145,6 +146,7 @@ function fake(over: Record<string, string> = {}) {
     RUN: "ok",
     CALL: "hi",
     HANG: "0",
+    CALLMODEL: "claude-sonnet-5-5",
     ...over,
   };
   fs.writeFileSync(
@@ -1067,6 +1069,172 @@ test("B2: an explore job spends from the run's ledger and writes its output to t
   }
 });
 
+async function exploreLaunch(
+  over: Record<string, string>,
+  env: Record<string, string | undefined>
+) {
+  const upstream = await startFakeUpstream();
+  try {
+    const cwd = prepare(over);
+    const lines: string[] = [];
+    const host = {
+      ...HOST_ENV,
+      BUGBASH_BUDGET_USD: "1",
+      ANTHROPIC_API_KEY: UPSTREAM_KEY,
+      ANTHROPIC_BASE_URL: `${upstream.baseUrl}/v1`,
+      BUGBASH_MODEL: "anthropic:claude-sonnet-5-5",
+      ...env,
+    };
+    const o = { root: fs.realpathSync(root), cwd, env: host, stop: new AbortController().signal };
+    const outcome = await launchJob(EXPLORE_ARGS, { ...o, log: (line) => lines.push(line) }).catch(
+      (e: unknown) => e
+    );
+    return { outcome, lines, requests: upstream.requests };
+  } finally {
+    await upstream.close();
+  }
+}
+
+test("B3: a real-mode explore job lets the app model through its proxy, and no key enters", async () => {
+  const real = {
+    BUGBASH_AI: "real",
+    BUGBASH_AI_RESOLVED: "real",
+    BUGBASH_AI_REASON: "probe ok",
+    BUGBASH_APP_MODEL: "anthropic:claude-haiku-4-5",
+  };
+  // The fake job sends one call for the app model: the proxy forwards it.
+  const { outcome, lines, requests } = await exploreLaunch(
+    { RUN: "proxycall", CALLMODEL: "claude-haiku-4-5" },
+    real
+  );
+  expect(outcome).toEqual({ code: 7, cleanup: "removed" });
+  expect(requests).toHaveLength(1);
+  const run = calls()
+    .split("\n")
+    .find((line) => line.startsWith("run "))!;
+  for (const env of ["BUGBASH_AI_RESOLVED=real", "BUGBASH_APP_MODEL=anthropic:claude-haiku-4-5"])
+    expect(run).toContain(`--env ${env}`);
+  expect(run).not.toContain(UPSTREAM_KEY);
+  expect(lines.join("\n")).toContain("real app AI anthropic:claude-haiku-4-5");
+  expectNothingLeft();
+});
+
+const REAL = { BUGBASH_AI: "real", BUGBASH_AI_RESOLVED: "real" };
+const MOCK_MODE = { BUGBASH_AI: "mock", BUGBASH_AI_RESOLVED: undefined };
+test.each([
+  ["a model the job does not list", "claude-opus-5-5", REAL],
+  ["the app model in mock mode", "claude-haiku-4-5", MOCK_MODE],
+])("B3: the proxy refuses %s", async (_name, model, env) => {
+  const { outcome, requests } = await exploreLaunch({ RUN: "proxycall", CALLMODEL: model }, env);
+  expect(outcome).toEqual({ code: 7, cleanup: "removed" });
+  expect(requests).toHaveLength(0);
+  expect(calls()).toContain("model: not allowed");
+});
+
+test.each([
+  ["an unpriced app model", { BUGBASH_APP_MODEL: "anthropic:claude-x-9" }, /only a priced/],
+  ["an OpenAI app model", { BUGBASH_APP_MODEL: "openai:gpt-6.1-sol" }, /only a priced/],
+  ["real without a resolved mode", { BUGBASH_AI_RESOLVED: undefined }, /only the mock app AI/],
+])("B3: a real-mode explore job refuses %s before any docker command", async (_n, env, message) => {
+  const real = { BUGBASH_AI: "real", BUGBASH_AI_RESOLVED: "real" };
+  const { outcome } = await exploreLaunch({}, { ...real, ...env });
+  expect(outcome).toBeInstanceOf(Refusal);
+  expect((outcome as Error).message).toMatch(message);
+  expect(calls()).toBe("");
+});
+
+test("B3: the app AI probe has a short deadline and ends at once on a stop", async () => {
+  const upstream = await startFakeUpstream();
+  try {
+    upstream.setMode("stall"); // accepts the request, never answers
+    const job = {
+      model: "claude-sonnet-5-5",
+      budgetUsd: 1,
+      upstream: { baseUrl: upstream.baseUrl, apiKey: UPSTREAM_KEY },
+    };
+    let started = Date.now();
+    const late = await probeApp(
+      job,
+      "claude-haiku-4-5",
+      new Ledger(1),
+      new AbortController().signal,
+      300
+    );
+    expect(late.status).not.toBe(200); // a silent upstream is unavailable, after the deadline
+    expect(Date.now() - started).toBeLessThan(5_000);
+    const stop = new AbortController();
+    started = Date.now();
+    const probe = probeApp(job, "claude-haiku-4-5", new Ledger(1), stop.signal, 60_000);
+    while (upstream.requests.length < 2) await Bun.sleep(10);
+    stop.abort("SIGINT");
+    expect((await probe).status).not.toBe(200);
+    expect(Date.now() - started).toBeLessThan(5_000); // not the 60 s deadline
+  } finally {
+    await upstream.close();
+  }
+}, 20_000);
+
+test("B3: the run's stop after another job's fault aborts this job's in-flight call", async () => {
+  // run.ts stops every job's signal when one job reports a fault. This job's call is still
+  // waiting on the upstream: the stop must abort it, keep its reservation and end the job.
+  const upstream = await startFakeUpstream();
+  try {
+    const cwd = prepare({ RUN: "proxycall", CALL: "[fake:stall]" });
+    const ledger = new Ledger(1);
+    const stop = new AbortController();
+    const env = {
+      ...HOST_ENV,
+      BUGBASH_BUDGET_USD: "1",
+      ANTHROPIC_API_KEY: UPSTREAM_KEY,
+      ANTHROPIC_BASE_URL: `${upstream.baseUrl}/v1`,
+      BUGBASH_MODEL: "anthropic:claude-sonnet-5-5",
+    };
+    const o = { root: fs.realpathSync(root), cwd, env, ledger, log: () => undefined };
+    const job = launchJob(EXPLORE_ARGS, { ...o, stop: stop.signal });
+    while (upstream.requests.length === 0) await Bun.sleep(10);
+    expect(ledger.totals().reservedNanoUsd).toBeGreaterThan(0); // in flight
+    const started = Date.now();
+    stop.abort("proxy fault");
+    const outcome = await job;
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(outcome).toMatchObject({ stopped: "proxy fault", cleanup: "removed" });
+    const records = fs.readFileSync(path.join(cwd, ".e2e/x.proxy.jsonl"), "utf8");
+    expect(records).toContain('"outcome":"kept"');
+    expect(records).toContain("aborted");
+    expect(ledger.totals()).toMatchObject({ reservedNanoUsd: 0 });
+    expect(ledger.totals().spentNanoUsd).toBeGreaterThan(0); // the full reservation stays spent
+    expectNothingLeft();
+  } finally {
+    await upstream.close();
+  }
+}, 20_000);
+
+test("B3: a call that outlives close() fails the job (exit 5), and the job leaves nothing", async () => {
+  // The real close() aborts every call first, so a call that stays open past CLOSE_MS is a proxy
+  // bug: a stand-in proxy plays it. The launcher process then exits, which ends the call.
+  const real = proxyModule.startProxy;
+  const start = spyOn(proxyModule, "startProxy").mockImplementation(async (options) => {
+    const proxy = await real(options);
+    return {
+      ...proxy,
+      close: async () => {
+        await proxy.close();
+        throw new Error(
+          "proxy: 1 call(s) still open 5000 ms after close(); their reservations stay counted"
+        );
+      },
+    };
+  });
+  try {
+    const { code, logged } = await mcpLaunch({ RUN: "proxycall" });
+    expect(code).toBe(5);
+    expect(logged.join("\n")).toContain("still open 5000 ms after close()");
+  } finally {
+    start.mockRestore();
+  }
+  expectNothingLeft(); // the container, the job folder with its socket, the client folder
+});
+
 test("B2: unknown cleanup outranks a stop, and a stop outranks a proxy fault", () => {
   const fault = { proxyFault: "proxy: 1 call(s) cost more" };
   expect(exitFor({ code: 0, cleanup: "unknown: x", stopped: "SIGINT", ...fault })).toBe(3);
@@ -1127,8 +1295,8 @@ test.each([
   expect(calls()).toBe("");
 });
 
-// Every non-mock mode refuses before any docker command, so before the container env exists and
-// before a job starts. Real mode waits for the provider proxy (#5714): no key enters the sandbox.
+// Every non-mock mode refuses a repro job before any docker command, so before the container env
+// exists and before a job starts. Only an explore job runs a real app AI (run.ts resolves it).
 const NOT_MOCK = [
   {},
   { BUGBASH_AI: "auto" },

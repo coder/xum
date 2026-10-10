@@ -6,6 +6,8 @@ import * as path from "node:path";
 import { forwardToProxy, inSandbox, modelDrivenSandbox, PROXY_SOCKET } from "./inContainer";
 import { e2eCommandRefusal } from "../hostPause";
 import { explorerModel } from "./explorerModel";
+import { AiModeError, resolveAiMode } from "../aiMode";
+import { modelDrivenGuard } from "../startApp";
 
 const cleanups: (() => unknown)[] = [];
 afterEach(async () => {
@@ -20,6 +22,10 @@ async function fakeRoot(over: { init?: string; devices?: string[]; socket?: bool
   fs.writeFileSync(path.join(root, "proc/1/cmdline"), over.init ?? "/sbin/docker-init\0--\0bun\0");
   for (const device of over.devices ?? ["lo"])
     fs.mkdirSync(path.join(root, "sys/class/net", device), { recursive: true });
+  fs.mkdirSync(path.join(root, "proc/sys/kernel/random"), { recursive: true });
+  fs.writeFileSync(path.join(root, "proc/sys/kernel/random/boot_id"), "boot-1\n");
+  fs.mkdirSync(path.join(root, "repo"), { recursive: true });
+  fs.writeFileSync(path.join(root, "repo/.sandbox-nonce"), "nonce-1");
   fs.mkdirSync(path.dirname(path.join(root, PROXY_SOCKET)), { recursive: true });
   if (over.socket !== false) {
     const server = net.createServer((socket) => socket.end("proxy says hi"));
@@ -29,7 +35,26 @@ async function fakeRoot(over: { init?: string; devices?: string[]; socket?: bool
   return root;
 }
 
-const SANDBOX_ENV = { BUGBASH_CONTAINER: "1", BUGBASH_MODEL_DRIVEN: "1" };
+const SANDBOX_ENV = {
+  BUGBASH_CONTAINER: "1",
+  BUGBASH_MODEL_DRIVEN: "1",
+  BUGBASH_HOST_BOOT: "boot-1",
+  BUGBASH_HOST_NONCE: "nonce-1",
+};
+
+test("B3: a container without the launcher's boot ID and nonce is no model-driven job", async () => {
+  const root = await fakeRoot();
+  expect(modelDrivenSandbox(SANDBOX_ENV, root)).toBe(true);
+  for (const over of [
+    { BUGBASH_HOST_NONCE: "nonce-2" },
+    { BUGBASH_HOST_BOOT: "boot-2" },
+    { BUGBASH_HOST_NONCE: "" },
+    { BUGBASH_HOST_BOOT: undefined },
+  ])
+    expect(modelDrivenSandbox({ ...SANDBOX_ENV, ...over }, root)).toBe(false);
+  fs.writeFileSync(path.join(root, "repo/.sandbox-nonce"), "");
+  expect(modelDrivenSandbox({ ...SANDBOX_ENV, BUGBASH_HOST_NONCE: "" }, root)).toBe(false);
+});
 
 test("model-driven jobs pass only in a sandbox container with a proxy socket", async () => {
   expect(modelDrivenSandbox(SANDBOX_ENV, await fakeRoot())).toBe(true);
@@ -96,4 +121,47 @@ test("the agents get the proxy model for `e2e explore` in the sandbox, and never
   expect(() =>
     explorerModel(["node", CLI, "explore", "x"], { ...DRIVEN, BUGBASH_MODEL: "openai:x" }, root)
   ).toThrow(/anthropic/);
+});
+
+const ALL_OFF = {
+  XUM_DISABLE_AGENT_TOOLS: "1",
+  XUM_DISABLE_TERMINALS: "1",
+  XUM_DISABLE_PROJECT_AUTOMATION: "1",
+};
+
+test("B3: the app refuses to start in a proxied sandbox job without the marker or a switch", async () => {
+  const root = await fakeRoot();
+  // The marker was dropped on its way to the app: the mounted socket still tells.
+  expect(modelDrivenGuard(ALL_OFF, {}, root)).toContain("BUGBASH_MODEL_DRIVEN did not reach");
+  expect(modelDrivenGuard(ALL_OFF, { BUGBASH_MODEL_DRIVEN: "1" }, root)).toBeNull();
+  const { XUM_DISABLE_TERMINALS: _, ...twoOff } = ALL_OFF;
+  expect(modelDrivenGuard(twoOff, { BUGBASH_MODEL_DRIVEN: "1" }, root)).toContain(
+    "without XUM_DISABLE_TERMINALS"
+  );
+  // A repro job (no socket) and this host start as before.
+  expect(modelDrivenGuard({}, {}, await fakeRoot({ socket: false }))).toBeNull();
+  expect(modelDrivenGuard({}, {})).toBeNull();
+});
+
+test("B3: a resolved real app AI in the sandbox talks to the proxy, never with a host key", async () => {
+  const root = await fakeRoot();
+  const env = {
+    ...SANDBOX_ENV,
+    BUGBASH_AI_RESOLVED: "real",
+    BUGBASH_APP_MODEL: "anthropic:claude-haiku-4-5",
+    ANTHROPIC_API_KEY: "sk-must-not-be-used",
+  };
+  expect(await resolveAiMode(env, root)).toMatchObject({
+    mode: "real",
+    provider: "anthropic",
+    model: "anthropic:claude-haiku-4-5",
+    apiKey: "bugbash-sandbox-placeholder",
+    baseUrl: "http://127.0.0.1:4141/anthropic/v1",
+  });
+  const openai = { ...env, BUGBASH_APP_MODEL: "openai:gpt-6.1-sol" };
+  expect(await resolveAiMode(openai, root).catch((e: unknown) => e)).toBeInstanceOf(AiModeError);
+  // Outside a model-driven sandbox job, real mode keeps reading the host settings.
+  expect(await resolveAiMode(env, await fakeRoot({ socket: false }))).toMatchObject({
+    apiKey: "sk-must-not-be-used",
+  });
 });

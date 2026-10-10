@@ -33,6 +33,11 @@ const read = (file: string) => {
  * that sets BUGBASH_CONTAINER=1 still fails the other two.
  */
 export function inSandbox(env: NodeJS.ProcessEnv = process.env, root = "/"): boolean {
+  return env.BUGBASH_CONTAINER === "1" && sandboxShaped(root);
+}
+
+/** The filesystem part of inSandbox(): docker-init as PID 1 and loopback as the only device. */
+export function sandboxShaped(root = "/"): boolean {
   const init = read(path.join(root, "proc/1/cmdline"));
   let devices: string[] = [];
   try {
@@ -40,18 +45,29 @@ export function inSandbox(env: NodeJS.ProcessEnv = process.env, root = "/"): boo
   } catch {
     return false;
   }
-  return (
-    env.BUGBASH_CONTAINER === "1" &&
-    init?.startsWith("/sbin/docker-init\0") === true &&
-    devices.join() === "lo"
-  );
+  return init?.startsWith("/sbin/docker-init\0") === true && devices.join() === "lo";
 }
 
-/** True in a sandbox container whose launcher started a provider proxy for this job. */
-export function modelDrivenSandbox(env: NodeJS.ProcessEnv = process.env, root = "/"): boolean {
-  if (!inSandbox(env, root) || env.BUGBASH_MODEL_DRIVEN !== "1") return false;
+/** Whether a proxy socket is mounted: the launcher started a model-driven job here. */
+export function proxySocketMounted(root = "/"): boolean {
   const socket = fs.lstatSync(path.join(root, PROXY_SOCKET), { throwIfNoEntry: false });
   return socket?.isSocket() === true;
+}
+
+/**
+ * True in a sandbox container whose launcher started a provider proxy for this job. Also the
+ * launcher's own marks, as entry.ts checks them: this host's boot ID and the nonce that it wrote
+ * into the staged copy. Another container with `--init`, `--network none` and a socket at that
+ * path fails here.
+ */
+export function modelDrivenSandbox(env: NodeJS.ProcessEnv = process.env, root = "/"): boolean {
+  if (!inSandbox(env, root) || env.BUGBASH_MODEL_DRIVEN !== "1") return false;
+  const boot = read(path.join(root, "proc/sys/kernel/random/boot_id"))?.trim();
+  const nonce = read(path.join(root, "repo/.sandbox-nonce"));
+  const marked =
+    boot != null && boot !== "" && boot === env.BUGBASH_HOST_BOOT &&
+    nonce != null && nonce !== "" && nonce === env.BUGBASH_HOST_NONCE; // prettier-ignore
+  return marked && proxySocketMounted(root);
 }
 
 /** Forwards each TCP connection on 127.0.0.1:`port` to the unix socket. Port 0 picks one. */
