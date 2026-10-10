@@ -2871,7 +2871,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                     <div className="flex flex-col gap-2">
                       <button
                         onClick={handleAddScratchWorkspace}
-                        className="bg-accent hover:bg-accent-dark cursor-pointer rounded border-none px-4 py-2 text-[13px] text-white transition-colors duration-200"
+                        className="bg-accent hover:bg-accent-button-hover text-accent-foreground cursor-pointer rounded border-none px-4 py-2 text-[13px] transition-colors duration-200"
                       >
                         Start a scratch chat
                       </button>

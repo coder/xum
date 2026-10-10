@@ -386,7 +386,7 @@ export function McpAppFrame(props: {
             disabled={!consentArming.armed}
             onPointerDown={consentArming.onPointerDown}
             onClick={(event) => consentArming.guardClick(event, () => settleConsent(consent, true))}
-            className="bg-accent text-background focus-visible:ring-accent focus-visible:ring-offset-background rounded px-2 py-0.5 focus-visible:ring-1 focus-visible:ring-offset-1 disabled:opacity-50"
+            className="bg-accent text-accent-foreground focus-visible:ring-accent focus-visible:ring-offset-background rounded px-2 py-0.5 focus-visible:ring-1 focus-visible:ring-offset-1 disabled:opacity-50"
           >
             {consentText(consent.request)[1]}
           </button>

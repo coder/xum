@@ -126,7 +126,7 @@ const WorkflowRunForm: React.FC<{
         type="button"
         disabled={props.busy || missingRequired}
         onClick={submit}
-        className="border-accent bg-accent inline-flex items-center gap-1 self-start rounded-md border px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:opacity-90 disabled:cursor-default disabled:opacity-50"
+        className="border-accent bg-accent text-accent-foreground hover:bg-accent-button-hover inline-flex items-center gap-1 self-start rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:cursor-default disabled:opacity-50"
       >
         <Play className="h-3 w-3" /> Start
       </button>
@@ -229,7 +229,7 @@ export const WorkflowEmptyState: React.FC<WorkflowEmptyStateProps> = (props) => 
                         !script.descriptor.executable || (props.busyScriptPath != null && !isBusy)
                       }
                       onClick={onRunClick}
-                      className="border-accent bg-accent inline-flex shrink-0 items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:opacity-90 disabled:cursor-default disabled:opacity-50"
+                      className="border-accent bg-accent text-accent-foreground hover:bg-accent-button-hover inline-flex shrink-0 items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:cursor-default disabled:opacity-50"
                     >
                       <Play className="h-3 w-3" /> Run
                     </button>
