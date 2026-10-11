@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { ORPCContext } from "@/node/orpc/context";
-import type { McpAppResultRecord } from "./mcpAppResultStore";
+import * as path from "node:path";
+import { McpAppResultStore, type McpAppResultRecord } from "./mcpAppResultStore";
+import { DisposableTempDir } from "./tempDir";
 import {
   getMcpAppView,
   getMcpAppViewRecord,
@@ -198,6 +200,61 @@ describe("getMcpAppViewRecord", () => {
     });
     // A lookup never reads the view resource; getView does when the tab mounts it.
     expect(reads).toEqual([]);
+  });
+
+  test("finds only records of the asking workspace and returns no result content", async () => {
+    using tmp = new DisposableTempDir("mcp-app-view-record");
+    const store = new McpAppResultStore((id) => path.join(tmp.path, id));
+    await store.record("ws-a", {
+      toolCallId: "call-a",
+      serverName: "charts",
+      toolName: "show_chart",
+      resourceUri: "ui://charts/view",
+      arguments: { title: "Q3" },
+      result: {
+        content: [{ type: "text", text: "secret" }],
+        structuredContent: { x: 1 },
+        _meta: {},
+      },
+    });
+    const ctx = {
+      experimentsService: { isExperimentEnabled: () => true },
+      mcpServerManager: {
+        getMcpAppResult: (workspaceId: string, toolCallId: string) =>
+          store.get(workspaceId, toolCallId),
+      },
+    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
+
+    // Another workspace naming ws-a's tool call gets nothing.
+    expect(await getMcpAppViewRecord(ctx, { workspaceId: "ws-b", toolCallId: "call-a" })).toEqual({
+      success: true,
+      data: null,
+    });
+    const own = await getMcpAppViewRecord(ctx, { workspaceId: "ws-a", toolCallId: "call-a" });
+    if (!own.success || own.data === null) throw new Error("expected ws-a's record");
+    // Only the view's binding: never the tool result (content, structuredContent, _meta).
+    expect(Object.keys(own.data).sort()).toEqual([
+      "arguments",
+      "resourceUri",
+      "serverName",
+      "toolName",
+    ]);
+    expect(JSON.stringify(own.data)).not.toContain("secret");
+  });
+
+  test("refuses while the artifacts experiment is off", async () => {
+    const { ctx } = context(RECORD);
+    const off = {
+      ...ctx,
+      experimentsService: { isExperimentEnabled: () => false },
+    } as unknown as typeof ctx;
+    let refused = false;
+    try {
+      await getMcpAppViewRecord(off, { workspaceId: "ws", toolCallId: "call-1" });
+    } catch {
+      refused = true;
+    }
+    expect(refused).toBe(true);
   });
 
   test("is null without a record", async () => {
