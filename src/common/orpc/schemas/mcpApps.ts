@@ -72,6 +72,13 @@ export const McpAppApproveDomainsRequestSchema = z.object({
   origins: z.array(z.string().max(256)).min(1).max(32),
 });
 
+/** One server's approved view origins in one project (Settings → MCP). */
+export const McpAppViewDomainsSchema = z.object({
+  projectPath: z.string(),
+  serverName: z.string(),
+  origins: z.array(z.string()),
+});
+
 /** resources/read issued by a view; the server is the view's own (bound) server. */
 export const McpAppResourceReadRequestSchema = z.object({
   workspaceId: z.string().min(1),

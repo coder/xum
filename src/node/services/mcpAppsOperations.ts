@@ -248,3 +248,29 @@ export async function approveMcpAppViewDomains(
   });
   return { success: true, data: { approvedDomains } };
 }
+
+/** Every project's approvals, for Settings → MCP (one call, not one per server). */
+export function listMcpAppViewDomains(
+  context: McpAppsContext
+): Array<{ projectPath: string; serverName: string; origins: string[] }> {
+  return [...context.config.loadConfigOrDefault().projects].flatMap(([projectPath, project]) =>
+    Object.entries(project.mcpAppViewDomains ?? {}).map(([serverName, origins]) => ({
+      projectPath,
+      serverName,
+      origins,
+    }))
+  );
+}
+
+export async function revokeMcpAppViewDomains(
+  context: McpAppsContext,
+  input: { projectPath: string; serverName: string }
+): Promise<void> {
+  await context.config.editConfig((config) => {
+    const project = config.projects.get(input.projectPath);
+    if (project?.mcpAppViewDomains?.[input.serverName] === undefined) return config;
+    const { [input.serverName]: _revoked, ...rest } = project.mcpAppViewDomains;
+    project.mcpAppViewDomains = Object.keys(rest).length > 0 ? rest : undefined;
+    return config;
+  });
+}

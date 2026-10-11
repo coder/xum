@@ -5,7 +5,9 @@ import {
   getMcpAppView,
   MCP_APP_TOOL_RESULT_MAX_BYTES,
   approveMcpAppViewDomains,
+  listMcpAppViewDomains,
   readMcpAppServerResource,
+  revokeMcpAppViewDomains,
   updateMcpAppModelContext,
 } from "./mcpAppsOperations";
 
@@ -227,7 +229,7 @@ describe("MCP Apps view domain approvals", () => {
     ...overrides,
   });
 
-  test("an approval is stored per server in the project and read back by every view", async () => {
+  test("an approval is stored per server in the project, read back by every view, and revoked", async () => {
     const { ctx, projects } = projectConfig();
     expect(await approveMcpAppViewDomains(ctx, approve(["https://api.example.com/"]))).toEqual({
       success: true,
@@ -247,6 +249,17 @@ describe("MCP Apps view domain approvals", () => {
       "https://api.example.com",
       "https://cdn.example.com",
     ]);
+    expect(listMcpAppViewDomains(ctx)).toEqual([
+      {
+        projectPath: "/repo",
+        serverName: "charts",
+        origins: ["https://api.example.com", "https://cdn.example.com"],
+      },
+    ]);
+    await revokeMcpAppViewDomains(ctx, { projectPath: "/repo", serverName: "charts" });
+    expect(listMcpAppViewDomains(ctx)).toEqual([]);
+    const after = await getMcpAppView(ctx, request(), undefined, noWarm);
+    expect(after.success && after.data.approvedDomains).toEqual([]);
   });
 
   test("refuses non-https origins, views without a record, and another server", async () => {

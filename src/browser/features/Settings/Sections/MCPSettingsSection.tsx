@@ -1,4 +1,5 @@
 import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
+import { McpAppViewDomainsSection, useMcpAppViewDomains } from "./McpAppViewDomains";
 import { getOwn } from "@/common/utils/getOwn";
 import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
@@ -876,6 +877,7 @@ export const MCPSettingsSection: React.FC = () => {
     Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
   >({});
   const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
+  const viewDomains = useMcpAppViewDomains();
 
   interface EditableServer {
     name: string;
@@ -1657,6 +1659,10 @@ export const MCPSettingsSection: React.FC = () => {
                       )}
                     </div>
                   )}
+                  <McpAppViewDomainsSection
+                    entries={viewDomains.entries.filter((e) => e.serverName === name)}
+                    onRevoke={(e) => void viewDomains.revoke(e)}
+                  />
                 </div>
               );
             })

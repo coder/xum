@@ -2360,6 +2360,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       approveViewDomains: (input: { origins: string[] }) =>
         Promise.resolve({ success: true as const, data: { approvedDomains: input.origins } }),
+      listViewDomains: () => Promise.resolve([]),
+      revokeViewDomains: () => Promise.resolve(),
       callTool: (input: { toolName: string; consented: boolean }) =>
         Promise.resolve({
           success: true as const,

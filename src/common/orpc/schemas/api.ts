@@ -78,6 +78,7 @@ import {
   McpAppToolCallResultSchema,
   McpAppApproveDomainsRequestSchema,
   McpAppModelContextRequestSchema,
+  McpAppViewDomainsSchema,
   McpAppResourceReadRequestSchema,
   McpAppViewRequestSchema,
   McpAppViewSchema,
@@ -1495,6 +1496,12 @@ export const mcpApps = {
   approveViewDomains: {
     input: McpAppApproveDomainsRequestSchema,
     output: ResultSchema(z.object({ approvedDomains: z.array(z.string()) }), z.string()),
+  },
+  listViewDomains: { input: z.void(), output: z.array(McpAppViewDomainsSchema) },
+  /** Applies on the next view mount (a mounted view keeps its policy). */
+  revokeViewDomains: {
+    input: McpAppViewDomainsSchema.pick({ projectPath: true, serverName: true }),
+    output: z.void(),
   },
   /** ui/update-model-context of a view; used by the workspace's next requests. */
   updateModelContext: {

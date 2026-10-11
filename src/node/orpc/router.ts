@@ -56,6 +56,8 @@ import {
   readMcpAppServerResource,
   updateMcpAppModelContext,
   approveMcpAppViewDomains,
+  listMcpAppViewDomains,
+  revokeMcpAppViewDomains,
 } from "@/node/services/mcpAppsOperations";
 import {
   listArtifactVersions,
@@ -1715,6 +1717,14 @@ export const router = (authToken?: string) => {
         .input(schemas.mcpApps.approveViewDomains.input)
         .output(schemas.mcpApps.approveViewDomains.output)
         .handler(({ context, input }) => approveMcpAppViewDomains(context, input)),
+      listViewDomains: t
+        .input(schemas.mcpApps.listViewDomains.input)
+        .output(schemas.mcpApps.listViewDomains.output)
+        .handler(({ context }) => listMcpAppViewDomains(context)),
+      revokeViewDomains: t
+        .input(schemas.mcpApps.revokeViewDomains.input)
+        .output(schemas.mcpApps.revokeViewDomains.output)
+        .handler(({ context, input }) => revokeMcpAppViewDomains(context, input)),
     },
     // Memory handlers run Effect generators via handlerGen (client aborts
     // interrupt the fiber); the wire contracts are unchanged.
