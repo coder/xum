@@ -159,4 +159,46 @@ describe("AgentPluginInstallService hook trust", () => {
 
     expect((await service.getHooks({ name: "guard" })).hooks[0]?.review).toBe("new");
   });
+
+  const trustFile = () =>
+    getPluginHookTrustPath(
+      xumRoot,
+      computePluginInstanceId(path.join(xumRoot, "plugins", "guard"))
+    );
+
+  test("trust stays with its install even when the trust file outlives an uninstall", async () => {
+    await install();
+    const [hook] = (await service.getHooks({ name: "guard" })).hooks;
+    await service.setHookTrust({ name: "guard", key: hook.key, hash: hook.hash, state: "trusted" });
+    const saved = await fsPromises.readFile(trustFile(), "utf8");
+
+    // An older build uninstalls and reinstalls without knowing about the trust file.
+    await service.uninstall({ name: "guard", deletePluginData: false });
+    await install();
+    await fsPromises.writeFile(trustFile(), saved);
+
+    expect((await service.getHooks({ name: "guard" })).hooks[0]?.review).toBe("new");
+  });
+
+  test("a trust decision waits for an overlapping uninstall instead of recreating trust", async () => {
+    await install();
+    const [hook] = (await service.getHooks({ name: "guard" })).hooks;
+    const uninstall = service.uninstall({ name: "guard", deletePluginData: false });
+    const decision = service.setHookTrust({
+      name: "guard",
+      key: hook.key,
+      hash: hook.hash,
+      state: "trusted",
+    });
+    await uninstall;
+    await expect(decision).rejects.toThrow("No managed plugin named 'guard'");
+    expect(await fsPromises.stat(trustFile()).catch(() => null)).toBeNull();
+  });
+
+  test("a malformed trust entry (a directory) does not block uninstall", async () => {
+    await install();
+    await fsPromises.mkdir(trustFile(), { recursive: true });
+    await service.uninstall({ name: "guard", deletePluginData: false });
+    expect(await fsPromises.stat(trustFile()).catch(() => null)).toBeNull();
+  });
 });

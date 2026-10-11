@@ -8,6 +8,8 @@
  * - MCP tools → `mcp__<server>__<tool>`, from the tool's origin (MCP_TOOL_ORIGIN), not from Xum's
  *   normalized name (that name can be lowercased or hash-suffixed). For a plugin's own server
  *   (`plugin:<instanceId>:<name>`) the server part is `<name>`, the name the plugin declared.
+ *   Like Codex, each part keeps only `[A-Za-z0-9_]` (every other character becomes `_`). Codex
+ *   also hash-suffixes names that collide after that or exceed 128 characters; Xum does not.
  *
  * Not mapped (no clear Codex equivalent; hooks match them by their Xum names):
  * - file_edit_replace_string, file_edit_insert: Codex `apply_patch` (also `Edit`, `Write`) carries
@@ -72,7 +74,7 @@ export function codexToolView(toolName: string, origin?: McpToolOrigin): CodexTo
   const codexName =
     builtin?.codexName ??
     (origin !== undefined
-      ? `mcp__${codexServerName(origin.serverName)}__${origin.toolName}`
+      ? `mcp__${codexNamePart(codexServerName(origin.serverName))}__${codexNamePart(origin.toolName)}`
       : undefined);
   return {
     ...(codexName !== undefined ? { codexName } : {}),
@@ -80,6 +82,11 @@ export function codexToolView(toolName: string, origin?: McpToolOrigin): CodexTo
     fromCodexInput: (input) =>
       builtin && isPlainObject(input) ? builtin.fromCodexInput(input) : input,
   };
+}
+
+/** Codex's sanitize_responses_api_tool_name (codex-rs/codex-mcp/src/mcp/mod.rs). */
+function codexNamePart(name: string): string {
+  return name.replace(/[^A-Za-z0-9_]/gu, "_") || "_";
 }
 
 function codexServerName(serverKey: string): string {

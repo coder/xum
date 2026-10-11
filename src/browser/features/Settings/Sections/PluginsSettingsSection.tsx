@@ -865,7 +865,9 @@ export const PluginsSettingsSection: React.FC = () => {
   const [componentsTarget, setComponentsTarget] = useState<string | null>(
     initialIntent?.type === "manage-components" ? initialIntent.name : null
   );
-  const [hooksTarget, setHooksTarget] = useState<string | null>(null);
+  const [hooksTarget, setHooksTarget] = useState<string | null>(
+    initialIntent?.type === "review-hooks" ? initialIntent.name : null
+  );
   const [installSucceeded, setInstallSucceeded] = useState(false);
   /** Name of the plugin with an update/uninstall in flight. */
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
@@ -955,6 +957,9 @@ export const PluginsSettingsSection: React.FC = () => {
           break;
         case "manage-components":
           setComponentsTarget(intent.name);
+          break;
+        case "review-hooks":
+          setHooksTarget(intent.name);
           break;
         case "confirm-uninstall":
           setUninstallTarget(intent.name);
