@@ -1185,13 +1185,15 @@ const playDomainsStrip = async (canvasElement: HTMLElement) => {
 };
 export const McpAppViewDomainsLaptop: Story = {
   globals: { viewport: { value: "laptop1200", isRotated: false } },
-  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
+  // Dark only: both widths are captured, and the strip uses shared theme tokens (Pixel budget).
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["laptop"] } } },
   render: () => renderMcpAppView(MCP_APP_VIEW_HTML, DOMAINS_CSP),
   play: ({ canvasElement }) => playDomainsStrip(canvasElement),
 };
 export const McpAppViewDomainsPhone: Story = {
   globals: { viewport: { value: "phone390", isRotated: false } },
-  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
+  // Dark only: both widths are captured, and the strip uses shared theme tokens (Pixel budget).
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
   render: () => renderMcpAppView(MCP_APP_VIEW_HTML, DOMAINS_CSP),
   play: ({ canvasElement }) => playDomainsStrip(canvasElement),
 };
