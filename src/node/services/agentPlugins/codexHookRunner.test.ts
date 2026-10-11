@@ -383,6 +383,19 @@ describe("UserPromptSubmit and Stop", () => {
     });
   });
 
+  test("prompt and Stop events carry the workspace cwd", async () => {
+    const prompt = setup([hook("UserPromptSubmit", { input: { dir: "${cwd}" } })], () => null);
+    await runMessageSendHooks(prompt.spine, workspaceId, { text: "hi", origin: "user", cwd: "/w" });
+    const stop = setup([hook("Stop", { input: { dir: "${cwd}" } })], () => null);
+    await runTurnStopHooks(stop.spine, workspaceId, {
+      messageId: "a1",
+      lastAssistantMessage: null,
+      stopHookActive: false,
+      cwd: "/w",
+    });
+    expect([...prompt.calls, ...stop.calls]).toEqual([{ dir: "/w" }, { dir: "/w" }]);
+  });
+
   test("Stop: decision block continues with the reason; continue false halts", async () => {
     const input = { messageId: "a1", lastAssistantMessage: "done", stopHookActive: false };
     const more = setup([hook("Stop", { input: { last: "${last_assistant_message}" } })], () =>

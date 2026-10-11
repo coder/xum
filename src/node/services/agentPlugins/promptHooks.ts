@@ -33,13 +33,14 @@ export type MessageSendHookOutcome =
 export async function runMessageSendHooks(
   spine: EventSpine,
   workspaceId: string,
-  input: { text: string; origin: MessageSendOrigin }
+  input: { text: string; origin: MessageSendOrigin; cwd?: string }
 ): Promise<MessageSendHookOutcome> {
   if (!spine.hasMiddleware("message.send")) return { kind: "none" };
   const ctx: MessageSendContext = {
     workspaceId,
     origin: input.origin,
     text: input.text,
+    ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
     additionalContext: [],
   };
   try {
@@ -89,7 +90,7 @@ export type TurnStopHookOutcome = { kind: "none" } | { kind: "continue"; prompt:
 export async function runTurnStopHooks(
   spine: EventSpine,
   workspaceId: string,
-  input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
+  input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "cwd">
 ): Promise<TurnStopHookOutcome> {
   if (!spine.hasMiddleware("turn.stop")) return { kind: "none" };
   const ctx: TurnStopContext = { workspaceId, ...input, continueReasons: [] };

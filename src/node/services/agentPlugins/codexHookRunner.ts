@@ -104,7 +104,8 @@ export function registerCodexPluginHooks(
               hook,
               { prompt: ctx.text },
               "UserPromptSubmit",
-              registration
+              registration,
+              { cwd: ctx.cwd }
             );
             if (output === null) continue;
             // Codex: a block without a non-empty reason is an invalid result and fails open
@@ -154,7 +155,8 @@ export function registerCodexPluginHooks(
                 last_assistant_message: ctx.lastAssistantMessage,
               },
               "Stop",
-              registration
+              registration,
+              { cwd: ctx.cwd }
             );
             if (output === null) continue;
             if (output.continue === false) ctx.halted = { pluginName: registration.pluginName };
