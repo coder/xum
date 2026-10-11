@@ -1,4 +1,5 @@
 import * as crypto from "crypto";
+import assert from "@/common/utils/assert";
 import { getOwn } from "@/common/utils/getOwn";
 import * as http from "http";
 import type { IncomingHttpHeaders } from "http";
@@ -159,6 +160,14 @@ function pluginDiscoveryState(config?: MCPServerOAuthConfig): OAuthDiscoveryStat
   const endpoints = config?.endpoints;
   if (endpoints === undefined) return undefined;
   const issuer = endpoints.issuer ?? new URL(endpoints.tokenUrl).origin;
+  // toServerOAuthConfig drops overrides with split origins; a config that still has them
+  // is a bug (the code and PKCE verifier could reach another server's token endpoint).
+  assert(
+    [endpoints.authorizationUrl, endpoints.registrationUrl, issuer].every(
+      (url) => url === undefined || new URL(url).origin === new URL(endpoints.tokenUrl).origin
+    ),
+    "plugin OAuth endpoints must share one origin"
+  );
   return {
     authorizationServerUrl: issuer,
     authorizationServerMetadata: {
@@ -795,7 +804,37 @@ export class McpOauthService {
     if (!server || server.transport === "stdio") {
       return { isLoggedIn: false, hasRefreshToken: false };
     }
-    return this.getAuthStatus({ serverUrl: server.url });
+    return this.getAuthStatus({
+      serverUrl: server.url,
+      ...(server.oauth !== undefined ? { oauth: server.oauth } : {}),
+    });
+  }
+
+  /**
+   * Settings (global scope): with `serverName`, the configured server's plugin OAuth settings
+   * apply, so tokens of another client read as signed out like they do at connect time.
+   */
+  async getAuthStatusForApi(input: {
+    serverUrl: string;
+    serverName?: string;
+  }): Promise<MCPOAuthAuthStatus> {
+    if (input.serverName === undefined) return this.getAuthStatus({ serverUrl: input.serverUrl });
+    const servers = await this.mcpConfigService.listServers(
+      this.config.rootDir,
+      isProjectTrusted(this.config, this.config.rootDir)
+    );
+    const server = getOwn(servers, input.serverName);
+    const oauth =
+      server !== undefined &&
+      server.transport !== "stdio" &&
+      normalizeServerUrlForComparison(server.url) ===
+        normalizeServerUrlForComparison(input.serverUrl)
+        ? server.oauth
+        : undefined;
+    return this.getAuthStatus({
+      serverUrl: input.serverUrl,
+      ...(oauth !== undefined ? { oauth } : {}),
+    });
   }
 
   async logoutProjectServer(input: {
@@ -812,7 +851,11 @@ export class McpOauthService {
     }
     return this.logout({ serverUrl: server.url });
   }
-  async getAuthStatus(input: { serverUrl: string }): Promise<MCPOAuthAuthStatus> {
+  async getAuthStatus(input: {
+    serverUrl: string;
+    /** Plugin OAuth settings: tokens issued to another client read as signed out. */
+    oauth?: MCPServerOAuthConfig;
+  }): Promise<MCPOAuthAuthStatus> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {
       return { isLoggedIn: false, hasRefreshToken: false };
@@ -820,7 +863,11 @@ export class McpOauthService {
 
     const creds = await this.getValidStoredCredentials({ serverUrl: normalizedServerUrl });
 
-    const tokens = creds?.tokens;
+    // The same guard as getAuthProviderForServer: status must not say "Logged in" for tokens
+    // the connection will not use.
+    const tokens = storedClientMatches(creds?.clientInformation, input.oauth)
+      ? creds?.tokens
+      : undefined;
     return {
       serverUrl: normalizedServerUrl,
       isLoggedIn: Boolean(tokens),

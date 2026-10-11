@@ -821,6 +821,23 @@ describe("McpOauthService OAuth flows", () => {
     });
     expect((await provider?.tokens())?.access_token).toBe("at-a");
     expect((await provider?.clientInformation())?.client_id).toBe("client-a");
+
+    // Status agrees with the connection: client B reads as signed out, everywhere.
+    const listServers = spyOn(mcpConfigService, "listServers");
+    for (const clientId of ["client-a", "client-b"]) {
+      listServers.mockResolvedValue({
+        docs: { transport: "http", url: serverUrl, oauth: { clientId } },
+      });
+      const loggedIn = clientId === "client-a";
+      expect(
+        (await service.getProjectAuthStatus({ projectPath, serverName: "docs" })).isLoggedIn
+      ).toBe(loggedIn);
+      expect(
+        (await service.getAuthStatusForApi({ serverUrl, serverName: "docs" })).isLoggedIn
+      ).toBe(loggedIn);
+    }
+    // Without a server name only the URL is known (a server without plugin OAuth).
+    expect((await service.getAuthStatusForApi({ serverUrl })).isLoggedIn).toBe(true);
   });
 
   test("a plugin resource that does not cover the server URL is refused at sign-in", async () => {

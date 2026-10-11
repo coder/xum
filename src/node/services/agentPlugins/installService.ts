@@ -1857,7 +1857,7 @@ export class AgentPluginInstallService {
       const serverHost = new URL(info.url).host;
       const endpoints = info.oauth?.endpoints;
       const authHosts = new Set(
-        [endpoints?.authorizationUrl, endpoints?.tokenUrl]
+        [endpoints?.authorizationUrl, endpoints?.tokenUrl, endpoints?.registrationUrl]
           .filter((url) => url !== undefined)
           .map((url) => new URL(url).host)
           .filter((host) => host !== serverHost)

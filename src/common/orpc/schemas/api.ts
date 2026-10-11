@@ -821,7 +821,8 @@ export const mcpOauth = {
     output: z.void(),
   },
   getAuthStatus: {
-    input: z.object({ serverUrl: z.string() }).strict(),
+    /** `serverName` applies that configured server's plugin client (see getAuthStatusForApi). */
+    input: z.object({ serverUrl: z.string(), serverName: z.string().optional() }).strict(),
     output: z.object({
       serverUrl: z.string().optional(),
       isLoggedIn: z.boolean(),

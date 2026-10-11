@@ -1955,7 +1955,7 @@ describe("AgentPluginInstallService", () => {
         type: "oauth",
         client: { mode: "provided", clientId },
         authorizationUrl: "https://accounts.example.com/authorize",
-        tokenUrl: "https://mcp.example.com/token",
+        tokenUrl: "https://accounts.example.com/token",
       };
       await fsPromises.writeFile(
         path.join(remoteDir, "mcp.json"),
@@ -1975,7 +1975,7 @@ describe("AgentPluginInstallService", () => {
     await writeAuth("client-a");
 
     const preview = await service.preview({ input: remoteDir });
-    // The token host equals the server host, so only the foreign host gets a line.
+    // One line per foreign host, not per endpoint.
     expect(preview.mcpServers.map((server) => server.summary)).toEqual([
       "https://mcp.example.com/mcp\nSign-in at accounts.example.com",
     ]);

@@ -1363,7 +1363,7 @@ export const router = (authToken?: string) => {
       getAuthStatus: t
         .input(schemas.mcpOauth.getAuthStatus.input)
         .output(schemas.mcpOauth.getAuthStatus.output)
-        .handler(({ context, input }) => context.mcpOauthService.getAuthStatus(input)),
+        .handler(({ context, input }) => context.mcpOauthService.getAuthStatusForApi(input)),
       logout: t
         .input(schemas.mcpOauth.logout.input)
         .output(schemas.mcpOauth.logout.output)
