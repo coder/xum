@@ -153,7 +153,10 @@ async function runToolHooks(
       ctx.blocked = { result: notes.length > 0 ? annotate(result, notes, registration) : result };
       return;
     }
-    if (output.updatedInput !== undefined) applyUpdatedInput(ctx, output, view, registration, hook);
+    if (output.updatedInput !== undefined) {
+      applyUpdatedInput(ctx, output, view, registration, hook);
+      if (ctx.blocked) return;
+    }
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
   }
   // The user cancelled while a hook ran: the tool must not start after the cancel.
@@ -200,7 +203,19 @@ function applyUpdatedInput(
   // A Codex-shaped rewrite (Bash `command`) maps back to Xum's names before the schema check.
   const updated = view.fromCodexInput(output.updatedInput);
   const schema = ctx.inputJsonSchema?.();
-  if (schema === undefined || !matchesToolSchema(schema, updated)) {
+  if (schema === undefined) {
+    // No schema to check the rewrite against (a caller that omitted it): deny. Running the
+    // original arguments would silently bypass a guard that redirects the call (Codex
+    // PRRT_kwDOPxxmWM6rRKxR).
+    warn(registration, hook, "returned updatedInput, but the tool has no input schema to check it");
+    ctx.blocked = {
+      result: {
+        error: `Tool call blocked by plugin '${registration.pluginName}' hook: Xum cannot check its rewrite of this call.`,
+      },
+    };
+    return;
+  }
+  if (!matchesToolSchema(schema, updated)) {
     warn(registration, hook, "returned updatedInput that does not match the tool's input schema");
     return;
   }
@@ -260,9 +275,19 @@ async function invoke(
   const signal = call.abortSignal
     ? AbortSignal.any([timeout.signal, call.abortSignal])
     : timeout.signal;
+  // The deadline ends the whole hook, the trust gate included (its reads can stall on a slow
+  // filesystem; Codex PRRT_kwDOPxxmWM6rN771).
+  const ended = new Promise<never>((_, reject) => {
+    const onAbort = () =>
+      reject(new Error(timeout.signal.aborted ? `timed out after ${seconds}s` : "interrupted"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  // Unobserved until a race below awaits it; a rejection must not surface as unhandled.
+  ended.catch(() => undefined);
   // Everything below fails open, the trust gate included (it reads stores that can fail).
   try {
-    if (!(await registration.deps.isHookAllowed(hook))) return null;
+    if (!(await Promise.race([registration.deps.isHookAllowed(hook), ended]))) return null;
     const event = {
       hook_event_name: eventName,
       session_id: registration.workspaceId,
@@ -288,12 +313,7 @@ async function invoke(
         input,
         signal,
       }),
-      new Promise<never>((_, reject) => {
-        const onAbort = () =>
-          reject(new Error(timeout.signal.aborted ? `timed out after ${seconds}s` : "interrupted"));
-        if (signal.aborted) onAbort();
-        else signal.addEventListener("abort", onAbort, { once: true });
-      }),
+      ended,
     ]);
     const output = parseHookOutput(result, eventName);
     if (output?.systemMessage !== undefined) registration.deps.notifyUser(output.systemMessage);
