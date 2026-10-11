@@ -53,6 +53,27 @@ export const McpAppViewRequestSchema = z.object({
   resourceUri: z.string().refine(isMcpAppResourceUri, "resourceUri must be a ui:// URI"),
 });
 
+/** A tool call's view, looked up by its result record alone (getViewRecord). */
+export const McpAppViewRecordRequestSchema = z.object({
+  workspaceId: z.string().min(1),
+  toolCallId: z.string().min(1),
+});
+
+/**
+ * What a restored app tab needs to show a view whose tool call is outside the loaded
+ * transcript: the record's server (display form, as cards carry it), the model-facing tool
+ * name, the view resource and the arguments. Null when the workspace has no record.
+ */
+export const McpAppViewRecordSchema = z
+  .object({
+    serverName: z.string().min(1),
+    toolName: z.string().min(1),
+    resourceUri: z.string().refine(isMcpAppResourceUri, "resourceUri must be a ui:// URI"),
+    arguments: z.unknown(),
+  })
+  .nullable();
+export type McpAppViewRecord = z.infer<typeof McpAppViewRecordSchema>;
+
 export const McpAppToolCallRequestSchema = z.object({
   workspaceId: z.string().min(1),
   serverName: z.string().min(1),

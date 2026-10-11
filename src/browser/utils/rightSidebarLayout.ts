@@ -1,4 +1,10 @@
-import { isNewTab, isTabType, NEW_TAB, type TabType } from "@/browser/types/rightSidebar";
+import {
+  getAppViewTabKey,
+  isNewTab,
+  isTabType,
+  NEW_TAB,
+  type TabType,
+} from "@/browser/types/rightSidebar";
 
 export type RightSidebarLayoutNode =
   | {
@@ -118,16 +124,34 @@ export function parseRightSidebarLayoutState(
     return {
       ...raw,
       openTabsOnly: true,
-      root: mapTabsets(raw.root, migrateLegacyTabset),
+      root: withoutDuplicateAppViewTabs(mapTabsets(raw.root, migrateLegacyTabset)),
     };
   }
 
-  // Marked layouts are used as-is; only repair invalid tabsets (empty, duplicate New tabs, a
-  // stale activeTab). Returns the same object when nothing changed so the persist-back effect
-  // in RightSidebar settles instead of rewriting storage on every render.
+  // Marked layouts are used as-is; only repair invalid tabsets (empty, duplicate New tabs or
+  // app tabs, a stale activeTab). Returns the same object when nothing changed so the
+  // persist-back effect in RightSidebar settles instead of rewriting storage on every render.
   const marked = raw as RightSidebarLayoutState;
-  const root = mapTabsets(marked.root, normalizeTabset);
+  const root = withoutDuplicateAppViewTabs(mapTabsets(marked.root, normalizeTabset));
   return root === marked.root ? marked : { ...marked, root };
+}
+
+/**
+ * Keep only the first copy (in tree order) of each MCP App view tab. A view must run in one
+ * place, but every app tab panel hosts its view, so a stored layout with the same app tab twice
+ * (in two tabsets, or twice in one) would mount two live frames of one app.
+ */
+function withoutDuplicateAppViewTabs(root: RightSidebarLayoutNode): RightSidebarLayoutNode {
+  const seen = new Set<TabType>();
+  return mapTabsets(root, (node) => {
+    const tabs = node.tabs.filter((tab) => {
+      if (getAppViewTabKey(tab) == null) return true;
+      if (seen.has(tab)) return false;
+      seen.add(tab);
+      return true;
+    });
+    return tabs.length === node.tabs.length ? node : normalizeTabset({ ...node, tabs });
+  });
 }
 
 /**
