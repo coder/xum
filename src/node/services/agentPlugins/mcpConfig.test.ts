@@ -165,7 +165,9 @@ describe("loadPluginMcpServers", () => {
     // The non-https endpoint is dropped; the valid unused settings are named once.
     const messages = diagnostics.map((d) => d.message);
     expect(messages).toHaveLength(2);
-    expect(messages[0]).toMatch(/'provided'.*authorizationUrl' must be an https URL/);
+    expect(messages[0]).toMatch(
+      /'provided'.*authorizationUrl' must be an https \(or loopback http\) URL/
+    );
     expect(messages[1]).toMatch(/'provided'.*ignores: tokenUrl \(needs authorizationUrl\)$/);
     const provided = Object.values(servers).find((s) => s.plugin?.serverName === "provided");
     expect(provided?.transport === "http" && provided.oauth).toEqual({
@@ -238,6 +240,37 @@ describe("loadPluginMcpServers", () => {
     expect(Object.values(servers).map((s) => [s.plugin?.serverName, s.transport])).toEqual([
       ["local", "stdio"],
     ]);
+  });
+
+  test("the Codex dialect maps streamable_http spellings and resolves a relative cwd", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    // `cwd: "."` is openai/plugins openai-developers/.mcp.json verbatim.
+    const plugin = await makePlugin(
+      tmp.path,
+      "codex-forms",
+      {
+        mcpServers: {
+          local: { cwd: ".", command: "node", args: ["./mcp/server.mjs"] },
+          nested: { cwd: "sub", command: "node" },
+          escape: { cwd: "../outside", command: "node" },
+          underscore: { type: "streamable_http", url: "https://a.example.com/mcp" },
+          dash: { type: "streamable-http", url: "https://b.example.com/mcp" },
+        },
+      },
+      { fileName: ".mcp.json" }
+    );
+    await fs.mkdir(path.join(plugin.rootPath, "sub"));
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    const byName = new Map(Object.values(servers).map((s) => [s.plugin?.serverName, s]));
+    expect((byName.get("local") as MCPStdioServerInfo).cwd).toBe(plugin.rootPath);
+    expect((byName.get("nested") as MCPStdioServerInfo).cwd).toBe(
+      path.join(plugin.rootPath, "sub")
+    );
+    expect(byName.get("underscore")?.transport).toBe("http");
+    expect(byName.get("dash")?.transport).toBe("http");
+    // The containment check still applies to a rewritten cwd.
+    expect(byName.has("escape")).toBe(false);
+    expect(diagnostics.map((d) => d.message).join("\n")).toContain("escapes its containment root");
   });
 
   test("a root mcp.json stays strict: no Codex dialect", async () => {
