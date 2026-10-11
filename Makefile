@@ -222,9 +222,12 @@ dev-server-sandbox: ## Start an isolated dev-server instance (fresh XUM_ROOT + f
 # bug-bash runs each e2e explore charter in its own bug-bash sandbox container (tests/bugbash/run.ts,
 # #5714): a model picks its actions, so it never runs on the host. The explorers reach their models
 # through a provider proxy per job, so the host needs BUGBASH_BUDGET_USD (one list-price cap for
-# the run) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. The app AI is the mock (run.ts refuses
-# another BUGBASH_AI). The containers mount dist/. The checks (env, Docker, the image) run before
-# the build, so a missing one refuses in about a second, not after the build.
+# the run) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. The app AI is BUGBASH_AI (default auto:
+# run.ts probes BUGBASH_APP_MODEL through the run's budget, and falls back to the mock when the
+# upstream is unavailable). The containers mount dist/. The checks (env, Docker, the image) run
+# before the build, so a missing one refuses in about a second, not after the build.
+# Do not name a build goal (build-main, build-renderer, build-static) on the same make command line
+# as bug-bash or mcp-apps-e2e: under -j the top-level make and the inner $(MAKE) build it twice at once.
 bug-bash: ## Agent bug bash in the bug-bash sandbox: e2e explore charters x models (needs BUGBASH_BUDGET_USD)
 	@bun tests/bugbash/run.ts --preflight $(BUGBASH_ARGS)
 	@$(MAKE) --no-print-directory build-main build-renderer build-static
@@ -281,7 +284,7 @@ test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash 
 # agent.act steps reach BUGBASH_MODEL through a provider proxy for the job, so the host needs
 # BUGBASH_BUDGET_USD (a list-price cap) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. Its seed
 # writes the MCP chat directly, so the app AI stays the mock. The container mounts dist/. As in
-# bug-bash, the checks run before the build.
+# bug-bash, the checks run before the build, and no build goal may share its make command line.
 MCP_APPS_LAUNCH = cd tests/bugbash && BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="MCP Apps suite" bun sandbox/launch.ts
 mcp-apps-e2e: ## MCP Apps e2e suite in the bug-bash sandbox (needs BUGBASH_BUDGET_USD)
 	@$(MCP_APPS_LAUNCH) --preflight -- run --config e2e.mcpapps.config.ts --output .e2e/mcp-apps-preflight $(MCP_APPS_E2E_ARGS)
