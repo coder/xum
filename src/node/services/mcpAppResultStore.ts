@@ -73,6 +73,8 @@ export class McpAppResultStore {
   private readonly memory = new Map<string, McpAppResultRecord>();
   private readonly modelContexts = new Map<string, readonly McpAppModelContext[]>();
   private readonly modelContextLock = new AsyncMutex();
+  /** The newest queued setModelContext per workspace + view (see its coalescing note). */
+  private readonly latestModelContextUpdate = new Map<string, symbol>();
 
   constructor(private readonly getSessionDir: (workspaceId: string) => string) {}
 
@@ -154,6 +156,10 @@ export class McpAppResultStore {
     } catch {
       // Missing or unreadable: no context.
     }
+    // A setModelContext that finished while this read was pending published newer state than
+    // the file this read may have opened: keep it instead of caching the stale snapshot.
+    const published = this.modelContexts.get(workspaceId);
+    if (published) return published;
     this.modelContexts.set(workspaceId, views);
     return views;
   }
@@ -161,19 +167,30 @@ export class McpAppResultStore {
   /**
    * Replace a view's model context ("Each request overwrites the previous context sent by the
    * View", MCP Apps 2026-01-26); empty text removes it. Durable before it is visible.
+   * Coalesced per view: an update still waiting for the lock when a newer update of the same
+   * view arrives is dropped without a write, because the newer one replaces it anyway. A view
+   * may send many updates a second, and every write is an fsync behind one lock shared by all
+   * workspaces, so obsolete updates must not queue up disk writes.
    */
   async setModelContext(
     workspaceId: string,
     entry: Omit<McpAppModelContext, "updatedAt">
   ): Promise<void> {
+    // Validate before queueing, so an invalid update never supersedes a valid one.
+    const updated =
+      entry.text === ""
+        ? null
+        : McpAppModelContextSchema.parse({ ...entry, updatedAt: Date.now() });
+    const viewKey = `${workspaceId}\0${entry.toolCallId}`;
+    const ticket = Symbol(viewKey);
+    this.latestModelContextUpdate.set(viewKey, ticket);
     await using _lock = await this.modelContextLock.acquire();
+    if (this.latestModelContextUpdate.get(viewKey) !== ticket) return;
+    this.latestModelContextUpdate.delete(viewKey);
     const others = (await this.getModelContexts(workspaceId)).filter(
       (view) => view.toolCallId !== entry.toolCallId
     );
-    const views =
-      entry.text === ""
-        ? others
-        : [McpAppModelContextSchema.parse({ ...entry, updatedAt: Date.now() }), ...others];
+    const views = updated === null ? others : [updated, ...others];
     const kept = views.slice(0, MCP_APP_MODEL_CONTEXT_MAX_VIEWS);
     await ensurePrivateDir(path.dirname(this.modelContextPath(workspaceId)));
     await writeFileAtomic(
@@ -210,6 +227,18 @@ export class McpAppResultStore {
 }
 
 /**
+ * A view tag attribute value: a JSON string literal (quotes and newlines escaped) with `<`, `>`
+ * and `&` as \u escapes. Server, tool and tool call names come from MCP servers and providers,
+ * so a name must not be able to close the view block or the section and pose as host text.
+ */
+function tagAttribute(value: string): string {
+  return JSON.stringify(value).replace(
+    /[<>&]/g,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
+  );
+}
+
+/**
  * The text of the request-only user-role message carrying the views' model context (merged
  * into the start of the newest user message at the provider), or undefined when none applies.
  * Only views of `enabledServers` count: a server disabled since its view wrote the context no
@@ -223,8 +252,8 @@ export function formatMcpAppModelContextSection(
     .filter((view) => enabledServers.has(view.serverName))
     .map(
       (view) =>
-        `<view server=${JSON.stringify(view.serverName)} tool=${JSON.stringify(view.toolName)} ` +
-        `tool_call_id=${JSON.stringify(view.toolCallId)}>\n` +
+        `<view server=${tagAttribute(view.serverName)} tool=${tagAttribute(view.toolName)} ` +
+        `tool_call_id=${tagAttribute(view.toolCallId)}>\n` +
         // The text cannot close its own block or the section and pose as host text.
         `${view.text.replace(/<\/(view|mcp-app-context)/gi, "<\\/$1")}\n</view>`
     );
