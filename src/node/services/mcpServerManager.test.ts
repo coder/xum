@@ -747,8 +747,10 @@ describe("MCPServerManager", () => {
     expect(servers.connectCount("settings-nostart")).toBe(1);
     // The instance goes away, but the restart options stay (as after a config change).
     await manager.stopServers("settings-nostart-ws", { retainRestartOptions: true });
-    const read = manager.readSettings("settings-nostart-ws", "cad", { noStart: true });
-    await expect(read).rejects.toThrow("not connected");
+    const error = await manager
+      .readSettings("settings-nostart-ws", "cad", { noStart: true })
+      .catch((caught: unknown) => caught);
+    expect(String(error)).toContain("not connected");
     expect(servers.connectCount("settings-nostart")).toBe(1);
   });
 
