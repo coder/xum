@@ -297,6 +297,29 @@ describe("loadPluginCodexHooks", () => {
     expect(warnings[0]).toMatch(/'PreToolUse' matcher is not a valid regex/);
   });
 
+  test("a Rust matcher that JavaScript would read differently drops its group", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-rust-only");
+    const refused = ["\\A(?:Bash|Edit)\\z", "^[[:alpha:]]+$", "^\\pL+$", "^[a-z&&[^x]]$"];
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": {
+        hooks: {
+          PreToolUse: [
+            ...refused.map((matcher) => ({ matcher, hooks: [scan] })),
+            // Escaped punctuation, \xhh and a plain class read the same in both dialects.
+            { matcher: "^mcp\\.\\x5f[a-z-]+$", hooks: [scan] },
+          ],
+        },
+      },
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.matcher)).toEqual(["^mcp\\.\\x5f[a-z-]+$"]);
+    expect(warnings).toHaveLength(refused.length);
+    expect(warnings[0]).toMatch(/not a valid regex \('\\A' means something else in JavaScript\)/);
+    expect(warnings[1]).toMatch(/'\[' in a character class/);
+  });
+
   test("compileHookMatcher reads matchers as Codex does", () => {
     const matching = (pattern: string, names: string[]) => {
       const matcher = compileHookMatcher(pattern);
