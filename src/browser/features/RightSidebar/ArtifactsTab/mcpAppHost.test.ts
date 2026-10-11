@@ -297,4 +297,28 @@ describe("MCP Apps host router", () => {
     expect(t.consents).toEqual([]);
     expect(t.composer).toEqual([]);
   });
+
+  test("ui/message stops reading blocks once the text limit is passed", async () => {
+    const t = setup();
+    // Counts reads of the block after the one that crosses the limit (32,000 + "\n" + "y").
+    let laterBlockReads = 0;
+    const laterBlock = {
+      type: "text",
+      get text() {
+        laterBlockReads += 1;
+        return "z";
+      },
+    };
+    await t.request(1, "ui/message", {
+      role: "user",
+      content: [
+        { type: "text", text: "x".repeat(32_000) },
+        { type: "text", text: "y" },
+        laterBlock,
+      ],
+    });
+    expect((t.reply(1)?.error as { code: number }).code).toBe(-32602);
+    expect(laterBlockReads).toBe(0);
+    expect(t.consents).toEqual([]);
+  });
 });

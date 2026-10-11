@@ -71,7 +71,10 @@ const ToolCallParams = z.object({
 const ReadResourceParams = z.object({ uri: z.string().min(1).max(MCP_APP_READ_URI_MAX_CHARS) });
 const OpenLinkParams = z.object({ url: z.string().max(4096) });
 const MESSAGE_TEXT_MAX_CHARS = 32_000;
-const TextBlock = z.object({ type: z.literal("text"), text: z.string() });
+const TextBlock = z.object({
+  type: z.literal("text"),
+  text: z.string().max(MESSAGE_TEXT_MAX_CHARS),
+});
 /**
  * The spec's single text block, or the content-block array of the ext-apps SDK and ChatGPT
  * (`content: [{ type: "text", text }]`, optional `_meta["openai/message"]`). Non-text blocks
@@ -88,13 +91,17 @@ const MessageParams = z.object({
 function messageText(content: z.infer<typeof MessageParams>["content"]): string | null {
   const blocks = Array.isArray(content) ? content : [content];
   const texts: string[] = [];
+  // Enforce the limit while iterating, counting the "\n" join() adds: a view can send 64
+  // blocks, so joining first would build an arbitrarily large string before rejecting it.
+  let length = 0;
   for (const block of blocks) {
     const parsed = TextBlock.safeParse(block);
     if (!parsed.success) return null;
+    length += parsed.data.text.length + (texts.length > 0 ? 1 : 0);
+    if (length > MESSAGE_TEXT_MAX_CHARS) return null;
     texts.push(parsed.data.text);
   }
-  const text = texts.join("\n");
-  return text.length <= MESSAGE_TEXT_MAX_CHARS ? text : null;
+  return texts.join("\n");
 }
 
 export type McpAppConsentRequest =
