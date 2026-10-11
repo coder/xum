@@ -7,6 +7,7 @@ on:
       base_sha: { description: "Base commit (40-hex SHA)", required: true, type: string }
       head_sha: { description: "Head commit (40-hex SHA)", required: true, type: string }
       pairs: { description: "Launch pairs", required: false, type: string, default: "20" }
+      metric: { description: "shell (app-shell-ready) or transcript (seeded ChatPane data-loaded)", required: false, type: string, default: "shell" }
 permissions:
   contents: read
 jobs:
@@ -17,11 +18,13 @@ jobs:
       BASE_SHA: ${{ inputs.base_sha }}
       HEAD_SHA: ${{ inputs.head_sha }}
       PAIRS: ${{ inputs.pairs }}
+      METRIC: ${{ inputs.metric }}
     steps:
       - name: Validate inputs
         run: |
           [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "SHAs must be 40-char lowercase hex"; exit 1; }
           [[ "$PAIRS" =~ ^([2-9]|[1-9][0-9]+)$ ]] || { echo "pairs must be an integer >= 2"; exit 1; }
+          [[ "$METRIC" =~ ^(shell|transcript)$ ]] || { echo "metric must be shell or transcript"; exit 1; }
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ inputs.head_sha }}
@@ -40,7 +43,7 @@ jobs:
         # Redirect inside sh -c: Ubuntu 22.04's xvfb-run runs the command with 2>&1, which mixed progress lines into the JSON.
         run: |
           # shellcheck disable=SC2016 # the inner sh -c expands these
-          xvfb-run -a sh -c 'node --import tsx scripts/perf/desktopColdStart.ts --base "$RUNNER_TEMP/base" --head "$GITHUB_WORKSPACE" --pairs "$PAIRS" --json > cold-start.json'
+          xvfb-run -a sh -c 'node --import tsx scripts/perf/desktopColdStart.ts --base "$RUNNER_TEMP/base" --head "$GITHUB_WORKSPACE" --pairs "$PAIRS" --metric "$METRIC" --json > cold-start.json'
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         if: always()
         with:

@@ -5,6 +5,9 @@
  * launchPlan) so order effects and drift hit both arms alike. Each launch gets a fresh copy of the
  * seeded root at one fixed path: config.json holds absolute paths, and state one launch writes must
  * not speed up the next. Each tree runs its own Electron, so an Electron bump is measured too.
+ * --metric transcript (T3 Phase 2) instead times the seeded workspace transcript: the renderer's
+ * performance.now() when ChatPane first reports data-loaded="true" (rAF polling). A setup launch
+ * stores the workspace route, which the app restores on each start (file:// lastVisitedRoute).
  * Runs under Node (tsx), not Bun: under Bun 1.3.12 Playwright never finishes the websocket
  * upgrade to Electron's debugger, so every launch hangs (`bun x playwright test` uses Node too).
  */
@@ -19,16 +22,22 @@ import { parseArgs } from "node:util";
 import { _electron as electron } from "playwright";
 import { setXumE2EEnv } from "../../tests/e2e/env";
 import { prepareDemoProject } from "../../tests/e2e/utils/demoProject";
+import { SEED_CODE_LINE, seedBootWorkspace } from "./bootSeed";
 import { launchPlan, pairedRelativeDelta, type PlannedLaunch } from "./desktopColdStartStats";
 
 const MARK = "xum:app-shell-ready";
 const USAGE =
-  "usage: node --import tsx scripts/perf/desktopColdStart.ts --base <appTree> --head <appTree> [--pairs 20] [--warmups 2] [--json] [--timeout-ms 120000]";
+  "usage: node --import tsx scripts/perf/desktopColdStart.ts --base <appTree> --head <appTree> [--pairs 20] [--warmups 2] [--metric shell|transcript] [--json] [--timeout-ms 120000]";
 const E2E_ENV = { E2E: "1", E2E_LOAD_DIST: "1", MOCK_AI: "1", ENABLE_TUTORIALS_IN_SANDBOX: "0" };
 type Arm = PlannedLaunch["arm"];
 // Run in the renderer: Playwright serializes them, so they must not close over module state.
 const markCount = (n: string) => performance.getEntriesByName(n, "mark").length;
 const markTimes = (n: string) => performance.getEntriesByName(n, "mark").map((e) => e.startTime);
+const transcriptLoaded = () =>
+  document.querySelector('[data-loaded="true"]') !== null && performance.now();
+const seededTranscriptShown = (line: string) =>
+  [...document.querySelectorAll(".code-line")].some((n) => n.textContent?.includes(line)) &&
+  !document.querySelector('[role="img"][aria-label^="Step "]');
 type Launch = PlannedLaunch & { index: number; warmup: boolean; markMs: number; wallMs: number };
 
 function usageError(message: string): never {
@@ -70,6 +79,7 @@ async function main(): Promise<void> {
         pairs: { type: "string", default: "20" },
         warmups: { type: "string", default: "2" },
         json: { type: "boolean", default: false },
+        metric: { type: "string", default: "shell" },
         "timeout-ms": { type: "string", default: "120000" },
       },
     }));
@@ -80,6 +90,8 @@ async function main(): Promise<void> {
   const pairs = intArg("pairs", values.pairs, 2);
   const warmups = intArg("warmups", values.warmups, 0);
   const timeout = intArg("timeout-ms", values["timeout-ms"], 1);
+  const metric = values.metric;
+  if (metric !== "shell" && metric !== "transcript") usageError(`--metric: ${metric}`);
   const tree = { base: path.resolve(values.base), head: path.resolve(values.head) };
   const bin = { base: electronFor(tree.base), head: electronFor(tree.head) };
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "xum-cold-start-"));
@@ -90,14 +102,25 @@ async function main(): Promise<void> {
   const env = { ...process.env, NODE_ENV: "production" } as Record<string, string>;
   env.ELECTRON_DISABLE_SECURITY_WARNINGS = "true";
   for (const [k, v] of Object.entries({ ...E2E_ENV, ROOT: root })) setXumE2EEnv(env, k, v);
+  const args = process.platform === "linux" ? ["--no-sandbox", "."] : ["."];
   const launchOnce = async (arm: Arm) => {
     const start = Date.now();
-    const args = process.platform === "linux" ? ["--no-sandbox", "."] : ["."];
     const executablePath = bin[arm];
     const app = await electron.launch({ executablePath, cwd: tree[arm], args, env, timeout });
     try {
       // E2E mode skips the splash, so the first window is the main window.
       const window = await app.firstWindow({ timeout });
+      if (metric === "transcript") {
+        const handle = await window.waitForFunction(transcriptLoaded, null, {
+          polling: "raf",
+          timeout,
+        });
+        const ms = (await handle.jsonValue()) as number;
+        // Guard the seed: the restored route must be the seeded workspace, with no wizard on top.
+        const seeded = await window.evaluate(seededTranscriptShown, SEED_CODE_LINE);
+        assert(seeded, `launch shows no seeded transcript (or the onboarding wizard is up)`);
+        return { markMs: ms, wallMs: Date.now() - start };
+      }
       await window.waitForFunction(markCount, MARK, { timeout });
       const startTimes = await window.evaluate(markTimes, MARK);
       assert(startTimes.length === 1 && startTimes[0] > 0, `${MARK} marks: [${startTimes.join()}]`);
@@ -107,7 +130,22 @@ async function main(): Promise<void> {
     }
   };
   const launches: Launch[] = [];
-  prepareDemoProject(root);
+  if (metric === "transcript") {
+    const route = JSON.stringify(`/workspace/${encodeURIComponent(seedBootWorkspace(root))}`);
+    const app = await electron.launch({
+      executablePath: bin.head,
+      cwd: tree.head,
+      args,
+      env,
+      timeout,
+    });
+    const window = await app.firstWindow({ timeout });
+    await window.waitForFunction(markCount, MARK, { timeout });
+    await window.evaluate((value) => localStorage.setItem("lastVisitedRoute", value), route);
+    await app.close(); // a clean close flushes localStorage into XUM_ROOT/user-data
+  } else {
+    prepareDemoProject(root);
+  }
   fs.cpSync(root, seed, { recursive: true });
   for (const [index, { arm, pair }] of launchPlan(pairs, warmups).entries()) {
     fs.rmSync(root, { recursive: true, force: true });
@@ -130,7 +168,13 @@ async function main(): Promise<void> {
       const git = spawnSync("git", ["-C", tree[arm], "rev-parse", "HEAD"], { encoding: "utf8" });
       return { tree: tree[arm], gitSha: git.status === 0 ? git.stdout.trim() : null };
     };
-    const result = { base: side("base"), head: side("head"), pairs, warmupsPerArm: warmups };
+    const result = {
+      base: side("base"),
+      head: side("head"),
+      pairs,
+      warmupsPerArm: warmups,
+      metric,
+    };
     out(JSON.stringify({ ...result, launches, stats }, null, 2));
     return;
   }
