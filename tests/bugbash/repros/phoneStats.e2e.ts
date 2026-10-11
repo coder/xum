@@ -1,5 +1,6 @@
 // #5767: at phone width the right sidebar is hidden, and with it the only way to open Stats.
-// Proves the workspace actions menu opens Stats in a dialog there.
+// Proves the workspace actions menu reaches Stats there: its Sidebar row shows the sidebar
+// full-screen, and the sidebar's New tab launcher opens Stats.
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { openPlayground } from "./helpers";
@@ -14,10 +15,10 @@ test(
     await openPlayground(app, screen, browser);
 
     await screen.getByRole("button", "Workspace actions").tap();
-    // Its name includes the shortcut where shortcuts show, e.g. "Stats (Shift+S)".
-    const stats = screen.getByRole("button", /^Stats\b/);
-    await expect(stats).toBeVisible();
-    await stats.tap();
-    await expect(screen.getByRole("dialog", "Stats")).toBeVisible();
+    await screen.getByRole("button", "Sidebar").tap();
+    await screen.getByRole("button", "New tab").tap();
+    // The launcher row's name includes its description.
+    await screen.getByRole("button", /^Stats\b/).tap();
+    await expect(screen.getByRole("tab", /^Stats\b/)).toBeVisible();
   }
 );
