@@ -223,6 +223,21 @@ describe("McpAppFrame", () => {
     expect(args).toContain('"city": "Berlin"');
   });
 
+  test("the context consent strip shows the view's full context as plain text", async () => {
+    const { view, frame } = await renderFrame();
+    const text = `<b>bold</b> ${"y".repeat(2000)} END`;
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "ui/update-model-context",
+      params: { content: [{ type: "text", text }] },
+    });
+    await view.findByRole("alert");
+    const shown = view.getByTestId("mcp-app-consent-args");
+    expect(shown.textContent).toBe(text);
+    expect(shown.querySelector("b")).toBeNull();
+  });
+
   test("a plugin server shows its server part, and its instance marker where consent is asked", async () => {
     const key = "plugin:0123456789abcdef:tray";
     const view = render(<McpAppFrame workspaceId="ws" view={{ ...VIEW, serverName: key }} />, {
