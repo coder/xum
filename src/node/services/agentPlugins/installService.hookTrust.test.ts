@@ -218,6 +218,16 @@ describe("AgentPluginInstallService hook trust", () => {
     expect(await fsPromises.readFile(trustFile(), "utf8")).toBe(newer);
   });
 
+  test("a malformed trust entry (a directory) does not block a trust decision", async () => {
+    await install();
+    const [hook] = (await service.getHooks({ name: "guard" })).hooks;
+    await fsPromises.mkdir(trustFile(), { recursive: true });
+
+    await service.setHookTrust({ name: "guard", key: hook.key, hash: hook.hash, state: "trusted" });
+
+    expect((await service.getHooks({ name: "guard" })).hooks[0]?.review).toBe("trusted");
+  });
+
   test("a malformed trust entry (a directory) does not block uninstall", async () => {
     await install();
     await fsPromises.mkdir(trustFile(), { recursive: true });

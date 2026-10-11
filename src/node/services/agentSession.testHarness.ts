@@ -160,6 +160,7 @@ export function createAgentSessionAIServiceFake(
       Promise.resolve(Ok(eventSpine.captureRequestAssembly(workspaceId)))
     ),
     // The real chain on the real spine: tests register fake prompt-hook consumers on it.
+    hasMessageSendHooks: mock(() => eventSpine.hasMiddleware("message.send")),
     runMessageSendHooks: mock(
       (workspaceId: string, input: Parameters<typeof runMessageSendHooks>[2]) =>
         runMessageSendHooks(eventSpine, workspaceId, input)

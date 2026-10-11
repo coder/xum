@@ -97,4 +97,28 @@ describe("plugin hook context in provider requests", () => {
     expect(text).toContain('plugin="first"');
     expect(text).not.toContain('plugin="second"');
   });
+
+  test("the context goes in the text part that merging keeps, before an inlined SVG", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rOv7j): an SVG attachment is inlined as a later text part, and
+    // merging consecutive user rows keeps only each message's first text part.
+    const svg = `data:image/svg+xml;base64,${Buffer.from("<svg/>").toString("base64")}`;
+    const messages = [
+      createMuxMessage("u1", "user", "first", { timestamp: 1 }),
+      createMuxMessage(
+        "u2",
+        "user",
+        "second",
+        { timestamp: 2, pluginHookContext: [{ pluginId: "guard", text: "Ask first." }] },
+        [{ type: "file", mediaType: "image/svg+xml", url: svg, filename: "a.svg" }]
+      ),
+    ];
+
+    const [text] = userTexts(
+      await prepareMessagesForProvider({ ...baseOptions, messagesWithSentinel: messages })
+    );
+
+    expect(text).toContain(
+      'second\n<plugin-hook-context plugin="guard">\nAsk first.\n</plugin-hook-context>'
+    );
+  });
 });
