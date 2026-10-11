@@ -265,15 +265,18 @@ const SELECTION_EXTENDING_KEYS = new Set([
 /**
  * An app view selected in the Artifacts picker. While the view is open in its app tab, this
  * shows the "Open in tab" placeholder and mounts no frame, so one view never runs twice.
+ * In the small-viewport dialog (`inDialog`) the view runs here even when the layout has its
+ * tab: that tab sits in the CSS-hidden sidebar, where "Go to tab" would only reopen this dialog.
+ * The dialog hosts it as "sheet", so the hidden tab and the hidden sidebar's Artifacts yield.
  */
-function ArtifactsAppView(props: { workspaceId: string; view: McpAppViewRef }) {
-  const { workspaceId } = props;
+function ArtifactsAppView(props: { workspaceId: string; view: McpAppViewRef; inDialog: boolean }) {
+  const { workspaceId, inDialog } = props;
   const { toolCallId } = props.view;
-  const inTab = useMcpAppViewInTab(workspaceId, toolCallId, ["tab"]);
+  const inTab = useMcpAppViewInTab(workspaceId, toolCallId, ["tab", "sheet"]) && !inDialog;
   useEffect(() => {
     if (inTab) return;
-    return markMcpAppViewHosted(workspaceId, toolCallId, "artifacts");
-  }, [inTab, workspaceId, toolCallId]);
+    return markMcpAppViewHosted(workspaceId, toolCallId, inDialog ? "sheet" : "artifacts");
+  }, [inTab, inDialog, workspaceId, toolCallId]);
   if (inTab) {
     return (
       <div className="p-3">
@@ -967,6 +970,7 @@ export function ArtifactsPanel(props: {
         key={`${selectedApp.toolCallId}\u0000${reloadTick}`}
         workspaceId={props.workspaceId}
         view={selectedApp}
+        inDialog={props.inDialog === true}
       />
     ) : selected == null && !waitingForPinned ? null : currentRead?.result ? (
       <ArtifactViewer

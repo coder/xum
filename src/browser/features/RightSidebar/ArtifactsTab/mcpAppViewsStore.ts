@@ -294,11 +294,12 @@ export function openMcpAppViewTab(workspaceId: string, view: McpAppViewRef) {
 }
 
 /**
- * Where a view is mounted outside its tool card: its app tab, or the Artifacts tab (which still
- * lists app views). Counted per workspace, tool call and host, so every place that can show a
- * view yields to the others and at most one live instance runs.
+ * Where a view is mounted outside its tool card: its app tab, the small-viewport dialog standing
+ * in for the hidden sidebar ("sheet"), or the Artifacts tab (which still lists app views).
+ * Counted per workspace, tool call and host, so every place that can show a view yields to the
+ * others and at most one live instance runs.
  */
-export type McpAppViewHost = "tab" | "artifacts";
+export type McpAppViewHost = "tab" | "sheet" | "artifacts";
 const hostedViews = new Map<string, number>();
 const hostedKey = (workspaceId: string, toolCallId: string, host: McpAppViewHost) =>
   `${workspaceId}\u0000${toolCallId}\u0000${host}`;

@@ -1032,6 +1032,76 @@ describe("ArtifactsPanel", () => {
     }
   });
 
+  test("the small-viewport dialog runs a view whose tab sits in the hidden sidebar", async () => {
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+    fake = createFakeArtifactsApi(
+      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      {}
+    );
+    fake.api.mcpApps = {
+      getView: () =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            html: "<p>view</p>",
+            csp: {},
+            prefersBorder: null,
+            resultAvailable: true,
+            result: { content: [] },
+            invocation: null,
+          },
+        }),
+    };
+    const workspaceId = "ws-dialog-owns";
+    const ref = {
+      toolCallId: "call-dialog",
+      serverName: "dice",
+      resourceUri: "ui://dice/board.html",
+      toolName: "dice_show_dice_board",
+      label: "Board",
+      arguments: {},
+      cancelled: false,
+      failed: false,
+    };
+    // Opened in its tab on a wide layout, then the viewport narrowed: the tab stays in the
+    // layout and its panel stays mounted (display:none) behind the dialog.
+    act(() => updateRightSidebarLayout(workspaceId, (s) => withAppViewTab(s, ref.toolCallId)));
+    openMcpAppView(workspaceId, ref);
+    try {
+      const view = render(
+        <ThemeProvider forcedTheme="dark">
+          <ApiWrapper>
+            <div data-testid="hidden-sidebar">
+              <AppViewTabPanel
+                workspaceId={workspaceId}
+                toolCallId={ref.toolCallId}
+                onClose={() => undefined}
+              />
+            </div>
+            <div data-testid="dialog">
+              <ArtifactsPanel workspaceId={workspaceId} inDialog />
+            </div>
+          </ApiWrapper>
+        </ThemeProvider>
+      );
+      const dialog = within(view.getByTestId("dialog"));
+      const sidebar = within(view.getByTestId("hidden-sidebar"));
+      await dialog.findByTestId("mcp-app-frame");
+      // The hidden tab yields; "Go to tab" in the dialog would only reopen the dialog.
+      await waitFor(() => expect(sidebar.queryByTestId("mcp-app-frame")).toBeNull());
+      expect(dialog.queryByRole("button", { name: "Go to tab" })).toBeNull();
+      expect(view.getAllByTestId("mcp-app-frame")).toHaveLength(1);
+    } finally {
+      resetTestExperiments();
+      closeMcpAppView(workspaceId, ref.toolCallId);
+      act(() =>
+        updateRightSidebarLayout(workspaceId, (s) =>
+          removeTabEverywhere(s, appViewTabFor(ref.toolCallId))
+        )
+      );
+    }
+  });
+
   test("lists app views from the transcript; Close returns to files and keeps them", async () => {
     fake = createFakeArtifactsApi(
       {
