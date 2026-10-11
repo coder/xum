@@ -150,6 +150,26 @@ describe("PreToolUse", () => {
     expect((await runTool(gateFails.spine, "bash", {})).executed).toBe(true);
   });
 
+  test("a trust gate that never settles ends at the hook deadline, and on cancel", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rRKxU): a stalled trust read must not hang the tool call.
+    const atDeadline = setup([hook("PreToolUse", { timeoutSeconds: 0.05 })], () => deny);
+    atDeadline.deps.isHookAllowed = () => new Promise(() => undefined);
+    expect((await runTool(atDeadline.spine, "bash", {})).executed).toBe(true);
+    expect(atDeadline.calls).toEqual([]);
+
+    // The default deadline is 10 s: only the cancel ends this wait in time.
+    const onCancel = setup([hook("PreToolUse")], () => deny);
+    onCancel.deps.isHookAllowed = () => new Promise(() => undefined);
+    const cancel = new AbortController();
+    setTimeout(() => cancel.abort(), 20);
+    const ctx = await runTool(onCancel.spine, "bash", {}, undefined, {
+      abortSignal: cancel.signal,
+    });
+    expect(ctx.executed).toBe(false);
+    expect(ctx.blocked?.result).toEqual({ error: "Tool call interrupted while plugin hooks ran." });
+    expect(onCancel.calls).toEqual([]);
+  });
+
   test("a deny tagged for another event is malformed and fails open", async () => {
     const { spine } = setup([hook("PreToolUse")], () =>
       json({ hookSpecificOutput: { hookEventName: "PostToolUse", permissionDecision: "deny" } })
