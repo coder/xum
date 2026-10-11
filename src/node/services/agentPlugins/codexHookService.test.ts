@@ -355,7 +355,8 @@ describe("CodexPluginHookService", () => {
     });
 
     test("a slow startup is bounded by the hook timeout, then the hook fails open", async () => {
-      await promptPlugin(0.05);
+      // 1s is the shortest timeout: the parser raises anything below it, as Codex does.
+      await promptPlugin(1);
       await trustAll("guard");
       await service.ensureWorkspaceHooks(promptArgs());
       let aborted = false;
@@ -370,7 +371,8 @@ describe("CodexPluginHookService", () => {
       const started = performance.now();
       await service.prepareForPromptHooks(workspaceId, startServers);
 
-      expect(performance.now() - started).toBeLessThan(1_000);
+      // The startup never settles on its own: only the 1s hook timeout ends the wait.
+      expect(performance.now() - started).toBeLessThan(3_000);
       expect(aborted).toBe(true);
       expect(await send()).toEqual({ kind: "none" });
     });
