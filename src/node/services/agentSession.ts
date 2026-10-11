@@ -1157,6 +1157,7 @@ export class AgentSession {
     [];
   private readonly initListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
+  private readonly stopEmptyErroredReplyDeletes: () => void;
   private readonly coordinator = new TurnCoordinator({
     streamStarted: (payload) => {
       // The admitted successor now owns completion through its own stream end.
@@ -1747,6 +1748,14 @@ export class AgentSession {
 
     this.attachAiListeners();
     this.attachInitListeners();
+    // #6116: the client still holds an empty failed reply that commitPartial deleted. Its next
+    // edit would send that row as evidence and be refused; drop it as a truncation does.
+    this.stopEmptyErroredReplyDeletes = this.historyService.onEmptyErroredReplyDeleted(
+      (workspaceId, historySequence) => {
+        if (workspaceId === this.workspaceId)
+          this.emitChatEvent({ type: "delete", historySequences: [historySequence] });
+      }
+    );
     // A subscription is lazy: protect an existing engine before any caller can
     // send through this new session, even before replay is first pulled.
     const existingStream = this.streamManager.getStreamInfo(this.workspaceId);
@@ -1856,6 +1865,7 @@ export class AgentSession {
         for (const { event, handler } of this.initListeners)
           this.initStateManager.off(event, handler as never);
         this.initListeners.length = 0;
+        this.stopEmptyErroredReplyDeletes();
         this.emitter.removeAllListeners();
         eventSpine.emit("session.end", { workspaceId: this.workspaceId });
       })

@@ -71,6 +71,42 @@ describe("HistoryService partial persistence - Error Recovery", () => {
     expect(await partialService.readPartial(workspaceId)).toBeNull();
   });
 
+  test("commitPartial reports the empty errored reply row it deletes, and only that (#6116)", async () => {
+    const workspaceId = "test-workspace";
+    const deleted: Array<[string, number]> = [];
+    const stop = partialService.onEmptyErroredReplyDeleted((id, sequence) =>
+      deleted.push([id, sequence])
+    );
+    const errored = (id: string, historySequence: number, text?: string): MuxMessage => ({
+      id,
+      role: "assistant",
+      metadata: { historySequence, partial: true, error: "Stream error", errorType: "api" },
+      parts: text === undefined ? [] : [{ type: "text", text }],
+    });
+
+    // An errored reply with output is committed, not deleted: nothing to report.
+    const withOutput = errored("msg-1", 1, "half an answer");
+    await appendPlaceholder(partialService, workspaceId, withOutput);
+    expect((await partialService.writePartial(workspaceId, withOutput)).success).toBe(true);
+    expect((await partialService.commitPartial(workspaceId)).success).toBe(true);
+    expect(deleted).toEqual([]);
+
+    const empty = errored("msg-2", 2);
+    await appendPlaceholder(partialService, workspaceId, empty);
+    expect((await partialService.writePartial(workspaceId, empty)).success).toBe(true);
+    expect((await partialService.commitPartial(workspaceId)).success).toBe(true);
+    expect(deleted).toEqual([[workspaceId, 2]]);
+    const history = await partialService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success && history.data.map((m) => m.id)).toEqual(["msg-1"]);
+
+    stop();
+    const later = errored("msg-3", 3);
+    await appendPlaceholder(partialService, workspaceId, later);
+    expect((await partialService.writePartial(workspaceId, later)).success).toBe(true);
+    expect((await partialService.commitPartial(workspaceId)).success).toBe(true);
+    expect(deleted).toEqual([[workspaceId, 2]]);
+  });
+
   test("updatePartialIfMessageIdMatches waits out a commitPartial transaction and declines", async () => {
     const workspaceId = "test-workspace";
     const partial: MuxMessage = {

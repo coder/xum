@@ -827,6 +827,23 @@ export class HistoryService {
     this.config = config;
   }
 
+  private readonly emptyErroredReplyDeletedListeners = new Set<
+    (workspaceId: string, historySequence: number) => void
+  >();
+
+  /**
+   * Called after commitPartial deleted the history row of a reply that failed with no output.
+   * No caller asked for that delete, so no caller tells the client. A client that keeps the row
+   * sends it as evidence with its next edit, and the edit is refused (#6116).
+   * Returns the unsubscribe function.
+   */
+  onEmptyErroredReplyDeleted(
+    listener: (workspaceId: string, historySequence: number) => void
+  ): () => void {
+    this.emptyErroredReplyDeletedListeners.add(listener);
+    return () => this.emptyErroredReplyDeletedListeners.delete(listener);
+  }
+
   private readonly continuousJournals = new Map<string, ContinuousCompactionJournalStore>();
 
   getContinuousCompactionJournal(workspaceId: string): ContinuousCompactionJournalStore {
@@ -3437,19 +3454,28 @@ export class HistoryService {
     if ((await this.readPartial(workspaceId)) == null) {
       return Ok(undefined);
     }
-    return this.withRecoveredHistoryWriteResultLock(
+    const committed = await this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to commit partial",
       (assertStillOwned) =>
         this.commitPartialUnderWriteLock(workspaceId, expectedMessageId, assertStillOwned)
     );
+    if (!committed.success) return committed;
+    // Notify after the locks are released: listeners publish to clients.
+    if (committed.data !== undefined) {
+      for (const listener of this.emptyErroredReplyDeletedListeners) {
+        listener(workspaceId, committed.data);
+      }
+    }
+    return Ok(undefined);
   }
 
+  /** Returns the history sequence of an empty errored reply row it deleted, if any. */
   private async commitPartialUnderWriteLock(
     workspaceId: string,
     expectedMessageId?: string,
     assertStillOwned?: () => Promise<void>
-  ): Promise<Result<void>> {
+  ): Promise<Result<number | undefined>> {
     try {
       let partial = await this.readPartial(workspaceId);
       if (!partial) {
@@ -3522,7 +3548,8 @@ export class HistoryService {
           messageId: partial.id,
           partialSeq,
         });
-        return this.deletePartialUnlocked(workspaceId);
+        const deleted = await this.deletePartialUnlocked(workspaceId);
+        return deleted.success ? Ok(undefined) : deleted;
       }
 
       const commitWorthy = hasCommitWorthyParts(partial.parts);
@@ -3557,6 +3584,7 @@ export class HistoryService {
         partial.metadata?.anthropicThinkingReplay === "off" &&
         existingMessage.metadata?.anthropicThinkingReplay !== "off";
 
+      let deletedSequence: number | undefined;
       if (shouldCommit) {
         const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, partial);
         if (!updateResult.success) {
@@ -3578,9 +3606,14 @@ export class HistoryService {
         ) {
           return deleteMessageResult;
         }
+        if (deleteMessageResult.success) {
+          deletedSequence = existingMessage.metadata?.historySequence;
+          assert(deletedSequence !== undefined, "the deleted row matched the partial's sequence");
+        }
       }
 
-      return this.deletePartialUnlocked(workspaceId);
+      const deleted = await this.deletePartialUnlocked(workspaceId);
+      return deleted.success ? Ok(deletedSequence) : deleted;
     } catch (error) {
       const errorMessage = getErrorMessage(error);
       return Err(`Failed to commit partial: ${errorMessage}`);
