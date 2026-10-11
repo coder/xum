@@ -1,0 +1,182 @@
+/**
+ * The message.send prompt hook point at the session boundary: what AgentSession saves, refuses
+ * and sends for each hook outcome. A fake consumer stands in for the plugin hook runner: it is
+ * real middleware on the real event spine, reached through the harness AI fake's
+ * runMessageSendHooks (the same runner AIService uses).
+ */
+import { afterEach, describe, expect, mock, test } from "bun:test";
+import assert from "node:assert";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import { computeSendDigest } from "./sendIds";
+import { eventSpine, type MessageSendContext } from "./events/eventSpine";
+import type { CompactionMonitor } from "./compactionMonitor";
+import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
+import type { AgentSessionAIService } from "./agentSession";
+
+const workspaceId = "prompt-hooks";
+const options = { model: "openai:gpt-4o", agentId: "exec" };
+const harnesses: AgentSessionHarness[] = [];
+const unregisters: Array<() => void> = [];
+
+afterEach(async () => {
+  for (const unregister of unregisters.splice(0)) unregister();
+  for (const h of harnesses.splice(0).reverse()) {
+    await h.session.dispose();
+    await h.cleanup();
+  }
+});
+
+type Decide = (ctx: MessageSendContext) => void;
+
+/** A session plus a fake prompt-hook consumer that records each call and applies `decide`. */
+async function setup(decide: Decide) {
+  const calls: Array<Pick<MessageSendContext, "text" | "origin">> = [];
+  unregisters.push(
+    eventSpine.useBefore(
+      "message.send",
+      (ctx) => {
+        calls.push({ text: ctx.text, origin: ctx.origin });
+        decide(ctx);
+      },
+      { workspaceId }
+    )
+  );
+  const streamed: Array<Parameters<AgentSessionAIService["streamMessage"]>[0]> = [];
+  const h = await createAgentSessionHarness({ workspaceId, captureEvents: true });
+  harnesses.push(h);
+  const baseStream = h.aiService.streamMessage.bind(h.aiService);
+  h.aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>((request) => {
+    streamed.push(request);
+    return baseStream(request);
+  });
+  return { h, calls, streamed };
+}
+
+async function userRows(h: AgentSessionHarness): Promise<MuxMessage[]> {
+  const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+  assert(history.success);
+  return history.data.filter((row) => row.role === "user");
+}
+
+const textOf = (row: MuxMessage | undefined) =>
+  (row?.parts ?? []).map((part) => (part.type === "text" ? part.text : "")).join("");
+
+/** Force (or suppress) on-send compaction regardless of usage. */
+function setOnSendCompaction(h: AgentSessionHarness, force: boolean): void {
+  (
+    h.session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+  ).contextController.compactionMonitor = {
+    checkBeforeSend: mock(() => ({
+      shouldShowWarning: false,
+      shouldForceCompact: force,
+      usagePercentage: force ? 99 : 10,
+      thresholdPercentage: 85,
+    })),
+    checkMidStream: mock(() => false),
+    resetForNewStream: mock(() => undefined),
+    noteUserTurn: mock(() => undefined),
+    noteAutoCompactionRequested: mock(() => undefined),
+    noteAutoCompactionCompleted: mock(() => undefined),
+    suppressRepeatedAutoCompaction: mock(() => false),
+  } as unknown as CompactionMonitor;
+}
+
+const blockAll: Decide = (ctx) => {
+  ctx.blocked = { pluginName: "guard", reason: "not today" };
+};
+
+describe("message.send outcomes", () => {
+  test("a block returns plugin_blocked and writes no row", async () => {
+    const { h, streamed } = await setup(blockAll);
+
+    const result = await h.session.sendMessage("deploy to prod", options);
+
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error).toEqual({ type: "plugin_blocked", plugin: "guard", reason: "not today" });
+    expect(await userRows(h)).toEqual([]);
+    expect(streamed).toEqual([]);
+    // A direct user send shows the reason in the composer, not as a transcript error.
+    expect(h.events.some((event) => event.type === "stream-error")).toBe(false);
+  });
+
+  test("an admission that goes stale while the hook runs wins over the hook's block", async () => {
+    let stale = false;
+    const { h } = await setup((ctx) => {
+      stale = true;
+      blockAll(ctx);
+    });
+    const result = await h.session.sendMessage("fix the bug", options, {
+      admissionStale: () => stale,
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.type).not.toBe("plugin_blocked");
+    expect(await userRows(h)).toEqual([]);
+  });
+
+  test("a retried send whose ids history already holds succeeds despite a block", async () => {
+    const { h, streamed } = await setup(blockAll);
+    const sendId = "client-send-1";
+    const digest = computeSendDigest({ message: "deploy to prod" });
+    // The first try was accepted (its row holds the id), but its response was lost.
+    const accepted = createMuxMessage("u1", "user", "deploy to prod", {
+      sendIds: [sendId],
+      sendDigests: { [sendId]: digest },
+    });
+    assert((await h.historyService.appendToHistory(workspaceId, accepted)).success);
+
+    const result = await h.session.sendMessage("deploy to prod", options, {
+      sendIdentities: [{ id: sendId, digest }],
+    });
+
+    expect(result.success).toBe(true);
+    expect((await userRows(h)).map((row) => row.id)).toEqual(["u1"]);
+    expect(streamed).toEqual([]);
+  });
+
+  test("an automatic send ignores a block, so its sender cannot loop on it", async () => {
+    const { h } = await setup(blockAll);
+    setOnSendCompaction(h, false);
+
+    const result = await h.session.sendMessage("wake up", options, {
+      acceptanceOrigin: "automatic",
+      synthetic: true,
+    });
+
+    expect(result.success).toBe(true);
+    expect((await userRows(h)).map(textOf)).toEqual(["wake up"]);
+  });
+
+  test("a compaction request never reaches the hooks", async () => {
+    const { h, calls } = await setup(blockAll);
+
+    const result = await h.session.sendMessage("Summarize this conversation.", {
+      ...options,
+      muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+    });
+
+    expect(result.success).toBe(true);
+    expect(calls).toEqual([]);
+  });
+
+  test("each send kind reaches the hook with its origin", async () => {
+    const { h, calls } = await setup(blockAll);
+    const send = (internal?: Parameters<typeof h.session.sendMessage>[2]) =>
+      h.session.sendMessage("probe", options, internal);
+
+    await send();
+    await send({ acceptanceOrigin: "automatic", agentInitiated: true });
+    await send({ acceptanceOrigin: "automatic", synthetic: true, taskTurnKind: "recovery" });
+    await send({
+      acceptanceOrigin: "automatic",
+      synthetic: true,
+      goalKind: GOAL_CONTINUATION_KIND,
+      goalId: "goal-1",
+    });
+    await send({ acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true });
+
+    expect(calls.map((call) => call.origin)).toEqual(["user", "task", "task", "goal", "system"]);
+  });
+});

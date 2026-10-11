@@ -1,5 +1,6 @@
 import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { eventSpine } from "./events/eventSpine";
+import { runMessageSendHooks } from "./agentPlugins/promptHooks";
 import { mock } from "bun:test";
 import { EventEmitter } from "events";
 
@@ -157,6 +158,11 @@ export function createAgentSessionAIServiceFake(
     ),
     captureRequestAssemblySnapshot: mock((workspaceId: string) =>
       Promise.resolve(Ok(eventSpine.captureRequestAssembly(workspaceId)))
+    ),
+    // The real chain on the real spine: tests register fake prompt-hook consumers on it.
+    runMessageSendHooks: mock(
+      (workspaceId: string, input: Parameters<typeof runMessageSendHooks>[2]) =>
+        runMessageSendHooks(eventSpine, workspaceId, input)
     ),
     ...createStreamLifecycleMocks(),
     streamMessage: mock<AgentSessionAIService["streamMessage"]>(() =>
