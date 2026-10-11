@@ -10,6 +10,8 @@ export const MCP_APP_MIME_TYPE = "text/html;profile=mcp-app";
 export const MCP_APP_RESOURCE_MAX_BYTES = 2 * 1024 * 1024;
 /** Longest ui:// URI kept on tool metadata and display snapshots. */
 export const MCP_APP_RESOURCE_URI_MAX_CHARS = 512;
+/** Largest ui/update-model-context text (UTF-8 bytes) a view may store; larger is -32602. */
+export const MCP_APP_MODEL_CONTEXT_MAX_BYTES = 16 * 1024;
 /** Longest URI a view may pass to resources/read (any scheme its server serves). */
 export const MCP_APP_READ_URI_MAX_CHARS = 2048;
 

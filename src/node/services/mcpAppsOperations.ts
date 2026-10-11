@@ -1,11 +1,13 @@
 /**
  * MCP Apps route operations (artifacts experiment): open a view (resources/read + host-only
- * tool result) and proxy tools/call and resources/read issued by a view to its own server.
+ * tool result), proxy tools/call and resources/read issued by a view to its own server, and
+ * store a view's ui/update-model-context.
  */
 import { ORPCError } from "@orpc/server";
 import type { z } from "zod";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
+  McpAppModelContextRequestSchema,
   McpAppResourceReadRequestSchema,
   McpAppToolCallRequestSchema,
   McpAppToolCallResult,
@@ -142,6 +144,36 @@ export async function readMcpAppServerResource(
       return { success: false, error: "The resource is too large to return to the view" };
     }
     return { success: true, data: result };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+/**
+ * ui/update-model-context of a view. Only a view with a result record may write: the record
+ * names the server that produced it, so the context is attributed to that server (never to
+ * the card's display values), and a request naming another server is refused. Whether that
+ * server is still enabled is checked when a request uses the context (turnRequestBuilder).
+ */
+export async function updateMcpAppModelContext(
+  context: McpAppsContext,
+  input: z.infer<typeof McpAppModelContextRequestSchema>
+): Promise<Result<Record<string, never>, string>> {
+  assertMcpAppsEnabled(context);
+  const record = await context.mcpServerManager.getMcpAppResult(
+    input.workspaceId,
+    input.toolCallId
+  );
+  if (
+    record === null ||
+    (input.serverName !== record.serverName &&
+      input.serverName !== displayConnectionKey(record.serverName))
+  ) {
+    return { success: false, error: "This view cannot update the model context" };
+  }
+  try {
+    await context.mcpServerManager.setMcpAppModelContext(input.workspaceId, record, input.text);
+    return { success: true, data: {} };
   } catch (error) {
     return { success: false, error: getErrorMessage(error) };
   }

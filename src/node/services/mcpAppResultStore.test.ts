@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { MCP_APP_MODEL_CONTEXT_MAX_BYTES } from "@/common/utils/mcpApps";
 import {
+  MCP_APP_MODEL_CONTEXT_FILE,
+  MCP_APP_MODEL_CONTEXT_MAX_VIEWS,
   MCP_APP_RESULT_DIR,
   MCP_APP_RESULT_MAX_BYTES,
   MCP_APP_RESULT_MAX_PER_WORKSPACE,
@@ -64,5 +67,52 @@ describe("McpAppResultStore", () => {
     }
     const files = await fs.readdir(path.join(tmp.path, "ws", MCP_APP_RESULT_DIR));
     expect(files).toHaveLength(MCP_APP_RESULT_MAX_PER_WORKSPACE);
+  });
+});
+
+describe("McpAppResultStore model context", () => {
+  const view = (toolCallId: string, text: string, serverName = "srv") => ({
+    toolCallId,
+    serverName,
+    toolName: "show",
+    text,
+  });
+
+  test("each update replaces the view's previous one and survives a restart", async () => {
+    using tmp = new DisposableTempDir("mcp-app-context");
+    const sessionDir = (id: string) => path.join(tmp.path, id);
+    const store = new McpAppResultStore(sessionDir);
+    await store.setModelContext("ws", view("c1", "first"));
+    await store.setModelContext("ws", view("c2", "other view"));
+    await store.setModelContext("ws", view("c1", "second"));
+    const fresh = new McpAppResultStore(sessionDir);
+    // Newest first; only the last update of c1.
+    expect((await fresh.getModelContexts("ws")).map((v) => [v.toolCallId, v.text])).toEqual([
+      ["c1", "second"],
+      ["c2", "other view"],
+    ]);
+    // Empty text clears the view's context.
+    await fresh.setModelContext("ws", view("c1", ""));
+    expect((await new McpAppResultStore(sessionDir).getModelContexts("ws")).length).toBe(1);
+    expect(await fresh.getModelContexts("other-ws")).toEqual([]);
+  });
+
+  test("keeps the newest views, refuses oversized text and heals a corrupt file", async () => {
+    using tmp = new DisposableTempDir("mcp-app-context");
+    const sessionDir = (id: string) => path.join(tmp.path, id);
+    const store = new McpAppResultStore(sessionDir);
+    for (let i = 0; i <= MCP_APP_MODEL_CONTEXT_MAX_VIEWS; i++) {
+      await store.setModelContext("ws", view(`c${i}`, `view ${i}`));
+    }
+    const kept = await store.getModelContexts("ws");
+    expect(kept).toHaveLength(MCP_APP_MODEL_CONTEXT_MAX_VIEWS);
+    expect(kept.some((v) => v.toolCallId === "c0")).toBe(false);
+    let refused = false;
+    await store
+      .setModelContext("ws", view("big", "x".repeat(MCP_APP_MODEL_CONTEXT_MAX_BYTES + 1)))
+      .catch(() => (refused = true));
+    expect(refused).toBe(true);
+    await fs.writeFile(path.join(tmp.path, "ws", MCP_APP_MODEL_CONTEXT_FILE), "{not json");
+    expect(await new McpAppResultStore(sessionDir).getModelContexts("ws")).toEqual([]);
   });
 });

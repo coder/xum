@@ -4591,6 +4591,21 @@ export class MCPServerManager {
     return (await this.mcpApps?.store.get(workspaceId, toolCallId)) ?? null;
   }
 
+  /** ui/update-model-context of the view of `record` (its result record binds the server). */
+  async setMcpAppModelContext(
+    workspaceId: string,
+    record: McpAppResultRecord,
+    text: string
+  ): Promise<void> {
+    assert(this.mcpApps, "MCP Apps support is not configured");
+    await this.mcpApps.store.setModelContext(workspaceId, {
+      toolCallId: record.toolCallId,
+      serverName: record.serverName,
+      toolName: record.toolName,
+      text,
+    });
+  }
+
   /** resources/read for an MCP Apps view, validated (mime, encoding, size). */
   async readMcpAppResource(
     workspaceId: string,

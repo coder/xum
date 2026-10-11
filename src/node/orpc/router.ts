@@ -54,6 +54,7 @@ import {
   callMcpAppTool,
   getMcpAppView,
   readMcpAppServerResource,
+  updateMcpAppModelContext,
 } from "@/node/services/mcpAppsOperations";
 import {
   listArtifactVersions,
@@ -1705,6 +1706,10 @@ export const router = (authToken?: string) => {
         .input(schemas.mcpApps.readResource.input)
         .output(schemas.mcpApps.readResource.output)
         .handler(({ context, input, signal }) => readMcpAppServerResource(context, input, signal)),
+      updateModelContext: t
+        .input(schemas.mcpApps.updateModelContext.input)
+        .output(schemas.mcpApps.updateModelContext.output)
+        .handler(({ context, input }) => updateMcpAppModelContext(context, input)),
     },
     // Memory handlers run Effect generators via handlerGen (client aborts
     // interrupt the fiber); the wire contracts are unchanged.

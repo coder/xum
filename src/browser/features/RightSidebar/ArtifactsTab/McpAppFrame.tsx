@@ -267,6 +267,16 @@ export function McpAppFrame(props: {
         if (!result.success) throw new Error(result.error);
         return result.data;
       },
+      // Bound like callTool: the backend attributes the context to the view's result record.
+      updateModelContext: async (text) => {
+        const result = await api.mcpApps.updateModelContext({
+          workspaceId,
+          toolCallId,
+          serverName: boundServerName,
+          text,
+        });
+        if (!result.success) throw new Error(result.error);
+      },
       requestConsent: (request) =>
         new Promise<boolean>((resolve) => {
           // One strip at a time, and a shown strip is never replaced: a frame could otherwise

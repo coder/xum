@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { isMcpAppResourceUri, MCP_APP_READ_URI_MAX_CHARS } from "@/common/utils/mcpApps";
+import {
+  isMcpAppResourceUri,
+  MCP_APP_MODEL_CONTEXT_MAX_BYTES,
+  MCP_APP_READ_URI_MAX_CHARS,
+} from "@/common/utils/mcpApps";
 
 /**
  * MCP Apps views in the Artifacts tab (artifacts experiment). The view HTML comes from the
@@ -63,6 +67,22 @@ export const McpAppResourceReadRequestSchema = z.object({
   workspaceId: z.string().min(1),
   serverName: z.string().min(1),
   uri: z.string().min(1).max(MCP_APP_READ_URI_MAX_CHARS),
+});
+
+/**
+ * ui/update-model-context of a view: `text` replaces the view's previous context (empty
+ * clears it). The view is bound by its tool call's result record, like getView.
+ */
+export const McpAppModelContextRequestSchema = z.object({
+  workspaceId: z.string().min(1),
+  toolCallId: z.string().min(1),
+  serverName: z.string().min(1),
+  text: z
+    .string()
+    .refine(
+      (text) => new TextEncoder().encode(text).length <= MCP_APP_MODEL_CONTEXT_MAX_BYTES,
+      "The model context is too large"
+    ),
 });
 
 export const McpAppToolCallResultSchema = z.discriminatedUnion("status", [

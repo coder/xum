@@ -3,8 +3,9 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
 import assert from "@/common/utils/assert";
-import { isMcpAppResourceUri } from "@/common/utils/mcpApps";
+import { isMcpAppResourceUri, MCP_APP_MODEL_CONTEXT_MAX_BYTES } from "@/common/utils/mcpApps";
 import { log } from "@/node/services/log";
+import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { ensurePrivateDir } from "@/node/utils/fs";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
@@ -41,6 +42,28 @@ const McpAppResultRecordSchema = z.object({
 });
 export type McpAppResultRecord = z.infer<typeof McpAppResultRecordSchema>;
 
+/** ui/update-model-context per view, in `<sessionDir>/` (outside the pruned results dir). */
+export const MCP_APP_MODEL_CONTEXT_FILE = "mcp-app-model-context.json";
+/** Views whose latest model context is kept per workspace (oldest update dropped first). */
+export const MCP_APP_MODEL_CONTEXT_MAX_VIEWS = 4;
+
+const McpAppModelContextSchema = z.object({
+  toolCallId: z.string().min(1),
+  /** The raw server key of the view's result record (never the card's display key). */
+  serverName: z.string().min(1),
+  toolName: z.string().min(1),
+  text: z
+    .string()
+    .min(1)
+    .refine((text) => Buffer.byteLength(text, "utf8") <= MCP_APP_MODEL_CONTEXT_MAX_BYTES),
+  updatedAt: z.number(),
+});
+export type McpAppModelContext = z.infer<typeof McpAppModelContextSchema>;
+const McpAppModelContextFileSchema = z.object({
+  version: z.literal(1),
+  views: z.array(McpAppModelContextSchema),
+});
+
 function fileNameFor(toolCallId: string): string {
   // Tool call IDs come from providers; hash them so they are always safe file names.
   return `${createHash("sha256").update(toolCallId).digest("hex").slice(0, 40)}.json`;
@@ -48,6 +71,8 @@ function fileNameFor(toolCallId: string): string {
 
 export class McpAppResultStore {
   private readonly memory = new Map<string, McpAppResultRecord>();
+  private readonly modelContexts = new Map<string, readonly McpAppModelContext[]>();
+  private readonly modelContextLock = new AsyncMutex();
 
   constructor(private readonly getSessionDir: (workspaceId: string) => string) {}
 
@@ -112,6 +137,54 @@ export class McpAppResultStore {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * The latest model context of every view that has one, newest first. A missing or corrupt
+   * file reads as none (self-healing).
+   */
+  async getModelContexts(workspaceId: string): Promise<readonly McpAppModelContext[]> {
+    const cached = this.modelContexts.get(workspaceId);
+    if (cached) return cached;
+    let views: readonly McpAppModelContext[] = [];
+    try {
+      const raw = await fs.readFile(this.modelContextPath(workspaceId), "utf8");
+      const parsed = McpAppModelContextFileSchema.safeParse(JSON.parse(raw));
+      if (parsed.success) views = parsed.data.views.slice(0, MCP_APP_MODEL_CONTEXT_MAX_VIEWS);
+    } catch {
+      // Missing or unreadable: no context.
+    }
+    this.modelContexts.set(workspaceId, views);
+    return views;
+  }
+
+  /**
+   * Replace a view's model context ("Each request overwrites the previous context sent by the
+   * View", MCP Apps 2026-01-26); empty text removes it. Durable before it is visible.
+   */
+  async setModelContext(
+    workspaceId: string,
+    entry: Omit<McpAppModelContext, "updatedAt">
+  ): Promise<void> {
+    await using _lock = await this.modelContextLock.acquire();
+    const others = (await this.getModelContexts(workspaceId)).filter(
+      (view) => view.toolCallId !== entry.toolCallId
+    );
+    const views =
+      entry.text === ""
+        ? others
+        : [McpAppModelContextSchema.parse({ ...entry, updatedAt: Date.now() }), ...others];
+    const kept = views.slice(0, MCP_APP_MODEL_CONTEXT_MAX_VIEWS);
+    await ensurePrivateDir(path.dirname(this.modelContextPath(workspaceId)));
+    await writeFileAtomic(
+      this.modelContextPath(workspaceId),
+      JSON.stringify({ version: 1, views: kept })
+    );
+    this.modelContexts.set(workspaceId, kept);
+  }
+
+  private modelContextPath(workspaceId: string): string {
+    return path.join(path.dirname(this.dirFor(workspaceId)), MCP_APP_MODEL_CONTEXT_FILE);
   }
 
   private async prune(dir: string) {

@@ -5,6 +5,7 @@ import {
   getMcpAppView,
   MCP_APP_TOOL_RESULT_MAX_BYTES,
   readMcpAppServerResource,
+  updateMcpAppModelContext,
 } from "./mcpAppsOperations";
 
 const RECORD: McpAppResultRecord = {
@@ -140,5 +141,45 @@ describe("readMcpAppServerResource", () => {
       input
     );
     expect(failed).toEqual({ success: false, error: "not connected" });
+  });
+});
+
+describe("updateMcpAppModelContext", () => {
+  function contextFor(record: McpAppResultRecord | null) {
+    const writes: Array<{ serverName: string; text: string }> = [];
+    const ctx = {
+      experimentsService: { isExperimentEnabled: () => true },
+      mcpServerManager: {
+        getMcpAppResult: () => Promise.resolve(record),
+        setMcpAppModelContext: (_ws: string, bound: McpAppResultRecord, text: string) => {
+          writes.push({ serverName: bound.serverName, text });
+          return Promise.resolve();
+        },
+      },
+    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
+    return { ctx, writes };
+  }
+  const input = (serverName = "charts") => ({
+    workspaceId: "ws",
+    toolCallId: "call-1",
+    serverName,
+    text: "ctx",
+  });
+
+  test("stores the context under the server of the view's result record", async () => {
+    const { ctx, writes } = contextFor(RECORD);
+    expect(await updateMcpAppModelContext(ctx, input())).toEqual({ success: true, data: {} });
+    expect(writes).toEqual([{ serverName: "charts", text: "ctx" }]);
+  });
+
+  test("refuses a view without a record or naming another server", async () => {
+    for (const [record, serverName] of [
+      [null, "charts"],
+      [RECORD, "other"],
+    ] as const) {
+      const { ctx, writes } = contextFor(record);
+      expect((await updateMcpAppModelContext(ctx, input(serverName))).success).toBe(false);
+      expect(writes).toEqual([]);
+    }
   });
 });

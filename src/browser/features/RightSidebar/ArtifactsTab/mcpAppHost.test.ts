@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
+import { MCP_APP_MODEL_CONTEXT_MAX_BYTES } from "@/common/utils/mcpApps";
 import { passesFrameGate } from "./artifactBridge";
 import {
   createMcpAppHost,
@@ -13,6 +14,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
   const sent: Array<Record<string, unknown>> = [];
   const calls: Array<{ toolName: string; consented: boolean }> = [];
   const reads: string[] = [];
+  const modelContexts: string[] = [];
   const consents: McpAppConsentRequest[] = [];
   const composer: string[] = [];
   const opened: string[] = [];
@@ -46,6 +48,10 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
       if (uri === "ui://missing") return Promise.reject(new Error("Resource not found"));
       return Promise.resolve({ contents: [{ uri, mimeType: "text/plain", text: "data" }] });
     },
+    updateModelContext: (text) => {
+      modelContexts.push(text);
+      return Promise.resolve();
+    },
     requestConsent: (request) => {
       consents.push(request);
       return Promise.resolve(true);
@@ -65,6 +71,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
     sent,
     calls,
     reads,
+    modelContexts,
     consents,
     composer,
     opened,
@@ -115,7 +122,7 @@ describe("MCP Apps host router", () => {
     const t = setup();
     for (const [id, method] of [
       [2, "resources/subscribe"],
-      [3, "ui/update-model-context"],
+      [3, "ui/request-teardown"],
       [4, "ui/request-display-mode"],
       [5, "sampling/createMessage"],
     ] as const) {
@@ -296,5 +303,38 @@ describe("MCP Apps host router", () => {
     for (const id of [1, 2, 3]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
     expect(t.consents).toEqual([]);
     expect(t.composer).toEqual([]);
+  });
+
+  test("update-model-context replaces the view's context with the latest update", async () => {
+    const t = setup();
+    await t.request(1, "ui/update-model-context", {
+      content: [{ type: "text", text: "3 dice" }],
+      structuredContent: { dice: [1, 2, 3] },
+    });
+    await t.request(2, "ui/update-model-context", { content: [{ type: "text", text: "2 dice" }] });
+    // An empty update clears the context.
+    await t.request(3, "ui/update-model-context", {});
+    expect(t.modelContexts).toEqual(['3 dice\n\n{"dice":[1,2,3]}', "2 dice", ""]);
+    for (const id of [1, 2, 3]) expect(t.reply(id)?.result).toEqual({});
+  });
+
+  test("update-model-context rejects non-text content and text over 16 KB", async () => {
+    const t = setup();
+    await t.request(1, "ui/update-model-context", {
+      content: [{ type: "image", data: "AAAA", mimeType: "image/png" }],
+    });
+    await t.request(2, "ui/update-model-context", {
+      content: [{ type: "text", text: "x".repeat(MCP_APP_MODEL_CONTEXT_MAX_BYTES + 1) }],
+    });
+    // Multi-byte text counts in UTF-8 bytes.
+    await t.request(3, "ui/update-model-context", {
+      content: [{ type: "text", text: "é".repeat(MCP_APP_MODEL_CONTEXT_MAX_BYTES / 2 + 1) }],
+    });
+    for (const id of [1, 2, 3]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
+    await t.request(4, "ui/update-model-context", {
+      content: [{ type: "text", text: "x".repeat(MCP_APP_MODEL_CONTEXT_MAX_BYTES) }],
+    });
+    expect(t.reply(4)?.result).toEqual({});
+    expect(t.modelContexts).toHaveLength(1);
   });
 });
