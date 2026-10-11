@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
@@ -41,7 +41,9 @@ import {
 } from "@/common/orpc/schemas/agentSkill";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
-import type { MCPServerInfo } from "@/common/types/mcp";
+import type { MCPServerInfo, MCPServerOAuthConfig } from "@/common/types/mcp";
+import type { McpOauthService } from "@/node/services/mcpOauthService";
+import { readPluginClientSecret } from "./openaiMcpAuth";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
@@ -407,6 +409,103 @@ function shortenHome(absPath: string): string {
   return absPath.startsWith(home + path.sep) ? `~${absPath.slice(home.length)}` : absPath;
 }
 
+/** Remote-server sign-in as the update review compares it. */
+interface SurfaceSignIn {
+  url: string;
+  oauth?: MCPServerOAuthConfig;
+  /** sha256 of the plugin client secret: compared, never shown. */
+  secretDigest?: string;
+  /** Tokens belong to this: client, endpoints, resource and scopes. */
+  identity: string;
+}
+
+interface SurfaceServer {
+  fingerprint: string;
+  display: string;
+  signIn?: SurfaceSignIn;
+}
+
+async function readSignIn(url: string, oauth?: MCPServerOAuthConfig): Promise<SurfaceSignIn> {
+  const secret =
+    oauth?.clientSecretSource !== undefined
+      ? await readPluginClientSecret(oauth.clientSecretSource).catch(() => undefined)
+      : undefined;
+  return {
+    url,
+    ...(oauth !== undefined ? { oauth: { ...oauth, clientSecretSource: undefined } } : {}),
+    ...(secret !== undefined
+      ? { secretDigest: createHash("sha256").update(secret).digest("hex") }
+      : {}),
+    identity: stableStringify({
+      clientId: oauth?.clientId ?? null,
+      authorizationUrl: oauth?.endpoints?.authorizationUrl ?? null,
+      tokenUrl: oauth?.endpoints?.tokenUrl ?? null,
+      resource: oauth?.resource ?? null,
+      baseScopes: oauth?.baseScopes ?? null,
+      defaultScopes: oauth?.defaultScopes ?? null,
+    }),
+  };
+}
+
+/** One review line per changed sign-in field. Secrets are named, never shown. */
+export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSignIn): string[] {
+  const lines: string[] = [];
+  const a = before?.oauth;
+  const b = after?.oauth;
+  const changed = (name: string, x?: string, y?: string): void => {
+    if (x === y) return;
+    lines.push(
+      y === undefined
+        ? `${name} removed`
+        : x === undefined
+          ? `${name} added (${y})`
+          : `${name} changed (${x} → ${y})`
+    );
+  };
+  changed("Sign-in client", a?.clientId, b?.clientId);
+  changed("Token auth method", a?.tokenEndpointAuthMethod, b?.tokenEndpointAuthMethod);
+  const hosts = (oauth?: MCPServerOAuthConfig): Set<string> =>
+    new Set(
+      [oauth?.endpoints?.authorizationUrl, oauth?.endpoints?.tokenUrl]
+        .filter((url) => url !== undefined)
+        .map((url) => new URL(url).host)
+    );
+  const [oldHosts, newHosts] = [hosts(a), hosts(b)];
+  for (const host of newHosts) if (!oldHosts.has(host)) lines.push(`Sign-in at ${host} (new)`);
+  for (const host of oldHosts) if (!newHosts.has(host)) lines.push(`Sign-in at ${host} (removed)`);
+  if (
+    lines.every((line) => !line.startsWith("Sign-in at")) &&
+    stableStringify(a?.endpoints ?? null) !== stableStringify(b?.endpoints ?? null)
+  )
+    lines.push("Sign-in endpoints changed");
+  const scopes = (oauth?: MCPServerOAuthConfig): string[] => [
+    ...(oauth?.baseScopes ?? []),
+    ...(oauth?.defaultScopes ?? []),
+  ];
+  const added = scopes(b).filter((scope) => !scopes(a).includes(scope));
+  const removed = scopes(a).filter((scope) => !scopes(b).includes(scope));
+  if (added.length + removed.length > 0)
+    lines.push(
+      `Scopes changed: ${[...added.map((x) => `+ ${x}`), ...removed.map((x) => `- ${x}`)].join(" ")}`
+    );
+  else if (
+    stableStringify([a?.baseScopes ?? null, a?.defaultScopes ?? null]) !==
+    stableStringify([b?.baseScopes ?? null, b?.defaultScopes ?? null])
+  )
+    lines.push("Scopes changed");
+  changed("Resource", a?.resource, b?.resource);
+  const [oldSecret, newSecret] = [before?.secretDigest, after?.secretDigest];
+  if (oldSecret !== newSecret)
+    lines.push(
+      oldSecret === undefined
+        ? "Client secret added"
+        : newSecret === undefined
+          ? "Client secret removed"
+          : "Client secret changed"
+    );
+  return lines;
+}
+
 function manifestSummary(manifest: AgentPluginManifest): AgentPluginManifestSummary {
   return {
     name: manifest.name,
@@ -420,6 +519,7 @@ function manifestSummary(manifest: AgentPluginManifest): AgentPluginManifestSumm
 }
 
 export class AgentPluginInstallService {
+  private mcpOauthService: Pick<McpOauthService, "logout"> | undefined;
   private readonly containerDir: string;
   private readonly stagingRoot: string;
   private readonly registryFile: string;
@@ -456,6 +556,8 @@ export class AgentPluginInstallService {
       mcpConfigService?: Pick<MCPConfigService, "pruneEnabledPluginServers">;
       /** Used to prune plugin server keys from per-workspace overrides on uninstall. */
       workspaceMcpOverridesService?: WorkspaceMcpOverridesService;
+      /** Signs out plugin servers whose sign-in identity an update changes. */
+      mcpOauthService?: Pick<McpOauthService, "logout">;
       /** Test override for the staged-clone checkout quota. */
       stagingQuota?: { maxBytes: number; maxFiles: number };
       /** Test override for the recovery wait bound. */
@@ -463,6 +565,7 @@ export class AgentPluginInstallService {
     }
   ) {
     assert(path.isAbsolute(config.rootDir), "AgentPluginInstallService: rootDir must be absolute");
+    this.mcpOauthService = deps.mcpOauthService;
     this.containerDir = path.join(config.rootDir, "plugins");
     this.stagingRoot = path.join(config.rootDir, STAGING_DIR_NAME);
     this.registryFile = path.join(config.rootDir, PLUGIN_REGISTRY_FILE_NAME);
@@ -1244,8 +1347,8 @@ export class AgentPluginInstallService {
     warnings: string[]
   ): Promise<{
     hook: AgentPluginPreviewHook | undefined;
-    /** serverName → { fingerprint (compared), display (shown in the update review) }. */
-    servers: Map<string, { fingerprint: string; display: string }>;
+    /** serverName → { fingerprint (compared), display (shown in the update review), remote sign-in }. */
+    servers: Map<string, SurfaceServer>;
     /** skillName → { fingerprint (compared), display (the advertisement as the model sees it) }. */
     skills: Map<string, { fingerprint: string; display: string }>;
     agents: Map<string, string>;
@@ -1284,7 +1387,7 @@ export class AgentPluginInstallService {
         (command) => `slash command /${command.name}`
       ),
     ]);
-    const servers = new Map<string, { fingerprint: string; display: string }>();
+    const servers = new Map<string, SurfaceServer>();
     if (plugin.mcpConfigPath !== undefined) {
       const { servers: infos, diagnostics } = await loadPluginMcpServers(plugin, {
         xumHome: this.config.rootDir,
@@ -1295,6 +1398,8 @@ export class AgentPluginInstallService {
       const rewrite = (value: string): string => value.split(plugin.rootPath).join(finalTargetPath);
       for (const info of Object.values(infos)) {
         assert(info.plugin !== undefined, "plugin server info must carry provenance");
+        const signIn =
+          info.transport === "stdio" ? undefined : await readSignIn(info.url, info.oauth);
         const fingerprint =
           info.transport === "stdio"
             ? JSON.stringify({
@@ -1314,17 +1419,14 @@ export class AgentPluginInstallService {
             : JSON.stringify({
                 transport: info.transport,
                 url: info.url,
-                // A changed auth block needs new consent. The secret counts
-                // by presence only: its value never leaves the file.
-                oauth: info.oauth && {
-                  ...info.oauth,
-                  clientSecretSource: undefined,
-                  hasClientSecret: info.oauth.clientSecretSource !== undefined,
-                },
+                // A changed auth block needs new consent. The secret takes
+                // part as a digest that never leaves this comparison.
+                signIn,
               });
         servers.set(info.plugin.serverName, {
           fingerprint,
           display: this.describeMcpServer(info, rewrite, finalTargetPath).summary,
+          ...(signIn !== undefined ? { signIn } : {}),
         });
       }
     }
@@ -1349,7 +1451,9 @@ export class AgentPluginInstallService {
     name: string,
     installedPath: string,
     stagedPlugin: AgentPluginInfo,
-    stagedWarnings: string[]
+    stagedWarnings: string[],
+    /** Receives server URLs whose sign-in identity changes (stored tokens must go). */
+    signInResets?: string[]
   ): Promise<AgentPluginCapabilityChange[]> {
     const instanceId = this.instanceIdFor(name);
     const { plugin: currentPlugin } = await discoverAgentPluginAt({
@@ -1407,11 +1511,18 @@ export class AgentPluginInstallService {
       if (currentServer === undefined) {
         changes.push({ summary: `adds MCP server '${serverName}'`, after: server.display });
       } else if (currentServer.fingerprint !== server.fingerprint) {
+        const authLines = describeSignInChanges(currentServer.signIn, server.signIn);
         changes.push({
-          summary: `changes MCP server '${serverName}'`,
+          summary: [`changes MCP server '${serverName}'`, ...authLines].join(": "),
           before: currentServer.display,
           after: server.display,
         });
+        if (
+          server.signIn !== undefined &&
+          currentServer.signIn?.url === server.signIn.url &&
+          currentServer.signIn.identity !== server.signIn.identity
+        )
+          signInResets?.push(server.signIn.url);
       }
     }
     // Skill advertisements interpolate into the model-visible skill index on
@@ -2807,6 +2918,11 @@ export class AgentPluginInstallService {
   }
 
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
+  /** The OAuth service is built in a later DI layer than this service. */
+  setMcpOauthService(service: Pick<McpOauthService, "logout">): void {
+    this.mcpOauthService = service;
+  }
+
   async list(): Promise<AgentPluginListItem[]> {
     // Section open re-runs crash recovery (the startup pass may have failed
     // or predates recent journals) BEFORE discovery scans the container, so
@@ -3970,7 +4086,14 @@ export class AgentPluginInstallService {
         // capability surface against the installed tree; changes need a
         // consent from previewUpdate naming this exact (from, to) pair,
         // which the user gave after seeing every change.
-        const changes = await this.collectCapabilityChanges(entry.name, targetPath, plugin, []);
+        const signInResets: string[] = [];
+        const changes = await this.collectCapabilityChanges(
+          entry.name,
+          targetPath,
+          plugin,
+          [],
+          signInResets
+        );
         if (changes.length > 0 && args.consent === undefined) {
           throw new Error(
             `The update to '${entry.name}' ${changes.map((change) => change.summary).join("; ")}. Updates cannot expand a plugin's capabilities without review — open Settings → Plugins and review the update to confirm it.`
@@ -4166,6 +4289,17 @@ export class AgentPluginInstallService {
           // state and workspace overrides are untouched (identity is the
           // lexical path).
           await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
+          // The new tree is in place: tokens issued to the old sign-in
+          // identity (client, endpoints, resource, scopes) must not be
+          // refreshed with the new client. Signed out, the server asks again.
+          for (const serverUrl of signInResets) {
+            const result = await this.mcpOauthService?.logout({ serverUrl });
+            if (result?.success === false)
+              log.warn("Could not sign out a plugin MCP server after its sign-in changed", {
+                plugin: entry.name,
+                error: result.error,
+              });
+          }
         }
 
         log.info(

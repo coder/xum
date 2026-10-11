@@ -8,6 +8,7 @@ import * as jsonc from "jsonc-parser";
 import { Config } from "@/node/config";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
+import { McpOauthService } from "@/node/services/mcpOauthService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as mcpSdk from "@/node/services/mcpClient";
@@ -24,7 +25,11 @@ import {
   journalDerivedDiscoveryGate,
   setAgentPluginDiscoveryGate,
 } from "./discovery";
-import { AgentPluginInstallService, withDiskQuotaWatchdog } from "./installService";
+import {
+  AgentPluginInstallService,
+  describeSignInChanges,
+  withDiskQuotaWatchdog,
+} from "./installService";
 import {
   AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
   buildAddedPluginKeyValidator,
@@ -1844,6 +1849,38 @@ describe("AgentPluginInstallService", () => {
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
       /changes MCP server 'docs'/
     );
+
+    // The review names the changed sign-in field, not only the unchanged URL.
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    expect(review.changes.map((change) => change.summary)).toEqual([
+      "changes MCP server 'docs': Sign-in client changed (client-a → client-b)",
+    ]);
+
+    // Tokens issued to client-a must not survive the switch to client-b.
+    const oauth = new McpOauthService(config, new MCPConfigService(config));
+    service.setMcpOauthService(oauth);
+    const serverUrl = "https://mcp.example.com/mcp";
+    await fsPromises.writeFile(
+      path.join(muxRoot, "mcp-oauth.json"),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: { client_id: "client-a" },
+            tokens: { access_token: "at", token_type: "Bearer", refresh_token: "rt" },
+          },
+        },
+      })
+    );
+    expect(await oauth.hasAuthTokens({ serverUrl })).toBe(true);
+    await service.update({
+      name: "demo-plugin",
+      consent: { fromSha: review.fromSha, toSha: review.toSha },
+    });
+    expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
+    await oauth.dispose();
   });
 
   test("update rejects capability increases (new hook, expanded grants, new/changed MCP servers)", async () => {
@@ -5268,5 +5305,67 @@ describe("AgentPluginInstallService", () => {
     expect(managed).toMatchObject({ managed: true, present: false, version: "1.0.0" });
     const unmanaged = items.find((item) => item.name === "handmade");
     expect(unmanaged).toMatchObject({ managed: false, present: true });
+  });
+});
+
+describe("describeSignInChanges", () => {
+  const signIn = (oauth: Record<string, unknown>, secretDigest?: string) => ({
+    url: "https://mcp.example.com/mcp",
+    oauth,
+    identity: "",
+    ...(secretDigest !== undefined ? { secretDigest } : {}),
+  });
+  const endpoints = (host: string) => ({
+    authorizationUrl: `https://${host}/authorize`,
+    tokenUrl: `https://mcp.example.com/token`,
+  });
+
+  test("names each changed field and never shows a secret", () => {
+    expect(
+      describeSignInChanges(
+        signIn({
+          clientId: "a",
+          endpoints: endpoints("mcp.example.com"),
+          baseScopes: ["docs:read"],
+          resource: "https://r1",
+        }),
+        signIn(
+          {
+            clientId: "b",
+            tokenEndpointAuthMethod: "client_secret_post",
+            endpoints: endpoints("accounts.example.com"),
+            baseScopes: ["docs:read", "docs:write"],
+            resource: "https://r2",
+          },
+          "digest-new"
+        )
+      )
+    ).toEqual([
+      "Sign-in client changed (a → b)",
+      "Token auth method added (client_secret_post)",
+      "Sign-in at accounts.example.com (new)",
+      "Scopes changed: + docs:write",
+      "Resource changed (https://r1 → https://r2)",
+      "Client secret added",
+    ]);
+  });
+
+  test("covers removals, same-host endpoint moves, and secret changes", () => {
+    const same = { ...endpoints("mcp.example.com"), tokenUrl: "https://mcp.example.com/v2" };
+    expect(
+      describeSignInChanges(
+        signIn(
+          { clientId: "a", endpoints: endpoints("mcp.example.com"), defaultScopes: ["x"] },
+          "d1"
+        ),
+        signIn({ endpoints: same }, "d2")
+      )
+    ).toEqual([
+      "Sign-in client removed",
+      "Sign-in endpoints changed",
+      "Scopes changed: - x",
+      "Client secret changed",
+    ]);
+    expect(describeSignInChanges(signIn({}, "d1"), signIn({}))).toEqual(["Client secret removed"]);
   });
 });
