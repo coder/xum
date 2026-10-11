@@ -948,46 +948,44 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           // and New terminal moves into the More menu. Not gated on the sidebar being hidden: at
           // phone widths it always is, except while the full-screen view shows it, and the
           // buttons must stay mounted then so focus can return to them when it closes.
-          (
-            <>
+          <>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={(e) => openSidebarTab("costs", e.currentTarget)}
+                  className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0"
+                  aria-label="Stats"
+                  data-testid="workspace-header-stats-button"
+                >
+                  <BarChart3 className="h-3.5 w-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" align="center">
+                Stats
+              </TooltipContent>
+            </Tooltip>
+            {artifactsExperimentEnabled && (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
                     variant="ghost"
                     size="icon"
-                    onClick={(e) => openSidebarTab("costs", e.currentTarget)}
+                    onClick={(e) => openSidebarTab("artifacts", e.currentTarget)}
                     className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0"
-                    aria-label="Stats"
-                    data-testid="workspace-header-stats-button"
+                    aria-label="Artifacts"
+                    data-testid="workspace-header-artifacts-button"
                   >
-                    <BarChart3 className="h-3.5 w-3.5" />
+                    <AppWindow className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" align="center">
-                  Stats
+                  Artifacts
                 </TooltipContent>
               </Tooltip>
-              {artifactsExperimentEnabled && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={(e) => openSidebarTab("artifacts", e.currentTarget)}
-                      className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0"
-                      aria-label="Artifacts"
-                      data-testid="workspace-header-artifacts-button"
-                    >
-                      <AppWindow className="h-3.5 w-3.5" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom" align="center">
-                    Artifacts
-                  </TooltipContent>
-                </Tooltip>
-              )}
-            </>
-          )
+            )}
+          </>
         ) : (
           <Tooltip>
             <TooltipTrigger asChild>
