@@ -56,6 +56,9 @@ const isEnumOption = (value: unknown): value is string =>
   typeof value === "string" && value.length <= MAX_TEXT;
 /** JSON Schema string length counts Unicode code points, not UTF-16 units. */
 const codePointLength = (value: string): number => [...value].length;
+/** Longer than `max` code points; counts them only when the UTF-16 length cannot decide. */
+const exceedsCodePoints = (value: string, max: number): boolean =>
+  value.length > max && (value.length > 2 * max || codePointLength(value) > max);
 const isLength = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 0;
 const isFiniteNumber = (value: unknown): value is number =>
@@ -139,7 +142,7 @@ export function validateMCPSettingValue(schema: MCPSettingSchema, value: unknown
     case "boolean":
       return typeof value === "boolean" ? null : "must be true or false";
     case "string": {
-      if (typeof value !== "string" || value.length > MAX_VALUE_LENGTH)
+      if (typeof value !== "string" || exceedsCodePoints(value, MAX_VALUE_LENGTH))
         return `must be text of at most ${MAX_VALUE_LENGTH} characters`;
       if (schema.enum !== undefined && !schema.enum.includes(value))
         return `must be one of: ${schema.enum.join(", ")}`;
@@ -176,7 +179,7 @@ export function filterMCPSettingValues(
   raw: unknown,
   warnings: string[]
 ): Record<string, MCPSettingValue> {
-  const values: Record<string, MCPSettingValue> = {};
+  const values = Object.create(null) as Record<string, MCPSettingValue>;
   if (!isRecord(raw)) {
     warnings.push("'values' must be an object");
     return values;
@@ -197,7 +200,8 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
   if (!isRecord(raw.schema.properties))
     return { error: "the settings schema has no 'properties' object" };
   const warnings: string[] = [];
-  const properties: Record<string, MCPSettingSchema> = {};
+  // Null prototypes: a setting named "__proto__" must stay an own key, not hit the legacy setter.
+  const properties = Object.create(null) as Record<string, MCPSettingSchema>;
   for (const [name, schema] of Object.entries(raw.schema.properties)) {
     const parsed = parseSchema(schema);
     if (parsed !== undefined) properties[name] = parsed;

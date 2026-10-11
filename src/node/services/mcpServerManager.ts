@@ -30,7 +30,6 @@ import {
   filterMCPSettingValues,
   parseMCPSettingsReadResult,
   validateMCPSettingValue,
-  type MCPSettingSchema,
   type MCPSettingValue,
   type MCPSettingsSnapshot,
 } from "@/common/utils/mcpSettings";
@@ -4613,15 +4612,34 @@ export class MCPServerManager {
     return instance === undefined ? undefined : this.settingsCache.get(instance)?.get(workspaceId);
   }
 
+  /**
+   * Latest settings request (read or update) per server instance, then workspace. A request
+   * takes its ID before dispatch, and its result is cached only while that ID is still the
+   * latest: an older read that settles last never overwrites a newer read or update.
+   */
+  private readonly settingsRequestIds = new WeakMap<MCPServerInstance, Map<string, number>>();
+  private settingsRequestCount = 0;
+
+  private takeSettingsRequestId(instance: MCPServerInstance, workspaceId: string): number {
+    const byWorkspace = this.settingsRequestIds.get(instance) ?? new Map<string, number>();
+    this.settingsRequestIds.set(instance, byWorkspace);
+    byWorkspace.set(workspaceId, ++this.settingsRequestCount);
+    return this.settingsRequestCount;
+  }
+
+  /** Caches `values` when `requestId` is still the latest request; returns whether it did. */
   private cacheSettings(
     instance: MCPServerInstance,
     workspaceId: string,
+    requestId: number,
     values: Record<string, MCPSettingValue>
-  ): void {
+  ): boolean {
+    if (this.settingsRequestIds.get(instance)?.get(workspaceId) !== requestId) return false;
     const byWorkspace =
       this.settingsCache.get(instance) ?? new Map<string, Record<string, MCPSettingValue>>();
     byWorkspace.set(workspaceId, values);
     this.settingsCache.set(instance, byWorkspace);
+    return true;
   }
 
   /** Calls a settings tool with the workspace `_meta`; returns its structuredContent. */
@@ -4656,13 +4674,13 @@ export class MCPServerManager {
     serverName: string,
     options?: { signal?: AbortSignal; timeoutMs?: number }
   ): Promise<MCPSettingsSnapshot> {
-    let source: MCPServerInstance | undefined;
+    let source: { instance: MCPServerInstance; requestId: number } | undefined;
     const snapshot = await this.invokeServerOperation(
       workspaceId,
       serverName,
       `MCP settings read for '${serverName}'`,
       (instance) => {
-        source = instance;
+        source = { instance, requestId: this.takeSettingsRequestId(instance, workspaceId) };
         return this.callSettingsTool(instance, workspaceId, "readTool", {}, options);
       },
       (content) => {
@@ -4674,34 +4692,36 @@ export class MCPServerManager {
     );
     for (const warning of snapshot.warnings)
       log.warn(`[MCP] Settings of '${serverName}': ${warning}`, { workspaceId });
-    if (source !== undefined) this.cacheSettings(source, workspaceId, snapshot.values);
+    if (source !== undefined)
+      this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
     return snapshot;
   }
 
   /**
    * Send changed settings (`{set}`) and cache the server's returned values.
-   * `properties` is the schema the caller validated `set` against.
+   * `prior` is the read the caller validated `set` against (its schema and values).
    */
   async updateSettings(
     workspaceId: string,
     serverName: string,
     set: Record<string, MCPSettingValue>,
-    properties: Record<string, MCPSettingSchema>
+    prior: Pick<MCPSettingsSnapshot, "properties" | "values">
   ): Promise<Record<string, MCPSettingValue>> {
+    const { properties } = prior;
     for (const [name, value] of Object.entries(set)) {
-      const schema = properties[name];
+      const schema = Object.hasOwn(properties, name) ? properties[name] : undefined;
       const error = schema === undefined ? "is unknown" : validateMCPSettingValue(schema, value);
       if (error !== null) throw new Error(`Setting '${name}' ${error}`);
     }
     // One-shot dispatch, like callMcpAppTool: an epoch retry must not send the update twice.
     let dispatched: Promise<unknown> | null = null;
-    let source: MCPServerInstance | undefined;
+    let source: { instance: MCPServerInstance; requestId: number } | undefined;
     const values = await this.invokeServerOperation(
       workspaceId,
       serverName,
       `MCP settings update for '${serverName}'`,
       (instance) => {
-        source ??= instance;
+        source ??= { instance, requestId: this.takeSettingsRequestId(instance, workspaceId) };
         return (dispatched ??= this.callSettingsTool(instance, workspaceId, "updateTool", { set }));
       },
       (content) => {
@@ -4710,10 +4730,13 @@ export class MCPServerManager {
         const result = filterMCPSettingValues(properties, Reflect.get(raw, "values"), warnings);
         for (const warning of warnings)
           log.warn(`[MCP] Settings update of '${serverName}': ${warning}`, { workspaceId });
-        return result;
+        // A property the result omits or sends invalid keeps its prior value: resetting it
+        // would show a false or empty control and forget what the server stores.
+        return { ...prior.values, ...result };
       }
     );
-    if (source !== undefined) this.cacheSettings(source, workspaceId, values);
+    if (source !== undefined)
+      this.cacheSettings(source.instance, workspaceId, source.requestId, values);
     return values;
   }
 
