@@ -1866,8 +1866,12 @@ describe("ArtifactsPanel", () => {
           callbacks.push(() => this.callback([], this as unknown as ResizeObserver));
         }
       }
-      unobserve() {}
-      disconnect() {}
+      unobserve() {
+        // The test drives the callbacks by hand.
+      }
+      disconnect() {
+        // Nothing to stop: no real observation runs.
+      }
     } as unknown as typeof ResizeObserver;
     try {
       fake = createFakeArtifactsApi(
