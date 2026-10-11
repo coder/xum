@@ -8,7 +8,7 @@
  * block for a failed page) and writes qualification.json, which gated runs read with --qualification.
  * PAGE_TIMING_LOCK=<file> holds that flock for each browser run (the shared dev-host measurement lock).
  * Exit: 0 pass or qualified, 1 a gate failed or the host did not qualify, 2 bad input, 3 an invalid run.
- * The summary is written only when every page ends: run gate blocks one page per invocation (--pages p1).
+ * A gated run (--qualification) takes one page: the summary is written only when every page ends.
  */
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -42,6 +42,7 @@ const PHONE = {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 type Values = Partial<core.Run["values"]>;
+type Common = { page: core.Page; out: string; chrome: string };
 
 /** Holds `flock <file>` while fn runs. The holder exits, and frees the lock, when its stdin closes. */
 async function withLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -119,36 +120,38 @@ async function startServer(tree: string, root: string, home: string, logFile: st
 }
 
 /** One navigation with a fresh root (and seed), server and browser. Values in seconds. */
-async function measure(o: {
-  tree: string;
-  page: core.Page;
-  mode: Signal;
-  out: string;
-  name: string;
-  chrome: string;
-}) {
+async function measure(o: Common & { tree: string; mode: Signal; name: string }) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "page-timing-"));
   const seedDir = path.join(tmp, "seed");
   const seed = o.page === "p2" ? writeNeutralSeed(seedDir) : null;
-  const before = seed && snapshotSeed(seedDir);
   const [root, home] = [seed?.root ?? path.join(tmp, "root"), seed?.home ?? path.join(tmp, "home")];
-  for (const dir of [root, home]) fs.mkdirSync(dir, { recursive: true });
-  const server = await startServer(o.tree, root, home, path.join(o.out, `${o.name}.server.log`));
-  let values: Values;
   try {
-    // The load check runs inside the lock: no other lock holder can start work between the check and the run.
-    values = await withLock(async () => {
+    const before = seed && snapshotSeed(seedDir);
+    for (const dir of [root, home]) fs.mkdirSync(dir, { recursive: true });
+    // The lock covers the load check and the server's whole life, so no other lock holder's server
+    // start-up or shutdown work overlaps a measured run.
+    const values = await withLock(async () => {
       await waitForQuietHost();
-      return browse(o, `${server.origin}${seed ? `/workspace/${seed.workspaceId}` : "/"}`);
+      const server = await startServer(
+        o.tree,
+        root,
+        home,
+        path.join(o.out, `${o.name}.server.log`)
+      );
+      try {
+        return await browse(o, `${server.origin}${seed ? `/workspace/${seed.workspaceId}` : "/"}`);
+      } finally {
+        await server.stop();
+      }
     });
+    const now = (rel: string) => fs.readFileSync(path.join(seedDir, rel));
+    const rewrites = before ? core.seedRewrites(diffSeed(before, seedDir), before, now) : [];
+    if (rewrites.length > 0) throw new Error(`${o.name}: a build rewrote the seed: ${rewrites}`);
+    return values;
   } finally {
-    await server.stop();
+    // Invalid runs clean up too, unless a process still uses the folder (stop() then threw).
+    if (withEnv(`HOME=${home}`).length === 0) fs.rmSync(tmp, { recursive: true, force: true });
   }
-  const now = (rel: string) => fs.readFileSync(path.join(seedDir, rel));
-  const rewrites = before ? core.seedRewrites(diffSeed(before, seedDir), before, now) : [];
-  fs.rmSync(tmp, { recursive: true, force: true });
-  if (rewrites.length > 0) throw new Error(`${o.name}: a build rewrote the seed: ${rewrites}`);
-  return values;
 }
 
 async function browse(o: Parameters<typeof measure>[0], url: string): Promise<Values> {
@@ -157,12 +160,8 @@ async function browse(o: Parameters<typeof measure>[0], url: string): Promise<Va
     const context = await browser.newContext(PHONE.context);
     let [workers, fromWorker] = [0, 0];
     context.on("serviceworker", () => workers++);
-    const arg = {
-      target: core.TARGET[o.page],
-      mode: o.mode,
-      page: o.page,
-      staticViewId: STATIC_VIEW_ID,
-    };
+    const { mode, page } = o;
+    const arg = { target: core.TARGET[page], mode, page, staticViewId: STATIC_VIEW_ID };
     // tsx (esbuild keepNames) wraps the probe's inner functions in __name(), which the page lacks.
     await context.addInitScript({
       content: `var __name = (f) => f; (${probe})(${JSON.stringify(arg)})`,
@@ -199,14 +198,7 @@ async function browse(o: Parameters<typeof measure>[0], url: string): Promise<Va
 }
 
 /** One block: BLOCK_PAIRS pairs in ABBA order, UCS and IR as separate navigations. d per signal, in s. */
-async function block(o: {
-  base: string;
-  head: string;
-  page: core.Page;
-  label: string;
-  out: string;
-  chrome: string;
-}) {
+async function block(o: Common & { base: string; head: string; label: string }) {
   const runs: core.Run[] = [];
   const { page } = o;
   for (const { arm, pair } of launchPlan(BLOCK_PAIRS, 0)) {
@@ -235,11 +227,20 @@ async function main(): Promise<number> {
     },
   });
   const pages = a.pages.split(",") as core.Page[];
-  if (!a.base || !a.head || pages.some((p) => !(p in core.TARGET)) || (a.aa && a.qualification)) {
-    console.error("usage: see the header of scripts/perf/pageTiming.ts");
+  const predict = new URLSearchParams(a.predict.replaceAll(",", "&")); // "p1.ucs=3.9,p2.ir=1.2"
+  const keys = pages.flatMap((p) => [`${p}.ucs`, `${p}.ir`]);
+  const errors = [
+    !a.base || !a.head ? "--base and --head are required" : "",
+    pages.some((p) => !(p in core.TARGET)) ? `unknown page in --pages ${a.pages}` : "",
+    a.aa && a.qualification ? "--aa and --qualification exclude each other" : "",
+    a.qualification && pages.length !== 1 ? "a gated run takes one page (--pages p1)" : "",
+    a.predict && !a.qualification ? "--predict needs --qualification" : "",
+    [...predict].some(([k, v]) => !keys.includes(k) || !(+v > 0)) ? "bad --predict keys" : "",
+  ].filter(Boolean);
+  if (!a.base || !a.head || errors.length > 0) {
+    console.error(`${errors.join("; ")} (usage: see the header of scripts/perf/pageTiming.ts)`);
     return 2;
   }
-  const predict = new URLSearchParams(a.predict.replaceAll(",", "&")); // "p1.ucs=3.9,p2.ir=1.2"
   const out = path.resolve(a.out ?? fs.mkdtempSync(path.join(os.tmpdir(), "page-timing-out-")));
   fs.mkdirSync(out, { recursive: true });
   const common = { base: path.resolve(a.base), head: path.resolve(a.head), out, chrome: a.chrome };
@@ -284,11 +285,11 @@ async function main(): Promise<number> {
   return failed ? 1 : 0;
 }
 
-// Any throw (seed rewritten, service worker, missing signal, timeout, busy host) is exit 3: the block is void.
+// A parseArgs error is bad input (2). Any other throw (seed, service worker, timeout, busy host) is 3.
 main().then(
   (code) => process.exit(code),
   (error: unknown) => {
     console.error(error);
-    process.exit(3);
+    process.exit(String((error as { code?: unknown }).code).startsWith("ERR_PARSE_ARGS") ? 2 : 3);
   }
 );

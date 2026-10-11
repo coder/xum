@@ -792,7 +792,7 @@ bench-compare: node_modules/.installed src/version.ts ## Compare *.bench.ts resu
 first-load-js: ## Report first-load JS bytes of dist/ (run make build-renderer first)
 	@bun scripts/perf/firstLoadJs.ts dist
 
-page-timing: ## Paired mobile UCS/IR timing of two built trees (PAGE_TIMING_ARGS; see scripts/perf/pageTiming.ts)
+page-timing: node_modules/.installed ## Paired mobile UCS/IR timing of two built trees (PAGE_TIMING_ARGS; see scripts/perf/pageTiming.ts)
 	@node --import tsx scripts/perf/pageTiming.ts $(PAGE_TIMING_ARGS)
 
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
