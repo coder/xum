@@ -271,16 +271,24 @@ function parseHandler(
   switch (raw.type) {
     case "mcp_tool": {
       const { server, tool, input, timeout, statusMessage } = raw;
-      if (typeof server !== "string" || server.length === 0) break;
-      if (typeof tool !== "string" || tool.length === 0) break;
+      // Codex skips a blank (whitespace-only) server or tool, so no blank target looks runnable.
+      if (typeof server !== "string" || server.trim().length === 0) break;
+      if (typeof tool !== "string" || tool.trim().length === 0) break;
       if (input !== undefined && !isPlainObject(input)) break;
-      if (timeout !== undefined && !(typeof timeout === "number" && timeout > 0)) break;
+      // Codex raises a timeout below one second (including 0) to one second instead of dropping
+      // the hook. Finite: `1e400` parses to Infinity.
+      if (
+        timeout !== undefined &&
+        !(typeof timeout === "number" && Number.isFinite(timeout) && timeout >= 0)
+      )
+        break;
       return {
         type: "mcp_tool",
         server,
         tool,
         input: input ?? {},
-        timeoutSeconds: typeof timeout === "number" ? timeout : DEFAULT_HOOK_TIMEOUT_SECONDS,
+        timeoutSeconds:
+          typeof timeout === "number" ? Math.max(1, timeout) : DEFAULT_HOOK_TIMEOUT_SECONDS,
         ...(typeof statusMessage === "string" ? { statusMessage } : {}),
       };
     }
@@ -359,6 +367,11 @@ function canonicalJson(value: unknown, depth = 0): string {
       (key) => `${JSON.stringify(key)}:${canonicalJson(value[key], depth + 1)}`
     );
     return `{${fields.join(",")}}`;
+  }
+  // `1e400` parses to Infinity, which JSON.stringify writes as null, so two different inputs
+  // would share one trust hash. Refuse it; the caller drops only this handler.
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    throw new Error("the hook definition contains a non-finite number");
   }
   return JSON.stringify(value) ?? "null";
 }
