@@ -4259,6 +4259,9 @@ export class MCPServerManager {
           url: info.url,
           headers,
           hasOauthTokens,
+          // Plugin OAuth settings are captured by the auth provider at start:
+          // a change must recycle the instance. Holds no secret value.
+          oauth: info.oauth ?? null,
         };
       } catch {
         // Missing secrets or invalid header config. Keep signature stable but avoid leaking details.
@@ -4267,6 +4270,7 @@ export class MCPServerManager {
           url: info.url,
           headers: null,
           hasOauthTokens,
+          oauth: info.oauth ?? null,
         };
       }
     }

@@ -19,7 +19,6 @@ import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import type { AgentPluginContainer, AgentPluginDiagnostic, AgentPluginInfo } from "./discovery";
 import {
-  CODEX_MCP_CONFIG_RELATIVE_PATH,
   computeAgentPluginContainers,
   discoverAgentPlugins,
   MAX_PLUGIN_MANIFEST_BYTES,
@@ -597,20 +596,28 @@ export async function loadPluginMcpServers(
   }
 
   // Codex packages ship `.mcp.json` in their own dialect (no `$schema`,
-  // `type: "http"`, `oauth`/`scopes`/`oauth_resource`). Only that file gets
-  // the dialect; a root mcp.json stays strict.
-  const codexDialect =
-    plugin.mcpConfigPath === path.join(plugin.rootPath, CODEX_MCP_CONFIG_RELATIVE_PATH);
+  // `type: "http"`, `oauth`/`scopes`/`oauth_resource`). Discovery marks it
+  // from the lexical selection (a contained symlink keeps the dialect); a
+  // root mcp.json stays strict.
+  const codexDialect = plugin.mcpConfigDialect === "codex";
+  // Codex also accepts a flat `{ "<server>": {...} }` map without `mcpServers`.
+  const doc: Record<string, unknown> =
+    codexDialect && !("mcpServers" in raw)
+      ? (({ $schema, ...servers }) => ({
+          ...($schema !== undefined ? { $schema } : {}),
+          mcpServers: servers,
+        }))(raw)
+      : raw;
 
   // Closed top-level: exactly { $schema, mcpServers }, both required (§7.2.1).
-  for (const key of Object.keys(raw)) {
+  for (const key of Object.keys(doc)) {
     if (key !== "$schema" && key !== "mcpServers") {
       return disableMcp(`${fileLabel} has unknown top-level field '${key}'`);
     }
   }
   if (
-    raw.$schema !== AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 &&
-    !(codexDialect && raw.$schema === undefined)
+    doc.$schema !== AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 &&
+    !(codexDialect && doc.$schema === undefined)
   ) {
     // Discovery only admits 1.0.0 manifests, so any other value is either an
     // unsupported version or a version mismatch with plugin.json — both
@@ -619,7 +626,7 @@ export async function loadPluginMcpServers(
       `${fileLabel} '$schema' must be '${AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0}' (matching plugin.json's Agent Plugins version)`
     );
   }
-  if (!isPlainObject(raw.mcpServers)) {
+  if (!isPlainObject(doc.mcpServers)) {
     return disableMcp(`${fileLabel} 'mcpServers' is required and must be an object`);
   }
 
@@ -631,7 +638,7 @@ export async function loadPluginMcpServers(
     vars: { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath },
   };
 
-  for (const [serverName, rawEntry] of Object.entries(raw.mcpServers)) {
+  for (const [serverName, rawEntry] of Object.entries(doc.mcpServers)) {
     // Filter before registration: saved workspace overrides cannot resurrect an unimported server.
     if (
       plugin.importedComponents != null &&
@@ -685,14 +692,20 @@ export async function loadPluginMcpServers(
       // DCR cover what the config omits. Messages name fields, never values
       // (see openaiMcpAuth's SECURITY AUDIT).
       const auth = readOpenAIMcpAuth(entry.extensions);
-      const oauth = toServerOAuthConfig(
-        auth.auth,
-        codex.hasClientSecret === true
-          ? { pluginRoot: plugin.rootPath, mcpConfigPath: plugin.mcpConfigPath, serverName }
-          : undefined
-      );
+      const { config: oauth, ignored: unusable } = toServerOAuthConfig(auth.auth, {
+        serverUrl: info.url,
+        ...(codex.hasClientSecret === true
+          ? {
+              clientSecretSource: {
+                pluginRoot: plugin.rootPath,
+                mcpConfigPath: plugin.mcpConfigPath,
+                serverName,
+              },
+            }
+          : {}),
+      });
       if (oauth !== undefined) info.oauth = oauth;
-      const ignored = [...codex.ignored, ...auth.ignored];
+      const ignored = [...codex.ignored, ...auth.ignored, ...unusable];
       if (codex.hasClientSecret === true && oauth?.clientSecretSource === undefined)
         ignored.push("oauth.client_secret (needs client_id)");
       const messages = [...codex.warnings, ...auth.warnings];

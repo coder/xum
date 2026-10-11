@@ -49,6 +49,7 @@ async function makePlugin(
     dirName: name,
     manifest: { schemaId: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name },
     mcpConfigPath,
+    ...(options?.fileName === ".mcp.json" ? { mcpConfigDialect: "codex" as const } : {}),
   };
 }
 
@@ -222,6 +223,21 @@ describe("loadPluginMcpServers", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  test("the Codex dialect infers stdio from a command and accepts a flat server map", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makePlugin(
+      tmp.path,
+      "flat",
+      { local: { command: "node", args: ["server.js"] } },
+      { fileName: ".mcp.json" }
+    );
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    expect(diagnostics).toEqual([]);
+    expect(Object.values(servers).map((s) => [s.plugin?.serverName, s.transport])).toEqual([
+      ["local", "stdio"],
+    ]);
   });
 
   test("a root mcp.json stays strict: no Codex dialect", async () => {

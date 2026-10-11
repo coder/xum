@@ -15,6 +15,7 @@ import * as mcpSdk from "@/node/services/mcpClient";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { acquirePluginMutationLock, MUTATION_LOCK_FILE, readMutationEpochToken } from "./journals";
 import * as treeHash from "./treeHash";
+import * as discoveryModule from "./discovery";
 import { readPluginMcpPolicy } from "./registry";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
@@ -1873,6 +1874,141 @@ describe("AgentPluginInstallService", () => {
     );
   });
 
+  test("an update signs out by credential key (rename, respelled URL, issuer) before the final stop", async () => {
+    const order: string[] = [];
+    const mcpStub = {
+      stopServersWithKeyPrefix: () => {
+        order.push("stop");
+        return Promise.resolve();
+      },
+    };
+    // A fresh service per phase: McpOauthService caches the store in memory.
+    const recordingOauth = () => {
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      const logout = oauth.logout.bind(oauth);
+      spyOn(oauth, "logout").mockImplementation((input) => {
+        order.push("logout");
+        return logout(input);
+      });
+      return oauth;
+    };
+    const updater = new AgentPluginInstallService(config, {
+      mcpServerManager: mcpStub as unknown as MCPServerManager,
+    });
+    const writeServer = async (name: string, url: string, clientId: string, issuer: string) => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+          mcpServers: {
+            [name]: {
+              type: "streamable-http",
+              url,
+              extensions: {
+                "com.openai": {
+                  auth: {
+                    type: "oauth",
+                    client: { mode: "provided", clientId },
+                    authorizationUrl: "https://mcp.example.com/authorize",
+                    tokenUrl: "https://mcp.example.com/token",
+                    authorizationServerBase: issuer,
+                  },
+                },
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `${name} ${clientId} ${issuer}`);
+    };
+    const serverUrl = "https://mcp.example.com/mcp";
+    const seedTokens = async () => {
+      await fsPromises.writeFile(
+        path.join(muxRoot, "mcp-oauth.json"),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "client-a" },
+              tokens: { access_token: "at", token_type: "Bearer" },
+            },
+          },
+        })
+      );
+      const oauth = recordingOauth();
+      updater.setMcpOauthService(oauth);
+      return oauth;
+    };
+    const applyUpdate = async () => {
+      const review = await updater.previewUpdate({ name: "demo-plugin" });
+      await updater.update({
+        name: "demo-plugin",
+        consent: { fromSha: review.fromSha, toSha: review.toSha },
+      });
+    };
+    await writeServer("docs", serverUrl, "client-a", "https://mcp.example.com");
+    const preview = await updater.preview({ input: remoteDir });
+    await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    // Renamed server, respelled URL, new client: the same stored credentials.
+    const first = await seedTokens();
+    order.length = 0;
+    await writeServer("docs2", `${serverUrl}/`, "client-b", "https://mcp.example.com");
+    await applyUpdate();
+    expect(await first.hasAuthTokens({ serverUrl })).toBe(false);
+    // Signed out first, so the final invalidation also catches a racing start.
+    expect(order.slice(-2)).toEqual(["logout", "stop"]);
+    await first.dispose();
+
+    // Only the issuer changes: tokens from the old issuer must go too.
+    const second = await seedTokens();
+    expect(await second.hasAuthTokens({ serverUrl })).toBe(true);
+    await writeServer("docs2", `${serverUrl}/`, "client-b", "https://auth.mcp.example.com");
+    await applyUpdate();
+    expect(await second.hasAuthTokens({ serverUrl })).toBe(false);
+    await second.dispose();
+  });
+
+  test("an update review reads a Codex .mcp.json once per tree, not once per server", async () => {
+    await fsPromises.rm(path.join(remoteDir, "mcp.json"));
+    const servers = (secret: string) =>
+      Object.fromEntries(
+        ["a", "b", "c"].map((name) => [
+          name,
+          {
+            type: "http",
+            url: `https://${name}.example.com/mcp`,
+            oauth: { client_id: name, client_secret: secret },
+          },
+        ])
+      );
+    await fsPromises.writeFile(
+      path.join(remoteDir, ".mcp.json"),
+      JSON.stringify({ mcpServers: servers("s1") })
+    );
+    await commitAll(remoteDir, "codex servers");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await fsPromises.writeFile(
+      path.join(remoteDir, ".mcp.json"),
+      JSON.stringify({ mcpServers: servers("s2") })
+    );
+    await commitAll(remoteDir, "rotate secrets");
+
+    const reads = spyOn(discoveryModule, "readPluginFileWithinRootCapped");
+    try {
+      const review = await service.previewUpdate({ name: "demo-plugin" });
+      expect(review.changes).toHaveLength(3);
+      // Per tree: one config load plus one secret read (was one per server).
+      const mcpReads = reads.mock.calls.filter(([args]) => args.label === ".mcp.json");
+      expect(mcpReads).toHaveLength(4);
+    } finally {
+      reads.mockRestore();
+    }
+  });
+
   test("preview lists foreign sign-in hosts; a changed auth block needs new consent", async () => {
     const writeAuth = async (clientId: string): Promise<void> => {
       const auth = {
@@ -1941,6 +2077,29 @@ describe("AgentPluginInstallService", () => {
     });
     expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
     await oauth.dispose();
+  });
+
+  test("preview shows a plugin token resource that differs from the server URL", async () => {
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          docs: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/mcp",
+            extensions: {
+              "com.openai": { auth: { type: "oauth", resource: "https://mcp.example.com" } },
+            },
+          },
+        },
+      })
+    );
+    await commitAll(remoteDir, "resource");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.mcpServers.map((server) => server.summary)).toEqual([
+      "https://mcp.example.com/mcp\nToken resource: https://mcp.example.com",
+    ]);
   });
 
   test("update rejects capability increases (new hook, expanded grants, new/changed MCP servers)", async () => {

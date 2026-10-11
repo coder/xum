@@ -94,6 +94,15 @@ describe("readOpenAIExtension", () => {
 });
 
 describe("normalizeCodexManifest", () => {
+  test("maps a one-entry skills array; longer arrays stay unknown", () => {
+    expect(normalizeCodexManifest({ name: "a", skills: ["./custom/"] }).manifest).toMatchObject({
+      contributes: { skills: "./custom" },
+    });
+    expect(normalizeCodexManifest({ name: "a", skills: ["./a", "./b"] }).manifest).toMatchObject({
+      skills: ["./a", "./b"],
+    });
+  });
+
   test("adds $schema and folds Codex top-level fields; inline extension values win", () => {
     const { manifest, warnings } = normalizeCodexManifest({
       name: "figma",

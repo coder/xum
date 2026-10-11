@@ -19,8 +19,8 @@
  * re-reads it from the consented file at flow time (memory only). The
  * `clientSecret` the OpenAI schema forbids is never used.
  */
+import { checkResourceAllowed } from "@modelcontextprotocol/client";
 import type { MCPServerOAuthConfig } from "@/common/types/mcp";
-import { getOwn } from "@/common/utils/getOwn";
 import { MAX_PLUGIN_MANIFEST_BYTES, readPluginFileWithinRootCapped } from "./discovery";
 import { isPlainObject } from "./manifest";
 import { OPENAI_EXTENSION_NAMESPACE } from "./openaiExtension";
@@ -60,7 +60,6 @@ export interface ReadOpenAIMcpAuthResult {
 
 /** Valid fields the OAuth flow has no use for (discovery covers them). */
 const UNUSED_FIELDS = [
-  "registrationUrl",
   "oidcConfigurationUrl",
   "oidcUserinfoEndpoint",
   "oidcScopesSupported",
@@ -124,6 +123,12 @@ function readClient(
       result.warnings.push(
         `'${AUTH}.client.clientId' must be a non-empty string on a provided client; ignoring`
       );
+  }
+  if (client.mode === "provided" && client.clientId === undefined) {
+    result.warnings.push(
+      `'${AUTH}.client.clientId' is required for a provided client; ignoring the client`
+    );
+    return undefined;
   }
   if (raw.tokenEndpointAuthMethod !== undefined) {
     if (
@@ -201,11 +206,13 @@ function readAuth(raw: Record<string, unknown>, result: ReadOpenAIMcpAuthResult)
   for (const key of [...UNUSED_FIELDS, "headerScheme", "headerName"]) {
     if (key in auth) ignore(key);
   }
-  if (
-    auth.authorizationServerBase !== undefined &&
-    (auth.authorizationUrl === undefined || auth.tokenUrl === undefined)
-  )
-    ignore("authorizationServerBase (needs both endpoints)");
+  for (const key of ["authorizationServerBase", "registrationUrl"] as const) {
+    if (
+      auth[key] !== undefined &&
+      (auth.authorizationUrl === undefined || auth.tokenUrl === undefined)
+    )
+      ignore(`${key} (needs both endpoints)`);
+  }
   result.auth = auth;
 }
 
@@ -249,6 +256,8 @@ export function translateCodexMcpEntry(entry: Record<string, unknown>): {
   const warnings: string[] = [];
   let hasClientSecret = false;
   if (rest.type === "http") rest.type = "streamable-http";
+  // Codex stdio entries carry a `command` and no `type`.
+  if (rest.type === undefined && typeof rest.command === "string") rest.type = "stdio";
 
   const auth: Record<string, unknown> = {};
   if (oauth !== undefined) {
@@ -284,46 +293,85 @@ export function translateCodexMcpEntry(entry: Record<string, unknown>): {
 type TokenAuthMethod = NonNullable<MCPServerOAuthConfig["tokenEndpointAuthMethod"]>;
 const SECRET_AUTH_METHODS = new Set<string>(["none", "client_secret_basic", "client_secret_post"]);
 
-/** The settings mcpOauthService uses; undefined when nothing applies (discovery + DCR). */
+/**
+ * The settings mcpOauthService uses (`config` undefined when nothing applies:
+ * discovery + DCR). `ignored` names settings dropped here; the caller adds
+ * them to the server's one consent-preview warning.
+ */
 export function toServerOAuthConfig(
   auth: OpenAIMcpAuth | undefined,
-  clientSecretSource?: MCPServerOAuthConfig["clientSecretSource"]
-): MCPServerOAuthConfig | undefined {
-  if (auth?.type !== "oauth" && auth?.type !== "mixed") return undefined;
-  const clientId = auth.client?.mode === "provided" ? auth.client.clientId : undefined;
+  ctx: { serverUrl: string; clientSecretSource?: MCPServerOAuthConfig["clientSecretSource"] }
+): { config?: MCPServerOAuthConfig; ignored: string[] } {
+  const ignored: string[] = [];
+  if (auth?.type !== "oauth" && auth?.type !== "mixed") return { ignored };
+  let clientId = auth.client?.mode === "provided" ? auth.client.clientId : undefined;
   const method = auth.client?.tokenEndpointAuthMethod;
+  // A secret method needs a secret, and only the Codex dialect can supply one.
+  // Without it the provider rejects every token request, so use discovery + DCR.
+  if (
+    clientId !== undefined &&
+    (method === "client_secret_basic" || method === "client_secret_post") &&
+    ctx.clientSecretSource === undefined
+  ) {
+    ignored.push(`client (${method} needs a client secret)`);
+    clientId = undefined;
+  }
+  // Endpoint overrides replace discovery, so dynamic registration then needs
+  // registrationUrl; without one, discovery keeps supplying everything.
+  let endpoints: MCPServerOAuthConfig["endpoints"];
+  if (auth.authorizationUrl !== undefined && auth.tokenUrl !== undefined) {
+    if (clientId === undefined && auth.registrationUrl === undefined) {
+      ignored.push("authorizationUrl, tokenUrl (registration needs registrationUrl)");
+    } else {
+      endpoints = {
+        authorizationUrl: auth.authorizationUrl,
+        tokenUrl: auth.tokenUrl,
+        // The RFC 9207 `iss` check compares against this issuer.
+        ...(auth.authorizationServerBase !== undefined
+          ? { issuer: auth.authorizationServerBase }
+          : {}),
+        ...(clientId === undefined ? { registrationUrl: auth.registrationUrl } : {}),
+      };
+    }
+  }
+  // SECURITY AUDIT: a token for another resource would be sent to this
+  // server. Apply the MCP SDK's own rule: the resource must cover the server
+  // URL (same origin, path prefix).
+  let resource = auth.resource;
+  if (
+    resource !== undefined &&
+    !checkResourceAllowed({ requestedResource: ctx.serverUrl, configuredResource: resource })
+  ) {
+    ignored.push("resource (does not cover the server URL)");
+    resource = undefined;
+  }
   const config: MCPServerOAuthConfig = {
     ...(clientId !== undefined ? { clientId } : {}),
     ...(clientId !== undefined && method !== undefined && SECRET_AUTH_METHODS.has(method)
       ? { tokenEndpointAuthMethod: method as TokenAuthMethod }
       : {}),
-    ...(auth.authorizationUrl !== undefined && auth.tokenUrl !== undefined
-      ? {
-          endpoints: {
-            authorizationUrl: auth.authorizationUrl,
-            tokenUrl: auth.tokenUrl,
-            // The RFC 9207 `iss` check compares against this issuer.
-            ...(auth.authorizationServerBase !== undefined
-              ? { issuer: auth.authorizationServerBase }
-              : {}),
-          },
-        }
-      : {}),
+    ...(endpoints !== undefined ? { endpoints } : {}),
     ...(auth.baseScopes !== undefined ? { baseScopes: auth.baseScopes } : {}),
     ...(auth.defaultScopes !== undefined ? { defaultScopes: auth.defaultScopes } : {}),
-    ...(auth.resource !== undefined ? { resource: auth.resource } : {}),
-    ...(clientId !== undefined && clientSecretSource !== undefined ? { clientSecretSource } : {}),
+    ...(resource !== undefined ? { resource } : {}),
+    ...(clientId !== undefined && ctx.clientSecretSource !== undefined
+      ? { clientSecretSource: ctx.clientSecretSource }
+      : {}),
   };
-  return Object.keys(config).length > 0 ? config : undefined;
+  return Object.keys(config).length > 0 ? { config, ignored } : { ignored };
 }
 
 /**
- * Re-read a Codex `.mcp.json` client secret from the consented plugin file
- * (bounded, containment-checked read). The caller keeps it in memory only.
+ * Every client secret in a consented Codex `.mcp.json` (bounded,
+ * containment-checked read), keyed by server name. One read and parse
+ * serves all of the file's servers. The caller keeps the values in memory only.
  */
-export async function readPluginClientSecret(
-  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>
-): Promise<string | undefined> {
+export async function readPluginClientSecrets(
+  source: Pick<
+    NonNullable<MCPServerOAuthConfig["clientSecretSource"]>,
+    "pluginRoot" | "mcpConfigPath"
+  >
+): Promise<Map<string, string>> {
   const { content } = await readPluginFileWithinRootCapped({
     filePath: source.mcpConfigPath,
     pluginRoot: source.pluginRoot,
@@ -331,9 +379,26 @@ export async function readPluginClientSecret(
     label: ".mcp.json",
   });
   const raw: unknown = JSON.parse(content);
-  const servers = isPlainObject(raw) && isPlainObject(raw.mcpServers) ? raw.mcpServers : {};
-  const entry = getOwn(servers, source.serverName);
-  const oauth = isPlainObject(entry) ? entry.oauth : undefined;
-  const secret = isPlainObject(oauth) ? oauth.client_secret : undefined;
-  return typeof secret === "string" && secret.length > 0 ? secret : undefined;
+  // Wrapped (`mcpServers`) or the flat Codex map, like loadPluginMcpServers.
+  const servers = !isPlainObject(raw)
+    ? {}
+    : "mcpServers" in raw
+      ? isPlainObject(raw.mcpServers)
+        ? raw.mcpServers
+        : {}
+      : raw;
+  const secrets = new Map<string, string>();
+  for (const [name, entry] of Object.entries(servers)) {
+    const oauth = isPlainObject(entry) ? entry.oauth : undefined;
+    const secret = isPlainObject(oauth) ? oauth.client_secret : undefined;
+    if (typeof secret === "string" && secret.length > 0) secrets.set(name, secret);
+  }
+  return secrets;
+}
+
+/** One server's client secret (see readPluginClientSecrets). */
+export async function readPluginClientSecret(
+  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>
+): Promise<string | undefined> {
+  return (await readPluginClientSecrets(source)).get(source.serverName);
 }
