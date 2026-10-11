@@ -233,4 +233,27 @@ describe("turn.stop", () => {
 
     expect(calls.map((call) => call.stopHookActive).slice(0, 2)).toEqual([false, false]);
   });
+
+  test("a Stop continuation does not run the UserPromptSubmit (message.send) hooks", async () => {
+    // Codex records a Stop continuation directly and runs UserPromptSubmit only for submitted
+    // input (codex-rs session/turn.rs, hook_runtime.rs inspect_pending_input).
+    addConsumer(keepGoing);
+    const promptHookTexts: string[] = [];
+    unregisters.push(
+      eventSpine.useBefore(
+        "message.send",
+        (ctx) => {
+          promptHookTexts.push(ctx.text);
+        },
+        { workspaceId }
+      )
+    );
+    const { h, streams } = await setup();
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(streams()).toBe(4);
+    expect(promptHookTexts).toEqual(["fix the tests"]);
+  });
 });

@@ -1079,6 +1079,13 @@ interface SendMessageInternalOptions {
    */
   skipOnSendCompaction?: boolean;
   /**
+   * Skip the message.send prompt hooks (Codex UserPromptSubmit). Set only for a turn.stop
+   * continuation: Codex records a Stop continuation directly as a conversation item and runs
+   * UserPromptSubmit only for submitted user input (codex-rs session/turn.rs and
+   * hook_runtime.rs inspect_pending_input), so a continuation never reaches those hooks.
+   */
+  skipPromptHooks?: boolean;
+  /**
    * Task-attempt obligation for this send (see TurnAdmissionToken): notified of the coordinator's
    * admission inside the synchronous prepare callback. Its staleness is already composed into
    * `admissionStale` by WorkspaceService.
@@ -4422,7 +4429,11 @@ export class AgentSession {
         ? { kind: "context", entries: applied.context }
         : { kind: "none" };
     }
-    if (this.aiService.runMessageSendHooks == null || isCompactionRequestMetadata(muxMetadata)) {
+    if (
+      internal?.skipPromptHooks === true ||
+      this.aiService.runMessageSendHooks == null ||
+      isCompactionRequestMetadata(muxMetadata)
+    ) {
       return { kind: "none" };
     }
     const origin = resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin);
@@ -10227,6 +10238,8 @@ export class AgentSession {
         acceptanceOrigin: "automatic",
         synthetic: true,
         dedupeKey: STOP_HOOK_CONTINUATION_DEDUPE_KEY,
+        // Codex runs no UserPromptSubmit hook for a Stop continuation (see skipPromptHooks).
+        skipPromptHooks: true,
       }
     );
   }
@@ -10729,6 +10742,8 @@ export class AgentSession {
       admissionStale?: () => boolean;
       /** See SendMessageInternalOptions.skipOnSendCompaction. */
       skipOnSendCompaction?: boolean;
+      /** See SendMessageInternalOptions.skipPromptHooks. */
+      skipPromptHooks?: boolean;
       /** Task-attempt obligation owned by the entry until its dispatch or removal. */
       turnAdmission?: TurnAdmissionToken;
       compactionAdmissionStale?: () => boolean;

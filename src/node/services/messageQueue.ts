@@ -226,6 +226,8 @@ interface QueuedMessageInternalOptions {
   admissionStale?: () => boolean;
   /** See AgentSession SendMessageInternalOptions.skipOnSendCompaction (entries carrying it are sealed). */
   skipOnSendCompaction?: boolean;
+  /** See AgentSession SendMessageInternalOptions.skipPromptHooks (entries carrying it are sealed). */
+  skipPromptHooks?: boolean;
   /**
    * Task-attempt obligation for this send. The queue owns it from insertion (onEnqueued) until
    * the entry dispatches (the session reports admission) or is removed (disposed here). Entries
@@ -336,6 +338,8 @@ interface QueueEntry {
   admissionStale?: () => boolean;
   /** Dispatch without on-send compaction (sealed; see QueuedMessageInternalOptions). */
   skipOnSendCompaction?: boolean;
+  /** Dispatch without the message.send prompt hooks (sealed; see QueuedMessageInternalOptions). */
+  skipPromptHooks?: boolean;
   /** Task-attempt obligation owned by this entry until dispatch or removal (sealed). */
   turnAdmission?: TurnAdmissionToken;
 }
@@ -786,6 +790,8 @@ export class MessageQueue {
       internal?.admissionStale != null ||
       // The on-send compaction opt-out applies to exactly the guarded send that asked for it.
       internal?.skipOnSendCompaction === true ||
+      // A prompt-hook opt-out (a Stop continuation) must not lend itself to other input.
+      internal?.skipPromptHooks === true ||
       internal?.turnAdmission != null ||
       internal?.goalKind != null ||
       // Task-turn provenance classifies one dispatch; batching would lend it to other messages.
@@ -902,6 +908,9 @@ export class MessageQueue {
     }
     if (internal?.skipOnSendCompaction === true) {
       entry.skipOnSendCompaction = true;
+    }
+    if (internal?.skipPromptHooks === true) {
+      entry.skipPromptHooks = true;
     }
     if (internal?.turnAdmission != null) {
       // Sealed entries are 1:1 with their token; a batched add can never reach a token-carrying
@@ -1478,6 +1487,7 @@ export class MessageQueue {
       entry.cancelSignal != null ||
       admissionStale != null ||
       entry.skipOnSendCompaction === true ||
+      entry.skipPromptHooks === true ||
       entry.turnAdmission != null ||
       refreshCompactionAdmission != null ||
       readCompactionAdmission != null ||
@@ -1503,6 +1513,7 @@ export class MessageQueue {
             : {}),
           ...(admissionStale != null ? { admissionStale } : {}),
           ...(entry.skipOnSendCompaction === true ? { skipOnSendCompaction: true } : {}),
+          ...(entry.skipPromptHooks === true ? { skipPromptHooks: true } : {}),
           ...(entry.turnAdmission != null ? { turnAdmission: entry.turnAdmission } : {}),
           ...(readCompactionAdmission != null ? { readCompactionAdmission } : {}),
           ...(refreshCompactionAdmission != null ? { refreshCompactionAdmission } : {}),
