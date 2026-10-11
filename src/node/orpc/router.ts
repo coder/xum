@@ -53,6 +53,7 @@ import {
 import {
   callMcpAppTool,
   getMcpAppView,
+  getMcpAppViewRecord,
   readMcpAppServerResource,
   updateMcpAppModelContext,
 } from "@/node/services/mcpAppsOperations";
@@ -1698,6 +1699,10 @@ export const router = (authToken?: string) => {
             listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
           )
         ),
+      getViewRecord: t
+        .input(schemas.mcpApps.getViewRecord.input)
+        .output(schemas.mcpApps.getViewRecord.output)
+        .handler(({ context, input }) => getMcpAppViewRecord(context, input)),
       callTool: t
         .input(schemas.mcpApps.callTool.input)
         .output(schemas.mcpApps.callTool.output)

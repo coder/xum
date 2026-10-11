@@ -3,6 +3,7 @@ import type { ORPCContext } from "@/node/orpc/context";
 import type { McpAppResultRecord } from "./mcpAppResultStore";
 import {
   getMcpAppView,
+  getMcpAppViewRecord,
   MCP_APP_TOOL_RESULT_MAX_BYTES,
   readMcpAppServerResource,
   updateMcpAppModelContext,
@@ -181,5 +182,27 @@ describe("updateMcpAppModelContext", () => {
       expect((await updateMcpAppModelContext(ctx, input(serverName))).success).toBe(false);
       expect(writes).toEqual([]);
     }
+  });
+});
+
+describe("getMcpAppViewRecord", () => {
+  test("names the record's view with the card's server form and model-facing tool name", async () => {
+    const { ctx, reads } = context({ ...RECORD, serverName: "my  charts" });
+    const result = await getMcpAppViewRecord(ctx, { workspaceId: "ws", toolCallId: "call-1" });
+    if (!result.success) throw new Error(result.error);
+    expect(result.data).toEqual({
+      serverName: "my charts",
+      toolName: "my_charts_show_chart",
+      resourceUri: "ui://charts/view",
+      arguments: { title: "Q3" },
+    });
+    // A lookup never reads the view resource; getView does when the tab mounts it.
+    expect(reads).toEqual([]);
+  });
+
+  test("is null without a record", async () => {
+    const { ctx } = context(null);
+    const result = await getMcpAppViewRecord(ctx, { workspaceId: "ws", toolCallId: "call-1" });
+    expect(result).toEqual({ success: true, data: null });
   });
 });
