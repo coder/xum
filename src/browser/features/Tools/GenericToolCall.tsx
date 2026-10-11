@@ -99,16 +99,12 @@ const McpAppToolDetails: React.FC<{
 }> = (props) => {
   // A failed call's error is in the raw output: show it without a click.
   const [showRaw, setShowRaw] = React.useState(props.view.failed);
-  const inTab = useMcpAppViewInTab(props.workspaceId, props.view.toolCallId, [
-    "tab",
-    "sheet",
-    "artifacts",
-  ]);
+  const inTab = useMcpAppViewInTab(props.workspaceId, props.view.toolCallId, ["tab", "sheet"]);
   if (!useMcpAppViewsSupported()) return <ToolDetails>{props.raw}</ToolDetails>;
   return (
     <ToolDetails>
       {inTab ? (
-        // One live instance per view: while its tab (or Artifacts) has it, the card shows this
+        // One live instance per view: while its tab (or the sheet) has it, the card shows this
         // instead of a second frame. Closing the tab brings the view back here.
         <AppViewInTabNotice workspaceId={props.workspaceId} view={props.view} />
       ) : (

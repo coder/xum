@@ -13,7 +13,8 @@ import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { writeArtifactSelection } from "./artifactSelection";
 import { ArtifactViewer } from "./ArtifactViewer";
-import { openMcpAppView } from "./mcpAppViewsStore";
+import { openMcpAppViewTab } from "./mcpAppViewsStore";
+import { AppViewTabPanel } from "../AppViewTab/AppViewTab";
 
 /**
  * Desktop and browser mode differ only in what the frame may navigate to (the desktop app
@@ -974,7 +975,8 @@ export const FullscreenKeepsFocusWhenViewerSwaps: Story = {
   },
 };
 
-// MCP Apps view (artifacts experiment): a fake server view implementing the spec handshake.
+// MCP Apps view (artifacts experiment) in its app tab (no longer in Artifacts): a fake server
+// view implementing the spec handshake.
 // The frame is opaque-origin, so the play test reads progress from the heights the view
 // reports: 321px only after initialize -> initialized -> tool-input -> tool-result, then
 // 333px once its own tools/call round trip (behind the consent strip) succeeded.
@@ -1075,7 +1077,7 @@ function DesktopApiStub(props: { children: ReactNode }) {
 }
 
 function renderMcpAppView(html: string = MCP_APP_VIEW_HTML) {
-  openMcpAppView(WORKSPACE_ID, {
+  openMcpAppViewTab(WORKSPACE_ID, {
     toolCallId: MCP_APP_TOOL_CALL_ID,
     serverName: "weather",
     resourceUri: "ui://weather/view.html",
@@ -1117,7 +1119,11 @@ function renderMcpAppView(html: string = MCP_APP_VIEW_HTML) {
       <DesktopApiStub>
         <div className="bg-background flex h-screen justify-end">
           <div className="bg-sidebar border-border-light h-full w-full max-w-[440px] border-l">
-            <ArtifactsPanel workspaceId={WORKSPACE_ID} />
+            <AppViewTabPanel
+              workspaceId={WORKSPACE_ID}
+              toolCallId={MCP_APP_TOOL_CALL_ID}
+              onClose={() => undefined}
+            />
           </div>
         </div>
       </DesktopApiStub>

@@ -2,18 +2,7 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import {
-  createTestApiClient,
-  resetTestExperiments,
-  setTestExperiment,
-  type TestApiOverrides,
-} from "@/browser/testUtils";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { GenericToolCall } from "@/browser/features/Tools/GenericToolCall";
-import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
-import { removeTabEverywhere } from "@/browser/utils/rightSidebarLayout";
-import { AppViewTabPanel } from "../AppViewTab/AppViewTab";
-import { appViewTabFor, useMcpAppViewInTab, withAppViewTab } from "../AppViewTab/appViewTabs";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
@@ -39,12 +28,6 @@ import {
 } from "@/common/constants/storage";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
-import {
-  appViewPickerDetails,
-  closeMcpAppView,
-  openMcpAppView,
-  type McpAppViewRef,
-} from "./mcpAppViewsStore";
 import { openArtifact } from "./openArtifact";
 
 function entry(path: string, modifiedMs: number, kind: ArtifactEntry["kind"]): ArtifactEntry {
@@ -845,194 +828,7 @@ describe("ArtifactsPanel", () => {
     expect(await view.findByText(/is too large to preview/)).toBeTruthy();
   });
 
-  test("Reload re-fetches a selected app view", async () => {
-    fake = createFakeArtifactsApi(
-      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
-      {}
-    );
-    let getViewCalls = 0;
-    fake.api.mcpApps = {
-      getView: () => {
-        getViewCalls += 1;
-        return Promise.resolve({
-          success: true as const,
-          data: {
-            html: "<p>view</p>",
-            csp: {},
-            prefersBorder: null,
-            resultAvailable: false,
-            result: null,
-            invocation: null,
-          },
-        });
-      },
-    };
-    openMcpAppView("ws-app-reload", {
-      toolCallId: "call-1",
-      serverName: "charts",
-      resourceUri: "ui://charts/view",
-      toolName: "show_chart",
-      label: "Show chart",
-      arguments: {},
-      cancelled: false,
-      failed: false,
-    });
-    try {
-      const view = render(<ArtifactsPanel workspaceId="ws-app-reload" />, {
-        wrapper: (props: { children: ReactNode }) => (
-          <ThemeProvider forcedTheme="dark">
-            <ApiWrapper>{props.children}</ApiWrapper>
-          </ThemeProvider>
-        ),
-      });
-      await view.findByTestId("mcp-app-frame");
-      expect(getViewCalls).toBe(1);
-      fireEvent.click(view.getByRole("button", { name: "Reload artifact" }));
-      await waitFor(() => expect(getViewCalls).toBe(2));
-    } finally {
-      closeMcpAppView("ws-app-reload", "call-1");
-    }
-  });
-
-  test("the remaining app views stay reachable after closing one, without a listing", async () => {
-    fake = createFakeArtifactsApi(
-      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
-      {}
-    );
-    fake.api.artifacts = {
-      ...fake.api.artifacts,
-      list: () => Promise.resolve({ success: false as const, error: "Listing failed" }),
-    };
-    fake.api.mcpApps = {
-      getView: () => Promise.resolve({ success: false as const, error: "No view" }),
-    };
-    const ref = (toolCallId: string, label: string) => ({
-      toolCallId,
-      serverName: "charts",
-      resourceUri: "ui://charts/view",
-      toolName: "show_chart",
-      label,
-      arguments: {},
-      cancelled: false,
-      failed: false,
-    });
-    openMcpAppView("ws-app-close", ref("call-a", "First view"));
-    openMcpAppView("ws-app-close", ref("call-b", "Second view"));
-    try {
-      const view = render(<ArtifactsPanel workspaceId="ws-app-close" />, {
-        wrapper: (props: { children: ReactNode }) => (
-          <ThemeProvider forcedTheme="dark">
-            <ApiWrapper>{props.children}</ApiWrapper>
-          </ThemeProvider>
-        ),
-      });
-      // The most recently opened view is selected; close it.
-      fireEvent.click(await view.findByRole("button", { name: "Close view" }));
-      expect(await view.findByText("Listing failed")).toBeTruthy();
-      expect(view.getByRole("combobox", { name: "Artifact" })).toBeTruthy();
-    } finally {
-      closeMcpAppView("ws-app-close", "call-a");
-      closeMcpAppView("ws-app-close", "call-b");
-    }
-  });
-
-  test("a view runs once: card, Artifacts and its app tab never mount two frames", async () => {
-    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
-    fake = createFakeArtifactsApi(
-      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
-      {}
-    );
-    fake.api.mcpApps = {
-      getView: () =>
-        Promise.resolve({
-          success: true as const,
-          data: {
-            html: "<p>view</p>",
-            csp: {},
-            prefersBorder: null,
-            resultAvailable: true,
-            result: { content: [] },
-            invocation: null,
-          },
-        }),
-    };
-    const workspaceId = "ws-one-instance";
-    const ref = {
-      toolCallId: "call-one",
-      serverName: "dice",
-      resourceUri: "ui://dice/board.html",
-      toolName: "dice_show_dice_board",
-      label: "Board",
-      arguments: {},
-      cancelled: false,
-      failed: false,
-    };
-    function TabIfOpen() {
-      // Stands in for RightSidebar: the tab panel mounts while the layout has the tab.
-      const open = useMcpAppViewInTab(workspaceId, ref.toolCallId, []);
-      return open ? (
-        <AppViewTabPanel
-          workspaceId={workspaceId}
-          toolCallId={ref.toolCallId}
-          onClose={() => undefined}
-        />
-      ) : null;
-    }
-    openMcpAppView(workspaceId, ref);
-    try {
-      const view = render(
-        <ThemeProvider forcedTheme="dark">
-          <ApiWrapper>
-            <GenericToolCall
-              toolName="dice_show_dice_board"
-              args={{}}
-              result={{ content: [] }}
-              status="completed"
-              workspaceId={workspaceId}
-              toolCallId={ref.toolCallId}
-              mcpServer={{
-                connection: { key: "dice", transport: "stdio" },
-                identity: { name: "dice", version: "1.0.0" },
-                source: "connection",
-                app: { resourceUri: ref.resourceUri },
-              }}
-            />
-            <ArtifactsPanel workspaceId={workspaceId} />
-            <TabIfOpen />
-          </ApiWrapper>
-        </ThemeProvider>
-      );
-      fireEvent.click(view.getByText("dice_show_dice_board"));
-      const frames = () => view.queryAllByTestId("mcp-app-frame").length;
-      // Selected in Artifacts: Artifacts runs it, the card yields.
-      await view.findByTestId("mcp-app-frame");
-      await waitFor(() =>
-        expect(view.getAllByRole("button", { name: "Go to tab" })).toHaveLength(1)
-      );
-      expect(frames()).toBe(1);
-      // Opened in its tab: Artifacts yields too, the tab runs it.
-      act(() => updateRightSidebarLayout(workspaceId, (s) => withAppViewTab(s, ref.toolCallId)));
-      await waitFor(() =>
-        expect(view.getAllByRole("button", { name: "Go to tab" })).toHaveLength(2)
-      );
-      expect(frames()).toBe(1);
-      // Tab closed: Artifacts runs it again.
-      act(() =>
-        updateRightSidebarLayout(workspaceId, (s) =>
-          removeTabEverywhere(s, appViewTabFor(ref.toolCallId))
-        )
-      );
-      await waitFor(() =>
-        expect(view.getAllByRole("button", { name: "Go to tab" })).toHaveLength(1)
-      );
-      expect(frames()).toBe(1);
-    } finally {
-      resetTestExperiments();
-      closeMcpAppView(workspaceId, ref.toolCallId);
-    }
-  });
-
-  test("lists app views from the transcript; Close returns to files and keeps them", async () => {
+  test("lists only files the agent created: app views have their own tabs now", async () => {
     fake = createFakeArtifactsApi(
       {
         available: true,
@@ -1042,101 +838,47 @@ describe("ArtifactsPanel", () => {
       },
       { "report.md": textFile("report.md", "markdown", "# Report") }
     );
+    let getViewCalls = 0;
     fake.api.mcpApps = {
-      getView: () =>
-        Promise.resolve({
-          success: true as const,
-          data: {
-            html: "<p>view</p>",
-            csp: {},
-            prefersBorder: null,
-            resultAvailable: true,
-            result: { content: [] },
-            invocation: null,
-          },
-        }),
+      getView: () => {
+        getViewCalls += 1;
+        return Promise.resolve({ success: false as const, error: "unused" });
+      },
     };
-    const toolCall = (toolCallId: string, status: "completed" | "executing") =>
-      ({
-        type: "tool",
-        id: toolCallId,
-        historyId: toolCallId,
-        toolCallId,
-        toolName: "dice_show_dice_board",
-        args: {},
-        status,
-        isPartial: false,
-        historySequence: 1,
-        mcpServer: {
-          connection: { key: "dice", transport: "stdio" },
-          identity: { name: "dice" },
-          source: "connection",
-          app: { resourceUri: "ui://dice/board.html" },
-        },
-      }) as unknown as DisplayedMessage;
-    // The loaded transcript holds a settled call and a still-running one; neither was opened
-    // from its card.
     const store = useWorkspaceStoreRaw();
-    // A code_execution call that made one nested MCP Apps call.
-    const parent = {
-      ...(toolCall("call-code", "completed") as object),
-      toolName: "code_execution",
-      mcpServer: undefined,
-      nestedCalls: [
-        {
-          toolCallId: "call-nested",
-          toolName: "dice_show_dice_board",
-          input: { count: 2 },
-          output: { content: [] },
-          state: "output-available",
-          mcpServer: (toolCall("x", "completed") as unknown as { mcpServer: unknown }).mcpServer,
-        },
-      ],
+    const call = {
+      type: "tool",
+      id: "call-done",
+      historyId: "call-done",
+      toolCallId: "call-done",
+      toolName: "dice_show_dice_board",
+      args: {},
+      status: "completed",
+      isPartial: false,
+      historySequence: 1,
+      mcpServer: {
+        connection: { key: "dice", transport: "stdio" },
+        identity: { name: "dice" },
+        source: "connection",
+        app: { resourceUri: "ui://dice/board.html" },
+      },
     } as unknown as DisplayedMessage;
-    const state = {
-      messages: [toolCall("call-done", "completed"), toolCall("call-running", "executing"), parent],
-    } as unknown as WorkspaceState;
     const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
-      (id) => id === "ws-app-transcript"
+      (id) => id === "ws-files-only"
     );
-    const getState = spyOn(store, "getWorkspaceState").mockImplementation(() => state);
+    const getState = spyOn(store, "getWorkspaceState").mockImplementation(
+      () => ({ messages: [call] }) as unknown as WorkspaceState
+    );
     try {
-      writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-done" });
-      const view = render(<ArtifactsPanel workspaceId="ws-app-transcript" />, {
-        wrapper: (props: { children: ReactNode }) => (
-          <ThemeProvider forcedTheme="dark">
-            <ApiWrapper>{props.children}</ApiWrapper>
-          </ThemeProvider>
-        ),
-      });
-      await view.findByTestId("mcp-app-frame");
-
-      fireEvent.click(view.getByRole("button", { name: "Close view" }));
+      // Even a selection left over from an older build that showed the view here.
+      writeArtifactSelection("ws-files-only", { path: "mcp-app:call-done" });
+      const view = renderPanel("ws-files-only");
       expect(await view.findByText("Report")).toBeTruthy();
       expect(view.queryByTestId("mcp-app-frame")).toBeNull();
-      expect(readArtifactSelection("ws-app-transcript").path).toBeNull();
-
-      // Still listed after Close: selecting it again shows the view.
-      act(() => writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-done" }));
-      await view.findByTestId("mcp-app-frame");
-
-      // A nested MCP Apps call (inside code_execution) is listed too.
-      act(() => writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-nested" }));
-      await view.findByTestId("mcp-app-frame");
-
-      // A call that has not settled has no view yet.
-      act(() => writeArtifactSelection("ws-app-transcript", { path: "mcp-app:call-running" }));
-      expect(await view.findByText("Report")).toBeTruthy();
-      expect(view.queryByTestId("mcp-app-frame")).toBeNull();
-
-      // J/K walk the picker into the app views and back out to the files.
       fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "j" });
-      await view.findByTestId("mcp-app-frame");
-      // The newest app view comes first: the nested call of the last message.
-      expect(readArtifactSelection("ws-app-transcript").path).toBe("mcp-app:call-nested");
-      fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "k" });
-      expect(await view.findByText("Report")).toBeTruthy();
-      expect(readArtifactSelection("ws-app-transcript").path).toBe("report.md");
+      expect(readArtifactSelection("ws-files-only").path).toBe("report.md");
+      expect(view.queryByText(/dice_show_dice_board|App views/)).toBeNull();
+      expect(getViewCalls).toBe(0);
     } finally {
       registered.mockRestore();
       getState.mockRestore();
@@ -2213,46 +1955,5 @@ describe("ArtifactsPanel", () => {
 
     fireEvent.keyDown(dialog, { key: "Escape" });
     await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
-  });
-});
-
-describe("appViewPickerDetails", () => {
-  const view = (toolCallId: string, args: unknown, failed = false): McpAppViewRef => ({
-    toolCallId,
-    serverName: "dice",
-    resourceUri: "ui://dice/board.html",
-    toolName: "show_dice_board",
-    label: "show_dice_board",
-    arguments: args,
-    cancelled: failed,
-    failed,
-  });
-
-  test("tells apart calls that differ only by arguments or outcome", () => {
-    const details = appViewPickerDetails([
-      view("c", { count: 4 }, true),
-      view("b", { count: 2 }),
-      view("a", { count: 4 }),
-    ]);
-    expect(new Set(details).size).toBe(3);
-    expect(details[0]).toContain("failed");
-  });
-
-  test("numbers repeats of the same call, oldest first", () => {
-    const details = appViewPickerDetails([
-      view("new", { count: 4 }),
-      view("other", { count: 6 }),
-      view("old", { count: 4 }),
-    ]);
-    expect(new Set(details).size).toBe(3);
-    expect(details[0].endsWith("#2")).toBe(true);
-    expect(details[2].endsWith("#1")).toBe(true);
-    expect(details[1]).not.toContain("#");
-  });
-
-  test("shows control and bidi characters from model arguments as escapes", () => {
-    const [detail] = appViewPickerDetails([view("a", { label: "safe\u202Eexe.txt\nnext" })]);
-    expect(detail).not.toMatch(/[\u202E\n]/);
-    expect(detail).toContain("\\u202e");
   });
 });

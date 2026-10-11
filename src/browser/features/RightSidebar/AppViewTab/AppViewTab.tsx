@@ -11,8 +11,8 @@ import {
 import { Notice } from "../ArtifactsTab/SourceText";
 
 /**
- * Shown where a view would otherwise mount a second live instance (its tool card, Artifacts)
- * while it lives elsewhere: "Go to tab" opens or focuses the view's tab.
+ * Shown where a view would otherwise mount a second live instance (its tool card, a tab the
+ * hidden sidebar keeps) while it lives elsewhere: "Go to tab" opens or focuses the view's tab.
  */
 export function AppViewInTabNotice(props: { workspaceId: string; view: McpAppViewRef }) {
   return (
