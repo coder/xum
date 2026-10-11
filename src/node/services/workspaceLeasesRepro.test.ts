@@ -36,6 +36,7 @@ import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks"
 import { SessionFileManager } from "@/node/utils/sessionFile";
 import { FileChangeTracker } from "@/node/services/utils/fileChangeTracker";
 import { CompactionCancellation } from "./compactionCancellation";
+import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 
 // Deterministic code repros of races between workspace use leases and other backends' structural
 // mutations. Each `test.failing` reproduces a violation and fails at its target assertion; each
@@ -345,6 +346,35 @@ describe("turn preparation vs another backend's structural mutation", () => {
         Ok({ nonce })
       );
       expect(await stop.read()).toBeNull();
+    } finally {
+      await b.session.dispose();
+      await b.cleanup();
+    }
+  });
+
+  // #5434 moved the lease confirmation before the resume's replacement checks, so a resume that
+  // returns early there (here: a rejected request) has confirmed a lease and starts no stream.
+  // The preparation must still release it: a held turn lease refuses every rename and removal.
+  test("a resume that returns early after confirming its lease releases it for a mutation", async () => {
+    const { b, streamMessage } = await setup();
+    try {
+      await b.historyService.appendToHistory(
+        workspaceId,
+        createContextBudgetRejectedMessage(
+          createMuxMessage("user-1", "user", "too big", { timestamp: Date.now() })
+        )
+      );
+      const result = await b.session.resumeStream({ model: sendOptions.model, agentId: "exec" });
+      expect(!result.success && result.error.type).toBe("context_budget_blocked");
+      expect(streamMessage).not.toHaveBeenCalled();
+      // This backend's own gate: it checks its turn lease count under the transition lock, after
+      // the release the preparation queued there (FIFO), so no wait is needed.
+      const gated = await workspaceUseLeasesFor(b.config).withMutationGate(
+        [workspaceId],
+        idle,
+        async () => "mutated"
+      );
+      expect(gated).toBe("mutated");
     } finally {
       await b.session.dispose();
       await b.cleanup();
