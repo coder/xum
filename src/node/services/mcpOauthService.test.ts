@@ -826,7 +826,7 @@ describe("McpOauthService OAuth flows", () => {
     const listServers = spyOn(mcpConfigService, "listServers");
     for (const clientId of ["client-a", "client-b"]) {
       listServers.mockResolvedValue({
-        docs: { transport: "http", url: serverUrl, oauth: { clientId } },
+        docs: { transport: "http", url: serverUrl, disabled: false, oauth: { clientId } },
       });
       const loggedIn = clientId === "client-a";
       expect(
