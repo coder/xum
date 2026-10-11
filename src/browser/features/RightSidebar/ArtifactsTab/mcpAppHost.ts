@@ -222,6 +222,11 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   let viewDisplayModes: readonly string[] | undefined;
   /** The mode the view was last told (initial context or host-context-changed). */
   let notifiedDisplayMode: McpAppDisplayMode | undefined;
+  /**
+   * The mode of an accepted move that has not run yet. The move replaces this instance, so
+   * every later request is answered with it: that is where the view ends up.
+   */
+  let pendingDisplayMode: McpAppDisplayMode | undefined;
 
   /**
    * The mode the view is told. "The host MUST NOT switch the View to a display mode that does
@@ -362,6 +367,9 @@ export function createMcpAppHost(options: McpAppHostOptions) {
       case "ui/request-display-mode": {
         const parsed = DisplayModeParams.safeParse(params);
         if (!parsed.success) return fail(id, INVALID_PARAMS, "Invalid display mode request");
+        // Requests that arrive after an accepted move (between its reply and the move) cannot
+        // change it: this instance is leaving, and the view ends up in the pending mode.
+        if (pendingDisplayMode !== undefined) return respond(id, { mode: pendingDisplayMode });
         const context = options.getHostContext();
         const current = viewMode(context.displayMode);
         const requested = context.availableDisplayModes.find((mode) => mode === parsed.data.mode);
@@ -377,6 +385,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         respond(id, { mode });
         displayModeChanged(mode);
         if (move == null) return;
+        pendingDisplayMode = mode;
         // The move unmounts this instance, and a frame removed before a queued postMessage
         // runs never gets it. The teardown reply comes after the view handled the mode reply
         // (messages arrive in order), and the view must get a teardown before it goes anyway.

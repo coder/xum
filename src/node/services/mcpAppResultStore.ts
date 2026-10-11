@@ -6,6 +6,8 @@ import assert from "@/common/utils/assert";
 import { isMcpAppResourceUri, MCP_APP_MODEL_CONTEXT_MAX_BYTES } from "@/common/utils/mcpApps";
 import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 import { ensurePrivateDir } from "@/node/utils/fs";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
@@ -71,12 +73,20 @@ function fileNameFor(toolCallId: string): string {
 
 export class McpAppResultStore {
   private readonly memory = new Map<string, McpAppResultRecord>();
-  private readonly modelContexts = new Map<string, readonly McpAppModelContext[]>();
+  /** Queues this backend's model-context updates, so superseded ones skip the target lock. */
   private readonly modelContextLock = new AsyncMutex();
   /** The newest queued setModelContext per workspace + view (see its coalescing note). */
   private readonly latestModelContextUpdate = new Map<string, symbol>();
 
-  constructor(private readonly getSessionDir: (workspaceId: string) => string) {}
+  /**
+   * `rootDir` is the Xum root (`config.rootDir`): model-context writes take its session-dir
+   * target mutation lock and check its removal tombstones. null (tests only) keeps the lock
+   * in-process and skips the tombstone check.
+   */
+  constructor(
+    private readonly getSessionDir: (workspaceId: string) => string,
+    private readonly rootDir: string | null = null
+  ) {}
 
   private dirFor(workspaceId: string): string {
     assert(
@@ -143,25 +153,19 @@ export class McpAppResultStore {
 
   /**
    * The latest model context of every view that has one, newest first. A missing or corrupt
-   * file reads as none (self-healing).
+   * file reads as none (self-healing). Always read from disk, never cached: with
+   * XUM_ALLOW_MULTIPLE_INSTANCES another backend may have replaced the file, and the file is
+   * small (at most MCP_APP_MODEL_CONTEXT_MAX_VIEWS views of 16 KB).
    */
   async getModelContexts(workspaceId: string): Promise<readonly McpAppModelContext[]> {
-    const cached = this.modelContexts.get(workspaceId);
-    if (cached) return cached;
-    let views: readonly McpAppModelContext[] = [];
     try {
       const raw = await fs.readFile(this.modelContextPath(workspaceId), "utf8");
       const parsed = McpAppModelContextFileSchema.safeParse(JSON.parse(raw));
-      if (parsed.success) views = parsed.data.views.slice(0, MCP_APP_MODEL_CONTEXT_MAX_VIEWS);
+      if (parsed.success) return parsed.data.views.slice(0, MCP_APP_MODEL_CONTEXT_MAX_VIEWS);
     } catch {
       // Missing or unreadable: no context.
     }
-    // A setModelContext that finished while this read was pending published newer state than
-    // the file this read may have opened: keep it instead of caching the stale snapshot.
-    const published = this.modelContexts.get(workspaceId);
-    if (published) return published;
-    this.modelContexts.set(workspaceId, views);
-    return views;
+    return [];
   }
 
   /**
@@ -171,6 +175,13 @@ export class McpAppResultStore {
    * view arrives is dropped without a write, because the newer one replaces it anyway. A view
    * may send many updates a second, and every write is an fsync behind one lock shared by all
    * workspaces, so obsolete updates must not queue up disk writes.
+   *
+   * The read-modify-write holds the session dir's target mutation lock (in-process mutex plus
+   * cross-process file lock), like the other session-dir writers (ReviewStateService,
+   * DevToolsService): two backends sharing one Xum root cannot drop each other's views, and
+   * workspace removal, which publishes its tombstone and deletes the session dir under the
+   * same lock, cannot interleave. A write for a removed workspace is refused and never
+   * recreates its session dir.
    */
   async setModelContext(
     workspaceId: string,
@@ -184,20 +195,36 @@ export class McpAppResultStore {
     const viewKey = `${workspaceId}\0${entry.toolCallId}`;
     const ticket = Symbol(viewKey);
     this.latestModelContextUpdate.set(viewKey, ticket);
-    await using _lock = await this.modelContextLock.acquire();
+    const filePath = this.modelContextPath(workspaceId);
+    const sessionDir = path.dirname(filePath);
+    await using _queue = await this.modelContextLock.acquire();
     if (this.latestModelContextUpdate.get(viewKey) !== ticket) return;
     this.latestModelContextUpdate.delete(viewKey);
-    const others = (await this.getModelContexts(workspaceId)).filter(
-      (view) => view.toolCallId !== entry.toolCallId
-    );
-    const views = updated === null ? others : [updated, ...others];
-    const kept = views.slice(0, MCP_APP_MODEL_CONTEXT_MAX_VIEWS);
-    await ensurePrivateDir(path.dirname(this.modelContextPath(workspaceId)));
-    await writeFileAtomic(
-      this.modelContextPath(workspaceId),
-      JSON.stringify({ version: 1, views: kept })
-    );
-    this.modelContexts.set(workspaceId, kept);
+    // Lock order: this queue, then the target lock. Nothing waits for the queue while holding
+    // a target lock, so the nesting cannot deadlock.
+    await withTargetMutationLock(this.rootDir, sessionDir, async () => {
+      // Fails closed: an unverifiable tombstone probe also refuses.
+      if (
+        this.rootDir !== null &&
+        (await isWorkspaceRemovalTombstoned(this.rootDir, workspaceId))
+      ) {
+        throw new Error(`Model context refused: workspace ${workspaceId} was removed`);
+      }
+      // A view only has a result record (required to write) in an existing session dir, so a
+      // missing dir means it was removed: refuse rather than recreate it.
+      try {
+        await fs.access(sessionDir);
+      } catch {
+        throw new Error(`Model context refused: workspace ${workspaceId} has no session`);
+      }
+      // Re-read inside the lock: another backend may have written since this one last read.
+      const others = (await this.getModelContexts(workspaceId)).filter(
+        (view) => view.toolCallId !== entry.toolCallId
+      );
+      const views = updated === null ? others : [updated, ...others];
+      const kept = views.slice(0, MCP_APP_MODEL_CONTEXT_MAX_VIEWS);
+      await writeFileAtomic(filePath, JSON.stringify({ version: 1, views: kept }));
+    });
   }
 
   private modelContextPath(workspaceId: string): string {

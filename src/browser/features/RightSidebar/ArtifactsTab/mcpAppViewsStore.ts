@@ -1,4 +1,5 @@
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { DisplayedMessage } from "@/common/types/message";
@@ -225,14 +226,64 @@ export function useMcpAppViews(workspaceId: string): readonly McpAppViewRef[] {
 }
 
 /**
+ * Lookups of views the loaded transcript lacks, by workspace and tool call: "pending" while the
+ * backend is asked, "missing" when it has no result record (or the lookup failed). A found view
+ * joins the session list (viewsByWorkspace) and its entry is dropped.
+ */
+const recordLookups = new Map<string, "pending" | "missing">();
+
+function lookUpViewRecord(api: APIClient, workspaceId: string, toolCallId: string) {
+  const key = `${workspaceId}\u0000${toolCallId}`;
+  if (recordLookups.has(key)) return;
+  recordLookups.set(key, "pending");
+  emit();
+  const settle = (view: McpAppViewRef | null) => {
+    if (view === null) {
+      recordLookups.set(key, "missing");
+    } else {
+      recordLookups.delete(key);
+      const current = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== toolCallId);
+      viewsByWorkspace.set(workspaceId, [...current, view]);
+    }
+    emit();
+  };
+  // Through a resolved promise, so a client that throws synchronously also settles as missing.
+  Promise.resolve()
+    .then(() => api.mcpApps.getViewRecord({ workspaceId, toolCallId }))
+    .then((result) => {
+      const record = result.success ? result.data : null;
+      settle(
+        record === null
+          ? null
+          : {
+              toolCallId,
+              serverName: record.serverName,
+              resourceUri: record.resourceUri,
+              toolName: record.toolName,
+              label: mcpToolDisplayName(record.toolName, { key: record.serverName }),
+              arguments: record.arguments ?? {},
+              // The record does not say how the call ended: a call without a result opens
+              // with "Result no longer available" instead of tool-cancelled.
+              cancelled: false,
+              failed: false,
+            }
+      );
+    })
+    .catch(() => settle(null));
+}
+
+/**
  * One view of the workspace: the ref, null when the workspace has no such view (any more), or
- * "loading" while the transcript is not loaded yet (a tab restored after a reload).
+ * "loading" while that is not known yet. A tab restored after a reload can name a call outside
+ * the loaded transcript (before a compaction boundary, or older than the first history page):
+ * once the transcript is loaded without it, the backend's result record decides.
  */
 export function useMcpAppView(
   workspaceId: string,
   toolCallId: string
 ): McpAppViewRef | null | "loading" {
   const store = useWorkspaceStoreRaw();
+  const { api } = useAPI();
   const views = useMcpAppViews(workspaceId);
   const loading = useSyncExternalStore(
     (listener) => store.subscribeKey(workspaceId, listener),
@@ -242,7 +293,16 @@ export function useMcpAppView(
       store.getWorkspaceState(workspaceId).isHydratingTranscript
   );
   const view = views.find((v) => v.toolCallId === toolCallId) ?? null;
-  return view ?? (loading ? "loading" : null);
+  const lookup = useSyncExternalStore(subscribe, () =>
+    recordLookups.get(`${workspaceId}\u0000${toolCallId}`)
+  );
+  const lookUp = view === null && !loading && toolCallId !== "" && api != null;
+  // Fetching from the backend is an external side effect, so an effect, not render.
+  useEffect(() => {
+    if (lookUp) lookUpViewRecord(api, workspaceId, toolCallId);
+  }, [lookUp, api, workspaceId, toolCallId]);
+  if (view !== null) return view;
+  return loading || (lookUp && lookup !== "missing") ? "loading" : null;
 }
 
 /**

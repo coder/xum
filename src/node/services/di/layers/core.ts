@@ -608,7 +608,10 @@ export const CoreWiringLive: Layer.Layer<
     // MCP Apps views (artifacts experiment): host-only raw results live in the session dir.
     mcpServerManager.setMcpApps({
       isEnabled: () => aiService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
-      store: new McpAppResultStore((workspaceId) => path.join(config.sessionsDir, workspaceId)),
+      store: new McpAppResultStore(
+        (workspaceId) => path.join(config.sessionsDir, workspaceId),
+        config.rootDir
+      ),
     });
     // Recorded prompt options can hold stale secret snapshots, so prompt refreshes
     // resolve credentials from current configuration.
