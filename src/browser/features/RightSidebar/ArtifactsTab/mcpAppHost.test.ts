@@ -145,6 +145,25 @@ describe("MCP Apps host router", () => {
     expect(t.initialized()).toBe(1);
   });
 
+  test("a second handshake on the same frame gets no tool-input or tool-result", async () => {
+    // In browser mode a page the frame navigated to posts from the same contentWindow until
+    // its load event; it must not get the call's arguments or result.
+    const t = setup({
+      onInitialized: () => {
+        t.host.sendToolInput({ secret: "args" });
+        t.host.sendToolResult({ content: [], structuredContent: { secret: "result" } });
+      },
+    });
+    const toolData = () =>
+      t.sent.filter((m) => String(m.method).startsWith("ui/notifications/tool-")).length;
+    for (const id of [1, 2]) {
+      await t.request(id, "ui/initialize", {});
+      await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    }
+    expect(t.reply(2)?.result).toBeDefined();
+    expect(toolData()).toBe(2);
+  });
+
   test("unknown methods get -32601 and malformed messages are rejected", async () => {
     const t = setup();
     for (const [id, method] of [

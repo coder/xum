@@ -211,14 +211,15 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   const allowServerRequest = createBridgeRateLimiter(TOOL_CALLS_PER_WINDOW, TOOL_CALL_WINDOW_MS);
   const pendingHostRequests = new Map<string, (ok: boolean) => void>();
   let nextHostRequestId = 1;
-  let initialized = false;
   /**
-   * A ui/initialize got its reply and its initialized has not come yet. Each handshake gets the
-   * lifecycle (tool-input, then tool-result or tool-cancelled): in a hybrid view the
-   * window.openai shim can connect first, and the view's own MCP Apps client must still get it.
-   * True at start, so the first initialized counts even without an initialize (as before).
+   * Set by the first initialized: the tool lifecycle (tool-input, then tool-result or
+   * tool-cancelled) goes out once per mounted frame. A later handshake on the same frame gets
+   * its initialize reply only: in browser mode a page the frame navigated to can still post
+   * from this contentWindow until its load event, and must not receive the call's data. A
+   * view's own MCP Apps client that connects after the window.openai shim gets the data from
+   * the shim, inside the page (mcpAppOpenAiShim.ts).
    */
-  let handshakePending = true;
+  let initialized = false;
   /** Whether the user allowed this mounted view's model context (ui/update-model-context). */
   let modelContextAllowed = false;
   /** The view's appCapabilities.availableDisplayModes; undefined when it declared none. */
@@ -288,7 +289,6 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         const context = options.getHostContext();
         const hostContext = { ...context, displayMode: viewMode(context.displayMode) };
         notifiedDisplayMode = hostContext.displayMode;
-        handshakePending = true;
         respond(id, {
           protocolVersion: MCP_APP_PROTOCOL_VERSION,
           hostInfo: { name: "xum", version: "1.0.0" },
@@ -456,8 +456,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   function handleNotification(method: string, params: unknown) {
     switch (method) {
       case "ui/notifications/initialized":
-        if (!handshakePending) return;
-        handshakePending = false;
+        if (initialized) return;
         initialized = true;
         options.onInitialized();
         return;
