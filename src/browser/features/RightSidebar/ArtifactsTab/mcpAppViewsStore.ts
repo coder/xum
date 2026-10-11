@@ -5,6 +5,7 @@ import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { DisplayedMessage } from "@/common/types/message";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
+import { MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolUtils";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
@@ -261,49 +262,88 @@ export function closeMcpAppView(workspaceId: string, toolCallId: string) {
 
 /**
  * Lookups of views the loaded transcript lacks, by workspace and tool call: "pending" while the
- * backend is asked, "missing" when it has no result record (or the lookup failed). A found view
- * joins the session list (viewsByWorkspace) and its entry is dropped.
+ * backend is asked, "missing" when it answered that it has no result record, "failed" when the
+ * request failed. Only "missing" is final: a failed lookup runs again the next time a tab asks
+ * (it remounts, or the API client reconnects). A found view joins the session list
+ * (viewsByWorkspace) and its entry is dropped.
  */
-const recordLookups = new Map<string, "pending" | "missing">();
+const recordLookups = new Map<string, "pending" | "missing" | "failed">();
+const lookupKey = (workspaceId: string, toolCallId: string) => `${workspaceId}\u0000${toolCallId}`;
+
+/**
+ * Lookups asked for in the current task, per workspace, sent as one getViewRecords request each
+ * at the next microtask: every tab of a restored layout mounts in one render, so one request
+ * covers all of them (one IPC call, not one per tab).
+ */
+const queuedLookups = new Map<string, { api: APIClient; toolCallIds: Set<string> }>();
 
 function lookUpViewRecord(api: APIClient, workspaceId: string, toolCallId: string) {
-  const key = `${workspaceId}\u0000${toolCallId}`;
-  if (recordLookups.has(key)) return;
-  recordLookups.set(key, "pending");
+  const state = recordLookups.get(lookupKey(workspaceId, toolCallId));
+  if (state === "pending" || state === "missing") return;
+  recordLookups.set(lookupKey(workspaceId, toolCallId), "pending");
   emit();
-  const settle = (view: McpAppViewRef | null) => {
-    if (view === null) {
-      recordLookups.set(key, "missing");
-    } else {
-      recordLookups.delete(key);
-      const current = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== toolCallId);
-      viewsByWorkspace.set(workspaceId, [...current, view]);
+  if (queuedLookups.size === 0) queueMicrotask(flushViewRecordLookups);
+  const queued = queuedLookups.get(workspaceId) ?? { api, toolCallIds: new Set<string>() };
+  queued.toolCallIds.add(toolCallId);
+  queuedLookups.set(workspaceId, queued);
+}
+
+function flushViewRecordLookups() {
+  const batches = [...queuedLookups];
+  queuedLookups.clear();
+  for (const [workspaceId, { api, toolCallIds }] of batches) {
+    const ids = [...toolCallIds];
+    for (let i = 0; i < ids.length; i += MCP_APP_VIEW_RECORDS_MAX_IDS) {
+      requestViewRecords(api, workspaceId, ids.slice(i, i + MCP_APP_VIEW_RECORDS_MAX_IDS));
     }
+  }
+}
+
+function requestViewRecords(api: APIClient, workspaceId: string, toolCallIds: string[]) {
+  const fail = () => {
+    for (const id of toolCallIds) recordLookups.set(lookupKey(workspaceId, id), "failed");
     emit();
   };
-  // Through a resolved promise, so a client that throws synchronously also settles as missing.
+  // Through a resolved promise, so a client that throws synchronously also counts as failed.
   Promise.resolve()
-    .then(() => api.mcpApps.getViewRecord({ workspaceId, toolCallId }))
+    .then(() => api.mcpApps.getViewRecords({ workspaceId, toolCallIds }))
     .then((result) => {
-      const record = result.success ? result.data : null;
-      settle(
-        record === null
-          ? null
-          : {
-              toolCallId,
-              serverName: record.serverName,
-              resourceUri: record.resourceUri,
-              toolName: record.toolName,
-              label: mcpToolDisplayName(record.toolName, { key: record.serverName }),
-              arguments: record.arguments ?? {},
-              // The record does not say how the call ended: a call without a result opens
-              // with "Result no longer available" instead of tool-cancelled.
-              cancelled: false,
-              failed: false,
-            }
-      );
+      if (!result.success) return fail();
+      const found: McpAppViewRef[] = [];
+      for (const { toolCallId, view } of result.data) {
+        if (!toolCallIds.includes(toolCallId)) continue;
+        if (view === null) {
+          recordLookups.set(lookupKey(workspaceId, toolCallId), "missing");
+          continue;
+        }
+        recordLookups.delete(lookupKey(workspaceId, toolCallId));
+        found.push({
+          toolCallId,
+          serverName: view.serverName,
+          resourceUri: view.resourceUri,
+          toolName: view.toolName,
+          label: mcpToolDisplayName(view.toolName, { key: view.serverName }),
+          arguments: view.arguments ?? {},
+          // The record does not say how the call ended: a call without a result opens with
+          // "Result no longer available" instead of tool-cancelled.
+          cancelled: false,
+          failed: false,
+        });
+      }
+      // An ID the answer left out was not looked up: it can be asked again.
+      for (const id of toolCallIds) {
+        if (recordLookups.get(lookupKey(workspaceId, id)) === "pending") {
+          recordLookups.set(lookupKey(workspaceId, id), "failed");
+        }
+      }
+      if (found.length > 0) {
+        const ids = new Set(found.map((v) => v.toolCallId));
+        const current = getMcpAppViews(workspaceId).filter((v) => !ids.has(v.toolCallId));
+        viewsByWorkspace.set(workspaceId, [...current, ...found]);
+      }
+      emit();
     })
-    .catch(() => settle(null));
+    .catch(fail);
 }
 
 /**
@@ -328,7 +368,7 @@ export function useMcpAppView(
   );
   const view = views.find((v) => v.toolCallId === toolCallId) ?? null;
   const lookup = useSyncExternalStore(subscribe, () =>
-    recordLookups.get(`${workspaceId}\u0000${toolCallId}`)
+    recordLookups.get(lookupKey(workspaceId, toolCallId))
   );
   const lookUp = view === null && !loading && toolCallId !== "" && api != null;
   // Fetching from the backend is an external side effect, so an effect, not render.
@@ -336,7 +376,8 @@ export function useMcpAppView(
     if (lookUp) lookUpViewRecord(api, workspaceId, toolCallId);
   }, [lookUp, api, workspaceId, toolCallId]);
   if (view !== null) return view;
-  return loading || (lookUp && lookup !== "missing") ? "loading" : null;
+  // A failed lookup shows as unavailable until it is retried.
+  return loading || (lookUp && lookup !== "missing" && lookup !== "failed") ? "loading" : null;
 }
 
 /**
