@@ -893,6 +893,72 @@ describe("MCPServerManager", () => {
     );
   });
 
+  test("settings for plugin hooks: a save during a slow hook read wins; a server disabled meanwhile is left out", async () => {
+    using tmp = new DisposableTempDir("mcp-hook-settings-race");
+    const pluginServer = (command: string, serverName: string) => ({
+      ...stdioConfig(command),
+      env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: path.join(tmp.path, "data") },
+      plugin: {
+        pluginName: "cad",
+        serverName,
+        sourceScope: "global" as const,
+        sourceLocation: "x",
+      },
+    });
+    configService.listServers.mockResolvedValue({
+      "plugin:abc:saved": pluginServer("hooks-race-saved", "saved"),
+      "plugin:abc:gone": pluginServer("hooks-race-gone", "gone"),
+    });
+    const pendingReads: Array<() => void> = [];
+    const settingsServer = () => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({
+          readTool: "s.read",
+          updateTool: "s.update",
+        }),
+        callSettingsTool: (name: string) => {
+          const result = (units: string): mcpSdk.MCPRawCallToolResult => ({
+            content: [],
+            structuredContent: {
+              schema: {
+                type: "object",
+                properties: { units: { type: "string", title: "Units" } },
+              },
+              values: { units },
+            },
+          });
+          if (name === "s.update") return Promise.resolve(result("in"));
+          return new Promise<mcpSdk.MCPRawCallToolResult>((resolve) =>
+            pendingReads.push(() => resolve(result("mm")))
+          );
+        },
+      },
+    });
+    servers.serve("hooks-race-saved", settingsServer());
+    servers.serve("hooks-race-gone", settingsServer());
+    const request = workspaceRequest("hooks-race-ws");
+    await manager.getToolsForWorkspace(request);
+
+    const hookSettings = manager.getSettingsForPluginHooks("hooks-race-ws", "plugin:abc:", 1000);
+    expect(pendingReads).toHaveLength(2);
+    // While both reads are in flight, the user saves one server and disables the other.
+    await manager.updateSettings(
+      "hooks-race-ws",
+      "plugin:abc:saved",
+      { units: "in" },
+      { units: { type: "string", title: "Units" } }
+    );
+    await manager.applyWorkspaceOverrides("hooks-race-ws", {
+      disabledServers: ["plugin:abc:gone"],
+    });
+    for (const settle of pendingReads.splice(0)) settle();
+
+    // The older read neither replaces the saved values nor reaches the hook.
+    expect(await hookSettings).toEqual({ saved: { units: "in" } });
+    expect(manager.getCachedSettings("hooks-race-ws", "plugin:abc:saved")).toEqual({ units: "in" });
+  });
+
   test("settings: a noStart read never starts or restarts the server", async () => {
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-nostart") });
     servers.serve("settings-nostart", {

@@ -4650,6 +4650,15 @@ export class MCPServerManager {
       }
       misses.push(
         this.readSettingsForHooks(instance, workspaceId, timeoutMs).then((values) => {
+          // Recheck after the await: a server disabled, removed or replaced meanwhile must not
+          // hand its settings to the hook.
+          const current = this.workspaceServers.get(workspaceId);
+          if (
+            current?.instances.get(name) !== instance ||
+            !current.enabledServerNames.has(name) ||
+            instance.isClosed
+          )
+            return;
           settings[pluginServerName] = values ?? {};
         })
       );
@@ -4676,6 +4685,10 @@ export class MCPServerManager {
             await this.callSettingsTool(instance, workspaceId, "readTool", {}, { timeoutMs })
           );
           if ("error" in parsed) throw new Error(parsed.error);
+          // A save (or dialog read) that finished while this read was in flight already cached
+          // newer values: keep them, and hand those to the hooks instead of this older read.
+          const newer = this.settingsCache.get(instance)?.get(workspaceId);
+          if (newer !== undefined) return newer;
           this.cacheSettings(instance, workspaceId, parsed.values);
           return parsed.values;
         } catch (error) {
