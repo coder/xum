@@ -197,6 +197,24 @@ export interface AssemblePromptPayloadOptions {
   workspaceId: string;
   /** Token budget: end each persisted user row with its session_history item ID. */
   tagHistoryItemIds?: boolean;
+  /**
+   * Request-only user-role context (MCP Apps model context), never persisted. It goes after the
+   * history and before the newest user row, or last when the request ends without one, so the
+   * cached prefix (system prompt and earlier turns) is unchanged when it changes. The provider
+   * transform (mergeConsecutiveUserMessages) merges it into the start of that user message.
+   */
+  requestContextMessage?: MuxMessage;
+}
+
+/** `history` with `context` before its trailing user message, or appended without one. */
+export function insertRequestContextMessage(
+  history: MuxMessage[],
+  context: MuxMessage | undefined
+): MuxMessage[] {
+  if (context === undefined) return history;
+  assert(context.role === "user", "request context must be a user-role message");
+  const last = history.at(-1);
+  return last?.role === "user" ? [...history.slice(0, -1), context, last] : [...history, context];
 }
 
 /**
@@ -245,10 +263,13 @@ export async function assemblePromptPayload(
     options.effectiveThinkingLevel
   );
   let messages = await prepareMessagesForProvider({
-    messagesWithSentinel: addInterruptedSentinel(
-      options.tagHistoryItemIds === true
-        ? tagUserRowsWithHistoryItemIds(prepared.providerRequestMessages)
-        : prepared.providerRequestMessages
+    messagesWithSentinel: insertRequestContextMessage(
+      addInterruptedSentinel(
+        options.tagHistoryItemIds === true
+          ? tagUserRowsWithHistoryItemIds(prepared.providerRequestMessages)
+          : prepared.providerRequestMessages
+      ),
+      options.requestContextMessage
     ),
     replayReceiptMessages: prepared.activeContextMessages,
     effectiveAgentId: options.effectiveAgentId,

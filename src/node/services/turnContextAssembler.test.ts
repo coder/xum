@@ -474,6 +474,41 @@ describe("assemblePromptPayload", () => {
       ...overrides,
     });
 
+  test("puts request context at the start of the newest user message, or last without one", async () => {
+    const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
+    const turns = [
+      createMuxMessage("u1", "user", "FIRST"),
+      createMuxMessage("a1", "assistant", "ANSWER"),
+    ];
+    const order = async (history: typeof turns) => {
+      const payload = await assemble({ history, requestContextMessage: context });
+      // Request-only: never part of the rows the request was built from.
+      expect(payload.providerRequestMessages.some((m) => m.id === "ctx")).toBe(false);
+      const wire = JSON.stringify(payload.messages);
+      return ["FIRST", "ANSWER", "VIEW-CONTEXT", "NEWEST"]
+        .filter((text) => wire.includes(text))
+        .sort((a, b) => wire.indexOf(a) - wire.indexOf(b));
+    };
+    expect(await order([...turns, createMuxMessage("u2", "user", "NEWEST")])).toEqual([
+      "FIRST",
+      "ANSWER",
+      "VIEW-CONTEXT",
+      "NEWEST",
+    ]);
+    // At the provider the two user rows are one message (mergeConsecutiveUserMessages): the
+    // context block first, then the user's text.
+    const merged = await assemble({
+      history: [...turns, createMuxMessage("u2", "user", "NEWEST")],
+      requestContextMessage: context,
+    });
+    expect(merged.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(JSON.stringify(merged.messages[2])).toContain("VIEW-CONTEXT\\nNEWEST");
+    expect(await order(turns)).toEqual(["FIRST", "ANSWER", "VIEW-CONTEXT"]);
+    const plain = await assemble({ history: turns });
+    const withContext = await assemble({ history: turns, requestContextMessage: context });
+    expect(withContext.system).toEqual(plain.system);
+  });
+
   test("replays tool_catalog_search results as tool references only for deferred tools", async () => {
     const history = [
       createMuxMessage("user", "user", "find it"),

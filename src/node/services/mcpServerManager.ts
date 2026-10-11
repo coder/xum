@@ -25,7 +25,11 @@ import {
   type MCPGetPromptResult,
   type MCPPrompt,
 } from "@/node/services/mcpClient";
-import type { McpAppResultRecord, McpAppResultStore } from "@/node/services/mcpAppResultStore";
+import type {
+  McpAppModelContext,
+  McpAppResultRecord,
+  McpAppResultStore,
+} from "@/node/services/mcpAppResultStore";
 import { extractMcpAppResource, type McpAppResource } from "@/node/services/mcpAppResource";
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
 import { isAppCallableTool, isMcpAppResourceUri, isModelVisibleTool } from "@/common/utils/mcpApps";
@@ -4604,6 +4608,12 @@ export class MCPServerManager {
       toolName: record.toolName,
       text,
     });
+  }
+
+  /** The views' latest model context, newest first; none while MCP Apps is off. */
+  async getMcpAppModelContexts(workspaceId: string): Promise<readonly McpAppModelContext[]> {
+    if (this.mcpApps?.isEnabled() !== true) return [];
+    return this.mcpApps.store.getModelContexts(workspaceId);
   }
 
   /** resources/read for an MCP Apps view, validated (mime, encoding, size). */
