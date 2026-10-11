@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  MAX_MCP_SETTINGS,
   parseMCPSettingsCapability,
   parseMCPSettingsReadResult,
   validateMCPSettingValue,
@@ -94,6 +95,28 @@ describe("parseMCPSettingsReadResult", () => {
     expect(result.values).toEqual({ code: "y", mode: "" });
     expect(result.properties.code).toEqual({ type: "string", title: "Code" });
     expect(result.warnings).toEqual([]);
+  });
+
+  test("bounds the settings and layout a server can send; excess settings count as dropped", () => {
+    const names = Array.from({ length: MAX_MCP_SETTINGS + 5 }, (_, i) => `s${i}`);
+    const result = parseMCPSettingsReadResult({
+      schema: {
+        type: "object",
+        properties: Object.fromEntries(names.map((n) => [n, { type: "boolean", title: n }])),
+      },
+      values: Object.fromEntries(names.map((n) => [n, true])),
+      layout: Array.from({ length: 30 }, (_, i) => ({
+        kind: "group",
+        title: `g${i}`,
+        items: Array.from({ length: 150 }, () => ({ kind: "tool", tool: "t" })),
+      })),
+    });
+    if ("error" in result) throw new Error(result.error);
+    expect(Object.keys(result.properties)).toHaveLength(MAX_MCP_SETTINGS);
+    expect(result.droppedSettingCount).toBe(5);
+    // 20 groups of at most 100 items, then "Other settings" for the ungrouped properties.
+    expect(result.layout).toHaveLength(21);
+    expect(Math.max(...result.layout.map((group) => group.items.length))).toBe(100);
   });
 
   test("a result without an object schema is an error", () => {

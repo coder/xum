@@ -46,6 +46,11 @@ export interface MCPSettingsSnapshot {
 
 const MAX_TEXT = 1024;
 const MAX_VALUE_LENGTH = 4096;
+// Collection bounds: the renderer mounts one control per setting, so a server must not be
+// able to send an unbounded schema or layout. Excess entries are dropped with one warning.
+export const MAX_MCP_SETTINGS = 100;
+const MAX_LAYOUT_GROUPS = 20;
+const MAX_GROUP_ITEMS = 100;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -183,7 +188,10 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
     return { error: "the settings schema has no 'properties' object" };
   const warnings: string[] = [];
   const properties: Record<string, MCPSettingSchema> = {};
-  for (const [name, schema] of Object.entries(raw.schema.properties)) {
+  const declared = Object.entries(raw.schema.properties);
+  if (declared.length > MAX_MCP_SETTINGS)
+    warnings.push(`Only the first ${MAX_MCP_SETTINGS} settings are shown; ignoring the rest`);
+  for (const [name, schema] of declared.slice(0, MAX_MCP_SETTINGS)) {
     const parsed = parseSchema(schema);
     if (parsed !== undefined) properties[name] = parsed;
     else warnings.push(`Setting '${name}' has an unsupported schema; ignoring it`);
@@ -196,13 +204,19 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
 
   const layout: MCPSettingsGroup[] = [];
   const placed = new Set<string>();
-  for (const group of Array.isArray(raw.layout) ? raw.layout : []) {
+  const groups: unknown[] = Array.isArray(raw.layout) ? raw.layout : [];
+  if (groups.length > MAX_LAYOUT_GROUPS)
+    warnings.push(`Only the first ${MAX_LAYOUT_GROUPS} layout groups are used; ignoring the rest`);
+  for (const group of groups.slice(0, MAX_LAYOUT_GROUPS)) {
     if (!isRecord(group) || group.kind !== "group" || !isNonBlank(group.title)) {
       warnings.push("A settings layout group is malformed; ignoring it");
       continue;
     }
     const items: MCPSettingsLayoutItem[] = [];
-    for (const item of Array.isArray(group.items) ? group.items : []) {
+    const rawItems: unknown[] = Array.isArray(group.items) ? group.items : [];
+    if (rawItems.length > MAX_GROUP_ITEMS)
+      warnings.push(`'${group.title}' lists more than ${MAX_GROUP_ITEMS} items; ignoring the rest`);
+    for (const item of rawItems.slice(0, MAX_GROUP_ITEMS)) {
       if (isRecord(item) && item.kind === "property" && typeof item.property === "string") {
         // Own properties only: "toString" or "constructor" must not resolve through the prototype.
         if (Object.hasOwn(properties, item.property) && !placed.has(item.property)) {
@@ -213,7 +227,9 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
         items.push({
           kind: "tool",
           tool: item.tool,
-          ...(typeof item.description === "string" ? { description: item.description } : {}),
+          ...(typeof item.description === "string" && item.description.length <= MAX_TEXT
+            ? { description: item.description }
+            : {}),
         });
       } else warnings.push(`A layout item in '${group.title}' is malformed; ignoring it`);
     }
