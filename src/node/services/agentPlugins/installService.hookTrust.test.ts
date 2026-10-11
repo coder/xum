@@ -220,6 +220,21 @@ describe("AgentPluginInstallService hook trust", () => {
     expect((await service.getHooks({ name: "guard" })).hooks[0]?.review).toBe("trusted");
   });
 
+  test("a trust decision replaces a symlinked trust file, never writes its target", async () => {
+    await install();
+    const [hook] = (await service.getHooks({ name: "guard" })).hooks;
+    const target = path.join(xumRoot, "victim.txt");
+    await fsPromises.writeFile(target, "keep me");
+    await fsPromises.mkdir(path.dirname(trustFile()), { recursive: true });
+    await fsPromises.symlink(target, trustFile());
+
+    await service.setHookTrust({ name: "guard", key: hook.key, hash: hook.hash, state: "trusted" });
+
+    expect(await fsPromises.readFile(target, "utf8")).toBe("keep me");
+    expect((await fsPromises.lstat(trustFile())).isFile()).toBe(true);
+    expect((await service.getHooks({ name: "guard" })).hooks[0]?.review).toBe("trusted");
+  });
+
   test("a malformed trust entry (a directory) does not block uninstall", async () => {
     await install();
     await fsPromises.mkdir(trustFile(), { recursive: true });
