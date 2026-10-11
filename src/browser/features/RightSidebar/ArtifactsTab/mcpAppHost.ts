@@ -67,12 +67,17 @@ const SizeChangedParams = z.object({
   width: z.number().finite().optional(),
   height: z.number().finite().optional(),
 });
-const LogParams = z.object({ level: z.string().max(32).optional(), data: z.unknown().optional() });
+const LogParams = z.object({
+  level: z.string().max(32).optional(),
+  data: z.unknown().optional(),
+});
 const ToolCallParams = z.object({
   name: z.string().min(1).max(256),
   arguments: z.record(z.string(), z.unknown()).optional(),
 });
-const ReadResourceParams = z.object({ uri: z.string().min(1).max(MCP_APP_READ_URI_MAX_CHARS) });
+const ReadResourceParams = z.object({
+  uri: z.string().min(1).max(MCP_APP_READ_URI_MAX_CHARS),
+});
 const OpenLinkParams = z.object({ url: z.string().max(4096) });
 const MESSAGE_TEXT_MAX_CHARS = 32_000;
 const TextBlock = z.object({ type: z.literal("text"), text: z.string() });
@@ -89,7 +94,9 @@ const MessageParams = z.object({
 });
 
 /** The message text, or null when a block is not text or the text is too long. */
-function messageText(content: z.infer<typeof MessageParams>["content"]): string | null {
+function messageText(
+  content: z.infer<typeof MessageParams>["content"],
+): string | null {
   const text = joinTextBlocks(Array.isArray(content) ? content : [content]);
   return text !== null && text.length <= MESSAGE_TEXT_MAX_CHARS ? text : null;
 }
@@ -115,20 +122,37 @@ const ModelContextParams = z.object({
  * JSON. Empty when the update has neither (it clears the view's context). Null when a block is
  * not text or the text exceeds the cap.
  */
-function modelContextText(params: z.infer<typeof ModelContextParams>): string | null {
+function modelContextText(
+  params: z.infer<typeof ModelContextParams>,
+): string | null {
   const text = joinTextBlocks(params.content ?? []);
   if (text === null) return null;
-  const structured =
-    params.structuredContent !== undefined ? JSON.stringify(params.structuredContent) : "";
-  const combined = [text, structured].filter((part) => part !== "").join("\n\n");
-  return new TextEncoder().encode(combined).length <= MCP_APP_MODEL_CONTEXT_MAX_BYTES
+  let structured = "";
+  if (params.structuredContent !== undefined) {
+    try {
+      structured = JSON.stringify(params.structuredContent);
+    } catch {
+      // postMessage's structured clone carries cyclic objects and BigInt; JSON cannot.
+      return null;
+    }
+  }
+  const combined = [text, structured]
+    .filter((part) => part !== "")
+    .join("\n\n");
+  return new TextEncoder().encode(combined).length <=
+    MCP_APP_MODEL_CONTEXT_MAX_BYTES
     ? combined
     : null;
 }
 
 export type McpAppConsentRequest =
   /** `args` are exactly what the backend receives once allowed, shown in the strip. */
-  | { kind: "tool"; toolName: string; serverName: string; args: Record<string, unknown> }
+  | {
+      kind: "tool";
+      toolName: string;
+      serverName: string;
+      args: Record<string, unknown>;
+    }
   /** `host` is the parsed host the link opens, shown in the strip ahead of the full URL. */
   | { kind: "link"; url: string; host: string }
   /** `text` is exactly what is added to the composer once accepted, shown in the strip. */
@@ -155,7 +179,7 @@ export interface McpAppHostOptions {
   callTool: (
     toolName: string,
     args: Record<string, unknown>,
-    consented: boolean
+    consented: boolean,
   ) => Promise<McpAppToolCallResult>;
   /** Backend resources/read, bound to the view's own server like callTool. */
   readResource: (uri: string) => Promise<unknown>;
@@ -170,11 +194,17 @@ export interface McpAppHostOptions {
 }
 
 export function clampMcpAppHeight(height: number): number {
-  return Math.min(MCP_APP_MAX_HEIGHT, Math.max(MCP_APP_MIN_HEIGHT, Math.round(height)));
+  return Math.min(
+    MCP_APP_MAX_HEIGHT,
+    Math.max(MCP_APP_MIN_HEIGHT, Math.round(height)),
+  );
 }
 
 export function createMcpAppHost(options: McpAppHostOptions) {
-  const allowServerRequest = createBridgeRateLimiter(TOOL_CALLS_PER_WINDOW, TOOL_CALL_WINDOW_MS);
+  const allowServerRequest = createBridgeRateLimiter(
+    TOOL_CALLS_PER_WINDOW,
+    TOOL_CALL_WINDOW_MS,
+  );
   const pendingHostRequests = new Map<string, (ok: boolean) => void>();
   let nextHostRequestId = 1;
   let initialized = false;
@@ -186,7 +216,11 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   const notify = (method: string, params: unknown) =>
     options.postToView({ jsonrpc: "2.0", method, params });
 
-  async function handleRequest(id: string | number, method: string, params: unknown) {
+  async function handleRequest(
+    id: string | number,
+    method: string,
+    params: unknown,
+  ) {
     switch (method) {
       case "ui/initialize":
         respond(id, {
@@ -208,18 +242,29 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         return;
       case "tools/call": {
         const parsed = ToolCallParams.safeParse(params);
-        if (!parsed.success) return fail(id, INVALID_PARAMS, "Invalid tools/call params");
+        if (!parsed.success)
+          return fail(id, INVALID_PARAMS, "Invalid tools/call params");
         if (!allowServerRequest())
-          return fail(id, REQUEST_FAILED, "Too many tool calls; try again shortly");
+          return fail(
+            id,
+            REQUEST_FAILED,
+            "Too many tool calls; try again shortly",
+          );
         const { name } = parsed.data;
         const args = parsed.data.arguments ?? {};
         options.log("tools/call", { name });
         try {
           let outcome = await options.callTool(name, args, false);
           if (outcome.status === "consent_required") {
-            const argsBytes = new TextEncoder().encode(JSON.stringify(args)).length;
+            const argsBytes = new TextEncoder().encode(
+              JSON.stringify(args),
+            ).length;
             if (argsBytes > MCP_APP_CONSENT_ARGS_MAX_BYTES) {
-              return fail(id, REQUEST_FAILED, "The tool arguments are too large to review");
+              return fail(
+                id,
+                REQUEST_FAILED,
+                "The tool arguments are too large to review",
+              );
             }
             const allowed = await options.requestConsent({
               kind: "tool",
@@ -227,44 +272,68 @@ export function createMcpAppHost(options: McpAppHostOptions) {
               serverName: options.serverName,
               args,
             });
-            if (!allowed) return fail(id, REQUEST_FAILED, "The user denied the tool call");
+            if (!allowed)
+              return fail(id, REQUEST_FAILED, "The user denied the tool call");
             outcome = await options.callTool(name, args, true);
           }
           if (outcome.status === "ok") return respond(id, outcome.result);
           return fail(
             id,
             REQUEST_FAILED,
-            outcome.status === "rejected" ? outcome.reason : "Tool call not allowed"
+            outcome.status === "rejected"
+              ? outcome.reason
+              : "Tool call not allowed",
           );
         } catch (error) {
-          return fail(id, REQUEST_FAILED, error instanceof Error ? error.message : String(error));
+          return fail(
+            id,
+            REQUEST_FAILED,
+            error instanceof Error ? error.message : String(error),
+          );
         }
       }
       case "resources/read": {
         const parsed = ReadResourceParams.safeParse(params);
-        if (!parsed.success) return fail(id, INVALID_PARAMS, "Invalid resources/read params");
+        if (!parsed.success)
+          return fail(id, INVALID_PARAMS, "Invalid resources/read params");
         if (!allowServerRequest())
-          return fail(id, REQUEST_FAILED, "Too many server requests; try again shortly");
+          return fail(
+            id,
+            REQUEST_FAILED,
+            "Too many server requests; try again shortly",
+          );
         options.log("resources/read", { uri: parsed.data.uri });
         try {
           // The request names only a URI: options.readResource is bound to this view's server,
           // so a view cannot read another server's resources.
           return respond(id, await options.readResource(parsed.data.uri));
         } catch (error) {
-          return fail(id, REQUEST_FAILED, error instanceof Error ? error.message : String(error));
+          return fail(
+            id,
+            REQUEST_FAILED,
+            error instanceof Error ? error.message : String(error),
+          );
         }
       }
       case "ui/update-model-context": {
         const parsed = ModelContextParams.safeParse(params);
         const text = parsed.success ? modelContextText(parsed.data) : null;
         if (text === null) {
-          return fail(id, INVALID_PARAMS, "Only text model context up to 16 KB is supported");
+          return fail(
+            id,
+            INVALID_PARAMS,
+            "Only text model context up to 16 KB is supported",
+          );
         }
         try {
           await options.updateModelContext(text);
           return respond(id, {});
         } catch (error) {
-          return fail(id, REQUEST_FAILED, error instanceof Error ? error.message : String(error));
+          return fail(
+            id,
+            REQUEST_FAILED,
+            error instanceof Error ? error.message : String(error),
+          );
         }
       }
       case "ui/open-link": {
@@ -281,10 +350,20 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         // Credentials disguise the real host (https://trusted.example@evil.example/ opens
         // evil.example), and this strip is the only gate before the OS opens the link.
         if (url.username !== "" || url.password !== "") {
-          return fail(id, INVALID_PARAMS, "Links with credentials cannot be opened");
+          return fail(
+            id,
+            INVALID_PARAMS,
+            "Links with credentials cannot be opened",
+          );
         }
         const href = url.toString();
-        if (!(await options.requestConsent({ kind: "link", url: href, host: url.host }))) {
+        if (
+          !(await options.requestConsent({
+            kind: "link",
+            url: href,
+            host: url.host,
+          }))
+        ) {
           return fail(id, REQUEST_FAILED, "The user declined to open the link");
         }
         options.openExternalLink(href);
@@ -294,7 +373,12 @@ export function createMcpAppHost(options: McpAppHostOptions) {
       case "ui/message": {
         const parsed = MessageParams.safeParse(params);
         const text = parsed.success ? messageText(parsed.data.content) : null;
-        if (text === null) return fail(id, INVALID_PARAMS, "Only user text messages are supported");
+        if (text === null)
+          return fail(
+            id,
+            INVALID_PARAMS,
+            "Only user text messages are supported",
+          );
         // Never inserted unasked (the user may be typing) and never sent: the user confirms the
         // insert in the host strip, then reviews and sends it from the composer.
         if (!(await options.requestConsent({ kind: "message", text }))) {
@@ -320,7 +404,9 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         const parsed = SizeChangedParams.safeParse(params);
         if (!parsed.success) return;
         options.onSizeChanged({
-          ...(parsed.data.width !== undefined ? { width: Math.max(0, parsed.data.width) } : {}),
+          ...(parsed.data.width !== undefined
+            ? { width: Math.max(0, parsed.data.width) }
+            : {}),
           ...(parsed.data.height !== undefined
             ? { height: clampMcpAppHeight(parsed.data.height) }
             : {}),
@@ -330,7 +416,10 @@ export function createMcpAppHost(options: McpAppHostOptions) {
       case "notifications/message": {
         const parsed = LogParams.safeParse(params);
         if (parsed.success)
-          options.log(`view log (${parsed.data.level ?? "info"})`, parsed.data.data);
+          options.log(
+            `view log (${parsed.data.level ?? "info"})`,
+            parsed.data.data,
+          );
         return;
       }
       default:
@@ -344,7 +433,11 @@ export function createMcpAppHost(options: McpAppHostOptions) {
     handleMessage(data: unknown): Promise<void> {
       const request = JsonRpcRequestSchema.safeParse(data);
       if (request.success) {
-        return handleRequest(request.data.id, request.data.method, request.data.params);
+        return handleRequest(
+          request.data.id,
+          request.data.method,
+          request.data.params,
+        );
       }
       const response = JsonRpcResponseSchema.safeParse(data);
       if (response.success && typeof response.data.id === "string") {
@@ -362,7 +455,8 @@ export function createMcpAppHost(options: McpAppHostOptions) {
       }
       // Malformed: answer only when there is an id to answer.
       const id = IdSchema.safeParse((data as { id?: unknown } | null)?.id);
-      if (id.success) fail(id.data, INVALID_REQUEST, "Invalid JSON-RPC message");
+      if (id.success)
+        fail(id.data, INVALID_REQUEST, "Invalid JSON-RPC message");
       options.log("rejected malformed message");
       return Promise.resolve();
     },

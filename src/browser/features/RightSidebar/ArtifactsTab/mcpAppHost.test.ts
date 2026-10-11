@@ -337,4 +337,14 @@ describe("MCP Apps host router", () => {
     expect(t.reply(4)?.result).toEqual({});
     expect(t.modelContexts).toHaveLength(1);
   });
+
+  test("update-model-context answers -32602 for structured content JSON cannot encode", async () => {
+    const t = setup();
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    await t.request(1, "ui/update-model-context", { structuredContent: cyclic });
+    await t.request(2, "ui/update-model-context", { structuredContent: { count: BigInt(3) } });
+    for (const id of [1, 2]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
+    expect(t.modelContexts).toEqual([]);
+  });
 });
