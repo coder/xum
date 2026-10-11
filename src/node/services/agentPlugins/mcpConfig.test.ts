@@ -200,6 +200,8 @@ describe("loadPluginMcpServers", () => {
       expect(Object.values(servers).map((s) => s.transport)).toEqual(["http", "http"]);
       const messages = diagnostics.map((d) => d.message);
       expect(messages).toHaveLength(2);
+      // Messages name the real file, not mcp.json.
+      expect(messages.every((message) => message.startsWith(".mcp.json server '"))).toBe(true);
       expect(messages[0]).toMatch(/'notion'.*ignores: resource$/);
       expect(messages[1]).toMatch(
         /'github'.*ignores: oauth\.client_secret, oauth\.callback_port, client\.mode: provided, client\.clientId$/

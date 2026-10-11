@@ -546,6 +546,9 @@ export async function loadPluginMcpServers(
 
   const diagnostics: AgentPluginDiagnostic[] = [];
   const servers: Record<string, MCPServerInfo> = {};
+  // Name the real file (mcp.json, the Codex .mcp.json fallback, or a
+  // contributes.mcp path) in every message.
+  const fileLabel = path.basename(plugin.mcpConfigPath);
 
   const disableMcp = (message: string): LoadPluginMcpServersResult => {
     log.warn(`Agent plugin ${plugin.rootPath}: ${message}`);
@@ -575,7 +578,7 @@ export async function loadPluginMcpServers(
         filePath: plugin.mcpConfigPath,
         pluginRoot: plugin.rootPath,
         maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
-        label: "mcp.json",
+        label: fileLabel,
       })
     ).content;
   } catch (error) {
@@ -586,11 +589,11 @@ export async function loadPluginMcpServers(
     raw = JSON.parse(text) as unknown;
   } catch (error) {
     // §7.2.2 rule 2: invalid JSON disables MCP for this plugin only.
-    return disableMcp(`mcp.json is not valid JSON: ${getErrorMessage(error)}`);
+    return disableMcp(`${fileLabel} is not valid JSON: ${getErrorMessage(error)}`);
   }
 
   if (!isPlainObject(raw)) {
-    return disableMcp("mcp.json must be a JSON object");
+    return disableMcp(`${fileLabel} must be a JSON object`);
   }
 
   // Codex packages ship `.mcp.json` in their own dialect (no `$schema`,
@@ -602,7 +605,7 @@ export async function loadPluginMcpServers(
   // Closed top-level: exactly { $schema, mcpServers }, both required (§7.2.1).
   for (const key of Object.keys(raw)) {
     if (key !== "$schema" && key !== "mcpServers") {
-      return disableMcp(`mcp.json has unknown top-level field '${key}'`);
+      return disableMcp(`${fileLabel} has unknown top-level field '${key}'`);
     }
   }
   if (
@@ -613,11 +616,11 @@ export async function loadPluginMcpServers(
     // unsupported version or a version mismatch with plugin.json — both
     // disable MCP for this plugin (§7.2.2 rule 2).
     return disableMcp(
-      `mcp.json '$schema' must be '${AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0}' (matching plugin.json's Agent Plugins version)`
+      `${fileLabel} '$schema' must be '${AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0}' (matching plugin.json's Agent Plugins version)`
     );
   }
   if (!isPlainObject(raw.mcpServers)) {
-    return disableMcp("mcp.json 'mcpServers' is required and must be an object");
+    return disableMcp(`${fileLabel} 'mcpServers' is required and must be an object`);
   }
 
   const instanceId = ctx.instanceId ?? computePluginInstanceId(plugin.rootPath);
@@ -636,7 +639,7 @@ export async function loadPluginMcpServers(
     )
       continue;
     const reportEntry = (severity: "warning" | "error", message: string): void => {
-      const fullMessage = `mcp.json server '${serverName}': ${message}; skipping this server`;
+      const fullMessage = `${fileLabel} server '${serverName}': ${message}; skipping this server`;
       log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);
       diagnostics.push({
         path: plugin.mcpConfigPath!,
@@ -688,7 +691,7 @@ export async function loadPluginMcpServers(
           `Xum's MCP OAuth uses discovery and dynamic client registration, so it ignores: ${ignored.join(", ")}`
         );
       for (const message of messages) {
-        const fullMessage = `mcp.json server '${serverName}': ${message}`;
+        const fullMessage = `${fileLabel} server '${serverName}': ${message}`;
         log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);
         diagnostics.push({
           path: plugin.mcpConfigPath,
