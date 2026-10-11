@@ -7,7 +7,7 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
 import { buildMcpAppCsp, MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
 import { createMcpAppHost, type McpAppConsentRequest } from "./mcpAppHost";
-import { MCP_APP_OPENAI_SHIM_SCRIPT } from "./mcpAppOpenAiShim";
+import { mcpAppOpenAiShimScript } from "./mcpAppOpenAiShim";
 
 interface OpenAi {
   toolOutput: unknown;
@@ -16,6 +16,7 @@ interface OpenAi {
   locale: string;
   callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
   sendFollowUpMessage(args: { prompt: string }): Promise<void>;
+  setWidgetState(state: unknown): Promise<void>;
 }
 type ViewWindow = Window & {
   openai: OpenAi;
@@ -26,10 +27,10 @@ type ViewWindow = Window & {
 const GRANTED = { resourceDomains: [], connectDomains: [] };
 
 /** The document McpAppFrame builds: CSP meta, preamble, shim, then the view. */
-function viewDocument(viewHtml: string): string {
+function viewDocument(viewHtml: string, widgetState: string | null = null): string {
   return finalizeSandboxedDocument(parseArtifactHtml(viewHtml), {
     csp: buildMcpAppCsp(GRANTED),
-    bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, MCP_APP_OPENAI_SHIM_SCRIPT],
+    bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, mcpAppOpenAiShimScript(widgetState)],
   });
 }
 
@@ -41,7 +42,12 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
  */
 async function runView(
   viewScript: string,
-  options: { consent?: boolean; beforeLoad?: (win: Window) => void } = {}
+  options: {
+    consent?: boolean;
+    beforeLoad?: (win: Window) => void;
+    /** The view's stored widget state (JSON), as McpAppFrame passes it. */
+    widgetState?: string;
+  } = {}
 ) {
   const win = new Window({
     settings: {
@@ -59,6 +65,7 @@ async function runView(
   const consents: McpAppConsentRequest[] = [];
   const composer: string[] = [];
   const calls: Array<{ toolName: string; args: unknown }> = [];
+  const savedStates: string[] = [];
   const parent = {
     postMessage: (message: { method?: string; params?: unknown }) => {
       posted.push(message);
@@ -89,6 +96,7 @@ async function runView(
     readResource: () => Promise.reject(new Error("unused")),
     updateModelContext: () => Promise.resolve(),
     setDisplayMode: () => null,
+    saveWidgetState: (json) => savedStates.push(json),
     requestConsent: (request) => {
       consents.push(request);
       return Promise.resolve(options.consent ?? true);
@@ -104,10 +112,13 @@ async function runView(
   });
   options.beforeLoad?.(win);
   win.document.write(
-    viewDocument(`<html><head></head><body><script>${viewScript}</script></body></html>`)
+    viewDocument(
+      `<html><head></head><body><script>${viewScript}</script></body></html>`,
+      options.widgetState
+    )
   );
   for (let i = 0; i < 5; i++) await tick();
-  return { win, host, posted, consents, composer, calls, warnings };
+  return { win, host, posted, consents, composer, calls, warnings, savedStates };
 }
 
 const COLLECT_EVENTS = `window.events = [];
@@ -188,7 +199,30 @@ describe("window.openai shim", () => {
     expect(t.win.done).toBe(true);
     expect((t.win as unknown as { widget: unknown }).widget).toBeNull();
     expect((t.win as unknown as { picker: unknown }).picker).toBe("own input");
-    expect(t.warnings).toHaveLength(4);
+    expect(t.warnings).toHaveLength(3);
+  });
+
+  test("widget state is stored at once, reaches the host, and starts the next mount", async () => {
+    // A string that would end the shim's script element if it were not escaped.
+    const state = { selected: "</script><b>x</b>", n: 3 };
+    const t = await runView(`
+      window.openai.setWidgetState({ n: 1 });
+      window.openai.setWidgetState(${JSON.stringify(state).replace(/</g, "\\u003c")});
+      window.read = window.openai.widgetState;`);
+    expect((t.win as unknown as { read: unknown }).read).toEqual(state);
+    // The host hears it once (the latest), after the flush delay.
+    expect(t.savedStates).toEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(t.savedStates.map((json) => JSON.parse(json) as unknown)).toEqual([state]);
+    // A teardown sends the state that has not gone out yet, before the shim's reply.
+    void t.win.openai.setWidgetState({ n: 4 });
+    await t.host.teardown("unmount");
+    expect(JSON.parse(t.savedStates.at(-1)!)).toEqual({ n: 4 });
+    // The next mount reads it at load, before any host message.
+    const again = await runView(`window.first = window.openai.widgetState;`, {
+      widgetState: JSON.stringify(state),
+    });
+    expect((again.win as unknown as { first: unknown }).first).toEqual(state);
   });
 
   test("a view that redefines window.openai, before or after load, keeps rendering", async () => {
@@ -199,9 +233,7 @@ describe("window.openai shim", () => {
     expect(before.win.done).toBe(true);
     // After load: the shim keeps its own references, so the event still fires.
     const after = await runView(`${COLLECT_EVENTS} window.openai.toolOutput; window.openai = {};`);
-    expect(after.win.events).toContainEqual(
-      expect.objectContaining({ toolOutput: { dice: [3, 5] } })
-    );
+    expect(after.win.events.find((e) => "toolOutput" in e)?.toolOutput).toEqual({ dice: [3, 5] });
   });
 
   test("the CSP allows the shim, and runs it before any CSP the view adds", () => {

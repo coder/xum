@@ -12,6 +12,7 @@ import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils"
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
+import { MCP_APP_WIDGET_STATE_MAX_BYTES } from "./mcpAppHost";
 import { McpAppFrame } from "./McpAppFrame";
 import { markMcpAppViewHosted, type McpAppViewRef } from "./mcpAppViewsStore";
 
@@ -544,6 +545,59 @@ describe("McpAppFrame host strips", () => {
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, onInsert);
     }
+  });
+
+  test("a view mounted again starts with the widget state it stored", async () => {
+    const mount = async () => {
+      const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+        wrapper: Wrapper,
+      });
+      return (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    };
+    const first = await mount();
+    expect(first.getAttribute("srcdoc")).toContain("widgetState: null");
+    postFromView(first, {
+      jsonrpc: "2.0",
+      method: "xum/notifications/widget-state",
+      params: { state: { picked: "call-1 state" } },
+    });
+    cleanup();
+    // Collapsed and expanded again: the new document carries the state.
+    const second = await mount();
+    expect(second.getAttribute("srcdoc")).toContain('widgetState: {"picked":"call-1 state"}');
+  });
+
+  const mountView = async (workspaceId: string, view: McpAppViewRef = VIEW) => {
+    const rendered = render(
+      <McpAppFrame workspaceId={workspaceId} view={view} variant="inline" />,
+      {
+        wrapper: Wrapper,
+      }
+    );
+    return (await rendered.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+  };
+  const sendWidgetState = (frame: HTMLIFrameElement, params: Record<string, unknown>) =>
+    postFromView(frame, { jsonrpc: "2.0", method: "xum/notifications/widget-state", params });
+
+  test("a widget state over the size cap is not stored; the earlier one stays", async () => {
+    const frame = await mountView("ws-cap");
+    sendWidgetState(frame, { state: { kept: 1 } });
+    sendWidgetState(frame, { state: { big: "x".repeat(MCP_APP_WIDGET_STATE_MAX_BYTES) } });
+    cleanup();
+    const again = await mountView("ws-cap");
+    expect(again.getAttribute("srcdoc")).toContain('widgetState: {"kept":1}');
+  });
+
+  test("widget state goes under the frame's own view, never a key named in the message", async () => {
+    const frame = await mountView("ws-key");
+    sendWidgetState(frame, { workspaceId: "ws-key", toolCallId: "call-2", state: { mine: 1 } });
+    cleanup();
+    // The other view starts empty; the sender gets its own state back.
+    const other = await mountView("ws-key", { ...VIEW, toolCallId: "call-2" });
+    expect(other.getAttribute("srcdoc")).toContain("widgetState: null");
+    cleanup();
+    const own = await mountView("ws-key");
+    expect(own.getAttribute("srcdoc")).toContain('widgetState: {"mine":1}');
   });
 
   test("fullscreen from the card moves the view to its tab; inline from the tab closes it", async () => {
