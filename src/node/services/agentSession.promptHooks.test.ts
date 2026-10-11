@@ -9,6 +9,7 @@ import assert from "node:assert";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { computeSendDigest } from "./sendIds";
+import { waitForCondition } from "./testDispatchHelpers";
 import { eventSpine, type MessageSendContext } from "./events/eventSpine";
 import type { CompactionMonitor } from "./compactionMonitor";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
@@ -159,6 +160,25 @@ describe("message.send outcomes", () => {
 
     expect(result.success).toBe(true);
     expect(calls).toEqual([]);
+  });
+
+  test("user text queued behind a /compact still reaches the hooks", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rNISe): the queue joins later texts into the open compaction
+    // entry and keeps its compaction metadata, so skipping compaction requests skipped them too.
+    const { h, calls, streamed } = await setup(blockAll);
+    const compaction = { type: "compaction-request", rawCommand: "/compact", parsed: {} };
+    h.session.queueMessage("Summarize this conversation.", { ...options, muxMetadata: compaction });
+    h.session.queueMessage("deploy to prod", options);
+
+    h.session.drainQueuedMessagesIfIdle();
+    await waitForCondition(
+      () => streamed.length > 0 || h.events.some((event) => event.type === "stream-error")
+    );
+
+    // Only the separately sent text reaches the hook: the compaction prompt never does.
+    expect(calls).toEqual([{ text: "deploy to prod", origin: "user" }]);
+    expect(await userRows(h)).toEqual([]);
+    expect(streamed).toEqual([]);
   });
 
   test("each send kind reaches the hook with its origin", async () => {
