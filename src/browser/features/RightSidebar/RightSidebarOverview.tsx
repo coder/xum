@@ -1,32 +1,53 @@
 import React from "react";
 import {
-  GitCompare,
+  FileText,
   HeartPulse,
   MessageCircle,
   PanelRightOpen,
   Plus,
+  Sparkles,
   SquareTerminal,
-  Target,
-  Workflow,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { ArtifactEntry } from "@/common/orpc/schemas/artifacts";
 import { goalActiveMode, isGoalPendingPersistence, type GoalSnapshot } from "@/common/types/goal";
-import { formatHeartbeatInterval } from "@/constants/heartbeat";
+import { hasGoalBudgetLimit } from "@/common/utils/goals/budgetPricing";
+import {
+  formatCostWithDollar,
+  getTotalCost,
+  sumUsageHistory,
+  type ChatUsageDisplay,
+} from "@/common/utils/tokens/usageAggregator";
+import { formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
+import { formatHeartbeatIntervalShort } from "@/constants/heartbeat";
 import { SIDE_CHAT_INITIAL_TITLE } from "@/constants/workspaceDefaults";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
+import { useOptionalAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
+import {
+  formatGoalBudgetSummary,
+  formatGoalTurns,
+} from "@/browser/features/Tools/Goal/goalToolUtils";
 import { useGitStatus } from "@/browser/stores/GitStatusStore";
-import { useOptionalWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import {
+  useOptionalWorkspaceSidebarState,
+  useWorkspaceUsage,
+  workspaceStore,
+} from "@/browser/stores/WorkspaceStore";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { makeSideChatTabType, type TabType } from "@/browser/types/rightSidebar";
+import { openArtifact } from "./ArtifactsTab/openArtifact";
+import { openMcpAppView, useMcpAppViews } from "./ArtifactsTab/mcpAppViewsStore";
+import { TAB_ICONS } from "./Tabs/tabIcons";
 
 /**
- * Side chats listed before the card collapses the rest into one row. The card floats over the
- * chat, so every list in it is capped to keep its footprint bounded.
+ * Rows a list section (side chats, outputs) shows before folding the rest into one "N more"
+ * row. The card floats over the chat, so every list in it is capped to keep it bounded.
  */
-export const OVERVIEW_MAX_SIDE_CHATS = 3;
+export const OVERVIEW_MAX_LIST_ROWS = 3;
 
 interface RightSidebarOverviewProps {
   workspaceId: string;
@@ -37,6 +58,10 @@ interface RightSidebarOverviewProps {
   /** Start a side chat; absent where side chats cannot start (a side chat itself). */
   onNewSideChat?: () => void;
   creatingSideChat: boolean;
+  /** The Artifacts experiment is on, so the card lists the newest outputs. */
+  artifactsEnabled: boolean;
+  /** Agent-flagged review hunks the user has not read (the Review tab's attention cue). */
+  unreadAssisted: number;
 }
 
 /** Side chats of this workspace, newest first. */
@@ -65,17 +90,46 @@ function getGoalStatus(goal: GoalSnapshot): { label: string; className?: string 
   }
 }
 
+/** The goal's spend and turns against its limits; null when it has neither limit. */
+function getGoalLimits(goal: GoalSnapshot): string | null {
+  const parts: string[] = [];
+  if (hasGoalBudgetLimit(goal.budgetCents)) {
+    parts.push(formatGoalBudgetSummary(goal.costCents, goal.budgetCents));
+  }
+  if (goal.turnCap != null) parts.push(formatGoalTurns(goal.turnsUsed, goal.turnCap));
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/** Session cost and tokens, as the Stats tab totals them (persisted session plus live stream). */
+function useSessionStats(workspaceId: string): { cost?: number; tokens: number } | null {
+  const usage = useWorkspaceUsage(workspaceId);
+  const parts: ChatUsageDisplay[] = [];
+  if (usage.sessionTotal) parts.push(usage.sessionTotal);
+  if (usage.liveCostUsage) parts.push(usage.liveCostUsage);
+  const total = parts.length > 0 ? sumUsageHistory(parts) : undefined;
+  if (total == null) return null;
+  const tokens =
+    total.input.tokens +
+    total.cached.tokens +
+    total.cacheCreate.tokens +
+    total.output.tokens +
+    total.reasoning.tokens;
+  return { cost: getTotalCost(total), tokens };
+}
+
 /**
  * What the collapsed right sidebar shows instead of a bare rail (Codex desktop style): a small
- * card over the chat's top-right corner that summarizes the workspace (goal, changes, side
- * chats, running work, heartbeat) and jumps to the matching sidebar tab. Sections without
- * content are left out, so the card stays as small as the workspace allows.
+ * card over the chat's top-right corner with the gist of each sidebar tab (stats, goal, changes,
+ * outputs, side chats, running work, heartbeat); each row reopens the sidebar on its tab. Only
+ * data is shown, no explanatory copy, and sections without data are left out, so the card
+ * stays as small as the workspace allows.
  */
 export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props) => {
   const { workspaceMetadata } = useWorkspaceMetadata();
   const metadata = workspaceMetadata.get(props.workspaceId) ?? null;
   const sidebarState = useOptionalWorkspaceSidebarState(props.workspaceId);
   const gitStatus = useGitStatus(props.workspaceId);
+  const stats = useSessionStats(props.workspaceId);
 
   const goal = sidebarState?.goal ?? null;
   const goalStatus = goal != null ? getGoalStatus(goal) : null;
@@ -84,23 +138,35 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
   const branch =
     gitStatus != null && gitStatus.branch.length > 0 ? gitStatus.branch : metadata?.name;
   const sideChats = getOverviewSideChats(workspaceMetadata, props.workspaceId);
-  const hiddenSideChatCount = Math.max(0, sideChats.length - OVERVIEW_MAX_SIDE_CHATS);
   const showSideChats = sideChats.length > 0 || props.onNewSideChat != null;
-  const runningTerminals = sidebarState?.terminalActiveCount ?? 0;
-  const runningWorkflows = sidebarState?.activeWorkflowRunCount ?? 0;
+  const workflowRuns = sidebarState?.activeWorkflowRunCount ?? 0;
+  const terminals = sidebarState?.terminalSessionCount ?? 0;
   const heartbeat = metadata?.heartbeat?.enabled === true ? metadata.heartbeat : null;
+  const showActivity = workflowRuns > 0 || terminals > 0 || heartbeat != null;
 
   return (
     <div className="divide-border-light flex flex-col divide-y px-3 pb-1.5 text-xs">
-      <div className="flex items-center justify-between gap-2 py-2">
-        <span className="text-muted text-[11px] font-medium">Overview</span>
+      {/* Stats lead the card (the Stats tab's session totals) and share a row with Expand. */}
+      <div className="flex items-center gap-2 py-1.5">
+        {stats != null ? (
+          <OverviewRow
+            Icon={TAB_ICONS.costs}
+            label={
+              stats.cost != null ? formatCostWithDollar(stats.cost) : formatTokens(stats.tokens)
+            }
+            detail={stats.cost != null && `${formatTokens(stats.tokens)} tokens`}
+            onClick={() => props.onOpenTab("costs")}
+          />
+        ) : (
+          <span className="flex-1" />
+        )}
         <Tooltip>
           <TooltipTrigger asChild>
             <button
               type="button"
               aria-label="Expand sidebar"
               onClick={props.onExpand}
-              className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent -mr-1 flex h-6 w-6 items-center justify-center rounded-md focus-visible:ring-1"
+              className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent -mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-md focus-visible:ring-1"
             >
               <PanelRightOpen className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
@@ -112,9 +178,10 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
       {goal != null && goalStatus != null && (
         <OverviewSection title="Goal">
           <OverviewRow
-            Icon={Target}
+            Icon={TAB_ICONS.goal}
             label={goal.objective}
             detail={<span className={goalStatus.className}>{goalStatus.label}</span>}
+            sub={getGoalLimits(goal)}
             onClick={() => props.onOpenTab("goal")}
           />
         </OverviewSection>
@@ -123,23 +190,36 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
       {hasRepository && (
         <OverviewSection title={branch ?? "Changes"}>
           <OverviewRow
-            Icon={GitCompare}
+            Icon={TAB_ICONS.review}
             label="Changes"
             detail={
               gitStatus != null && (
-                <span className="counter-nums flex gap-1.5">
+                <span className="counter-nums flex items-center gap-1.5">
                   <span className="text-success-light">
                     +{gitStatus.outgoingAdditions.toLocaleString()}
                   </span>
                   <span className="text-danger-light">
                     -{gitStatus.outgoingDeletions.toLocaleString()}
                   </span>
+                  {props.unreadAssisted > 0 && (
+                    <span
+                      className="text-review-accent inline-flex items-center gap-0.5"
+                      aria-label={`${props.unreadAssisted} unread agent-flagged hunk${props.unreadAssisted === 1 ? "" : "s"}`}
+                    >
+                      <Sparkles className="h-3 w-3" aria-hidden="true" />
+                      {props.unreadAssisted}
+                    </span>
+                  )}
                 </span>
               )
             }
             onClick={() => props.onOpenTab("review")}
           />
         </OverviewSection>
+      )}
+
+      {props.artifactsEnabled && (
+        <OverviewOutputs workspaceId={props.workspaceId} onOpenTab={props.onOpenTab} />
       )}
 
       {showSideChats && (
@@ -164,88 +244,162 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
             )
           }
         >
-          {sideChats.length === 0 ? (
-            <p className="text-muted px-1.5 py-1">
-              Ask a side question without derailing this chat
-            </p>
-          ) : (
-            <>
-              {sideChats.slice(0, OVERVIEW_MAX_SIDE_CHATS).map((sideChat) => (
-                <OverviewRow
-                  key={sideChat.id}
-                  Icon={MessageCircle}
-                  label={
-                    sideChat.title != null && sideChat.title.length > 0
-                      ? sideChat.title
-                      : SIDE_CHAT_INITIAL_TITLE
-                  }
-                  onClick={() => props.onOpenTab(makeSideChatTabType(sideChat.id))}
-                />
-              ))}
-              {hiddenSideChatCount > 0 && (
-                <OverviewRow label={`${hiddenSideChatCount} more`} muted onClick={props.onExpand} />
-              )}
-            </>
-          )}
+          {sideChats.slice(0, OVERVIEW_MAX_LIST_ROWS).map((sideChat) => (
+            <OverviewRow
+              key={sideChat.id}
+              Icon={MessageCircle}
+              label={
+                sideChat.title != null && sideChat.title.length > 0
+                  ? sideChat.title
+                  : SIDE_CHAT_INITIAL_TITLE
+              }
+              onClick={() => props.onOpenTab(makeSideChatTabType(sideChat.id))}
+            />
+          ))}
+          <MoreRow count={sideChats.length - OVERVIEW_MAX_LIST_ROWS} onClick={props.onExpand} />
         </OverviewSection>
       )}
 
-      {(runningTerminals > 0 || runningWorkflows > 0) && (
-        <OverviewSection title="Running">
-          {runningWorkflows > 0 && (
+      {showActivity && (
+        // Each row names itself, so this group needs no visible heading.
+        <OverviewSection title="Activity" showTitle={false}>
+          {workflowRuns > 0 && (
             <OverviewRow
-              Icon={Workflow}
+              Icon={TAB_ICONS.workflows}
               label="Workflows"
-              detail={<span className="counter-nums">{runningWorkflows}</span>}
+              detail={<span className="counter-nums">{workflowRuns}</span>}
               onClick={() => props.onOpenTab("workflows")}
             />
           )}
-          {runningTerminals > 0 && (
+          {terminals > 0 && (
             <OverviewRow
               Icon={SquareTerminal}
               label="Terminals"
-              detail={<span className="counter-nums">{runningTerminals}</span>}
+              detail={<span className="counter-nums">{terminals}</span>}
               onClick={props.onExpand}
             />
           )}
-        </OverviewSection>
-      )}
-
-      {heartbeat != null && (
-        <OverviewSection title="Scheduled">
-          <OverviewRow
-            Icon={HeartPulse}
-            label="Heartbeat"
-            detail={
-              heartbeat.intervalMs != null &&
-              `Every ${formatHeartbeatInterval(heartbeat.intervalMs)}`
-            }
-          />
+          {heartbeat != null && (
+            <OverviewRow
+              Icon={HeartPulse}
+              label="Heartbeat"
+              detail={
+                heartbeat.intervalMs != null &&
+                `Every ${formatHeartbeatIntervalShort(heartbeat.intervalMs)}`
+              }
+            />
+          )}
         </OverviewSection>
       )}
     </div>
   );
 };
 
+/**
+ * The Artifacts tab's newest files and app views. Listed once when the card shows, then again
+ * after the agent's file edits; the card is a glance, so it skips the tab's polling.
+ */
+const OverviewOutputs: React.FC<{
+  workspaceId: string;
+  onOpenTab: (tab: TabType) => void;
+}> = (props) => {
+  const api = useOptionalAPI()?.api ?? null;
+  const appViews = useMcpAppViews(props.workspaceId);
+  const [files, setFiles] = React.useState<readonly ArtifactEntry[]>([]);
+  const [refreshTick, setRefreshTick] = React.useState(0);
+
+  React.useEffect(() => {
+    if (api == null) return;
+    const controller = new AbortController();
+    api.artifacts
+      .list({ workspaceId: props.workspaceId }, { signal: controller.signal })
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        // A failed listing hides the section; the Artifacts tab reports the error.
+        setFiles(result.success && result.data.available ? result.data.entries : []);
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error) || controller.signal.aborted) return;
+        setFiles([]);
+      });
+    return () => controller.abort();
+  }, [api, props.workspaceId, refreshTick]);
+
+  React.useEffect(
+    () =>
+      workspaceStore.subscribeFileModifyingTool(
+        () => setRefreshTick((tick) => tick + 1),
+        props.workspaceId
+      ),
+    [props.workspaceId]
+  );
+
+  // Files come newest first; app views in transcript order, so newest last.
+  const outputs = [
+    ...files.map((file) => ({
+      key: `file:${file.path}`,
+      Icon: FileText,
+      label: file.path.split("/").pop() ?? file.path,
+      open: () => openArtifact({ workspaceId: props.workspaceId, path: file.path }),
+    })),
+    ...[...appViews].reverse().map((view) => ({
+      key: `app:${view.toolCallId}`,
+      Icon: TAB_ICONS.artifacts,
+      label: view.label,
+      open: () => openMcpAppView(props.workspaceId, view),
+    })),
+  ];
+  if (outputs.length === 0) return null;
+
+  return (
+    <OverviewSection title="Outputs">
+      {outputs.slice(0, OVERVIEW_MAX_LIST_ROWS).map((output) => (
+        <OverviewRow
+          key={output.key}
+          Icon={output.Icon}
+          label={output.label}
+          onClick={output.open}
+        />
+      ))}
+      <MoreRow
+        count={outputs.length - OVERVIEW_MAX_LIST_ROWS}
+        onClick={() => props.onOpenTab("artifacts")}
+      />
+    </OverviewSection>
+  );
+};
+
 const OverviewSection: React.FC<{
   title: string;
+  /** False when the rows name themselves; the title then only labels the region. */
+  showTitle?: boolean;
   action?: React.ReactNode;
   children: React.ReactNode;
 }> = (props) => (
   <section aria-label={props.title} className="flex flex-col gap-0.5 py-2">
-    <div className="flex min-w-0 items-center justify-between gap-2 px-1.5 pb-0.5">
-      <h3 className="text-muted truncate text-[11px] font-medium">{props.title}</h3>
-      {props.action}
-    </div>
+    {props.showTitle !== false && (
+      <div className="flex min-w-0 items-center justify-between gap-2 px-1.5 pb-0.5">
+        <h3 className="text-muted truncate text-[11px] font-medium">{props.title}</h3>
+        {props.action}
+      </div>
+    )}
     {props.children}
   </section>
 );
+
+/** The rows a capped list leaves out, as one row that leads to the full list. */
+const MoreRow: React.FC<{ count: number; onClick: () => void }> = (props) =>
+  props.count > 0 ? (
+    <OverviewRow label={`${props.count} more`} muted onClick={props.onClick} />
+  ) : null;
 
 /** One line of the card: a button when it leads somewhere, plain text otherwise. */
 const OverviewRow: React.FC<{
   Icon?: LucideIcon;
   label: string;
   detail?: React.ReactNode;
+  /** A second, muted line under the label. */
+  sub?: string | null;
   muted?: boolean;
   onClick?: () => void;
 }> = (props) => {
@@ -254,13 +408,16 @@ const OverviewRow: React.FC<{
       {props.Icon != null && (
         <props.Icon className="text-muted h-3.5 w-3.5 shrink-0" aria-hidden="true" />
       )}
-      <span
-        className={cn("min-w-0 flex-1 truncate", props.muted ? "text-muted" : "text-foreground")}
-      >
-        {props.label}
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className={cn("truncate", props.muted ? "text-muted" : "text-foreground")}>
+          {props.label}
+        </span>
+        {props.sub != null && (
+          <span className="text-muted counter-nums truncate text-[11px]">{props.sub}</span>
+        )}
       </span>
       {props.detail != null && props.detail !== false && (
-        <span className="text-muted shrink-0">{props.detail}</span>
+        <span className="text-muted counter-nums shrink-0">{props.detail}</span>
       )}
     </>
   );

@@ -1,26 +1,32 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import {
   WorkspaceContext,
   type WorkspaceContext as WorkspaceContextValue,
   type WorkspaceMetadataContextValue,
 } from "@/browser/contexts/WorkspaceContext";
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
+import { createTestApiClient } from "@/browser/testUtils";
+import { CUSTOM_EVENTS } from "@/common/constants/events";
+import type { ArtifactEntry } from "@/common/orpc/schemas/artifacts";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
 import type { GoalSnapshot } from "@/common/types/goal";
-import type { WorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
+import type { WorkspaceSidebarState, WorkspaceUsageState } from "@/browser/stores/WorkspaceStore";
 import type { TabType } from "@/browser/types/rightSidebar";
 import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as RealGitStatusStoreModule from "@/browser/stores/GitStatusStore";
 
-// The card subscribes to the workspace and git stores directly; stubbing the two hooks keeps
+// The card subscribes to the workspace and git stores directly; stubbing those hooks keeps
 // these tests on the card's own gating and navigation.
 let sidebarState: Partial<WorkspaceSidebarState> | null = null;
 let gitStatus: GitStatus | null = null;
+let workspaceUsage: WorkspaceUsageState = { totalTokens: 0 };
 restoreModulesAfterSuite([
   ["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }],
   ["@/browser/stores/GitStatusStore", { ...RealGitStatusStoreModule }],
@@ -28,13 +34,14 @@ restoreModulesAfterSuite([
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   ...RealWorkspaceStoreModule,
   useOptionalWorkspaceSidebarState: () => sidebarState,
+  useWorkspaceUsage: () => workspaceUsage,
 }));
 void mock.module("@/browser/stores/GitStatusStore", () => ({
   ...RealGitStatusStoreModule,
   useGitStatus: () => gitStatus,
 }));
 
-import { OVERVIEW_MAX_SIDE_CHATS, RightSidebarOverview } from "./RightSidebarOverview";
+import { OVERVIEW_MAX_LIST_ROWS, RightSidebarOverview } from "./RightSidebarOverview";
 
 const WORKSPACE_ID = "ws-main";
 
@@ -70,9 +77,30 @@ function goal(overrides: Partial<GoalSnapshot> = {}): GoalSnapshot {
   };
 }
 
+/** Usage with all of its tokens and cost on input, which is all the card's totals need. */
+function usage(tokens: number, costUsd: number): ChatUsageDisplay {
+  const none = { tokens: 0, cost_usd: 0 };
+  return {
+    input: { tokens, cost_usd: costUsd },
+    cached: none,
+    cacheCreate: none,
+    output: none,
+    reasoning: none,
+  };
+}
+
+function artifact(path: string, modifiedMs: number): ArtifactEntry {
+  return { path, kind: "markdown", size: 10, modifiedMs };
+}
+
 function renderOverview(
   workspaces: FrontendWorkspaceMetadata[],
-  options: { canStartSideChat?: boolean } = {}
+  options: {
+    canStartSideChat?: boolean;
+    artifactsEnabled?: boolean;
+    unreadAssisted?: number;
+    client?: APIClient;
+  } = {}
 ) {
   const opened: TabType[] = [];
   let expanded = 0;
@@ -83,7 +111,7 @@ function renderOverview(
     loaded: true,
     loadError: null,
   };
-  const view = render(
+  const card = (
     <WorkspaceContext.Provider value={value as WorkspaceContextValue}>
       <TooltipProvider>
         <RightSidebarOverview
@@ -100,9 +128,14 @@ function renderOverview(
                 }
           }
           creatingSideChat={false}
+          artifactsEnabled={options.artifactsEnabled ?? false}
+          unreadAssisted={options.unreadAssisted ?? 0}
         />
       </TooltipProvider>
     </WorkspaceContext.Provider>
+  );
+  const view = render(
+    options.client != null ? <APIProvider client={options.client}>{card}</APIProvider> : card
   );
   return {
     view,
@@ -119,12 +152,33 @@ describe("RightSidebarOverview", () => {
     cleanupDom = installDom();
     sidebarState = null;
     gitStatus = null;
+    workspaceUsage = { totalTokens: 0 };
   });
 
   afterEach(() => {
     cleanup();
     cleanupDom?.();
     cleanupDom = null;
+  });
+
+  test("leads with the session cost and tokens, live stream included, and opens Stats", () => {
+    workspaceUsage = {
+      totalTokens: 0,
+      sessionTotal: usage(1_000_000, 1.25),
+      liveCostUsage: usage(200_000, 0.5),
+    };
+    const { view, opened } = renderOverview([workspace({ id: WORKSPACE_ID })]);
+
+    const stats = view.getByRole("button", { name: /\$1\.75/ });
+    expect(stats.textContent).toContain("1.2M tokens");
+    fireEvent.click(stats);
+    expect(opened).toEqual(["costs"]);
+  });
+
+  test("shows no stats before the session has usage", () => {
+    const { view } = renderOverview([workspace({ id: WORKSPACE_ID })]);
+    expect(view.queryByRole("button", { name: /\$/ })).toBeNull();
+    expect(view.getByRole("button", { name: "Expand sidebar" })).toBeTruthy();
   });
 
   test("lists this workspace's side chats newest first, capped, and opens the picked one", () => {
@@ -154,7 +208,7 @@ describe("RightSidebarOverview", () => {
       "Newest question",
       "New chat",
       "Middle question",
-      `${chats.length - OVERVIEW_MAX_SIDE_CHATS} more`,
+      `${chats.length - OVERVIEW_MAX_LIST_ROWS} more`,
     ]);
     expect(view.queryByText("Someone else's side chat")).toBeNull();
 
@@ -164,9 +218,12 @@ describe("RightSidebarOverview", () => {
     expect(expandCount()).toBe(1);
   });
 
-  test("offers starting a side chat only where one can start", () => {
+  test("an empty side chat section is only its heading and the new-chat button", () => {
     const startable = renderOverview([workspace({ id: WORKSPACE_ID })]);
-    fireEvent.click(startable.view.getByRole("button", { name: "New side chat" }));
+    const section = startable.view.getByRole("region", { name: "Side chats" });
+    // No rows and no explanatory copy, just the action.
+    expect(section.textContent).toBe("Side chats");
+    fireEvent.click(within(section).getByRole("button", { name: "New side chat" }));
     expect(startable.newSideChatCount()).toBe(1);
     cleanup();
 
@@ -177,8 +234,8 @@ describe("RightSidebarOverview", () => {
     expect(sideChatWorkspace.view.queryByRole("region", { name: "Side chats" })).toBeNull();
   });
 
-  test("shows changes under the branch for repository workspaces and opens Review", () => {
-    const status: GitStatus = {
+  test("shows changes and flagged hunks under the branch, and opens Review", () => {
+    gitStatus = {
       branch: "feature/overview",
       ahead: 1,
       behind: 0,
@@ -188,13 +245,15 @@ describe("RightSidebarOverview", () => {
       incomingAdditions: 0,
       incomingDeletions: 0,
     };
-    gitStatus = status;
-    const { view, opened } = renderOverview([workspace({ id: WORKSPACE_ID })]);
+    const { view, opened } = renderOverview([workspace({ id: WORKSPACE_ID })], {
+      unreadAssisted: 3,
+    });
 
     const section = within(view.getByRole("region", { name: "feature/overview" }));
     const changes = section.getByRole("button");
     expect(changes.textContent).toContain("+29,692");
     expect(changes.textContent).toContain("-6,248");
+    expect(section.getByLabelText("3 unread agent-flagged hunks")).toBeTruthy();
     fireEvent.click(changes);
     expect(opened).toEqual(["review"]);
   });
@@ -204,32 +263,41 @@ describe("RightSidebarOverview", () => {
     expect(view.queryByRole("button", { name: /Changes/ })).toBeNull();
   });
 
-  test("summarizes the goal and running work, each opening its tab", () => {
+  test("summarizes the goal against its limits and the workspace's activity", () => {
     sidebarState = {
-      goal: goal({ status: "paused" }),
+      goal: goal({ status: "paused", costCents: 42, budgetCents: 500, turnsUsed: 3, turnCap: 10 }),
       activeWorkflowRunCount: 2,
-      terminalActiveCount: 0,
+      terminalSessionCount: 1,
     };
-    const { view, opened } = renderOverview([workspace({ id: WORKSPACE_ID })]);
+    const { view, opened, expandCount } = renderOverview([workspace({ id: WORKSPACE_ID })]);
 
     const goalRow = within(view.getByRole("region", { name: "Goal" })).getByRole("button");
     expect(goalRow.textContent).toContain("Ship the overview card");
     expect(goalRow.textContent).toContain("Paused");
+    expect(goalRow.textContent).toContain("$0.42 / $5.00 · 3 / 10 turns");
     fireEvent.click(goalRow);
 
-    const running = within(view.getByRole("region", { name: "Running" }));
-    // Idle terminals are not running work, so only the workflows row shows.
-    expect(running.queryByText("Terminals")).toBeNull();
-    fireEvent.click(running.getByRole("button", { name: /Workflows/ }));
+    const activity = within(view.getByRole("region", { name: "Activity" }));
+    fireEvent.click(activity.getByRole("button", { name: /Workflows/ }));
+    fireEvent.click(activity.getByRole("button", { name: /Terminals/ }));
 
     expect(opened).toEqual(["goal", "workflows"]);
+    expect(expandCount()).toBe(1);
   });
 
-  test("hides goal, running, and scheduled sections when there is nothing to report", () => {
+  test("a goal without limits shows no limits line", () => {
+    sidebarState = { goal: goal() };
+    const { view } = renderOverview([workspace({ id: WORKSPACE_ID })]);
+    const goalRow = within(view.getByRole("region", { name: "Goal" })).getByRole("button");
+    expect(goalRow.textContent).toContain("Active");
+    expect(goalRow.textContent).not.toMatch(/\$|turns/);
+  });
+
+  test("hides goal and activity when there is nothing to report", () => {
     const { view } = renderOverview([
       workspace({ id: WORKSPACE_ID, heartbeat: { enabled: false, intervalMs: 300_000 } }),
     ]);
-    for (const name of ["Goal", "Running", "Scheduled"]) {
+    for (const name of ["Goal", "Activity", "Outputs"]) {
       expect(view.queryByRole("region", { name })).toBeNull();
     }
   });
@@ -238,7 +306,69 @@ describe("RightSidebarOverview", () => {
     const { view } = renderOverview([
       workspace({ id: WORKSPACE_ID, heartbeat: { enabled: true, intervalMs: 300_000 } }),
     ]);
-    const scheduled = view.getByRole("region", { name: "Scheduled" });
-    expect(scheduled.textContent).toContain("Every 5 minutes");
+    const activity = view.getByRole("region", { name: "Activity" });
+    expect(activity.textContent).toContain("Every 5m");
+  });
+
+  test("lists the newest outputs when Artifacts is on, and opens the picked one", async () => {
+    let listCalls = 0;
+    const client = createTestApiClient({
+      artifacts: {
+        list: () => {
+          listCalls += 1;
+          return Promise.resolve({
+            success: true as const,
+            data: {
+              available: true as const,
+              dir: "/scratch/artifacts",
+              // Newest first, as the backend lists them.
+              entries: [
+                artifact("reports/summary.md", 4),
+                artifact("plan.md", 3),
+                artifact("notes.md", 2),
+                artifact("old.md", 1),
+              ],
+              truncated: false,
+            },
+          });
+        },
+      },
+    });
+    const openedArtifacts: string[] = [];
+    const onOpenArtifact = (event: Event) =>
+      openedArtifacts.push((event as CustomEvent<{ path: string }>).detail.path);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onOpenArtifact);
+
+    try {
+      const { view, opened } = renderOverview([workspace({ id: WORKSPACE_ID })], {
+        artifactsEnabled: true,
+        client,
+      });
+      const section = within(await view.findByRole("region", { name: "Outputs" }));
+      const rows = section.getAllByRole("button");
+      expect(rows.map((row) => row.textContent)).toEqual([
+        "summary.md",
+        "plan.md",
+        "notes.md",
+        "1 more",
+      ]);
+
+      fireEvent.click(rows[0]);
+      expect(openedArtifacts).toEqual(["reports/summary.md"]);
+      fireEvent.click(rows[3]);
+      expect(opened).toEqual(["artifacts"]);
+      cleanup();
+
+      // With the experiment off the card neither lists nor shows outputs.
+      const callsBefore = listCalls;
+      const off = renderOverview([workspace({ id: WORKSPACE_ID })], { client });
+      await waitFor(() =>
+        expect(off.view.getByRole("button", { name: "Expand sidebar" })).toBeTruthy()
+      );
+      expect(off.view.queryByRole("region", { name: "Outputs" })).toBeNull();
+      expect(listCalls).toBe(callsBefore);
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onOpenArtifact);
+    }
   });
 });

@@ -44,6 +44,19 @@ export const CollapsedOverview: AppStory = {
             ),
           ],
           gitStatus: { ahead: 3, dirty: 2, outgoingAdditions: 29692, outgoingDeletions: 6248 },
+          sessionUsage: {
+            byModel: {
+              "claude-opus-4-5": {
+                input: { tokens: 820_000, cost_usd: 4.1 },
+                cached: { tokens: 2_400_000, cost_usd: 1.2 },
+                cacheCreate: { tokens: 90_000, cost_usd: 0.56 },
+                output: { tokens: 64_000, cost_usd: 1.6 },
+                reasoning: { tokens: 21_000, cost_usd: 0.53 },
+                model: "claude-opus-4-5",
+              },
+            },
+            version: 1,
+          },
           additionalWorkspaces: [
             sideChat("side-bq", "Give me the BQ migration", "2026-01-01T10:00:00.000Z"),
             sideChat("side-hedger", "How real-time is the hedger?", "2026-01-01T11:00:00.000Z"),
@@ -66,6 +79,8 @@ export const CollapsedOverview: AppStory = {
     await waitFor(() =>
       expect(within(card).getByRole("button", { name: /Changes/ })).toHaveTextContent("+29,692")
     );
+    // The session's cost leads the card.
+    await within(card).findByRole("button", { name: /\$7\.99/ });
 
     // Bounded: the card is a fraction of the workspace's height, and the chat is not narrowed
     // by a collapsed rail: it reaches the workspace's right edge.

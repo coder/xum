@@ -2408,6 +2408,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             onOpenTab={handleOpenTabFromOverview}
             onNewSideChat={canStartSideChat ? () => handleStartSideChat() : undefined}
             creatingSideChat={creatingSideChat}
+            artifactsEnabled={artifactsExperimentEnabled}
+            unreadAssisted={unreadAssisted}
           />
         )}
       </SidebarContainer>
