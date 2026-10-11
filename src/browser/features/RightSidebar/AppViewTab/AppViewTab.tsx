@@ -5,6 +5,7 @@ import {
   markMcpAppViewHosted,
   openMcpAppViewTab,
   useMcpAppView,
+  useMcpAppViewHostedBy,
   type McpAppViewRef,
 } from "../ArtifactsTab/mcpAppViewsStore";
 import { Notice } from "../ArtifactsTab/SourceText";
@@ -52,14 +53,23 @@ export function AppViewTabPanel(props: {
   workspaceId: string;
   toolCallId: string | null;
   onClose: () => void;
+  /** The phone sheet ("sheet") wins over a tab ("tab", default) the hidden sidebar still has. */
+  host?: "tab" | "sheet";
 }) {
   const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
   const { workspaceId, toolCallId } = props;
+  const host = props.host ?? "tab";
+  // The narrow layout hides the right sidebar but keeps it mounted: its tab yields to the sheet.
+  const yieldToSheet =
+    useMcpAppViewHostedBy(workspaceId, toolCallId ?? "", ["sheet"]) && host === "tab";
   useEffect(() => {
-    if (toolCallId == null) return;
-    return markMcpAppViewHosted(workspaceId, toolCallId, "tab");
-  }, [workspaceId, toolCallId]);
+    if (toolCallId == null || yieldToSheet) return;
+    return markMcpAppViewHosted(workspaceId, toolCallId, host);
+  }, [workspaceId, toolCallId, host, yieldToSheet]);
   if (view === "loading") return <Notice>Loading…</Notice>;
+  if (yieldToSheet && view != null) {
+    return <AppViewInTabNotice workspaceId={workspaceId} view={view} />;
+  }
   if (view == null) {
     return (
       <div className="flex flex-col items-start gap-2 p-4 text-xs">

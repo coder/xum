@@ -70,6 +70,8 @@ import {
 } from "@/constants/layout";
 import { TimelineDialog } from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 import { ArtifactsDialog } from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
+import { AppViewDialog } from "@/browser/features/RightSidebar/AppViewTab/AppViewDialog";
+import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import { StatsDialog } from "@/browser/features/RightSidebar/StatsDialog";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
@@ -306,6 +308,15 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     timelineSidebarHidden,
     artifactsExperimentEnabled ? "artifacts" : undefined
   );
+  // An MCP App view's tab ("Open in tab") as a sheet; its tab is selected on sidebar shown.
+  const [appViewToolCallId, setAppViewToolCallId] = useState<string | null>(null);
+  const [appViewDialogOpen, setAppViewDialogWorkspaceId] = useSidebarTabDialog(
+    workspaceId,
+    timelineSidebarHidden,
+    artifactsExperimentEnabled && appViewToolCallId != null
+      ? appViewTabFor(appViewToolCallId)
+      : undefined
+  );
   const [statsDialogOpen, setStatsDialogWorkspaceId] = useSidebarTabDialog(
     workspaceId,
     timelineSidebarHidden,
@@ -405,8 +416,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     workspaceId,
   ]);
 
-  // "Open in Artifacts" on an MCP Apps tool card and openArtifact() (chat cards, file cards,
-  // Review, palette): while the sidebar is hidden, the dialog is the only place to show them
+  // openArtifact() (chat cards, file cards, Review, palette) and "Open in tab" on an MCP Apps
+  // tool card: while the sidebar is hidden, a dialog is the only place to show them
   // (RightSidebar handles the same events on wider layouts).
   useEffect(() => {
     if (!artifactsExperimentEnabled) {
@@ -419,15 +430,24 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       }
       setArtifactsDialogWorkspaceId(workspaceId);
     };
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+    const appViewHandler = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspaceId: string; toolCallId: string }>).detail;
+      if (detail?.workspaceId !== workspaceId || !isTimelineSidebarHidden()) {
+        return;
+      }
+      setAppViewToolCallId(detail.toolCallId);
+      setAppViewDialogWorkspaceId(workspaceId);
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
     window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
     };
   }, [
     artifactsExperimentEnabled,
     isTimelineSidebarHidden,
+    setAppViewDialogWorkspaceId,
     setArtifactsDialogWorkspaceId,
     workspaceId,
   ]);
@@ -1094,6 +1114,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         workspaceId={workspaceId}
         open={artifactsDialogOpen}
         onOpenChange={(open) => setArtifactsDialogWorkspaceId(open ? workspaceId : null)}
+      />
+      <AppViewDialog
+        workspaceId={workspaceId}
+        toolCallId={appViewToolCallId}
+        open={appViewDialogOpen}
+        onOpenChange={(open) => setAppViewDialogWorkspaceId(open ? workspaceId : null)}
       />
       <DebugLlmRequestModal
         workspaceId={workspaceId}

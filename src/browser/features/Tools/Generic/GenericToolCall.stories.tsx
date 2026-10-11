@@ -1,11 +1,18 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
+import type { ReactNode } from "react";
 import { APIProvider } from "@/browser/contexts/API";
 import { GenericToolCall } from "@/browser/features/Tools/GenericToolCall";
 import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  AppViewTabLabel,
+  AppViewTabPanel,
+} from "@/browser/features/RightSidebar/AppViewTab/AppViewTab";
+import { AppViewDialog } from "@/browser/features/RightSidebar/AppViewTab/AppViewDialog";
 import { withAppViewTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
+import { openMcpAppViewTab } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 
 const meta = {
@@ -199,4 +206,97 @@ export const McpAppInTabPhone: Story = {
   parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
   render: () => <div style={{ width: 358 }}>{renderInTab()}</div>,
   play: ({ canvasElement }) => playInTab(canvasElement),
+};
+
+// MCP App views get their own right-sidebar tab ("Open in tab").
+const APP_TAB_WORKSPACE_ID = "ws-app-tab";
+const APP_TAB_TOOL_CALL_ID = "call-dice-tab";
+
+function withView(children: ReactNode) {
+  // The ref the tab resolves (a view opened from its card this session).
+  openMcpAppViewTab(APP_TAB_WORKSPACE_ID, {
+    toolCallId: APP_TAB_TOOL_CALL_ID,
+    serverName: "demo-app",
+    resourceUri: "ui://prototype/board.html",
+    toolName: "demo_app_show_dice_board",
+    label: "Show dice board",
+    arguments: { count: 4, sides: 6 },
+    cancelled: false,
+    failed: false,
+  });
+  return (
+    <APIProvider
+      client={createMockORPCClient({
+        experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true },
+        mcpApps: {
+          views: {
+            [APP_TAB_TOOL_CALL_ID]: {
+              html: DICE_VIEW_HTML,
+              csp: {},
+              prefersBorder: true,
+              resultAvailable: true,
+              result: DICE_RESULT,
+              invocation: null,
+            },
+          },
+        },
+      })}
+    >
+      {children}
+    </APIProvider>
+  );
+}
+
+const playTab = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement.ownerDocument.body);
+  const frame = await canvas.findByTestId("mcp-app-frame");
+  await waitFor(() => expect(frame.style.height).toBe("184px"), { timeout: 5000 });
+  await expect(canvas.getAllByText("Show dice board").length).toBeGreaterThan(0);
+};
+
+/** An app tab in the right sidebar: the strip label (tool title, server) above the view. */
+export const McpAppTabLaptop: Story = {
+  args: { toolName: "demo_app_show_dice_board" },
+  globals: { viewport: { value: "laptop1200", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["laptop"] } } },
+  render: () =>
+    withView(
+      <div className="bg-background flex h-screen justify-end">
+        <div className="bg-sidebar border-border-light flex h-full w-full max-w-[400px] flex-col border-l">
+          <div className="border-border-light flex h-8 items-center border-b px-3 text-xs">
+            <span className="bg-background-secondary rounded px-2 py-0.5">
+              <AppViewTabLabel
+                workspaceId={APP_TAB_WORKSPACE_ID}
+                toolCallId={APP_TAB_TOOL_CALL_ID}
+              />
+            </span>
+          </div>
+          <div className="min-h-0 flex-1">
+            <AppViewTabPanel
+              workspaceId={APP_TAB_WORKSPACE_ID}
+              toolCallId={APP_TAB_TOOL_CALL_ID}
+              onClose={() => undefined}
+            />
+          </div>
+        </div>
+      </div>
+    ),
+  play: ({ canvasElement }) => playTab(canvasElement),
+};
+
+/** Phones show the tab in a sheet (the right sidebar is hidden there). */
+export const McpAppTabPhoneSheet: Story = {
+  args: { toolName: "demo_app_show_dice_board" },
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
+  render: () =>
+    withView(
+      <AppViewDialog
+        workspaceId={APP_TAB_WORKSPACE_ID}
+        toolCallId={APP_TAB_TOOL_CALL_ID}
+        open
+        onOpenChange={() => undefined}
+      />
+    ),
+  play: ({ canvasElement }) => playTab(canvasElement),
 };

@@ -40,6 +40,25 @@ import {
   openArtifactsTab,
   pinAndOpenArtifact,
 } from "@/browser/features/RightSidebar/ArtifactsTab/openArtifact";
+import {
+  getMcpAppViews,
+  openMcpAppViewTab,
+  transcriptViews,
+  type McpAppViewRef,
+} from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+
+/** The workspace's MCP App views: the loaded transcript's, then ones opened this session. */
+function appViewsOf(
+  workspaceId: string,
+  messages: Parameters<typeof transcriptViews>[1]
+): McpAppViewRef[] {
+  const fromTranscript = transcriptViews(workspaceId, messages);
+  const known = new Set(fromTranscript.map((view) => view.toolCallId));
+  return [
+    ...fromTranscript,
+    ...getMcpAppViews(workspaceId).filter((view) => !known.has(view.toolCallId)),
+  ];
+}
 import { isTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
   getOrderedBaseTabIds,
@@ -894,6 +913,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 keywords: ["artifacts", "preview", "versions"],
                 run: () => openArtifactsTab(wsId),
               },
+              // One per MCP App view of the workspace (transcript or opened this session): opens
+              // its tab or focuses the one it has, the keyboard path to "Open in tab".
+              ...appViewsOf(wsId, p.selectedWorkspaceState?.messages ?? []).map((view) => ({
+                id: CommandIds.navOpenAppView(view.toolCallId),
+                title: `Open App View: ${view.label}`,
+                subtitle: view.serverName,
+                section: section.navigation,
+                keywords: ["app", "view", "mcp", "tab", view.serverName],
+                run: () => openMcpAppViewTab(wsId, view),
+              })),
               {
                 id: CommandIds.navOpenFileAsArtifact(),
                 title: "Open File as Artifact…",
