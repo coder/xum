@@ -117,7 +117,7 @@ import {
   type TerminalSessionCreateOptions,
 } from "@/browser/utils/terminal";
 import { SideChatTabTitle } from "./Tabs/TabLabels";
-import { AppViewTabLabel, AppViewTabPanel } from "./AppViewTab/AppViewTab";
+import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab/AppViewTab";
 import { appViewTabToolCallId, liveAppViewTabs, withAppViewTab } from "./AppViewTab/appViewTabs";
 import { ReviewAssistedStatsReporter } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
 import {
@@ -488,6 +488,11 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
     const tooltip = sideChatWorkspaceId ? (
       <>
         <SideChatTabTitle workspaceId={sideChatWorkspaceId} />
+        {keybindStr && ` (${keybindStr})`}
+      </>
+    ) : getAppViewTabKey(tab) != null ? (
+      <>
+        <AppViewTabTooltip workspaceId={props.workspaceId} toolCallId={appViewTabToolCallId(tab)} />
         {keybindStr && ` (${keybindStr})`}
       </>
     ) : (
