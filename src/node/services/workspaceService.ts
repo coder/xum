@@ -61,6 +61,7 @@ import {
   SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
 } from "@/node/services/sessionTapes/sessionTapeReplaySource";
 import { eventSpine } from "@/node/services/events/eventSpine";
+import { codexPluginHookService } from "@/node/services/agentPlugins/codexHookService";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
@@ -8279,6 +8280,7 @@ export class WorkspaceService
       // Plugin hook mounts live under their own scope keys; unregister their
       // spine middleware and drop their runtimes too. Never throws.
       await agentPluginHookService.disposeWorkspace(workspaceId);
+      await codexPluginHookService.disposeWorkspace(workspaceId);
       try {
         await this.timelineRecorder.closeWorkspace(workspaceId);
         timelineClosed = true;
@@ -12608,6 +12610,7 @@ export class WorkspaceService
       // Plugin hooks re-register lazily on the next send after un-archive, so
       // disposal here only frees runtimes and spine middleware. Never throws.
       await agentPluginHookService.disposeWorkspace(workspaceId);
+      await codexPluginHookService.disposeWorkspace(workspaceId);
 
       await this.syncCodeWorkspaceFiles({
         projectPath,

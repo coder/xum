@@ -1,0 +1,140 @@
+/**
+ * Per-workspace lifecycle for Codex-format plugin hooks (hooks.json): discovers the managed
+ * global plugins, registers each plugin's runnable hooks (codexHookRunner.ts) on the event spine,
+ * and supplies the runner's dependencies.
+ *
+ * Scope: managed global plugins only (`~/.xum/plugins`, in the install registry). Project
+ * plugins and unmanaged global plugins never run hooks.json hooks: their trust review is a
+ * follow-up, and an unreviewed hook must not run.
+ *
+ * The gate before EACH hook call (the fix for #6042's P1-a and P1-b) reads, at that moment:
+ * 1. the workspace's project trust (live config read);
+ * 2. the trust store (pluginHookTrust.ts): this exact hash must be trusted;
+ * 3. the plugin's hooks on disk: the hook must still be declared with this hash, so an edit,
+ *    an update or an uninstall stops it before the next registration catches up.
+ * The MCP call itself then requires the plugin's server to be enabled and running in this
+ * workspace (MCPServerManager.callToolForPluginHook).
+ */
+import * as path from "node:path";
+import { log } from "@/node/services/log";
+import { eventSpine, type EventSpine } from "@/node/services/events/eventSpine";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
+import { discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
+import { loadPluginCodexHooks, type PluginHookDefinition } from "./codexHooks";
+import { registerCodexPluginHooks, type CodexHookRunnerDeps } from "./codexHookRunner";
+import { buildPluginServerKey, computePluginInstanceId } from "./mcpConfig";
+import { isPluginHookTrusted, readPluginHookTrust } from "./pluginHookTrust";
+import { PLUGIN_REGISTRY_FILE_NAME } from "./registry";
+
+export interface EnsureCodexHooksArgs {
+  workspaceId: string;
+  /** Xum home (config.rootDir): the managed container and the trust store live here. */
+  xumHome: string;
+  /** Live project-trust read for this workspace; called before every hook call. */
+  isProjectTrusted: () => boolean;
+  mcp: Pick<MCPServerManager, "callToolForPluginHook">;
+  /** Shows a hook's systemMessage to the user (never the model). */
+  notifyUser: (pluginName: string, message: string) => void;
+}
+
+interface WorkspaceRegistration {
+  fingerprint: string;
+  unregister: () => void;
+}
+
+export class CodexPluginHookService {
+  private readonly registrations = new Map<string, WorkspaceRegistration>();
+  private readonly locks = new Map<string, AsyncMutex>();
+
+  constructor(private readonly spine: EventSpine = eventSpine) {}
+
+  /** Register (or refresh) the workspace's hooks. Fail-soft: a broken plugin is skipped. */
+  async ensureWorkspaceHooks(args: EnsureCodexHooksArgs): Promise<void> {
+    let lock = this.locks.get(args.workspaceId);
+    if (lock === undefined) {
+      lock = new AsyncMutex();
+      this.locks.set(args.workspaceId, lock);
+    }
+    await using _guard = await lock.acquire();
+    const plugins = await this.discoverManagedPlugins(args.xumHome);
+    const loaded = await Promise.all(
+      plugins.map(async (plugin) => ({ plugin, ...(await loadPluginCodexHooks(plugin)) }))
+    );
+    const runnable = loaded
+      .map((entry) => ({
+        ...entry,
+        hooks: entry.hooks.filter((hook) => hook.status === "runnable"),
+      }))
+      .filter((entry) => entry.hooks.length > 0);
+    const fingerprint = JSON.stringify(
+      runnable.map((entry) => [entry.plugin.rootPath, entry.hooks.map((hook) => hook.hash)])
+    );
+    const existing = this.registrations.get(args.workspaceId);
+    if (existing?.fingerprint === fingerprint) return;
+    existing?.unregister();
+    const unregisters = runnable.map((entry, order) =>
+      registerCodexPluginHooks(this.spine, {
+        workspaceId: args.workspaceId,
+        pluginName: entry.plugin.name,
+        order,
+        hooks: entry.hooks,
+        deps: this.depsFor(entry.plugin, args),
+      })
+    );
+    this.registrations.set(args.workspaceId, {
+      fingerprint,
+      unregister: () => unregisters.forEach((unregister) => unregister()),
+    });
+  }
+
+  async disposeWorkspace(workspaceId: string): Promise<void> {
+    const lock = this.locks.get(workspaceId);
+    await using _guard = lock !== undefined ? await lock.acquire() : undefined;
+    this.registrations.get(workspaceId)?.unregister();
+    this.registrations.delete(workspaceId);
+  }
+
+  private async discoverManagedPlugins(xumHome: string): Promise<AgentPluginInfo[]> {
+    const { plugins } = await discoverAgentPlugins([
+      {
+        path: path.join(xumHome, "plugins"),
+        scope: "global",
+        registryPath: path.join(xumHome, PLUGIN_REGISTRY_FILE_NAME),
+      },
+    ]);
+    // componentPolicy marks a plugin the install registry manages.
+    return plugins.filter((plugin) => plugin.componentPolicy !== undefined);
+  }
+
+  private depsFor(plugin: AgentPluginInfo, args: EnsureCodexHooksArgs): CodexHookRunnerDeps {
+    // Same identity as the install service and the plugin's MCP server keys.
+    const instanceId = computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName));
+    return {
+      isHookAllowed: async (hook: PluginHookDefinition) => {
+        if (!args.isProjectTrusted()) return false;
+        const trust = await readPluginHookTrust(args.xumHome, instanceId);
+        if (!isPluginHookTrusted(trust, hook)) return false;
+        const current = await loadPluginCodexHooks(plugin);
+        const stillDeclared = current.hooks.some(
+          (candidate) => candidate.key === hook.key && candidate.hash === hook.hash
+        );
+        if (!stillDeclared)
+          log.debug("Plugin hooks: a hook changed on disk; skipping it", { key: hook.key });
+        return stillDeclared;
+      },
+      // The key is built from THIS plugin's instance: a hook names a server, never a key.
+      callPluginTool: (call) =>
+        args.mcp.callToolForPluginHook(
+          args.workspaceId,
+          buildPluginServerKey(instanceId, call.server),
+          call.tool,
+          call.input,
+          { signal: call.signal }
+        ),
+      notifyUser: (message) => args.notifyUser(plugin.name, message),
+    };
+  }
+}
+
+export const codexPluginHookService = new CodexPluginHookService();

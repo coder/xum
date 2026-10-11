@@ -1352,6 +1352,8 @@ interface MCPServerInstance {
   tools: Record<string, Tool>;
   prompts: MCPPrompt[];
   getPrompt: MCPClientHandle["getPrompt"];
+  /** Codex plugin hooks (see MCPServerManager.callToolForPluginHook). */
+  callToolForHook: MCPClientHandle["callToolForHook"];
   /**
    * MCP Apps (artifacts experiment): present only when the connection announced the
    * extension. Tool metadata includes tools hidden from the model.
@@ -4578,6 +4580,32 @@ export class MCPServerManager {
   }
 
   /**
+   * tools/call for a Codex-format plugin hook, on a server that is ALREADY running and enabled in
+   * this workspace. It never starts or reconnects a server (Codex: hooks use an existing
+   * connection), so a hook whose server is off, excluded or not yet started fails, and the
+   * runner fails open. The caller builds `serverKey` from the hook's own plugin instance, so a
+   * hook can never reach another plugin's or the user's servers.
+   */
+  async callToolForPluginHook(
+    workspaceId: string,
+    serverKey: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    options: { signal: AbortSignal }
+  ): Promise<unknown> {
+    const entry = this.workspaceServers.get(workspaceId);
+    if (!entry?.enabledServerNames.has(serverKey)) {
+      throw new Error(`MCP server '${serverKey}' is not enabled in this workspace`);
+    }
+    const instance = entry.instances.get(serverKey);
+    if (instance === undefined || instance.isClosed) {
+      throw new Error(`MCP server '${serverKey}' is not running`);
+    }
+    this.markActivity(workspaceId);
+    return instance.callToolForHook(toolName, args, options);
+  }
+
+  /**
    * Whether a send or prompt discovery recorded this workspace's request options. Without them
    * server operations cannot start servers (invokeServerOperation), e.g. right after a restart.
    */
@@ -6649,6 +6677,8 @@ export class MCPServerManager {
           prompts: [],
           getPrompt: (promptName, args, options) =>
             readyClient.getPrompt(promptName, args, options),
+          callToolForHook: (toolName, args, options) =>
+            readyClient.callToolForHook(toolName, args, options),
           ...(appResultStore ? { apps: readyClient } : {}),
           refreshPrompts: (options) => readyClient.prompts(options),
           isClosed: transportClosed,
@@ -6949,6 +6979,8 @@ export class MCPServerManager {
         tools,
         prompts: [],
         getPrompt: (promptName, args, options) => activeClient.getPrompt(promptName, args, options),
+        callToolForHook: (toolName, args, options) =>
+          activeClient.callToolForHook(toolName, args, options),
         ...(appResultStore ? { apps: activeClient } : {}),
         refreshPrompts: (options) => activeClient.prompts(options),
         isClosed: transportErrored || clientClosed,

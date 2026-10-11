@@ -150,6 +150,15 @@ export interface MCPClientHandle {
     args: Record<string, unknown>,
     options?: { signal?: AbortSignal }
   ): Promise<MCPRawCallToolResult>;
+  /**
+   * tools/call for a Codex-format plugin hook (mcp_tool handler); returns the raw CallToolResult.
+   * The caller owns the deadline through `signal`.
+   */
+  callToolForHook(
+    name: string,
+    args: Record<string, unknown>,
+    options: { signal: AbortSignal }
+  ): Promise<MCPRawCallToolResult>;
   /** MCP Apps only: resources/read for a view's ui:// resource. */
   readResource(uri: string, options?: { signal?: AbortSignal }): Promise<MCPReadResourceResult>;
   close(): Promise<void>;
@@ -386,6 +395,8 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         }
       );
     },
+    callToolForHook: (name, args, options) =>
+      client.callTool({ name, arguments: args }, { signal: options.signal }),
     readResource: (uri, options) => {
       assert(mcpApps, "readResource requires an MCP Apps connection");
       return client.readResource(

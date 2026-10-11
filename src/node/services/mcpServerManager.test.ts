@@ -680,6 +680,40 @@ describe("MCPServerManager", () => {
     });
   });
 
+  test("plugin hook calls reach only a running server that is enabled in the workspace", async () => {
+    configService.listServers.mockResolvedValue({
+      "plugin:aaaaaaaaaaaaaaaa:guard": stdioConfig("hook-guard"),
+      "plugin:aaaaaaaaaaaaaaaa:off": stdioConfig("hook-off", true),
+    });
+    const calls: unknown[] = [];
+    servers.serve("hook-guard", {
+      tools: { check: testTool() },
+      callToolForHook: (name, args) => {
+        calls.push({ name, args });
+        return Promise.resolve({ content: [{ type: "text", text: "{}" }] });
+      },
+    });
+    const signal = new AbortController().signal;
+    const call = (workspaceId: string, key: string) =>
+      manager.callToolForPluginHook(workspaceId, key, "check", { a: 1 }, { signal });
+    const failure = (workspaceId: string, key: string) =>
+      call(workspaceId, key).then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      );
+
+    // Never starts a server: before any request the workspace has none running.
+    expect(await failure("hook-ws", "plugin:aaaaaaaaaaaaaaaa:guard")).toContain("not enabled");
+    await manager.getToolsForWorkspace(workspaceRequest("hook-ws"));
+
+    expect(await call("hook-ws", "plugin:aaaaaaaaaaaaaaaa:guard")).toEqual({
+      content: [{ type: "text", text: "{}" }],
+    });
+    expect(await failure("hook-ws", "plugin:aaaaaaaaaaaaaaaa:off")).toContain("not enabled");
+    expect(await failure("other-ws", "plugin:aaaaaaaaaaaaaaaa:guard")).toContain("not enabled");
+    expect(calls).toEqual([{ name: "check", args: { a: 1 } }]);
+  });
+
   test("an epoch retry never re-runs an MCP Apps view's tool call", async () => {
     // A sibling's plugin mutation lands while the approved call runs: the epoch postflight
     // re-runs the operation, which must not call the (possibly mutating) tool again.

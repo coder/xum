@@ -1,0 +1,217 @@
+/**
+ * Codex plugin hooks in a workspace, with real plugin files, a real registry and a real trust
+ * store. The MCP manager is a fake that records the server key of each call. Covers the per-call
+ * gate (#6042's P1-a and P1-b) and the same-plugin server rule.
+ */
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { EventSpine, type ToolExecuteContext } from "@/node/services/events/eventSpine";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { DisposableTempDir } from "@/node/services/tempDir";
+import { CodexPluginHookService, type EnsureCodexHooksArgs } from "./codexHookService";
+import { loadPluginCodexHooks } from "./codexHooks";
+import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { buildPluginServerKey, computePluginInstanceId } from "./mcpConfig";
+import { setPluginHookTrust } from "./pluginHookTrust";
+import { PLUGIN_REGISTRY_FILE_NAME } from "./registry";
+import { createTestPluginInstallEntry } from "./testFixtures";
+
+const workspaceId = "ws-hooks";
+const deny = {
+  structuredContent: {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: "no",
+    },
+  },
+};
+
+describe("CodexPluginHookService", () => {
+  let tmp: DisposableTempDir;
+  let xumHome: string;
+  let spine: EventSpine;
+  let service: CodexPluginHookService;
+  let projectTrusted: boolean;
+  let calledKeys: string[];
+  let mcpFails: boolean;
+
+  const pluginRoot = (name: string) => path.join(xumHome, "plugins", name);
+  const instanceId = (name: string) => computePluginInstanceId(pluginRoot(name));
+
+  async function writePlugin(name: string, server: string, managed = true) {
+    await fs.mkdir(path.join(pluginRoot(name), "hooks"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginRoot(name), "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name })
+    );
+    await fs.writeFile(
+      path.join(pluginRoot(name), "hooks", "hooks.json"),
+      JSON.stringify({
+        hooks: { PreToolUse: [{ hooks: [{ type: "mcp_tool", server, tool: "check" }] }] },
+      })
+    );
+    if (!managed) return;
+    const registryPath = path.join(xumHome, PLUGIN_REGISTRY_FILE_NAME);
+    const existing = await fs.readFile(registryPath, "utf8").then(
+      (raw) => (JSON.parse(raw) as { plugins: unknown[] }).plugins,
+      () => []
+    );
+    await fs.writeFile(
+      registryPath,
+      JSON.stringify({ plugins: [...existing, createTestPluginInstallEntry(name)] })
+    );
+  }
+
+  async function trustAll(name: string) {
+    const { hooks } = await loadPluginCodexHooks({
+      rootPath: await fs.realpath(pluginRoot(name)),
+      manifest: { schemaId: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name },
+    });
+    for (const hook of hooks) {
+      await setPluginHookTrust(xumHome, instanceId(name), {
+        key: hook.key,
+        hash: hook.hash,
+        state: "trusted",
+      });
+    }
+    return hooks;
+  }
+
+  const args = (): EnsureCodexHooksArgs => ({
+    workspaceId,
+    xumHome,
+    isProjectTrusted: () => projectTrusted,
+    mcp: {
+      callToolForPluginHook: (_workspaceId, serverKey) => {
+        calledKeys.push(serverKey);
+        return mcpFails
+          ? Promise.reject(new Error(`MCP server '${serverKey}' is not enabled in this workspace`))
+          : Promise.resolve(deny);
+      },
+    },
+    notifyUser: () => undefined,
+  });
+
+  async function runBash(): Promise<ToolExecuteContext> {
+    const ctx: ToolExecuteContext = {
+      toolName: "bash",
+      args: {},
+      host: {
+        runtime: new LocalRuntime(xumHome),
+        runtimeTempDir: xumHome,
+        cwd: xumHome,
+        workspaceId,
+      },
+      executed: false,
+    };
+    await spine.run("tool.execute", ctx, (c) => {
+      c.result = { ok: true };
+      c.executed = true;
+    });
+    return ctx;
+  }
+
+  beforeEach(() => {
+    tmp = new DisposableTempDir("codex-hook-service");
+    xumHome = tmp.path;
+    spine = new EventSpine();
+    service = new CodexPluginHookService(spine);
+    projectTrusted = true;
+    calledKeys = [];
+    mcpFails = false;
+  });
+
+  afterEach(async () => {
+    await service.disposeWorkspace(workspaceId);
+    tmp[Symbol.dispose]();
+  });
+
+  test("an untrusted hook never runs; a trusted one calls its own plugin's server", async () => {
+    await writePlugin("guard", "scanner");
+    await service.ensureWorkspaceHooks(args());
+    expect((await runBash()).executed).toBe(true);
+    expect(calledKeys).toEqual([]);
+
+    await trustAll("guard");
+    expect((await runBash()).executed).toBe(false);
+    expect(calledKeys).toEqual([buildPluginServerKey(instanceId("guard"), "scanner")]);
+  });
+
+  test("a hook turned off mid-turn does not run on the next call", async () => {
+    await writePlugin("guard", "scanner");
+    const [hook] = await trustAll("guard");
+    await service.ensureWorkspaceHooks(args());
+    expect((await runBash()).executed).toBe(false);
+
+    // No re-registration in between: the gate reads the store at the call.
+    await setPluginHookTrust(xumHome, instanceId("guard"), {
+      key: hook.key,
+      hash: hook.hash,
+      state: "disabled",
+    });
+    expect((await runBash()).executed).toBe(true);
+    expect(calledKeys).toHaveLength(1);
+  });
+
+  test("revoking project trust mid-stream stops the next call", async () => {
+    await writePlugin("guard", "scanner");
+    await trustAll("guard");
+    await service.ensureWorkspaceHooks(args());
+    expect((await runBash()).executed).toBe(false);
+
+    projectTrusted = false;
+    expect((await runBash()).executed).toBe(true);
+    expect(calledKeys).toHaveLength(1);
+  });
+
+  test("uninstalling or editing the plugin mid-stream stops the next call", async () => {
+    await writePlugin("guard", "scanner");
+    await trustAll("guard");
+    await service.ensureWorkspaceHooks(args());
+    expect((await runBash()).executed).toBe(false);
+
+    // The definition changed on disk: the trusted hash no longer matches what is declared.
+    await fs.writeFile(
+      path.join(pluginRoot("guard"), "hooks", "hooks.json"),
+      JSON.stringify({
+        hooks: { PreToolUse: [{ hooks: [{ type: "mcp_tool", server: "x", tool: "y" }] }] },
+      })
+    );
+    expect((await runBash()).executed).toBe(true);
+    await fs.rm(pluginRoot("guard"), { recursive: true });
+    expect((await runBash()).executed).toBe(true);
+    expect(calledKeys).toHaveLength(1);
+  });
+
+  test("a disabled plugin server fails open: the tool runs", async () => {
+    await writePlugin("guard", "scanner");
+    await trustAll("guard");
+    await service.ensureWorkspaceHooks(args());
+    mcpFails = true;
+    expect((await runBash()).executed).toBe(true);
+  });
+
+  test("a hook cannot reach another plugin's server", async () => {
+    await writePlugin("victim", "db");
+    const victimKey = buildPluginServerKey(instanceId("victim"), "db");
+    await writePlugin("attacker", victimKey);
+    await trustAll("attacker");
+    await service.ensureWorkspaceHooks(args());
+
+    await runBash();
+
+    expect(calledKeys).toEqual([buildPluginServerKey(instanceId("attacker"), victimKey)]);
+    expect(calledKeys).not.toContain(victimKey);
+  });
+
+  test("an unmanaged plugin's hooks never run, even with a trust record", async () => {
+    await writePlugin("loose", "scanner", false);
+    await trustAll("loose");
+    await service.ensureWorkspaceHooks(args());
+
+    expect((await runBash()).executed).toBe(true);
+    expect(calledKeys).toEqual([]);
+  });
+});
