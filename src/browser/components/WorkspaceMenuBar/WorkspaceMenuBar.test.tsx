@@ -632,6 +632,35 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       targets.forEach((target) => target.remove());
     });
 
+    it("while the sidebar shows full-screen, Shift+T and Shift+S switch its tab", () => {
+      // Shown full-screen, the sidebar is visible: the narrow query no longer hides it.
+      stubMatchMedia(() => false);
+      const { shown, onOpenSidebar } = renderRecording({ sidebarFullscreen: true });
+
+      act(() => {
+        fireEvent.keyDown(window, { key: "T", shiftKey: true });
+      });
+      expect(activeTab()).toBe("timeline");
+      act(() => {
+        fireEvent.keyDown(window, { key: "S", shiftKey: true });
+      });
+      expect(activeTab()).toBe("costs");
+      // Already open: no second open, so focus still returns to the original opener.
+      expect(onOpenSidebar).not.toHaveBeenCalled();
+      expect(shown).toEqual([]);
+    });
+
+    it("keeps the phone header buttons mounted while the sidebar shows full-screen", () => {
+      // The full-screen sidebar is visible, so only the phone header query matches.
+      stubMatchMedia((query) => query === "(max-width: 480px) and (pointer: coarse)");
+      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+      const view = render(<WorkspaceMenuBar {...defaultProps} sidebarFullscreen />);
+
+      // Focus returns to them when the view closes, so they must not unmount meanwhile.
+      expect(view.getByRole("button", { name: "Stats" })).toBeTruthy();
+      expect(view.getByRole("button", { name: "Artifacts" })).toBeTruthy();
+    });
+
     it("touch phones swap the header terminal button for Stats and Artifacts", () => {
       // Narrow viewport (sidebar hidden) plus the coarse-pointer phone header query.
       stubMatchMedia(

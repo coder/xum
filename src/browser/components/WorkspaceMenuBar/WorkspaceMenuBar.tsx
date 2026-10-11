@@ -264,13 +264,15 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // shortcuts, palette and "Open in Artifacts") open their tab in the sidebar itself, shown
   // full-screen, like every other tab. They used to open dialogs of their own (#5767, #5795).
   // Focus returns to `returnFocusTo` when the view closes.
+  // Already open (Shift+T from another full-screen tab): only switch the tab, so focus still
+  // returns to the control that opened the view.
   const openSidebarTab = useCallback(
     (tab: TabType, returnFocusTo: HTMLElement | null) => {
       if (onOpenSidebar == null) return;
       focusRightSidebarTab(workspaceId, tab);
-      onOpenSidebar(returnFocusTo);
+      if (!sidebarFullscreen) onOpenSidebar(returnFocusTo);
     },
-    [onOpenSidebar, workspaceId]
+    [onOpenSidebar, sidebarFullscreen, workspaceId]
   );
   const activeElement = () =>
     document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -301,7 +303,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         !matchesKeybind(e, KEYBINDS.OPEN_TIMELINE_DIALOG) ||
         isDialogOpen() ||
         isEditableElement(e.target) ||
-        !isTimelineSidebarHidden()
+        // Shown full-screen, the sidebar is visible, and the shortcut switches its tab.
+        !(isTimelineSidebarHidden() || sidebarFullscreen)
       ) {
         return;
       }
@@ -310,7 +313,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [isTimelineSidebarHidden, openSidebarTab]);
+  }, [isTimelineSidebarHidden, openSidebarTab, sidebarFullscreen]);
 
   // Stats while the sidebar is hidden: its shortcut, and the palette's "Add Tool: Stats" (which
   // also adds the tab to the hidden layout, so wide layouts keep their old behavior).
@@ -321,12 +324,13 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         matchesKeybind(e, KEYBINDS.OPEN_STATS_DIALOG) &&
         !isDialogOpen() &&
         !isEditableElement(e.target) &&
-        isTimelineSidebarHidden()
+        (isTimelineSidebarHidden() || sidebarFullscreen)
       ) {
         e.preventDefault();
         open();
       }
     };
+    // The palette already selected the tab; only a hidden sidebar needs showing.
     const onPalette = (event: Event) => {
       const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
       if (detail?.workspaceId === workspaceId && isTimelineSidebarHidden()) open();
@@ -337,7 +341,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_STATS_DIALOG, onPalette);
     };
-  }, [isTimelineSidebarHidden, openSidebarTab, workspaceId]);
+  }, [isTimelineSidebarHidden, openSidebarTab, sidebarFullscreen, workspaceId]);
 
   // Ctrl+Shift+K normally opens the Artifacts tab (RightSidebar owns that handler); while the
   // sidebar is hidden it shows that tab full-screen instead.
@@ -928,8 +932,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         {isPhoneHeader ? (
           // Touch phones: the terminal opens as a pop-out window, which mobile Safari does not
           // show, so the header row offers Stats and Artifacts (the hidden right sidebar's tabs)
-          // and New terminal moves into the More menu.
-          timelineSidebarHidden && (
+          // and New terminal moves into the More menu. They stay mounted while the full-screen
+          // sidebar shows (it is visible then), so focus can return to them when it closes.
+          (timelineSidebarHidden || sidebarFullscreen) && (
             <>
               <Tooltip>
                 <TooltipTrigger asChild>
