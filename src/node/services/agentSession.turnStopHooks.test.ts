@@ -3,14 +3,23 @@
  * for the plugin hook runner: real middleware on the real event spine, reached through the
  * harness AI fake's runTurnStopHooks (the same runner AIService uses).
  */
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import assert from "node:assert";
 import { EventEmitter } from "events";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { Ok } from "@/common/types/result";
 import { eventSpine, type TurnStopContext } from "./events/eventSpine";
 import type { TurnCompletion } from "./streamManager";
-import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  type AgentSessionHarness,
+  type AgentSessionHarnessOptions,
+} from "./agentSession.testHarness";
+import { ExtensionMetadataService } from "./ExtensionMetadataService";
+import { createTestHistoryService } from "./testHistoryService";
+import { registerNoopContinuationBridgeForTest } from "./testDispatchHelpers";
+import { WorkspaceGoalService } from "./workspaceGoalService";
+import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 
 const workspaceId = "turn-stop-hooks";
 const model = "openai:gpt-4o";
@@ -53,11 +62,13 @@ async function setup(
   input: {
     parts?: (turn: number) => CompletedMessagePart[];
     ending?: (turn: number) => "completed" | "aborted";
+    session?: Omit<AgentSessionHarnessOptions, "workspaceId" | "aiEmitter" | "aiServiceOverrides">;
   } = {}
 ) {
   const emitter = new EventEmitter();
   let turns = 0;
   const h = await createAgentSessionHarness({
+    ...input.session,
     workspaceId,
     aiEmitter: emitter,
     aiServiceOverrides: {
@@ -101,6 +112,47 @@ async function settle(h: AgentSessionHarness): Promise<void> {
     if (!h.session.isBusy() && !h.session.hasQueuedMessages()) return;
   }
   throw new Error("session never settled");
+}
+
+/** A session with a real goal service and an active goal (the goal loop's bridge is a no-op). */
+async function setupWithGoal() {
+  const history = await createTestHistoryService();
+  const projectPath = "/tmp/turn-stop-hooks-project";
+  await history.config.addWorkspace(projectPath, {
+    id: workspaceId,
+    name: workspaceId,
+    projectName: "turn-stop-hooks-project",
+    projectPath,
+    runtimeConfig: { type: "local" },
+  });
+  const goalService = new WorkspaceGoalService(
+    history.config,
+    history.historyService,
+    new ExtensionMetadataService(`${history.config.rootDir}/extension-metadata.json`)
+  );
+  registerNoopContinuationBridgeForTest(goalService);
+  const goal = await goalService.setGoal({ workspaceId, objective: "Ship the release" });
+  assert(goal.success);
+  const session = await setup({
+    session: {
+      config: history.config,
+      historyService: history.historyService,
+      workspaceGoalService: goalService,
+    },
+  });
+  unregisters.push(() => void history.cleanup());
+  return { ...session, goalId: goal.data.goalId };
+}
+
+/** A goal-loop continuation send, as WorkspaceGoalService dispatches it. */
+function sendGoalTurn(h: AgentSessionHarness, goalId: string) {
+  return h.session.sendMessage("Continue the goal.", options, {
+    acceptanceOrigin: "automatic",
+    synthetic: true,
+    agentInitiated: true,
+    goalKind: GOAL_CONTINUATION_KIND,
+    goalId,
+  });
 }
 
 async function userTexts(h: AgentSessionHarness): Promise<string[]> {
@@ -174,6 +226,85 @@ describe("turn.stop", () => {
 
     expect(await userTexts(h)).toEqual(["fix the tests", "actually, stop"]);
     expect(streams()).toBe(2);
+  });
+
+  test("a user send still in WorkspaceService's preflight wins over a continuation", async () => {
+    // The send is not queued yet (pricing/settings preflight), so only the preflight probe sees it.
+    let userSendInPreflight = false;
+    addConsumer((ctx) => {
+      userSendInPreflight = true;
+      keepGoing(ctx);
+    });
+    const { h, streams } = await setup({
+      session: { hasExternalManualSendPreflight: () => userSendInPreflight },
+    });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual(["fix the tests"]);
+    expect(streams()).toBe(1);
+  });
+
+  test("a goal turn's continuation stays a goal turn of the same goal", async () => {
+    let continued = false;
+    addConsumer((ctx) => {
+      if (continued) return;
+      continued = true;
+      keepGoing(ctx);
+    });
+    const { h, streams, goalId } = await setupWithGoal();
+
+    expect((await sendGoalTurn(h, goalId)).success).toBe(true);
+    await settle(h);
+
+    expect(streams()).toBe(2);
+    const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(history.success);
+    const continuation = history.data.filter((row) => row.role === "user")[1];
+    // The goal counts the continuation's turn and cost (goal_continuation stream origin).
+    expect(continuation?.metadata?.kind).toBe(GOAL_CONTINUATION_KIND);
+    expect(continuation?.metadata?.goalId).toBe(goalId);
+  });
+
+  test("a goal turn is not continued once its goal no longer admits a continuation", async () => {
+    addConsumer(keepGoing);
+    const { h, streams } = await setupWithGoal();
+
+    // The ended turn belongs to a goal that is no longer the workspace's goal.
+    expect((await sendGoalTurn(h, "replaced-goal")).success).toBe(true);
+    await settle(h);
+
+    expect(streams()).toBe(1);
+  });
+
+  test("a continuation refused before streaming leaves no stopHookActive for the next turn", async () => {
+    const calls: StopCall[] = [];
+    let continued = false;
+    addConsumer((ctx) => {
+      if (continued) return;
+      continued = true;
+      keepGoing(ctx);
+    }, calls);
+    const { h, streams } = await setup();
+    // Refuse the continuation at its admission, as a context mutation or a goal gate would.
+    const queueMessage = h.session.queueMessage.bind(h.session);
+    spyOn(h.session, "queueMessage").mockImplementationOnce((message, queuedOptions, internal) =>
+      queueMessage(message, queuedOptions, { ...internal, admissionStale: () => true })
+    );
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+    expect(streams()).toBe(1);
+
+    // A later automatic turn (a wake, a heartbeat) is a new turn for Stop.
+    await h.session.sendMessage("Background task finished.", options, {
+      acceptanceOrigin: "automatic",
+      synthetic: true,
+    });
+    await settle(h);
+
+    expect(calls.map((call) => call.stopHookActive)).toEqual([false, false]);
   });
 
   test("the reply text is the trailing text run, and null when the turn ends on a tool", async () => {

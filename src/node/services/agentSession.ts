@@ -553,6 +553,13 @@ const PDF_MEDIA_TYPE = "application/pdf";
 const MAX_STOP_HOOK_CONTINUATIONS = 3;
 const STOP_HOOK_CONTINUATION_DEDUPE_KEY = "stop-hook-continuation";
 
+/** The ended stream's provenance that its turn.stop continuation keeps. */
+interface StopContinuationProvenance {
+  goalKind?: GoalSyntheticMessageKind;
+  goalId?: string;
+  agentInitiated?: boolean;
+}
+
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
   if (!metadata) return [];
 
@@ -4747,8 +4754,17 @@ export class AgentSession {
         createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
       );
 
-    // A person's send starts a new user turn: Stop may continue it again.
-    if (attempt.acceptanceOrigin === "manual") this.stopHookContinuations = 0;
+    // A new prompt starts a new turn for Stop: a person's send, or any other send that runs the
+    // message.send hooks (Codex runs UserPromptSubmit for every input but a Stop continuation).
+    // An on-send compaction follow-up continues its own send. A continuation that never started
+    // (refused before streaming) so leaves no stopHookActive behind for the next turn.
+    if (
+      attempt.acceptanceOrigin === "manual" ||
+      (internal?.skipPromptHooks !== true &&
+        internal?.pluginSendHooksApplied == null &&
+        !isCompactionRequestMetadata(options?.muxMetadata))
+    )
+      this.stopHookContinuations = 0;
     // Prompt hooks (message.send): before the pricing gate (its rejected-input row), routing,
     // @file snapshots, edit truncation and every history write, so a block leaves history
     // unchanged.
@@ -9925,6 +9941,12 @@ export class AgentSession {
     const streamEndPayload = payload;
     const activeStreamGoalKind = this.activeStreamContext?.goalKind;
     const activeStreamOptions = this.activeStreamContext?.options;
+    // A turn.stop continuation keeps this stream's goal provenance (read before the reset below).
+    const activeStreamProvenance: StopContinuationProvenance = {
+      goalKind: activeStreamGoalKind,
+      goalId: this.activeStreamContext?.goalId,
+      agentInitiated: this.activeStreamContext?.agentInitiated,
+    };
 
     let goalContinuationRequest: {
       sendOptions: SendMessageOptions;
@@ -10068,7 +10090,7 @@ export class AgentSession {
       if (!handled && !this.coordinator.editBlocked()) {
         // Before the queue flush: a continuation is queued work, so the flush dispatches it and
         // the goal loop waits for it, and input the user queued meanwhile wins over it.
-        await this.runTurnStopHooks(streamEndPayload, activeStreamOptions);
+        await this.runTurnStopHooks(streamEndPayload, activeStreamOptions, activeStreamProvenance);
         if (
           !this.coordinator.isCurrentTurn(turn) ||
           !this.coordinator.isCurrentOperation(operation)
@@ -10209,7 +10231,8 @@ export class AgentSession {
    */
   private async runTurnStopHooks(
     payload: StreamEndEvent,
-    options: SendMessageOptions | undefined
+    options: SendMessageOptions | undefined,
+    provenance: StopContinuationProvenance
   ): Promise<void> {
     if (this.aiService.runTurnStopHooks == null) return;
     if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
@@ -10218,8 +10241,38 @@ export class AgentSession {
       lastAssistantMessage: lastAssistantText(payload.parts),
       stopHookActive: this.stopHookContinuations > 0,
     });
-    // Queued work (typed input, wakes) is the next turn instead; the user turn ends here.
-    if (outcome.kind === "none" || options == null || this.hasPendingManualFollowUp()) {
+    if (outcome.kind === "none" || options == null) {
+      this.stopHookContinuations = 0;
+      return;
+    }
+    // A goal turn's continuation stays a goal turn: the goal counts its turns and cost against
+    // its caps. Like a redispatched goal follow-up, it runs only while the goal still admits a
+    // continuation (still active, same goal, no Pause or Stop since): a goal that just reached
+    // its turn or cost limit, or a budget wrap-up, ends here.
+    let goalAdmissionStale: (() => boolean) | undefined;
+    if (provenance.goalKind != null && this.workspaceGoalService != null) {
+      const admission =
+        provenance.goalId == null
+          ? { admissible: false as const }
+          : await this.workspaceGoalService.buildGoalRedispatchAdmission(
+              this.workspaceId,
+              provenance.goalId,
+              GOAL_CONTINUATION_KIND
+            );
+      if (!admission.admissible) {
+        log.info("Prompt hooks: the goal no longer admits a turn.stop continuation", {
+          workspaceId: this.workspaceId,
+          goalKind: provenance.goalKind,
+        });
+        this.stopHookContinuations = 0;
+        return;
+      }
+      goalAdmissionStale = admission.admissionStale;
+    }
+    // Queued work (typed input, wakes) is the next turn instead; the user turn ends here. A user
+    // send still in its preflight (this session's or WorkspaceService's) is not queued yet, but
+    // it wins too: the continuation must not run another model turn ahead of newer input.
+    if (this.hasPendingManualFollowUp() || this.hasManualSendInPreflight()) {
       this.stopHookContinuations = 0;
       return;
     }
@@ -10237,6 +10290,11 @@ export class AgentSession {
       {
         acceptanceOrigin: "automatic",
         synthetic: true,
+        ...(provenance.agentInitiated === true ? { agentInitiated: true } : {}),
+        ...(provenance.goalKind != null
+          ? { goalKind: GOAL_CONTINUATION_KIND, goalId: provenance.goalId }
+          : {}),
+        ...(goalAdmissionStale != null ? { admissionStale: goalAdmissionStale } : {}),
         dedupeKey: STOP_HOOK_CONTINUATION_DEDUPE_KEY,
         // Codex runs no UserPromptSubmit hook for a Stop continuation (see skipPromptHooks).
         skipPromptHooks: true,
@@ -10725,6 +10783,9 @@ export class AgentSession {
       workspaceTurnContinuation?: boolean;
       /** Automatic sub-agent turn provenance carried to the dispatched send. */
       taskTurnKind?: TaskTurnKind;
+      /** Goal-loop provenance carried to the dispatched send (seals the entry). */
+      goalKind?: GoalSyntheticMessageKind;
+      goalId?: string;
       /** Coalescing: drop the message when an entry with the same key is already queued. */
       dedupeKey?: string;
       /** Isolate this keyed message so it can be selectively superseded later. */
