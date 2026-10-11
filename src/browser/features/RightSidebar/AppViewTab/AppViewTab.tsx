@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { AppWindow } from "lucide-react";
+import { cn } from "@/common/lib/utils";
 import { mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { McpAppFrame } from "../ArtifactsTab/McpAppFrame";
 import {
@@ -32,15 +33,25 @@ export function AppViewInTabNotice(props: { workspaceId: string; view: McpAppVie
 }
 
 /** Tab strip label of an app tab: the tool's title (or name), then its server. */
-export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string | null }) {
+export function AppViewTabLabel(props: {
+  workspaceId: string;
+  toolCallId: string | null;
+  /**
+   * Fit the label to its container's width, truncating the server too (the phone sheet header,
+   * where an unbroken server key of up to 80 characters would push its close button off the
+   * sheet). The tab strip keeps the full server: the tab's own max width clips it.
+   */
+  fitWidth?: boolean;
+}) {
   const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
   const ref = typeof view === "object" ? view : null;
+  const fit = props.fitWidth === true;
   return (
-    <span className="inline-flex min-w-0 items-center gap-1">
+    <span className={cn("min-w-0 items-center gap-1", fit ? "flex" : "inline-flex")}>
       <AppWindow className="h-3 w-3 shrink-0" />
       <span className="min-w-0 truncate">{ref?.label ?? "App view"}</span>
       {ref != null && (
-        <span className="text-muted shrink-0 text-[10px]">
+        <span className={cn("text-muted text-[10px]", fit ? "min-w-0 truncate" : "shrink-0")}>
           {mcpServerDisplayName(ref.serverName)}
         </span>
       )}
