@@ -1748,19 +1748,20 @@ export class AgentSession {
 
     this.attachAiListeners();
     this.attachInitListeners();
+    // A subscription is lazy: protect an existing engine before any caller can
+    // send through this new session, even before replay is first pulled.
+    const existingStream = this.streamManager.getStreamInfo(this.workspaceId);
+    if (existingStream) this.coordinator.observeStreamReplay(existingStream.messageId);
+    eventSpine.emit("session.start", { workspaceId: this.workspaceId });
     // #6116: the client still holds an empty failed reply that commitPartial deleted. Its next
     // edit would send that row as evidence and be refused; drop it as a truncation does.
+    // Last statement: no later constructor step can throw and leak this process-wide listener.
     this.stopEmptyErroredReplyDeletes = this.historyService.onEmptyErroredReplyDeleted(
       (workspaceId, historySequence) => {
         if (workspaceId === this.workspaceId)
           this.emitChatEvent({ type: "delete", historySequences: [historySequence] });
       }
     );
-    // A subscription is lazy: protect an existing engine before any caller can
-    // send through this new session, even before replay is first pulled.
-    const existingStream = this.streamManager.getStreamInfo(this.workspaceId);
-    if (existingStream) this.coordinator.observeStreamReplay(existingStream.messageId);
-    eventSpine.emit("session.start", { workspaceId: this.workspaceId });
   }
 
   /**
@@ -1809,6 +1810,9 @@ export class AgentSession {
 
   dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise;
+    // First, before any step that can throw: the listener lives in the process-wide
+    // HistoryService. A delete during disposal is not published anyway (emitChatEvent).
+    this.stopEmptyErroredReplyDeletes();
     const disposed = Promise.withResolvers<void>();
     this.disposePromise = disposed.promise;
     // Register before closing the guardian so app teardown also joins stop/background cleanup.
@@ -1865,7 +1869,6 @@ export class AgentSession {
         for (const { event, handler } of this.initListeners)
           this.initStateManager.off(event, handler as never);
         this.initListeners.length = 0;
-        this.stopEmptyErroredReplyDeletes();
         this.emitter.removeAllListeners();
         eventSpine.emit("session.end", { workspaceId: this.workspaceId });
       })

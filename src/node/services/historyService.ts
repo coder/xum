@@ -844,6 +844,11 @@ export class HistoryService {
     return () => this.emptyErroredReplyDeletedListeners.delete(listener);
   }
 
+  /** Test-visible: how many onEmptyErroredReplyDeleted listeners are subscribed. */
+  get emptyErroredReplyDeletedListenerCount(): number {
+    return this.emptyErroredReplyDeletedListeners.size;
+  }
+
   private readonly continuousJournals = new Map<string, ContinuousCompactionJournalStore>();
 
   getContinuousCompactionJournal(workspaceId: string): ContinuousCompactionJournalStore {
@@ -3464,7 +3469,15 @@ export class HistoryService {
     // Notify after the locks are released: listeners publish to clients.
     if (committed.data !== undefined) {
       for (const listener of this.emptyErroredReplyDeletedListeners) {
-        listener(workspaceId, committed.data);
+        // One failing session must neither skip the others nor fail this commit.
+        try {
+          listener(workspaceId, committed.data);
+        } catch (error) {
+          log.warn("Empty errored reply delete listener failed", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
       }
     }
     return Ok(undefined);

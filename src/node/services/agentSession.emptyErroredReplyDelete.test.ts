@@ -27,6 +27,15 @@ async function seedEmptyErroredReply(
 }
 
 describe("AgentSession: a deleted empty failed reply (#6116)", () => {
+  test("disposing the session removes its HistoryService listener", async () => {
+    const h = await createAgentSessionHarness({ workspaceId: "ws" });
+    await using _cleanup = { [Symbol.asyncDispose]: h.cleanup };
+    // The harness built one session on this HistoryService.
+    expect(h.historyService.emptyErroredReplyDeletedListenerCount).toBe(1);
+    await h.session.dispose();
+    expect(h.historyService.emptyErroredReplyDeletedListenerCount).toBe(0);
+  });
+
   test("tells its own clients to drop the row", async () => {
     const h = await createAgentSessionHarness({ workspaceId: "ws", captureEvents: true });
     await using _cleanup = { [Symbol.asyncDispose]: h.cleanup };

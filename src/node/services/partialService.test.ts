@@ -107,6 +107,33 @@ describe("HistoryService partial persistence - Error Recovery", () => {
     expect(deleted).toEqual([[workspaceId, 2]]);
   });
 
+  test("a throwing empty-errored-reply listener skips no other listener and no commit (#6116)", async () => {
+    const workspaceId = "test-workspace";
+    const received: number[] = [];
+    const stopThrowing = partialService.onEmptyErroredReplyDeleted(() => {
+      throw new Error("listener failed");
+    });
+    const stopReceiving = partialService.onEmptyErroredReplyDeleted((_id, sequence) =>
+      received.push(sequence)
+    );
+    try {
+      const empty: MuxMessage = {
+        id: "msg-1",
+        role: "assistant",
+        metadata: { historySequence: 1, partial: true, error: "Stream error", errorType: "api" },
+        parts: [],
+      };
+      await appendPlaceholder(partialService, workspaceId, empty);
+      expect((await partialService.writePartial(workspaceId, empty)).success).toBe(true);
+      expect(await partialService.commitPartial(workspaceId)).toEqual(Ok(undefined));
+      expect(received).toEqual([1]);
+      expect(await partialService.readPartial(workspaceId)).toBeNull();
+    } finally {
+      stopThrowing();
+      stopReceiving();
+    }
+  });
+
   test("updatePartialIfMessageIdMatches waits out a commitPartial transaction and declines", async () => {
     const workspaceId = "test-workspace";
     const partial: MuxMessage = {
