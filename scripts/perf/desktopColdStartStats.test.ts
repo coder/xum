@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { launchPlan, pairedRelativeDelta } from "./desktopColdStartStats";
+import { launchPlan, pairedRelativeDelta, refusedConfig } from "./desktopColdStartStats";
 
 const near = (value: number) => expect.closeTo(value, 12);
 
@@ -48,5 +48,12 @@ describe("pairedRelativeDelta", () => {
     expect(() => pairedRelativeDelta([100], [100])).toThrow();
     expect(() => pairedRelativeDelta([100, 0], [100, 100])).toThrow();
     expect(() => pairedRelativeDelta([100, 100], [100, Number.NaN])).toThrow();
+  });
+});
+
+describe("refusedConfig", () => {
+  test("refuses transcript runs without a warm-up per arm, and nothing else", () => {
+    expect(refusedConfig("transcript", 0)).toContain("--warmups >= 1");
+    expect([refusedConfig("transcript", 1), refusedConfig("shell", 0)]).toEqual([null, null]);
   });
 });

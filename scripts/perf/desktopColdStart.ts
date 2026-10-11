@@ -23,7 +23,12 @@ import { _electron as electron } from "playwright";
 import { setXumE2EEnv } from "../../tests/e2e/env";
 import { prepareDemoProject } from "../../tests/e2e/utils/demoProject";
 import { SEED_CODE_LINE, seedBootWorkspace } from "./bootSeed";
-import { launchPlan, pairedRelativeDelta, type PlannedLaunch } from "./desktopColdStartStats";
+import {
+  launchPlan,
+  pairedRelativeDelta,
+  refusedConfig,
+  type PlannedLaunch,
+} from "./desktopColdStartStats";
 
 const MARK = "xum:app-shell-ready";
 const USAGE =
@@ -92,6 +97,8 @@ async function main(): Promise<void> {
   const timeout = intArg("timeout-ms", values["timeout-ms"], 1);
   const metric = values.metric;
   if (metric !== "shell" && metric !== "transcript") usageError(`--metric: ${metric}`);
+  const refused = refusedConfig(metric, warmups);
+  if (refused) usageError(refused);
   const tree = { base: path.resolve(values.base), head: path.resolve(values.head) };
   const bin = { base: electronFor(tree.base), head: electronFor(tree.head) };
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "xum-cold-start-"));

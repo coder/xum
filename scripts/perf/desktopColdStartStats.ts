@@ -15,6 +15,20 @@ const T_ONE_SIDED_95 = [
   1.699, 1.697,
 ];
 
+/**
+ * Why a run configuration is refused, or null. Transcript runs need a warm-up per arm: their
+ * setup launch runs only the head tree, so without warm-ups pair 0 would see a head-warmed OS page
+ * cache. The warm-ups give both trees the same seeded route up to transcript readiness first.
+ */
+export function refusedConfig(
+  metric: "shell" | "transcript",
+  warmupsPerArm: number
+): string | null {
+  return metric === "transcript" && warmupsPerArm < 1
+    ? "--metric transcript needs --warmups >= 1"
+    : null;
+}
+
 /** Warm-ups alternate base, head; pairs then run ABBA (base-head, head-base, base-head, ...). */
 export function launchPlan(pairs: number, warmupsPerArm = 2): PlannedLaunch[] {
   assert(Number.isInteger(pairs) && pairs >= 2, `pairs must be an integer >= 2, got ${pairs}`);
