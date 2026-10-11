@@ -4,7 +4,7 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
@@ -644,13 +644,30 @@ export const WorkspaceMCPServerSettingsNotConnected: Story = {
   },
 };
 
-/** The modal behind an open button: Cancel really closes it, so a play can reopen it. */
+/**
+ * The modal behind an open button: Cancel really closes it, so a play can
+ * reopen it. A second button changes a value on the server while the dialog is
+ * closed (another client, a hook), so a reopen must read again.
+ */
 const ReopenableWorkspaceMCPModal: FC = () => {
   const [open, setOpen] = useState(true);
+  const { api } = useAPI();
   return (
     <>
       <button type="button" onClick={() => setOpen(true)}>
         Open workspace MCP
+      </button>
+      <button
+        type="button"
+        onClick={() =>
+          void api?.mcp.settings.update({
+            workspaceId: WORKSPACE_ID,
+            serverName: "cad",
+            set: { zoom: 4 },
+          })
+        }
+      >
+        Change zoom on the server
       </button>
       <WorkspaceMCPModal
         workspaceId={WORKSPACE_ID}
@@ -686,7 +703,10 @@ async function saveUnits(canvasElement: HTMLElement, units: string) {
   return { section, save };
 }
 
-/** Save, close and reopen: the reopened form reads the saved value again (no Refresh Tools). */
+/**
+ * Save, close and reopen: the reopened form shows the saved value and a value
+ * changed elsewhere meanwhile, with no Refresh Tools.
+ */
 export const WorkspaceMCPServerSettingsReopen: Story = {
   render: () => (
     <WorkspaceMCPModalStoryShell setup={() => setupWorkspaceMCPModalStory(settingsStoryOptions())}>
@@ -700,6 +720,9 @@ export const WorkspaceMCPServerSettingsReopen: Story = {
     await waitFor(() =>
       expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
     );
+    await userEvent.click(
+      within(canvasElement).getByRole("button", { name: "Change zoom on the server" })
+    );
 
     await userEvent.click(within(canvasElement).getByRole("button", { name: "Open workspace MCP" }));
     const section = within(
@@ -708,6 +731,7 @@ export const WorkspaceMCPServerSettingsReopen: Story = {
       )
     );
     await waitFor(() => expect(section.getByLabelText("Units setting")).toHaveTextContent("in"));
+    await expect(section.getByLabelText("Default zoom setting")).toHaveValue(4);
   },
 };
 
