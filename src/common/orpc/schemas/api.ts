@@ -190,6 +190,7 @@ import {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallPreviewSchema,
   AgentPluginComponentsSchema,
+  AgentPluginHooksSchema,
   AgentPluginListItemSchema,
   AgentPluginUpdateCheckSchema,
   AgentPluginUpdateConsentSchema,
@@ -1208,6 +1209,21 @@ export const agentPlugins = {
   getComponents: {
     input: z.object({ name: z.string() }),
     output: ResultSchema(AgentPluginComponentsSchema, z.string()),
+  },
+  /** Codex-format hooks (hooks.json) of a managed plugin, with their trust review state. */
+  getHooks: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginHooksSchema, z.string()),
+  },
+  /** Trust, turn off, or clear (null) one hook; refused when `hash` is no longer current. */
+  setHookTrust: {
+    input: z.object({
+      name: z.string(),
+      key: z.string(),
+      hash: z.string(),
+      state: z.enum(["trusted", "disabled"]).nullable(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
   },
   setComponents: {
     input: z.object({

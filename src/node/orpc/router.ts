@@ -1295,6 +1295,16 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.agentPluginInstallService.getComponentsResult(input)
         ),
+      getHooks: t
+        .input(schemas.agentPlugins.getHooks.input)
+        .output(schemas.agentPlugins.getHooks.output)
+        .handler(({ context, input }) => context.agentPluginInstallService.getHooksResult(input)),
+      setHookTrust: t
+        .input(schemas.agentPlugins.setHookTrust.input)
+        .output(schemas.agentPlugins.setHookTrust.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.setHookTrustResult(input)
+        ),
       setComponents: t
         .input(schemas.agentPlugins.setComponents.input)
         .output(schemas.agentPlugins.setComponents.output)

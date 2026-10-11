@@ -16,6 +16,11 @@
  */
 import * as crypto from "node:crypto";
 import * as path from "node:path";
+import type {
+  AgentPluginHook,
+  PluginHookHandler,
+  PluginHookStatus,
+} from "@/common/orpc/schemas/agentPlugins";
 import { getErrorMessage } from "@/common/utils/errors";
 import { ensurePathContained } from "@/node/services/tools/skillFileUtils";
 import { readPluginFileWithinRootCapped, type AgentPluginInfo } from "./discovery";
@@ -47,31 +52,8 @@ const MAX_HOOKS_FILE_BYTES = 256 * 1024;
 /** Codex default handler timeout, in seconds. */
 export const DEFAULT_HOOK_TIMEOUT_SECONDS = 600;
 
-export type PluginHookHandler =
-  | {
-      type: "mcp_tool";
-      server: string;
-      tool: string;
-      /** Argument templates (`${tool_input.x}`); defaults to `{}`. */
-      input: Record<string, unknown>;
-      timeoutSeconds: number;
-      statusMessage?: string;
-    }
-  /** Parsed and shown, never run (Xum runs no hook commands). */
-  | { type: "command" | "prompt" | "agent"; summary: string };
-
-export type PluginHookStatus = "runnable" | "unsupported-handler" | "ignored-event";
-
-export interface PluginHookDefinition {
-  /** sha256 of the canonical definition (event, matcher, handler): the trust key. */
-  hash: string;
-  event: string;
-  matcher?: string;
-  handler: PluginHookHandler;
-  status: PluginHookStatus;
-  /** Where it was declared, e.g. `hooks/hooks.json` or `plugin.json#hooks[0]`. */
-  source: string;
-}
+/** A parsed hook; the trust review state is added by pluginHookTrust.ts. */
+export type PluginHookDefinition = Omit<AgentPluginHook, "review">;
 
 export interface PluginHooksLoadResult {
   hooks: PluginHookDefinition[];
@@ -195,20 +177,20 @@ function parseHooksDocument(
       warnings.push(`${source}: '${event}' must be an array of matcher groups; ignoring it`);
       continue;
     }
-    for (const group of groups) {
-      parseMatcherGroup(group, event, mapped, source, out, warnings);
+    for (const [groupIndex, group] of groups.entries()) {
+      const groupKey = `${source}#${event}[${groupIndex}]`;
+      parseMatcherGroup(group, { source, groupKey, event, mapped }, out, warnings);
     }
   }
 }
 
 function parseMatcherGroup(
   group: unknown,
-  event: string,
-  mapped: boolean,
-  source: string,
+  where: { source: string; groupKey: string; event: string; mapped: boolean },
   out: PluginHookDefinition[],
   warnings: string[]
 ): void {
+  const { source, groupKey, event, mapped } = where;
   if (!isPlainObject(group) || !Array.isArray(group.hooks)) {
     warnings.push(`${source}: a '${event}' matcher group needs a "hooks" array; ignoring it`);
     return;
@@ -221,7 +203,7 @@ function parseMatcherGroup(
     }
     matcher = group.matcher;
   }
-  for (const raw of group.hooks) {
+  for (const [handlerIndex, raw] of group.hooks.entries()) {
     const handler = parseHandler(raw, `${source}: '${event}'`, warnings);
     if (handler === undefined) continue;
     const status: PluginHookStatus = !mapped
@@ -230,6 +212,7 @@ function parseMatcherGroup(
         ? "runnable"
         : "unsupported-handler";
     out.push({
+      key: `${groupKey}[${handlerIndex}]`,
       hash: hashHookDefinition(event, matcher, raw),
       event,
       ...(matcher !== undefined ? { matcher } : {}),

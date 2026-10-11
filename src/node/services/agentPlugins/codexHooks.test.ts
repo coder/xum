@@ -117,9 +117,9 @@ describe("loadPluginCodexHooks", () => {
     const { hooks, warnings } = await loadPluginCodexHooks(plugin);
 
     expect(warnings).toEqual([]);
-    expect(hooks.map((hook) => [hook.event, hook.source])).toEqual([
-      ["PostToolUse", "hooks/tools.json"],
-      ["UserPromptSubmit", "plugin.json#hooks[1]"],
+    expect(hooks.map((hook) => [hook.event, hook.source, hook.key])).toEqual([
+      ["PostToolUse", "hooks/tools.json", "hooks/tools.json#PostToolUse[0][0]"],
+      ["UserPromptSubmit", "plugin.json#hooks[1]", "plugin.json#hooks[1]#UserPromptSubmit[0][0]"],
     ]);
   });
 

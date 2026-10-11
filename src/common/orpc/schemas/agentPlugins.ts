@@ -48,6 +48,54 @@ export const AgentPluginPreviewHookSchema = z.object({
   toolGrants: z.array(z.string()),
 });
 
+/**
+ * One Codex-format plugin hook handler (hooks.json). Only `mcp_tool` can run; `command`,
+ * `prompt` and `agent` are parsed and shown, never run.
+ */
+export const PluginHookHandlerSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("mcp_tool"),
+    server: z.string(),
+    tool: z.string(),
+    /** Argument templates (`${tool_input.x}`); `{}` when omitted. */
+    input: z.record(z.string(), z.unknown()),
+    timeoutSeconds: z.number(),
+    statusMessage: z.string().optional(),
+  }),
+  z.object({ type: z.enum(["command", "prompt", "agent"]), summary: z.string() }),
+]);
+
+/**
+ * `runnable`: an mcp_tool handler on a mapped event. `unsupported-handler`: a command, prompt or
+ * agent handler. `ignored-event`: a Codex event Xum does not map.
+ */
+export const PluginHookStatusSchema = z.enum(["runnable", "unsupported-handler", "ignored-event"]);
+
+/**
+ * Trust review state, keyed by the hook's location and checked against its hash (Codex trust):
+ * `new` and `changed` hooks never run until the user trusts them; `disabled` is turned off.
+ */
+export const PluginHookReviewStateSchema = z.enum(["trusted", "disabled", "new", "changed"]);
+
+export const AgentPluginHookSchema = z.object({
+  /** Stable location (file, event, group, handler index): the trust record's key. */
+  key: z.string(),
+  /** sha256 of the canonical definition; trust applies only to this exact hash. */
+  hash: z.string(),
+  event: z.string(),
+  matcher: z.string().optional(),
+  handler: PluginHookHandlerSchema,
+  status: PluginHookStatusSchema,
+  /** Where it was declared, e.g. `hooks/hooks.json` or `plugin.json#hooks[0]`. */
+  source: z.string(),
+  review: PluginHookReviewStateSchema,
+});
+
+export const AgentPluginHooksSchema = z.object({
+  hooks: z.array(AgentPluginHookSchema),
+  warnings: z.array(z.string()),
+});
+
 /** Composer slash command declared by the manifest (data-driven expansion). */
 export const AgentPluginPreviewSlashCommandSchema = z.object({
   name: z.string(),
@@ -163,6 +211,11 @@ export type AgentPluginUpdateReview = z.infer<typeof AgentPluginUpdateReviewSche
 export type AgentPluginPreviewSkill = z.infer<typeof AgentPluginPreviewSkillSchema>;
 export type AgentPluginPreviewMcpServer = z.infer<typeof AgentPluginPreviewMcpServerSchema>;
 export type AgentPluginPreviewHook = z.infer<typeof AgentPluginPreviewHookSchema>;
+export type PluginHookHandler = z.infer<typeof PluginHookHandlerSchema>;
+export type PluginHookStatus = z.infer<typeof PluginHookStatusSchema>;
+export type PluginHookReviewState = z.infer<typeof PluginHookReviewStateSchema>;
+export type AgentPluginHook = z.infer<typeof AgentPluginHookSchema>;
+export type AgentPluginHooks = z.infer<typeof AgentPluginHooksSchema>;
 export type AgentPluginManifestSummary = z.infer<typeof AgentPluginManifestSummarySchema>;
 export type AgentPluginInstallPreview = z.infer<typeof AgentPluginInstallPreviewSchema>;
 export type AgentPluginListItem = z.infer<typeof AgentPluginListItemSchema>;
