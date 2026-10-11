@@ -144,7 +144,10 @@ export const McpAppModelContextRequestSchema = z.object({
  * view mounts with), so the tab survives a reload.
  */
 export const McpAppEntrypointSchema = z.object({
+  /** The server key: binds the view (dispatch, result store). Never shown as is. */
   serverName: z.string().min(1),
+  /** What the user sees: "<plugin> · <server>" for a plugin server, else the server key. */
+  serverLabel: z.string(),
   toolName: z.string().min(1),
   title: z.string(),
   resourceUri: z.string().refine(isMcpAppResourceUri),

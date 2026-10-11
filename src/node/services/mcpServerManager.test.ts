@@ -1298,7 +1298,17 @@ describe("MCPServerManager", () => {
     manager.setMcpApps({ isEnabled: () => true, store });
     configService.listServers.mockResolvedValue({
       apps: stdioConfig("apps-entry"),
-      other: stdioConfig("apps-entry-other"),
+      // A plugin server: its label names the plugin, never the internal instance key.
+      other: {
+        ...stdioConfig("apps-entry-other"),
+        env: { PLUGIN_DATA: path.join(tmp.path, "data") },
+        plugin: {
+          pluginName: "bits-and-bolts",
+          serverName: "tray",
+          sourceScope: "global" as const,
+          sourceLocation: "~/.xum/plugins/bits-and-bolts",
+        },
+      },
       off: stdioConfig("apps-entry-off", true),
     });
     const calls: string[] = [];
@@ -1327,6 +1337,7 @@ describe("MCPServerManager", () => {
     expect(manager.listMcpAppEntrypoints(request.workspaceId)).toEqual([
       {
         serverName: "apps",
+        serverLabel: "apps",
         toolName: "board",
         title: "board view",
         resourceUri: "ui://x/view",
@@ -1335,6 +1346,7 @@ describe("MCPServerManager", () => {
       },
       {
         serverName: "other",
+        serverLabel: "bits-and-bolts · tray",
         toolName: "tray",
         title: "tray view",
         resourceUri: "ui://x/view",

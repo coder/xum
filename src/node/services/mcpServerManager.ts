@@ -12,6 +12,7 @@ import { resolveServerIcon } from "./mcpServerIcon";
 import {
   buildToolCallDisplay,
   describeConnection,
+  displayConnectionKey,
   normalizeServerIdentity,
   takeStandardDisplayMeta,
   type IconCandidate,
@@ -5156,6 +5157,7 @@ export class MCPServerManager {
         for (const type of tool.types) {
           entrypoints.push({
             serverName,
+            serverLabel: this.appServerLabel(workspaceId, serverName),
             toolName: tool.toolName,
             title: tool.title,
             resourceUri: tool.resourceUri,
@@ -5217,6 +5219,7 @@ export class MCPServerManager {
           });
           return {
             serverName,
+            serverLabel: this.appServerLabel(workspaceId, serverName),
             toolName,
             title: tool.title,
             resourceUri: tool.resourceUri,
@@ -5229,6 +5232,18 @@ export class MCPServerManager {
       (result) => result,
       options
     );
+  }
+
+  /**
+   * What a user sees for a server: a plugin server's key carries an internal instance ID
+   * (`plugin:<hex>:<server>`), so it shows as "<plugin> · <server>" from its provenance.
+   * Other servers show their (display-sanitized) key.
+   */
+  private appServerLabel(workspaceId: string, serverName: string): string {
+    const plugin = this.workspaceServers.get(workspaceId)?.enabledServers[serverName]?.plugin;
+    return plugin !== undefined
+      ? `${plugin.pluginName} · ${plugin.serverName}`
+      : displayConnectionKey(serverName);
   }
 
   /** Effective tool allowlist of a server for MCP Apps calls (read at dispatch). */
