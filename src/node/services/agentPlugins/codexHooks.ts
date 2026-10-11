@@ -49,6 +49,13 @@ const IGNORED_CODEX_HOOK_EVENTS = new Set([
 
 const DEFAULT_HOOKS_FILE = "hooks/hooks.json";
 const MAX_HOOKS_FILE_BYTES = 256 * 1024;
+/**
+ * Bounds for one plugin. Install Preview loads the hooks of an untrusted repository, and a
+ * 256 KiB manifest can repeat one path tens of thousands of times: without them one Preview
+ * could reread the same file each time and exhaust the backend's memory.
+ */
+const MAX_HOOK_POINTER_ENTRIES = 32;
+const MAX_PLUGIN_HOOKS = 256;
 /** Codex default handler timeout, in seconds. */
 export const DEFAULT_HOOK_TIMEOUT_SECONDS = 600;
 
@@ -105,7 +112,14 @@ export async function loadPluginCodexHooks(
   const hooks: PluginHookDefinition[] = [];
   const pointer = readOpenAIHooksPointer(plugin.manifest, warnings);
   const entries = pointer ?? [DEFAULT_HOOKS_FILE];
-  for (const [index, entry] of entries.entries()) {
+  if (entries.length > MAX_HOOK_POINTER_ENTRIES) {
+    warnings.push(
+      `'extensions["com.openai"].hooks' has ${entries.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
+    );
+  }
+  const seenFiles = new Set<string>();
+  for (const [index, entry] of entries.slice(0, MAX_HOOK_POINTER_ENTRIES).entries()) {
+    if (hooks.length > MAX_PLUGIN_HOOKS) break;
     if (typeof entry !== "string") {
       parseHooksDocument(entry, `plugin.json#hooks[${index}]`, hooks, warnings);
       continue;
@@ -117,6 +131,11 @@ export async function loadPluginCodexHooks(
       warnings.push(`${entry}: a hooks file path must not contain '#'; ignoring it`);
       continue;
     }
+    if (seenFiles.has(path.normalize(entry))) {
+      warnings.push(`${entry} is listed more than once; reading it once`);
+      continue;
+    }
+    seenFiles.add(path.normalize(entry));
     const content = await readHooksFile(plugin.rootPath, entry, pointer == null, warnings);
     if (content === undefined) continue;
     let document: unknown;
@@ -127,6 +146,10 @@ export async function loadPluginCodexHooks(
       continue;
     }
     parseHooksDocument(document, path.normalize(entry), hooks, warnings);
+  }
+  if (hooks.length > MAX_PLUGIN_HOOKS) {
+    warnings.push(`More than ${MAX_PLUGIN_HOOKS} hooks; ignoring the rest`);
+    hooks.length = MAX_PLUGIN_HOOKS;
   }
   return { hooks, warnings };
 }

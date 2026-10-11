@@ -112,6 +112,30 @@ describe("loadPluginCodexHooks", () => {
     expect(warnings).toHaveLength(1);
   });
 
+  test("bounds the work for a pointer: entries, repeated files and hook count", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-bounds");
+    const many = { hooks: { Stop: [{ hooks: Array.from({ length: 300 }, () => scan) }] } };
+    const plugin = await writePlugin(
+      tmp.path,
+      { "hooks/one.json": { hooks: { Stop: [{ hooks: [scan] }] } }, "hooks/many.json": many },
+      { "com.openai": { hooks: Array.from({ length: 1000 }, () => "./hooks/one.json") } }
+    );
+    const withPointer = (hooks: unknown[]) => ({
+      rootPath: plugin.rootPath,
+      manifest: { ...plugin.manifest, extensions: { "com.openai": { hooks } } },
+    });
+    // The same file repeated is read once.
+    expect((await loadPluginCodexHooks(plugin)).hooks).toHaveLength(1);
+    // Only the first 32 entries are read.
+    const inline = { hooks: { Stop: [{ hooks: [scan] }] } };
+    const fromEntries = await loadPluginCodexHooks(withPointer(Array(40).fill(inline)));
+    expect(fromEntries.hooks).toHaveLength(32);
+    // At most 256 hooks per plugin.
+    const { hooks, warnings } = await loadPluginCodexHooks(withPointer(["./hooks/many.json"]));
+    expect(hooks).toHaveLength(256);
+    expect(warnings).toEqual(["More than 256 hooks; ignoring the rest"]);
+  });
+
   test("a hooks file path cannot take an inline source's hook keys", async () => {
     using tmp = new DisposableTempDir("codex-hooks-key-collision");
     const document = { hooks: { Stop: [{ hooks: [scan] }] } };
