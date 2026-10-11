@@ -504,6 +504,10 @@ export class AIService extends EventEmitter {
   }
 
   /** Run the message.send prompt-hook chain for one new message (fail-open). */
+  hasMessageSendHooks(): boolean {
+    return eventSpine.hasMiddleware("message.send");
+  }
+
   runMessageSendHooks(
     workspaceId: string,
     input: MessageSendHookInput

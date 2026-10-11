@@ -542,10 +542,20 @@ function compactionFollowUpKey(
   return muxMetadata.parsed.followUpContent != null ? "followUpContent" : "continueMessage";
 }
 
-/** A compaction request's non-empty follow-up text (legacy requests use continueMessage). */
+/**
+ * A compaction request's follow-up as the redispatch will send it (dispatchPendingFollowUpOnce):
+ * review notes are formatted into the prompt, so a review-only follow-up is a real prompt and
+ * the hooks see every review. Undefined when it is empty.
+ */
 function compactionFollowUpText(muxMetadata: CompactionRequestMetadata): string | undefined {
-  const text: unknown = muxMetadata.parsed[compactionFollowUpKey(muxMetadata)]?.text;
-  return typeof text === "string" && text.trim().length > 0 ? text : undefined;
+  const followUp = muxMetadata.parsed[compactionFollowUpKey(muxMetadata)];
+  if (followUp == null) return undefined;
+  const text: unknown = followUp.text;
+  const prompt = prepareUserMessageForSend({
+    text: typeof text === "string" ? text : "",
+    reviews: followUp.reviews,
+  }).finalText;
+  return prompt.trim().length > 0 ? prompt : undefined;
 }
 
 /**
@@ -920,6 +930,8 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   captureRequestAssemblySnapshot?(
     workspaceId: string
   ): Promise<Result<RequestAssemblySnapshot, SendMessageError>>;
+  /** Whether any message.send hook is registered (lets a send skip work done only for hooks). */
+  hasMessageSendHooks?(): boolean;
   /** The message.send prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
   runMessageSendHooks?(
     workspaceId: string,
@@ -4780,6 +4792,19 @@ export class AgentSession {
         createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
       );
 
+    // A client retry of an accepted send (same send ids after a lost response) adds nothing:
+    // the accepted row wins over anything the hooks decide.
+    const sendIdsAlreadyAccepted = async (): Promise<boolean> => {
+      if (sendIdentities.length === 0) return false;
+      const known = await this.historyService.decideSendIds(this.workspaceId, sendIdentities);
+      return known.success && this.settleKnownSendIds(known.data, attempt)?.success === true;
+    };
+    // Checked before the hooks run, so their side effects (logs, notifications) do not repeat
+    // for such a retry. History is read only when hooks exist.
+    if (this.aiService.hasMessageSendHooks?.() === true && (await sendIdsAlreadyAccepted())) {
+      return Ok(undefined);
+    }
+
     // Prompt hooks (message.send): before the pricing gate (its rejected-input row), routing,
     // @file snapshots, edit truncation and every history write, so a block leaves history
     // unchanged.
@@ -4799,15 +4824,9 @@ export class AgentSession {
         createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
       );
     if (pluginSend.kind === "blocked") {
-      // A client retry of an accepted send (same send ids after a lost response) runs the hooks
-      // again. Its block must not report failure for a message history already holds: the
-      // accepted row wins. History is read only on a block, so ordinary sends pay nothing.
-      if (sendIdentities.length > 0) {
-        const known = await this.historyService.decideSendIds(this.workspaceId, sendIdentities);
-        if (known.success && this.settleKnownSendIds(known.data, attempt)?.success === true) {
-          return Ok(undefined);
-        }
-      }
+      // The original send can be accepted while the hooks ran (a retry racing it): its block
+      // must not report failure for a message history now holds.
+      if (await sendIdsAlreadyAccepted()) return Ok(undefined);
       const blockedError: SendMessageError = {
         type: "plugin_blocked",
         plugin: pluginSend.pluginName,

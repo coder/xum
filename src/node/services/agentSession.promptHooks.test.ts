@@ -9,6 +9,7 @@ import assert from "node:assert";
 import {
   createMuxMessage,
   getCompactionFollowUpContent,
+  prepareUserMessageForSend,
   type CompactionFollowUpRequest,
   type MuxMessage,
 } from "@/common/types/message";
@@ -162,7 +163,7 @@ describe("message.send outcomes", () => {
   });
 
   test("a retried send whose ids history already holds succeeds despite a block", async () => {
-    const { h, streamed } = await setup(blockAll);
+    const { h, calls, streamed } = await setup(blockAll);
     const sendId = "client-send-1";
     const digest = computeSendDigest({ message: "deploy to prod" });
     // The first try was accepted (its row holds the id), but its response was lost.
@@ -179,6 +180,9 @@ describe("message.send outcomes", () => {
     expect(result.success).toBe(true);
     expect((await userRows(h)).map((row) => row.id)).toEqual(["u1"]);
     expect(streamed).toEqual([]);
+    // Codex P2 (PRRT_kwDOPxxmWM6rOvE1): the retry adds nothing, so the hooks (and their side
+    // effects) do not run a second time.
+    expect(calls).toEqual([]);
   });
 
   test("an automatic send ignores a block, so its sender cannot loop on it", async () => {
@@ -252,6 +256,41 @@ describe("message.send outcomes", () => {
     expect(calls).toEqual([{ text: "deploy to prod", origin: "user" }]);
     expect(await userRows(h)).toEqual([]);
     expect(streamed).toEqual([]);
+  });
+
+  test("a /compact follow-up's review notes reach the hooks as the prompt formats them", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rOvEs): the redispatch formats reviews into the prompt, and a
+    // review-only follow-up is a real prompt, so the hooks must check it at admission.
+    const { h, calls } = await setup(blockAll);
+    const reviews = [
+      {
+        filePath: "src/app.ts",
+        lineRange: "4",
+        selectedCode: "deploy()",
+        userNote: "ship it to prod",
+      },
+    ];
+    const prompt = (text: string) => prepareUserMessageForSend({ text, reviews }).finalText;
+    const send = (text: string) =>
+      h.session.sendMessage("Summarize this conversation.", {
+        ...options,
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: { followUpContent: { text, reviews, model: options.model, agentId: "exec" } },
+        },
+      });
+
+    const reviewOnly = await send("");
+    const withText = await send("and then lint");
+
+    expect(reviewOnly.success).toBe(false);
+    expect(withText.success).toBe(false);
+    expect(calls).toEqual([
+      { text: prompt(""), origin: "user" },
+      { text: prompt("and then lint"), origin: "user" },
+    ]);
+    expect(calls[0]?.text).toContain("ship it to prod");
   });
 
   test("an automatic compaction request's follow-up does not reach the hooks", async () => {
