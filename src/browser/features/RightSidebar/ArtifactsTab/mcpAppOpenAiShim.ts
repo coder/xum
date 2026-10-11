@@ -15,7 +15,8 @@
  * Handshake: standard views initialize themselves, and the shim reads the host's replies and
  * notifications passively. The shim sends its own ui/initialize only when the view first uses
  * `window.openai` and no handshake was seen yet, so a standard-only view gets no extra
- * handshake. Members without a standard equivalent warn once; their Promises reject and
+ * handshake. If the view's own client connects later, the host sends it the tool lifecycle
+ * again, and the shim leaves teardown replies to that client. Members without a standard equivalent warn once; their Promises reject and
  * nothing throws. setWidgetState updates window.openai.widgetState in this page only: the state
  * lasts as long as the frame (a collapsed card or a move to the tab starts with null). Optional
  * extensions Xum lacks (uploadFile, selectFiles, getFileDownloadUrl, requestCheckout,
@@ -62,6 +63,8 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
   var nextId = 1;
   var handshakeSeen = false;
   var ownHandshake = false;
+  // A handshake reply that was not the shim's: the view's own MCP Apps client is connected.
+  var standardClient = false;
   var warned = {};
   var globals = {
     theme: "light",
@@ -125,6 +128,7 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
     if (data.method === undefined) {
       if (data.result && typeof data.result === "object" && data.result.hostContext) {
         handshakeSeen = true;
+        if (!pending.has(data.id)) standardClient = true;
         setGlobals(fromHostContext(data.result.hostContext));
       }
       var settle = pending.get(data.id);
@@ -148,8 +152,9 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
         setGlobals(fromHostContext(params));
         return;
       case "ui/resource-teardown":
-        // Only a view the shim connected has no SDK of its own to answer.
-        if (ownHandshake) post({ jsonrpc: "2.0", id: data.id, result: {} });
+        // Only a view the shim connected, and whose own client never connected, has no SDK to
+        // answer; an early reply here would end the host's wait before the SDK cleans up.
+        if (ownHandshake && !standardClient) post({ jsonrpc: "2.0", id: data.id, result: {} });
         return;
     }
   });

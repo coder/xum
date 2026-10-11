@@ -242,6 +242,39 @@ describe("window.openai shim", () => {
     expect((t.win as unknown as { broken?: number }).broken).toBeUndefined();
   });
 
+  /** The view's own MCP Apps client connecting after the shim did (a hybrid view). */
+  function connectStandardClient(t: Awaited<ReturnType<typeof runView>>) {
+    const received: string[] = [];
+    t.win.addEventListener("message", (event) => {
+      const method = (event as unknown as { data: { method?: string } }).data.method;
+      if (method !== undefined) received.push(method);
+    });
+    const parent = t.win.parent as unknown as { postMessage: (message: unknown) => void };
+    parent.postMessage({ jsonrpc: "2.0", id: 99, method: "ui/initialize", params: {} });
+    parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    return received;
+  }
+
+  test("a standard client that connects after the shim still gets tool-input and result", async () => {
+    const t = await runView("window.openai.toolOutput;");
+    expect(t.win.openai.toolOutput).toEqual({ dice: [3, 5] });
+    const received = connectStandardClient(t);
+    await tick();
+    expect(received).toEqual(["ui/notifications/tool-input", "ui/notifications/tool-result"]);
+  });
+
+  test("the shim stops answering teardown once the view's own client connected", async () => {
+    const teardownReplies = (t: Awaited<ReturnType<typeof runView>>) =>
+      t.posted.filter((m) => (m as { id?: unknown }).id === "host-1").length;
+    const shimOnly = await runView("window.openai.toolOutput;");
+    void shimOnly.host.teardown("unmount");
+    expect(teardownReplies(shimOnly)).toBe(1);
+    const hybrid = await runView("window.openai.toolOutput;");
+    connectStandardClient(hybrid);
+    void hybrid.host.teardown("unmount");
+    expect(teardownReplies(hybrid)).toBe(0);
+  });
+
   test("a view that redefines window.openai, before or after load, keeps rendering", async () => {
     const before = await runView("window.done = true;", {
       beforeLoad: (win) =>

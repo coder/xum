@@ -210,6 +210,13 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   const pendingHostRequests = new Map<string, (ok: boolean) => void>();
   let nextHostRequestId = 1;
   let initialized = false;
+  /**
+   * A ui/initialize got its reply and its initialized has not come yet. Each handshake gets the
+   * lifecycle (tool-input, then tool-result or tool-cancelled): in a hybrid view the
+   * window.openai shim can connect first, and the view's own MCP Apps client must still get it.
+   * True at start, so the first initialized counts even without an initialize (as before).
+   */
+  let handshakePending = true;
   /** The view's appCapabilities.availableDisplayModes; undefined when it declared none. */
   let viewDisplayModes: readonly string[] | undefined;
   /** The mode the view was last told (initial context or host-context-changed). */
@@ -277,6 +284,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         const context = options.getHostContext();
         const hostContext = { ...context, displayMode: viewMode(context.displayMode) };
         notifiedDisplayMode = hostContext.displayMode;
+        handshakePending = true;
         respond(id, {
           protocolVersion: MCP_APP_PROTOCOL_VERSION,
           hostInfo: { name: "xum", version: "1.0.0" },
@@ -430,7 +438,8 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   function handleNotification(method: string, params: unknown) {
     switch (method) {
       case "ui/notifications/initialized":
-        if (initialized) return;
+        if (!handshakePending) return;
+        handshakePending = false;
         initialized = true;
         options.onInitialized();
         return;
