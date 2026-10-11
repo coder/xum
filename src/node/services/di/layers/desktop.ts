@@ -155,6 +155,7 @@ import { HeartbeatService } from "@/node/services/heartbeatService";
 import { IdleCompactionService } from "@/node/services/idleCompactionService";
 import { InstructionsService } from "@/node/services/instructionsService";
 import { McpOauthService } from "@/node/services/mcpOauthService";
+import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { MenuEventService } from "@/node/services/menuEventService";
 import { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
 import { ProjectService } from "@/node/services/projectService";
@@ -744,6 +745,10 @@ export const DesktopWiringLive: Layer.Layer<
     timelineService.subscribeToWorkspace(workspaceService);
 
     mcpServerManager.setMcpOauthService(mcpOauthService);
+    // Plugin hooks read their own MCP servers' structured settings.
+    agentPluginHookService.setSettingsProvider((workspaceId, keyPrefix, timeoutMs) =>
+      mcpServerManager.getSettingsForPluginHooks(workspaceId, keyPrefix, timeoutMs)
+    );
     turnRequestBuilderBindings.codexOauthService = codexOauthService;
     turnRequestBuilderBindings.coderOauthService = coderOauthService;
 

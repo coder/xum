@@ -4597,6 +4597,59 @@ export class MCPServerManager {
   /** Last settings values per workspace, then server. Memory only: the server persists them. */
   private readonly settingsCache = new Map<string, Map<string, Record<string, MCPSettingValue>>>();
 
+  /** Servers whose hook-time settings read already ran once (success or failure), per workspace. */
+  private readonly hookSettingsReadAttempted = new Map<string, Set<string>>();
+
+  /**
+   * Settings for plugin hooks: every connected, enabled server of this
+   * workspace whose config key starts with `keyPrefix` (one plugin instance)
+   * and that has `openai/settings`, keyed by the plugin's own server name.
+   * Uses the cache; an empty cache is read once with a short timeout, and a
+   * failed read yields `{}` for that server. Never starts servers and never
+   * throws: hooks must not stall or break the turn.
+   */
+  async getSettingsForPluginHooks(
+    workspaceId: string,
+    keyPrefix: string,
+    timeoutMs: number
+  ): Promise<Record<string, Record<string, MCPSettingValue>>> {
+    const entry = this.workspaceServers.get(workspaceId);
+    const settings: Record<string, Record<string, MCPSettingValue>> = {};
+    if (entry === undefined) return settings;
+    const attempted = this.hookSettingsReadAttempted.get(workspaceId) ?? new Set<string>();
+    this.hookSettingsReadAttempted.set(workspaceId, attempted);
+    for (const [name, instance] of entry.instances) {
+      const pluginServerName = entry.enabledServers[name]?.plugin?.serverName;
+      if (
+        !name.startsWith(keyPrefix) ||
+        pluginServerName === undefined ||
+        !entry.enabledServerNames.has(name) ||
+        instance.isClosed ||
+        instance.settings?.settingsCapability() === undefined
+      )
+        continue;
+      let values = this.getCachedSettings(workspaceId, name);
+      if (values === undefined && !attempted.has(name)) {
+        attempted.add(name);
+        try {
+          const parsed = parseMCPSettingsReadResult(
+            await this.callSettingsTool(instance, workspaceId, "readTool", {}, { timeoutMs })
+          );
+          if ("error" in parsed) throw new Error(parsed.error);
+          this.cacheSettings(workspaceId, name, parsed.values);
+          values = parsed.values;
+        } catch (error) {
+          log.warn(`[MCP] Settings read for plugin hooks failed for '${name}'; passing {}`, {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
+      }
+      settings[pluginServerName] = values ?? {};
+    }
+    return settings;
+  }
+
   /** Last settings values read or saved for this workspace's server, if any. */
   getCachedSettings(
     workspaceId: string,
@@ -5233,6 +5286,7 @@ export class MCPServerManager {
       );
       this.lastWorkspaceRequestOptions.delete(workspaceId);
       this.settingsCache.delete(workspaceId);
+      this.hookSettingsReadAttempted.delete(workspaceId);
       this.workspaceOptionsMutationCounts.delete(workspaceId);
       this.latestWorkspaceOverrides.delete(workspaceId);
     }

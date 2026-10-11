@@ -730,6 +730,58 @@ describe("MCPServerManager", () => {
     expect(manager.isWorkspaceServerConnected("settings-connected-ws", "other")).toBe(false);
   });
 
+  test("settings for plugin hooks: cache first, one read on a miss, {} on failure", async () => {
+    using tmp = new DisposableTempDir("mcp-hook-settings");
+    const pluginServer = (command: string, serverName: string) => ({
+      ...stdioConfig(command),
+      env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: path.join(tmp.path, "data") },
+      plugin: {
+        pluginName: "cad",
+        serverName,
+        sourceScope: "global" as const,
+        sourceLocation: "x",
+      },
+    });
+    configService.listServers.mockResolvedValue({
+      "plugin:abc:cached": pluginServer("hooks-cached", "cached"),
+      "plugin:abc:broken": pluginServer("hooks-broken", "broken"),
+      "plugin:other:foreign": pluginServer("hooks-foreign", "foreign"),
+    });
+    let reads = 0;
+    const settingsServer = (fail: boolean) => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () => {
+          reads++;
+          if (fail) return Promise.reject(new Error("server down"));
+          return Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: { units: { type: "string", title: "Units" } } },
+              values: { units: "mm" },
+            },
+          });
+        },
+      },
+    });
+    servers.serve("hooks-cached", settingsServer(false));
+    servers.serve("hooks-broken", settingsServer(true));
+    servers.serve("hooks-foreign", settingsServer(false));
+    await manager.getToolsForWorkspace(workspaceRequest("hooks-ws"));
+
+    // The UI read fills the cache; the hook path then makes no call for it.
+    await manager.readSettings("hooks-ws", "plugin:abc:cached");
+    expect(reads).toBe(1);
+    const first = await manager.getSettingsForPluginHooks("hooks-ws", "plugin:abc:", 100);
+    // Keyed by the plugin's own server names; the other plugin's server is left out.
+    expect(first).toEqual({ cached: { units: "mm" }, broken: {} });
+    expect(reads).toBe(2);
+    // A failed server is not read again on every hook call.
+    expect(await manager.getSettingsForPluginHooks("hooks-ws", "plugin:abc:", 100)).toEqual(first);
+    expect(reads).toBe(2);
+  });
+
   test("settings: a server without the capability reads as null", async () => {
     configService.listServers.mockResolvedValue({ plain: stdioConfig("settings-none") });
     servers.serve("settings-none", { tools: { draw: testTool() } });
