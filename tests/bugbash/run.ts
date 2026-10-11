@@ -17,10 +17,15 @@
  *   e2e.config.ts. No other config runs in the sandbox (sandbox/inputs.ts exploreRefusal).
  *   Paths are relative to the current directory.
  *
- * Models: BUGBASH_MODELS, comma-separated `anthropic:<model>`, default Opus 5.5 and Sonnet 5.5.
- * In a three-model comparison (2026-10) these two found 14 of 15 distinct bugs and overlapped on
- * only 4, so the default runs both; GPT-6.1 Sol found 1. Every model runs every charter, all in
- * one pool of --parallel explorers. Reasoning: BUGBASH_EFFORT, default medium (e2e.config.ts).
+ * Models: BUGBASH_MODELS, comma-separated `anthropic:<model>`, default Sonnet 5.5 alone (6 jobs).
+ * In a three-model comparison (2026-10) Opus 5.5 and Sonnet 5.5 together found 14 of 15 distinct
+ * bugs and overlapped on only 4; GPT-6.1 Sol found 1. Opus about doubles the cost of a run, so it
+ * is opt-in: BUGBASH_MODELS=anthropic:claude-sonnet-5-5,anthropic:claude-opus-5-5. Every model
+ * runs every charter, all in one pool of --parallel explorers. Reasoning: BUGBASH_EFFORT, default
+ * medium (e2e.config.ts).
+ *
+ * Cost: before any job, the run prints its estimate and a recommended budget (estimateRun), and
+ * refuses a BUGBASH_BUDGET_USD below it.
  *
  * Charters: tests/bugbash/charters.txt. Config and personas: tests/bugbash/e2e.config.ts.
  * Output: tests/bugbash/.e2e/bugbash/<run>/<model>/ with one directory, log and app log per
@@ -56,7 +61,7 @@ import {
   probeApp,
   probeUnreachable,
 } from "./sandbox/launch";
-import { Ledger, priced } from "./sandbox/proxyPolicy";
+import { Ledger, listPrice, priced, worstCaseNanoUsd } from "./sandbox/proxyPolicy";
 import { Refusal, Stopped } from "./sandbox/runner";
 
 const projectDir = import.meta.dir;
@@ -232,8 +237,84 @@ function writeFindings(
   fs.writeFileSync(file, `${lines.join("\n")}\n`);
 }
 
-/** Opus 5.5 and Sonnet 5.5: see the header comment for why both. */
-const DEFAULT_MODELS = ["anthropic:claude-opus-5-5", "anthropic:claude-sonnet-5-5"];
+/** Sonnet 5.5 alone: see the header comment for why Opus is opt-in. */
+const DEFAULT_MODELS = ["anthropic:claude-sonnet-5-5"];
+
+/**
+ * Measured list-price cost of one charter at --max-steps 6 and medium effort, explorer and app AI
+ * together: four `make bug-bash` runs of Sonnet 5.5 on #5714, #6076 and #6079 averaged $0.34 to
+ * $0.52 per charter (21 charters, $9.50 in all).
+ */
+const MEASURED_USD_PER_JOB: Record<string, number> = { "claude-sonnet-5-5": 0.45 };
+const MEASURED_STEPS = 6;
+/** An unmeasured model: Sonnet's measured cost, scaled by list price, times this margin. */
+const UNMEASURED_MARGIN = 2;
+/**
+ * Explorer cost per charter relative to medium effort, where it was measured. Higher efforts add
+ * thinking tokens; nothing measured them, so these are guesses, and the run labels them so. Low
+ * is not lowered: an estimate must not undercount.
+ */
+const EFFORT_FACTOR: Record<string, number> = { low: 1, medium: 1, high: 2, xhigh: 3, max: 4 };
+
+/**
+ * The real app AI's own share per charter with Haiku 4.5, the default app model: #6079's five
+ * real-mode charters spent 19,545 input and 1,022 output tokens on it, about $0.005 each. That
+ * share is already in the explorer measurement above, so only another app model adds to it.
+ */
+const MEASURED_APP_USD_PER_JOB = 0.005;
+
+/**
+ * The run's cost estimate and the budget it needs. The estimate scales the measured cost per
+ * charter linearly with --max-steps. The headroom covers the reservations of the calls in flight:
+ * one per running explorer, each at the largest bound the proxy can reserve (proxyPolicy.ts).
+ * Without it, the last jobs of a run that fits its estimate find the budget reserved and fail.
+ * `appModel` is the app's model when its AI can be real (the probe decides later, so the check
+ * assumes it is): its calls share the ledger, so its bound counts too, and a model other than the
+ * measured Haiku 4.5 adds a guessed share per charter.
+ */
+export function estimateRun(o: {
+  models: string[];
+  charters: number;
+  parallel: number;
+  maxSteps: number;
+  effort: string;
+  appModel?: string;
+}) {
+  const { models, charters, parallel, maxSteps, appModel } = o;
+  const effortFactor = EFFORT_FACTOR[o.effort];
+  assert(effortFactor != null, `estimateRun: unknown effort ${o.effort}`);
+  const sonnet = listPrice("claude-sonnet-5-5")!;
+  const perModel = models.map((spec) => {
+    const id = spec.split(/:(.*)/s, 2)[1];
+    const measured = MEASURED_USD_PER_JOB[id];
+    const perJob =
+      (measured ??
+        (MEASURED_USD_PER_JOB["claude-sonnet-5-5"] * listPrice(id)!.output * UNMEASURED_MARGIN) /
+          sonnet.output) *
+      (maxSteps / MEASURED_STEPS) *
+      effortFactor;
+    // Measured means: this model, at the effort of the measurement.
+    return { spec, perJob, measured: measured != null && o.effort === "medium" };
+  });
+  const appId = appModel?.split(/:(.*)/s, 2)[1];
+  const haiku = listPrice(DEFAULT_APP_MODEL.split(":")[1])!;
+  const appPerJob =
+    appId == null || appModel === DEFAULT_APP_MODEL
+      ? 0
+      : ((MEASURED_APP_USD_PER_JOB * listPrice(appId)!.output * UNMEASURED_MARGIN) / haiku.output) *
+        (maxSteps / MEASURED_STEPS);
+  const jobs = charters * models.length;
+  // Each job runs its own app, so the app's share counts once per job.
+  const estimateUsd = perModel.reduce((sum, m) => sum + m.perJob * charters, 0) + appPerJob * jobs;
+  const inFlight = Math.min(parallel, jobs);
+  const ids = [...models.map((spec) => spec.split(/:(.*)/s, 2)[1]), ...(appId ? [appId] : [])];
+  const worst = Math.max(...ids.map(worstCaseNanoUsd));
+  const headroomUsd = (inFlight * worst) / 1e9;
+  // Whole dollars, so the number is easy to type.
+  const recommendedUsd = Math.ceil(estimateUsd + headroomUsd);
+  const app = appPerJob > 0 ? { spec: appModel!, perJob: appPerJob } : undefined;
+  return { perModel, app, estimateUsd, headroomUsd, inFlight, recommendedUsd };
+}
 
 function modelDirName(model: string): string {
   return model.replace(/[^a-zA-Z0-9.-]+/g, "_");
@@ -364,6 +445,37 @@ export async function runBugBash(
     return 2;
   }
   const budgetUsd = job0!.budgetUsd;
+  // The app AI can be real unless it is pinned to the mock (see the probe below).
+  const appReal = requested !== "mock" && !charters.every((c) => c.goal.includes("[mock:"));
+  const appSpec = env.BUGBASH_APP_MODEL ?? DEFAULT_APP_MODEL;
+  const appPriced = appSpec.startsWith("anthropic:") && priced(appSpec.slice("anthropic:".length));
+  const cost = estimateRun({
+    models,
+    charters: charters.length,
+    parallel,
+    maxSteps,
+    effort,
+    appModel: appReal && appPriced ? appSpec : undefined,
+  });
+  const per = cost.perModel.map(
+    (m) => `${m.spec} $${m.perJob.toFixed(2)}${m.measured ? "" : " (not measured: a guess)"}`
+  );
+  if (cost.app)
+    per.push(
+      `app ${cost.app.spec} +$${cost.app.perJob.toFixed(2)} per job (not measured: a guess)`
+    );
+  out(
+    `Estimate: $${cost.estimateUsd.toFixed(2)} for ${charters.length} charter(s) x ${models.length} model(s) ` +
+      `(per charter: ${per.join(", ")}), plus $${cost.headroomUsd.toFixed(2)} headroom for ` +
+      `${cost.inFlight} call(s) in flight. Recommended budget: $${cost.recommendedUsd}.`
+  );
+  if (budgetUsd < cost.recommendedUsd) {
+    err(
+      `make bug-bash: set BUGBASH_BUDGET_USD to at least $${cost.recommendedUsd} (it is $${budgetUsd}), ` +
+        "or run fewer charters (--only), fewer at a time (--parallel) or fewer models"
+    );
+    return 2;
+  }
   // One budget for the whole run: every job's proxy reserves from it (sandbox/proxyPolicy.ts).
   const ledger = new Ledger(budgetUsd);
   const mockPin: AppAi = { mode: "mock", reason: "the charter names a [mock:...] prompt" };

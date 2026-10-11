@@ -53,6 +53,21 @@ const VISUAL_TOKENS = 4784;
 
 /** Whether the proxy can price (and so bound) a call of this model. */
 export const priced = (model: string) => PRICES.has(model);
+/** A model's list price per token in nano-dollars (run.ts scales its cost estimate by it). */
+export const listPrice = (model: string) => PRICES.get(model);
+
+/** A call's upper bound: every input token at the cache-write rate (2x input), all output paid. */
+const callBound = (price: { input: number; output: number }, input: number, output: number) =>
+  input * 2 * price.input + output * price.output;
+/**
+ * The most one call of `model` can reserve: the bound at the largest input and output that
+ * checkRequest admits. run.ts reserves budget headroom for the calls in flight with it.
+ */
+export function worstCaseNanoUsd(model: string): number {
+  const price = PRICES.get(model);
+  if (!price) throw new Error(`worstCaseNanoUsd: no price for ${model}`);
+  return callBound(price, MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS);
+}
 
 export interface JobPolicy {
   /** Model IDs this job may call: its explorer model and the app model (P3). */
@@ -206,7 +221,7 @@ export function checkRequest(
   const inputTokens =
     Buffer.byteLength(body) - images.bytes + images.count * 2 * VISUAL_TOKENS + OVERHEAD_TOKENS;
   if (inputTokens > MAX_INPUT_TOKENS) return refuse("body: input bound above 200k tokens");
-  const maxCostNanoUsd = inputTokens * 2 * price.input + outputTokens * price.output;
+  const maxCostNanoUsd = callBound(price, inputTokens, outputTokens);
   return { ok: true, model, body, headers, maxCostNanoUsd };
 }
 

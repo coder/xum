@@ -3,7 +3,7 @@ import * as childProcess from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type RunDeps, runBugBash } from "./run";
+import { estimateRun, type RunDeps, runBugBash } from "./run";
 import type { JobOutcome, LaunchOptions } from "./sandbox/launch";
 import type { Ledger } from "./sandbox/proxyPolicy";
 import { Refusal, Stopped } from "./sandbox/runner";
@@ -12,7 +12,8 @@ import { Refusal, Stopped } from "./sandbox/runner";
 // (sandbox/runner.test.ts) cover the job itself.
 const ENV = {
   BUGBASH_MODELS: "anthropic:claude-sonnet-5-5",
-  BUGBASH_BUDGET_USD: "2",
+  // Above the recommended budget of every run here (estimateRun): up to 4 charters at once.
+  BUGBASH_BUDGET_USD: "10",
   ANTHROPIC_API_KEY: "sk-run-test",
   ANTHROPIC_BASE_URL: "http://127.0.0.1:9/v1",
 };
@@ -93,7 +94,7 @@ test("B2: every charter runs through the launcher with one shared ledger, none o
     expect(spawn).not.toHaveBeenCalled();
     const findings = lines.find((line) => line.startsWith("Findings: "))!.slice(10);
     expect(fs.readFileSync(findings, "utf8")).toMatch(
-      /Cost: 0 proxied calls, 0 refused by the budget, \$0\.0000 of \$2\.0000 at list price/
+      /Cost: 0 proxied calls, 0 refused by the budget, \$0\.0000 of \$10\.0000 at list price/
     );
   } finally {
     spawn.mockRestore();
@@ -316,7 +317,10 @@ test("U1: Docker is checked once, before the probe and any folder; --preflight s
   expect(checks).toBe(1);
   expect(dead.probes).toHaveLength(0);
   expect(dead.calls).toHaveLength(0);
-  expect(dead.lines).toEqual(["make bug-bash: docker info: no daemon answered"]);
+  // The cost estimate prints first (U4); the only refusal is Docker's.
+  expect(dead.lines.filter((line) => line.startsWith("make bug-bash:"))).toEqual([
+    "make bug-bash: docker info: no daemon answered",
+  ]);
 
   const live = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
   let liveChecks = 0;
@@ -341,7 +345,7 @@ test("U1: a probe the budget refused (HTTP 402) blames the budget, not the key",
   const stop = new AbortController().signal;
   expect(await runBugBash([...charters("a")], ENV, stop, deps)).toBe(2);
   expect(calls).toHaveLength(0);
-  expect(lines.join("\n")).toMatch(/BUGBASH_BUDGET_USD \(\$2\) is too small to cover/);
+  expect(lines.join("\n")).toMatch(/BUGBASH_BUDGET_USD \(\$10\) is too small to cover/);
   expect(lines.join("\n")).not.toMatch(/Fix the key/);
 });
 
@@ -399,3 +403,78 @@ test.each([
     expect(lines[0]).not.toContain("/v1");
   }
 );
+
+const SONNET = "anthropic:claude-sonnet-5-5";
+const OPUS = "anthropic:claude-opus-5-5";
+const run6 = { models: [SONNET], charters: 6, parallel: 8, maxSteps: 6, effort: "medium" };
+
+test("U4: the estimate scales the measured cost, and its headroom covers the calls in flight", () => {
+  const base = estimateRun(run6);
+  // Sonnet's measured $0.45 per charter; 6 calls in flight at Sonnet's worst bound.
+  expect(base.estimateUsd).toBeCloseTo(6 * 0.45);
+  expect(base.inFlight).toBe(6);
+  expect(base.recommendedUsd).toBe(Math.ceil(base.estimateUsd + base.headroomUsd));
+  expect(base.perModel[0].measured).toBe(true);
+  // Twice the steps cost twice as much; fewer at once need less headroom, not less estimate.
+  expect(estimateRun({ ...run6, maxSteps: 12 }).estimateUsd).toBeCloseTo(2 * base.estimateUsd);
+  const two = estimateRun({ ...run6, parallel: 2 });
+  expect(two.estimateUsd).toBeCloseTo(base.estimateUsd);
+  expect(two.headroomUsd).toBeCloseTo((base.headroomUsd * 2) / 6);
+  // An unmeasured model is a guess above its list-price share; its bound sets the headroom.
+  const both = estimateRun({ ...run6, models: [SONNET, OPUS] });
+  expect(both.perModel[1].measured).toBe(false);
+  expect(both.perModel[1].perJob).toBeGreaterThan(2 * base.perModel[0].perJob); // Opus is 2x list
+  expect(both.headroomUsd).toBeGreaterThan(base.headroomUsd * (8 / 6));
+  // A higher effort is an unmeasured guess that costs more; it reserves no more per call.
+  const high = estimateRun({ ...run6, effort: "high" });
+  expect(high.estimateUsd).toBeGreaterThan(base.estimateUsd);
+  expect(high.perModel[0].measured).toBe(false);
+  expect(high.headroomUsd).toBeCloseTo(base.headroomUsd);
+  // Low effort is not measured either, and it is not priced below medium.
+  const low = estimateRun({ ...run6, effort: "low" });
+  expect(low.perModel[0].measured).toBe(false);
+  expect(low.estimateUsd).toBeCloseTo(base.estimateUsd);
+  // A real app AI with a costlier model adds its share and its larger bound; Haiku adds nothing.
+  const opusApp = estimateRun({ ...run6, appModel: OPUS });
+  expect(opusApp.estimateUsd).toBeGreaterThan(base.estimateUsd);
+  expect(opusApp.headroomUsd).toBeGreaterThan(base.headroomUsd);
+  const haiku = estimateRun({ ...run6, appModel: "anthropic:claude-haiku-4-5" });
+  expect(haiku.recommendedUsd).toBe(base.recommendedUsd);
+});
+
+test("U4: the default runs Sonnet alone, and a budget below the estimate refuses before the probe", async () => {
+  const stop = new AbortController().signal;
+  const { BUGBASH_MODELS: _models, ...defaults } = ENV;
+  const six = charters("a", "b", "c", "d", "e", "f");
+  const need = estimateRun(run6).recommendedUsd;
+  const low = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  const below = { ...defaults, BUGBASH_BUDGET_USD: String(need - 1) };
+  expect(await runBugBash(six, below, stop, low.deps)).toBe(2);
+  expect(low.calls).toHaveLength(0);
+  expect(low.probes).toHaveLength(0);
+  // The refusal names the variable and the number to set.
+  const refusal = low.lines.find((line) => line.includes("BUGBASH_BUDGET_USD"))!;
+  expect(refusal).toContain(`$${need}`);
+
+  const enough = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  const at = { ...defaults, BUGBASH_BUDGET_USD: String(need) };
+  expect(await runBugBash(six, at, stop, enough.deps)).toBe(0);
+  expect(new Set(enough.calls.map((c) => c.o.env.BUGBASH_MODEL))).toEqual(new Set([SONNET]));
+  expect(enough.calls).toHaveLength(6);
+});
+
+test("U4: the run passes its effort and a possibly real app model to the estimate", async () => {
+  const stop = new AbortController().signal;
+  // A budget that fits medium effort with the Haiku app, but not high effort or an Opus app.
+  const fits = estimateRun({ ...run6, charters: 1 }).recommendedUsd;
+  const env = { ...ENV, BUGBASH_BUDGET_USD: String(fits) };
+  for (const [over, code] of [
+    [{}, 0],
+    [{ BUGBASH_EFFORT: "max" }, 2],
+    [{ BUGBASH_APP_MODEL: OPUS }, 2],
+    [{ BUGBASH_APP_MODEL: OPUS, BUGBASH_AI: "mock" }, 0], // a mock app makes no calls
+  ] as const) {
+    const { deps } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+    expect(await runBugBash([...charters("a")], { ...env, ...over }, stop, deps)).toBe(code);
+  }
+});
