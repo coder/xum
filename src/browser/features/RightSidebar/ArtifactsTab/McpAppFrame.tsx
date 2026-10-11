@@ -464,7 +464,7 @@ export function McpAppFrame(props: {
       {grant.pending.length > 0 && current.view.invocation == null && (
         // Without its result record nothing binds the view to a server, so no Allow is offered.
         <NoteBar>
-          Blocked, and cannot be allowed because this view's tool result record is gone:{" "}
+          Blocked, and cannot be allowed because the tool result record of this view is gone:{" "}
           {grant.pending.map((origin) => new URL(origin).host).join(", ")}
         </NoteBar>
       )}
