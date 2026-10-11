@@ -61,8 +61,13 @@ const McpAppModelContextSchema = z.object({
   updatedAt: z.number(),
 });
 export type McpAppModelContext = z.infer<typeof McpAppModelContextSchema>;
+/**
+ * Version 2: written only after the user allowed the view's context (McpAppFrame consent).
+ * Version 1 files hold context written before that consent existed and read as none.
+ */
+const MCP_APP_MODEL_CONTEXT_FILE_VERSION = 2;
 const McpAppModelContextFileSchema = z.object({
-  version: z.literal(1),
+  version: z.literal(MCP_APP_MODEL_CONTEXT_FILE_VERSION),
   views: z.array(McpAppModelContextSchema),
 });
 
@@ -254,7 +259,10 @@ export class McpAppResultStore {
       );
       const views = updated === null ? others : [updated, ...others];
       const kept = views.slice(0, MCP_APP_MODEL_CONTEXT_MAX_VIEWS);
-      await writeFileAtomic(filePath, JSON.stringify({ version: 1, views: kept }));
+      await writeFileAtomic(
+        filePath,
+        JSON.stringify({ version: MCP_APP_MODEL_CONTEXT_FILE_VERSION, views: kept })
+      );
     });
   }
 

@@ -100,6 +100,8 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
       return [`Open a link to ${request.host}?`, "Open", "Cancel"];
     case "message":
       return ["Insert into message?", "Insert", "Dismiss"];
+    case "context":
+      return ["Share this view's context with the model in your next messages?", "Allow", "Deny"];
   }
 }
 
@@ -403,7 +405,9 @@ export function McpAppFrame(props: {
             {consent.request.kind === "tool" && (
               <ConsentArgs json={consentArgsJson(consent.request.args)} />
             )}
-            {consent.request.kind === "message" && <ConsentArgs json={consent.request.text} />}
+            {(consent.request.kind === "message" || consent.request.kind === "context") && (
+              <ConsentArgs json={consent.request.text} />
+            )}
             {consent.request.kind === "link" && <ConsentArgs json={consent.request.url} />}
           </div>
           <button

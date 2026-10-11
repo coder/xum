@@ -123,6 +123,17 @@ describe("McpAppResultStore model context", () => {
     expect(await new McpAppResultStore(sessionDir).getModelContexts("ws")).toEqual([]);
   });
 
+  test("context stored before consent existed (a version 1 file) reads as none", async () => {
+    using tmp = new DisposableTempDir("mcp-app-context");
+    const sessionDir = await sessionsIn(tmp);
+    const store = new McpAppResultStore(sessionDir);
+    await store.setModelContext("ws", view("c1", "allowed"));
+    const file = path.join(tmp.path, "ws", MCP_APP_MODEL_CONTEXT_FILE);
+    const current = JSON.parse(await fs.readFile(file, "utf8")) as { views: unknown[] };
+    await fs.writeFile(file, JSON.stringify({ version: 1, views: current.views }));
+    expect(await new McpAppResultStore(sessionDir).getModelContexts("ws")).toEqual([]);
+  });
+
   test("a cold read that finishes after an update does not bring back the old context", async () => {
     using tmp = new DisposableTempDir("mcp-app-context");
     const sessionDir = await sessionsIn(tmp);
