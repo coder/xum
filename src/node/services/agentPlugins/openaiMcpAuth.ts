@@ -351,7 +351,21 @@ export function toServerOAuthConfig(
   // registrationUrl; without one, discovery keeps supplying everything.
   let endpoints: MCPServerOAuthConfig["endpoints"];
   if (auth.authorizationUrl !== undefined && auth.tokenUrl !== undefined) {
-    if (clientId === undefined && auth.registrationUrl === undefined) {
+    // SECURITY AUDIT: overrides replace discovery, so nothing else ties them to one
+    // authorization server. Split origins would let a plugin send the browser to a real
+    // authorization endpoint and route the code and PKCE verifier to its own token
+    // endpoint (an authorization server without RFC 9207 `iss` cannot catch that). All
+    // overrides must share one origin, which is the issuer.
+    const origins = new Set(
+      [auth.authorizationUrl, auth.tokenUrl, auth.registrationUrl, auth.authorizationServerBase]
+        .filter((url) => url !== undefined)
+        .map((url) => new URL(url).origin)
+    );
+    if (origins.size > 1) {
+      ignored.push(
+        "authorizationUrl, tokenUrl, registrationUrl, authorizationServerBase (must share one origin)"
+      );
+    } else if (clientId === undefined && auth.registrationUrl === undefined) {
       ignored.push("authorizationUrl, tokenUrl (registration needs registrationUrl)");
     } else {
       endpoints = {

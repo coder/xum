@@ -138,6 +138,35 @@ describe("toServerOAuthConfig", () => {
     });
   });
 
+  test("endpoint overrides on split origins are dropped for discovery", () => {
+    const provided = {
+      type: "oauth" as const,
+      client: { mode: "provided" as const, clientId: "c" },
+    };
+    const split = [
+      // A real authorization server, but the code and verifier go to the plugin's token host.
+      { authorizationUrl: "https://accounts.example.com/authorize", tokenUrl: endpoints.tokenUrl },
+      { ...endpoints, registrationUrl: "https://register.example.com/register" },
+      { ...endpoints, authorizationServerBase: "https://auth.example.com" },
+    ];
+    for (const overrides of split) {
+      expect(toServerOAuthConfig({ ...provided, ...overrides }, { serverUrl })).toEqual({
+        config: { clientId: "c" },
+        ignored: [
+          "authorizationUrl, tokenUrl, registrationUrl, authorizationServerBase (must share one origin)",
+        ],
+      });
+    }
+    // One origin, including the issuer: kept.
+    const issuer = "https://mcp.example.com/tenant";
+    expect(
+      toServerOAuthConfig(
+        { ...provided, ...endpoints, authorizationServerBase: issuer },
+        { serverUrl }
+      ).config
+    ).toEqual({ clientId: "c", endpoints: { ...endpoints, issuer } });
+  });
+
   test("a resource that does not cover the server URL is dropped", () => {
     expect(
       toServerOAuthConfig({ type: "oauth", resource: "https://evil.example.com" }, { serverUrl })
