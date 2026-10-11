@@ -1398,7 +1398,10 @@ export class MessageQueue {
     entryId?: string;
     message: string;
     options?: SendMessageOptions & { fileParts?: FilePart[] };
-    internal?: QueuedMessageInternalOptions;
+    internal?: QueuedMessageInternalOptions & {
+      /** See SendMessageInternalOptions.textBatchedBehindCompaction. */
+      textBatchedBehindCompaction?: string;
+    };
     /** Timestamp of the latest add batched into this entry (see QueueEntry.lastAddedAtMs). */
     enqueuedAtMs?: number;
   } {
@@ -1408,6 +1411,13 @@ export class MessageQueue {
     }
 
     const joinedMessages = entry.messages.join("\n");
+    // A compaction entry stays open, so texts added after it join its request. Its first message
+    // is the compaction request's own text (compaction always starts a new entry); the rest were
+    // sent separately and must still reach the message.send prompt hooks.
+    const textBatchedBehindCompaction =
+      isCompactionMetadata(entry.muxMetadata) && entry.messages.length > 1
+        ? entry.messages.slice(1).join("\n")
+        : undefined;
     const options = entry.latestOptions
       ? (() => {
           const restOptions: SendMessageOptions = { ...entry.latestOptions };
@@ -1492,6 +1502,7 @@ export class MessageQueue {
       refreshCompactionAdmission != null ||
       readCompactionAdmission != null ||
       (entry.preTurnMessages?.length ?? 0) > 0 ||
+      textBatchedBehindCompaction != null ||
       entry.sendIdentities.length > 0;
     const internal = hasInternalOptions
       ? {
@@ -1517,6 +1528,7 @@ export class MessageQueue {
           ...(entry.turnAdmission != null ? { turnAdmission: entry.turnAdmission } : {}),
           ...(readCompactionAdmission != null ? { readCompactionAdmission } : {}),
           ...(refreshCompactionAdmission != null ? { refreshCompactionAdmission } : {}),
+          ...(textBatchedBehindCompaction != null ? { textBatchedBehindCompaction } : {}),
         }
       : undefined;
 

@@ -78,6 +78,7 @@ import {
   type AnthropicCacheTtl,
 } from "@/common/utils/ai/cacheStrategy";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 const keepContextRow = (message: MuxMessage) =>
   !isModelHiddenMessage(message) && !message.metadata?.contextBudgetRejected;
@@ -247,7 +248,10 @@ export async function assemblePromptPayload(
   let messages = await prepareMessagesForProvider({
     messagesWithSentinel: addInterruptedSentinel(
       options.tagHistoryItemIds === true
-        ? tagUserRowsWithHistoryItemIds(prepared.providerRequestMessages)
+        ? // Hook context renders first so each tagged row still ends with its [id: ...] tag.
+          tagUserRowsWithHistoryItemIds(
+            renderPluginHookContextForProvider(prepared.providerRequestMessages)
+          )
         : prepared.providerRequestMessages
     ),
     replayReceiptMessages: prepared.activeContextMessages,

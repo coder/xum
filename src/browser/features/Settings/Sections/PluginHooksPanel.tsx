@@ -14,7 +14,9 @@ import { getErrorMessage } from "@/common/utils/errors";
 /** One-line handler summary, shared by the consent preview and the review panel. */
 export function describePluginHookHandler(handler: PluginHookHandler): string {
   return handler.type === "mcp_tool"
-    ? `MCP tool ${handler.server} / ${handler.tool}`
+    ? // The timeout is part of what the user trusts (and of the hash): a changed hook may differ
+      // only there.
+      `MCP tool ${handler.server} / ${handler.tool}, timeout ${handler.timeoutSeconds}s`
     : `${handler.type}: ${handler.summary}`;
 }
 

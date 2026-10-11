@@ -14,7 +14,8 @@
  * Only an explicit deny or block decision blocks.
  *
  * Within one plugin, matching hooks run one after another in declaration order (Codex launches
- * them concurrently). Plugins run in discovery order (spine `order`).
+ * them concurrently). Plugins run in discovery order (spine `order`), except PostToolUse: it runs
+ * as the around-middleware unwinds, so in reverse plugin order (Codex promises no order at all).
  */
 import type { EventSpine, ToolExecuteContext } from "@/node/services/events/eventSpine";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -102,6 +103,7 @@ async function runToolHooks(
   registration: CodexHookRegistration
 ): Promise<void> {
   const notes: string[] = [];
+  const call = { cwd: ctx.host.cwd, abortSignal: ctx.abortSignal };
   // Codex names and fields (Bash, mcp__<server>__<tool>, tool_input.command), so a Codex
   // hooks.json works without edits. Xum's own names and fields stay available too.
   const view = codexToolView(ctx.toolName, ctx.mcpOrigin);
@@ -112,7 +114,8 @@ async function runToolHooks(
       : ctx.args,
   });
   for (const hook of pre.filter((candidate) => matches(candidate, ctx.toolName, view))) {
-    const output = await invoke(hook, toolEvent(), "PreToolUse", registration);
+    const output = await invoke(hook, toolEvent(), "PreToolUse", registration, call);
+    if (ctx.abortSignal?.aborted) break;
     if (output === null) continue;
     // Codex: PreToolUse does not support continue/stopReason or "ask"; such a run fails (open).
     if (
@@ -136,6 +139,11 @@ async function runToolHooks(
     if (output.updatedInput !== undefined) applyUpdatedInput(ctx, output, view, registration, hook);
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
   }
+  // The user cancelled while a hook ran: the tool must not start after the cancel.
+  if (ctx.abortSignal?.aborted) {
+    ctx.blocked = { result: { error: "Tool call interrupted while plugin hooks ran." } };
+    return;
+  }
   await next();
   if (ctx.executed) {
     for (const hook of post.filter((candidate) => matches(candidate, ctx.toolName, view))) {
@@ -143,16 +151,18 @@ async function runToolHooks(
         hook,
         { ...toolEvent(), tool_response: ctx.result },
         "PostToolUse",
-        registration
+        registration,
+        call
       );
       if (output === null) continue;
+      if (output.additionalContext !== undefined) notes.push(output.additionalContext);
       // Codex: block (or continue: false) replaces the tool result with the hook's feedback.
+      // The context gathered so far still reaches the model (Codex adds it next to the feedback).
       if (output.decision === "block" || output.continue === false) {
         const feedback = output.reason ?? output.stopReason ?? "Stopped by a plugin hook.";
         ctx.result = { error: `[plugin:${registration.pluginName}] ${feedback}` };
-        return;
+        break;
       }
-      if (output.additionalContext !== undefined) notes.push(output.additionalContext);
     }
   }
   // Model-visible tool context rides on the tool result (logged in chat.jsonl with it).
@@ -193,42 +203,52 @@ async function invoke(
   hook: PluginHookDefinition,
   eventFields: Record<string, unknown>,
   eventName: string,
-  registration: CodexHookRegistration
+  registration: CodexHookRegistration,
+  /** Tool calls: the session cwd (a Codex common field) and the tool's abort signal. */
+  call: { cwd?: string; abortSignal?: AbortSignal } = {}
 ): Promise<HookOutput | null> {
   const handler = hook.handler;
   if (handler.type !== "mcp_tool") return null;
-  if (!(await registration.deps.isHookAllowed(hook))) return null;
-  const event = {
-    hook_event_name: eventName,
-    session_id: registration.workspaceId,
-    ...eventFields,
-  };
-  const input = expandHookTemplate(handler.input, event);
-  if (!isPlainObject(input) || JSON.stringify(input).length > HOOK_INPUT_MAX_CHARS) {
-    warn(registration, hook, "expanded input is too large; skipping the hook");
-    return null;
-  }
+  if (call.abortSignal?.aborted) return null;
   const seconds = Math.min(
     handler.timeoutSeconds ?? HOOK_DEFAULT_TIMEOUT_SECONDS,
     HOOK_MAX_TIMEOUT_SECONDS
   );
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), seconds * 1000);
+  const timeout = new AbortController();
+  const timer = setTimeout(() => timeout.abort(), seconds * 1000);
+  // The hook call ends at the hook timeout or when the user cancels the tool, whichever is first.
+  const signal = call.abortSignal
+    ? AbortSignal.any([timeout.signal, call.abortSignal])
+    : timeout.signal;
+  // Everything below fails open, the trust gate included (it reads stores that can fail).
   try {
+    if (!(await registration.deps.isHookAllowed(hook))) return null;
+    const event = {
+      hook_event_name: eventName,
+      session_id: registration.workspaceId,
+      ...(call.cwd !== undefined ? { cwd: call.cwd } : {}),
+      ...eventFields,
+    };
+    const input = expandHookTemplate(handler.input, event);
+    if (!isPlainObject(input) || JSON.stringify(input).length > HOOK_INPUT_MAX_CHARS) {
+      warn(registration, hook, "expanded input is too large; skipping the hook");
+      return null;
+    }
     const result = await Promise.race([
       registration.deps.callPluginTool({
         server: handler.server,
         tool: handler.tool,
         input,
-        signal: controller.signal,
+        signal,
       }),
-      new Promise<never>((_, reject) =>
-        controller.signal.addEventListener("abort", () =>
-          reject(new Error(`timed out after ${seconds}s`))
-        )
-      ),
+      new Promise<never>((_, reject) => {
+        const onAbort = () =>
+          reject(new Error(timeout.signal.aborted ? `timed out after ${seconds}s` : "interrupted"));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }),
     ]);
-    const output = parseHookOutput(result, eventName === "UserPromptSubmit");
+    const output = parseHookOutput(result, eventName);
     if (output?.systemMessage !== undefined) registration.deps.notifyUser(output.systemMessage);
     return output;
   } catch (error) {
@@ -278,7 +298,8 @@ function lookup(root: unknown, dottedPath: string): unknown {
  * JSON. Plain text counts only for UserPromptSubmit (Codex adds it as context). An `isError`
  * result is a failure.
  */
-export function parseHookOutput(result: unknown, plainTextIsContext: boolean): HookOutput | null {
+export function parseHookOutput(result: unknown, eventName: string): HookOutput | null {
+  const plainTextIsContext = eventName === "UserPromptSubmit";
   if (!isPlainObject(result)) throw new Error("the MCP result is not an object");
   if (result.isError === true) throw new Error("the MCP tool returned an error");
   let raw: unknown = result.structuredContent;
@@ -296,6 +317,14 @@ export function parseHookOutput(result: unknown, plainTextIsContext: boolean): H
     }
   }
   if (!isPlainObject(raw)) return null;
+  // Codex's schema requires hookSpecificOutput.hookEventName to name this event; an output
+  // tagged for another event (or untagged) is malformed and fails open.
+  if (
+    raw.hookSpecificOutput !== undefined &&
+    !(isPlainObject(raw.hookSpecificOutput) && raw.hookSpecificOutput.hookEventName === eventName)
+  ) {
+    throw new Error(`hookSpecificOutput is not tagged hookEventName "${eventName}"`);
+  }
   const specific = isPlainObject(raw.hookSpecificOutput) ? raw.hookSpecificOutput : {};
   const text = (value: unknown) =>
     typeof value === "string" && value.trim() ? cut(value) : undefined;
@@ -324,8 +353,18 @@ function annotate(result: unknown, notes: string[], registration: CodexHookRegis
     return result;
   const note = notes.map((text) => `[plugin:${registration.pluginName}] ${text}`).join("\n");
   const existing = (result as { hook_output?: unknown }).hook_output;
+  // MCP tools convert their result for the model from `content` (raw MCP) or `value` (Xum's
+  // { type: "content" } shape) only (mcpToModelOutput), so the note must ride there as text too.
+  const record = result as Record<string, unknown>;
+  const part = { type: "text", text: note };
+  const contentParts: Record<string, unknown[]> = Array.isArray(record.content)
+    ? { content: [...(record.content as unknown[]), part] }
+    : record.type === "content" && Array.isArray(record.value)
+      ? { value: [...(record.value as unknown[]), part] }
+      : {};
   return {
     ...result,
+    ...contentParts,
     hook_output:
       typeof existing === "string" && existing.length > 0 ? `${existing}\n${note}` : note,
   };

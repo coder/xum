@@ -98,6 +98,19 @@ describe("loadPluginCodexHooks", () => {
     expect(hooks[2]?.handler).toMatchObject({ input: {}, timeoutSeconds: 30 });
   });
 
+  test("a non-finite timeout drops only that handler", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-timeout");
+    const plugin = await writePlugin(tmp.path, {
+      // 1e400 parses to Infinity, which JSON and the review RPC cannot carry.
+      "hooks/hooks.json": `{ "hooks": { "Stop": [ { "hooks": [ { "type": "mcp_tool", "server": "s", "tool": "t", "timeout": 1e400 }, { "type": "mcp_tool", "server": "s", "tool": "t" } ] } ] } }`,
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.key)).toEqual(["hooks/hooks.json#Stop[0][1]"]);
+    expect(warnings).toHaveLength(1);
+  });
+
   test("a com.openai pointer replaces the default file instead of adding to it", async () => {
     using tmp = new DisposableTempDir("codex-hooks-pointer");
     const plugin = await writePlugin(
@@ -194,6 +207,51 @@ describe("loadPluginCodexHooks", () => {
     ];
     expect(warnings).toHaveLength(patterns.length);
     patterns.forEach((pattern, index) => expect(warnings[index]).toMatch(pattern));
+  });
+
+  test('"*", "" and an omitted matcher all mean match-all (no matcher)', async () => {
+    using tmp = new DisposableTempDir("codex-hooks-match-all");
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": {
+        hooks: {
+          PreToolUse: [
+            { matcher: "*", hooks: [scan] },
+            { matcher: "", hooks: [scan] },
+            { hooks: [scan] },
+          ],
+        },
+      },
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(warnings).toEqual([]);
+    expect(hooks.map((hook) => [hook.status, hook.matcher])).toEqual([
+      ["runnable", undefined],
+      ["runnable", undefined],
+      ["runnable", undefined],
+    ]);
+    // Same thing runs, so the same trust key.
+    expect(new Set(hooks.map((hook) => hook.hash)).size).toBe(1);
+  });
+
+  test("a handler nested too deeply to hash is dropped with a warning; siblings load", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-deep");
+    // Under the 256 KiB file cap, but deeper than the stack can recurse.
+    const depth = 100_000;
+    const deepInput = `{"x":${"[".repeat(depth)}${"]".repeat(depth)}}`;
+    const deep = `{"type":"mcp_tool","server":"s","tool":"t","input":${deepInput}}`;
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": `{"hooks":{"PreToolUse":[{"hooks":[${deep},${JSON.stringify(scan)}]}]}}`,
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.handler.type === "mcp_tool" && hook.handler.server)).toEqual([
+      "scanner",
+    ]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/nests deeper than \d+ levels; ignoring a handler/);
   });
 
   test("a plugin without hooks has none, silently", async () => {
