@@ -11,6 +11,7 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { textContrast } from "@/browser/stories/helpers/contrast";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { MCPServerInfo } from "@/common/types/mcp";
@@ -657,8 +658,12 @@ export const WorkspaceMCPServerSettingsNarrow: Story = {
   play: async ({ canvasElement }) => exerciseServerSettings(canvasElement, 358),
 };
 
+// Settings stories marked PIXEL_DISABLED exist for their plays (which still run in Test /
+// Storybook). Their first frame adds no look beyond WorkspaceMCPServerSettings, Narrow and
+// ReadError, so they skip Pixel to stay within the snapshot budget.
 /** Not running yet: the dialog does not start it on open; Fetch Tools connects it. */
 export const WorkspaceMCPServerSettingsNotConnected: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => renderWorkspaceMCPModal({ ...settingsStoryOptions(), settingsConnected: [] }),
   play: async ({ canvasElement }) => {
     const modal = within(await findWorkspaceMCPDialog(canvasElement));
@@ -676,6 +681,7 @@ const settingsReads: string[][] = [];
 
 /** Opening the dialog reads every enabled server's settings in ONE IPC call. */
 export const WorkspaceMCPServerSettingsOneRead: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => {
     settingsReads.length = 0;
     return renderWorkspaceMCPModal({
@@ -724,6 +730,7 @@ const saveGate = storyGate();
 
 /** While a save is in flight the controls are locked, so no edit can be lost to its response. */
 export const WorkspaceMCPServerSettingsSaveInFlight: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
   render: () =>
     renderWorkspaceMCPModal({ ...settingsStoryOptions(), settingsUpdateGate: saveGate }),
   play: async ({ canvasElement }) => {
@@ -747,6 +754,7 @@ export const WorkspaceMCPServerSettingsSaveInFlight: Story = {
  * are not read (the backend's saved enablement would refuse the read as disabled).
  */
 export const WorkspaceMCPServerSettingsUnsavedEnable: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
   render: () =>
     renderWorkspaceMCPModal({
       ...settingsStoryOptions(),
@@ -754,7 +762,7 @@ export const WorkspaceMCPServerSettingsUnsavedEnable: Story = {
     }),
   play: async ({ canvasElement }) => {
     const modal = within(await findWorkspaceMCPDialog(canvasElement));
-    await userEvent.click(modal.getByRole("switch", { name: "Toggle cad MCP server" }));
+    await userEvent.click(await modal.findByRole("switch", { name: "Toggle cad MCP server" }));
     await userEvent.click(await modal.findByRole("button", { name: "Fetch Tools" }));
     await expect(modal.findByText("draw_part")).resolves.toBeInTheDocument();
     await expect(modal.queryByTestId("mcp-server-settings")).toBeNull();
@@ -804,6 +812,7 @@ const lateFetchReads: string[][] = [];
  * the new dialog (its generation is stale): only the reopen's own read happens.
  */
 export const WorkspaceMCPServerSettingsLateFetch: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => {
     lateFetchReads.length = 0;
     return (
@@ -851,6 +860,7 @@ const slowFirstReads: string[][] = [];
  * again. When the slow read lands (lathe's section appears), cad keeps the newer read.
  */
 export const WorkspaceMCPServerSettingsSlowFirstRead: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => {
     slowFirstReads.length = 0;
     return (
@@ -881,7 +891,7 @@ export const WorkspaceMCPServerSettingsSlowFirstRead: Story = {
     await fireEvent.click(
       within(canvasElement).getByRole("button", { name: "Change zoom on the server", hidden: true })
     );
-    await userEvent.click(modal.getAllByRole("button", { name: "Fetch Tools" })[0]);
+    await userEvent.click((await modal.findAllByRole("button", { name: "Fetch Tools" }))[0]);
     const cad = within(await modal.findByTestId("mcp-server-settings"));
     await expect(cad.getByLabelText("Default zoom setting")).toHaveValue(4);
     slowFirstReadGate.open();
@@ -919,6 +929,7 @@ async function saveUnits(canvasElement: HTMLElement, units: string) {
  * changed elsewhere meanwhile, with no Refresh Tools.
  */
 export const WorkspaceMCPServerSettingsReopen: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <WorkspaceMCPModalStoryShell setup={() => setupWorkspaceMCPModalStory(settingsStoryOptions())}>
       <ReopenableWorkspaceMCPModal />
@@ -951,6 +962,7 @@ export const WorkspaceMCPServerSettingsReopen: Story = {
  * again is a change, also after the section remounts (server toggled off and on).
  */
 export const WorkspaceMCPServerSettingsOldValueAgain: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => renderWorkspaceMCPModal(settingsStoryOptions()),
   play: async ({ canvasElement }) => {
     await saveUnits(canvasElement, "in");
