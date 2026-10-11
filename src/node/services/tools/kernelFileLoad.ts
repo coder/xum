@@ -16,6 +16,8 @@ import {
 } from "@/node/runtime/streamUtils";
 import { MAX_FILE_SIZE, resolvePathWithinCwd, validateFileSize } from "./fileCommon";
 import { KERNEL_LOAD_PREVIEW_CHARS } from "@/constants/kernelOutput";
+import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { runThroughToolHookPipeline, type HookConfig } from "./withHooks";
 
 /** Full content + bounded model-visible summary of one loaded file. */
@@ -138,6 +140,9 @@ export function createKernelFileLoader(config: {
       args: { path },
       config: hooks,
       abortSignal,
+      // file_read's own schema: a hook's allowed rewrite is checked against it, as for the tool.
+      inputJsonSchema: () =>
+        extractToolJsonSchema({ inputSchema: TOOL_DEFINITIONS.file_read.schema }),
       execute: async (currentArgs) => {
         // Middleware may rewrite args; honor the rewritten path, but never
         // read from a shape a middleware corrupted.
