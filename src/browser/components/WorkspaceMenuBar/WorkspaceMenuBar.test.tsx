@@ -37,6 +37,7 @@ import {
   writeArtifactSelection,
 } from "@/browser/features/RightSidebar/ArtifactsTab/artifactSelection";
 import { mcpAppSelectionKey } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import * as StatsDialogModule from "@/browser/features/RightSidebar/StatsDialog";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
@@ -899,6 +900,37 @@ describe("WorkspaceMenuBar archive confirmations", () => {
         expect([tab, activeTab()]).toEqual([tab, tab]);
         view.unmount();
       }
+    });
+
+    it('"Open in tab" opens the view\'s own app tab once the sidebar shows again', () => {
+      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+      const widen = widenable();
+      focusRightSidebarTab(workspaceId, "review");
+      render(<WorkspaceMenuBar {...defaultProps} />);
+      act(() => {
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: "call-w" })
+        );
+      });
+      widen();
+      expect(activeTab()).toBe(appViewTabFor("call-w"));
+      expect(allTabs()).not.toContain("artifacts");
+    });
+
+    it("selects Artifacts when the dialog moved on to another artifact", () => {
+      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+      const widen = widenable();
+      focusRightSidebarTab(workspaceId, "review");
+      render(<WorkspaceMenuBar {...defaultProps} />);
+      act(() => {
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: "call-w" })
+        );
+      });
+      // The user picks a file in the dialog's picker before widening.
+      writeArtifactSelection(workspaceId, { scope: "artifact", path: "report.md", version: null });
+      widen();
+      expect(activeTab()).toBe("artifacts");
     });
 
     it("does not add the Artifacts tab once its experiment is off", () => {
