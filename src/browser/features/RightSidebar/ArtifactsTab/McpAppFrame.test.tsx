@@ -29,6 +29,7 @@ const VIEW: McpAppViewRef = {
 let invocation: McpAppView["invocation"] = null;
 let viewCsp: McpAppView["csp"] = {};
 let approvals: Array<{ serverName: string; origins: string[] }> = [];
+let approveFails: Error | null = null;
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -49,11 +50,13 @@ function Wrapper(props: { children: ReactNode }) {
             resultAvailable: true,
             result: { content: [] },
             invocation,
+            approvalProjectPath: "/repo",
           },
         });
       },
       approveViewDomains: (input: { serverName: string; origins: string[] }) => {
         approvals.push({ serverName: input.serverName, origins: input.origins });
+        if (approveFails) return Promise.reject(approveFails);
         return Promise.resolve({
           success: true as const,
           data: { approvedDomains: input.origins },
@@ -124,6 +127,15 @@ function captureReplies(frame: HTMLIFrameElement) {
   return replies;
 }
 
+/** Press the strip's Allow once its arming delay is over (confirmArming.ts). */
+async function pressAllow(button: HTMLElement) {
+  await waitFor(() => expect(button.hasAttribute("disabled")).toBe(false), {
+    timeout: CONFIRM_ARM_DELAY_MS * 4,
+  });
+  fireEvent.pointerDown(button);
+  fireEvent.click(button);
+}
+
 async function renderFrame() {
   const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
   const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
@@ -139,6 +151,7 @@ describe("McpAppFrame", () => {
     invocation = null;
     viewCsp = {};
     approvals = [];
+    approveFails = null;
     toolCalls = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -168,10 +181,7 @@ describe("McpAppFrame", () => {
     cleanup();
 
     const again = await renderFrame();
-    const allow = again.view.getByRole("button", { name: "Allow" });
-    await new Promise((resolve) => setTimeout(resolve, CONFIRM_ARM_DELAY_MS + 50));
-    fireEvent.pointerDown(allow);
-    fireEvent.click(allow);
+    await pressAllow(again.view.getByRole("button", { name: "Allow" }));
     // Approved for the record's raw server key, then the view reloads under the wider policy.
     await waitFor(() =>
       expect(approvals).toEqual([
@@ -185,6 +195,37 @@ describe("McpAppFrame", () => {
       expect(csp).toContain("frame-src 'none'");
     });
     expect(again.view.queryByText(/wants to reach/)).toBeNull();
+  });
+
+  test("an approval applies at once to every mounted view of the same server", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws" view={VIEW} />
+        <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />
+      </>,
+      { wrapper: Wrapper }
+    );
+    await waitFor(() => expect(view.getAllByTestId("mcp-app-frame")).toHaveLength(2));
+    await pressAllow(view.getAllByRole("button", { name: "Allow" })[0]);
+    await waitFor(() => {
+      for (const frame of view.getAllByTestId("mcp-app-frame")) {
+        expect(frame.getAttribute("srcdoc")).toContain("connect-src https://api.example.com");
+      }
+    });
+    expect(view.queryAllByRole("button", { name: "Allow" })).toHaveLength(0);
+  });
+
+  test("a failed approval request shows its error instead of a silently armed strip", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    approveFails = new Error("config write failed");
+    const { view, frame } = await renderFrame();
+    await pressAllow(view.getByRole("button", { name: "Allow" }));
+    await view.findByText(/config write failed/);
+    expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
+    expect(frame.getAttribute("srcdoc")).not.toContain("api.example.com");
   });
 
   test("the view is bound to the recorded tool call, not the card", async () => {

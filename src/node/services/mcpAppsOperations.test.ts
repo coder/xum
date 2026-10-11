@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import type { ORPCContext } from "@/node/orpc/context";
+import { McpAppApproveDomainsRequestSchema } from "@/common/orpc/schemas/mcpApps";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import type { MCPServerInfo } from "@/common/types/mcp";
 import type { McpAppResultRecord } from "./mcpAppResultStore";
 import {
   getMcpAppView,
   MCP_APP_TOOL_RESULT_MAX_BYTES,
   approveMcpAppViewDomains,
   listMcpAppViewDomains,
+  type McpAppsContext,
   readMcpAppServerResource,
   revokeMcpAppViewDomains,
   updateMcpAppModelContext,
@@ -40,7 +43,7 @@ function context(record: McpAppResultRecord | null, warm = true) {
         return Promise.resolve({ html: "<p>view</p>", csp: {}, prefersBorder: null });
       },
     },
-  } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager" | "config">;
+  } as unknown as McpAppsContext;
   return { ctx, reads };
 }
 
@@ -128,7 +131,7 @@ describe("readMcpAppServerResource", () => {
           return result instanceof Error ? Promise.reject(result) : Promise.resolve(result);
         },
       },
-    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager" | "config">;
+    } as unknown as McpAppsContext;
     return { ctx, reads };
   }
   const input = { workspaceId: "ws", serverName: "charts", uri: "ui://charts/data" };
@@ -165,7 +168,7 @@ describe("updateMcpAppModelContext", () => {
           return Promise.resolve();
         },
       },
-    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager" | "config">;
+    } as unknown as McpAppsContext;
     return { ctx, writes };
   }
   const input = (serverName = "charts") => ({
@@ -194,12 +197,26 @@ describe("updateMcpAppModelContext", () => {
 });
 
 describe("MCP Apps view domain approvals", () => {
-  function projectConfig() {
+  function projectConfig(
+    options: {
+      record?: McpAppResultRecord;
+      // A multi-project workspace (stored under _multi, first project /a) and its servers.
+      multi?: Record<string, Partial<MCPServerInfo>>;
+    } = {}
+  ) {
+    const record = options.record ?? RECORD;
     const projects = new Map<string, { mcpAppViewDomains?: Record<string, string[]> }>([
       ["/repo", {}],
+      ["/a", {}],
+      [MULTI_PROJECT_CONFIG_KEY, {}],
     ]);
     const config = {
-      findWorkspace: (id: string) => (id === "ws" ? { projectPath: "/repo" } : null),
+      findWorkspace: (id: string) =>
+        id !== "ws"
+          ? null
+          : options.multi
+            ? { projectPath: MULTI_PROJECT_CONFIG_KEY, attributionProjectPath: "/a" }
+            : { projectPath: "/repo", attributionProjectPath: "/repo" },
       loadConfigOrDefault: () => ({ projects }),
       editConfig: (fn: (c: { projects: typeof projects }) => unknown) => {
         fn({ projects });
@@ -211,11 +228,15 @@ describe("MCP Apps view domain approvals", () => {
       config,
       mcpServerManager: {
         getMcpAppResult: (_ws: string, id: string) =>
-          Promise.resolve(id === "call-1" ? RECORD : null),
+          Promise.resolve(id === "call-1" ? record : null),
         hasWorkspaceRequestOptions: () => true,
         readMcpAppResource: () => Promise.resolve({ html: "<p/>", csp: {}, prefersBorder: null }),
       },
-    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager" | "config">;
+      mcpConfigService: {
+        listForApi: (input: { projectPath?: string }) =>
+          Promise.resolve(input.projectPath === "/a" ? (options.multi ?? {}) : {}),
+      },
+    } as unknown as McpAppsContext;
     return { ctx, projects };
   }
   const approve = (
@@ -273,5 +294,64 @@ describe("MCP Apps view domain approvals", () => {
       expect((await approveMcpAppViewDomains(ctx, input)).success).toBe(false);
     }
     expect(projects.get("/repo")?.mcpAppViewDomains).toBeUndefined();
+  });
+
+  test("a multi-project workspace keeps approvals on its server's project, never in _multi", async () => {
+    // The project's own server: its approval lands on that project.
+    const own = projectConfig({ multi: { charts: { configLayer: "project" } } });
+    expect(
+      (await approveMcpAppViewDomains(own.ctx, approve(["https://api.example.com"]))).success
+    ).toBe(true);
+    expect(own.projects.get("/a")?.mcpAppViewDomains).toEqual({
+      charts: ["https://api.example.com"],
+    });
+    expect(own.projects.get(MULTI_PROJECT_CONFIG_KEY)?.mcpAppViewDomains).toBeUndefined();
+    const view = await getMcpAppView(own.ctx, request(), undefined, noWarm);
+    expect(view.success && view.data.approvalProjectPath).toBe("/a");
+    expect(view.success && view.data.approvedDomains).toEqual(["https://api.example.com"]);
+
+    // A global server has no single owner project there: refused, nothing stored anywhere.
+    const global = projectConfig({ multi: { charts: { configLayer: "global" } } });
+    expect(
+      (await approveMcpAppViewDomains(global.ctx, approve(["https://api.example.com"]))).success
+    ).toBe(false);
+    for (const project of global.projects.values())
+      expect(project.mcpAppViewDomains).toBeUndefined();
+    const globalView = await getMcpAppView(global.ctx, request(), undefined, noWarm);
+    expect(globalView.success && globalView.data.approvalProjectPath).toBeNull();
+  });
+
+  test("a server named like an Object.prototype member reads no inherited approvals", async () => {
+    const { ctx, projects } = projectConfig({ record: { ...RECORD, serverName: "constructor" } });
+    projects.set("/repo", { mcpAppViewDomains: {} });
+    const named = request({ serverName: "constructor" });
+    const view = await getMcpAppView(ctx, named, undefined, noWarm);
+    expect(view.success && view.data.approvedDomains).toEqual([]);
+    const result = await approveMcpAppViewDomains(
+      ctx,
+      approve(["https://api.example.com"], { serverName: "constructor" })
+    );
+    expect(result).toEqual({
+      success: true,
+      data: { approvedDomains: ["https://api.example.com"] },
+    });
+  });
+
+  test("an approval that would exceed the cap fails and keeps the stored list", async () => {
+    const { ctx, projects } = projectConfig();
+    const full = Array.from({ length: 64 }, (_, i) => `https://h${i}.example.com`);
+    projects.set("/repo", { mcpAppViewDomains: { charts: full } });
+    // Already approved origins still succeed; a new one does not fit.
+    expect((await approveMcpAppViewDomains(ctx, approve([full[0]]))).success).toBe(true);
+    expect(
+      (await approveMcpAppViewDomains(ctx, approve(["https://new.example.com"]))).success
+    ).toBe(false);
+    expect(projects.get("/repo")?.mcpAppViewDomains?.charts).toEqual(full);
+  });
+
+  test("one request carries a view's whole pending batch (resource and connect lists)", () => {
+    const origins = (n: number) => Array.from({ length: n }, (_, i) => `https://h${i}.example.com`);
+    expect(McpAppApproveDomainsRequestSchema.safeParse(approve(origins(64))).success).toBe(true);
+    expect(McpAppApproveDomainsRequestSchema.safeParse(approve(origins(65))).success).toBe(false);
   });
 });

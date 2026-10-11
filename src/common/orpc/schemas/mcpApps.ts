@@ -3,6 +3,7 @@ import {
   isMcpAppResourceUri,
   MCP_APP_MODEL_CONTEXT_MAX_BYTES,
   MCP_APP_READ_URI_MAX_CHARS,
+  MCP_APP_VIEW_DOMAINS_MAX,
 } from "@/common/utils/mcpApps";
 
 /**
@@ -32,6 +33,11 @@ export const McpAppViewSchema = z.object({
   result: z.unknown().nullable(),
   /** Origins the user allowed this view's server to reach in this project (mcpAppViewDomains). */
   approvedDomains: z.array(z.string()).optional(),
+  /**
+   * The project whose approvals the view's server uses (a multi-project workspace's server
+   * project, never the shared `_multi` bucket); null when none can be approved.
+   */
+  approvalProjectPath: z.string().nullable().optional(),
   /**
    * The tool call the side-store record names: its server, server-local tool name and the
    * sanitized arguments the server received. When present the view is bound to it (toolInfo,
@@ -69,7 +75,8 @@ export const McpAppApproveDomainsRequestSchema = z.object({
   workspaceId: z.string().min(1),
   toolCallId: z.string().min(1),
   serverName: z.string().min(1),
-  origins: z.array(z.string().max(256)).min(1).max(32),
+  // One strip asks for a view's resource and connect domains together (up to 32 each).
+  origins: z.array(z.string().max(256)).min(1).max(MCP_APP_VIEW_DOMAINS_MAX),
 });
 
 /** One server's approved view origins in one project (Settings → MCP). */
