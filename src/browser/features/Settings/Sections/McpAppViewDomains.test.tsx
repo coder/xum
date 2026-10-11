@@ -255,7 +255,7 @@ describe("MCP Apps allowed view domains", () => {
       pushConfigChanged();
       await Promise.resolve();
     });
-    await waitFor(async () => {
+    await waitFor(() => {
       for (const element of view.getAllByTestId("mcp-app-frame")) {
         expect(element.getAttribute("srcdoc")).not.toContain(API_ORIGIN);
       }
