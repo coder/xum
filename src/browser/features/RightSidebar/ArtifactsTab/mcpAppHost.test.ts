@@ -6,7 +6,6 @@ import {
   createMcpAppHost,
   MCP_APP_CONSENT_ARGS_MAX_BYTES,
   MCP_APP_MAX_HEIGHT,
-  MCP_APP_WIDGET_STATE_MAX_BYTES,
   type McpAppConsentRequest,
   type McpAppDisplayMode,
   type McpAppHostOptions,
@@ -18,7 +17,6 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
   const reads: string[] = [];
   const modelContexts: string[] = [];
   const modeRequests: string[] = [];
-  const widgetStates: string[] = [];
   const moves: string[] = [];
   let displayMode: McpAppDisplayMode = "inline";
   const consents: McpAppConsentRequest[] = [];
@@ -65,7 +63,6 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
         displayMode = mode;
       };
     },
-    saveWidgetState: (json) => widgetStates.push(json),
     requestConsent: (request) => {
       consents.push(request);
       return Promise.resolve(true);
@@ -98,7 +95,6 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
     reads,
     modelContexts,
     modeRequests,
-    widgetStates,
     moves,
     requestMode,
     setHostMode: (mode: McpAppDisplayMode) => (displayMode = mode),
@@ -142,6 +138,7 @@ describe("MCP Apps host router", () => {
       "sandbox",
       "serverResources",
       "serverTools",
+      "updateModelContext",
     ]);
     await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
     await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
@@ -333,6 +330,50 @@ describe("MCP Apps host router", () => {
     for (const id of [1, 2, 3]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
     expect(t.consents).toEqual([]);
     expect(t.composer).toEqual([]);
+  });
+
+  test("a view that checks the host capability before updating model context sends it", async () => {
+    const t = setup();
+    await t.request(1, "ui/initialize", { appInfo: { name: "v" }, protocolVersion: "2026-01-26" });
+    // Gates like an ext-apps view: it sends only the modalities the host advertises.
+    const { hostCapabilities } = t.reply(1)?.result as {
+      hostCapabilities: { updateModelContext?: { text?: object; structuredContent?: object } };
+    };
+    const supported = hostCapabilities.updateModelContext;
+    if (supported !== undefined) {
+      await t.request(2, "ui/update-model-context", {
+        ...(supported.text !== undefined ? { content: [{ type: "text", text: "3 dice" }] } : {}),
+        ...(supported.structuredContent !== undefined
+          ? { structuredContent: { dice: [1, 2, 3] } }
+          : {}),
+      });
+    }
+    expect(t.modelContexts).toEqual(['3 dice\n\n{"dice":[1,2,3]}']);
+  });
+
+  test("model context is stored only after the user allows it, once per mounted view", async () => {
+    const declined = setup({ requestConsent: () => Promise.resolve(false) });
+    await declined.request(1, "ui/update-model-context", {
+      content: [{ type: "text", text: "3 dice" }],
+    });
+    expect(declined.reply(1)?.error).toEqual({ code: -32000, message: "Context update denied" });
+    expect(declined.modelContexts).toEqual([]);
+    // Clearing needs no consent.
+    await declined.request(2, "ui/update-model-context", {});
+    expect(declined.reply(2)?.result).toEqual({});
+    expect(declined.modelContexts).toEqual([""]);
+
+    const t = setup();
+    await t.request(1, "ui/update-model-context", { content: [{ type: "text", text: "3 dice" }] });
+    await t.request(2, "ui/update-model-context", { content: [{ type: "text", text: "2 dice" }] });
+    expect(t.consents).toEqual([{ kind: "context", text: "3 dice" }]);
+    expect(t.modelContexts).toEqual(["3 dice", "2 dice"]);
+    // A remounted view gets a new host, which asks again.
+    const remounted = setup();
+    await remounted.request(1, "ui/update-model-context", {
+      content: [{ type: "text", text: "2 dice" }],
+    });
+    expect(remounted.consents).toEqual([{ kind: "context", text: "2 dice" }]);
   });
 
   test("update-model-context replaces the view's context with the latest update", async () => {
@@ -539,19 +580,5 @@ describe("MCP Apps host router", () => {
     await t.request(2, "ui/update-model-context", { structuredContent: { count: BigInt(3) } });
     for (const id of [1, 2]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
     expect(t.modelContexts).toEqual([]);
-  });
-
-  test("widget state is kept as JSON up to the size limit", async () => {
-    const t = setup();
-    const send = (state: unknown) =>
-      t.host.handleMessage({
-        jsonrpc: "2.0",
-        method: "xum/notifications/widget-state",
-        params: { state },
-      });
-    await send({ selected: 2 });
-    await send(undefined);
-    await send("x".repeat(MCP_APP_WIDGET_STATE_MAX_BYTES));
-    expect(t.widgetStates).toEqual(['{"selected":2}', "null"]);
   });
 });

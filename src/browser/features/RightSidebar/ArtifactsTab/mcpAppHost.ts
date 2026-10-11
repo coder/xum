@@ -6,7 +6,6 @@ import {
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
 import { createBridgeRateLimiter } from "./artifactBridge";
 import type { GrantedMcpAppCsp } from "./mcpAppCsp";
-import { MCP_APP_WIDGET_STATE_METHOD } from "./mcpAppOpenAiShim";
 
 /**
  * Host side of the MCP Apps (SEP-1865, 2026-01-26) JSON-RPC protocol for a view in the
@@ -18,8 +17,7 @@ import { MCP_APP_WIDGET_STATE_METHOD } from "./mcpAppOpenAiShim";
  * and consent rules enforced by the backend), resources/read (own server only), ui/open-link
  * (https, after a confirm), ui/message (inserted into the composer after a confirm, never sent),
  * ui/update-model-context (stored per view for the workspace's next requests) and
- * ui/request-display-mode (inline / fullscreen). Every other request gets -32601. The
- * window.openai shim also sends its widget state (MCP_APP_WIDGET_STATE_METHOD), kept per view.
+ * ui/request-display-mode (inline / fullscreen). Every other request gets -32601.
  */
 
 export const MCP_APP_PROTOCOL_VERSION = "2026-01-26";
@@ -40,8 +38,6 @@ const TOOL_CALL_WINDOW_MS = 10_000;
  * asking rather than shown truncated (a padded prefix could hide what the call really sends).
  */
 export const MCP_APP_CONSENT_ARGS_MAX_BYTES = 64 * 1024;
-/** Largest window.openai widget state (JSON) the host keeps for a view; larger is dropped. */
-export const MCP_APP_WIDGET_STATE_MAX_BYTES = 64 * 1024;
 /** How long teardown waits for the view's reply before the host removes it. */
 export const MCP_APP_TEARDOWN_TIMEOUT_MS = 500;
 /** Clamp for reported view heights (px). */
@@ -148,8 +144,6 @@ function modelContextText(params: z.infer<typeof ModelContextParams>): string | 
     : null;
 }
 
-const WidgetStateParams = z.object({ state: z.unknown() });
-
 export type McpAppDisplayMode = "inline" | "fullscreen" | "pip";
 const DisplayModeParams = z.object({ mode: z.string().max(32) });
 const InitializeParams = z.object({
@@ -164,7 +158,9 @@ export type McpAppConsentRequest =
   /** `host` is the parsed host the link opens, shown in the strip ahead of the full URL. */
   | { kind: "link"; url: string; host: string }
   /** `text` is exactly what is added to the composer once accepted, shown in the strip. */
-  | { kind: "message"; text: string };
+  | { kind: "message"; text: string }
+  /** `text` is exactly what the model sees with later requests once allowed. */
+  | { kind: "context"; text: string };
 
 export interface McpAppHostContext {
   theme: "dark" | "light";
@@ -199,8 +195,6 @@ export interface McpAppHostOptions {
    * A move unmounts this instance, so the host runs it only once the view has its reply.
    */
   setDisplayMode: (mode: McpAppDisplayMode) => (() => void) | null;
-  /** Keep the view's window.openai widget state (JSON) for its next mount this session. */
-  saveWidgetState: (json: string) => void;
   requestConsent: (request: McpAppConsentRequest) => Promise<boolean>;
   insertIntoComposer: (text: string) => void;
   openExternalLink: (url: string) => void;
@@ -218,6 +212,15 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   const pendingHostRequests = new Map<string, (ok: boolean) => void>();
   let nextHostRequestId = 1;
   let initialized = false;
+  /**
+   * A ui/initialize got its reply and its initialized has not come yet. Each handshake gets the
+   * lifecycle (tool-input, then tool-result or tool-cancelled): in a hybrid view the
+   * window.openai shim can connect first, and the view's own MCP Apps client must still get it.
+   * True at start, so the first initialized counts even without an initialize (as before).
+   */
+  let handshakePending = true;
+  /** Whether the user allowed this mounted view's model context (ui/update-model-context). */
+  let modelContextAllowed = false;
   /** The view's appCapabilities.availableDisplayModes; undefined when it declared none. */
   let viewDisplayModes: readonly string[] | undefined;
   /** The mode the view was last told (initial context or host-context-changed). */
@@ -285,6 +288,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         const context = options.getHostContext();
         const hostContext = { ...context, displayMode: viewMode(context.displayMode) };
         notifiedDisplayMode = hostContext.displayMode;
+        handshakePending = true;
         respond(id, {
           protocolVersion: MCP_APP_PROTOCOL_VERSION,
           hostInfo: { name: "xum", version: "1.0.0" },
@@ -294,6 +298,9 @@ export function createMcpAppHost(options: McpAppHostOptions) {
             serverResources: {},
             logging: {},
             openLinks: {},
+            // The modalities ui/update-model-context accepts (McpUiSupportedContentBlockModalities):
+            // text blocks and structuredContent. Other blocks get -32602.
+            updateModelContext: { text: {}, structuredContent: {} },
             sandbox: { csp: options.grantedCsp },
           },
           hostContext,
@@ -356,6 +363,17 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         const text = parsed.success ? modelContextText(parsed.data) : null;
         if (text === null) {
           return fail(id, INVALID_PARAMS, "Only text model context up to 16 KB is supported");
+        }
+        // The context reaches the model with every later request, so the user allows it once
+        // per mounted view (this host lives as long as the view's document; a remount asks
+        // again, and nothing is persisted). After Allow, the view can change its context until
+        // it unmounts. Its server can already put any text in front of the model through tool
+        // results; this keeps context the user never agreed to out. Clearing needs no consent.
+        if (text !== "" && !modelContextAllowed) {
+          if (!(await options.requestConsent({ kind: "context", text }))) {
+            return fail(id, REQUEST_FAILED, "Context update denied");
+          }
+          modelContextAllowed = true;
         }
         try {
           await options.updateModelContext(text);
@@ -438,7 +456,8 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   function handleNotification(method: string, params: unknown) {
     switch (method) {
       case "ui/notifications/initialized":
-        if (initialized) return;
+        if (!handshakePending) return;
+        handshakePending = false;
         initialized = true;
         options.onInitialized();
         return;
@@ -451,25 +470,6 @@ export function createMcpAppHost(options: McpAppHostOptions) {
             ? { height: clampMcpAppHeight(parsed.data.height) }
             : {}),
         });
-        return;
-      }
-      case MCP_APP_WIDGET_STATE_METHOD: {
-        const parsed = WidgetStateParams.safeParse(params);
-        if (!parsed.success) return;
-        let json: string | undefined;
-        try {
-          json = JSON.stringify(parsed.data.state ?? null);
-        } catch {
-          json = undefined;
-        }
-        if (
-          json === undefined ||
-          new TextEncoder().encode(json).length > MCP_APP_WIDGET_STATE_MAX_BYTES
-        ) {
-          options.log("dropped widget state over the size limit");
-          return;
-        }
-        options.saveWidgetState(json);
         return;
       }
       case "notifications/message": {

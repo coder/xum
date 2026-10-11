@@ -5,6 +5,7 @@ import {
   MCP_APP_MODEL_CONTEXT_MAX_BYTES,
   MCP_APP_READ_URI_MAX_CHARS,
   MCP_APP_VIEW_DOMAINS_MAX,
+  MCP_APP_VIEW_RECORDS_MAX_IDS,
 } from "@/common/utils/mcpApps";
 
 /**
@@ -62,10 +63,10 @@ export const McpAppViewRequestSchema = z.object({
   resourceUri: z.string().refine(isMcpAppResourceUri, "resourceUri must be a ui:// URI"),
 });
 
-/** A tool call's view, looked up by its result record alone (getViewRecord). */
-export const McpAppViewRecordRequestSchema = z.object({
+/** Tool calls' views, looked up by their result records alone (getViewRecords). */
+export const McpAppViewRecordsRequestSchema = z.object({
   workspaceId: z.string().min(1),
-  toolCallId: z.string().min(1),
+  toolCallIds: z.array(z.string().min(1)).min(1).max(MCP_APP_VIEW_RECORDS_MAX_IDS),
 });
 
 /**
@@ -82,6 +83,11 @@ export const McpAppViewRecordSchema = z
   })
   .nullable();
 export type McpAppViewRecord = z.infer<typeof McpAppViewRecordSchema>;
+
+/** One entry per requested tool call, in request order. */
+export const McpAppViewRecordsSchema = z.array(
+  z.object({ toolCallId: z.string(), view: McpAppViewRecordSchema })
+);
 
 export const McpAppToolCallRequestSchema = z.object({
   workspaceId: z.string().min(1),

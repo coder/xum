@@ -7,7 +7,7 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
 import { buildMcpAppCsp, MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
 import { createMcpAppHost, type McpAppConsentRequest } from "./mcpAppHost";
-import { mcpAppOpenAiShimScript } from "./mcpAppOpenAiShim";
+import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
 
 interface OpenAi {
   toolOutput: unknown;
@@ -16,7 +16,6 @@ interface OpenAi {
   locale: string;
   callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
   sendFollowUpMessage(args: { prompt: string }): Promise<void>;
-  setWidgetState(state: unknown): Promise<void>;
 }
 type ViewWindow = Window & {
   openai: OpenAi;
@@ -27,10 +26,18 @@ type ViewWindow = Window & {
 const GRANTED = { resourceDomains: [], connectDomains: [] };
 
 /** The document McpAppFrame builds: CSP meta, preamble, shim, then the view. */
-function viewDocument(viewHtml: string, widgetState: string | null = null): string {
+const SEED: McpAppOpenAiSeed = {
+  theme: "light",
+  displayMode: "inline",
+  locale: "en-US",
+  platform: "desktop",
+  maxHeight: 600,
+};
+
+function viewDocument(viewHtml: string, seed: McpAppOpenAiSeed = SEED): string {
   return finalizeSandboxedDocument(parseArtifactHtml(viewHtml), {
     csp: buildMcpAppCsp(GRANTED),
-    bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, mcpAppOpenAiShimScript(widgetState)],
+    bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, mcpAppOpenAiShimScript(seed)],
   });
 }
 
@@ -45,8 +52,9 @@ async function runView(
   options: {
     consent?: boolean;
     beforeLoad?: (win: Window) => void;
-    /** The view's stored widget state (JSON), as McpAppFrame passes it. */
-    widgetState?: string;
+    seed?: McpAppOpenAiSeed;
+    /** The host does not answer (yet): what the view sees before any handshake reply. */
+    silentHost?: boolean;
   } = {}
 ) {
   const win = new Window({
@@ -65,11 +73,10 @@ async function runView(
   const consents: McpAppConsentRequest[] = [];
   const composer: string[] = [];
   const calls: Array<{ toolName: string; args: unknown }> = [];
-  const savedStates: string[] = [];
   const parent = {
     postMessage: (message: { method?: string; params?: unknown }) => {
       posted.push(message);
-      void host.handleMessage(message);
+      if (!options.silentHost) void host.handleMessage(message);
     },
   };
   Object.defineProperty(win, "parent", { value: parent, configurable: true });
@@ -96,7 +103,6 @@ async function runView(
     readResource: () => Promise.reject(new Error("unused")),
     updateModelContext: () => Promise.resolve(),
     setDisplayMode: () => null,
-    saveWidgetState: (json) => savedStates.push(json),
     requestConsent: (request) => {
       consents.push(request);
       return Promise.resolve(options.consent ?? true);
@@ -114,11 +120,11 @@ async function runView(
   win.document.write(
     viewDocument(
       `<html><head></head><body><script>${viewScript}</script></body></html>`,
-      options.widgetState
+      options.seed
     )
   );
   for (let i = 0; i < 5; i++) await tick();
-  return { win, host, posted, consents, composer, calls, warnings, savedStates };
+  return { win, host, posted, consents, composer, calls, warnings };
 }
 
 const COLLECT_EVENTS = `window.events = [];
@@ -186,43 +192,87 @@ describe("window.openai shim", () => {
     expect(declined.composer).toEqual([]);
   });
 
-  test("unsupported members never throw, warn once each, and widgetState reads null", async () => {
+  test("unsupported members never throw and warn once each; widgetState lives in the page", async () => {
     const t = await runView(`
       var o = window.openai;
       window.widget = o.widgetState;
-      ["requestModal", "requestClose"].forEach(function (name) { o[name]({}).catch(function () {}); o[name]({}).catch(function () {}); });
+      o.requestClose().catch(function () {});
+      o.requestClose().catch(function () {});
       o.setWidgetState({ a: 1 });
+      window.widgetAfter = o.widgetState;
       o.setOpenInAppUrl({ href: "https://example.com" });
       // The Apps SDK feature-detection pattern: no file APIs here, so the view uses its own.
       window.picker = o.selectFiles ? "library" : o.uploadFile ? "upload" : "own input";
+      window.modal = o.requestModal ? "host modal" : "own dialog";
       window.done = true;`);
     expect(t.win.done).toBe(true);
     expect((t.win as unknown as { widget: unknown }).widget).toBeNull();
+    // The Apps SDK reads its snapshot back synchronously after setWidgetState.
+    expect((t.win as unknown as { widgetAfter: unknown }).widgetAfter).toEqual({ a: 1 });
     expect((t.win as unknown as { picker: unknown }).picker).toBe("own input");
-    expect(t.warnings).toHaveLength(3);
+    expect((t.win as unknown as { modal: unknown }).modal).toBe("own dialog");
+    expect(t.warnings).toHaveLength(2);
   });
 
-  test("widget state is stored at once, reaches the host, and starts the next mount", async () => {
-    // A string that would end the shim's script element if it were not escaped.
-    const state = { selected: "</script><b>x</b>", n: 3 };
-    const t = await runView(`
-      window.openai.setWidgetState({ n: 1 });
-      window.openai.setWidgetState(${JSON.stringify(state).replace(/</g, "\\u003c")});
-      window.read = window.openai.widgetState;`);
-    expect((t.win as unknown as { read: unknown }).read).toEqual(state);
-    // The host hears it once (the latest), after the flush delay.
-    expect(t.savedStates).toEqual([]);
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    expect(t.savedStates.map((json) => JSON.parse(json) as unknown)).toEqual([state]);
-    // A teardown sends the state that has not gone out yet, before the shim's reply.
-    void t.win.openai.setWidgetState({ n: 4 });
-    await t.host.teardown("unmount");
-    expect(JSON.parse(t.savedStates.at(-1)!)).toEqual({ n: 4 });
-    // The next mount reads it at load, before any host message.
-    const again = await runView(`window.first = window.openai.widgetState;`, {
-      widgetState: JSON.stringify(state),
+  test("host context is in the globals before any view script reads them", async () => {
+    // A host value with "</script>" or "<!--" cannot end the shim's script element.
+    const locale = "x</script><!--<script>window.broken = 1</script>";
+    const t = await runView(
+      `window.first = { theme: window.openai.theme, mode: window.openai.displayMode,
+        max: window.openai.maxHeight, locale: window.openai.locale,
+        device: window.openai.userAgent.device.type };`,
+      {
+        seed: {
+          theme: "dark",
+          displayMode: "fullscreen",
+          locale,
+          platform: "mobile",
+          maxHeight: 321,
+        },
+        silentHost: true,
+      }
+    );
+    expect((t.win as unknown as { first: unknown }).first).toEqual({
+      theme: "dark",
+      mode: "fullscreen",
+      max: 321,
+      locale,
+      device: "mobile",
     });
-    expect((again.win as unknown as { first: unknown }).first).toEqual(state);
+    expect((t.win as unknown as { broken?: number }).broken).toBeUndefined();
+  });
+
+  /** The view's own MCP Apps client connecting after the shim did (a hybrid view). */
+  function connectStandardClient(t: Awaited<ReturnType<typeof runView>>) {
+    const received: string[] = [];
+    t.win.addEventListener("message", (event) => {
+      const method = (event as unknown as { data: { method?: string } }).data.method;
+      if (method !== undefined) received.push(method);
+    });
+    const parent = t.win.parent as unknown as { postMessage: (message: unknown) => void };
+    parent.postMessage({ jsonrpc: "2.0", id: 99, method: "ui/initialize", params: {} });
+    parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    return received;
+  }
+
+  test("a standard client that connects after the shim still gets tool-input and result", async () => {
+    const t = await runView("window.openai.toolOutput;");
+    expect(t.win.openai.toolOutput).toEqual({ dice: [3, 5] });
+    const received = connectStandardClient(t);
+    await tick();
+    expect(received).toEqual(["ui/notifications/tool-input", "ui/notifications/tool-result"]);
+  });
+
+  test("the shim stops answering teardown once the view's own client connected", async () => {
+    const teardownReplies = (t: Awaited<ReturnType<typeof runView>>) =>
+      t.posted.filter((m) => (m as { id?: unknown }).id === "host-1").length;
+    const shimOnly = await runView("window.openai.toolOutput;");
+    void shimOnly.host.teardown("unmount");
+    expect(teardownReplies(shimOnly)).toBe(1);
+    const hybrid = await runView("window.openai.toolOutput;");
+    connectStandardClient(hybrid);
+    void hybrid.host.teardown("unmount");
+    expect(teardownReplies(hybrid)).toBe(0);
   });
 
   test("a view that redefines window.openai, before or after load, keeps rendering", async () => {
