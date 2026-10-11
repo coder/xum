@@ -543,6 +543,30 @@ describe("modelMessageTransform", () => {
       );
     });
 
+    it("keeps every text part of merged messages, and a file-only message's place", () => {
+      const file = { type: "file" as const, mediaType: "image/png", data: "AAAA" };
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "Context" }] },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Request" },
+            { type: "text", text: "Converted SVG" },
+          ],
+        },
+        { role: "user", content: [file] },
+      ];
+
+      const result = transformModelMessages(messages, "anthropic");
+      // A message without text still adds its separator, as before multi-text merging.
+      expect(result).toEqual([
+        {
+          role: "user",
+          content: [{ type: "text", text: "Context\nRequest\nConverted SVG\n" }, file],
+        },
+      ]);
+    });
+
     it("should not merge user messages separated by assistant message", () => {
       const messages: ModelMessage[] = [
         {
