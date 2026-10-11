@@ -418,7 +418,11 @@ describe("UserPromptSubmit and Stop", () => {
       json({ decision: "block", reason: "Contains a token." })
     );
     expect(
-      await runMessageSendHooks(block.spine, workspaceId, { text: "key=abc", origin: "user" })
+      await runMessageSendHooks(block.spine, workspaceId, {
+        text: "key=abc",
+        origin: "user",
+        canBlock: true,
+      })
     ).toEqual({
       kind: "blocked",
       pluginName: "guard",
@@ -430,7 +434,11 @@ describe("UserPromptSubmit and Stop", () => {
       content: [{ type: "text", text: "Ask for a repro first." }],
     }));
     expect(
-      await runMessageSendHooks(plain.spine, workspaceId, { text: "fix", origin: "user" })
+      await runMessageSendHooks(plain.spine, workspaceId, {
+        text: "fix",
+        origin: "user",
+        canBlock: true,
+      })
     ).toEqual({
       kind: "context",
       entries: [{ pluginId: "guard", text: "Ask for a repro first." }],
@@ -439,7 +447,12 @@ describe("UserPromptSubmit and Stop", () => {
 
   test("prompt and Stop events carry the workspace cwd", async () => {
     const prompt = setup([hook("UserPromptSubmit", { input: { dir: "${cwd}" } })], () => null);
-    await runMessageSendHooks(prompt.spine, workspaceId, { text: "hi", origin: "user", cwd: "/w" });
+    await runMessageSendHooks(prompt.spine, workspaceId, {
+      text: "hi",
+      origin: "user",
+      canBlock: true,
+      cwd: "/w",
+    });
     const stop = setup([hook("Stop", { input: { dir: "${cwd}" } })], () => null);
     await runTurnStopHooks(stop.spine, workspaceId, {
       messageId: "a1",
@@ -477,6 +490,7 @@ describe("UserPromptSubmit and Stop", () => {
       runMessageSendHooks(setup([hook("UserPromptSubmit")], () => answer).spine, workspaceId, {
         text: "fix",
         origin: "user",
+        canBlock: true,
       });
     expect(await send(json({ decision: "block" }))).toEqual({ kind: "none" });
     expect(
@@ -497,7 +511,11 @@ describe("UserPromptSubmit and Stop", () => {
     };
     const prompt = setup([hook("UserPromptSubmit")], () => answer);
     expect(
-      await runMessageSendHooks(prompt.spine, workspaceId, { text: "fix", origin: "user" })
+      await runMessageSendHooks(prompt.spine, workspaceId, {
+        text: "fix",
+        origin: "user",
+        canBlock: true,
+      })
     ).toMatchObject({ kind: "blocked", reason: "Contains a token." });
     const stop = setup([hook("Stop")], () => ({
       content: [{ type: "text", text: JSON.stringify({ continue: false }) }],
