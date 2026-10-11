@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { publishMcpAppViewDomains } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
+import {
+  beginMcpAppViewDomainsRequest,
+  publishMcpAppViewDomains,
+} from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
 import type { McpAppViewDomains } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -39,6 +42,7 @@ export function useMcpAppViewDomains() {
     revokeError,
     revoke: async (entry: Pick<McpAppViewDomains, "projectPath" | "serverName">) => {
       if (!api) return;
+      const requestSeq = beginMcpAppViewDomainsRequest();
       try {
         await api.mcpApps.revokeViewDomains({
           projectPath: entry.projectPath,
@@ -50,7 +54,7 @@ export function useMcpAppViewDomains() {
       }
       setRevokeError(null);
       // Mounted views of this server reload at once under the base policy (and ask again).
-      publishMcpAppViewDomains(entry.projectPath, entry.serverName, []);
+      publishMcpAppViewDomains(entry.projectPath, entry.serverName, [], requestSeq);
       setTick((value) => value + 1);
     },
   };

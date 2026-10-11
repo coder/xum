@@ -32,13 +32,22 @@ let revokeFails: Error | null = null;
 let revoked: Array<{ projectPath: string; serverName: string }> = [];
 // Pushes one project-config change event to the open onConfigChanged subscriptions.
 let pushConfigChanged: () => void = () => undefined;
+// Backend calls the renderer made, and the signals of its config subscriptions.
+let listCalls = 0;
+let subscriptions: AbortSignal[] = [];
 
 function api(): APIClient {
   const overrides: TestApiOverrides<APIClient> = {
     config: {
       onConfigChanged: (_input: void, options?: { signal?: AbortSignal }) => {
+        if (options?.signal) subscriptions.push(options.signal);
         const waiting: Array<() => void> = [];
-        pushConfigChanged = () => waiting.splice(0).forEach((resolve) => resolve());
+        // Every open subscription sees the event (the app's config store has one too).
+        const pushOthers = pushConfigChanged;
+        pushConfigChanged = () => {
+          pushOthers();
+          waiting.splice(0).forEach((resolve) => resolve());
+        };
         async function* changes() {
           while (!options?.signal?.aborted) {
             await new Promise<void>((resolve) => waiting.push(resolve));
@@ -63,7 +72,10 @@ function api(): APIClient {
             approvalProjectPath: "/repo",
           },
         }),
-      listViewDomains: () => Promise.resolve(stored),
+      listViewDomains: () => {
+        listCalls++;
+        return Promise.resolve(stored);
+      },
       revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
         if (revokeFails) return Promise.reject(revokeFails);
         revoked.push(input);
@@ -89,10 +101,12 @@ function Approvals() {
   );
 }
 
+let client: APIClient;
 function renderWith(children: React.ReactNode) {
+  client = api();
   return render(
     <ThemeProvider forcedTheme="dark">
-      <APIProvider client={api()}>{children}</APIProvider>
+      <APIProvider client={client}>{children}</APIProvider>
     </ThemeProvider>
   );
 }
@@ -108,6 +122,9 @@ describe("MCP Apps allowed view domains", () => {
     stored = [{ projectPath: "/repo", serverName: "charts", origins: [API_ORIGIN] }];
     revokeFails = null;
     revoked = [];
+    pushConfigChanged = () => undefined;
+    listCalls = 0;
+    subscriptions = [];
   });
   afterEach(() => {
     cleanup();
@@ -139,6 +156,52 @@ describe("MCP Apps allowed view domains", () => {
       await Promise.resolve();
     });
     await waitFor(async () => expect(await frameCsp(view)).not.toContain(API_ORIGIN));
+  });
+
+  test("a revoke between the view's fetch and its subscription still reloads it", async () => {
+    // getView still reports the approval, but it is gone by the time the view follows changes,
+    // and no further config event comes.
+    stored = [];
+    const view = renderWith(<McpAppFrame workspaceId="ws" view={VIEW} />);
+    await waitFor(async () => expect(await frameCsp(view)).not.toContain(API_ORIGIN));
+  });
+
+  test("mounted views share one subscription and one read per config change", async () => {
+    const settled = async () => {
+      for (let i = 0; i < 5; i++) await act(() => Promise.resolve());
+    };
+    const live = () => subscriptions.filter((signal) => !signal.aborted).length;
+    const frames = (count: number) => (
+      <>
+        {Array.from({ length: count }, (_, i) => (
+          <McpAppFrame key={i} workspaceId="ws" view={VIEW} variant={i ? "inline" : "panel"} />
+        ))}
+      </>
+    );
+    const view = renderWith(frames(1));
+    await waitFor(() => expect(listCalls).toBeGreaterThan(0));
+    await settled();
+    const withOne = live();
+    // A second view of the server opens no subscription of its own.
+    view.rerender(
+      <ThemeProvider forcedTheme="dark">
+        <APIProvider client={client}>{frames(2)}</APIProvider>
+      </ThemeProvider>
+    );
+    await waitFor(() => expect(view.getAllByTestId("mcp-app-frame")).toHaveLength(2));
+    await settled();
+    expect(live()).toBe(withOne);
+    const before = listCalls;
+    await act(async () => {
+      pushConfigChanged();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(listCalls).toBeGreaterThan(before));
+    await settled();
+    expect(listCalls - before).toBe(1);
+    // The shared subscription closes with the last view.
+    cleanup();
+    expect(live()).toBe(0);
   });
 
   test("a failed revoke shows its error next to the entry and keeps it", async () => {

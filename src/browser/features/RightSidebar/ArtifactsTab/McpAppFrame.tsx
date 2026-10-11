@@ -22,6 +22,7 @@ import {
 } from "./mcpAppHost";
 import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
 import {
+  beginMcpAppViewDomainsRequest,
   currentMcpAppViewDomainsSeq,
   publishMcpAppViewDomains,
   useMcpAppViewDomains,
@@ -240,6 +241,7 @@ export function McpAppFrame(props: {
   const allowDomains = async (origins: string[]) => {
     if (!api) return;
     try {
+      const requestSeq = beginMcpAppViewDomainsRequest();
       const result = await api.mcpApps.approveViewDomains({
         workspaceId,
         toolCallId,
@@ -250,7 +252,12 @@ export function McpAppFrame(props: {
         setDomainsDismissed({ toolCallId, error: result.error });
       } else if (approvalProjectPath != null) {
         // The new grant changes every such view's document: they reload under the wider policy.
-        publishMcpAppViewDomains(approvalProjectPath, boundServerName, result.data.approvedDomains);
+        publishMcpAppViewDomains(
+          approvalProjectPath,
+          boundServerName,
+          result.data.approvedDomains,
+          requestSeq
+        );
       }
     } catch (error) {
       // A failed write or a lost connection: the same visible failure as a refusal.

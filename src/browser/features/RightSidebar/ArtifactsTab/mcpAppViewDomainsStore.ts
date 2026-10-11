@@ -9,9 +9,16 @@ import type { APIClient } from "@/browser/contexts/API";
  *
  * Renderer memory only: nothing here is persisted, and the project config (read through getView)
  * stays the source of truth. Callers publish only the list a successful backend call returned.
+ *
+ * Responses can arrive out of order (two views approving at once), so each change carries the
+ * sequence taken when its request was sent (beginMcpAppViewDomainsRequest), and a list from an
+ * older request never replaces one from a newer request.
  */
 export interface McpAppViewDomainsEntry {
+  /** When the entry was published: compared with a frame's getView fetch. */
   seq: number;
+  /** When the request that returned `origins` was sent. */
+  requestSeq: number;
   origins: readonly string[];
 }
 
@@ -27,12 +34,20 @@ export function currentMcpAppViewDomainsSeq(): number {
   return seq;
 }
 
+/** Take a request's sequence just before it is sent; pass it to publishMcpAppViewDomains. */
+export function beginMcpAppViewDomainsRequest(): number {
+  return ++seq;
+}
+
 export function publishMcpAppViewDomains(
   projectPath: string,
   serverName: string,
-  origins: readonly string[]
+  origins: readonly string[],
+  requestSeq: number
 ): void {
-  entries.set(keyOf(projectPath, serverName), { seq: ++seq, origins });
+  const key = keyOf(projectPath, serverName);
+  if ((entries.get(key)?.requestSeq ?? 0) > requestSeq) return;
+  entries.set(key, { seq: ++seq, requestSeq, origins });
   for (const listener of listeners) listener();
 }
 
@@ -50,11 +65,90 @@ export function useMcpAppViewDomains(
   );
 }
 
+interface Follower {
+  projectPath: string;
+  serverName: string;
+  approved: readonly string[];
+}
+
+/** Mounted views running with approved origins; they share one subscription (O(1) IPC). */
+const followers = new Set<Follower>();
+let following: { api: APIClient; controller: AbortController; ready: boolean } | null = null;
+let reconciling: Promise<void> | null = null;
+let reconcileAgain = false;
+
+/**
+ * Re-read the stored approvals once and publish them for every follower that uses an origin
+ * no longer stored. A request made while one runs is coalesced into one more read after it.
+ */
+async function reconcile(api: APIClient): Promise<void> {
+  if (reconciling != null) {
+    reconcileAgain = true;
+    return reconciling;
+  }
+  reconciling = (async () => {
+    do {
+      reconcileAgain = false;
+      const requestSeq = beginMcpAppViewDomainsRequest();
+      const list = await api.mcpApps.listViewDomains();
+      for (const follower of followers) {
+        const stored =
+          list.find(
+            (entry) =>
+              entry.projectPath === follower.projectPath && entry.serverName === follower.serverName
+          )?.origins ?? [];
+        if (follower.approved.some((origin) => !stored.includes(origin))) {
+          publishMcpAppViewDomains(follower.projectPath, follower.serverName, stored, requestSeq);
+        }
+      }
+    } while (reconcileAgain);
+  })().finally(() => {
+    reconciling = null;
+  });
+  return reconciling;
+}
+
+function startFollowing(api: APIClient): void {
+  const state = { api, controller: new AbortController(), ready: false };
+  following = state;
+  const { signal } = state.controller;
+  const follow = async () => {
+    // Listener first, then the read: a revoke before the subscription is in the read, and one
+    // after it is an event, so none falls between the two.
+    const changes = await api.config.onConfigChanged(undefined, { signal });
+    state.ready = true;
+    await reconcile(api);
+    for await (const _ of changes) {
+      if (signal.aborted) break;
+      await reconcile(api);
+    }
+  };
+  // Ends with the abort when the last view unmounts; a lost subscription leaves views as they are.
+  follow().catch(() => undefined);
+}
+
+function follow(api: APIClient, follower: Follower): () => void {
+  followers.add(follower);
+  if (following?.api !== api) {
+    following?.controller.abort();
+    startFollowing(api);
+  } else if (following.ready) {
+    // This view's getView may predate an event the shared listener already handled.
+    reconcile(api).catch(() => undefined);
+  }
+  return () => {
+    followers.delete(follower);
+    if (followers.size === 0) {
+      following?.controller.abort();
+      following = null;
+    }
+  };
+}
+
 /**
  * While a view runs with approved origins, follow project-config changes, so a revoke from
- * another window or device also reloads it under the narrower policy: re-read the stored
- * approvals and publish them when any origin this view uses is gone. (A revoke in this renderer
- * publishes directly.)
+ * another window or device also reloads it under the narrower policy. (A revoke in this
+ * renderer publishes directly.)
  */
 export function useMcpAppViewDomainsRevocations(
   api: APIClient | null,
@@ -65,24 +159,8 @@ export function useMcpAppViewDomainsRevocations(
   const approvedKey = JSON.stringify(approved);
   useEffect(() => {
     if (api == null || projectPath == null || approved.length === 0) return;
-    const controller = new AbortController();
-    const follow = async () => {
-      const changes = await api.config.onConfigChanged(undefined, { signal: controller.signal });
-      for await (const _ of changes) {
-        const stored =
-          (await api.mcpApps.listViewDomains()).find(
-            (entry) => entry.projectPath === projectPath && entry.serverName === serverName
-          )?.origins ?? [];
-        if (controller.signal.aborted) return;
-        if (approved.some((origin) => !stored.includes(origin))) {
-          publishMcpAppViewDomains(projectPath, serverName, stored);
-        }
-      }
-    };
-    // Ends with the abort on unmount; a lost subscription leaves the view as it is.
-    follow().catch(() => undefined);
-    return () => controller.abort();
-    // `approved` is keyed by its content: a re-render with an equal list keeps the subscription.
+    return follow(api, { projectPath, serverName, approved });
+    // `approved` is keyed by its content: a re-render with an equal list keeps the follower.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, projectPath, serverName, approvedKey]);
 }
