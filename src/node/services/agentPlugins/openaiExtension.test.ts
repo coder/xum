@@ -13,12 +13,10 @@ describe("readOpenAIExtension", () => {
           apps: "./.app.json",
           hooks: ["./hooks/session.json", { hooks: {} }],
           onboardingSkill: "./skills/setup/SKILL.md",
-          interface: { displayName: 3 },
         },
       },
     });
 
-    // `interface` is not validated here (no warning even when malformed).
     expect(warnings).toEqual([]);
     expect(extension).toEqual({
       apps: "./.app.json",
@@ -45,6 +43,46 @@ describe("readOpenAIExtension", () => {
     for (const field of ["apps", "hooks", "onboardingSkill"]) {
       expect(warnings.some((warning) => warning.includes(field))).toBe(true);
     }
+  });
+
+  test("validates the interface: bad URL, too-long text and an escaping image are dropped", () => {
+    const { extension, warnings } = readOpenAIExtension({
+      extensions: {
+        "com.openai": {
+          interface: {
+            ...validInterface,
+            longDescription: "x".repeat(4001),
+            websiteURL: "http://example.com",
+            privacyPolicyURL: "https://example.com/privacy",
+            brandColor: "#1ABCFE",
+            logo: "../outside.png",
+            composerIcon: "./assets/icon.png",
+            defaultPrompt: "Inspect a design",
+            capabilities: ["Read"],
+          },
+        },
+      },
+    });
+    expect(extension?.interface).toEqual({
+      ...validInterface,
+      privacyPolicyURL: "https://example.com/privacy",
+      brandColor: "#1ABCFE",
+      composerIcon: "./assets/icon.png",
+      defaultPrompt: ["Inspect a design"],
+      capabilities: ["Read"],
+    });
+    expect(warnings).toHaveLength(3);
+    for (const field of ["longDescription", "websiteURL", "logo"]) {
+      expect(warnings.some((warning) => warning.includes(`interface.${field}'`))).toBe(true);
+    }
+  });
+
+  test("an interface without its required names is dropped as a whole", () => {
+    const { extension, warnings } = readOpenAIExtension({
+      extensions: { "com.openai": { interface: { displayName: "Only a name" } } },
+    });
+    expect(extension).toEqual({});
+    expect(warnings).toHaveLength(1);
   });
 
   test("an absent namespace yields nothing; a non-object namespace warns", () => {

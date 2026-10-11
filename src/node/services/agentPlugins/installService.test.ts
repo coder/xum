@@ -1813,6 +1813,66 @@ describe("AgentPluginInstallService", () => {
     expect(preview.warnings.join("\n")).toContain("skills/wrong-dir");
   });
 
+  test("preview and list show the interface; the logo is a contained data URL", async () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    await fsPromises.mkdir(path.join(remoteDir, "assets"));
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "logo.png"), png);
+    // Staging accepts an absolute link outside the managed container; only
+    // the contained reader stands between it and the renderer.
+    const outside = path.join(muxRoot, "outside.png");
+    await fsPromises.writeFile(outside, "outside-secret");
+    await fsPromises.symlink(outside, path.join(remoteDir, "assets", "escape.png"));
+    const writeInterface = async (logo: string): Promise<void> => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "demo-plugin",
+          version: "1.0.0",
+          extensions: {
+            "com.openai": {
+              interface: {
+                displayName: "Demo",
+                shortDescription: "<b>Demo</b>",
+                developerName: "Example",
+                websiteURL: "https://example.com",
+                logo,
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `logo ${logo}`);
+    };
+
+    await writeInterface("./assets/logo.png");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.manifest.interface).toEqual({
+      displayName: "Demo",
+      shortDescription: "<b>Demo</b>",
+      developerName: "Example",
+      websiteURL: "https://example.com",
+      logoDataUrl: `data:image/png;base64,${png.toString("base64")}`,
+    });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await service.list())[0].interface?.logoDataUrl).toStartWith("data:image/png;base64,");
+    await service.uninstall({ name: "demo-plugin", deletePluginData: true });
+
+    await writeInterface("./assets/escape.png");
+    const escaped = await service.preview({ input: remoteDir });
+    expect(escaped.manifest.interface?.logoDataUrl).toBeUndefined();
+    expect(JSON.stringify(escaped)).not.toContain(Buffer.from("outside-secret").toString("base64"));
+
+    await fsPromises.symlink("../.git/config", path.join(remoteDir, "assets", "git.png"));
+    await writeInterface("./assets/git.png");
+    const intoGit = await service.preview({ input: remoteDir });
+    expect(intoGit.manifest.interface?.logoDataUrl).toBeUndefined();
+    expect(intoGit.warnings.some((w) => w.includes("resolves into .git"))).toBe(true);
+    expect(escaped.warnings.some((w) => w.includes("'./assets/escape.png' cannot be shown"))).toBe(
+      true
+    );
+  });
+
   test("preview lists foreign sign-in hosts; a changed auth block needs new consent", async () => {
     const writeAuth = async (clientId: string): Promise<void> => {
       const auth = {

@@ -996,10 +996,10 @@ describe("discoverAgentPlugins", () => {
     expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, ".mcp.json"));
     // Parsed and exposed only: no hook component resolves from the legacy key.
     expect(plugin.hooksPath).toBeUndefined();
-    expect(plugin.openai).toEqual({ apps: "./.app.json", hooks: ["./hooks.json"] });
-    // `interface` is folded into the extension but kept opaque.
-    expect(plugin.manifest.extensions?.["com.openai"]).toMatchObject({
-      interface: { displayName: "Figma" },
+    expect(plugin.openai).toEqual({
+      apps: "./.app.json",
+      hooks: ["./hooks.json"],
+      interface: { displayName: "Figma", shortDescription: "Design", developerName: "Figma" },
     });
   });
 

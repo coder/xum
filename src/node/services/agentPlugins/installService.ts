@@ -14,9 +14,11 @@ import {
   type AgentPluginInstallEntry,
 } from "@/common/config/schemas/agentPluginInstalls";
 import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
+import { getOwn } from "@/common/utils/getOwn";
 import type {
   AgentPluginInstallPreview,
   AgentPluginComponents,
+  AgentPluginInterfaceSummary,
   AgentPluginListItem,
   AgentPluginManifestSummary,
   AgentPluginPreviewHook,
@@ -57,6 +59,7 @@ import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
   CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+  readPluginFileWithinRootCapped,
   discoverAgentPluginAt,
   discoverAgentPlugins,
   journalDerivedDiscoveryGate,
@@ -504,6 +507,66 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
           : "Client secret changed"
     );
   return lines;
+}
+
+const LOGO_MAX_BYTES = 512 * 1024;
+// No SVG: a data-URL <img> cannot run script, but raster-only keeps the
+// renderer away from markup altogether.
+const LOGO_MIME_BY_EXTENSION: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+};
+
+/**
+ * UI projection of the OpenAI `interface`. SECURITY AUDIT: the logo crosses
+ * to the renderer only as a data URL read through the contained, capped
+ * reader (a symlink out of the plugin root fails there); never a file path.
+ */
+async function interfaceSummary(
+  plugin: Pick<AgentPluginInfo, "rootPath" | "openai">,
+  warnings: string[]
+): Promise<AgentPluginInterfaceSummary | undefined> {
+  const info = plugin.openai?.interface;
+  if (info === undefined) return undefined;
+  const logoPath = info.logo ?? info.composerIcon;
+  let logoDataUrl: string | undefined;
+  const mime =
+    logoPath === undefined
+      ? undefined
+      : getOwn(LOGO_MIME_BY_EXTENSION, path.extname(logoPath).toLowerCase());
+  if (logoPath !== undefined && mime === undefined) {
+    warnings.push(`Plugin logo '${logoPath}' must be a PNG, JPEG, WebP or GIF image; ignoring`);
+  } else if (logoPath !== undefined && mime !== undefined) {
+    try {
+      // A staged clone still holds .git (its config can carry the remote's
+      // credentials), so a committed link into it must not become an image.
+      const real = await fsPromises.realpath(path.join(plugin.rootPath, logoPath));
+      if (path.relative(plugin.rootPath, real).split(path.sep)[0] === ".git")
+        throw new Error("it resolves into .git");
+      const { bytes } = await readPluginFileWithinRootCapped({
+        filePath: path.join(plugin.rootPath, logoPath),
+        pluginRoot: plugin.rootPath,
+        maxBytes: LOGO_MAX_BYTES,
+        label: "Plugin logo",
+      });
+      logoDataUrl = `data:${mime};base64,${bytes.toString("base64")}`;
+    } catch (error) {
+      warnings.push(`Plugin logo '${logoPath}' cannot be shown: ${getErrorMessage(error)}`);
+    }
+  }
+  return {
+    displayName: info.displayName,
+    developerName: info.developerName,
+    shortDescription: info.shortDescription,
+    ...(info.capabilities !== undefined ? { capabilities: info.capabilities } : {}),
+    ...(info.websiteURL !== undefined ? { websiteURL: info.websiteURL } : {}),
+    ...(info.privacyPolicyURL !== undefined ? { privacyPolicyURL: info.privacyPolicyURL } : {}),
+    ...(info.termsOfServiceURL !== undefined ? { termsOfServiceURL: info.termsOfServiceURL } : {}),
+    ...(logoDataUrl !== undefined ? { logoDataUrl } : {}),
+  };
 }
 
 function manifestSummary(manifest: AgentPluginManifest): AgentPluginManifestSummary {
@@ -1952,6 +2015,7 @@ export class AgentPluginInstallService {
         warnings
       );
       const hook = this.collectHook(plugin);
+      const openaiInterface = await interfaceSummary(plugin, warnings);
       const agents = (await this.collectAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
       const workflows = await this.collectComponentFiles(plugin.workflowsDir, ".js");
       const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
@@ -1974,7 +2038,10 @@ export class AgentPluginInstallService {
       return {
         source,
         lockedSha: sha,
-        manifest: manifestSummary(plugin.manifest),
+        manifest: {
+          ...manifestSummary(plugin.manifest),
+          ...(openaiInterface !== undefined ? { interface: openaiInterface } : {}),
+        },
         skills,
         mcpServers,
         ...(hook !== undefined ? { hook } : {}),
@@ -2974,6 +3041,8 @@ export class AgentPluginInstallService {
           ? `plugin.json names itself '${plugin.name}' — the installed name '${entry.name}' stays authoritative.`
           : undefined;
       const description = manifestNameDrift ?? plugin.manifest.description;
+      // The install preview already disclosed logo problems; the row only shows what loads.
+      const openaiInterface = await interfaceSummary(plugin, []);
       items.push({
         name: entry?.name ?? plugin.name,
         managed: entry !== undefined,
@@ -2981,6 +3050,7 @@ export class AgentPluginInstallService {
         location: shortenHome(path.join(plugin.containerPath, plugin.dirName)),
         ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
         ...(description !== undefined ? { description } : {}),
+        ...(openaiInterface !== undefined ? { interface: openaiInterface } : {}),
         ...(entry !== undefined
           ? {
               source: entry.source,

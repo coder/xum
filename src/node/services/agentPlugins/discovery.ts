@@ -75,6 +75,8 @@ export const MAX_PLUGIN_HOOK_SOURCE_BYTES = 1024 * 1024;
 
 export interface PluginFileReadResult {
   content: string;
+  /** Raw bytes of `content` (for binary files such as interface images). */
+  bytes: Buffer;
   /** Bytes actually returned (handle-read), for pagination/size metadata. */
   byteSize: number;
   /** Modification time from the SAME handle's fstat as the content read. */
@@ -154,6 +156,7 @@ export async function readPluginFileWithinRootCapped(args: {
     }
     return {
       content: buffer.subarray(0, offset).toString("utf8"),
+      bytes: buffer.subarray(0, offset),
       byteSize: offset,
       modifiedTime: stat.mtime,
     };
