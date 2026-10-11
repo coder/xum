@@ -61,8 +61,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * `openai/outputTemplate`: the alias is resolved into a plain resourceUri at tool discovery, so
  * this reader cannot tell which key named the view, and carrying that through would add a field
  * to tool metadata, display snapshots and result records. Both types are HTML rendered in the
- * same sandbox, so accepting either grants nothing extra. A skybridge template's
- * `openai/widgetCSP` is not mapped: only `_meta.ui.csp` grants domains.
+ * same sandbox, so accepting either grants nothing extra. The declared CSP is `_meta.ui.csp`
+ * merged with ChatGPT's `openai/widgetCSP` alias (mergeCsp). Either way a declared domain is
+ * granted only after the user approves it for the server (mcpAppCsp.ts).
  */
 export function extractMcpAppResource(result: unknown, uri: string): McpAppResource {
   const contents = isRecord(result) && Array.isArray(result.contents) ? result.contents : [];
