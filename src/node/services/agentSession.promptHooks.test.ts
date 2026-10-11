@@ -8,6 +8,7 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import assert from "node:assert";
 import {
   createMuxMessage,
+  getCompactionFollowUpContent,
   type CompactionFollowUpRequest,
   type MuxMessage,
 } from "@/common/types/message";
@@ -353,6 +354,44 @@ describe("on-send compaction follow-up", () => {
       { pluginId: "fake", text: "Ask for a reproduction first." },
     ]);
   });
+
+  // `continueMessage` is the legacy key getCompactionFollowUpContent still falls back to.
+  test.each(["followUpContent", "continueMessage"] as const)(
+    "a manual /compact follow-up (%s) checked at admission is not hooked again on redispatch",
+    async (key) => {
+      // N7of follow-up: the admission run is the follow-up's one hook run, and its context
+      // moves to the follow-up row instead of the summarization request.
+      const { h, calls } = await setup(addContext);
+      setOnSendCompaction(h, false);
+      const followUp = { text: "then fix the bug", model: options.model, agentId: "exec" };
+
+      const result = await h.session.sendMessage("Summarize this conversation.", {
+        ...options,
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact\nthen fix the bug",
+          parsed: { [key]: followUp },
+        },
+      });
+      expect(result.success).toBe(true);
+      await h.session.waitForIdle();
+      const [request] = await userRows(h);
+      expect(request?.metadata?.pluginHookContext).toBeUndefined();
+      // Hand the persisted follow-up to the summary as the compaction handler does.
+      const pendingFollowUp = getCompactionFollowUpContent(request?.metadata?.muxMetadata);
+      assert(pendingFollowUp != null);
+      await seedHandoff(h, pendingFollowUp);
+
+      expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+
+      expect(calls).toEqual([{ text: "then fix the bug", origin: "user" }]);
+      const dispatched = (await userRows(h)).at(-1);
+      expect(textOf(dispatched)).toBe("then fix the bug");
+      expect(dispatched?.metadata?.pluginHookContext).toEqual([
+        { pluginId: "fake", text: "Ask for a reproduction first." },
+      ]);
+    }
+  );
 
   test("a follow-up the hooks never saw (manual /compact) runs them as a system send", async () => {
     const { h, calls } = await setup(() => undefined);
