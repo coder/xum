@@ -99,6 +99,19 @@ describe("loadPluginCodexHooks", () => {
     expect(hooks[2]?.handler).toMatchObject({ input: {}, timeoutSeconds: 30 });
   });
 
+  test("a non-finite timeout drops only that handler", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-timeout");
+    const plugin = await writePlugin(tmp.path, {
+      // 1e400 parses to Infinity, which JSON and the review RPC cannot carry.
+      "hooks/hooks.json": `{ "hooks": { "Stop": [ { "hooks": [ { "type": "mcp_tool", "server": "s", "tool": "t", "timeout": 1e400 }, { "type": "mcp_tool", "server": "s", "tool": "t" } ] } ] } }`,
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.key)).toEqual(["hooks/hooks.json#Stop[0][1]"]);
+    expect(warnings).toHaveLength(1);
+  });
+
   test("a com.openai pointer replaces the default file instead of adding to it", async () => {
     using tmp = new DisposableTempDir("codex-hooks-pointer");
     const plugin = await writePlugin(
