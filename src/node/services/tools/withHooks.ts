@@ -24,6 +24,7 @@ import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
 import { readMcpToolOrigin } from "@/node/services/agentPlugins/codexToolNames";
+import { unsanitizedTool } from "@/common/utils/tools/schemaSanitizer";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { WithHookOutput, MayHaveHookOutput } from "@/common/types/tools";
 import {
@@ -137,7 +138,8 @@ export function withHooks<TParameters, TResult>(
       args,
       config,
       abortSignal,
-      inputJsonSchema: () => extractToolJsonSchema(tool),
+      // The full schema: OpenAI requests carry a sanitized copy that drops constraints.
+      inputJsonSchema: () => extractToolJsonSchema(unsanitizedTool(tool)),
       mcpOrigin: readMcpToolOrigin(tool),
       execute: (currentArgs) =>
         Promise.resolve(executeFn.call(tool, currentArgs, options) as TResult | Promise<TResult>),

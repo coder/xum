@@ -50,20 +50,39 @@ export function renderPluginHookContextEntry(entry: PluginHookContextEntry): str
 }
 
 /**
+ * Rendered context per message (the full blocks). promptHooks drops entries past it when it saves
+ * them, and the read below applies it again (same cap as request.assemble).
+ */
+export const PLUGIN_HOOK_CONTEXT_MAX_CHARS = 64 * 1024;
+
+/**
  * chat.jsonl is untrusted on read: the history reader checks only that metadata is an object.
- * A malformed value or entry is dropped, so one bad row never fails every later request.
+ * A malformed value or entry is dropped, and entries past the cap are cut, so one bad row never
+ * fails or overflows every later request.
  */
 function readPersistedEntries(value: unknown): PluginHookContextEntry[] {
   if (!Array.isArray(value)) return [];
-  return value.filter(
-    (entry: unknown): entry is PluginHookContextEntry =>
-      typeof entry === "object" &&
-      entry !== null &&
-      "pluginId" in entry &&
-      typeof entry.pluginId === "string" &&
-      "text" in entry &&
-      typeof entry.text === "string"
-  );
+  const entries: unknown[] = value;
+  const kept: PluginHookContextEntry[] = [];
+  let size = 0;
+  for (const entry of entries) {
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      !("pluginId" in entry) ||
+      typeof entry.pluginId !== "string" ||
+      !("text" in entry) ||
+      typeof entry.text !== "string"
+    ) {
+      continue;
+    }
+    const valid = { pluginId: entry.pluginId, text: entry.text };
+    size += renderPluginHookContextEntry(valid).length;
+    // Same rule as the write side: the first entry past the cap ends the list.
+    if (size > PLUGIN_HOOK_CONTEXT_MAX_CHARS) break;
+    kept.push(valid);
+  }
+  return kept;
 }
 
 /** Plugin-authored text must not be able to close the block or forge another tag. */
