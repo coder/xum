@@ -59,7 +59,8 @@ export const PluginHookHandlerSchema = z.discriminatedUnion("type", [
     tool: z.string(),
     /** Argument templates (`${tool_input.x}`); `{}` when omitted. */
     input: z.record(z.string(), z.unknown()),
-    timeoutSeconds: z.number(),
+    /** Declared `timeout` in seconds; absent means the runner default. */
+    timeoutSeconds: z.number().optional(),
     statusMessage: z.string().optional(),
   }),
   z.object({ type: z.enum(["command", "prompt", "agent"]), summary: z.string() }),

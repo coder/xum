@@ -49,8 +49,6 @@ const IGNORED_CODEX_HOOK_EVENTS = new Set([
 
 const DEFAULT_HOOKS_FILE = "hooks/hooks.json";
 const MAX_HOOKS_FILE_BYTES = 256 * 1024;
-/** Codex default handler timeout, in seconds. */
-export const DEFAULT_HOOK_TIMEOUT_SECONDS = 600;
 
 /** A parsed hook; the trust review state is added by pluginHookTrust.ts. */
 export type PluginHookDefinition = Omit<AgentPluginHook, "review">;
@@ -244,7 +242,7 @@ function parseHandler(
         server,
         tool,
         input: input ?? {},
-        timeoutSeconds: typeof timeout === "number" ? timeout : DEFAULT_HOOK_TIMEOUT_SECONDS,
+        ...(typeof timeout === "number" ? { timeoutSeconds: timeout } : {}),
         ...(typeof statusMessage === "string" ? { statusMessage } : {}),
       };
     }

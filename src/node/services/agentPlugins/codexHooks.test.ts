@@ -94,7 +94,6 @@ describe("loadPluginCodexHooks", () => {
       server: "scanner",
       tool: "scan",
       input: { cmd: "${tool_input.command}" },
-      timeoutSeconds: 600,
     });
     expect(hooks[2]?.handler).toMatchObject({ input: {}, timeoutSeconds: 30 });
   });

@@ -69,6 +69,8 @@ export interface ToolExecuteContext {
   args: unknown;
   readonly host: ToolExecutionHost;
   readonly abortSignal?: AbortSignal;
+  /** The tool's input JSON schema, when the caller holds the Tool (validates hook rewrites). */
+  readonly inputJsonSchema?: () => unknown;
   /** Set by the terminal after the tool actually executed. */
   executed: boolean;
   /** Set by the terminal; mutable after next() returns (middleware may augment). */

@@ -22,6 +22,7 @@ import assert from "node:assert";
 import type { Tool } from "ai";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
+import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { WithHookOutput, MayHaveHookOutput } from "@/common/types/tools";
 import {
@@ -135,6 +136,7 @@ export function withHooks<TParameters, TResult>(
       args,
       config,
       abortSignal,
+      inputJsonSchema: () => extractToolJsonSchema(tool),
       execute: (currentArgs) =>
         Promise.resolve(executeFn.call(tool, currentArgs, options) as TResult | Promise<TResult>),
     });
@@ -164,6 +166,8 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
   args: TArgs;
   config: HookConfig;
   abortSignal?: AbortSignal;
+  /** See ToolExecuteContext.inputJsonSchema. */
+  inputJsonSchema?: () => unknown;
   execute: (args: TArgs) => Promise<TResult>;
 }): Promise<ToolHookPipelineOutcome<TResult>> {
   const { toolName, config } = input;
@@ -180,6 +184,7 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
       env: config.env,
     },
     abortSignal: input.abortSignal,
+    ...(input.inputJsonSchema != null ? { inputJsonSchema: input.inputJsonSchema } : {}),
     executed: false,
   };
 
