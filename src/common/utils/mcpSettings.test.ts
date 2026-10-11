@@ -72,6 +72,8 @@ describe("parseMCPSettingsReadResult", () => {
     ]);
     // color, badRegex, noTitle (schema); wrongValue (value); mystery item; page group.
     expect(result.warnings).toHaveLength(6);
+    // Settings the UI cannot show: color, badRegex, noTitle and wrongValue (not layout items).
+    expect(result.droppedSettingCount).toBe(4);
   });
 
   test("a result without an object schema is an error", () => {

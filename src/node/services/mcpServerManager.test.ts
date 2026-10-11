@@ -721,6 +721,15 @@ describe("MCPServerManager", () => {
     expect(manager.getCachedSettings("settings-ws", "cad")).toEqual(values);
   });
 
+  test("settings: a server counts as connected only once the workspace started it", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-connected") });
+    servers.serve("settings-connected", { tools: { draw: testTool() } });
+    expect(manager.isWorkspaceServerConnected("settings-connected-ws", "cad")).toBe(false);
+    await manager.getToolsForWorkspace(workspaceRequest("settings-connected-ws"));
+    expect(manager.isWorkspaceServerConnected("settings-connected-ws", "cad")).toBe(true);
+    expect(manager.isWorkspaceServerConnected("settings-connected-ws", "other")).toBe(false);
+  });
+
   test("settings: a server without the capability reads as null", async () => {
     configService.listServers.mockResolvedValue({ plain: stdioConfig("settings-none") });
     servers.serve("settings-none", { tools: { draw: testTool() } });

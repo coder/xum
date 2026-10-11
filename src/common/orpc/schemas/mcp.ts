@@ -382,10 +382,18 @@ export const MCPSettingsSnapshotSchema = z.object({
     })
   ),
   warnings: z.array(z.string()),
+  droppedSettingCount: z.number().int().nonnegative(),
 });
 export const MCPSettingsReadParamsSchema = z.object({
   workspaceId: z.string(),
   serverName: z.string(),
+});
+export const MCPSettingsReadInputSchema = MCPSettingsReadParamsSchema.extend({
+  /**
+   * Read only a server the workspace already runs; never start one (the
+   * workspace MCP dialog reads on open). Otherwise `{ notConnected: true }`.
+   */
+  ifConnected: z.boolean().optional(),
 });
 export const MCPSettingsUpdateParamsSchema = MCPSettingsReadParamsSchema.extend({
   /** Changed values only. */

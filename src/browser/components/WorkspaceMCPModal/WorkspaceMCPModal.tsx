@@ -23,6 +23,20 @@ import {
   stripBranding,
 } from "@/browser/components/MCPServerIdentity/MCPServerIdentityBadge";
 
+/**
+ * Effective workspace enablement: enabledServers overrides a project/global
+ * disable, disabledServers overrides an enable, otherwise the project state.
+ */
+function isServerEnabledFor(
+  overrides: WorkspaceMCPOverrides,
+  serverName: string,
+  projectDisabled: boolean
+): boolean {
+  if (overrides.enabledServers?.includes(serverName)) return true;
+  if (overrides.disabledServers?.includes(serverName)) return false;
+  return !projectDisabled;
+}
+
 interface WorkspaceMCPModalProps {
   workspaceId: string;
   projectPath: string;
@@ -56,10 +70,16 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   const [branding, setBranding] = useState<
     Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
   >({});
-  // OpenAI structured settings, read with each tool fetch (the fetch already
-  // connects the server). `fetchId` remounts the section on every refresh.
+  // OpenAI structured settings, read fresh on every open (connected servers
+  // only) and with each tool fetch. `fetchId` remounts the section on every
+  // read; a save keeps it and only replaces the snapshot's values (onSaved).
   const [serverSettings, setServerSettings] = useState<
-    Record<string, { fetchId: number; snapshot: MCPSettingsSnapshot } | { error: string }>
+    Record<
+      string,
+      | { fetchId: number; snapshot: MCPSettingsSnapshot }
+      | { error: string }
+      | { notConnected: true }
+    >
   >({});
   const settingsFetchCount = useRef(0);
   const [loading, setLoading] = useState(false);
@@ -75,6 +95,38 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   const reloadCacheRef = useRef(reloadCache);
   reloadCacheRef.current = reloadCache;
 
+  /**
+   * Read one server's structured settings into `serverSettings`. A read that
+   * started under an older open (generation) is dropped. `onOpen` reads only
+   * a server the workspace already runs (opening the dialog never starts one;
+   * Fetch Tools does) and drops failures: most servers have no settings, so a
+   * failed read must not claim "Settings unavailable" there.
+   */
+  const readServerSettings = useCallback(
+    async (serverName: string, onOpen: boolean) => {
+      if (!api) return;
+      const generation = loadGeneration.current;
+      let read: Awaited<ReturnType<typeof api.mcp.settings.read>>;
+      try {
+        read = await api.mcp.settings.read({ workspaceId, serverName, ifConnected: onOpen });
+      } catch (err) {
+        read = { success: false, error: err instanceof Error ? err.message : String(err) };
+      }
+      if (generation !== loadGeneration.current || (onOpen && !read.success)) return;
+      const fetchId = ++settingsFetchCount.current;
+      setServerSettings((prev) => {
+        const { [serverName]: _stale, ...others } = prev;
+        if (!read.success) return { ...others, [serverName]: { error: read.error } };
+        if (read.data === null) return others;
+        if ("notConnected" in read.data) return { ...others, [serverName]: read.data };
+        return { ...others, [serverName]: { fetchId, snapshot: read.data } };
+      });
+    },
+    [api, workspaceId]
+  );
+  const readServerSettingsRef = useRef(readServerSettings);
+  readServerSettingsRef.current = readServerSettings;
+
   // Load project servers and workspace overrides when modal opens
   useEffect(() => {
     if (!open || !api) return;
@@ -85,6 +137,9 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     const loadData = async () => {
       loadGeneration.current += 1;
       setBranding({});
+      // Settings from an earlier open are stale: the server persists them and
+      // may have changed (or a save in that open replaced them).
+      setServerSettings({});
       setLoading(true);
       setError(null);
       try {
@@ -97,6 +152,13 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
         setServers(projectServers ?? {});
         setOverrides(workspaceOverrides.overrides ?? {});
         setOverridesRevision(workspaceOverrides.revision);
+        // Settings show without Fetch Tools: read every server the saved
+        // overrides enable and the workspace already runs. Not awaited: the
+        // dialog renders now and each section appears when its read lands.
+        for (const [name, info] of Object.entries(projectServers ?? {})) {
+          if (isServerEnabledFor(workspaceOverrides.overrides ?? {}, name, info.disabled))
+            void readServerSettingsRef.current(name, true);
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load MCP configuration");
       } finally {
@@ -129,15 +191,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
         if (!result.success) {
           setError(`Failed to fetch tools for ${serverName}: ${result.error}`);
         } else {
-          const read = await api.mcp.settings.read({ workspaceId, serverName });
-          const fetchId = ++settingsFetchCount.current;
-          setServerSettings((prev) => {
-            const { [serverName]: _stale, ...others } = prev;
-            if (!read.success) return { ...others, [serverName]: { error: read.error } };
-            return read.data === null
-              ? others
-              : { ...others, [serverName]: { fetchId, snapshot: read.data } };
-          });
+          await readServerSettings(serverName, false);
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : `Failed to fetch tools for ${serverName}`);
@@ -145,7 +199,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
         setLoadingTools((prev) => ({ ...prev, [serverName]: false }));
       }
     },
-    [api, projectPath, workspaceId, setResult]
+    [api, projectPath, workspaceId, setResult, readServerSettings]
   );
 
   /**
@@ -156,12 +210,9 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
    * - Otherwise: use project-level state (info.disabled)
    */
   const isServerEnabled = useCallback(
-    (serverName: string, projectDisabled: boolean): boolean => {
-      if (overrides.enabledServers?.includes(serverName)) return true;
-      if (overrides.disabledServers?.includes(serverName)) return false;
-      return !projectDisabled;
-    },
-    [overrides.enabledServers, overrides.disabledServers]
+    (serverName: string, projectDisabled: boolean): boolean =>
+      isServerEnabledFor(overrides, serverName, projectDisabled),
+    [overrides]
   );
 
   // Toggle server enabled/disabled for workspace
@@ -493,12 +544,28 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                               Settings unavailable: {entry.error}
                             </div>
                           );
+                        if ("notConnected" in entry)
+                          return (
+                            <div className="text-content-secondary mt-4 border-t pt-4 text-xs">
+                              Connect the server to see its settings
+                            </div>
+                          );
                         return (
                           <MCPServerSettingsSection
                             key={entry.fetchId}
                             workspaceId={workspaceId}
                             serverName={name}
                             snapshot={entry.snapshot}
+                            onSaved={(values) =>
+                              setServerSettings((prev) => {
+                                const current = getOwn(prev, name);
+                                if (current === undefined || !("snapshot" in current)) return prev;
+                                return {
+                                  ...prev,
+                                  [name]: { ...current, snapshot: { ...current.snapshot, values } },
+                                };
+                              })
+                            }
                           />
                         );
                       })()}

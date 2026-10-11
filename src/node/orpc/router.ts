@@ -178,6 +178,7 @@ import { throwWorkflowOrpcError } from "./formatOrpcError";
 import { isDraftTooLargeError } from "@/common/utils/drafts";
 import { resolveDraftSends } from "@/node/services/draftSendResolution";
 import type { SendAcceptance } from "@/node/services/draftService";
+import type { MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 
 /**
@@ -218,6 +219,29 @@ async function runMcpSettingsRoute<T>(
   } catch (error) {
     return { success: false, error: getErrorMessage(error) };
   }
+}
+
+/**
+ * `mcp.settings.read`. With `ifConnected`, a server the workspace does not run
+ * reads as `{ notConnected: true }` and is not started (checked before
+ * runMcpSettingsRoute: its warm-up and the read start servers).
+ */
+async function readMcpSettingsRoute(
+  context: ORPCContext,
+  input: { workspaceId: string; serverName: string; ifConnected?: boolean },
+  signal: AbortSignal | undefined
+): Promise<
+  | { success: true; data: MCPSettingsSnapshot | { notConnected: true } | null }
+  | { success: false; error: string }
+> {
+  if (
+    input.ifConnected === true &&
+    !context.mcpServerManager.isWorkspaceServerConnected(input.workspaceId, input.serverName)
+  )
+    return { success: true, data: { notConnected: true } };
+  return runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+    context.mcpServerManager.readSettings(input.workspaceId, input.serverName, { signal })
+  );
 }
 
 function sendAcceptanceOf(context: ORPCContext): SendAcceptance {
@@ -1237,13 +1261,7 @@ export const router = (authToken?: string) => {
         read: t
           .input(schemas.mcp.settings.read.input)
           .output(schemas.mcp.settings.read.output)
-          .handler(({ context, input, signal }) =>
-            runMcpSettingsRoute(context, input.workspaceId, signal, () =>
-              context.mcpServerManager.readSettings(input.workspaceId, input.serverName, {
-                signal,
-              })
-            )
-          ),
+          .handler(({ context, input, signal }) => readMcpSettingsRoute(context, input, signal)),
         update: t
           .input(schemas.mcp.settings.update.input)
           .output(schemas.mcp.settings.update.output)

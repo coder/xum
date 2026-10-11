@@ -4646,6 +4646,21 @@ export class MCPServerManager {
    * Read and validate a server's structured settings for one workspace
    * (cached on success). Null when the server has no `openai/settings`.
    */
+  /**
+   * Whether this workspace runs the server now (enabled, connected). The
+   * workspace MCP dialog reads settings on open only then, so opening it never
+   * starts a server; Fetch Tools does.
+   */
+  isWorkspaceServerConnected(workspaceId: string, serverName: string): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    const instance = entry?.instances.get(serverName);
+    return (
+      entry?.enabledServerNames.has(serverName) === true &&
+      instance !== undefined &&
+      !instance.isClosed
+    );
+  }
+
   async readSettings(
     workspaceId: string,
     serverName: string,

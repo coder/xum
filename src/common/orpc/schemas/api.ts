@@ -174,7 +174,7 @@ import {
   MCPRemoveGlobalParamsSchema,
   MCPRemoveParamsSchema,
   MCPServerMapSchema,
-  MCPSettingsReadParamsSchema,
+  MCPSettingsReadInputSchema,
   MCPSettingsSnapshotSchema,
   MCPSettingsUpdateParamsSchema,
   MCPSetEnabledGlobalParamsSchema,
@@ -1133,9 +1133,15 @@ export const mcp = {
   /** OpenAI structured settings of one workspace server (`openai/settings`). */
   settings: {
     read: {
-      input: MCPSettingsReadParamsSchema,
-      /** Null when the server has no `openai/settings` capability. */
-      output: ResultSchema(MCPSettingsSnapshotSchema.nullable(), z.string()),
+      input: MCPSettingsReadInputSchema,
+      /**
+       * Null when the server has no `openai/settings` capability;
+       * `{ notConnected: true }` when `ifConnected` found it not running.
+       */
+      output: ResultSchema(
+        z.union([MCPSettingsSnapshotSchema, z.object({ notConnected: z.literal(true) })]).nullable(),
+        z.string()
+      ),
     },
     update: {
       input: MCPSettingsUpdateParamsSchema,

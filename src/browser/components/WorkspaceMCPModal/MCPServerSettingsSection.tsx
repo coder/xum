@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Loader2 } from "lucide-react";
+import { Loader2, TriangleAlert } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Input } from "@/browser/components/Input/Input";
 import { Select } from "@/browser/components/Select/Select";
@@ -17,13 +17,20 @@ interface MCPServerSettingsSectionProps {
   workspaceId: string;
   serverName: string;
   snapshot: MCPSettingsSnapshot;
+  /**
+   * The values a successful save returned. The dialog keeps them as the
+   * snapshot's values, so a remount (server toggled off and on) starts from
+   * what the server stored, not from the first read.
+   */
+  onSaved: (values: MCPSettingsSnapshot["values"]) => void;
 }
 
 /**
  * OpenAI structured settings (`openai/settings`) of one workspace server:
  * native controls drawn from the server's schema, in its layout groups.
- * Server strings render as plain text. Saves send only the changed values;
- * a failed save shows the error and restores the last saved values.
+ * Server strings render as plain text. Saves send only the values that differ
+ * from the last values the server returned (read or update result); a failed
+ * save shows the error and restores those values.
  */
 export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> = (props) => {
   const { api } = useAPI();
@@ -61,6 +68,7 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
       if (result.success) {
         setSaved(result.data);
         setDraft(result.data);
+        props.onSaved(result.data);
       } else {
         setError(result.error);
         setDraft(saved);
@@ -125,6 +133,15 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
   return (
     <div className="mt-4 space-y-3 border-t pt-4" data-testid="mcp-server-settings">
       <div className="text-sm font-medium">Settings</div>
+      {props.snapshot.droppedSettingCount > 0 && (
+        <div className="bg-warning/10 text-warning flex items-start gap-2 rounded-md px-3 py-2 text-xs">
+          <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            This server sent {props.snapshot.droppedSettingCount}{" "}
+            {props.snapshot.droppedSettingCount === 1 ? "setting" : "settings"} Xum cannot show
+          </span>
+        </div>
+      )}
       {props.snapshot.layout.map((group) => (
         <div key={group.title} className="space-y-2">
           <div className="text-content-secondary text-xs font-medium wrap-anywhere">

@@ -39,6 +39,8 @@ export interface MCPSettingsSnapshot {
   /** Layout groups in order; properties no group lists go last, in "Other settings". */
   layout: MCPSettingsGroup[];
   warnings: string[];
+  /** Schema properties dropped (unsupported schema or no valid value); the UI notes them. */
+  droppedSettingCount: number;
 }
 
 const MAX_TEXT = 1024;
@@ -227,5 +229,7 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
       title: "Other settings",
       items: rest.map((property) => ({ kind: "property", property })),
     });
-  return { properties, values, layout, warnings };
+  const droppedSettingCount =
+    Object.keys(raw.schema.properties).length - Object.keys(properties).length;
+  return { properties, values, layout, warnings, droppedSettingCount };
 }

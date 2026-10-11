@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
@@ -64,6 +64,8 @@ interface WorkspaceMCPStoryOptions {
   testResults?: Record<string, string[]>;
   preCacheTools?: boolean;
   settings?: Record<string, MCPSettingsSnapshot>;
+  /** Servers the workspace already runs (the dialog reads their settings on open). */
+  settingsConnected?: string[];
 }
 
 function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): APIClient {
@@ -136,6 +138,7 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
         structuredClone(snapshot),
       ])
     ),
+    mcpSettingsConnected: new Set(options.settingsConnected ?? []),
   });
 }
 
@@ -562,22 +565,30 @@ const CAD_SETTINGS: MCPSettingsSnapshot = {
       ],
     },
   ],
-  warnings: [],
+  warnings: ["Setting 'color' has an unsupported schema; ignoring it"],
+  droppedSettingCount: 1,
 };
 
 const settingsStoryOptions = (): WorkspaceMCPStoryOptions => ({
   servers: { cad: { transport: "stdio", command: "bunx cad-mcp", disabled: false } },
   testResults: { cad: ["draw_part"] },
   settings: { cad: CAD_SETTINGS },
+  settingsConnected: ["cad"],
 });
 
-/** Shared play: settings load with Fetch Tools, render as text, validate, and send changes. */
+/**
+ * Shared play: settings load on open (no Fetch Tools), render as text, note the
+ * dropped setting, validate, and send changes.
+ */
 async function exerciseServerSettings(canvasElement: HTMLElement): Promise<void> {
   const dialog = await findWorkspaceMCPDialog(canvasElement);
   const modal = within(dialog);
-  await userEvent.click(await modal.findByRole("button", { name: "Fetch Tools" }));
   const section = within(await modal.findByTestId("mcp-server-settings"));
+  await expect(modal.getByRole("button", { name: "Fetch Tools" })).toBeInTheDocument();
   await expect(section.findByText("Opens in a later version")).resolves.toBeInTheDocument();
+  await expect(
+    section.findByText(/This server sent 1 setting Xum cannot show/)
+  ).resolves.toBeInTheDocument();
   // Server strings are text, never markup.
   await expect(
     section.findByText("Draws a <b>grid</b> behind parts.")
@@ -616,4 +627,109 @@ export const WorkspaceMCPServerSettingsNarrow: Story = {
   },
   render: () => renderWorkspaceMCPModal(settingsStoryOptions()),
   play: async ({ canvasElement }) => exerciseServerSettings(canvasElement),
+};
+
+/** Not running yet: the dialog does not start it on open; Fetch Tools connects it. */
+export const WorkspaceMCPServerSettingsNotConnected: Story = {
+  render: () => renderWorkspaceMCPModal({ ...settingsStoryOptions(), settingsConnected: [] }),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    await expect(
+      modal.findByText("Connect the server to see its settings")
+    ).resolves.toBeInTheDocument();
+    await expect(modal.queryByTestId("mcp-server-settings")).toBeNull();
+    await userEvent.click(modal.getByRole("button", { name: "Fetch Tools" }));
+    await expect(modal.findByTestId("mcp-server-settings")).resolves.toBeInTheDocument();
+    await expect(modal.queryByText("Connect the server to see its settings")).toBeNull();
+  },
+};
+
+/** The modal behind an open button: Cancel really closes it, so a play can reopen it. */
+const ReopenableWorkspaceMCPModal: FC = () => {
+  const [open, setOpen] = useState(true);
+  return (
+    <>
+      <button type="button" onClick={() => setOpen(true)}>
+        Open workspace MCP
+      </button>
+      <WorkspaceMCPModal
+        workspaceId={WORKSPACE_ID}
+        projectPath={PROJECT_PATH}
+        open={open}
+        onOpenChange={setOpen}
+      />
+    </>
+  );
+};
+
+/** Pick `option` in the Radix select labelled `label` (its list renders in a portal). */
+async function chooseSetting(
+  canvasElement: HTMLElement,
+  section: ReturnType<typeof within>,
+  label: string,
+  option: string
+): Promise<void> {
+  await userEvent.click(section.getByLabelText(label));
+  const body = within(canvasElement.ownerDocument.body);
+  await userEvent.click(await body.findByRole("option", { name: option }));
+}
+
+async function saveUnits(canvasElement: HTMLElement, units: string) {
+  const section = within(
+    await within(await findWorkspaceMCPDialog(canvasElement)).findByTestId("mcp-server-settings")
+  );
+  await chooseSetting(canvasElement, section, "Units setting", units);
+  const save = section.getByRole("button", { name: "Save settings" });
+  await waitFor(() => expect(save).toBeEnabled());
+  await userEvent.click(save);
+  await waitFor(() => expect(save).toBeDisabled());
+  return { section, save };
+}
+
+/** Save, close and reopen: the reopened form reads the saved value again (no Refresh Tools). */
+export const WorkspaceMCPServerSettingsReopen: Story = {
+  render: () => (
+    <WorkspaceMCPModalStoryShell setup={() => setupWorkspaceMCPModalStory(settingsStoryOptions())}>
+      <ReopenableWorkspaceMCPModal />
+    </WorkspaceMCPModalStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    await saveUnits(canvasElement, "in");
+    const dialog = await findWorkspaceMCPDialog(canvasElement);
+    await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
+    );
+
+    await userEvent.click(within(canvasElement).getByRole("button", { name: "Open workspace MCP" }));
+    const section = within(
+      await within(await findWorkspaceMCPDialog(canvasElement)).findByTestId(
+        "mcp-server-settings"
+      )
+    );
+    await waitFor(() => expect(section.getByLabelText("Units setting")).toHaveTextContent("in"));
+  },
+};
+
+/**
+ * After a save, the saved value is the form's base: choosing the previous value
+ * again is a change, also after the section remounts (server toggled off and on).
+ */
+export const WorkspaceMCPServerSettingsOldValueAgain: Story = {
+  render: () => renderWorkspaceMCPModal(settingsStoryOptions()),
+  play: async ({ canvasElement }) => {
+    await saveUnits(canvasElement, "in");
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const toggle = modal.getByRole("switch", { name: "Toggle cad MCP server" });
+    await userEvent.click(toggle);
+    await waitFor(() => expect(modal.queryByTestId("mcp-server-settings")).toBeNull());
+    await userEvent.click(toggle);
+
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    await expect(section.getByLabelText("Units setting")).toHaveTextContent("in");
+    await chooseSetting(canvasElement, section, "Units setting", "mm");
+    await waitFor(() =>
+      expect(section.getByRole("button", { name: "Save settings" })).toBeEnabled()
+    );
+  },
 };
