@@ -1846,6 +1846,29 @@ describe("AgentPluginInstallService", () => {
     );
   });
 
+  test("preview shows a plugin token resource that differs from the server URL", async () => {
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          docs: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/mcp",
+            extensions: {
+              "com.openai": { auth: { type: "oauth", resource: "https://mcp.example.com" } },
+            },
+          },
+        },
+      })
+    );
+    await commitAll(remoteDir, "resource");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.mcpServers.map((server) => server.summary)).toEqual([
+      "https://mcp.example.com/mcp\nToken resource: https://mcp.example.com",
+    ]);
+  });
+
   test("update rejects capability increases (new hook, expanded grants, new/changed MCP servers)", async () => {
     // Security gate: a compromised upstream must not auto-load new executable
     // capabilities through a routine update click. Additions/changes are

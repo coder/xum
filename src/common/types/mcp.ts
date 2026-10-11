@@ -85,7 +85,13 @@ export interface MCPServerOAuthConfig {
   clientId?: string;
   tokenEndpointAuthMethod?: "none" | "client_secret_basic" | "client_secret_post";
   /** Set together; replace authorization-server discovery. `issuer` defaults to the token URL origin. */
-  endpoints?: { authorizationUrl: string; tokenUrl: string; issuer?: string };
+  endpoints?: {
+    authorizationUrl: string;
+    tokenUrl: string;
+    issuer?: string;
+    /** Dynamic registration endpoint (no provided client). */
+    registrationUrl?: string;
+  };
   /** Sent on every request. */
   baseScopes?: string[];
   /** Replaces the discovered default scopes ([] requests none). */

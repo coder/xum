@@ -767,6 +767,107 @@ describe("McpOauthService OAuth flows", () => {
     }
   });
 
+  test("stored tokens stay bound to the client they were issued to", async () => {
+    const serverUrl = "https://example.com/mcp";
+    await fs.writeFile(
+      getStoreFilePath(xumHome),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: { client_id: "client-a" },
+            tokens: { access_token: "at-a", token_type: "Bearer", refresh_token: "rt-a" },
+          },
+        },
+      })
+    );
+    // A second plugin at the same URL with another client is signed out.
+    expect(
+      await service.getAuthProviderForServer({ serverUrl, oauth: { clientId: "client-b" } })
+    ).toBeUndefined();
+    const provider = await service.getAuthProviderForServer({
+      serverUrl,
+      oauth: { clientId: "client-a" },
+    });
+    expect((await provider?.tokens())?.access_token).toBe("at-a");
+    expect((await provider?.clientInformation())?.client_id).toBe("client-a");
+  });
+
+  test("a plugin resource that does not cover the server URL is refused at sign-in", async () => {
+    spyOn(mcpConfigService, "listServers").mockResolvedValue({
+      docs: {
+        transport: "http",
+        url: "http://127.0.0.1:9/mcp",
+        disabled: true,
+        oauth: {
+          clientId: "c",
+          resource: "https://evil.example.com",
+          endpoints: {
+            authorizationUrl: "http://127.0.0.1:9/authorize",
+            tokenUrl: "http://127.0.0.1:9/token",
+          },
+        },
+      },
+    });
+    const start = await service.startServerFlow({
+      projectPath,
+      serverName: "docs",
+      redirectUri: "https://x/cb",
+    });
+    expect(start.success).toBe(false);
+    expect(start.success ? "" : start.error).toContain("does not cover");
+  });
+
+  test("endpoint overrides with registrationUrl register there instead of discovering", async () => {
+    const paths: string[] = [];
+    const server = createServer((req, res) => {
+      const pathname = (req.url ?? "/").split("?")[0];
+      paths.push(pathname);
+      if (pathname === "/custom-register") {
+        res.writeHead(201, { "content-type": "application/json" });
+        res.end(JSON.stringify({ client_id: "registered", redirect_uris: ["https://x/cb"] }));
+        return;
+      }
+      res.statusCode = pathname === "/mcp" ? 401 : 404;
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Failed to bind");
+      const base = `http://127.0.0.1:${address.port}`;
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: {
+          transport: "http",
+          url: `${base}/mcp`,
+          disabled: true,
+          oauth: {
+            endpoints: {
+              authorizationUrl: `${base}/custom-authorize`,
+              tokenUrl: `${base}/custom-token`,
+              registrationUrl: `${base}/custom-register`,
+            },
+          },
+        },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      const authorizeUrl = new URL(start.data.authorizeUrl);
+      expect(authorizeUrl.pathname).toBe("/custom-authorize");
+      expect(authorizeUrl.searchParams.get("client_id")).toBe("registered");
+      expect(paths).toContain("/custom-register");
+      await service.cancelServerFlow(start.data.flowId);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test("a plugin's provided client, endpoints, scopes and resource replace discovery and DCR", async () => {
     const secret = "native-app-secret-8252";
     const requests: Array<{ path: string; raw: string }> = [];
@@ -820,7 +921,8 @@ describe("McpOauthService OAuth flows", () => {
             },
             baseScopes: ["base"],
             defaultScopes: ["docs:read"],
-            resource: "https://api.example.com",
+            // Covers the server URL (the SDK's resource rule).
+            resource: base,
             clientSecretSource: { pluginRoot, mcpConfigPath, serverName: "github" },
           },
         },
@@ -836,7 +938,7 @@ describe("McpOauthService OAuth flows", () => {
       expect(authorizeUrl.pathname).toBe("/custom-authorize");
       expect(authorizeUrl.searchParams.get("client_id")).toBe("provided-id");
       expect(authorizeUrl.searchParams.get("scope")).toBe("base docs:read");
-      expect(authorizeUrl.searchParams.get("resource")).toBe("https://api.example.com/");
+      expect(authorizeUrl.searchParams.get("resource")).toBe(`${base}/`);
 
       const exchange = await service.handleServerCallbackAndExchange({
         state: start.data.flowId,

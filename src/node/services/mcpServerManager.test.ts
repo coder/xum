@@ -3278,6 +3278,24 @@ describe("MCPServerManager", () => {
     expect(result.toolServerNames).toEqual({});
   });
 
+  test("a plugin OAuth settings change restarts a remote server with an unchanged URL", async () => {
+    const url = "https://mcp.example.test/oauth-change";
+    let clientId = "client-a";
+    configService.listServers = mock(() =>
+      Promise.resolve({
+        server: { transport: "http" as const, url, disabled: false, oauth: { clientId } },
+      })
+    );
+    servers.serve(url, { tools: { work: testTool() } });
+    const request = workspaceRequest("oauth-change");
+    await manager.getToolsForWorkspace(request);
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount(url)).toBe(1);
+    clientId = "client-b";
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount(url)).toBe(2);
+  });
+
   test("a closed client observed by a background tools/list refresh is excluded from that response", async () => {
     const workspaceId = "closed-during-background-refresh";
     const url = "https://mcp.example.test/refresh";

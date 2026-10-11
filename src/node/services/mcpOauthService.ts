@@ -7,6 +7,7 @@ import * as fsPromises from "fs/promises";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import {
   auth,
+  checkResourceAllowed,
   IssuerMismatchError,
   type OAuthClientProvider,
   type OAuthDiscoveryState,
@@ -164,6 +165,9 @@ function pluginDiscoveryState(config?: MCPServerOAuthConfig): OAuthDiscoveryStat
       issuer,
       authorization_endpoint: endpoints.authorizationUrl,
       token_endpoint: endpoints.tokenUrl,
+      ...(endpoints.registrationUrl !== undefined
+        ? { registration_endpoint: endpoints.registrationUrl }
+        : {}),
       response_types_supported: ["code"],
       code_challenge_methods_supported: ["S256"],
     },
@@ -183,6 +187,31 @@ function pluginClient(
       ? { token_endpoint_auth_method: config.tokenEndpointAuthMethod }
       : {}),
   };
+}
+
+/**
+ * Defense in depth for the plugin resource (mcpConfig already dropped one
+ * that does not cover the server): the SDK's own resource/server rule.
+ */
+function pluginResourceValidator(resource: string): (serverResource: URL) => Promise<URL> {
+  return (serverResource) =>
+    checkResourceAllowed({ requestedResource: serverResource, configuredResource: resource })
+      ? Promise.resolve(new URL(resource))
+      : Promise.reject(
+          new Error(`Plugin resource ${resource} does not cover ${serverResource.href}`)
+        );
+}
+
+/**
+ * Stored credentials belong to the client they were issued to. A plugin with
+ * another provided client (a second plugin at the same URL, or an update)
+ * must not use them, and must never refresh client A's token with client B.
+ */
+function storedClientMatches(
+  stored: MCPOAuthClientInformation | undefined,
+  config: MCPServerOAuthConfig | undefined
+): boolean {
+  return config?.clientId === undefined || stored?.client_id === config.clientId;
 }
 
 /** SECURITY AUDIT: the store (mcp-oauth.json) never receives a plugin client secret. */
@@ -848,6 +877,10 @@ export class McpOauthService {
     if (!creds?.tokens || !creds.clientInformation) {
       return undefined;
     }
+    // Tokens of another client: signed out for this plugin server.
+    if (!storedClientMatches(creds.clientInformation, input.oauth)) {
+      return undefined;
+    }
 
     return this.createBackgroundProvider({
       serverUrl: normalizedServerUrl,
@@ -1418,7 +1451,7 @@ export class McpOauthService {
         );
       },
       ...(flow.plugin?.config.resource !== undefined
-        ? { validateResourceURL: () => Promise.resolve(new URL(flow.plugin!.config.resource!)) }
+        ? { validateResourceURL: pluginResourceValidator(flow.plugin.config.resource) }
         : {}),
       saveClientInformation: async (clientInformation) => {
         // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
@@ -1447,6 +1480,7 @@ export class McpOauthService {
     return {
       tokens: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
+        if (!storedClientMatches(creds?.clientInformation, input.oauth)) return undefined;
         // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         return creds?.tokens as unknown as MCPOAuthTokens | undefined;
       },
@@ -1499,14 +1533,16 @@ export class McpOauthService {
       },
       clientInformation: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
-        const stored = creds?.clientInformation;
+        const stored = storedClientMatches(creds?.clientInformation, input.oauth)
+          ? creds?.clientInformation
+          : undefined;
         // Token refresh re-reads a plugin secret from its consented file.
         const plugin = stored && pluginClient(input.oauth, await readClientSecret(input.oauth));
         return stored && { ...stored, ...plugin };
       },
       ...(pluginState !== undefined ? { discoveryState: () => Promise.resolve(pluginState) } : {}),
       ...(input.oauth?.resource !== undefined
-        ? { validateResourceURL: () => Promise.resolve(new URL(input.oauth!.resource!)) }
+        ? { validateResourceURL: pluginResourceValidator(input.oauth.resource) }
         : {}),
       saveClientInformation: async (clientInformation) => {
         await this.saveClientInformation({

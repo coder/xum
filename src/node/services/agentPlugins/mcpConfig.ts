@@ -692,14 +692,20 @@ export async function loadPluginMcpServers(
       // DCR cover what the config omits. Messages name fields, never values
       // (see openaiMcpAuth's SECURITY AUDIT).
       const auth = readOpenAIMcpAuth(entry.extensions);
-      const oauth = toServerOAuthConfig(
-        auth.auth,
-        codex.hasClientSecret === true
-          ? { pluginRoot: plugin.rootPath, mcpConfigPath: plugin.mcpConfigPath, serverName }
-          : undefined
-      );
+      const { config: oauth, ignored: unusable } = toServerOAuthConfig(auth.auth, {
+        serverUrl: info.url,
+        ...(codex.hasClientSecret === true
+          ? {
+              clientSecretSource: {
+                pluginRoot: plugin.rootPath,
+                mcpConfigPath: plugin.mcpConfigPath,
+                serverName,
+              },
+            }
+          : {}),
+      });
       if (oauth !== undefined) info.oauth = oauth;
-      const ignored = [...codex.ignored, ...auth.ignored];
+      const ignored = [...codex.ignored, ...auth.ignored, ...unusable];
       if (codex.hasClientSecret === true && oauth?.clientSecretSource === undefined)
         ignored.push("oauth.client_secret (needs client_id)");
       const messages = [...codex.warnings, ...auth.warnings];

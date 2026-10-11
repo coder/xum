@@ -1713,7 +1713,15 @@ export class AgentPluginInstallService {
       return {
         serverName: info.plugin.serverName,
         transport: info.transport === "http" ? "http" : "sse",
-        summary: [info.url, ...[...authHosts].map((host) => `Sign-in at ${host}`)].join("\n"),
+        summary: [
+          info.url,
+          ...[...authHosts].map((host) => `Sign-in at ${host}`),
+          // The token audience, when the plugin narrows or widens it.
+          ...(info.oauth?.resource !== undefined &&
+          new URL(info.oauth.resource).href !== new URL(info.url).href
+            ? [`Token resource: ${info.oauth.resource}`]
+            : []),
+        ].join("\n"),
       };
     }
     // Mirror the runtime's rendering (MCPServerManager shell-quotes every
