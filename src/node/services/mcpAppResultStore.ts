@@ -73,6 +73,8 @@ export class McpAppResultStore {
   private readonly memory = new Map<string, McpAppResultRecord>();
   private readonly modelContexts = new Map<string, readonly McpAppModelContext[]>();
   private readonly modelContextLock = new AsyncMutex();
+  /** The newest queued setModelContext per workspace + view (see its coalescing note). */
+  private readonly latestModelContextUpdate = new Map<string, symbol>();
 
   constructor(private readonly getSessionDir: (workspaceId: string) => string) {}
 
@@ -154,6 +156,10 @@ export class McpAppResultStore {
     } catch {
       // Missing or unreadable: no context.
     }
+    // A setModelContext that finished while this read was pending published newer state than
+    // the file this read may have opened: keep it instead of caching the stale snapshot.
+    const published = this.modelContexts.get(workspaceId);
+    if (published) return published;
     this.modelContexts.set(workspaceId, views);
     return views;
   }
@@ -161,19 +167,30 @@ export class McpAppResultStore {
   /**
    * Replace a view's model context ("Each request overwrites the previous context sent by the
    * View", MCP Apps 2026-01-26); empty text removes it. Durable before it is visible.
+   * Coalesced per view: an update still waiting for the lock when a newer update of the same
+   * view arrives is dropped without a write, because the newer one replaces it anyway. A view
+   * may send many updates a second, and every write is an fsync behind one lock shared by all
+   * workspaces, so obsolete updates must not queue up disk writes.
    */
   async setModelContext(
     workspaceId: string,
     entry: Omit<McpAppModelContext, "updatedAt">
   ): Promise<void> {
+    // Validate before queueing, so an invalid update never supersedes a valid one.
+    const updated =
+      entry.text === ""
+        ? null
+        : McpAppModelContextSchema.parse({ ...entry, updatedAt: Date.now() });
+    const viewKey = `${workspaceId}\0${entry.toolCallId}`;
+    const ticket = Symbol(viewKey);
+    this.latestModelContextUpdate.set(viewKey, ticket);
     await using _lock = await this.modelContextLock.acquire();
+    if (this.latestModelContextUpdate.get(viewKey) !== ticket) return;
+    this.latestModelContextUpdate.delete(viewKey);
     const others = (await this.getModelContexts(workspaceId)).filter(
       (view) => view.toolCallId !== entry.toolCallId
     );
-    const views =
-      entry.text === ""
-        ? others
-        : [McpAppModelContextSchema.parse({ ...entry, updatedAt: Date.now() }), ...others];
+    const views = updated === null ? others : [updated, ...others];
     const kept = views.slice(0, MCP_APP_MODEL_CONTEXT_MAX_VIEWS);
     await ensurePrivateDir(path.dirname(this.modelContextPath(workspaceId)));
     await writeFileAtomic(
