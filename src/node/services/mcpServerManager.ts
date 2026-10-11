@@ -4702,7 +4702,7 @@ export class MCPServerManager {
       (instance) => {
         if (instance.settings?.settingsCapability() === undefined)
           return Promise.resolve(noSettings);
-        source = instance;
+        source = { instance, requestId: this.takeSettingsRequestId(instance, workspaceId) };
         return this.callSettingsTool(instance, workspaceId, "readTool", {}, options);
       },
       (content) => {
