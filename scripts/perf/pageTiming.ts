@@ -25,13 +25,9 @@ import { probe, STATIC_VIEW_ID } from "./pageTimingProbe";
 import { BLOCK_PAIRS, gate, kthLargest, launchPlan, median, type Signal } from "./pageTimingStats";
 
 /** Lighthouse's mobile values, applied as DevTools throttling: real timings, not the simulator's. */
+const viewport = { width: 412, height: 823 };
 const PHONE = {
-  context: {
-    viewport: { width: 412, height: 823 },
-    deviceScaleFactor: 1.75,
-    isMobile: true,
-    hasTouch: true,
-  },
+  context: { viewport, deviceScaleFactor: 1.75, isMobile: true, hasTouch: true },
   network: {
     offline: false,
     latency: 562.5,
@@ -43,6 +39,7 @@ const PHONE = {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 type Values = Partial<core.Run["values"]>;
+type Host = ReturnType<typeof core.qualifyHostPage>;
 type Common = { page: core.Page; out: string; chrome: string };
 
 /** Holds `flock <file>` while fn runs. The holder exits, and frees the lock, when its stdin closes. */
@@ -105,15 +102,17 @@ async function startServer(tree: string, root: string, home: string, logFile: st
       .catch(() => false);
   for (let i = 0; i < 120 && !(await up()); i++) await sleep(500);
   const stop = async () => {
-    process.kill(-server.pid!, "SIGTERM");
-    if (server.exitCode === null) await once(server, "exit");
+    try {
+      process.kill(-server.pid!, "SIGTERM");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; // ESRCH: the group already exited
+    }
+    if (server.exitCode === null && server.signalCode === null) await once(server, "exit");
     // Workspace commands run in their own process groups, so the group kill misses them, and they can
     // still write into the seed after the server exits. All inherit HOME: wait until no process has it.
-    for (let i = 0, left = withEnv(`HOME=${home}`); left.length > 0; i++) {
-      if (i === 100)
-        throw new Error(`${logFile}: ${left.length} process(es) outlived the server by 10 s`);
+    for (let i = 0; withEnv(`HOME=${home}`).length > 0; i++) {
+      if (i === 100) throw new Error(`${logFile}: processes outlived the server by 10 s`);
       await sleep(100);
-      left = withEnv(`HOME=${home}`);
     }
     fs.closeSync(log);
   };
@@ -122,26 +121,21 @@ async function startServer(tree: string, root: string, home: string, logFile: st
 
 /** One navigation with a fresh root (and seed), server and browser. Values in seconds. */
 async function measure(o: Common & { tree: string; mode: Signal; name: string }) {
-  // One lock hold per run, from seed creation to the removal of its folder, so nothing a run does (git in
-  // the seed, server start-up and shutdown) overlaps another holder's run. Never hold it for a block.
+  // One lock hold per run, from seed creation to folder removal, never per block (see the header).
   return withLock(async () => {
     await waitForQuietHost();
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "page-timing-"));
     const [seedDir, log] = [path.join(tmp, "seed"), path.join(o.out, `${o.name}.server.log`)];
-    const seed = o.page === "p2" ? writeNeutralSeed(seedDir) : null;
-    const root = seed?.root ?? path.join(tmp, "root");
-    const home = seed?.home ?? path.join(tmp, "home");
-    const route = seed ? `/workspace/${seed.workspaceId}` : "/";
+    let home = path.join(tmp, "home"); // a P2 run uses its seed's home
     try {
+      const seed = o.page === "p2" ? writeNeutralSeed(seedDir) : null;
+      const root = seed?.root ?? path.join(tmp, "root");
+      home = seed?.home ?? home;
+      const route = seed ? `/workspace/${seed.workspaceId}` : "/";
       const before = seed && snapshotSeed(seedDir);
       for (const dir of [root, home]) fs.mkdirSync(dir, { recursive: true });
       const server = await startServer(o.tree, root, home, log);
-      let values: Values;
-      try {
-        values = await browse(o, `${server.origin}${route}`);
-      } finally {
-        await server.stop();
-      }
+      const values = await browse(o, `${server.origin}${route}`).finally(server.stop);
       const now = (rel: string) => fs.readFileSync(path.join(seedDir, rel));
       const rewrites = before ? core.seedRewrites(diffSeed(before, seedDir), before, now) : [];
       if (rewrites.length > 0) throw new Error(`${o.name}: a build rewrote the seed: ${rewrites}`);
@@ -162,23 +156,18 @@ async function browse(o: Parameters<typeof measure>[0], url: string): Promise<Va
     const { mode, page } = o;
     const arg = { target: core.TARGET[page], mode, page, staticViewId: STATIC_VIEW_ID };
     // tsx (esbuild keepNames) wraps the probe's inner functions in __name(), which the page lacks.
-    await context.addInitScript({
-      content: `var __name = (f) => f; (${probe})(${JSON.stringify(arg)})`,
-    });
+    const content = `var __name = (f) => f; (${probe})(${JSON.stringify(arg)})`;
+    await context.addInitScript({ content });
     const tab = await context.newPage();
-    tab.on("response", (response) => {
-      if (response.fromServiceWorker()) fromWorker++;
-    });
+    tab.on("response", (r) => (fromWorker += r.fromServiceWorker() ? 1 : 0));
     const cdp = await context.newCDPSession(tab);
     await cdp.send("Network.enable");
     await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
     await cdp.send("Network.emulateNetworkConditions", PHONE.network);
     await cdp.send("Emulation.setCPUThrottlingRate", { rate: PHONE.cpuSlowdown });
     await tab.goto(url, { waitUntil: "load", timeout: 180_000 });
-    const done =
-      o.mode === "ucs"
-        ? "r.visibleLive !== null && r.elementTiming.some((e) => e.live)"
-        : "r.ir !== null";
+    const ucsDone = "r.visibleLive !== null && r.elementTiming.some((e) => e.live)";
+    const done = o.mode === "ucs" ? ucsDone : "r.ir !== null";
     await tab.waitForFunction(`((r) => !!r && ${done})(window.__pageTiming)`, null, {
       timeout: 120_000,
     });
@@ -212,6 +201,17 @@ async function block(o: Common & { base: string; head: string; label: string }) 
   return { ucs: d("ucs"), ucsLive: d("ucsLive"), ir: d("ir") };
 }
 
+/** The file's entry for the page if it can gate a run: qualified, with finite MDIs. Else null. */
+function qualifiedEntry(file: string, page: core.Page) {
+  try {
+    const q = JSON.parse(fs.readFileSync(file, "utf8"))[page] as Host;
+    const ok = [q.mdi.ucs, q.mdi.ir].every((v) => typeof v === "number" && v >= 0 && v < Infinity);
+    return q.qualification === "qualified" && ok ? q : null;
+  } catch {
+    return null; // unreadable, not JSON, or no entry or MDIs for the page
+  }
+}
+
 async function main(): Promise<number> {
   const { values: a } = parseArgs({
     options: {
@@ -230,12 +230,14 @@ async function main(): Promise<number> {
   const keys = pages.flatMap((p) => [`${p}.ucs`, `${p}.ir`]);
   const cli = (t?: string) => (t ? path.resolve(t, "dist/cli/index.js") : "");
   const missing = [cli(a.base), cli(a.head)].filter((f) => f && !fs.existsSync(f));
+  const host = a.qualification ? qualifiedEntry(a.qualification, pages[0]) : null;
   const errors = [
     !a.base || !a.head ? "--base and --head are required" : "",
     missing.length > 0 ? `not a built tree, missing: ${missing.join(", ")}` : "",
     pages.some((p) => !(p in core.TARGET)) ? `unknown page in --pages ${a.pages}` : "",
     a.aa && a.qualification ? "--aa and --qualification exclude each other" : "",
     a.qualification && pages.length !== 1 ? "a gated run takes one page (--pages p1)" : "",
+    a.qualification && !host ? `${a.qualification} has no qualified ${pages[0]} entry` : "",
     a.predict && !a.qualification ? "--predict needs --qualification" : "",
     [...predict].some(([k, v]) => !keys.includes(k) || !(+v > 0)) ? "bad --predict keys" : "",
   ].filter(Boolean);
@@ -246,7 +248,6 @@ async function main(): Promise<number> {
   const out = path.resolve(a.out ?? fs.mkdtempSync(path.join(os.tmpdir(), "page-timing-out-")));
   fs.mkdirSync(out, { recursive: true });
   const common = { base: path.resolve(a.base), head: path.resolve(a.head), out, chrome: a.chrome };
-  const host = a.qualification ? JSON.parse(fs.readFileSync(a.qualification, "utf8")) : null;
   const summary: Record<string, unknown> = {};
   let failed = false;
   for (const page of pages) {
@@ -266,10 +267,8 @@ async function main(): Promise<number> {
     }
     const gates = (["ucs", "ir"] as const).map((signal) => {
       const d = blocks[0][signal];
-      const saving = predict.get(`${page}.${signal}`);
-      const predictedSaving = saving === null ? null : Number(saving);
-      const verdict =
-        host && gate({ ...host[page], mdi: host[page].mdi[signal], signal, d, predictedSaving });
+      const predictedSaving = Number(predict.get(`${page}.${signal}`)) || null; // validated > 0
+      const verdict = host && gate({ ...host, mdi: host.mdi[signal], signal, d, predictedSaving });
       failed ||= !!verdict && verdict.verdict !== "pass";
       const result = verdict ? `${verdict.verdict} (${verdict.rule})` : "not gated";
       console.log(
