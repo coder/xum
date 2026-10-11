@@ -104,7 +104,8 @@ describe("runMessageSendHooks", () => {
     });
   });
 
-  test("a throwing consumer fails open: the message goes out unchanged", async () => {
+  test("a throwing consumer is skipped: a healthy plugin's context still applies", async () => {
+    // Each message.send consumer fails open on its own (PRRT_kwDOPxxmWM6rPqnn).
     const spine = new EventSpine();
     spine.useBefore("message.send", (ctx) => {
       ctx.additionalContext.push({ pluginId: "healthy", text: "from a healthy plugin" });
@@ -113,6 +114,9 @@ describe("runMessageSendHooks", () => {
       throw new Error("broken plugin");
     });
 
-    expect(await runMessageSendHooks(spine, "ws", input)).toEqual({ kind: "none" });
+    expect(await runMessageSendHooks(spine, "ws", input)).toEqual({
+      kind: "context",
+      entries: [{ pluginId: "healthy", text: "from a healthy plugin" }],
+    });
   });
 });
