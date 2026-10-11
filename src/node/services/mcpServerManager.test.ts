@@ -726,13 +726,20 @@ describe("MCPServerManager", () => {
     const signal = new AbortController().signal;
     const call = (tool: string) =>
       manager.callToolForPluginHook(workspaceId, key, tool, {}, { signal });
+    const canCall = (tool: string) => manager.canCallToolForPluginHook(workspaceId, key, tool);
     expect(await call("check")).toEqual({ content: [] });
+    expect(canCall("check")).toBe(true);
 
     // The workspace allowlist narrows the hook's server: its tool is refused at the call.
     await manager.applyWorkspaceOverrides(workspaceId, { toolAllowlist: { [key]: ["other"] } });
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(call("check")).rejects.toThrow("disabled");
     expect(await call("other")).toEqual({ content: [] });
+    expect([canCall("check"), canCall("other")]).toEqual([false, true]);
+
+    // The user turns the server off: no tool of it can be called.
+    await manager.applyWorkspaceOverrides(workspaceId, { disabledServers: [key] });
+    expect(canCall("other")).toBe(false);
   });
 
   test("a plugin hook call re-checks enablement at dispatch: a server disabled after the serve is refused", async () => {
