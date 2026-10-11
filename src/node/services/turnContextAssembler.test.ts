@@ -509,6 +509,23 @@ describe("assemblePromptPayload", () => {
     expect(withContext.system).toEqual(plain.system);
   });
 
+  test("request context keeps every part of the user message it merges into", async () => {
+    const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
+    const svg = `data:image/svg+xml;base64,${Buffer.from("<svg><text>SVG-BODY</text></svg>").toString("base64")}`;
+    const history = [
+      createMuxMessage("u1", "user", "NEWEST", undefined, [
+        { type: "file", mediaType: "image/svg+xml", url: svg, filename: "chart.svg" },
+      ]),
+    ];
+    const payload = await assemble({ history, requestContextMessage: context });
+    expect(payload.messages.map((m) => m.role)).toEqual(["user"]);
+    const wire = JSON.stringify(payload.messages);
+    // The SVG reaches the provider as text, after the context and the user's own text.
+    expect(wire).toContain("SVG-BODY");
+    expect(wire.indexOf("VIEW-CONTEXT")).toBeLessThan(wire.indexOf("NEWEST"));
+    expect(wire.indexOf("NEWEST")).toBeLessThan(wire.indexOf("SVG-BODY"));
+  });
+
   test("puts request context before the request a trailing partial assistant continues", async () => {
     const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
     // The refusal fallback (and an interrupted turn) ends the history in the partial reply.
