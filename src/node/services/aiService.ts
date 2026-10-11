@@ -5,6 +5,7 @@ import {
   type RequestAssemblySnapshot,
   type TurnStopContext,
 } from "./events/eventSpine";
+import { codexPluginHookService } from "./agentPlugins/codexHookService";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import {
   runMessageSendHooks,
@@ -531,6 +532,12 @@ export class AIService extends EventEmitter {
     if (snapshot?.success === false) {
       log.debug("Prompt hooks: hook setup skipped", { workspaceId, error: snapshot.error });
     }
+    // Codex UserPromptSubmit hooks call their plugin's MCP server, which the turn only starts
+    // after this chain: start it first (the turn's own startup, bounded), or the first prompt
+    // after a restart misses the hooks.
+    await codexPluginHookService.prepareForPromptHooks(workspaceId, (signal) =>
+      this.turnRequestBuilder.startWorkspaceMcpServers(workspaceId, signal)
+    );
     return runMessageSendHooks(eventSpine, workspaceId, input);
   }
 

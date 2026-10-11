@@ -735,6 +735,55 @@ export class TurnRequestBuilder {
     };
   }
 
+  /**
+   * Start this workspace's MCP servers exactly as a send's request build does (same inputs to
+   * MCPServerManager.getToolsForWorkspace), so the same servers start and no others. Codex plugin
+   * hooks on UserPromptSubmit run before request building and need their plugin's server, which
+   * after a restart is not running yet. Returns false when the workspace is not ready for MCP
+   * (init failed, unsanitized checkout, runtime not ready, no MCP manager).
+   */
+  async startWorkspaceMcpServers(workspaceId: string, signal: AbortSignal): Promise<boolean> {
+    const mcpServerManager = this.dependencies.bindings.mcpServerManager;
+    if (mcpServerManager === undefined) return false;
+    const metadataResult = await this.dependencies.getWorkspaceMetadata(workspaceId);
+    if (!metadataResult.success) return false;
+    const metadata = metadataResult.data;
+    const runtimeContext = this.dependencies.createWorkspaceRuntimeContext(workspaceId, metadata);
+    if (!runtimeContext.success) return false;
+    const { runtime, workspacePath, hostCheckoutRoot } = runtimeContext.data;
+    await this.dependencies.initStateManager.waitForInit(workspaceId, signal);
+    if (this.dependencies.initStateManager.getUnsanitizedCheckoutError(workspaceId)) return false;
+    const ready = await runtime.ensureReady({ signal });
+    if (!ready.ready || signal.aborted) return false;
+    const readStartedAt = Date.now();
+    const read = await this.dependencies.workspaceMcpOverridesService
+      .getOverridesForWorkspace(workspaceId, { timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS, signal })
+      .catch(() => ({ overrides: undefined, authoritative: false }));
+    const projectSecrets = isMultiProject(metadata)
+      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
+      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
+    await mcpServerManager.getToolsForWorkspace(
+      {
+        workspaceId,
+        projectPath: metadata.projectPath,
+        runtime,
+        workspacePath,
+        trusted: isWorkspaceProjectTrusted(this.dependencies.config, metadata),
+        overrides: read.overrides,
+        overridesAuthoritative: read.authoritative,
+        ...(read.authoritative
+          ? {}
+          : { overridesReadDeadlineAt: readStartedAt + MCP_OVERRIDES_READ_TIMEOUT_MS }),
+        projectSecrets: await secretsToRecord(projectSecrets),
+        agentPlugins: hostCheckoutRoot
+          ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
+          : null,
+      },
+      { signal }
+    );
+    return true;
+  }
+
   prepareModelAttempt(options: PrepareModelAttemptOptions): PreparedModelAttempt {
     const buildProviderOptionsStartedAt = Date.now();
     const providerOptions = buildProviderOptions(

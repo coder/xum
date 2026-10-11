@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { EventSpine, type ToolExecuteContext } from "@/node/services/events/eventSpine";
+import { runMessageSendHooks } from "./promptHooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { CodexPluginHookService, type EnsureCodexHooksArgs } from "./codexHookService";
@@ -40,7 +41,14 @@ describe("CodexPluginHookService", () => {
   const pluginRoot = (name: string) => path.join(xumHome, "plugins", name);
   const instanceId = (name: string) => computePluginInstanceId(pluginRoot(name));
 
-  async function writePlugin(name: string, server: string, managed = true) {
+  async function writePlugin(
+    name: string,
+    server: string,
+    managed = true,
+    document: unknown = {
+      hooks: { PreToolUse: [{ hooks: [{ type: "mcp_tool", server, tool: "check" }] }] },
+    }
+  ) {
     await fs.mkdir(path.join(pluginRoot(name), "hooks"), { recursive: true });
     await fs.writeFile(
       path.join(pluginRoot(name), "plugin.json"),
@@ -48,9 +56,7 @@ describe("CodexPluginHookService", () => {
     );
     await fs.writeFile(
       path.join(pluginRoot(name), "hooks", "hooks.json"),
-      JSON.stringify({
-        hooks: { PreToolUse: [{ hooks: [{ type: "mcp_tool", server, tool: "check" }] }] },
-      })
+      JSON.stringify(document)
     );
     if (!managed) return;
     const registryPath = path.join(xumHome, PLUGIN_REGISTRY_FILE_NAME);
@@ -213,5 +219,115 @@ describe("CodexPluginHookService", () => {
 
     expect((await runBash()).executed).toBe(true);
     expect(calledKeys).toEqual([]);
+  });
+
+  describe("UserPromptSubmit after a restart", () => {
+    const promptPlugin = (timeout?: number) =>
+      writePlugin("guard", "scanner", true, {
+        hooks: {
+          UserPromptSubmit: [
+            {
+              hooks: [
+                {
+                  type: "mcp_tool",
+                  server: "scanner",
+                  tool: "check",
+                  ...(timeout !== undefined ? { timeout } : {}),
+                },
+              ],
+            },
+          ],
+        },
+      });
+    let serverRunning: boolean;
+    const promptArgs = (): EnsureCodexHooksArgs => ({
+      ...args(),
+      mcp: {
+        // Like MCPServerManager.callToolForPluginHook: a server that is not running is refused.
+        callToolForPluginHook: (_workspaceId, serverKey) => {
+          calledKeys.push(serverKey);
+          return serverRunning
+            ? Promise.resolve({ structuredContent: { decision: "block", reason: "No secrets." } })
+            : Promise.reject(new Error(`MCP server '${serverKey}' is not running`));
+        },
+      },
+    });
+    const send = () => runMessageSendHooks(spine, workspaceId, { text: "key=abc", origin: "user" });
+
+    beforeEach(() => {
+      serverRunning = false;
+    });
+
+    test("the hooks wait for the turn's MCP startup, so the first prompt is checked", async () => {
+      await promptPlugin();
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(promptArgs());
+      const startServers = async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        serverRunning = true;
+        return true;
+      };
+
+      await service.prepareForPromptHooks(workspaceId, startServers);
+
+      expect(await send()).toMatchObject({ kind: "blocked", reason: "No secrets." });
+    });
+
+    test("without the wait the hook would miss the first prompt (fails open)", async () => {
+      await promptPlugin();
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(promptArgs());
+
+      expect(await send()).toEqual({ kind: "none" });
+      expect(calledKeys).toHaveLength(1);
+    });
+
+    test("a slow startup is bounded by the hook timeout, then the hook fails open", async () => {
+      await promptPlugin(0.05);
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(promptArgs());
+      let aborted = false;
+      const startServers = (signal: AbortSignal) =>
+        new Promise<boolean>((resolve) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            resolve(false);
+          });
+        });
+
+      const started = performance.now();
+      await service.prepareForPromptHooks(workspaceId, startServers);
+
+      expect(performance.now() - started).toBeLessThan(1_000);
+      expect(aborted).toBe(true);
+      expect(await send()).toEqual({ kind: "none" });
+    });
+
+    test("a failed startup is logged and the hooks still run", async () => {
+      await promptPlugin();
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(promptArgs());
+
+      await service.prepareForPromptHooks(workspaceId, () =>
+        Promise.reject(new Error("runtime not ready"))
+      );
+
+      expect(await send()).toEqual({ kind: "none" });
+      expect(calledKeys).toHaveLength(1);
+    });
+
+    test("no UserPromptSubmit hook: nothing is started", async () => {
+      await writePlugin("guard", "scanner");
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(args());
+      let starts = 0;
+
+      await service.prepareForPromptHooks(workspaceId, () => {
+        starts++;
+        return Promise.resolve(true);
+      });
+
+      expect(starts).toBe(0);
+    });
   });
 });
