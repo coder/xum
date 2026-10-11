@@ -1525,6 +1525,14 @@ test("U1: the Docker preflight reports an unknown cleanup instead of a refusal o
     expect(await checkDocker(o).catch((e: unknown) => e)).toBeInstanceOf(Refusal);
     ensure.mockResolvedValue("ref");
     expect(await checkDocker(o)).toBe("none");
+    // A stop that lands during the cleanup still ends the preflight as a stop.
+    const stop = new AbortController();
+    cleanup.mockImplementation(() => {
+      stop.abort("SIGINT");
+      return Promise.resolve("none");
+    });
+    const stopped = await checkDocker({ ...o, stop: stop.signal }).catch((e: unknown) => e);
+    expect(stopped).toBeInstanceOf(Stopped);
   } finally {
     ensure.mockRestore();
     cleanup.mockRestore();

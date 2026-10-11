@@ -203,6 +203,8 @@ export async function checkDocker(o: { root: string; stop: AbortSignal }): Promi
     if (failure) logLine(`preflight: ${String(failure.error)}`);
     return cleanup;
   }
+  // A stop during the check or its cleanup wins over a refusal or success: no build after it.
+  if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
   if (failure) throw failure.error;
   return cleanup;
 }
