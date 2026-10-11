@@ -1,5 +1,6 @@
 import type { CompactionHandler } from "../../compactionHandler";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
+import { providerVisibleUserText } from "@/common/utils/messages/pluginHookContext";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { isSyntheticSnapshotUserMessage } from "@/common/types/message";
 import { createUserMessageId } from "../../utils/messageIds";
@@ -217,9 +218,7 @@ export class TokenBudgetStrategy {
     // overhead. Keep the model-scaled floor; final assembly checks the actual prompt.
     const estimate = await estimateFreshRequestTokensForModel(
       {
-        userText: userMessage.parts
-          .flatMap((part) => (part.type === "text" ? [part.text] : []))
-          .join("\n"),
+        userText: providerVisibleUserText(userMessage),
         attachments: userMessage.parts.filter((part) => part.type === "file"),
         prelude: prelude.map((row) => row.parts),
         modelContextLimit: maxTokens,
@@ -322,10 +321,8 @@ export class TokenBudgetStrategy {
       (tokenCount(usage?.input.tokens) ?? 0) +
       (tokenCount(usage?.cached.tokens) ?? 0) +
       (tokenCount(usage?.cacheCreate.tokens) ?? 0);
-    const userText = userMessage.parts
-      .filter((part) => part.type === "text")
-      .map((part) => part.text)
-      .join("\n");
+    // Includes the hook context the request renders into this row.
+    const userText = providerVisibleUserText(userMessage);
     const attachments = userMessage.parts.filter((part) => part.type === "file");
     const budgetModel = {
       model: options.model,
