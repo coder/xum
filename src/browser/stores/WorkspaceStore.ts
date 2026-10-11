@@ -1198,6 +1198,20 @@ export class WorkspaceStore {
       this.cancelPendingIdleBump(workspaceId);
       this.states.bump(workspaceId);
     },
+    // Toast-only events (the aggregator queues the toast and changes no rows). Like stream-error,
+    // a replayed event hydrates without side effects, so a reconnect never re-shows a toast.
+    "plugin-hook-notice": (workspaceId, aggregator, data) => {
+      const transient = this.assertChatTransientState(workspaceId);
+      applyWorkspaceChatEventToAggregator(aggregator, data, {
+        allowSideEffects: !transient.replayingHistory,
+      });
+    },
+    "goal-budget-limited": (workspaceId, aggregator, data) => {
+      const transient = this.assertChatTransientState(workspaceId);
+      applyWorkspaceChatEventToAggregator(aggregator, data, {
+        allowSideEffects: !transient.replayingHistory,
+      });
+    },
     "queued-message-changed": (workspaceId, aggregator, data) => {
       if (!isQueuedMessageChanged(data)) return;
 

@@ -1,3 +1,4 @@
+import { dismissChatError, peekChatError } from "@/browser/utils/chatErrorToasts";
 import { EventEmitter } from "node:events";
 // This integration regression drives the real server replay into the real renderer store.
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only server fixture, never bundled into the renderer
@@ -854,6 +855,58 @@ describe("WorkspaceStore", () => {
 
   afterEach(() => {
     store.dispose();
+  });
+
+  describe("toast-only events through the store", () => {
+    const notice = (workspaceId: string, message: string): WorkspaceChatMessage => ({
+      type: "plugin-hook-notice",
+      workspaceId,
+      plugin: "guard",
+      message,
+    });
+    const budget = (workspaceId: string, message: string): WorkspaceChatMessage => ({
+      type: "goal-budget-limited",
+      workspaceId,
+      goalId: "goal-1",
+      causedByChild: true,
+      childWorkspaceId: "child-1",
+      message,
+    });
+    const drainToasts = (workspaceId: string): string[] => {
+      const shown: string[] = [];
+      for (let message = peekChatError(workspaceId); message != null; ) {
+        shown.push(message);
+        dismissChatError(workspaceId, message);
+        message = peekChatError(workspaceId);
+      }
+      return shown;
+    };
+
+    it("a live plugin hook notice and goal-budget event queue their toasts", async () => {
+      const workspaceId = "live-toast-events";
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+      await send(caughtUpEvent());
+
+      await send(notice(workspaceId, "Checked the command."), budget(workspaceId, "Over budget."));
+
+      expect(drainToasts(workspaceId)).toEqual([
+        "Plugin guard: Checked the command.",
+        "Over budget.",
+      ]);
+    });
+
+    it("replayed notices hydrate without toasts", async () => {
+      const workspaceId = "replayed-toast-events";
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+
+      // Before caught-up the store buffers them, then replays them after history loads.
+      await send(notice(workspaceId, "Old notice."), budget(workspaceId, "Old budget."));
+      await send(caughtUpEvent());
+
+      expect(drainToasts(workspaceId)).toEqual([]);
+    });
   });
 
   it("shows a refused session tape replay as an error and does not retry it", async () => {
