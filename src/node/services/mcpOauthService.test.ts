@@ -14,6 +14,7 @@ import {
 } from "./mcpOauthService";
 import type { OAuthDiscoveryState } from "@modelcontextprotocol/client";
 import { Ok } from "@/common/types/result";
+import type { MCPServerOAuthConfig } from "@/common/types/mcp";
 import type {
   MCPOAuthClientInformation,
   MCPOAuthStoredCredentials,
@@ -969,6 +970,149 @@ describe("McpOauthService OAuth flows", () => {
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  describe("stored credentials serve only the issuer that minted them", () => {
+    const serverUrl = "https://mcp.example.com/mcp";
+    const pinned = (origin: string): MCPServerOAuthConfig => ({
+      clientId: "shared",
+      endpoints: { authorizationUrl: `${origin}/authorize`, tokenUrl: `${origin}/token` },
+    });
+    const issuerA = "https://a.example.com";
+    const seed = async (clientIssuer: string | null = issuerA) =>
+      fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: {
+                client_id: "shared",
+                ...(clientIssuer !== null ? { issuer: clientIssuer } : {}),
+              },
+              tokens: { access_token: "at-a", token_type: "Bearer", issuer: issuerA },
+            },
+          },
+        })
+      );
+    const usable = async (oauth: MCPServerOAuthConfig) =>
+      (await service.getAuthProviderForServer({ serverUrl, oauth })) !== undefined &&
+      (await service.hasAuthTokens({ serverUrl, oauth })) &&
+      (await service.getAuthStatus({ serverUrl, oauth })).isLoggedIn;
+
+    test("a server removed and re-added under another issuer, same client, reuses nothing", async () => {
+      // Removal resets nothing and the re-add finds no previous entry, so the issuer-A
+      // credentials are still stored when the server comes back pinned to issuer B.
+      await seed();
+      expect(await usable(pinned(issuerA))).toBe(true);
+      expect(await usable(pinned("https://b.example.com"))).toBe(false);
+      // A standalone authorizationServerBase pins the issuer too (one trailing slash tolerated).
+      expect(
+        await usable({ clientId: "shared", discovery: { authorizationServerBase: `${issuerA}/` } })
+      ).toBe(true);
+      expect(
+        await usable({
+          clientId: "shared",
+          discovery: { authorizationServerBase: "https://b.example.com" },
+        })
+      ).toBe(false);
+      // Only the tokens carry the stamp (an unstamped client record): still refused for B.
+      await service.dispose();
+      service = new McpOauthService(config, mcpConfigService);
+      await seed(null);
+      expect(await usable(pinned(issuerA))).toBe(true);
+      expect(await usable(pinned("https://b.example.com"))).toBe(false);
+    });
+
+    test("a background refresh that saves after the sign-out is not used for the new issuer", async () => {
+      await seed();
+      const provider = await service.getAuthProviderForServer({
+        serverUrl,
+        oauth: pinned(issuerA),
+      });
+      if (provider === undefined) throw new Error("expected a provider");
+      await service.logout({ serverUrl });
+      // The refresh of the old identity lands after the sign-out (the SDK stamps the issuer).
+      await provider.saveClientInformation?.({ client_id: "shared", issuer: issuerA } as never);
+      await provider.saveTokens({
+        access_token: "late",
+        token_type: "Bearer",
+        issuer: issuerA,
+      } as never);
+      expect(await usable(pinned(issuerA))).toBe(true);
+      expect(await usable(pinned("https://b.example.com"))).toBe(false);
+    });
+
+    test("a sign-in whose probe spans a sign-out writes credentials the new issuer never uses", async () => {
+      let probing!: () => void;
+      const probed = new Promise<void>((resolve) => (probing = resolve));
+      let releaseProbe!: () => void;
+      const release = new Promise<void>((resolve) => (releaseProbe = resolve));
+      const server = createServer((req, res) => {
+        void (async () => {
+          for await (const _chunk of req) {
+            // Drain the body.
+          }
+          const pathname = (req.url ?? "/").split("?")[0];
+          if (pathname === "/token") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ access_token: "late", token_type: "Bearer" }));
+            return;
+          }
+          if (pathname === "/mcp") {
+            probing();
+            await release;
+            res.statusCode = 401;
+            res.end();
+            return;
+          }
+          res.statusCode = 404;
+          res.end();
+        })();
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("Failed to bind");
+        const url = `http://127.0.0.1:${address.port}/mcp`;
+        const configA = pinned(`http://127.0.0.1:${address.port}`);
+        // The same server under another origin: another issuer, the same client ID.
+        const configB = pinned(`http://localhost:${address.port}`);
+        spyOn(mcpConfigService, "listServers").mockResolvedValue({
+          docs: { transport: "http", url, disabled: true, oauth: configA },
+        });
+        const starting = service.startServerFlow({
+          projectPath,
+          serverName: "docs",
+          redirectUri: "https://x/cb",
+        });
+        await probed;
+        // The update's sign-out lands while the flow is still probing.
+        await service.logout({ serverUrl: url });
+        releaseProbe();
+        const start = await starting;
+        if (!start.success) throw new Error(start.error);
+        await service.handleServerCallbackAndExchange({
+          state: start.data.flowId,
+          code: "the-code",
+          iss: null,
+          error: null,
+        });
+        // The old-identity flow did write; only the issuer it carries keeps it from serving B.
+        expect(
+          await service.getAuthProviderForServer({ serverUrl: url, oauth: configA })
+        ).toBeDefined();
+        expect(
+          await service.getAuthProviderForServer({ serverUrl: url, oauth: configB })
+        ).toBeUndefined();
+        expect(await service.hasAuthTokens({ serverUrl: url, oauth: configB })).toBe(false);
+      } finally {
+        releaseProbe();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
   });
 
   test("stored tokens stay bound to the client they were issued to", async () => {
