@@ -216,6 +216,9 @@ export function createMcpAppHost(options: McpAppHostOptions) {
             serverResources: {},
             logging: {},
             openLinks: {},
+            // The modalities ui/update-model-context accepts (McpUiSupportedContentBlockModalities):
+            // text blocks and structuredContent. Other blocks get -32602.
+            updateModelContext: { text: {}, structuredContent: {} },
             sandbox: { csp: options.grantedCsp },
           },
           hostContext: options.getHostContext(),

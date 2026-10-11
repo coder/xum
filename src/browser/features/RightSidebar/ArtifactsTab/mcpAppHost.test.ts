@@ -112,6 +112,7 @@ describe("MCP Apps host router", () => {
       "sandbox",
       "serverResources",
       "serverTools",
+      "updateModelContext",
     ]);
     await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
     await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
@@ -303,6 +304,25 @@ describe("MCP Apps host router", () => {
     for (const id of [1, 2, 3]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
     expect(t.consents).toEqual([]);
     expect(t.composer).toEqual([]);
+  });
+
+  test("a view that checks the host capability before updating model context sends it", async () => {
+    const t = setup();
+    await t.request(1, "ui/initialize", { appInfo: { name: "v" }, protocolVersion: "2026-01-26" });
+    // Gates like an ext-apps view: it sends only the modalities the host advertises.
+    const { hostCapabilities } = t.reply(1)?.result as {
+      hostCapabilities: { updateModelContext?: { text?: object; structuredContent?: object } };
+    };
+    const supported = hostCapabilities.updateModelContext;
+    if (supported !== undefined) {
+      await t.request(2, "ui/update-model-context", {
+        ...(supported.text !== undefined ? { content: [{ type: "text", text: "3 dice" }] } : {}),
+        ...(supported.structuredContent !== undefined
+          ? { structuredContent: { dice: [1, 2, 3] } }
+          : {}),
+      });
+    }
+    expect(t.modelContexts).toEqual(['3 dice\n\n{"dice":[1,2,3]}']);
   });
 
   test("update-model-context replaces the view's context with the latest update", async () => {
