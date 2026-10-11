@@ -119,6 +119,19 @@ function dispatchMuxGatewaySessionExpired(): void {
  * - "immediate": state changed and callers should update UI immediately
  * - "ignored": event does not affect the aggregator
  */
+/**
+ * A hook's systemMessage can be up to 16 KiB, but the chat-input toast has no height limit or
+ * scrolling and an error toast stays until dismissed: a long one covers the chat and pushes its
+ * dismiss control off screen. Show only the start of it.
+ */
+const PLUGIN_HOOK_NOTICE_MAX_CHARS = 500;
+
+function boundPluginHookNotice(message: string): string {
+  if (message.length <= PLUGIN_HOOK_NOTICE_MAX_CHARS) return message;
+  // Cut by code point so the cut never splits a surrogate pair.
+  return `${Array.from(message).slice(0, PLUGIN_HOOK_NOTICE_MAX_CHARS).join("").trimEnd()}…`;
+}
+
 export function applyWorkspaceChatEventToAggregator(
   aggregator: WorkspaceChatEventAggregator,
   event: WorkspaceChatMessage,
@@ -215,7 +228,10 @@ export function applyWorkspaceChatEventToAggregator(
   if (isPluginHookNoticeEvent(event)) {
     // A plugin hook's systemMessage: a toast for the user, never a transcript row.
     if (allowSideEffects)
-      publishChatError(event.workspaceId, `Plugin ${event.plugin}: ${event.message}`);
+      publishChatError(
+        event.workspaceId,
+        `Plugin ${event.plugin}: ${boundPluginHookNotice(event.message)}`
+      );
     return "ignored";
   }
 

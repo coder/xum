@@ -201,6 +201,22 @@ describe("applyWorkspaceChatEventToAggregator", () => {
     expect(peekChatError("ws-notice")).toBeUndefined();
   });
 
+  test("a long plugin hook notice is cut to a toast-safe length", () => {
+    const long = "x".repeat(16 * 1024);
+    applyWorkspaceChatEventToAggregator(new StubAggregator(), {
+      type: "plugin-hook-notice",
+      workspaceId: "ws-long-notice",
+      plugin: "guard",
+      message: long,
+    });
+
+    const shown = peekChatError("ws-long-notice");
+    expect(shown?.startsWith("Plugin guard: xxx")).toBe(true);
+    expect(shown?.endsWith("…")).toBe(true);
+    expect(shown!.length).toBeLessThan(1_000);
+    dismissChatError("ws-long-notice", shown!);
+  });
+
   test("stream-abort clears token state before calling handleStreamAbort", () => {
     const aggregator = new StubAggregator();
 
