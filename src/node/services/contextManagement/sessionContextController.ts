@@ -505,6 +505,7 @@ export class SessionContextController {
         workspaceTurnMetadata: inheritedWorkspaceTurnMetadata,
         autoModelRouting: input.autoModelRouting,
         pluginSendHooksApplied: input.pluginSendHooksApplied,
+        pluginHookContext: input.pluginHookContext,
       });
 
       // Waterfall hook point: lets registered middleware (e.g. refinement

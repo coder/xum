@@ -202,6 +202,7 @@ import {
   type MuxMessageMetadata,
   type MuxFilePart,
   type MuxMessage,
+  type PluginHookContextEntry,
   type StartupRetrySendOptions,
   type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
@@ -497,6 +498,21 @@ function resolveMessageSendOrigin(
     return "task";
   if (internal?.synthetic === true || acceptanceOrigin === "automatic") return "system";
   return "user";
+}
+
+/** Raw JSON boundary for a persisted follow-up's hook context: malformed entries are dropped. */
+function coercePluginHookContext(value: unknown): PluginHookContextEntry[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const entries = value.filter(
+    (entry: unknown): entry is PluginHookContextEntry =>
+      typeof entry === "object" &&
+      entry !== null &&
+      "pluginId" in entry &&
+      typeof entry.pluginId === "string" &&
+      "text" in entry &&
+      typeof entry.text === "string"
+  );
+  return entries.length > 0 ? entries : undefined;
 }
 
 function getGoalStreamOriginKind(input: {
@@ -1060,9 +1076,9 @@ interface SendMessageInternalOptions {
   /**
    * This send's text already went through the message.send prompt hooks (an on-send compaction
    * follow-up re-sending the diverted message): the hooks run once per message, so the session
-   * skips them. Their context already sits in the preserved additionalSystemInstructions.
+   * skips them and keeps the context they added.
    */
-  pluginSendHooksApplied?: true;
+  pluginSendHooksApplied?: { context?: PluginHookContextEntry[] };
 }
 
 /**
@@ -4379,11 +4395,13 @@ export class AgentSession {
     internal: SendMessageInternalOptions | undefined,
     acceptanceOrigin: TurnAcceptanceOrigin
   ): Promise<MessageSendHookOutcome> {
-    if (
-      internal?.pluginSendHooksApplied === true ||
-      this.aiService.runMessageSendHooks == null ||
-      isCompactionRequestMetadata(muxMetadata)
-    ) {
+    const applied = internal?.pluginSendHooksApplied;
+    if (applied != null) {
+      return applied.context != null && applied.context.length > 0
+        ? { kind: "context", entries: applied.context }
+        : { kind: "none" };
+    }
+    if (this.aiService.runMessageSendHooks == null || isCompactionRequestMetadata(muxMetadata)) {
       return { kind: "none" };
     }
     const origin = resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin);
@@ -5399,6 +5417,7 @@ export class AgentSession {
         autoModelRouting: routedOptions.autoModelRoutingRecord,
         // `message` already ran the prompt hooks: the follow-up must not run them again.
         pluginSendHooksApplied: true,
+        pluginHookContext: pluginSend.kind === "context" ? pluginSend.entries : undefined,
         replacement: manualReplacement || automaticReplacement,
         cancelBeforeAcceptance,
       });
@@ -12349,7 +12368,13 @@ export class AgentSession {
       turnAdmission,
       compactionFollowUpSummary: lastMessage,
       // The diverted send already ran the prompt hooks.
-      ...(followUp.pluginSendHooksApplied === true ? { pluginSendHooksApplied: true } : {}),
+      ...(followUp.pluginSendHooksApplied === true
+        ? {
+            pluginSendHooksApplied: {
+              context: coercePluginHookContext(followUp.pluginHookContext),
+            },
+          }
+        : {}),
     });
     if (!sendResult.success) {
       const heartbeatAfterSend = isHeartbeatFollowUp ? heartbeatState() : "on";

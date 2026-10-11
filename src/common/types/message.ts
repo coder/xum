@@ -239,6 +239,8 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
    * a second time. Only Xum sets it (stripClientPluginSendHookFields drops a client's).
    */
   pluginSendHooksApplied?: true;
+  /** The diverted send's prompt-hook context, restored on the redispatched user row. */
+  pluginHookContext?: PluginHookContextEntry[];
 }
 
 /**
