@@ -610,6 +610,8 @@ interface StopContinuationProvenance {
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
   agentInitiated?: boolean;
+  /** The stream was a delegated workspace turn: WorkspaceTurnManager owns its end. */
+  delegatedWorkspaceTurn: boolean;
 }
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
@@ -10052,6 +10054,7 @@ export class AgentSession {
       goalKind: activeStreamGoalKind,
       goalId: this.activeStreamContext?.goalId,
       agentInitiated: this.activeStreamContext?.agentInitiated,
+      delegatedWorkspaceTurn: this.activeStreamContext?.workspaceTurnMetadata != null,
     };
 
     let goalContinuationRequest: {
@@ -10333,7 +10336,10 @@ export class AgentSession {
    * Run the turn.stop prompt hooks (Codex Stop) for a turn that ended normally. A continuation
    * (Codex `decision: "block"`) queues its prompt as a new synthetic user row, at most
    * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Sub-agent turns skip the hooks: TaskService
-   * owns their stream end (Codex has SubagentStop for them).
+   * owns their stream end (Codex has SubagentStop for them). A delegated workspace turn
+   * (`workspace-turn-task`) skips them for the same reason: WorkspaceTurnManager settles its
+   * handle from this stream end, and can remove a disposable workspace, while a slow hook still
+   * runs, so a continuation would arrive after the caller already got the turn as finished.
    */
   private async runTurnStopHooks(
     payload: StreamEndEvent,
@@ -10342,6 +10348,7 @@ export class AgentSession {
   ): Promise<void> {
     if (this.aiService.runTurnStopHooks == null) return;
     if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
+    if (provenance.delegatedWorkspaceTurn) return;
     // A hard Stop can land while a slow hook runs, after the stream ended: it then finds no live
     // stream to supersede and clears the queue before the hook returns. Its epoch fences the
     // continuation instead (rechecked below, after the last await).
