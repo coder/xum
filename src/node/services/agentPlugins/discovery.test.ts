@@ -11,6 +11,7 @@ import {
   setAgentPluginDiscoveryGate,
 } from "./discovery";
 import { bumpContainerMutationEpoch, MUTATION_EPOCH_FILE, STAGING_DIR_NAME } from "./journals";
+import { resolvePluginHookGrants } from "./hookSandbox";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { createTestPluginInstallEntry } from "./testFixtures";
 
@@ -1003,6 +1004,80 @@ describe("discoverAgentPlugins", () => {
     });
   });
 
+  test("a Codex-fallback package gets no Xum hooks, agents, workflows, slash commands or grants", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "hostile");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    for (const dir of ["skills", "agents", "workflows", "hooks"]) {
+      await fs.mkdir(path.join(pluginDir, dir), { recursive: true });
+    }
+    await fs.writeFile(path.join(pluginDir, "hooks.js"), "export default {};", "utf8");
+    await fs.writeFile(path.join(pluginDir, "hooks", "alt.js"), "export default {};", "utf8");
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "hostile",
+        skills: ["./skills/"],
+        extensions: { mux: { hooks: { tools: ["bash"] } } },
+        contributes: {
+          hooks: "hooks/alt.js",
+          slashCommands: [{ name: "x", expansion: "y" }],
+        },
+      }),
+      "utf8"
+    );
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toHaveLength(1);
+    const plugin = result.plugins[0];
+    expect(plugin.codexFallback).toBe(true);
+    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "skills"));
+    expect(plugin.hooksPath).toBeUndefined();
+    expect(plugin.agentsDir).toBeUndefined();
+    expect(plugin.workflowsDir).toBeUndefined();
+    expect(plugin.manifest.contributes?.slashCommands).toBeUndefined();
+    expect(resolvePluginHookGrants(plugin.manifest).bridgeTools.allow).toEqual([]);
+    expect(result.diagnostics.map((d) => d.message)).toEqual([
+      "'contributes' is not supported in .codex-plugin/plugin.json; ignoring",
+      "'extensions.mux' is not supported in .codex-plugin/plugin.json; ignoring",
+    ]);
+  });
+
+  test("a root plugin.json without com.openai takes it from the .codex-plugin overlay", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "overlay");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    const overlay = { name: "other-name", apps: "./.app.json", hooks: "./hooks.js" };
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify(overlay),
+      "utf8"
+    );
+    await fs.writeFile(path.join(pluginDir, "hooks.js"), "export default {};", "utf8");
+
+    const first = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+    // Root identity and components stay canonical; only com.openai comes from the overlay.
+    expect(first.plugins[0]).toMatchObject({
+      name: "overlay",
+      openai: { apps: "./.app.json", hooks: ["./hooks.js"] },
+      hooksPath: path.join(first.plugins[0].rootPath, "hooks.js"),
+    });
+
+    // An inline root com.openai object replaces the overlay entirely.
+    await writePlugin(container, "overlay", {
+      manifest: {
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "overlay",
+        extensions: { "com.openai": { onboardingSkill: "./skills/a/SKILL.md" } },
+      },
+    });
+    const second = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+    expect(second.plugins[0].openai).toEqual({ onboardingSkill: "./skills/a/SKILL.md" });
+  });
+
   test("root plugin.json and mcp.json win over the Codex fallbacks", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");
@@ -1019,6 +1094,25 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins.map((p) => p.name)).toEqual(["root-plugin"]);
     expect(result.plugins[0].mcpConfigPath).toBe(path.join(result.plugins[0].rootPath, "mcp.json"));
+  });
+
+  test("a symlinked .mcp.json keeps the Codex dialect; a root mcp.json does not", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const linked = await writePlugin(container, "linked");
+    await fs.mkdir(path.join(linked, "config"));
+    await fs.writeFile(path.join(linked, "config", "server.json"), "{}", "utf8");
+    await fs.symlink("config/server.json", path.join(linked, ".mcp.json"));
+    await writePlugin(container, "portable", { mcpJson: "{}" });
+
+    const { plugins } = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const byName = new Map(plugins.map((p) => [p.name, p]));
+    expect(byName.get("linked")?.mcpConfigPath).toBe(
+      path.join(byName.get("linked")!.rootPath, "config", "server.json")
+    );
+    expect(byName.get("linked")?.mcpConfigDialect).toBe("codex");
+    expect(byName.get("portable")?.mcpConfigDialect).toBeUndefined();
   });
 
   test("falls back to .mcp.json for a root-manifest plugin without mcp.json", async () => {
