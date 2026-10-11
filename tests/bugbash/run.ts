@@ -55,7 +55,7 @@ import {
   probeApp,
 } from "./sandbox/launch";
 import { Ledger, priced } from "./sandbox/proxyPolicy";
-import { Refusal } from "./sandbox/runner";
+import { Refusal, Stopped } from "./sandbox/runner";
 
 const projectDir = import.meta.dir;
 // Real path: the launcher labels and stages the checkout by it.
@@ -375,8 +375,13 @@ export async function runBugBash(
   }
   // Docker once for the run, before the probe and any folder: not once per charter.
   try {
-    await (deps.checkDocker ?? checkDocker)({ root: repoRoot, stop });
+    const state = await (deps.checkDocker ?? checkDocker)({ root: repoRoot, stop });
+    if (state.startsWith("unknown")) {
+      err(`make bug-bash: Docker check cleanup: ${state}`);
+      return 3;
+    }
   } catch (error) {
+    if (error instanceof Stopped) return stop.reason === "SIGTERM" ? 143 : 130;
     if (!(error instanceof Refusal)) throw error;
     err(`make bug-bash: ${error.message}`);
     return 2;
@@ -464,8 +469,8 @@ export async function runBugBash(
   let unknownCleanup = false;
   const results: CharterResult[] = [];
   let next = 0;
-  /** Jobs that reached the launcher's job run (no refusal or launcher error). */
-  let launched = 0;
+  /** Jobs that ended in a refusal with a known cleanup: nothing else to keep for them. */
+  let refused = 0;
   async function worker(): Promise<void> {
     while (next < jobs.length && !stop.aborted && !halt.signal.aborted) {
       const job = jobs[next++];
@@ -499,7 +504,8 @@ export async function runBugBash(
         const what = error instanceof Refusal ? "refused" : "failed";
         fs.writeSync(fd, `sandbox ${what}: ${message}\n`);
         err(`  ${name}: ${what}: ${message}`);
-      } else launched += 1;
+        if (error instanceof Refusal && !outcome.cleanup.startsWith("unknown")) refused += 1;
+      }
       fs.closeSync(fd);
       if (outcome.cleanup.startsWith("unknown")) unknownCleanup = true;
       // A fault that close() found (a call that outlived it) has no earlier signal.
@@ -526,7 +532,8 @@ export async function runBugBash(
   results.sort((a, b) => jobs.indexOf(a.job) - jobs.indexOf(b.job));
   // Every charter refused and nothing was spent: the folder would hold only the refusals that
   // stderr already shows. A run that made a proxied call keeps it, as the record of that call.
-  if (launched === 0 && !stop.aborted && fault == null && ledger.totals().calls === 0) {
+  // A launcher error or an unknown cleanup keeps the folder: its logs are the diagnostics.
+  if (refused === jobs.length && !stop.aborted && fault == null && ledger.totals().calls === 0) {
     fs.rmSync(runDir, { recursive: true, force: true });
     err("Every charter refused: no run folder kept.");
     return Math.max(2, ...results.map((r) => r.exitCode));

@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { type RunDeps, runBugBash } from "./run";
 import type { JobOutcome, LaunchOptions } from "./sandbox/launch";
 import type { Ledger } from "./sandbox/proxyPolicy";
-import { Refusal } from "./sandbox/runner";
+import { Refusal, Stopped } from "./sandbox/runner";
 
 // run.ts with a fake launcher: no container, no proxy, no model. The launcher's own tests
 // (sandbox/runner.test.ts) cover the job itself.
@@ -47,7 +47,7 @@ function fakeLaunch(
       probes.push(ledger);
       return Promise.resolve({ status: probeStatus, records: [{ outcome: "settled" }] });
     },
-    checkDocker: () => Promise.resolve(),
+    checkDocker: () => Promise.resolve("none"),
     launchJob: async (args, o) => {
       const call = { args, o };
       calls.push(call);
@@ -312,7 +312,10 @@ test("U1: Docker is checked once, before the probe and any folder; --preflight s
 
   const live = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
   let liveChecks = 0;
-  live.deps.checkDocker = () => Promise.resolve(void (liveChecks += 1));
+  live.deps.checkDocker = () => {
+    liveChecks += 1;
+    return Promise.resolve("none");
+  };
   expect(await runBugBash([...charters("a"), "--preflight"], ENV, stop, live.deps)).toBe(0);
   expect(liveChecks).toBe(1);
   expect(live.probes).toHaveLength(0);
@@ -332,4 +335,36 @@ test("U1: a probe the budget refused (HTTP 402) blames the budget, not the key",
   expect(calls).toHaveLength(0);
   expect(lines.join("\n")).toMatch(/BUGBASH_BUDGET_USD \(\$2\) is too small to cover/);
   expect(lines.join("\n")).not.toMatch(/Fix the key/);
+});
+
+test("U1: a stop during the Docker check exits with the signal; an unknown cleanup exits 3", async () => {
+  const stop = new AbortController();
+  const stopped = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  stopped.deps.checkDocker = () => {
+    stop.abort("SIGTERM");
+    return Promise.reject(new Stopped("SIGTERM"));
+  };
+  expect(await runBugBash([...charters("a")], ENV, stop.signal, stopped.deps)).toBe(143);
+  expect(stopped.calls).toHaveLength(0);
+
+  const unknown = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  unknown.deps.checkDocker = () => Promise.resolve("unknown: process groups 7 still run");
+  const live = new AbortController().signal;
+  expect(await runBugBash([...charters("a")], ENV, live, unknown.deps)).toBe(3);
+  expect(unknown.calls).toHaveLength(0);
+  expect(unknown.lines.join("\n")).toContain("process groups 7 still run");
+});
+
+test("U1: a launcher error or an unknown cleanup keeps the run folder and its logs", async () => {
+  const env = { ...ENV, BUGBASH_AI: "mock" };
+  const stop = new AbortController().signal;
+  for (const outcome of [
+    { error: new Error("launcher bug"), cleanup: "none" },
+    { error: new Refusal("x"), cleanup: "unknown: process groups 1 still run" },
+  ] as const) {
+    const { deps, lines } = fakeLaunch(() => outcome);
+    expect(await runBugBash([...charters("a")], env, stop, deps)).toBeGreaterThanOrEqual(3);
+    const runDir = lines.find((line) => line.includes(" -> "))!.split(" -> ")[1];
+    expect(fs.existsSync(path.join(runDir, "findings.md"))).toBe(true);
+  }
 });

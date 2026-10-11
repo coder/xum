@@ -186,15 +186,25 @@ export async function probeApp(
 /**
  * The Docker part of a preflight: the local daemon answers, it is supported, and the pinned
  * image is present (pulled when missing). The Makefile runs it before the build, so a missing
- * daemon refuses in about a second instead of after it. Throws a Refusal; leaves no folder.
+ * daemon refuses in about a second instead of after it. Throws a Refusal (or Stopped); leaves no
+ * folder. Returns the cleanup state: an `unknown` one (a process group still runs) outranks a
+ * refusal, as in launchJob, and the caller exits 3.
  */
-export async function checkDocker(o: { root: string; stop: AbortSignal }): Promise<void> {
+export async function checkDocker(o: { root: string; stop: AbortSignal }): Promise<CleanupState> {
   const session = new Session(o.stop, { root: o.root, log: logLine });
+  let failure: { error: unknown } | undefined;
   try {
     await session.ensureImage();
-  } finally {
-    await session.cleanup();
+  } catch (error) {
+    failure = { error };
   }
+  const cleanup = await session.cleanup();
+  if (cleanup.startsWith("unknown")) {
+    if (failure) logLine(`preflight: ${String(failure.error)}`);
+    return cleanup;
+  }
+  if (failure) throw failure.error;
+  return cleanup;
 }
 
 /** Removes the per-checkout folder and its parent once empty: other jobs may still use them. */
@@ -416,9 +426,9 @@ function checkJob(args: string[], o: LaunchOptions) {
 }
 
 /** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
-export async function preflight(args: string[], o: LaunchOptions): Promise<void> {
+export async function preflight(args: string[], o: LaunchOptions): Promise<CleanupState> {
   checkJob(args, o);
-  await checkDocker(o);
+  return checkDocker(o);
 }
 
 /** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
@@ -633,7 +643,11 @@ if (import.meta.main) {
   const run = recovering
     ? recover(options)
     : checking
-      ? preflight(job, options).then(() => 0)
+      ? preflight(job, options).then((state) => {
+          if (!state.startsWith("unknown")) return 0;
+          logLine(`preflight cleanup: ${state}`);
+          return 3;
+        })
       : launch(args, options);
   run.then(
     (code) => process.exit(code),

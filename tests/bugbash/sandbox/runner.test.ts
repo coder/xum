@@ -5,7 +5,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { startFakeUpstream } from "./fakeUpstream";
-import { exitFor, launch, launchJob, ownerState, probeApp, recover } from "./launch";
+import { checkDocker, exitFor, launch, launchJob, ownerState, probeApp, recover } from "./launch";
 import * as proxyModule from "./proxy";
 import { Ledger } from "./proxyPolicy";
 import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
@@ -1508,4 +1508,26 @@ test("D2: a launcher Refusal after the preflight exits 2 and starts no other job
   expect(await selfCheckExit(new AbortController().signal, (l) => lines.push(l), launch)).toBe(2);
   expect(launches).toBe(1);
   expect(lines.at(-1)).toBe("self-check refused: rootless Docker is not supported");
+});
+
+test("U1: the Docker preflight reports an unknown cleanup instead of a refusal or success", async () => {
+  const ensure = spyOn(Session.prototype, "ensureImage").mockRejectedValue(
+    new Refusal("no daemon")
+  );
+  const cleanup = spyOn(Session.prototype, "cleanup").mockResolvedValue(
+    "unknown: process groups 9 still run"
+  );
+  const error = spyOn(console, "error").mockImplementation(() => undefined);
+  try {
+    const o = { root: fs.realpathSync(root), stop: new AbortController().signal };
+    expect(await checkDocker(o)).toBe("unknown: process groups 9 still run");
+    cleanup.mockResolvedValue("none");
+    expect(await checkDocker(o).catch((e: unknown) => e)).toBeInstanceOf(Refusal);
+    ensure.mockResolvedValue("ref");
+    expect(await checkDocker(o)).toBe("none");
+  } finally {
+    ensure.mockRestore();
+    cleanup.mockRestore();
+    error.mockRestore();
+  }
 });
