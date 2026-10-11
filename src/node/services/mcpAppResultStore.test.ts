@@ -204,7 +204,7 @@ describe("McpAppResultStore model context", () => {
       rename.mockRestore();
     }
     // "a" and "b" were dropped for "c", so they report "c"'s failure, not success.
-    expect(outcomes).toEqual(Array(3).fill("Error: disk full"));
+    expect(outcomes).toEqual(["Error: disk full", "Error: disk full", "Error: disk full"]);
     expect((await store.getModelContexts("ws")).map((v) => v.text)).toEqual(["stored"]);
   });
 

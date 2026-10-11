@@ -81,7 +81,7 @@ export class McpAppResultStore {
    */
   private readonly latestModelContextUpdate = new Map<
     string,
-    { ticket: symbol; outcome: PromiseWithResolvers<void> }
+    { ticket: symbol; outcome: ReturnType<typeof Promise.withResolvers<void>> }
   >();
 
   /**
