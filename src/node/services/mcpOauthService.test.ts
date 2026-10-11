@@ -802,30 +802,21 @@ describe("McpOauthService OAuth flows", () => {
   });
 
   test("logout cancels a sign-in flow already running for that server", async () => {
-    spyOn(mcpConfigService, "listServers").mockResolvedValue({
-      docs: {
-        transport: "http",
-        url: "http://127.0.0.1:9/mcp",
-        disabled: true,
-        oauth: {
-          clientId: "c",
-          endpoints: {
-            authorizationUrl: "http://127.0.0.1:9/authorize",
-            tokenUrl: "http://127.0.0.1:9/token",
-          },
-        },
-      },
-    });
-    const start = await service.startServerFlow({
-      projectPath,
-      serverName: "docs",
-      redirectUri: "https://x/cb",
-    });
-    if (!start.success) throw new Error(start.error);
-    await service.logout({ serverUrl: "http://127.0.0.1:9/mcp/" });
-    expect(await service.waitForServerFlow(start.data.flowId)).toEqual({
-      success: false,
-      error: "Signed out",
+    await withAuthServer(async (base) => {
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: `${base}/mcp`, disabled: true, oauth: { clientId: "c" } },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      await service.logout({ serverUrl: `${base}/mcp/` });
+      expect(await service.waitForServerFlow(start.data.flowId)).toEqual({
+        success: false,
+        error: "Signed out",
+      });
     });
   });
 
@@ -846,6 +837,11 @@ describe("McpOauthService OAuth flows", () => {
           res.end(JSON.stringify({ access_token: "late", token_type: "Bearer" }));
           return;
         }
+        if ((req.url ?? "").startsWith("/.well-known/oauth-authorization-server")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(authServerMetadata(`http://${req.headers.host ?? ""}`)));
+          return;
+        }
         res.statusCode = (req.url ?? "").startsWith("/mcp") ? 401 : 404;
         res.end();
       })();
@@ -860,10 +856,7 @@ describe("McpOauthService OAuth flows", () => {
           transport: "http",
           url: `${base}/mcp`,
           disabled: true,
-          oauth: {
-            clientId: "c",
-            endpoints: { authorizationUrl: `${base}/authorize`, tokenUrl: `${base}/token` },
-          },
+          oauth: { clientId: "c" },
         },
       });
       const start = await service.startServerFlow({
