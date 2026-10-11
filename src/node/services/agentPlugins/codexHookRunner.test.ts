@@ -12,6 +12,7 @@ import {
   registerCodexPluginHooks,
   type CodexHookRunnerDeps,
 } from "./codexHookRunner";
+import { runMessageSendHooks, runTurnStopHooks } from "./promptHooks";
 
 const workspaceId = "ws";
 
@@ -267,16 +268,64 @@ describe("PostToolUse", () => {
   });
 });
 
-test("hooks that cannot run are never called", async () => {
-  const { spine, calls } = setup(
-    [
-      hook("PreToolUse", { status: "unsupported-handler" }),
-      hook("SessionStart", { status: "ignored-event" }),
-    ],
-    () => deny
-  );
-  expect((await runTool(spine, "bash", {})).executed).toBe(true);
-  expect(calls).toEqual([]);
+describe("UserPromptSubmit and Stop", () => {
+  test("UserPromptSubmit blocks, or adds context (JSON or plain text)", async () => {
+    const block = setup([hook("UserPromptSubmit", { input: { p: "${prompt}" } })], () =>
+      json({ decision: "block", reason: "Contains a token." })
+    );
+    expect(
+      await runMessageSendHooks(block.spine, workspaceId, { text: "key=abc", origin: "user" })
+    ).toEqual({
+      kind: "blocked",
+      pluginName: "guard",
+      reason: "Contains a token.",
+    });
+    expect(block.calls).toEqual([{ p: "key=abc" }]);
+
+    const plain = setup([hook("UserPromptSubmit")], () => ({
+      content: [{ type: "text", text: "Ask for a repro first." }],
+    }));
+    expect(
+      await runMessageSendHooks(plain.spine, workspaceId, { text: "fix", origin: "user" })
+    ).toEqual({
+      kind: "context",
+      entries: [{ pluginId: "guard", text: "Ask for a repro first." }],
+    });
+  });
+
+  test("Stop: decision block continues with the reason; continue false halts", async () => {
+    const input = { messageId: "a1", lastAssistantMessage: "done", stopHookActive: false };
+    const more = setup([hook("Stop", { input: { last: "${last_assistant_message}" } })], () =>
+      json({ decision: "block", reason: "Run the tests again." })
+    );
+    expect(await runTurnStopHooks(more.spine, workspaceId, input)).toEqual({
+      kind: "continue",
+      prompt: "Run the tests again.",
+    });
+    expect(more.calls).toEqual([{ last: "done" }]);
+
+    // One hook asks to continue, another says continue: false: the halt wins (Codex).
+    const halt = setup(
+      [hook("Stop", { key: "a", input: { n: 1 } }), hook("Stop", { key: "b", input: { n: 2 } })],
+      (input) =>
+        input.n === 1
+          ? json({ decision: "block", reason: "Run the tests again." })
+          : { structuredContent: { continue: false } }
+    );
+    expect(await runTurnStopHooks(halt.spine, workspaceId, input)).toEqual({ kind: "none" });
+  });
+
+  test("hooks that cannot run are never called", async () => {
+    const { spine, calls } = setup(
+      [
+        hook("PreToolUse", { status: "unsupported-handler" }),
+        hook("SessionStart", { status: "ignored-event" }),
+      ],
+      () => deny
+    );
+    expect((await runTool(spine, "bash", {})).executed).toBe(true);
+    expect(calls).toEqual([]);
+  });
 });
 
 describe("expandHookTemplate", () => {

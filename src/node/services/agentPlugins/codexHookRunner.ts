@@ -1,6 +1,7 @@
 /**
- * Runs trusted Codex-format `mcp_tool` hooks (hooks.json) on Xum's hook points: PreToolUse and
- * PostToolUse on `tool.execute`. Source: https://learn.chatgpt.com/docs/hooks.
+ * Runs trusted Codex-format `mcp_tool` hooks (hooks.json) on Xum's hook points:
+ * PreToolUse and PostToolUse on `tool.execute`, UserPromptSubmit on `message.send`, and Stop on
+ * `turn.stop`. Source: https://learn.chatgpt.com/docs/hooks.
  *
  * Security (the fix for #6042's P1-a and P1-b): `deps.isHookAllowed` runs before EACH call. It
  * reads the trust store and the plugin and project state at that moment, never a snapshot from
@@ -87,6 +88,66 @@ export function registerCodexPluginHooks(
       spine.use(
         "tool.execute",
         (ctx, next) => runToolHooks(ctx, next, pre, post, registration),
+        scope
+      )
+    );
+  }
+  const prompt = forEvent("UserPromptSubmit");
+  if (prompt.length > 0) {
+    unregisters.push(
+      spine.useBefore(
+        "message.send",
+        async (ctx) => {
+          for (const hook of prompt) {
+            const output = await invoke(
+              hook,
+              { prompt: ctx.text },
+              "UserPromptSubmit",
+              registration
+            );
+            if (output === null) continue;
+            if (output.decision === "block" || output.continue === false) {
+              ctx.blocked = {
+                pluginName: registration.pluginName,
+                reason: output.reason ?? output.stopReason ?? "Blocked by a plugin hook.",
+              };
+              return;
+            }
+            if (output.additionalContext !== undefined) {
+              ctx.additionalContext.push({
+                pluginId: registration.pluginName,
+                text: output.additionalContext,
+              });
+            }
+          }
+        },
+        scope
+      )
+    );
+  }
+  const stop = forEvent("Stop");
+  if (stop.length > 0) {
+    unregisters.push(
+      spine.useBefore(
+        "turn.stop",
+        async (ctx) => {
+          for (const hook of stop) {
+            const output = await invoke(
+              hook,
+              {
+                stop_hook_active: ctx.stopHookActive,
+                last_assistant_message: ctx.lastAssistantMessage,
+              },
+              "Stop",
+              registration
+            );
+            if (output === null) continue;
+            if (output.continue === false) ctx.halted = { pluginName: registration.pluginName };
+            else if (output.decision === "block" && output.reason !== undefined) {
+              ctx.continueReasons.push(output.reason);
+            }
+          }
+        },
         scope
       )
     );
