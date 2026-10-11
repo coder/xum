@@ -47,8 +47,18 @@ const IGNORED_CODEX_HOOK_EVENTS = new Set([
   "Interrupt",
 ]);
 
+/** Codex ignores the matcher on these events (codex-rs/hooks/src/events/common.rs). */
+const MATCHERLESS_CODEX_HOOK_EVENTS = new Set(["UserPromptSubmit", "Stop", "Interrupt"]);
+
 const DEFAULT_HOOKS_FILE = "hooks/hooks.json";
 const MAX_HOOKS_FILE_BYTES = 256 * 1024;
+/**
+ * Bounds for one plugin. Install Preview loads the hooks of an untrusted repository, and a
+ * 256 KiB manifest can repeat one path tens of thousands of times: without them one Preview
+ * could reread the same file each time and exhaust the backend's memory.
+ */
+const MAX_HOOK_POINTER_ENTRIES = 32;
+const MAX_PLUGIN_HOOKS = 256;
 
 /** A parsed hook; the trust review state is added by pluginHookTrust.ts. */
 export type PluginHookDefinition = Omit<AgentPluginHook, "review">;
@@ -103,11 +113,30 @@ export async function loadPluginCodexHooks(
   const hooks: PluginHookDefinition[] = [];
   const pointer = readOpenAIHooksPointer(plugin.manifest, warnings);
   const entries = pointer ?? [DEFAULT_HOOKS_FILE];
-  for (const [index, entry] of entries.entries()) {
+  if (entries.length > MAX_HOOK_POINTER_ENTRIES) {
+    warnings.push(
+      `'extensions["com.openai"].hooks' has ${entries.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
+    );
+  }
+  const seenFiles = new Set<string>();
+  for (const [index, entry] of entries.slice(0, MAX_HOOK_POINTER_ENTRIES).entries()) {
+    if (hooks.length > MAX_PLUGIN_HOOKS) break;
     if (typeof entry !== "string") {
       parseHooksDocument(entry, `plugin.json#hooks[${index}]`, hooks, warnings);
       continue;
     }
+    // A hook key is `<source>#<event>[group][handler]`, and an inline source is
+    // `plugin.json#hooks[i]`. A file path with `#` could produce an inline source's keys and
+    // share or overwrite its trust, so such paths are refused.
+    if (entry.includes("#")) {
+      warnings.push(`${entry}: a hooks file path must not contain '#'; ignoring it`);
+      continue;
+    }
+    if (seenFiles.has(path.normalize(entry))) {
+      warnings.push(`${entry} is listed more than once; reading it once`);
+      continue;
+    }
+    seenFiles.add(path.normalize(entry));
     const content = await readHooksFile(plugin.rootPath, entry, pointer == null, warnings);
     if (content === undefined) continue;
     let document: unknown;
@@ -118,6 +147,10 @@ export async function loadPluginCodexHooks(
       continue;
     }
     parseHooksDocument(document, path.normalize(entry), hooks, warnings);
+  }
+  if (hooks.length > MAX_PLUGIN_HOOKS) {
+    warnings.push(`More than ${MAX_PLUGIN_HOOKS} hooks; ignoring the rest`);
+    hooks.length = MAX_PLUGIN_HOOKS;
   }
   return { hooks, warnings };
 }
@@ -194,10 +227,16 @@ function parseMatcherGroup(
     return;
   }
   // Codex treats "*", "" and an omitted matcher as match-all, and "*" is not a valid regex.
-  // All three become "no matcher", which the runtime matches against every tool.
+  // All three become "no matcher", which the runtime matches against every tool. On the events
+  // where Codex ignores the matcher, an invalid one must not drop the group, so it is ignored too.
   let matcher: string | undefined;
-  if (group.matcher !== undefined && group.matcher !== "*" && group.matcher !== "") {
-    if (typeof group.matcher !== "string" || !isValidRegex(group.matcher)) {
+  if (
+    group.matcher !== undefined &&
+    group.matcher !== "*" &&
+    group.matcher !== "" &&
+    !MATCHERLESS_CODEX_HOOK_EVENTS.has(event)
+  ) {
+    if (typeof group.matcher !== "string" || !isValidHookMatcher(group.matcher)) {
       warnings.push(`${source}: a '${event}' matcher is not a valid regex; ignoring its group`);
       return;
     }
@@ -277,9 +316,30 @@ function parseHandler(
   return undefined;
 }
 
-function isValidRegex(pattern: string): boolean {
+/**
+ * Compile a hook matcher the way Codex reads it (codex-rs/hooks/src/engine/matcher.rs). Codex
+ * matchers use Rust `regex` syntax; Xum compiles them as JavaScript RegExps, with two rules:
+ * - A list of names (only letters, digits, `_` and `|`, e.g. `Bash|Edit`) matches one of the
+ *   names exactly, not as a substring.
+ * - A leading inline-flag group of `i`, `m` and `s` (e.g. `(?i)`, `(?is)`) becomes RegExp flags.
+ * Rust-only syntax that is not translated, so JavaScript rejects it (the group is dropped with a
+ * warning) or reads it differently: inline flags after the start or negated (`(?-i)`), the `x`,
+ * `U`, `u` and `R` flags, scoped flag groups `(?i:...)`, `\A` and `\z`, `(?P<name>...)`,
+ * one-letter classes such as `\pL`, POSIX classes such as `[[:alpha:]]`, and the class set
+ * operators `&&`, `--` and `~~`.
+ * Callers handle match-all ("*", "" or no matcher) first. Throws a SyntaxError when JavaScript
+ * cannot compile the pattern.
+ */
+export function compileHookMatcher(pattern: string): RegExp {
+  if (/^[A-Za-z0-9_|]+$/.test(pattern)) return new RegExp(`^(?:${pattern})$`);
+  const flags = /^\(\?([ims]+)\)/.exec(pattern);
+  if (flags === null) return new RegExp(pattern);
+  return new RegExp(pattern.slice(flags[0].length), [...new Set(flags[1])].join(""));
+}
+
+function isValidHookMatcher(pattern: string): boolean {
   try {
-    new RegExp(pattern);
+    compileHookMatcher(pattern);
     return true;
   } catch {
     return false;

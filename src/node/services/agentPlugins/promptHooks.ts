@@ -18,30 +18,54 @@ import type { PluginHookContextEntry } from "@/common/types/message";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
-import { renderPluginHookContextEntry } from "@/node/utils/messages/renderPluginHookContextForProvider";
+import {
+  PLUGIN_HOOK_CONTEXT_MAX_CHARS,
+  renderPluginHookContextEntry,
+} from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 /** Block reasons are shown to the user; longer ones are cut. */
 const MESSAGE_SEND_BLOCK_REASON_MAX_CHARS = 500;
-/** Total rendered context per message; entries past it are dropped (same cap as request.assemble). */
-const MESSAGE_SEND_CONTEXT_MAX_CHARS = 64 * 1024;
 
 export type MessageSendHookOutcome =
   | { kind: "none" }
   | { kind: "context"; entries: PluginHookContextEntry[] }
   | { kind: "blocked"; pluginName: string; reason: string };
 
+export interface MessageSendHookInput {
+  text: string;
+  origin: MessageSendOrigin;
+  /**
+   * False for sends no plugin may refuse (automatic senders retry a refused send, so a block
+   * would loop). Their blocks are ignored as they are set, so the chain keeps running: every
+   * later hook still sees the send, independent of plugin order.
+   */
+  canBlock: boolean;
+}
+
 export async function runMessageSendHooks(
   spine: EventSpine,
   workspaceId: string,
-  input: { text: string; origin: MessageSendOrigin }
+  input: MessageSendHookInput
 ): Promise<MessageSendHookOutcome> {
   if (!spine.hasMiddleware("message.send")) return { kind: "none" };
-  const ctx: MessageSendContext = {
-    workspaceId,
-    origin: input.origin,
-    text: input.text,
-    additionalContext: [],
-  };
+  const base = { workspaceId, origin: input.origin, text: input.text, additionalContext: [] };
+  const ctx: MessageSendContext = input.canBlock
+    ? base
+    : {
+        ...base,
+        // useBefore ends the chain when `blocked` reads as set, so it never does here.
+        get blocked() {
+          return undefined;
+        },
+        set blocked(block: MessageSendContext["blocked"]) {
+          if (block == null) return;
+          log.warn("Prompt hooks: ignoring a block of an automatic send", {
+            workspaceId,
+            plugin: block.pluginName,
+            origin: input.origin,
+          });
+        },
+      };
   try {
     await spine.run("message.send", ctx);
   } catch (error) {
@@ -67,7 +91,7 @@ export async function runMessageSendHooks(
     // Charge the whole rendered block (plugin ID, wrapper, escaping), not just the text: many
     // tiny entries or a long plugin ID must not slip past the cap.
     const rendered = renderPluginHookContextEntry({ pluginId: entry.pluginId, text }).length;
-    if (size + rendered > MESSAGE_SEND_CONTEXT_MAX_CHARS) {
+    if (size + rendered > PLUGIN_HOOK_CONTEXT_MAX_CHARS) {
       log.warn("Prompt hooks: message.send context over the cap; dropping the rest", {
         workspaceId,
       });
