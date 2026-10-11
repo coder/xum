@@ -338,6 +338,38 @@ describe("MCP Apps host router", () => {
     expect(t.modelContexts).toHaveLength(1);
   });
 
+  test("text blocks are not read past the length limit", async () => {
+    const t = setup();
+    // Counts reads of each block after the one that crosses the limit.
+    let laterBlockReads = 0;
+    const laterBlock = {
+      type: "text",
+      get text() {
+        laterBlockReads += 1;
+        return "z";
+      },
+    };
+    await t.request(1, "ui/message", {
+      role: "user",
+      content: [
+        { type: "text", text: "x".repeat(32_000) },
+        { type: "text", text: "y" },
+        laterBlock,
+      ],
+    });
+    await t.request(2, "ui/update-model-context", {
+      content: [
+        { type: "text", text: "x".repeat(MCP_APP_MODEL_CONTEXT_MAX_BYTES) },
+        { type: "text", text: "y" },
+        laterBlock,
+      ],
+    });
+    for (const id of [1, 2]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
+    expect(laterBlockReads).toBe(0);
+    expect(t.consents).toEqual([]);
+    expect(t.modelContexts).toEqual([]);
+  });
+
   test("update-model-context answers -32602 for structured content JSON cannot encode", async () => {
     const t = setup();
     const cyclic: Record<string, unknown> = {};
