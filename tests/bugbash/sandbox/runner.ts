@@ -94,8 +94,9 @@ export class Session {
   readonly #signalGroup: (group: number, signal: NodeJS.Signals) => void;
   #stopped: string | null = null;
   readonly #binfmtDir: string;
-  /** The daemon's `docker info` Architecture, read by #connect for the amd64 check. */
+  /** The daemon's `docker info` Architecture and KernelVersion, read by #connect (amd64 check). */
   #architecture = "";
+  #kernel = "";
   #client: Record<string, string> | null = null;
   #clientDir: string | null = null;
   #cleanup: Promise<CleanupState> | null = null;
@@ -470,9 +471,11 @@ export class Session {
       OSType?: string;
       OperatingSystem?: string;
       Architecture?: string;
+      KernelVersion?: string;
       SecurityOptions?: string[];
     };
     this.#architecture = daemon.Architecture ?? "";
+    this.#kernel = daemon.KernelVersion ?? "";
     // `docker info` exits 0 when no daemon answers, with only the client fields.
     if ((daemon.OSType ?? "") === "") throw new Refusal("docker info: no daemon answered");
     if (daemon.OSType !== "linux" || /docker desktop/i.test(daemon.OperatingSystem ?? ""))
@@ -484,24 +487,30 @@ export class Session {
 
   /**
    * The published image is linux/amd64 only (build.sh). On another architecture its first
-   * container fails unless the kernel runs amd64 binaries through emulation (a binfmt_misc entry,
-   * shared with the local daemon), so refuse before the pull with the two ways out. Not in
-   * #connect: recover() needs no image and works on any host.
+   * container fails unless the daemon's kernel runs amd64 binaries through emulation, so refuse
+   * before the pull with the ways out. The emulation is read from this host's binfmt_misc, which
+   * is the daemon's only when both run on one kernel: a daemon in a VM or sidecar (another
+   * KernelVersion) refuses instead. The entry needs the F (fix-binary) flag, or the interpreter is
+   * gone once Docker enters the container's mount namespace. Not in #connect: recover() needs no
+   * image and works on any host.
    */
   #checkArchitecture() {
     const arch = this.#architecture;
     if (arch === "x86_64" || arch === "amd64") return;
+    const fix = "use an amd64 host, or register amd64 emulation (binfmt_misc qemu-x86_64, F flag)";
+    const on = `the sandbox image is linux/amd64 and Docker runs on ${arch || "an unknown architecture"}`;
+    if (this.#kernel !== os.release())
+      throw new Refusal(`${on} on another kernel, whose emulation cannot be checked: ${fix}`);
     let entry = "";
     try {
       entry = fs.readFileSync(path.join(this.#binfmtDir, "qemu-x86_64"), "utf8");
     } catch {
       // no entry: no emulation
     }
-    if (entry.split("\n")[0] === "enabled") return;
-    throw new Refusal(
-      `the sandbox image is linux/amd64 and Docker runs on ${arch || "an unknown architecture"}: ` +
-        "use an amd64 host, or register amd64 emulation (binfmt_misc qemu-x86_64)"
-    );
+    const lines = entry.split("\n");
+    const flags = lines.find((line) => line.startsWith("flags:"))?.slice("flags:".length) ?? "";
+    if (lines[0] === "enabled" && flags.includes("F")) return;
+    throw new Refusal(`${on}: ${fix}`);
   }
 
   async #must(args: string[], timeoutMs: number): Promise<Result> {

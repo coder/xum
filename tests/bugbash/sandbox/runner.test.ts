@@ -251,14 +251,29 @@ const binfmtSession = (binfmtDir: string) => {
   sessions.push(s);
   return s;
 };
-const ARM = '{"OSType":"linux","OperatingSystem":"Ubuntu 22.04","Architecture":"aarch64"}';
+// The daemon on this host's kernel, so this host's binfmt_misc is the daemon's.
+const ARM = JSON.stringify({
+  OSType: "linux",
+  OperatingSystem: "Ubuntu 22.04",
+  Architecture: "aarch64",
+  KernelVersion: os.release(),
+});
+const EMULATED = "enabled\ninterpreter /usr/bin/qemu-x86_64\nflags: POCF\n";
 test.each([
-  ["no emulation", {}],
-  ["a disabled emulation entry", { "qemu-x86_64": "disabled\ninterpreter /usr/bin/qemu-x86_64\n" }],
+  ["no emulation", {}, ARM],
+  ["a disabled emulation entry", { "qemu-x86_64": EMULATED.replace("enabled", "disabled") }, ARM],
+  // Without F, the interpreter is not there inside the container's mount namespace.
+  ["an entry without the F flag", { "qemu-x86_64": EMULATED.replace("POCF", "POC") }, ARM],
+  // Another kernel (a VM or a sidecar): this host's entry says nothing about the daemon's.
+  [
+    "emulation here but a daemon on another kernel",
+    { "qemu-x86_64": EMULATED },
+    ARM.replace(os.release(), "6.1.0-vm"),
+  ],
 ])(
   "U6: an arm64 daemon with %s refuses before the pull, naming the fix",
-  async (_name, entries) => {
-    fake({ INFO: ARM });
+  async (_name, entries, info) => {
+    fake({ INFO: info });
     const s = binfmtSession(binfmt(entries));
     const error = await failure(s.ensureImage());
     expect(error).toThrow(/linux\/amd64/);
@@ -270,7 +285,7 @@ test.each([
 
 test("U6: an arm64 daemon with amd64 emulation registered may pull and run the image", async () => {
   fake({ INFO: ARM });
-  const dir = binfmt({ "qemu-x86_64": "enabled\ninterpreter /usr/bin/qemu-x86_64\n" });
+  const dir = binfmt({ "qemu-x86_64": EMULATED });
   expect(await binfmtSession(dir).ensureImage()).toBe(REF);
   expect(calls()).toContain("pull");
 });
