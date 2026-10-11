@@ -635,6 +635,11 @@ function authServerMetadata(issuer: string) {
 async function withAuthServer(run: (base: string) => Promise<void>): Promise<void> {
   const server = createServer((req, res) => {
     const pathname = (req.url ?? "/").split("?")[0];
+    if (pathname === "/token") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ access_token: "flow-token", token_type: "Bearer" }));
+      return;
+    }
     if (pathname === "/.well-known/oauth-authorization-server") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(authServerMetadata(`http://${req.headers.host ?? ""}`)));
@@ -1249,6 +1254,85 @@ describe("McpOauthService OAuth flows", () => {
         releaseProbe();
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
+    });
+  });
+
+  test("interleaved sign-ins of two clients at one URL never store client B with token A", async () => {
+    await withAuthServer(async (base) => {
+      const serverUrl = `${base}/mcp`;
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "client-a" },
+              tokens: { access_token: "at-a", token_type: "Bearer", refresh_token: "rt-a" },
+            },
+          },
+        })
+      );
+      // Server A's refresh is under way with client A...
+      const providerA = await service.getAuthProviderForServer({
+        serverUrl,
+        oauth: { clientId: "client-a" },
+      });
+      if (providerA === undefined) throw new Error("expected a provider");
+      expect((await providerA.clientInformation())?.client_id).toBe("client-a");
+      // ...when server B (same URL, client B) starts signing in and saves client B.
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        b: { transport: "http", url: serverUrl, disabled: true, oauth: { clientId: "client-b" } },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "b",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      // Then A's token lands: it is dropped, never stored next to client B.
+      await providerA.saveTokens({ access_token: "at-a-new", token_type: "Bearer" } as never);
+      const store = JSON.parse(await fs.readFile(getStoreFilePath(xumHome), "utf-8")) as {
+        entries: Record<string, { clientInformation?: { client_id: string }; tokens?: unknown }>;
+      };
+      expect(store.entries[serverUrl].clientInformation?.client_id).toBe("client-b");
+      expect(JSON.stringify(store.entries[serverUrl].tokens ?? null)).not.toContain("at-a");
+      await service.cancelServerFlow(start.data.flowId);
+    });
+  });
+
+  test("an interactive sign-in whose client was replaced meanwhile stores no token", async () => {
+    await withAuthServer(async (base) => {
+      const serverUrl = `${base}/mcp`;
+      const listServers = spyOn(mcpConfigService, "listServers");
+      const startFor = async (name: string, clientId: string) => {
+        listServers.mockResolvedValue({
+          [name]: { transport: "http", url: serverUrl, disabled: true, oauth: { clientId } },
+        });
+        const start = await service.startServerFlow({
+          projectPath,
+          serverName: name,
+          redirectUri: "https://x/cb",
+        });
+        if (!start.success) throw new Error(start.error);
+        return start.data.flowId;
+      };
+      // Flow A saves client A, flow B then saves client B, then A's code exchange lands.
+      const flowA = await startFor("a", "client-a");
+      const flowB = await startFor("b", "client-b");
+      await service.handleServerCallbackAndExchange({
+        state: flowA,
+        code: "code-a",
+        iss: null,
+        error: null,
+      });
+      const store = JSON.parse(await fs.readFile(getStoreFilePath(xumHome), "utf-8")) as {
+        entries: Record<string, { clientInformation?: { client_id: string }; tokens?: unknown }>;
+      };
+      expect(store.entries[serverUrl].clientInformation?.client_id).toBe("client-b");
+      expect(store.entries[serverUrl].tokens).toBeUndefined();
+      await service.cancelServerFlow(flowB);
     });
   });
 
