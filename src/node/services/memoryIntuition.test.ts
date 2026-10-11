@@ -828,6 +828,7 @@ describe("runMemoryIntuition", () => {
       ],
       deps: {
         isHookAllowed: () => Promise.resolve(true),
+        canCallPluginTool: () => true,
         callPluginTool: () =>
           Promise.resolve(
             modelStarted

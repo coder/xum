@@ -233,6 +233,7 @@ describe("createKernelFileLoader Codex hook rewrites", () => {
       ],
       deps: {
         isHookAllowed: () => Promise.resolve(true),
+        canCallPluginTool: () => true,
         callPluginTool: () =>
           Promise.resolve({
             structuredContent: {
