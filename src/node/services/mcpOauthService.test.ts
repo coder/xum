@@ -620,6 +620,39 @@ describe("probeServerForBearerChallenge", () => {
   });
 });
 
+/** RFC 8414 metadata of a test authorization server at `issuer`. */
+function authServerMetadata(issuer: string) {
+  return {
+    issuer,
+    authorization_endpoint: `${issuer}/authorize`,
+    token_endpoint: `${issuer}/token`,
+    response_types_supported: ["code"],
+    code_challenge_methods_supported: ["S256"],
+  };
+}
+
+/** A local MCP server (401 at /mcp) that is its own authorization server. */
+async function withAuthServer(run: (base: string) => Promise<void>): Promise<void> {
+  const server = createServer((req, res) => {
+    const pathname = (req.url ?? "/").split("?")[0];
+    if (pathname === "/.well-known/oauth-authorization-server") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(authServerMetadata(`http://${req.headers.host ?? ""}`)));
+      return;
+    }
+    res.statusCode = pathname === "/mcp" ? 401 : 404;
+    res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Failed to bind");
+    await run(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
 describe("McpOauthService OAuth flows", () => {
   let xumHome: string;
   let projectPath: string;
@@ -818,6 +851,9 @@ describe("McpOauthService OAuth flows", () => {
       if (pathname === "/.well-known/oauth-authorization-server") return json(metadata(base));
       if (pathname === "/.well-known/oauth-authorization-server/tenant")
         return json(metadata(`${base}/tenant`));
+      // Tenant A's metadata claims to be tenant B on the same origin.
+      if (pathname === "/.well-known/oauth-authorization-server/tenant-a")
+        return json(metadata(`${base}/tenant-b`));
       if (pathname.endsWith("register")) {
         void (async () => {
           let raw = "";
@@ -848,7 +884,7 @@ describe("McpOauthService OAuth flows", () => {
           redirectUri: "https://x/cb",
         });
         listServers.mockRestore();
-        if (!start.success) throw new Error(start.error);
+        if (!start.success) return `refused: ${start.error}`;
         await service.cancelServerFlow(start.data.flowId);
         return new URL(start.data.authorizeUrl).pathname;
       };
@@ -863,6 +899,31 @@ describe("McpOauthService OAuth flows", () => {
       // authorizationServerBase alone: only where discovery looks changes.
       expect(await signIn({ authorizationServerBase: `${base}/tenant` })).toBe("/tenant/authorize");
       expect(paths).toContain("/tenant/register");
+
+      // Tenants share an origin: the full issuer URL decides, path included.
+      // A registrationUrl under another tenant's path is dropped...
+      await signIn({
+        authorizationServerBase: `${base}/tenant`,
+        registrationUrl: `${base}/tenant-b/register`,
+      });
+      expect(paths).toContain("/tenant/register");
+      expect(paths).not.toContain("/tenant-b/register");
+      // ...one under the issuer's own path is kept.
+      await signIn({
+        authorizationServerBase: `${base}/tenant`,
+        registrationUrl: `${base}/tenant/custom-register`,
+      });
+      expect(paths).toContain("/tenant/custom-register");
+      expect(paths).not.toContain("/tenant/register");
+      // A base whose metadata names another issuer is refused (the SDK's RFC 8414 check).
+      expect(await signIn({ authorizationServerBase: `${base}/tenant-a` })).toStartWith("refused:");
+      // Also when a registrationUrl makes Xum run that discovery itself.
+      expect(
+        await signIn({
+          authorizationServerBase: `${base}/tenant-a`,
+          registrationUrl: `${base}/tenant-b/register`,
+        })
+      ).toStartWith("refused:");
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
@@ -870,9 +931,9 @@ describe("McpOauthService OAuth flows", () => {
 
   describe("stored credentials serve only the issuer that minted them", () => {
     const serverUrl = "https://mcp.example.com/mcp";
-    const pinned = (origin: string): MCPServerOAuthConfig => ({
+    const pinned = (issuer: string): MCPServerOAuthConfig => ({
       clientId: "shared",
-      endpoints: { authorizationUrl: `${origin}/authorize`, tokenUrl: `${origin}/token` },
+      discovery: { authorizationServerBase: issuer },
     });
     const issuerA = "https://a.example.com";
     const seed = async (clientIssuer: string | null = issuerA) =>
@@ -955,6 +1016,11 @@ describe("McpOauthService OAuth flows", () => {
           if (pathname === "/token") {
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ access_token: "late", token_type: "Bearer" }));
+            return;
+          }
+          if (pathname === "/.well-known/oauth-authorization-server") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(authServerMetadata(`http://${req.headers.host ?? ""}`)));
             return;
           }
           if (pathname === "/mcp") {
@@ -1060,60 +1126,13 @@ describe("McpOauthService OAuth flows", () => {
   });
 
   test("a plugin resource that does not cover the server URL is refused at sign-in", async () => {
-    spyOn(mcpConfigService, "listServers").mockResolvedValue({
-      docs: {
-        transport: "http",
-        url: "http://127.0.0.1:9/mcp",
-        disabled: true,
-        oauth: {
-          clientId: "c",
-          resource: "https://evil.example.com",
-          endpoints: {
-            authorizationUrl: "http://127.0.0.1:9/authorize",
-            tokenUrl: "http://127.0.0.1:9/token",
-          },
-        },
-      },
-    });
-    const start = await service.startServerFlow({
-      projectPath,
-      serverName: "docs",
-      redirectUri: "https://x/cb",
-    });
-    expect(start.success).toBe(false);
-    expect(start.success ? "" : start.error).toContain("does not cover");
-  });
-
-  test("endpoint overrides with registrationUrl register there instead of discovering", async () => {
-    const paths: string[] = [];
-    const server = createServer((req, res) => {
-      const pathname = (req.url ?? "/").split("?")[0];
-      paths.push(pathname);
-      if (pathname === "/custom-register") {
-        res.writeHead(201, { "content-type": "application/json" });
-        res.end(JSON.stringify({ client_id: "registered", redirect_uris: ["https://x/cb"] }));
-        return;
-      }
-      res.statusCode = pathname === "/mcp" ? 401 : 404;
-      res.end();
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    try {
-      const address = server.address();
-      if (!address || typeof address === "string") throw new Error("Failed to bind");
-      const base = `http://127.0.0.1:${address.port}`;
+    await withAuthServer(async (base) => {
       spyOn(mcpConfigService, "listServers").mockResolvedValue({
         docs: {
           transport: "http",
           url: `${base}/mcp`,
           disabled: true,
-          oauth: {
-            endpoints: {
-              authorizationUrl: `${base}/custom-authorize`,
-              tokenUrl: `${base}/custom-token`,
-              registrationUrl: `${base}/custom-register`,
-            },
-          },
+          oauth: { clientId: "c", resource: "https://evil.example.com" },
         },
       });
       const start = await service.startServerFlow({
@@ -1121,18 +1140,12 @@ describe("McpOauthService OAuth flows", () => {
         serverName: "docs",
         redirectUri: "https://x/cb",
       });
-      if (!start.success) throw new Error(start.error);
-      const authorizeUrl = new URL(start.data.authorizeUrl);
-      expect(authorizeUrl.pathname).toBe("/custom-authorize");
-      expect(authorizeUrl.searchParams.get("client_id")).toBe("registered");
-      expect(paths).toContain("/custom-register");
-      await service.cancelServerFlow(start.data.flowId);
-    } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
+      expect(start.success).toBe(false);
+      expect(start.success ? "" : start.error).toContain("does not cover");
+    });
   });
 
-  test("a plugin's provided client, endpoints, scopes and resource replace discovery and DCR", async () => {
+  test("a plugin's provided client, scopes and resource replace DCR; discovery supplies endpoints", async () => {
     const secret = "native-app-secret-8252";
     const requests: Array<{ path: string; raw: string }> = [];
     const server = createServer((req, res) => {
@@ -1151,7 +1164,21 @@ describe("McpOauthService OAuth flows", () => {
           );
           return;
         }
-        // The MCP endpoint demands auth; every discovery document is missing.
+        // Discovery supplies the endpoints (no registration endpoint is advertised).
+        if (pathname === "/.well-known/oauth-authorization-server") {
+          const issuer = `http://${req.headers.host ?? ""}`;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              issuer,
+              authorization_endpoint: `${issuer}/custom-authorize`,
+              token_endpoint: `${issuer}/custom-token`,
+              response_types_supported: ["code"],
+              code_challenge_methods_supported: ["S256"],
+            })
+          );
+          return;
+        }
         res.statusCode = pathname === "/mcp" ? 401 : 404;
         res.end();
       })();
@@ -1179,10 +1206,6 @@ describe("McpOauthService OAuth flows", () => {
           oauth: {
             clientId: "provided-id",
             tokenEndpointAuthMethod: "client_secret_post",
-            endpoints: {
-              authorizationUrl: `${base}/custom-authorize`,
-              tokenUrl: `${base}/custom-token`,
-            },
             baseScopes: ["base"],
             defaultScopes: ["docs:read"],
             // Covers the server URL (the SDK's resource rule).

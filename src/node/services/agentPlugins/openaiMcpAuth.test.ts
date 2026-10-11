@@ -127,44 +127,38 @@ describe("toServerOAuthConfig", () => {
     });
   });
 
-  test("endpoint overrides without a provided client need registrationUrl", () => {
-    const dcr = { type: "oauth" as const, client: { mode: "dcr" as const }, ...endpoints };
-    expect(toServerOAuthConfig(dcr, { serverUrl })).toEqual({
-      ignored: ["authorizationUrl, tokenUrl (registration needs registrationUrl)"],
-    });
-    const registrationUrl = "https://mcp.example.com/register";
-    expect(toServerOAuthConfig({ ...dcr, registrationUrl }, { serverUrl }).config).toEqual({
-      endpoints: { ...endpoints, registrationUrl },
-    });
-  });
-
-  test("endpoint overrides on split origins are dropped for discovery", () => {
+  test("authorization and token endpoint overrides are ignored; discovery supplies them", () => {
     const provided = {
       type: "oauth" as const,
       client: { mode: "provided" as const, clientId: "c" },
     };
-    const split = [
-      // A real authorization server, but the code and verifier go to the plugin's token host.
+    for (const overrides of [
+      endpoints,
+      // Split origins (the old one-origin case) and a path-scoped tenant are both ignored.
       { authorizationUrl: "https://accounts.example.com/authorize", tokenUrl: endpoints.tokenUrl },
-      { ...endpoints, registrationUrl: "https://register.example.com/register" },
-      { ...endpoints, authorizationServerBase: "https://auth.example.com" },
-    ];
-    for (const overrides of split) {
-      expect(toServerOAuthConfig({ ...provided, ...overrides }, { serverUrl })).toEqual({
-        config: { clientId: "c" },
-        ignored: [
-          "authorizationUrl, tokenUrl, registrationUrl, authorizationServerBase (must share one origin)",
-        ],
-      });
+      { ...endpoints, authorizationServerBase: "https://mcp.example.com/tenant-a" },
+    ]) {
+      const { config, ignored } = toServerOAuthConfig({ ...provided, ...overrides }, { serverUrl });
+      expect(ignored).toEqual(["authorizationUrl, tokenUrl (discovery supplies the endpoints)"]);
+      expect(config?.clientId).toBe("c");
+      expect(JSON.stringify(config)).not.toContain("/authorize");
+      expect(JSON.stringify(config)).not.toContain("/token");
     }
-    // One origin, including the issuer: kept.
-    const issuer = "https://mcp.example.com/tenant";
-    expect(
-      toServerOAuthConfig(
-        { ...provided, ...endpoints, authorizationServerBase: issuer },
-        { serverUrl }
-      ).config
-    ).toEqual({ clientId: "c", endpoints: { ...endpoints, issuer } });
+  });
+
+  test("a provided private_key_jwt client is dropped so discovery and DCR recover", () => {
+    const auth = {
+      type: "oauth" as const,
+      client: {
+        mode: "provided" as const,
+        clientId: "c",
+        tokenEndpointAuthMethod: "private_key_jwt",
+      },
+    };
+    // Even with a secret source: Xum cannot sign the assertion.
+    expect(toServerOAuthConfig(auth, { serverUrl, clientSecretSource: source })).toEqual({
+      ignored: ["client (private_key_jwt is not supported)"],
+    });
   });
 
   test("standalone registrationUrl and authorizationServerBase are kept for discovery", () => {
@@ -175,16 +169,18 @@ describe("toServerOAuthConfig", () => {
       config: { discovery: { registrationUrl } },
       ignored: [],
     });
+    // Checked against the issuer-verified metadata at sign-in, not here.
     expect(
       toServerOAuthConfig({ ...dcr, authorizationServerBase: base, registrationUrl }, { serverUrl })
         .config
     ).toEqual({ discovery: { authorizationServerBase: base, registrationUrl } });
+    // A provided client registers nothing: registrationUrl does not apply.
     expect(
       toServerOAuthConfig(
-        { ...dcr, authorizationServerBase: base, registrationUrl: "https://evil.example.com/r" },
+        { type: "oauth", client: { mode: "provided", clientId: "c" }, registrationUrl },
         { serverUrl }
-      )
-    ).toEqual({ ignored: ["authorizationServerBase, registrationUrl (must share one origin)"] });
+      ).config
+    ).toEqual({ clientId: "c" });
   });
 
   test("a resource that does not cover the server URL is dropped", () => {

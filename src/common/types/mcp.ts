@@ -84,19 +84,12 @@ export interface MCPServerOAuthConfig {
   /** A registered client; skips dynamic client registration. */
   clientId?: string;
   tokenEndpointAuthMethod?: "none" | "client_secret_basic" | "client_secret_post";
-  /** Set together; replace authorization-server discovery. `issuer` defaults to the token URL origin. */
-  endpoints?: {
-    authorizationUrl: string;
-    tokenUrl: string;
-    issuer?: string;
-    /** Dynamic registration endpoint (no provided client). */
-    registrationUrl?: string;
-  };
   /**
-   * Standalone overrides (no `endpoints`): discovery still supplies the endpoints.
-   * `authorizationServerBase` changes where authorization-server metadata is fetched.
-   * `registrationUrl` replaces the discovered registration endpoint, and only when its origin
-   * is the discovered issuer's (dynamic registration only).
+   * Discovery always supplies the authorization and token endpoints (#6142 tracks verified
+   * overrides). `authorizationServerBase` changes where authorization-server metadata is
+   * fetched (its issuer must be that URL). `registrationUrl` replaces the discovered
+   * registration endpoint only when it is that endpoint or sits under the issuer URL (dynamic
+   * registration only).
    */
   discovery?: { authorizationServerBase?: string; registrationUrl?: string };
   /** Sent on every request. */

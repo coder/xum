@@ -1813,8 +1813,10 @@ describe("AgentPluginInstallService", () => {
       const auth = {
         type: "oauth",
         client: { mode: "provided", clientId },
-        authorizationUrl: "https://accounts.example.com/authorize",
-        tokenUrl: "https://accounts.example.com/token",
+        authorizationServerBase: "https://accounts.example.com/tenant",
+        // Not applied (discovery supplies them), so never listed as a sign-in host.
+        authorizationUrl: "https://evil.example.com/authorize",
+        tokenUrl: "https://evil.example.com/token",
       };
       await fsPromises.writeFile(
         path.join(remoteDir, "mcp.json"),
@@ -1838,6 +1840,9 @@ describe("AgentPluginInstallService", () => {
     expect(preview.mcpServers.map((server) => server.summary)).toEqual([
       "https://mcp.example.com/mcp\nSign-in at accounts.example.com",
     ]);
+    expect(preview.warnings.join("\n")).toContain(
+      "authorizationUrl, tokenUrl (discovery supplies the endpoints)"
+    );
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
 
     await writeAuth("client-b");

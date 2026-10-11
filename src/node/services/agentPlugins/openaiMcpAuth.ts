@@ -205,14 +205,6 @@ function readAuth(raw: Record<string, unknown>, result: ReadOpenAIMcpAuthResult)
   const client = auth.client;
   if (client?.mode === "cimd" || (client?.mode === "provided" && client.clientId === undefined))
     ignore(`client.mode: ${client.mode}`);
-  if (client?.tokenEndpointAuthMethod === "private_key_jwt")
-    ignore("client.tokenEndpointAuthMethod: private_key_jwt");
-  if ((auth.authorizationUrl === undefined) !== (auth.tokenUrl === undefined))
-    ignore(
-      auth.tokenUrl === undefined
-        ? "authorizationUrl (needs tokenUrl)"
-        : "tokenUrl (needs authorizationUrl)"
-    );
   for (const key of [...UNUSED_FIELDS, "headerScheme", "headerName"]) {
     if (key in auth) ignore(key);
   }
@@ -330,6 +322,12 @@ export function toServerOAuthConfig(
   if (auth?.type !== "oauth" && auth?.type !== "mixed") return { ignored };
   let clientId = auth.client?.mode === "provided" ? auth.client.clientId : undefined;
   const method = auth.client?.tokenEndpointAuthMethod;
+  // Xum cannot sign a private_key_jwt assertion; the provider would reject every token
+  // request, so drop the provided client and let discovery + DCR recover.
+  if (clientId !== undefined && method === "private_key_jwt") {
+    ignored.push("client (private_key_jwt is not supported)");
+    clientId = undefined;
+  }
   // A secret method needs a secret, and only the Codex dialect can supply one.
   // Without it the provider rejects every token request, so use discovery + DCR.
   if (
@@ -340,56 +338,30 @@ export function toServerOAuthConfig(
     ignored.push(`client (${method} needs a client secret)`);
     clientId = undefined;
   }
-  // Endpoint overrides replace discovery, so dynamic registration then needs
-  // registrationUrl; without one, discovery keeps supplying everything.
-  let endpoints: MCPServerOAuthConfig["endpoints"];
-  let discovery: MCPServerOAuthConfig["discovery"];
-  if (auth.authorizationUrl === undefined || auth.tokenUrl === undefined) {
-    // Standalone overrides: discovery supplies the endpoints. registrationUrl is checked
-    // against the discovered issuer at sign-in (mcpOauthService pluginFlowFields).
-    const registrationUrl = clientId === undefined ? auth.registrationUrl : undefined;
-    const base = auth.authorizationServerBase;
-    if (
-      base !== undefined &&
-      registrationUrl !== undefined &&
-      new URL(base).origin !== new URL(registrationUrl).origin
-    ) {
-      ignored.push("authorizationServerBase, registrationUrl (must share one origin)");
-    } else if (base !== undefined || registrationUrl !== undefined) {
-      discovery = {
-        ...(base !== undefined ? { authorizationServerBase: base } : {}),
-        ...(registrationUrl !== undefined ? { registrationUrl } : {}),
-      };
-    }
-  } else {
-    // SECURITY AUDIT: overrides replace discovery, so nothing else ties them to one
-    // authorization server. Split origins would let a plugin send the browser to a real
-    // authorization endpoint and route the code and PKCE verifier to its own token
-    // endpoint (an authorization server without RFC 9207 `iss` cannot catch that). All
-    // overrides must share one origin, which is the issuer.
-    const origins = new Set(
-      [auth.authorizationUrl, auth.tokenUrl, auth.registrationUrl, auth.authorizationServerBase]
-        .filter((url) => url !== undefined)
-        .map((url) => new URL(url).origin)
+  // SECURITY AUDIT: authorization and token endpoint overrides are not applied; discovery
+  // supplies them. Pinning them to one origin was not enough (tenants share origins), and
+  // nothing bound them to verified issuer metadata. Follow-up #6142 binds them.
+  if (auth.authorizationUrl !== undefined || auth.tokenUrl !== undefined) {
+    ignored.push(
+      [
+        auth.authorizationUrl !== undefined ? "authorizationUrl" : undefined,
+        auth.tokenUrl !== undefined ? "tokenUrl" : undefined,
+      ]
+        .filter((key) => key !== undefined)
+        .join(", ") + " (discovery supplies the endpoints)"
     );
-    if (origins.size > 1) {
-      ignored.push(
-        "authorizationUrl, tokenUrl, registrationUrl, authorizationServerBase (must share one origin)"
-      );
-    } else if (clientId === undefined && auth.registrationUrl === undefined) {
-      ignored.push("authorizationUrl, tokenUrl (registration needs registrationUrl)");
-    } else {
-      endpoints = {
-        authorizationUrl: auth.authorizationUrl,
-        tokenUrl: auth.tokenUrl,
-        // The RFC 9207 `iss` check compares against this issuer.
-        ...(auth.authorizationServerBase !== undefined
-          ? { issuer: auth.authorizationServerBase }
-          : {}),
-        ...(clientId === undefined ? { registrationUrl: auth.registrationUrl } : {}),
-      };
-    }
   }
+  // authorizationServerBase moves discovery; registrationUrl is checked against the
+  // discovered, issuer-verified metadata at sign-in (mcpOauthService pluginFlowDiscoveryState).
+  const registrationUrl = clientId === undefined ? auth.registrationUrl : undefined;
+  const base = auth.authorizationServerBase;
+  const discovery: MCPServerOAuthConfig["discovery"] =
+    base !== undefined || registrationUrl !== undefined
+      ? {
+          ...(base !== undefined ? { authorizationServerBase: base } : {}),
+          ...(registrationUrl !== undefined ? { registrationUrl } : {}),
+        }
+      : undefined;
   // SECURITY AUDIT: a token for another resource would be sent to this
   // server. Apply the MCP SDK's own rule: the resource must cover the server
   // URL (same origin, path prefix).
@@ -406,7 +378,6 @@ export function toServerOAuthConfig(
     ...(clientId !== undefined && method !== undefined && SECRET_AUTH_METHODS.has(method)
       ? { tokenEndpointAuthMethod: method as TokenAuthMethod }
       : {}),
-    ...(endpoints !== undefined ? { endpoints } : {}),
     ...(discovery !== undefined ? { discovery } : {}),
     ...(auth.baseScopes !== undefined ? { baseScopes: auth.baseScopes } : {}),
     ...(auth.defaultScopes !== undefined ? { defaultScopes: auth.defaultScopes } : {}),
