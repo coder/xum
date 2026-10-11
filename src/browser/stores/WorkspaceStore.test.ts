@@ -896,6 +896,20 @@ describe("WorkspaceStore", () => {
       ]);
     });
 
+    it("live notices that arrive before a failed history replay still show their toasts", async () => {
+      const workspaceId = "failed-replay-toast-events";
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+
+      await send(notice(workspaceId, "Checked the command."), budget(workspaceId, "Over budget."));
+      await send(caughtUpEvent({ replay: "full", historyReplayStatus: "failed" }));
+
+      expect(drainToasts(workspaceId)).toEqual([
+        "Plugin guard: Checked the command.",
+        "Over budget.",
+      ]);
+    });
+
     it("live notices that arrive during a reconnect replay still show their toasts", async () => {
       const workspaceId = "buffered-toast-events";
       const send = openChat(workspaceId);
