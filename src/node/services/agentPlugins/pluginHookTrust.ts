@@ -169,9 +169,10 @@ export async function setPluginHookTrust(
   await fs.mkdir(path.dirname(file), { recursive: true });
   // A wrong-kind entry (a directory, a FIFO) read as no trust above. The atomic rename cannot
   // replace a directory, so remove it first: corrupted state must not block every decision.
-  // A symlink is left alone: the rename replaces the link itself.
+  // A symlink is removed too: writeFileAtomic resolves it and would overwrite its target, an
+  // arbitrary file of this user.
   const existing = await fs.lstat(file).catch(() => null);
-  if (existing !== null && !existing.isFile() && !existing.isSymbolicLink()) {
+  if (existing !== null && !existing.isFile()) {
     await fs.rm(file, { recursive: true, force: true });
   }
   await writeFileAtomic(file, JSON.stringify({ version: 1, installedAt, hooks }, null, 2));

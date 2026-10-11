@@ -246,6 +246,42 @@ describe("turn.stop", () => {
     expect(streams()).toBe(1);
   });
 
+  for (const stop of ["finished", "still in progress"] as const) {
+    test(`a hard Stop during a slow Stop hook queues no continuation (Stop ${stop})`, async () => {
+      // The stream already ended, so the Stop finds no live stream to supersede: only the Stop
+      // fence (its epoch and in-progress latch) can tell the hook's late outcome is stale.
+      let stopEpoch = 0;
+      let stopInProgress = false;
+      unregisters.push(
+        eventSpine.useBefore(
+          "turn.stop",
+          async (ctx) => {
+            await Promise.resolve();
+            // A finished Stop bumped the epoch and released its latch. A Stop still in progress
+            // holds the latch (whether it bumped the epoch yet is the caller's order).
+            if (stop === "finished") stopEpoch++;
+            else stopInProgress = true;
+            await Promise.resolve();
+            keepGoing(ctx);
+          },
+          { workspaceId }
+        )
+      );
+      const { h, streams } = await setup({
+        session: { getStopEpoch: () => stopEpoch, isStopInProgress: () => stopInProgress },
+      });
+
+      await h.session.sendMessage("fix the tests", options);
+      await h.session.waitForIdle();
+      // A held Stop latch defers dispatch, so a wrongly queued continuation would wait here.
+      expect(h.session.hasQueuedMessages()).toBe(false);
+      await settle(h);
+
+      expect(await userTexts(h)).toEqual(["fix the tests"]);
+      expect(streams()).toBe(1);
+    });
+  }
+
   test("a goal turn's continuation stays a goal turn of the same goal", async () => {
     let continued = false;
     addConsumer((ctx) => {
