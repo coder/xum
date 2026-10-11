@@ -315,6 +315,46 @@ describe("UserPromptSubmit and Stop", () => {
     expect(await runTurnStopHooks(halt.spine, workspaceId, input)).toEqual({ kind: "none" });
   });
 
+  test("UserPromptSubmit: a block without a reason fails open (Codex), continue false still blocks", async () => {
+    const send = (answer: unknown) =>
+      runMessageSendHooks(setup([hook("UserPromptSubmit")], () => answer).spine, workspaceId, {
+        text: "fix",
+        origin: "user",
+      });
+    expect(await send(json({ decision: "block" }))).toEqual({ kind: "none" });
+    expect(
+      await send(
+        json({ decision: "block", reason: "  ", hookSpecificOutput: { additionalContext: "c" } })
+      )
+    ).toEqual({ kind: "none" });
+    expect(await send(json({ continue: false }))).toMatchObject({ kind: "blocked" });
+  });
+
+  test("the decision comes from every text block, as Codex reads it, not from structuredContent", async () => {
+    const answer = {
+      content: [
+        { type: "text", text: '{"decision": "block",' },
+        { type: "text", text: '"reason": "Contains a token."}' },
+      ],
+      structuredContent: { scanned: 3 },
+    };
+    const prompt = setup([hook("UserPromptSubmit")], () => answer);
+    expect(
+      await runMessageSendHooks(prompt.spine, workspaceId, { text: "fix", origin: "user" })
+    ).toMatchObject({ kind: "blocked", reason: "Contains a token." });
+    const stop = setup([hook("Stop")], () => ({
+      content: [{ type: "text", text: JSON.stringify({ continue: false }) }],
+      structuredContent: { decision: "block", reason: "metadata, not a decision" },
+    }));
+    expect(
+      await runTurnStopHooks(stop.spine, workspaceId, {
+        messageId: "a1",
+        lastAssistantMessage: "done",
+        stopHookActive: false,
+      })
+    ).toEqual({ kind: "none" });
+  });
+
   test("hooks that cannot run are never called", async () => {
     const { spine, calls } = setup(
       [

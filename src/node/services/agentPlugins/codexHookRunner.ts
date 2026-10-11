@@ -106,6 +106,20 @@ export function registerCodexPluginHooks(
               registration
             );
             if (output === null) continue;
+            // Codex: a block without a non-empty reason is an invalid result and fails open
+            // (its context is dropped too); continue: false blocks on its own.
+            if (
+              output.decision === "block" &&
+              output.reason === undefined &&
+              output.continue !== false
+            ) {
+              warn(
+                registration,
+                hook,
+                "returned decision block without a reason; ignoring its output"
+              );
+              continue;
+            }
             if (output.decision === "block" || output.continue === false) {
               ctx.blocked = {
                 pluginName: registration.pluginName,
@@ -335,25 +349,29 @@ function lookup(root: unknown, dottedPath: string): unknown {
 }
 
 /**
- * The hook's output from an MCP call result: `structuredContent`, else the first text content as
- * JSON. Plain text counts only for UserPromptSubmit (Codex adds it as context). An `isError`
- * result is a failure.
+ * The hook's output from an MCP call result: every text content block, joined with newlines and
+ * read as JSON, as Codex does (hook_mcp_executor.rs). Codex ignores `structuredContent`; Xum
+ * reads it only when the result has no text. Plain text counts only for UserPromptSubmit (Codex
+ * adds it as context). An `isError` result is a failure.
  */
 export function parseHookOutput(result: unknown, plainTextIsContext: boolean): HookOutput | null {
   if (!isPlainObject(result)) throw new Error("the MCP result is not an object");
   if (result.isError === true) throw new Error("the MCP tool returned an error");
+  const content: unknown[] = Array.isArray(result.content) ? result.content : [];
+  const joined = content
+    .flatMap((part) =>
+      isPlainObject(part) && part.type === "text" && typeof part.text === "string"
+        ? [part.text]
+        : []
+    )
+    .join("\n")
+    .trim();
   let raw: unknown = result.structuredContent;
-  if (!isPlainObject(raw)) {
-    const content = Array.isArray(result.content) ? result.content : [];
-    const first: unknown = content.find(
-      (part: unknown) => isPlainObject(part) && part.type === "text"
-    );
-    const text = isPlainObject(first) && typeof first.text === "string" ? first.text.trim() : "";
-    if (text.length === 0) return null;
+  if (joined.length > 0) {
     try {
-      raw = JSON.parse(text);
+      raw = JSON.parse(joined);
     } catch {
-      return plainTextIsContext ? { additionalContext: cut(text) } : null;
+      return plainTextIsContext ? { additionalContext: cut(joined) } : null;
     }
   }
   if (!isPlainObject(raw)) return null;
