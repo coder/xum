@@ -20,6 +20,7 @@ import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getOwn } from "@/common/utils/getOwn";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { isSystemProjectEntry } from "@/common/utils/systemProjects";
 import type { ORPCContext } from "@/node/orpc/context";
 import { displayConnectionKey } from "./mcpServerIdentity";
 
@@ -31,6 +32,10 @@ export type McpAppsContext = Pick<
 /**
  * The project whose `mcpAppViewDomains` hold `serverName`'s approvals for the workspace's views,
  * or null when none can (unknown workspace, or no single owner project).
+ *
+ * Only a user project qualifies (isSystemProjectEntry): the synthetic `_scratch` and `_multi`
+ * buckets are shared by unrelated workspaces, so an approval there would reach their views
+ * without consent.
  *
  * A multi-project workspace is stored under the shared `_multi` bucket, which every
  * multi-project workspace reads, so an approval there would reach views in unrelated
@@ -45,9 +50,12 @@ async function approvalProjectPathOf(
 ): Promise<string | null> {
   const workspace = context.config.findWorkspace(workspaceId);
   if (workspace == null) return null;
-  if (workspace.projectPath !== MULTI_PROJECT_CONFIG_KEY) return workspace.projectPath;
-  const owner = workspace.attributionProjectPath;
-  if (owner == null || owner === MULTI_PROJECT_CONFIG_KEY) return null;
+  const multi = workspace.projectPath === MULTI_PROJECT_CONFIG_KEY;
+  const owner = multi ? workspace.attributionProjectPath : workspace.projectPath;
+  const project =
+    owner == null ? undefined : context.config.loadConfigOrDefault().projects.get(owner);
+  if (owner == null || project == null || isSystemProjectEntry(owner, project)) return null;
+  if (!multi) return owner;
   const server = getOwn(
     await context.mcpConfigService.listForApi({ projectPath: owner, workspaceId }),
     serverName

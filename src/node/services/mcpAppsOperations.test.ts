@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { McpAppApproveDomainsRequestSchema } from "@/common/orpc/schemas/mcpApps";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { MCPServerInfo } from "@/common/types/mcp";
 import type { McpAppResultRecord } from "./mcpAppResultStore";
 import {
@@ -200,6 +201,8 @@ describe("MCP Apps view domain approvals", () => {
       record?: McpAppResultRecord;
       // A multi-project workspace (stored under _multi, first project /a) and its servers.
       multi?: Record<string, Partial<MCPServerInfo>>;
+      // A scratch chat: stored under the shared _scratch bucket.
+      scratch?: boolean;
     } = {}
   ) {
     const record = options.record ?? RECORD;
@@ -207,6 +210,7 @@ describe("MCP Apps view domain approvals", () => {
       ["/repo", {}],
       ["/a", {}],
       [MULTI_PROJECT_CONFIG_KEY, {}],
+      [SCRATCH_PROJECT_CONFIG_KEY, {}],
     ]);
     const config = {
       findWorkspace: (id: string) =>
@@ -214,7 +218,12 @@ describe("MCP Apps view domain approvals", () => {
           ? null
           : options.multi
             ? { projectPath: MULTI_PROJECT_CONFIG_KEY, attributionProjectPath: "/a" }
-            : { projectPath: "/repo", attributionProjectPath: "/repo" },
+            : options.scratch
+              ? {
+                  projectPath: SCRATCH_PROJECT_CONFIG_KEY,
+                  attributionProjectPath: SCRATCH_PROJECT_CONFIG_KEY,
+                }
+              : { projectPath: "/repo", attributionProjectPath: "/repo" },
       loadConfigOrDefault: () => ({ projects }),
       editConfig: (fn: (c: { projects: typeof projects }) => unknown) => {
         fn({ projects });
@@ -306,6 +315,23 @@ describe("MCP Apps view domain approvals", () => {
       expect(project.mcpAppViewDomains).toBeUndefined();
     const globalView = await getMcpAppView(global.ctx, request(), undefined, noWarm);
     expect(globalView.success && globalView.data.approvalProjectPath).toBeNull();
+  });
+
+  test("a scratch chat refuses approvals: the shared _scratch bucket is no user project", async () => {
+    const { ctx, projects } = projectConfig({ scratch: true });
+    projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
+      mcpAppViewDomains: { charts: ["https://old.example.com"] },
+    });
+    expect(
+      (await approveMcpAppViewDomains(ctx, approve(["https://api.example.com"]))).success
+    ).toBe(false);
+    expect(projects.get(SCRATCH_PROJECT_CONFIG_KEY)?.mcpAppViewDomains).toEqual({
+      charts: ["https://old.example.com"],
+    });
+    // Nothing stored there applies to a scratch view either.
+    const view = await getMcpAppView(ctx, request(), undefined, noWarm);
+    expect(view.success && view.data.approvalProjectPath).toBeNull();
+    expect(view.success && view.data.approvedDomains).toEqual([]);
   });
 
   test("a server named like an Object.prototype member reads no inherited approvals", async () => {
