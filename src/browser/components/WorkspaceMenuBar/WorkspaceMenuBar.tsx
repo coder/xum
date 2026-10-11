@@ -21,6 +21,7 @@ import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
 import {
   formatKeybind,
+  isBrowserViewportFocused,
   isDesktopViewportFocused,
   isDialogOpen,
   isEditableElement,
@@ -308,6 +309,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     // without resizing the shell, so re-read it then too.
   }, [isTimelineSidebarHidden, sidebarFullscreen]);
 
+  // Remote desktop and browser viewports own their keystrokes: in the full-screen view they can
+  // have focus, and a capital T or S typed there must not switch tabs.
+  const isViewportTarget = (target: EventTarget | null) =>
+    isDesktopViewportFocused(target) || isBrowserViewportFocused(target);
+
   // The Timeline shortcut while the sidebar is hidden. Evaluated at keydown time so the gate
   // tracks live viewport/layout changes without a resize subscription.
   useEffect(() => {
@@ -316,6 +322,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         !matchesKeybind(e, KEYBINDS.OPEN_TIMELINE_DIALOG) ||
         isDialogOpen() ||
         isEditableElement(e.target) ||
+        isViewportTarget(e.target) ||
         // Shown full-screen, the sidebar is visible, and the shortcut switches its tab.
         !(isTimelineSidebarHidden() || sidebarFullscreen)
       ) {
@@ -337,6 +344,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         matchesKeybind(e, KEYBINDS.OPEN_STATS_DIALOG) &&
         !isDialogOpen() &&
         !isEditableElement(e.target) &&
+        !isViewportTarget(e.target) &&
         (isTimelineSidebarHidden() || sidebarFullscreen)
       ) {
         e.preventDefault();

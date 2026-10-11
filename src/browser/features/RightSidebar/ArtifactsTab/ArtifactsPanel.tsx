@@ -629,7 +629,18 @@ export function ArtifactsPanel(props: {
       }
     });
     observer.observe(document.body, { childList: true, subtree: true });
+    // A hidden ancestor hides the pinned panel too (the phone sidebar, hidden again after its
+    // full-screen view closed on a rotation), which would leave the rest of the app inert
+    // behind nothing. Leave fullscreen once the panel has no box.
+    const sizeObserver = new ResizeObserver(() => {
+      if (panel.getClientRects().length > 0) return;
+      // setFullscreenMode's steps; its state setters are stable, so the effect needs no deps.
+      setAnnotationPick(null);
+      setFullscreen(false);
+    });
+    sizeObserver.observe(panel);
     return () => {
+      sizeObserver.disconnect();
       observer.disconnect();
       restore();
       // Back to the opener when it is still a control of this panel, else to the panel, so J/K

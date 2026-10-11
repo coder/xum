@@ -33,7 +33,11 @@ import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
+import {
+  BROWSER_VIEWPORT_ATTR,
+  DESKTOP_VIEWPORT_ATTR,
+  TERMINAL_CONTAINER_ATTR,
+} from "@/browser/utils/ui/keybinds";
 import { focusRightSidebarTab, readRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -636,6 +640,20 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       // Shown full-screen, the sidebar is visible: the narrow query no longer hides it.
       stubMatchMedia(() => false);
       const { shown, onOpenSidebar } = renderRecording({ sidebarFullscreen: true });
+      focusRightSidebarTab(workspaceId, "desktop");
+
+      // Remote desktop and browser viewports in the view own their keystrokes.
+      for (const attr of [DESKTOP_VIEWPORT_ATTR, BROWSER_VIEWPORT_ATTR]) {
+        const viewport = document.body.appendChild(document.createElement("div"));
+        viewport.setAttribute(attr, "");
+        viewport.tabIndex = 0;
+        act(() => {
+          fireEvent.keyDown(viewport, { key: "T", shiftKey: true });
+          fireEvent.keyDown(viewport, { key: "S", shiftKey: true });
+        });
+        viewport.remove();
+      }
+      expect(activeTab()).toBe("desktop");
 
       act(() => {
         fireEvent.keyDown(window, { key: "T", shiftKey: true });
