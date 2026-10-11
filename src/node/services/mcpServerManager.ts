@@ -4640,6 +4640,31 @@ export class MCPServerManager {
   }
 
   /**
+   * Whether callToolForPluginHook would dispatch `toolName` on `serverKey` now, from cached state
+   * only (no disk read, no serve): enabled (an override publication repairs this set) and running,
+   * not invalidated, and allowed by the project and workspace tool allowlists. The runner asks
+   * before it denies a call that is too large for the hook to check.
+   */
+  canCallToolForPluginHook(workspaceId: string, serverKey: string, toolName: string): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    const info = entry?.enabledServers[serverKey];
+    const instance = entry?.instances.get(serverKey);
+    if (
+      entry === undefined ||
+      info === undefined ||
+      instance === undefined ||
+      instance.isClosed ||
+      !entry.enabledServerNames.has(serverKey) ||
+      this.overridesInvalidationGenerations.has(workspaceId)
+    ) {
+      return false;
+    }
+    const overrides = this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides;
+    const allowlist = effectiveToolAllowlist(serverKey, info.toolAllowlist, overrides);
+    return allowlist === null || allowlist.has(toolName);
+  }
+
+  /**
    * Whether a send or prompt discovery recorded this workspace's request options. Without them
    * server operations cannot start servers (invokeServerOperation), e.g. right after a restart.
    */

@@ -49,6 +49,7 @@ function setup(hooks: PluginHookDefinition[], answer: (input: Record<string, unk
   const state = { allowed: true };
   const deps: CodexHookRunnerDeps = {
     isHookAllowed: () => Promise.resolve(state.allowed),
+    canCallPluginTool: () => true,
     callPluginTool: (call) => {
       calls.push(call.input);
       return Promise.resolve(answer(call.input));
@@ -236,6 +237,7 @@ describe("PreToolUse", () => {
     });
     const deps: CodexHookRunnerDeps = {
       isHookAllowed: () => Promise.resolve(true),
+      canCallPluginTool: () => true,
       callPluginTool: () =>
         Promise.resolve(
           json({

@@ -17,7 +17,7 @@ export async function prepareWorkspaceRequestHooks(args: {
   hostCheckoutRoot: string | null;
   journal: DurableEventJournal;
   /** Codex-format hooks (hooks.json) call plugin MCP servers through it; absent: none run. */
-  mcpServerManager?: Pick<MCPServerManager, "callToolForPluginHook">;
+  mcpServerManager?: Pick<MCPServerManager, "callToolForPluginHook" | "canCallToolForPluginHook">;
 }): Promise<void> {
   const pluginContext = args.hostCheckoutRoot
     ? resolveAgentPluginsMcpContext(args.metadata, args.hostCheckoutRoot)

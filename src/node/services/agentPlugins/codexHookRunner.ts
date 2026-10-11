@@ -50,6 +50,12 @@ export interface CodexHookRunnerDeps {
     input: Record<string, unknown>;
     signal: AbortSignal;
   }): Promise<unknown>;
+  /**
+   * Whether `callPluginTool` would reach `tool` on `server` now (enabled, running, allowed),
+   * from cached state. Only the oversized-input deny asks: it must not block a call when the
+   * hook could not run anyway.
+   */
+  canCallPluginTool(call: { server: string; tool: string }): boolean;
   /** Show a hook's `systemMessage` to the user. It never reaches the model. */
   notifyUser(message: string): void;
 }
@@ -359,7 +365,12 @@ async function invoke(
       warn(registration, hook, "expanded input is too large; the hook cannot check this call");
       // A PreToolUse guard that cannot see the call must not let it through: tool arguments
       // (a Bash script) are model-controlled and could be padded past the limit on purpose.
-      return eventName === "PreToolUse"
+      // Only a hook that could run denies (Codex PRRT_kwDOPxxmWM6rPrku): with its server or tool
+      // off, it fails open like any unavailable hook.
+      const couldRun =
+        eventName === "PreToolUse" &&
+        registration.deps.canCallPluginTool({ server: handler.server, tool: handler.tool });
+      return couldRun
         ? {
             permissionDecision: "deny",
             permissionDecisionReason: `the call is too large for the hook to check (its input is over ${HOOK_INPUT_MAX_CHARS} characters)`,
