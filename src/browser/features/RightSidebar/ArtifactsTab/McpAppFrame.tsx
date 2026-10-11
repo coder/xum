@@ -13,14 +13,20 @@ import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/p
 import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
 import { buildMcpAppCsp, grantMcpAppCsp, MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
-import { MCP_APP_OPENAI_SHIM_SCRIPT } from "./mcpAppOpenAiShim";
+import { mcpAppOpenAiShimScript } from "./mcpAppOpenAiShim";
 import {
   createMcpAppHost,
   type McpAppConsentRequest,
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
-import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
+import {
+  getMcpAppWidgetState,
+  isMcpAppViewHosted,
+  openMcpAppViewTab,
+  setMcpAppWidgetState,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
 import {
   beginMcpAppViewDomainsRequest,
   currentMcpAppViewDomainsSeq,
@@ -85,6 +91,8 @@ interface Loaded {
   error: string | null;
   /** currentMcpAppViewDomainsSeq() when the fetch started: newer approval changes win. */
   domainsSeq: number;
+  /** The view's window.openai widget state when it loaded; fixed, so the document is too. */
+  widgetState: string | null;
 }
 
 interface PendingConsent {
@@ -201,15 +209,22 @@ export function McpAppFrame(props: {
       .getView({ workspaceId, toolCallId, serverName, resourceUri }, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
+        const widgetState = getMcpAppWidgetState(workspaceId, toolCallId);
         setLoaded(
           result.success
-            ? { toolCallId, view: result.data, error: null, domainsSeq }
-            : { toolCallId, view: null, error: result.error, domainsSeq }
+            ? { toolCallId, view: result.data, error: null, domainsSeq, widgetState }
+            : { toolCallId, view: null, error: result.error, domainsSeq, widgetState }
         );
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) {
-          setLoaded({ toolCallId, view: null, error: getErrorMessage(error), domainsSeq });
+          setLoaded({
+            toolCallId,
+            view: null,
+            error: getErrorMessage(error),
+            domainsSeq,
+            widgetState: null,
+          });
         }
       });
     return () => controller.abort();
@@ -268,7 +283,7 @@ export function McpAppFrame(props: {
     current?.view && grant
       ? finalizeSandboxedDocument(parseArtifactHtml(current.view.html), {
           csp: buildMcpAppCsp(grant.granted),
-          bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, MCP_APP_OPENAI_SHIM_SCRIPT],
+          bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, mcpAppOpenAiShimScript(current.widgetState)],
         })
       : null;
   const guard = useFrameNavigationGuard(srcDoc);
@@ -346,6 +361,8 @@ export function McpAppFrame(props: {
         });
         if (!result.success) throw new Error(result.error);
       },
+      // Keyed by this frame's own view only: the message carries no key the host would trust.
+      saveWidgetState: (json) => setMcpAppWidgetState(workspaceId, toolCallId, json),
       requestConsent: (request) =>
         new Promise<boolean>((resolve) => {
           // One strip at a time, and a shown strip is never replaced: a frame could otherwise
@@ -462,6 +479,13 @@ export function McpAppFrame(props: {
       )}
       {grant.notGranted.length > 0 && (
         <NoteBar>Not granted to this view: {grant.notGranted.join(", ")}</NoteBar>
+      )}
+      {grant.pending.length > 0 && current.view.invocation == null && (
+        // Without its result record nothing binds the view to a server, so no Allow is offered.
+        <NoteBar>
+          Blocked, and cannot be allowed because the tool result record of this view is gone:{" "}
+          {grant.pending.map((origin) => new URL(origin).host).join(", ")}
+        </NoteBar>
       )}
       {domainsDismissed?.toolCallId === toolCallId && domainsDismissed.error != null && (
         <NoteBar>Could not allow the domains: {domainsDismissed.error}</NoteBar>

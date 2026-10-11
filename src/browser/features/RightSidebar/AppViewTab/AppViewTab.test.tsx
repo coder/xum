@@ -25,7 +25,7 @@ describe("AppViewTabPanel", () => {
     cleanupDom?.();
   });
 
-  test("a tab whose view is gone shows the unavailable state with Close", () => {
+  test("a tab whose view is gone shows the unavailable state with Close", async () => {
     const store = useWorkspaceStoreRaw();
     const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
       (id) => id === "ws-gone"
@@ -39,14 +39,18 @@ describe("AppViewTabPanel", () => {
         }) as unknown as WorkspaceState
     );
     let closed = 0;
+    // Not in the transcript and no result record in the backend either.
+    const client = createTestApiClient({
+      mcpApps: { getViewRecord: () => Promise.resolve({ success: true as const, data: null }) },
+    });
     try {
       const view = render(
-        <APIProvider client={createTestApiClient({})}>
+        <APIProvider client={client}>
           <AppViewTabLabel workspaceId="ws-gone" toolCallId="call-x" />
           <AppViewTabPanel workspaceId="ws-gone" toolCallId="call-x" onClose={() => closed++} />
         </APIProvider>
       );
-      expect(view.getByText("This view is no longer available.")).toBeTruthy();
+      expect(await view.findByText("This view is no longer available.")).toBeTruthy();
       expect(view.getByText("App view")).toBeTruthy();
       expect(view.queryByTestId("mcp-app-frame")).toBeNull();
       fireEvent.click(view.getByRole("button", { name: "Close" }));
@@ -122,6 +126,78 @@ describe("AppViewTabPanel", () => {
     }
   });
 
+  test("a restored tab outside the loaded transcript finds its view in the result store", async () => {
+    // E.g. the call is before the last compaction boundary: the transcript is loaded, the view
+    // is not in it, but the backend still has the call's result record.
+    const store = useWorkspaceStoreRaw();
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
+      (id) => id === "ws-older"
+    );
+    const state = spyOn(store, "getWorkspaceState").mockImplementation(
+      () =>
+        ({
+          messages: [],
+          loading: false,
+          isHydratingTranscript: false,
+        }) as unknown as WorkspaceState
+    );
+    const opened: Array<{ serverName: string; resourceUri: string }> = [];
+    const client = createTestApiClient({
+      mcpApps: {
+        getViewRecord: (input: { toolCallId: string }) =>
+          Promise.resolve({
+            success: true as const,
+            data:
+              input.toolCallId === "call-old"
+                ? {
+                    serverName: "dice",
+                    toolName: "dice_show_dice_board",
+                    resourceUri: "ui://dice/board.html",
+                    arguments: { count: 4 },
+                  }
+                : null,
+          }),
+        getView: (input: { serverName: string; resourceUri: string }) => {
+          opened.push({ serverName: input.serverName, resourceUri: input.resourceUri });
+          return Promise.resolve({
+            success: true as const,
+            data: {
+              html: "<p>view</p>",
+              csp: {},
+              prefersBorder: null,
+              resultAvailable: true,
+              result: { content: [] },
+              invocation: null,
+            },
+          });
+        },
+      },
+    });
+    try {
+      const view = render(
+        <ThemeProvider forcedTheme="dark">
+          <APIProvider client={client}>
+            <AppViewTabLabel workspaceId="ws-older" toolCallId="call-old" />
+            <AppViewTabPanel
+              workspaceId="ws-older"
+              toolCallId="call-old"
+              onClose={() => undefined}
+            />
+          </APIProvider>
+        </ThemeProvider>
+      );
+      await view.findByTestId("mcp-app-frame");
+      expect(view.queryByText("This view is no longer available.")).toBeNull();
+      expect(view.getByText("dice_show_dice_board")).toBeTruthy();
+      await waitFor(() =>
+        expect(opened).toEqual([{ serverName: "dice", resourceUri: "ui://dice/board.html" }])
+      );
+    } finally {
+      registered.mockRestore();
+      state.mockRestore();
+    }
+  });
+
   test("a plugin view's tab shows its server part; the tooltip names the full key", () => {
     const key = "plugin:0123456789abcdef:tray";
     openMcpAppViewTab("ws-plugin", {
@@ -189,8 +265,12 @@ describe("app view details", () => {
     openMcpAppViewTab("ws-lone", view("lone", { count: 1 }));
     try {
       const label = (workspaceId: string, toolCallId: string) =>
-        render(<AppViewTabLabel workspaceId={workspaceId} toolCallId={toolCallId} />).container
-          .textContent;
+        // The label hook can ask the backend for a view outside the transcript (useAPI).
+        render(
+          <APIProvider client={createTestApiClient({})}>
+            <AppViewTabLabel workspaceId={workspaceId} toolCallId={toolCallId} />
+          </APIProvider>
+        ).container.textContent;
       const [older, newer] = [label("ws-details", "d-old"), label("ws-details", "d-new")];
       expect(older).not.toBe(newer);
       expect(older?.startsWith("Boarddice")).toBe(true);

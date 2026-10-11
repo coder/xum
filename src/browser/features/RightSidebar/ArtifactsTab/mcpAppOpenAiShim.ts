@@ -1,3 +1,8 @@
+/** Shim -> host notification carrying window.openai widget state (Xum only, not MCP Apps). */
+export const MCP_APP_WIDGET_STATE_METHOD = "xum/notifications/widget-state";
+/** Widget state goes to the host at most this often; it stays under the bridge rate limit. */
+const WIDGET_STATE_FLUSH_MS = 100;
+
 /**
  * ChatGPT compatibility for MCP Apps views: `window.openai` (Apps SDK) on top of the standard
  * MCP Apps bridge, so a view built for ChatGPT renders in Xum. Injected as the second script of
@@ -6,7 +11,9 @@
  * SECURITY AUDIT: the shim adds no host power. It runs inside the view's own sandboxed document
  * (same opaque origin, same CSP) and only posts JSON-RPC messages the view could post itself
  * (ui/initialize, tools/call, ui/message, ui/open-link, ui/request-display-mode,
- * ui/notifications/*). Every check (frame gate, rate limits, visibility, consent, https-only
+ * ui/notifications/*, and the widget-state notification, stored for that view only and size
+ * capped by the host). The stored state comes back only into the same view's document, as
+ * escaped JSON. Every check (frame gate, rate limits, visibility, consent, https-only
  * links, composer-only messages) stays in the host (mcpAppHost.ts, the backend), which cannot
  * tell shim messages from view messages. A view that redefines or tampers with `window.openai`
  * only changes what it sees: the shim keeps its own references (parent window, dispatch, event
@@ -15,19 +22,40 @@
  * Handshake: standard views initialize themselves, and the shim reads the host's replies and
  * notifications passively. The shim sends its own ui/initialize only when the view first uses
  * `window.openai` and no handshake was seen yet, so a standard-only view gets no extra
- * handshake. Members without a standard equivalent warn once; their Promises reject (or
- * resolve, for setWidgetState, which views call on every change) and nothing throws. Optional
+ * handshake. Members without a standard equivalent warn once; their Promises reject and
+ * nothing throws. Optional
  * extensions Xum lacks (uploadFile, selectFiles, getFileDownloadUrl, requestCheckout) are
  * absent, so `if (window.openai?.selectFiles)` takes the view's fallback.
  * Shapes: https://developers.openai.com/plugins/reference.md and the Apps SDK example types.
+ *
+ * Widget state: setWidgetState stores the snapshot at once (window.openai.widgetState) and
+ * sends it to the host (MCP_APP_WIDGET_STATE_METHOD, at most one message per
+ * WIDGET_STATE_FLUSH_MS, and before a teardown reply). The host keeps it in renderer memory
+ * per view, and the next mount of the view starts with it: `widgetStateJson` is written into
+ * this script, so a view reading widgetState once at load (the Apps SDK example) sees it.
  */
-export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
+export function mcpAppOpenAiShimScript(widgetStateJson: string | null): string {
+  // SECURITY AUDIT: view data in a script element of the view's srcdoc. JSON text is a JS
+  // expression; "<" only occurs inside its strings, where the \u003c escape is the same
+  // character, so the data cannot close this script element ("</script>") or open an HTML
+  // comment, and U+2028/U+2029 are escaped for older JS parsers. The state comes from this same
+  // view (stored under the frame's own workspace and tool call, never a key from the message)
+  // and returns only into this view's sandboxed document, so even a break-out could run
+  // nothing the view could not already run.
+  const initialWidgetState = (widgetStateJson ?? "null")
+    .replace(/</g, "\\u003c")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+  return `(function () {
   "use strict";
   var parentWindow = window.parent;
   var dispatch = window.dispatchEvent.bind(window);
   var CustomEventCtor = window.CustomEvent;
   var warn = console.warn.bind(console);
   var media = typeof window.matchMedia === "function" ? window.matchMedia.bind(window) : null;
+  var setTimer = window.setTimeout.bind(window);
+  var clearTimer = window.clearTimeout.bind(window);
+  var stateTimer = null;
   var pending = new Map();
   var nextId = 1;
   var handshakeSeen = false;
@@ -45,7 +73,7 @@ export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
     toolInput: null,
     toolOutput: null,
     toolResponseMetadata: null,
-    widgetState: null
+    widgetState: ${initialWidgetState}
   };
   setLang(globals.locale);
 
@@ -109,13 +137,15 @@ export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
       case "ui/notifications/tool-result":
         setGlobals({
           toolOutput: params.structuredContent === undefined ? null : params.structuredContent,
-          toolResponseMetadata: params._meta === undefined ? null : params._meta
+          toolResponseMetadata: responseMetadata(params)
         });
         return;
       case "ui/notifications/host-context-changed":
         setGlobals(fromHostContext(params));
         return;
       case "ui/resource-teardown":
+        // Listeners run in order and the shim's is first: the last state goes before the reply.
+        flushWidgetState();
         // Only a view the shim connected has no SDK of its own to answer.
         if (ownHandshake) post({ jsonrpc: "2.0", id: data.id, result: {} });
         return;
@@ -144,6 +174,28 @@ export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
       post({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
     }, function () {});
   }
+  // The reference's toolResponseMetadata: "status, call_tool_result, and mcp_tool_result,
+  // preserving the full MCP result envelope, including hidden _meta". The result's own _meta
+  // keys stay on top as well, for views written when this global was the bare _meta.
+  function responseMetadata(result) {
+    var envelope = {};
+    var meta = result._meta;
+    if (meta && typeof meta === "object") for (var key in meta) envelope[key] = meta[key];
+    envelope.status = result.isError === true ? "error" : "success";
+    envelope.call_tool_result = result;
+    envelope.mcp_tool_result = result;
+    return envelope;
+  }
+  function flushWidgetState() {
+    if (stateTimer === null) return;
+    clearTimer(stateTimer);
+    stateTimer = null;
+    try {
+      post({ jsonrpc: "2.0", method: "${MCP_APP_WIDGET_STATE_METHOD}", params: { state: globals.widgetState } });
+    } catch (error) {
+      warn("[Xum] window.openai.setWidgetState: the state cannot be stored", error);
+    }
+  }
   function warnOnce(name) {
     if (warned[name]) return;
     warned[name] = true;
@@ -170,8 +222,10 @@ export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
     openExternal: function (args) {
       request("ui/open-link", { url: String((args && args.href) || "") }).catch(function () {});
     },
-    setWidgetState: function () {
-      warnOnce("setWidgetState");
+    setWidgetState: function (state) {
+      connect();
+      setGlobals({ widgetState: state === undefined ? null : state });
+      if (stateTimer === null) stateTimer = setTimer(flushWidgetState, ${WIDGET_STATE_FLUSH_MS});
       return Promise.resolve();
     },
     setOpenInAppUrl: function () {
@@ -200,3 +254,4 @@ export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
     Object.defineProperty(window, "openai", { value: api, writable: true, configurable: true });
   } catch (error) {}
 })();`;
+}

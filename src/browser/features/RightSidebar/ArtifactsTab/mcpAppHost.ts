@@ -6,6 +6,7 @@ import {
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
 import { createBridgeRateLimiter } from "./artifactBridge";
 import type { GrantedMcpAppCsp } from "./mcpAppCsp";
+import { MCP_APP_WIDGET_STATE_METHOD } from "./mcpAppOpenAiShim";
 
 /**
  * Host side of the MCP Apps (SEP-1865, 2026-01-26) JSON-RPC protocol for a view in the
@@ -17,7 +18,8 @@ import type { GrantedMcpAppCsp } from "./mcpAppCsp";
  * and consent rules enforced by the backend), resources/read (own server only), ui/open-link
  * (https, after a confirm), ui/message (inserted into the composer after a confirm, never sent),
  * ui/update-model-context (stored per view for the workspace's next requests) and
- * ui/request-display-mode (inline / fullscreen). Every other request gets -32601.
+ * ui/request-display-mode (inline / fullscreen). Every other request gets -32601. The
+ * window.openai shim also sends its widget state (MCP_APP_WIDGET_STATE_METHOD), kept per view.
  */
 
 export const MCP_APP_PROTOCOL_VERSION = "2026-01-26";
@@ -38,6 +40,8 @@ const TOOL_CALL_WINDOW_MS = 10_000;
  * asking rather than shown truncated (a padded prefix could hide what the call really sends).
  */
 export const MCP_APP_CONSENT_ARGS_MAX_BYTES = 64 * 1024;
+/** Largest window.openai widget state (JSON) the host keeps for a view; larger is dropped. */
+export const MCP_APP_WIDGET_STATE_MAX_BYTES = 64 * 1024;
 /** How long teardown waits for the view's reply before the host removes it. */
 export const MCP_APP_TEARDOWN_TIMEOUT_MS = 500;
 /** Clamp for reported view heights (px). */
@@ -144,6 +148,8 @@ function modelContextText(params: z.infer<typeof ModelContextParams>): string | 
     : null;
 }
 
+const WidgetStateParams = z.object({ state: z.unknown() });
+
 export type McpAppDisplayMode = "inline" | "fullscreen" | "pip";
 const DisplayModeParams = z.object({ mode: z.string().max(32) });
 const InitializeParams = z.object({
@@ -193,6 +199,8 @@ export interface McpAppHostOptions {
    * A move unmounts this instance, so the host runs it only once the view has its reply.
    */
   setDisplayMode: (mode: McpAppDisplayMode) => (() => void) | null;
+  /** Keep the view's window.openai widget state (JSON) for its next mount this session. */
+  saveWidgetState: (json: string) => void;
   requestConsent: (request: McpAppConsentRequest) => Promise<boolean>;
   insertIntoComposer: (text: string) => void;
   openExternalLink: (url: string) => void;
@@ -214,6 +222,11 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   let viewDisplayModes: readonly string[] | undefined;
   /** The mode the view was last told (initial context or host-context-changed). */
   let notifiedDisplayMode: McpAppDisplayMode | undefined;
+  /**
+   * The mode of an accepted move that has not run yet. The move replaces this instance, so
+   * every later request is answered with it: that is where the view ends up.
+   */
+  let pendingDisplayMode: McpAppDisplayMode | undefined;
 
   /**
    * The mode the view is told. "The host MUST NOT switch the View to a display mode that does
@@ -354,6 +367,9 @@ export function createMcpAppHost(options: McpAppHostOptions) {
       case "ui/request-display-mode": {
         const parsed = DisplayModeParams.safeParse(params);
         if (!parsed.success) return fail(id, INVALID_PARAMS, "Invalid display mode request");
+        // Requests that arrive after an accepted move (between its reply and the move) cannot
+        // change it: this instance is leaving, and the view ends up in the pending mode.
+        if (pendingDisplayMode !== undefined) return respond(id, { mode: pendingDisplayMode });
         const context = options.getHostContext();
         const current = viewMode(context.displayMode);
         const requested = context.availableDisplayModes.find((mode) => mode === parsed.data.mode);
@@ -369,6 +385,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         respond(id, { mode });
         displayModeChanged(mode);
         if (move == null) return;
+        pendingDisplayMode = mode;
         // The move unmounts this instance, and a frame removed before a queued postMessage
         // runs never gets it. The teardown reply comes after the view handled the mode reply
         // (messages arrive in order), and the view must get a teardown before it goes anyway.
@@ -434,6 +451,25 @@ export function createMcpAppHost(options: McpAppHostOptions) {
             ? { height: clampMcpAppHeight(parsed.data.height) }
             : {}),
         });
+        return;
+      }
+      case MCP_APP_WIDGET_STATE_METHOD: {
+        const parsed = WidgetStateParams.safeParse(params);
+        if (!parsed.success) return;
+        let json: string | undefined;
+        try {
+          json = JSON.stringify(parsed.data.state ?? null);
+        } catch {
+          json = undefined;
+        }
+        if (
+          json === undefined ||
+          new TextEncoder().encode(json).length > MCP_APP_WIDGET_STATE_MAX_BYTES
+        ) {
+          options.log("dropped widget state over the size limit");
+          return;
+        }
+        options.saveWidgetState(json);
         return;
       }
       case "notifications/message": {

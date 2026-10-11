@@ -6,6 +6,7 @@ import {
   createMcpAppHost,
   MCP_APP_CONSENT_ARGS_MAX_BYTES,
   MCP_APP_MAX_HEIGHT,
+  MCP_APP_WIDGET_STATE_MAX_BYTES,
   type McpAppConsentRequest,
   type McpAppDisplayMode,
   type McpAppHostOptions,
@@ -17,6 +18,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
   const reads: string[] = [];
   const modelContexts: string[] = [];
   const modeRequests: string[] = [];
+  const widgetStates: string[] = [];
   const moves: string[] = [];
   let displayMode: McpAppDisplayMode = "inline";
   const consents: McpAppConsentRequest[] = [];
@@ -63,6 +65,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
         displayMode = mode;
       };
     },
+    saveWidgetState: (json) => widgetStates.push(json),
     requestConsent: (request) => {
       consents.push(request);
       return Promise.resolve(true);
@@ -95,6 +98,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
     reads,
     modelContexts,
     modeRequests,
+    widgetStates,
     moves,
     requestMode,
     setHostMode: (mode: McpAppDisplayMode) => (displayMode = mode),
@@ -380,17 +384,27 @@ describe("MCP Apps host router", () => {
     await t.requestMode(2, "fullscreen");
     expect(t.reply(2)?.result).toEqual({ mode: "fullscreen" });
     expect(changes()).toEqual([{ displayMode: "fullscreen" }]);
-    await t.requestMode(3, "inline");
-    expect(t.reply(3)?.result).toEqual({ mode: "inline" });
-    expect(t.modeRequests).toEqual(["fullscreen", "inline"]);
+    expect(t.moves).toEqual(["fullscreen"]);
+    // The move replaced that instance; the one in the tab (fullscreen) asks for inline.
+    const tab = setup();
+    tab.setHostMode("fullscreen");
+    await tab.request(1, "ui/initialize", {});
+    await tab.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    await tab.requestMode(2, "inline");
+    expect(tab.reply(2)?.result).toEqual({ mode: "inline" });
+    expect(tab.moves).toEqual(["inline"]);
     // A change from outside the view (closing it in Artifacts) notifies once.
-    t.host.displayModeChanged("inline");
-    t.host.displayModeChanged("fullscreen");
-    t.host.displayModeChanged("fullscreen");
-    expect(changes()).toEqual([
-      { displayMode: "fullscreen" },
+    const tabChanges = () =>
+      tab.sent
+        .filter((m) => m.method === "ui/notifications/host-context-changed")
+        .map((m) => m.params);
+    tab.host.displayModeChanged("fullscreen");
+    tab.host.displayModeChanged("inline");
+    tab.host.displayModeChanged("inline");
+    expect(tabChanges()).toEqual([
       { displayMode: "inline" },
       { displayMode: "fullscreen" },
+      { displayMode: "inline" },
     ]);
   });
 
@@ -459,6 +473,23 @@ describe("MCP Apps host router", () => {
     expect(t.moves).toEqual(["fullscreen"]);
   });
 
+  test("requests before a pending move runs are answered with the pending mode", async () => {
+    const t = setup();
+    await t.request(1, "ui/initialize", {});
+    await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    const done = t.request(2, "ui/request-display-mode", { mode: "fullscreen" });
+    // The view got its reply and asks again before answering the teardown.
+    await t.request(3, "ui/request-display-mode", { mode: "inline" });
+    await t.request(4, "ui/request-display-mode", { mode: "fullscreen" });
+    expect(t.reply(3)?.result).toEqual({ mode: "fullscreen" });
+    expect(t.reply(4)?.result).toEqual({ mode: "fullscreen" });
+    await t.host.handleMessage({ jsonrpc: "2.0", id: "host-1", result: {} });
+    await done;
+    // One move, to the mode every reply named.
+    expect(t.modeRequests).toEqual(["fullscreen"]);
+    expect(t.moves).toEqual(["fullscreen"]);
+  });
+
   test("a mode the host cannot show now returns the current mode and does not move", async () => {
     const t = setup({ setDisplayMode: () => null });
     await t.request(1, "ui/initialize", {});
@@ -508,5 +539,19 @@ describe("MCP Apps host router", () => {
     await t.request(2, "ui/update-model-context", { structuredContent: { count: BigInt(3) } });
     for (const id of [1, 2]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
     expect(t.modelContexts).toEqual([]);
+  });
+
+  test("widget state is kept as JSON up to the size limit", async () => {
+    const t = setup();
+    const send = (state: unknown) =>
+      t.host.handleMessage({
+        jsonrpc: "2.0",
+        method: "xum/notifications/widget-state",
+        params: { state },
+      });
+    await send({ selected: 2 });
+    await send(undefined);
+    await send("x".repeat(MCP_APP_WIDGET_STATE_MAX_BYTES));
+    expect(t.widgetStates).toEqual(['{"selected":2}', "null"]);
   });
 });

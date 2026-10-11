@@ -2390,6 +2390,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         mockViewDomains.delete(JSON.stringify([input.projectPath, input.serverName]));
         return Promise.resolve();
       },
+      // Story views are always in the story transcript, so no record lookup finds one.
+      getViewRecord: () => Promise.resolve({ success: true as const, data: null }),
       callTool: (input: { toolName: string; consented: boolean }) =>
         Promise.resolve({
           success: true as const,

@@ -64,6 +64,22 @@ export function useMcpAppViewInTab(
 export const MAX_LIVE_APP_VIEW_TABS = 3;
 
 /**
+ * The stored activation order after `active` became the active tab: newest first, only tabs
+ * still in the tabset, at most MAX_LIVE_APP_VIEW_TABS. Bounded, because a long-lived tabset
+ * opens and closes many views and only the newest few can stay mounted anyway.
+ */
+export function nextRecentAppViewTabs(
+  recent: readonly TabType[],
+  active: TabType,
+  tabs: readonly TabType[]
+): TabType[] {
+  return [active, ...recent.filter((tab) => tab !== active && tabs.includes(tab))].slice(
+    0,
+    MAX_LIVE_APP_VIEW_TABS
+  );
+}
+
+/**
  * The app tabs of a tabset that stay mounted: the most recently active ones, newest first.
  * `recent` is the tabset's activation order; tabs no longer in the tabset drop out.
  */
