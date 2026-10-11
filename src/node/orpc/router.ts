@@ -1296,7 +1296,7 @@ export const router = (authToken?: string) => {
                 input.workspaceId,
                 input.serverName,
                 input.set,
-                snapshot.properties
+                snapshot
               );
             })
           ),

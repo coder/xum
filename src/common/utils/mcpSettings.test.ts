@@ -146,6 +146,21 @@ describe("parseMCPSettingsReadResult", () => {
     expect(result.droppedSettingCount).toBe(1);
   });
 
+  test("a setting named __proto__ stays an own key of properties, values and layout", () => {
+    // JSON.parse keeps "__proto__" as an own key, as a server's JSON response would.
+    const result = parseMCPSettingsReadResult(
+      JSON.parse(
+        '{"schema":{"type":"object","properties":{"__proto__":{"type":"boolean","title":"P"}}},"values":{"__proto__":true}}'
+      )
+    );
+    if ("error" in result) throw new Error(result.error);
+    expect(Object.keys(result.properties)).toEqual(["__proto__"]);
+    expect(Object.hasOwn(result.values, "__proto__")).toBe(true);
+    expect(result.layout).toEqual([
+      { title: "Other settings", items: [{ kind: "property", property: "__proto__" }] },
+    ]);
+  });
+
   test("a result without an object schema is an error", () => {
     expect(parseMCPSettingsReadResult({ values: {} })).toHaveProperty("error");
   });
@@ -161,6 +176,9 @@ test("validateMCPSettingValue checks enum, code-point lengths, bounds and multip
   expect(
     validateMCPSettingValue({ type: "string", title: "t", maxLength: 2 }, "abc")
   ).not.toBeNull();
+  // The host's own text limit counts code points too: 3000 emoji fit, 4097 do not.
+  expect(validateMCPSettingValue({ type: "string", title: "t" }, "😀".repeat(3000))).toBeNull();
+  expect(validateMCPSettingValue({ type: "string", title: "t" }, "😀".repeat(4097))).not.toBeNull();
   expect(validateMCPSettingValue({ type: "number", title: "t", maximum: 1 }, 2)).not.toBeNull();
   expect(validateMCPSettingValue({ type: "number", title: "t", multipleOf: 0.1 }, 0.3)).toBeNull();
   // Large magnitudes: the quotient's float error scales with it.
