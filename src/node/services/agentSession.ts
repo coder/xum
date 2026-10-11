@@ -10356,6 +10356,10 @@ export class AgentSession {
   ): Promise<void> {
     if (this.aiService.runTurnStopHooks == null) return;
     if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
+    // A hard Stop can land while a slow hook runs, after the stream ended: it then finds no live
+    // stream to supersede and clears the queue before the hook returns. Its epoch fences the
+    // continuation instead (rechecked below, after the last await).
+    const stopEpochAtHook = this.getStopEpoch();
     const outcome = await this.aiService.runTurnStopHooks(this.workspaceId, {
       messageId: payload.messageId,
       lastAssistantMessage: lastAssistantText(payload.parts),
@@ -10393,6 +10397,11 @@ export class AgentSession {
     // send still in its preflight (this session's or WorkspaceService's) is not queued yet, but
     // it wins too: the continuation must not run another model turn ahead of newer input.
     if (this.hasPendingManualFollowUp() || this.hasManualSendInPreflight()) {
+      this.stopHookContinuations = 0;
+      return;
+    }
+    // A Stop since the hook started ends the turn: no continuation runs after it.
+    if (this.isStopInProgress() || this.getStopEpoch() !== stopEpochAtHook) {
       this.stopHookContinuations = 0;
       return;
     }

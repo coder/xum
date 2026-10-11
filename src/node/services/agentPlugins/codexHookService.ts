@@ -21,6 +21,7 @@ import { log } from "@/node/services/log";
 import { eventSpine, type EventSpine } from "@/node/services/events/eventSpine";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
+import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 import {
   discoverAgentPlugins,
   MAX_PLUGIN_MANIFEST_BYTES,
@@ -45,7 +46,7 @@ export interface EnsureCodexHooksArgs {
   xumHome: string;
   /** Live project-trust read for this workspace; called before every hook call. */
   isProjectTrusted: () => boolean;
-  mcp: Pick<MCPServerManager, "callToolForPluginHook">;
+  mcp: Pick<MCPServerManager, "callToolForPluginHook" | "canCallToolForPluginHook">;
   /** Shows a hook's systemMessage to the user (never the model). */
   notifyUser: (pluginName: string, message: string) => void;
   /**
@@ -76,7 +77,9 @@ export class CodexPluginHookService {
       this.locks.set(args.workspaceId, lock);
     }
     await using _guard = await lock.acquire();
-    if (args.sideChat) {
+    // XUM_DISABLE_AGENT_TOOLS (bug-bash real mode) sends no tools: no hook may call MCP either
+    // (Codex PRRT_kwDOPxxmWM6rPrkn).
+    if (args.sideChat || isAgentToolsDisabled()) {
       this.registrations.get(args.workspaceId)?.unregister();
       this.registrations.delete(args.workspaceId);
       return;
@@ -85,12 +88,25 @@ export class CodexPluginHookService {
     const loaded = await Promise.all(
       plugins.map(async (plugin) => ({ plugin, ...(await loadPluginCodexHooks(plugin)) }))
     );
-    const runnable = loaded
-      .map((entry) => ({
-        ...entry,
-        hooks: entry.hooks.filter((hook) => hook.status === "runnable"),
-      }))
-      .filter((entry) => entry.hooks.length > 0);
+    // Only hooks trusted NOW register, so an untrusted hook's matcher (a plugin regex, possibly
+    // catastrophic) never runs (Codex PRRT_kwDOPxxmWM6rPrkq). Trust can change afterwards: the
+    // per-call gate still refuses a revoked hook, and this refresh runs on every send and turn,
+    // so a newly trusted hook registers on the next one (the fingerprint changes).
+    const projectTrusted = args.isProjectTrusted();
+    const runnable = (
+      await Promise.all(
+        loaded.map(async (entry) => {
+          if (!projectTrusted) return { ...entry, hooks: [] };
+          const trust = await readPluginHookTrust(args.xumHome, instanceIdOf(entry.plugin));
+          return {
+            ...entry,
+            hooks: entry.hooks.filter(
+              (hook) => hook.status === "runnable" && isPluginHookTrusted(trust, hook)
+            ),
+          };
+        })
+      )
+    ).filter((entry) => entry.hooks.length > 0);
     // Key and hash: the per-call gate matches both, so a hook that only moved (new key, same
     // hash) must re-register or its stale key is refused forever.
     const fingerprint = JSON.stringify(
@@ -192,8 +208,7 @@ export class CodexPluginHookService {
   }
 
   private depsFor(plugin: AgentPluginInfo, args: EnsureCodexHooksArgs): CodexHookRunnerDeps {
-    // Same identity as the install service and the plugin's MCP server keys.
-    const instanceId = computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName));
+    const instanceId = instanceIdOf(plugin);
     return {
       isHookAllowed: async (hook: PluginHookDefinition) => {
         if (!args.isProjectTrusted()) return false;
@@ -220,9 +235,20 @@ export class CodexPluginHookService {
           call.input,
           { signal: call.signal }
         ),
+      canCallPluginTool: (call) =>
+        args.mcp.canCallToolForPluginHook(
+          args.workspaceId,
+          buildPluginServerKey(instanceId, call.server),
+          call.tool
+        ),
       notifyUser: (message) => args.notifyUser(plugin.name, message),
     };
   }
+}
+
+/** Same identity as the install service and the plugin's MCP server keys. */
+function instanceIdOf(plugin: AgentPluginInfo): string {
+  return computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName));
 }
 
 /**

@@ -1,5 +1,6 @@
 import type { TurnCompletion } from "./streamManager";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, jest } from "bun:test";
+import { NESTED_COMPACTION_FOLLOW_UP_MESSAGE } from "@/common/utils/messages/pluginSendHookFields";
 import type { WorkspaceService } from "./workspaceService";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
@@ -269,6 +270,33 @@ describe("WorkspaceService sendMessage status clearing", () => {
     });
     expect(result.success).toBe(false);
     expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+  });
+
+  test("a /compact whose follow-up is itself a compaction request is refused", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rPrJh): no Xum path builds this shape, and the nested request's
+    // own follow-up would later dispatch as an automatic send no message.send hook may block.
+    const compaction = (followUpContent: Record<string, unknown>) => ({
+      type: "compaction-request" as const,
+      rawCommand: "/compact",
+      parsed: { followUpContent },
+    });
+    const result = await workspaceService.sendMessage("test-workspace", "Summarize.", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+      muxMetadata: compaction({
+        text: "/compact",
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+        muxMetadata: compaction({ text: "deploy to prod", model: "openai:gpt-4o-mini" }),
+      }),
+    });
+
+    expect(result).toEqual({
+      success: false,
+      error: { type: "unknown", raw: NESTED_COMPACTION_FOLLOW_UP_MESSAGE },
+    });
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+    expect(fakeSession.sendMessage).not.toHaveBeenCalled();
   });
 
   test("an artifact interaction sent while streaming queues tool-end with its dedupe key", async () => {

@@ -37,6 +37,7 @@ describe("CodexPluginHookService", () => {
   let projectTrusted: boolean;
   let calledKeys: string[];
   let mcpFails: boolean;
+  let toolAvailable: boolean;
 
   const pluginRoot = (name: string) => path.join(xumHome, "plugins", name);
   const instanceId = (name: string) => computePluginInstanceId(pluginRoot(name));
@@ -90,6 +91,7 @@ describe("CodexPluginHookService", () => {
     xumHome,
     isProjectTrusted: () => projectTrusted,
     mcp: {
+      canCallToolForPluginHook: () => toolAvailable,
       callToolForPluginHook: (_workspaceId, serverKey) => {
         calledKeys.push(serverKey);
         return mcpFails
@@ -101,10 +103,10 @@ describe("CodexPluginHookService", () => {
     sideChat: false,
   });
 
-  async function runBash(): Promise<ToolExecuteContext> {
+  async function runBash(toolArgs: unknown = {}): Promise<ToolExecuteContext> {
     const ctx: ToolExecuteContext = {
       toolName: "bash",
-      args: {},
+      args: toolArgs,
       host: {
         runtime: new LocalRuntime(xumHome),
         runtimeTempDir: xumHome,
@@ -128,6 +130,7 @@ describe("CodexPluginHookService", () => {
     projectTrusted = true;
     calledKeys = [];
     mcpFails = false;
+    toolAvailable = true;
   });
 
   afterEach(async () => {
@@ -141,7 +144,9 @@ describe("CodexPluginHookService", () => {
     expect((await runBash()).executed).toBe(true);
     expect(calledKeys).toEqual([]);
 
+    // Only hooks trusted at registration register; the next refresh (every send) picks it up.
     await trustAll("guard");
+    await service.ensureWorkspaceHooks(args());
     expect((await runBash()).executed).toBe(false);
     expect(calledKeys).toEqual([buildPluginServerKey(instanceId("guard"), "scanner")]);
   });
@@ -246,6 +251,82 @@ describe("CodexPluginHookService", () => {
     expect(calledKeys).toHaveLength(1);
   });
 
+  test("XUM_DISABLE_AGENT_TOOLS=1 registers no hook: a trusted hook makes no MCP call", async () => {
+    await writePlugin("guard", "scanner");
+    await trustAll("guard");
+    const previous = process.env.XUM_DISABLE_AGENT_TOOLS;
+    process.env.XUM_DISABLE_AGENT_TOOLS = "1";
+    try {
+      await service.ensureWorkspaceHooks(args());
+      expect((await runBash()).executed).toBe(true);
+      expect(calledKeys).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.XUM_DISABLE_AGENT_TOOLS;
+      else process.env.XUM_DISABLE_AGENT_TOOLS = previous;
+    }
+  });
+
+  test("an untrusted hook's matcher never runs (it can be a catastrophic regex)", async () => {
+    await writePlugin("guard", "scanner");
+    const matcher = "^ba(sh)$";
+    await fs.writeFile(
+      path.join(pluginRoot("guard"), "hooks", "hooks.json"),
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            { matcher, hooks: [{ type: "mcp_tool", server: "scanner", tool: "check" }] },
+          ],
+        },
+      })
+    );
+    await service.ensureWorkspaceHooks(args());
+    const tested: string[] = [];
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- restored below
+    const originalTest = RegExp.prototype.test;
+    RegExp.prototype.test = function (this: RegExp, value: string) {
+      if (this.source === matcher) tested.push(value);
+      return originalTest.call(this, value);
+    };
+    try {
+      expect((await runBash()).executed).toBe(true);
+    } finally {
+      RegExp.prototype.test = originalTest;
+    }
+    expect(tested).toEqual([]);
+  });
+
+  test("a large Bash call runs when the hook's server or tool is unavailable", async () => {
+    await writePlugin("guard", "scanner");
+    await fs.writeFile(
+      path.join(pluginRoot("guard"), "hooks", "hooks.json"),
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            {
+              hooks: [
+                {
+                  type: "mcp_tool",
+                  server: "scanner",
+                  tool: "check",
+                  input: { cmd: "${tool_input.script}" },
+                },
+              ],
+            },
+          ],
+        },
+      })
+    );
+    await trustAll("guard");
+    await service.ensureWorkspaceHooks(args());
+    const large = { script: "x".repeat(70 * 1024) };
+    // Available: the hook cannot check the call, so it is denied.
+    expect((await runBash(large)).executed).toBe(false);
+
+    toolAvailable = false;
+    expect((await runBash(large)).executed).toBe(true);
+    expect(calledKeys).toEqual([]);
+  });
+
   test("a disabled plugin server fails open: the tool runs", async () => {
     await writePlugin("guard", "scanner");
     await trustAll("guard");
@@ -314,6 +395,7 @@ describe("CodexPluginHookService", () => {
     const promptArgs = (): EnsureCodexHooksArgs => ({
       ...args(),
       mcp: {
+        canCallToolForPluginHook: () => serverRunning,
         // Like MCPServerManager.callToolForPluginHook: a server that is not running is refused.
         callToolForPluginHook: (_workspaceId, serverKey) => {
           calledKeys.push(serverKey);

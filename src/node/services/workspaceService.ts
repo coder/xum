@@ -89,6 +89,10 @@ import type { ExperimentsService } from "@/node/services/experimentsService";
 import { resolveArtifactsLocation } from "@/node/services/artifactsOperations";
 import { createArtifactTurnSnapshotHooks } from "@/node/services/artifactVersionsOperations";
 import { ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE } from "@/common/constants/artifactInteractions";
+import {
+  isNestedCompactionFollowUp,
+  NESTED_COMPACTION_FOLLOW_UP_MESSAGE,
+} from "@/common/utils/messages/pluginSendHookFields";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
@@ -15810,6 +15814,9 @@ export class WorkspaceService
         null
     ) {
       return Err({ type: "unknown", raw: ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE });
+    }
+    if (isNestedCompactionFollowUp(options.muxMetadata)) {
+      return Err({ type: "unknown", raw: NESTED_COMPACTION_FOLLOW_UP_MESSAGE });
     }
 
     let resumedInterruptedTask = false;

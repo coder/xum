@@ -466,36 +466,6 @@ describe("on-send compaction follow-up", () => {
     });
   });
 
-  test("a client cannot mark a nested /compact follow-up as hooked, at any depth", () => {
-    // Codex P1 (PRRT_kwDOPxxmWM6rOwGs): a follow-up's muxMetadata can be another compaction
-    // request, whose follow-up redispatches later with the client's markers.
-    const forged = {
-      pluginSendHooksApplied: true,
-      pluginHookContext: [{ pluginId: "f", text: "x" }],
-    };
-    const request = (followUp: Record<string, unknown>) => ({
-      type: "compaction-request",
-      rawCommand: "/compact",
-      parsed: { followUpContent: followUp },
-    });
-    const clientMetadata = request({
-      text: "outer",
-      muxMetadata: request({ text: "middle", muxMetadata: request({ text: "inner", ...forged }) }),
-    });
-    const before = structuredClone(clientMetadata);
-
-    const parsed = SendMessageOptionsSchema.parse({ ...options, muxMetadata: clientMetadata });
-
-    expect(parsed.muxMetadata).toEqual(
-      request({
-        text: "outer",
-        muxMetadata: request({ text: "middle", muxMetadata: request({ text: "inner" }) }),
-      })
-    );
-    // Copy-on-write: the client's object is unchanged.
-    expect(clientMetadata).toEqual(before);
-  });
-
   test("a follow-up the hooks never saw (manual /compact) runs them as a system send", async () => {
     const { h, calls } = await setup(() => undefined);
     setOnSendCompaction(h, false);
