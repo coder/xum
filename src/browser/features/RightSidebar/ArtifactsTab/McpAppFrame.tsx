@@ -241,11 +241,21 @@ export function McpAppFrame(props: {
       ? published.origins
       : (current?.view?.approvedDomains ?? []);
   const grant = current?.view ? grantMcpAppCsp(current.view.csp, approved) : null;
-  // Only a view with a result record can be approved (the record binds its server).
+  // Only a view with a result record can be approved (the record binds its server), and only
+  // when a user project can own the approval (approvalProjectPathOf in mcpAppsOperations.ts): not in a scratch chat, nor for
+  // a global server of a multi-project workspace. Otherwise every Allow would fail.
+  const unapprovable =
+    current?.view == null
+      ? null
+      : current.view.invocation == null
+        ? "the tool result record of this view is gone"
+        : approvalProjectPath == null
+          ? "no project of this workspace owns this server"
+          : null;
   const domainsPrompt =
     grant != null &&
     grant.pending.length > 0 &&
-    current?.view?.invocation != null &&
+    unapprovable == null &&
     domainsDismissed?.toolCallId !== toolCallId
       ? grant.pending
       : null;
@@ -478,10 +488,9 @@ export function McpAppFrame(props: {
       {grant.notGranted.length > 0 && (
         <NoteBar>Not granted to this view: {grant.notGranted.join(", ")}</NoteBar>
       )}
-      {grant.pending.length > 0 && current.view.invocation == null && (
-        // Without its result record nothing binds the view to a server, so no Allow is offered.
+      {grant.pending.length > 0 && unapprovable != null && (
         <NoteBar>
-          Blocked, and cannot be allowed because the tool result record of this view is gone:{" "}
+          Blocked, and cannot be allowed because {unapprovable}:{" "}
           {grant.pending.map((origin) => new URL(origin).host).join(", ")}
         </NoteBar>
       )}
