@@ -36,7 +36,7 @@ import * as path from "node:path";
 import type { Readable } from "node:stream";
 import { receiveExport } from "./exportStream";
 import { PROXY_DIR } from "./inContainer";
-import { startProxy } from "./proxy";
+import { startProxy, UNREACHABLE } from "./proxy";
 import { Ledger, priced } from "./proxyPolicy";
 // prettier-ignore
 import { checkMountSource, containerEnv, exactStepRefusal, exploreRefusal, jobEnv, outputDir, plainFolders, stage } from "./inputs";
@@ -135,6 +135,14 @@ export function modelJob(env: NodeJS.ProcessEnv, modelVar = "BUGBASH_MODEL"): Mo
 }
 
 const usd = (nanoUsd: number) => `$${(nanoUsd / 1e9).toFixed(4)}`;
+
+/** The text of an unreachable upstream. The host only: the base URL's path can hold a token. */
+export const cannotReach = (job: ModelJob) =>
+  `cannot reach ANTHROPIC_BASE_URL (${new URL(job.upstream.baseUrl).host})`;
+/** Whether the proxy released a probe call because it could not connect (proxy.ts). */
+export const probeUnreachable = (records: object[]) =>
+  records.some((r) => (r as { reason?: unknown }).reason === UNREACHABLE);
+
 /** The app AI probe's deadline: aiMode.ts's probe timeout. */
 const PROBE_MS = 10_000;
 
@@ -424,7 +432,7 @@ function checkJob(args: string[], o: LaunchOptions) {
   // First, before any docker command and before the container env exists.
   const ai = appAi(o.env, args[0] === "explore");
   const driven = mcpApps || selfCheck || args[0] === "explore" ? modelJob(o.env) : undefined;
-  return { dir, selfCheck, ai, driven };
+  return { dir, mcpApps, selfCheck, ai, driven };
 }
 
 /** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
@@ -436,7 +444,7 @@ export async function preflight(args: string[], o: LaunchOptions): Promise<Clean
 /** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
 export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
   const log = o.log ?? logLine;
-  const { dir, selfCheck, ai, driven } = checkJob(args, o);
+  const { dir, mcpApps, selfCheck, ai, driven } = checkJob(args, o);
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -460,6 +468,8 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   // A call record that could not be written (a full disk): the proxy record is incomplete, so
   // the job must not look successful. The errno code only: the message can hold the path.
   let recordFault: string | undefined;
+  /** The MCP Apps probe's proxy fault: its own proxy, closed before the job's starts. */
+  let probeFault: string | undefined;
   // The first proxy fault stops this job at once (its proxy closes with the lifeline), so no
   // more paid calls go out on a wrong cost model or without a record.
   let faulted = false;
@@ -530,6 +540,27 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     };
     const env = containerEnv(o.env, { ...jobEnv(output), ...host, ...modeEnv(ai), ...drivenEnv });
     plainFolders(dir, path.dirname(output), true);
+    // The MCP Apps suite fails every test without its explorer model, so one probe call of that
+    // model, through the job's ledger, refuses a dead upstream or key before the container starts.
+    // run.ts probes before its explore jobs; the self-check has a fake upstream.
+    if (mcpApps && driven) {
+      ledger = o.ledger ?? new Ledger(driven.budgetUsd);
+      // A bound miss in the probe is a proxy fault like any other: exit 5, and run-wide halt.
+      const probe = await probeApp(driven, driven.model, ledger, o.stop).catch((error: Error) => {
+        probeFault = error.message;
+        fault(probeFault);
+        throw error;
+      });
+      for (const entry of probe.records) record(entry);
+      if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
+      if (probe.status !== 200)
+        throw new Refusal(
+          probeUnreachable(probe.records)
+            ? `${cannotReach(driven)}: check the URL and the network`
+            : `the ${driven.model} probe failed (HTTP ${probe.status}): check ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL and BUGBASH_BUDGET_USD`
+        );
+      log(`${name} probe: ${driven.model} answered`);
+    }
     const proxyMount: string[] = [];
     if (driven) {
       // The socket's folder, read-only: connect() needs no write access to the mount (measured
@@ -537,7 +568,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       const proxyDir = path.join(jobDir, "proxy");
       fs.mkdirSync(proxyDir, { mode: 0o700 });
       fs.mkdirSync(path.join(staged, path.relative("/repo", PROXY_DIR))); // its mount point
-      ledger = o.ledger ?? new Ledger(driven.budgetUsd);
+      ledger ??= o.ledger ?? new Ledger(driven.budgetUsd);
       proxy = await startProxy({
         socketPath: path.join(proxyDir, "sock"),
         // The job folder: not mounted (only stage/ and proxy/ are), and one place to clean up.
@@ -607,7 +638,9 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   }
   const missed = await closeProxy();
   if (proxy && ledger) {
-    const { settled, kept, refused, refusedBy } = proxy.stats();
+    const { settled, kept, refused, released, refusedBy } = proxy.stats();
+    if (released > 0)
+      log(`${name} proxy: ${cannotReach(driven!)}: ${released} call(s) released at $0`);
     // A shared ledger's totals are the run's: run.ts reports them once.
     const { spentNanoUsd, capNanoUsd } = ledger.totals();
     const spent = o.ledger ? "" : `, ${usd(spentNanoUsd)} of ${usd(capNanoUsd)} at list price`;
@@ -626,7 +659,10 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     cleanup,
     // Read after cleanup: a stop seen before cleanup ended counts.
     ...(o.stop.aborted && { stopped: String(o.stop.reason) }),
-    ...(missed != null && { proxyFault: missed }),
+    // recordFault too: a probe record that was not written, before the job's proxy existed.
+    ...((missed ?? probeFault ?? recordFault) != null && {
+      proxyFault: missed ?? probeFault ?? recordFault,
+    }),
   };
 }
 

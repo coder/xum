@@ -54,6 +54,8 @@ export async function startFakeUpstream(port = 0, onRequest?: (request: FakeRequ
       const model = parsed.model ?? "claude-haiku-4-5";
       const headers = { "request-id": "req_fake", "x-fake-internal": "dropped by the proxy" };
       if (mode === "stall") return;
+      // The request arrived, then the connection drops without an answer.
+      if (mode === "reset") return void req.socket.destroy();
       if (mode === "redirect") return res.writeHead(307, { location: "/redirected" }).end();
       if (mode === "529") {
         const error = { type: "error", error: { type: "overloaded_error", message: "Overloaded" } };

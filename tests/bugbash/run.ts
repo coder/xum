@@ -49,10 +49,12 @@ import {
   checkDocker,
   JOB_EXIT_3,
   type JobOutcome,
+  cannotReach,
   launchJob,
   type ModelJob,
   modelJob,
   probeApp,
+  probeUnreachable,
 } from "./sandbox/launch";
 import { Ledger, priced } from "./sandbox/proxyPolicy";
 import { Refusal, Stopped } from "./sandbox/runner";
@@ -389,22 +391,30 @@ export async function runBugBash(
   if (values.preflight) return 0;
   let runAi: AppAi = { mode: "mock", reason: "BUGBASH_AI=mock" };
   let probeRecords: object[] = [];
+  // The app model when the app AI may be real; else an explorer model: the explorers need the
+  // upstream in every mode, so even a mock run probes it once.
+  const probeModel = probing ? id : job0!.model;
+  let status: number;
+  try {
+    ({ status, records: probeRecords } = await (deps.probeApp ?? probeApp)(
+      job0!,
+      probeModel,
+      ledger,
+      stop
+    ));
+  } catch (error) {
+    // The probe's own proxy fault (a bound miss): the cost model is wrong.
+    err(`make bug-bash: probe: ${error instanceof Error ? error.message : String(error)}`);
+    return 5;
+  }
+  // A stop during the probe ends the run here, before any folder or job.
+  if (stop.aborted) return stop.reason === "SIGTERM" ? 143 : 130;
+  // No explorer works without the upstream either, so this refuses in every mode.
+  if (probeUnreachable(probeRecords)) {
+    err(`make bug-bash: ${cannotReach(job0!)}: check the URL and the network`);
+    return 2;
+  }
   if (probing) {
-    let status: number;
-    try {
-      ({ status, records: probeRecords } = await (deps.probeApp ?? probeApp)(
-        job0!,
-        id,
-        ledger,
-        stop
-      ));
-    } catch (error) {
-      // The probe's own proxy fault (a bound miss): the cost model is wrong.
-      err(`make bug-bash: probe: ${error instanceof Error ? error.message : String(error)}`);
-      return 5;
-    }
-    // A stop during the probe ends the run here, before any folder or job.
-    if (stop.aborted) return stop.reason === "SIGTERM" ? 143 : 130;
     const unavailable = status === 429 || status >= 500;
     if (status === 200) runAi = { mode: "real", reason: `${appModel} answered the probe` };
     else if (requested === "auto" && unavailable)

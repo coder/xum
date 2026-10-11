@@ -246,8 +246,9 @@ export function usageCost(model: string, usage: unknown): number | undefined {
 
 /**
  * The run-wide budget (P7), shared by every job of a run. A dispatched call ends with `settle`
- * (a complete response with usage) or `keep` (anything else). There is no release: no
- * documented no-charge outcome is relied on.
+ * (a complete response with usage), `release` (no connection to the upstream was made, so no
+ * request left the host) or `keep` (anything else). No documented no-charge outcome of the
+ * provider is relied on: a call that reached it is never released.
  */
 export class Ledger {
   readonly #cap: number;
@@ -297,6 +298,11 @@ export class Ledger {
       output: 0,
     });
     for (const key of Object.keys(tokens) as (keyof Usage)[]) tokens[key] += read[key];
+  }
+
+  /** Frees the reservation of a call that never reached the upstream (no connection): $0. */
+  release(id: number): void {
+    this.#take(id);
   }
 
   /** Counts the full reservation as spent: error, cancel, deadline, cut stream, close. */

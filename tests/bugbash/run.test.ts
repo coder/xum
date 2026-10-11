@@ -41,10 +41,12 @@ function fakeLaunch(
   const calls: Call[] = [];
   const lines: string[] = [];
   const probes: Ledger[] = [];
+  const probeModels: string[] = [];
   const deps: RunDeps = {
     // The app AI probe: 502 (the upstream failed) unless a test says otherwise.
-    probeApp: (_job, _model, ledger) => {
+    probeApp: (_job, model, ledger) => {
       probes.push(ledger);
+      probeModels.push(model);
       return Promise.resolve({ status: probeStatus, records: [{ outcome: "settled" }] });
     },
     checkDocker: () => Promise.resolve("none"),
@@ -64,7 +66,7 @@ function fakeLaunch(
     },
     err: (line) => lines.push(line),
   };
-  return { deps, calls, lines, probes };
+  return { deps, calls, lines, probes, probeModels };
 }
 const until = (signal: AbortSignal): Promise<JobOutcome> =>
   new Promise((resolve) => {
@@ -234,14 +236,20 @@ test.each([
   ["auto, upstream unavailable: the mock", {}, 502, 0],
   ["real, upstream unavailable: refused", { BUGBASH_AI: "real" }, 502, 2],
   ["auto, a rejected key: refused", {}, 401, 2],
-  ["mock: no probe", { BUGBASH_AI: "mock" }, 200, 0],
+  ["mock: the explorer model is probed, not the app model", { BUGBASH_AI: "mock" }, 200, 0],
 ])("B3: %s", async (_name, over, status, code) => {
-  const { deps, calls, probes } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }), status);
+  const { deps, calls, probes, probeModels } = fakeLaunch(
+    () => ({ code: 0, cleanup: "removed" }),
+    status
+  );
   const stop = new AbortController().signal;
   expect(await runBugBash([...charters("a")], { ...ENV, ...over }, stop, deps)).toBe(code);
   if (code === 0) expect(calls[0].o.env.BUGBASH_AI).toBe("mock");
   else expect(calls).toHaveLength(0);
-  expect(probes).toHaveLength("BUGBASH_AI" in over && over.BUGBASH_AI === "mock" ? 0 : 1);
+  // U2: one probe in every mode; a mock run probes the explorer's upstream instead.
+  expect(probes).toHaveLength(1);
+  const mock = "BUGBASH_AI" in over && over.BUGBASH_AI === "mock";
+  expect(probeModels).toEqual([mock ? "claude-sonnet-5-5" : "claude-haiku-4-5"]);
 });
 
 test("B3: a stop during the app AI probe ends the run before any job", async () => {
@@ -368,3 +376,26 @@ test("U1: a launcher error or an unknown cleanup keeps the run folder and its lo
     expect(fs.existsSync(path.join(runDir, "findings.md"))).toBe(true);
   }
 });
+
+test.each([
+  ["auto", {}],
+  ["real", { BUGBASH_AI: "real" }],
+  ["mock", { BUGBASH_AI: "mock" }],
+])(
+  "U2: %s, an upstream the probe cannot reach refuses (exit 2) before any job or folder",
+  async (_mode, over) => {
+    const { deps, calls, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+    deps.probeApp = () =>
+      Promise.resolve({
+        status: 502,
+        records: [{ outcome: "released", status: 502, reason: "upstream: unreachable" }],
+      });
+    const stop = new AbortController().signal;
+    expect(await runBugBash([...charters("a")], { ...ENV, ...over }, stop, deps)).toBe(2);
+    expect(calls).toHaveLength(0);
+    // It names the variable and the host to check, never the URL's path.
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("ANTHROPIC_BASE_URL (127.0.0.1:9)");
+    expect(lines[0]).not.toContain("/v1");
+  }
+);

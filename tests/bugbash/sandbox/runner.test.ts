@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { startFakeUpstream } from "./fakeUpstream";
@@ -1016,12 +1017,16 @@ test("B1: an MCP Apps job reaches the model only through its proxy, with the hos
   // D1: the inner socket's private folder is in the job folder, beside the mounted ones.
   expect(calls()).toContain("job folder: group h-X passwd proxy stage ");
   expect(calls()).toContain('"usage":');
-  expect(requests).toHaveLength(1);
-  expect(requests[0].headers["x-api-key"]).toBe(UPSTREAM_KEY);
+  // U2: the probe first (max_tokens 1, through its own proxy), then the job's call.
+  expect(requests).toHaveLength(2);
+  expect(JSON.parse(requests[0].body)).toMatchObject({ max_tokens: 1 });
+  for (const request of requests) expect(request.headers["x-api-key"]).toBe(UPSTREAM_KEY);
   const lines = fs.readFileSync(records, "utf8").trim().split("\n");
   expect(lines.map((line) => (JSON.parse(line) as { outcome: string }).outcome)).toEqual([
     "settled",
+    "settled",
   ]);
+  expect(logged.join("\n")).toContain("probe: claude-sonnet-5-5 answered");
   expect(fs.statSync(records).mode & 0o777).toBe(0o600);
   expect(logged.join("\n")).toMatch(/proxy for anthropic:claude-sonnet-5-5 \(budget \$1\.00\)/);
   expect(logged.join("\n")).toMatch(
@@ -1029,6 +1034,70 @@ test("B1: an MCP Apps job reaches the model only through its proxy, with the hos
   );
   expect(logged.join("\n")).not.toContain(UPSTREAM_KEY);
   expectNothingLeft(); // the job folder with the proxy socket is gone too
+});
+
+test("U2: an MCP Apps job whose upstream cannot be reached refuses before the container", async () => {
+  const dead = net.createServer();
+  await new Promise<void>((done) => dead.listen(0, "127.0.0.1", done));
+  const { port } = dead.address() as net.AddressInfo;
+  await new Promise((done) => dead.close(done)); // a closed port: connections are refused
+  const base = { ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}/v1` };
+  const { code, records } = await mcpLaunch({ RUN: "proxycall" }, base);
+  expect(code).toBeInstanceOf(Refusal);
+  // It names the variable and the host to check, never the URL's path or the key.
+  expect((code as Error).message).toContain(`ANTHROPIC_BASE_URL (127.0.0.1:${port})`);
+  expect((code as Error).message).not.toMatch(/\/v1|sk-host/);
+  expect(calls()).not.toMatch(/^run /m); // no container started
+  const [record] = fs.readFileSync(records, "utf8").trim().split("\n");
+  expect(JSON.parse(record)).toMatchObject({
+    outcome: "released",
+    reason: "upstream: unreachable",
+  });
+  expectNothingLeft();
+});
+
+test("U2: a bound miss in the MCP Apps probe is a proxy fault (exit 5), before the container", async () => {
+  const real = proxyModule.startProxy;
+  const start = spyOn(proxyModule, "startProxy").mockImplementation(async (options) => {
+    const proxy = await real(options);
+    if (!options.socketPath.includes("xum-bugbash-probe-")) return proxy;
+    return {
+      ...proxy,
+      close: async () => {
+        await proxy.close();
+        throw new Error("proxy: 1 call(s) cost more than their reserved bound");
+      },
+    };
+  });
+  try {
+    const { code, logged } = await mcpLaunch({ RUN: "proxycall" });
+    expect(code).toBe(5);
+    expect(logged.join("\n")).toContain("cost more than their reserved bound: the job stops");
+    expect(calls()).not.toMatch(/^run /m);
+  } finally {
+    start.mockRestore();
+  }
+  expectNothingLeft();
+});
+
+test("U2: a probe record that cannot be written is a proxy fault (exit 5), even when the probe fails", async () => {
+  const dead = net.createServer();
+  await new Promise<void>((done) => dead.listen(0, "127.0.0.1", done));
+  const { port } = dead.address() as net.AddressInfo;
+  await new Promise((done) => dead.close(done));
+  const append = spyOn(fs, "appendFileSync").mockImplementation((file) => {
+    if (String(file).endsWith(".proxy.jsonl"))
+      throw Object.assign(new Error("ENOSPC"), { code: "ENOSPC" });
+  });
+  try {
+    const base = { ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}/v1` };
+    const { code } = await mcpLaunch({ RUN: "proxycall" }, base);
+    expect(code).toBe(5);
+    expect(calls()).not.toMatch(/^run /m);
+  } finally {
+    append.mockRestore();
+  }
+  expectNothingLeft();
 });
 
 test("B1: a proxied call that costs more than its bound fails the job (exit 5)", async () => {
@@ -1287,6 +1356,8 @@ test("B3: a call that outlives close() fails the job (exit 5), and the job leave
   const real = proxyModule.startProxy;
   const start = spyOn(proxyModule, "startProxy").mockImplementation(async (options) => {
     const proxy = await real(options);
+    // The job's proxy only: the MCP Apps probe's own proxy closes normally.
+    if (options.socketPath.includes("xum-bugbash-probe-")) return proxy;
     return {
       ...proxy,
       close: async () => {
