@@ -6,6 +6,11 @@
 
 export const MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui";
 export const MCP_APP_MIME_TYPE = "text/html;profile=mcp-app";
+/**
+ * ChatGPT Apps SDK templates (reached through `_meta["openai/outputTemplate"]`) are served as
+ * this legacy MIME type. Accepted for view resources next to MCP_APP_MIME_TYPE.
+ */
+export const MCP_APP_SKYBRIDGE_MIME_TYPE = "text/html+skybridge";
 /** Largest view resource (decoded HTML) the host accepts from resources/read. */
 export const MCP_APP_RESOURCE_MAX_BYTES = 2 * 1024 * 1024;
 /** Longest ui:// URI kept on tool metadata and display snapshots. */

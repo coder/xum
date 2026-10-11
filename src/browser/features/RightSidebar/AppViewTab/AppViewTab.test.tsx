@@ -4,7 +4,11 @@ import "../../../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { openMcpAppViewTab } from "../ArtifactsTab/mcpAppViewsStore";
+import {
+  appViewDetails,
+  openMcpAppViewTab,
+  type McpAppViewRef,
+} from "../ArtifactsTab/mcpAppViewsStore";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider } from "@/browser/contexts/API";
 import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
@@ -116,5 +120,76 @@ describe("AppViewTabPanel", () => {
       registered.mockRestore();
       state.mockRestore();
     }
+  });
+});
+
+describe("app view details", () => {
+  const view = (toolCallId: string, args: unknown, failed = false): McpAppViewRef => ({
+    toolCallId,
+    serverName: "dice",
+    resourceUri: "ui://dice/board.html",
+    toolName: "show_dice_board",
+    label: "Board",
+    arguments: args,
+    cancelled: failed,
+    failed,
+  });
+  let cleanupDom: (() => void) | null = null;
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+  });
+
+  test("tab labels of several calls of one tool differ; a lone call shows none", () => {
+    const store = useWorkspaceStoreRaw();
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(() => true);
+    const state = spyOn(store, "getWorkspaceState").mockImplementation(
+      () =>
+        ({
+          messages: [],
+          loading: false,
+          isHydratingTranscript: false,
+        }) as unknown as WorkspaceState
+    );
+    for (const [id, args] of [
+      ["d-old", { count: 4 }],
+      ["d-new", { count: 6 }],
+    ] as const) {
+      openMcpAppViewTab("ws-details", view(id, args));
+    }
+    openMcpAppViewTab("ws-lone", view("lone", { count: 1 }));
+    try {
+      const label = (workspaceId: string, toolCallId: string) =>
+        render(<AppViewTabLabel workspaceId={workspaceId} toolCallId={toolCallId} />).container
+          .textContent;
+      const [older, newer] = [label("ws-details", "d-old"), label("ws-details", "d-new")];
+      expect(older).not.toBe(newer);
+      expect(older?.startsWith("Boarddice")).toBe(true);
+      expect(label("ws-lone", "lone")).toBe("Boarddice");
+    } finally {
+      registered.mockRestore();
+      state.mockRestore();
+    }
+  });
+
+  test("numbers repeats of the same call, oldest first", () => {
+    const details = appViewDetails([
+      view("new", { count: 4 }),
+      view("other", { count: 6 }),
+      view("old", { count: 4 }),
+    ]);
+    expect(new Set(details).size).toBe(3);
+    expect(details[0].endsWith("#2")).toBe(true);
+    expect(details[2].endsWith("#1")).toBe(true);
+    expect(details[1]).not.toContain("#");
+  });
+
+  test("shows control and bidi characters from model arguments as escapes", () => {
+    const [detail] = appViewDetails([view("a", { label: "safe\u202Eexe.txt\nnext" })]);
+    expect(detail).not.toMatch(/[\u202E\n]/);
+    expect(detail).toContain("\\u202e");
   });
 });
