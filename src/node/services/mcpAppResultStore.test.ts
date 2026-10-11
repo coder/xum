@@ -175,6 +175,39 @@ describe("McpAppResultStore model context", () => {
     ).toEqual(["c"]);
   });
 
+  test("updates dropped for a newer one fail when the newer write fails", async () => {
+    using tmp = new DisposableTempDir("mcp-app-context");
+    const sessionDir = await sessionsIn(tmp);
+    const store = new McpAppResultStore(sessionDir);
+    await store.setModelContext("ws", view("c1", "stored"));
+    const contextFile = path.join(tmp.path, "ws", MCP_APP_MODEL_CONTEXT_FILE);
+    const realRename = fsSync.rename;
+    const rename = spyOn(fsSync, "rename").mockImplementation(((
+      from: fsSync.PathLike,
+      to: fsSync.PathLike,
+      callback: fsSync.NoParamCallback
+    ) => {
+      if (String(to) === contextFile) return callback(new Error("disk full"));
+      return realRename(from, to, callback);
+    }) as typeof fsSync.rename);
+    let outcomes: string[];
+    try {
+      outcomes = await Promise.all(
+        ["a", "b", "c"].map((text) =>
+          store.setModelContext("ws", view("c1", text)).then(
+            () => "stored",
+            (error: unknown) => String(error)
+          )
+        )
+      );
+    } finally {
+      rename.mockRestore();
+    }
+    // "a" and "b" were dropped for "c", so they report "c"'s failure, not success.
+    expect(outcomes).toEqual(Array(3).fill("Error: disk full"));
+    expect((await store.getModelContexts("ws")).map((v) => v.text)).toEqual(["stored"]);
+  });
+
   test("a write for a removed workspace is refused and never recreates its session", async () => {
     using tmp = new DisposableTempDir("mcp-app-context");
     const rootDir = path.join(tmp.path, "root");
