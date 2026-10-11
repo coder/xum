@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import type { AgentPluginManifest } from "./manifest";
-import { loadPluginCodexHooks } from "./codexHooks";
+import { compileHookMatcher, loadPluginCodexHooks } from "./codexHooks";
 
 const SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
@@ -109,6 +109,45 @@ describe("loadPluginCodexHooks", () => {
 
     expect(hooks.map((hook) => hook.key)).toEqual(["hooks/hooks.json#Stop[0][1]"]);
     expect(warnings).toHaveLength(1);
+  });
+
+  test("bounds the work for a pointer: entries, repeated files and hook count", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-bounds");
+    const many = { hooks: { Stop: [{ hooks: Array.from({ length: 300 }, () => scan) }] } };
+    const plugin = await writePlugin(
+      tmp.path,
+      { "hooks/one.json": { hooks: { Stop: [{ hooks: [scan] }] } }, "hooks/many.json": many },
+      { "com.openai": { hooks: Array.from({ length: 1000 }, () => "./hooks/one.json") } }
+    );
+    const withPointer = (hooks: unknown[]) => ({
+      rootPath: plugin.rootPath,
+      manifest: { ...plugin.manifest, extensions: { "com.openai": { hooks } } },
+    });
+    // The same file repeated is read once.
+    expect((await loadPluginCodexHooks(plugin)).hooks).toHaveLength(1);
+    // Only the first 32 entries are read.
+    const inline = { hooks: { Stop: [{ hooks: [scan] }] } };
+    const fromEntries = await loadPluginCodexHooks(withPointer(Array(40).fill(inline)));
+    expect(fromEntries.hooks).toHaveLength(32);
+    // At most 256 hooks per plugin.
+    const { hooks, warnings } = await loadPluginCodexHooks(withPointer(["./hooks/many.json"]));
+    expect(hooks).toHaveLength(256);
+    expect(warnings).toEqual(["More than 256 hooks; ignoring the rest"]);
+  });
+
+  test("a hooks file path cannot take an inline source's hook keys", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-key-collision");
+    const document = { hooks: { Stop: [{ hooks: [scan] }] } };
+    const plugin = await writePlugin(
+      tmp.path,
+      { "plugin.json#hooks[1]": document },
+      { "com.openai": { hooks: ["plugin.json#hooks[1]", document] } }
+    );
+
+    const { hooks } = await loadPluginCodexHooks(plugin);
+
+    // Only the inline entry's key remains: the file path would have produced the same one.
+    expect(hooks.map((hook) => hook.source)).toEqual(["plugin.json#hooks[1]"]);
   });
 
   test("a com.openai pointer replaces the default file instead of adding to it", async () => {
@@ -252,6 +291,48 @@ describe("loadPluginCodexHooks", () => {
     ]);
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toMatch(/nests deeper than \d+ levels; ignoring a handler/);
+  });
+
+  test("Codex matchers: a leading inline-flag group loads; untranslated Rust syntax drops its group", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-rust-regex");
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": {
+        hooks: {
+          PreToolUse: [
+            { matcher: "(?i)^bash$", hooks: [scan] },
+            { matcher: "(?x) bash", hooks: [scan] },
+          ],
+          // Codex ignores the matcher on these events, so an invalid one does not drop the group.
+          Stop: [{ matcher: "(", hooks: [scan] }],
+          UserPromptSubmit: [{ matcher: "(?P<x>", hooks: [scan] }],
+        },
+      },
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => [hook.event, hook.matcher])).toEqual([
+      ["PreToolUse", "(?i)^bash$"],
+      ["Stop", undefined],
+      ["UserPromptSubmit", undefined],
+    ]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/'PreToolUse' matcher is not a valid regex/);
+  });
+
+  test("compileHookMatcher reads matchers as Codex does", () => {
+    const matching = (pattern: string, names: string[]) => {
+      const matcher = compileHookMatcher(pattern);
+      return names.filter((name) => matcher.test(name));
+    };
+    expect(matching("(?i)^bash$", ["bash", "BASH", "bash2"])).toEqual(["bash", "BASH"]);
+    expect(matching("(?is)^a.b$", ["A\nB", "axb", "a\n\nb"])).toEqual(["A\nB", "axb"]);
+    // A plain name list matches whole names only.
+    expect(matching("Bash|Edit", ["Bash", "Edit", "BashOutput", "MultiEdit"])).toEqual([
+      "Bash",
+      "Edit",
+    ]);
+    expect(matching("^mcp__.*", ["mcp__s__t", "x_mcp__"])).toEqual(["mcp__s__t"]);
   });
 
   test("a plugin without hooks has none, silently", async () => {

@@ -3,7 +3,7 @@ import { EventSpine } from "@/node/services/events/eventSpine";
 import { runMessageSendHooks } from "./promptHooks";
 import { renderPluginHookContextEntry } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
-const input = { text: "hello", origin: "user" as const };
+const input = { text: "hello", origin: "user" as const, canBlock: true };
 
 describe("runMessageSendHooks", () => {
   test("joins context in chain order and drops entries past the size cap", async () => {
@@ -43,6 +43,48 @@ describe("runMessageSendHooks", () => {
       .reduce((sum, block) => sum + block.length, 0);
     expect(renderedChars).toBeLessThanOrEqual(64 * 1024);
     expect(outcome.entries.length).toBeLessThan(64 * 1024);
+  });
+
+  test("a send no plugin may block runs the whole chain and ignores every block", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rN7oi): an ignored block must not hide the send from later hooks.
+    const spine = new EventSpine();
+    const seen: string[] = [];
+    spine.useBefore("message.send", (ctx) => {
+      seen.push("guard");
+      ctx.blocked = { pluginName: "guard", reason: "no" };
+    });
+    spine.useBefore("message.send", (ctx) => {
+      seen.push(`later:${ctx.blocked === undefined}`);
+    });
+
+    expect(
+      await runMessageSendHooks(spine, "ws", { ...input, origin: "goal", canBlock: false })
+    ).toEqual({ kind: "none" });
+    expect(seen).toEqual(["guard", "later:true"]);
+  });
+
+  test("a send no plugin may block keeps the context added before an ignored block", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rN8CX).
+    const spine = new EventSpine();
+    spine.useBefore("message.send", (ctx) => {
+      ctx.additionalContext.push({ pluginId: "notes", text: "Read the runbook." });
+    });
+    spine.useBefore("message.send", (ctx) => {
+      ctx.blocked = { pluginName: "guard", reason: "no" };
+    });
+    spine.useBefore("message.send", (ctx) => {
+      ctx.additionalContext.push({ pluginId: "later", text: "Also this." });
+    });
+
+    expect(
+      await runMessageSendHooks(spine, "ws", { ...input, origin: "task", canBlock: false })
+    ).toEqual({
+      kind: "context",
+      entries: [
+        { pluginId: "notes", text: "Read the runbook." },
+        { pluginId: "later", text: "Also this." },
+      ],
+    });
   });
 
   test("a throwing consumer fails open: the message goes out unchanged", async () => {

@@ -1289,7 +1289,9 @@ export const PluginsSettingsSection: React.FC = () => {
                   )}
                   {item.managed && item.present && hooksTarget === item.name && (
                     <PluginHooksPanel
-                      key={item.name}
+                      // Keyed by the installed commit too: an update (here or from the palette)
+                      // remounts the panel, so it never shows the old hooks and trust states.
+                      key={`${item.name}@${item.lockedSha ?? ""}`}
                       name={item.name}
                       onClose={() => setHooksTarget(null)}
                     />

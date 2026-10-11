@@ -22,7 +22,7 @@ import type { EventSpine, ToolExecuteContext } from "@/node/services/events/even
 import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubset } from "@/common/utils/jsonSchemaSubset";
 import { log } from "@/node/services/log";
-import type { PluginHookDefinition } from "./codexHooks";
+import { compileHookMatcher, type PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
 import { codexToolView, type CodexToolView } from "./codexToolNames";
 
@@ -206,11 +206,12 @@ async function runToolHooks(
     if (output.permissionDecision === "deny" || output.decision === "block") {
       const reason =
         output.permissionDecisionReason ?? output.reason ?? "No reason given by the hook.";
-      ctx.blocked = {
-        result: {
-          error: `Tool call blocked by plugin '${registration.pluginName}' hook: ${reason}`,
-        },
+      // Codex keeps the context of a blocking PreToolUse, and of the hooks before it.
+      if (output.additionalContext !== undefined) notes.push(output.additionalContext);
+      const result = {
+        error: `Tool call blocked by plugin '${registration.pluginName}' hook: ${reason}`,
       };
+      ctx.blocked = { result: notes.length > 0 ? annotate(result, notes, registration) : result };
       return;
     }
     if (output.updatedInput !== undefined) applyUpdatedInput(ctx, output, view, registration, hook);
@@ -269,10 +270,11 @@ function applyUpdatedInput(
 }
 
 function matches(hook: PluginHookDefinition, toolName: string, view: CodexToolView): boolean {
-  // The parser already proved the matcher compiles. Codex applies it to tool_name; Xum tests
-  // both the Xum name and the Codex alias.
+  // The parser already proved the matcher compiles, with the same Codex-dialect translation
+  // (inline flags, whole-name lists). Codex applies it to tool_name; Xum tests both the Xum
+  // name and the Codex alias.
   if (hook.matcher === undefined) return true;
-  const matcher = new RegExp(hook.matcher);
+  const matcher = compileHookMatcher(hook.matcher);
   return matcher.test(toolName) || (view.codexName !== undefined && matcher.test(view.codexName));
 }
 
@@ -407,6 +409,16 @@ export function parseHookOutput(result: unknown, eventName: string): HookOutput 
     throw new Error(`hookSpecificOutput is not tagged hookEventName "${eventName}"`);
   }
   const specific = isPlainObject(raw.hookSpecificOutput) ? raw.hookSpecificOutput : {};
+  // Codex's schemas allow only these exact values; anything else (" deny ", "Block") is malformed
+  // and fails open instead of becoming a policy action.
+  const oneOf = (value: unknown, allowed: string[]) =>
+    value == null || (typeof value === "string" && allowed.includes(value));
+  if (!oneOf(raw.decision, eventName === "PreToolUse" ? ["approve", "block"] : ["block"])) {
+    throw new Error(`invalid decision ${JSON.stringify(raw.decision)}`);
+  }
+  if (!oneOf(specific.permissionDecision, ["allow", "deny", "ask"])) {
+    throw new Error(`invalid permissionDecision ${JSON.stringify(specific.permissionDecision)}`);
+  }
   const text = (value: unknown) =>
     typeof value === "string" && value.trim() ? cut(value) : undefined;
   const output: HookOutput = {

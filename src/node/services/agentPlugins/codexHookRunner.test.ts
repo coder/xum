@@ -111,6 +111,22 @@ describe("PreToolUse", () => {
     expect(calls).toEqual([{ cmd: "rm -rf /" }]);
   });
 
+  test("matchers run in Codex's dialect: inline flags and whole-name lists", async () => {
+    const { spine, calls } = setup(
+      [
+        hook("PreToolUse", { matcher: "(?i)^BASH$", input: { n: "1" } }),
+        hook("PreToolUse", { matcher: "file_read|bash", input: { n: "2" } }),
+      ],
+      () => ({ content: [] })
+    );
+
+    await runTool(spine, "bash", {});
+    await runTool(spine, "bash_output", {});
+
+    // bash matches both; bash_output matches neither ("bash" in a name list is a whole name).
+    expect(calls.map((call) => call.n).sort()).toEqual(["1", "2"]);
+  });
+
   test("the trust gate runs before each call: a revoke stops the next call", async () => {
     const { spine, calls, state } = setup([hook("PreToolUse")], () => deny);
 
@@ -147,6 +163,39 @@ describe("PreToolUse", () => {
       json({ hookSpecificOutput: { hookEventName: "PostToolUse", permissionDecision: "deny" } })
     );
     expect((await runTool(spine, "bash", {})).executed).toBe(true);
+  });
+
+  test("a decision that is not an exact Codex enum value is malformed and fails open", async () => {
+    const outputs = [
+      json({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: " deny " } }),
+      json({ decision: " block ", reason: "x" }),
+      json({ decision: "Block", reason: "x" }),
+    ];
+    for (const output of outputs) {
+      const { spine } = setup([hook("PreToolUse")], () => output);
+      expect((await runTool(spine, "bash", {})).executed).toBe(true);
+    }
+  });
+
+  test("a deny keeps its own context and the context of earlier hooks", async () => {
+    const { spine } = setup(
+      [hook("PreToolUse", { input: { first: true } }), hook("PreToolUse")],
+      (input) =>
+        json({
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            additionalContext: input.first === true ? "First." : "Second.",
+            ...(input.first === true ? {} : { permissionDecision: "deny" }),
+          },
+        })
+    );
+
+    const ctx = await runTool(spine, "bash", {});
+
+    expect(ctx.blocked?.result).toEqual({
+      error: "Tool call blocked by plugin 'guard' hook: No reason given by the hook.",
+      hook_output: "[plugin:guard] First.\n[plugin:guard] Second.",
+    });
   });
 
   test("a cancel during a hook ends the hook call and the tool never starts", async () => {
@@ -262,6 +311,11 @@ describe("Codex tool names", () => {
       toolName: "scan",
     });
     await runTool(spine, "other_scan", {}, undefined, { serverName: "other", toolName: "scan" });
+    // A user server whose name only looks like a plugin key keeps its whole name.
+    await runTool(spine, "user_scan", {}, undefined, {
+      serverName: "plugin:abc:scanner",
+      toolName: "scan",
+    });
 
     expect(calls).toEqual([{ name: "mcp__scanner__scan" }]);
   });
