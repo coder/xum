@@ -12,6 +12,7 @@ import { convertToModelMessages, type AssistantModelMessage, type ModelMessage }
 import { applyToolOutputRedaction } from "@/browser/utils/messages/applyToolOutputRedaction";
 import { sanitizeToolInputs } from "@/browser/utils/messages/sanitizeToolInput";
 import { inlineSvgAsTextForProvider } from "@/node/utils/messages/inlineSvgAsTextForProvider";
+import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 import { neutralizeAgentEnvelopeLookalikesForProvider } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { extractToolMediaAsUserMessages } from "@/node/utils/messages/extractToolMediaAsUserMessages";
 import { sanitizeAnthropicPdfFilenames } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
@@ -168,12 +169,17 @@ export async function prepareMessagesForProvider(
   const messagesWithNeutralizedEnvelopes =
     neutralizeAgentEnvelopeLookalikesForProvider(messagesWithInlinedSvg);
 
+  // Render prompt-hook context into its own user message (never the system prompt).
+  const messagesWithHookContext = renderPluginHookContextForProvider(
+    messagesWithNeutralizedEnvelopes
+  );
+
   // Sanitize PDF filenames for Anthropic (request-only, preserves original in UI/history).
   // Anthropic rejects document names containing periods, underscores, etc.
   const messagesWithSanitizedPdf =
     providerForMessages === "anthropic"
-      ? sanitizeAnthropicPdfFilenames(messagesWithNeutralizedEnvelopes)
-      : messagesWithNeutralizedEnvelopes;
+      ? sanitizeAnthropicPdfFilenames(messagesWithHookContext)
+      : messagesWithHookContext;
 
   // Rewrite supported tool-result attachments to small text placeholders + file parts.
   // Prevents providers from treating large base64 payloads as text/JSON context.

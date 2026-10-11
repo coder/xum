@@ -19,7 +19,11 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { z } from "zod";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { DevToolsLogEntry } from "@/common/types/devtools";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type MuxMessage,
+  type PluginHookContextEntry,
+} from "@/common/types/message";
 import { applyCacheControlToTools, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import assert from "@/common/utils/assert";
 import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
@@ -65,6 +69,8 @@ const REPLAY_FIXTURE_WIRE_PROVIDER = "anthropic";
 /** One turn appended to a fixture session by appendReplayFixtureTurn. */
 export interface ReplayFixtureTurnSpec {
   userText: string;
+  /** Prompt-hook context saved on the user row (MuxMetadata.pluginHookContext). */
+  pluginHookContext?: PluginHookContextEntry[];
   /** Omit to simulate a stream that failed before appending an assistant row. */
   assistantText?: string;
   /** Extra assistant-row parts after the text (e.g. completed tool calls). */
@@ -152,6 +158,7 @@ export async function appendReplayFixtureTurn(
 
   const userMessage = createMuxMessage(`user-${turnNumber}`, "user", spec.userText, {
     timestamp: baseTimestamp,
+    ...(spec.pluginHookContext != null ? { pluginHookContext: spec.pluginHookContext } : {}),
   });
   const requestHistorySequence = await appendOrThrow(ctx, userMessage);
 

@@ -208,6 +208,11 @@ export const MuxMessageSchema = z.object({
       // instead of failing whole-chat loading at the oRPC output boundary.
       modelFallback: ModelFallbackRecordSchema.optional().catch(undefined),
       autoModelRouting: AutoModelRoutingRecordSchema.optional().catch(undefined),
+      // Prompt-hook context (MuxMetadata.pluginHookContext); a malformed record degrades to none.
+      pluginHookContext: z
+        .array(z.object({ pluginId: z.string(), text: z.string() }))
+        .optional()
+        .catch(undefined),
       // Anthropic thinking-signature repair receipt (see MuxMetadata.anthropicThinkingReplay).
       anthropicThinkingReplay: z.literal("off").optional().catch(undefined),
       usage: z.any().optional(),

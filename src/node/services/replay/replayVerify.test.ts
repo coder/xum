@@ -299,6 +299,31 @@ describe("replayVerifySession pairing", () => {
     expect(devtoolsRaw).toContain('"ttl":"1h"');
   });
 
+  test("prompt-hook context replays from chat.jsonl on its turn and later turns", async () => {
+    using tmp = new DisposableTempDir("replay-verify-plugin-hook-context");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+
+    await appendReplayFixtureTurn(ctx, {
+      userText: "Fix the bug.",
+      pluginHookContext: [{ pluginId: "guard", text: "Ask for a reproduction first." }],
+      assistantText: "Can you share a reproduction?",
+      systemPrompt: SYSTEM_PROMPT,
+      tools: tools(),
+    });
+    await appendReplayFixtureTurn(ctx, {
+      userText: "Here it is.",
+      assistantText: "Fixed.",
+      systemPrompt: SYSTEM_PROMPT,
+      tools: tools(),
+    });
+
+    const result = await verify(ctx);
+    expect(result.turns.map((turn) => turn.status)).toEqual(["PASS", "PASS"]);
+    // Guard against a vacuous pass: both recorded requests carry the block.
+    const devtoolsRaw = await fs.readFile(`${tmp.path}/devtools.jsonl`, "utf-8");
+    expect(devtoolsRaw.split('<plugin-hook-context plugin=\\"guard\\">').length - 1).toBe(2);
+  });
+
   test("refusal-fallback partial continuation is log-derivable", async () => {
     using tmp = new DisposableTempDir("replay-verify-partial-continuation");
     const ctx = createReplayFixtureSessionContext(tmp.path);

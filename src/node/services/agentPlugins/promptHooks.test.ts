@@ -5,28 +5,31 @@ import { runMessageSendHooks } from "./promptHooks";
 const input = { text: "hello", origin: "user" as const };
 
 describe("runMessageSendHooks", () => {
-  test("the first block ends the chain; its reason is trimmed", async () => {
+  test("joins context in chain order and drops entries past the size cap", async () => {
     const spine = new EventSpine();
-    const seen: string[] = [];
     spine.useBefore("message.send", (ctx) => {
-      seen.push("guard");
-      ctx.blocked = { pluginName: "guard", reason: "  no secrets  " };
-    });
-    spine.useBefore("message.send", () => {
-      seen.push("later");
+      ctx.additionalContext.push(
+        { pluginId: "a", text: " one " },
+        { pluginId: "b", text: "   " },
+        { pluginId: "c", text: "two" },
+        { pluginId: "d", text: "x".repeat(64 * 1024) }
+      );
     });
 
     expect(await runMessageSendHooks(spine, "ws", input)).toEqual({
-      kind: "blocked",
-      pluginName: "guard",
-      reason: "no secrets",
+      kind: "context",
+      entries: [
+        { pluginId: "a", text: "one" },
+        { pluginId: "c", text: "two" },
+      ],
     });
-    expect(seen).toEqual(["guard"]);
   });
 
   test("a throwing consumer fails open: the message goes out unchanged", async () => {
     const spine = new EventSpine();
-    spine.useBefore("message.send", () => undefined);
+    spine.useBefore("message.send", (ctx) => {
+      ctx.additionalContext.push({ pluginId: "healthy", text: "from a healthy plugin" });
+    });
     spine.useBefore("message.send", () => {
       throw new Error("broken plugin");
     });

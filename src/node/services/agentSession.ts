@@ -5257,6 +5257,9 @@ export class AgentSession {
         // Persist the queue-entry authoring time so goal-safety reconciliation
         // can re-derive the pre-goal/post-goal distinction after a restart.
         ...(internal?.enqueuedAtMs != null ? { enqueuedAtMs: internal.enqueuedAtMs } : {}),
+        // Hook context belongs to this message (Codex adds it to the conversation here), not to
+        // the system prompt: a per-send system change would miss the whole cached prefix.
+        ...(pluginSend.kind === "context" ? { pluginHookContext: pluginSend.entries } : {}),
         // Auto-resume and other system-generated messages are synthetic + UI-visible
         ...(internal?.synthetic && {
           synthetic: true,
