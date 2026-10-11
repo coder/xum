@@ -75,7 +75,10 @@ const ToolCallParams = z.object({
 const ReadResourceParams = z.object({ uri: z.string().min(1).max(MCP_APP_READ_URI_MAX_CHARS) });
 const OpenLinkParams = z.object({ url: z.string().max(4096) });
 const MESSAGE_TEXT_MAX_CHARS = 32_000;
-const TextBlock = z.object({ type: z.literal("text"), text: z.string() });
+const TextBlock = z.object({
+  type: z.literal("text"),
+  text: z.string().max(MESSAGE_TEXT_MAX_CHARS),
+});
 /**
  * The spec's single text block, or the content-block array of the ext-apps SDK and ChatGPT
  * (`content: [{ type: "text", text }]`, optional `_meta["openai/message"]`). Non-text blocks
@@ -90,16 +93,23 @@ const MessageParams = z.object({
 
 /** The message text, or null when a block is not text or the text is too long. */
 function messageText(content: z.infer<typeof MessageParams>["content"]): string | null {
-  const text = joinTextBlocks(Array.isArray(content) ? content : [content]);
-  return text !== null && text.length <= MESSAGE_TEXT_MAX_CHARS ? text : null;
+  return joinTextBlocks(Array.isArray(content) ? content : [content], MESSAGE_TEXT_MAX_CHARS);
 }
 
-/** Text blocks joined by newlines, or null when any block is not text. */
-function joinTextBlocks(blocks: readonly unknown[]): string | null {
+/**
+ * Text blocks joined by newlines, or null when any block is not text or the joined text would
+ * be longer than `maxChars` (UTF-16 code units).
+ */
+function joinTextBlocks(blocks: readonly unknown[], maxChars: number): string | null {
   const texts: string[] = [];
+  // Enforce the limit while iterating, counting the "\n" join() adds: a view can send 64
+  // blocks, so joining first would build an arbitrarily large string before rejecting it.
+  let length = 0;
   for (const block of blocks) {
     const parsed = TextBlock.safeParse(block);
     if (!parsed.success) return null;
+    length += parsed.data.text.length + (texts.length > 0 ? 1 : 0);
+    if (length > maxChars) return null;
     texts.push(parsed.data.text);
   }
   return texts.join("\n");
@@ -116,10 +126,18 @@ const ModelContextParams = z.object({
  * not text or the text exceeds the cap.
  */
 function modelContextText(params: z.infer<typeof ModelContextParams>): string | null {
-  const text = joinTextBlocks(params.content ?? []);
+  // A UTF-16 code unit is at least one UTF-8 byte, so the byte cap also bounds the code units.
+  const text = joinTextBlocks(params.content ?? [], MCP_APP_MODEL_CONTEXT_MAX_BYTES);
   if (text === null) return null;
-  const structured =
-    params.structuredContent !== undefined ? JSON.stringify(params.structuredContent) : "";
+  let structured = "";
+  if (params.structuredContent !== undefined) {
+    try {
+      structured = JSON.stringify(params.structuredContent);
+    } catch {
+      // postMessage's structured clone carries cyclic objects and BigInt; JSON cannot.
+      return null;
+    }
+  }
   const combined = [text, structured].filter((part) => part !== "").join("\n\n");
   return new TextEncoder().encode(combined).length <= MCP_APP_MODEL_CONTEXT_MAX_BYTES
     ? combined
@@ -170,10 +188,11 @@ export interface McpAppHostOptions {
   /** Store the view's model context; it replaces the previous one ("" clears it). */
   updateModelContext: (text: string) => Promise<void>;
   /**
-   * Switch to a mode from availableDisplayModes other than the current one; returns the
-   * resulting mode (what getHostContext reports from now on).
+   * Prepare a switch to a mode from availableDisplayModes other than the current one: returns
+   * the move, or null when the host cannot show the view in that mode now (the mode stays).
+   * A move unmounts this instance, so the host runs it only once the view has its reply.
    */
-  setDisplayMode: (mode: McpAppDisplayMode) => McpAppDisplayMode;
+  setDisplayMode: (mode: McpAppDisplayMode) => (() => void) | null;
   requestConsent: (request: McpAppConsentRequest) => Promise<boolean>;
   insertIntoComposer: (text: string) => void;
   openExternalLink: (url: string) => void;
@@ -219,6 +238,27 @@ export function createMcpAppHost(options: McpAppHostOptions) {
     options.postToView({ jsonrpc: "2.0", id, error: { code, message } });
   const notify = (method: string, params: unknown) =>
     options.postToView({ jsonrpc: "2.0", method, params });
+
+  /** ui/resource-teardown; resolves when the view replies or after the bounded wait. */
+  const teardown = (reason: string): Promise<void> => {
+    const id = `host-${nextHostRequestId++}`;
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        pendingHostRequests.delete(id);
+        resolve();
+      }, MCP_APP_TEARDOWN_TIMEOUT_MS);
+      pendingHostRequests.set(id, () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      options.postToView({
+        jsonrpc: "2.0",
+        id,
+        method: "ui/resource-teardown",
+        params: { reason },
+      });
+    });
+  };
 
   async function handleRequest(id: string | number, method: string, params: unknown) {
     switch (method) {
@@ -319,14 +359,21 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         const requested = context.availableDisplayModes.find((mode) => mode === parsed.data.mode);
         // An unavailable mode, or one the view did not declare (the host MUST NOT switch to it),
         // leaves the mode unchanged; the spec has the host return the current mode, not fail.
-        const mode =
+        const move =
           requested !== undefined &&
           requested !== current &&
           (viewDisplayModes?.includes(requested) ?? true)
-            ? viewMode(options.setDisplayMode(requested))
-            : current;
+            ? options.setDisplayMode(requested)
+            : null;
+        const mode = move != null && requested !== undefined ? requested : current;
         respond(id, { mode });
         displayModeChanged(mode);
+        if (move == null) return;
+        // The move unmounts this instance, and a frame removed before a queued postMessage
+        // runs never gets it. The teardown reply comes after the view handled the mode reply
+        // (messages arrive in order), and the view must get a teardown before it goes anyway.
+        await teardown("display-mode");
+        move();
         return;
       }
       case "ui/open-link": {
@@ -444,26 +491,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
       if (!initialized) return;
       notify("ui/notifications/host-context-changed", context);
     },
-    /** ui/resource-teardown; resolves when the view replies or after the bounded wait. */
-    teardown(reason: string): Promise<void> {
-      const id = `host-${nextHostRequestId++}`;
-      return new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          pendingHostRequests.delete(id);
-          resolve();
-        }, MCP_APP_TEARDOWN_TIMEOUT_MS);
-        pendingHostRequests.set(id, () => {
-          clearTimeout(timer);
-          resolve();
-        });
-        options.postToView({
-          jsonrpc: "2.0",
-          id,
-          method: "ui/resource-teardown",
-          params: { reason },
-        });
-      });
-    },
+    teardown,
   };
 }
 

@@ -32,6 +32,7 @@ import * as WorkspaceTerminalIconModule from "../icons/WorkspaceTerminalIcon/Wor
 import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
 import * as TimelineDialogModule from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 import * as ArtifactsDialogModule from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
+import * as AppViewDialogModule from "@/browser/features/RightSidebar/AppViewTab/AppViewDialog";
 import * as StatsDialogModule from "@/browser/features/RightSidebar/StatsDialog";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
@@ -635,6 +636,26 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     });
     expect(lastOpen()).toBe(true);
     terminal.remove();
+  });
+
+  it('narrow "Open in tab" opens the requested view in its sheet', () => {
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+    const sheetSpy = spyOn(AppViewDialogModule, "AppViewDialog").mockImplementation(
+      (() => null) as unknown as typeof AppViewDialogModule.AppViewDialog
+    );
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    act(() => {
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: "call-1" })
+      );
+    });
+
+    const last = sheetSpy.mock.calls.at(-1) as
+      | Array<{ open: boolean; toolCallId: string | null }>
+      | undefined;
+    expect([last?.[0]?.open, last?.[0]?.toolCallId]).toEqual([true, "call-1"]);
   });
 
   it("touch phones swap the header terminal button for Stats and Artifacts", () => {
