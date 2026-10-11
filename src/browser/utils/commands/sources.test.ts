@@ -2442,3 +2442,36 @@ test("a plugin view's palette entry shows its server part and keeps the full key
   expect(entry?.subtitle).toBe("tray");
   expect(entry?.keywords).toContain(key);
 });
+
+test("two plugin installs with one server name keep their instance markers apart", () => {
+  const call = (toolCallId: string, key: string) => ({
+    type: "tool",
+    toolCallId,
+    toolName: "tray_show",
+    args: {},
+    status: "completed",
+    mcpServer: {
+      connection: { key, transport: "stdio" },
+      identity: { name: "tray", version: "1.0.0" },
+      source: "connection",
+      app: { resourceUri: "ui://tray/view.html" },
+    },
+  });
+  const actions = getActions({
+    artifactsEnabled: true,
+    selectedWorkspaceState: {
+      messages: [
+        call("i1", "plugin:0123456789abcdef:tray"),
+        call("i2", "plugin:fedcba9876543210:tray"),
+        call("own", "solo"),
+      ],
+    } as unknown as WorkspaceState,
+  });
+  const subtitle = (id: string) =>
+    actions.find((a) => a.id === CommandIds.navOpenAppView(id))?.subtitle;
+  expect([subtitle("i1"), subtitle("i2"), subtitle("own")]).toEqual([
+    "tray (plugin 01234567)",
+    "tray (plugin fedcba98)",
+    "solo",
+  ]);
+});

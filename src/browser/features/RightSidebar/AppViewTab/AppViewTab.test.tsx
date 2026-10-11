@@ -198,6 +198,40 @@ describe("AppViewTabPanel", () => {
     }
   });
 
+  test("tabs of two plugin installs with one server name show their instance markers", () => {
+    for (const [id, key] of [
+      ["m1", "plugin:0123456789abcdef:tray"],
+      ["m2", "plugin:fedcba9876543210:tray"],
+    ] as const) {
+      openMcpAppViewTab("ws-markers", {
+        toolCallId: id,
+        serverName: key,
+        resourceUri: "ui://tray/view",
+        toolName: "tray_show",
+        label: "show",
+        arguments: {},
+        cancelled: false,
+        failed: false,
+      });
+    }
+    const store = useWorkspaceStoreRaw();
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(() => false);
+    try {
+      const label = (toolCallId: string) =>
+        render(
+          <APIProvider client={createTestApiClient({})}>
+            <AppViewTabLabel workspaceId="ws-markers" toolCallId={toolCallId} />
+          </APIProvider>
+        ).container.textContent;
+      expect([label("m1"), label("m2")]).toEqual([
+        "showtray (plugin 01234567)",
+        "showtray (plugin fedcba98)",
+      ]);
+    } finally {
+      registered.mockRestore();
+    }
+  });
+
   test("a plugin view's tab shows its server part; the tooltip names the full key", () => {
     const key = "plugin:0123456789abcdef:tray";
     openMcpAppViewTab("ws-plugin", {

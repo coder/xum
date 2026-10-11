@@ -5,6 +5,7 @@ import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { DisplayedMessage } from "@/common/types/message";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
+import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolUtils";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 
@@ -69,6 +70,23 @@ export function appViewDetails(views: readonly McpAppViewRef[]): string[] {
     const index = count - (seen.get(keys[i]) ?? 0);
     seen.set(keys[i], (seen.get(keys[i]) ?? 0) + 1);
     return detail === "" ? `#${index}` : `${detail} · #${index}`;
+  });
+}
+
+/**
+ * The server name shown per view (same order), for app tab labels and palette entries. A plugin
+ * key shows only its server part, unless another view's different key shows the same: then both
+ * keep the plugin's instance marker (`tray (plugin 0123abcd)`), so two installs stay apart.
+ */
+export function appViewServerNames(views: readonly McpAppViewRef[]): string[] {
+  const keysByName = new Map<string, Set<string>>();
+  for (const view of views) {
+    const name = mcpServerDisplayName(view.serverName);
+    keysByName.set(name, (keysByName.get(name) ?? new Set()).add(view.serverName));
+  }
+  return views.map((view) => {
+    const name = mcpServerDisplayName(view.serverName);
+    return (keysByName.get(name)?.size ?? 0) > 1 ? mcpServerConsentName(view.serverName) : name;
   });
 }
 
