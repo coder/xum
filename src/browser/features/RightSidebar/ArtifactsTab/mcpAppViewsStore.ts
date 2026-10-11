@@ -5,6 +5,7 @@ import type { DisplayedMessage } from "@/common/types/message";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
 import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolUtils";
+import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 
 /**
  * MCP Apps views (artifacts experiment), per workspace, for app tabs and the command palette:
@@ -25,6 +26,49 @@ export interface McpAppViewRef {
   cancelled: boolean;
   /** The call returned an error (a subset of `cancelled`). */
   failed: boolean;
+}
+
+/** Longest argument summary shown next to a view's label. */
+const SUMMARY_MAX_CHARS = 80;
+
+/**
+ * One line naming a call by its arguments (`count: 4, sides: 6`), so the palette and tab labels
+ * can tell several views of the same tool apart. Strings show unquoted; other values as JSON.
+ * The model writes the arguments, so control and bidi characters show as visible escapes.
+ */
+export function summarizeToolArguments(args: unknown): string {
+  if (typeof args !== "object" || args === null || Array.isArray(args)) return "";
+  const text = Object.entries(args)
+    .map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`)
+    .join(", ")
+    .replace(/\s+/g, " ");
+  const short = text.length > SUMMARY_MAX_CHARS ? `${text.slice(0, SUMMARY_MAX_CHARS - 1)}…` : text;
+  return escapeControls(short, NAME_CONTROLS);
+}
+
+/**
+ * Detail per view (same order), for the command palette and app tab labels: the outcome, the
+ * argument summary, and `#n` when two views would otherwise read the same (the same call made
+ * twice). `#1` is the oldest, so a number stays with its call as newer calls arrive.
+ */
+export function appViewDetails(views: readonly McpAppViewRef[]): string[] {
+  const details = views.map(
+    (view) =>
+      `${view.failed ? "failed · " : view.cancelled ? "interrupted · " : ""}` +
+      summarizeToolArguments(view.arguments)
+  );
+  const keys = views.map((view, i) => `${view.label}\u0000${view.serverName}\u0000${details[i]}`);
+  const total = new Map<string, number>();
+  for (const key of keys) total.set(key, (total.get(key) ?? 0) + 1);
+  const seen = new Map<string, number>();
+  return details.map((detail, i) => {
+    const count = total.get(keys[i]) ?? 0;
+    if (count < 2) return detail;
+    // Views are newest first: the first one met is the newest, number `count`.
+    const index = count - (seen.get(keys[i]) ?? 0);
+    seen.set(keys[i], (seen.get(keys[i]) ?? 0) + 1);
+    return detail === "" ? `#${index}` : `${detail} · #${index}`;
+  });
 }
 
 /** The view key of an app view (its app tab is "app:<viewKey>"). */
