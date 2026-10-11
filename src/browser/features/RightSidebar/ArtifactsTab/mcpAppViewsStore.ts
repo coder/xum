@@ -364,19 +364,3 @@ export function useMcpAppViewHostedBy(
     hosts.some((host) => isMcpAppViewHosted(workspaceId, toolCallId, host))
   );
 }
-
-/**
- * window.openai widget state per view (JSON), in renderer memory for this session: a view
- * collapsed or moved to its tab mounts again with it. Not persisted, so a restart drops it.
- */
-const widgetStates = new Map<string, string>();
-const widgetStateKey = (workspaceId: string, toolCallId: string) =>
-  `${workspaceId}\u0000${toolCallId}`;
-
-export function getMcpAppWidgetState(workspaceId: string, toolCallId: string): string | null {
-  return widgetStates.get(widgetStateKey(workspaceId, toolCallId)) ?? null;
-}
-
-export function setMcpAppWidgetState(workspaceId: string, toolCallId: string, json: string) {
-  widgetStates.set(widgetStateKey(workspaceId, toolCallId), json);
-}

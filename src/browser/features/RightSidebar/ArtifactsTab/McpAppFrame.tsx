@@ -13,20 +13,14 @@ import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/p
 import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
 import { buildMcpAppCsp, grantMcpAppCsp, MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
-import { mcpAppOpenAiShimScript } from "./mcpAppOpenAiShim";
+import { MCP_APP_OPENAI_SHIM_SCRIPT } from "./mcpAppOpenAiShim";
 import {
   createMcpAppHost,
   type McpAppConsentRequest,
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
-import {
-  getMcpAppWidgetState,
-  isMcpAppViewHosted,
-  openMcpAppViewTab,
-  setMcpAppWidgetState,
-  type McpAppViewRef,
-} from "./mcpAppViewsStore";
+import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
@@ -82,8 +76,6 @@ interface Loaded {
   toolCallId: string;
   view: McpAppView | null;
   error: string | null;
-  /** The view's window.openai widget state when it loaded; fixed, so the document is too. */
-  widgetState: string | null;
 }
 
 interface PendingConsent {
@@ -195,16 +187,15 @@ export function McpAppFrame(props: {
       .getView({ workspaceId, toolCallId, serverName, resourceUri }, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
-        const widgetState = getMcpAppWidgetState(workspaceId, toolCallId);
         setLoaded(
           result.success
-            ? { toolCallId, view: result.data, error: null, widgetState }
-            : { toolCallId, view: null, error: result.error, widgetState }
+            ? { toolCallId, view: result.data, error: null }
+            : { toolCallId, view: null, error: result.error }
         );
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) {
-          setLoaded({ toolCallId, view: null, error: getErrorMessage(error), widgetState: null });
+          setLoaded({ toolCallId, view: null, error: getErrorMessage(error) });
         }
       });
     return () => controller.abort();
@@ -216,7 +207,7 @@ export function McpAppFrame(props: {
     current?.view && grant
       ? finalizeSandboxedDocument(parseArtifactHtml(current.view.html), {
           csp: buildMcpAppCsp(grant.granted),
-          bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, mcpAppOpenAiShimScript(current.widgetState)],
+          bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, MCP_APP_OPENAI_SHIM_SCRIPT],
         })
       : null;
   const guard = useFrameNavigationGuard(srcDoc);
@@ -297,8 +288,6 @@ export function McpAppFrame(props: {
         });
         if (!result.success) throw new Error(result.error);
       },
-      // Keyed by this frame's own view only: the message carries no key the host would trust.
-      saveWidgetState: (json) => setMcpAppWidgetState(workspaceId, toolCallId, json),
       requestConsent: (request) =>
         new Promise<boolean>((resolve) => {
           // One strip at a time, and a shown strip is never replaced: a frame could otherwise

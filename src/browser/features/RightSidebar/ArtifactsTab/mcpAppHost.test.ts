@@ -6,7 +6,6 @@ import {
   createMcpAppHost,
   MCP_APP_CONSENT_ARGS_MAX_BYTES,
   MCP_APP_MAX_HEIGHT,
-  MCP_APP_WIDGET_STATE_MAX_BYTES,
   type McpAppConsentRequest,
   type McpAppDisplayMode,
   type McpAppHostOptions,
@@ -18,7 +17,6 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
   const reads: string[] = [];
   const modelContexts: string[] = [];
   const modeRequests: string[] = [];
-  const widgetStates: string[] = [];
   const moves: string[] = [];
   let displayMode: McpAppDisplayMode = "inline";
   const consents: McpAppConsentRequest[] = [];
@@ -65,7 +63,6 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
         displayMode = mode;
       };
     },
-    saveWidgetState: (json) => widgetStates.push(json),
     requestConsent: (request) => {
       consents.push(request);
       return Promise.resolve(true);
@@ -98,7 +95,6 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
     reads,
     modelContexts,
     modeRequests,
-    widgetStates,
     moves,
     requestMode,
     setHostMode: (mode: McpAppDisplayMode) => (displayMode = mode),
@@ -539,19 +535,5 @@ describe("MCP Apps host router", () => {
     await t.request(2, "ui/update-model-context", { structuredContent: { count: BigInt(3) } });
     for (const id of [1, 2]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
     expect(t.modelContexts).toEqual([]);
-  });
-
-  test("widget state is kept as JSON up to the size limit", async () => {
-    const t = setup();
-    const send = (state: unknown) =>
-      t.host.handleMessage({
-        jsonrpc: "2.0",
-        method: "xum/notifications/widget-state",
-        params: { state },
-      });
-    await send({ selected: 2 });
-    await send(undefined);
-    await send("x".repeat(MCP_APP_WIDGET_STATE_MAX_BYTES));
-    expect(t.widgetStates).toEqual(['{"selected":2}', "null"]);
   });
 });
