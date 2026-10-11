@@ -501,15 +501,17 @@ export class Session {
     const on = `the sandbox image is linux/amd64 and Docker runs on ${arch || "an unknown architecture"}`;
     if (this.#kernel !== os.release())
       throw new Refusal(`${on} on another kernel, whose emulation cannot be checked: ${fix}`);
-    let entry = "";
-    try {
-      entry = fs.readFileSync(path.join(this.#binfmtDir, "qemu-x86_64"), "utf8");
-    } catch {
-      // no entry: no emulation
-    }
-    const lines = entry.split("\n");
+    // binfmt_misc's own `status` switch turns off every entry at once.
+    const read = (name: string) => {
+      try {
+        return fs.readFileSync(path.join(this.#binfmtDir, name), "utf8").split("\n");
+      } catch {
+        return []; // absent: no emulation
+      }
+    };
+    const lines = read("qemu-x86_64");
     const flags = lines.find((line) => line.startsWith("flags:"))?.slice("flags:".length) ?? "";
-    if (lines[0] === "enabled" && flags.includes("F")) return;
+    if (read("status")[0] === "enabled" && lines[0] === "enabled" && flags.includes("F")) return;
     throw new Refusal(`${on}: ${fix}`);
   }
 

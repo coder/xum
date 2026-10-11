@@ -260,14 +260,24 @@ const ARM = JSON.stringify({
 });
 const EMULATED = "enabled\ninterpreter /usr/bin/qemu-x86_64\nflags: POCF\n";
 test.each([
-  ["no emulation", {}, ARM],
-  ["a disabled emulation entry", { "qemu-x86_64": EMULATED.replace("enabled", "disabled") }, ARM],
+  ["no emulation", { status: "enabled\n" }, ARM],
+  // binfmt_misc switched off as a whole, though the entry itself is enabled.
+  ["binfmt_misc disabled", { status: "disabled\n", "qemu-x86_64": EMULATED }, ARM],
+  [
+    "a disabled emulation entry",
+    { status: "enabled\n", "qemu-x86_64": EMULATED.replace("enabled", "disabled") },
+    ARM,
+  ],
   // Without F, the interpreter is not there inside the container's mount namespace.
-  ["an entry without the F flag", { "qemu-x86_64": EMULATED.replace("POCF", "POC") }, ARM],
+  [
+    "an entry without the F flag",
+    { status: "enabled\n", "qemu-x86_64": EMULATED.replace("POCF", "POC") },
+    ARM,
+  ],
   // Another kernel (a VM or a sidecar): this host's entry says nothing about the daemon's.
   [
     "emulation here but a daemon on another kernel",
-    { "qemu-x86_64": EMULATED },
+    { status: "enabled\n", "qemu-x86_64": EMULATED },
     ARM.replace(os.release(), "6.1.0-vm"),
   ],
 ])(
@@ -285,7 +295,7 @@ test.each([
 
 test("U6: an arm64 daemon with amd64 emulation registered may pull and run the image", async () => {
   fake({ INFO: ARM });
-  const dir = binfmt({ "qemu-x86_64": EMULATED });
+  const dir = binfmt({ status: "enabled\n", "qemu-x86_64": EMULATED });
   expect(await binfmtSession(dir).ensureImage()).toBe(REF);
   expect(calls()).toContain("pull");
 });
