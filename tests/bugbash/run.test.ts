@@ -480,3 +480,22 @@ test("U4: the run passes its effort and a possibly real app model to the estimat
     expect(await runBugBash([...charters("a")], { ...env, ...over }, stop, deps)).toBe(code);
   }
 });
+
+test.each([
+  ["mock", 401],
+  ["auto", 401],
+  ["real", 403],
+])(
+  "U5: %s, a key the probe saw rejected (HTTP %d) refuses (exit 2) before any job",
+  async (mode, status) => {
+    const { deps, calls, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }), status);
+    const stop = new AbortController().signal;
+    expect(await runBugBash([...charters("a")], { ...ENV, BUGBASH_AI: mode }, stop, deps)).toBe(2);
+    expect(calls).toHaveLength(0);
+    // It names the key variable, the host and the status, never the URL's path or the key.
+    const refusal = lines.find((line) => line.startsWith("make bug-bash:"))!;
+    expect(refusal).toContain("ANTHROPIC_API_KEY");
+    expect(refusal).toContain(`127.0.0.1:9 (HTTP ${status})`);
+    expect(refusal).not.toMatch(/\/v1|sk-run-test/);
+  }
+);

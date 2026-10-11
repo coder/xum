@@ -55,6 +55,7 @@ import {
   JOB_EXIT_3,
   type JobOutcome,
   cannotReach,
+  keyRejected,
   launchJob,
   type ModelJob,
   modelJob,
@@ -524,6 +525,12 @@ export async function runBugBash(
   // No explorer works without the upstream either, so this refuses in every mode.
   if (probeUnreachable(probeRecords)) {
     err(`make bug-bash: ${cannotReach(job0!)}: check the URL and the network`);
+    return 2;
+  }
+  // A rejected key too, in every mode: each explorer call would fail and keep its reservation.
+  const rejected = keyRejected(job0!, status);
+  if (rejected != null) {
+    err(`make bug-bash: ${rejected}`);
     return 2;
   }
   if (probing) {

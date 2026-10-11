@@ -946,9 +946,11 @@ const UPSTREAM_KEY = "sk-host-upstream-key-for-the-launch-test";
 async function mcpLaunch(
   over: Record<string, string>,
   env: Record<string, string> = {},
-  stop = new AbortController()
+  stop = new AbortController(),
+  upstreamMode?: string
 ) {
   const upstream = await startFakeUpstream();
+  upstream.setMode(upstreamMode);
   try {
     const host = {
       ...HOST_ENV,
@@ -1097,6 +1099,18 @@ test("U2: a probe record that cannot be written is a proxy fault (exit 5), even 
   } finally {
     append.mockRestore();
   }
+  expectNothingLeft();
+});
+
+test("U5: an MCP Apps job whose key the upstream rejects refuses before the container", async () => {
+  const { code, records } = await mcpLaunch({ RUN: "proxycall" }, {}, undefined, "401");
+  expect(code).toBeInstanceOf(Refusal);
+  const message = (code as Error).message;
+  expect(message).toContain("ANTHROPIC_API_KEY");
+  expect(message).toMatch(/127\.0\.0\.1:\d+ \(HTTP 401\)/);
+  expect(message).not.toMatch(/\/v1|sk-host/);
+  expect(calls()).not.toMatch(/^run /m);
+  expect(fs.existsSync(records)).toBe(true); // the probe's record stays
   expectNothingLeft();
 });
 
