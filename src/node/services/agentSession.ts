@@ -21,8 +21,16 @@ import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { PreparedStreamMessage } from "./turnRequestBuilder";
-import type { MessageSendOrigin, RequestAssemblySnapshot } from "./events/eventSpine";
-import type { MessageSendHookOutcome } from "./agentPlugins/promptHooks";
+import type {
+  MessageSendOrigin,
+  RequestAssemblySnapshot,
+  TurnStopContext,
+} from "./events/eventSpine";
+import {
+  lastAssistantText,
+  type MessageSendHookOutcome,
+  type TurnStopHookOutcome,
+} from "./agentPlugins/promptHooks";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import {
   isProviderEligibleMessage,
@@ -541,6 +549,9 @@ function coerceGoalId(value: unknown): string | undefined {
 }
 
 const PDF_MEDIA_TYPE = "application/pdf";
+/** Codex Stop: a turn.stop hook continues one user turn at most this many times. */
+const MAX_STOP_HOOK_CONTINUATIONS = 3;
+const STOP_HOOK_CONTINUATION_DEDUPE_KEY = "stop-hook-continuation";
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
   if (!metadata) return [];
@@ -865,6 +876,11 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     workspaceId: string,
     input: { text: string; origin: MessageSendOrigin }
   ): Promise<MessageSendHookOutcome>;
+  /** The turn.stop prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
+  runTurnStopHooks?(
+    workspaceId: string,
+    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
+  ): Promise<TurnStopHookOutcome>;
   resolveXumToolScopeForWorkspace?(
     metadata: WorkspaceMetadata,
     runtime: Runtime,
@@ -1370,6 +1386,11 @@ export class AgentSession {
   private readonly contextController: SessionContextController;
   private readonly compactionCancellation: CompactionCancellation;
   private compactionStopGeneration = 0;
+  /**
+   * turn.stop continuations queued since the last manual send or the last turn Stop did not
+   * continue: the hooks see `stopHookActive`, and the cap ends the loop.
+   */
+  private stopHookContinuations = 0;
   private pendingResumeIntent?: AbortController;
 
   private readonly retryManager: RetryManager;
@@ -4715,6 +4736,8 @@ export class AgentSession {
         createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
       );
 
+    // A person's send starts a new user turn: Stop may continue it again.
+    if (attempt.acceptanceOrigin === "manual") this.stopHookContinuations = 0;
     // Prompt hooks (message.send): before the pricing gate (its rejected-input row), routing,
     // @file snapshots, edit truncation and every history write, so a block leaves history
     // unchanged.
@@ -10031,6 +10054,17 @@ export class AgentSession {
           return;
       }
 
+      if (!handled && !this.coordinator.editBlocked()) {
+        // Before the queue flush: a continuation is queued work, so the flush dispatches it and
+        // the goal loop waits for it, and input the user queued meanwhile wins over it.
+        await this.runTurnStopHooks(streamEndPayload, activeStreamOptions);
+        if (
+          !this.coordinator.isCurrentTurn(turn) ||
+          !this.coordinator.isCurrentOperation(operation)
+        )
+          return;
+      }
+
       // Stream end: auto-send queued messages (for user messages typed during streaming)
       // and suppress goal continuations for external slash workflow follow-ups waiting on idle.
       // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
@@ -10154,6 +10188,47 @@ export class AgentSession {
         }
       }
     }
+  }
+
+  /**
+   * Run the turn.stop prompt hooks (Codex Stop) for a turn that ended normally. A continuation
+   * (Codex `decision: "block"`) queues its prompt as a new synthetic user row, at most
+   * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Sub-agent turns skip the hooks: TaskService
+   * owns their stream end (Codex has SubagentStop for them).
+   */
+  private async runTurnStopHooks(
+    payload: StreamEndEvent,
+    options: SendMessageOptions | undefined
+  ): Promise<void> {
+    if (this.aiService.runTurnStopHooks == null) return;
+    if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
+    const outcome = await this.aiService.runTurnStopHooks(this.workspaceId, {
+      messageId: payload.messageId,
+      lastAssistantMessage: lastAssistantText(payload.parts),
+      stopHookActive: this.stopHookContinuations > 0,
+    });
+    // Queued work (typed input, wakes) is the next turn instead; the user turn ends here.
+    if (outcome.kind === "none" || options == null || this.hasPendingManualFollowUp()) {
+      this.stopHookContinuations = 0;
+      return;
+    }
+    if (this.stopHookContinuations >= MAX_STOP_HOOK_CONTINUATIONS) {
+      log.warn("Prompt hooks: turn.stop continuation cap reached; ending the turn", {
+        workspaceId: this.workspaceId,
+      });
+      this.stopHookContinuations = 0;
+      return;
+    }
+    this.stopHookContinuations++;
+    this.queueMessage(
+      outcome.prompt,
+      { ...pickStartupRetrySendOptions(options), model: options.model },
+      {
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        dedupeKey: STOP_HOOK_CONTINUATION_DEDUPE_KEY,
+      }
+    );
   }
 
   /** Bounded, failure-tolerant onLogicalTurnCompleted (see AgentSessionOptions). */

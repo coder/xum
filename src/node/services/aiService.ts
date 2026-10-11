@@ -3,9 +3,15 @@ import {
   eventSpine,
   type MessageSendOrigin,
   type RequestAssemblySnapshot,
+  type TurnStopContext,
 } from "./events/eventSpine";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
-import { runMessageSendHooks, type MessageSendHookOutcome } from "./agentPlugins/promptHooks";
+import {
+  runMessageSendHooks,
+  runTurnStopHooks,
+  type MessageSendHookOutcome,
+  type TurnStopHookOutcome,
+} from "./agentPlugins/promptHooks";
 import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
@@ -509,6 +515,14 @@ export class AIService extends EventEmitter {
     input: { text: string; origin: MessageSendOrigin }
   ): Promise<MessageSendHookOutcome> {
     return runMessageSendHooks(eventSpine, workspaceId, input);
+  }
+
+  /** Run the turn.stop prompt-hook chain for one finished turn (fail-open). */
+  runTurnStopHooks(
+    workspaceId: string,
+    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
+  ): Promise<TurnStopHookOutcome> {
+    return runTurnStopHooks(eventSpine, workspaceId, input);
   }
 
   releaseMockStreamStartGate(workspaceId: string): void {

@@ -130,11 +130,30 @@ export interface MessageSendContext {
   blocked?: { pluginName: string; reason: string };
 }
 
+/**
+ * `turn.stop` (the Codex Stop event): middleware sees each turn that finished normally, before
+ * Xum picks the next turn. Every consumer runs (none can skip the rest). Interrupted, failed and
+ * compaction turns never reach it, and neither do sub-agent turns (Codex SubagentStop).
+ */
+export interface TurnStopContext {
+  readonly workspaceId: string;
+  readonly messageId: string;
+  /** The reply's trailing text, or null when the turn ended on a tool call or without text. */
+  readonly lastAssistantMessage: string | null;
+  /** True when Stop already continued this turn (Codex stop_hook_active). */
+  readonly stopHookActive: boolean;
+  /** Continuation prompts (Codex `decision: "block"` reasons), in chain order. */
+  readonly continueReasons: string[];
+  /** Set by a consumer whose output said `continue: false`: it overrides every continuation. */
+  halted?: { pluginName: string };
+}
+
 export interface WaterfallPointMap {
   "tool.execute": ToolExecuteContext;
   "request.assemble": RequestAssembleContext;
   "compaction.prepare": CompactionPrepareContext;
   "message.send": MessageSendContext;
+  "turn.stop": TurnStopContext;
 }
 
 export type WaterfallNext = () => Promise<void>;
