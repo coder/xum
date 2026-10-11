@@ -242,8 +242,9 @@ export function McpAppFrame(props: {
       : (current?.view?.approvedDomains ?? []);
   const grant = current?.view ? grantMcpAppCsp(current.view.csp, approved) : null;
   // Only a view with a result record can be approved (the record binds its server), and only
-  // when a user project can own the approval (approvalProjectPathOf in mcpAppsOperations.ts): not in a scratch chat, nor for
-  // a global server of a multi-project workspace. Otherwise every Allow would fail.
+  // when a user project can own the approval (approvalProjectPathOf in mcpAppsOperations.ts):
+  // not in a scratch chat, nor for a global server of a multi-project workspace. Otherwise
+  // every Allow would fail.
   const unapprovable =
     current?.view == null
       ? null
