@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createMuxMessage, type PluginHookContextEntry } from "@/common/types/message";
 import { prepareMessagesForProvider } from "@/node/services/messagePipeline";
+import { PLUGIN_HOOK_CONTEXT_MAX_CHARS } from "./renderPluginHookContextForProvider";
 
 const baseOptions = {
   effectiveAgentId: "exec",
@@ -74,5 +75,26 @@ describe("plugin hook context in provider requests", () => {
     expect(userTexts(result)).toEqual([
       'one\ntwo\nthree\n<plugin-hook-context plugin="guard">\nAsk first.\n</plugin-hook-context>',
     ]);
+  });
+
+  test("a persisted record over the cap renders only the entries that fit", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rN8CU): a valid-shaped but oversized record must not overflow
+    // every later request.
+    const big = "a".repeat(PLUGIN_HOOK_CONTEXT_MAX_CHARS / 2);
+    const messages = [
+      createMuxMessage("u1", "user", "one", {
+        pluginHookContext: [
+          { pluginId: "first", text: big },
+          { pluginId: "second", text: big },
+        ],
+      }),
+    ];
+
+    const [text] = userTexts(
+      await prepareMessagesForProvider({ ...baseOptions, messagesWithSentinel: messages })
+    );
+
+    expect(text).toContain('plugin="first"');
+    expect(text).not.toContain('plugin="second"');
   });
 });
