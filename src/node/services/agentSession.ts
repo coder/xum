@@ -1047,6 +1047,12 @@ interface SendMessageInternalOptions {
    */
   skipOnSendCompaction?: boolean;
   /**
+   * Texts sent after a queued compaction request and batched into it (MessageQueue joins them
+   * into the request's message). The message.send prompt hooks run on these texts only: the
+   * compaction prompt never reaches them, but separately sent user text must.
+   */
+  textBatchedBehindCompaction?: string;
+  /**
    * Task-attempt obligation for this send (see TurnAdmissionToken): notified of the coordinator's
    * admission inside the synchronous prepare callback. Its staleness is already composed into
    * `admissionStale` by WorkspaceService.
@@ -4360,7 +4366,8 @@ export class AgentSession {
   }
 
   /**
-   * Run the message.send prompt hooks for this message. Compaction requests never reach them.
+   * Run the message.send prompt hooks for this message. A compaction request's own text never
+   * reaches them, only the texts batched behind it in the queue.
    *
    * Only a send a person made (typed, edited, queued, plan-review feedback) can be blocked.
    * Automatic senders (goals, tasks, wakes, follow-ups) retry a refused send, so a block would
@@ -4372,12 +4379,15 @@ export class AgentSession {
     internal: SendMessageInternalOptions | undefined,
     acceptanceOrigin: TurnAcceptanceOrigin
   ): Promise<MessageSendHookOutcome> {
-    if (this.aiService.runMessageSendHooks == null || isCompactionRequestMetadata(muxMetadata)) {
+    const hookText = isCompactionRequestMetadata(muxMetadata)
+      ? internal?.textBatchedBehindCompaction
+      : message;
+    if (this.aiService.runMessageSendHooks == null || hookText == null) {
       return { kind: "none" };
     }
     const origin = resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin);
     const outcome = await this.aiService.runMessageSendHooks(this.workspaceId, {
-      text: message,
+      text: hookText,
       origin,
     });
     if (
