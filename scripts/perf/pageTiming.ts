@@ -6,7 +6,8 @@
  * A tree is a built checkout (`make build`). P1 is "/" on an empty root, P2 "/workspace/<id>" on the neutral
  * seed. Every run gets a fresh root, server and browser profile. --aa qualifies the host (one confirmatory
  * block for a failed page) and writes qualification.json, which gated runs read with --qualification.
- * PAGE_TIMING_LOCK=<file> holds that flock for each browser run (the shared dev-host measurement lock).
+ * For --aa, base and head are two builds of one commit, so build-to-build noise counts as host noise.
+ * PAGE_TIMING_LOCK=<file>: one flock hold per run, never per block (the shared dev-host measurement lock).
  * Exit: 0 pass or qualified, 1 a gate failed or the host did not qualify, 2 bad input, 3 an invalid run.
  * A gated run (--qualification) takes one page: the summary is written only when every page ends.
  */
@@ -121,37 +122,35 @@ async function startServer(tree: string, root: string, home: string, logFile: st
 
 /** One navigation with a fresh root (and seed), server and browser. Values in seconds. */
 async function measure(o: Common & { tree: string; mode: Signal; name: string }) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "page-timing-"));
-  const seedDir = path.join(tmp, "seed");
-  const seed = o.page === "p2" ? writeNeutralSeed(seedDir) : null;
-  const [root, home] = [seed?.root ?? path.join(tmp, "root"), seed?.home ?? path.join(tmp, "home")];
-  try {
-    const before = seed && snapshotSeed(seedDir);
-    for (const dir of [root, home]) fs.mkdirSync(dir, { recursive: true });
-    // The lock covers the load check and the server's whole life, so no other lock holder's server
-    // start-up or shutdown work overlaps a measured run.
-    const values = await withLock(async () => {
-      await waitForQuietHost();
-      const server = await startServer(
-        o.tree,
-        root,
-        home,
-        path.join(o.out, `${o.name}.server.log`)
-      );
+  // One lock hold per run, from seed creation to the removal of its folder, so nothing a run does (git in
+  // the seed, server start-up and shutdown) overlaps another holder's run. Never hold it for a block.
+  return withLock(async () => {
+    await waitForQuietHost();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "page-timing-"));
+    const [seedDir, log] = [path.join(tmp, "seed"), path.join(o.out, `${o.name}.server.log`)];
+    const seed = o.page === "p2" ? writeNeutralSeed(seedDir) : null;
+    const root = seed?.root ?? path.join(tmp, "root");
+    const home = seed?.home ?? path.join(tmp, "home");
+    const route = seed ? `/workspace/${seed.workspaceId}` : "/";
+    try {
+      const before = seed && snapshotSeed(seedDir);
+      for (const dir of [root, home]) fs.mkdirSync(dir, { recursive: true });
+      const server = await startServer(o.tree, root, home, log);
+      let values: Values;
       try {
-        return await browse(o, `${server.origin}${seed ? `/workspace/${seed.workspaceId}` : "/"}`);
+        values = await browse(o, `${server.origin}${route}`);
       } finally {
         await server.stop();
       }
-    });
-    const now = (rel: string) => fs.readFileSync(path.join(seedDir, rel));
-    const rewrites = before ? core.seedRewrites(diffSeed(before, seedDir), before, now) : [];
-    if (rewrites.length > 0) throw new Error(`${o.name}: a build rewrote the seed: ${rewrites}`);
-    return values;
-  } finally {
-    // Invalid runs clean up too, unless a process still uses the folder (stop() then threw).
-    if (withEnv(`HOME=${home}`).length === 0) fs.rmSync(tmp, { recursive: true, force: true });
-  }
+      const now = (rel: string) => fs.readFileSync(path.join(seedDir, rel));
+      const rewrites = before ? core.seedRewrites(diffSeed(before, seedDir), before, now) : [];
+      if (rewrites.length > 0) throw new Error(`${o.name}: a build rewrote the seed: ${rewrites}`);
+      return values;
+    } finally {
+      // Invalid runs clean up too, unless a process still uses the folder (stop() then threw).
+      if (withEnv(`HOME=${home}`).length === 0) fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 }
 
 async function browse(o: Parameters<typeof measure>[0], url: string): Promise<Values> {
@@ -229,8 +228,11 @@ async function main(): Promise<number> {
   const pages = a.pages.split(",") as core.Page[];
   const predict = new URLSearchParams(a.predict.replaceAll(",", "&")); // "p1.ucs=3.9,p2.ir=1.2"
   const keys = pages.flatMap((p) => [`${p}.ucs`, `${p}.ir`]);
+  const cli = (t?: string) => (t ? path.resolve(t, "dist/cli/index.js") : "");
+  const missing = [cli(a.base), cli(a.head)].filter((f) => f && !fs.existsSync(f));
   const errors = [
     !a.base || !a.head ? "--base and --head are required" : "",
+    missing.length > 0 ? `not a built tree, missing: ${missing.join(", ")}` : "",
     pages.some((p) => !(p in core.TARGET)) ? `unknown page in --pages ${a.pages}` : "",
     a.aa && a.qualification ? "--aa and --qualification exclude each other" : "",
     a.qualification && pages.length !== 1 ? "a gated run takes one page (--pages p1)" : "",
@@ -269,9 +271,7 @@ async function main(): Promise<number> {
       const verdict =
         host && gate({ ...host[page], mdi: host[page].mdi[signal], signal, d, predictedSaving });
       failed ||= !!verdict && verdict.verdict !== "pass";
-      const result = verdict
-        ? `${verdict.verdict} (${verdict.rule})`
-        : "not gated (no --qualification)";
+      const result = verdict ? `${verdict.verdict} (${verdict.rule})` : "not gated";
       console.log(
         `${page} ${signal}: median d ${median(d).toFixed(3)} s, d(7) ${kthLargest(d, 2).toFixed(3)} s, ${result}`
       );
