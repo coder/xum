@@ -169,7 +169,7 @@ export async function prepareMessagesForProvider(
   const messagesWithNeutralizedEnvelopes =
     neutralizeAgentEnvelopeLookalikesForProvider(messagesWithInlinedSvg);
 
-  // Render prompt-hook context into its own user message (never the system prompt).
+  // Render prompt-hook context into its user message (never the system prompt).
   const messagesWithHookContext = renderPluginHookContextForProvider(
     messagesWithNeutralizedEnvelopes
   );
