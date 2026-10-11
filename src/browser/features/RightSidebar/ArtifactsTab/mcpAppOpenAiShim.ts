@@ -16,7 +16,9 @@
  * notifications passively. The shim sends its own ui/initialize only when the view first uses
  * `window.openai` and no handshake was seen yet, so a standard-only view gets no extra
  * handshake. Members without a standard equivalent warn once; their Promises reject (or
- * resolve, for setWidgetState, which views call on every change) and nothing throws.
+ * resolve, for setWidgetState, which views call on every change) and nothing throws. Optional
+ * extensions Xum lacks (uploadFile, selectFiles, getFileDownloadUrl, requestCheckout) are
+ * absent, so `if (window.openai?.selectFiles)` takes the view's fallback.
  * Shapes: https://developers.openai.com/plugins/reference.md and the Apps SDK example types.
  */
 export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
@@ -176,7 +178,9 @@ export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
       warnOnce("setOpenInAppUrl");
     }
   };
-  ["requestModal", "requestClose", "uploadFile", "selectFiles", "getFileDownloadUrl", "requestCheckout"]
+  // Members the Apps SDK's own API type always has get a rejecting stub. Optional extensions
+  // (file APIs, checkout) stay absent: views feature-detect them and pick their fallback.
+  ["requestModal", "requestClose"]
     .forEach(function (name) {
       api[name] = function () {
         warnOnce(name);
