@@ -245,22 +245,47 @@ describe("window.openai shim", () => {
   /** The view's own MCP Apps client connecting after the shim did (a hybrid view). */
   function connectStandardClient(t: Awaited<ReturnType<typeof runView>>) {
     const received: string[] = [];
-    t.win.addEventListener("message", (event) => {
-      const method = (event as unknown as { data: { method?: string } }).data.method;
-      if (method !== undefined) received.push(method);
-    });
     const parent = t.win.parent as unknown as { postMessage: (message: unknown) => void };
+    t.win.addEventListener("message", (event) => {
+      const { data, source } = event as unknown as { data: { method?: string }; source: unknown };
+      // The ext-apps SDK's PostMessageTransport accepts only messages from window.parent.
+      if (source === parent && data.method !== undefined) received.push(data.method);
+    });
     parent.postMessage({ jsonrpc: "2.0", id: 99, method: "ui/initialize", params: {} });
     parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
     return received;
   }
 
-  test("a standard client that connects after the shim still gets tool-input and result", async () => {
+  test("a standard client that connects after the shim gets the lifecycle from the shim", async () => {
     const t = await runView("window.openai.toolOutput;");
     expect(t.win.openai.toolOutput).toEqual({ dice: [3, 5] });
+    const fromHost = () => t.posted.length;
+    const before = fromHost();
     const received = connectStandardClient(t);
-    await tick();
+    for (let i = 0; i < 3; i++) await tick();
     expect(received).toEqual(["ui/notifications/tool-input", "ui/notifications/tool-result"]);
+    // Replayed in the page: the host sent the client its initialize reply and nothing more.
+    expect(t.posted.slice(before).map((m) => m.method)).toEqual([
+      "ui/initialize",
+      "ui/notifications/initialized",
+    ]);
+  });
+
+  test("a standard-only view gets the lifecycle once, with no shim handshake", async () => {
+    const t = await runView(`
+      window.got = [];
+      window.addEventListener("message", function (e) {
+        if (e.source !== window.parent) return;
+        if (e.data.method) window.got.push(e.data.method);
+        if (e.data.id === 1) window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" }, "*");
+      });
+      window.parent.postMessage({ jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} }, "*");`);
+    for (let i = 0; i < 3; i++) await tick();
+    expect((t.win as unknown as { got: string[] }).got).toEqual([
+      "ui/notifications/tool-input",
+      "ui/notifications/tool-result",
+    ]);
+    expect(t.posted.filter((m) => m.method === "ui/initialize")).toHaveLength(1);
   });
 
   test("the shim stops answering teardown once the view's own client connected", async () => {
