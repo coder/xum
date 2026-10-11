@@ -1,11 +1,9 @@
 import { useState, useEffect, useRef, type ReactNode } from "react";
-import { AnimatePresence, motion } from "motion/react";
 import App from "../../App";
 import { AuthTokenModal } from "../AuthTokenModal/AuthTokenModal";
 import { ThemeProvider } from "../../contexts/ThemeContext";
 import { LoadingScreen } from "../LoadingScreen/LoadingScreen";
 import { StartupConnectionError } from "../StartupConnectionError/StartupConnectionError";
-import { useReducedMotion } from "../../hooks/useReducedMotion";
 import { useWorkspaceStoreRaw, workspaceStore } from "../../stores/WorkspaceStore";
 import { useGitStatusStoreRaw } from "../../stores/GitStatusStore";
 import { useRuntimeStatusStoreRaw } from "../../stores/RuntimeStatusStore";
@@ -174,8 +172,6 @@ function AppLoaderInner() {
   const runtimeStatusStore = useRuntimeStatusStoreRaw();
   const backgroundBashStore = useBackgroundBashStoreRaw();
 
-  const prefersReducedMotion = useReducedMotion();
-
   // Track whether stores have been synced
   const [storesSynced, setStoresSynced] = useState(false);
 
@@ -263,21 +259,15 @@ function AppLoaderInner() {
     );
   }
 
-  // AnimatePresence provides a smooth fade-out when the loading screen
-  // transitions to the main app. mode="wait" ensures the exit animation
-  // completes before the enter animation starts.
+  // T3 #5971: no fade. The old exit animation (0.4 s, mode "wait") delayed even mounting the app,
+  // then faded it in from opacity 0, and kept `motion` on the first load. Reduced motion already
+  // got this instant swap.
   return (
-    <AnimatePresence mode="wait">
+    <>
       {!initialLoadComplete ? (
         // #6017: the loading screen is the whole page, so it is the page's main landmark until the
-        // App (with its own main) replaces it. mode="wait" keeps the two from overlapping.
-        <motion.main
-          key="loading"
-          initial={{ opacity: 1 }}
-          exit={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, y: -20 }}
-          transition={prefersReducedMotion ? { duration: 0 } : { duration: 0.4, ease: "easeInOut" }}
-          className="bg-surface-primary h-full"
-        >
+        // App (with its own main) replaces it in the same commit, so the two never overlap.
+        <main className="bg-surface-primary h-full">
           {apiState.status === "error" ? (
             <StartupConnectionError error={apiState.error} onRetry={apiState.retry} />
           ) : (
@@ -289,21 +279,15 @@ function AppLoaderInner() {
               }
             />
           )}
-        </motion.main>
+        </main>
       ) : (
-        <motion.div
-          key="app"
-          initial={prefersReducedMotion ? { opacity: 1 } : { opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={prefersReducedMotion ? { duration: 0 } : { duration: 0.3, ease: "easeOut" }}
-          className="bg-surface-primary h-full"
-        >
+        <div className="bg-surface-primary h-full">
           <TerminalRouterProvider>
             <App />
             <UpdateRestartOverlay />
           </TerminalRouterProvider>
-        </motion.div>
+        </div>
       )}
-    </AnimatePresence>
+    </>
   );
 }
