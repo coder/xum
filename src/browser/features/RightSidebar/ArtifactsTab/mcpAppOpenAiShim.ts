@@ -109,7 +109,7 @@ export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
       case "ui/notifications/tool-result":
         setGlobals({
           toolOutput: params.structuredContent === undefined ? null : params.structuredContent,
-          toolResponseMetadata: params._meta === undefined ? null : params._meta
+          toolResponseMetadata: responseMetadata(params)
         });
         return;
       case "ui/notifications/host-context-changed":
@@ -143,6 +143,18 @@ export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
     }).then(function () {
       post({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
     }, function () {});
+  }
+  // The reference's toolResponseMetadata: "status, call_tool_result, and mcp_tool_result,
+  // preserving the full MCP result envelope, including hidden _meta". The result's own _meta
+  // keys stay on top as well, for views written when this global was the bare _meta.
+  function responseMetadata(result) {
+    var envelope = {};
+    var meta = result._meta;
+    if (meta && typeof meta === "object") for (var key in meta) envelope[key] = meta[key];
+    envelope.status = result.isError === true ? "error" : "success";
+    envelope.call_tool_result = result;
+    envelope.mcp_tool_result = result;
+    return envelope;
   }
   function warnOnce(name) {
     if (warned[name]) return;

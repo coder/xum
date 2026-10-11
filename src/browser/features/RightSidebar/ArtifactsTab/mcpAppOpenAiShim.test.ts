@@ -132,11 +132,20 @@ describe("window.openai shim", () => {
     expect((t.win as unknown as { firstInput: unknown }).firstInput).toBeNull();
     expect((t.win.openai as unknown as { toolInput: unknown }).toolInput).toEqual({ count: 2 });
     expect(t.win.openai.toolOutput).toEqual({ dice: [3, 5] });
-    expect(t.win.openai.toolResponseMetadata).toEqual({ seed: 7 });
+    // The reference's envelope (status, call_tool_result, mcp_tool_result) with the whole
+    // result, hidden _meta included; the _meta keys stay readable at the top too.
+    const result = { structuredContent: { dice: [3, 5] }, _meta: { seed: 7 } };
+    const metadata = {
+      seed: 7,
+      status: "success",
+      call_tool_result: result,
+      mcp_tool_result: result,
+    };
+    expect(t.win.openai.toolResponseMetadata).toEqual(metadata);
     expect(t.win.events).toContainEqual({ toolInput: { count: 2 } });
     expect(t.win.events).toContainEqual({
       toolOutput: { dice: [3, 5] },
-      toolResponseMetadata: { seed: 7 },
+      toolResponseMetadata: metadata,
     });
     // The host context reaches the globals and the document language.
     expect(t.win.openai.locale).toBe("de-DE");
@@ -190,10 +199,9 @@ describe("window.openai shim", () => {
     expect(before.win.done).toBe(true);
     // After load: the shim keeps its own references, so the event still fires.
     const after = await runView(`${COLLECT_EVENTS} window.openai.toolOutput; window.openai = {};`);
-    expect(after.win.events).toContainEqual({
-      toolOutput: { dice: [3, 5] },
-      toolResponseMetadata: { seed: 7 },
-    });
+    expect(after.win.events).toContainEqual(
+      expect.objectContaining({ toolOutput: { dice: [3, 5] } })
+    );
   });
 
   test("the CSP allows the shim, and runs it before any CSP the view adds", () => {
