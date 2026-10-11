@@ -1139,7 +1139,9 @@ export const mcp = {
        * `{ notConnected: true }` when `ifConnected` found it not running.
        */
       output: ResultSchema(
-        z.union([MCPSettingsSnapshotSchema, z.object({ notConnected: z.literal(true) })]).nullable(),
+        z
+          .union([MCPSettingsSnapshotSchema, z.object({ notConnected: z.literal(true) })])
+          .nullable(),
         z.string()
       ),
     },

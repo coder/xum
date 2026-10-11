@@ -679,14 +679,13 @@ const ReopenableWorkspaceMCPModal: FC = () => {
   );
 };
 
-/** Pick `option` in the Radix select labelled `label` (its list renders in a portal). */
+/** Pick `option` in a Radix select (its list renders in a portal). */
 async function chooseSetting(
   canvasElement: HTMLElement,
-  section: ReturnType<typeof within>,
-  label: string,
+  select: HTMLElement,
   option: string
 ): Promise<void> {
-  await userEvent.click(section.getByLabelText(label));
+  await userEvent.click(select);
   const body = within(canvasElement.ownerDocument.body);
   await userEvent.click(await body.findByRole("option", { name: option }));
 }
@@ -695,7 +694,7 @@ async function saveUnits(canvasElement: HTMLElement, units: string) {
   const section = within(
     await within(await findWorkspaceMCPDialog(canvasElement)).findByTestId("mcp-server-settings")
   );
-  await chooseSetting(canvasElement, section, "Units setting", units);
+  await chooseSetting(canvasElement, section.getByLabelText("Units setting"), units);
   const save = section.getByRole("button", { name: "Save settings" });
   await waitFor(() => expect(save).toBeEnabled());
   await userEvent.click(save);
@@ -724,11 +723,11 @@ export const WorkspaceMCPServerSettingsReopen: Story = {
       within(canvasElement).getByRole("button", { name: "Change zoom on the server" })
     );
 
-    await userEvent.click(within(canvasElement).getByRole("button", { name: "Open workspace MCP" }));
+    await userEvent.click(
+      within(canvasElement).getByRole("button", { name: "Open workspace MCP" })
+    );
     const section = within(
-      await within(await findWorkspaceMCPDialog(canvasElement)).findByTestId(
-        "mcp-server-settings"
-      )
+      await within(await findWorkspaceMCPDialog(canvasElement)).findByTestId("mcp-server-settings")
     );
     await waitFor(() => expect(section.getByLabelText("Units setting")).toHaveTextContent("in"));
     await expect(section.getByLabelText("Default zoom setting")).toHaveValue(4);
@@ -751,7 +750,7 @@ export const WorkspaceMCPServerSettingsOldValueAgain: Story = {
 
     const section = within(await modal.findByTestId("mcp-server-settings"));
     await expect(section.getByLabelText("Units setting")).toHaveTextContent("in");
-    await chooseSetting(canvasElement, section, "Units setting", "mm");
+    await chooseSetting(canvasElement, section.getByLabelText("Units setting"), "mm");
     await waitFor(() =>
       expect(section.getByRole("button", { name: "Save settings" })).toBeEnabled()
     );
