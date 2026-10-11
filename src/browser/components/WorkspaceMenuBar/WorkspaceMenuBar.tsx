@@ -711,8 +711,10 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         align="end"
         sideOffset={6}
         // Size to the widest row ("Messages from other workspaces" + shortcut
-        // overflowed a fixed 240px), but never wider than the viewport.
-        className="w-max max-w-[calc(100vw-1rem)] !min-w-[240px] p-1"
+        // overflowed a fixed 240px), but never wider than the viewport. On phones the sidebar
+        // tool rows make it taller than a short screen, so it scrolls within the room below
+        // the button instead of hiding its last actions.
+        className="max-h-(--radix-popover-content-available-height) w-max max-w-[calc(100vw-1rem)] !min-w-[240px] overflow-y-auto p-1"
         onClick={(event: React.MouseEvent<HTMLDivElement>) => {
           event.stopPropagation();
         }}
