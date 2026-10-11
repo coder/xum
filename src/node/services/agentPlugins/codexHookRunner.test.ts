@@ -103,6 +103,22 @@ describe("PreToolUse", () => {
     expect(calls).toEqual([{ cmd: "rm -rf /" }]);
   });
 
+  test("matchers run in Codex's dialect: inline flags and whole-name lists", async () => {
+    const { spine, calls } = setup(
+      [
+        hook("PreToolUse", { matcher: "(?i)^BASH$", input: { n: "1" } }),
+        hook("PreToolUse", { matcher: "file_read|bash", input: { n: "2" } }),
+      ],
+      () => ({ content: [] })
+    );
+
+    await runTool(spine, "bash", {});
+    await runTool(spine, "bash_output", {});
+
+    // bash matches both; bash_output matches neither ("bash" in a name list is a whole name).
+    expect(calls.map((call) => call.n).sort()).toEqual(["1", "2"]);
+  });
+
   test("the trust gate runs before each call: a revoke stops the next call", async () => {
     const { spine, calls, state } = setup([hook("PreToolUse")], () => deny);
 

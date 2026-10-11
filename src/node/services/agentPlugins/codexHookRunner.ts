@@ -21,7 +21,7 @@ import type { EventSpine, ToolExecuteContext } from "@/node/services/events/even
 import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubset } from "@/common/utils/jsonSchemaSubset";
 import { log } from "@/node/services/log";
-import type { PluginHookDefinition } from "./codexHooks";
+import { compileHookMatcher, type PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
 
 /** Xum's limits for one hook call, in seconds (Codex's default is 600). */
@@ -186,8 +186,9 @@ function applyUpdatedInput(
 }
 
 function matches(hook: PluginHookDefinition, toolName: string): boolean {
-  // The parser already proved the matcher compiles. Codex applies it to tool_name.
-  return hook.matcher === undefined || new RegExp(hook.matcher).test(toolName);
+  // The parser already proved the matcher compiles, with the same Codex-dialect translation
+  // (inline flags, whole-name lists). Codex applies it to tool_name.
+  return hook.matcher === undefined || compileHookMatcher(hook.matcher).test(toolName);
 }
 
 async function invoke(
