@@ -1618,8 +1618,9 @@ export class AgentPluginInstallService {
       this.mcpOauthService?.credentialKey(url) ?? null;
     // Compare each entry with its own previous identity (same name, same key): when two
     // servers share a URL, another entry already using the new identity must not mask the
-    // change. A renamed entry has no previous self, so it compares with every identity at
-    // the key.
+    // change. A renamed (or added) entry has no previous self, and the stored credentials
+    // cannot be traced to one entry: reset whenever any identity at the key differs. A
+    // needless sign-out is acceptable; stale credentials offered under a new identity are not.
     const currentIdentities = new Map<string, Set<string>>();
     const currentEntryIdentity = new Map<string, string>();
     for (const [serverName, server] of current?.servers ?? []) {
@@ -1634,10 +1635,11 @@ export class AgentPluginInstallService {
       const key = server.signIn && credentialKey(server.signIn.url);
       if (!key || !server.signIn) continue;
       const previous = currentEntryIdentity.get(`${serverName}\0${key}`);
+      const identity = server.signIn.identity;
       const changed =
         previous !== undefined
-          ? previous !== server.signIn.identity
-          : currentIdentities.get(key)?.has(server.signIn.identity) === false;
+          ? previous !== identity
+          : [...(currentIdentities.get(key) ?? [])].some((other) => other !== identity);
       if (changed) signInResets?.push(server.signIn.url);
     }
     // Skill advertisements interpolate into the model-visible skill index on
@@ -1930,8 +1932,15 @@ export class AgentPluginInstallService {
       // no public-suffix list exists here to make parent-domain matching safe.
       const serverHost = new URL(info.url).host;
       const endpoints = info.oauth?.endpoints;
+      const discovery = info.oauth?.discovery;
       const authHosts = new Set(
-        [endpoints?.authorizationUrl, endpoints?.tokenUrl, endpoints?.registrationUrl]
+        [
+          endpoints?.authorizationUrl,
+          endpoints?.tokenUrl,
+          endpoints?.registrationUrl,
+          discovery?.authorizationServerBase,
+          discovery?.registrationUrl,
+        ]
           .filter((url) => url !== undefined)
           .map((url) => new URL(url).host)
           .filter((host) => host !== serverHost)

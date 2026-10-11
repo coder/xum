@@ -9,6 +9,8 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import {
   auth,
   checkResourceAllowed,
+  discoverAuthorizationServerMetadata,
+  discoverOAuthServerInfo,
   IssuerMismatchError,
   type OAuthClientProvider,
   type OAuthDiscoveryState,
@@ -160,7 +162,10 @@ function resolvePluginScope(
  */
 function pluginDiscoveryState(config?: MCPServerOAuthConfig): OAuthDiscoveryState | undefined {
   const endpoints = config?.endpoints;
-  if (endpoints === undefined) return undefined;
+  // A standalone authorizationServerBase: the SDK fetches (and issuer-checks) its metadata.
+  const base = config?.discovery?.authorizationServerBase;
+  if (endpoints === undefined)
+    return base !== undefined ? { authorizationServerUrl: base } : undefined;
   const issuer = endpoints.issuer ?? new URL(endpoints.tokenUrl).origin;
   // toServerOAuthConfig drops overrides with split origins; a config that still has them
   // is a bug (the code and PKCE verifier could reach another server's token endpoint).
@@ -185,6 +190,57 @@ function pluginDiscoveryState(config?: MCPServerOAuthConfig): OAuthDiscoveryStat
   };
 }
 
+/**
+ * The discovery state a sign-in starts from. A standalone registrationUrl replaces the
+ * discovered registration endpoint, so discovery runs here first: the SDK registers with the
+ * metadata it is given. SECURITY AUDIT: the URL must share the issuer's origin (the
+ * authorizationServerBase's when set, else the discovered one), the same one-origin rule as
+ * full endpoint overrides; otherwise it is dropped and plain discovery applies.
+ */
+async function pluginFlowDiscoveryState(
+  config: MCPServerOAuthConfig,
+  challenge: BearerChallenge | null,
+  serverUrlForDiscovery: string
+): Promise<OAuthDiscoveryState | undefined> {
+  const registrationUrl = config.discovery?.registrationUrl;
+  if (config.endpoints !== undefined || registrationUrl === undefined)
+    return pluginDiscoveryState(config);
+  const base = config.discovery?.authorizationServerBase;
+  try {
+    const discovered =
+      base !== undefined
+        ? {
+            authorizationServerUrl: base,
+            authorizationServerMetadata: await discoverAuthorizationServerMetadata(base),
+          }
+        : await discoverOAuthServerInfo(serverUrlForDiscovery, {
+            ...(challenge?.resourceMetadataUrl !== undefined
+              ? { resourceMetadataUrl: challenge.resourceMetadataUrl }
+              : {}),
+          });
+    const metadata = discovered.authorizationServerMetadata;
+    if (metadata === undefined) return pluginDiscoveryState(config);
+    const issuerOrigin = new URL(base ?? metadata.issuer).origin;
+    if (new URL(registrationUrl).origin !== issuerOrigin) {
+      log.warn("[MCP OAuth] Ignoring a plugin registrationUrl outside the issuer's origin", {
+        issuerOrigin,
+      });
+      return pluginDiscoveryState(config);
+    }
+    return {
+      authorizationServerUrl: String(discovered.authorizationServerUrl),
+      authorizationServerMetadata: { ...metadata, registration_endpoint: registrationUrl },
+      ...("resourceMetadata" in discovered && discovered.resourceMetadata !== undefined
+        ? { resourceMetadata: discovered.resourceMetadata }
+        : {}),
+    };
+  } catch (error) {
+    // The SDK repeats discovery and reports the failure to the user.
+    log.debug("[MCP OAuth] Plugin registrationUrl discovery failed", { error });
+    return pluginDiscoveryState(config);
+  }
+}
+
 /** A plugin's registered client (skips DCR). The SDK sends client_secret to the token endpoint only. */
 function pluginClient(
   config: MCPServerOAuthConfig | undefined,
@@ -201,13 +257,36 @@ function pluginClient(
 }
 
 /**
+ * A URL whose serialization is the configured string. The SDK sends `resource.href` in the
+ * authorization, token and refresh requests, and `new URL("https://api.example.com").href`
+ * appends a slash: an authorization server that compares RFC 8707 resources exactly rejects
+ * that. The value is still validated as a URL by the constructor.
+ */
+class ExactResourceURL extends URL {
+  readonly #raw: string;
+  constructor(raw: string) {
+    super(raw);
+    this.#raw = raw;
+  }
+  override get href(): string {
+    return this.#raw;
+  }
+  override toString(): string {
+    return this.#raw;
+  }
+  override toJSON(): string {
+    return this.#raw;
+  }
+}
+
+/**
  * Defense in depth for the plugin resource (mcpConfig already dropped one
  * that does not cover the server): the SDK's own resource/server rule.
  */
 function pluginResourceValidator(resource: string): (serverResource: URL) => Promise<URL> {
   return (serverResource) =>
     checkResourceAllowed({ requestedResource: serverResource, configuredResource: resource })
-      ? Promise.resolve(new URL(resource))
+      ? Promise.resolve(new ExactResourceURL(resource))
       : Promise.reject(
           new Error(`Plugin resource ${resource} does not cover ${serverResource.href}`)
         );
@@ -569,6 +648,12 @@ function parseStoredCredentials(value: unknown): MCPOAuthStoredCredentials | nul
         client_secret:
           typeof clientInformationRaw.client_secret === "string"
             ? clientInformationRaw.client_secret
+            : undefined,
+        // A dynamically registered client's method: plugin endpoint metadata advertises no
+        // supported methods, so without it the SDK falls back to client_secret_basic.
+        token_endpoint_auth_method:
+          typeof clientInformationRaw.token_endpoint_auth_method === "string"
+            ? clientInformationRaw.token_endpoint_auth_method
             : undefined,
         client_id_issued_at:
           typeof clientInformationRaw.client_id_issued_at === "number"
@@ -979,14 +1064,22 @@ export class McpOauthService {
   /**
    * Used by MCPServerManager caching to restart servers when auth state changes.
    */
-  async hasAuthTokens(input: { serverUrl: string }): Promise<boolean> {
+  async hasAuthTokens(input: {
+    serverUrl: string;
+    /** Plugin OAuth settings: the same client check as getAuthProviderForServer. */
+    oauth?: MCPServerOAuthConfig;
+  }): Promise<boolean> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {
       return false;
     }
 
     const creds = await this.getValidStoredCredentials({ serverUrl: normalizedServerUrl });
-    return Boolean(creds?.tokens && creds.clientInformation);
+    return Boolean(
+      creds?.tokens &&
+      creds.clientInformation &&
+      storedClientMatches(creds.clientInformation, input.oauth)
+    );
   }
 
   private async resolveServerForOauthFlow(input: {
@@ -1154,7 +1247,11 @@ export class McpOauthService {
       clientInformation: null,
       authorizeUrl: "",
       redirectUri,
-      ...(await this.pluginFlowFields(serverConfig.data.oauth, challenge)),
+      ...(await this.pluginFlowFields(
+        serverConfig.data.oauth,
+        challenge,
+        serverConfig.data.serverUrlForDiscovery
+      )),
       resourceMetadataUrl: challenge?.resourceMetadataUrl,
       codeVerifier: null,
       server: serverListener,
@@ -1299,7 +1396,11 @@ export class McpOauthService {
       clientInformation: null,
       authorizeUrl: "",
       redirectUri: redirectUri.toString(),
-      ...(await this.pluginFlowFields(serverConfig.data.oauth, challenge)),
+      ...(await this.pluginFlowFields(
+        serverConfig.data.oauth,
+        challenge,
+        serverConfig.data.serverUrlForDiscovery
+      )),
       resourceMetadataUrl: challenge?.resourceMetadataUrl,
       codeVerifier: null,
       timeout: setTimeout(() => {
@@ -1462,14 +1563,15 @@ export class McpOauthService {
   /** Scope, discovery state and plugin client for a new flow. */
   private async pluginFlowFields(
     config: MCPServerOAuthConfig | undefined,
-    challenge: BearerChallenge | null
+    challenge: BearerChallenge | null,
+    serverUrlForDiscovery: string
   ): Promise<Pick<OAuthFlowBase, "scope" | "discoveryState" | "plugin">> {
     const scope = await resolveOAuthScope(challenge);
     if (config === undefined) return { scope, discoveryState: undefined };
     const clientSecret = await readClientSecret(config);
     return {
       scope: resolvePluginScope(config, scope),
-      discoveryState: pluginDiscoveryState(config),
+      discoveryState: await pluginFlowDiscoveryState(config, challenge, serverUrlForDiscovery),
       plugin: { config, ...(clientSecret !== undefined ? { clientSecret } : {}) },
     };
   }
