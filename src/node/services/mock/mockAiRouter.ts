@@ -501,6 +501,9 @@ const defaultHandlers: MockAiRouterHandler[] = [
     respond: () => buildPermissionExecReply(),
   },
   {
+    // This reply sets holdToolCalls: a hand-typed `[mock:tool:parallel-step]` prompt (a bug
+    // bash, a dogfood run) keeps streaming with no tool call until a test calls
+    // aiService.releaseMockToolCalls(workspaceId), or the user presses Stop.
     match: (request) => hasMockMarker(request.latestUserText, "tool:parallel-step"),
     respond: () => buildParallelToolStepReply(),
   },
