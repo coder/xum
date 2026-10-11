@@ -265,11 +265,14 @@ function computeHasInterruptedStream(
   }
 
   // These terminal failures require a new request or workspace, not replaying the same turn.
+  // plugin_blocked: a blocked queued send saved no row (its draft returns to the composer), so a
+  // resume would replay the previous accepted turn instead of the blocked message.
   if (
     lastMessage.type === "stream-error" &&
     (lastMessage.errorType === "runtime_not_ready" ||
       lastMessage.errorType === "context_budget_blocked" ||
-      lastMessage.errorType === "session_tape_replay")
+      lastMessage.errorType === "session_tape_replay" ||
+      lastMessage.errorType === "plugin_blocked")
   ) {
     return false;
   }

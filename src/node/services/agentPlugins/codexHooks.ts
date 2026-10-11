@@ -193,8 +193,10 @@ function parseMatcherGroup(
     warnings.push(`${source}: a '${event}' matcher group needs a "hooks" array; ignoring it`);
     return;
   }
+  // Codex treats "*", "" and an omitted matcher as match-all, and "*" is not a valid regex.
+  // All three become "no matcher", which the runtime matches against every tool.
   let matcher: string | undefined;
-  if (group.matcher !== undefined) {
+  if (group.matcher !== undefined && group.matcher !== "*" && group.matcher !== "") {
     if (typeof group.matcher !== "string" || !isValidRegex(group.matcher)) {
       warnings.push(`${source}: a '${event}' matcher is not a valid regex; ignoring its group`);
       return;
@@ -204,6 +206,14 @@ function parseMatcherGroup(
   for (const [handlerIndex, raw] of group.hooks.entries()) {
     const handler = parseHandler(raw, `${source}: '${event}'`, warnings);
     if (handler === undefined) continue;
+    let hash: string;
+    try {
+      hash = hashHookDefinition(event, matcher, raw);
+    } catch (error) {
+      // Drop only this handler: one malformed hook must not fail the plugin's whole hook load.
+      warnings.push(`${source}: '${event}': ${getErrorMessage(error)}; ignoring a handler`);
+      continue;
+    }
     const status: PluginHookStatus = !mapped
       ? "ignored-event"
       : handler.type === "mcp_tool"
@@ -211,7 +221,7 @@ function parseMatcherGroup(
         : "unsupported-handler";
     out.push({
       key: `${groupKey}[${handlerIndex}]`,
-      hash: hashHookDefinition(event, matcher, raw),
+      hash,
       event,
       ...(matcher !== undefined ? { matcher } : {}),
       handler,
@@ -236,7 +246,12 @@ function parseHandler(
       if (typeof server !== "string" || server.length === 0) break;
       if (typeof tool !== "string" || tool.length === 0) break;
       if (input !== undefined && !isPlainObject(input)) break;
-      if (timeout !== undefined && !(typeof timeout === "number" && timeout > 0)) break;
+      // Finite: `1e400` parses to Infinity, which JSON (and the review RPC) cannot carry.
+      if (
+        timeout !== undefined &&
+        !(typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0)
+      )
+        break;
       return {
         type: "mcp_tool",
         server,
@@ -272,19 +287,34 @@ function isValidRegex(pattern: string): boolean {
 }
 
 /**
+ * Nesting limit for a hashed definition. canonicalJson recurses, and a 256 KiB file can nest
+ * far deeper than the stack allows; real hook inputs nest a few levels.
+ */
+const MAX_HOOK_DEFINITION_DEPTH = 64;
+
+/**
  * The trust key. Canonical JSON (sorted keys) of the event, the matcher and the handler exactly
  * as declared, so reformatting the file keeps trust and any change to what runs drops it.
+ * Throws when the definition nests deeper than MAX_HOOK_DEFINITION_DEPTH.
  */
 export function hashHookDefinition(event: string, matcher: string | undefined, handler: unknown) {
   const canonical = canonicalJson({ event, matcher: matcher ?? null, handler });
   return crypto.createHash("sha256").update(canonical, "utf8").digest("hex");
 }
 
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+function canonicalJson(value: unknown, depth = 0): string {
+  if (depth > MAX_HOOK_DEFINITION_DEPTH) {
+    throw new Error(`the hook definition nests deeper than ${MAX_HOOK_DEFINITION_DEPTH} levels`);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item, depth + 1)).join(",")}]`;
+  }
   if (isPlainObject(value)) {
     const keys = Object.keys(value).sort();
-    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+    const fields = keys.map(
+      (key) => `${JSON.stringify(key)}:${canonicalJson(value[key], depth + 1)}`
+    );
+    return `{${fields.join(",")}}`;
   }
   return JSON.stringify(value) ?? "null";
 }

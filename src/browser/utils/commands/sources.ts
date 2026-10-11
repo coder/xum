@@ -2264,6 +2264,41 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         },
       },
       {
+        id: CommandIds.pluginsReviewHooks(),
+        title: "Review Plugin Hooks…",
+        subtitle: "Trust or turn off a plugin's hooks.json hooks",
+        section: section.settings,
+        keywords: ["plugin", "hooks", "trust", "review", "turn off", "codex"],
+        run: () => undefined,
+        prompt: {
+          title: "Review Plugin Hooks",
+          fields: [
+            {
+              type: "select",
+              name: "pluginName",
+              label: "Installed managed plugin",
+              placeholder: "Search installed plugins…",
+              getOptions: async () => {
+                const result = await p.api?.agentPlugins.list();
+                return result?.success
+                  ? result.data
+                      .filter((item) => item.managed && item.present)
+                      .map((item) => ({
+                        id: item.name,
+                        label: item.name,
+                        keywords: [item.name, item.location],
+                      }))
+                  : [];
+              },
+            },
+          ],
+          onSubmit: (values) => {
+            publishPluginsSectionIntent({ type: "review-hooks", name: values.pluginName });
+            openSettings("plugins");
+          },
+        },
+      },
+      {
         id: CommandIds.pluginsUninstall(),
         title: "Uninstall Agent Plugin…",
         section: section.settings,
