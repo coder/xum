@@ -643,6 +643,11 @@ export class AgentPluginHookService {
     if (state.disposed) {
       return null;
     }
+    // Preflight: a plugin already revoked (here or by another backend's committed update or
+    // uninstall) must not even have its settings server contacted.
+    if (await this.retireIfEpochStale(workspaceId)) {
+      return null;
+    }
     // Every hook point gets `settings` from the plugin's own MCP servers.
     // Read BEFORE the revocation checks below: an uninstall or teardown that
     // lands during this read must stop the call, or withPersistentMount would

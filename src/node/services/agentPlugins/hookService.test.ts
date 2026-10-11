@@ -707,6 +707,30 @@ describe("AgentPluginHookService", () => {
     }
   );
 
+  test("a plugin revoked (epoch bump, e.g. another backend's update) before the hook call never has its settings server contacted", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "revoked-before-read",
+      `({ "tool.execute.before": () => ({ deny: "removed hook ran" }) })`,
+      { tools: ["file_read"] }
+    );
+    let settingsReads = 0;
+    harness.service.setSettingsProvider(() => {
+      settingsReads++;
+      return Promise.resolve({});
+    });
+    await harness.ensure();
+    // The middleware stays registered (no local teardown yet); only the epoch moved.
+    const ctx = makeToolCtx("file_read", { path: "/repo/a.txt" });
+    const stagingRoot = path.join(harness.tmp.path, STAGING_DIR_NAME);
+    await fs.mkdir(stagingRoot, { recursive: true });
+    await bumpContainerMutationEpoch(stagingRoot);
+    await runTool(harness.spine, ctx);
+    expect(ctx.blocked).toBeUndefined();
+    expect(settingsReads).toBe(0);
+  });
+
   test("an admitted context snapshot reacquires a dropped sandbox instead of retaining its runtime", async () => {
     const harness = await createHarness();
     await writeHookPlugin(
