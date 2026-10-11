@@ -1198,19 +1198,14 @@ export class WorkspaceStore {
       this.cancelPendingIdleBump(workspaceId);
       this.states.bump(workspaceId);
     },
-    // Toast-only events (the aggregator queues the toast and changes no rows). Like stream-error,
-    // a replayed event hydrates without side effects, so a reconnect never re-shows a toast.
-    "plugin-hook-notice": (workspaceId, aggregator, data) => {
-      const transient = this.assertChatTransientState(workspaceId);
-      applyWorkspaceChatEventToAggregator(aggregator, data, {
-        allowSideEffects: !transient.replayingHistory,
-      });
+    // Toast-only events (the aggregator queues the toast and changes no rows). Both are live
+    // only: the server never saves or replays them, so one buffered before caught-up is a live
+    // event and keeps its toast (unlike stream-error, whose replay must not re-show it).
+    "plugin-hook-notice": (_workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
     },
-    "goal-budget-limited": (workspaceId, aggregator, data) => {
-      const transient = this.assertChatTransientState(workspaceId);
-      applyWorkspaceChatEventToAggregator(aggregator, data, {
-        allowSideEffects: !transient.replayingHistory,
-      });
+    "goal-budget-limited": (_workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
     },
     "queued-message-changed": (workspaceId, aggregator, data) => {
       if (!isQueuedMessageChanged(data)) return;

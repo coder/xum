@@ -896,16 +896,19 @@ describe("WorkspaceStore", () => {
       ]);
     });
 
-    it("replayed notices hydrate without toasts", async () => {
-      const workspaceId = "replayed-toast-events";
+    it("live notices that arrive during a reconnect replay still show their toasts", async () => {
+      const workspaceId = "buffered-toast-events";
       const send = openChat(workspaceId);
       createAndAddWorkspace(store, workspaceId);
 
-      // Before caught-up the store buffers them, then replays them after history loads.
-      await send(notice(workspaceId, "Old notice."), budget(workspaceId, "Old budget."));
+      // The server never replays these: one before caught-up is live, buffered until history loads.
+      await send(notice(workspaceId, "Checked the command."), budget(workspaceId, "Over budget."));
       await send(caughtUpEvent());
 
-      expect(drainToasts(workspaceId)).toEqual([]);
+      expect(drainToasts(workspaceId)).toEqual([
+        "Plugin guard: Checked the command.",
+        "Over budget.",
+      ]);
     });
   });
 
