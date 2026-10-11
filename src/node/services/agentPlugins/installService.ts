@@ -2731,15 +2731,19 @@ export class AgentPluginInstallService {
     hash: string;
     state: PluginHookTrustState | null;
   }): Promise<void> {
-    const { hooks } = await this.loadManagedPluginHooks(args.name);
-    const hook = hooks.find((candidate) => candidate.key === args.key);
-    if (hook?.hash !== args.hash) {
-      throw new Error("This hook changed since you reviewed it. Review it again.");
-    }
-    if (args.state === "trusted" && hook.status !== "runnable") {
-      throw new Error("Xum does not run this hook, so it cannot be trusted.");
-    }
-    await setPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name), args);
+    // Under the plugin mutation lock: an overlapping uninstall (in any process) must not delete
+    // the trust file between this check and the write, which would recreate it.
+    return this.runExclusive(async () => {
+      const { hooks } = await this.loadManagedPluginHooks(args.name);
+      const hook = hooks.find((candidate) => candidate.key === args.key);
+      if (hook?.hash !== args.hash) {
+        throw new Error("This hook changed since you reviewed it. Review it again.");
+      }
+      if (args.state === "trusted" && hook.status !== "runnable") {
+        throw new Error("Xum does not run this hook, so it cannot be trusted.");
+      }
+      await setPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name), args);
+    });
   }
 
   private async loadManagedPluginHooks(name: string) {

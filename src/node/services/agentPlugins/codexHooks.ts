@@ -238,7 +238,12 @@ function parseHandler(
       if (typeof server !== "string" || server.length === 0) break;
       if (typeof tool !== "string" || tool.length === 0) break;
       if (input !== undefined && !isPlainObject(input)) break;
-      if (timeout !== undefined && !(typeof timeout === "number" && timeout > 0)) break;
+      // Finite: `1e400` parses to Infinity, which JSON (and the review RPC) cannot carry.
+      if (
+        timeout !== undefined &&
+        !(typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0)
+      )
+        break;
       return {
         type: "mcp_tool",
         server,
