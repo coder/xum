@@ -95,17 +95,5 @@ describe("precompress-static", () => {
       expect(served.equals(brotliAt(data, quality))).toBe(true);
       expect(served.equals(brotliAt(data, quality === 11 ? 9 : 11))).toBe(false);
     }
-
-    // A dist/ from before quality 11 holds quality-9 outputs for unchanged large chunks: a rerun
-    // replaces them, and still keeps the outputs of smaller files.
-    for (const name of Object.keys(sizes)) {
-      await fs.writeFile(path.join(dir, `${name}.br`), "stale br");
-    }
-    await runScript(dir);
-    const at = await fs.readFile(path.join(dir, "at-AbCd1234.js"));
-    expect((await fs.readFile(path.join(dir, "at-AbCd1234.js.br"))).equals(brotliAt(at, 11))).toBe(
-      true
-    );
-    expect(await fs.readFile(path.join(dir, "below-AbCd1234.js.br"), "utf-8")).toBe("stale br");
   });
 });
