@@ -1836,7 +1836,8 @@ describe("AgentPluginInstallService", () => {
                 displayName: "Demo",
                 shortDescription: "<b>Demo</b>",
                 developerName: "Example",
-                websiteURL: "https://example.com",
+                websiteURL: "HTTPS://Example.com",
+                supportURL: "https://example.com/support",
                 logo,
               },
             },
@@ -1852,7 +1853,9 @@ describe("AgentPluginInstallService", () => {
       displayName: "Demo",
       shortDescription: "<b>Demo</b>",
       developerName: "Example",
-      websiteURL: "https://example.com",
+      // Normalized: the renderer only links a literal `https://` prefix.
+      websiteURL: "https://example.com/",
+      supportURL: "https://example.com/support",
       logoDataUrl: `data:image/png;base64,${png.toString("base64")}`,
     });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });

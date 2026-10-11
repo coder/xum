@@ -56,11 +56,14 @@ function formatSource(item: AgentPluginListItem): string | null {
 
 const Badge: React.FC<{
   tone: "muted" | "accent" | "warning" | "error";
+  /** Manifest text (up to 120 chars) must wrap on narrow cards; status words stay on one line. */
+  wrap?: boolean;
   children: React.ReactNode;
 }> = (props) => (
   <span
     className={cn(
-      "rounded px-1.5 py-0.5 text-[10px] font-medium whitespace-nowrap",
+      "rounded px-1.5 py-0.5 text-[10px] font-medium",
+      props.wrap === true ? "max-w-full wrap-anywhere" : "whitespace-nowrap",
       props.tone === "muted" && "bg-foreground/10 text-muted",
       props.tone === "accent" && "bg-accent/15 text-accent",
       props.tone === "warning" && "bg-warning/15 text-warning",
@@ -82,6 +85,7 @@ const PluginInterfaceDetails: React.FC<{ info: AgentPluginInterfaceSummary }> = 
     { label: "Website", url: props.info.websiteURL },
     { label: "Privacy", url: props.info.privacyPolicyURL },
     { label: "Terms", url: props.info.termsOfServiceURL },
+    { label: "Support", url: props.info.supportURL },
   ];
   const httpsLinks = links.filter((link) => link.url?.startsWith("https://") === true);
   return (
@@ -98,7 +102,7 @@ const PluginInterfaceDetails: React.FC<{ info: AgentPluginInterfaceSummary }> = 
         {props.info.capabilities !== undefined && props.info.capabilities.length > 0 && (
           <div className="flex flex-wrap gap-1">
             {props.info.capabilities.map((capability) => (
-              <Badge key={capability} tone="muted">
+              <Badge key={capability} tone="muted" wrap>
                 {capability}
               </Badge>
             ))}

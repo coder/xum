@@ -67,6 +67,7 @@ export const AgentPluginInterfaceSummarySchema = z.object({
   websiteURL: z.string().optional(),
   privacyPolicyURL: z.string().optional(),
   termsOfServiceURL: z.string().optional(),
+  supportURL: z.string().optional(),
   /** `data:image/...;base64,` read through the contained capped reader; never a path. */
   logoDataUrl: z.string().optional(),
 });

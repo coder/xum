@@ -27,14 +27,16 @@ const OPENAI_INTERFACE: AgentPluginInterfaceSummary = {
   websiteURL: "https://example.com",
   privacyPolicyURL: "https://example.com/privacy",
   termsOfServiceURL: "https://example.com/terms",
+  supportURL: "https://example.com/support",
   logoDataUrl: LOGO_DATA_URL,
 };
 
 /** Shared play check: the interface renders, as text, with external https links. */
 async function expectInterfaceAsText(canvasElement: HTMLElement): Promise<void> {
   const canvas = within(canvasElement);
-  await canvas.findByText("Plans, **grilled** <b>hard</b>");
-  const details = await canvas.findByTestId("plugin-interface");
+  const text = await canvas.findByText("Plans, **grilled** <b>hard</b>");
+  const details = text.closest<HTMLElement>("[data-testid='plugin-interface']");
+  if (details === null) throw new Error("Interface text is outside the interface details");
   if (details.querySelector("b, strong") !== null) {
     throw new Error("Manifest text was rendered as markup");
   }
@@ -112,6 +114,7 @@ const MISSING_ITEM: AgentPluginListItem = {
 
 /** Valid max-length (64-char, separator-free) name: the worst case for narrow-width wrapping. */
 const MAX_LENGTH_NAME = "a".repeat(64);
+const MAX_LENGTH_CAPABILITY = "c".repeat(120);
 const MAX_LENGTH_ITEM: AgentPluginListItem = {
   name: MAX_LENGTH_NAME,
   managed: true,
@@ -126,6 +129,13 @@ const MAX_LENGTH_ITEM: AgentPluginListItem = {
   },
   lockedSha: "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
   installedAt: "2026-08-01T12:00:00.000Z",
+  // Max-length (120-char) separator-free capability: must wrap like the name.
+  interface: {
+    displayName: "Max",
+    developerName: "Example Co",
+    shortDescription: "Worst-case wrapping",
+    capabilities: [MAX_LENGTH_CAPABILITY],
+  },
   skillCount: 1,
   mcpServerCount: 0,
 };
@@ -254,6 +264,14 @@ export const InstalledPhoneViewport: Story = {
     const card = maxRow.closest("div[class*='rounded-md']");
     if (card instanceof HTMLElement && card.scrollWidth > card.clientWidth + 1) {
       throw new Error("Max-length plugin row overflows its card at phone width");
+    }
+    const capability = await canvas.findByText(MAX_LENGTH_CAPABILITY);
+    const capabilityCard = capability.closest("div[class*='rounded-md']");
+    if (
+      capabilityCard instanceof HTMLElement &&
+      capability.getBoundingClientRect().right > capabilityCard.getBoundingClientRect().right + 1
+    ) {
+      throw new Error("Max-length capability badge overflows its card at phone width");
     }
   },
 };

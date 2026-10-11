@@ -32,6 +32,7 @@ export interface OpenAIPluginInterface {
   websiteURL?: string;
   privacyPolicyURL?: string;
   termsOfServiceURL?: string;
+  supportURL?: string;
   /** The spec allows a string or an array; normalized to an array. */
   defaultPrompt?: string[];
   brandColor?: string;
@@ -59,8 +60,11 @@ export interface OpenAIPluginExtension {
 
 const FIELD = `extensions["${OPENAI_EXTENSION_NAMESPACE}"]`;
 
-// Display caps. OpenAI's submission limits are tighter (30-char display name
-// and subtitle), but real packages exceed them, so these only bound layout.
+// OpenAI's package-validation limits
+// (https://developers.openai.com/plugins/deploy/submission-errors). Directory
+// submission is stricter (30-char display name and subtitle), but installable
+// packages only pass package validation, so a tighter cap here would drop a
+// valid required name and with it the whole interface.
 type FieldKind = "name" | "text" | "url" | "color" | "path" | "labels" | "prompts" | "paths";
 const INTERFACE_FIELDS: Record<keyof OpenAIPluginInterface, FieldKind> = {
   displayName: "name",
@@ -72,6 +76,7 @@ const INTERFACE_FIELDS: Record<keyof OpenAIPluginInterface, FieldKind> = {
   websiteURL: "url",
   privacyPolicyURL: "url",
   termsOfServiceURL: "url",
+  supportURL: "url",
   defaultPrompt: "prompts",
   brandColor: "color",
   brandColorDark: "color",
@@ -82,20 +87,20 @@ const INTERFACE_FIELDS: Record<keyof OpenAIPluginInterface, FieldKind> = {
   screenshots: "paths",
 };
 const TEXT_CAPS: Partial<Record<keyof OpenAIPluginInterface, number>> = {
-  displayName: 64,
-  shortDescription: 200,
-  developerName: 80,
+  displayName: 80,
+  shortDescription: 240,
+  developerName: 120,
   longDescription: 4000,
   category: 64,
 };
 const RULES: Record<FieldKind, string> = {
   name: "a non-empty string",
   text: "a string",
-  url: "an https URL (max 1024 characters)",
+  url: "an https URL (max 2048 characters)",
   color: "a #RRGGBB color",
   path: "a relative path inside the plugin",
   labels: "at most 20 strings of at most 120 characters",
-  prompts: "at most 3 strings of at most 128 characters",
+  prompts: "at most 3 strings of at most 512 characters",
   paths: "at most 10 relative paths inside the plugin",
 };
 
@@ -112,9 +117,11 @@ function parseField(kind: FieldKind, value: unknown, cap: number): unknown {
     case "text":
       return isText(value, cap) ? value : undefined;
     case "url": {
-      if (!isText(value, 1024) || !URL.canParse(value)) return undefined;
+      if (!isText(value, 2048) || !URL.canParse(value)) return undefined;
       const url = new URL(value);
-      return url.protocol === "https:" && !url.username && !url.password ? value : undefined;
+      // The parsed spelling: the renderer checks a literal `https://` prefix,
+      // so `HTTPS://example.com` must reach it normalized.
+      return url.protocol === "https:" && !url.username && !url.password ? url.href : undefined;
     }
     case "color":
       return typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value) ? value : undefined;
@@ -124,7 +131,7 @@ function parseField(kind: FieldKind, value: unknown, cap: number): unknown {
       return isTextList(value, 20, 120) ? value : undefined;
     case "prompts": {
       const prompts = typeof value === "string" ? [value] : value;
-      return isTextList(prompts, 3, 128) ? prompts : undefined;
+      return isTextList(prompts, 3, 512) ? prompts : undefined;
     }
     case "paths": {
       if (!Array.isArray(value) || value.length > 10) return undefined;

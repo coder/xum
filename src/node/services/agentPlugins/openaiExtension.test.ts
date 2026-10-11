@@ -77,6 +77,22 @@ describe("readOpenAIExtension", () => {
     }
   });
 
+  test("required names up to OpenAI's package limits are kept; one more character drops the interface", () => {
+    const atLimits = {
+      displayName: "d".repeat(80),
+      shortDescription: "s".repeat(240),
+      developerName: "v".repeat(120),
+    };
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    expect(read(atLimits)).toEqual({ extension: { interface: atLimits }, warnings: [] });
+    for (const [field, value] of Object.entries(atLimits)) {
+      const { extension, warnings } = read({ ...atLimits, [field]: `${value}x` });
+      expect(extension).toEqual({});
+      expect(warnings.some((warning) => warning.includes(`interface.${field}'`))).toBe(true);
+    }
+  });
+
   test("an interface without its required names is dropped as a whole", () => {
     const { extension, warnings } = readOpenAIExtension({
       extensions: { "com.openai": { interface: { displayName: "Only a name" } } },

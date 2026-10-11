@@ -590,6 +590,7 @@ async function interfaceSummary(
     ...(info.websiteURL !== undefined ? { websiteURL: info.websiteURL } : {}),
     ...(info.privacyPolicyURL !== undefined ? { privacyPolicyURL: info.privacyPolicyURL } : {}),
     ...(info.termsOfServiceURL !== undefined ? { termsOfServiceURL: info.termsOfServiceURL } : {}),
+    ...(info.supportURL !== undefined ? { supportURL: info.supportURL } : {}),
     ...(logoDataUrl !== undefined ? { logoDataUrl } : {}),
   };
 }
