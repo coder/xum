@@ -15,10 +15,11 @@ import type {
 import type { PluginHookContextEntry } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
+import { renderPluginHookContextEntry } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 /** Block reasons are shown to the user; longer ones are cut. */
 const MESSAGE_SEND_BLOCK_REASON_MAX_CHARS = 500;
-/** Total added context per message; entries past it are dropped (same cap as request.assemble). */
+/** Total rendered context per message; entries past it are dropped (same cap as request.assemble). */
 const MESSAGE_SEND_CONTEXT_MAX_CHARS = 64 * 1024;
 
 export type MessageSendHookOutcome =
@@ -60,14 +61,17 @@ export async function runMessageSendHooks(
   for (const entry of ctx.additionalContext) {
     const text = entry.text.trim();
     if (text.length === 0) continue;
-    if (size + text.length > MESSAGE_SEND_CONTEXT_MAX_CHARS) {
+    // Charge the whole rendered block (plugin ID, wrapper, escaping), not just the text: many
+    // tiny entries or a long plugin ID must not slip past the cap.
+    const rendered = renderPluginHookContextEntry({ pluginId: entry.pluginId, text }).length;
+    if (size + rendered > MESSAGE_SEND_CONTEXT_MAX_CHARS) {
       log.warn("Prompt hooks: message.send context over the cap; dropping the rest", {
         workspaceId,
       });
       break;
     }
     kept.push({ pluginId: entry.pluginId, text });
-    size += text.length;
+    size += rendered;
   }
   return kept.length > 0 ? { kind: "context", entries: kept } : { kind: "none" };
 }

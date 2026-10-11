@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { sliceMessagesFromLatestCompactionBoundary } from "@/common/utils/messages/compactionBoundary";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
@@ -683,6 +683,32 @@ describe("assemblePromptPayload", () => {
     expect(JSON.stringify(longPayload.messages.slice(0, shortPayload.messages.length))).toBe(
       JSON.stringify(shortPayload.messages)
     );
+  });
+
+  test("a hooked row keeps its hook context and still ends with its ID tag, merged or not", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rNI3m): the tag must stay last on a row with hook context.
+    const hooked = createMuxMessage("hooked", "user", "fix the bug", {
+      historySequence: 7,
+      pluginHookContext: [{ pluginId: "guard", text: "Ask first." }],
+    });
+    const next = createMuxMessage("next", "user", "now lint", { historySequence: 8 });
+    const block = '<plugin-hook-context plugin="guard">\nAsk first.\n</plugin-hook-context>';
+    const userText = async (history: MuxMessage[]) => {
+      const payload = await assemble({ history, tagHistoryItemIds: true });
+      return payload.messages
+        .filter((message) => message.role === "user")
+        .map((message) =>
+          typeof message.content === "string"
+            ? message.content
+            : message.content.map((part) => (part.type === "text" ? part.text : "")).join("|")
+        );
+    };
+
+    expect(await userText([hooked])).toEqual([`fix the bug\n${block}\n[id: 7]`]);
+    // Merging keeps one text part per message, so the context must live inside it.
+    expect(await userText([hooked, next])).toEqual([
+      `fix the bug\n${block}\n[id: 7]\nnow lint\n[id: 8]`,
+    ]);
   });
 
   test("token budget tags survive user-row merging but skip rows session_history hides", async () => {
