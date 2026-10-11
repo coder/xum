@@ -19,12 +19,14 @@ import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import type { AgentPluginContainer, AgentPluginDiagnostic, AgentPluginInfo } from "./discovery";
 import {
+  CODEX_MCP_CONFIG_RELATIVE_PATH,
   computeAgentPluginContainers,
   discoverAgentPlugins,
   MAX_PLUGIN_MANIFEST_BYTES,
   readPluginFileWithinRootCapped,
 } from "./discovery";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
+import { readOpenAIMcpAuth, translateCodexMcpEntry } from "./openaiMcpAuth";
 
 /**
  * Agent Plugins MCP documents become default-disabled, read-only Xum servers.
@@ -161,8 +163,11 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 // Closed variants (§7.2.1): an unknown field makes the entry invalid.
-const STDIO_ENTRY_KEYS = new Set(["type", "command", "args", "env", "cwd"]);
-const REMOTE_ENTRY_KEYS = new Set(["type", "url", "headers"]);
+// `extensions` is not in the Agent Plugins 1.0.0 mcp schema; it is where
+// OpenAI documents per-server settings (`extensions["com.openai"].auth`).
+// Other namespaces stay opaque.
+const STDIO_ENTRY_KEYS = new Set(["type", "command", "args", "env", "cwd", "extensions"]);
+const REMOTE_ENTRY_KEYS = new Set(["type", "url", "headers", "extensions"]);
 
 // Canonical mcp.schema.json cwd pattern: `./…`, `${PLUGIN_ROOT}[/…]`, `${PLUGIN_DATA}[/…]`.
 const CWD_FORM_PATTERN = /^(?:\.\/|\$\{PLUGIN_ROOT\}(?:\/|$)|\$\{PLUGIN_DATA\}(?:\/|$))/;
@@ -588,13 +593,22 @@ export async function loadPluginMcpServers(
     return disableMcp("mcp.json must be a JSON object");
   }
 
+  // Codex packages ship `.mcp.json` in their own dialect (no `$schema`,
+  // `type: "http"`, `oauth`/`scopes`/`oauth_resource`). Only that file gets
+  // the dialect; a root mcp.json stays strict.
+  const codexDialect =
+    plugin.mcpConfigPath === path.join(plugin.rootPath, CODEX_MCP_CONFIG_RELATIVE_PATH);
+
   // Closed top-level: exactly { $schema, mcpServers }, both required (§7.2.1).
   for (const key of Object.keys(raw)) {
     if (key !== "$schema" && key !== "mcpServers") {
       return disableMcp(`mcp.json has unknown top-level field '${key}'`);
     }
   }
-  if (raw.$schema !== AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0) {
+  if (
+    raw.$schema !== AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 &&
+    !(codexDialect && raw.$schema === undefined)
+  ) {
     // Discovery only admits 1.0.0 manifests, so any other value is either an
     // unsupported version or a version mismatch with plugin.json — both
     // disable MCP for this plugin (§7.2.2 rule 2).
@@ -614,7 +628,7 @@ export async function loadPluginMcpServers(
     vars: { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath },
   };
 
-  for (const [serverName, entry] of Object.entries(raw.mcpServers)) {
+  for (const [serverName, rawEntry] of Object.entries(raw.mcpServers)) {
     // Filter before registration: saved workspace overrides cannot resurrect an unimported server.
     if (
       plugin.importedComponents != null &&
@@ -632,10 +646,14 @@ export async function loadPluginMcpServers(
       });
     };
 
-    if (!isPlainObject(entry)) {
+    if (!isPlainObject(rawEntry)) {
       reportEntry("error", "server entry must be an object");
       continue;
     }
+    const codex = codexDialect
+      ? translateCodexMcpEntry(rawEntry)
+      : { entry: rawEntry, ignored: [], warnings: [] };
+    const entry = codex.entry;
 
     // §7.2.2 rules 3-4: invalid entries and unknown transports are skipped
     // individually; sibling servers keep loading.
@@ -659,6 +677,27 @@ export async function loadPluginMcpServers(
     }
 
     const info = result.info;
+    if (info.transport !== "stdio") {
+      // Warnings only: the server still loads with OAuth discovery + DCR.
+      // Messages name fields, never values (see openaiMcpAuth's SECURITY AUDIT).
+      const auth = readOpenAIMcpAuth(entry.extensions);
+      const ignored = [...codex.ignored, ...auth.ignored];
+      const messages = [...codex.warnings, ...auth.warnings];
+      if (ignored.length > 0)
+        messages.push(
+          `Xum's MCP OAuth uses discovery and dynamic client registration, so it ignores: ${ignored.join(", ")}`
+        );
+      for (const message of messages) {
+        const fullMessage = `mcp.json server '${serverName}': ${message}`;
+        log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);
+        diagnostics.push({
+          path: plugin.mcpConfigPath,
+          scope: plugin.scope,
+          severity: "warning",
+          message: fullMessage,
+        });
+      }
+    }
     assert(
       info.plugin !== undefined,
       "loadPluginMcpServers: normalized info must carry provenance"
