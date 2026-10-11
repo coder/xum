@@ -243,7 +243,13 @@ describe("turn preparation vs another backend's structural mutation", () => {
   // reads tracked checkout files, so it must not run before the lease is confirmed.
   test("a resume refused by another backend's mutation does not read tracked checkout files", async () => {
     const { b, leasesA, streamMessage } = await setup();
+    // The spy is on the prototype, so it also sees every other live session in the test process
+    // (late retries of earlier files' sessions): count only this session's tracker (#6185). Its
+    // tracker is the one recordFileState records into.
+    const record = spyOn(FileChangeTracker.prototype, "record");
     const detect = spyOn(FileChangeTracker.prototype, "getChangedAttachments");
+    let ownTracker: unknown;
+    const ownDetections = () => detect.mock.contexts.filter((tracker) => tracker === ownTracker);
     try {
       await b.historyService.appendToHistory(
         workspaceId,
@@ -255,6 +261,9 @@ describe("turn preparation vs another backend's structural mutation", () => {
         content: "original",
         timestamp: (await fs.stat(tracked)).mtimeMs,
       });
+      expect(record).toHaveBeenCalledTimes(1);
+      ownTracker = record.mock.contexts[0];
+      expect(ownTracker).toBeInstanceOf(FileChangeTracker);
       const entered = createDeferred<void>();
       const finish = createDeferred<void>();
       const mutation = leasesA.withMutationGate([workspaceId], idle, async () => {
@@ -270,13 +279,14 @@ describe("turn preparation vs another backend's structural mutation", () => {
         "being renamed, removed or archived"
       );
       expect(streamMessage).not.toHaveBeenCalled();
-      expect(detect).not.toHaveBeenCalled();
+      expect(ownDetections()).toHaveLength(0);
 
       // Control: once the mutation ends, the same resume detects file changes and streams.
       await b.session.resumeStream({ model: sendOptions.model, agentId: "exec" });
-      expect(detect).toHaveBeenCalledTimes(1);
+      expect(ownDetections()).toHaveLength(1);
       expect(streamMessage).toHaveBeenCalledTimes(1);
     } finally {
+      record.mockRestore();
       detect.mockRestore();
       await b.session.dispose();
       await b.cleanup();
