@@ -76,13 +76,16 @@ export function writeNeutralSeed(outDir: string) {
 /** Every file under dir by relative path, as raw bytes. `.git/` is skipped: git may rewrite its index. */
 export function snapshotSeed(dir: string): Map<string, Buffer> {
   const files = new Map<string, Buffer>();
-  // String entries, not Dirent.parentPath: that field needs Node 20.12, and the repo admits any Node 20.
-  for (const rel of fs.readdirSync(dir, { recursive: true, encoding: "utf8" })) {
-    const full = path.join(dir, rel);
-    if (!rel.split(path.sep).includes(".git") && fs.lstatSync(full).isFile()) {
-      files.set(rel, fs.readFileSync(full));
+  // An explicit walk: readdirSync's `recursive` option needs Node 20.1 and Dirent.parentPath 20.12, while
+  // the repo admits any Node 20. A walk that silently skips files would let every check pass.
+  const walk = (rel: string) => {
+    for (const entry of fs.readdirSync(path.join(dir, rel), { withFileTypes: true })) {
+      const child = path.join(rel, entry.name);
+      if (entry.isDirectory() && entry.name !== ".git") walk(child);
+      if (entry.isFile()) files.set(child, fs.readFileSync(path.join(dir, child)));
     }
-  }
+  };
+  walk("");
   return files;
 }
 
