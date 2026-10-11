@@ -185,6 +185,30 @@ describe("CodexPluginHookService", () => {
     expect(calledKeys).toHaveLength(1);
   });
 
+  test("a trusted hook that moves to another position runs again after re-registration", async () => {
+    await writePlugin("guard", "scanner");
+    await trustAll("guard");
+    await service.ensureWorkspaceHooks(args());
+    expect((await runBash()).executed).toBe(false);
+
+    // Same runnable hook (same hash), new trust key: a command group now precedes it.
+    await fs.writeFile(
+      path.join(pluginRoot("guard"), "hooks", "hooks.json"),
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            { hooks: [{ type: "command", command: "true" }] },
+            { hooks: [{ type: "mcp_tool", server: "scanner", tool: "check" }] },
+          ],
+        },
+      })
+    );
+    await trustAll("guard");
+    await service.ensureWorkspaceHooks(args());
+    expect((await runBash()).executed).toBe(false);
+    expect(calledKeys).toHaveLength(2);
+  });
+
   test("a disabled plugin server fails open: the tool runs", async () => {
     await writePlugin("guard", "scanner");
     await trustAll("guard");
