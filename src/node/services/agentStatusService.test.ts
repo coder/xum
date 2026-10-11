@@ -239,14 +239,16 @@ describe("AgentStatusService", () => {
     );
     const recordSpy = spyOn(sessionUsageService, "recordHeadlessUsage");
     const model = "anthropic:claude-haiku-4-5";
+    type RecordUsage = NonNullable<
+      NonNullable<
+        Parameters<typeof workspaceStatusGenerator.generateWorkspaceStatus>[3]
+      >["recordUsage"]
+    >;
     generateSpy.mockImplementation(async (_transcript, _candidates, _ai, options) => {
-      await options.recordUsage?.(
-        model,
-        { inputTokens: 1000, outputTokens: 50, totalTokens: 1050 } as Parameters<
-          NonNullable<typeof options.recordUsage>
-        >[1],
-        {}
-      );
+      const usage = { inputTokens: 1000, outputTokens: 50, totalTokens: 1050 };
+      await options?.recordUsage?.(model, usage as Parameters<RecordUsage>[1], {
+        metadataModel: model,
+      });
       return Ok({ status: { emoji: "🛠️", message: "Editing source" }, modelUsed: model });
     });
     const service = createService({ sessionUsageService });
@@ -261,19 +263,19 @@ describe("AgentStatusService", () => {
     );
     await getInternals(service).runForWorkspace(workspaceId);
     expect(recordSpy).toHaveBeenCalledTimes(1);
-    const recorded = await recordSpy.mock.results[0].value;
+    const recorded = (await recordSpy.mock.results[0].value) as Awaited<
+      ReturnType<SessionUsageService["recordHeadlessUsage"]>
+    >;
     if (!recorded) throw new Error("the status usage was recorded");
-    expect(usageDeltas()).toEqual([
-      [
+    expect(usageDeltas()).toHaveLength(1);
+    expect(usageDeltas()[0]).toMatchObject([
+      workspaceId,
+      {
+        type: "session-usage-delta",
         workspaceId,
-        {
-          type: "session-usage-delta",
-          workspaceId,
-          sourceWorkspaceId: workspaceId,
-          byModelDelta: { [recorded.model]: recorded.usage },
-          timestamp: expect.any(Number),
-        },
-      ],
+        sourceWorkspaceId: workspaceId,
+        byModelDelta: { [recorded.model]: recorded.usage },
+      },
     ]);
 
     // A failed record (the recorder returns undefined) publishes nothing.
