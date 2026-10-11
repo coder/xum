@@ -252,17 +252,13 @@ const SELECTION_EXTENDING_KEYS = new Set([
 /**
  * Artifacts tab (experiment: "artifacts"): files the agent writes to
  * $XUM_SCRATCH_DIR/artifacts, listed newest first with a preview of the selected one.
- * `inDialog` is set by the small-viewport dialog, which is already near full screen and whose
- * focus trap would fight a second full-screen overlay, so fullscreen is not offered there.
  */
 export function ArtifactsPanel(props: {
   workspaceId: string;
-  inDialog?: boolean;
   /** Take focus once rendered (the tab was opened by shortcut), then report it consumed. */
   autoFocus?: boolean;
   onAutoFocusConsumed?: () => void;
 }) {
-  const allowFullscreen = props.inDialog !== true;
   const { api } = useAPI();
   const [listing, setListing] = useState<ArtifactListing | null>(null);
   const [listError, setListError] = useState<string | null>(null);
@@ -598,7 +594,7 @@ export function ArtifactsPanel(props: {
     setFullscreen(false);
   }
   // Fullscreen only makes sense with something selected.
-  const showFullscreen = allowFullscreen && fullscreen && selected != null;
+  const showFullscreen = fullscreen && selected != null;
   // The comment box sits at the selection's screen position, which the layout change moves:
   // left open, it floated over the sidebar far from its text. Annotate mode itself stays on.
   const setFullscreenMode = (next: boolean) => {
@@ -863,7 +859,7 @@ export function ArtifactsPanel(props: {
     if (interactions.handleKeyDown(e)) return;
     if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
       e.preventDefault();
-      if (selected && allowFullscreen) setFullscreenMode(!showFullscreen);
+      if (selected) setFullscreenMode(!showFullscreen);
     } else if (matchesKeybind(e, KEYBINDS.NEXT_ARTIFACT)) {
       e.preventDefault();
       keepFocusForShortcuts(e.target);
@@ -1284,23 +1280,21 @@ export function ArtifactsPanel(props: {
           <Download className="h-3.5 w-3.5" />
         </button>
       </TooltipIfPresent>
-      {allowFullscreen && (
-        <TooltipIfPresent tooltip={showFullscreen ? "Exit fullscreen" : "Fullscreen"}>
-          <button
-            type="button"
-            aria-label={showFullscreen ? "Exit fullscreen" : "Fullscreen"}
-            disabled={selected == null}
-            onClick={() => setFullscreenMode(!showFullscreen)}
-            className={toolbarButtonClassName}
-          >
-            {showFullscreen ? (
-              <Minimize2 className="h-3.5 w-3.5" />
-            ) : (
-              <Maximize2 className="h-3.5 w-3.5" />
-            )}
-          </button>
-        </TooltipIfPresent>
-      )}
+      <TooltipIfPresent tooltip={showFullscreen ? "Exit fullscreen" : "Fullscreen"}>
+        <button
+          type="button"
+          aria-label={showFullscreen ? "Exit fullscreen" : "Fullscreen"}
+          disabled={selected == null}
+          onClick={() => setFullscreenMode(!showFullscreen)}
+          className={toolbarButtonClassName}
+        >
+          {showFullscreen ? (
+            <Minimize2 className="h-3.5 w-3.5" />
+          ) : (
+            <Maximize2 className="h-3.5 w-3.5" />
+          )}
+        </button>
+      </TooltipIfPresent>
       <TooltipIfPresent tooltip="Reload">
         <button
           type="button"

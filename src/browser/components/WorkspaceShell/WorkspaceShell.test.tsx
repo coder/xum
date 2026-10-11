@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getReviewImmersiveKey } from "@/common/constants/storage";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { MutableRefObject } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
@@ -386,6 +387,23 @@ describe("WorkspaceShell loading placeholders", () => {
       expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("false");
 
       view.rerender(<WorkspaceShell {...defaultProps} />);
+      expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("false");
+    });
+
+    it("closes when the Timeline reveals a message in this workspace's transcript", () => {
+      rightSidebarDisplay = "none";
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      fireEvent.click(view.getByRole("button", { name: "Sidebar" }));
+      const reveal = (workspaceId: string) =>
+        act(() => {
+          window.dispatchEvent(
+            createCustomEvent(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, { workspaceId })
+          );
+        });
+
+      reveal("workspace-2");
+      expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("true");
+      reveal(defaultProps.workspaceId);
       expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("false");
     });
 

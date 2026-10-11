@@ -1885,7 +1885,7 @@ describe("ArtifactsPanel", () => {
     expect(dialog.getAttribute("data-shortcut-focus")).toBe("true");
   });
 
-  // A narrow window mounts ArtifactsDialog while the CSS-hidden sidebar panel stays mounted.
+  // Every mounted panel reads the same view choices.
   test("two mounted panels share annotate mode, JSON mode and tree expansion", async () => {
     const workspaceId = "ws-two-panels";
     fake = createFakeArtifactsApi(

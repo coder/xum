@@ -1323,9 +1323,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   // "Open in Artifacts" on an MCP Apps tool card and openArtifact() (chat cards, file cards,
   // Review, palette) persist their selection, then ask for the tab like OPEN_GOAL_TAB. On small
-  // viewports WorkspaceMenuBar opens the Artifacts dialog instead; this handler then stays out,
-  // so a view never mounts twice (dialog plus a hidden sidebar copy, each running the app's
-  // init and tool calls).
+  // viewports WorkspaceMenuBar shows the tab in the full-screen sidebar instead; this handler
+  // then stays out, so one event never acts twice.
   React.useEffect(() => {
     if (!artifactsExperimentEnabled) return;
     const handleOpenArtifactsTab = (event: Event) => {
@@ -1346,8 +1345,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   // Global shortcut: open (and un-collapse) the Artifacts tab. Works from the chat input
   // too, because Ctrl+Shift+K inserts nothing there. While the narrow layout hides the
-  // sidebar, WorkspaceMenuBar opens the Artifacts dialog instead; this handler then stays out,
-  // so one keystroke never acts twice.
+  // sidebar, WorkspaceMenuBar shows the tab in the full-screen sidebar instead; this handler then
+  // stays out, so one keystroke never acts twice.
   React.useEffect(() => {
     if (!artifactsExperimentEnabled) return;
     const handler = (e: KeyboardEvent) => {

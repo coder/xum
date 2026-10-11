@@ -19,7 +19,8 @@ import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 import { StatsContainer } from "@/browser/features/RightSidebar/StatsContainer";
 import { ReviewPanel } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
 import type { GoalCreateIntent } from "@/browser/features/RightSidebar/GoalTab";
-// Timeline and Artifacts stay eager: TimelineDialog and ArtifactsDialog import them statically.
+// Timeline and Artifacts load eagerly, unlike the LazyFeature panels: the phone dialogs that
+// imported them statically are gone, so they could move to LazyFeature in a separate change.
 import { TimelinePanel } from "@/browser/features/RightSidebar/Timeline/TimelinePanel";
 import { ArtifactsPanel } from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsPanel";
 import type { GoalSnapshot, GoalStatus } from "@/common/types/goal";

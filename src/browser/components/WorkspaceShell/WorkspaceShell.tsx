@@ -15,6 +15,7 @@ import { usePersistedState, updatePersistedState } from "@/browser/hooks/usePers
 import { RightSidebar } from "@/browser/features/RightSidebar/RightSidebar";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
+import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { PopoverError } from "../PopoverError/PopoverError";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
@@ -236,6 +237,18 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   // Layer 1: the full-screen sidebar is drawn above the narrow-screen drawer (layer 0), so it
   // answers Escape first when both are open.
   useEscapeToDismiss(sidebarFullscreen, closeSidebarFullscreen, 1);
+  // The Timeline's "Reveal in transcript" scrolls to and highlights a message in the chat behind
+  // the view, so close the view to show it (the phone Timeline dialog did the same).
+  useEffect(() => {
+    if (!sidebarFullscreen) return;
+    const workspaceId = props.workspaceId;
+    const handleReveal = (event: Event) => {
+      const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR>).detail;
+      if (detail?.workspaceId === workspaceId) setFullscreenSidebarWorkspaceId(null);
+    };
+    window.addEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, handleReveal);
+    return () => window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, handleReveal);
+  }, [sidebarFullscreen, props.workspaceId]);
   // After RightSidebar lifts `inert` from the rest of the page (effect cleanups run before
   // effects), so the element can take focus again.
   useEffect(() => {

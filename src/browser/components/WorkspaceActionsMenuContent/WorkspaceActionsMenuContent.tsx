@@ -2,10 +2,8 @@ import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import {
-  BarChart3,
   GitBranch,
   HeartPulse,
-  AppWindow,
   Maximize2,
   MessagesSquare,
   PanelRight,
@@ -16,7 +14,6 @@ import {
   Square,
 } from "lucide-react";
 import React from "react";
-import { TAB_ICONS } from "@/browser/features/RightSidebar/Tabs/tabIcons";
 
 interface WorkspaceActionButtonProps {
   label: string;
@@ -64,18 +61,12 @@ interface WorkspaceActionsMenuContentProps {
   /** Mobile workspace-header action: open immersive review in full-screen touch mode. */
   onOpenTouchFullscreenReview?: (() => void) | null;
   onEnterImmersiveReview?: (() => void) | null;
-  /** Small-viewport action: open the timeline dialog (the right sidebar hosting the tab is hidden there). */
-  onOpenTimeline?: (() => void) | null;
   /**
    * Small viewports only: show the hidden right sidebar full-screen. One row for the whole
    * sidebar, not one per tool, so the menu does not grow with every sidebar tab: the sidebar's
    * own New tab launcher lists the tools.
    */
   onOpenSidebar?: (() => void) | null;
-  /** Small viewports only: the Artifacts dialog (the right sidebar is hidden there). */
-  onOpenArtifacts?: (() => void) | null;
-  /** Stats dialog; only set while the right sidebar (home of the Stats tab) is hidden. */
-  onOpenStats?: (() => void) | null;
   /** Touch phones only: the header row carries Stats and Artifacts there, so New terminal moves here. */
   onOpenTerminal?: (() => void) | null;
   onStopRuntime?: (() => void) | null;
@@ -174,20 +165,6 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
           }}
         />
       )}
-      {props.onOpenTimeline && (
-        <WorkspaceActionButton
-          label="Timeline"
-          shortcut={formatKeybind(KEYBINDS.OPEN_TIMELINE_DIALOG)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<TAB_ICONS.timeline className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onOpenTimeline?.();
-          }}
-          testId="workspace-timeline-button"
-        />
-      )}
       {props.onOpenSidebar && (
         <WorkspaceActionButton
           label="Sidebar"
@@ -198,34 +175,6 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
             props.onOpenSidebar?.();
           }}
           testId="workspace-open-sidebar"
-        />
-      )}
-      {props.onOpenStats && (
-        <WorkspaceActionButton
-          label="Stats"
-          shortcut={formatKeybind(KEYBINDS.OPEN_STATS_DIALOG)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<BarChart3 className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onOpenStats?.();
-          }}
-          testId="workspace-stats-button"
-        />
-      )}
-      {props.onOpenArtifacts && (
-        <WorkspaceActionButton
-          label="Artifacts"
-          shortcut={formatKeybind(KEYBINDS.OPEN_ARTIFACTS_TAB)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<AppWindow className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onOpenArtifacts?.();
-          }}
-          testId="workspace-artifacts-button"
         />
       )}
       {props.onOpenTerminal && (
