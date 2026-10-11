@@ -20,24 +20,39 @@ export function stripClientPluginSendHookFields<T>(muxMetadata: T): T {
   for (const key of FOLLOW_UP_KEYS) {
     const followUp = parsed[key];
     if (!isRecord(followUp)) continue;
+    if (!("pluginSendHooksApplied" in followUp) && !("pluginHookContext" in followUp)) continue;
     const { pluginSendHooksApplied: _applied, pluginHookContext: _context, ...rest } = followUp;
-    // A follow-up's own muxMetadata can be another compaction request (its follow-up redispatches
-    // with it), so its markers are stripped at every depth.
-    const nested = stripClientPluginSendHookFields(followUp.muxMetadata);
-    const changed =
-      "pluginSendHooksApplied" in followUp ||
-      "pluginHookContext" in followUp ||
-      nested !== followUp.muxMetadata;
-    if (!changed) continue;
-    strippedParsed = {
-      ...(strippedParsed ?? parsed),
-      [key]: nested !== followUp.muxMetadata ? { ...rest, muxMetadata: nested } : rest,
-    };
+    strippedParsed = { ...(strippedParsed ?? parsed), [key]: rest };
   }
   if (strippedParsed === undefined) return muxMetadata;
   const stripped = { ...muxMetadata, parsed: strippedParsed };
   // Same shape as the input minus optional fields, so it stays assignable to T.
   return stripped as T;
+}
+
+/** Refusal for {@link isNestedCompactionFollowUp} sends. */
+export const NESTED_COMPACTION_FOLLOW_UP_MESSAGE =
+  "A /compact follow-up cannot itself be a compaction request. Send the second /compact after the first one finishes.";
+
+/**
+ * True for a compaction request whose follow-up is itself a compaction request. No Xum path
+ * builds this (a follow-up's muxMetadata is agent-skill, MCP-prompt, heartbeat or workspace-turn
+ * metadata, and on-send compaction never diverts a compaction request), so WorkspaceService
+ * refuses it from clients: the nested request's own follow-up would redispatch as an automatic
+ * send that no message.send hook may block, and the strip above covers only one level.
+ */
+export function isNestedCompactionFollowUp(muxMetadata: unknown): boolean {
+  if (!isRecord(muxMetadata) || muxMetadata.type !== "compaction-request") return false;
+  const parsed = muxMetadata.parsed;
+  if (!isRecord(parsed)) return false;
+  return FOLLOW_UP_KEYS.some((key) => {
+    const followUp = parsed[key];
+    return (
+      isRecord(followUp) &&
+      isRecord(followUp.muxMetadata) &&
+      followUp.muxMetadata.type === "compaction-request"
+    );
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
