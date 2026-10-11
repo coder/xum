@@ -136,6 +136,23 @@ describe("loadPluginCodexHooks", () => {
     expect(warnings).toEqual(["More than 256 hooks; ignoring the rest"]);
   });
 
+  test("bounds the warnings of invalid pointer entries and invalid groups", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-warning-bounds");
+    const invalidGroups = { hooks: { Stop: Array<number>(1000).fill(1) } };
+    const plugin = await writePlugin(
+      tmp.path,
+      { "hooks/bad.json": invalidGroups },
+      { "com.openai": { hooks: ["./hooks/bad.json", ...Array<number>(100_000).fill(1)] } }
+    );
+
+    const { warnings } = await loadPluginCodexHooks(plugin);
+
+    // 1 count warning + 31 invalid raw entries (none past the first 32) + 1000 invalid groups:
+    // 50 are kept, plus a summary of the rest.
+    expect(warnings).toHaveLength(51);
+    expect(warnings.at(-1)).toBe("982 more hook warnings not shown");
+  });
+
   test("a hooks file path cannot take an inline source's hook keys", async () => {
     using tmp = new DisposableTempDir("codex-hooks-key-collision");
     const document = { hooks: { Stop: [{ hooks: [scan] }] } };

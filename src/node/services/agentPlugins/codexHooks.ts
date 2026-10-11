@@ -59,6 +59,8 @@ const MAX_HOOKS_FILE_BYTES = 256 * 1024;
  */
 const MAX_HOOK_POINTER_ENTRIES = 32;
 const MAX_PLUGIN_HOOKS = 256;
+/** Warnings kept per plugin: each file can hold ~100k invalid groups, each one a warning. */
+const MAX_HOOK_WARNINGS = 50;
 /** Codex default handler timeout, in seconds. */
 export const DEFAULT_HOOK_TIMEOUT_SECONDS = 600;
 
@@ -86,8 +88,14 @@ export function readOpenAIHooksPointer(
   const openai = manifest.extensions?.["com.openai"];
   if (!isPlainObject(openai) || openai.hooks === undefined) return undefined;
   const entries: unknown[] = Array.isArray(openai.hooks) ? openai.hooks : [openai.hooks];
+  // Capped before validation: each invalid raw entry would add a warning.
+  if (entries.length > MAX_HOOK_POINTER_ENTRIES) {
+    warnings.push(
+      `'extensions["com.openai"].hooks' has ${entries.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
+    );
+  }
   const hooks: OpenAIPluginHooksEntry[] = [];
-  for (const entry of entries) {
+  for (const entry of entries.slice(0, MAX_HOOK_POINTER_ENTRIES)) {
     if (isPlainObject(entry)) {
       hooks.push(entry);
       continue;
@@ -115,13 +123,12 @@ export async function loadPluginCodexHooks(
   const hooks: PluginHookDefinition[] = [];
   const pointer = readOpenAIHooksPointer(plugin.manifest, warnings);
   const entries = pointer ?? [DEFAULT_HOOKS_FILE];
-  if (entries.length > MAX_HOOK_POINTER_ENTRIES) {
-    warnings.push(
-      `'extensions["com.openai"].hooks' has ${entries.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
-    );
-  }
   const seenFiles = new Set<string>();
-  for (const [index, entry] of entries.slice(0, MAX_HOOK_POINTER_ENTRIES).entries()) {
+  let omittedWarnings = 0;
+  for (const [index, entry] of entries.entries()) {
+    // Trimmed after each entry, so at most one file's warnings are held at a time.
+    omittedWarnings += Math.max(0, warnings.length - MAX_HOOK_WARNINGS);
+    warnings.length = Math.min(warnings.length, MAX_HOOK_WARNINGS);
     if (hooks.length > MAX_PLUGIN_HOOKS) break;
     if (typeof entry !== "string") {
       parseHooksDocument(entry, `plugin.json#hooks[${index}]`, hooks, warnings);
@@ -150,6 +157,9 @@ export async function loadPluginCodexHooks(
     }
     parseHooksDocument(document, path.normalize(entry), hooks, warnings);
   }
+  omittedWarnings += Math.max(0, warnings.length - MAX_HOOK_WARNINGS);
+  warnings.length = Math.min(warnings.length, MAX_HOOK_WARNINGS);
+  if (omittedWarnings > 0) warnings.push(`${omittedWarnings} more hook warnings not shown`);
   if (hooks.length > MAX_PLUGIN_HOOKS) {
     warnings.push(`More than ${MAX_PLUGIN_HOOKS} hooks; ignoring the rest`);
     hooks.length = MAX_PLUGIN_HOOKS;
