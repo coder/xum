@@ -782,6 +782,100 @@ describe("MCPServerManager", () => {
     expect(reads).toBe(2);
   });
 
+  test("settings for plugin hooks: concurrent calls join one read; misses read concurrently; __proto__ stays a key", async () => {
+    using tmp = new DisposableTempDir("mcp-hook-settings-join");
+    const pluginServer = (command: string, serverName: string) => ({
+      ...stdioConfig(command),
+      env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: path.join(tmp.path, "data") },
+      plugin: { pluginName: "cad", serverName, sourceScope: "global" as const, sourceLocation: "x" },
+    });
+    configService.listServers.mockResolvedValue({
+      "plugin:abc:a": pluginServer("hooks-join-a", "a"),
+      // A valid JSON key; it must stay an own key of the hook settings.
+      "plugin:abc:__proto__": pluginServer("hooks-join-proto", "__proto__"),
+    });
+    const pending: Array<() => void> = [];
+    let reads = 0;
+    let fail = true;
+    const settingsServer = () => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () => {
+          reads++;
+          return new Promise<mcpSdk.MCPRawCallToolResult>((resolve, reject) =>
+            pending.push(() =>
+              fail
+                ? reject(new Error("server down"))
+                : resolve({
+                    content: [],
+                    structuredContent: {
+                      schema: { type: "object", properties: { on: { type: "boolean", title: "On" } } },
+                      values: { on: true },
+                    },
+                  })
+            )
+          );
+        },
+      },
+    });
+    servers.serve("hooks-join-a", settingsServer());
+    servers.serve("hooks-join-proto", settingsServer());
+    await manager.getToolsForWorkspace(workspaceRequest("hooks-join-ws"));
+
+    fail = false;
+    const first = manager.getSettingsForPluginHooks("hooks-join-ws", "plugin:abc:", 100);
+    const second = manager.getSettingsForPluginHooks("hooks-join-ws", "plugin:abc:", 100);
+    // Both servers' reads started before either settled, and the second call started none.
+    expect(reads).toBe(2);
+    for (const settle of pending.splice(0)) settle();
+    const expected = { a: { on: true }, ["__proto__"]: { on: true } };
+    expect(Object.keys(await first)).toEqual(Object.keys(expected));
+    expect(Object.keys(await second)).toEqual(Object.keys(expected));
+    expect(JSON.parse(JSON.stringify(await second))).toEqual(JSON.parse(JSON.stringify(expected)));
+    expect(reads).toBe(2);
+  });
+
+  test("settings for plugin hooks: a recycled plugin server is read again after a failed read", async () => {
+    using tmp = new DisposableTempDir("mcp-hook-settings-recycle");
+    configService.listServers.mockResolvedValue({
+      "plugin:abc:a": {
+        ...stdioConfig("hooks-recycle"),
+        env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: path.join(tmp.path, "data") },
+        plugin: { pluginName: "cad", serverName: "a", sourceScope: "global" as const, sourceLocation: "x" },
+      },
+    });
+    let fail = true;
+    servers.serve("hooks-recycle", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          fail
+            ? Promise.reject(new Error("server down"))
+            : Promise.resolve({
+                content: [],
+                structuredContent: {
+                  schema: { type: "object", properties: { on: { type: "boolean", title: "On" } } },
+                  values: { on: true },
+                },
+              }),
+      },
+    });
+    const request = workspaceRequest("hooks-recycle-ws");
+    await manager.getToolsForWorkspace(request);
+    expect(await manager.getSettingsForPluginHooks("hooks-recycle-ws", "plugin:abc:", 100)).toEqual({
+      a: {},
+    });
+    // A plugin update recycles its servers; the new instance's settings are read again.
+    fail = false;
+    await manager.stopServersWithKeyPrefix("plugin:abc:");
+    await manager.getToolsForWorkspace(request);
+    expect(await manager.getSettingsForPluginHooks("hooks-recycle-ws", "plugin:abc:", 100)).toEqual({
+      a: { on: true },
+    });
+  });
+
   test("settings: a noStart read never starts or restarts the server", async () => {
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-nostart") });
     servers.serve("settings-nostart", {
