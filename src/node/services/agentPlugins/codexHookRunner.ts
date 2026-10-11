@@ -149,7 +149,10 @@ async function runToolHooks(
       ctx.blocked = { result: notes.length > 0 ? annotate(result, notes, registration) : result };
       return;
     }
-    if (output.updatedInput !== undefined) applyUpdatedInput(ctx, output, registration, hook);
+    if (output.updatedInput !== undefined) {
+      applyUpdatedInput(ctx, output, registration, hook);
+      if (ctx.blocked) return;
+    }
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
   }
   // The user cancelled while a hook ran: the tool must not start after the cancel.
@@ -193,7 +196,19 @@ function applyUpdatedInput(
     return;
   }
   const schema = ctx.inputJsonSchema?.();
-  if (schema === undefined || !matchesToolSchema(schema, output.updatedInput)) {
+  if (schema === undefined) {
+    // No schema to check the rewrite against (a caller that omitted it): deny. Running the
+    // original arguments would silently bypass a guard that redirects the call (Codex
+    // PRRT_kwDOPxxmWM6rRKxR).
+    warn(registration, hook, "returned updatedInput, but the tool has no input schema to check it");
+    ctx.blocked = {
+      result: {
+        error: `Tool call blocked by plugin '${registration.pluginName}' hook: Xum cannot check its rewrite of this call.`,
+      },
+    };
+    return;
+  }
+  if (!matchesToolSchema(schema, output.updatedInput)) {
     warn(registration, hook, "returned updatedInput that does not match the tool's input schema");
     return;
   }

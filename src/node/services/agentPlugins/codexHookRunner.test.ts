@@ -332,7 +332,6 @@ describe("PreToolUse", () => {
     const cases: Array<[unknown, unknown, unknown]> = [
       [rewrite("allow", { script: "ls" }), schema, { script: "ls" }],
       [rewrite("allow", { script: 1 }), schema, { script: "x" }],
-      [rewrite("allow", { script: "ls" }), undefined, { script: "x" }],
       [json({ hookSpecificOutput: { updatedInput: { script: "ls" } } }), schema, { script: "x" }],
     ];
     // MCP schemas: local $ref/$defs (2020-12 by default) and a draft-07 declaration.
@@ -353,6 +352,14 @@ describe("PreToolUse", () => {
       const ctx = await runTool(spine, "bash", { script: "x" }, toolSchema);
       expect(ctx.result).toEqual({ ran: expected });
     }
+    // No schema to check the rewrite against: the call is denied, never run with the original
+    // arguments the guard meant to replace (Codex PRRT_kwDOPxxmWM6rRKxR).
+    const noSchema = setup([hook("PreToolUse")], () => rewrite("allow", { script: "ls" }));
+    const denied = await runTool(noSchema.spine, "bash", { script: "x" });
+    expect(denied.executed).toBe(false);
+    expect(denied.blocked?.result).toEqual({
+      error: "Tool call blocked by plugin 'guard' hook: Xum cannot check its rewrite of this call.",
+    });
   });
 
   test("additionalContext and systemMessage: the model sees the context, only the user sees the message", async () => {
