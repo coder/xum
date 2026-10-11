@@ -9,6 +9,7 @@ import { exitFor, launch, launchJob, ownerState, probeApp, recover } from "./lau
 import * as proxyModule from "./proxy";
 import { Ledger } from "./proxyPolicy";
 import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
+import { checkSet, CONTAINER_CHECKS, runSelfCheck, selfCheckExit } from "./selfCheckRun";
 
 // Each test runs the real build.sh in a throwaway git repo and a fake `docker` on PATH. The
 // runner gives docker a stripped env, so the fake reads its answers from bin/fake.env.
@@ -721,6 +722,11 @@ test("D1: under hidepid (or an unknown /proc policy) a gone PID cannot tell", ()
   for (const hidden of ["rw,hidepid=2", "rw,hidepid=invisible", "rw,gid=4,hidepid=1"])
     expect(ownerState(gone, proc(hidden))).toBe("cannot tell");
   expect(ownerState(gone, () => "22 1 0:21 / /sys rw - sysfs sysfs rw\n")).toBe("cannot tell");
+  // Two /proc mounts: the later one is in effect, whichever way round.
+  const stacked = (first: string, last: string) => () =>
+    `${proc(first)()}1990 1907 0:180 / /proc rw,nosuid - proc proc ${last}\n`;
+  expect(ownerState(gone, stacked("rw", "rw,hidepid=2"))).toBe("cannot tell");
+  expect(ownerState(gone, stacked("rw,hidepid=2", "rw"))).toBe("dead");
   expect(
     ownerState(gone, () => {
       throw new Error("EACCES");
@@ -1115,6 +1121,25 @@ test("B2: an explore job spends from the run's ledger and writes its output to t
   }
 });
 
+async function selfCheckLaunch(over: Record<string, string>, args: string[]) {
+  const upstream = await startFakeUpstream();
+  try {
+    const cwd = prepare(over);
+    const env = {
+      ...HOST_ENV,
+      BUGBASH_BUDGET_USD: "1",
+      ANTHROPIC_API_KEY: UPSTREAM_KEY,
+      ANTHROPIC_BASE_URL: `${upstream.baseUrl}/v1`,
+      BUGBASH_MODEL: "anthropic:claude-haiku-4-5",
+    };
+    const o = { root: fs.realpathSync(root), cwd, env, stop: new AbortController().signal };
+    const outcome = await launchJob(args, { ...o, log: () => undefined }).catch((e: unknown) => e);
+    return { outcome };
+  } finally {
+    await upstream.close();
+  }
+}
+
 async function exploreLaunch(
   over: Record<string, string>,
   env: Record<string, string | undefined>
@@ -1281,6 +1306,35 @@ test("B3: a call that outlives close() fails the job (exit 5), and the job leave
   expectNothingLeft(); // the container, the job folder with its socket, the client folder
 });
 
+test.each([
+  ["an extra argument", ["self-check", "--output", ".e2e/s", "--grep", "x"]],
+  ["an unknown fixture", ["self-check", "--export-fixture", "symlink", "--output", ".e2e/s"]],
+  [
+    "a fixture after the output",
+    ["self-check", "--output", ".e2e/s", "--export-fixture", "oversize"],
+  ],
+  ["no output", ["self-check"]],
+])("D2: a self-check with %s refuses before any docker command", async (_name, args) => {
+  const { outcome } = await selfCheckLaunch({}, args);
+  expect(outcome).toBeInstanceOf(Refusal);
+  expect(calls()).toBe("");
+});
+
+test("D2: the self-check runs only its fixed command, with the fixture before it and the host uid", async () => {
+  const args = ["self-check", "--export-fixture", "traversal", "--output", ".e2e/s"];
+  const { outcome } = await selfCheckLaunch({}, args);
+  expect(outcome).toMatchObject({ code: 7, cleanup: "removed" });
+  const run = calls()
+    .split("\n")
+    .find((line) => line.startsWith("run "))!;
+  expect(run).toMatch(
+    / sandbox\/entry\.ts --export \.e2e\/s --export-fixture traversal -- bun sandbox\/selfCheck\.ts \.e2e\/s /
+  );
+  expect(run).toContain(`--env BUGBASH_HOST_UID=${process.getuid!()}`);
+  expect(run).toContain("--env BUGBASH_MODEL_DRIVEN=1"); // proxied, like a model-driven job
+  expect(run).not.toContain("e2e/dist/cli/bin.js");
+});
+
 test("B2: unknown cleanup outranks a stop, and a stop outranks a proxy fault", () => {
   const fault = { proxyFault: "proxy: 1 call(s) cost more" };
   expect(exitFor({ code: 0, cleanup: "unknown: x", stopped: "SIGINT", ...fault })).toBe(3);
@@ -1381,4 +1435,76 @@ test("the command line refuses an ambient BUGBASH_AI_RESOLVED=real before any do
   expect(cli.status).toBe(2);
   expect(calls()).toBe("");
   expect(fs.existsSync(path.join(dir, output))).toBe(false);
+});
+
+test("D2: the self-check fails on a partial or unknown container report", () => {
+  expect(checkSet([...CONTAINER_CHECKS])).toEqual({ missing: [], unexpected: [] });
+  // A report that stops early (the last check missing) names what is missing.
+  const partial = CONTAINER_CHECKS.slice(0, -1);
+  expect(checkSet(partial)).toEqual({ missing: [CONTAINER_CHECKS.at(-1)!], unexpected: [] });
+  expect(checkSet([])).toEqual({ missing: [...CONTAINER_CHECKS], unexpected: [] });
+  // A repeated or unknown name cannot stand in for a missing one.
+  const [first, second] = CONTAINER_CHECKS;
+  expect(checkSet([first, first, ...CONTAINER_CHECKS.slice(2), "made up"])).toEqual({
+    missing: [second],
+    unexpected: [first, "made up"],
+  });
+});
+
+test("D2: a stopped self-check job ends the run with Stopped and starts no other job", async () => {
+  const launched: string[][] = [];
+  const launch = async (args: string[]) => {
+    launched.push(args);
+    return { cleanup: "removed", stopped: "SIGTERM" } as const;
+  };
+  const run = runSelfCheck(new AbortController().signal, () => {}, launch);
+  expect(await run.catch((e: unknown) => e)).toEqual(new Stopped("SIGTERM"));
+  expect(launched).toHaveLength(1);
+});
+
+test("D2: an unknown cleanup ends the self-check with exit 3, even with a stop", async () => {
+  for (const stopped of ["SIGTERM", undefined]) {
+    let launches = 0;
+    const launch = async () => {
+      launches += 1;
+      return { cleanup: "unknown: inspect failed", stopped } as const;
+    };
+    expect(await runSelfCheck(new AbortController().signal, () => {}, launch)).toBe(3);
+    expect(launches).toBe(1);
+  }
+});
+
+test("D2: the self-check checks the upstream for every job, the fixtures too", async () => {
+  const lines: string[] = [];
+  const launch = async (args: string[], o: { env: NodeJS.ProcessEnv }) => {
+    // Each job's container makes its one allowed call. The traversal job also lets one
+    // forbidden call through, which only a per-job check of the fixture job can see.
+    const post = (marker: string) =>
+      fetch(`${o.env.ANTHROPIC_BASE_URL}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ model: "m", messages: [{ role: "user", content: marker }] }),
+      }).then((r) => r.text());
+    await post("selfcheck-allowed");
+    if (args.includes("traversal")) await post("selfcheck-forbidden");
+    return { cleanup: "removed", code: 0 } as const;
+  };
+  expect(await runSelfCheck(new AbortController().signal, (l) => lines.push(l), launch)).toBe(1);
+  const fails = lines.filter((l) => l.includes("the upstream"));
+  expect(fails.filter((l) => l.startsWith("self-check FAIL"))).toEqual([
+    "self-check FAIL: traversal: the upstream saw no forbidden call (1)",
+    "self-check FAIL: traversal: the upstream saw nothing else (2 requests)",
+  ]);
+  expect(fails.filter((l) => l.startsWith("self-check pass"))).toHaveLength(10);
+});
+
+test("D2: a launcher Refusal after the preflight exits 2 and starts no other job", async () => {
+  let launches = 0;
+  const launch = async () => {
+    launches += 1;
+    return { cleanup: "none", error: new Refusal("rootless Docker is not supported") } as const;
+  };
+  const lines: string[] = [];
+  expect(await selfCheckExit(new AbortController().signal, (l) => lines.push(l), launch)).toBe(2);
+  expect(launches).toBe(1);
+  expect(lines.at(-1)).toBe("self-check refused: rootless Docker is not supported");
 });

@@ -1,6 +1,10 @@
 /**
  * The job process of a bug-bash sandbox container (#5714), under docker-init (`--init`).
- * Usage: bun sandbox/entry.ts --export <output folder> -- <command...>
+ * Usage: bun sandbox/entry.ts --export <output folder> [--export-fixture <name>] -- <command...>
+ *
+ * `--export-fixture traversal|oversize` (the self-check only, `bun sandbox/selfCheck.ts`) sends
+ * one frame that the host receiver must refuse instead of the real export: it proves the host
+ * side of the export stream in a real container (selfCheckRun.ts).
  *
  * The job's stdout and stderr go to this process's stderr, so its stdout carries only the export
  * stream (exportStream.ts). Its stdin is the lifeline: sandbox/launch.ts holds the other end, so
@@ -24,12 +28,25 @@ if (!inSandbox()) {
   process.exit(2);
 }
 
-const args = process.argv.slice(2);
+const given = process.argv.slice(2);
+const fixture = given[2] === "--export-fixture" ? given[3] : undefined;
+const args = fixture === undefined ? given : [...given.slice(0, 2), ...given.slice(4)];
 if (args[0] !== "--export" || args[2] !== "--" || args.length < 4) {
-  console.error("usage: entry.ts --export <output folder> -- <command...>");
+  console.error(
+    "usage: entry.ts --export <output folder> [--export-fixture <name>] -- <command...>"
+  );
   process.exit(2);
 }
 const exportDir = args[1];
+if (
+  fixture !== undefined &&
+  (!["traversal", "oversize"].includes(fixture) ||
+    args[3] !== "bun" ||
+    args[4] !== "sandbox/selfCheck.ts")
+) {
+  console.error("sandbox entry: an export fixture runs only with the self-check");
+  process.exit(2);
+}
 // The launcher sets the mode. No provider key ever enters, so the real app AI runs only in a
 // model-driven job, through its proxy (aiMode.ts); the proxy socket is checked below.
 const resolvedAi = process.env.BUGBASH_AI_RESOLVED;
@@ -88,6 +105,14 @@ async function finish(code: number): Promise<void> {
   finished = true;
   killAllOthers(); // the app and Chromium too: nothing writes to the output after this
   await othersGone();
+  if (fixture !== undefined) {
+    // One frame the host must refuse: a path out of the export folder, or a declared size past
+    // the export cap (no bytes follow; the host refuses on the header). Then the end frame.
+    const frame = fixture === "traversal" ? { p: "../escape", n: 1 } : { p: "big", n: 2 ** 40 };
+    process.stdout.write(`${JSON.stringify(frame)}\n${fixture === "traversal" ? "x" : ""}`);
+    process.stdout.write(`${JSON.stringify({ end: true })}\n`, () => process.exit(code));
+    return;
+  }
   const sent = await writeExport(process.stdout, exportDir);
   if (sent.skipped.length > 0)
     console.error(`sandbox entry: not exported: ${sent.skipped.join(", ")}`);

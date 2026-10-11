@@ -88,3 +88,16 @@ export async function forwardToProxy(port = PROXY_PORT, socketPath = PROXY_SOCKE
   });
   return server;
 }
+
+/**
+ * The capability sets of a `/proc/<pid>/status` text that are not all zero (selfCheck.ts). All
+ * five count: a capability left in the permitted, inheritable, bounding or ambient set can be
+ * made effective again, so CapEff 0 alone proves nothing. A missing set counts as nonzero.
+ */
+export const CAP_SETS = ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] as const;
+export function nonzeroCapSets(status: string): string[] {
+  return CAP_SETS.flatMap((set) => {
+    const value = new RegExp(`^${set}:\\s*([0-9a-f]+)$`, "m").exec(status)?.[1];
+    return value != null && /^0+$/.test(value) ? [] : [`${set} ${value ?? "missing"}`];
+  });
+}
