@@ -149,7 +149,7 @@ import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
 import { SideChatPanel } from "./SideChatPanel";
 import { NewTabLauncher } from "./NewTabLauncher";
-import { getOrderedBaseTabIds, type SidebarMenuItem } from "./Tabs/tabConfig";
+import { getOrderedBaseTabIds } from "./Tabs/tabConfig";
 import { useExperimentGatedTab } from "./useExperimentGatedTab";
 
 interface SidebarContainerProps {
@@ -272,12 +272,8 @@ interface RightSidebarProps {
    */
   fullscreen?: boolean;
   onCloseFullscreen?: () => void;
-  /** The New tab shortcut while the narrow layout hides the sidebar: show it full-screen. */
+  /** Sidebar shortcuts while the narrow layout hides the sidebar: show it full-screen. */
   onRequestFullscreen?: () => void;
-  /** Exposes "open this item like the New tab launcher does" to the parent (the phone menu). */
-  openToolRef?: React.MutableRefObject<((item: SidebarMenuItem) => void) | null>;
-  /** Reports what the New tab launcher offers, so the phone menu lists the same items. */
-  onLauncherToolsChange?: (items: readonly SidebarMenuItem[]) => void;
 }
 
 /**
@@ -804,8 +800,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   fullscreen = false,
   onCloseFullscreen,
   onRequestFullscreen,
-  openToolRef,
-  onLauncherToolsChange,
 }) => {
   // Trigger for focusing Review panel (preserves hunk selection)
   const [focusTrigger, _setFocusTrigger] = React.useState(0);
@@ -847,9 +841,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const terminalCreateError = usePopoverError();
 
   // Manual collapse state (persisted globally)
-  const [collapsed, setCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
-    listener: true,
-  });
+  const [storedCollapsed, setCollapsed] = usePersistedState<boolean>(
+    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    false,
+    { listener: true }
+  );
+  // The phone full-screen view always shows the sidebar expanded. It leaves the stored state
+  // alone, so a sidebar collapsed on a wide layout is still collapsed there afterwards.
+  const collapsed = storedCollapsed && !fullscreen;
   const [isReviewImmersive, setIsReviewImmersive] = usePersistedState<boolean>(
     getReviewImmersiveKey(workspaceId),
     false,
@@ -1449,7 +1448,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   }, [canReviewDiffs, selectOrOpenReviewTab, setCollapsed, setIsReviewImmersive, workspaceId]);
 
   // Keyboard shortcuts for tab switching by position (Cmd/Ctrl+1-9)
-  // Auto-expands sidebar if collapsed
+  // Auto-expands sidebar if collapsed. While the narrow layout hides the sidebar, they show it
+  // full-screen on that tab where the parent can (phones): the keyboard path to the workspace
+  // menu's Sidebar row.
   React.useEffect(() => {
     const tabKeybinds = [
       KEYBINDS.SIDEBAR_TAB_1,
@@ -1493,6 +1494,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             selectTabByIndex(canReviewDiffs ? prev : removeTabEverywhere(prev, "review"), tabIndex)
           );
           setCollapsed(false);
+          const container = sidebarContainerRef.current;
+          if (container != null && isRightSidebarResponsivelyHidden(container)) {
+            onRequestFullscreen?.();
+          }
           return;
         }
       }
@@ -1503,6 +1508,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   }, [
     canReviewDiffs,
     initialActiveTab,
+    onRequestFullscreen,
     setAutoFocusTerminalSession,
     setCollapsed,
     setLayout,
@@ -1942,41 +1948,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     debug: llmDebugLogsEnabled === true,
   };
   const launcherTools = getOrderedBaseTabIds().filter((tool) => toolAvailable[tool]);
-  // The phone menu lists these same items, Side chat included where the launcher offers it;
-  // WorkspaceShell relays them (and ignores an unchanged list, so a re-render does not re-render
-  // the chat pane).
-  const canOpenSideChat = currentWorkspaceMetadata?.sideChatParentWorkspaceId == null;
-  React.useEffect(() => {
-    onLauncherToolsChange?.(canOpenSideChat ? [...launcherTools, "side-chat"] : launcherTools);
-  }, [canOpenSideChat, launcherTools, onLauncherToolsChange]);
-
-  // The phone menu opens an item here exactly like the New tab launcher does (a tool replaces
-  // the focused pane's New tab, or is selected where it is already open).
-  const openToolLikeLauncher = (item: SidebarMenuItem) => {
-    setCollapsed(false);
-    const tabsetId = getBaseLayout().focusedTabsetId;
-    if (item === "side-chat") {
-      // Show the pane's New tab first: its Side chat row shows the pending creation, the new
-      // chat replaces it once created, and a failed creation leaves the launcher (as on desktop),
-      // not whatever tool happened to be open. Focus moves into that launcher, so it does not
-      // stay on the menu button behind the full-screen view while the chat is created.
-      handleAddNewTab(tabsetId);
-      handleOpenSideChatFromNewTab(tabsetId);
-    } else {
-      handleOpenToolFromNewTab(tabsetId, item);
-    }
-  };
-  // The latest handler on every render: it reads this render's layout and side-chat state.
-  React.useEffect(() => {
-    if (openToolRef) openToolRef.current = openToolLikeLauncher;
-  });
-  React.useEffect(() => {
-    if (!openToolRef) return;
-    return () => {
-      openToolRef.current = null;
-    };
-  }, [openToolRef]);
-
   // Full-screen mode only makes sense while the narrow layout hides the sidebar. Its header is
   // shown by the same CSS rules (globals.css), so a header that computes to display:none means
   // the layout widened (a rotated phone, a wider window): the sidebar is back in its column.
@@ -1998,6 +1969,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         // cannot lower `??=` and would skip this whole component.
         if (restoreOthers != null) return;
         restoreOthers = makeOthersInert(container);
+        // Focus was outside (the menu button, now inert): move it to the shown tab, so keyboard
+        // and screen reader users land in the view. A launcher or panel that took focus already
+        // (the New tab shortcut) keeps it.
+        if (!container.contains(document.activeElement)) {
+          container.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus();
+        }
       }
     };
     closeIfWidened();

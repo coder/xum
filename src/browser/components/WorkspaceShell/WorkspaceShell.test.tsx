@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getReviewImmersiveKey } from "@/common/constants/storage";
-import { useEffect, type MutableRefObject } from "react";
+import type { MutableRefObject } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as RealLottieModule from "lottie-react";
@@ -33,9 +33,6 @@ let originalWindowApi: WindowApi | undefined;
 const openTerminalMock = mock(() => Promise.resolve());
 const addReviewMock = mock(() => undefined);
 const addTerminalMock = mock(() => undefined);
-const openSidebarToolMock = mock((_tool: string) => undefined);
-// Tools the stub right sidebar reports as its New tab launcher's list.
-const LAUNCHER_TOOLS = ["workflows", "browser"];
 // Inline display of the stub right sidebar: "none" stands in for the narrow-layout CSS hide.
 let rightSidebarDisplay = "flex";
 
@@ -83,16 +80,15 @@ void mock.module("@/browser/components/ChatPane/ChatPane", () => ({
   ChatPane: (props: {
     workspaceId: string;
     onOpenTerminal: () => void;
-    sidebarTools?: readonly string[];
-    onOpenSidebarTool?: (tool: string, returnFocusTo: HTMLElement | null) => void;
+    onOpenSidebar?: (returnFocusTo: HTMLElement | null) => void;
   }) => (
-    <div data-testid="chat-pane" data-sidebar-tools={props.sidebarTools?.join(",") ?? ""}>
+    <div data-testid="chat-pane">
       Chat pane for {props.workspaceId}
       <button type="button" onClick={() => props.onOpenTerminal()}>
         New terminal
       </button>
-      <button type="button" onClick={(e) => props.onOpenSidebarTool?.("browser", e.currentTarget)}>
-        Browser
+      <button type="button" onClick={(e) => props.onOpenSidebar?.(e.currentTarget)}>
+        Sidebar
       </button>
     </div>
   ),
@@ -101,17 +97,10 @@ void mock.module("@/browser/components/ChatPane/ChatPane", () => ({
 void mock.module("@/browser/features/RightSidebar/RightSidebar", () => ({
   RightSidebar: (props: {
     addTerminalRef: MutableRefObject<(() => void) | null>;
-    openToolRef?: MutableRefObject<((tool: string) => void) | null>;
     fullscreen?: boolean;
     onCloseFullscreen?: () => void;
-    onLauncherToolsChange?: (tools: readonly string[]) => void;
   }) => {
     props.addTerminalRef.current = addTerminalMock;
-    if (props.openToolRef) props.openToolRef.current = openSidebarToolMock;
-    const { onLauncherToolsChange } = props;
-    useEffect(() => {
-      onLauncherToolsChange?.(LAUNCHER_TOOLS);
-    }, [onLauncherToolsChange]);
     return (
       <div
         data-testid="right-sidebar"
@@ -237,7 +226,6 @@ describe("WorkspaceShell loading placeholders", () => {
     openTerminalMock.mockClear();
     addReviewMock.mockClear();
     addTerminalMock.mockClear();
-    openSidebarToolMock.mockClear();
     rightSidebarDisplay = "flex";
   });
 
@@ -359,15 +347,14 @@ describe("WorkspaceShell loading placeholders", () => {
   });
 
   describe("full-screen sidebar (phones)", () => {
-    it("opens the picked tool in the sidebar shown full-screen", () => {
+    it("shows the sidebar full-screen from the menu's Sidebar row", () => {
       rightSidebarDisplay = "none";
       const view = render(<WorkspaceShell {...defaultProps} />);
       const sidebar = view.getByTestId("right-sidebar");
       expect(sidebar.dataset.fullscreen).toBe("false");
 
-      fireEvent.click(view.getByRole("button", { name: "Browser" }));
+      fireEvent.click(view.getByRole("button", { name: "Sidebar" }));
 
-      expect(openSidebarToolMock).toHaveBeenCalledWith("browser");
       expect(sidebar.dataset.fullscreen).toBe("true");
 
       // The stub keeps its inline display:none; the real CSS shows it full-screen.
@@ -379,7 +366,7 @@ describe("WorkspaceShell loading placeholders", () => {
     it("closes on Escape and returns focus to the control that opened it", () => {
       rightSidebarDisplay = "none";
       const view = render(<WorkspaceShell {...defaultProps} />);
-      const opener = view.getByRole("button", { name: "Browser" });
+      const opener = view.getByRole("button", { name: "Sidebar" });
       fireEvent.click(opener);
       expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("true");
 
@@ -392,7 +379,7 @@ describe("WorkspaceShell loading placeholders", () => {
     it("closes when switching workspaces and stays closed on the way back", () => {
       rightSidebarDisplay = "none";
       const view = render(<WorkspaceShell {...defaultProps} />);
-      fireEvent.click(view.getByRole("button", { name: "Browser" }));
+      fireEvent.click(view.getByRole("button", { name: "Sidebar" }));
       expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("true");
 
       view.rerender(<WorkspaceShell {...defaultProps} workspaceId="workspace-2" />);
@@ -405,7 +392,7 @@ describe("WorkspaceShell loading placeholders", () => {
     it("closes when immersive review starts and stays closed after it ends", () => {
       rightSidebarDisplay = "none";
       const view = render(<WorkspaceShell {...defaultProps} />);
-      fireEvent.click(view.getByRole("button", { name: "Browser" }));
+      fireEvent.click(view.getByRole("button", { name: "Sidebar" }));
       expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("true");
 
       act(() => {
@@ -417,12 +404,6 @@ describe("WorkspaceShell loading placeholders", () => {
         updatePersistedState(getReviewImmersiveKey(defaultProps.workspaceId), false);
       });
       expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("false");
-    });
-
-    it("relays the sidebar's launcher tools to the chat pane's menu", () => {
-      const view = render(<WorkspaceShell {...defaultProps} />);
-
-      expect(view.getByTestId("chat-pane").dataset.sidebarTools).toBe(LAUNCHER_TOOLS.join(","));
     });
   });
 });

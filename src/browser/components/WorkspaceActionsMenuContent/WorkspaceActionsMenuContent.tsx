@@ -8,6 +8,7 @@ import {
   AppWindow,
   Maximize2,
   MessagesSquare,
+  PanelRight,
   Pencil,
   Pin,
   PinOff,
@@ -15,7 +16,6 @@ import {
   Square,
 } from "lucide-react";
 import React from "react";
-import { TAB_CONFIG, type SidebarMenuItem } from "@/browser/features/RightSidebar/Tabs/tabConfig";
 import { TAB_ICONS } from "@/browser/features/RightSidebar/Tabs/tabIcons";
 
 interface WorkspaceActionButtonProps {
@@ -67,11 +67,11 @@ interface WorkspaceActionsMenuContentProps {
   /** Small-viewport action: open the timeline dialog (the right sidebar hosting the tab is hidden there). */
   onOpenTimeline?: (() => void) | null;
   /**
-   * Small viewports only: the hidden right sidebar's tools, each opening the sidebar full-screen
-   * on that tool. Listed with the other views, not under a heading of their own.
+   * Small viewports only: show the hidden right sidebar full-screen. One row for the whole
+   * sidebar, not one per tool, so the menu does not grow with every sidebar tab: the sidebar's
+   * own New tab launcher lists the tools.
    */
-  sidebarTools?: readonly SidebarMenuItem[] | null;
-  onOpenSidebarTool?: ((item: SidebarMenuItem) => void) | null;
+  onOpenSidebar?: (() => void) | null;
   /** Small viewports only: the Artifacts dialog (the right sidebar is hidden there). */
   onOpenArtifacts?: (() => void) | null;
   /** Stats dialog; only set while the right sidebar (home of the Stats tab) is hidden. */
@@ -188,24 +188,18 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
           testId="workspace-timeline-button"
         />
       )}
-      {props.onOpenSidebarTool &&
-        props.sidebarTools?.map((tool) => {
-          // Side chat is the launcher's own row, not a tool tab: same label and icon as there.
-          const ToolIcon = tool === "side-chat" ? MessagesSquare : TAB_ICONS[tool];
-          return (
-            <WorkspaceActionButton
-              key={tool}
-              label={tool === "side-chat" ? "Side chat" : TAB_CONFIG[tool].name}
-              icon={<ToolIcon className="h-3 w-3 shrink-0" />}
-              onClick={(e) => {
-                e.stopPropagation();
-                props.onCloseMenu();
-                props.onOpenSidebarTool?.(tool);
-              }}
-              testId={`workspace-sidebar-tool-${tool}`}
-            />
-          );
-        })}
+      {props.onOpenSidebar && (
+        <WorkspaceActionButton
+          label="Sidebar"
+          icon={<PanelRight className="h-3 w-3 shrink-0" />}
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onCloseMenu();
+            props.onOpenSidebar?.();
+          }}
+          testId="workspace-open-sidebar"
+        />
+      )}
       {props.onOpenStats && (
         <WorkspaceActionButton
           label="Stats"

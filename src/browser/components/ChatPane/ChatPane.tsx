@@ -7,7 +7,6 @@ import React, {
   useDeferredValue,
   useMemo,
 } from "react";
-import type { SidebarMenuItem } from "@/browser/features/RightSidebar/Tabs/tabConfig";
 import { Lightbulb } from "lucide-react";
 import { SideChatBanner } from "@/browser/components/SideChatBanner/SideChatBanner";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
@@ -162,9 +161,8 @@ interface ChatPaneProps {
   onOpenTerminal: (options?: TerminalSessionCreateOptions) => void;
   /** Hide + inactivate chat pane while immersive review overlay is active. */
   immersiveHidden?: boolean;
-  /** Phones: the right sidebar's tools, listed in the workspace menu (see WorkspaceShell). */
-  sidebarTools?: readonly SidebarMenuItem[];
-  onOpenSidebarTool?: (tool: SidebarMenuItem, returnFocusTo: HTMLElement | null) => void;
+  /** Phones: show the hidden right sidebar full-screen (see WorkspaceShell). */
+  onOpenSidebar?: (returnFocusTo: HTMLElement | null) => void;
   sidebarFullscreen?: boolean;
 }
 
@@ -173,8 +171,7 @@ export type ChatPaneContentProps = Omit<
   | "leftSidebarCollapsed"
   | "onToggleLeftSidebarCollapsed"
   | "immersiveHidden"
-  | "sidebarTools"
-  | "onOpenSidebarTool"
+  | "onOpenSidebar"
   | "sidebarFullscreen"
 > & {
   /**
@@ -305,8 +302,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
               namedWorkspacePath={props.namedWorkspacePath}
               runtimeConfig={props.runtimeConfig}
               onOpenTerminal={props.onOpenTerminal}
-              sidebarTools={props.sidebarTools}
-              onOpenSidebarTool={props.onOpenSidebarTool}
+              onOpenSidebar={props.onOpenSidebar}
               sidebarFullscreen={props.sidebarFullscreen}
             />
           </PerfRenderMarker>

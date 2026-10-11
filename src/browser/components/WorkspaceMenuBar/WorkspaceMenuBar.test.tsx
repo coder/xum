@@ -1,6 +1,5 @@
 import "../../../../tests/ui/dom";
 
-import type { BaseTabType } from "@/browser/features/RightSidebar/Tabs/tabConfig";
 import type { ComponentProps, PropsWithChildren, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
@@ -104,8 +103,7 @@ function getLastMenuContentProps() {
             onEnterImmersiveReview?: (() => void) | null;
             onOpenTouchFullscreenReview?: (() => void) | null;
             onOpenTimeline?: (() => void) | null;
-            sidebarTools?: readonly string[] | null;
-            onOpenSidebarTool?: ((tool: BaseTabType) => void) | null;
+            onOpenSidebar?: (() => void) | null;
             onOpenStats?: (() => void) | null;
             onOpenArtifacts?: (() => void) | null;
             onOpenTerminal?: (() => void) | null;
@@ -522,44 +520,25 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(dialogProps?.workspaceId).toBe(workspaceId);
   });
 
-  it("lists the hidden sidebar's tools, except those with their own dialog, and opens one", () => {
+  it("offers the hidden sidebar as one row, and opens it full-screen", () => {
     stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
-    const onOpenSidebarTool = mock(
-      (_tool: string, _returnFocusTo: HTMLElement | null) => undefined
-    );
+    const onOpenSidebar = mock((_returnFocusTo: HTMLElement | null) => undefined);
 
-    const view = render(
-      <WorkspaceMenuBar
-        {...defaultProps}
-        sidebarTools={["costs", "review", "workflows", "timeline", "artifacts", "browser"]}
-        onOpenSidebarTool={onOpenSidebarTool}
-      />
-    );
+    const view = render(<WorkspaceMenuBar {...defaultProps} onOpenSidebar={onOpenSidebar} />);
 
-    const menuProps = getLastMenuContentProps();
-    expect(menuProps?.sidebarTools).toEqual(["review", "workflows", "browser"]);
     act(() => {
-      menuProps?.onOpenSidebarTool?.("browser");
+      getLastMenuContentProps()?.onOpenSidebar?.();
     });
     // Focus returns to the More button once the full-screen sidebar closes.
-    expect(onOpenSidebarTool).toHaveBeenCalledWith(
-      "browser",
-      view.getByTestId("workspace-more-actions")
-    );
+    expect(onOpenSidebar).toHaveBeenCalledWith(view.getByTestId("workspace-more-actions"));
   });
 
-  it("lists no sidebar tools while the sidebar is visible", () => {
+  it("offers no Sidebar row while the sidebar is visible", () => {
     stubMatchMedia(() => false);
 
-    render(
-      <WorkspaceMenuBar
-        {...defaultProps}
-        sidebarTools={["workflows", "browser"]}
-        onOpenSidebarTool={() => undefined}
-      />
-    );
+    render(<WorkspaceMenuBar {...defaultProps} onOpenSidebar={() => undefined} />);
 
-    expect(getLastMenuContentProps()?.sidebarTools).toBeNull();
+    expect(getLastMenuContentProps()?.onOpenSidebar).toBeNull();
   });
 
   it("hides the Timeline action on wide viewports", () => {

@@ -120,12 +120,6 @@ const TAB_CONFIG_DEF = {
 /** Static (non-terminal) tab id union, derived from the lightweight config keys. */
 export type BaseTabType = keyof typeof TAB_CONFIG_DEF;
 
-/**
- * What the phone workspace menu can open in the hidden right sidebar: the New tab launcher's
- * tools plus its Side chat row (Terminal has its own menu row).
- */
-export type SidebarMenuItem = BaseTabType | "side-chat";
-
 /** Public lightweight config indexed by tab id. */
 export const TAB_CONFIG: Record<BaseTabType, TabConfig> = TAB_CONFIG_DEF;
 

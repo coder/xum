@@ -1,11 +1,11 @@
 /**
- * Phones: the narrow layout hides the right sidebar, so the workspace menu lists its tools and
- * opens them in the sidebar itself, shown full-screen.
+ * Phones: the narrow layout hides the right sidebar, so the workspace menu's Sidebar row shows
+ * the sidebar itself full-screen. Its own New tab launcher lists the tools.
  *
  * The stories pin a 390px frame instead of relying on the viewport, so the shell's container query
  * hides the sidebar at any window size (the Storybook test-runner plays at desktop size).
- * FullScreenFromWorkspaceMenu holds the behavior checks and is play-only. FullScreenToolOnPhone is
- * the Pixel capture of the open view at the phone viewport.
+ * FullScreenFromWorkspaceMenu holds the behavior checks and is play-only. FullScreenSidebarOnPhone
+ * is the Pixel capture of the open view at the phone viewport.
  */
 import { wrapAsyncIterator } from "@orpc/shared";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
@@ -57,7 +57,7 @@ const RUN: WorkflowRunRecord = {
 };
 
 // A workflow run opens its own tab, so the strip holds only Workflows: the Browser tool is not
-// open yet and is reachable only through the menu.
+// open yet and is reachable through the sidebar's New tab launcher.
 const LAYOUT: RightSidebarLayoutState = {
   version: 1,
   nextId: 2,
@@ -84,15 +84,14 @@ function setup() {
     ],
   });
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
-  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+  // Collapsed on a wide layout earlier: the full-screen view still shows it expanded.
+  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
   updatePersistedState(getRightSidebarLayoutKey(WORKSPACE_ID), LAYOUT);
   // The Browser tool polls for sessions; this story has none.
   client.browser = {
     ...client.browser,
     listSessions: () => Promise.resolve({ sessions: [], otherSessions: [] }),
   };
-  // Side chat creation never finishes here, so the play can check the pending state.
-  client.workspace.createSideChat = () => new Promise(() => undefined);
   client.workflows.listScripts = () => Promise.resolve([]);
   client.workflows.listRuns = () => Promise.resolve([]);
   client.workflows.getRun = () => Promise.resolve(RUN);
@@ -113,10 +112,10 @@ function PhoneFrameDecorator(Story: ComponentType) {
   );
 }
 
-async function pickMenuTool(canvasElement: HTMLElement, tool: string) {
+async function openSidebarFromMenu(canvasElement: HTMLElement) {
   await userEvent.click(within(canvasElement).getByTestId("workspace-more-actions"));
   const page = within(canvasElement.ownerDocument.body);
-  await userEvent.click(await page.findByTestId(`workspace-sidebar-tool-${tool}`));
+  await userEvent.click(await page.findByTestId("workspace-open-sidebar"));
 }
 
 export const FullScreenFromWorkspaceMenu: AppStory = {
@@ -133,36 +132,36 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     const chatPane = canvas.getByRole("log", { name: "Conversation transcript" });
     await waitFor(() => expect(sidebar).not.toBeVisible());
 
-    // The menu lists the launcher's tools, including Browser, which no tab has opened yet.
-    // Stats, Timeline and Artifacts keep their own dialogs, so they get no tool row.
-    await userEvent.click(moreButton);
-    await expect(await page.findByTestId("workspace-sidebar-tool-browser")).toBeVisible();
-    // The launcher's Side chat row is offered too.
-    await expect(page.getByTestId("workspace-sidebar-tool-side-chat")).toBeVisible();
-    for (const tool of ["costs", "timeline", "artifacts"]) {
-      await expect(page.queryByTestId(`workspace-sidebar-tool-${tool}`)).not.toBeInTheDocument();
-    }
-    await userEvent.click(page.getByTestId("workspace-sidebar-tool-browser"));
-
-    // The real sidebar shows full-screen on the new Browser tab; the chat behind it is inert.
+    // One Sidebar row stands in for the hidden sidebar. It shows the sidebar full-screen on the
+    // tab it shows (Workflows), expanded although it was collapsed; the chat behind it is inert.
+    await openSidebarFromMenu(canvasElement);
     await waitFor(() => expect(sidebar).toBeVisible());
-    await expect(within(sidebar).getByRole("tab", { name: /Browser/ })).toHaveAttribute(
+    await expect(within(sidebar).getByRole("tab", { name: /Workflows/ })).toHaveAttribute(
       "aria-selected",
       "true"
     );
+    await within(sidebar).findByText(RUN_NAME);
     // Everything behind the view is inert, not just the chat: the left sidebar and the footer
     // sit outside the chat pane.
     await expect(chatPane.closest("[inert]")).not.toBeNull();
     const expandLeftSidebar = canvas.getByRole("button", { name: "Expand sidebar", hidden: true });
     await expect(expandLeftSidebar.closest("[inert]")).not.toBeNull();
-    // Focus moves to the picked tool and stays there. The closing menu returns focus to the More
+    // Focus moves into the view and stays there. The closing menu returns focus to the More
     // button on a timer, which must not win: the inert chat pane cannot take focus. Check again
     // after that timer had its turn.
     await waitFor(() => expect(sidebar.contains(document.activeElement)).toBe(true));
     await new Promise((resolve) => setTimeout(resolve, 50));
     await expect(sidebar.contains(document.activeElement)).toBe(true);
 
-    // Its own strip switches tools. Closing keeps the panel mounted and returns focus.
+    // Its New tab launcher opens the tools that have no tab yet, Browser among them.
+    await userEvent.click(within(sidebar).getByRole("button", { name: "New tab" }));
+    await userEvent.click(await within(sidebar).findByRole("button", { name: /^Browser/ }));
+    await expect(within(sidebar).getByRole("tab", { name: /Browser/ })).toHaveAttribute(
+      "aria-selected",
+      "true"
+    );
+
+    // Closing keeps the panels mounted and returns focus.
     await userEvent.click(within(sidebar).getByRole("tab", { name: /Workflows/ }));
     const runTitle = await within(sidebar).findByText(RUN_NAME);
     await userEvent.click(within(sidebar).getByRole("button", { name: "Close sidebar" }));
@@ -171,24 +170,26 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await expect(chatPane.closest("[inert]")).toBeNull();
     await expect(expandLeftSidebar.closest("[inert]")).toBeNull();
 
-    // Reopening shows the same panel instance, not a remounted copy.
-    await pickMenuTool(canvasElement, "workflows");
+    // Reopening shows the tab used last, the same panel instance, not a remounted copy.
+    await openSidebarFromMenu(canvasElement);
     await waitFor(() => expect(sidebar).toBeVisible());
     await expect(within(sidebar).getByText(RUN_NAME)).toBe(runTitle);
 
-    // Focus is on the Workflows tab, which shows no shortcut tooltip on a phone (a tooltip would
-    // also take the first Escape). Escape closes the view.
+    // Focus is on a tab, which shows no shortcut tooltip on a phone (a tooltip would also take
+    // the first Escape). Escape closes the view.
     await waitFor(() => expect(sidebar.contains(document.activeElement)).toBe(true));
     await expect(page.queryByRole("tooltip")).toBeNull();
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(sidebar).not.toBeVisible());
 
-    // Side chat shows the New tab launcher while the chat is created, and focus moves into it
-    // instead of staying on the menu button behind the view.
-    await pickMenuTool(canvasElement, "side-chat");
+    // The tab shortcuts are the keyboard path to the Sidebar row: Ctrl+2 shows the view on the
+    // second tab (Browser).
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "2", code: "Digit2", ctrlKey: true }));
     await waitFor(() => expect(sidebar).toBeVisible());
-    await expect(await within(sidebar).findByText("Open a tool")).toBeVisible();
-    await waitFor(() => expect(sidebar.contains(document.activeElement)).toBe(true));
+    await expect(within(sidebar).getByRole("tab", { name: /Browser/ })).toHaveAttribute(
+      "aria-selected",
+      "true"
+    );
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(sidebar).not.toBeVisible());
 
@@ -212,8 +213,8 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
   },
 };
 
-/** The Browser tool opened from the workspace menu, full-screen at the phone viewport. */
-export const FullScreenToolOnPhone: AppStory = {
+/** The sidebar opened from the workspace menu's Sidebar row, full-screen at the phone viewport. */
+export const FullScreenSidebarOnPhone: AppStory = {
   // A phone viewport for local viewing (the fixed frame does not move innerWidth).
   globals: {
     viewport: { value: "mobile2", isRotated: false },
@@ -229,8 +230,9 @@ export const FullScreenToolOnPhone: AppStory = {
     await waitForChatInputAutofocusDone(canvasElement);
     const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
     if (sidebar == null) throw new Error("right sidebar missing");
-    await pickMenuTool(canvasElement, "browser");
+    await openSidebarFromMenu(canvasElement);
     await waitFor(() => expect(sidebar).toBeVisible());
+    await within(sidebar).findByText(RUN_NAME);
     await waitFor(() => expect(sidebar.contains(document.activeElement)).toBe(true));
   },
 };
