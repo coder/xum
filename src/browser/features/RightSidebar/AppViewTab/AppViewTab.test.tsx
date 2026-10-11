@@ -206,6 +206,48 @@ describe("AppViewTabPanel", () => {
     }
   });
 
+  test("lookups of two workspaces in one tick go out as one request per workspace", async () => {
+    const store = useWorkspaceStoreRaw();
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(() => true);
+    const state = spyOn(store, "getWorkspaceState").mockImplementation(
+      () =>
+        ({
+          messages: [],
+          loading: false,
+          isHydratingTranscript: false,
+        }) as unknown as WorkspaceState
+    );
+    const requests: Array<{ workspaceId: string; toolCallIds: string[] }> = [];
+    const client = createTestApiClient({
+      mcpApps: {
+        getViewRecords: (input: { workspaceId: string; toolCallIds: string[] }) => {
+          requests.push(input);
+          return Promise.resolve({
+            success: true as const,
+            data: input.toolCallIds.map((toolCallId) => ({ toolCallId, view: null })),
+          });
+        },
+      },
+    });
+    try {
+      render(
+        <APIProvider client={client}>
+          <AppViewTabLabel workspaceId="ws-one" toolCallId="one-a" />
+          <AppViewTabLabel workspaceId="ws-two" toolCallId="two-a" />
+          <AppViewTabLabel workspaceId="ws-one" toolCallId="one-b" />
+        </APIProvider>
+      );
+      await waitFor(() => expect(requests).toHaveLength(2));
+      expect([...requests].sort((a, b) => a.workspaceId.localeCompare(b.workspaceId))).toEqual([
+        { workspaceId: "ws-one", toolCallIds: ["one-a", "one-b"] },
+        { workspaceId: "ws-two", toolCallIds: ["two-a"] },
+      ]);
+    } finally {
+      registered.mockRestore();
+      state.mockRestore();
+    }
+  });
+
   test("a plugin view's tab shows its server part; the tooltip names the full key", () => {
     const key = "plugin:0123456789abcdef:tray";
     openMcpAppViewTab("ws-plugin", {

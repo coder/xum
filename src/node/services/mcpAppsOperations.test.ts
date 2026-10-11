@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { ORPCContext } from "@/node/orpc/context";
 import * as path from "node:path";
+import { McpAppViewRecordsRequestSchema } from "@/common/orpc/schemas/mcpApps";
+import { MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
 import { McpAppResultStore, type McpAppResultRecord } from "./mcpAppResultStore";
 import { DisposableTempDir } from "./tempDir";
 import {
@@ -223,6 +225,34 @@ describe("getMcpAppViewRecords", () => {
       ]
     );
     expect(asked.sort()).toEqual(["call-1", "gone"]);
+  });
+
+  test("answers a repeated ID once; the request schema refuses an empty or too long list", async () => {
+    let reads = 0;
+    const ctx = {
+      experimentsService: { isExperimentEnabled: () => true },
+      mcpServerManager: {
+        getMcpAppResult: () => {
+          reads++;
+          return Promise.resolve(RECORD);
+        },
+      },
+    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
+    const result = await getMcpAppViewRecords(ctx, {
+      workspaceId: "ws",
+      toolCallIds: ["call-1", "call-1"],
+    });
+    if (!result.success) throw new Error(result.error);
+    expect([result.data.map((entry) => entry.toolCallId), reads]).toEqual([["call-1"], 1]);
+
+    const ids = (n: number) => Array.from({ length: n }, (_, i) => `c${i}`);
+    const parses = (toolCallIds: string[]) =>
+      McpAppViewRecordsRequestSchema.safeParse({ workspaceId: "ws", toolCallIds }).success;
+    expect([
+      parses([]),
+      parses(ids(MCP_APP_VIEW_RECORDS_MAX_IDS)),
+      parses(ids(MCP_APP_VIEW_RECORDS_MAX_IDS + 1)),
+    ]).toEqual([false, true, false]);
   });
 
   test("names the record's view with the card's server form and model-facing tool name", async () => {

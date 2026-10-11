@@ -101,7 +101,7 @@ export async function getMcpAppView(
 }
 
 /**
- * The views of tool calls by their result records alone, one entry per requested ID. A restored
+ * The views of tool calls by their result records alone, one entry per distinct requested ID. A restored
  * app tab knows only the tool call ID; when that call is outside the loaded transcript (before a
  * compaction boundary, or older than the first history page) this is how the tab still finds its
  * view. One request covers every tab restored at once. Records are read from the asking
@@ -112,8 +112,10 @@ export async function getMcpAppViewRecords(
   input: z.infer<typeof McpAppViewRecordsRequestSchema>
 ): Promise<Result<Array<{ toolCallId: string; view: McpAppViewRecord }>, string>> {
   assertMcpAppsEnabled(context);
+  // One entry per distinct ID: a repeated ID is answered once (the schema caps the list and
+  // refuses an empty one).
   const data = await Promise.all(
-    input.toolCallIds.map(async (toolCallId) => {
+    [...new Set(input.toolCallIds)].map(async (toolCallId) => {
       const record = await context.mcpServerManager.getMcpAppResult(input.workspaceId, toolCallId);
       return { toolCallId, view: record === null ? null : viewOfRecord(record) };
     })
