@@ -56,12 +56,14 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
     api.agentPlugins.getHooks({ name }).then(
       (result) => {
         if (ignore) return;
-        if (result.success) setData(result.data);
-        else setError(result.error);
+        // A failed reload clears the list: after a decision, the old review states are stale.
+        setData(result.success ? result.data : null);
+        if (!result.success) setError(result.error);
         setBusy(false);
       },
       (err: unknown) => {
         if (ignore) return;
+        setData(null);
         setError(getErrorMessage(err));
         setBusy(false);
       }
