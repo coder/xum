@@ -31,6 +31,7 @@ let invocation: McpAppView["invocation"] = null;
 let viewCsp: McpAppView["csp"] = {};
 let approvals: Array<{ serverName: string; origins: string[] }> = [];
 let approveFails: Error | null = null;
+let approvalProjectPath: string | null = "/repo";
 // When set, each approve call waits for the test to resolve it with the list it returns.
 let approveDeferred: Array<(approvedDomains: string[]) => void> | null = null;
 let toolCalls: Array<{
@@ -53,7 +54,7 @@ function Wrapper(props: { children: ReactNode }) {
             resultAvailable: true,
             result: { content: [] },
             invocation,
-            approvalProjectPath: "/repo",
+            approvalProjectPath,
           },
         });
       },
@@ -163,6 +164,7 @@ describe("McpAppFrame", () => {
     viewCsp = {};
     approvals = [];
     approveFails = null;
+    approvalProjectPath = "/repo";
     approveDeferred = null;
     toolCalls = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
@@ -271,6 +273,16 @@ describe("McpAppFrame", () => {
     expect(view.getByText(/api\.example\.com/)).toBeTruthy();
     expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
     expect(frame.getAttribute("srcdoc")).not.toContain("https://api.example.com");
+  });
+
+  test("a view whose server no project owns names its blocked domains and offers no Allow", async () => {
+    // A scratch chat, or a global server in a multi-project workspace: approving always fails.
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    approvalProjectPath = null;
+    const { view } = await renderFrame();
+    expect(view.getByText(/api\.example\.com/)).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
   });
 
   test("a failed approval request shows its error instead of a silently armed strip", async () => {
