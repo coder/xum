@@ -3626,13 +3626,13 @@ export class HistoryService {
           return deleteMessageResult;
         }
         if (deleteMessageResult.success) {
-          // The delete is by id: corrupted history can hold duplicates at other sequences.
-          const sequences = existingMessages.flatMap((message) => {
-            const sequence = message.metadata?.historySequence;
-            return message.id === partial.id && isNonNegativeInteger(sequence) ? [sequence] : [];
-          });
-          assert(sequences.length > 0, "the deleted rows include the partial's own row");
-          recordDeleted(sequences);
+          // The delete is by id: corrupted history can hold duplicates at other sequences,
+          // including before the latest boundary, so report what the delete removed.
+          assert(
+            deleteMessageResult.data.length > 0,
+            "the deleted rows include the partial's own row"
+          );
+          recordDeleted(deleteMessageResult.data);
         }
       }
 
@@ -5553,7 +5553,9 @@ export class HistoryService {
    */
   async deleteMessage(workspaceId: string, messageId: string): Promise<Result<void>> {
     return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to delete message", () =>
-      this.deleteMessageUnderWriteLock(workspaceId, messageId)
+      this.deleteMessageUnderWriteLock(workspaceId, messageId).then((result) =>
+        result.success ? Ok(undefined) : result
+      )
     );
   }
 
@@ -5595,8 +5597,14 @@ export class HistoryService {
   private async deleteMessageUnderWriteLock(
     workspaceId: string,
     messageId: string
-  ): Promise<Result<void>> {
+  ): Promise<Result<number[]>> {
     invalidateHistoryAppendProvenance();
+    // The sequences of the removed rows (every row with this id), for callers that publish them.
+    const sequencesOf = (removed: readonly MuxMessage[]) =>
+      removed.flatMap((msg) => {
+        const seq = msg.id === messageId ? msg.metadata?.historySequence : undefined;
+        return isNonNegativeInteger(seq) ? [seq] : [];
+      });
     try {
       // Structural rewrite requires full file content
       const { rows, messages } = await this.readHistoryForRewrite(
@@ -5630,7 +5638,7 @@ export class HistoryService {
           messages.length
         );
         await writeFileAtomic(this.getChatArchivePath(workspaceId), archiveEntries);
-        return Ok(undefined);
+        return Ok(sequencesOf(archiveMessages));
       }
 
       const historyPath = this.getChatHistoryPath(workspaceId);
@@ -5679,7 +5687,7 @@ export class HistoryService {
         this.sequenceCounters.set(workspaceId, nextSeq);
       }
 
-      return Ok(undefined);
+      return Ok(sequencesOf(messages));
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to delete message: ${message}`);
