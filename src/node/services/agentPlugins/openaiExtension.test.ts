@@ -100,6 +100,8 @@ describe("readOpenAIExtension", () => {
     const spoofed = read({ ...validInterface, developerName: "Example\u202eelgooG" });
     expect(spoofed.extension).toEqual({});
     expect(spoofed.warnings.some((w) => w.includes("interface.developerName'"))).toBe(true);
+    // U+061C (ARABIC LETTER MARK) is a direction control too.
+    expect(read({ ...validInterface, developerName: "Example\u061cCo" }).extension).toEqual({});
     for (const bad of [
       "a\u0007b",
       "a\u0085b",

@@ -39,6 +39,17 @@ function webpVp8x(width: number, height: number, flags: number, anim = false): B
   return Buffer.concat([Buffer.from("RIFF\x00\x00\x00\x00WEBP", "latin1"), body, rest]);
 }
 
+/** A VP8X WebP followed by these extra chunks (FourCC, data); odd sizes are padded. */
+function webpWithChunks(chunks: Array<[string, string]>): Buffer {
+  const parts = chunks.map(([fourCC, data]) => {
+    const header = Buffer.alloc(8);
+    header.write(fourCC, 0, "latin1");
+    header.writeUInt32LE(data.length, 4);
+    return Buffer.concat([header, Buffer.from(data, "latin1"), Buffer.alloc(data.length % 2)]);
+  });
+  return Buffer.concat([webpVp8x(64, 64, 0), ...parts]);
+}
+
 function webpVp8l(width: number, height: number): Buffer {
   const head = Buffer.alloc(30);
   head.write("RIFF", 0, "latin1");
@@ -71,6 +82,31 @@ describe("checkLogoImage", () => {
     expect(checkLogoImage(png(64, 64, "acTL"), "image/png")).toContain("animated");
     expect(checkLogoImage(webpVp8x(64, 64, 0x02), "image/webp")).toContain("animated");
     expect(checkLogoImage(webpVp8x(64, 64, 0, true), "image/webp")).toContain("animated");
+  });
+
+  test("only a real ANIM chunk header marks a WebP animated, not its bytes elsewhere", () => {
+    // XMP metadata (odd length, padded) that mentions ANIMATION: still a static image.
+    const xmp = "<x:xmpmeta><dc:subject>ANIMATION reference</dc:subject></x:xmpmeta>!?";
+    expect(xmp.length % 2).toBe(1);
+    expect(
+      checkLogoImage(
+        webpWithChunks([
+          ["XMP ", xmp],
+          ["VP8L", "x"],
+        ]),
+        "image/webp"
+      )
+    ).toBeNull();
+    // A real ANIM chunk after the padded XMP chunk is found by walking the headers.
+    expect(
+      checkLogoImage(
+        webpWithChunks([
+          ["XMP ", xmp],
+          ["ANIM", "\x00".repeat(6)],
+        ]),
+        "image/webp"
+      )
+    ).toContain("animated");
   });
 
   test("refuses what it cannot read, and GIF", () => {

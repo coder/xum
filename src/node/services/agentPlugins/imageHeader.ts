@@ -60,6 +60,20 @@ function jpegInfo(bytes: Buffer): ImageInfo | string {
   return "its JPEG size is missing";
 }
 
+/**
+ * Whether a RIFF/WEBP file has a chunk with this FourCC. Walks the chunk headers (FourCC,
+ * 32-bit little-endian size, data padded to an even length), so the bytes of another chunk's
+ * data (an XMP packet that mentions "ANIMATION") never count as a header.
+ */
+function hasRiffChunk(bytes: Buffer, fourCC: string): boolean {
+  for (let offset = 12; offset + 8 <= bytes.length; ) {
+    if (bytes.toString("latin1", offset, offset + 4) === fourCC) return true;
+    const size = bytes.readUInt32LE(offset + 4);
+    offset += 8 + size + (size % 2);
+  }
+  return false;
+}
+
 function webpInfo(bytes: Buffer): ImageInfo | string {
   if (
     bytes.length < 30 ||
@@ -73,8 +87,8 @@ function webpInfo(bytes: Buffer): ImageInfo | string {
     const animatedFlag = (bytes[20] & 0x02) !== 0;
     const width = 1 + bytes.readUIntLE(24, 3);
     const height = 1 + bytes.readUIntLE(27, 3);
-    // An ANIM chunk anywhere also marks an animation (a writer that forgot the flag).
-    return { width, height, animated: animatedFlag || bytes.includes("ANIM", 30, "latin1") };
+    // A real ANIM chunk also marks an animation (a writer that forgot the flag).
+    return { width, height, animated: animatedFlag || hasRiffChunk(bytes, "ANIM") };
   }
   if (chunk === "VP8 ") {
     // Keyframe start code 9d 01 2a, then 14-bit width and height.

@@ -107,12 +107,12 @@ const RULES: Record<FieldKind, string> = {
 /**
  * Characters manifest text must not carry (OpenAI's package rules exclude them too): C0 and C1
  * controls, the Unicode line and paragraph separators, and the invisible direction controls
- * (LRM/RLM, embeddings/overrides, isolates), which can spoof a displayed plugin or developer.
+ * (LRM/RLM/ALM, embeddings/overrides, isolates), which can spoof a displayed plugin or developer.
  * `longDescription` may break lines with \n only.
  */
 const UNSAFE_TEXT =
   // eslint-disable-next-line no-control-regex -- the control characters are the point
-  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200e\u200f]/;
+  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/;
 const isText = (value: unknown, max: number, multiline = false): value is string =>
   typeof value === "string" &&
   value.length <= max &&
