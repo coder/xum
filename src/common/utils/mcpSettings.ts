@@ -86,10 +86,7 @@ function parseSchema(raw: unknown): MCPSettingSchema | undefined {
   if (raw.type === "boolean") return { ...base, type: "boolean" };
   if (raw.type === "string") {
     const enumValues = raw.enum;
-    if (
-      enumValues !== undefined &&
-      !(Array.isArray(enumValues) && enumValues.every(isEnumOption))
-    )
+    if (enumValues !== undefined && !(Array.isArray(enumValues) && enumValues.every(isEnumOption)))
       return undefined;
     if ([raw.minLength, raw.maxLength].some((n) => n !== undefined && !isLength(n)))
       return undefined;
