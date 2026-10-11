@@ -94,14 +94,14 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   /**
    * Read servers' structured settings into `serverSettings`, in one IPC call. A read that
    * started under an older open (generation) is dropped. `onOpen` reads only servers the
-   * workspace already runs (opening the dialog never starts one; Fetch Tools does) and drops
-   * failures: most servers have no settings, so a failed read must not claim "Settings
-   * unavailable" there.
+   * workspace already runs (opening the dialog never starts one; Fetch Tools does). A failed
+   * read shows as "Settings unavailable": servers without settings read as null, not as errors.
    */
   const readServerSettings = useCallback(
-    async (serverNames: string[], onOpen: boolean) => {
-      if (!api || serverNames.length === 0) return;
-      const generation = loadGeneration.current;
+    // `generation`: the open the caller started under. A Fetch Tools that began before a
+    // reopen (or a workspace switch) must not install its read into the new dialog.
+    async (serverNames: string[], onOpen: boolean, generation: number) => {
+      if (!api || serverNames.length === 0 || generation !== loadGeneration.current) return;
       let reads: Awaited<ReturnType<typeof api.mcp.settings.read>>;
       try {
         reads = await api.mcp.settings.read({ workspaceId, serverNames, ifConnected: onOpen });
@@ -113,7 +113,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
       const updates = new Map<string, ServerSettingsEntry | null>();
       for (const name of serverNames) {
         const read = getOwn(reads, name);
-        if (read === undefined || (onOpen && !read.success)) continue;
+        if (read === undefined) continue;
         if (!read.success) updates.set(name, { error: read.error });
         else if (read.data === null) updates.set(name, null);
         else if ("notConnected" in read.data) updates.set(name, read.data);
@@ -165,7 +165,11 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
             )
             .map(([name]) => name)
         );
-        void readServerSettingsRef.current([...savedEnabledServers.current], true);
+        void readServerSettingsRef.current(
+          [...savedEnabledServers.current],
+          true,
+          loadGeneration.current
+        );
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load MCP configuration");
       } finally {
@@ -201,7 +205,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
           // Enabled only in this unsaved dialog: the read would fail as "disabled". The
           // section appears after Save, on the next open.
           if (savedEnabledServers.current.has(serverName))
-            await readServerSettings([serverName], false);
+            await readServerSettings([serverName], false, generation);
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : `Failed to fetch tools for ${serverName}`);

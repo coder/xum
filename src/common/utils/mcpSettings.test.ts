@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   advertisedMCPSettingsToolNames,
+  MAX_MCP_SETTING_ENUM_OPTIONS,
   MAX_MCP_SETTINGS,
   parseMCPSettingsCapability,
   parseMCPSettingsReadResult,
@@ -126,6 +127,23 @@ describe("parseMCPSettingsReadResult", () => {
     // 20 groups of at most 100 items, then "Other settings" for the ungrouped properties.
     expect(result.layout).toHaveLength(21);
     expect(Math.max(...result.layout.map((group) => group.items.length))).toBe(100);
+  });
+
+  test("drops a setting with more enum options than a Select can show", () => {
+    const options = (n: number) => Array.from({ length: n }, (_, i) => `o${i}`);
+    const result = parseMCPSettingsReadResult({
+      schema: {
+        type: "object",
+        properties: {
+          ok: { type: "string", title: "Ok", enum: options(MAX_MCP_SETTING_ENUM_OPTIONS) },
+          huge: { type: "string", title: "Huge", enum: options(MAX_MCP_SETTING_ENUM_OPTIONS + 1) },
+        },
+      },
+      values: { ok: "o0", huge: "o0" },
+    });
+    if ("error" in result) throw new Error(result.error);
+    expect(Object.keys(result.properties)).toEqual(["ok"]);
+    expect(result.droppedSettingCount).toBe(1);
   });
 
   test("a result without an object schema is an error", () => {

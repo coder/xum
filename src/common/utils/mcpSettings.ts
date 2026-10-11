@@ -51,6 +51,8 @@ const MAX_VALUE_LENGTH = 4096;
 export const MAX_MCP_SETTINGS = 100;
 const MAX_LAYOUT_GROUPS = 20;
 const MAX_GROUP_ITEMS = 100;
+/** Options one Select can show; a setting with more is dropped (counted as not shown). */
+export const MAX_MCP_SETTING_ENUM_OPTIONS = 100;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -108,7 +110,14 @@ function parseSchema(raw: unknown): MCPSettingSchema | undefined {
   if (raw.type === "boolean") return { ...base, type: "boolean" };
   if (raw.type === "string") {
     const enumValues = raw.enum;
-    if (enumValues !== undefined && !(Array.isArray(enumValues) && enumValues.every(isEnumOption)))
+    if (
+      enumValues !== undefined &&
+      !(
+        Array.isArray(enumValues) &&
+        enumValues.length <= MAX_MCP_SETTING_ENUM_OPTIONS &&
+        enumValues.every(isEnumOption)
+      )
+    )
       return undefined;
     if ([raw.minLength, raw.maxLength].some((n) => n !== undefined && !isLength(n)))
       return undefined;

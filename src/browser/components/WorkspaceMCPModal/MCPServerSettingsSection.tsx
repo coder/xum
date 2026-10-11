@@ -83,6 +83,8 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
     }
   };
 
+  // Every control is disabled while a save is in flight (`saving`): the response replaces the
+  // draft, so an edit made meanwhile would be lost silently.
   const renderControl = (name: string, schema: MCPSettingSchema) => {
     const value = getOwn(draft, name);
     const label = `${schema.title} setting`;
@@ -92,6 +94,7 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
           checked={value === true}
           onCheckedChange={(checked) => setValue(name, checked)}
           aria-label={label}
+          disabled={saving}
         />
       );
     if (schema.type === "string" && schema.enum !== undefined) {
@@ -106,6 +109,7 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
           }))}
           onChange={(next) => setValue(name, options[Number(next)] ?? "")}
           aria-label={label}
+          disabled={saving}
           className="w-40 max-w-full"
         />
       );
@@ -116,6 +120,7 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
           value={typeof value === "string" ? value : ""}
           onChange={(event) => setValue(name, event.target.value)}
           aria-label={label}
+          disabled={saving}
           className="w-40 max-w-full"
         />
       );
@@ -132,6 +137,7 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
           setValue(name, event.target.value.trim() === "" ? NaN : Number(event.target.value));
         }}
         aria-label={label}
+        disabled={saving}
         className="w-28 max-w-full"
       />
     );

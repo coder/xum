@@ -67,6 +67,9 @@ interface WorkspaceMCPStoryOptions {
   /** Servers the workspace already runs (the dialog reads their settings on open). */
   settingsConnected?: string[];
   settingsReads?: string[][];
+  settingsReadErrors?: Record<string, string>;
+  settingsUpdateGate?: { promise: Promise<void> };
+  testGate?: { promise: Promise<void> };
 }
 
 function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): APIClient {
@@ -141,6 +144,9 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     ),
     mcpSettingsConnected: new Set(options.settingsConnected ?? []),
     mcpSettingsReads: options.settingsReads,
+    mcpSettingsReadErrors: new Map(Object.entries(options.settingsReadErrors ?? {})),
+    mcpSettingsUpdateGate: options.settingsUpdateGate,
+    mcpTestGate: options.testGate,
   });
 }
 
@@ -676,6 +682,52 @@ export const WorkspaceMCPServerSettingsOneRead: Story = {
   },
 };
 
+/** A connected server whose settings read fails shows the error on open (not silence). */
+export const WorkspaceMCPServerSettingsReadError: Story = {
+  render: () =>
+    renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settingsReadErrors: { cad: "settings read timed out" },
+    }),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    await expect(
+      modal.findByText("Settings unavailable: settings read timed out")
+    ).resolves.toBeInTheDocument();
+  },
+};
+
+/** A gate a play opens by hand: holds a mock request in flight. */
+function storyGate(): { promise: Promise<void>; open: () => void } {
+  let open: () => void = () => undefined;
+  const promise = new Promise<void>((resolve) => {
+    open = () => resolve();
+  });
+  return { promise, open };
+}
+
+const saveGate = storyGate();
+
+/** While a save is in flight the controls are locked, so no edit can be lost to its response. */
+export const WorkspaceMCPServerSettingsSaveInFlight: Story = {
+  render: () =>
+    renderWorkspaceMCPModal({ ...settingsStoryOptions(), settingsUpdateGate: saveGate }),
+  play: async ({ canvasElement }) => {
+    const section = within(
+      await within(await findWorkspaceMCPDialog(canvasElement)).findByTestId("mcp-server-settings")
+    );
+    const zoom = section.getByLabelText("Default zoom setting");
+    await userEvent.clear(zoom);
+    await userEvent.type(zoom, "3");
+    await userEvent.click(section.getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(zoom).toBeDisabled());
+    await expect(section.getByLabelText("Show grid setting")).toBeDisabled();
+    saveGate.open();
+    await waitFor(() => expect(zoom).toBeEnabled());
+    await expect(zoom).toHaveValue(3);
+  },
+};
+
 /**
  * A server enabled only in this unsaved dialog: Fetch Tools shows its tools, but its settings
  * are not read (the backend's saved enablement would refuse the read as disabled).
@@ -728,6 +780,50 @@ const ReopenableWorkspaceMCPModal: FC = () => {
       />
     </>
   );
+};
+
+const lateFetchGate = storyGate();
+const lateFetchReads: string[][] = [];
+
+/**
+ * A Fetch Tools still running when the dialog closes and reopens must not read settings into
+ * the new dialog (its generation is stale): only the reopen's own read happens.
+ */
+export const WorkspaceMCPServerSettingsLateFetch: Story = {
+  render: () => {
+    lateFetchReads.length = 0;
+    return (
+      <WorkspaceMCPModalStoryShell
+        setup={() =>
+          setupWorkspaceMCPModalStory({
+            ...settingsStoryOptions(),
+            testGate: lateFetchGate,
+            settingsReads: lateFetchReads,
+          })
+        }
+      >
+        <ReopenableWorkspaceMCPModal />
+      </WorkspaceMCPModalStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    await modal.findByTestId("mcp-server-settings");
+    await userEvent.click(modal.getByRole("button", { name: "Fetch Tools" }));
+    await userEvent.click(modal.getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
+    );
+    await userEvent.click(
+      within(canvasElement).getByRole("button", { name: "Open workspace MCP" })
+    );
+    await within(await findWorkspaceMCPDialog(canvasElement)).findByTestId("mcp-server-settings");
+    await waitFor(() => expect(lateFetchReads).toHaveLength(2));
+    lateFetchGate.open();
+    // Let the late Fetch Tools continuation run; it must not read again.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await expect(lateFetchReads).toHaveLength(2);
+  },
 };
 
 /** Pick `option` in a Radix select (its list renders in a portal). */
