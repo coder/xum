@@ -170,10 +170,11 @@ export interface McpAppHostOptions {
   /** Store the view's model context; it replaces the previous one ("" clears it). */
   updateModelContext: (text: string) => Promise<void>;
   /**
-   * Switch to a mode from availableDisplayModes other than the current one; returns the
-   * resulting mode (what getHostContext reports from now on).
+   * Prepare a switch to a mode from availableDisplayModes other than the current one: returns
+   * the move, or null when the host cannot show the view in that mode now (the mode stays).
+   * A move unmounts this instance, so the host runs it only once the view has its reply.
    */
-  setDisplayMode: (mode: McpAppDisplayMode) => McpAppDisplayMode;
+  setDisplayMode: (mode: McpAppDisplayMode) => (() => void) | null;
   requestConsent: (request: McpAppConsentRequest) => Promise<boolean>;
   insertIntoComposer: (text: string) => void;
   openExternalLink: (url: string) => void;
@@ -219,6 +220,27 @@ export function createMcpAppHost(options: McpAppHostOptions) {
     options.postToView({ jsonrpc: "2.0", id, error: { code, message } });
   const notify = (method: string, params: unknown) =>
     options.postToView({ jsonrpc: "2.0", method, params });
+
+  /** ui/resource-teardown; resolves when the view replies or after the bounded wait. */
+  const teardown = (reason: string): Promise<void> => {
+    const id = `host-${nextHostRequestId++}`;
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        pendingHostRequests.delete(id);
+        resolve();
+      }, MCP_APP_TEARDOWN_TIMEOUT_MS);
+      pendingHostRequests.set(id, () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      options.postToView({
+        jsonrpc: "2.0",
+        id,
+        method: "ui/resource-teardown",
+        params: { reason },
+      });
+    });
+  };
 
   async function handleRequest(id: string | number, method: string, params: unknown) {
     switch (method) {
@@ -319,14 +341,21 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         const requested = context.availableDisplayModes.find((mode) => mode === parsed.data.mode);
         // An unavailable mode, or one the view did not declare (the host MUST NOT switch to it),
         // leaves the mode unchanged; the spec has the host return the current mode, not fail.
-        const mode =
+        const move =
           requested !== undefined &&
           requested !== current &&
           (viewDisplayModes?.includes(requested) ?? true)
-            ? viewMode(options.setDisplayMode(requested))
-            : current;
+            ? options.setDisplayMode(requested)
+            : null;
+        const mode = move != null && requested !== undefined ? requested : current;
         respond(id, { mode });
         displayModeChanged(mode);
+        if (move == null) return;
+        // The move unmounts this instance, and a frame removed before a queued postMessage
+        // runs never gets it. The teardown reply comes after the view handled the mode reply
+        // (messages arrive in order), and the view must get a teardown before it goes anyway.
+        await teardown("display-mode");
+        move();
         return;
       }
       case "ui/open-link": {
@@ -444,26 +473,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
       if (!initialized) return;
       notify("ui/notifications/host-context-changed", context);
     },
-    /** ui/resource-teardown; resolves when the view replies or after the bounded wait. */
-    teardown(reason: string): Promise<void> {
-      const id = `host-${nextHostRequestId++}`;
-      return new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          pendingHostRequests.delete(id);
-          resolve();
-        }, MCP_APP_TEARDOWN_TIMEOUT_MS);
-        pendingHostRequests.set(id, () => {
-          clearTimeout(timer);
-          resolve();
-        });
-        options.postToView({
-          jsonrpc: "2.0",
-          id,
-          method: "ui/resource-teardown",
-          params: { reason },
-        });
-      });
-    },
+    teardown,
   };
 }
 

@@ -13,7 +13,7 @@ import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
-import type { McpAppViewRef } from "./mcpAppViewsStore";
+import { markMcpAppViewHosted, type McpAppViewRef } from "./mcpAppViewsStore";
 
 // The card's display values: the aggregated tool name and the pre-sanitization arguments.
 const VIEW: McpAppViewRef = {
@@ -529,19 +529,28 @@ describe("McpAppFrame host strips", () => {
   });
 
   test("fullscreen from the card moves the view to its tab; inline from the tab closes it", async () => {
+    // Whether the requester already had its reply when the move (which unmounts it) ran.
+    const repliedAtMove: boolean[] = [];
+    let posted: Posted[] = [];
     const opened: string[] = [];
-    const onOpen = (e: Event) =>
+    const onOpen = (e: Event) => {
+      repliedAtMove.push(posted.some((m) => m.id === 2));
       opened.push((e as CustomEvent<{ toolCallId: string }>).detail.toolCallId);
+    };
     window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
     let closed = 0;
+    const onClose = () => {
+      repliedAtMove.push(posted.some((m) => m.id === 2));
+      closed++;
+    };
     try {
       const run = async (variant: "inline" | undefined, mode: string) => {
         const view = render(
-          <McpAppFrame workspaceId="ws" view={VIEW} variant={variant} onClose={() => closed++} />,
+          <McpAppFrame workspaceId="ws" view={VIEW} variant={variant} onClose={onClose} />,
           { wrapper: Wrapper }
         );
         const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
-        const posted = capturePosted(frame);
+        posted = capturePosted(frame);
         postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
         await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
         postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
@@ -552,6 +561,14 @@ describe("McpAppFrame host strips", () => {
           params: { mode },
         });
         await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+        // A move waits for the view to answer the teardown: its proof that the reply arrived.
+        const moves = opened.length + closed;
+        const teardown = posted.find((m) => m.method === "ui/resource-teardown");
+        if (teardown !== undefined) {
+          expect(opened.length + closed).toBe(moves);
+          postFromView(frame, { jsonrpc: "2.0", id: teardown.id, result: {} });
+          await waitFor(() => expect(opened.length + closed).toBe(moves + 1));
+        }
         const initial = (
           posted.find((m) => m.id === 1)?.result as {
             hostContext: { displayMode: string; availableDisplayModes: string[] };
@@ -569,12 +586,22 @@ describe("McpAppFrame host strips", () => {
       expect(card.reply).toEqual({ mode: "fullscreen" });
       expect(opened).toEqual(["call-1"]);
       expect(closed).toBe(0);
-      // The tab instance is fullscreen; inline closes the tab (the card takes the view back).
-      const tab = await run(undefined, "inline");
-      expect(tab.initial.displayMode).toBe("fullscreen");
-      expect(tab.reply).toEqual({ mode: "inline" });
+      // The tab instance is fullscreen. With no expanded card to return to, inline is declined.
+      const noCard = await run(undefined, "inline");
+      expect(noCard.initial.displayMode).toBe("fullscreen");
+      expect(noCard.reply).toEqual({ mode: "fullscreen" });
+      expect(closed).toBe(0);
+      // With an expanded card, inline closes the tab (the card takes the view back).
+      const unmarkCard = markMcpAppViewHosted("ws", "call-1", "card");
+      try {
+        const tab = await run(undefined, "inline");
+        expect(tab.reply).toEqual({ mode: "inline" });
+      } finally {
+        unmarkCard();
+      }
       expect(closed).toBe(1);
       expect(opened).toEqual(["call-1"]);
+      expect(repliedAtMove).toEqual([true, true]);
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
     }
