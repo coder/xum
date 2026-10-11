@@ -299,7 +299,8 @@ export const ContextSettings: AppStory = {
     const page = within(canvasElement.ownerDocument.body);
     const dialog = await page.findByRole("dialog");
     // The slider is the handoff target itself; no force buffer is advertised.
-    await expect(within(dialog).getByText(/Handoff target: 70%/)).toBeVisible();
+    // The label switches to the handoff wording once the experiment flags arrive.
+    await expect(await within(dialog).findByText(/Handoff target: 70%/)).toBeVisible();
     await expect(within(dialog).queryByText(/Rolls over by/)).not.toBeInTheDocument();
     await expect(within(dialog).getByText("Idle compaction", { exact: true })).toBeVisible();
     await expect(within(dialog).getByText("/compact", { exact: true })).toBeVisible();

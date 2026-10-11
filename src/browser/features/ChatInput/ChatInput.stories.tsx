@@ -1053,7 +1053,10 @@ async function assertDockSurfacesMatchTranscript(
     surfaces.push([label, element]);
   };
   addSurface("composer", '[data-component="ChatInputSurface"]');
-  addSurface("decoration", '[data-component="ChatInputDecorationStack"] button');
+  // The background-process decoration can mount after the composer autofocuses.
+  await waitFor(() =>
+    addSurface("decoration", '[data-component="ChatInputDecorationStack"] button')
+  );
   const wrapped = storyRoot.querySelectorAll<HTMLElement>('[data-component="ChatDockSurface"]');
   if (wrapped.length === 0) throw new Error("No ChatDockSurface-wrapped entry rendered");
   wrapped.forEach((element, index) => surfaces.push([`wrapped surface ${index}`, element]));

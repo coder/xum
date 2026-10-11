@@ -413,20 +413,22 @@ const selectedTab = (root: HTMLElement) => [
  */
 async function expectCodeReadable(canvasElement: HTMLElement, theme: ThemeMode) {
   await within(canvasElement).findByText("Renamed", { exact: false }, { timeout: 15_000 });
-  const tokens = await findTexts("highlighted token", 8, () => shikiTokens(canvasElement));
   // The diff's added and removed lines carry a green and a red tint over the code background.
+  // Look the tokens up on every retry: the diff can highlight after the first 8 tokens render.
   await waitFor(() => {
+    const found = shikiTokens(canvasElement);
     for (const tint of ["--color-success", "--color-danger"]) {
-      if (!tokens.some((token) => token.element.closest(`[style*="${tint}"]`))) {
+      if (!found.some((token) => token.closest(`[style*="${tint}"]`))) {
         throw new Error(`no highlighted token on a ${tint} diff line yet`);
       }
     }
     // The seeded review highlights diff lines; tokens there sit on the darkest light
     // backgrounds, so at least one must be measured (#6006).
-    if (!tokens.some((token) => isOnReviewHighlight(token.element))) {
+    if (!found.some(isOnReviewHighlight)) {
       throw new Error("no highlighted token on a review-highlighted line yet");
     }
   });
+  const tokens = await findTexts("highlighted token", 8, () => shikiTokens(canvasElement));
   const inlineCode = await findTexts("inline code", 2, () =>
     [...canvasElement.querySelectorAll<HTMLElement>(".markdown-content code")].filter(
       (code) => !code.closest("pre")
@@ -530,12 +532,12 @@ const diffGutterStory = (theme: ThemeMode): AppStory => ({
  */
 async function expectDarkCodeReadable(canvasElement: HTMLElement) {
   await within(canvasElement).findByText("Renamed", { exact: false }, { timeout: 15_000 });
-  const tokens = await findTexts("highlighted token", 8, () => shikiTokens(canvasElement));
   await waitFor(() => {
-    if (!tokens.some((token) => isOnReviewHighlight(token.element))) {
+    if (!shikiTokens(canvasElement).some(isOnReviewHighlight)) {
       throw new Error("no highlighted token on a review-highlighted line yet");
     }
   });
+  const tokens = await findTexts("highlighted token", 8, () => shikiTokens(canvasElement));
   await expectReadable(tokens);
 
   const replacements = Object.values(SHIKI_COLOR_REPLACEMENTS[SHIKI_DARK_THEME]);
