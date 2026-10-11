@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { flushSync } from "react-dom";
 import { AppWindow, BarChart3, Bell, BellOff, Ellipsis, Info, Menu, Pencil } from "lucide-react";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -265,12 +266,24 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // full-screen, like every other tab. They used to open dialogs of their own (#5767, #5795).
   // Focus returns to `returnFocusTo` when the view closes.
   // Already open (Shift+T from another full-screen tab): only switch the tab, so focus still
-  // returns to the control that opened the view.
+  // returns to the control that opened the view. The switch unmounts the old tab's panel, so if
+  // focus was in it, it moves to the new tab instead of falling out of the view. flushSync
+  // commits the switch first, so that tab is in the DOM.
   const openSidebarTab = useCallback(
     (tab: TabType, returnFocusTo: HTMLElement | null) => {
       if (onOpenSidebar == null) return;
-      focusRightSidebarTab(workspaceId, tab);
-      if (!sidebarFullscreen) onOpenSidebar(returnFocusTo);
+      if (!sidebarFullscreen) {
+        focusRightSidebarTab(workspaceId, tab);
+        onOpenSidebar(returnFocusTo);
+        return;
+      }
+      flushSync(() => focusRightSidebarTab(workspaceId, tab));
+      if (document.activeElement == null || document.activeElement === document.body) {
+        menuBarRef.current
+          ?.closest("[data-workspace-shell]")
+          ?.querySelector<HTMLElement>(`[role="tab"][aria-selected="true"][id$="-tab-${tab}"]`)
+          ?.focus();
+      }
     },
     [onOpenSidebar, sidebarFullscreen, workspaceId]
   );
@@ -932,9 +945,10 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         {isPhoneHeader ? (
           // Touch phones: the terminal opens as a pop-out window, which mobile Safari does not
           // show, so the header row offers Stats and Artifacts (the hidden right sidebar's tabs)
-          // and New terminal moves into the More menu. They stay mounted while the full-screen
-          // sidebar shows (it is visible then), so focus can return to them when it closes.
-          (timelineSidebarHidden || sidebarFullscreen) && (
+          // and New terminal moves into the More menu. Not gated on the sidebar being hidden: at
+          // phone widths it always is, except while the full-screen view shows it, and the
+          // buttons must stay mounted then so focus can return to them when it closes.
+          (
             <>
               <Tooltip>
                 <TooltipTrigger asChild>

@@ -678,7 +678,19 @@ export const IPhone16eStats: AppStory = {
     // The full-screen sidebar shows the Stats tab with its sub-tabs.
     const sidebar = await canvas.findByRole("complementary", { name: "Workspace insights" });
     await waitFor(() => expect(sidebar).toBeVisible());
-    await within(sidebar).findByRole("button", { name: "Timing" }, { timeout: 10_000 });
+    const timing = await within(sidebar).findByRole(
+      "button",
+      { name: "Timing" },
+      { timeout: 10_000 }
+    );
+
+    // With the view open, the Timeline shortcut switches its tab. Focus was in the Stats panel,
+    // which the switch unmounts, so it moves to the Timeline tab instead of leaving the view.
+    timing.focus();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "T", shiftKey: true }));
+    const timelineTab = within(sidebar).getByRole("tab", { name: /Timeline/ });
+    await expect(timelineTab).toHaveAttribute("aria-selected", "true");
+    await expect(timelineTab).toHaveFocus();
 
     blurActiveElement();
   },

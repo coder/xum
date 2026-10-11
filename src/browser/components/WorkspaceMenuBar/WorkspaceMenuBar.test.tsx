@@ -655,10 +655,13 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       stubMatchMedia((query) => query === "(max-width: 480px) and (pointer: coarse)");
       setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
       const view = render(<WorkspaceMenuBar {...defaultProps} sidebarFullscreen />);
-
-      // Focus returns to them when the view closes, so they must not unmount meanwhile.
-      expect(view.getByRole("button", { name: "Stats" })).toBeTruthy();
+      const stats = view.getByRole("button", { name: "Stats" });
       expect(view.getByRole("button", { name: "Artifacts" })).toBeTruthy();
+
+      // Focus returns to them when the view closes, so they must not unmount meanwhile, not
+      // even in the closing render, before the hidden sidebar is measured again.
+      view.rerender(<WorkspaceMenuBar {...defaultProps} sidebarFullscreen={false} />);
+      expect(view.getByRole("button", { name: "Stats" })).toBe(stats);
     });
 
     it("touch phones swap the header terminal button for Stats and Artifacts", () => {
