@@ -47,6 +47,7 @@ function fakeLaunch(
       probes.push(ledger);
       return Promise.resolve({ status: probeStatus, records: [{ outcome: "settled" }] });
     },
+    checkDocker: () => Promise.resolve(),
     launchJob: async (args, o) => {
       const call = { args, o };
       calls.push(call);
@@ -186,7 +187,16 @@ test.each([
   ["an unpriced app model", { BUGBASH_APP_MODEL: "anthropic:claude-x-9" }, /only a priced/],
   ["no budget", { BUGBASH_BUDGET_USD: "" }, /BUGBASH_BUDGET_USD/],
   ["no key", { ANTHROPIC_API_KEY: "" }, /ANTHROPIC_API_KEY/],
-  ["an OpenAI model", { BUGBASH_MODELS: "openai:gpt-6.1-sol" }, /only anthropic/],
+  [
+    "an OpenAI model",
+    { BUGBASH_MODELS: "openai:gpt-6.1-sol" },
+    /BUGBASH_MODELS entry "openai:gpt-6.1-sol": only anthropic/,
+  ],
+  [
+    "BUGBASH_MODEL, which run.ts would ignore",
+    { BUGBASH_MODEL: "anthropic:x" },
+    /use BUGBASH_MODELS/,
+  ],
 ])("B2: %s refuses (exit 2) before any job or folder", async (_name, over, message) => {
   const { deps, calls, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
   const stop = new AbortController().signal;
@@ -252,4 +262,74 @@ test("B3: a proxy fault in the probe stops the run before any job (exit 5)", asy
   const stop = new AbortController().signal;
   expect(await runBugBash([...charters("a")], ENV, stop, deps)).toBe(5);
   expect(calls).toHaveLength(0);
+});
+
+test("U1: a refusal the launcher returns (after docker started) names its reason", async () => {
+  // A returned refusal, as when `docker info` fails: once in the log, once on stderr.
+  const { deps, lines } = fakeLaunch((call) =>
+    call.args.includes("look at a")
+      ? { error: new Refusal("docker info: no daemon answered"), cleanup: "none" }
+      : { code: 0, cleanup: "removed" }
+  );
+  const stop = new AbortController().signal;
+  expect(await runBugBash([...charters("a", "b")], ENV, stop, deps)).toBe(2);
+  expect(lines).toContain(
+    "  a [anthropic:claude-sonnet-5-5]: refused: docker info: no daemon answered"
+  );
+  const runDir = lines.find((line) => line.includes(" -> "))!.split(" -> ")[1];
+  const log = path.join(runDir, "anthropic_claude-sonnet-5-5", "a.log");
+  expect(fs.readFileSync(log, "utf8")).toContain(
+    "sandbox refused: docker info: no daemon answered"
+  );
+});
+
+test("U1: a run whose every charter refuses, with no call made, keeps no run folder", async () => {
+  const { deps, lines } = fakeLaunch(() => ({
+    error: new Refusal("stale image"),
+    cleanup: "none",
+  }));
+  const stop = new AbortController().signal;
+  const env = { ...ENV, BUGBASH_AI: "mock" }; // no probe, so no proxied call
+  expect(await runBugBash([...charters("a", "b")], env, stop, deps)).toBe(2);
+  const runDir = lines.find((line) => line.includes(" -> "))!.split(" -> ")[1];
+  expect(fs.existsSync(runDir)).toBe(false);
+  expect(lines.filter((line) => line.endsWith("refused: stale image"))).toHaveLength(2);
+});
+
+test("U1: Docker is checked once, before the probe and any folder; --preflight stops there", async () => {
+  const dead = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  let checks = 0;
+  dead.deps.checkDocker = () => {
+    checks += 1;
+    return Promise.reject(new Refusal("docker info: no daemon answered"));
+  };
+  const stop = new AbortController().signal;
+  expect(await runBugBash([...charters("a", "b")], ENV, stop, dead.deps)).toBe(2);
+  expect(checks).toBe(1);
+  expect(dead.probes).toHaveLength(0);
+  expect(dead.calls).toHaveLength(0);
+  expect(dead.lines).toEqual(["make bug-bash: docker info: no daemon answered"]);
+
+  const live = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  let liveChecks = 0;
+  live.deps.checkDocker = () => Promise.resolve(void (liveChecks += 1));
+  expect(await runBugBash([...charters("a"), "--preflight"], ENV, stop, live.deps)).toBe(0);
+  expect(liveChecks).toBe(1);
+  expect(live.probes).toHaveLength(0);
+  expect(live.calls).toHaveLength(0);
+  expect(live.lines.some((line) => line.includes(" -> "))).toBe(false);
+});
+
+test("U1: a probe the budget refused (HTTP 402) blames the budget, not the key", async () => {
+  const { deps, calls, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }), 402);
+  deps.probeApp = () =>
+    Promise.resolve({
+      status: 402,
+      records: [{ outcome: "refused", reason: "budget: call does not fit the remaining budget" }],
+    });
+  const stop = new AbortController().signal;
+  expect(await runBugBash([...charters("a")], ENV, stop, deps)).toBe(2);
+  expect(calls).toHaveLength(0);
+  expect(lines.join("\n")).toMatch(/BUGBASH_BUDGET_USD \(\$2\) is too small to cover/);
+  expect(lines.join("\n")).not.toMatch(/Fix the key/);
 });

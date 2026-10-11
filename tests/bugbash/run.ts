@@ -46,6 +46,7 @@ import { parseArgs } from "node:util";
 import { DEFAULT_APP_MODEL } from "./aiMode";
 import { EXPLORE_CONFIGS } from "./sandbox/inputs";
 import {
+  checkDocker,
   JOB_EXIT_3,
   type JobOutcome,
   launchJob,
@@ -267,6 +268,7 @@ function jobMode(ai: AppAi, appModel: string): Record<string, string | undefined
 export interface RunDeps {
   launchJob: typeof launchJob;
   probeApp?: typeof probeApp;
+  checkDocker?: typeof checkDocker;
   /** Progress lines (default stdout) and problems (default stderr). */
   out?: (line: string) => void;
   err?: (line: string) => void;
@@ -303,6 +305,8 @@ export async function runBugBash(
       // Total explorers (containers) at once across all models.
       parallel: { type: "string", default: "8" },
       "max-steps": { type: "string", default: "6" },
+      // The Makefile's check before the build: every check below, Docker too, then exit 0.
+      preflight: { type: "boolean", default: false },
     },
   });
   const parallel = Number(values.parallel);
@@ -333,6 +337,11 @@ export async function runBugBash(
   }
   assert(charters.length > 0, "no charters selected");
 
+  // run.ts reads BUGBASH_MODELS; the launcher's BUGBASH_MODEL would be ignored without a word.
+  if ((env.BUGBASH_MODEL ?? "") !== "") {
+    err("make bug-bash: unset BUGBASH_MODEL: use BUGBASH_MODELS=anthropic:<model>[,...]");
+    return 2;
+  }
   const models = readModels(env);
   // Must match the default in e2e.config.ts; it only labels the output here.
   const effort = env.BUGBASH_EFFORT ?? "medium";
@@ -345,7 +354,8 @@ export async function runBugBash(
   // Every model, the budget and the provider settings, before any folder or job (launch.ts).
   let job0: ModelJob | undefined;
   try {
-    for (const model of models) job0 = modelJob({ ...env, BUGBASH_MODEL: model });
+    for (const model of models)
+      job0 = modelJob({ ...env, BUGBASH_MODEL: model }, "BUGBASH_MODELS entry");
   } catch (error) {
     if (!(error instanceof Refusal)) throw error;
     err(`make bug-bash: ${error.message}`);
@@ -357,14 +367,24 @@ export async function runBugBash(
   const mockPin: AppAi = { mode: "mock", reason: "the charter names a [mock:...] prompt" };
   const needsMock = (charter: Charter) => charter.goal.includes("[mock:");
   const appModel = env.BUGBASH_APP_MODEL ?? DEFAULT_APP_MODEL;
+  const probing = requested !== "mock" && !charters.every(needsMock);
+  const [provider, id] = appModel.split(/:(.*)/s, 2);
+  if (probing && (provider !== "anthropic" || !id || !priced(id))) {
+    err(`make bug-bash: BUGBASH_APP_MODEL "${appModel}": only a priced anthropic:<model> runs`);
+    return 2;
+  }
+  // Docker once for the run, before the probe and any folder: not once per charter.
+  try {
+    await (deps.checkDocker ?? checkDocker)({ root: repoRoot, stop });
+  } catch (error) {
+    if (!(error instanceof Refusal)) throw error;
+    err(`make bug-bash: ${error.message}`);
+    return 2;
+  }
+  if (values.preflight) return 0;
   let runAi: AppAi = { mode: "mock", reason: "BUGBASH_AI=mock" };
   let probeRecords: object[] = [];
-  if (requested !== "mock" && !charters.every(needsMock)) {
-    const [provider, id] = appModel.split(/:(.*)/s, 2);
-    if (provider !== "anthropic" || !id || !priced(id)) {
-      err(`make bug-bash: BUGBASH_APP_MODEL "${appModel}": only a priced anthropic:<model> runs`);
-      return 2;
-    }
+  if (probing) {
     let status: number;
     try {
       ({ status, records: probeRecords } = await (deps.probeApp ?? probeApp)(
@@ -384,7 +404,15 @@ export async function runBugBash(
     if (status === 200) runAi = { mode: "real", reason: `${appModel} answered the probe` };
     else if (requested === "auto" && unavailable)
       runAi = { mode: "mock", reason: `upstream unavailable (probe HTTP ${status})` };
-    else {
+    else if (
+      probeRecords.some((r) => String((r as { reason?: unknown }).reason).startsWith("budget:"))
+    ) {
+      // The proxy refused the probe itself (HTTP 402): no call left, so the key is not at fault.
+      err(
+        `make bug-bash: BUGBASH_BUDGET_USD ($${budgetUsd}) is too small to cover the ${appModel} probe. Raise it, or set BUGBASH_AI=mock.`
+      );
+      return 2;
+    } else {
       err(
         `make bug-bash: ${appModel} probe failed (HTTP ${status}). Fix the key or base URL, or set BUGBASH_AI=mock.`
       );
@@ -436,6 +464,8 @@ export async function runBugBash(
   let unknownCleanup = false;
   const results: CharterResult[] = [];
   let next = 0;
+  /** Jobs that reached the launcher's job run (no refusal or launcher error). */
+  let launched = 0;
   async function worker(): Promise<void> {
     while (next < jobs.length && !stop.aborted && !halt.signal.aborted) {
       const job = jobs[next++];
@@ -459,12 +489,18 @@ export async function runBugBash(
         });
       } catch (error) {
         // A refusal before any docker command; anything else is a launcher bug.
-        const message = error instanceof Error ? error.message : String(error);
-        fs.writeSync(fd, `sandbox refused: ${message}\n`);
         outcome = { error, cleanup: "none" };
-      } finally {
-        fs.closeSync(fd);
       }
+      // A refusal thrown or returned (a later docker refusal): its reason goes to the charter
+      // log and to stderr, or the run shows only "setup error or refused".
+      if ("error" in outcome) {
+        const { error } = outcome;
+        const message = error instanceof Error ? error.message : String(error);
+        const what = error instanceof Refusal ? "refused" : "failed";
+        fs.writeSync(fd, `sandbox ${what}: ${message}\n`);
+        err(`  ${name}: ${what}: ${message}`);
+      } else launched += 1;
+      fs.closeSync(fd);
       if (outcome.cleanup.startsWith("unknown")) unknownCleanup = true;
       // A fault that close() found (a call that outlived it) has no earlier signal.
       if (outcome.proxyFault != null) onFault(name, outcome.proxyFault);
@@ -488,6 +524,13 @@ export async function runBugBash(
   await Promise.all(Array.from({ length: Math.min(parallel, jobs.length) }, worker));
 
   results.sort((a, b) => jobs.indexOf(a.job) - jobs.indexOf(b.job));
+  // Every charter refused and nothing was spent: the folder would hold only the refusals that
+  // stderr already shows. A run that made a proxied call keeps it, as the record of that call.
+  if (launched === 0 && !stop.aborted && fault == null && ledger.totals().calls === 0) {
+    fs.rmSync(runDir, { recursive: true, force: true });
+    err("Every charter refused: no run folder kept.");
+    return Math.max(2, ...results.map((r) => r.exitCode));
+  }
   const findingsFile = path.join(runDir, "findings.md");
   writeFindings(findingsFile, results, models, effort, ledger, runAi);
   out(`Findings: ${findingsFile}`);

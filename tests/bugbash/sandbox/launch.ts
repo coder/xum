@@ -108,14 +108,15 @@ export interface ModelJob {
  * Reads a model-driven job from the host env, before any docker command. Refusal texts never
  * hold the key or the base URL.
  */
-export function modelJob(env: NodeJS.ProcessEnv): ModelJob {
+export function modelJob(env: NodeJS.ProcessEnv, modelVar = "BUGBASH_MODEL"): ModelJob {
   const spec = env.BUGBASH_MODEL ?? MCP_APPS_MODEL;
   const [provider, model] = spec.split(/:(.*)/s, 2);
+  // `modelVar` names the variable the user set (run.ts: a BUGBASH_MODELS entry).
+  const named = `${modelVar} ${JSON.stringify(spec)}`;
   if (provider !== "anthropic" || !model)
-    throw new Refusal(`BUGBASH_MODEL ${JSON.stringify(spec)}: only anthropic:<model> runs here`);
+    throw new Refusal(`${named}: only anthropic:<model> runs here`);
   // The proxy refuses every call of a model it cannot price, so the job could only fail.
-  if (!priced(model))
-    throw new Refusal(`BUGBASH_MODEL ${JSON.stringify(spec)}: the proxy has no price for it`);
+  if (!priced(model)) throw new Refusal(`${named}: the proxy has no price for it`);
   const budget = env.BUGBASH_BUDGET_USD ?? "";
   if (!/^\d+(\.\d+)?$/.test(budget) || !(Number(budget) > 0))
     throw new Refusal("set BUGBASH_BUDGET_USD: the most this run may spend at list price, in $");
@@ -179,6 +180,31 @@ export async function probeApp(
     return { status, records };
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The Docker part of a preflight: the local daemon answers, it is supported, and the pinned
+ * image is present (pulled when missing). The Makefile runs it before the build, so a missing
+ * daemon refuses in about a second instead of after it. Throws a Refusal; leaves no folder.
+ */
+export async function checkDocker(o: { root: string; stop: AbortSignal }): Promise<void> {
+  const session = new Session(o.stop, { root: o.root, log: logLine });
+  try {
+    await session.ensureImage();
+  } finally {
+    await session.cleanup();
+  }
+}
+
+/** Removes the per-checkout folder and its parent once empty: other jobs may still use them. */
+function removeEmptyParents(jobDir: string) {
+  for (const dir of [path.dirname(jobDir), path.dirname(path.dirname(jobDir))]) {
+    try {
+      fs.rmdirSync(dir);
+    } catch {
+      return; // not empty (another job), or already gone
+    }
   }
 }
 
@@ -365,9 +391,8 @@ function selfCheckRefusal(args: string[]): string | null {
   return null;
 }
 
-/** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
-export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
-  const log = o.log ?? logLine;
+/** The checks of a job that need no docker command. Throws a Refusal. */
+function checkJob(args: string[], o: LaunchOptions) {
   const dir = path.join(o.root, "tests/bugbash");
   const mcpApps = exactStepRefusal(args, o.cwd, dir, MCP_APPS_CONFIG) == null;
   const selfCheck = args[0] === "self-check";
@@ -387,6 +412,19 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   // First, before any docker command and before the container env exists.
   const ai = appAi(o.env, args[0] === "explore");
   const driven = mcpApps || selfCheck || args[0] === "explore" ? modelJob(o.env) : undefined;
+  return { dir, selfCheck, ai, driven };
+}
+
+/** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
+export async function preflight(args: string[], o: LaunchOptions): Promise<void> {
+  checkJob(args, o);
+  await checkDocker(o);
+}
+
+/** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
+export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
+  const log = o.log ?? logLine;
+  const { dir, selfCheck, ai, driven } = checkJob(args, o);
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -449,8 +487,16 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
           : `leftover: ${entry.job.name} owner ${ownerState(entry.job.owner)} (make bug-bash-sandbox-recover)`
       );
     const image = await session.ensureImage();
-    fs.mkdirSync(path.dirname(jobDir), { recursive: true, mode: 0o700 });
-    fs.mkdirSync(jobDir, { mode: 0o700 }); // EEXIST: not this job's folder, so cleanup keeps it
+    // Another job's cleanup can remove the empty per-checkout folder between the two mkdirs.
+    for (let attempt = 1; ; attempt++) {
+      fs.mkdirSync(path.dirname(jobDir), { recursive: true, mode: 0o700 });
+      try {
+        fs.mkdirSync(jobDir, { mode: 0o700 }); // EEXIST: not this job's folder, so cleanup keeps it
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT" || attempt === 3) throw error;
+      }
+    }
     made = true;
     const staged = path.join(jobDir, "stage");
     log(`${name} staged ${stage(o.root, staged)} files`);
@@ -560,6 +606,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   }
   const cleanup = await session.cleanup();
   if (made) fs.rmSync(jobDir, { recursive: true, force: true });
+  removeEmptyParents(jobDir);
   log(`${name} cleanup: ${cleanup}`);
   if (missed != null) log(`${name} ${missed}`);
   return {
@@ -580,7 +627,15 @@ if (import.meta.main) {
   const args = given[0] === "--" ? given.slice(1) : given;
   const options = { root: ROOT, cwd: process.cwd(), env: process.env, stop: controller.signal };
   const recovering = args.length === 1 && args[0] === "--recover";
-  (recovering ? recover(options) : launch(args, options)).then(
+  // `--preflight -- <job args>`: the job's checks and the Docker check, then exit 0.
+  const checking = args[0] === "--preflight";
+  const job = checking ? args.slice(args[1] === "--" ? 2 : 1) : args;
+  const run = recovering
+    ? recover(options)
+    : checking
+      ? preflight(job, options).then(() => 0)
+      : launch(args, options);
+  run.then(
     (code) => process.exit(code),
     (error: unknown) => {
       if (error instanceof Stopped) {

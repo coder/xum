@@ -596,7 +596,8 @@ function prepare(over: Record<string, string> = {}, leftovers: string[] = []) {
 function expectNothingLeft() {
   expect(fs.readFileSync(path.join(bin, "containers"), "utf8").trim().split("\n")).toEqual(FOREIGN);
   const left = fs.readdirSync(tmp, { recursive: true }).map(String);
-  expect(left.filter((p) => /xbb-|xum-bugbash-(docker|proxy)/.test(p))).toEqual([]);
+  // xum-bugbash-sandbox too: no empty per-checkout folder stays behind.
+  expect(left.filter((p) => /xbb-|xum-bugbash-(docker|proxy|sandbox)/.test(p))).toEqual([]);
   expect(calls()).not.toMatch(/^(rmi|image rm|image prune|system prune)/m);
 }
 
