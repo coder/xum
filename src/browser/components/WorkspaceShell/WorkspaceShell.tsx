@@ -205,15 +205,18 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   // opens them in the sidebar itself, shown full-screen. The real sidebar (not a copy in a
   // dialog) keeps its tabs and panel state. Keyed by workspace: a switch closes it for good
   // (render-time reset, so it does not reopen on the way back). Immersive review covers the
-  // workspace on its own, so it wins.
+  // workspace on its own, so it wins and closes it.
   const [fullscreenSidebarWorkspaceId, setFullscreenSidebarWorkspaceId] = useState<string | null>(
     null
   );
-  if (fullscreenSidebarWorkspaceId !== null && fullscreenSidebarWorkspaceId !== props.workspaceId) {
+  // Immersive review closes it for good too: it is not reopened once immersive review ends.
+  if (
+    fullscreenSidebarWorkspaceId !== null &&
+    (fullscreenSidebarWorkspaceId !== props.workspaceId || isReviewImmersive)
+  ) {
     setFullscreenSidebarWorkspaceId(null);
   }
-  const sidebarFullscreen =
-    fullscreenSidebarWorkspaceId === props.workspaceId && !isReviewImmersive;
+  const sidebarFullscreen = fullscreenSidebarWorkspaceId === props.workspaceId;
   const openSidebarToolRef = useRef<((tool: SidebarMenuItem) => void) | null>(null);
   // Focus returns here when the full-screen sidebar closes (the menu button, or wherever the
   // shortcut was pressed).

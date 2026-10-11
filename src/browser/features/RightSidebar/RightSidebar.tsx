@@ -12,7 +12,10 @@ import { trimRecordToChars } from "@/browser/utils/boundedPersistedValue";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import {
+  DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
+  isDesktopMode,
+} from "@/browser/hooks/useDesktopTitlebar";
 import {
   readPersistedState,
   updatePersistedState,
@@ -1951,6 +1954,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     setCollapsed(false);
     const tabsetId = getBaseLayout().focusedTabsetId;
     if (item === "side-chat") {
+      // Show the pane's New tab first: its Side chat row shows the pending creation, the new
+      // chat replaces it once created, and a failed creation leaves the launcher (as on desktop),
+      // not whatever tool happened to be open.
+      setLayout((prev) => addNewTabToTabset(prev, tabsetId));
       handleOpenSideChatFromNewTab(tabsetId);
     } else {
       handleOpenToolFromNewTab(tabsetId, item);
@@ -2294,7 +2301,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
           // Shown only by the full-screen CSS (globals.css); also the probe for "layout widened".
           <div
             ref={fullscreenHeaderRef}
-            className="right-sidebar-fullscreen-header border-border-light shrink-0 items-center justify-between gap-2 border-b py-1 pr-1 pl-3"
+            className={cn(
+              // It covers the window's top edge, so on Windows/Linux and macOS desktop it must
+              // keep clear of the native window controls and stay a drag region, like the
+              // workspace header.
+              "right-sidebar-fullscreen-header border-border-light titlebar-safe-left titlebar-safe-left-gutter-4 titlebar-safe-right titlebar-safe-right-gutter-2 shrink-0 items-center justify-between gap-2 border-b py-1",
+              isDesktopMode() && cn(DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS, "titlebar-drag")
+            )}
           >
             <span className="text-foreground min-w-0 truncate text-sm font-medium">
               {workspaceDisplayTitle}
@@ -2302,7 +2315,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             <Button
               variant="ghost"
               size="icon"
-              className="text-muted hover:text-foreground h-8 w-8 shrink-0"
+              className={cn(
+                "text-muted hover:text-foreground h-8 w-8 shrink-0",
+                isDesktopMode() && "titlebar-no-drag"
+              )}
               aria-label="Close sidebar"
               onClick={onCloseFullscreen}
             >

@@ -1,7 +1,9 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getReviewImmersiveKey } from "@/common/constants/storage";
 import { useEffect, type MutableRefObject } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
@@ -397,6 +399,23 @@ describe("WorkspaceShell loading placeholders", () => {
       expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("false");
 
       view.rerender(<WorkspaceShell {...defaultProps} />);
+      expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("false");
+    });
+
+    it("closes when immersive review starts and stays closed after it ends", () => {
+      rightSidebarDisplay = "none";
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      fireEvent.click(view.getByRole("button", { name: "Browser" }));
+      expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("true");
+
+      act(() => {
+        updatePersistedState(getReviewImmersiveKey(defaultProps.workspaceId), true);
+      });
+      expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("false");
+
+      act(() => {
+        updatePersistedState(getReviewImmersiveKey(defaultProps.workspaceId), false);
+      });
       expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("false");
     });
 
