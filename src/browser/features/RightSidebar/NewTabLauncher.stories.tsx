@@ -15,9 +15,10 @@ const ENTRYPOINTS: McpAppEntrypoint[] = [
     viewKey: "entrypoint:bits-and-bolts:cad.library:global",
   },
   {
-    // A long, separator-free server key must wrap at phone width.
-    serverName: "plugin:0123456789abcdef:bits-and-bolts-tray-with-a-very-long-server-name",
-    serverLabel: "plugin:0123456789abcdef:bits-and-bolts-tray-with-a-very-long-server-name",
+    // A plugin server: the row shows its label, never the internal key, and a long label
+    // stays on one line at phone width (the Tooltip has the full text).
+    serverName: "plugin:0123456789abcdef:tray",
+    serverLabel: "bits-and-bolts-parts-and-fasteners-catalog · tray-with-a-very-long-server-name",
     toolName: "cad.tray",
     title: "Parts Tray",
     resourceUri: "ui://bits-and-bolts/tray",
@@ -99,6 +100,11 @@ async function expectPluginViews(canvasElement: HTMLElement, onOpen: unknown) {
   await expect(onOpen).toHaveBeenCalledWith(ENTRYPOINTS[0]);
   const container = canvasElement.firstElementChild!;
   await expect(container.scrollWidth).toBeLessThanOrEqual(container.clientWidth);
+  await expect(canvasElement.textContent).not.toContain("plugin:0123456789abcdef");
+  // The long label is one line, cut with an ellipsis.
+  const label = canvas.getByText(ENTRYPOINTS[1].serverLabel);
+  await expect(label.scrollWidth).toBeGreaterThan(label.clientWidth);
+  await expect(label.getBoundingClientRect().height).toBeLessThan(20);
 }
 
 export const PluginViewsDesktop: Story = {

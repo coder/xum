@@ -943,7 +943,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               ...(p.mcpAppEntrypoints ?? []).map((entrypoint) => ({
                 id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
                 title: `Open Plugin View: ${entrypoint.title}`,
-                subtitle: entrypoint.serverName,
+                subtitle: entrypoint.serverLabel,
                 section: section.navigation,
                 keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
                 run: async () => {

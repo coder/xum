@@ -6,6 +6,7 @@ import {
   Terminal as TerminalIcon,
   type LucideIcon,
 } from "lucide-react";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 import { cn } from "@/common/lib/utils";
 import { formatKeybind, KEYBINDS, type Keybind } from "@/browser/utils/ui/keybinds";
@@ -134,7 +135,9 @@ export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
                 key={entrypoint.viewKey}
                 Icon={ENTRYPOINT_ICONS[entrypoint.type]}
                 name={entrypoint.title}
-                description={entrypoint.serverName}
+                // Never the raw server key (a plugin's carries an internal instance ID).
+                description={entrypoint.serverLabel}
+                singleLineDescription
                 onClick={() => void openEntrypoint(entrypoint)}
                 disabled={opening !== null}
               />
@@ -158,6 +161,8 @@ const LauncherRow: React.FC<{
   shortcut?: string;
   onClick: () => void;
   disabled?: boolean;
+  /** One line with an ellipsis; the shared Tooltip shows the full text. */
+  singleLineDescription?: boolean;
 }> = (props) => {
   // The tool name is the row's accessible name; the description is read as its description.
   const descriptionId = React.useId();
@@ -179,9 +184,17 @@ const LauncherRow: React.FC<{
       />
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="text-foreground truncate text-xs font-medium">{props.name}</span>
-        <span id={descriptionId} className="text-muted text-[11px] leading-snug break-words">
-          {props.description}
-        </span>
+        {props.singleLineDescription === true ? (
+          <TooltipIfPresent tooltip={props.description}>
+            <span id={descriptionId} className="text-muted truncate text-[11px] leading-snug">
+              {props.description}
+            </span>
+          </TooltipIfPresent>
+        ) : (
+          <span id={descriptionId} className="text-muted text-[11px] leading-snug">
+            {props.description}
+          </span>
+        )}
       </span>
       {props.shortcut != null && (
         <kbd className="mobile-hide-shortcut-hints text-muted mt-0.5 shrink-0 font-sans text-[10px] max-[768px]:hidden">
