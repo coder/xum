@@ -135,6 +135,23 @@ describe("loadPluginCodexHooks", () => {
     expect(warnings).toEqual(["More than 256 hooks; ignoring the rest"]);
   });
 
+  test("bounds the warnings of invalid pointer entries and invalid groups", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-warning-bounds");
+    const invalidGroups = { hooks: { Stop: Array<number>(1000).fill(1) } };
+    const plugin = await writePlugin(
+      tmp.path,
+      { "hooks/bad.json": invalidGroups },
+      { "com.openai": { hooks: ["./hooks/bad.json", ...Array<number>(100_000).fill(1)] } }
+    );
+
+    const { warnings } = await loadPluginCodexHooks(plugin);
+
+    // 1 count warning + 31 invalid raw entries (none past the first 32) + 1000 invalid groups:
+    // 50 are kept, plus a summary of the rest.
+    expect(warnings).toHaveLength(51);
+    expect(warnings.at(-1)).toBe("982 more hook warnings not shown");
+  });
+
   test("a hooks file path cannot take an inline source's hook keys", async () => {
     using tmp = new DisposableTempDir("codex-hooks-key-collision");
     const document = { hooks: { Stop: [{ hooks: [scan] }] } };
@@ -333,6 +350,43 @@ describe("loadPluginCodexHooks", () => {
       "Edit",
     ]);
     expect(matching("^mcp__.*", ["mcp__s__t", "x_mcp__"])).toEqual(["mcp__s__t"]);
+  });
+
+  test("mcp_tool fields follow Codex: blank targets are dropped, a timeout below 1s becomes 1s", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-mcp-fields");
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": `{"hooks":{"PreToolUse":[{"hooks":[${[
+        `{"type":"mcp_tool","server":"s","tool":"zero","timeout":0}`,
+        `{"type":"mcp_tool","server":" ","tool":"t"}`,
+        `{"type":"mcp_tool","server":"s","tool":"\\t"}`,
+        `{"type":"mcp_tool","server":"s","tool":"negative","timeout":-1}`,
+        `{"type":"mcp_tool","server":"s","tool":"infinite","timeout":1e400}`,
+      ].join(",")}]}]}}`,
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.handler)).toEqual([
+      { type: "mcp_tool", server: "s", tool: "zero", input: {}, timeoutSeconds: 1 },
+    ]);
+    expect(warnings).toHaveLength(4);
+    for (const warning of warnings) expect(warning).toMatch(/missing or invalid fields/);
+  });
+
+  test("a handler whose input holds a non-finite number is dropped with a warning", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-non-finite");
+    const infinite = `{"type":"mcp_tool","server":"s","tool":"t","input":{"a":[{"b":1e400}]}}`;
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": `{"hooks":{"PreToolUse":[{"hooks":[${infinite},${JSON.stringify(scan)}]}]}}`,
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.handler.type === "mcp_tool" && hook.handler.server)).toEqual([
+      "scanner",
+    ]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/non-finite number; ignoring a handler/);
   });
 
   test("a plugin without hooks has none, silently", async () => {

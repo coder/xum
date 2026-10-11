@@ -204,6 +204,67 @@ describe("PreToolUse", () => {
     });
   });
 
+  test("a field with the wrong type makes the whole output malformed (fails open)", async () => {
+    const pre = setup([hook("PreToolUse")], () =>
+      json({ decision: "block", reason: "x", suppressOutput: "yes" })
+    );
+    expect((await runTool(pre.spine, "bash", {})).executed).toBe(true);
+    const post = setup([hook("PostToolUse")], () => json({ decision: "block", continue: "false" }));
+    expect((await runTool(post.spine, "bash", {})).result).toEqual({ ran: {} });
+  });
+
+  test("an input too large to send denies the call instead of skipping the guard", async () => {
+    const { spine, calls } = setup(
+      [hook("PreToolUse", { input: { cmd: "${tool_input.script}" } })],
+      () => null
+    );
+
+    const ctx = await runTool(spine, "bash", { script: "x".repeat(70 * 1024) });
+
+    expect(calls).toEqual([]);
+    expect(ctx.executed).toBe(false);
+    expect(JSON.stringify(ctx.blocked?.result)).toContain("too large for the hook to check");
+  });
+
+  test("plugin middleware runs before default-order middleware, so it gates rewritten input", async () => {
+    const spine = new EventSpine();
+    const seen: unknown[] = [];
+    // Stands in for the shell .xum/tool_pre gate (registered at the default order 0, first).
+    spine.use("tool.execute", (ctx, next) => {
+      seen.push(ctx.args);
+      return next();
+    });
+    const deps: CodexHookRunnerDeps = {
+      isHookAllowed: () => Promise.resolve(true),
+      callPluginTool: () =>
+        Promise.resolve(
+          json({
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse",
+              permissionDecision: "allow",
+              updatedInput: { script: "safe" },
+            },
+          })
+        ),
+      notifyUser: () => undefined,
+    };
+    for (const order of [0, 1]) {
+      registerCodexPluginHooks(spine, {
+        workspaceId,
+        pluginName: `p${order}`,
+        order,
+        hooks: [hook("PreToolUse")],
+        deps,
+      });
+    }
+
+    const schema = { type: "object", properties: { script: { type: "string" } } };
+    const ctx = await runTool(spine, "bash", { script: "rm -rf /" }, schema);
+
+    expect(seen).toEqual([{ script: "safe" }]);
+    expect(ctx.result).toEqual({ ran: { script: "safe" } });
+  });
+
   test("a cancel during a hook ends the hook call and the tool never starts", async () => {
     const controller = new AbortController();
     // The longest hook timeout: the run must end at the cancel, not when the hook times out.
@@ -243,6 +304,19 @@ describe("PreToolUse", () => {
       [rewrite("allow", { script: "ls" }), undefined, { script: "x" }],
       [json({ hookSpecificOutput: { updatedInput: { script: "ls" } } }), schema, { script: "x" }],
     ];
+    // MCP schemas: local $ref/$defs (2020-12 by default) and a draft-07 declaration.
+    const refSchema = {
+      $defs: { script: { type: "string", minLength: 1 } },
+      type: "object",
+      properties: { script: { $ref: "#/$defs/script" } },
+      required: ["script"],
+    };
+    const draft7 = { $schema: "http://json-schema.org/draft-07/schema#", ...schema };
+    cases.push(
+      [rewrite("allow", { script: "ls" }), refSchema, { script: "ls" }],
+      [rewrite("allow", { script: "" }), refSchema, { script: "x" }],
+      [rewrite("allow", { script: "ls" }), draft7, { script: "ls" }]
+    );
     for (const [output, toolSchema, expected] of cases) {
       const { spine } = setup([hook("PreToolUse")], () => output);
       const ctx = await runTool(spine, "bash", { script: "x" }, toolSchema);

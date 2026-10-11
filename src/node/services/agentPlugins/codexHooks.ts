@@ -59,6 +59,8 @@ const MAX_HOOKS_FILE_BYTES = 256 * 1024;
  */
 const MAX_HOOK_POINTER_ENTRIES = 32;
 const MAX_PLUGIN_HOOKS = 256;
+/** Warnings kept per plugin: each file can hold ~100k invalid groups, each one a warning. */
+const MAX_HOOK_WARNINGS = 50;
 
 /** A parsed hook; the trust review state is added by pluginHookTrust.ts. */
 export type PluginHookDefinition = Omit<AgentPluginHook, "review">;
@@ -84,8 +86,14 @@ export function readOpenAIHooksPointer(
   const openai = manifest.extensions?.["com.openai"];
   if (!isPlainObject(openai) || openai.hooks === undefined) return undefined;
   const entries: unknown[] = Array.isArray(openai.hooks) ? openai.hooks : [openai.hooks];
+  // Capped before validation: each invalid raw entry would add a warning.
+  if (entries.length > MAX_HOOK_POINTER_ENTRIES) {
+    warnings.push(
+      `'extensions["com.openai"].hooks' has ${entries.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
+    );
+  }
   const hooks: OpenAIPluginHooksEntry[] = [];
-  for (const entry of entries) {
+  for (const entry of entries.slice(0, MAX_HOOK_POINTER_ENTRIES)) {
     if (isPlainObject(entry)) {
       hooks.push(entry);
       continue;
@@ -113,13 +121,12 @@ export async function loadPluginCodexHooks(
   const hooks: PluginHookDefinition[] = [];
   const pointer = readOpenAIHooksPointer(plugin.manifest, warnings);
   const entries = pointer ?? [DEFAULT_HOOKS_FILE];
-  if (entries.length > MAX_HOOK_POINTER_ENTRIES) {
-    warnings.push(
-      `'extensions["com.openai"].hooks' has ${entries.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
-    );
-  }
   const seenFiles = new Set<string>();
-  for (const [index, entry] of entries.slice(0, MAX_HOOK_POINTER_ENTRIES).entries()) {
+  let omittedWarnings = 0;
+  for (const [index, entry] of entries.entries()) {
+    // Trimmed after each entry, so at most one file's warnings are held at a time.
+    omittedWarnings += Math.max(0, warnings.length - MAX_HOOK_WARNINGS);
+    warnings.length = Math.min(warnings.length, MAX_HOOK_WARNINGS);
     if (hooks.length > MAX_PLUGIN_HOOKS) break;
     if (typeof entry !== "string") {
       parseHooksDocument(entry, `plugin.json#hooks[${index}]`, hooks, warnings);
@@ -148,6 +155,9 @@ export async function loadPluginCodexHooks(
     }
     parseHooksDocument(document, path.normalize(entry), hooks, warnings);
   }
+  omittedWarnings += Math.max(0, warnings.length - MAX_HOOK_WARNINGS);
+  warnings.length = Math.min(warnings.length, MAX_HOOK_WARNINGS);
+  if (omittedWarnings > 0) warnings.push(`${omittedWarnings} more hook warnings not shown`);
   if (hooks.length > MAX_PLUGIN_HOOKS) {
     warnings.push(`More than ${MAX_PLUGIN_HOOKS} hooks; ignoring the rest`);
     hooks.length = MAX_PLUGIN_HOOKS;
@@ -282,13 +292,15 @@ function parseHandler(
   switch (raw.type) {
     case "mcp_tool": {
       const { server, tool, input, timeout, statusMessage } = raw;
-      if (typeof server !== "string" || server.length === 0) break;
-      if (typeof tool !== "string" || tool.length === 0) break;
+      // Codex skips a blank (whitespace-only) server or tool, so no blank target looks runnable.
+      if (typeof server !== "string" || server.trim().length === 0) break;
+      if (typeof tool !== "string" || tool.trim().length === 0) break;
       if (input !== undefined && !isPlainObject(input)) break;
-      // Finite: `1e400` parses to Infinity, which JSON (and the review RPC) cannot carry.
+      // Codex raises a timeout below one second (including 0) to one second instead of dropping
+      // the hook. Finite: `1e400` parses to Infinity.
       if (
         timeout !== undefined &&
-        !(typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0)
+        !(typeof timeout === "number" && Number.isFinite(timeout) && timeout >= 0)
       )
         break;
       return {
@@ -296,7 +308,7 @@ function parseHandler(
         server,
         tool,
         input: input ?? {},
-        ...(typeof timeout === "number" ? { timeoutSeconds: timeout } : {}),
+        ...(typeof timeout === "number" ? { timeoutSeconds: Math.max(1, timeout) } : {}),
         ...(typeof statusMessage === "string" ? { statusMessage } : {}),
       };
     }
@@ -375,6 +387,11 @@ function canonicalJson(value: unknown, depth = 0): string {
       (key) => `${JSON.stringify(key)}:${canonicalJson(value[key], depth + 1)}`
     );
     return `{${fields.join(",")}}`;
+  }
+  // `1e400` parses to Infinity, which JSON.stringify writes as null, so two different inputs
+  // would share one trust hash. Refuse it; the caller drops only this handler.
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    throw new Error("the hook definition contains a non-finite number");
   }
   return JSON.stringify(value) ?? "null";
 }
