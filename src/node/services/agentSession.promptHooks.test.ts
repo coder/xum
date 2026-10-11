@@ -8,6 +8,7 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import assert from "node:assert";
 import {
   createMuxMessage,
+  getCompactionFollowUpContent,
   type CompactionFollowUpRequest,
   type MuxMessage,
 } from "@/common/types/message";
@@ -215,13 +216,62 @@ describe("message.send outcomes", () => {
 
     h.session.drainQueuedMessagesIfIdle();
     await waitForCondition(
-      () => streamed.length > 0 || h.events.some((event) => event.type === "stream-error")
+      () => streamed.length > 0 || h.events.some((event) => event.type === "restore-to-input")
     );
 
     // Only the separately sent text reaches the hook: the compaction prompt never does.
     expect(calls).toEqual([{ text: "deploy to prod", origin: "user" }]);
     expect(await userRows(h)).toEqual([]);
     expect(streamed).toEqual([]);
+    // Codex P2 (PRRT_kwDOPxxmWM6rN7od): the composer gets the command and the draft back, never
+    // the model-facing summarization prompt.
+    const restored = h.events.find((event) => event.type === "restore-to-input");
+    expect(restored?.type === "restore-to-input" ? restored.text : undefined).toBe(
+      "/compact\ndeploy to prod"
+    );
+  });
+
+  test("a /compact with inline follow-up text runs the hooks on that text first", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rN7of): the follow-up later dispatches as an automatic send,
+    // which no plugin may block, so the block must stop the /compact itself.
+    const { h, calls, streamed } = await setup(blockAll);
+    const followUpContent = { text: "deploy to prod", model: options.model, agentId: "exec" };
+
+    const result = await h.session.sendMessage("Summarize this conversation.", {
+      ...options,
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact\ndeploy to prod",
+        parsed: { followUpContent },
+      },
+    });
+
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.type).toBe("plugin_blocked");
+    expect(calls).toEqual([{ text: "deploy to prod", origin: "user" }]);
+    expect(await userRows(h)).toEqual([]);
+    expect(streamed).toEqual([]);
+  });
+
+  test("an automatic compaction request's follow-up does not reach the hooks", async () => {
+    // Its follow-up (here the resume sentinel) is not user text; it reaches them when it is sent.
+    const { h, calls } = await setup(blockAll);
+
+    await h.session.sendMessage(
+      "Summarize this conversation.",
+      {
+        ...options,
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: { followUpContent: { text: "Continue", model: options.model, agentId: "exec" } },
+        },
+      },
+      { acceptanceOrigin: "automatic", synthetic: true }
+    );
+
+    expect(calls).toEqual([]);
   });
 
   test("each send kind reaches the hook with its origin", async () => {
@@ -304,6 +354,44 @@ describe("on-send compaction follow-up", () => {
       { pluginId: "fake", text: "Ask for a reproduction first." },
     ]);
   });
+
+  // `continueMessage` is the legacy key getCompactionFollowUpContent still falls back to.
+  test.each(["followUpContent", "continueMessage"] as const)(
+    "a manual /compact follow-up (%s) checked at admission is not hooked again on redispatch",
+    async (key) => {
+      // N7of follow-up: the admission run is the follow-up's one hook run, and its context
+      // moves to the follow-up row instead of the summarization request.
+      const { h, calls } = await setup(addContext);
+      setOnSendCompaction(h, false);
+      const followUp = { text: "then fix the bug", model: options.model, agentId: "exec" };
+
+      const result = await h.session.sendMessage("Summarize this conversation.", {
+        ...options,
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact\nthen fix the bug",
+          parsed: { [key]: followUp },
+        },
+      });
+      expect(result.success).toBe(true);
+      await h.session.waitForIdle();
+      const [request] = await userRows(h);
+      expect(request?.metadata?.pluginHookContext).toBeUndefined();
+      // Hand the persisted follow-up to the summary as the compaction handler does.
+      const pendingFollowUp = getCompactionFollowUpContent(request?.metadata?.muxMetadata);
+      assert(pendingFollowUp != null);
+      await seedHandoff(h, pendingFollowUp);
+
+      expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+
+      expect(calls).toEqual([{ text: "then fix the bug", origin: "user" }]);
+      const dispatched = (await userRows(h)).at(-1);
+      expect(textOf(dispatched)).toBe("then fix the bug");
+      expect(dispatched?.metadata?.pluginHookContext).toEqual([
+        { pluginId: "fake", text: "Ask for a reproduction first." },
+      ]);
+    }
+  );
 
   test("a follow-up the hooks never saw (manual /compact) runs them as a system send", async () => {
     const { h, calls } = await setup(() => undefined);

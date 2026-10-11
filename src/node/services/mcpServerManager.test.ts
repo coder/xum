@@ -714,6 +714,27 @@ describe("MCPServerManager", () => {
     expect(calls).toEqual([{ name: "check", args: { a: 1 } }]);
   });
 
+  test("a plugin hook call honors the live tool allowlist", async () => {
+    const key = "plugin:aaaaaaaaaaaaaaaa:guard";
+    configService.listServers.mockResolvedValue({ [key]: stdioConfig("hook-guard") });
+    servers.serve("hook-guard", {
+      tools: { check: testTool() },
+      callToolForHook: () => Promise.resolve({ content: [] }),
+    });
+    const workspaceId = "ws-hook-allowlist";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const signal = new AbortController().signal;
+    const call = (tool: string) =>
+      manager.callToolForPluginHook(workspaceId, key, tool, {}, { signal });
+    expect(await call("check")).toEqual({ content: [] });
+
+    // The workspace allowlist narrows the hook's server: its tool is refused at the call.
+    await manager.applyWorkspaceOverrides(workspaceId, { toolAllowlist: { [key]: ["other"] } });
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(call("check")).rejects.toThrow("disabled");
+    expect(await call("other")).toEqual({ content: [] });
+  });
+
   test("a plugin hook call re-checks enablement at dispatch: a server disabled after the serve is refused", async () => {
     // A direct edit of the override document (or another backend's save) disables the hook's
     // server after the serve that started it; the cached enabled set still lists it.
@@ -740,10 +761,17 @@ describe("MCPServerManager", () => {
     const call = () => manager.callToolForPluginHook(workspaceId, key, "check", {}, { signal });
     expect(await call()).toEqual({ content: [{ type: "text", text: "{}" }] });
 
+    // A server enabled since the serve: re-serving (what a model's MCP call does after a direct
+    // edit) would start it. A hook call refuses instead and starts nothing.
+    servers.serve("hook-late", {});
+    configService.listServers = mock(() =>
+      Promise.resolve({ [key]: stdioConfig("hook-guard"), late: stdioConfig("hook-late") })
+    );
     diskOverrides = { disabledServers: [key] };
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(call()).rejects.toThrow("is disabled");
+    await expect(call()).rejects.toThrow("disabled");
     expect(callToolForHook).toHaveBeenCalledTimes(1);
+    expect(servers.connectCount("hook-late")).toBe(0);
   });
 
   test("an epoch retry never re-runs an MCP Apps view's tool call", async () => {

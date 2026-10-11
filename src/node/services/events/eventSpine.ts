@@ -131,6 +131,8 @@ export interface MessageSendContext {
   readonly workspaceId: string;
   readonly origin: MessageSendOrigin;
   readonly text: string;
+  /** The workspace path (Codex common field `cwd`), when Xum could resolve it. */
+  readonly cwd?: string;
   /** Appended by middleware, in chain order; saved on the user row (pluginHookContext). */
   readonly additionalContext: Array<{ pluginId: string; text: string }>;
   /** Set to refuse the send. useBefore skips the rest of the chain (first block wins). */
@@ -145,6 +147,8 @@ export interface MessageSendContext {
 export interface TurnStopContext {
   readonly workspaceId: string;
   readonly messageId: string;
+  /** The workspace path (Codex common field `cwd`), when Xum could resolve it. */
+  readonly cwd?: string;
   /** The reply's trailing text, or null when the turn ended on a tool call or without text. */
   readonly lastAssistantMessage: string | null;
   /** True when Stop already continued this turn (Codex stop_hook_active). */

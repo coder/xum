@@ -3,6 +3,7 @@ import type { Config } from "@/node/config";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { sideChatCapabilityGrants } from "@/node/services/sideChat";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { codexPluginHookService } from "./codexHookService";
@@ -33,6 +34,7 @@ export async function prepareWorkspaceRequestHooks(args: {
     const { config, metadata } = args;
     await codexPluginHookService.ensureWorkspaceHooks({
       workspaceId: metadata.id,
+      sideChat: sideChatCapabilityGrants(metadata) != null,
       xumHome: config.rootDir,
       // A function, not a value: the gate re-reads trust before every hook call.
       isProjectTrusted: () => isWorkspaceProjectTrusted(config, metadata),

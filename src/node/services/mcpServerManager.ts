@@ -5,7 +5,7 @@ import { getOwn } from "@/common/utils/getOwn";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { OAuthClientProvider, PriorDiscovery } from "@modelcontextprotocol/client";
-import type { Tool } from "ai";
+import { jsonSchema, type Tool } from "ai";
 import { getExecutionScope } from "./tools/withExecutionScope";
 import { MCPIconRegistry, type MCPIconOwner } from "./mcpIconRegistry";
 import { resolveServerIcon } from "./mcpServerIcon";
@@ -4606,16 +4606,37 @@ export class MCPServerManager {
     if (instance === undefined || instance.isClosed) {
       throw new Error(`MCP server '${serverKey}' is not running`);
     }
-    // One-shot dispatch, as in callMcpAppTool: an epoch retry must not call the tool again.
-    let dispatched: Promise<unknown> | null = null;
-    return this.invokeServerOperation(
+    // The served-tool gate (Codex PRRT_kwDOPxxmWM6rN775, PRRT_kwDOPxxmWM6rN8uX): it re-derives
+    // enablement and the project/workspace tool allowlists at the call, inside the epoch and
+    // admission fences, like a model's MCP tool call. `reconcile: false`: where a model's call
+    // would re-serve (and so start or reconnect servers), a hook call is refused instead.
+    const hookTool: Tool = {
+      inputSchema: jsonSchema({ type: "object" }),
+      execute: () => {
+        // Dispatch-time instance: the gate's checks ran synchronously before this.
+        const current = this.workspaceServers.get(workspaceId)?.instances.get(serverKey);
+        if (current === undefined || current.isClosed) {
+          throw new Error(`MCP server '${serverKey}' is not running`);
+        }
+        this.markActivity(workspaceId);
+        return current.callToolForHook(toolName, args, options);
+      },
+    };
+    const gated = this.gateServedToolOnEnablement(
       workspaceId,
       serverKey,
-      `Plugin hook call '${serverKey}/${toolName}'`,
-      (current) => (dispatched ??= current.callToolForHook(toolName, args, options)),
-      (result) => result,
-      options
+      toolName,
+      hookTool,
+      entry.enabledServers[serverKey],
+      { reconcile: false }
     );
+    assert(gated.execute !== undefined, "the gate keeps execute");
+    return await gated.execute(args, {
+      toolCallId: `plugin-hook:${toolName}`,
+      messages: [],
+      abortSignal: options.signal,
+      context: undefined,
+    });
   }
 
   /**
@@ -5563,7 +5584,9 @@ export class MCPServerManager {
     serverName: string,
     toolName: string,
     tool: Tool,
-    servedInfo: MCPServerInfo | undefined
+    servedInfo: MCPServerInfo | undefined,
+    /** false (plugin hooks): refuse instead of re-serving, so the gate never starts a server. */
+    gateOptions: { reconcile: boolean } = { reconcile: true }
   ): Tool {
     if (!tool.execute) {
       return tool;
@@ -5704,7 +5727,11 @@ export class MCPServerManager {
                     this.forgetWorkspaceOverrides(workspaceId);
                   }
                 }
-                if (this.overridesInvalidationGenerations.has(workspaceId)) {
+                // Without reconciling, the live marker makes decide() refuse the call.
+                if (
+                  gateOptions.reconcile &&
+                  this.overridesInvalidationGenerations.has(workspaceId)
+                ) {
                   const latest = this.lastWorkspaceRequestOptions.get(workspaceId);
                   if (latest !== undefined) {
                     await this.ensureWorkspaceServers(latest, false, abortSignal);
