@@ -4,6 +4,7 @@ import { mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { McpAppFrame } from "../ArtifactsTab/McpAppFrame";
 import {
   appViewDetails,
+  appViewServerNames,
   markMcpAppViewHosted,
   openMcpAppViewTab,
   useMcpAppView,
@@ -42,24 +43,28 @@ export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string
   const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
   const views = useMcpAppViews(props.workspaceId);
   const ref = typeof view === "object" ? view : null;
+  const index = ref == null ? -1 : views.findIndex((v) => v.toolCallId === ref.toolCallId);
+  // Compared by what the label shows: two plugin installs share a short server name.
   const ambiguous =
     ref != null &&
     views.some(
       (v) =>
-        v.toolCallId !== ref.toolCallId && v.label === ref.label && v.serverName === ref.serverName
+        v.toolCallId !== ref.toolCallId &&
+        v.label === ref.label &&
+        mcpServerDisplayName(v.serverName) === mcpServerDisplayName(ref.serverName)
     );
-  const detail = ambiguous
-    ? appViewDetails(views)[views.findIndex((v) => v.toolCallId === ref.toolCallId)]
-    : "";
+  const detail = ambiguous && index >= 0 ? appViewDetails(views)[index] : "";
+  const server =
+    ref == null
+      ? ""
+      : index >= 0
+        ? appViewServerNames(views)[index]
+        : mcpServerDisplayName(ref.serverName);
   return (
     <span className="inline-flex min-w-0 items-center gap-1">
       <AppWindow className="h-3 w-3 shrink-0" />
       <span className="min-w-0 truncate">{ref?.label ?? "App view"}</span>
-      {ref != null && (
-        <span className="text-muted shrink-0 text-[10px]">
-          {mcpServerDisplayName(ref.serverName)}
-        </span>
-      )}
+      {ref != null && <span className="text-muted shrink-0 text-[10px]">{server}</span>}
       {detail !== "" && <span className="text-muted min-w-0 truncate text-[10px]">{detail}</span>}
     </span>
   );
