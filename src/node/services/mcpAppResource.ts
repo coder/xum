@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { MCP_APP_MIME_TYPE, MCP_APP_RESOURCE_MAX_BYTES } from "@/common/utils/mcpApps";
+import {
+  MCP_APP_CSP_DOMAINS_MAX,
+  MCP_APP_MIME_TYPE,
+  MCP_APP_RESOURCE_MAX_BYTES,
+} from "@/common/utils/mcpApps";
 import {
   McpAppCspDeclarationSchema,
   type McpAppCspDeclaration,
@@ -16,7 +20,7 @@ export interface McpAppResource {
  * `redirect_domains` is ignored: it lists window.openai.openExternal redirect targets, not
  * origins the view fetches from or loads, so it maps to no CSP directive.
  */
-const DomainList = z.array(z.string().max(256)).max(32).optional();
+const DomainList = z.array(z.string().max(256)).max(MCP_APP_CSP_DOMAINS_MAX).optional();
 const McpAppWidgetCspSchema = z.object({
   connect_domains: DomainList,
   resource_domains: DomainList,
@@ -27,8 +31,11 @@ function mergeCsp(
   ui: McpAppCspDeclaration,
   alias: z.infer<typeof McpAppWidgetCspSchema>
 ): McpAppCspDeclaration {
+  // Capped like each source list, so the merged view still fits McpAppCspDeclarationSchema.
   const union = (a: string[] | undefined, b: string[] | undefined) =>
-    a === undefined && b === undefined ? undefined : [...new Set([...(a ?? []), ...(b ?? [])])];
+    a === undefined && b === undefined
+      ? undefined
+      : [...new Set([...(a ?? []), ...(b ?? [])])].slice(0, MCP_APP_CSP_DOMAINS_MAX);
   const merged: McpAppCspDeclaration = {
     ...ui,
     connectDomains: union(ui.connectDomains, alias.connect_domains),

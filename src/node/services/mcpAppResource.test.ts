@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { MCP_APP_MIME_TYPE } from "@/common/utils/mcpApps";
+import { McpAppCspDeclarationSchema } from "@/common/orpc/schemas/mcpApps";
 import { extractMcpAppResource } from "./mcpAppResource";
 
 const URI = "ui://dice/board.html";
@@ -26,5 +27,17 @@ describe("extractMcpAppResource CSP", () => {
       frameDomains: ["https://frame.example.com"],
     });
     expect(read({}).csp).toEqual({});
+  });
+
+  test("merged lists stay within the declaration limit the view schema accepts", () => {
+    const hosts = (prefix: string) =>
+      Array.from({ length: 32 }, (_, i) => `https://${prefix}${i}.example.com`);
+    const resource = read({
+      ui: { csp: { connectDomains: hosts("ui") } },
+      "openai/widgetCSP": { connect_domains: hosts("alias") },
+    });
+    // _meta.ui.csp comes first and wins the slots.
+    expect(resource.csp.connectDomains).toEqual(hosts("ui"));
+    expect(McpAppCspDeclarationSchema.safeParse(resource.csp).success).toBe(true);
   });
 });

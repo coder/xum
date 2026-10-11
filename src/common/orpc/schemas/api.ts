@@ -1498,7 +1498,7 @@ export const mcpApps = {
     output: ResultSchema(z.object({ approvedDomains: z.array(z.string()) }), z.string()),
   },
   listViewDomains: { input: z.void(), output: z.array(McpAppViewDomainsSchema) },
-  /** Applies on the next view mount (a mounted view keeps its policy). */
+  /** Mounted views of the server reload under the narrower policy (mcpAppViewDomainsStore). */
   revokeViewDomains: {
     input: McpAppViewDomainsSchema.pick({ projectPath: true, serverName: true }),
     output: z.void(),

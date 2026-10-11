@@ -14,6 +14,7 @@ import type {
   McpAppToolCallRequestSchema,
   McpAppToolCallResult,
   McpAppView,
+  McpAppViewDomains,
   McpAppViewRequestSchema,
 } from "@/common/orpc/schemas/mcpApps";
 import type { Result } from "@/common/types/result";
@@ -298,9 +299,7 @@ export async function approveMcpAppViewDomains(
 }
 
 /** Every project's approvals, for Settings → MCP (one call, not one per server). */
-export function listMcpAppViewDomains(
-  context: McpAppsContext
-): Array<{ projectPath: string; serverName: string; origins: string[] }> {
+export function listMcpAppViewDomains(context: McpAppsContext): McpAppViewDomains[] {
   return [...context.config.loadConfigOrDefault().projects].flatMap(([projectPath, project]) =>
     Object.entries(project.mcpAppViewDomains ?? {}).map(([serverName, origins]) => ({
       projectPath,

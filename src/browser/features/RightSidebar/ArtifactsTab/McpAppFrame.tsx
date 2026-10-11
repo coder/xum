@@ -24,6 +24,7 @@ import {
   currentMcpAppViewDomainsSeq,
   publishMcpAppViewDomains,
   useMcpAppViewDomains,
+  useMcpAppViewDomainsRevocations,
 } from "./mcpAppViewDomainsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
@@ -219,6 +220,7 @@ export function McpAppFrame(props: {
       ? published.origins
       : (current?.view?.approvedDomains ?? []);
   const grant = current?.view ? grantMcpAppCsp(current.view.csp, approved) : null;
+  useMcpAppViewDomainsRevocations(api, approvalProjectPath, boundServerName, approved);
   // Only a view with a result record can be approved (the record binds its server).
   const domainsPrompt =
     grant != null &&
