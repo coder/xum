@@ -407,6 +407,8 @@ interface RightSidebarTabsetNodeProps {
   onRequestTerminalFocus: (sessionId: string) => void;
   /** Callback to clear the auto-focus state after it's been consumed */
   onAutoFocusConsumed: () => void;
+  /** False in the phone full-screen view: phones show no keyboard shortcuts. */
+  showTabShortcuts: boolean;
 }
 
 const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) => {
@@ -489,7 +491,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
       KEYBINDS.SIDEBAR_TAB_9,
     ];
     const keybindStr =
-      tabPosition !== undefined && tabPosition < keybinds.length
+      props.showTabShortcuts && tabPosition !== undefined && tabPosition < keybinds.length
         ? formatKeybind(keybinds[tabPosition])
         : undefined;
 
@@ -1956,8 +1958,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     if (item === "side-chat") {
       // Show the pane's New tab first: its Side chat row shows the pending creation, the new
       // chat replaces it once created, and a failed creation leaves the launcher (as on desktop),
-      // not whatever tool happened to be open.
-      setLayout((prev) => addNewTabToTabset(prev, tabsetId));
+      // not whatever tool happened to be open. Focus moves into that launcher, so it does not
+      // stay on the menu button behind the full-screen view while the chat is created.
+      handleAddNewTab(tabsetId);
       handleOpenSideChatFromNewTab(tabsetId);
     } else {
       handleOpenToolFromNewTab(tabsetId, item);
@@ -2218,6 +2221,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       <RightSidebarTabsetNode
         key={node.id}
         node={node}
+        showTabShortcuts={!fullscreen}
         baseId={baseId}
         workspaceId={workspaceId}
         workspacePath={workspacePath}

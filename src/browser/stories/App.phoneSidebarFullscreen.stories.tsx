@@ -2,9 +2,10 @@
  * Phones: the narrow layout hides the right sidebar, so the workspace menu lists its tools and
  * opens them in the sidebar itself, shown full-screen.
  *
- * The story pins a 390px frame instead of relying on the viewport, so the shell's container query
- * hides the sidebar at any window size (the Storybook test-runner plays at desktop size). Play-only:
- * Pixel does not snapshot it.
+ * The stories pin a 390px frame instead of relying on the viewport, so the shell's container query
+ * hides the sidebar at any window size (the Storybook test-runner plays at desktop size).
+ * FullScreenFromWorkspaceMenu holds the behavior checks and is play-only. FullScreenToolOnPhone is
+ * the Pixel capture of the open view at the phone viewport.
  */
 import { wrapAsyncIterator } from "@orpc/shared";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
@@ -29,7 +30,6 @@ import { waitForChatInputAutofocusDone } from "./storyPlayHelpers.js";
 export default {
   ...appMeta,
   title: "App/PhoneSidebarFullscreen",
-  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
 };
 
 const WORKSPACE_ID = "ws-phone-sidebar-fullscreen";
@@ -91,6 +91,8 @@ function setup() {
     ...client.browser,
     listSessions: () => Promise.resolve({ sessions: [], otherSessions: [] }),
   };
+  // Side chat creation never finishes here, so the play can check the pending state.
+  client.workspace.createSideChat = () => new Promise(() => undefined);
   client.workflows.listScripts = () => Promise.resolve([]);
   client.workflows.listRuns = () => Promise.resolve([]);
   client.workflows.getRun = () => Promise.resolve(RUN);
@@ -119,6 +121,7 @@ async function pickMenuTool(canvasElement: HTMLElement, tool: string) {
 
 export const FullScreenFromWorkspaceMenu: AppStory = {
   decorators: [PhoneFrameDecorator],
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   render: () => <AppWithMocks setup={setup} />,
   play: async ({ canvasElement }) => {
     await waitForChatInputAutofocusDone(canvasElement);
@@ -173,9 +176,19 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await waitFor(() => expect(sidebar).toBeVisible());
     await expect(within(sidebar).getByText(RUN_NAME)).toBe(runTitle);
 
-    // Escape closes it. (Focus on a tab shows that tab's tooltip, which takes the first Escape,
-    // so press it from the close button.)
-    within(sidebar).getByRole("button", { name: "Close sidebar" }).focus();
+    // Focus is on the Workflows tab, which shows no shortcut tooltip on a phone (a tooltip would
+    // also take the first Escape). Escape closes the view.
+    await waitFor(() => expect(sidebar.contains(document.activeElement)).toBe(true));
+    await expect(page.queryByRole("tooltip")).toBeNull();
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(sidebar).not.toBeVisible());
+
+    // Side chat shows the New tab launcher while the chat is created, and focus moves into it
+    // instead of staying on the menu button behind the view.
+    await pickMenuTool(canvasElement, "side-chat");
+    await waitFor(() => expect(sidebar).toBeVisible());
+    await expect(await within(sidebar).findByText("Open a tool")).toBeVisible();
+    await waitFor(() => expect(sidebar.contains(document.activeElement)).toBe(true));
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(sidebar).not.toBeVisible());
 
@@ -196,5 +209,28 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
       await expect(sidebar).toBeVisible();
       await expect(within(sidebar).queryByRole("button", { name: "Close sidebar" })).toBeNull();
     }
+  },
+};
+
+/** The Browser tool opened from the workspace menu, full-screen at the phone viewport. */
+export const FullScreenToolOnPhone: AppStory = {
+  // A phone viewport for local viewing (the fixed frame does not move innerWidth).
+  globals: {
+    viewport: { value: "mobile2", isRotated: false },
+  },
+  decorators: [PhoneFrameDecorator],
+  render: () => <AppWithMocks setup={setup} />,
+  // Dark only: the snapshot budget (scripts/check-storybook-snapshot-budget.mjs) is nearly full.
+  parameters: {
+    ...appMeta.parameters,
+    pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } },
+  },
+  play: async ({ canvasElement }) => {
+    await waitForChatInputAutofocusDone(canvasElement);
+    const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
+    if (sidebar == null) throw new Error("right sidebar missing");
+    await pickMenuTool(canvasElement, "browser");
+    await waitFor(() => expect(sidebar).toBeVisible());
+    await waitFor(() => expect(sidebar.contains(document.activeElement)).toBe(true));
   },
 };

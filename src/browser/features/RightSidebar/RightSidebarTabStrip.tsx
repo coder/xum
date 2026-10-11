@@ -147,9 +147,12 @@ const SortableTab: React.FC<{
             )}
           </div>
         </TooltipTrigger>
-        <TooltipContent side="bottom" align="center">
-          {item.tooltip}
-        </TooltipContent>
+        {/* No tooltip, no empty bubble: tabs without a shortcut (or with shortcuts hidden). */}
+        {item.tooltip != null && (
+          <TooltipContent side="bottom" align="center">
+            {item.tooltip}
+          </TooltipContent>
+        )}
       </Tooltip>
     </div>
   );

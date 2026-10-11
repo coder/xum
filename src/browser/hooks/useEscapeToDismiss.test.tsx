@@ -148,4 +148,36 @@ describe("useEscapeToDismiss", () => {
 
     expect(onDismiss).not.toHaveBeenCalled();
   });
+
+  // The drawer (layer 0) and the full-screen sidebar (layer 1) can open in either order.
+  for (const order of ["lower opened first", "higher opened first"] as const) {
+    test(`with two overlays open (${order}), each Escape closes the one drawn on top`, () => {
+      const closeLower = mock(() => undefined);
+      const closeHigher = mock(() => undefined);
+      const { rerender } = renderHook(
+        (open: { lower: boolean; higher: boolean }) => {
+          useEscapeToDismiss(open.lower, closeLower);
+          useEscapeToDismiss(open.higher, closeHigher, 1);
+        },
+        { initialProps: { lower: false, higher: false } }
+      );
+      // A listener registers when its overlay opens, so this decides the registration order.
+      rerender(
+        order === "lower opened first"
+          ? { lower: true, higher: false }
+          : { lower: false, higher: true }
+      );
+      rerender({ lower: true, higher: true });
+      const composer = addComposer();
+
+      pressEscape(composer);
+      expect(closeHigher).toHaveBeenCalledTimes(1);
+      expect(closeLower).not.toHaveBeenCalled();
+
+      rerender({ lower: true, higher: false });
+      pressEscape(composer);
+      expect(closeLower).toHaveBeenCalledTimes(1);
+      expect(closeHigher).toHaveBeenCalledTimes(1);
+    });
+  }
 });

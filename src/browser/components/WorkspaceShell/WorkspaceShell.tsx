@@ -235,7 +235,9 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
     );
   };
   const closeSidebarFullscreen = () => setFullscreenSidebarWorkspaceId(null);
-  useEscapeToDismiss(sidebarFullscreen, closeSidebarFullscreen);
+  // Layer 1: the full-screen sidebar is drawn above the narrow-screen drawer (layer 0), so it
+  // answers Escape first when both are open.
+  useEscapeToDismiss(sidebarFullscreen, closeSidebarFullscreen, 1);
   // After RightSidebar lifts `inert` from the rest of the page (effect cleanups run before
   // effects), so the element can take focus again.
   useEffect(() => {
