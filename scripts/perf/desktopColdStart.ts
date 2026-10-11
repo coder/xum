@@ -131,7 +131,10 @@ async function main(): Promise<void> {
   };
   const launches: Launch[] = [];
   if (metric === "transcript") {
-    const route = JSON.stringify(`/workspace/${encodeURIComponent(seedBootWorkspace(root))}`);
+    // Open the workspace once so the app's own route persistence stores it (restored on every
+    // file:// start), then check the stored value before any measured launch depends on it.
+    const workspaceId = seedBootWorkspace(root);
+    const route = `/workspace/${encodeURIComponent(workspaceId)}`;
     const app = await electron.launch({
       executablePath: bin.head,
       cwd: tree.head,
@@ -140,9 +143,35 @@ async function main(): Promise<void> {
       timeout,
     });
     const window = await app.firstWindow({ timeout });
-    await window.waitForFunction(markCount, MARK, { timeout });
-    await window.evaluate((value) => localStorage.setItem("lastVisitedRoute", value), route);
+    const row = window.locator(`[data-workspace-id="${workspaceId}"][role="button"]`);
+    const projects = window.getByRole("navigation", { name: "Projects" });
+    await projects.waitFor({ timeout });
+    if (!(await row.isVisible())) {
+      await projects
+        .getByRole("button", { name: /expand project/i })
+        .first()
+        .click({ timeout });
+    }
+    await row.click({ timeout });
+    const stored = await window
+      .waitForFunction(
+        (r) => localStorage.getItem("lastVisitedRoute") === JSON.stringify(r),
+        route,
+        { timeout }
+      )
+      .then(
+        () => true,
+        () => false
+      );
     await app.close(); // a clean close flushes localStorage into XUM_ROOT/user-data
+    assert(stored, `setup launch did not persist ${route}`);
+    // Keep only Local Storage: caches the head tree warmed (Code Cache, GPU cache) would speed up
+    // head launches only, since base runs from another directory.
+    const userData = path.join(root, "user-data");
+    for (const entry of fs.readdirSync(userData)) {
+      if (entry !== "Local Storage")
+        fs.rmSync(path.join(userData, entry), { recursive: true, force: true });
+    }
   } else {
     prepareDemoProject(root);
   }
