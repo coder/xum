@@ -139,7 +139,7 @@ function lock(inputsKey: string, digest = DIGEST) {
 function fake(over: Record<string, string> = {}) {
   const vars = {
     HOST: "unix:///var/run/docker.sock",
-    INFO: '{"OSType":"linux","OperatingSystem":"Ubuntu 22.04","SecurityOptions":["name=seccomp"]}',
+    INFO: '{"OSType":"linux","OperatingSystem":"Ubuntu 22.04","Architecture":"x86_64","SecurityOptions":["name=seccomp"]}',
     IMAGES_RC: "0",
     IMAGES: "",
     PULL: "ok",
@@ -236,6 +236,43 @@ test.each([
   expect(await failure(session().ensureImage())).toThrow(message);
   await Bun.sleep(50);
   expect(calls()).not.toContain("pull");
+});
+
+// U6: the published image is linux/amd64 only (build.sh), so another daemon architecture needs
+// amd64 emulation registered in the kernel's binfmt_misc, or the first container fails.
+function binfmt(entries: Record<string, string>) {
+  const dir = path.join(root, "binfmt_misc");
+  fs.mkdirSync(dir, { recursive: true });
+  for (const [name, text] of Object.entries(entries)) fs.writeFileSync(path.join(dir, name), text);
+  return dir;
+}
+const binfmtSession = (binfmtDir: string) => {
+  const s = new Session(new AbortController().signal, { root, binfmtDir, log: () => undefined });
+  sessions.push(s);
+  return s;
+};
+const ARM = '{"OSType":"linux","OperatingSystem":"Ubuntu 22.04","Architecture":"aarch64"}';
+test.each([
+  ["no emulation", {}],
+  ["a disabled emulation entry", { "qemu-x86_64": "disabled\ninterpreter /usr/bin/qemu-x86_64\n" }],
+])(
+  "U6: an arm64 daemon with %s refuses before the pull, naming the fix",
+  async (_name, entries) => {
+    fake({ INFO: ARM });
+    const s = binfmtSession(binfmt(entries));
+    const error = await failure(s.ensureImage());
+    expect(error).toThrow(/linux\/amd64/);
+    expect(error).toThrow(/aarch64/);
+    expect(error).toThrow(/amd64 host|amd64 emulation/);
+    expect(calls()).not.toContain("pull");
+  }
+);
+
+test("U6: an arm64 daemon with amd64 emulation registered may pull and run the image", async () => {
+  fake({ INFO: ARM });
+  const dir = binfmt({ "qemu-x86_64": "enabled\ninterpreter /usr/bin/qemu-x86_64\n" });
+  expect(await binfmtSession(dir).ensureImage()).toBe(REF);
+  expect(calls()).toContain("pull");
 });
 
 const JOB = { name: "xbb-1", owner: "boot:pid", checkout: "abc" };

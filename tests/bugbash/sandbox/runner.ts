@@ -93,6 +93,9 @@ export class Session {
   readonly #members = new Map<number, Set<string>>();
   readonly #signalGroup: (group: number, signal: NodeJS.Signals) => void;
   #stopped: string | null = null;
+  readonly #binfmtDir: string;
+  /** The daemon's `docker info` Architecture, read by #connect for the amd64 check. */
+  #architecture = "";
   #client: Record<string, string> | null = null;
   #clientDir: string | null = null;
   #cleanup: Promise<CleanupState> | null = null;
@@ -120,9 +123,12 @@ export class Session {
       log?: (line: string) => void;
       /** Injection point: runner.test.ts records the group signals; production uses killGroup. */
       signalGroup?: (group: number, signal: NodeJS.Signals) => void;
+      /** Injection point: runner.test.ts fakes the kernel's binfmt_misc entries (amd64 check). */
+      binfmtDir?: string;
     } = {}
   ) {
     this.#signalGroup = options.signalGroup ?? killGroup;
+    this.#binfmtDir = options.binfmtDir ?? "/proc/sys/fs/binfmt_misc";
     this.#root = options.root ?? ROOT;
     this.#graceMs = options.graceMs ?? GRACE_MS;
     this.#hookMs = options.hookMs ?? HOOK_MS;
@@ -142,6 +148,7 @@ export class Session {
           `${key.slice(0, 16)}. Publish a new image, then update tests/bugbash/sandbox/image.json.`
       );
     await this.#connect();
+    this.#checkArchitecture();
     const ref = `${lock.image}@${lock.digest}`;
     // An empty list with exit 0 means absent. Any failure refuses: it is not "absent".
     const listed = await this.#must(["images", "--no-trunc", "--quiet", ref], 15_000);
@@ -462,8 +469,10 @@ export class Session {
     const daemon = JSON.parse(info.stdout) as {
       OSType?: string;
       OperatingSystem?: string;
+      Architecture?: string;
       SecurityOptions?: string[];
     };
+    this.#architecture = daemon.Architecture ?? "";
     // `docker info` exits 0 when no daemon answers, with only the client fields.
     if ((daemon.OSType ?? "") === "") throw new Refusal("docker info: no daemon answered");
     if (daemon.OSType !== "linux" || /docker desktop/i.test(daemon.OperatingSystem ?? ""))
@@ -471,6 +480,28 @@ export class Session {
     if ((daemon.SecurityOptions ?? []).some((o) => o.includes("rootless")))
       throw new Refusal("rootless Docker is not supported");
     this.#client = client;
+  }
+
+  /**
+   * The published image is linux/amd64 only (build.sh). On another architecture its first
+   * container fails unless the kernel runs amd64 binaries through emulation (a binfmt_misc entry,
+   * shared with the local daemon), so refuse before the pull with the two ways out. Not in
+   * #connect: recover() needs no image and works on any host.
+   */
+  #checkArchitecture() {
+    const arch = this.#architecture;
+    if (arch === "x86_64" || arch === "amd64") return;
+    let entry = "";
+    try {
+      entry = fs.readFileSync(path.join(this.#binfmtDir, "qemu-x86_64"), "utf8");
+    } catch {
+      // no entry: no emulation
+    }
+    if (entry.split("\n")[0] === "enabled") return;
+    throw new Refusal(
+      `the sandbox image is linux/amd64 and Docker runs on ${arch || "an unknown architecture"}: ` +
+        "use an amd64 host, or register amd64 emulation (binfmt_misc qemu-x86_64)"
+    );
   }
 
   async #must(args: string[], timeoutMs: number): Promise<Result> {
