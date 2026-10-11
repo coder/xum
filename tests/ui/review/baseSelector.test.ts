@@ -9,6 +9,7 @@ import "../dom";
 import { fireEvent, waitFor } from "@testing-library/react";
 
 import { shouldRunIntegrationTests } from "../../testUtils";
+import type { TestEnvironment } from "../../ipc/setup";
 import {
   cleanupSharedRepo,
   configureTestRetries,
@@ -54,6 +55,25 @@ async function setupReviewPanel(
     },
     { timeout: 60_000 }
   );
+}
+
+/**
+ * Wait until trunk detection has set the workspace's first base. A base that lands while the
+ * dropdown is open replaces its search text, and that text then filters HEAD out (#6143).
+ */
+async function waitForInitialBase(
+  view: RenderedApp,
+  env: TestEnvironment,
+  metadata: FrontendWorkspaceMetadata
+): Promise<void> {
+  const branchResult = await env.orpc.projects.listBranches({ projectPath: metadata.projectPath });
+  // The shared repo has no origin remote, so origin/<trunk> does not exist: the default is
+  // the local trunk, not a ref that fails every diff (#5682).
+  const expectedInitialBase = branchResult.recommendedTrunk?.trim();
+  expect(expectedInitialBase).toBeTruthy();
+  await waitFor(() => expect(getDisplayedBase(view.container)).toBe(expectedInitialBase), {
+    timeout: 5_000,
+  });
 }
 
 /**
@@ -165,21 +185,7 @@ describeIntegration("ReviewPanel base selector", () => {
 
       try {
         await setupReviewPanel(view, metadata, workspaceId);
-
-        const branchResult = await env.orpc.projects.listBranches({
-          projectPath: metadata.projectPath,
-        });
-        // The shared repo has no origin remote, so origin/<trunk> does not exist: the default is
-        // the local trunk, not a ref that fails every diff (#5682).
-        const expectedInitialBase = branchResult.recommendedTrunk?.trim();
-        expect(expectedInitialBase).toBeTruthy();
-
-        await waitFor(
-          () => {
-            expect(getDisplayedBase(view.container)).toBe(expectedInitialBase);
-          },
-          { timeout: 5_000 }
-        );
+        await waitForInitialBase(view, env, metadata);
 
         // Open dropdown and click HEAD
         await openBaseSelectorDropdown(view.container, revisionChecks);
@@ -211,6 +217,7 @@ describeIntegration("ReviewPanel base selector", () => {
 
       try {
         await setupReviewPanel(view, metadata, workspaceId);
+        await waitForInitialBase(view, env, metadata);
 
         // Click through multiple suggestions
         const selections = ["HEAD", "--staged", "HEAD"];
@@ -245,6 +252,7 @@ describeIntegration("ReviewPanel base selector", () => {
 
       try {
         await setupReviewPanel(view, metadata, workspaceId);
+        await waitForInitialBase(view, env, metadata);
         await openBaseSelectorDropdown(view.container, revisionChecks);
         // HEAD exists in any repo with a commit; the existence check has answered.
         await waitFor(() => {
