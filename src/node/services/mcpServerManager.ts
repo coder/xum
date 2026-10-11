@@ -4680,16 +4680,15 @@ export class MCPServerManager {
     if (read === undefined) {
       read = (async () => {
         try {
+          const requestId = this.takeSettingsRequestId(instance, workspaceId);
           const parsed = parseMCPSettingsReadResult(
             await this.callSettingsTool(instance, workspaceId, "readTool", {}, { timeoutMs })
           );
           if ("error" in parsed) throw new Error(parsed.error);
-          // A save (or dialog read) that finished while this read was in flight already cached
-          // newer values: keep them, and hand those to the hooks instead of this older read.
-          const newer = this.settingsCache.get(instance)?.get(workspaceId);
-          if (newer !== undefined) return newer;
-          this.cacheSettings(instance, workspaceId, parsed.values);
-          return parsed.values;
+          // A newer request (a save or dialog read) began meanwhile: its cached values win.
+          if (this.cacheSettings(instance, workspaceId, requestId, parsed.values))
+            return parsed.values;
+          return this.settingsCache.get(instance)?.get(workspaceId) ?? parsed.values;
         } catch (error) {
           log.warn(
             `[MCP] Settings read for plugin hooks failed for '${instance.name}'; passing {}`,

@@ -942,7 +942,7 @@ describe("MCPServerManager", () => {
       "hooks-race-ws",
       "plugin:abc:saved",
       { units: "in" },
-      { units: { type: "string", title: "Units" } }
+      { properties: { units: { type: "string", title: "Units" } }, values: { units: "mm" } }
     );
     await manager.applyWorkspaceOverrides("hooks-race-ws", {
       disabledServers: ["plugin:abc:gone"],
