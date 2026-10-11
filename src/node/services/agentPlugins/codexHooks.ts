@@ -1,0 +1,309 @@
+/**
+ * Codex-format plugin hooks (`hooks/hooks.json`, or `extensions["com.openai"].hooks`): discovery,
+ * parsing and a hash per hook. Nothing here runs a hook.
+ *
+ * Sources: https://developers.openai.com/plugins/build/plugins.md (bundled lifecycle hooks) and
+ * https://learn.chatgpt.com/docs/hooks (shape, events, handlers, trust).
+ *
+ * - Shape: `{ hooks: { <Event>: [{ matcher?: regex, hooks: [handler] }] } }`.
+ * - Only `mcp_tool` handlers on the four mapped events can run (in a later change). `command`,
+ *   `prompt` and `agent` handlers are parsed and never run; other Codex events are parsed and
+ *   ignored. Both are listed so the user sees what the plugin declares.
+ * - Trust: Codex trusts each hook by the hash of its exact definition, so a new or changed hook
+ *   is skipped until the user trusts it. `hash` is that key (see pluginHookTrust.ts).
+ *
+ * Fail-soft like the manifest: every invalid file, group or handler is dropped with a warning.
+ */
+import * as crypto from "node:crypto";
+import * as path from "node:path";
+import { getErrorMessage } from "@/common/utils/errors";
+import { ensurePathContained } from "@/node/services/tools/skillFileUtils";
+import { readPluginFileWithinRootCapped, type AgentPluginInfo } from "./discovery";
+import { isPlainObject, isSafeContributesPath, type AgentPluginManifest } from "./manifest";
+
+/** Codex events Xum maps to its own hook points. */
+export const MAPPED_CODEX_HOOK_EVENTS = {
+  PreToolUse: "tool.execute.before",
+  PostToolUse: "tool.execute.after",
+  UserPromptSubmit: "message.send",
+  Stop: "turn.stop",
+} as const;
+export type MappedCodexHookEvent = keyof typeof MAPPED_CODEX_HOOK_EVENTS;
+
+/** Other Codex events: parsed and listed, never run. */
+const IGNORED_CODEX_HOOK_EVENTS = new Set([
+  "PermissionRequest",
+  "PreCompact",
+  "PostCompact",
+  "SubagentStart",
+  "SubagentStop",
+  "SessionStart",
+  "SessionEnd",
+  "Interrupt",
+]);
+
+const DEFAULT_HOOKS_FILE = "hooks/hooks.json";
+const MAX_HOOKS_FILE_BYTES = 256 * 1024;
+/** Codex default handler timeout, in seconds. */
+export const DEFAULT_HOOK_TIMEOUT_SECONDS = 600;
+
+export type PluginHookHandler =
+  | {
+      type: "mcp_tool";
+      server: string;
+      tool: string;
+      /** Argument templates (`${tool_input.x}`); defaults to `{}`. */
+      input: Record<string, unknown>;
+      timeoutSeconds: number;
+      statusMessage?: string;
+    }
+  /** Parsed and shown, never run (Xum runs no hook commands). */
+  | { type: "command" | "prompt" | "agent"; summary: string };
+
+export type PluginHookStatus = "runnable" | "unsupported-handler" | "ignored-event";
+
+export interface PluginHookDefinition {
+  /** sha256 of the canonical definition (event, matcher, handler): the trust key. */
+  hash: string;
+  event: string;
+  matcher?: string;
+  handler: PluginHookHandler;
+  status: PluginHookStatus;
+  /** Where it was declared, e.g. `hooks/hooks.json` or `plugin.json#hooks[0]`. */
+  source: string;
+}
+
+export interface PluginHooksLoadResult {
+  hooks: PluginHookDefinition[];
+  warnings: string[];
+}
+
+/** One `extensions["com.openai"].hooks` entry: a relative hooks-file path or an inline object. */
+export type OpenAIPluginHooksEntry = string | Record<string, unknown>;
+
+/**
+ * Adapter for the `extensions["com.openai"].hooks` pointer (path | path[] | object | object[]).
+ * The A1 stack (`plugin-openai-extension`) parses the same field in `readOpenAIExtension`, with
+ * the `.codex-plugin/plugin.json` fallback. When the stacks meet, replace this body with
+ * `readOpenAIExtension(manifest).extension?.hooks` (same result type and rules).
+ */
+export function readOpenAIHooksPointer(
+  manifest: Pick<AgentPluginManifest, "extensions">,
+  warnings: string[]
+): OpenAIPluginHooksEntry[] | undefined {
+  const openai = manifest.extensions?.["com.openai"];
+  if (!isPlainObject(openai) || openai.hooks === undefined) return undefined;
+  const entries: unknown[] = Array.isArray(openai.hooks) ? openai.hooks : [openai.hooks];
+  const hooks: OpenAIPluginHooksEntry[] = [];
+  for (const entry of entries) {
+    if (isPlainObject(entry)) {
+      hooks.push(entry);
+      continue;
+    }
+    const relative = typeof entry === "string" ? entry.replace(/[/\\]+$/, "") : undefined;
+    if (relative === undefined || !isSafeContributesPath(relative)) {
+      warnings.push(
+        `'extensions["com.openai"].hooks' entries must be relative paths inside the plugin or hooks objects; ignoring an entry`
+      );
+      continue;
+    }
+    hooks.push(relative);
+  }
+  return hooks;
+}
+
+/**
+ * Read and parse a plugin's Codex hooks. An explicit `com.openai` pointer replaces the default
+ * `hooks/hooks.json`; it never adds to it.
+ */
+export async function loadPluginCodexHooks(
+  plugin: Pick<AgentPluginInfo, "rootPath" | "manifest">
+): Promise<PluginHooksLoadResult> {
+  const warnings: string[] = [];
+  const hooks: PluginHookDefinition[] = [];
+  const pointer = readOpenAIHooksPointer(plugin.manifest, warnings);
+  const entries = pointer ?? [DEFAULT_HOOKS_FILE];
+  for (const [index, entry] of entries.entries()) {
+    if (typeof entry !== "string") {
+      parseHooksDocument(entry, `plugin.json#hooks[${index}]`, hooks, warnings);
+      continue;
+    }
+    const content = await readHooksFile(plugin.rootPath, entry, pointer == null, warnings);
+    if (content === undefined) continue;
+    let document: unknown;
+    try {
+      document = JSON.parse(content);
+    } catch (error) {
+      warnings.push(`${entry} is not valid JSON; ignoring it: ${getErrorMessage(error)}`);
+      continue;
+    }
+    parseHooksDocument(document, path.normalize(entry), hooks, warnings);
+  }
+  return { hooks, warnings };
+}
+
+async function readHooksFile(
+  rootPath: string,
+  relativePath: string,
+  isDefault: boolean,
+  warnings: string[]
+): Promise<string | undefined> {
+  let canonical: string;
+  try {
+    canonical = await ensurePathContained(rootPath, path.join(rootPath, relativePath));
+  } catch (error) {
+    // The default file is optional; a pointer naming a missing file is a plugin bug.
+    if (isDefault && getErrorCode(error) === "ENOENT") return undefined;
+    warnings.push(`${relativePath} cannot be read; ignoring it: ${getErrorMessage(error)}`);
+    return undefined;
+  }
+  try {
+    const result = await readPluginFileWithinRootCapped({
+      filePath: canonical,
+      pluginRoot: rootPath,
+      maxBytes: MAX_HOOKS_FILE_BYTES,
+      label: relativePath,
+    });
+    return result.content;
+  } catch (error) {
+    warnings.push(`${relativePath} cannot be read; ignoring it: ${getErrorMessage(error)}`);
+    return undefined;
+  }
+}
+
+function getErrorCode(error: unknown): unknown {
+  return typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+}
+
+function parseHooksDocument(
+  document: unknown,
+  source: string,
+  out: PluginHookDefinition[],
+  warnings: string[]
+): void {
+  if (!isPlainObject(document) || !isPlainObject(document.hooks)) {
+    warnings.push(`${source}: expected { "hooks": { <Event>: [...] } }; ignoring it`);
+    return;
+  }
+  for (const [event, groups] of Object.entries(document.hooks)) {
+    const mapped = Object.hasOwn(MAPPED_CODEX_HOOK_EVENTS, event);
+    if (!mapped && !IGNORED_CODEX_HOOK_EVENTS.has(event)) {
+      warnings.push(`${source}: unknown hook event '${event}'; ignoring it`);
+      continue;
+    }
+    if (!Array.isArray(groups)) {
+      warnings.push(`${source}: '${event}' must be an array of matcher groups; ignoring it`);
+      continue;
+    }
+    for (const group of groups) {
+      parseMatcherGroup(group, event, mapped, source, out, warnings);
+    }
+  }
+}
+
+function parseMatcherGroup(
+  group: unknown,
+  event: string,
+  mapped: boolean,
+  source: string,
+  out: PluginHookDefinition[],
+  warnings: string[]
+): void {
+  if (!isPlainObject(group) || !Array.isArray(group.hooks)) {
+    warnings.push(`${source}: a '${event}' matcher group needs a "hooks" array; ignoring it`);
+    return;
+  }
+  let matcher: string | undefined;
+  if (group.matcher !== undefined) {
+    if (typeof group.matcher !== "string" || !isValidRegex(group.matcher)) {
+      warnings.push(`${source}: a '${event}' matcher is not a valid regex; ignoring its group`);
+      return;
+    }
+    matcher = group.matcher;
+  }
+  for (const raw of group.hooks) {
+    const handler = parseHandler(raw, `${source}: '${event}'`, warnings);
+    if (handler === undefined) continue;
+    const status: PluginHookStatus = !mapped
+      ? "ignored-event"
+      : handler.type === "mcp_tool"
+        ? "runnable"
+        : "unsupported-handler";
+    out.push({
+      hash: hashHookDefinition(event, matcher, raw),
+      event,
+      ...(matcher !== undefined ? { matcher } : {}),
+      handler,
+      status,
+      source,
+    });
+  }
+}
+
+function parseHandler(
+  raw: unknown,
+  where: string,
+  warnings: string[]
+): PluginHookHandler | undefined {
+  if (!isPlainObject(raw)) {
+    warnings.push(`${where}: a hook handler must be an object; ignoring it`);
+    return undefined;
+  }
+  switch (raw.type) {
+    case "mcp_tool": {
+      const { server, tool, input, timeout, statusMessage } = raw;
+      if (typeof server !== "string" || server.length === 0) break;
+      if (typeof tool !== "string" || tool.length === 0) break;
+      if (input !== undefined && !isPlainObject(input)) break;
+      if (timeout !== undefined && !(typeof timeout === "number" && timeout > 0)) break;
+      return {
+        type: "mcp_tool",
+        server,
+        tool,
+        input: input ?? {},
+        timeoutSeconds: typeof timeout === "number" ? timeout : DEFAULT_HOOK_TIMEOUT_SECONDS,
+        ...(typeof statusMessage === "string" ? { statusMessage } : {}),
+      };
+    }
+    case "command":
+      if (typeof raw.command !== "string") break;
+      return { type: "command", summary: raw.command };
+    case "prompt":
+    case "agent":
+      return { type: raw.type, summary: `${raw.type} handler` };
+    default:
+      warnings.push(`${where}: unknown handler type; ignoring it`);
+      return undefined;
+  }
+  warnings.push(
+    `${where}: a '${String(raw.type)}' handler has missing or invalid fields; ignoring it`
+  );
+  return undefined;
+}
+
+function isValidRegex(pattern: string): boolean {
+  try {
+    new RegExp(pattern);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The trust key. Canonical JSON (sorted keys) of the event, the matcher and the handler exactly
+ * as declared, so reformatting the file keeps trust and any change to what runs drops it.
+ */
+export function hashHookDefinition(event: string, matcher: string | undefined, handler: unknown) {
+  const canonical = canonicalJson({ event, matcher: matcher ?? null, handler });
+  return crypto.createHash("sha256").update(canonical, "utf8").digest("hex");
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (isPlainObject(value)) {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
