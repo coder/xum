@@ -39,8 +39,9 @@ export function probe(arg: ProbeArg) {
   }).observe({ type: "element", buffered: true });
   const visible = (el: Element) => {
     const box = el.getBoundingClientRect();
-    if (box.width <= 0 || box.height <= 0 || box.bottom <= 0 || box.top >= innerHeight)
-      return false;
+    const onScreen =
+      box.bottom > 0 && box.right > 0 && box.top < innerHeight && box.left < innerWidth;
+    if (box.width <= 0 || box.height <= 0 || !onScreen) return false;
     for (let n: Element | null = el; n; n = n.parentElement) {
       const style = getComputedStyle(n);
       if (style.visibility === "hidden" || style.display === "none" || Number(style.opacity) < 1) {
