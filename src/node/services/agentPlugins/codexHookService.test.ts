@@ -395,6 +395,7 @@ describe("CodexPluginHookService", () => {
     const promptArgs = (): EnsureCodexHooksArgs => ({
       ...args(),
       mcp: {
+        canCallToolForPluginHook: () => serverRunning,
         // Like MCPServerManager.callToolForPluginHook: a server that is not running is refused.
         callToolForPluginHook: (_workspaceId, serverKey) => {
           calledKeys.push(serverKey);
