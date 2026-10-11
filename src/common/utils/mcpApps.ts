@@ -120,3 +120,51 @@ export function isModelVisibleTool(ui: MCPToolUi | undefined): boolean {
 export function isAppCallableTool(ui: MCPToolUi | undefined): boolean {
   return (ui?.visibility ?? DEFAULT_VISIBILITY).includes("app");
 }
+
+/**
+ * View-initiated tools/call + resources/read budget per view (both reach the server). Opening an
+ * entry point calls its tool, so the backend applies the same budget per workspace and server.
+ */
+export const MCP_APP_TOOL_CALLS_PER_WINDOW = 5;
+export const MCP_APP_TOOL_CALL_WINDOW_MS = 10_000;
+
+/** An entry point type Xum opens (see parseMCPAppEntrypoints for the skipped `file` type). */
+export type MCPAppEntrypointType = "global" | "thread";
+
+/** The spec's limit on entry points per tool. */
+export const MCP_APP_ENTRYPOINTS_MAX = 3;
+
+/**
+ * Read `_meta["openai/ui"].entrypoints` (OpenAI MCP extensions, "MCP App Entrypoints"): at most
+ * three `{type: "global"}`, `{type: "thread"}` or `{type: "file", extensions}` entries. Xum skips
+ * `file` entry points: they open with a FileInput argument and read the file through the
+ * extended `openai/resource` APIs, which Xum does not implement. Unknown types are ignored;
+ * duplicates collapse. `_meta.ui.visibility` does not apply to entry points (the spec ignores it
+ * when a view opens as one), so a `visibility: ["app"]` tool still has its entry points.
+ */
+export function parseMCPAppEntrypoints(meta: unknown): {
+  types: MCPAppEntrypointType[];
+  skippedFile: boolean;
+} {
+  const openaiUi = isRecord(meta) && isRecord(meta["openai/ui"]) ? meta["openai/ui"] : undefined;
+  const raw = Array.isArray(openaiUi?.entrypoints)
+    ? openaiUi.entrypoints.slice(0, MCP_APP_ENTRYPOINTS_MAX)
+    : [];
+  const types = new Set<MCPAppEntrypointType>();
+  let skippedFile = false;
+  for (const entry of raw) {
+    const type = isRecord(entry) ? entry.type : undefined;
+    if (type === "global" || type === "thread") types.add(type);
+    else if (type === "file") skippedFile = true;
+  }
+  return { types: [...types], skippedFile };
+}
+
+/** The result-store key of an opened entry point (one view record per server, tool and type). */
+export function mcpAppEntrypointKey(
+  serverName: string,
+  toolName: string,
+  type: MCPAppEntrypointType
+): string {
+  return `entrypoint:${serverName}:${toolName}:${type}`;
+}

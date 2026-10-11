@@ -17,9 +17,12 @@ import {
   isModelVisibleTool,
   MCP_APP_MIME_TYPE,
   MCP_APPS_EXTENSION_ID,
+  parseMCPAppEntrypoints,
   parseMCPToolUiMeta,
+  type MCPAppEntrypointType,
   type MCPToolUi,
 } from "@/common/utils/mcpApps";
+import { log } from "@/node/services/log";
 
 /**
  * MCP client adapter over the official TypeScript SDK v2
@@ -120,6 +123,15 @@ export function getMCPToolUi(tool: Tool): MCPToolUi | undefined {
   return toolUiByTool.get(tool);
 }
 
+/** A tool of the latest tools/list that declares MCP App entry points (it always has a view). */
+export interface MCPAppEntrypointTool {
+  toolName: string;
+  /** The spec's entry point title: `title`, then `annotations.title`, then `name`. */
+  title: string;
+  resourceUri: string;
+  types: MCPAppEntrypointType[];
+}
+
 export interface MCPClientHandle {
   /** Fetch tools/list and build AI SDK tools whose execute calls tools/call. */
   tools(): Promise<Record<string, Tool>>;
@@ -149,6 +161,8 @@ export interface MCPClientHandle {
   toolUi(name: string): MCPToolUi | undefined;
   /** MCP Apps only: whether the latest tools() listing contained `name` (hidden tools included). */
   hasTool(name: string): boolean;
+  /** MCP Apps only: the entry point tools of the latest tools() listing (hidden tools included). */
+  appEntrypoints(): readonly MCPAppEntrypointTool[];
   /** MCP Apps only: tools/call on behalf of a view; returns the raw CallToolResult. */
   callToolForApp(
     name: string,
@@ -312,6 +326,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
   });
   // Every tool of the latest listing (hidden ones included) -> its `_meta.ui`, if any.
   let listedTools = new Map<string, MCPToolUi | undefined>();
+  let listedEntrypoints: readonly MCPAppEntrypointTool[] = [];
 
   if (config.onUncaughtError) {
     const onUncaughtError = config.onUncaughtError;
@@ -336,12 +351,33 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
 
       const tools: Record<string, Tool> = {};
       const listed = new Map<string, MCPToolUi | undefined>();
+      const entrypoints: MCPAppEntrypointTool[] = [];
       for (const definition of listResult.tools) {
         // Settings tools are host-only: left out of the listing too, so an MCP App view
         // cannot call them through callToolForApp (hasTool is false for them).
         if (settingsTools.has(definition.name)) continue;
         const ui = mcpApps ? parseMCPToolUiMeta(definition._meta) : undefined;
         listed.set(definition.name, ui);
+        // Read before the visibility filter below: entry points ignore visibility.
+        if (ui?.resourceUri !== undefined) {
+          const { types, skippedFile } = parseMCPAppEntrypoints(definition._meta);
+          if (skippedFile) {
+            log.debug("[MCP Apps] Skipping a file entry point (not supported)", {
+              tool: definition.name,
+            });
+          }
+          if (types.length > 0) {
+            entrypoints.push({
+              toolName: definition.name,
+              title:
+                [definition.title, definition.annotations?.title].find(
+                  (title) => typeof title === "string" && title.trim().length > 0
+                ) ?? definition.name,
+              resourceUri: ui.resourceUri,
+              types,
+            });
+          }
+        }
         // MCP Apps: "Host MUST NOT include tools in the agent's tool list" when visibility
         // lacks "model". Such tools stay callable by their views (callToolForApp).
         if (!isModelVisibleTool(ui)) continue;
@@ -379,6 +415,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         tools[definition.name] = tool;
       }
       listedTools = listed;
+      listedEntrypoints = entrypoints;
       return tools;
     },
     prompts: async (options) => {
@@ -410,6 +447,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     },
     toolUi: (name) => listedTools.get(name),
     hasTool: (name) => listedTools.has(name),
+    appEntrypoints: () => listedEntrypoints,
     callToolForApp: (name, args, options) => {
       assert(mcpApps, "callToolForApp requires an MCP Apps connection");
       return client.callTool(

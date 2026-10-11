@@ -74,6 +74,35 @@ describe("MCP Apps client gating", () => {
   });
 });
 
+describe("MCP App entry points", () => {
+  test("lists entry points with the spec's title order; visibility does not hide them", async () => {
+    expect((await connect(false)).appEntrypoints()).toEqual([]);
+    const client = await connect(true);
+    await client.tools();
+    expect(client.appEntrypoints()).toEqual([
+      {
+        toolName: "show_chart",
+        title: "Show chart",
+        resourceUri: "ui://chart/view",
+        types: ["global"],
+      },
+      // App-only (hidden from the model) and titled by annotations; the file entry is skipped.
+      {
+        toolName: "refresh_chart",
+        title: "Refresh chart",
+        resourceUri: "ui://chart/view",
+        types: ["thread"],
+      },
+      {
+        toolName: "legacy_view",
+        title: "legacy_view",
+        resourceUri: "ui://chart/legacy",
+        types: ["global"],
+      },
+    ]);
+  });
+});
+
 describe("MCP Apps view resources", () => {
   test("accepts text and base64 blob views with their declared CSP", async () => {
     const client = await connect(true);

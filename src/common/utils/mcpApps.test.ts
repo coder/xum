@@ -1,5 +1,34 @@
 import { describe, expect, test } from "bun:test";
-import { isAppCallableTool, isModelVisibleTool, parseMCPToolUiMeta } from "./mcpApps";
+import {
+  isAppCallableTool,
+  isModelVisibleTool,
+  parseMCPAppEntrypoints,
+  parseMCPToolUiMeta,
+} from "./mcpApps";
+
+describe("parseMCPAppEntrypoints", () => {
+  test("keeps global and thread, skips file and unknown types, reads at most three", () => {
+    const entrypoints = (list: unknown) => ({ "openai/ui": { entrypoints: list } });
+    expect(
+      parseMCPAppEntrypoints(
+        entrypoints([
+          { type: "thread" },
+          { type: "file", extensions: [".stl"] },
+          { type: "global" },
+        ])
+      )
+    ).toEqual({ types: ["thread", "global"], skippedFile: true });
+    // The spec allows three; a fourth is ignored. Duplicates collapse.
+    expect(
+      parseMCPAppEntrypoints(
+        entrypoints([{ type: "global" }, { type: "global" }, { type: "nav" }, { type: "thread" }])
+      )
+    ).toEqual({ types: ["global"], skippedFile: false });
+    for (const meta of [undefined, {}, { "openai/ui": [] }, entrypoints("global")]) {
+      expect(parseMCPAppEntrypoints(meta)).toEqual({ types: [], skippedFile: false });
+    }
+  });
+});
 
 describe("parseMCPToolUiMeta", () => {
   test("reads _meta.ui and defaults visibility to model + app", () => {

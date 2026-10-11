@@ -138,6 +138,28 @@ export const McpAppModelContextRequestSchema = z.object({
     ),
 });
 
+/**
+ * A tool's MCP App entry point (`_meta["openai/ui"].entrypoints`) on a server enabled in the
+ * workspace. `viewKey` is the result-store key its view record is kept under (the toolCallId the
+ * view mounts with), so the tab survives a reload.
+ */
+export const McpAppEntrypointSchema = z.object({
+  serverName: z.string().min(1),
+  toolName: z.string().min(1),
+  title: z.string(),
+  resourceUri: z.string().refine(isMcpAppResourceUri),
+  type: z.enum(["global", "thread"]),
+  viewKey: z.string().min(1),
+});
+export type McpAppEntrypoint = z.infer<typeof McpAppEntrypointSchema>;
+
+export const McpAppOpenEntrypointRequestSchema = z.object({
+  workspaceId: z.string().min(1),
+  serverName: z.string().min(1),
+  toolName: z.string().min(1).max(256),
+  type: z.enum(["global", "thread"]),
+});
+
 export const McpAppToolCallResultSchema = z.discriminatedUnion("status", [
   z.object({ status: z.literal("ok"), result: z.unknown() }),
   /** The tool is visible to the model too: the user must allow this call first. */

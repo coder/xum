@@ -7,6 +7,8 @@ import { createInterface } from "node:readline";
  * - show_chart: model + app visible, view ui://chart/view, returns structuredContent.
  * - refresh_chart: app-only (hidden from the model), callable from the view.
  * - legacy_view: deprecated flat `_meta["ui/resourceUri"]`.
+ * Entry points (`_meta["openai/ui"].entrypoints`): show_chart global (title over annotations), refresh_chart
+ * thread + file (app-only; annotations.title), legacy_view global (no title: name).
  * - capabilities_probe: echoes the client's initialize capabilities (gating tests).
  * Extra resources exercise the host's resources/read validation.
  */
@@ -131,18 +133,32 @@ lines.on("line", (line) => {
           {
             name: "show_chart",
             title: "Show chart",
+            // Loses to `title` (the spec's order: title, then annotations.title, then name).
+            annotations: { title: "Chart (annotation)" },
             inputSchema: { type: "object", properties: { title: { type: "string" } } },
-            _meta: { ui: { resourceUri: VIEW_URI, visibility: ["model", "app"] } },
+            _meta: {
+              ui: { resourceUri: VIEW_URI, visibility: ["model", "app"] },
+              "openai/ui": { entrypoints: [{ type: "global" }] },
+            },
           },
           {
             name: "refresh_chart",
+            annotations: { title: "Refresh chart" },
             inputSchema: { type: "object", properties: {} },
-            _meta: { ui: { resourceUri: VIEW_URI, visibility: ["app"] } },
+            _meta: {
+              ui: { resourceUri: VIEW_URI, visibility: ["app"] },
+              "openai/ui": {
+                entrypoints: [{ type: "thread" }, { type: "file", extensions: [".csv"] }],
+              },
+            },
           },
           {
             name: "legacy_view",
             inputSchema: { type: "object", properties: {} },
-            _meta: { "ui/resourceUri": "ui://chart/legacy" },
+            _meta: {
+              "ui/resourceUri": "ui://chart/legacy",
+              "openai/ui": { entrypoints: [{ type: "global" }] },
+            },
           },
           { name: "capabilities_probe", inputSchema: { type: "object", properties: {} } },
         ],

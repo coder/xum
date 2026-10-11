@@ -48,7 +48,12 @@ export interface FakeServerBehavior {
   /** Never finish connecting, so only the manager's startup deadline ends the attempt. */
   hang?: boolean;
   /** MCP Apps client methods, used when the manager connects with MCP Apps enabled. */
-  apps?: Partial<Pick<MCPClientHandle, "toolUi" | "hasTool" | "callToolForApp" | "readResource">>;
+  apps?: Partial<
+    Pick<
+      MCPClientHandle,
+      "toolUi" | "hasTool" | "callToolForApp" | "readResource" | "appEntrypoints"
+    >
+  >;
   /** Raw tools/call for plugin hooks (MCPServerManager.callToolForPluginHook). */
   callToolForHook?: MCPClientHandle["callToolForHook"];
   /** OpenAI structured settings client methods. */

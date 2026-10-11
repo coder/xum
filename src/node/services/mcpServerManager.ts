@@ -41,8 +41,16 @@ import type {
   McpAppResultStore,
 } from "@/node/services/mcpAppResultStore";
 import { extractMcpAppResource, type McpAppResource } from "@/node/services/mcpAppResource";
-import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
-import { isAppCallableTool, isMcpAppResourceUri, isModelVisibleTool } from "@/common/utils/mcpApps";
+import type { McpAppEntrypoint, McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
+import {
+  isAppCallableTool,
+  isMcpAppResourceUri,
+  isModelVisibleTool,
+  MCP_APP_TOOL_CALL_WINDOW_MS,
+  MCP_APP_TOOL_CALLS_PER_WINDOW,
+  mcpAppEntrypointKey,
+  type MCPAppEntrypointType,
+} from "@/common/utils/mcpApps";
 import { log } from "@/node/services/log";
 import { MCPStdioTransport, MCP_STDIO_KILL_JOIN_MS } from "@/node/services/mcpStdioTransport";
 import type {
@@ -1370,7 +1378,10 @@ interface MCPServerInstance {
    * MCP Apps (artifacts experiment): present only when the connection announced the
    * extension. Tool metadata includes tools hidden from the model.
    */
-  apps?: Pick<MCPClientHandle, "toolUi" | "hasTool" | "callToolForApp" | "readResource">;
+  apps?: Pick<
+    MCPClientHandle,
+    "toolUi" | "hasTool" | "callToolForApp" | "readResource" | "appEntrypoints"
+  >;
   /** OpenAI structured settings (`openai/settings`); its tools are hidden from the model. */
   settings?: Pick<MCPClientHandle, "settingsCapability" | "callSettingsTool">;
   /** True once the underlying MCP client/transport has been closed. */
@@ -5114,11 +5125,7 @@ export class MCPServerManager {
         if (dispatched !== null) return dispatched;
         const apps = requireAppsConnection(instance);
         // Read synchronously at dispatch, from the same state the served-tool gate uses.
-        const allowlist = effectiveToolAllowlist(
-          serverName,
-          this.workspaceServers.get(workspaceId)?.enabledServers[serverName]?.toolAllowlist,
-          this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides
-        );
+        const allowlist = this.appToolAllowlist(workspaceId, serverName);
         const refusal = checkMcpAppToolCall(apps, toolName, options.consented, allowlist);
         if (refusal !== null) return Promise.resolve(refusal);
         log.info("[MCP Apps] View-initiated tools/call", { workspaceId, serverName, toolName });
@@ -5130,6 +5137,122 @@ export class MCPServerManager {
       (result) => result,
       options
     );
+  }
+
+  /**
+   * MCP App entry points of the workspace's enabled, connected servers. The tool allowlist
+   * applies (opening one calls the tool); `_meta.ui.visibility` does not (spec).
+   */
+  listMcpAppEntrypoints(workspaceId: string): McpAppEntrypoint[] {
+    const entry = this.workspaceServers.get(workspaceId);
+    if (entry === undefined || this.mcpApps?.isEnabled() !== true) return [];
+    const entrypoints: McpAppEntrypoint[] = [];
+    for (const [serverName, instance] of entry.instances) {
+      if (!entry.enabledServerNames.has(serverName) || instance.isClosed || !instance.apps)
+        continue;
+      const allowlist = this.appToolAllowlist(workspaceId, serverName);
+      for (const tool of instance.apps.appEntrypoints()) {
+        if (allowlist !== null && !allowlist.has(tool.toolName)) continue;
+        for (const type of tool.types) {
+          entrypoints.push({
+            serverName,
+            toolName: tool.toolName,
+            title: tool.title,
+            resourceUri: tool.resourceUri,
+            type,
+            viewKey: mcpAppEntrypointKey(serverName, tool.toolName, type),
+          });
+        }
+      }
+    }
+    return entrypoints;
+  }
+
+  /**
+   * Open an entry point: call its tool with `{}` (the spec's entry point arguments) on
+   * `serverName` only, and store the result as the view record under the entry point's key, so
+   * its tab mounts (and remounts after a reload) through getMcpAppView. No chat row is written.
+   * Rate limited like a view's own tool calls, per workspace and server.
+   */
+  async openMcpAppEntrypoint(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    type: MCPAppEntrypointType,
+    options?: { signal?: AbortSignal }
+  ): Promise<McpAppEntrypoint> {
+    assert(this.mcpApps, "MCP Apps support is not configured");
+    const store = this.mcpApps.store;
+    if (!this.allowEntrypointCall(workspaceId, serverName)) {
+      throw new Error(`Too many entry point opens for '${serverName}'; try again shortly`);
+    }
+    // One-shot dispatch, as in callMcpAppTool: an epoch retry must not call the tool twice.
+    let dispatched: Promise<McpAppEntrypoint> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP Apps entry point '${serverName}/${toolName}'`,
+      (instance): Promise<McpAppEntrypoint> => {
+        if (dispatched !== null) return dispatched;
+        const apps = requireAppsConnection(instance);
+        const tool = apps
+          .appEntrypoints()
+          .find((candidate) => candidate.toolName === toolName && candidate.types.includes(type));
+        const allowlist = this.appToolAllowlist(workspaceId, serverName);
+        if (tool === undefined || (allowlist !== null && !allowlist.has(toolName))) {
+          return Promise.reject(
+            new Error(`'${serverName}' has no ${type} entry point named '${toolName}'`)
+          );
+        }
+        log.info("[MCP Apps] Opening an entry point", { workspaceId, serverName, toolName, type });
+        const viewKey = mcpAppEntrypointKey(serverName, toolName, type);
+        dispatched = apps.callToolForApp(toolName, {}, options).then(async (result) => {
+          await store.record(workspaceId, {
+            toolCallId: viewKey,
+            serverName,
+            toolName,
+            resourceUri: tool.resourceUri,
+            arguments: {},
+            result,
+          });
+          return {
+            serverName,
+            toolName,
+            title: tool.title,
+            resourceUri: tool.resourceUri,
+            type,
+            viewKey,
+          };
+        });
+        return dispatched;
+      },
+      (result) => result,
+      options
+    );
+  }
+
+  /** Effective tool allowlist of a server for MCP Apps calls (read at dispatch). */
+  private appToolAllowlist(workspaceId: string, serverName: string): Set<string> | null {
+    return effectiveToolAllowlist(
+      serverName,
+      this.workspaceServers.get(workspaceId)?.enabledServers[serverName]?.toolAllowlist,
+      this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides
+    );
+  }
+
+  private readonly entrypointCallWindows = new Map<string, { start: number; count: number }>();
+
+  /** The view tool-call budget (mcpAppHost), applied per workspace and server. */
+  private allowEntrypointCall(workspaceId: string, serverName: string): boolean {
+    const key = `${workspaceId}\0${serverName}`;
+    const now = Date.now();
+    const window = this.entrypointCallWindows.get(key);
+    if (window === undefined || now - window.start >= MCP_APP_TOOL_CALL_WINDOW_MS) {
+      this.entrypointCallWindows.set(key, { start: now, count: 1 });
+      return true;
+    }
+    window.count += 1;
+    return window.count <= MCP_APP_TOOL_CALLS_PER_WINDOW;
   }
 
   /**

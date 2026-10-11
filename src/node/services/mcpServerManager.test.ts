@@ -64,6 +64,7 @@ import {
 import { FakeMcpServers, MCP_STARTUP_TIMEOUT_MS } from "./mcpServerManager.testHarness";
 import { readMcpToolOrigin } from "./agentPlugins/codexToolNames";
 import type { McpOauthService } from "./mcpOauthService";
+import { MCP_APP_TOOL_CALLS_PER_WINDOW } from "@/common/utils/mcpApps";
 
 const PROJECT_PATH = "/tmp/project";
 const WORKSPACE_PATH = "/tmp/workspace";
@@ -1289,6 +1290,150 @@ describe("MCPServerManager", () => {
       );
     expect(refused).toBeInstanceOf(Error);
     expect(reads).toEqual(["apps-read ui://x/a"]);
+  });
+
+  test("entry points: listed per enabled server, opened with {} on their own server only", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entrypoints");
+    const store = new McpAppResultStore((id) => path.join(tmp.path, id));
+    manager.setMcpApps({ isEnabled: () => true, store });
+    configService.listServers.mockResolvedValue({
+      apps: stdioConfig("apps-entry"),
+      other: stdioConfig("apps-entry-other"),
+      off: stdioConfig("apps-entry-off", true),
+    });
+    const calls: string[] = [];
+    const serveEntrypoints = (command: string, toolName: string) =>
+      servers.serve(command, {
+        tools: { show: testTool() },
+        apps: {
+          hasTool: () => true,
+          toolUi: () => undefined,
+          appEntrypoints: () => [
+            { toolName, title: `${toolName} view`, resourceUri: "ui://x/view", types: ["global"] },
+          ],
+          callToolForApp: (name: string, args: Record<string, unknown>) => {
+            calls.push(`${command} ${name} ${JSON.stringify(args)}`);
+            return Promise.resolve({ content: [{ type: "text", text: command }] });
+          },
+        },
+      });
+    serveEntrypoints("apps-entry", "board");
+    serveEntrypoints("apps-entry-other", "tray");
+    serveEntrypoints("apps-entry-off", "hidden");
+    const request = workspaceRequest("apps-entry");
+    await manager.getToolsForWorkspace(request);
+
+    // Disabled servers contribute none.
+    expect(manager.listMcpAppEntrypoints(request.workspaceId)).toEqual([
+      {
+        serverName: "apps",
+        toolName: "board",
+        title: "board view",
+        resourceUri: "ui://x/view",
+        type: "global",
+        viewKey: "entrypoint:apps:board:global",
+      },
+      {
+        serverName: "other",
+        toolName: "tray",
+        title: "tray view",
+        resourceUri: "ui://x/view",
+        type: "global",
+        viewKey: "entrypoint:other:tray:global",
+      },
+    ]);
+
+    const opened = await manager.openMcpAppEntrypoint(
+      request.workspaceId,
+      "apps",
+      "board",
+      "global"
+    );
+    expect(opened.viewKey).toBe("entrypoint:apps:board:global");
+    expect(calls).toEqual(["apps-entry board {}"]);
+    // The view record binds the view to its server: getMcpAppView mounts it after a reload.
+    expect(await store.get(request.workspaceId, opened.viewKey)).toMatchObject({
+      serverName: "apps",
+      toolName: "board",
+      resourceUri: "ui://x/view",
+      arguments: {},
+      result: { content: [{ type: "text", text: "apps-entry" }] },
+    });
+
+    // Another server's tool, or a type the tool does not declare, is refused before any call.
+    for (const [server, tool, type] of [
+      ["apps", "tray", "global"],
+      ["apps", "board", "thread"],
+    ] as const) {
+      const refused = await manager
+        .openMcpAppEntrypoint(request.workspaceId, server, tool, type)
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+      expect(refused).toBeInstanceOf(Error);
+    }
+    expect(calls).toHaveLength(1);
+
+    // The workspace tool allowlist applies: opening calls the tool. An excluded tool's entry
+    // point is not listed, and opening it is refused before any call.
+    await manager.applyWorkspaceOverrides(request.workspaceId, {
+      toolAllowlist: { apps: ["other"] },
+    });
+    expect(
+      manager.listMcpAppEntrypoints(request.workspaceId).map((entry) => entry.serverName)
+    ).toEqual(["other"]);
+    const excluded = await manager
+      .openMcpAppEntrypoint(request.workspaceId, "apps", "board", "global")
+      .then(
+        () => null,
+        (error: unknown) => error
+      );
+    expect(excluded).toBeInstanceOf(Error);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("entry point opens share the view tool-call budget per server", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-limit");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({
+      apps: stdioConfig("apps-entry-limit"),
+      other: stdioConfig("apps-entry-limit-other"),
+    });
+    let calls = 0;
+    for (const command of ["apps-entry-limit", "apps-entry-limit-other"]) {
+      servers.serve(command, {
+        tools: { show: testTool() },
+        apps: {
+          hasTool: () => true,
+          toolUi: () => undefined,
+          appEntrypoints: () => [
+            { toolName: "board", title: "Board", resourceUri: "ui://x/view", types: ["global"] },
+          ],
+          callToolForApp: () => {
+            calls++;
+            return Promise.resolve({ content: [] });
+          },
+        },
+      });
+    }
+    const request = workspaceRequest("apps-entry-limit");
+    await manager.getToolsForWorkspace(request);
+    const open = (server: string) =>
+      manager.openMcpAppEntrypoint(request.workspaceId, server, "board", "global").then(
+        () => true,
+        () => false
+      );
+    const results: boolean[] = [];
+    for (let i = 0; i <= MCP_APP_TOOL_CALLS_PER_WINDOW; i++) results.push(await open("apps"));
+    expect(results.filter(Boolean)).toHaveLength(MCP_APP_TOOL_CALLS_PER_WINDOW);
+    expect(results.at(-1)).toBe(false);
+    expect(calls).toBe(MCP_APP_TOOL_CALLS_PER_WINDOW);
+    // Another server of the workspace has its own budget.
+    expect(await open("other")).toBe(true);
   });
 
   test("idle cleanup retries retired-only failures without another MCP request", async () => {

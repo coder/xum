@@ -77,7 +77,9 @@ import {
   McpAppToolCallRequestSchema,
   McpAppToolCallResultSchema,
   McpAppApproveDomainsRequestSchema,
+  McpAppEntrypointSchema,
   McpAppModelContextRequestSchema,
+  McpAppOpenEntrypointRequestSchema,
   McpAppViewDomainsSchema,
   McpAppResourceReadRequestSchema,
   McpAppViewRecordsRequestSchema,
@@ -1555,6 +1557,16 @@ export const mcpApps = {
   updateModelContext: {
     input: McpAppModelContextRequestSchema,
     output: ResultSchema(z.object({}), z.string()),
+  },
+  /** Entry points of the servers enabled in the workspace (starts them like prompt discovery). */
+  listEntrypoints: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: z.array(McpAppEntrypointSchema),
+  },
+  /** Call an entry point's tool with `{}` and store its view record (no chat row). */
+  openEntrypoint: {
+    input: McpAppOpenEntrypointRequestSchema,
+    output: ResultSchema(McpAppEntrypointSchema, z.string()),
   },
 };
 

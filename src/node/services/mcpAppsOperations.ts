@@ -9,6 +9,8 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { MCP_APP_VIEW_DOMAINS_MAX, mcpAppGrantableOrigin } from "@/common/utils/mcpApps";
 import type {
   McpAppApproveDomainsRequestSchema,
+  McpAppEntrypoint,
+  McpAppOpenEntrypointRequestSchema,
   McpAppModelContextRequestSchema,
   McpAppResourceReadRequestSchema,
   McpAppToolCallRequestSchema,
@@ -227,6 +229,46 @@ export async function callMcpAppTool(
       return { success: false, error: "The tool result is too large to return to the view" };
     }
     return { success: true, data: outcome };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+/**
+ * Entry points of the workspace's enabled servers. Starts them first, the way prompt
+ * discovery does, so a server just enabled (or a cold backend) is listed.
+ */
+export async function listMcpAppEntrypoints(
+  context: McpAppsContext,
+  workspaceId: string,
+  signal: AbortSignal | undefined,
+  warmServers: (workspaceId: string, signal: AbortSignal | undefined) => Promise<unknown>
+): Promise<McpAppEntrypoint[]> {
+  assertMcpAppsEnabled(context);
+  await warmServers(workspaceId, signal);
+  return context.mcpServerManager.listMcpAppEntrypoints(workspaceId);
+}
+
+/** Open an entry point (see MCPServerManager.openMcpAppEntrypoint); warms servers like getView. */
+export async function openMcpAppEntrypoint(
+  context: McpAppsContext,
+  input: z.infer<typeof McpAppOpenEntrypointRequestSchema>,
+  signal: AbortSignal | undefined,
+  warmServers: (workspaceId: string, signal: AbortSignal | undefined) => Promise<unknown>
+): Promise<Result<McpAppEntrypoint, string>> {
+  assertMcpAppsEnabled(context);
+  try {
+    if (!context.mcpServerManager.hasWorkspaceRequestOptions(input.workspaceId)) {
+      await warmServers(input.workspaceId, signal);
+    }
+    const entrypoint = await context.mcpServerManager.openMcpAppEntrypoint(
+      input.workspaceId,
+      input.serverName,
+      input.toolName,
+      input.type,
+      signal !== undefined ? { signal } : undefined
+    );
+    return { success: true, data: entrypoint };
   } catch (error) {
     return { success: false, error: getErrorMessage(error) };
   }
