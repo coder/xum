@@ -397,10 +397,12 @@ test.each([
     const stop = new AbortController().signal;
     expect(await runBugBash([...charters("a")], { ...ENV, ...over }, stop, deps)).toBe(2);
     expect(calls).toHaveLength(0);
-    // It names the variable and the host to check, never the URL's path.
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("ANTHROPIC_BASE_URL (127.0.0.1:9)");
-    expect(lines[0]).not.toContain("/v1");
+    // One refusal (after U4's estimate line). It names the variable and the host to check,
+    // never the URL's path.
+    const refusals = lines.filter((line) => line.startsWith("make bug-bash:"));
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toContain("ANTHROPIC_BASE_URL (127.0.0.1:9)");
+    expect(refusals[0]).not.toContain("/v1");
   }
 );
 
