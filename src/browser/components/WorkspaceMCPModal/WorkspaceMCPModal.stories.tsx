@@ -545,7 +545,7 @@ const CAD_SETTINGS: MCPSettingsSnapshot = {
     units: { type: "string", title: "Units", enum: ["mm", "in"] },
     grid: { type: "boolean", title: "Show grid", description: "Draws a <b>grid</b> behind parts." },
     zoom: { type: "integer", title: "Default zoom", minimum: 1, maximum: 5 },
-    prefix: { type: "string", title: "Part prefix", pattern: "^[A-Z]{2}$" },
+    prefix: { type: "string", title: "Part prefix", maxLength: 2 },
   },
   values: { units: "mm", grid: true, zoom: 2, prefix: "BB" },
   layout: [

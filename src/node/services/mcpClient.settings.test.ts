@@ -20,6 +20,9 @@ test("settings tools are hidden from the model and called with the host's _meta"
   });
   // The model sees only ordinary tools: it cannot change the user's settings.
   expect(Object.keys(await client.tools())).toEqual(["echo"]);
+  // Nor can an MCP App view: app calls go only to listed tools.
+  expect(client.hasTool("echo")).toBe(true);
+  expect(client.hasTool("settings.update")).toBe(false);
 
   const result = await client.callSettingsTool(
     "settings.update",

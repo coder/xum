@@ -358,7 +358,6 @@ const MCPSettingSchemaSchema = z.object({
   enum: z.array(z.string()).optional(),
   minLength: z.number().optional(),
   maxLength: z.number().optional(),
-  pattern: z.string().optional(),
   minimum: z.number().optional(),
   maximum: z.number().optional(),
   multipleOf: z.number().optional(),

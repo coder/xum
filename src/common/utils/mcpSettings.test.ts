@@ -31,12 +31,12 @@ describe("parseMCPSettingsReadResult", () => {
           grid: { type: "boolean", title: "Show grid" },
           zoom: { type: "integer", title: "Zoom", minimum: 1, maximum: 5 },
           color: { type: "object", title: "Unsupported type" },
-          badRegex: { type: "string", title: "Bad", pattern: "(" },
+          badEnum: { type: "string", title: "Bad", enum: ["a", 1] },
           noTitle: { type: "boolean" },
           wrongValue: { type: "number", title: "Wrong value" },
         },
       },
-      values: { units: "in", grid: false, zoom: 2, badRegex: "x", noTitle: true, wrongValue: "9" },
+      values: { units: "in", grid: false, zoom: 2, badEnum: "a", noTitle: true, wrongValue: "9" },
       layout: [
         {
           kind: "group",
@@ -45,6 +45,8 @@ describe("parseMCPSettingsReadResult", () => {
             { kind: "property", property: "units" },
             { kind: "tool", tool: "cad.library" },
             { kind: "property", property: "color" },
+            // Inherited, not declared: must not resolve through Object.prototype.
+            { kind: "property", property: "toString" },
             { kind: "mystery" },
           ],
         },
@@ -70,10 +72,28 @@ describe("parseMCPSettingsReadResult", () => {
         ],
       },
     ]);
-    // color, badRegex, noTitle (schema); wrongValue (value); mystery item; page group.
+    // color, badEnum, noTitle (schema); wrongValue (value); mystery item; page group.
     expect(result.warnings).toHaveLength(6);
     // Settings the UI cannot show: color, badRegex, noTitle and wrongValue (not layout items).
     expect(result.droppedSettingCount).toBe(4);
+  });
+
+  test("ignores a server pattern (never runs server regexes) and accepts an empty enum option", () => {
+    const result = parseMCPSettingsReadResult({
+      schema: {
+        type: "object",
+        properties: {
+          // A value that breaks its pattern stays: the server's update tool is the judge.
+          code: { type: "string", title: "Code", pattern: "^x$" },
+          mode: { type: "string", title: "Mode", enum: ["", "fast"] },
+        },
+      },
+      values: { code: "y", mode: "" },
+    });
+    if ("error" in result) throw new Error(result.error);
+    expect(result.values).toEqual({ code: "y", mode: "" });
+    expect(result.properties.code).toEqual({ type: "string", title: "Code" });
+    expect(result.warnings).toEqual([]);
   });
 
   test("a result without an object schema is an error", () => {
@@ -81,11 +101,13 @@ describe("parseMCPSettingsReadResult", () => {
   });
 });
 
-test("validateMCPSettingValue checks enum, bounds, pattern and multipleOf", () => {
+test("validateMCPSettingValue checks enum, code-point lengths, bounds and multipleOf", () => {
   expect(validateMCPSettingValue({ type: "string", title: "t", enum: ["a"] }, "b")).not.toBeNull();
+  // Lengths count code points (JSON Schema), not UTF-16 units.
+  expect(validateMCPSettingValue({ type: "string", title: "t", maxLength: 1 }, "😀")).toBeNull();
   expect(
-    validateMCPSettingValue({ type: "string", title: "t", pattern: "^v\\d$" }, "v1")
-  ).toBeNull();
+    validateMCPSettingValue({ type: "string", title: "t", minLength: 2 }, "😀")
+  ).not.toBeNull();
   expect(
     validateMCPSettingValue({ type: "string", title: "t", maxLength: 2 }, "abc")
   ).not.toBeNull();
