@@ -390,7 +390,8 @@ export const MCPSettingsReadParamsSchema = z.object({
 /** One call for every server the dialog shows (bulk data in one IPC call). */
 export const MCPSettingsReadInputSchema = z.object({
   workspaceId: z.string(),
-  serverNames: z.array(z.string()).max(256),
+  // No count limit: the dialog sends every enabled server, and each read has its own timeout.
+  serverNames: z.array(z.string()),
   /**
    * Read only servers the workspace already runs; never start or restart one
    * (the workspace MCP dialog reads on open). Otherwise `{ notConnected: true }`.

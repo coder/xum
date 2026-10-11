@@ -178,7 +178,11 @@ import { throwWorkflowOrpcError } from "./formatOrpcError";
 import { isDraftTooLargeError } from "@/common/utils/drafts";
 import { resolveDraftSends } from "@/node/services/draftSendResolution";
 import type { SendAcceptance } from "@/node/services/draftService";
-import type { MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
+import {
+  boundMCPSettingsError,
+  MCP_SETTINGS_READ_TIMEOUT_MS,
+  type MCPSettingsSnapshot,
+} from "@/common/utils/mcpSettings";
 import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
 
 /**
@@ -217,7 +221,8 @@ async function runMcpSettingsRoute<T>(
       await listWorkspaceMcpPrompts(context, workspaceId, signal);
     return { success: true, data: await run() };
   } catch (error) {
-    return { success: false, error: getErrorMessage(error) };
+    // Server error text is untrusted and unbounded: bound it before it crosses IPC.
+    return { success: false, error: boundMCPSettingsError(getErrorMessage(error)) };
   }
 }
 
@@ -238,21 +243,24 @@ async function readMcpSettingsRoute(
   signal: AbortSignal | undefined
 ): Promise<Record<string, McpSettingsReadResult>> {
   const manager = context.mcpServerManager;
+  // Per server: a hung server times out with its own error and does not hold back the others.
+  const timeoutMs = MCP_SETTINGS_READ_TIMEOUT_MS;
   const readOne = async (serverName: string): Promise<McpSettingsReadResult> => {
     if (input.ifConnected !== true)
       return runMcpSettingsRoute(context, input.workspaceId, signal, () =>
-        manager.readSettings(input.workspaceId, serverName, { signal })
+        manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs })
       );
     if (!manager.isWorkspaceServerConnected(input.workspaceId, serverName))
       return { success: true, data: { notConnected: true } };
     try {
       const data = await manager.readSettings(input.workspaceId, serverName, {
         signal,
+        timeoutMs,
         noStart: true,
       });
       return { success: true, data };
     } catch (error) {
-      return { success: false, error: getErrorMessage(error) };
+      return { success: false, error: boundMCPSettingsError(getErrorMessage(error)) };
     }
   };
   const entries = await Promise.all(
