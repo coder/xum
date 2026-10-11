@@ -34,12 +34,18 @@ let revoked: Array<{ projectPath: string; serverName: string }> = [];
 let pushConfigChanged: () => void = () => undefined;
 // Backend calls the renderer made, and the signals of its config subscriptions.
 let listCalls = 0;
+let listFailures = 0;
+let subscribeFailures = 0;
 let subscriptions: AbortSignal[] = [];
 
 function api(): APIClient {
   const overrides: TestApiOverrides<APIClient> = {
     config: {
       onConfigChanged: (_input: void, options?: { signal?: AbortSignal }) => {
+        if (subscribeFailures > 0) {
+          subscribeFailures--;
+          return Promise.reject(new Error("transient IPC failure"));
+        }
         if (options?.signal) subscriptions.push(options.signal);
         const waiting: Array<() => void> = [];
         // Every open subscription sees the event (the app's config store has one too).
@@ -74,6 +80,10 @@ function api(): APIClient {
         }),
       listViewDomains: () => {
         listCalls++;
+        if (listFailures > 0) {
+          listFailures--;
+          return Promise.reject(new Error("transient IPC failure"));
+        }
         return Promise.resolve(stored);
       },
       revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
@@ -124,6 +134,8 @@ describe("MCP Apps allowed view domains", () => {
     revoked = [];
     pushConfigChanged = () => undefined;
     listCalls = 0;
+    listFailures = 0;
+    subscribeFailures = 0;
     subscriptions = [];
   });
   afterEach(() => {
@@ -202,6 +214,52 @@ describe("MCP Apps allowed view domains", () => {
     // The shared subscription closes with the last view.
     cleanup();
     expect(live()).toBe(0);
+  });
+
+  test("a failed reconciliation read does not stop later revocations from applying", async () => {
+    listFailures = 1;
+    const view = renderWith(<McpAppFrame workspaceId="ws" view={VIEW} />);
+    expect(await frameCsp(view)).toContain(`connect-src ${API_ORIGIN}`);
+    // The first read (when the listener starts) fails.
+    await waitFor(() => expect(listCalls).toBeGreaterThan(0));
+    stored = [];
+    await act(async () => {
+      pushConfigChanged();
+      await Promise.resolve();
+    });
+    await waitFor(async () => expect(await frameCsp(view)).not.toContain(API_ORIGIN));
+  });
+
+  test("a lost subscription is started again by the next view that mounts", async () => {
+    const frame = (count: number) => (
+      <ThemeProvider forcedTheme="dark">
+        <APIProvider client={client}>
+          {Array.from({ length: count }, (_, i) => (
+            <McpAppFrame key={i} workspaceId="ws" view={VIEW} variant={i ? "inline" : "panel"} />
+          ))}
+        </APIProvider>
+      </ThemeProvider>
+    );
+    const view = renderWith(<></>);
+    await act(() => Promise.resolve());
+    // The views' shared subscription (opened after the app's own) fails once.
+    subscribeFailures = 1;
+    view.rerender(frame(1));
+    expect(await frameCsp(view)).toContain(`connect-src ${API_ORIGIN}`);
+    await waitFor(() => expect(subscribeFailures).toBe(0));
+    view.rerender(frame(2));
+    await waitFor(() => expect(view.getAllByTestId("mcp-app-frame")).toHaveLength(2));
+    for (let i = 0; i < 5; i++) await act(() => Promise.resolve());
+    stored = [];
+    await act(async () => {
+      pushConfigChanged();
+      await Promise.resolve();
+    });
+    await waitFor(async () => {
+      for (const element of view.getAllByTestId("mcp-app-frame")) {
+        expect(element.getAttribute("srcdoc")).not.toContain(API_ORIGIN);
+      }
+    });
   });
 
   test("a failed revoke shows its error next to the entry and keeps it", async () => {

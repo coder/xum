@@ -112,19 +112,26 @@ function startFollowing(api: APIClient): void {
   const state = { api, controller: new AbortController(), ready: false };
   following = state;
   const { signal } = state.controller;
+  // One failed read (a transient IPC error) must not end the stream: the next change retries.
+  const reconcileOnce = () => reconcile(api).catch(() => undefined);
   const follow = async () => {
     // Listener first, then the read: a revoke before the subscription is in the read, and one
     // after it is an event, so none falls between the two.
     const changes = await api.config.onConfigChanged(undefined, { signal });
     state.ready = true;
-    await reconcile(api);
+    await reconcileOnce();
     for await (const _ of changes) {
       if (signal.aborted) break;
-      await reconcile(api);
+      await reconcileOnce();
     }
   };
-  // Ends with the abort when the last view unmounts; a lost subscription leaves views as they are.
-  follow().catch(() => undefined);
+  // Ends with the abort when the last view unmounts. A lost subscription leaves views as they are,
+  // and the next view that mounts starts a new one.
+  follow()
+    .catch(() => undefined)
+    .finally(() => {
+      if (following === state) following = null;
+    });
 }
 
 function follow(api: APIClient, follower: Follower): () => void {
