@@ -740,7 +740,7 @@ export class TurnRequestBuilder {
    * MCPServerManager.getToolsForWorkspace), so the same servers start and no others. Codex plugin
    * hooks on UserPromptSubmit run before request building and need their plugin's server, which
    * after a restart is not running yet. Returns false when the workspace is not ready for MCP
-   * (init failed, unsanitized checkout, runtime not ready, no MCP manager).
+   * (init failed, unsanitized checkout, runtime not ready, no MCP manager) or is a side chat.
    */
   async startWorkspaceMcpServers(workspaceId: string, signal: AbortSignal): Promise<boolean> {
     const mcpServerManager = this.dependencies.bindings.mcpServerManager;
@@ -748,6 +748,9 @@ export class TurnRequestBuilder {
     const metadataResult = await this.dependencies.getWorkspaceMetadata(workspaceId);
     if (!metadataResult.success) return false;
     const metadata = metadataResult.data;
+    // Like request building: a side chat never starts MCP servers (its local-read-only ceiling),
+    // so its prompt hooks fail open instead of reaching a possibly mutating MCP tool.
+    if (sideChatCapabilityGrants(metadata) != null) return false;
     const runtimeContext = this.dependencies.createWorkspaceRuntimeContext(workspaceId, metadata);
     if (!runtimeContext.success) return false;
     const { runtime, workspacePath, hostCheckoutRoot } = runtimeContext.data;

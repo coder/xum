@@ -136,6 +136,20 @@ describe("UserPromptSubmit hooks on the first prompt", () => {
     expect(order).toEqual([`startup:${workspaceId}:true`, "hook"]);
   });
 
+  test("a side chat starts no MCP server before its hooks (its local-read-only ceiling)", async () => {
+    const { service, getToolsForWorkspace } = await setup(promptHook, {
+      sideChatParentWorkspaceId: "main-workspace",
+    });
+
+    const outcome = await service.runMessageSendHooks(workspaceId, {
+      text: "key=abc",
+      origin: "user",
+    });
+
+    expect(getToolsForWorkspace).not.toHaveBeenCalled();
+    expect(outcome).toEqual({ kind: "none" });
+  });
+
   test("a workspace without UserPromptSubmit hooks starts nothing before the send", async () => {
     const { service, getToolsForWorkspace } = await setup({
       hooks: { PreToolUse: [{ hooks: [{ type: "mcp_tool", server: "scanner", tool: "check" }] }] },
