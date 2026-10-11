@@ -46,16 +46,17 @@ import {
 } from "@/common/constants/computerUse";
 import { ArtifactKindSchema } from "@/common/orpc/schemas/artifacts";
 import { z } from "zod";
+import { AgentIdSchema } from "@/common/schemas/ids";
+import { AgentSkillPackageSchema, SkillNameSchema } from "@/common/orpc/schemas/agentSkill";
 import {
-  AgentIdSchema,
-  AgentSkillPackageSchema,
   BestOfGroupSchema,
-  SkillNameSchema,
+  WorkspaceHeartbeatSettingsSchema,
+} from "@/common/orpc/schemas/workspace";
+import {
   WorkflowRunRecordSchema,
   WorkflowRunStatusSchema,
   WorkflowStepStatusSchema,
-  WorkspaceHeartbeatSettingsSchema,
-} from "@/common/orpc/schemas";
+} from "@/common/orpc/schemas/workflow";
 import {
   RUNTIME_MODE,
   runtimeModeSupportsSharedTaskWorkspace,

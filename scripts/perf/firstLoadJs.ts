@@ -23,6 +23,7 @@ export const FIRST_LOAD_FORBIDDEN_SOURCES: readonly string[] = [
   "node_modules/@shikijs/langs/",
   "node_modules/recharts/",
   "features/desktop/DesktopPanel",
+  "src/common/orpc/schemas/api.ts",
 ];
 
 function fail(message: string): never {

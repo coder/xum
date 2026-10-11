@@ -2055,6 +2055,22 @@ const localPlugin = {
   },
 };
 
+// Shared by the two no-restricted-imports blocks for src/** (a later block replaces an earlier
+// block's options for the files it matches, so each block must restate these).
+const AI_TOKENIZER_ENCODING_RESTRICTION = {
+  name: "ai-tokenizer/encoding",
+  allowTypeImports: true,
+  message:
+    "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts.",
+};
+const SHIKI_RESTRICTION = {
+  group: ["shiki"],
+  importNamePattern: "^(?!type\\s)",
+  allowTypeImports: true,
+  message:
+    "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead.",
+};
+
 export default defineConfig([
   {
     ignores: [
@@ -2437,21 +2453,34 @@ export default defineConfig([
         {
           // Lives here, not in the src/** block above: this later block replaces that block's
           // no-restricted-imports options for every file it matches.
-          paths: [
-            {
-              name: "ai-tokenizer/encoding",
-              allowTypeImports: true,
-              message:
-                "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts.",
-            },
-          ],
+          paths: [AI_TOKENIZER_ENCODING_RESTRICTION],
+          patterns: [SHIKI_RESTRICTION],
+        },
+      ],
+    },
+  },
+  {
+    // Browser and common code import schemas from their leaf modules, never the
+    // @/common/orpc/schemas barrel: one value import of the barrel puts every schema, including
+    // the api.ts router schemas, on the browser's first load (#5971). Type-only imports are
+    // erased at compile time, so they stay allowed. Restates the block above, because this block
+    // replaces its no-restricted-imports options for the files it matches.
+    files: ["src/browser/**/*.{ts,tsx}", "src/common/**/*.{ts,tsx}"],
+    ignores: ["src/browser/workers/highlightWorker.ts", "src/**/*.test.{ts,tsx}"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [AI_TOKENIZER_ENCODING_RESTRICTION],
           patterns: [
+            SHIKI_RESTRICTION,
             {
-              group: ["shiki"],
-              importNamePattern: "^(?!type\\s)",
+              // Matches "@/common/orpc/schemas" and relative forms such as "../orpc/schemas",
+              // but not leaf modules such as "@/common/orpc/schemas/runtime".
+              regex: "(^|/)orpc/schemas$",
               allowTypeImports: true,
               message:
-                "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead.",
+                "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine.",
             },
           ],
         },
