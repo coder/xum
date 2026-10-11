@@ -325,10 +325,14 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       : undefined
   );
   // Any other way of opening the dialog is not an app view's tab request.
-  const setArtifactsDialogWorkspaceId = (openWorkspaceId: string | null) => {
-    setArtifactsAppViewRequest(null);
-    setArtifactsDialogWorkspaceIdRaw(openWorkspaceId);
-  };
+  // Stable: the shortcut and event effects list it as a dependency.
+  const setArtifactsDialogWorkspaceId = useCallback(
+    (openWorkspaceId: string | null) => {
+      setArtifactsAppViewRequest(null);
+      setArtifactsDialogWorkspaceIdRaw(openWorkspaceId);
+    },
+    [setArtifactsDialogWorkspaceIdRaw]
+  );
   const [statsDialogOpen, setStatsDialogWorkspaceId] = useSidebarTabDialog(
     workspaceId,
     timelineSidebarHidden,
