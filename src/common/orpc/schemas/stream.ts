@@ -688,6 +688,17 @@ export const GoalBudgetLimitedEventSchema = z.object({
   message: z.string(),
 });
 
+/**
+ * A plugin hook's `systemMessage` (Codex: "surfaced as a warning in the UI"). Live only: it is never
+ * saved to chat.jsonl and never sent to the model.
+ */
+export const PluginHookNoticeEventSchema = z.object({
+  type: z.literal("plugin-hook-notice"),
+  workspaceId: z.string(),
+  plugin: z.string(),
+  message: z.string(),
+});
+
 /** Wire shape of ArtifactInteractionMetadata (Artifacts M5b), for queued-message projections. */
 export const ArtifactInteractionMetadataSchema = z.object({
   id: z.string(),
@@ -854,6 +865,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   // Error events
   ErrorEventSchema,
   GoalBudgetLimitedEventSchema,
+  PluginHookNoticeEventSchema,
   // Usage and queue events
   UsageDeltaEventSchema,
   SessionUsageDeltaEventSchema,

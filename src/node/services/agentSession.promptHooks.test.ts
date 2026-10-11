@@ -317,3 +317,30 @@ describe("on-send compaction follow-up", () => {
     });
   });
 });
+
+describe("plugin hook notices", () => {
+  test("reach this workspace's chat as a live event and never its history", async () => {
+    const { h } = await setup(() => undefined);
+    const before = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+
+    eventSpine.emit("plugin.hook.notice", {
+      workspaceId,
+      pluginName: "guard",
+      message: "Checked.",
+    });
+    eventSpine.emit("plugin.hook.notice", {
+      workspaceId: "other",
+      pluginName: "guard",
+      message: "No.",
+    });
+
+    expect(h.events.filter((event) => event.type === "plugin-hook-notice")).toEqual([
+      { type: "plugin-hook-notice", workspaceId, plugin: "guard", message: "Checked." },
+    ]);
+    expect(await h.historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(before);
+
+    await h.session.dispose();
+    eventSpine.emit("plugin.hook.notice", { workspaceId, pluginName: "guard", message: "Late." });
+    expect(h.events.filter((event) => event.type === "plugin-hook-notice")).toHaveLength(1);
+  });
+});

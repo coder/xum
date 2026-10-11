@@ -4,7 +4,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import { log } from "@/node/services/log";
+import { eventSpine } from "@/node/services/events/eventSpine";
 import { codexPluginHookService } from "./codexHookService";
 import { agentPluginHookService } from "./hookService";
 import { resolveAgentPluginsMcpContext } from "./mcpConfig";
@@ -38,7 +38,7 @@ export async function prepareWorkspaceRequestHooks(args: {
       isProjectTrusted: () => isWorkspaceProjectTrusted(config, metadata),
       mcp: args.mcpServerManager,
       notifyUser: (pluginName, message) =>
-        log.info("Plugin hook message", { workspaceId: metadata.id, pluginName, message }),
+        eventSpine.emit("plugin.hook.notice", { workspaceId: metadata.id, pluginName, message }),
     });
   }
 }

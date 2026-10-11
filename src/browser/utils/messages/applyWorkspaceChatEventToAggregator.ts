@@ -8,6 +8,7 @@ import {
   isCaughtUpMessage,
   isDeleteMessage,
   isGoalBudgetLimitedEvent,
+  isPluginHookNoticeEvent,
   isInitEnd,
   isInitOutput,
   isInitProgress,
@@ -209,6 +210,13 @@ export function applyWorkspaceChatEventToAggregator(
   if (isReasoningEnd(event)) {
     aggregator.handleReasoningEnd(event);
     return "immediate";
+  }
+
+  if (isPluginHookNoticeEvent(event)) {
+    // A plugin hook's systemMessage: a toast for the user, never a transcript row.
+    if (allowSideEffects)
+      publishChatError(event.workspaceId, `Plugin ${event.plugin}: ${event.message}`);
+    return "ignored";
   }
 
   if (isGoalBudgetLimitedEvent(event)) {
