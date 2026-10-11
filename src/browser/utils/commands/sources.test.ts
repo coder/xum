@@ -2415,3 +2415,30 @@ test("app view entries tell several calls of one tool apart", () => {
   expect(subtitles.every((s) => s?.startsWith("dice"))).toBe(true);
   expect(new Set(subtitles).size).toBe(3);
 });
+
+test("a plugin view's palette entry shows its server part and keeps the full key searchable", () => {
+  const key = "plugin:0123456789abcdef:tray";
+  const actions = getActions({
+    artifactsEnabled: true,
+    selectedWorkspaceState: {
+      messages: [
+        {
+          type: "tool",
+          toolCallId: "p",
+          toolName: "tray_show",
+          args: {},
+          status: "completed",
+          mcpServer: {
+            connection: { key, transport: "stdio" },
+            identity: { name: "tray", version: "1.0.0" },
+            source: "connection",
+            app: { resourceUri: "ui://tray/view.html" },
+          },
+        },
+      ],
+    } as unknown as WorkspaceState,
+  });
+  const entry = actions.find((a) => a.id === CommandIds.navOpenAppView("p"));
+  expect(entry?.subtitle).toBe("tray");
+  expect(entry?.keywords).toContain(key);
+});
