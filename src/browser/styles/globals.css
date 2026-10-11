@@ -967,7 +967,10 @@ body,
     top: 0 !important;
     width: 18rem !important;
     z-index: 1000 !important;
-    transition: transform 0.3s !important;
+    /* Visibility flips at once on open and after the slide on close (see the collapsed rule). */
+    transition:
+      transform 0.3s,
+      visibility 0s linear 0s !important;
     box-shadow: 2px 0 8px rgba(0, 0, 0, 0.5) !important;
 
     /* Account for iOS safe areas (the sidebar is position: fixed) */
@@ -975,9 +978,17 @@ body,
     padding-left: env(safe-area-inset-left, 0px) !important;
   }
 
+  /* The closed drawer is off-screen, and "Open sidebar menu" reopens it. Hidden, its controls
+     ("Expand sidebar") take no Tab stop (#6102). visibility, not `inert`: the artifact fullscreen
+     manages `inert` on this element's ancestors and siblings, and two owners of one attribute
+     clear each other's state. The delay keeps the drawer visible while it slides out. */
   .mobile-sidebar-collapsed {
     transform: translateX(-100%) !important;
     box-shadow: none !important;
+    visibility: hidden !important;
+    transition:
+      transform 0.3s,
+      visibility 0s linear 0.3s !important;
   }
 
   /* Stack vertically so main content gets the full viewport width */

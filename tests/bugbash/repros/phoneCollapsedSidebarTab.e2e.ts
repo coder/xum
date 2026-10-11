@@ -23,6 +23,19 @@ test(
     await openPlayground(app, screen, browser);
     const menu = screen.getByRole("button", "Open sidebar menu");
     await expect(menu).toBeVisible();
+    // Wait until the closed drawer is fully off the screen and no transition runs in it or its
+    // controls: closing during the opening slide shortens the slide but not a delayed change, and
+    // a control with `transition-all` also animates the visibility it inherits.
+    await expect
+      .poll(() =>
+        browser.evaluate(() => {
+          const drawer = document.querySelector('[data-testid="left-sidebar"]');
+          if (drawer?.getAnimations({ subtree: true }).length !== 0)
+            return Number.POSITIVE_INFINITY;
+          return drawer.getBoundingClientRect().right;
+        })
+      )
+      .toBeLessThanOrEqual(0);
 
     await screen.getByRole("textbox", "Message").focus();
     const stops: FocusStop[] = [];
@@ -36,8 +49,6 @@ test(
           return { label: "(body)", offScreen: false };
         }
         const box = el.getBoundingClientRect();
-        // Less than half of it on screen counts as off-screen: the drawer's close transition can
-        // still leave a few px of the button inside the screen when the Tab lands.
         const shown = Math.min(box.right, window.innerWidth) - Math.max(box.left, 0);
         return {
           label: el.getAttribute("aria-label") ?? el.textContent?.trim().slice(0, 40) ?? el.tagName,
