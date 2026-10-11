@@ -1611,6 +1611,7 @@ export class McpOauthService {
           tokens: tokens as unknown as MCPOAuthTokens,
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
           flowGeneration: flow.signOutGeneration,
+          clientId: flow.clientInformation?.client_id ?? flow.plugin?.config.clientId,
         });
       },
       saveDiscoveryState: (state) => {
@@ -1693,6 +1694,8 @@ export class McpOauthService {
     oauth?: MCPServerOAuthConfig;
   }): OAuthClientProvider {
     let discoveryState: OAuthDiscoveryState | undefined;
+    // The client a refresh runs with: its tokens are saved only while that client is stored.
+    let refreshedWithClientId: string | undefined;
     const pluginState = pluginDiscoveryState(input.oauth);
 
     return {
@@ -1708,6 +1711,7 @@ export class McpOauthService {
           // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           tokens: tokens as unknown as MCPOAuthTokens,
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
+          clientId: refreshedWithClientId ?? input.oauth?.clientId,
         });
       },
       saveDiscoveryState: (state) => {
@@ -1754,6 +1758,7 @@ export class McpOauthService {
         const stored = storedClientMatches(creds, input.oauth)
           ? creds?.clientInformation
           : undefined;
+        refreshedWithClientId = stored?.client_id;
         // Token refresh re-reads a plugin secret from its consented file.
         const plugin = stored && pluginClient(input.oauth, await readClientSecret(input.oauth));
         return stored && { ...stored, ...plugin };
@@ -2051,10 +2056,28 @@ export class McpOauthService {
     legacyBinding?: AuthorizationServerBinding;
     /** An interactive flow's sign-out generation; the save is dropped when it is stale. */
     flowGeneration?: number;
+    /** The client the tokens were issued to (the flow's or the refresh's). */
+    clientId?: string;
   }): Promise<void> {
     await this.storeLock.withLock(this.storeFilePath, async () => {
       if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return;
       const store = await this.ensureStoreLoadedLocked();
+      // Two plugin servers can share an MCP URL with different clients, and their sign-ins
+      // interleave: A saves client A, B saves client B, then A's token lands. One record per
+      // URL cannot hold both, so a token for a client that is no longer stored is dropped
+      // (never client B with token A). The losing server signs in once more; #6159 keys
+      // credentials by client to remove that extra sign-in.
+      const storedClientId = store.entries[input.serverUrl]?.clientInformation?.client_id;
+      if (
+        input.clientId !== undefined &&
+        storedClientId !== undefined &&
+        storedClientId !== input.clientId
+      ) {
+        log.info("[MCP OAuth] Dropping tokens of a client that is no longer stored", {
+          serverUrl: input.serverUrl,
+        });
+        return;
+      }
       const creds = (store.entries[input.serverUrl] ??= {
         serverUrl: input.serverUrl,
         updatedAtMs: Date.now(),
