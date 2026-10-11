@@ -26,7 +26,7 @@ import {
   readPluginFileWithinRootCapped,
 } from "./discovery";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
-import { readOpenAIMcpAuth, translateCodexMcpEntry } from "./openaiMcpAuth";
+import { readOpenAIMcpAuth, toServerOAuthConfig, translateCodexMcpEntry } from "./openaiMcpAuth";
 
 /**
  * Agent Plugins MCP documents become default-disabled, read-only Xum servers.
@@ -655,7 +655,7 @@ export async function loadPluginMcpServers(
     }
     const codex = codexDialect
       ? translateCodexMcpEntry(rawEntry)
-      : { entry: rawEntry, ignored: [], warnings: [] };
+      : { entry: rawEntry, ignored: [], warnings: [], hasClientSecret: false };
     const entry = codex.entry;
 
     // §7.2.2 rules 3-4: invalid entries and unknown transports are skipped
@@ -681,15 +681,22 @@ export async function loadPluginMcpServers(
 
     const info = result.info;
     if (info.transport !== "stdio") {
-      // Warnings only: the server still loads with OAuth discovery + DCR.
-      // Messages name fields, never values (see openaiMcpAuth's SECURITY AUDIT).
+      // Unusable settings only warn: the server still loads, and discovery +
+      // DCR cover what the config omits. Messages name fields, never values
+      // (see openaiMcpAuth's SECURITY AUDIT).
       const auth = readOpenAIMcpAuth(entry.extensions);
+      const oauth = toServerOAuthConfig(
+        auth.auth,
+        codex.hasClientSecret === true
+          ? { pluginRoot: plugin.rootPath, mcpConfigPath: plugin.mcpConfigPath, serverName }
+          : undefined
+      );
+      if (oauth !== undefined) info.oauth = oauth;
       const ignored = [...codex.ignored, ...auth.ignored];
+      if (codex.hasClientSecret === true && oauth?.clientSecretSource === undefined)
+        ignored.push("oauth.client_secret (needs client_id)");
       const messages = [...codex.warnings, ...auth.warnings];
-      if (ignored.length > 0)
-        messages.push(
-          `Xum's MCP OAuth uses discovery and dynamic client registration, so it ignores: ${ignored.join(", ")}`
-        );
+      if (ignored.length > 0) messages.push(`Xum's MCP OAuth ignores: ${ignored.join(", ")}`);
       for (const message of messages) {
         const fullMessage = `${fileLabel} server '${serverName}': ${message}`;
         log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);

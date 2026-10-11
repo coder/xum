@@ -5,6 +5,7 @@ import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
 import { MCPConfigService } from "./mcpConfigService";
+import { log } from "./log";
 import {
   McpOauthService,
   parseBearerWwwAuthenticate,
@@ -762,6 +763,100 @@ describe("McpOauthService OAuth flows", () => {
       // Clean up the loopback listener (no callback will occur during this test).
       await service.cancelDesktopFlow(startResult.data.flowId);
     } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  test("a plugin's provided client, endpoints, scopes and resource replace discovery and DCR", async () => {
+    const secret = "native-app-secret-8252";
+    const requests: Array<{ path: string; raw: string }> = [];
+    const server = createServer((req, res) => {
+      void (async () => {
+        let body = "";
+        for await (const chunk of req) body += Buffer.from(chunk as Uint8Array).toString("utf-8");
+        const pathname = (req.url ?? "/").split("?")[0];
+        requests.push({
+          path: pathname,
+          raw: `${req.url ?? ""} ${JSON.stringify(req.headers)} ${body}`,
+        });
+        if (pathname === "/custom-token") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({ access_token: "at", token_type: "Bearer", refresh_token: "rt" })
+          );
+          return;
+        }
+        // The MCP endpoint demands auth; every discovery document is missing.
+        res.statusCode = pathname === "/mcp" ? 401 : 404;
+        res.end();
+      })();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const logged = [spyOn(log, "warn"), spyOn(log, "debug"), spyOn(log, "info")];
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Failed to bind");
+      const base = `http://127.0.0.1:${address.port}`;
+      const pluginRoot = await fs.realpath(projectPath);
+      const mcpConfigPath = path.join(pluginRoot, ".mcp.json");
+      const oauthEntry = { client_id: "provided-id", client_secret: secret };
+      await fs.writeFile(
+        mcpConfigPath,
+        JSON.stringify({
+          mcpServers: { github: { type: "http", url: `${base}/mcp`, oauth: oauthEntry } },
+        })
+      );
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        github: {
+          transport: "http",
+          url: `${base}/mcp`,
+          disabled: true,
+          oauth: {
+            clientId: "provided-id",
+            tokenEndpointAuthMethod: "client_secret_post",
+            endpoints: {
+              authorizationUrl: `${base}/custom-authorize`,
+              tokenUrl: `${base}/custom-token`,
+            },
+            baseScopes: ["base"],
+            defaultScopes: ["docs:read"],
+            resource: "https://api.example.com",
+            clientSecretSource: { pluginRoot, mcpConfigPath, serverName: "github" },
+          },
+        },
+      });
+
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "github",
+        redirectUri: "https://xum.example/callback",
+      });
+      if (!start.success) throw new Error(start.error);
+      const authorizeUrl = new URL(start.data.authorizeUrl);
+      expect(authorizeUrl.pathname).toBe("/custom-authorize");
+      expect(authorizeUrl.searchParams.get("client_id")).toBe("provided-id");
+      expect(authorizeUrl.searchParams.get("scope")).toBe("base docs:read");
+      expect(authorizeUrl.searchParams.get("resource")).toBe("https://api.example.com/");
+
+      const exchange = await service.handleServerCallbackAndExchange({
+        state: start.data.flowId,
+        code: "the-code",
+        iss: null,
+        error: null,
+      });
+      expect(exchange).toEqual({ success: true, data: undefined });
+      // No dynamic registration; the secret reached the token endpoint and nothing else.
+      expect(requests.some((request) => request.path.includes("register"))).toBe(false);
+      expect(requests.filter((request) => request.raw.includes(secret)).map((r) => r.path)).toEqual(
+        ["/custom-token"]
+      );
+      const store = await fs.readFile(getStoreFilePath(xumHome), "utf-8");
+      expect(store).toContain("provided-id");
+      expect(store).not.toContain(secret);
+      expect(start.data.authorizeUrl).not.toContain(secret);
+      expect(JSON.stringify(logged.map((spy) => spy.mock.calls))).not.toContain(secret);
+    } finally {
+      for (const spy of logged) spy.mockRestore();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });

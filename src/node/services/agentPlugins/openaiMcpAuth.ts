@@ -6,17 +6,22 @@
  * MCP authentication"); dialect checked against github.com/openai/plugins
  * (figma, notion, slack, github, gmail `.mcp.json`).
  *
- * Xum only reads and checks these fields for now. Its MCP OAuth
- * (mcpOauthService) still uses OAuth discovery plus dynamic client
- * registration, so `oauth`/`mixed` with no client or a `dcr` client work as
- * before. Every setting it cannot use yet is listed in `ignored`, which the
- * caller reports as one consent-preview warning; the server keeps loading.
+ * `toServerOAuthConfig` hands mcpOauthService what it can use: a provided
+ * client, its token auth method, both endpoint overrides together, scopes and
+ * the resource. Discovery + DCR fill in the rest. Every setting it cannot use
+ * is listed in `ignored`, which the caller reports as one consent-preview
+ * warning; the server keeps loading.
  *
- * SECURITY AUDIT: a client secret (Codex `oauth.client_secret`, or the
- * `clientSecret` the OpenAI schema forbids) is never copied, logged or quoted.
- * Messages carry field NAMES only, never values, because any value here can
- * be a credential (including URLs with embedded user information).
+ * SECURITY AUDIT: a client secret is never copied into parsed results, logged
+ * or quoted. Messages carry field NAMES only, never values, because any value
+ * here can be a credential (including URLs with embedded user information).
+ * Only the Codex `oauth.client_secret` is used: readPluginClientSecret
+ * re-reads it from the consented file at flow time (memory only). The
+ * `clientSecret` the OpenAI schema forbids is never used.
  */
+import type { MCPServerOAuthConfig } from "@/common/types/mcp";
+import { getOwn } from "@/common/utils/getOwn";
+import { MAX_PLUGIN_MANIFEST_BYTES, readPluginFileWithinRootCapped } from "./discovery";
 import { isPlainObject } from "./manifest";
 import { OPENAI_EXTENSION_NAMESPACE } from "./openaiExtension";
 
@@ -53,6 +58,14 @@ export interface ReadOpenAIMcpAuthResult {
   ignored: string[];
 }
 
+/** Valid fields the OAuth flow has no use for (discovery covers them). */
+const UNUSED_FIELDS = [
+  "registrationUrl",
+  "oidcConfigurationUrl",
+  "oidcUserinfoEndpoint",
+  "oidcScopesSupported",
+  "oidcEnabled",
+] as const;
 const AUTH_TYPES = new Set<string>(["none", "oauth", "mixed", "api_key"]);
 const CLIENT_MODES = new Set<string>(["provided", "dcr", "cimd"]);
 const TOKEN_AUTH_METHODS = new Set<string>([
@@ -171,16 +184,28 @@ function readAuth(raw: Record<string, unknown>, result: ReadOpenAIMcpAuthResult)
     else result.warnings.push(`'${AUTH}.headerName' needs headerScheme custom_header; ignoring`);
   }
 
-  // Only discovery + DCR is wired today (mcpOauthService); list everything else.
-  if (auth.type === "api_key") result.ignored.push("type: api_key (no plugin API key storage)");
-  if (auth.client !== undefined && auth.client.mode !== "dcr")
-    result.ignored.push(`client.mode: ${auth.client.mode}`);
-  for (const key of ["clientId", "tokenEndpointAuthMethod"] as const) {
-    if (auth.client?.[key] !== undefined) result.ignored.push(`client.${key}`);
+  // Keep in sync with toServerOAuthConfig: name everything it drops.
+  const ignore = (field: string): number => result.ignored.push(field);
+  if (auth.type === "api_key") ignore("type: api_key (no plugin API key storage)");
+  const client = auth.client;
+  if (client?.mode === "cimd" || (client?.mode === "provided" && client.clientId === undefined))
+    ignore(`client.mode: ${client.mode}`);
+  if (client?.tokenEndpointAuthMethod === "private_key_jwt")
+    ignore("client.tokenEndpointAuthMethod: private_key_jwt");
+  if ((auth.authorizationUrl === undefined) !== (auth.tokenUrl === undefined))
+    ignore(
+      auth.tokenUrl === undefined
+        ? "authorizationUrl (needs tokenUrl)"
+        : "tokenUrl (needs authorizationUrl)"
+    );
+  for (const key of [...UNUSED_FIELDS, "headerScheme", "headerName"]) {
+    if (key in auth) ignore(key);
   }
-  for (const key of [...URL_FIELDS, ...SCOPE_FIELDS, "oidcEnabled", "headerScheme", "headerName"]) {
-    if (key in auth) result.ignored.push(key);
-  }
+  if (
+    auth.authorizationServerBase !== undefined &&
+    (auth.authorizationUrl === undefined || auth.tokenUrl === undefined)
+  )
+    ignore("authorizationServerBase (needs both endpoints)");
   result.auth = auth;
 }
 
@@ -209,17 +234,20 @@ export function readOpenAIMcpAuth(extensions: unknown): ReadOpenAIMcpAuthResult 
  * Rewrite one Codex `.mcp.json` server entry into the Agent Plugins shape:
  * `type: "http"` becomes `streamable-http`, and `oauth.client_id`, `scopes`
  * and `oauth_resource` become an OpenAI `auth` block (an existing inline
- * `auth` wins). Callback settings and the client secret are only NAMED in
- * `ignored`; the secret value is dropped here and never copied.
+ * `auth` wins). Callback settings are only NAMED in `ignored`. The secret
+ * value is dropped here; `hasClientSecret` tells the caller to point the
+ * OAuth service at the file (see readPluginClientSecret).
  */
 export function translateCodexMcpEntry(entry: Record<string, unknown>): {
   entry: Record<string, unknown>;
   ignored: string[];
   warnings: string[];
+  hasClientSecret?: boolean;
 } {
   const { oauth, scopes, oauth_resource: resource, ...rest } = entry;
   const ignored: string[] = [];
   const warnings: string[] = [];
+  let hasClientSecret = false;
   if (rest.type === "http") rest.type = "streamable-http";
 
   const auth: Record<string, unknown> = {};
@@ -228,6 +256,9 @@ export function translateCodexMcpEntry(entry: Record<string, unknown>): {
     else
       for (const key of Object.keys(oauth)) {
         if (key === "client_id") auth.client = { mode: "provided", clientId: oauth.client_id };
+        else if (key === "client_secret" && typeof oauth.client_secret === "string")
+          hasClientSecret = true;
+        // A fixed loopback callback is not honored: Xum binds a random port.
         else ignored.push(`oauth.${key}`);
       }
   }
@@ -247,5 +278,62 @@ export function translateCodexMcpEntry(entry: Record<string, unknown>): {
     ...extensions,
     [OPENAI_EXTENSION_NAMESPACE]: { ...namespace, auth: { type: "oauth", ...auth } },
   };
-  return { entry: rest, ignored, warnings };
+  return { entry: rest, ignored, warnings, hasClientSecret };
+}
+
+type TokenAuthMethod = NonNullable<MCPServerOAuthConfig["tokenEndpointAuthMethod"]>;
+const SECRET_AUTH_METHODS = new Set<string>(["none", "client_secret_basic", "client_secret_post"]);
+
+/** The settings mcpOauthService uses; undefined when nothing applies (discovery + DCR). */
+export function toServerOAuthConfig(
+  auth: OpenAIMcpAuth | undefined,
+  clientSecretSource?: MCPServerOAuthConfig["clientSecretSource"]
+): MCPServerOAuthConfig | undefined {
+  if (auth?.type !== "oauth" && auth?.type !== "mixed") return undefined;
+  const clientId = auth.client?.mode === "provided" ? auth.client.clientId : undefined;
+  const method = auth.client?.tokenEndpointAuthMethod;
+  const config: MCPServerOAuthConfig = {
+    ...(clientId !== undefined ? { clientId } : {}),
+    ...(clientId !== undefined && method !== undefined && SECRET_AUTH_METHODS.has(method)
+      ? { tokenEndpointAuthMethod: method as TokenAuthMethod }
+      : {}),
+    ...(auth.authorizationUrl !== undefined && auth.tokenUrl !== undefined
+      ? {
+          endpoints: {
+            authorizationUrl: auth.authorizationUrl,
+            tokenUrl: auth.tokenUrl,
+            // The RFC 9207 `iss` check compares against this issuer.
+            ...(auth.authorizationServerBase !== undefined
+              ? { issuer: auth.authorizationServerBase }
+              : {}),
+          },
+        }
+      : {}),
+    ...(auth.baseScopes !== undefined ? { baseScopes: auth.baseScopes } : {}),
+    ...(auth.defaultScopes !== undefined ? { defaultScopes: auth.defaultScopes } : {}),
+    ...(auth.resource !== undefined ? { resource: auth.resource } : {}),
+    ...(clientId !== undefined && clientSecretSource !== undefined ? { clientSecretSource } : {}),
+  };
+  return Object.keys(config).length > 0 ? config : undefined;
+}
+
+/**
+ * Re-read a Codex `.mcp.json` client secret from the consented plugin file
+ * (bounded, containment-checked read). The caller keeps it in memory only.
+ */
+export async function readPluginClientSecret(
+  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>
+): Promise<string | undefined> {
+  const { content } = await readPluginFileWithinRootCapped({
+    filePath: source.mcpConfigPath,
+    pluginRoot: source.pluginRoot,
+    maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
+    label: ".mcp.json",
+  });
+  const raw: unknown = JSON.parse(content);
+  const servers = isPlainObject(raw) && isPlainObject(raw.mcpServers) ? raw.mcpServers : {};
+  const entry = getOwn(servers, source.serverName);
+  const oauth = isPlainObject(entry) ? entry.oauth : undefined;
+  const secret = isPlainObject(oauth) ? oauth.client_secret : undefined;
+  return typeof secret === "string" && secret.length > 0 ? secret : undefined;
 }

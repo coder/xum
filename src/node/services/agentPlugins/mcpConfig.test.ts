@@ -127,7 +127,7 @@ describe("loadPluginMcpServers", () => {
     expect(values.map((s) => s.transport).sort()).toEqual(["http", "sse"]);
   });
 
-  test("accepts entry extensions; OAuth settings Xum cannot use yet load with one warning", async () => {
+  test("accepts entry extensions, maps usable OAuth settings and names the rest once", async () => {
     using tmp = new DisposableTempDir("plugin-mcp");
     const plugin = await makePlugin(
       tmp.path,
@@ -165,9 +165,12 @@ describe("loadPluginMcpServers", () => {
     const messages = diagnostics.map((d) => d.message);
     expect(messages).toHaveLength(2);
     expect(messages[0]).toMatch(/'provided'.*authorizationUrl' must be an https URL/);
-    expect(messages[1]).toMatch(
-      /'provided'.*ignores: client\.mode: provided, client\.clientId, tokenUrl, baseScopes$/
-    );
+    expect(messages[1]).toMatch(/'provided'.*ignores: tokenUrl \(needs authorizationUrl\)$/);
+    const provided = Object.values(servers).find((s) => s.plugin?.serverName === "provided");
+    expect(provided?.transport === "http" && provided.oauth).toEqual({
+      clientId: "docs-client",
+      baseScopes: ["docs:read"],
+    });
   });
 
   test("maps the Codex .mcp.json dialect and never echoes the client secret", async () => {
@@ -197,15 +200,23 @@ describe("loadPluginMcpServers", () => {
     try {
       const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
 
-      expect(Object.values(servers).map((s) => s.transport)).toEqual(["http", "http"]);
-      const messages = diagnostics.map((d) => d.message);
-      expect(messages).toHaveLength(2);
-      // Messages name the real file, not mcp.json.
-      expect(messages.every((message) => message.startsWith(".mcp.json server '"))).toBe(true);
-      expect(messages[0]).toMatch(/'notion'.*ignores: resource$/);
-      expect(messages[1]).toMatch(
-        /'github'.*ignores: oauth\.client_secret, oauth\.callback_port, client\.mode: provided, client\.clientId$/
-      );
+      const infos = Object.values(servers);
+      expect(infos.map((s) => (s.transport === "http" ? s.oauth : s))).toEqual([
+        { resource: "https://mcp.notion.com" },
+        {
+          clientId: "Iv23li",
+          // Only where to re-read it: the value stays in the consented file.
+          clientSecretSource: {
+            pluginRoot: plugin.rootPath,
+            mcpConfigPath: plugin.mcpConfigPath!,
+            serverName: "github",
+          },
+        },
+      ]);
+      expect(diagnostics.map((d) => d.message)).toEqual([
+        // The real file name, not mcp.json.
+        ".mcp.json server 'github': Xum's MCP OAuth ignores: oauth.callback_port",
+      ]);
       const everything = JSON.stringify([servers, diagnostics, warn.mock.calls]);
       expect(everything).not.toContain(secret);
     } finally {

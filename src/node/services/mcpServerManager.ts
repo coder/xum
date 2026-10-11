@@ -5279,6 +5279,7 @@ export class MCPServerManager {
         const authProvider = await this.mcpOauthService?.getAuthProviderForServer({
           serverName: trimmedName,
           serverUrl: server.url,
+          oauth: server.oauth,
         });
 
         return testNamedServer({
@@ -6709,6 +6710,7 @@ export class MCPServerManager {
       : await this.mcpOauthService?.getAuthProviderForServer({
           serverName: name,
           serverUrl: info.url,
+          oauth: info.oauth,
         });
 
     if (signal.aborted) {

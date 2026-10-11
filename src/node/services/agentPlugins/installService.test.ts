@@ -1808,6 +1808,44 @@ describe("AgentPluginInstallService", () => {
     expect(preview.warnings.join("\n")).toContain("skills/wrong-dir");
   });
 
+  test("preview lists foreign sign-in hosts; a changed auth block needs new consent", async () => {
+    const writeAuth = async (clientId: string): Promise<void> => {
+      const auth = {
+        type: "oauth",
+        client: { mode: "provided", clientId },
+        authorizationUrl: "https://accounts.example.com/authorize",
+        tokenUrl: "https://mcp.example.com/token",
+      };
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+          mcpServers: {
+            docs: {
+              type: "streamable-http",
+              url: "https://mcp.example.com/mcp",
+              extensions: { "com.openai": { auth } },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `auth ${clientId}`);
+    };
+    await writeAuth("client-a");
+
+    const preview = await service.preview({ input: remoteDir });
+    // The token host equals the server host, so only the foreign host gets a line.
+    expect(preview.mcpServers.map((server) => server.summary)).toEqual([
+      "https://mcp.example.com/mcp\nSign-in at accounts.example.com",
+    ]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writeAuth("client-b");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
+      /changes MCP server 'docs'/
+    );
+  });
+
   test("update rejects capability increases (new hook, expanded grants, new/changed MCP servers)", async () => {
     // Security gate: a compromised upstream must not auto-load new executable
     // capabilities through a routine update click. Additions/changes are

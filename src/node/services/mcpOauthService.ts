@@ -20,6 +20,8 @@ import { log } from "@/node/services/log";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import { roundToBase2 } from "@/common/telemetry/utils";
+import type { MCPServerOAuthConfig } from "@/common/types/mcp";
+import { readPluginClientSecret } from "@/node/services/agentPlugins/openaiMcpAuth";
 import type {
   MCPOAuthAuthStatus,
   MCPOAuthClientInformation,
@@ -119,6 +121,9 @@ interface OAuthFlowBase {
 
   /** PKCE verifier for this flow (set by the MCP SDK auth()). */
   codeVerifier: string | null;
+
+  /** Plugin OAuth settings; the client secret lives only here, in memory. */
+  plugin?: { config: MCPServerOAuthConfig; clientSecret?: string };
   discoveryState: OAuthDiscoveryState | undefined;
 
   timeout: ReturnType<typeof setTimeout>;
@@ -134,6 +139,76 @@ interface DesktopFlow extends OAuthFlowBase {
 }
 
 type ServerFlow = OAuthFlowBase;
+
+/** baseScopes always; defaultScopes replace the discovered scope. */
+function resolvePluginScope(
+  config: MCPServerOAuthConfig,
+  discovered: string | undefined
+): string | undefined {
+  const defaults = config.defaultScopes ?? discovered?.split(" ").filter(Boolean) ?? [];
+  const scopes = [...new Set([...(config.baseScopes ?? []), ...defaults])];
+  return scopes.length > 0 ? scopes.join(" ") : undefined;
+}
+
+/**
+ * Explicit plugin endpoints replace discovery: the SDK reads cached discovery
+ * state before it discovers. The parser (openaiMcpAuth) already required https.
+ */
+function pluginDiscoveryState(config?: MCPServerOAuthConfig): OAuthDiscoveryState | undefined {
+  const endpoints = config?.endpoints;
+  if (endpoints === undefined) return undefined;
+  const issuer = endpoints.issuer ?? new URL(endpoints.tokenUrl).origin;
+  return {
+    authorizationServerUrl: issuer,
+    authorizationServerMetadata: {
+      issuer,
+      authorization_endpoint: endpoints.authorizationUrl,
+      token_endpoint: endpoints.tokenUrl,
+      response_types_supported: ["code"],
+      code_challenge_methods_supported: ["S256"],
+    },
+  };
+}
+
+/** A plugin's registered client (skips DCR). The SDK sends client_secret to the token endpoint only. */
+function pluginClient(
+  config: MCPServerOAuthConfig | undefined,
+  clientSecret: string | undefined
+): MCPOAuthClientInformation | undefined {
+  if (config?.clientId === undefined) return undefined;
+  return {
+    client_id: config.clientId,
+    ...(clientSecret !== undefined ? { client_secret: clientSecret } : {}),
+    ...(config.tokenEndpointAuthMethod !== undefined
+      ? { token_endpoint_auth_method: config.tokenEndpointAuthMethod }
+      : {}),
+  };
+}
+
+/** SECURITY AUDIT: the store (mcp-oauth.json) never receives a plugin client secret. */
+function withoutPluginSecret(
+  info: MCPOAuthClientInformation,
+  config: MCPServerOAuthConfig | undefined
+): MCPOAuthClientInformation {
+  if (config?.clientId === undefined) return info;
+  const persisted = { ...info };
+  delete persisted.client_secret;
+  return persisted;
+}
+
+async function readClientSecret(config?: MCPServerOAuthConfig): Promise<string | undefined> {
+  if (config?.clientSecretSource === undefined) return undefined;
+  try {
+    return await readPluginClientSecret(config.clientSecretSource);
+  } catch (error) {
+    // Never log the file content: it holds the secret.
+    log.warn("[MCP OAuth] Could not read the plugin client secret", {
+      serverName: config.clientSecretSource.serverName,
+      error: getErrorMessage(error),
+    });
+    return undefined;
+  }
+}
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -760,6 +835,8 @@ export class McpOauthService {
   async getAuthProviderForServer(input: {
     serverUrl: string;
     serverName?: string;
+    /** Plugin OAuth settings of this server (for token refresh). */
+    oauth?: MCPServerOAuthConfig;
   }): Promise<OAuthClientProvider | undefined> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {
@@ -775,6 +852,7 @@ export class McpOauthService {
     return this.createBackgroundProvider({
       serverUrl: normalizedServerUrl,
       serverName: input.serverName,
+      oauth: input.oauth,
     });
   }
 
@@ -801,6 +879,7 @@ export class McpOauthService {
         serverUrlForDiscovery: string;
         serverUrlForStoreKey: string;
         transport: "http" | "sse" | "auto";
+        oauth?: MCPServerOAuthConfig;
       },
       string
     >
@@ -848,7 +927,12 @@ export class McpOauthService {
       return Err("Invalid MCP server URL");
     }
 
-    return Ok({ serverUrlForDiscovery, serverUrlForStoreKey, transport: server.transport });
+    return Ok({
+      serverUrlForDiscovery,
+      serverUrlForStoreKey,
+      transport: server.transport,
+      ...(server.oauth !== undefined ? { oauth: server.oauth } : {}),
+    });
   }
 
   async startDesktopFlow(input: {
@@ -950,10 +1034,9 @@ export class McpOauthService {
       clientInformation: null,
       authorizeUrl: "",
       redirectUri,
-      scope: await resolveOAuthScope(challenge),
+      ...(await this.pluginFlowFields(serverConfig.data.oauth, challenge)),
       resourceMetadataUrl: challenge?.resourceMetadataUrl,
       codeVerifier: null,
-      discoveryState: undefined,
       server: serverListener,
       timeout: setTimeout(() => {
         void this.finishDesktopFlow(flowId, Err("Timed out waiting for OAuth callback"));
@@ -1095,10 +1178,9 @@ export class McpOauthService {
       clientInformation: null,
       authorizeUrl: "",
       redirectUri: redirectUri.toString(),
-      scope: await resolveOAuthScope(challenge),
+      ...(await this.pluginFlowFields(serverConfig.data.oauth, challenge)),
       resourceMetadataUrl: challenge?.resourceMetadataUrl,
       codeVerifier: null,
-      discoveryState: undefined,
       timeout: setTimeout(() => {
         void this.finishServerFlow(flowId, Err("Timed out waiting for OAuth callback"));
       }, DEFAULT_SERVER_TIMEOUT_MS),
@@ -1255,6 +1337,21 @@ export class McpOauthService {
     return "unknown";
   }
 
+  /** Scope, discovery state and plugin client for a new flow. */
+  private async pluginFlowFields(
+    config: MCPServerOAuthConfig | undefined,
+    challenge: BearerChallenge | null
+  ): Promise<Pick<OAuthFlowBase, "scope" | "discoveryState" | "plugin">> {
+    const scope = await resolveOAuthScope(challenge);
+    if (config === undefined) return { scope, discoveryState: undefined };
+    const clientSecret = await readClientSecret(config);
+    return {
+      scope: resolvePluginScope(config, scope),
+      discoveryState: pluginDiscoveryState(config),
+      plugin: { config, ...(clientSecret !== undefined ? { clientSecret } : {}) },
+    };
+  }
+
   private createFlowProvider(flow: OAuthFlowBase): OAuthClientProvider {
     return {
       tokens: () => Promise.resolve(undefined),
@@ -1313,17 +1410,25 @@ export class McpOauthService {
       clientInformation: () => {
         // We intentionally register an OAuth client per interactive flow because the
         // redirect URI may vary between environments (desktop loopback ports, proxied
-        // server origins, etc.).
-        return Promise.resolve(flow.clientInformation ?? undefined);
+        // server origins, etc.). A plugin-provided client skips registration.
+        return Promise.resolve(
+          flow.clientInformation ??
+            pluginClient(flow.plugin?.config, flow.plugin?.clientSecret) ??
+            undefined
+        );
       },
+      ...(flow.plugin?.config.resource !== undefined
+        ? { validateResourceURL: () => Promise.resolve(new URL(flow.plugin!.config.resource!)) }
+        : {}),
       saveClientInformation: async (clientInformation) => {
         // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         const next = clientInformation as unknown as MCPOAuthClientInformation;
+        // Memory keeps a plugin secret for the code exchange; the store does not.
         flow.clientInformation = next;
 
         await this.saveClientInformation({
           serverUrl: flow.serverUrlForStoreKey,
-          clientInformation: next,
+          clientInformation: withoutPluginSecret(next, flow.plugin?.config),
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
         });
       },
@@ -1334,8 +1439,10 @@ export class McpOauthService {
   private createBackgroundProvider(input: {
     serverUrl: string;
     serverName?: string;
+    oauth?: MCPServerOAuthConfig;
   }): OAuthClientProvider {
     let discoveryState: OAuthDiscoveryState | undefined;
+    const pluginState = pluginDiscoveryState(input.oauth);
 
     return {
       tokens: async () => {
@@ -1392,14 +1499,23 @@ export class McpOauthService {
       },
       clientInformation: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
-        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-        return creds?.clientInformation as unknown as MCPOAuthClientInformation | undefined;
+        const stored = creds?.clientInformation;
+        // Token refresh re-reads a plugin secret from its consented file.
+        const plugin = stored && pluginClient(input.oauth, await readClientSecret(input.oauth));
+        return stored && { ...stored, ...plugin };
       },
+      ...(pluginState !== undefined ? { discoveryState: () => Promise.resolve(pluginState) } : {}),
+      ...(input.oauth?.resource !== undefined
+        ? { validateResourceURL: () => Promise.resolve(new URL(input.oauth!.resource!)) }
+        : {}),
       saveClientInformation: async (clientInformation) => {
         await this.saveClientInformation({
           serverUrl: input.serverUrl,
-          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-          clientInformation: clientInformation as unknown as MCPOAuthClientInformation,
+          clientInformation: withoutPluginSecret(
+            // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
+            clientInformation as unknown as MCPOAuthClientInformation,
+            input.oauth
+          ),
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
         });
       },

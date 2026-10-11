@@ -1311,7 +1311,17 @@ export class AgentPluginInstallService {
                 // root → writable PLUGIN_DATA), so it is consent-relevant.
                 ...(info.cwd !== undefined ? { cwd: normalize(info.cwd) } : {}),
               })
-            : JSON.stringify({ transport: info.transport, url: info.url });
+            : JSON.stringify({
+                transport: info.transport,
+                url: info.url,
+                // A changed auth block needs new consent. The secret counts
+                // by presence only: its value never leaves the file.
+                oauth: info.oauth && {
+                  ...info.oauth,
+                  clientSecretSource: undefined,
+                  hasClientSecret: info.oauth.clientSecretSource !== undefined,
+                },
+              });
         servers.set(info.plugin.serverName, {
           fingerprint,
           display: this.describeMcpServer(info, rewrite, finalTargetPath).summary,
@@ -1689,10 +1699,21 @@ export class AgentPluginInstallService {
   ): AgentPluginPreviewMcpServer {
     assert(info.plugin !== undefined, "plugin server info must carry provenance");
     if (info.transport !== "stdio") {
+      // SECURITY AUDIT: the user consents to the server URL, so each auth host
+      // that differs from its host gets its own line. Exact host comparison:
+      // no public-suffix list exists here to make parent-domain matching safe.
+      const serverHost = new URL(info.url).host;
+      const endpoints = info.oauth?.endpoints;
+      const authHosts = new Set(
+        [endpoints?.authorizationUrl, endpoints?.tokenUrl]
+          .filter((url) => url !== undefined)
+          .map((url) => new URL(url).host)
+          .filter((host) => host !== serverHost)
+      );
       return {
         serverName: info.plugin.serverName,
         transport: info.transport === "http" ? "http" : "sse",
-        summary: info.url,
+        summary: [info.url, ...[...authHosts].map((host) => `Sign-in at ${host}`)].join("\n"),
       };
     }
     // Mirror the runtime's rendering (MCPServerManager shell-quotes every
