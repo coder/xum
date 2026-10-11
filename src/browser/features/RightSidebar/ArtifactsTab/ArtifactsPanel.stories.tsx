@@ -15,6 +15,7 @@ import { writeArtifactSelection } from "./artifactSelection";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { openMcpAppViewTab } from "./mcpAppViewsStore";
 import { AppViewTabPanel } from "../AppViewTab/AppViewTab";
+import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 
 /**
  * Desktop and browser mode differ only in what the frame may navigate to (the desktop app
@@ -1076,7 +1077,11 @@ function DesktopApiStub(props: { children: ReactNode }) {
   return <>{props.children}</>;
 }
 
-function renderMcpAppView(html: string = MCP_APP_VIEW_HTML) {
+function renderMcpAppView(
+  html: string = MCP_APP_VIEW_HTML,
+  // A non-https host is never granted, so it is listed as not granted.
+  csp: McpAppView["csp"] = { resourceDomains: ["http://tiles.example.com"] }
+) {
   openMcpAppViewTab(WORKSPACE_ID, {
     toolCallId: MCP_APP_TOOL_CALL_ID,
     serverName: "weather",
@@ -1095,9 +1100,7 @@ function renderMcpAppView(html: string = MCP_APP_VIEW_HTML) {
           views: {
             [MCP_APP_TOOL_CALL_ID]: {
               html,
-              // jsdelivr is on the CDN allowlist; the tile host is not, so it is listed as
-              // not granted.
-              csp: { resourceDomains: ["https://cdn.jsdelivr.net", "https://tiles.example.com"] },
+              csp,
               prefersBorder: null,
               resultAvailable: true,
               result: { content: [{ type: "text", text: "Berlin: 18°C, light rain" }] },
@@ -1135,7 +1138,7 @@ const playMcpAppView = async (canvasElement: HTMLElement) => {
   const canvas = within(canvasElement);
   const frame = await canvas.findByTestId("mcp-app-frame");
   await expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
-  await canvas.findByText(/Not granted to this view: https:\/\/tiles\.example\.com/);
+  await canvas.findByText(/Not granted to this view: http:\/\/tiles\.example\.com/);
   await waitFor(() => expect(frame.style.height).toBe("321px"), { timeout: 5000 });
   const strip = await canvas.findByRole("alert");
   await expect(strip.textContent).toContain("Allow get_forecast from weather?");
@@ -1155,6 +1158,32 @@ export const McpAppViewPhone: Story = {
   ...PHONE,
   render: () => renderMcpAppView(),
   play: ({ canvasElement }) => playMcpAppView(canvasElement),
+};
+
+// A view that declares https domains asks once per server; until then it runs on the base policy.
+const DOMAINS_CSP = {
+  connectDomains: ["https://api.example.com"],
+  resourceDomains: ["https://cdn.example.com"],
+};
+const playDomainsStrip = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement);
+  const strip = await canvas.findByText(/This view wants to reach/);
+  await expect(strip.textContent).toBe(
+    "This view wants to reach: cdn.example.com, api.example.com"
+  );
+  await expect(canvas.getByRole("button", { name: "Not now" })).toBeVisible();
+};
+export const McpAppViewDomainsLaptop: Story = {
+  globals: { viewport: { value: "laptop1200", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
+  render: () => renderMcpAppView(MCP_APP_VIEW_HTML, DOMAINS_CSP),
+  play: ({ canvasElement }) => playDomainsStrip(canvasElement),
+};
+export const McpAppViewDomainsPhone: Story = {
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
+  render: () => renderMcpAppView(MCP_APP_VIEW_HTML, DOMAINS_CSP),
+  play: ({ canvasElement }) => playDomainsStrip(canvasElement),
 };
 
 // An MCP view that navigates itself away loses its host: no more messages either way.

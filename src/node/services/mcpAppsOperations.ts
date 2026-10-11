@@ -6,7 +6,9 @@
 import { ORPCError } from "@orpc/server";
 import type { z } from "zod";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { MCP_APP_VIEW_DOMAINS_MAX, mcpAppGrantableOrigin } from "@/common/utils/mcpApps";
 import type {
+  McpAppApproveDomainsRequestSchema,
   McpAppModelContextRequestSchema,
   McpAppResourceReadRequestSchema,
   McpAppToolCallRequestSchema,
@@ -19,7 +21,24 @@ import { getErrorMessage } from "@/common/utils/errors";
 import type { ORPCContext } from "@/node/orpc/context";
 import { displayConnectionKey } from "./mcpServerIdentity";
 
-type McpAppsContext = Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
+type McpAppsContext = Pick<ORPCContext, "experimentsService" | "mcpServerManager" | "config">;
+
+/** The project a workspace belongs to, or null (unknown workspace). */
+function projectPathOf(context: McpAppsContext, workspaceId: string): string | null {
+  return context.config.findWorkspace(workspaceId)?.projectPath ?? null;
+}
+
+/** Origins the user allowed `serverName`'s views to reach in the workspace's project. */
+function approvedDomainsFor(
+  context: McpAppsContext,
+  workspaceId: string,
+  serverName: string
+): string[] {
+  const projectPath = projectPathOf(context, workspaceId);
+  if (projectPath === null) return [];
+  const project = context.config.loadConfigOrDefault().projects.get(projectPath);
+  return project?.mcpAppViewDomains?.[serverName] ?? [];
+}
 
 /** Largest view-initiated tools/call or resources/read result returned to a view. */
 export const MCP_APP_TOOL_RESULT_MAX_BYTES = 2 * 1024 * 1024;
@@ -81,6 +100,11 @@ export async function getMcpAppView(
         ...resource,
         resultAvailable: result !== null,
         result,
+        approvedDomains: approvedDomainsFor(
+          context,
+          input.workspaceId,
+          record?.serverName ?? input.serverName
+        ),
         invocation:
           record !== null
             ? {
@@ -177,4 +201,50 @@ export async function updateMcpAppModelContext(
   } catch (error) {
     return { success: false, error: getErrorMessage(error) };
   }
+}
+
+/**
+ * Allow the server of a view to reach `origins` from its views in every workspace of the
+ * project. Like updateMcpAppModelContext, the view's result record binds the server: a view
+ * without one, or a request naming another server, is refused. Only bare https origins are
+ * stored (mcpAppGrantableOrigin); the list is capped.
+ */
+export async function approveMcpAppViewDomains(
+  context: McpAppsContext,
+  input: z.infer<typeof McpAppApproveDomainsRequestSchema>
+): Promise<Result<{ approvedDomains: string[] }, string>> {
+  assertMcpAppsEnabled(context);
+  const record = await context.mcpServerManager.getMcpAppResult(
+    input.workspaceId,
+    input.toolCallId
+  );
+  const projectPath = projectPathOf(context, input.workspaceId);
+  if (
+    record === null ||
+    projectPath === null ||
+    (input.serverName !== record.serverName &&
+      input.serverName !== displayConnectionKey(record.serverName))
+  ) {
+    return { success: false, error: "This view cannot be allowed more domains" };
+  }
+  const origins = input.origins.map(mcpAppGrantableOrigin);
+  if (origins.some((origin) => origin === null)) {
+    return { success: false, error: "Only https origins can be allowed" };
+  }
+  let approvedDomains: string[] = [];
+  await context.config.editConfig((config) => {
+    const project = config.projects.get(projectPath);
+    if (!project) throw new Error(`Project not found: ${projectPath}`);
+    const current = project.mcpAppViewDomains?.[record.serverName] ?? [];
+    approvedDomains = [...new Set([...current, ...origins.filter((o) => o !== null)])].slice(
+      0,
+      MCP_APP_VIEW_DOMAINS_MAX
+    );
+    project.mcpAppViewDomains = {
+      ...project.mcpAppViewDomains,
+      [record.serverName]: approvedDomains,
+    };
+    return config;
+  });
+  return { success: true, data: { approvedDomains } };
 }

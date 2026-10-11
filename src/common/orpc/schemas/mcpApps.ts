@@ -30,6 +30,8 @@ export const McpAppViewSchema = z.object({
   resultAvailable: z.boolean(),
   /** Raw CallToolResult for ui/notifications/tool-result; null when unavailable. */
   result: z.unknown().nullable(),
+  /** Origins the user allowed this view's server to reach in this project (mcpAppViewDomains). */
+  approvedDomains: z.array(z.string()).optional(),
   /**
    * The tool call the side-store record names: its server, server-local tool name and the
    * sanitized arguments the server received. When present the view is bound to it (toolInfo,
@@ -60,6 +62,14 @@ export const McpAppToolCallRequestSchema = z.object({
   arguments: z.record(z.string(), z.unknown()),
   /** The user allowed this call in the confirm strip (required for model-visible tools). */
   consented: z.boolean(),
+});
+
+/** Allow a view's server to reach more origins; bound by the view's result record. */
+export const McpAppApproveDomainsRequestSchema = z.object({
+  workspaceId: z.string().min(1),
+  toolCallId: z.string().min(1),
+  serverName: z.string().min(1),
+  origins: z.array(z.string().max(256)).min(1).max(32),
 });
 
 /** resources/read issued by a view; the server is the view's own (bound) server. */

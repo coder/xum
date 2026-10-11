@@ -4,6 +4,7 @@ import type { McpAppResultRecord } from "./mcpAppResultStore";
 import {
   getMcpAppView,
   MCP_APP_TOOL_RESULT_MAX_BYTES,
+  approveMcpAppViewDomains,
   readMcpAppServerResource,
   updateMcpAppModelContext,
 } from "./mcpAppsOperations";
@@ -19,10 +20,16 @@ const RECORD: McpAppResultRecord = {
   createdAt: 1,
 };
 
+const NO_PROJECTS = {
+  findWorkspace: () => null,
+  loadConfigOrDefault: () => ({ projects: new Map() }),
+};
+
 function context(record: McpAppResultRecord | null, warm = true) {
   const reads: Array<{ serverName: string; uri: string }> = [];
   const ctx = {
     experimentsService: { isExperimentEnabled: () => true },
+    config: NO_PROJECTS,
     mcpServerManager: {
       hasWorkspaceRequestOptions: () => warm,
       getMcpAppResult: () => Promise.resolve(record),
@@ -31,7 +38,7 @@ function context(record: McpAppResultRecord | null, warm = true) {
         return Promise.resolve({ html: "<p>view</p>", csp: {}, prefersBorder: null });
       },
     },
-  } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
+  } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager" | "config">;
   return { ctx, reads };
 }
 
@@ -119,7 +126,7 @@ describe("readMcpAppServerResource", () => {
           return result instanceof Error ? Promise.reject(result) : Promise.resolve(result);
         },
       },
-    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
+    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager" | "config">;
     return { ctx, reads };
   }
   const input = { workspaceId: "ws", serverName: "charts", uri: "ui://charts/data" };
@@ -156,7 +163,7 @@ describe("updateMcpAppModelContext", () => {
           return Promise.resolve();
         },
       },
-    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
+    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager" | "config">;
     return { ctx, writes };
   }
   const input = (serverName = "charts") => ({
@@ -181,5 +188,77 @@ describe("updateMcpAppModelContext", () => {
       expect((await updateMcpAppModelContext(ctx, input(serverName))).success).toBe(false);
       expect(writes).toEqual([]);
     }
+  });
+});
+
+describe("MCP Apps view domain approvals", () => {
+  function projectConfig() {
+    const projects = new Map<string, { mcpAppViewDomains?: Record<string, string[]> }>([
+      ["/repo", {}],
+    ]);
+    const config = {
+      findWorkspace: (id: string) => (id === "ws" ? { projectPath: "/repo" } : null),
+      loadConfigOrDefault: () => ({ projects }),
+      editConfig: (fn: (c: { projects: typeof projects }) => unknown) => {
+        fn({ projects });
+        return Promise.resolve();
+      },
+    };
+    const ctx = {
+      experimentsService: { isExperimentEnabled: () => true },
+      config,
+      mcpServerManager: {
+        getMcpAppResult: (_ws: string, id: string) =>
+          Promise.resolve(id === "call-1" ? RECORD : null),
+        hasWorkspaceRequestOptions: () => true,
+        readMcpAppResource: () => Promise.resolve({ html: "<p/>", csp: {}, prefersBorder: null }),
+      },
+    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager" | "config">;
+    return { ctx, projects };
+  }
+  const approve = (
+    origins: string[],
+    overrides: Partial<{ toolCallId: string; serverName: string }> = {}
+  ) => ({
+    workspaceId: "ws",
+    toolCallId: "call-1",
+    serverName: "charts",
+    origins,
+    ...overrides,
+  });
+
+  test("an approval is stored per server in the project and read back by every view", async () => {
+    const { ctx, projects } = projectConfig();
+    expect(await approveMcpAppViewDomains(ctx, approve(["https://api.example.com/"]))).toEqual({
+      success: true,
+      data: { approvedDomains: ["https://api.example.com"] },
+    });
+    // A grown list adds only the new origin.
+    await approveMcpAppViewDomains(
+      ctx,
+      approve(["https://api.example.com", "https://cdn.example.com"])
+    );
+    expect(projects.get("/repo")?.mcpAppViewDomains).toEqual({
+      charts: ["https://api.example.com", "https://cdn.example.com"],
+    });
+    const view = await getMcpAppView(ctx, request(), undefined, noWarm);
+    if (!view.success) throw new Error(view.error);
+    expect(view.data.approvedDomains).toEqual([
+      "https://api.example.com",
+      "https://cdn.example.com",
+    ]);
+  });
+
+  test("refuses non-https origins, views without a record, and another server", async () => {
+    const { ctx, projects } = projectConfig();
+    for (const input of [
+      approve(["http://api.example.com"]),
+      approve(["https://*.example.com"]),
+      approve(["https://api.example.com"], { toolCallId: "no-record" }),
+      approve(["https://api.example.com"], { serverName: "other" }),
+    ]) {
+      expect((await approveMcpAppViewDomains(ctx, input)).success).toBe(false);
+    }
+    expect(projects.get("/repo")?.mcpAppViewDomains).toBeUndefined();
   });
 });

@@ -2358,6 +2358,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             : { success: false as const, error: `No view for ${input.toolCallId}` }
         );
       },
+      approveViewDomains: (input: { origins: string[] }) =>
+        Promise.resolve({ success: true as const, data: { approvedDomains: input.origins } }),
       callTool: (input: { toolName: string; consented: boolean }) =>
         Promise.resolve({
           success: true as const,

@@ -7,7 +7,6 @@ import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
@@ -29,6 +28,7 @@ const VIEW: McpAppViewRef = {
 
 let invocation: McpAppView["invocation"] = null;
 let viewCsp: McpAppView["csp"] = {};
+let approvals: Array<{ serverName: string; origins: string[] }> = [];
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -50,6 +50,13 @@ function Wrapper(props: { children: ReactNode }) {
             result: { content: [] },
             invocation,
           },
+        });
+      },
+      approveViewDomains: (input: { serverName: string; origins: string[] }) => {
+        approvals.push({ serverName: input.serverName, origins: input.origins });
+        return Promise.resolve({
+          success: true as const,
+          data: { approvedDomains: input.origins },
         });
       },
       callTool: (input: {
@@ -131,6 +138,7 @@ describe("McpAppFrame", () => {
     window.localStorage.clear();
     invocation = null;
     viewCsp = {};
+    approvals = [];
     toolCalls = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -142,11 +150,41 @@ describe("McpAppFrame", () => {
     cleanupDom = null;
   });
 
-  test("grants no CDN source until the saved preferences load", async () => {
-    getAppConfigStore().clearCachedState();
-    viewCsp = { resourceDomains: ["https://cdn.tailwindcss.com"] };
-    const { frame } = await renderFrame();
-    expect(frame.getAttribute("srcdoc")).not.toContain("https://cdn.tailwindcss.com");
+  test("declared domains run under the base policy until the user allows them", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = {
+      connectDomains: ["https://api.example.com", "http://insecure.example.com"],
+      frameDomains: ["https://frame.example.com"],
+    };
+    const { view, frame } = await renderFrame();
+    expect(frame.getAttribute("srcdoc")).not.toContain("api.example.com");
+    expect(view.getByRole("alert").textContent).toContain(
+      "This view wants to reach: api.example.com"
+    );
+    // Not now keeps the base policy and hides the strip.
+    fireEvent.click(view.getByRole("button", { name: "Not now" }));
+    expect(view.queryByRole("alert")).toBeNull();
+    expect(approvals).toEqual([]);
+    cleanup();
+
+    const again = await renderFrame();
+    const allow = again.view.getByRole("button", { name: "Allow" });
+    await new Promise((resolve) => setTimeout(resolve, CONFIRM_ARM_DELAY_MS + 50));
+    fireEvent.pointerDown(allow);
+    fireEvent.click(allow);
+    // Approved for the record's raw server key, then the view reloads under the wider policy.
+    await waitFor(() =>
+      expect(approvals).toEqual([
+        { serverName: "charts-raw", origins: ["https://api.example.com"] },
+      ])
+    );
+    await waitFor(() => {
+      const csp = again.view.getByTestId("mcp-app-frame").getAttribute("srcdoc") ?? "";
+      expect(csp).toContain("connect-src https://api.example.com");
+      expect(csp).not.toContain("insecure.example.com");
+      expect(csp).toContain("frame-src 'none'");
+    });
+    expect(again.view.queryByText(/wants to reach/)).toBeNull();
   });
 
   test("the view is bound to the recorded tool call, not the card", async () => {

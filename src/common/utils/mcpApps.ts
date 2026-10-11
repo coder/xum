@@ -12,6 +12,32 @@ export const MCP_APP_RESOURCE_MAX_BYTES = 2 * 1024 * 1024;
 export const MCP_APP_RESOURCE_URI_MAX_CHARS = 512;
 /** Largest ui/update-model-context text (UTF-8 bytes) a view may store; larger is -32602. */
 export const MCP_APP_MODEL_CONTEXT_MAX_BYTES = 16 * 1024;
+/** Most approved view domains kept per server and project. */
+export const MCP_APP_VIEW_DOMAINS_MAX = 64;
+
+/**
+ * The origin a view may be granted for a declared CSP domain, or null. Only a bare https origin
+ * qualifies: no wildcard, path, query, fragment or credentials, so an approval names exactly the
+ * host (and port) the user saw in the strip.
+ */
+export function mcpAppGrantableOrigin(declared: string): string | null {
+  if (declared.includes("*")) return null;
+  let url: URL;
+  try {
+    url = new URL(declared);
+  } catch {
+    return null;
+  }
+  const bare =
+    url.protocol === "https:" &&
+    url.username === "" &&
+    url.password === "" &&
+    url.search === "" &&
+    url.hash === "" &&
+    (url.pathname === "/" || url.pathname === "");
+  return bare ? url.origin : null;
+}
+
 /** Longest URI a view may pass to resources/read (any scheme its server serves). */
 export const MCP_APP_READ_URI_MAX_CHARS = 2048;
 

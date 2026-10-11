@@ -23,7 +23,7 @@ import { openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
-import { ARTIFACT_IFRAME_SANDBOX, useArtifactsAllowCdnScripts } from "./SandboxedArtifactFrame";
+import { ARTIFACT_IFRAME_SANDBOX } from "./SandboxedArtifactFrame";
 import { Notice, NoteBar } from "./SourceText";
 
 // Spec style variable -> the app's CSS variable it is read from (globals.css). Values are
@@ -158,7 +158,13 @@ export function McpAppFrame(props: {
 }) {
   const inline = props.variant === "inline";
   const { api } = useAPI();
-  const allowCdn = useArtifactsAllowCdnScripts();
+  // Origins approved from this frame's strip since it loaded (the fetched view has the rest),
+  // and whether the user chose "Not now" for this call.
+  const [approvedHere, setApprovedHere] = useState<{ toolCallId: string; origins: string[] }>();
+  const [domainsDismissed, setDomainsDismissed] = useState<{
+    toolCallId: string;
+    error?: string;
+  }>();
   const { theme: themeMode } = useTheme();
   const theme: "light" | "dark" = isLightThemeMode(themeMode) ? "light" : "dark";
   const [loaded, setLoaded] = useState<Loaded | null>(null);
@@ -196,7 +202,33 @@ export function McpAppFrame(props: {
   }, [api, workspaceId, toolCallId, serverName, resourceUri]);
 
   const current = loaded?.toolCallId === toolCallId ? loaded : null;
-  const grant = current?.view ? grantMcpAppCsp(current.view.csp, { allowCdn }) : null;
+  const approved = [
+    ...(current?.view?.approvedDomains ?? []),
+    ...(approvedHere?.toolCallId === toolCallId ? approvedHere.origins : []),
+  ];
+  const grant = current?.view ? grantMcpAppCsp(current.view.csp, approved) : null;
+  // Only a view with a result record can be approved (the record binds its server).
+  const domainsPrompt =
+    grant != null &&
+    grant.pending.length > 0 &&
+    current?.view?.invocation != null &&
+    domainsDismissed?.toolCallId !== toolCallId
+      ? grant.pending
+      : null;
+  const [domainsPromptId] = useState(newConfirmPromptId);
+  const domainsArming = useConfirmArmed(domainsPrompt != null ? domainsPromptId : null);
+  const allowDomains = async (origins: string[]) => {
+    if (!api) return;
+    const result = await api.mcpApps.approveViewDomains({
+      workspaceId,
+      toolCallId,
+      serverName: boundServerName,
+      origins,
+    });
+    // The new grant changes the document, so the view reloads under the wider policy.
+    if (result.success) setApprovedHere({ toolCallId, origins: result.data.approvedDomains });
+    else setDomainsDismissed({ toolCallId, error: result.error });
+  };
   const srcDoc =
     current?.view && grant
       ? finalizeSandboxedDocument(parseArtifactHtml(current.view.html), {
@@ -392,6 +424,40 @@ export function McpAppFrame(props: {
       )}
       {grant.notGranted.length > 0 && (
         <NoteBar>Not granted to this view: {grant.notGranted.join(", ")}</NoteBar>
+      )}
+      {domainsDismissed?.toolCallId === toolCallId && domainsDismissed.error != null && (
+        <NoteBar>Could not allow the domains: {domainsDismissed.error}</NoteBar>
+      )}
+      {domainsPrompt != null && (
+        <div
+          role="alert"
+          className="border-border-light bg-background-secondary flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs"
+        >
+          <div className="text-foreground min-w-0 flex-1 break-words">
+            This view wants to reach:{" "}
+            {domainsPrompt.map((origin) => new URL(origin).host).join(", ")}
+          </div>
+          <button
+            type="button"
+            // Disabled briefly after the strip appears (confirmArming.ts), like the consent strip.
+            disabled={!domainsArming.armed}
+            onPointerDown={domainsArming.onPointerDown}
+            onClick={(event) =>
+              domainsArming.guardClick(event, () => void allowDomains(domainsPrompt))
+            }
+            className="bg-accent text-accent-foreground focus-visible:ring-accent focus-visible:ring-offset-background rounded px-2 py-0.5 focus-visible:ring-1 focus-visible:ring-offset-1 disabled:opacity-50"
+          >
+            Allow
+          </button>
+          <button
+            type="button"
+            // The view keeps running under the base policy.
+            onClick={() => setDomainsDismissed({ toolCallId })}
+            className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
+          >
+            Not now
+          </button>
+        </div>
       )}
       {consent != null && (
         <div
