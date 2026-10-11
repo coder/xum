@@ -841,14 +841,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const terminalCreateError = usePopoverError();
 
   // Manual collapse state (persisted globally)
-  const [storedCollapsed, setCollapsed] = usePersistedState<boolean>(
-    RIGHT_SIDEBAR_COLLAPSED_KEY,
-    false,
-    { listener: true }
-  );
-  // The phone full-screen view always shows the sidebar expanded. It leaves the stored state
-  // alone, so a sidebar collapsed on a wide layout is still collapsed there afterwards.
-  const collapsed = storedCollapsed && !fullscreen;
+  // WorkspaceShell expands it when it opens the phone full-screen view (see there).
+  const [collapsed, setCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
+    listener: true,
+  });
   const [isReviewImmersive, setIsReviewImmersive] = usePersistedState<boolean>(
     getReviewImmersiveKey(workspaceId),
     false,
@@ -1494,9 +1490,15 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             selectTabByIndex(canReviewDiffs ? prev : removeTabEverywhere(prev, "review"), tabIndex)
           );
           setCollapsed(false);
-          // Only for a tab that exists: Ctrl+9 with two tabs must not cover the chat.
+          // Only for a tab that exists (a shortcut past the last tab must not cover the chat),
+          // and not behind an open modal: the view would make it inert.
           const container = sidebarContainerRef.current;
-          if (target && container != null && isRightSidebarResponsivelyHidden(container)) {
+          if (
+            target &&
+            !isDialogOpen() &&
+            container != null &&
+            isRightSidebarResponsivelyHidden(container)
+          ) {
             onRequestFullscreen?.();
           }
           return;
@@ -1974,12 +1976,16 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         // and screen reader users land in the view. A launcher or panel that took focus already
         // (the New tab shortcut) keeps it. The focused pane's tab: focusing a tab focuses its
         // pane, and a split layout must keep the pane it had.
+        // The rendered tab, not the stored layout's: rendering can filter tabs out (Review in a
+        // workspace without a repository). Falls back to any shown tab, then the close button,
+        // so focus always lands inside.
         if (!container.contains(document.activeElement)) {
-          const shown = getBaseLayout();
-          const tabset = findTabset(shown.root, shown.focusedTabsetId);
-          if (tabset?.type === "tabset") {
-            document.getElementById(`${baseId}-${tabset.id}-tab-${tabset.activeTab}`)?.focus();
-          }
+          const focusedPaneTabs = `[id^="${baseId}-${getBaseLayout().focusedTabsetId}-tab-"]`;
+          const target =
+            container.querySelector<HTMLElement>(`${focusedPaneTabs}[aria-selected="true"]`) ??
+            container.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]') ??
+            header.querySelector<HTMLElement>("button");
+          target?.focus();
         }
       }
     };

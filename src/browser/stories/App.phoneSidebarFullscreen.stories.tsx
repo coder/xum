@@ -11,7 +11,7 @@ import { wrapAsyncIterator } from "@orpc/shared";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { ComponentType } from "react";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
@@ -84,7 +84,7 @@ function setup(layout: RightSidebarLayoutState = LAYOUT) {
     ],
   });
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
-  // Collapsed on a wide layout earlier: the full-screen view still shows it expanded.
+  // Collapsed on a wide layout earlier: opening the full-screen view expands it.
   updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
   updatePersistedState(getRightSidebarLayoutKey(WORKSPACE_ID), layout);
   // The Browser tool polls for sessions; this story has none.
@@ -133,7 +133,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await waitFor(() => expect(sidebar).not.toBeVisible());
 
     // One Sidebar row stands in for the hidden sidebar. It shows the sidebar full-screen on the
-    // tab it shows (Workflows), expanded although it was collapsed; the chat behind it is inert.
+    // tab it shows (Workflows), expanded although it was collapsed. The chat behind it is inert.
     await openSidebarFromMenu(canvasElement);
     await waitFor(() => expect(sidebar).toBeVisible());
     await expect(within(sidebar).getByRole("tab", { name: /Workflows/ })).toHaveAttribute(
@@ -169,6 +169,8 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await waitFor(() => expect(moreButton).toHaveFocus());
     await expect(chatPane.closest("[inert]")).toBeNull();
     await expect(expandLeftSidebar.closest("[inert]")).toBeNull();
+    // Opening the view expanded the sidebar (it was collapsed), so its panels stay mounted.
+    await expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
 
     // Reopening shows the tab used last, the same panel instance, not a remounted copy.
     await openSidebarFromMenu(canvasElement);
@@ -182,8 +184,16 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(sidebar).not.toBeVisible());
 
-    // A shortcut for a tab that does not exist (two tabs, Ctrl+9) leaves the chat in view.
+    // A shortcut for a tab that does not exist (two tabs, Ctrl+9), or one pressed behind an open
+    // modal, leaves the chat in view. The handler requests the view synchronously, so one task
+    // later a wrong request would already show.
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "9", code: "Digit9", ctrlKey: true }));
+    const modal = document.createElement("div");
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    document.body.appendChild(modal);
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "2", code: "Digit2", ctrlKey: true }));
+    modal.remove();
     await new Promise((resolve) => setTimeout(resolve, 50));
     await expect(sidebar).not.toBeVisible();
 

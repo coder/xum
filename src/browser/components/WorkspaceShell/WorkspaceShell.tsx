@@ -4,13 +4,14 @@ import { cn } from "@/common/lib/utils";
 import { LazyFeature } from "../LazyFeature/LazyFeature";
 import {
   LEFT_SIDEBAR_WIDTH_KEY,
+  RIGHT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getReviewImmersiveKey,
 } from "@/common/constants/storage";
 import { useResizableSidebar } from "@/browser/hooks/useResizableSidebar";
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { usePersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { RightSidebar } from "@/browser/features/RightSidebar/RightSidebar";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
@@ -221,6 +222,9 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const fullscreenReturnFocusRef = useRef<HTMLElement | null>(null);
   const openSidebarFullscreen = (returnFocusTo: HTMLElement | null) => {
     fullscreenReturnFocusRef.current = returnFocusTo;
+    // Opening the sidebar expands it, like every other way to open it (tab shortcuts, "Open in
+    // Artifacts"). A collapsed sidebar would unmount its panels each time the view closes.
+    updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
     setFullscreenSidebarWorkspaceId(props.workspaceId);
   };
   const handleRequestSidebarFullscreen = () => {
