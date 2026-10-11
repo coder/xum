@@ -158,6 +158,26 @@ describe("PreToolUse", () => {
     expect((await runTool(gateFails.spine, "bash", {})).executed).toBe(true);
   });
 
+  test("a trust gate that never settles ends at the hook deadline, and on cancel", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rRKxU): a stalled trust read must not hang the tool call.
+    const atDeadline = setup([hook("PreToolUse", { timeoutSeconds: 0.05 })], () => deny);
+    atDeadline.deps.isHookAllowed = () => new Promise(() => undefined);
+    expect((await runTool(atDeadline.spine, "bash", {})).executed).toBe(true);
+    expect(atDeadline.calls).toEqual([]);
+
+    // The default deadline is 10 s: only the cancel ends this wait in time.
+    const onCancel = setup([hook("PreToolUse")], () => deny);
+    onCancel.deps.isHookAllowed = () => new Promise(() => undefined);
+    const cancel = new AbortController();
+    setTimeout(() => cancel.abort(), 20);
+    const ctx = await runTool(onCancel.spine, "bash", {}, undefined, {
+      abortSignal: cancel.signal,
+    });
+    expect(ctx.executed).toBe(false);
+    expect(ctx.blocked?.result).toEqual({ error: "Tool call interrupted while plugin hooks ran." });
+    expect(onCancel.calls).toEqual([]);
+  });
+
   test("a deny tagged for another event is malformed and fails open", async () => {
     const { spine } = setup([hook("PreToolUse")], () =>
       json({ hookSpecificOutput: { hookEventName: "PostToolUse", permissionDecision: "deny" } })
@@ -322,7 +342,6 @@ describe("PreToolUse", () => {
     const cases: Array<[unknown, unknown, unknown]> = [
       [rewrite("allow", { script: "ls" }), schema, { script: "ls" }],
       [rewrite("allow", { script: 1 }), schema, { script: "x" }],
-      [rewrite("allow", { script: "ls" }), undefined, { script: "x" }],
       [json({ hookSpecificOutput: { updatedInput: { script: "ls" } } }), schema, { script: "x" }],
     ];
     // MCP schemas: local $ref/$defs (2020-12 by default) and a draft-07 declaration.
@@ -343,6 +362,14 @@ describe("PreToolUse", () => {
       const ctx = await runTool(spine, "bash", { script: "x" }, toolSchema);
       expect(ctx.result).toEqual({ ran: expected });
     }
+    // No schema to check the rewrite against: the call is denied, never run with the original
+    // arguments the guard meant to replace (Codex PRRT_kwDOPxxmWM6rRKxR).
+    const noSchema = setup([hook("PreToolUse")], () => rewrite("allow", { script: "ls" }));
+    const denied = await runTool(noSchema.spine, "bash", { script: "x" });
+    expect(denied.executed).toBe(false);
+    expect(denied.blocked?.result).toEqual({
+      error: "Tool call blocked by plugin 'guard' hook: Xum cannot check its rewrite of this call.",
+    });
   });
 
   test("additionalContext and systemMessage: the model sees the context, only the user sees the message", async () => {

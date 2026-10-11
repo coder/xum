@@ -5,6 +5,9 @@ import * as nodePath from "node:path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 
+import { registerCodexPluginHooks } from "@/node/services/agentPlugins/codexHookRunner";
+import { eventSpine } from "@/node/services/events/eventSpine";
+
 import { createKernelFileLoader } from "./kernelFileLoad";
 
 describe("createKernelFileLoader line counting", () => {
@@ -203,5 +206,61 @@ describe("createKernelFileLoader cancellation", () => {
 
     expect(seenStatSignals).toEqual([controller.signal]);
     expect(seenReadSignals).toEqual([controller.signal]);
+  });
+});
+
+describe("createKernelFileLoader Codex hook rewrites", () => {
+  it("runs an allowed rewrite with the rewritten path (Codex PRRT_kwDOPxxmWM6rRKxR)", async () => {
+    // A guard that redirects a read must not be bypassed: the loader passes file_read's schema,
+    // so the rewrite is checked and applied instead of the original path running.
+    using tmp = new DisposableTempDir("kernel-load-rewrite");
+    await fs.writeFile(nodePath.join(tmp.path, "secret.txt"), "secret\n", "utf8");
+    await fs.writeFile(nodePath.join(tmp.path, "safe.txt"), "safe\n", "utf8");
+    const unregister = registerCodexPluginHooks(eventSpine, {
+      workspaceId: "kernel-rewrite-ws",
+      pluginName: "guard",
+      order: 0,
+      hooks: [
+        {
+          key: "hooks/hooks.json#PreToolUse[0][0]",
+          hash: "h".repeat(64),
+          event: "PreToolUse",
+          matcher: "^file_read$",
+          handler: { type: "mcp_tool", server: "guard", tool: "check", input: {} },
+          status: "runnable",
+          source: "hooks/hooks.json",
+        },
+      ],
+      deps: {
+        isHookAllowed: () => Promise.resolve(true),
+        callPluginTool: () =>
+          Promise.resolve({
+            structuredContent: {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "allow",
+                updatedInput: { path: "safe.txt" },
+              },
+            },
+          }),
+        notifyUser: () => undefined,
+      },
+    });
+    try {
+      const runtime = new LocalRuntime(tmp.path);
+      const load = createKernelFileLoader({
+        cwd: tmp.path,
+        runtime,
+        hooks: {
+          runtime,
+          cwd: tmp.path,
+          runtimeTempDir: tmp.path,
+          workspaceId: "kernel-rewrite-ws",
+        },
+      });
+      expect((await load({ path: "secret.txt" })).content).toBe("safe\n");
+    } finally {
+      unregister();
+    }
   });
 });
