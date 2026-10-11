@@ -80,6 +80,13 @@ export function mcpAppSelectionKey(toolCallId: string): string {
   return `${MCP_APP_SELECTION_PREFIX}${toolCallId}`;
 }
 
+/** The tool call of a view key, or null for anything else. */
+export function toolCallIdFromMcpAppKey(key: string): string | null {
+  return key.startsWith(MCP_APP_SELECTION_PREFIX) && key.length > MCP_APP_SELECTION_PREFIX.length
+    ? key.slice(MCP_APP_SELECTION_PREFIX.length)
+    : null;
+}
+
 const EMPTY: readonly McpAppViewRef[] = [];
 const viewsByWorkspace = new Map<string, readonly McpAppViewRef[]>();
 const listeners = new Set<() => void>();
@@ -153,7 +160,7 @@ function sameViews(a: readonly McpAppViewRef[], b: readonly McpAppViewRef[]): bo
 const viewsByMessages = new WeakMap<readonly DisplayedMessage[], readonly McpAppViewRef[]>();
 const lastTranscriptViews = new Map<string, readonly McpAppViewRef[]>();
 
-function transcriptViews(
+export function transcriptViews(
   workspaceId: string,
   messages: readonly DisplayedMessage[]
 ): readonly McpAppViewRef[] {
@@ -249,4 +256,76 @@ export function closeMcpAppView(workspaceId: string, toolCallId: string) {
   if (readArtifactSelection(workspaceId).path === mcpAppSelectionKey(toolCallId)) {
     writeArtifactSelection(workspaceId, { scope: "artifact", path: null, version: null });
   }
+}
+
+/**
+ * One view of the workspace: the ref, null when the workspace has no such view (any more), or
+ * "loading" while the transcript is not loaded yet (a tab restored after a reload).
+ */
+export function useMcpAppView(
+  workspaceId: string,
+  toolCallId: string
+): McpAppViewRef | null | "loading" {
+  const store = useWorkspaceStoreRaw();
+  const views = useMcpAppViews(workspaceId);
+  const loading = useSyncExternalStore(
+    (listener) => store.subscribeKey(workspaceId, listener),
+    () =>
+      !store.hasRegisteredWorkspace(workspaceId) ||
+      store.getWorkspaceState(workspaceId).loading ||
+      store.getWorkspaceState(workspaceId).isHydratingTranscript
+  );
+  const view = views.find((v) => v.toolCallId === toolCallId) ?? null;
+  return view ?? (loading ? "loading" : null);
+}
+
+/**
+ * Open a view in its own right-sidebar tab, or focus the tab it already has (RightSidebar and,
+ * on small viewports, WorkspaceMenuBar's sheet handle OPEN_MCP_APP_VIEW). The ref is kept for
+ * the session so a view from outside the loaded transcript window still resolves.
+ */
+export function openMcpAppViewTab(workspaceId: string, view: McpAppViewRef) {
+  const current = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== view.toolCallId);
+  viewsByWorkspace.set(workspaceId, [view, ...current]);
+  emit();
+  window.dispatchEvent(
+    createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: view.toolCallId })
+  );
+}
+
+/**
+ * Where a view is mounted outside its tool card: its app tab, or the Artifacts tab (which still
+ * lists app views). Counted per workspace, tool call and host, so every place that can show a
+ * view yields to the others and at most one live instance runs.
+ */
+export type McpAppViewHost = "tab" | "artifacts";
+const hostedViews = new Map<string, number>();
+const hostedKey = (workspaceId: string, toolCallId: string, host: McpAppViewHost) =>
+  `${workspaceId}\u0000${toolCallId}\u0000${host}`;
+
+/** Mark a view hosted while that host's frame is mounted; returns the unmark. */
+export function markMcpAppViewHosted(
+  workspaceId: string,
+  toolCallId: string,
+  host: McpAppViewHost
+): () => void {
+  const key = hostedKey(workspaceId, toolCallId, host);
+  hostedViews.set(key, (hostedViews.get(key) ?? 0) + 1);
+  emit();
+  return () => {
+    const left = (hostedViews.get(key) ?? 1) - 1;
+    if (left > 0) hostedViews.set(key, left);
+    else hostedViews.delete(key);
+    emit();
+  };
+}
+
+export function useMcpAppViewHostedBy(
+  workspaceId: string,
+  toolCallId: string,
+  hosts: readonly McpAppViewHost[]
+): boolean {
+  return useSyncExternalStore(subscribe, () =>
+    hosts.some((host) => hostedViews.has(hostedKey(workspaceId, toolCallId, host)))
+  );
 }

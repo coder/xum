@@ -55,7 +55,15 @@ import { useArtifactInteractions } from "./useArtifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { createCappedMemory, useCappedMemory } from "./cappedMemory";
 import { McpAppFrame } from "./McpAppFrame";
-import { appViewPickerDetails, mcpAppSelectionKey, useMcpAppViews } from "./mcpAppViewsStore";
+import {
+  appViewPickerDetails,
+  markMcpAppViewHosted,
+  mcpAppSelectionKey,
+  useMcpAppViews,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
+import { AppViewInTabNotice } from "../AppViewTab/AppViewTab";
+import { useMcpAppViewInTab } from "../AppViewTab/appViewTabs";
 import {
   type ArtifactSelection,
   type ArtifactSelectionScope,
@@ -254,6 +262,28 @@ const SELECTION_EXTENDING_KEYS = new Set([
  * `inDialog` is set by the small-viewport dialog, which is already near full screen and whose
  * focus trap would fight a second full-screen overlay, so fullscreen is not offered there.
  */
+/**
+ * An app view selected in the Artifacts picker. While the view is open in its app tab, this
+ * shows the "Open in tab" placeholder and mounts no frame, so one view never runs twice.
+ */
+function ArtifactsAppView(props: { workspaceId: string; view: McpAppViewRef }) {
+  const { workspaceId } = props;
+  const { toolCallId } = props.view;
+  const inTab = useMcpAppViewInTab(workspaceId, toolCallId, ["tab"]);
+  useEffect(() => {
+    if (inTab) return;
+    return markMcpAppViewHosted(workspaceId, toolCallId, "artifacts");
+  }, [inTab, workspaceId, toolCallId]);
+  if (inTab) {
+    return (
+      <div className="p-3">
+        <AppViewInTabNotice workspaceId={workspaceId} view={props.view} />
+      </div>
+    );
+  }
+  return <McpAppFrame workspaceId={workspaceId} view={props.view} />;
+}
+
 export function ArtifactsPanel(props: {
   workspaceId: string;
   inDialog?: boolean;
@@ -932,7 +962,7 @@ export function ArtifactsPanel(props: {
 
   const viewerBody =
     selectedApp != null ? (
-      <McpAppFrame
+      <ArtifactsAppView
         // Reload remounts the view, so it re-fetches its resource and result.
         key={`${selectedApp.toolCallId}\u0000${reloadTick}`}
         workspaceId={props.workspaceId}

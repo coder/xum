@@ -28,10 +28,12 @@ import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   mcpAppViewRefFor,
-  openMcpAppView,
+  openMcpAppViewTab,
   type McpAppViewRef,
 } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
 import { McpAppFrame } from "@/browser/features/RightSidebar/ArtifactsTab/McpAppFrame";
+import { useMcpAppViewInTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
+import { AppViewInTabNotice } from "@/browser/features/RightSidebar/AppViewTab/AppViewTab";
 
 interface GenericToolCallProps {
   toolName: string;
@@ -58,27 +60,27 @@ function useMcpAppViewsSupported(): boolean {
 }
 
 /**
- * Tools that declare a ui:// view get an action that opens it in the Artifacts tab. Own
- * component so plain rows keep their exact previous render tree.
+ * Tools that declare a ui:// view get an action that opens it in its own right-sidebar tab (or
+ * focuses that tab). Own component so plain rows keep their exact previous render tree.
  */
 const OpenMcpAppViewButton: React.FC<{ workspaceId: string; view: McpAppViewRef }> = (props) => {
   if (!useMcpAppViewsSupported()) return null;
   // Narrow cards (phones, a narrow chat) show the icon only, so the action never pushes the
   // header past the card's right edge.
   return (
-    <TooltipIfPresent tooltip="Open in Artifacts">
+    <TooltipIfPresent tooltip="Open in tab">
       <button
         type="button"
-        aria-label="Open in Artifacts"
+        aria-label="Open in tab"
         onClick={(e) => {
           // The header toggles expansion; this action must not.
           e.stopPropagation();
-          openMcpAppView(props.workspaceId, props.view);
+          openMcpAppViewTab(props.workspaceId, props.view);
         }}
         className="text-muted hover:text-foreground focus-visible:ring-accent ml-auto inline-flex shrink-0 items-center gap-1 rounded text-[11px] focus-visible:ring-1"
       >
         <AppWindow className="h-3 w-3" />
-        <span className="hidden @[32rem]:inline">Open in Artifacts</span>
+        <span className="hidden @[32rem]:inline">Open in tab</span>
       </button>
     </TooltipIfPresent>
   );
@@ -97,10 +99,17 @@ const McpAppToolDetails: React.FC<{
 }> = (props) => {
   // A failed call's error is in the raw output: show it without a click.
   const [showRaw, setShowRaw] = React.useState(props.view.failed);
+  const inTab = useMcpAppViewInTab(props.workspaceId, props.view.toolCallId, ["tab", "artifacts"]);
   if (!useMcpAppViewsSupported()) return <ToolDetails>{props.raw}</ToolDetails>;
   return (
     <ToolDetails>
-      <McpAppFrame workspaceId={props.workspaceId} view={props.view} variant="inline" />
+      {inTab ? (
+        // One live instance per view: while its tab (or Artifacts) has it, the card shows this
+        // instead of a second frame. Closing the tab brings the view back here.
+        <AppViewInTabNotice workspaceId={props.workspaceId} view={props.view} />
+      ) : (
+        <McpAppFrame workspaceId={props.workspaceId} view={props.view} variant="inline" />
+      )}
       <button
         type="button"
         aria-expanded={showRaw}

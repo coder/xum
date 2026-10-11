@@ -5,6 +5,8 @@ import { GenericToolCall } from "@/browser/features/Tools/GenericToolCall";
 import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { withAppViewTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
+import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 
 const meta = {
   ...lightweightMeta,
@@ -169,9 +171,32 @@ export const McpAppInlinePhone: Story = {
     // The header action stays inside the card instead of pushing past its right edge.
     const canvas = within(canvasElement);
     const card = canvas.getByTestId("phone-width").getBoundingClientRect();
-    const action = canvas
-      .getByRole("button", { name: "Open in Artifacts" })
-      .getBoundingClientRect();
+    const action = canvas.getByRole("button", { name: "Open in tab" }).getBoundingClientRect();
     await expect(action.right).toBeLessThanOrEqual(card.right);
   },
+};
+
+/** The view lives in its app tab: the card shows a placeholder instead of a second frame. */
+function renderInTab() {
+  updateRightSidebarLayout("ws-generic-mcp-app", (state) => withAppViewTab(state, "call-dice-1"));
+  return renderMcpAppCall();
+}
+const playInTab = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement);
+  await userEvent.click(canvas.getByText("demo_app_show_dice_board"));
+  await canvas.findByRole("button", { name: "Go to tab" });
+  await expect(canvas.queryByTestId("mcp-app-frame")).toBeNull();
+};
+export const McpAppInTab: Story = {
+  args: { toolName: "demo_app_show_dice_board" },
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["laptop"] } } },
+  render: () => renderInTab(),
+  play: ({ canvasElement }) => playInTab(canvasElement),
+};
+export const McpAppInTabPhone: Story = {
+  args: { toolName: "demo_app_show_dice_board" },
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
+  render: () => <div style={{ width: 358 }}>{renderInTab()}</div>,
+  play: ({ canvasElement }) => playInTab(canvasElement),
 };

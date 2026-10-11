@@ -2,7 +2,18 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import {
+  createTestApiClient,
+  resetTestExperiments,
+  setTestExperiment,
+  type TestApiOverrides,
+} from "@/browser/testUtils";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { GenericToolCall } from "@/browser/features/Tools/GenericToolCall";
+import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
+import { removeTabEverywhere } from "@/browser/utils/rightSidebarLayout";
+import { AppViewTabPanel } from "../AppViewTab/AppViewTab";
+import { appViewTabFor, useMcpAppViewInTab, withAppViewTab } from "../AppViewTab/appViewTabs";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
@@ -922,6 +933,102 @@ describe("ArtifactsPanel", () => {
     } finally {
       closeMcpAppView("ws-app-close", "call-a");
       closeMcpAppView("ws-app-close", "call-b");
+    }
+  });
+
+  test("a view runs once: card, Artifacts and its app tab never mount two frames", async () => {
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+    fake = createFakeArtifactsApi(
+      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      {}
+    );
+    fake.api.mcpApps = {
+      getView: () =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            html: "<p>view</p>",
+            csp: {},
+            prefersBorder: null,
+            resultAvailable: true,
+            result: { content: [] },
+            invocation: null,
+          },
+        }),
+    };
+    const workspaceId = "ws-one-instance";
+    const ref = {
+      toolCallId: "call-one",
+      serverName: "dice",
+      resourceUri: "ui://dice/board.html",
+      toolName: "dice_show_dice_board",
+      label: "Board",
+      arguments: {},
+      cancelled: false,
+      failed: false,
+    };
+    function TabIfOpen() {
+      // Stands in for RightSidebar: the tab panel mounts while the layout has the tab.
+      const open = useMcpAppViewInTab(workspaceId, ref.toolCallId, []);
+      return open ? (
+        <AppViewTabPanel
+          workspaceId={workspaceId}
+          toolCallId={ref.toolCallId}
+          onClose={() => undefined}
+        />
+      ) : null;
+    }
+    openMcpAppView(workspaceId, ref);
+    try {
+      const view = render(
+        <ThemeProvider forcedTheme="dark">
+          <ApiWrapper>
+            <GenericToolCall
+              toolName="dice_show_dice_board"
+              args={{}}
+              result={{ content: [] }}
+              status="completed"
+              workspaceId={workspaceId}
+              toolCallId={ref.toolCallId}
+              mcpServer={{
+                connection: { key: "dice", transport: "stdio" },
+                identity: { name: "dice", version: "1.0.0" },
+                source: "connection",
+                app: { resourceUri: ref.resourceUri },
+              }}
+            />
+            <ArtifactsPanel workspaceId={workspaceId} />
+            <TabIfOpen />
+          </ApiWrapper>
+        </ThemeProvider>
+      );
+      fireEvent.click(view.getByText("dice_show_dice_board"));
+      const frames = () => view.queryAllByTestId("mcp-app-frame").length;
+      // Selected in Artifacts: Artifacts runs it, the card yields.
+      await view.findByTestId("mcp-app-frame");
+      await waitFor(() =>
+        expect(view.getAllByRole("button", { name: "Go to tab" })).toHaveLength(1)
+      );
+      expect(frames()).toBe(1);
+      // Opened in its tab: Artifacts yields too, the tab runs it.
+      act(() => updateRightSidebarLayout(workspaceId, (s) => withAppViewTab(s, ref.toolCallId)));
+      await waitFor(() =>
+        expect(view.getAllByRole("button", { name: "Go to tab" })).toHaveLength(2)
+      );
+      expect(frames()).toBe(1);
+      // Tab closed: Artifacts runs it again.
+      act(() =>
+        updateRightSidebarLayout(workspaceId, (s) =>
+          removeTabEverywhere(s, appViewTabFor(ref.toolCallId))
+        )
+      );
+      await waitFor(() =>
+        expect(view.getAllByRole("button", { name: "Go to tab" })).toHaveLength(1)
+      );
+      expect(frames()).toBe(1);
+    } finally {
+      resetTestExperiments();
+      closeMcpAppView(workspaceId, ref.toolCallId);
     }
   });
 
