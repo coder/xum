@@ -168,7 +168,9 @@ describe("loadPluginMcpServers", () => {
     expect(messages[0]).toMatch(
       /'provided'.*authorizationUrl' must be an https \(or loopback http\) URL/
     );
-    expect(messages[1]).toMatch(/'provided'.*ignores: tokenUrl \(needs authorizationUrl\)$/);
+    expect(messages[1]).toMatch(
+      /'provided'.*ignores: tokenUrl \(discovery supplies the endpoints\)$/
+    );
     const provided = Object.values(servers).find((s) => s.plugin?.serverName === "provided");
     expect(provided?.transport === "http" && provided.oauth).toEqual({
       clientId: "docs-client",
