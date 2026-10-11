@@ -14,11 +14,18 @@ const COMPRESSIBLE_EXTENSIONS = new Set([".js", ".mjs", ".css", ".svg", ".json",
 const brotli = promisify(zlib.brotliCompress);
 const gzip = promisify(zlib.gzip);
 // Brotli quality 11 took ~9x longer than 9 on the full bundle (18.5 s vs 2.1 s) for ~8% smaller
-// output (5.08 vs 5.53 MiB), so 9 it is.
+// output. Only the few large chunks are worth that cost (they hold most first-load bytes, #5971),
+// so quality 11 applies from this size up and quality 9 below it.
+const BROTLI_MAX_QUALITY_MIN_BYTES = 256 * 1024;
 const { BROTLI_PARAM_QUALITY, BROTLI_PARAM_SIZE_HINT } = zlib.constants;
 const compress = (encoding: "br" | "gzip", data: Buffer) =>
   encoding === "br"
-    ? brotli(data, { params: { [BROTLI_PARAM_QUALITY]: 9, [BROTLI_PARAM_SIZE_HINT]: data.length } })
+    ? brotli(data, {
+        params: {
+          [BROTLI_PARAM_QUALITY]: data.length >= BROTLI_MAX_QUALITY_MIN_BYTES ? 11 : 9,
+          [BROTLI_PARAM_SIZE_HINT]: data.length,
+        },
+      })
     : gzip(data, { level: 9 });
 const exists = (filePath: string) => fs.stat(filePath).then(Boolean, () => false);
 
