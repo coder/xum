@@ -37,7 +37,13 @@ describe("AppViewTabPanel", () => {
     let closed = 0;
     // Not in the transcript and no result record in the backend either.
     const client = createTestApiClient({
-      mcpApps: { getViewRecord: () => Promise.resolve({ success: true as const, data: null }) },
+      mcpApps: {
+        getViewRecords: (input: { toolCallIds: string[] }) =>
+          Promise.resolve({
+            success: true as const,
+            data: input.toolCallIds.map((toolCallId) => ({ toolCallId, view: null })),
+          }),
+      },
     });
     try {
       const view = render(
@@ -75,18 +81,21 @@ describe("AppViewTabPanel", () => {
     const opened: Array<{ serverName: string; resourceUri: string }> = [];
     const client = createTestApiClient({
       mcpApps: {
-        getViewRecord: (input: { toolCallId: string }) =>
+        getViewRecords: (input: { toolCallIds: string[] }) =>
           Promise.resolve({
             success: true as const,
-            data:
-              input.toolCallId === "call-old"
-                ? {
-                    serverName: "dice",
-                    toolName: "dice_show_dice_board",
-                    resourceUri: "ui://dice/board.html",
-                    arguments: { count: 4 },
-                  }
-                : null,
+            data: input.toolCallIds.map((toolCallId) => ({
+              toolCallId,
+              view:
+                toolCallId === "call-old"
+                  ? {
+                      serverName: "dice",
+                      toolName: "dice_show_dice_board",
+                      resourceUri: "ui://dice/board.html",
+                      arguments: { count: 4 },
+                    }
+                  : null,
+            })),
           }),
         getView: (input: { serverName: string; resourceUri: string }) => {
           opened.push({ serverName: input.serverName, resourceUri: input.resourceUri });
@@ -123,6 +132,74 @@ describe("AppViewTabPanel", () => {
       await waitFor(() =>
         expect(opened).toEqual([{ serverName: "dice", resourceUri: "ui://dice/board.html" }])
       );
+    } finally {
+      registered.mockRestore();
+      state.mockRestore();
+    }
+  });
+
+  test("restored tabs outside the transcript share one record lookup; a failed one is retried", async () => {
+    const store = useWorkspaceStoreRaw();
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
+      (id) => id === "ws-batch"
+    );
+    const state = spyOn(store, "getWorkspaceState").mockImplementation(
+      () =>
+        ({
+          messages: [],
+          loading: false,
+          isHydratingTranscript: false,
+        }) as unknown as WorkspaceState
+    );
+    const requests: string[][] = [];
+    let reachable = false;
+    const client = createTestApiClient({
+      mcpApps: {
+        getViewRecords: (input: { toolCallIds: string[] }) => {
+          requests.push(input.toolCallIds);
+          // E.g. the backend restarts while the layout is restored.
+          if (!reachable) return Promise.reject(new Error("disconnected"));
+          return Promise.resolve({
+            success: true as const,
+            data: input.toolCallIds.map((toolCallId) => ({
+              toolCallId,
+              view: {
+                serverName: "dice",
+                toolName: `tool_${toolCallId}`,
+                resourceUri: "ui://dice/board.html",
+                arguments: {},
+              },
+            })),
+          });
+        },
+      },
+    });
+    const labels = (panel: boolean) => (
+      <APIProvider client={client}>
+        {["b1", "b2", "b3"].map((id) => (
+          <AppViewTabLabel key={id} workspaceId="ws-batch" toolCallId={id} />
+        ))}
+        {panel && (
+          <AppViewTabPanel workspaceId="ws-batch" toolCallId="b1" onClose={() => undefined} />
+        )}
+      </APIProvider>
+    );
+    try {
+      const first = render(labels(true));
+      // Until it is retried, a failed lookup reads as unavailable.
+      expect(await first.findByText("This view is no longer available.")).toBeTruthy();
+      // Three restored tabs, one request.
+      expect(requests).toEqual([["b1", "b2", "b3"]]);
+      first.unmount();
+
+      reachable = true;
+      const second = render(labels(false));
+      // The failure was not cached as "no record": the tabs ask again and find their views.
+      expect(await second.findByText("tool_b3")).toBeTruthy();
+      expect(requests).toEqual([
+        ["b1", "b2", "b3"],
+        ["b1", "b2", "b3"],
+      ]);
     } finally {
       registered.mockRestore();
       state.mockRestore();
