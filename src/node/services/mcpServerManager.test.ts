@@ -714,6 +714,38 @@ describe("MCPServerManager", () => {
     expect(calls).toEqual([{ name: "check", args: { a: 1 } }]);
   });
 
+  test("a plugin hook call re-checks enablement at dispatch: a server disabled after the serve is refused", async () => {
+    // A direct edit of the override document (or another backend's save) disables the hook's
+    // server after the serve that started it; the cached enabled set still lists it.
+    manager.dispose();
+    let diskOverrides: Record<string, unknown> = {};
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve("epoch-1"),
+        readWorkspaceOverrides: () => Promise.resolve(diskOverrides),
+      },
+    });
+    const key = "plugin:aaaaaaaaaaaaaaaa:guard";
+    configService.listServers = mock(() => Promise.resolve({ [key]: stdioConfig("hook-guard") }));
+    const callToolForHook = mock(() =>
+      Promise.resolve({ content: [{ type: "text" as const, text: "{}" }] })
+    );
+    servers.serve("hook-guard", { tools: { check: testTool() }, callToolForHook });
+    const workspaceId = "ws-hook-revoked";
+    await manager.getToolsForWorkspace(
+      workspaceRequest(workspaceId, { overrides: {}, overridesAuthoritative: true })
+    );
+    const signal = new AbortController().signal;
+    const call = () => manager.callToolForPluginHook(workspaceId, key, "check", {}, { signal });
+    expect(await call()).toEqual({ content: [{ type: "text", text: "{}" }] });
+
+    diskOverrides = { disabledServers: [key] };
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(call()).rejects.toThrow("is disabled");
+    expect(callToolForHook).toHaveBeenCalledTimes(1);
+  });
+
   test("an epoch retry never re-runs an MCP Apps view's tool call", async () => {
     // A sibling's plugin mutation lands while the approved call runs: the epoch postflight
     // re-runs the operation, which must not call the (possibly mutating) tool again.
