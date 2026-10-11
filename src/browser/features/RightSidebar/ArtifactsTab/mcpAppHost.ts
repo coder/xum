@@ -150,7 +150,9 @@ export type McpAppConsentRequest =
   /** `host` is the parsed host the link opens, shown in the strip ahead of the full URL. */
   | { kind: "link"; url: string; host: string }
   /** `text` is exactly what is added to the composer once accepted, shown in the strip. */
-  | { kind: "message"; text: string };
+  | { kind: "message"; text: string }
+  /** `text` is exactly what the model sees with later requests once allowed. */
+  | { kind: "context"; text: string };
 
 export interface McpAppHostContext {
   theme: "dark" | "light";
@@ -196,6 +198,8 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   const pendingHostRequests = new Map<string, (ok: boolean) => void>();
   let nextHostRequestId = 1;
   let initialized = false;
+  /** Whether the user allowed this mounted view's model context (ui/update-model-context). */
+  let modelContextAllowed = false;
 
   const respond = (id: string | number, result: unknown) =>
     options.postToView({ jsonrpc: "2.0", id, result });
@@ -216,6 +220,9 @@ export function createMcpAppHost(options: McpAppHostOptions) {
             serverResources: {},
             logging: {},
             openLinks: {},
+            // The modalities ui/update-model-context accepts (McpUiSupportedContentBlockModalities):
+            // text blocks and structuredContent. Other blocks get -32602.
+            updateModelContext: { text: {}, structuredContent: {} },
             sandbox: { csp: options.grantedCsp },
           },
           hostContext: options.getHostContext(),
@@ -277,6 +284,17 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         const text = parsed.success ? modelContextText(parsed.data) : null;
         if (text === null) {
           return fail(id, INVALID_PARAMS, "Only text model context up to 16 KB is supported");
+        }
+        // The context reaches the model with every later request, so the user allows it once
+        // per mounted view (this host lives as long as the view's document; a remount asks
+        // again, and nothing is persisted). After Allow, the view can change its context until
+        // it unmounts. Its server can already put any text in front of the model through tool
+        // results; this keeps context the user never agreed to out. Clearing needs no consent.
+        if (text !== "" && !modelContextAllowed) {
+          if (!(await options.requestConsent({ kind: "context", text }))) {
+            return fail(id, REQUEST_FAILED, "Context update denied");
+          }
+          modelContextAllowed = true;
         }
         try {
           await options.updateModelContext(text);

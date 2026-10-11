@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { ORPCContext } from "@/node/orpc/context";
 import * as path from "node:path";
+import { McpAppViewRecordsRequestSchema } from "@/common/orpc/schemas/mcpApps";
+import { MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
 import { McpAppResultStore, type McpAppResultRecord } from "./mcpAppResultStore";
 import { DisposableTempDir } from "./tempDir";
 import {
   getMcpAppView,
-  getMcpAppViewRecord,
+  getMcpAppViewRecords,
   MCP_APP_TOOL_RESULT_MAX_BYTES,
   readMcpAppServerResource,
   updateMcpAppModelContext,
@@ -187,10 +189,75 @@ describe("updateMcpAppModelContext", () => {
   });
 });
 
-describe("getMcpAppViewRecord", () => {
+/** One tool call through getMcpAppViewRecords: its view, as a single-ID result. */
+async function viewRecord(
+  ctx: Parameters<typeof getMcpAppViewRecords>[0],
+  input: { workspaceId: string; toolCallId: string }
+) {
+  const result = await getMcpAppViewRecords(ctx, {
+    workspaceId: input.workspaceId,
+    toolCallIds: [input.toolCallId],
+  });
+  return result.success ? { success: true as const, data: result.data[0].view } : result;
+}
+
+describe("getMcpAppViewRecords", () => {
+  test("answers every requested tool call in one request, in order", async () => {
+    const asked: string[] = [];
+    const ctx = {
+      experimentsService: { isExperimentEnabled: () => true },
+      mcpServerManager: {
+        getMcpAppResult: (_workspaceId: string, toolCallId: string) => {
+          asked.push(toolCallId);
+          return Promise.resolve(toolCallId === "call-1" ? RECORD : null);
+        },
+      },
+    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
+    const result = await getMcpAppViewRecords(ctx, {
+      workspaceId: "ws",
+      toolCallIds: ["gone", "call-1"],
+    });
+    if (!result.success) throw new Error(result.error);
+    expect(result.data.map((entry) => [entry.toolCallId, entry.view?.resourceUri ?? null])).toEqual(
+      [
+        ["gone", null],
+        ["call-1", "ui://charts/view"],
+      ]
+    );
+    expect(asked.sort()).toEqual(["call-1", "gone"]);
+  });
+
+  test("answers a repeated ID once; the request schema refuses an empty or too long list", async () => {
+    let reads = 0;
+    const ctx = {
+      experimentsService: { isExperimentEnabled: () => true },
+      mcpServerManager: {
+        getMcpAppResult: () => {
+          reads++;
+          return Promise.resolve(RECORD);
+        },
+      },
+    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
+    const result = await getMcpAppViewRecords(ctx, {
+      workspaceId: "ws",
+      toolCallIds: ["call-1", "call-1"],
+    });
+    if (!result.success) throw new Error(result.error);
+    expect([result.data.map((entry) => entry.toolCallId), reads]).toEqual([["call-1"], 1]);
+
+    const ids = (n: number) => Array.from({ length: n }, (_, i) => `c${i}`);
+    const parses = (toolCallIds: string[]) =>
+      McpAppViewRecordsRequestSchema.safeParse({ workspaceId: "ws", toolCallIds }).success;
+    expect([
+      parses([]),
+      parses(ids(MCP_APP_VIEW_RECORDS_MAX_IDS)),
+      parses(ids(MCP_APP_VIEW_RECORDS_MAX_IDS + 1)),
+    ]).toEqual([false, true, false]);
+  });
+
   test("names the record's view with the card's server form and model-facing tool name", async () => {
     const { ctx, reads } = context({ ...RECORD, serverName: "my  charts" });
-    const result = await getMcpAppViewRecord(ctx, { workspaceId: "ws", toolCallId: "call-1" });
+    const result = await viewRecord(ctx, { workspaceId: "ws", toolCallId: "call-1" });
     if (!result.success) throw new Error(result.error);
     expect(result.data).toEqual({
       serverName: "my charts",
@@ -226,11 +293,11 @@ describe("getMcpAppViewRecord", () => {
     } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
 
     // Another workspace naming ws-a's tool call gets nothing.
-    expect(await getMcpAppViewRecord(ctx, { workspaceId: "ws-b", toolCallId: "call-a" })).toEqual({
+    expect(await viewRecord(ctx, { workspaceId: "ws-b", toolCallId: "call-a" })).toEqual({
       success: true,
       data: null,
     });
-    const own = await getMcpAppViewRecord(ctx, { workspaceId: "ws-a", toolCallId: "call-a" });
+    const own = await viewRecord(ctx, { workspaceId: "ws-a", toolCallId: "call-a" });
     if (!own.success || own.data === null) throw new Error("expected ws-a's record");
     // Only the view's binding: never the tool result (content, structuredContent, _meta).
     expect(Object.keys(own.data).sort()).toEqual([
@@ -250,7 +317,7 @@ describe("getMcpAppViewRecord", () => {
     } as unknown as typeof ctx;
     let refused = false;
     try {
-      await getMcpAppViewRecord(off, { workspaceId: "ws", toolCallId: "call-1" });
+      await viewRecord(off, { workspaceId: "ws", toolCallId: "call-1" });
     } catch {
       refused = true;
     }
@@ -259,7 +326,7 @@ describe("getMcpAppViewRecord", () => {
 
   test("is null without a record", async () => {
     const { ctx } = context(null);
-    const result = await getMcpAppViewRecord(ctx, { workspaceId: "ws", toolCallId: "call-1" });
+    const result = await viewRecord(ctx, { workspaceId: "ws", toolCallId: "call-1" });
     expect(result).toEqual({ success: true, data: null });
   });
 });
