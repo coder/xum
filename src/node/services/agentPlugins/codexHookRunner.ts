@@ -18,9 +18,10 @@
  * them concurrently). Plugins run in discovery order (spine `order`), except PostToolUse: it runs
  * as the around-middleware unwinds, so in reverse plugin order (Codex promises no order at all).
  */
+import assert from "node:assert";
 import type { EventSpine, ToolExecuteContext } from "@/node/services/events/eventSpine";
 import { getErrorMessage } from "@/common/utils/errors";
-import { validateJsonSchemaSubset } from "@/common/utils/jsonSchemaSubset";
+import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/ajv";
 import { log } from "@/node/services/log";
 import { compileHookMatcher, type PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
@@ -29,7 +30,9 @@ import { codexToolView, type CodexToolView } from "./codexToolNames";
 /** Xum's limits for one hook call, in seconds (Codex's default is 600). */
 export const HOOK_DEFAULT_TIMEOUT_SECONDS = 10;
 export const HOOK_MAX_TIMEOUT_SECONDS = 30;
-/** Expanded `input` larger than this (as JSON) is not sent; the hook is skipped. */
+/** Spine order of discovery index 0; below the default order 0 of the shell hook middleware. */
+const CODEX_HOOK_ORDER_BASE = -1_000_000;
+/** Expanded `input` larger than this (as JSON) is not sent (PreToolUse then denies the call). */
 const HOOK_INPUT_MAX_CHARS = 64 * 1024;
 /** Hook text that reaches the model or the user is cut to this length. */
 const HOOK_TEXT_MAX_CHARS = 16 * 1024;
@@ -80,7 +83,18 @@ export function registerCodexPluginHooks(
 ): () => void {
   const runnable = registration.hooks.filter((hook) => hook.status === "runnable");
   const forEvent = (event: string) => runnable.filter((hook) => hook.event === event);
-  const scope = { workspaceId: registration.workspaceId, order: registration.order };
+  assert(
+    Number.isInteger(registration.order) && registration.order >= 0,
+    "Codex hook order must be a discovery index"
+  );
+  // Codex plugin middleware runs outside every default-order middleware (the shell
+  // .xum/tool_pre gate registers at order 0), in discovery order. Rewrites (updatedInput) then
+  // finish before the shell pre-hook reads ctx.args, so the shell policy checks the exact input
+  // the tool runs with.
+  const scope = {
+    workspaceId: registration.workspaceId,
+    order: CODEX_HOOK_ORDER_BASE + registration.order,
+  };
   const unregisters: Array<() => void> = [];
   const pre = forEvent("PreToolUse");
   const post = forEvent("PostToolUse");
@@ -261,12 +275,34 @@ function applyUpdatedInput(
   // A Codex-shaped rewrite (Bash `command`) maps back to Xum's names before the schema check.
   const updated = view.fromCodexInput(output.updatedInput);
   const schema = ctx.inputJsonSchema?.();
-  const valid = schema !== undefined && validateJsonSchemaSubset(schema, updated);
-  if (valid === false || !valid.success) {
+  if (schema === undefined || !matchesToolSchema(schema, updated)) {
     warn(registration, hook, "returned updatedInput that does not match the tool's input schema");
     return;
   }
   ctx.args = updated;
+}
+
+/**
+ * The MCP SDK's own validator (the one Xum's MCP client checks tool output schemas with): it picks
+ * the engine from the schema's `$schema` (2020-12 by default, the MCP rule; draft-07 and 2019-09
+ * too) and resolves local `$ref`/`$defs`. Compiled validators are cached per schema text.
+ */
+const rewriteValidator = new AjvJsonSchemaValidator();
+const rewriteValidatorCache = new Map<string, (input: unknown) => { valid: boolean }>();
+
+function matchesToolSchema(schema: unknown, value: unknown): boolean {
+  if (!isPlainObject(schema)) return false;
+  try {
+    const key = JSON.stringify(schema);
+    let validate = rewriteValidatorCache.get(key);
+    if (validate === undefined) {
+      validate = rewriteValidator.getValidator(schema);
+      rewriteValidatorCache.set(key, validate);
+    }
+    return validate(value).valid;
+  } catch {
+    return false; // a schema the validator cannot compile: keep the original arguments
+  }
 }
 
 function matches(hook: PluginHookDefinition, toolName: string, view: CodexToolView): boolean {
@@ -310,8 +346,15 @@ async function invoke(
     };
     const input = expandHookTemplate(handler.input, event);
     if (!isPlainObject(input) || JSON.stringify(input).length > HOOK_INPUT_MAX_CHARS) {
-      warn(registration, hook, "expanded input is too large; skipping the hook");
-      return null;
+      warn(registration, hook, "expanded input is too large; the hook cannot check this call");
+      // A PreToolUse guard that cannot see the call must not let it through: tool arguments
+      // (a Bash script) are model-controlled and could be padded past the limit on purpose.
+      return eventName === "PreToolUse"
+        ? {
+            permissionDecision: "deny",
+            permissionDecisionReason: `the call is too large for the hook to check (its input is over ${HOOK_INPUT_MAX_CHARS} characters)`,
+          }
+        : null;
     }
     const result = await Promise.race([
       registration.deps.callPluginTool({
@@ -419,6 +462,18 @@ export function parseHookOutput(result: unknown, eventName: string): HookOutput 
   if (!oneOf(specific.permissionDecision, ["allow", "deny", "ask"])) {
     throw new Error(`invalid permissionDecision ${JSON.stringify(specific.permissionDecision)}`);
   }
+  // Codex's schemas type every field; a wrong type anywhere ("continue": "false") makes the whole
+  // output malformed, so it fails open instead of honoring the other fields.
+  const typed = (record: Record<string, unknown>, fields: string[], type: string) => {
+    for (const field of fields) {
+      if (record[field] != null && typeof record[field] !== type) {
+        throw new Error(`${field} is not a ${type}`);
+      }
+    }
+  };
+  typed(raw, ["continue", "suppressOutput"], "boolean");
+  typed(raw, ["stopReason", "systemMessage", "reason"], "string");
+  typed(specific, ["permissionDecisionReason", "additionalContext"], "string");
   const text = (value: unknown) =>
     typeof value === "string" && value.trim() ? cut(value) : undefined;
   const output: HookOutput = {
