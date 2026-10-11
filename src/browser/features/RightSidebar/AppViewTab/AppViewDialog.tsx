@@ -27,7 +27,11 @@ export function AppViewDialog(props: {
       >
         <DialogHeader className="border-border shrink-0 flex-row items-center justify-between space-y-0 border-b px-4 py-3">
           <DialogTitle className="min-w-0 text-base">
-            <AppViewTabLabel workspaceId={props.workspaceId} toolCallId={props.toolCallId} />
+            <AppViewTabLabel
+              workspaceId={props.workspaceId}
+              toolCallId={props.toolCallId}
+              fitWidth
+            />
           </DialogTitle>
           <DialogClose className="text-muted hover:text-foreground flex shrink-0 items-center rounded-sm transition-colors focus:outline-none">
             <X className="h-4 w-4" />
