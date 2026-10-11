@@ -1557,11 +1557,27 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const closeNonTerminalTab = React.useCallback(
     (tabsetId: string, tab: TabType) => {
       const prev = getBaseLayout();
-      const nextLayout = closeTabInTabset(prev, tabsetId, tab);
+      // #6117: the closed tab's button (with its X) and panel unmount, so focus inside them
+      // would fall to <body> and the next Tab would start over from the top of the page.
+      const closedTabHeldFocus = [
+        `${baseId}-${tabsetId}-tab-${tab}`,
+        `${baseId}-${tabsetId}-panel-${tab}`,
+      ].some((id) => document.getElementById(id)?.contains(document.activeElement) === true);
+      let nextLayout = closeTabInTabset(prev, tabsetId, tab);
+      if (!closedTabHeldFocus) {
+        setLayout(() => nextLayout);
+        focusTerminalTab(getTabRevealedByClose(prev, nextLayout, tabsetId, tab));
+        return;
+      }
+      // Keep focus in this tabset when it survives (the focus effect looks in the focused one).
+      const survivor = findTabset(nextLayout.root, tabsetId);
+      if (survivor?.type === "tabset") nextLayout = setFocusedTabset(nextLayout, tabsetId);
       setLayout(() => nextLayout);
-      focusTerminalTab(getTabRevealedByClose(prev, nextLayout, tabsetId, tab));
+      const target = getFocusedActiveTab(nextLayout, NEW_TAB);
+      if (isTerminalTab(target)) focusTerminalTab(target);
+      else setTabToFocus(target);
     },
-    [focusTerminalTab, getBaseLayout, setLayout]
+    [baseId, focusTerminalTab, getBaseLayout, setLayout]
   );
 
   const { workspaceMetadata: allWorkspaceMetadata, loaded: workspaceMetadataLoaded } =
