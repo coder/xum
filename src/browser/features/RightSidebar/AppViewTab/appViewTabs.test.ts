@@ -57,4 +57,32 @@ describe("app view tabs", () => {
     // A closed tab drops out.
     expect(liveAppViewTabs(recent, [recent[1]])).toEqual([recent[1]]);
   });
+
+  test("a restored layout keeps only the first copy of an app tab", () => {
+    const tab = appViewTabFor("call-dup");
+    const restored = parseRightSidebarLayoutState({
+      version: 1,
+      openTabsOnly: true,
+      nextId: 3,
+      focusedTabsetId: "tabset-2",
+      root: {
+        type: "split",
+        id: "split-1",
+        direction: "horizontal",
+        sizes: [50, 50],
+        children: [
+          { type: "tabset", id: "tabset-1", tabs: ["costs", tab, tab], activeTab: tab },
+          { type: "tabset", id: "tabset-2", tabs: [tab, "review"], activeTab: tab },
+        ],
+      },
+    });
+    expect(collectAllTabs(restored.root).filter((t) => t === tab)).toHaveLength(1);
+    const first = findTabset(restored.root, "tabset-1");
+    const second = findTabset(restored.root, "tabset-2");
+    expect(first?.type === "tabset" && first.tabs).toEqual(["costs", tab]);
+    expect(second?.type === "tabset" && [second.tabs, second.activeTab]).toEqual([
+      ["review"],
+      "review",
+    ]);
+  });
 });
