@@ -20,9 +20,19 @@ export function stripClientPluginSendHookFields<T>(muxMetadata: T): T {
   for (const key of FOLLOW_UP_KEYS) {
     const followUp = parsed[key];
     if (!isRecord(followUp)) continue;
-    if (!("pluginSendHooksApplied" in followUp) && !("pluginHookContext" in followUp)) continue;
     const { pluginSendHooksApplied: _applied, pluginHookContext: _context, ...rest } = followUp;
-    strippedParsed = { ...(strippedParsed ?? parsed), [key]: rest };
+    // A follow-up's own muxMetadata can be another compaction request (its follow-up redispatches
+    // with it), so its markers are stripped at every depth.
+    const nested = stripClientPluginSendHookFields(followUp.muxMetadata);
+    const changed =
+      "pluginSendHooksApplied" in followUp ||
+      "pluginHookContext" in followUp ||
+      nested !== followUp.muxMetadata;
+    if (!changed) continue;
+    strippedParsed = {
+      ...(strippedParsed ?? parsed),
+      [key]: nested !== followUp.muxMetadata ? { ...rest, muxMetadata: nested } : rest,
+    };
   }
   if (strippedParsed === undefined) return muxMetadata;
   const stripped = { ...muxMetadata, parsed: strippedParsed };
