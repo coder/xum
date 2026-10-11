@@ -5,6 +5,8 @@ import * as os from "os";
 import { tool } from "ai";
 import { z } from "zod";
 import { withHooks } from "./withHooks";
+import { eventSpine, type ToolExecuteContext } from "@/node/services/events/eventSpine";
+import { MCP_TOOL_ORIGIN } from "@/node/services/agentPlugins/codexToolNames";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 
 describe("withHooks", () => {
@@ -27,6 +29,40 @@ describe("withHooks", () => {
       execute: (args) => executeFn(args),
     });
   }
+
+  test("hands an MCP tool's origin and input schema to tool.execute middleware", async () => {
+    const baseTool = createTestTool((args) => Promise.resolve({ output: args.input }));
+    Object.defineProperty(baseTool, MCP_TOOL_ORIGIN, {
+      value: { serverName: "plugin:0123456789abcdef:scanner", toolName: "scan" },
+      enumerable: true,
+    });
+    const seen: Array<Pick<ToolExecuteContext, "mcpOrigin"> & { schema: unknown }> = [];
+    const unregister = eventSpine.useBefore(
+      "tool.execute",
+      (ctx) => {
+        seen.push({ mcpOrigin: ctx.mcpOrigin, schema: ctx.inputJsonSchema?.() });
+      },
+      { workspaceId: "origin-ws" }
+    );
+    try {
+      const wrapped = withHooks("plugin_x_scanner_scan", baseTool, {
+        runtime,
+        cwd: tempDir,
+        runtimeTempDir: tempDir,
+        workspaceId: "origin-ws",
+      });
+      await wrapped.execute!({ input: "hi" }, {} as never);
+    } finally {
+      unregister();
+    }
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.mcpOrigin).toEqual({
+      serverName: "plugin:0123456789abcdef:scanner",
+      toolName: "scan",
+    });
+    expect(seen[0]?.schema).toMatchObject({ properties: { input: { type: "string" } } });
+  });
 
   test("executes tool directly when no hook exists", async () => {
     const baseTool = createTestTool((args) =>

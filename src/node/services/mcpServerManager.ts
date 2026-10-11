@@ -1,3 +1,5 @@
+import { MCP_TOOL_ORIGIN } from "@/node/services/agentPlugins/codexToolNames";
+import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { isPluginMcpServerAllowed, type PluginMcpPolicy } from "./agentPlugins/registry";
 import { getOwn } from "@/common/utils/getOwn";
 import * as fsPromises from "node:fs/promises";
@@ -5886,7 +5888,14 @@ export class MCPServerManager {
           });
         }
 
-        aggregated[result.toolName] = gate(instance.name, toolName, tool);
+        // Tag a copy with its origin for Codex plugin hooks: the served tool can be frozen, and
+        // the instance's own tool must stay as wrapRawTools built it.
+        const served = cloneToolPreservingDescriptors(gate(instance.name, toolName, tool));
+        Object.defineProperty(served, MCP_TOOL_ORIGIN, {
+          value: { serverName: instance.name, toolName },
+          enumerable: true,
+        });
+        aggregated[result.toolName] = served;
         toolServerNames[result.toolName] = instance.name;
       }
     }

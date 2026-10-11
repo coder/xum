@@ -71,6 +71,8 @@ export interface ToolExecuteContext {
   readonly abortSignal?: AbortSignal;
   /** The tool's input JSON schema, when the caller holds the Tool (validates hook rewrites). */
   readonly inputJsonSchema?: () => unknown;
+  /** Server and original name of an MCP tool (Codex hooks match `mcp__<server>__<tool>`). */
+  readonly mcpOrigin?: { serverName: string; toolName: string };
   /** Set by the terminal after the tool actually executed. */
   executed: boolean;
   /** Set by the terminal; mutable after next() returns (middleware may augment). */

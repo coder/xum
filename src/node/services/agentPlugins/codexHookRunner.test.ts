@@ -1,4 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { DisposableTempDir } from "@/node/services/tempDir";
+import { loadPluginCodexHooks } from "./codexHooks";
+import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { EventSpine, type ToolExecuteContext } from "@/node/services/events/eventSpine";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { PluginHookDefinition } from "./codexHooks";
@@ -59,11 +64,13 @@ async function runTool(
   spine: EventSpine,
   toolName: string,
   args: unknown,
-  inputJsonSchema?: unknown
+  inputJsonSchema?: unknown,
+  mcpOrigin?: { serverName: string; toolName: string }
 ): Promise<ToolExecuteContext> {
   const ctx: ToolExecuteContext = {
     toolName,
     args,
+    ...(mcpOrigin !== undefined ? { mcpOrigin } : {}),
     host: { runtime: new LocalRuntime("/tmp"), runtimeTempDir: "/tmp", cwd: "/w", workspaceId },
     ...(inputJsonSchema !== undefined ? { inputJsonSchema: () => inputJsonSchema } : {}),
     executed: false,
@@ -167,6 +174,82 @@ describe("PreToolUse", () => {
 
     expect(ctx.result).toEqual({ ran: {}, hook_output: "[plugin:guard] Touches generated files." });
     expect(notices).toEqual(["Checked by guard."]);
+  });
+});
+
+describe("Codex tool names", () => {
+  test("a Codex hooks.json for Bash works unedited on Xum's bash tool", async () => {
+    // Shape and names from the Codex hooks docs: matcher ^Bash$, ${tool_input.command}.
+    using tmp = new DisposableTempDir("codex-bash-hooks");
+    await fs.mkdir(path.join(tmp.path, "hooks"));
+    await fs.writeFile(
+      path.join(tmp.path, "hooks", "hooks.json"),
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            {
+              matcher: "^Bash$",
+              hooks: [
+                {
+                  type: "mcp_tool",
+                  server: "guard",
+                  tool: "check_command",
+                  input: { command: "${tool_input.command}", tool: "${tool_name}" },
+                  timeout: 30,
+                },
+              ],
+            },
+          ],
+        },
+      })
+    );
+    const { hooks } = await loadPluginCodexHooks({
+      rootPath: await fs.realpath(tmp.path),
+      manifest: { schemaId: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "guard" },
+    });
+    const { spine, calls } = setup(hooks, () => deny);
+
+    const ctx = await runTool(spine, "bash", { script: "rm -rf /", display_name: "Clean" });
+
+    expect(calls).toEqual([{ command: "rm -rf /", tool: "Bash" }]);
+    expect(ctx.executed).toBe(false);
+  });
+
+  test("MCP tools match and are named mcp__<server>__<tool>, from their origin", async () => {
+    const { spine, calls } = setup(
+      [hook("PreToolUse", { matcher: "^mcp__scanner__.*", input: { name: "${tool_name}" } })],
+      () => deny
+    );
+
+    await runTool(spine, "plugin_0123456789abcdef_scanner_scan_ab12", {}, undefined, {
+      serverName: "plugin:0123456789abcdef:scanner",
+      toolName: "scan",
+    });
+    await runTool(spine, "other_scan", {}, undefined, { serverName: "other", toolName: "scan" });
+
+    expect(calls).toEqual([{ name: "mcp__scanner__scan" }]);
+  });
+
+  test("a Codex-shaped updatedInput maps back to Xum's arguments before the schema check", async () => {
+    const schema = {
+      type: "object",
+      properties: { script: { type: "string" }, display_name: { type: "string" } },
+      required: ["script"],
+      additionalProperties: false,
+    };
+    const { spine } = setup([hook("PreToolUse", { matcher: "^Bash$" })], () =>
+      json({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          updatedInput: { command: "echo rewritten", display_name: "Echo" },
+        },
+      })
+    );
+
+    const ctx = await runTool(spine, "bash", { script: "rm -rf /" }, schema);
+
+    expect(ctx.result).toEqual({ ran: { script: "echo rewritten", display_name: "Echo" } });
   });
 });
 

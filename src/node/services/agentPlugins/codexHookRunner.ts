@@ -22,6 +22,7 @@ import { validateJsonSchemaSubset } from "@/common/utils/jsonSchemaSubset";
 import { log } from "@/node/services/log";
 import type { PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
+import { codexToolView, type CodexToolView } from "./codexToolNames";
 
 /** Xum's limits for one hook call, in seconds (Codex's default is 600). */
 export const HOOK_DEFAULT_TIMEOUT_SECONDS = 10;
@@ -101,13 +102,17 @@ async function runToolHooks(
   registration: CodexHookRegistration
 ): Promise<void> {
   const notes: string[] = [];
-  for (const hook of pre.filter((candidate) => matches(candidate, ctx.toolName))) {
-    const output = await invoke(
-      hook,
-      { tool_name: ctx.toolName, tool_input: ctx.args },
-      "PreToolUse",
-      registration
-    );
+  // Codex names and fields (Bash, mcp__<server>__<tool>, tool_input.command), so a Codex
+  // hooks.json works without edits. Xum's own names and fields stay available too.
+  const view = codexToolView(ctx.toolName, ctx.mcpOrigin);
+  const toolEvent = () => ({
+    tool_name: view.codexName ?? ctx.toolName,
+    tool_input: isPlainObject(ctx.args)
+      ? { ...ctx.args, ...view.toCodexFields(ctx.args) }
+      : ctx.args,
+  });
+  for (const hook of pre.filter((candidate) => matches(candidate, ctx.toolName, view))) {
+    const output = await invoke(hook, toolEvent(), "PreToolUse", registration);
     if (output === null) continue;
     // Codex: PreToolUse does not support continue/stopReason or "ask"; such a run fails (open).
     if (
@@ -128,15 +133,15 @@ async function runToolHooks(
       };
       return;
     }
-    if (output.updatedInput !== undefined) applyUpdatedInput(ctx, output, registration, hook);
+    if (output.updatedInput !== undefined) applyUpdatedInput(ctx, output, view, registration, hook);
     if (output.additionalContext !== undefined) notes.push(output.additionalContext);
   }
   await next();
   if (ctx.executed) {
-    for (const hook of post.filter((candidate) => matches(candidate, ctx.toolName))) {
+    for (const hook of post.filter((candidate) => matches(candidate, ctx.toolName, view))) {
       const output = await invoke(
         hook,
-        { tool_name: ctx.toolName, tool_input: ctx.args, tool_response: ctx.result },
+        { ...toolEvent(), tool_response: ctx.result },
         "PostToolUse",
         registration
       );
@@ -157,6 +162,7 @@ async function runToolHooks(
 function applyUpdatedInput(
   ctx: ToolExecuteContext,
   output: HookOutput,
+  view: CodexToolView,
   registration: CodexHookRegistration,
   hook: PluginHookDefinition
 ): void {
@@ -164,18 +170,23 @@ function applyUpdatedInput(
     warn(registration, hook, "returned updatedInput without permissionDecision allow; ignoring it");
     return;
   }
+  // A Codex-shaped rewrite (Bash `command`) maps back to Xum's names before the schema check.
+  const updated = view.fromCodexInput(output.updatedInput);
   const schema = ctx.inputJsonSchema?.();
-  const valid = schema !== undefined && validateJsonSchemaSubset(schema, output.updatedInput);
+  const valid = schema !== undefined && validateJsonSchemaSubset(schema, updated);
   if (valid === false || !valid.success) {
     warn(registration, hook, "returned updatedInput that does not match the tool's input schema");
     return;
   }
-  ctx.args = output.updatedInput;
+  ctx.args = updated;
 }
 
-function matches(hook: PluginHookDefinition, toolName: string): boolean {
-  // The parser already proved the matcher compiles. Codex applies it to tool_name.
-  return hook.matcher === undefined || new RegExp(hook.matcher).test(toolName);
+function matches(hook: PluginHookDefinition, toolName: string, view: CodexToolView): boolean {
+  // The parser already proved the matcher compiles. Codex applies it to tool_name; Xum tests
+  // both the Xum name and the Codex alias.
+  if (hook.matcher === undefined) return true;
+  const matcher = new RegExp(hook.matcher);
+  return matcher.test(toolName) || (view.codexName !== undefined && matcher.test(view.codexName));
 }
 
 async function invoke(
