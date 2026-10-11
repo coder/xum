@@ -35,6 +35,7 @@ import { workspaceUseLeasesFor } from "./workspaceUseLeases";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { SessionFileManager } from "@/node/utils/sessionFile";
 import { FileChangeTracker } from "@/node/services/utils/fileChangeTracker";
+import { CompactionCancellation } from "./compactionCancellation";
 
 // Deterministic code repros of races between workspace use leases and other backends' structural
 // mutations. Each `test.failing` reproduces a violation and fails at its target assertion; each
@@ -288,6 +289,63 @@ describe("turn preparation vs another backend's structural mutation", () => {
     } finally {
       record.mockRestore();
       detect.mockRestore();
+      await b.session.dispose();
+      await b.cleanup();
+    }
+  });
+
+  // #5434: a manual resume carries the replacement authority of a retained compaction Stop, and
+  // accepting it stamps the resumed row (a history rewrite) and retires the Stop. That ran before
+  // the turn lease was confirmed, so a resume refused by another backend's mutation had already
+  // rewritten history. A refused resume must leave history and the pending Stop as they were.
+  test("a resume refused by another backend's mutation does not accept a pending compaction replacement", async () => {
+    const { b, leasesA, streamMessage } = await setup();
+    const chatPath = path.join(b.config.sessionsDir, workspaceId, "chat.jsonl");
+    try {
+      await b.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-1", "user", "hello", { timestamp: Date.now() })
+      );
+      // A Stop of a compaction that waits for its replacement (another instance on the same
+      // storage, as a Stop from the UI or another backend writes it).
+      const stop = new CompactionCancellation(
+        b.historyService.getCompactionCancellationStorage(workspaceId)
+      );
+      expect(await stop.cancel({ retainUntilReplacement: true })).toBe("applied");
+      const nonce = (await stop.read())?.nonce;
+      if (nonce == null) throw new Error("the Stop records a replacement nonce");
+      const before = await fs.readFile(chatPath);
+      const entered = createDeferred<void>();
+      const finish = createDeferred<void>();
+      const mutation = leasesA.withMutationGate([workspaceId], idle, async () => {
+        entered.resolve();
+        await finish.promise;
+      });
+      await entered.promise;
+
+      const result = await b.session.resumeStream({ model: sendOptions.model, agentId: "exec" });
+      finish.resolve();
+      await mutation;
+      expect(!result.success && result.error.type === "unknown" && result.error.raw).toContain(
+        "being renamed, removed or archived"
+      );
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect((await fs.readFile(chatPath, "utf-8")).split("\n")).toEqual(
+        before.toString("utf-8").split("\n")
+      );
+      expect(await b.historyService.findCompactionReplacementWitness(workspaceId, nonce)).toEqual(
+        Ok(null)
+      );
+      expect((await stop.read())?.nonce).toBe(nonce);
+
+      // Control: once the mutation ends, the same resume accepts the replacement and streams.
+      await b.session.resumeStream({ model: sendOptions.model, agentId: "exec" });
+      expect(streamMessage).toHaveBeenCalledTimes(1);
+      expect(await b.historyService.findCompactionReplacementWitness(workspaceId, nonce)).toEqual(
+        Ok({ nonce })
+      );
+      expect(await stop.read()).toBeNull();
+    } finally {
       await b.session.dispose();
       await b.cleanup();
     }
