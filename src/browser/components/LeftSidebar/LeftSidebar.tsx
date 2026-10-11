@@ -1,4 +1,4 @@
-import React, { useSyncExternalStore } from "react";
+import React, { useEffect, useRef, useSyncExternalStore } from "react";
 import { cn } from "@/common/lib/utils";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { LEFT_SIDEBAR_COLLAPSED_WIDTH_PX, LEFT_SIDEBAR_DEFAULT_WIDTH_PX } from "@/constants/layout";
@@ -52,6 +52,23 @@ export function LeftSidebar(props: LeftSidebarProps) {
   // (#5685), unless a popover, menu or dialog inside it owns Escape.
   useEscapeToDismiss(!collapsed && isMobileOverlay, onToggleCollapsed);
 
+  // At phone width a collapsed sidebar is a closed drawer: CSS moves it off-screen
+  // (.mobile-sidebar-collapsed), and "Open sidebar menu" reopens it. Its "Expand sidebar" button
+  // must not take a Tab stop there (#6102), so the closed drawer is inert. React 18 has no `inert`
+  // prop, so set the attribute directly, as ChatPane does for the immersive review.
+  const sidebarRef = useRef<HTMLDivElement>(null);
+  const closedDrawer = collapsed && isMobileOverlay;
+  useEffect(() => {
+    const sidebar = sidebarRef.current;
+    if (!sidebar) return;
+    if (closedDrawer) {
+      sidebar.setAttribute("inert", "");
+    } else {
+      sidebar.removeAttribute("inert");
+    }
+    return () => sidebar.removeAttribute("inert");
+  }, [closedDrawer]);
+
   const handleBeforeOpenSettings = () => {
     // Keep settings navigation escapable on narrow viewports by dismissing the
     // off-canvas sidebar as soon as the user opens settings from this sidebar.
@@ -80,6 +97,7 @@ export function LeftSidebar(props: LeftSidebarProps) {
 
       {/* Sidebar */}
       <div
+        ref={sidebarRef}
         data-testid="left-sidebar"
         className={cn(
           "h-full bg-sidebar border-r border-border flex flex-col shrink-0 overflow-hidden relative z-20",
