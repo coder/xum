@@ -372,7 +372,7 @@ describe("turn preparation vs another backend's structural mutation", () => {
       const gated = await workspaceUseLeasesFor(b.config).withMutationGate(
         [workspaceId],
         idle,
-        async () => "mutated"
+        () => Promise.resolve("mutated")
       );
       expect(gated).toBe("mutated");
     } finally {
