@@ -323,11 +323,14 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       const tools: Record<string, Tool> = {};
       const listed = new Map<string, MCPToolUi | undefined>();
       for (const definition of listResult.tools) {
+        // Settings tools are host-only: left out of the listing too, so an MCP App view
+        // cannot call them through callToolForApp (hasTool is false for them).
+        if (settingsTools.has(definition.name)) continue;
         const ui = mcpApps ? parseMCPToolUiMeta(definition._meta) : undefined;
         listed.set(definition.name, ui);
         // MCP Apps: "Host MUST NOT include tools in the agent's tool list" when visibility
         // lacks "model". Such tools stay callable by their views (callToolForApp).
-        if (!isModelVisibleTool(ui) || settingsTools.has(definition.name)) continue;
+        if (!isModelVisibleTool(ui)) continue;
         const inputSchema = definition.inputSchema ?? { type: "object" };
         const tool = dynamicTool({
           description: definition.description,
