@@ -176,6 +176,33 @@ describe("PreToolUse", () => {
     }
   });
 
+  test("an explicit continue: true is the default and keeps a deny; continue: false fails open", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rQe1X): output_parser.rs rejects only continue: false.
+    const denies = [
+      json({
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: "x",
+        },
+      }),
+      json({ continue: true, decision: "block", reason: "x" }),
+    ];
+    for (const output of denies) {
+      const { spine } = setup([hook("PreToolUse")], () => output);
+      const ctx = await runTool(spine, "bash", {});
+      expect(ctx.executed).toBe(false);
+      expect(ctx.blocked?.result).toEqual({
+        error: "Tool call blocked by plugin 'guard' hook: x",
+      });
+    }
+    const unsupported = setup([hook("PreToolUse")], () =>
+      json({ continue: false, decision: "block", reason: "x" })
+    );
+    expect((await runTool(unsupported.spine, "bash", {})).executed).toBe(true);
+  });
+
   test("a deny keeps its own context and the context of earlier hooks", async () => {
     const { spine } = setup(
       [hook("PreToolUse", { input: { first: true } }), hook("PreToolUse")],

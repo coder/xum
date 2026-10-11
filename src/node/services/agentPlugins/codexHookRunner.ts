@@ -131,9 +131,11 @@ async function runToolHooks(
     const output = await invoke(hook, toolEvent(), "PreToolUse", registration, call);
     if (ctx.abortSignal?.aborted) break;
     if (output === null) continue;
-    // Codex: PreToolUse does not support continue/stopReason or "ask"; such a run fails (open).
+    // Codex: PreToolUse does not support continue: false, stopReason or "ask"; such a run fails
+    // (open). `continue: true` is the schema default, so Codex accepts it (output_parser.rs
+    // rejects only false): a serializer that writes the default must not void a deny.
     if (
-      output.continue !== undefined ||
+      output.continue === false ||
       output.stopReason !== undefined ||
       output.permissionDecision === "ask"
     ) {
