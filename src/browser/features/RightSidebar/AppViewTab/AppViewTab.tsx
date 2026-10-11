@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { AppWindow } from "lucide-react";
+import { cn } from "@/common/lib/utils";
 import { mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { McpAppFrame } from "../ArtifactsTab/McpAppFrame";
 import {
@@ -39,7 +40,16 @@ export function AppViewInTabNotice(props: { workspaceId: string; view: McpAppVie
  * of the workspace reads the same, the call's detail (outcome, arguments, `#n`) follows, so tabs
  * of several calls of one tool stay apart.
  */
-export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string | null }) {
+export function AppViewTabLabel(props: {
+  workspaceId: string;
+  toolCallId: string | null;
+  /**
+   * Fit the label to its container's width, truncating the server too (the phone sheet header,
+   * where an unbroken server key of up to 80 characters would push its close button off the
+   * sheet). The tab strip keeps the full server: the tab's own max width clips it.
+   */
+  fitWidth?: boolean;
+}) {
   const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
   const views = useMcpAppViews(props.workspaceId);
   const ref = typeof view === "object" ? view : null;
@@ -60,11 +70,16 @@ export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string
       : index >= 0
         ? appViewServerNames(views)[index]
         : mcpServerDisplayName(ref.serverName);
+  const fit = props.fitWidth === true;
   return (
-    <span className="inline-flex min-w-0 items-center gap-1">
+    <span className={cn("min-w-0 items-center gap-1", fit ? "flex" : "inline-flex")}>
       <AppWindow className="h-3 w-3 shrink-0" />
       <span className="min-w-0 truncate">{ref?.label ?? "App view"}</span>
-      {ref != null && <span className="text-muted shrink-0 text-[10px]">{server}</span>}
+      {ref != null && (
+        <span className={cn("text-muted text-[10px]", fit ? "min-w-0 truncate" : "shrink-0")}>
+          {server}
+        </span>
+      )}
       {detail !== "" && <span className="text-muted min-w-0 truncate text-[10px]">{detail}</span>}
     </span>
   );
