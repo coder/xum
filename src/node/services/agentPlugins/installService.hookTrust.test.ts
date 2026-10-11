@@ -64,6 +64,14 @@ describe("AgentPluginInstallService hook trust", () => {
     await fsPromises.rm(remoteDir, { recursive: true, force: true });
   });
 
+  test("the consent preview lists every hooks.json hook", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.codexHooks.map((hook) => [hook.event, hook.status])).toEqual([
+      ["PreToolUse", "runnable"],
+      ["Stop", "unsupported-handler"],
+    ]);
+  });
+
   test("install trusts nothing; trust applies to the reviewed hash only", async () => {
     await install();
     const { hooks } = await service.getHooks({ name: "guard" });

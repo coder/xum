@@ -126,6 +126,11 @@ export const AgentPluginInstallPreviewSchema = z.object({
   mcpServers: z.array(AgentPluginPreviewMcpServerSchema),
   /** Present when the plugin ships an executable hooks.js (absent = no hooks). */
   hook: AgentPluginPreviewHookSchema.optional(),
+  /**
+   * Codex-format hooks (hooks.json). Install trusts none of them: each runs only after the user
+   * trusts it in Settings (Codex trust per hash).
+   */
+  codexHooks: z.array(AgentPluginHookSchema.omit({ review: true })),
   /** Agent definition files (agents/*.md) that become selectable agents. */
   agents: z.array(z.string()),
   /** Executable workflow scripts (workflows/*.js) invokable after install. */

@@ -1831,6 +1831,8 @@ export class AgentPluginInstallService {
         warnings
       );
       const hook = this.collectHook(plugin);
+      const codexHooks = await loadPluginCodexHooks(plugin);
+      warnings.push(...codexHooks.warnings);
       const agents = (await this.collectAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
       const workflows = await this.collectComponentFiles(plugin.workflowsDir, ".js");
       const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
@@ -1857,6 +1859,7 @@ export class AgentPluginInstallService {
         skills,
         mcpServers,
         ...(hook !== undefined ? { hook } : {}),
+        codexHooks: codexHooks.hooks,
         agents,
         workflows,
         slashCommands,

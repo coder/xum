@@ -64,6 +64,7 @@ import type {
   AgentPluginListItem,
   AgentPluginUpdateCheck,
   AgentPluginUpdateReview,
+  AgentPluginHooks,
 } from "@/common/orpc/schemas/agentPlugins";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { ChatStats } from "@/common/types/chatStats";
@@ -164,6 +165,8 @@ export interface MockORPCClientOptions {
     preview?: AgentPluginInstallPreview;
     /** Returned by agentPlugins.previewUpdate for the named plugin; omit to make it fail. */
     updateReview?: AgentPluginUpdateReview;
+    /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
+    hooks?: Record<string, AgentPluginHooks>;
   };
   projects?: Map<string, ProjectConfig>;
   workspaces?: FrontendWorkspaceMetadata[];
@@ -1294,6 +1297,27 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           success: false,
           error: "No component selection configured in this story",
         }),
+      getHooks: (input: { name: string }) => {
+        const hooks = agentPluginsMock?.hooks?.[input.name];
+        return Promise.resolve(
+          hooks
+            ? { success: true as const, data: hooks }
+            : { success: false as const, error: `No hooks mock for '${input.name}'` }
+        );
+      },
+      setHookTrust: (input: {
+        name: string;
+        key: string;
+        state: "trusted" | "disabled" | null;
+      }) => {
+        const hooks = agentPluginsMock?.hooks?.[input.name];
+        if (hooks) {
+          hooks.hooks = hooks.hooks.map((hook) =>
+            hook.key === input.key ? { ...hook, review: input.state ?? "new" } : hook
+          );
+        }
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       checkUpdates: () =>
         Promise.resolve({ success: true, data: agentPluginsMock?.updateChecks ?? [] }),
       preview: () =>
