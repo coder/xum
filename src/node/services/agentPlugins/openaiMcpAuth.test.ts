@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
-import { readOpenAIMcpAuth, toServerOAuthConfig } from "./openaiMcpAuth";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { DisposableTempDir } from "@/node/services/tempDir";
+import { readOpenAIMcpAuth, readPluginClientSecret, toServerOAuthConfig } from "./openaiMcpAuth";
 
 const withAuth = (auth: unknown) => ({ "com.openai": { auth } });
 
@@ -123,4 +126,17 @@ describe("toServerOAuthConfig", () => {
         .config
     ).toEqual({ resource: "https://mcp.example.com" });
   });
+});
+
+test("readPluginClientSecret reads wrapped and flat Codex server maps", async () => {
+  using tmp = new DisposableTempDir("plugin-secret");
+  const pluginRoot = await fs.realpath(tmp.path);
+  const mcpConfigPath = path.join(pluginRoot, ".mcp.json");
+  const entry = { type: "http", url: "https://x", oauth: { client_id: "c", client_secret: "s1" } };
+  for (const doc of [{ mcpServers: { gh: entry } }, { gh: entry }]) {
+    await fs.writeFile(mcpConfigPath, JSON.stringify(doc));
+    expect(await readPluginClientSecret({ pluginRoot, mcpConfigPath, serverName: "gh" })).toBe(
+      "s1"
+    );
+  }
 });

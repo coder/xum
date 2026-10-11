@@ -376,7 +376,14 @@ export async function readPluginClientSecret(
     label: ".mcp.json",
   });
   const raw: unknown = JSON.parse(content);
-  const servers = isPlainObject(raw) && isPlainObject(raw.mcpServers) ? raw.mcpServers : {};
+  // Wrapped (`mcpServers`) or the flat Codex map, like loadPluginMcpServers.
+  const servers = !isPlainObject(raw)
+    ? {}
+    : "mcpServers" in raw
+      ? isPlainObject(raw.mcpServers)
+        ? raw.mcpServers
+        : {}
+      : raw;
   const entry = getOwn(servers, source.serverName);
   const oauth = isPlainObject(entry) ? entry.oauth : undefined;
   const secret = isPlainObject(oauth) ? oauth.client_secret : undefined;
