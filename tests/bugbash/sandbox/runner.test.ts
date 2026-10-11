@@ -238,65 +238,20 @@ test.each([
   expect(calls()).not.toContain("pull");
 });
 
-// U6: the published image is linux/amd64 only (build.sh), so another daemon architecture needs
-// amd64 emulation registered in the kernel's binfmt_misc, or the first container fails.
-function binfmt(entries: Record<string, string>) {
-  const dir = path.join(root, "binfmt_misc");
-  fs.mkdirSync(dir, { recursive: true });
-  for (const [name, text] of Object.entries(entries)) fs.writeFileSync(path.join(dir, name), text);
-  return dir;
-}
-const binfmtSession = (binfmtDir: string) => {
-  const s = new Session(new AbortController().signal, { root, binfmtDir, log: () => undefined });
-  sessions.push(s);
-  return s;
-};
-// The daemon on this host's kernel, so this host's binfmt_misc is the daemon's.
-const ARM = JSON.stringify({
-  OSType: "linux",
-  OperatingSystem: "Ubuntu 22.04",
-  Architecture: "aarch64",
-  KernelVersion: os.release(),
+// U6: the published image is linux/amd64 only (build.sh), so another daemon architecture
+// refuses before any image command; amd64 (x86_64 in `docker info`, the fake's default) pulls.
+test("U6: an arm64 daemon refuses before the pull, naming the fix", async () => {
+  fake({ INFO: '{"OSType":"linux","OperatingSystem":"Ubuntu 22.04","Architecture":"aarch64"}' });
+  const error = await failure(session().ensureImage());
+  expect(error).toThrow(/linux\/amd64/);
+  expect(error).toThrow(/aarch64/);
+  expect(error).toThrow(/use an amd64 host/);
+  expect(calls()).not.toMatch(/^(images|pull)/m);
 });
-const EMULATED = "enabled\ninterpreter /usr/bin/qemu-x86_64\nflags: POCF\n";
-test.each([
-  ["no emulation", { status: "enabled\n" }, ARM],
-  // binfmt_misc switched off as a whole, though the entry itself is enabled.
-  ["binfmt_misc disabled", { status: "disabled\n", "qemu-x86_64": EMULATED }, ARM],
-  [
-    "a disabled emulation entry",
-    { status: "enabled\n", "qemu-x86_64": EMULATED.replace("enabled", "disabled") },
-    ARM,
-  ],
-  // Without F, the interpreter is not there inside the container's mount namespace.
-  [
-    "an entry without the F flag",
-    { status: "enabled\n", "qemu-x86_64": EMULATED.replace("POCF", "POC") },
-    ARM,
-  ],
-  // Another kernel (a VM or a sidecar): this host's entry says nothing about the daemon's.
-  [
-    "emulation here but a daemon on another kernel",
-    { status: "enabled\n", "qemu-x86_64": EMULATED },
-    ARM.replace(os.release(), "6.1.0-vm"),
-  ],
-])(
-  "U6: an arm64 daemon with %s refuses before the pull, naming the fix",
-  async (_name, entries, info) => {
-    fake({ INFO: info });
-    const s = binfmtSession(binfmt(entries));
-    const error = await failure(s.ensureImage());
-    expect(error).toThrow(/linux\/amd64/);
-    expect(error).toThrow(/aarch64/);
-    expect(error).toThrow(/amd64 host|amd64 emulation/);
-    expect(calls()).not.toContain("pull");
-  }
-);
 
-test("U6: an arm64 daemon with amd64 emulation registered may pull and run the image", async () => {
-  fake({ INFO: ARM });
-  const dir = binfmt({ status: "enabled\n", "qemu-x86_64": EMULATED });
-  expect(await binfmtSession(dir).ensureImage()).toBe(REF);
+test("U6: an amd64 daemon pulls the image", async () => {
+  fake();
+  expect(await session().ensureImage()).toBe(REF);
   expect(calls()).toContain("pull");
 });
 
