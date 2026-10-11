@@ -216,13 +216,6 @@ function readAuth(raw: Record<string, unknown>, result: ReadOpenAIMcpAuthResult)
   for (const key of [...UNUSED_FIELDS, "headerScheme", "headerName"]) {
     if (key in auth) ignore(key);
   }
-  for (const key of ["authorizationServerBase", "registrationUrl"] as const) {
-    if (
-      auth[key] !== undefined &&
-      (auth.authorizationUrl === undefined || auth.tokenUrl === undefined)
-    )
-      ignore(`${key} (needs both endpoints)`);
-  }
   result.auth = auth;
 }
 
@@ -350,7 +343,25 @@ export function toServerOAuthConfig(
   // Endpoint overrides replace discovery, so dynamic registration then needs
   // registrationUrl; without one, discovery keeps supplying everything.
   let endpoints: MCPServerOAuthConfig["endpoints"];
-  if (auth.authorizationUrl !== undefined && auth.tokenUrl !== undefined) {
+  let discovery: MCPServerOAuthConfig["discovery"];
+  if (auth.authorizationUrl === undefined || auth.tokenUrl === undefined) {
+    // Standalone overrides: discovery supplies the endpoints. registrationUrl is checked
+    // against the discovered issuer at sign-in (mcpOauthService pluginFlowFields).
+    const registrationUrl = clientId === undefined ? auth.registrationUrl : undefined;
+    const base = auth.authorizationServerBase;
+    if (
+      base !== undefined &&
+      registrationUrl !== undefined &&
+      new URL(base).origin !== new URL(registrationUrl).origin
+    ) {
+      ignored.push("authorizationServerBase, registrationUrl (must share one origin)");
+    } else if (base !== undefined || registrationUrl !== undefined) {
+      discovery = {
+        ...(base !== undefined ? { authorizationServerBase: base } : {}),
+        ...(registrationUrl !== undefined ? { registrationUrl } : {}),
+      };
+    }
+  } else {
     // SECURITY AUDIT: overrides replace discovery, so nothing else ties them to one
     // authorization server. Split origins would let a plugin send the browser to a real
     // authorization endpoint and route the code and PKCE verifier to its own token
@@ -396,6 +407,7 @@ export function toServerOAuthConfig(
       ? { tokenEndpointAuthMethod: method as TokenAuthMethod }
       : {}),
     ...(endpoints !== undefined ? { endpoints } : {}),
+    ...(discovery !== undefined ? { discovery } : {}),
     ...(auth.baseScopes !== undefined ? { baseScopes: auth.baseScopes } : {}),
     ...(auth.defaultScopes !== undefined ? { defaultScopes: auth.defaultScopes } : {}),
     ...(resource !== undefined ? { resource } : {}),

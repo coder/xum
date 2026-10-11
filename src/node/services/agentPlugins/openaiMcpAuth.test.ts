@@ -167,6 +167,26 @@ describe("toServerOAuthConfig", () => {
     ).toEqual({ clientId: "c", endpoints: { ...endpoints, issuer } });
   });
 
+  test("standalone registrationUrl and authorizationServerBase are kept for discovery", () => {
+    const dcr = { type: "oauth" as const, client: { mode: "dcr" as const } };
+    const registrationUrl = "https://mcp.example.com/register";
+    const base = "https://mcp.example.com/tenant";
+    expect(toServerOAuthConfig({ ...dcr, registrationUrl }, { serverUrl })).toEqual({
+      config: { discovery: { registrationUrl } },
+      ignored: [],
+    });
+    expect(
+      toServerOAuthConfig({ ...dcr, authorizationServerBase: base, registrationUrl }, { serverUrl })
+        .config
+    ).toEqual({ discovery: { authorizationServerBase: base, registrationUrl } });
+    expect(
+      toServerOAuthConfig(
+        { ...dcr, authorizationServerBase: base, registrationUrl: "https://evil.example.com/r" },
+        { serverUrl }
+      )
+    ).toEqual({ ignored: ["authorizationServerBase, registrationUrl (must share one origin)"] });
+  });
+
   test("a resource that does not cover the server URL is dropped", () => {
     expect(
       toServerOAuthConfig({ type: "oauth", resource: "https://evil.example.com" }, { serverUrl })

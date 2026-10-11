@@ -1704,8 +1704,15 @@ export class AgentPluginInstallService {
       // no public-suffix list exists here to make parent-domain matching safe.
       const serverHost = new URL(info.url).host;
       const endpoints = info.oauth?.endpoints;
+      const discovery = info.oauth?.discovery;
       const authHosts = new Set(
-        [endpoints?.authorizationUrl, endpoints?.tokenUrl, endpoints?.registrationUrl]
+        [
+          endpoints?.authorizationUrl,
+          endpoints?.tokenUrl,
+          endpoints?.registrationUrl,
+          discovery?.authorizationServerBase,
+          discovery?.registrationUrl,
+        ]
           .filter((url) => url !== undefined)
           .map((url) => new URL(url).host)
           .filter((host) => host !== serverHost)

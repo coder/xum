@@ -92,6 +92,13 @@ export interface MCPServerOAuthConfig {
     /** Dynamic registration endpoint (no provided client). */
     registrationUrl?: string;
   };
+  /**
+   * Standalone overrides (no `endpoints`): discovery still supplies the endpoints.
+   * `authorizationServerBase` changes where authorization-server metadata is fetched.
+   * `registrationUrl` replaces the discovered registration endpoint, and only when its origin
+   * is the discovered issuer's (dynamic registration only).
+   */
+  discovery?: { authorizationServerBase?: string; registrationUrl?: string };
   /** Sent on every request. */
   baseScopes?: string[];
   /** Replaces the discovered default scopes ([] requests none). */

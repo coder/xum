@@ -59,6 +59,7 @@ import {
   MCP_STDIO_LAUNCH_FENCE_MS,
 } from "@/constants/mcp";
 import { FakeMcpServers, MCP_STARTUP_TIMEOUT_MS } from "./mcpServerManager.testHarness";
+import type { McpOauthService } from "./mcpOauthService";
 
 const PROJECT_PATH = "/tmp/project";
 const WORKSPACE_PATH = "/tmp/workspace";
@@ -3292,6 +3293,39 @@ describe("MCPServerManager", () => {
     await manager.getToolsForWorkspace(request);
     expect(servers.connectCount(url)).toBe(1);
     clientId = "client-b";
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount(url)).toBe(2);
+  });
+
+  test("signing in as the configured client recycles a remote cached with another client's tokens", async () => {
+    const url = "https://mcp.example.test/oauth-signin";
+    configService.listServers = mock(() =>
+      Promise.resolve({
+        server: {
+          transport: "http" as const,
+          url,
+          disabled: false,
+          oauth: { clientId: "client-b" },
+        },
+      })
+    );
+    let storedClient = "client-a";
+    // Stored tokens of client A stay at the URL; the plugin declares client B.
+    const oauth = {
+      hasAuthTokens: (input: { oauth?: { clientId?: string } }) =>
+        Promise.resolve(
+          input.oauth?.clientId === undefined || input.oauth.clientId === storedClient
+        ),
+      getAuthProviderForServer: () => Promise.resolve(undefined),
+    };
+    manager.setMcpOauthService(oauth as unknown as McpOauthService);
+    servers.serve(url, { tools: { work: testTool() } });
+    const request = workspaceRequest("oauth-signin");
+    await manager.getToolsForWorkspace(request);
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount(url)).toBe(1);
+    // B signs in: the instance started without usable credentials must restart with them.
+    storedClient = "client-b";
     await manager.getToolsForWorkspace(request);
     expect(servers.connectCount(url)).toBe(2);
   });

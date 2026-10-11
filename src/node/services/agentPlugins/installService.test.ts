@@ -1846,6 +1846,31 @@ describe("AgentPluginInstallService", () => {
     );
   });
 
+  test("preview shows the host of a standalone authorizationServerBase", async () => {
+    await fsPromises.writeFile(
+      path.join(remoteDir, "mcp.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+        mcpServers: {
+          docs: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/mcp",
+            extensions: {
+              "com.openai": {
+                auth: { type: "oauth", authorizationServerBase: "https://login.example.com/t" },
+              },
+            },
+          },
+        },
+      })
+    );
+    await commitAll(remoteDir, "base");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.mcpServers.map((server) => server.summary)).toEqual([
+      "https://mcp.example.com/mcp\nSign-in at login.example.com",
+    ]);
+  });
+
   test("preview shows a plugin token resource that differs from the server URL", async () => {
     await fsPromises.writeFile(
       path.join(remoteDir, "mcp.json"),
