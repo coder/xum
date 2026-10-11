@@ -4244,8 +4244,11 @@ export class MCPServerManager {
       let hasOauthTokens = false;
       if (this.mcpOauthService) {
         try {
+          // Client-bound like getAuthProviderForServer: tokens of another client must not
+          // count, or signing in as the configured client would not recycle the instance.
           hasOauthTokens = await this.mcpOauthService.hasAuthTokens({
             serverUrl: info.url,
+            ...(info.oauth !== undefined ? { oauth: info.oauth } : {}),
           });
         } catch (error) {
           log.debug("[MCP] Failed to resolve MCP OAuth status", { name, error });

@@ -871,6 +871,106 @@ describe("McpOauthService OAuth flows", () => {
     }
   });
 
+  test("a registered client's token endpoint auth method survives a restart", async () => {
+    const serverUrl = "https://example.com/mcp";
+    await fs.writeFile(
+      getStoreFilePath(xumHome),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: {
+              client_id: "dcr-client",
+              client_secret: "dcr-secret",
+              token_endpoint_auth_method: "client_secret_post",
+            },
+            tokens: { access_token: "at", token_type: "Bearer", refresh_token: "rt" },
+          },
+        },
+      })
+    );
+    const provider = await service.getAuthProviderForServer({ serverUrl });
+    expect(await provider?.clientInformation()).toMatchObject({
+      client_id: "dcr-client",
+      token_endpoint_auth_method: "client_secret_post",
+    });
+  });
+
+  test("standalone registrationUrl and authorizationServerBase merge with discovery", async () => {
+    const paths: string[] = [];
+    const server = createServer((req, res) => {
+      const pathname = (req.url ?? "/").split("?")[0];
+      paths.push(pathname);
+      const json = (body: unknown) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(body));
+      };
+      const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+      const metadata = (issuer: string) => ({
+        issuer,
+        authorization_endpoint: `${issuer}/authorize`,
+        token_endpoint: `${issuer}/token`,
+        registration_endpoint: `${issuer}/register`,
+        response_types_supported: ["code"],
+        code_challenge_methods_supported: ["S256"],
+      });
+      if (pathname === "/.well-known/oauth-protected-resource/mcp")
+        return json({ resource: `${base}/mcp`, authorization_servers: [base] });
+      if (pathname === "/.well-known/oauth-authorization-server") return json(metadata(base));
+      if (pathname === "/.well-known/oauth-authorization-server/tenant")
+        return json(metadata(`${base}/tenant`));
+      if (pathname.endsWith("register")) {
+        void (async () => {
+          let raw = "";
+          for await (const chunk of req) raw += Buffer.from(chunk as Uint8Array).toString("utf-8");
+          json({ ...(JSON.parse(raw) as object), client_id: "registered" });
+        })();
+        return;
+      }
+      res.statusCode = pathname === "/mcp" ? 401 : 404;
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Failed to bind");
+      const base = `http://127.0.0.1:${address.port}`;
+      const signIn = async (discovery: {
+        authorizationServerBase?: string;
+        registrationUrl?: string;
+      }) => {
+        paths.length = 0;
+        const listServers = spyOn(mcpConfigService, "listServers").mockResolvedValue({
+          docs: { transport: "http", url: `${base}/mcp`, disabled: true, oauth: { discovery } },
+        });
+        const start = await service.startServerFlow({
+          projectPath,
+          serverName: "docs",
+          redirectUri: "https://x/cb",
+        });
+        listServers.mockRestore();
+        if (!start.success) throw new Error(start.error);
+        await service.cancelServerFlow(start.data.flowId);
+        return new URL(start.data.authorizeUrl).pathname;
+      };
+      // registrationUrl alone: discovery supplies the endpoints, registration goes there.
+      expect(await signIn({ registrationUrl: `${base}/custom-register` })).toBe("/authorize");
+      expect(paths).toContain("/custom-register");
+      expect(paths).not.toContain("/register");
+      // On a foreign origin (localhost is not 127.0.0.1) it is dropped for the discovered one.
+      await signIn({ registrationUrl: `http://localhost:${address.port}/custom-register` });
+      expect(paths).toContain("/register");
+      expect(paths).not.toContain("/custom-register");
+      // authorizationServerBase alone: only where discovery looks changes.
+      expect(await signIn({ authorizationServerBase: `${base}/tenant` })).toBe("/tenant/authorize");
+      expect(paths).toContain("/tenant/register");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test("stored tokens stay bound to the client they were issued to", async () => {
     const serverUrl = "https://example.com/mcp";
     await fs.writeFile(
@@ -914,6 +1014,9 @@ describe("McpOauthService OAuth flows", () => {
     }
     // Without a server name only the URL is known (a server without plugin OAuth).
     expect((await service.getAuthStatusForApi({ serverUrl })).isLoggedIn).toBe(true);
+    // The manager's cache signature uses the same check (a B sign-in must recycle it).
+    expect(await service.hasAuthTokens({ serverUrl, oauth: { clientId: "client-b" } })).toBe(false);
+    expect(await service.hasAuthTokens({ serverUrl, oauth: { clientId: "client-a" } })).toBe(true);
   });
 
   test("a plugin resource that does not cover the server URL is refused at sign-in", async () => {
@@ -1059,7 +1162,8 @@ describe("McpOauthService OAuth flows", () => {
       expect(authorizeUrl.pathname).toBe("/custom-authorize");
       expect(authorizeUrl.searchParams.get("client_id")).toBe("provided-id");
       expect(authorizeUrl.searchParams.get("scope")).toBe("base docs:read");
-      expect(authorizeUrl.searchParams.get("resource")).toBe(`${base}/`);
+      // The configured spelling, exactly: no slash appended (RFC 8707 exact comparison).
+      expect(authorizeUrl.searchParams.get("resource")).toBe(base);
 
       const exchange = await service.handleServerCallbackAndExchange({
         state: start.data.flowId,
