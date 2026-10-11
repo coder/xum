@@ -16,11 +16,11 @@
 @source "../node_modules/streamdown/dist/index.js";
 
 /* Geist Font Declarations */
-/* Latin-script text uses a subset of Geist Variable (64% of its bytes), so a Latin-only page never
+/* Latin-script text uses a subset of Geist Variable (68% of its bytes), so a Latin-only page never
    downloads the full font. Every other character that Geist has (Cyrillic, Greek, most symbols)
    goes to the full font, and the two ranges do not overlap. scripts/subset-geist-font.py
-   regenerates the subset (sha256 fe210c854a79e21b60c3c85a396a0561331dac9b0f6a626a56c640353b02286e)
-   and prints both ranges. License: fonts/Geist-OFL.txt. */
+   regenerates the subset (sha256 ce8b6557ddd8d03e2058996eb442f53ad9b03439a56dc3a65d35e85b1f480056)
+   and prints both ranges. License: fonts/Geist-OFL.txt, also embedded in the subset's name table. */
 @font-face {
   font-family: "Geist";
   src: url("./fonts/Geist-Latin-Variable.woff2") format("woff2");

@@ -41,10 +41,15 @@ await Promise.all(
     if (!isHashedStaticAssetName(name) || !COMPRESSIBLE_EXTENSIONS.has(path.extname(name))) return;
     const outputs = PRECOMPRESSED_ENCODINGS.map((e) => ({ ...e, path: filePath + e.extension }));
     // Hashed names never change content, and vite's emptyOutDir:false keeps old chunks in a
-    // local dist/, so existing outputs are still valid.
-    if ((await Promise.all(outputs.map((o) => exists(o.path)))).every(Boolean)) return;
+    // local dist/, so existing outputs are still valid. Large files are recompressed anyway: a
+    // dist/ built before quality 11 holds quality-9 .br files for chunks whose hash is unchanged.
+    const { size } = await fs.stat(filePath);
+    if (size < 1024) return;
+    const trustExisting = size < BROTLI_MAX_QUALITY_MIN_BYTES;
+    if (trustExisting && (await Promise.all(outputs.map((o) => exists(o.path)))).every(Boolean)) {
+      return;
+    }
     const data = await fs.readFile(filePath);
-    if (data.length < 1024) return;
     await Promise.all(
       outputs.map(async (output) => {
         const compressed = await compress(output.encoding, data);

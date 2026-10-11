@@ -79,11 +79,23 @@ def main():
     subsetter = subset.Subsetter(options)
     subsetter.populate(unicodes=latin)
     subsetter.subset(font)
+    # OFL condition 2: every copy of a modified version carries the copyright notice and the
+    # license. The dist/ build ships only the font file, so both go into its name table.
+    license_text = (ROOT / "node_modules/geist/LICENSE.TXT").read_text()
+    name = font["name"]
+    name.setName(
+        license_text.splitlines()[0].strip(), 0, 3, 1, 0x409
+    )  # copyright notice
+    name.setName(license_text, 13, 3, 1, 0x409)  # license text
+    name.setName("https://openfontlicense.org", 14, 3, 1, 0x409)  # license URL
     subset.save_font(font, str(OUTPUT), options)
 
     # The subset must keep every Latin glyph of the full font, so no character falls back.
     kept = set(TTFont(OUTPUT).getBestCmap())
     assert kept == set(latin), f"missing {sorted(set(latin) - kept)[:10]}"
+    assert TTFont(OUTPUT)["name"].getDebugName(13) == license_text, (
+        "license text not embedded"
+    )
     rest = sorted(full_cmap - set(latin))
     print(f"subset: {OUTPUT.relative_to(ROOT)} {OUTPUT.stat().st_size} bytes")
     print(f"sha256: {hashlib.sha256(OUTPUT.read_bytes()).hexdigest()}")
