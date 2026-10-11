@@ -525,25 +525,6 @@ function coercePluginHookContext(value: unknown): PluginHookContextEntry[] | und
   return entries.length > 0 ? entries : undefined;
 }
 
-/**
- * The user-authored text a compaction request carries, for the message.send hooks: the inline
- * `/compact` follow-up and the texts queued behind the request. The compaction prompt itself
- * never reaches the hooks. A manual request's follow-up is checked here, where a block can still
- * stop the whole send: it later dispatches as an automatic send, which no plugin may block.
- * Automatic requests (mid-stream, idle, heartbeat) carry no user text in their follow-up.
- */
-function compactionTextForSendHooks(
-  muxMetadata: CompactionRequestMetadata,
-  internal: SendMessageInternalOptions | undefined,
-  manual: boolean
-): string | undefined {
-  const texts = [
-    manual ? compactionFollowUpText(muxMetadata) : undefined,
-    internal?.textBatchedBehindCompaction,
-  ].filter((text): text is string => typeof text === "string" && text.trim().length > 0);
-  return texts.length > 0 ? texts.join("\n") : undefined;
-}
-
 /** Key of a compaction request's follow-up: same precedence as getCompactionFollowUpContent. */
 function compactionFollowUpKey(
   muxMetadata: CompactionRequestMetadata
@@ -551,10 +532,20 @@ function compactionFollowUpKey(
   return muxMetadata.parsed.followUpContent != null ? "followUpContent" : "continueMessage";
 }
 
-/** A compaction request's non-empty follow-up text (legacy requests use continueMessage). */
+/**
+ * A compaction request's follow-up as the redispatch will send it (dispatchPendingFollowUpOnce):
+ * review notes are formatted into the prompt, so a review-only follow-up is a real prompt and
+ * the hooks see every review. Undefined when it is empty.
+ */
 function compactionFollowUpText(muxMetadata: CompactionRequestMetadata): string | undefined {
-  const text: unknown = muxMetadata.parsed[compactionFollowUpKey(muxMetadata)]?.text;
-  return typeof text === "string" && text.trim().length > 0 ? text : undefined;
+  const followUp = muxMetadata.parsed[compactionFollowUpKey(muxMetadata)];
+  if (followUp == null) return undefined;
+  const text: unknown = followUp.text;
+  const prompt = prepareUserMessageForSend({
+    text: typeof text === "string" ? text : "",
+    reviews: followUp.reviews,
+  }).finalText;
+  return prompt.trim().length > 0 ? prompt : undefined;
 }
 
 /**
@@ -939,6 +930,8 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   captureRequestAssemblySnapshot?(
     workspaceId: string
   ): Promise<Result<RequestAssemblySnapshot, SendMessageError>>;
+  /** Whether any message.send hook is registered (lets a send skip work done only for hooks). */
+  hasMessageSendHooks?(): boolean;
   /** The message.send prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
   runMessageSendHooks?(
     workspaceId: string,
@@ -4486,7 +4479,7 @@ export class AgentSession {
 
   /**
    * Run the message.send prompt hooks once for this message. A compaction request's own text
-   * never reaches them, only the user text it carries (compactionTextForSendHooks). A send
+   * never reaches them, only the user text it carries (see the compaction branch below). A send
    * that already ran them (an on-send compaction follow-up) skips them.
    *
    * Only a send a person made (typed, edited, queued, plan-review feedback) can be blocked.
@@ -4498,39 +4491,66 @@ export class AgentSession {
     muxMetadata: unknown,
     internal: SendMessageInternalOptions | undefined,
     acceptanceOrigin: TurnAcceptanceOrigin
-  ): Promise<MessageSendHookOutcome & { followUpHooked?: true }> {
+  ): Promise<
+    MessageSendHookOutcome & {
+      /** The hooks checked the request's follow-up; its outcome travels with the follow-up. */
+      followUpHook?: { context?: PluginHookContextEntry[] };
+    }
+  > {
     const applied = internal?.pluginSendHooksApplied;
     if (applied != null) {
       return applied.context != null && applied.context.length > 0
         ? { kind: "context", entries: applied.context }
         : { kind: "none" };
     }
+    const runMessageSendHooks = this.aiService.runMessageSendHooks?.bind(this.aiService);
+    if (runMessageSendHooks == null) return { kind: "none" };
     const canBlock = internal?.synthetic !== true && acceptanceOrigin === "manual";
-    const hookText = isCompactionRequestMetadata(muxMetadata)
-      ? compactionTextForSendHooks(muxMetadata, internal, canBlock)
-      : message;
-    if (
-      internal?.skipPromptHooks === true ||
-      this.aiService.runMessageSendHooks == null ||
-      hookText == null
-    ) {
-      return { kind: "none" };
-    }
-    const outcome = await this.aiService.runMessageSendHooks(
-      this.workspaceId,
-      {
-        text: hookText,
-        origin: resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin),
-        canBlock,
-      },
-      internal?.cancelSignal
-    );
+    // A turn.stop continuation never reaches the hooks (see skipPromptHooks).
+    if (internal?.skipPromptHooks === true) return { kind: "none" };
+    const run = (text: string) =>
+      runMessageSendHooks(
+        this.workspaceId,
+        {
+          text,
+          origin: resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin),
+          canBlock,
+        },
+        internal?.cancelSignal
+      );
+    if (!isCompactionRequestMetadata(muxMetadata))
+      return this.assertSendHookOutcome(await run(message), canBlock);
+    // A compaction request carries up to two user messages; its own prompt never reaches the
+    // hooks. The follow-up and the texts batched behind the request each get their own run, so
+    // each one's context stays with the row that carries that text: the follow-up's travels with
+    // the follow-up (withHookedCompactionFollowUp), the batched texts' stays on this row. A
+    // manual request's follow-up is checked here, where a block can still stop the whole send:
+    // it later dispatches as an automatic send, which no plugin may block. Automatic requests
+    // (mid-stream, idle, heartbeat) carry no user text in their follow-up.
+    const followUpText = canBlock ? compactionFollowUpText(muxMetadata) : undefined;
+    const batchedText = internal?.textBatchedBehindCompaction;
+    const followUp =
+      followUpText != null
+        ? this.assertSendHookOutcome(await run(followUpText), canBlock)
+        : undefined;
+    if (followUp?.kind === "blocked") return followUp;
+    const request =
+      batchedText != null && batchedText.trim().length > 0
+        ? this.assertSendHookOutcome(await run(batchedText), canBlock)
+        : ({ kind: "none" } as const);
+    if (request.kind === "blocked" || followUp == null) return request;
+    return {
+      ...request,
+      followUpHook: followUp.kind === "context" ? { context: followUp.entries } : {},
+    };
+  }
+
+  private assertSendHookOutcome(
+    outcome: MessageSendHookOutcome,
+    canBlock: boolean
+  ): MessageSendHookOutcome {
     assert(canBlock || outcome.kind !== "blocked", "a send no plugin may refuse was blocked");
-    const followUpHooked =
-      canBlock &&
-      isCompactionRequestMetadata(muxMetadata) &&
-      compactionFollowUpText(muxMetadata) != null;
-    return followUpHooked ? { ...outcome, followUpHooked } : outcome;
+    return outcome;
   }
 
   private async prepareMessage(
@@ -4836,6 +4856,20 @@ export class AgentSession {
         !isCompactionRequestMetadata(options?.muxMetadata))
     )
       this.stopHookContinuations = 0;
+
+    // A client retry of an accepted send (same send ids after a lost response) adds nothing:
+    // the accepted row wins over anything the hooks decide.
+    const sendIdsAlreadyAccepted = async (): Promise<boolean> => {
+      if (sendIdentities.length === 0) return false;
+      const known = await this.historyService.decideSendIds(this.workspaceId, sendIdentities);
+      return known.success && this.settleKnownSendIds(known.data, attempt)?.success === true;
+    };
+    // Checked before the hooks run, so their side effects (logs, notifications) do not repeat
+    // for such a retry. History is read only when hooks exist.
+    if (this.aiService.hasMessageSendHooks?.() === true && (await sendIdsAlreadyAccepted())) {
+      return Ok(undefined);
+    }
+
     // Prompt hooks (message.send): before the pricing gate (its rejected-input row), routing,
     // @file snapshots, edit truncation and every history write, so a block leaves history
     // unchanged.
@@ -4855,15 +4889,9 @@ export class AgentSession {
         createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
       );
     if (pluginSend.kind === "blocked") {
-      // A client retry of an accepted send (same send ids after a lost response) runs the hooks
-      // again. Its block must not report failure for a message history already holds: the
-      // accepted row wins. History is read only on a block, so ordinary sends pay nothing.
-      if (sendIdentities.length > 0) {
-        const known = await this.historyService.decideSendIds(this.workspaceId, sendIdentities);
-        if (known.success && this.settleKnownSendIds(known.data, attempt)?.success === true) {
-          return Ok(undefined);
-        }
-      }
+      // The original send can be accepted while the hooks ran (a retry racing it): its block
+      // must not report failure for a message history now holds.
+      if (await sendIdsAlreadyAccepted()) return Ok(undefined);
       const blockedError: SendMessageError = {
         type: "plugin_blocked",
         plugin: pluginSend.pluginName,
@@ -5377,17 +5405,13 @@ export class AgentSession {
               : typedMuxMetadata
           )
         : typedMuxMetadata;
-    // A manual /compact whose follow-up the hooks checked: the context belongs to the follow-up
-    // (the message the model acts on), so it moves there instead of onto this summarization
-    // request, where the summarizer would read it as instructions and compaction drops it anyway.
-    const hookedCompactionFollowUp =
-      pluginSend.followUpHooked === true && stampedMuxMetadata?.type === "compaction-request";
-    const persistedMuxMetadata = hookedCompactionFollowUp
-      ? withHookedCompactionFollowUp(
-          stampedMuxMetadata,
-          pluginSend.kind === "context" ? pluginSend.entries : undefined
-        )
-      : stampedMuxMetadata;
+    // A manual /compact whose follow-up the hooks checked: that run's context belongs to the
+    // follow-up (the message the model acts on), so it travels there instead of onto this
+    // summarization request. Context from texts batched behind the request stays on this row.
+    const persistedMuxMetadata =
+      pluginSend.followUpHook != null && stampedMuxMetadata?.type === "compaction-request"
+        ? withHookedCompactionFollowUp(stampedMuxMetadata, pluginSend.followUpHook.context)
+        : stampedMuxMetadata;
 
     const userMessage = createMuxMessage(
       messageId,
@@ -5420,9 +5444,7 @@ export class AgentSession {
         ...(internal?.enqueuedAtMs != null ? { enqueuedAtMs: internal.enqueuedAtMs } : {}),
         // Hook context belongs to this message (Codex adds it to the conversation here), not to
         // the system prompt: a per-send system change would miss the whole cached prefix.
-        ...(pluginSend.kind === "context" && !hookedCompactionFollowUp
-          ? { pluginHookContext: pluginSend.entries }
-          : {}),
+        ...(pluginSend.kind === "context" ? { pluginHookContext: pluginSend.entries } : {}),
         // Auto-resume and other system-generated messages are synthetic + UI-visible
         ...(internal?.synthetic && {
           synthetic: true,
