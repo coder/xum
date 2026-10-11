@@ -8,13 +8,12 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { Config, ProvidersConfigStore } from "@/node/config";
+import { ProvidersConfigStore } from "@/node/config";
 import { AIService } from "./aiService";
-import { HistoryService } from "./historyService";
 import { InitStateManager } from "./initStateManager";
 import { ProviderService } from "./providerService";
 import type { MCPServerManager } from "./mcpServerManager";
-import { DisposableTempDir } from "./tempDir";
+import { createTestHistoryService } from "./testHistoryService";
 import { codexPluginHookService } from "./agentPlugins/codexHookService";
 import { loadPluginCodexHooks } from "./agentPlugins/codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./agentPlugins/manifest";
@@ -24,22 +23,23 @@ import { PLUGIN_REGISTRY_FILE_NAME } from "./agentPlugins/registry";
 import { createTestPluginInstallEntry } from "./agentPlugins/testFixtures";
 
 const workspaceId = "prompt-hook-startup";
-let tmp: DisposableTempDir | undefined;
+let cleanup: (() => Promise<void>) | undefined;
 
 afterEach(async () => {
   await codexPluginHookService.disposeWorkspace(workspaceId);
-  tmp?.[Symbol.dispose]();
-  tmp = undefined;
+  await cleanup?.();
+  cleanup = undefined;
 });
 
-async function setup(hooksDocument: unknown) {
-  tmp = new DisposableTempDir("prompt-hook-startup");
-  const root = path.join(tmp.path, "xum");
-  const projectPath = path.join(tmp.path, "project");
+async function setup(hooksDocument: unknown, metadataOverrides: Partial<WorkspaceMetadata> = {}) {
+  const fixture = await createTestHistoryService();
+  cleanup = fixture.cleanup;
+  const { config, historyService } = fixture;
+  const root = config.rootDir;
+  const projectPath = path.join(fixture.tempDir, "project");
   await fs.mkdir(projectPath, { recursive: true });
   // AIService creates the sessions dir in the background; create it first so teardown is quiet.
   await fs.mkdir(path.join(root, "sessions"), { recursive: true });
-  const config = new Config(root);
   await config.editConfig((cfg) => {
     cfg.projects.set(projectPath, {
       trusted: true,
@@ -70,7 +70,6 @@ async function setup(hooksDocument: unknown) {
     });
   }
 
-  const historyService = new HistoryService(config);
   const providersConfigStore = new ProvidersConfigStore(config.rootDir);
   const service = new AIService(
     config,
@@ -93,6 +92,7 @@ async function setup(hooksDocument: unknown) {
     projectName: "project",
     projectPath,
     runtimeConfig: { type: "local" },
+    ...metadataOverrides,
   };
   spyOn(service, "getWorkspaceMetadata").mockResolvedValue({ success: true, data: metadata });
 
@@ -134,6 +134,20 @@ describe("UserPromptSubmit hooks on the first prompt", () => {
 
     expect(outcome).toEqual({ kind: "blocked", pluginName: "guard", reason: "No secrets." });
     expect(order).toEqual([`startup:${workspaceId}:true`, "hook"]);
+  });
+
+  test("a side chat starts no MCP server before its hooks (its local-read-only ceiling)", async () => {
+    const { service, getToolsForWorkspace } = await setup(promptHook, {
+      sideChatParentWorkspaceId: "main-workspace",
+    });
+
+    const outcome = await service.runMessageSendHooks(workspaceId, {
+      text: "key=abc",
+      origin: "user",
+    });
+
+    expect(getToolsForWorkspace).not.toHaveBeenCalled();
+    expect(outcome).toEqual({ kind: "none" });
   });
 
   test("a workspace without UserPromptSubmit hooks starts nothing before the send", async () => {

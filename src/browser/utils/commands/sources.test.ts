@@ -1995,6 +1995,31 @@ test("plugin component action only targets present managed installs without muta
   }
 });
 
+test("plugin hook review action opens the hooks panel of a present managed install", async () => {
+  const openSettings = mock(() => undefined);
+  const plugin = (name: string, present: boolean) => ({
+    name,
+    location: `/plugins/${name}`,
+    managed: true,
+    present,
+    skillCount: 0,
+    mcpServerCount: 0,
+  });
+  const api = createMockORPCClient({
+    agentPlugins: { items: [plugin("managed", true), plugin("missing", false)] },
+  });
+  const action = mk({ api, onOpenSettings: openSettings })
+    .flatMap((source) => source())
+    .find((action) => action.id === CommandIds.pluginsReviewHooks());
+  const field = action?.prompt?.fields[0];
+  if (field?.type !== "select" || !action?.prompt) throw new Error("Expected hook review picker");
+  expect((await field.getOptions({})).map((option) => option.id)).toEqual(["managed"]);
+  consumePendingPluginsSectionIntent();
+  await action.prompt.onSubmit({ pluginName: "managed" });
+  expect(consumePendingPluginsSectionIntent()).toEqual({ type: "review-hooks", name: "managed" });
+  expect(openSettings).toHaveBeenCalledWith("plugins");
+});
+
 describe("Open Server Window palette action", () => {
   const makeBridge = (result: OpenLocalServerResult) =>
     ({
