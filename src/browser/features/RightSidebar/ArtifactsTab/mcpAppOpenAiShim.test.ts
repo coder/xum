@@ -179,19 +179,22 @@ describe("window.openai shim", () => {
     const t = await runView(`
       var o = window.openai;
       window.widget = o.widgetState;
-      ["requestModal", "requestClose"].forEach(function (name) { o[name]({}).catch(function () {}); o[name]({}).catch(function () {}); });
+      o.requestClose().catch(function () {});
+      o.requestClose().catch(function () {});
       o.setWidgetState({ a: 1 });
       window.widgetAfter = o.widgetState;
       o.setOpenInAppUrl({ href: "https://example.com" });
       // The Apps SDK feature-detection pattern: no file APIs here, so the view uses its own.
       window.picker = o.selectFiles ? "library" : o.uploadFile ? "upload" : "own input";
+      window.modal = o.requestModal ? "host modal" : "own dialog";
       window.done = true;`);
     expect(t.win.done).toBe(true);
     expect((t.win as unknown as { widget: unknown }).widget).toBeNull();
     // The Apps SDK reads its snapshot back synchronously after setWidgetState.
     expect((t.win as unknown as { widgetAfter: unknown }).widgetAfter).toEqual({ a: 1 });
     expect((t.win as unknown as { picker: unknown }).picker).toBe("own input");
-    expect(t.warnings).toHaveLength(3);
+    expect((t.win as unknown as { modal: unknown }).modal).toBe("own dialog");
+    expect(t.warnings).toHaveLength(2);
   });
 
   test("a view that redefines window.openai, before or after load, keeps rendering", async () => {

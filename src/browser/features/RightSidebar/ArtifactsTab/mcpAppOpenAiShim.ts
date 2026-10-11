@@ -18,8 +18,8 @@
  * handshake. Members without a standard equivalent warn once; their Promises reject and
  * nothing throws. setWidgetState updates window.openai.widgetState in this page only: the state
  * lasts as long as the frame (a collapsed card or a move to the tab starts with null). Optional
- * extensions Xum lacks (uploadFile, selectFiles, getFileDownloadUrl, requestCheckout) are
- * absent, so `if (window.openai?.selectFiles)` takes the view's fallback.
+ * extensions Xum lacks (uploadFile, selectFiles, getFileDownloadUrl, requestCheckout,
+ * requestModal) are absent, so `if (window.openai?.selectFiles)` takes the view's fallback.
  * Shapes: https://developers.openai.com/plugins/reference.md and the Apps SDK example types.
  */
 export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
@@ -191,15 +191,13 @@ export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
       warnOnce("setOpenInAppUrl");
     }
   };
-  // Members the Apps SDK's own API type always has get a rejecting stub. Optional extensions
-  // (file APIs, checkout) stay absent: views feature-detect them and pick their fallback.
-  ["requestModal", "requestClose"]
-    .forEach(function (name) {
-      api[name] = function () {
-        warnOnce(name);
-        return Promise.reject(new Error("window.openai." + name + " is not supported here"));
-      };
-    });
+  // requestClose is a plain runtime API in the reference (views call it unguarded), so it gets
+  // a rejecting stub. Extensions (file APIs, checkout, requestModal) stay absent: the UI guide
+  // feature-detects them (\`if (openai?.requestModal)\`) and picks a fallback.
+  api.requestClose = function () {
+    warnOnce("requestClose");
+    return Promise.reject(new Error("window.openai.requestClose is not supported here"));
+  };
   Object.keys(globals).forEach(function (key) {
     Object.defineProperty(api, key, {
       enumerable: true,
