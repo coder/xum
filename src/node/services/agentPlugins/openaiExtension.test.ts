@@ -93,6 +93,42 @@ describe("readOpenAIExtension", () => {
     }
   });
 
+  test("control and direction characters: a required field drops the interface, an optional one is dropped", () => {
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    // U+202E reverses the rest of the line: "Example\u202eelgooG" reads as "ExampleGoogle".
+    const spoofed = read({ ...validInterface, developerName: "Example\u202eelgooG" });
+    expect(spoofed.extension).toEqual({});
+    expect(spoofed.warnings.some((w) => w.includes("interface.developerName'"))).toBe(true);
+    for (const bad of [
+      "a\u0007b",
+      "a\u0085b",
+      "a\u2028b",
+      "a\u2066b",
+      "a\u200fb",
+      "two\nlines",
+      "  ",
+    ]) {
+      expect(read({ ...validInterface, displayName: bad }).extension).toEqual({});
+    }
+    // Optional: dropped alone, with a warning. longDescription may break lines with \n.
+    const optional = read({
+      ...validInterface,
+      category: "Design\u202a",
+      longDescription: "First line\nSecond line",
+    });
+    expect(optional.extension?.interface).toEqual({
+      ...validInterface,
+      longDescription: "First line\nSecond line",
+    });
+    expect(optional.warnings).toHaveLength(1);
+    expect(optional.warnings[0]).toContain("interface.category'");
+    // Capabilities and prompts are text too.
+    expect(read({ ...validInterface, capabilities: ["Read\u202e"] }).extension?.interface).toEqual(
+      validInterface
+    );
+  });
+
   test("an interface without its required names is dropped as a whole", () => {
     const { extension, warnings } = readOpenAIExtension({
       extensions: { "com.openai": { interface: { displayName: "Only a name" } } },

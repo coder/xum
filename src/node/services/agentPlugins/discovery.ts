@@ -1,4 +1,5 @@
 import * as fsPromises from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -127,7 +128,20 @@ export async function readPluginFileWithinRootCapped(args: {
   label: string;
 }): Promise<PluginFileReadResult> {
   const { filePath, pluginRoot, maxBytes, label } = args;
-  const handle = await fsPromises.open(filePath, "r");
+  // Opening a FIFO for reading blocks until a writer appears, which would hang every caller
+  // (list(), preview, skill/agent/hook/MCP config loads). Refuse anything but a regular file
+  // before the open; O_NONBLOCK covers a swap to a FIFO between this stat and the open (it
+  // has no effect on regular files), and the identity check below still runs after the open.
+  const target = await fsPromises.stat(filePath);
+  if (!target.isFile()) {
+    throw new Error(`${label} is not a regular file: ${filePath}`);
+  }
+  const handle = await fsPromises.open(
+    filePath,
+    process.platform === "win32"
+      ? fsConstants.O_RDONLY
+      : fsConstants.O_RDONLY | fsConstants.O_NONBLOCK
+  );
   try {
     const stat = await handle.stat({ bigint: true });
     const rootReal = await fsPromises.realpath(pluginRoot);

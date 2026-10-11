@@ -68,6 +68,7 @@ import {
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
+import { checkLogoImage } from "./imageHeader";
 import {
   acquirePluginMutationLock,
   bumpContainerMutationEpoch,
@@ -535,13 +536,13 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
 
 const LOGO_MAX_BYTES = 512 * 1024;
 // No SVG: a data-URL <img> cannot run script, but raster-only keeps the
-// renderer away from markup altogether.
+// renderer away from markup altogether. No GIF: OpenAI does not list it, and it
+// animates (no unrequested UI animation); animated PNG/WebP are refused by header.
 const LOGO_MIME_BY_EXTENSION: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
   ".webp": "image/webp",
-  ".gif": "image/gif",
 };
 
 /**
@@ -562,7 +563,7 @@ async function interfaceSummary(
       ? undefined
       : getOwn(LOGO_MIME_BY_EXTENSION, path.extname(logoPath).toLowerCase());
   if (logoPath !== undefined && mime === undefined) {
-    warnings.push(`Plugin logo '${logoPath}' must be a PNG, JPEG, WebP or GIF image; ignoring`);
+    warnings.push(`Plugin logo '${logoPath}' must be a PNG, JPEG or WebP image; ignoring`);
   } else if (logoPath !== undefined && mime !== undefined) {
     try {
       // A staged clone still holds .git (its config can carry the remote's
@@ -576,6 +577,10 @@ async function interfaceSummary(
         maxBytes: LOGO_MAX_BYTES,
         label: "Plugin logo",
       });
+      // SECURITY AUDIT: bounded decoded size (a tiny compressed file can decode to
+      // hundreds of MB in the renderer) and no animation, from the header alone.
+      const refusal = checkLogoImage(bytes, mime);
+      if (refusal !== null) throw new Error(refusal);
       logoDataUrl = `data:${mime};base64,${bytes.toString("base64")}`;
     } catch (error) {
       warnings.push(`Plugin logo '${logoPath}' cannot be shown: ${getErrorMessage(error)}`);

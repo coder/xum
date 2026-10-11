@@ -94,8 +94,8 @@ const TEXT_CAPS: Partial<Record<keyof OpenAIPluginInterface, number>> = {
   category: 64,
 };
 const RULES: Record<FieldKind, string> = {
-  name: "a non-empty string",
-  text: "a string",
+  name: "a non-empty single line without control or direction characters",
+  text: "a string without control or direction characters",
   url: "an https URL (max 2048 characters)",
   color: "a #RRGGBB color",
   path: "a relative path inside the plugin",
@@ -104,18 +104,30 @@ const RULES: Record<FieldKind, string> = {
   paths: "at most 10 relative paths inside the plugin",
 };
 
-const isText = (value: unknown, max: number): value is string =>
-  typeof value === "string" && value.length <= max;
+/**
+ * Characters manifest text must not carry (OpenAI's package rules exclude them too): C0 and C1
+ * controls, the Unicode line and paragraph separators, and the invisible direction controls
+ * (LRM/RLM, embeddings/overrides, isolates), which can spoof a displayed plugin or developer.
+ * `longDescription` may break lines with \n only.
+ */
+const UNSAFE_TEXT =
+  // eslint-disable-next-line no-control-regex -- the control characters are the point
+  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200e\u200f]/;
+const isText = (value: unknown, max: number, multiline = false): value is string =>
+  typeof value === "string" &&
+  value.length <= max &&
+  !UNSAFE_TEXT.test(value) &&
+  (multiline || !value.includes("\n"));
 const isTextList = (value: unknown, count: number, max: number): value is string[] =>
   Array.isArray(value) && value.length <= count && value.every((entry) => isText(entry, max));
 
 /** The validated value, or undefined when `value` breaks the rule for `kind`. */
-function parseField(kind: FieldKind, value: unknown, cap: number): unknown {
+function parseField(kind: FieldKind, value: unknown, cap: number, multiline: boolean): unknown {
   switch (kind) {
     case "name":
       return isText(value, cap) && value.trim().length > 0 ? value : undefined;
     case "text":
-      return isText(value, cap) ? value : undefined;
+      return isText(value, cap, multiline) ? value : undefined;
     case "url": {
       if (!isText(value, 2048) || !URL.canParse(value)) return undefined;
       const url = new URL(value);
@@ -153,7 +165,7 @@ function readInterface(raw: unknown, warnings: string[]): OpenAIPluginInterface 
       warnings.push(`Unknown '${FIELD}.interface.${key}' ignored`);
       continue;
     }
-    const parsed = parseField(kind, value, getOwn(TEXT_CAPS, key) ?? 0);
+    const parsed = parseField(kind, value, getOwn(TEXT_CAPS, key) ?? 0, key === "longDescription");
     if (parsed !== undefined) result[key] = parsed;
     else warnings.push(`'${FIELD}.interface.${key}' must be ${RULES[kind]}; ignoring`);
   }
