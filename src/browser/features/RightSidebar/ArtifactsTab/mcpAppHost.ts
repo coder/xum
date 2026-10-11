@@ -75,7 +75,10 @@ const ToolCallParams = z.object({
 const ReadResourceParams = z.object({ uri: z.string().min(1).max(MCP_APP_READ_URI_MAX_CHARS) });
 const OpenLinkParams = z.object({ url: z.string().max(4096) });
 const MESSAGE_TEXT_MAX_CHARS = 32_000;
-const TextBlock = z.object({ type: z.literal("text"), text: z.string() });
+const TextBlock = z.object({
+  type: z.literal("text"),
+  text: z.string().max(MESSAGE_TEXT_MAX_CHARS),
+});
 /**
  * The spec's single text block, or the content-block array of the ext-apps SDK and ChatGPT
  * (`content: [{ type: "text", text }]`, optional `_meta["openai/message"]`). Non-text blocks
