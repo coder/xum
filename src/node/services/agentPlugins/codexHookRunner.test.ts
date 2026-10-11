@@ -230,6 +230,25 @@ describe("Codex tool names", () => {
     expect(calls).toEqual([{ name: "mcp__scanner__scan" }]);
   });
 
+  test("MCP name parts keep only [A-Za-z0-9_], as Codex sanitizes them", async () => {
+    const { spine, calls } = setup(
+      [
+        hook("PreToolUse", {
+          matcher: "^mcp__Scan_Server__Find_Issues$",
+          input: { n: "${tool_name}" },
+        }),
+      ],
+      () => deny
+    );
+
+    await runTool(spine, "scan_server_find_issues", {}, undefined, {
+      serverName: "Scan Server",
+      toolName: "Find-Issues",
+    });
+
+    expect(calls).toEqual([{ n: "mcp__Scan_Server__Find_Issues" }]);
+  });
+
   test("a Codex-shaped updatedInput maps back to Xum's arguments before the schema check", async () => {
     const schema = {
       type: "object",
