@@ -1104,6 +1104,7 @@ function renderMcpAppView(
               prefersBorder: null,
               resultAvailable: true,
               result: { content: [{ type: "text", text: "Berlin: 18°C, light rain" }] },
+              approvalProjectPath: "/repo",
               invocation: {
                 serverName: "weather",
                 toolName: "show_weather",
@@ -1165,13 +1166,22 @@ const DOMAINS_CSP = {
   connectDomains: ["https://api.example.com"],
   resourceDomains: ["https://cdn.example.com"],
 };
+/** The domains strip: the alert that lists the declared hosts (the tool-consent strip does not). */
+const findDomainsStrip = (canvasElement: HTMLElement) =>
+  waitFor(() => {
+    const strip = within(canvasElement)
+      .getAllByRole("alert")
+      .find((alert) => alert.textContent?.includes("api.example.com"));
+    if (strip == null) throw new Error("no domains strip");
+    return strip;
+  });
 const playDomainsStrip = async (canvasElement: HTMLElement) => {
-  const canvas = within(canvasElement);
-  const strip = await canvas.findByText(/This view wants to reach/);
-  await expect(strip.textContent).toBe(
-    "This view wants to reach: cdn.example.com, api.example.com"
-  );
-  await expect(canvas.getByRole("button", { name: "Not now" })).toBeVisible();
+  const strip = await findDomainsStrip(canvasElement);
+  // Both declared hosts are asked for, and nothing is granted before the user allows them.
+  await expect(strip.textContent).toContain("cdn.example.com");
+  const frame = within(canvasElement).getByTestId("mcp-app-frame");
+  await expect(frame.getAttribute("srcdoc")).not.toContain("https://api.example.com");
+  await expect(within(strip).getByRole("button", { name: "Not now" })).toBeVisible();
 };
 export const McpAppViewDomainsLaptop: Story = {
   globals: { viewport: { value: "laptop1200", isRotated: false } },
@@ -1184,6 +1194,24 @@ export const McpAppViewDomainsPhone: Story = {
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
   render: () => renderMcpAppView(MCP_APP_VIEW_HTML, DOMAINS_CSP),
   play: ({ canvasElement }) => playDomainsStrip(canvasElement),
+};
+
+// Allow widens the frame's policy to exactly the approved hosts and retires the strip.
+export const McpAppViewDomainsAllow: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => renderMcpAppView(MCP_APP_VIEW_HTML, DOMAINS_CSP),
+  play: async ({ canvasElement }) => {
+    const strip = await findDomainsStrip(canvasElement);
+    const allow = within(strip).getByRole("button", { name: "Allow" });
+    await waitFor(() => expect(allow).toBeEnabled(), { timeout: 5000 });
+    await userEvent.click(allow);
+    await waitFor(async () => {
+      const csp = within(canvasElement).getByTestId("mcp-app-frame").getAttribute("srcdoc") ?? "";
+      await expect(csp).toContain("connect-src https://api.example.com");
+      await expect(csp).toContain("https://cdn.example.com");
+    });
+    await expect(strip.isConnected).toBe(false);
+  },
 };
 
 // An MCP view that navigates itself away loses its host: no more messages either way.
