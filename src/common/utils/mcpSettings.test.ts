@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  advertisedMCPSettingsToolNames,
   parseMCPSettingsCapability,
   parseMCPSettingsReadResult,
   validateMCPSettingValue,
@@ -19,6 +20,12 @@ describe("parseMCPSettingsCapability", () => {
     ).toBeUndefined();
     expect(parseMCPSettingsCapability({ tools: {} })).toBeUndefined();
   });
+
+  test("a half-malformed capability still names its valid tool, so the host hides it", () => {
+    const half = { experimental: { "openai/settings": { readTool: "", updateTool: "s.update" } } };
+    expect(parseMCPSettingsCapability(half)).toBeUndefined();
+    expect(advertisedMCPSettingsToolNames(half)).toEqual(["s.update"]);
+  });
 });
 
 describe("parseMCPSettingsReadResult", () => {
@@ -34,6 +41,8 @@ describe("parseMCPSettingsReadResult", () => {
           badEnum: { type: "string", title: "Bad", enum: ["a", 1] },
           noTitle: { type: "boolean" },
           wrongValue: { type: "number", title: "Wrong value" },
+          // Declared with no value: must not survive through Object.prototype.toString.
+          toString: { type: "boolean", title: "Inherited name" },
         },
       },
       values: { units: "in", grid: false, zoom: 2, badEnum: "a", noTitle: true, wrongValue: "9" },
@@ -72,8 +81,8 @@ describe("parseMCPSettingsReadResult", () => {
         ],
       },
     ]);
-    // color, badEnum, noTitle (schema); wrongValue (value); mystery item; page group.
-    expect(result.warnings).toHaveLength(6);
+    // color, badEnum, noTitle (schema); wrongValue, toString (value); mystery item; page group.
+    expect(result.warnings).toHaveLength(7);
   });
 
   test("ignores a server pattern (never runs server regexes) and accepts an empty enum option", () => {
@@ -111,6 +120,13 @@ test("validateMCPSettingValue checks enum, code-point lengths, bounds and multip
   ).not.toBeNull();
   expect(validateMCPSettingValue({ type: "number", title: "t", maximum: 1 }, 2)).not.toBeNull();
   expect(validateMCPSettingValue({ type: "number", title: "t", multipleOf: 0.1 }, 0.3)).toBeNull();
+  // Large magnitudes: the quotient's float error scales with it.
+  expect(
+    validateMCPSettingValue({ type: "number", title: "t", multipleOf: 0.1 }, 1000000000.3)
+  ).toBeNull();
+  expect(
+    validateMCPSettingValue({ type: "number", title: "t", multipleOf: 0.1 }, 1000000000.35)
+  ).not.toBeNull();
   expect(validateMCPSettingValue({ type: "integer", title: "t" }, 1.5)).not.toBeNull();
   expect(validateMCPSettingValue({ type: "boolean", title: "t" }, "true")).not.toBeNull();
 });

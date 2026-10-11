@@ -36,3 +36,16 @@ test("settings tools are hidden from the model and called with the host's _meta"
   // Only the advertised settings tools go through this host-only path.
   expect(() => client!.callSettingsTool("echo", {}, {})).toThrow();
 });
+
+test("a half-malformed capability still hides its valid tool from the model and apps", async () => {
+  client = await createMCPClient({
+    transport: new StdioClientTransport({
+      command: process.execPath,
+      args: [fixture],
+      env: { ...process.env, SETTINGS_FIXTURE_HALF: "1" } as Record<string, string>,
+    }),
+  });
+  expect(client.settingsCapability()).toBeUndefined();
+  expect(Object.keys(await client.tools())).toEqual(["settings.read", "echo"]);
+  expect(client.hasTool("settings.update")).toBe(false);
+});
