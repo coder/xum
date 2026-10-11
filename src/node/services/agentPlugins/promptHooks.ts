@@ -22,17 +22,41 @@ export type MessageSendHookOutcome =
   | { kind: "none" }
   | { kind: "blocked"; pluginName: string; reason: string };
 
+export interface MessageSendHookInput {
+  text: string;
+  origin: MessageSendOrigin;
+  /**
+   * False for sends no plugin may refuse (automatic senders retry a refused send, so a block
+   * would loop). Their blocks are ignored as they are set, so the chain keeps running: every
+   * later hook still sees the send, independent of plugin order.
+   */
+  canBlock: boolean;
+}
+
 export async function runMessageSendHooks(
   spine: EventSpine,
   workspaceId: string,
-  input: { text: string; origin: MessageSendOrigin }
+  input: MessageSendHookInput
 ): Promise<MessageSendHookOutcome> {
   if (!spine.hasMiddleware("message.send")) return { kind: "none" };
-  const ctx: MessageSendContext = {
-    workspaceId,
-    origin: input.origin,
-    text: input.text,
-  };
+  const base = { workspaceId, origin: input.origin, text: input.text };
+  const ctx: MessageSendContext = input.canBlock
+    ? base
+    : {
+        ...base,
+        // useBefore ends the chain when `blocked` reads as set, so it never does here.
+        get blocked() {
+          return undefined;
+        },
+        set blocked(block: MessageSendContext["blocked"]) {
+          if (block == null) return;
+          log.warn("Prompt hooks: ignoring a block of an automatic send", {
+            workspaceId,
+            plugin: block.pluginName,
+            origin: input.origin,
+          });
+        },
+      };
   try {
     await spine.run("message.send", ctx);
   } catch (error) {

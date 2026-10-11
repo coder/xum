@@ -22,7 +22,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { PreparedStreamMessage } from "./turnRequestBuilder";
 import type { MessageSendOrigin, RequestAssemblySnapshot } from "./events/eventSpine";
-import type { MessageSendHookOutcome } from "./agentPlugins/promptHooks";
+import type { MessageSendHookInput, MessageSendHookOutcome } from "./agentPlugins/promptHooks";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import {
   isProviderEligibleMessage,
@@ -257,6 +257,7 @@ import {
   inheritOpenWorkspaceTurnMetadata,
   computeKeepRecentTailStamp,
   isCompactionRequestMetadata,
+  type CompactionRequestMetadata,
 } from "./contextManagement/compactionRequests";
 import {
   RetryManager,
@@ -497,6 +498,27 @@ function resolveMessageSendOrigin(
     return "task";
   if (internal?.synthetic === true || acceptanceOrigin === "automatic") return "system";
   return "user";
+}
+
+/**
+ * The user-authored text a compaction request carries, for the message.send hooks: the inline
+ * `/compact` follow-up and the texts queued behind the request. The compaction prompt itself
+ * never reaches the hooks. A manual request's follow-up is checked here, where a block can still
+ * stop the whole send: it later dispatches as an automatic send, which no plugin may block.
+ * Automatic requests (mid-stream, idle, heartbeat) carry no user text in their follow-up.
+ */
+function compactionTextForSendHooks(
+  muxMetadata: CompactionRequestMetadata,
+  internal: SendMessageInternalOptions | undefined,
+  manual: boolean
+): string | undefined {
+  // Same precedence as getCompactionFollowUpContent (legacy requests use continueMessage).
+  const followUp = muxMetadata.parsed.followUpContent ?? muxMetadata.parsed.continueMessage;
+  const followUpText: unknown = manual ? followUp?.text : undefined;
+  const texts = [followUpText, internal?.textBatchedBehindCompaction].filter(
+    (text): text is string => typeof text === "string" && text.trim().length > 0
+  );
+  return texts.length > 0 ? texts.join("\n") : undefined;
 }
 
 function getGoalStreamOriginKind(input: {
@@ -847,7 +869,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   /** The message.send prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
   runMessageSendHooks?(
     workspaceId: string,
-    input: { text: string; origin: MessageSendOrigin }
+    input: MessageSendHookInput
   ): Promise<MessageSendHookOutcome>;
   resolveXumToolScopeForWorkspace?(
     metadata: WorkspaceMetadata,
@@ -4367,11 +4389,11 @@ export class AgentSession {
 
   /**
    * Run the message.send prompt hooks for this message. A compaction request's own text never
-   * reaches them, only the texts batched behind it in the queue.
+   * reaches them, only the user text it carries (compactionTextForSendHooks).
    *
    * Only a send a person made (typed, edited, queued, plan-review feedback) can be blocked.
    * Automatic senders (goals, tasks, wakes, follow-ups) retry a refused send, so a block would
-   * loop: their sends keep the hooks' context and ignore a block.
+   * loop: their sends run the whole chain, keep the hooks' context and ignore every block.
    */
   private async runPluginSendHooks(
     message: string,
@@ -4379,28 +4401,19 @@ export class AgentSession {
     internal: SendMessageInternalOptions | undefined,
     acceptanceOrigin: TurnAcceptanceOrigin
   ): Promise<MessageSendHookOutcome> {
+    const canBlock = internal?.synthetic !== true && acceptanceOrigin === "manual";
     const hookText = isCompactionRequestMetadata(muxMetadata)
-      ? internal?.textBatchedBehindCompaction
+      ? compactionTextForSendHooks(muxMetadata, internal, canBlock)
       : message;
     if (this.aiService.runMessageSendHooks == null || hookText == null) {
       return { kind: "none" };
     }
-    const origin = resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin);
     const outcome = await this.aiService.runMessageSendHooks(this.workspaceId, {
       text: hookText,
-      origin,
+      origin: resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin),
+      canBlock,
     });
-    if (
-      outcome.kind === "blocked" &&
-      (internal?.synthetic === true || acceptanceOrigin !== "manual")
-    ) {
-      log.warn("Prompt hooks: ignoring a block of an automatic send", {
-        workspaceId: this.workspaceId,
-        plugin: outcome.pluginName,
-        origin,
-      });
-      return { kind: "none" };
-    }
+    assert(canBlock || outcome.kind !== "blocked", "a send no plugin may refuse was blocked");
     return outcome;
   }
 

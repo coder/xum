@@ -172,13 +172,62 @@ describe("message.send outcomes", () => {
 
     h.session.drainQueuedMessagesIfIdle();
     await waitForCondition(
-      () => streamed.length > 0 || h.events.some((event) => event.type === "stream-error")
+      () => streamed.length > 0 || h.events.some((event) => event.type === "restore-to-input")
     );
 
     // Only the separately sent text reaches the hook: the compaction prompt never does.
     expect(calls).toEqual([{ text: "deploy to prod", origin: "user" }]);
     expect(await userRows(h)).toEqual([]);
     expect(streamed).toEqual([]);
+    // Codex P2 (PRRT_kwDOPxxmWM6rN7od): the composer gets the command and the draft back, never
+    // the model-facing summarization prompt.
+    const restored = h.events.find((event) => event.type === "restore-to-input");
+    expect(restored?.type === "restore-to-input" ? restored.text : undefined).toBe(
+      "/compact\ndeploy to prod"
+    );
+  });
+
+  test("a /compact with inline follow-up text runs the hooks on that text first", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rN7of): the follow-up later dispatches as an automatic send,
+    // which no plugin may block, so the block must stop the /compact itself.
+    const { h, calls, streamed } = await setup(blockAll);
+    const followUpContent = { text: "deploy to prod", model: options.model, agentId: "exec" };
+
+    const result = await h.session.sendMessage("Summarize this conversation.", {
+      ...options,
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact\ndeploy to prod",
+        parsed: { followUpContent },
+      },
+    });
+
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.type).toBe("plugin_blocked");
+    expect(calls).toEqual([{ text: "deploy to prod", origin: "user" }]);
+    expect(await userRows(h)).toEqual([]);
+    expect(streamed).toEqual([]);
+  });
+
+  test("an automatic compaction request's follow-up does not reach the hooks", async () => {
+    // Its follow-up (here the resume sentinel) is not user text; it reaches them when it is sent.
+    const { h, calls } = await setup(blockAll);
+
+    await h.session.sendMessage(
+      "Summarize this conversation.",
+      {
+        ...options,
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: { followUpContent: { text: "Continue", model: options.model, agentId: "exec" } },
+        },
+      },
+      { acceptanceOrigin: "automatic", synthetic: true }
+    );
+
+    expect(calls).toEqual([]);
   });
 
   test("each send kind reaches the hook with its origin", async () => {
