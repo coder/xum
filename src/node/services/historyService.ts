@@ -828,17 +828,18 @@ export class HistoryService {
   }
 
   private readonly emptyErroredReplyDeletedListeners = new Set<
-    (workspaceId: string, historySequence: number) => void
+    (workspaceId: string, historySequences: number[]) => void
   >();
 
   /**
-   * Called after commitPartial deleted the history row of a reply that failed with no output.
+   * Called after commitPartial deleted the history rows of a reply that failed with no output
+   * (one row, or every duplicate of its id in corrupted history).
    * No caller asked for that delete, so no caller tells the client. A client that keeps the row
    * sends it as evidence with its next edit, and the edit is refused (#6116).
    * Returns the unsubscribe function.
    */
   onEmptyErroredReplyDeleted(
-    listener: (workspaceId: string, historySequence: number) => void
+    listener: (workspaceId: string, historySequences: number[]) => void
   ): () => void {
     this.emptyErroredReplyDeletedListeners.add(listener);
     return () => this.emptyErroredReplyDeletedListeners.delete(listener);
@@ -3459,19 +3460,25 @@ export class HistoryService {
     if ((await this.readPartial(workspaceId)) == null) {
       return Ok(undefined);
     }
+    let deletedSequences: number[] = [];
     const committed = await this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to commit partial",
       (assertStillOwned) =>
-        this.commitPartialUnderWriteLock(workspaceId, expectedMessageId, assertStillOwned)
+        this.commitPartialUnderWriteLock(
+          workspaceId,
+          expectedMessageId,
+          assertStillOwned,
+          (sequences) => (deletedSequences = sequences)
+        )
     );
-    if (!committed.success) return committed;
-    // Notify after the locks are released: listeners publish to clients.
-    if (committed.data !== undefined) {
+    // Notify after the locks are released (listeners publish to clients), and also when a later
+    // step failed: the rows are gone, and a retry finds the partial orphaned and reports nothing.
+    if (deletedSequences.length > 0) {
       for (const listener of this.emptyErroredReplyDeletedListeners) {
         // One failing session must neither skip the others nor fail this commit.
         try {
-          listener(workspaceId, committed.data);
+          listener(workspaceId, deletedSequences);
         } catch (error) {
           log.warn("Empty errored reply delete listener failed", {
             workspaceId,
@@ -3480,15 +3487,16 @@ export class HistoryService {
         }
       }
     }
-    return Ok(undefined);
+    return committed;
   }
 
-  /** Returns the history sequence of an empty errored reply row it deleted, if any. */
+  /** `recordDeleted` receives the sequences of the empty errored reply rows it deleted. */
   private async commitPartialUnderWriteLock(
     workspaceId: string,
-    expectedMessageId?: string,
-    assertStillOwned?: () => Promise<void>
-  ): Promise<Result<number | undefined>> {
+    expectedMessageId: string | undefined,
+    assertStillOwned: (() => Promise<void>) | undefined,
+    recordDeleted: (historySequences: number[]) => void
+  ): Promise<Result<void>> {
     try {
       let partial = await this.readPartial(workspaceId);
       if (!partial) {
@@ -3561,8 +3569,7 @@ export class HistoryService {
           messageId: partial.id,
           partialSeq,
         });
-        const deleted = await this.deletePartialUnlocked(workspaceId);
-        return deleted.success ? Ok(undefined) : deleted;
+        return this.deletePartialUnlocked(workspaceId);
       }
 
       const commitWorthy = hasCommitWorthyParts(partial.parts);
@@ -3597,7 +3604,6 @@ export class HistoryService {
         partial.metadata?.anthropicThinkingReplay === "off" &&
         existingMessage.metadata?.anthropicThinkingReplay !== "off";
 
-      let deletedSequence: number | undefined;
       if (shouldCommit) {
         const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, partial);
         if (!updateResult.success) {
@@ -3620,13 +3626,17 @@ export class HistoryService {
           return deleteMessageResult;
         }
         if (deleteMessageResult.success) {
-          deletedSequence = existingMessage.metadata?.historySequence;
-          assert(deletedSequence !== undefined, "the deleted row matched the partial's sequence");
+          // The delete is by id: corrupted history can hold duplicates at other sequences.
+          const sequences = existingMessages.flatMap((message) => {
+            const sequence = message.metadata?.historySequence;
+            return message.id === partial.id && isNonNegativeInteger(sequence) ? [sequence] : [];
+          });
+          assert(sequences.length > 0, "the deleted rows include the partial's own row");
+          recordDeleted(sequences);
         }
       }
 
-      const deleted = await this.deletePartialUnlocked(workspaceId);
-      return deleted.success ? Ok(deletedSequence) : deleted;
+      return this.deletePartialUnlocked(workspaceId);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
       return Err(`Failed to commit partial: ${errorMessage}`);

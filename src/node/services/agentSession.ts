@@ -1757,9 +1757,9 @@ export class AgentSession {
     // edit would send that row as evidence and be refused; drop it as a truncation does.
     // Last statement: no later constructor step can throw and leak this process-wide listener.
     this.stopEmptyErroredReplyDeletes = this.historyService.onEmptyErroredReplyDeleted(
-      (workspaceId, historySequence) => {
+      (workspaceId, historySequences) => {
         if (workspaceId === this.workspaceId)
-          this.emitChatEvent({ type: "delete", historySequences: [historySequence] });
+          this.emitChatEvent({ type: "delete", historySequences });
       }
     );
   }
