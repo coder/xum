@@ -1,4 +1,5 @@
 import * as crypto from "crypto";
+import assert from "@/common/utils/assert";
 import { getOwn } from "@/common/utils/getOwn";
 import * as http from "http";
 import type { IncomingHttpHeaders } from "http";
@@ -133,6 +134,8 @@ interface OAuthFlowBase {
   resultPromise: Promise<Result<void, string>>;
   resolveResult: (result: Result<void, string>) => void;
   settled: boolean;
+  /** The server key's sign-out generation when the flow started (see signOutGenerations). */
+  signOutGeneration: number;
 }
 
 interface DesktopFlow extends OAuthFlowBase {
@@ -159,6 +162,14 @@ function pluginDiscoveryState(config?: MCPServerOAuthConfig): OAuthDiscoveryStat
   const endpoints = config?.endpoints;
   if (endpoints === undefined) return undefined;
   const issuer = endpoints.issuer ?? new URL(endpoints.tokenUrl).origin;
+  // toServerOAuthConfig drops overrides with split origins; a config that still has them
+  // is a bug (the code and PKCE verifier could reach another server's token endpoint).
+  assert(
+    [endpoints.authorizationUrl, endpoints.registrationUrl, issuer].every(
+      (url) => url === undefined || new URL(url).origin === new URL(endpoints.tokenUrl).origin
+    ),
+    "plugin OAuth endpoints must share one origin"
+  );
   return {
     authorizationServerUrl: issuer,
     authorizationServerMetadata: {
@@ -795,7 +806,37 @@ export class McpOauthService {
     if (!server || server.transport === "stdio") {
       return { isLoggedIn: false, hasRefreshToken: false };
     }
-    return this.getAuthStatus({ serverUrl: server.url });
+    return this.getAuthStatus({
+      serverUrl: server.url,
+      ...(server.oauth !== undefined ? { oauth: server.oauth } : {}),
+    });
+  }
+
+  /**
+   * Settings (global scope): with `serverName`, the configured server's plugin OAuth settings
+   * apply, so tokens of another client read as signed out like they do at connect time.
+   */
+  async getAuthStatusForApi(input: {
+    serverUrl: string;
+    serverName?: string;
+  }): Promise<MCPOAuthAuthStatus> {
+    if (input.serverName === undefined) return this.getAuthStatus({ serverUrl: input.serverUrl });
+    const servers = await this.mcpConfigService.listServers(
+      this.config.rootDir,
+      isProjectTrusted(this.config, this.config.rootDir)
+    );
+    const server = getOwn(servers, input.serverName);
+    const oauth =
+      server !== undefined &&
+      server.transport !== "stdio" &&
+      normalizeServerUrlForComparison(server.url) ===
+        normalizeServerUrlForComparison(input.serverUrl)
+        ? server.oauth
+        : undefined;
+    return this.getAuthStatus({
+      serverUrl: input.serverUrl,
+      ...(oauth !== undefined ? { oauth } : {}),
+    });
   }
 
   async logoutProjectServer(input: {
@@ -812,7 +853,11 @@ export class McpOauthService {
     }
     return this.logout({ serverUrl: server.url });
   }
-  async getAuthStatus(input: { serverUrl: string }): Promise<MCPOAuthAuthStatus> {
+  async getAuthStatus(input: {
+    serverUrl: string;
+    /** Plugin OAuth settings: tokens issued to another client read as signed out. */
+    oauth?: MCPServerOAuthConfig;
+  }): Promise<MCPOAuthAuthStatus> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {
       return { isLoggedIn: false, hasRefreshToken: false };
@@ -820,7 +865,11 @@ export class McpOauthService {
 
     const creds = await this.getValidStoredCredentials({ serverUrl: normalizedServerUrl });
 
-    const tokens = creds?.tokens;
+    // The same guard as getAuthProviderForServer: status must not say "Logged in" for tokens
+    // the connection will not use.
+    const tokens = storedClientMatches(creds?.clientInformation, input.oauth)
+      ? creds?.tokens
+      : undefined;
     return {
       serverUrl: normalizedServerUrl,
       isLoggedIn: Boolean(tokens),
@@ -828,6 +877,25 @@ export class McpOauthService {
       scope: tokens?.scope,
       updatedAtMs: creds?.updatedAtMs,
     };
+  }
+
+  /**
+   * Sign-outs per credential key. Settling a flow does not stop a token exchange already in
+   * flight, so each flow remembers the generation it started under, and its saves are dropped
+   * (inside the store lock) once a sign-out bumped it.
+   */
+  private readonly signOutGenerations = new Map<string, number>();
+
+  private signOutGeneration(serverUrlForStoreKey: string): number {
+    return this.signOutGenerations.get(serverUrlForStoreKey) ?? 0;
+  }
+
+  /** True (and logged) when a sign-out happened after the flow started. */
+  private isStaleFlowSave(serverUrl: string, flowGeneration: number | undefined): boolean {
+    if (flowGeneration === undefined || flowGeneration === this.signOutGeneration(serverUrl))
+      return false;
+    log.info("[MCP OAuth] Dropping credentials of a flow started before a sign-out", { serverUrl });
+    return true;
   }
 
   /** The credential-store key of a server URL (null for an invalid URL). */
@@ -840,6 +908,11 @@ export class McpOauthService {
     if (!normalizedServerUrl) {
       return Ok(undefined);
     }
+    // Before any await: an exchange already past its settled check must not save either.
+    this.signOutGenerations.set(
+      normalizedServerUrl,
+      this.signOutGeneration(normalizedServerUrl) + 1
+    );
     // A flow started before the sign-out must not save its credentials back.
     await Promise.all([
       ...[...this.desktopFlows]
@@ -1092,6 +1165,7 @@ export class McpOauthService {
       resultPromise,
       resolveResult,
       settled: false,
+      signOutGeneration: this.signOutGeneration(serverUrlForStoreKey),
     };
 
     this.desktopFlows.set(flowId, flow);
@@ -1235,6 +1309,7 @@ export class McpOauthService {
       resultPromise,
       resolveResult,
       settled: false,
+      signOutGeneration: this.signOutGeneration(serverUrlForStoreKey),
     };
 
     this.serverFlows.set(flowId, flow);
@@ -1408,6 +1483,7 @@ export class McpOauthService {
           // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           tokens: tokens as unknown as MCPOAuthTokens,
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
+          flowGeneration: flow.signOutGeneration,
         });
       },
       saveDiscoveryState: (state) => {
@@ -1477,6 +1553,7 @@ export class McpOauthService {
           serverUrl: flow.serverUrlForStoreKey,
           clientInformation: withoutPluginSecret(next, flow.plugin?.config),
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
+          flowGeneration: flow.signOutGeneration,
         });
       },
       state: () => Promise.resolve(flow.flowId),
@@ -1845,8 +1922,11 @@ export class McpOauthService {
     serverUrl: string;
     tokens: MCPOAuthTokens;
     legacyBinding?: AuthorizationServerBinding;
+    /** An interactive flow's sign-out generation; the save is dropped when it is stale. */
+    flowGeneration?: number;
   }): Promise<void> {
     await this.storeLock.withLock(this.storeFilePath, async () => {
+      if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return;
       const store = await this.ensureStoreLoadedLocked();
       const creds = (store.entries[input.serverUrl] ??= {
         serverUrl: input.serverUrl,
@@ -1875,8 +1955,10 @@ export class McpOauthService {
     serverUrl: string;
     clientInformation: MCPOAuthClientInformation;
     legacyBinding?: AuthorizationServerBinding;
+    flowGeneration?: number;
   }): Promise<void> {
     await this.storeLock.withLock(this.storeFilePath, async () => {
+      if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return;
       const store = await this.ensureStoreLoadedLocked();
       const creds = (store.entries[input.serverUrl] ??= {
         serverUrl: input.serverUrl,

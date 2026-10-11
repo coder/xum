@@ -86,11 +86,20 @@ const KNOWN_AUTH_KEYS = new Set<string>([
 ]);
 const AUTH = `extensions["${OPENAI_EXTENSION_NAMESPACE}"].auth`;
 
-/** Absolute https URL without user information or a fragment. */
-function isSafeHttpsUrl(value: unknown): value is string {
+/** Loopback hosts, the only ones an http: endpoint override may name (RFC 8252 §8.3 dev use). */
+const LOOPBACK_HOSTS = new Set<string>(["127.0.0.1", "[::1]", "localhost"]);
+
+/**
+ * Absolute https URL without user information or a fragment. OpenAI's reference allows http
+ * too, but a token endpoint on plain http across the network would expose the authorization
+ * code and the client secret, so http is kept only for a loopback development server.
+ */
+function isSafeEndpointUrl(value: unknown): value is string {
   if (typeof value !== "string" || !URL.canParse(value)) return false;
   const url = new URL(value);
-  return url.protocol === "https:" && url.username === "" && url.password === "" && !url.hash;
+  const secureScheme =
+    url.protocol === "https:" || (url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname));
+  return secureScheme && url.username === "" && url.password === "" && !url.hash;
 }
 
 function isScopeList(value: unknown): value is string[] {
@@ -159,10 +168,10 @@ function readAuth(raw: Record<string, unknown>, result: ReadOpenAIMcpAuthResult)
   }
   for (const key of URL_FIELDS) {
     if (raw[key] === undefined) continue;
-    if (isSafeHttpsUrl(raw[key])) auth[key] = raw[key];
+    if (isSafeEndpointUrl(raw[key])) auth[key] = raw[key];
     else
       result.warnings.push(
-        `'${AUTH}.${key}' must be an https URL without credentials or a fragment; ignoring`
+        `'${AUTH}.${key}' must be an https (or loopback http) URL without credentials or a fragment; ignoring`
       );
   }
   for (const key of SCOPE_FIELDS) {
@@ -237,9 +246,29 @@ export function readOpenAIMcpAuth(extensions: unknown): ReadOpenAIMcpAuthResult 
   return result;
 }
 
+/** Codex's plugin parser (codex-mcp plugin_config.rs) accepts all three spellings. */
+const CODEX_STREAMABLE_HTTP_TYPES = new Set<unknown>([
+  "http",
+  "streamable_http",
+  "streamable-http",
+]);
+
+/**
+ * Codex resolves a relative stdio cwd (`.`, `sub/dir`) against the plugin root; the portable
+ * format spells that `./…`. Only the spelling changes: normalizeStdioEntry still applies its
+ * containment check, so `../x` (now `./../x`) is still refused as an escape.
+ */
+function portableCodexCwd(cwd: unknown): unknown {
+  if (typeof cwd !== "string" || cwd.length === 0) return cwd;
+  if (cwd.startsWith("./") || cwd.startsWith("/") || cwd.startsWith("~") || cwd.startsWith("$"))
+    return cwd;
+  return cwd === "." ? "./" : `./${cwd}`;
+}
+
 /**
  * Rewrite one Codex `.mcp.json` server entry into the Agent Plugins shape:
- * `type: "http"` becomes `streamable-http`, and `oauth.client_id`, `scopes`
+ * `type: "http"` (or `streamable_http`) becomes `streamable-http`, a relative cwd gets
+ * its `./` prefix, and `oauth.client_id`, `scopes`
  * and `oauth_resource` become an OpenAI `auth` block (an existing inline
  * `auth` wins). Callback settings are only NAMED in `ignored`. The secret
  * value is dropped here; `hasClientSecret` tells the caller to point the
@@ -255,7 +284,8 @@ export function translateCodexMcpEntry(entry: Record<string, unknown>): {
   const ignored: string[] = [];
   const warnings: string[] = [];
   let hasClientSecret = false;
-  if (rest.type === "http") rest.type = "streamable-http";
+  if (CODEX_STREAMABLE_HTTP_TYPES.has(rest.type)) rest.type = "streamable-http";
+  if (rest.cwd !== undefined) rest.cwd = portableCodexCwd(rest.cwd);
   // Codex stdio entries carry a `command` and no `type`.
   if (rest.type === undefined && typeof rest.command === "string") rest.type = "stdio";
 
@@ -320,7 +350,21 @@ export function toServerOAuthConfig(
   // registrationUrl; without one, discovery keeps supplying everything.
   let endpoints: MCPServerOAuthConfig["endpoints"];
   if (auth.authorizationUrl !== undefined && auth.tokenUrl !== undefined) {
-    if (clientId === undefined && auth.registrationUrl === undefined) {
+    // SECURITY AUDIT: overrides replace discovery, so nothing else ties them to one
+    // authorization server. Split origins would let a plugin send the browser to a real
+    // authorization endpoint and route the code and PKCE verifier to its own token
+    // endpoint (an authorization server without RFC 9207 `iss` cannot catch that). All
+    // overrides must share one origin, which is the issuer.
+    const origins = new Set(
+      [auth.authorizationUrl, auth.tokenUrl, auth.registrationUrl, auth.authorizationServerBase]
+        .filter((url) => url !== undefined)
+        .map((url) => new URL(url).origin)
+    );
+    if (origins.size > 1) {
+      ignored.push(
+        "authorizationUrl, tokenUrl, registrationUrl, authorizationServerBase (must share one origin)"
+      );
+    } else if (clientId === undefined && auth.registrationUrl === undefined) {
       ignored.push("authorizationUrl, tokenUrl (registration needs registrationUrl)");
     } else {
       endpoints = {

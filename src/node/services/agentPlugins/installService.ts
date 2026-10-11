@@ -1616,19 +1616,29 @@ export class AgentPluginInstallService {
     // respelled URL (`/mcp` vs `/mcp/`) with a new identity still resets.
     const credentialKey = (url: string): string | null =>
       this.mcpOauthService?.credentialKey(url) ?? null;
+    // Compare each entry with its own previous identity (same name, same key): when two
+    // servers share a URL, another entry already using the new identity must not mask the
+    // change. A renamed entry has no previous self, so it compares with every identity at
+    // the key.
     const currentIdentities = new Map<string, Set<string>>();
-    for (const server of current?.servers.values() ?? []) {
+    const currentEntryIdentity = new Map<string, string>();
+    for (const [serverName, server] of current?.servers ?? []) {
       const key = server.signIn && credentialKey(server.signIn.url);
       if (!key || !server.signIn) continue;
       const identities = currentIdentities.get(key) ?? new Set<string>();
       identities.add(server.signIn.identity);
       currentIdentities.set(key, identities);
+      currentEntryIdentity.set(`${serverName}\0${key}`, server.signIn.identity);
     }
-    for (const server of staged.servers.values()) {
+    for (const [serverName, server] of staged.servers) {
       const key = server.signIn && credentialKey(server.signIn.url);
-      const identities = key ? currentIdentities.get(key) : undefined;
-      if (server.signIn && identities && !identities.has(server.signIn.identity))
-        signInResets?.push(server.signIn.url);
+      if (!key || !server.signIn) continue;
+      const previous = currentEntryIdentity.get(`${serverName}\0${key}`);
+      const changed =
+        previous !== undefined
+          ? previous !== server.signIn.identity
+          : currentIdentities.get(key)?.has(server.signIn.identity) === false;
+      if (changed) signInResets?.push(server.signIn.url);
     }
     // Skill advertisements interpolate into the model-visible skill index on
     // every request, so a new skill — or a reworded description — can inject
@@ -1921,7 +1931,7 @@ export class AgentPluginInstallService {
       const serverHost = new URL(info.url).host;
       const endpoints = info.oauth?.endpoints;
       const authHosts = new Set(
-        [endpoints?.authorizationUrl, endpoints?.tokenUrl]
+        [endpoints?.authorizationUrl, endpoints?.tokenUrl, endpoints?.registrationUrl]
           .filter((url) => url !== undefined)
           .map((url) => new URL(url).host)
           .filter((host) => host !== serverHost)

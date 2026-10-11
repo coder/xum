@@ -71,6 +71,27 @@ describe("readOpenAIMcpAuth", () => {
     expect(result.warnings[0]).toContain("client.clientId' is required");
   });
 
+  test("an http endpoint override is kept only for a loopback host", () => {
+    const result = readOpenAIMcpAuth(
+      withAuth({
+        type: "oauth",
+        authorizationUrl: "http://127.0.0.1:8080/authorize",
+        tokenUrl: "http://localhost:8080/token",
+        registrationUrl: "http://[::1]:8080/register",
+        authorizationServerBase: "http://auth.example.com",
+      })
+    );
+    expect(result.auth).toEqual({
+      type: "oauth",
+      authorizationUrl: "http://127.0.0.1:8080/authorize",
+      tokenUrl: "http://localhost:8080/token",
+      registrationUrl: "http://[::1]:8080/register",
+    });
+    // A network http endpoint would expose the code and the secret: still dropped.
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toContain("authorizationServerBase");
+  });
+
   test("an unknown auth type ignores the whole block", () => {
     const result = readOpenAIMcpAuth(withAuth({ type: "magic", clientSecret: "s3cret" }));
     expect(result.auth).toBeUndefined();
@@ -115,6 +136,35 @@ describe("toServerOAuthConfig", () => {
     expect(toServerOAuthConfig({ ...dcr, registrationUrl }, { serverUrl }).config).toEqual({
       endpoints: { ...endpoints, registrationUrl },
     });
+  });
+
+  test("endpoint overrides on split origins are dropped for discovery", () => {
+    const provided = {
+      type: "oauth" as const,
+      client: { mode: "provided" as const, clientId: "c" },
+    };
+    const split = [
+      // A real authorization server, but the code and verifier go to the plugin's token host.
+      { authorizationUrl: "https://accounts.example.com/authorize", tokenUrl: endpoints.tokenUrl },
+      { ...endpoints, registrationUrl: "https://register.example.com/register" },
+      { ...endpoints, authorizationServerBase: "https://auth.example.com" },
+    ];
+    for (const overrides of split) {
+      expect(toServerOAuthConfig({ ...provided, ...overrides }, { serverUrl })).toEqual({
+        config: { clientId: "c" },
+        ignored: [
+          "authorizationUrl, tokenUrl, registrationUrl, authorizationServerBase (must share one origin)",
+        ],
+      });
+    }
+    // One origin, including the issuer: kept.
+    const issuer = "https://mcp.example.com/tenant";
+    expect(
+      toServerOAuthConfig(
+        { ...provided, ...endpoints, authorizationServerBase: issuer },
+        { serverUrl }
+      ).config
+    ).toEqual({ clientId: "c", endpoints: { ...endpoints, issuer } });
   });
 
   test("a resource that does not cover the server URL is dropped", () => {

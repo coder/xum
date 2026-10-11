@@ -1974,6 +1974,60 @@ describe("AgentPluginInstallService", () => {
     await second.dispose();
   });
 
+  test("an identity change resets credentials even when another entry at the URL has it", async () => {
+    const serverUrl = "https://mcp.example.com/mcp";
+    const entry = (clientId: string) => ({
+      type: "streamable-http",
+      url: serverUrl,
+      extensions: {
+        "com.openai": { auth: { type: "oauth", client: { mode: "provided", clientId } } },
+      },
+    });
+    const writeServers = async (docsClient: string) => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "mcp.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+          mcpServers: { docs: entry(docsClient), other: entry("client-b") },
+        })
+      );
+      await commitAll(remoteDir, `docs ${docsClient}`);
+    };
+    const updater = new AgentPluginInstallService(config, {
+      mcpServerManager: {
+        stopServersWithKeyPrefix: () => Promise.resolve(),
+      } as unknown as MCPServerManager,
+    });
+    await writeServers("client-a");
+    const preview = await updater.preview({ input: remoteDir });
+    await updater.install({ source: preview.source, expectedSha: preview.lockedSha });
+    await fsPromises.writeFile(
+      path.join(muxRoot, "mcp-oauth.json"),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: { client_id: "client-a" },
+            tokens: { access_token: "at", token_type: "Bearer" },
+          },
+        },
+      })
+    );
+    const oauth = new McpOauthService(config, new MCPConfigService(config));
+    updater.setMcpOauthService(oauth);
+    // docs moves from client A to client B; "other" already uses client B.
+    await writeServers("client-b");
+    const review = await updater.previewUpdate({ name: "demo-plugin" });
+    await updater.update({
+      name: "demo-plugin",
+      consent: { fromSha: review.fromSha, toSha: review.toSha },
+    });
+    expect(await oauth.hasAuthTokens({ serverUrl })).toBe(false);
+    await oauth.dispose();
+  });
+
   test("an update review reads a Codex .mcp.json once per tree, not once per server", async () => {
     await fsPromises.rm(path.join(remoteDir, "mcp.json"));
     const servers = (secret: string) =>
@@ -2018,7 +2072,7 @@ describe("AgentPluginInstallService", () => {
         type: "oauth",
         client: { mode: "provided", clientId },
         authorizationUrl: "https://accounts.example.com/authorize",
-        tokenUrl: "https://mcp.example.com/token",
+        tokenUrl: "https://accounts.example.com/token",
       };
       await fsPromises.writeFile(
         path.join(remoteDir, "mcp.json"),
@@ -2038,7 +2092,7 @@ describe("AgentPluginInstallService", () => {
     await writeAuth("client-a");
 
     const preview = await service.preview({ input: remoteDir });
-    // The token host equals the server host, so only the foreign host gets a line.
+    // One line per foreign host, not per endpoint.
     expect(preview.mcpServers.map((server) => server.summary)).toEqual([
       "https://mcp.example.com/mcp\nSign-in at accounts.example.com",
     ]);
