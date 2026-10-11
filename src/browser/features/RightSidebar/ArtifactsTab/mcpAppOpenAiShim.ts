@@ -22,7 +22,36 @@
  * requestModal) are absent, so `if (window.openai?.selectFiles)` takes the view's fallback.
  * Shapes: https://developers.openai.com/plugins/reference.md and the Apps SDK example types.
  */
-export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
+/**
+ * Host context the frame already knows when it builds the view document, so the globals are
+ * right before any view script reads them (a widget may read theme or displayMode once at
+ * load). Host-authored values only: nothing from the view or the tool result goes in here.
+ */
+export interface McpAppOpenAiSeed {
+  theme: "light" | "dark";
+  displayMode: string;
+  locale: string;
+  platform: string;
+  /** The inline cap; null in a panel, whose frame is as tall as its container. */
+  maxHeight: number | null;
+}
+
+export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
+  // SECURITY AUDIT: host data in a script element of the view's srcdoc. JSON text is a JS
+  // expression; "<" only occurs inside its strings, where the \u003c escape is the same
+  // character, so a value cannot close this script element ("</script>") or open an HTML
+  // comment, and U+2028/U+2029 are escaped for older JS parsers.
+  const seedJson = JSON.stringify({
+    theme: seed.theme,
+    displayMode: seed.displayMode,
+    locale: seed.locale,
+    platform: seed.platform,
+    ...(seed.maxHeight != null ? { containerDimensions: { maxHeight: seed.maxHeight } } : {}),
+  })
+    .replace(/</g, "\\u003c")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+  return `(function () {
   "use strict";
   var parentWindow = window.parent;
   var dispatch = window.dispatchEvent.bind(window);
@@ -48,6 +77,8 @@ export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
     toolResponseMetadata: null,
     widgetState: null
   };
+  var seeded = fromHostContext(${seedJson});
+  for (var seedKey in seeded) globals[seedKey] = seeded[seedKey];
   setLang(globals.locale);
 
   function post(message) {
@@ -211,3 +242,4 @@ export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
     Object.defineProperty(window, "openai", { value: api, writable: true, configurable: true });
   } catch (error) {}
 })();`;
+}

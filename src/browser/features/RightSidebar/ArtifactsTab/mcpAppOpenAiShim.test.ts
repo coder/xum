@@ -7,7 +7,7 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
 import { buildMcpAppCsp, MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
 import { createMcpAppHost, type McpAppConsentRequest } from "./mcpAppHost";
-import { MCP_APP_OPENAI_SHIM_SCRIPT } from "./mcpAppOpenAiShim";
+import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
 
 interface OpenAi {
   toolOutput: unknown;
@@ -26,10 +26,18 @@ type ViewWindow = Window & {
 const GRANTED = { resourceDomains: [], connectDomains: [] };
 
 /** The document McpAppFrame builds: CSP meta, preamble, shim, then the view. */
-function viewDocument(viewHtml: string): string {
+const SEED: McpAppOpenAiSeed = {
+  theme: "light",
+  displayMode: "inline",
+  locale: "en-US",
+  platform: "desktop",
+  maxHeight: 600,
+};
+
+function viewDocument(viewHtml: string, seed: McpAppOpenAiSeed = SEED): string {
   return finalizeSandboxedDocument(parseArtifactHtml(viewHtml), {
     csp: buildMcpAppCsp(GRANTED),
-    bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, MCP_APP_OPENAI_SHIM_SCRIPT],
+    bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, mcpAppOpenAiShimScript(seed)],
   });
 }
 
@@ -41,7 +49,13 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
  */
 async function runView(
   viewScript: string,
-  options: { consent?: boolean; beforeLoad?: (win: Window) => void } = {}
+  options: {
+    consent?: boolean;
+    beforeLoad?: (win: Window) => void;
+    seed?: McpAppOpenAiSeed;
+    /** The host does not answer (yet): what the view sees before any handshake reply. */
+    silentHost?: boolean;
+  } = {}
 ) {
   const win = new Window({
     settings: {
@@ -62,7 +76,7 @@ async function runView(
   const parent = {
     postMessage: (message: { method?: string; params?: unknown }) => {
       posted.push(message);
-      void host.handleMessage(message);
+      if (!options.silentHost) void host.handleMessage(message);
     },
   };
   Object.defineProperty(win, "parent", { value: parent, configurable: true });
@@ -104,7 +118,10 @@ async function runView(
   });
   options.beforeLoad?.(win);
   win.document.write(
-    viewDocument(`<html><head></head><body><script>${viewScript}</script></body></html>`)
+    viewDocument(
+      `<html><head></head><body><script>${viewScript}</script></body></html>`,
+      options.seed
+    )
   );
   for (let i = 0; i < 5; i++) await tick();
   return { win, host, posted, consents, composer, calls, warnings };
@@ -195,6 +212,34 @@ describe("window.openai shim", () => {
     expect((t.win as unknown as { picker: unknown }).picker).toBe("own input");
     expect((t.win as unknown as { modal: unknown }).modal).toBe("own dialog");
     expect(t.warnings).toHaveLength(2);
+  });
+
+  test("host context is in the globals before any view script reads them", async () => {
+    // A host value with "</script>" or "<!--" cannot end the shim's script element.
+    const locale = "x</script><!--<script>window.broken = 1</script>";
+    const t = await runView(
+      `window.first = { theme: window.openai.theme, mode: window.openai.displayMode,
+        max: window.openai.maxHeight, locale: window.openai.locale,
+        device: window.openai.userAgent.device.type };`,
+      {
+        seed: {
+          theme: "dark",
+          displayMode: "fullscreen",
+          locale,
+          platform: "mobile",
+          maxHeight: 321,
+        },
+        silentHost: true,
+      }
+    );
+    expect((t.win as unknown as { first: unknown }).first).toEqual({
+      theme: "dark",
+      mode: "fullscreen",
+      max: 321,
+      locale,
+      device: "mobile",
+    });
+    expect((t.win as unknown as { broken?: number }).broken).toBeUndefined();
   });
 
   test("a view that redefines window.openai, before or after load, keeps rendering", async () => {

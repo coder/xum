@@ -13,7 +13,7 @@ import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/p
 import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
 import { buildMcpAppCsp, grantMcpAppCsp, MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
-import { MCP_APP_OPENAI_SHIM_SCRIPT } from "./mcpAppOpenAiShim";
+import { mcpAppOpenAiShimScript } from "./mcpAppOpenAiShim";
 import {
   createMcpAppHost,
   type McpAppConsentRequest,
@@ -167,6 +167,15 @@ export function McpAppFrame(props: {
   const allowCdn = useArtifactsAllowCdnScripts();
   const { theme: themeMode } = useTheme();
   const theme: "light" | "dark" = isLightThemeMode(themeMode) ? "light" : "dark";
+  // The window.openai globals start with this host context. Fixed at mount: a theme change or
+  // a resize must not rebuild (reload) the view document; host-context-changed tells the view.
+  const [openAiSeed] = useState(() => ({
+    theme,
+    displayMode: props.variant === "inline" ? "inline" : "fullscreen",
+    locale: navigator.language,
+    platform: hostPlatform(),
+    maxHeight: props.variant === "inline" ? inlineMaxHeight() : null,
+  }));
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [consent, setConsent] = useState<PendingConsent | null>(null);
   // Set synchronously with `consent`, so a request arriving before the re-render sees the strip.
@@ -207,7 +216,7 @@ export function McpAppFrame(props: {
     current?.view && grant
       ? finalizeSandboxedDocument(parseArtifactHtml(current.view.html), {
           csp: buildMcpAppCsp(grant.granted),
-          bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, MCP_APP_OPENAI_SHIM_SCRIPT],
+          bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, mcpAppOpenAiShimScript(openAiSeed)],
         })
       : null;
   const guard = useFrameNavigationGuard(srcDoc);

@@ -546,6 +546,21 @@ describe("McpAppFrame host strips", () => {
     }
   });
 
+  test("the view document starts with the host context, fixed at mount", async () => {
+    const tree = <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />;
+    const view = render(tree, { wrapper: Wrapper });
+    const frame = await view.findByTestId("mcp-app-frame");
+    const srcdoc = frame.getAttribute("srcdoc") ?? "";
+    expect(srcdoc).toContain('"theme":"dark","displayMode":"inline"');
+    // A resize (or theme change) must not rebuild, and so reload, the view document.
+    Object.defineProperty(window, "innerHeight", { value: 333, configurable: true });
+    await act(async () => {
+      view.rerender(tree);
+      await Promise.resolve();
+    });
+    expect(view.getByTestId("mcp-app-frame").getAttribute("srcdoc")).toBe(srcdoc);
+  });
+
   test("fullscreen from the card moves the view to its tab; inline from the tab closes it", async () => {
     // Whether the requester already had its reply when the move (which unmounts it) ran.
     const repliedAtMove: boolean[] = [];
