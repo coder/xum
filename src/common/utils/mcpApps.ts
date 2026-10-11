@@ -19,6 +19,8 @@ export const MCP_APP_RESOURCE_URI_MAX_CHARS = 512;
 export const MCP_APP_MODEL_CONTEXT_MAX_BYTES = 16 * 1024;
 /** Longest URI a view may pass to resources/read (any scheme its server serves). */
 export const MCP_APP_READ_URI_MAX_CHARS = 2048;
+/** Most tool calls one mcpApps.getViewRecords request may name (the client splits longer lists). */
+export const MCP_APP_VIEW_RECORDS_MAX_IDS = 64;
 
 export type MCPToolVisibility = "model" | "app";
 

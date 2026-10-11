@@ -33,6 +33,7 @@ import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
 import * as TimelineDialogModule from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 import * as ArtifactsDialogModule from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
 import * as AppViewDialogModule from "@/browser/features/RightSidebar/AppViewTab/AppViewDialog";
+import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import * as StatsDialogModule from "@/browser/features/RightSidebar/StatsDialog";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
@@ -893,6 +894,32 @@ describe("WorkspaceMenuBar archive confirmations", () => {
         widen();
         expect([tab, activeTab()]).toEqual([tab, tab]);
         view.unmount();
+      }
+    });
+
+    it('"Open in tab" opens the view\'s own app tab once the sidebar shows again', () => {
+      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+      // The sheet itself is not under test here (it needs its Dialog context).
+      const sheetSpy = spyOn(AppViewDialogModule, "AppViewDialog").mockImplementation(
+        (() => null) as unknown as typeof AppViewDialogModule.AppViewDialog
+      );
+      try {
+        const widen = widenable();
+        focusRightSidebarTab(workspaceId, "review");
+        render(<WorkspaceMenuBar {...defaultProps} />);
+        act(() => {
+          window.dispatchEvent(
+            createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, {
+              workspaceId,
+              toolCallId: "call-w",
+            })
+          );
+        });
+        widen();
+        expect(activeTab()).toBe(appViewTabFor("call-w"));
+        expect(allTabs()).not.toContain("artifacts");
+      } finally {
+        sheetSpy.mockRestore();
       }
     });
 

@@ -151,6 +151,17 @@ describe("McpAppResultStore model context", () => {
     expect(section).toContain('server="\\"\\u003e\\u003c/view\\u003e');
   });
 
+  test("context stored before consent existed (a version 1 file) reads as none", async () => {
+    using tmp = new DisposableTempDir("mcp-app-context");
+    const sessionDir = await sessionsIn(tmp);
+    const store = new McpAppResultStore(sessionDir);
+    await store.setModelContext("ws", view("c1", "allowed"));
+    const file = path.join(tmp.path, "ws", MCP_APP_MODEL_CONTEXT_FILE);
+    const current = JSON.parse(await fs.readFile(file, "utf8")) as { views: unknown[] };
+    await fs.writeFile(file, JSON.stringify({ version: 1, views: current.views }));
+    expect(await new McpAppResultStore(sessionDir).getModelContexts("ws")).toEqual([]);
+  });
+
   test("a cold read that finishes after an update does not bring back the old context", async () => {
     using tmp = new DisposableTempDir("mcp-app-context");
     const sessionDir = await sessionsIn(tmp);
@@ -201,6 +212,39 @@ describe("McpAppResultStore model context", () => {
     expect(
       (await new McpAppResultStore(sessionDir).getModelContexts("ws")).map((v) => v.text)
     ).toEqual(["c"]);
+  });
+
+  test("updates dropped for a newer one fail when the newer write fails", async () => {
+    using tmp = new DisposableTempDir("mcp-app-context");
+    const sessionDir = await sessionsIn(tmp);
+    const store = new McpAppResultStore(sessionDir);
+    await store.setModelContext("ws", view("c1", "stored"));
+    const contextFile = path.join(tmp.path, "ws", MCP_APP_MODEL_CONTEXT_FILE);
+    const realRename = fsSync.rename;
+    const rename = spyOn(fsSync, "rename").mockImplementation(((
+      from: fsSync.PathLike,
+      to: fsSync.PathLike,
+      callback: fsSync.NoParamCallback
+    ) => {
+      if (String(to) === contextFile) return callback(new Error("disk full"));
+      return realRename(from, to, callback);
+    }) as typeof fsSync.rename);
+    let outcomes: string[];
+    try {
+      outcomes = await Promise.all(
+        ["a", "b", "c"].map((text) =>
+          store.setModelContext("ws", view("c1", text)).then(
+            () => "stored",
+            (error: unknown) => String(error)
+          )
+        )
+      );
+    } finally {
+      rename.mockRestore();
+    }
+    // "a" and "b" were dropped for "c", so they report "c"'s failure, not success.
+    expect(outcomes).toEqual(["Error: disk full", "Error: disk full", "Error: disk full"]);
+    expect((await store.getModelContexts("ws")).map((v) => v.text)).toEqual(["stored"]);
   });
 
   test("a write for a removed workspace is refused and never recreates its session", async () => {

@@ -14,6 +14,12 @@ import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
 import { markMcpAppViewHosted, type McpAppViewRef } from "./mcpAppViewsStore";
+import { appViewTabFor, withAppViewTab } from "../AppViewTab/appViewTabs";
+import { collectAllTabs } from "@/browser/utils/rightSidebarLayout";
+import {
+  readRightSidebarLayout,
+  updateRightSidebarLayout,
+} from "@/browser/utils/rightSidebarTabFocus";
 
 // The card's display values: the aggregated tool name and the pre-sanitization arguments.
 const VIEW: McpAppViewRef = {
@@ -221,6 +227,21 @@ describe("McpAppFrame", () => {
     const args = view.getByTestId("mcp-app-consent-args").textContent ?? "";
     expect(args).toContain("x".repeat(2000));
     expect(args).toContain('"city": "Berlin"');
+  });
+
+  test("the context consent strip shows the view's full context as plain text", async () => {
+    const { view, frame } = await renderFrame();
+    const text = `<b>bold</b> ${"y".repeat(2000)} END`;
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "ui/update-model-context",
+      params: { content: [{ type: "text", text }] },
+    });
+    await view.findByRole("alert");
+    const shown = view.getByTestId("mcp-app-consent-args");
+    expect(shown.textContent).toBe(text);
+    expect(shown.querySelector("b")).toBeNull();
   });
 
   test("a plugin server shows its server part, and its instance marker where consent is asked", async () => {
@@ -624,7 +645,9 @@ describe("McpAppFrame host strips", () => {
       expect(noCard.initial.displayMode).toBe("fullscreen");
       expect(noCard.reply).toEqual({ mode: "fullscreen" });
       expect(closed).toBe(0);
-      // With an expanded card, inline closes the tab (the card takes the view back).
+      // With an expanded card, inline closes the tab (the card takes the view back). From the
+      // phone sheet, whose close only closes the dialog, the stored tab goes as well.
+      updateRightSidebarLayout("ws", (layout) => withAppViewTab(layout, "call-1"));
       const unmarkCard = markMcpAppViewHosted("ws", "call-1", "card");
       try {
         const tab = await run(undefined, "inline");
@@ -633,6 +656,9 @@ describe("McpAppFrame host strips", () => {
         unmarkCard();
       }
       expect(closed).toBe(1);
+      expect(collectAllTabs(readRightSidebarLayout("ws").root)).not.toContain(
+        appViewTabFor("call-1")
+      );
       expect(opened).toEqual(["call-1"]);
       expect(repliedAtMove).toEqual([true, true]);
     } finally {
