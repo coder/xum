@@ -1,11 +1,12 @@
 /**
  * MCP Apps route operations (artifacts experiment): open a view (resources/read + host-only
- * tool result) and proxy tools/call issued by a view to its own server.
+ * tool result) and proxy tools/call and resources/read issued by a view to its own server.
  */
 import { ORPCError } from "@orpc/server";
 import type { z } from "zod";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
+  McpAppResourceReadRequestSchema,
   McpAppToolCallRequestSchema,
   McpAppToolCallResult,
   McpAppView,
@@ -18,7 +19,7 @@ import { displayConnectionKey } from "./mcpServerIdentity";
 
 type McpAppsContext = Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
 
-/** Largest view-initiated tools/call result returned to a view. */
+/** Largest view-initiated tools/call or resources/read result returned to a view. */
 export const MCP_APP_TOOL_RESULT_MAX_BYTES = 2 * 1024 * 1024;
 
 function assertMcpAppsEnabled(context: McpAppsContext): void {
@@ -115,6 +116,32 @@ export async function callMcpAppTool(
       return { success: false, error: "The tool result is too large to return to the view" };
     }
     return { success: true, data: outcome };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+/**
+ * resources/read issued by a view. The frame passes the view's bound server (the same binding as
+ * its tools/call), so a view can only read from the server that produced it.
+ */
+export async function readMcpAppServerResource(
+  context: McpAppsContext,
+  input: z.infer<typeof McpAppResourceReadRequestSchema>,
+  signal?: AbortSignal
+): Promise<Result<unknown, string>> {
+  assertMcpAppsEnabled(context);
+  try {
+    const result = await context.mcpServerManager.readMcpAppServerResource(
+      input.workspaceId,
+      input.serverName,
+      input.uri,
+      signal !== undefined ? { signal } : undefined
+    );
+    if (Buffer.byteLength(JSON.stringify(result) ?? "", "utf8") > MCP_APP_TOOL_RESULT_MAX_BYTES) {
+      return { success: false, error: "The resource is too large to return to the view" };
+    }
+    return { success: true, data: result };
   } catch (error) {
     return { success: false, error: getErrorMessage(error) };
   }

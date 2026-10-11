@@ -257,6 +257,16 @@ export function McpAppFrame(props: {
         if (!result.success) throw new Error(result.error);
         return result.data;
       },
+      // Same server binding as callTool: reads go only to the server that produced the view.
+      readResource: async (uri) => {
+        const result = await api.mcpApps.readResource({
+          workspaceId,
+          serverName: boundServerName,
+          uri,
+        });
+        if (!result.success) throw new Error(result.error);
+        return result.data;
+      },
       requestConsent: (request) =>
         new Promise<boolean>((resolve) => {
           // One strip at a time, and a shown strip is never replaced: a frame could otherwise

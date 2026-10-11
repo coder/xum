@@ -4610,6 +4610,28 @@ export class MCPServerManager {
   }
 
   /**
+   * resources/read issued by an MCP Apps view of `serverName` (the caller passes the view's own
+   * server, so reads never cross servers). Returns the server's raw ReadResourceResult. Any URI
+   * the server serves is allowed: the view is that server's own UI, so it reads nothing the
+   * server could not already hand it through a tool result.
+   */
+  async readMcpAppServerResource(
+    workspaceId: string,
+    serverName: string,
+    uri: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<unknown> {
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP Apps resource read for '${serverName}'`,
+      (instance) => requireAppsConnection(instance).readResource(uri, options),
+      (result): unknown => result,
+      options
+    );
+  }
+
+  /**
    * tools/call on behalf of an MCP Apps view of `serverName` (the caller passes the view's own
    * server, so calls never cross servers). Enforces the spec's visibility rules: tools whose
    * visibility lacks "app" are rejected, and tools also visible to the model need the user's

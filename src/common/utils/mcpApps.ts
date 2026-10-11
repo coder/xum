@@ -10,6 +10,8 @@ export const MCP_APP_MIME_TYPE = "text/html;profile=mcp-app";
 export const MCP_APP_RESOURCE_MAX_BYTES = 2 * 1024 * 1024;
 /** Longest ui:// URI kept on tool metadata and display snapshots. */
 export const MCP_APP_RESOURCE_URI_MAX_CHARS = 512;
+/** Longest URI a view may pass to resources/read (any scheme its server serves). */
+export const MCP_APP_READ_URI_MAX_CHARS = 2048;
 
 export type MCPToolVisibility = "model" | "app";
 
@@ -41,6 +43,11 @@ const DEFAULT_VISIBILITY: readonly MCPToolVisibility[] = ["model", "app"];
 
 /**
  * Read a tool definition's `_meta.ui` (or the deprecated flat `_meta["ui/resourceUri"]`).
+ * The view URI is taken from the first key present, in this order: `_meta.ui.resourceUri`,
+ * `_meta["ui/resourceUri"]`, then ChatGPT's compatibility alias `_meta["openai/outputTemplate"]`
+ * (so servers built for ChatGPT render here too). ChatGPT's `openai/visibility` and
+ * `openai/widgetAccessible` are not mapped: their documented semantics do not say how they
+ * combine with the spec's default visibility, so only `_meta.ui.visibility` counts.
  * The view URI and the visibility are parsed independently: an invalid or missing ui:// view
  * drops only `resourceUri`, never a declared visibility (a `visibility: ["app"]` helper must
  * stay hidden from the model). Returns undefined when neither is declared. Visibility defaults
@@ -49,7 +56,7 @@ const DEFAULT_VISIBILITY: readonly MCPToolVisibility[] = ["model", "app"];
 export function parseMCPToolUiMeta(meta: unknown): MCPToolUi | undefined {
   if (!isRecord(meta)) return undefined;
   const ui = isRecord(meta.ui) ? meta.ui : undefined;
-  const rawResourceUri = ui?.resourceUri ?? meta["ui/resourceUri"];
+  const rawResourceUri = ui?.resourceUri ?? meta["ui/resourceUri"] ?? meta["openai/outputTemplate"];
   const resourceUri = isMcpAppResourceUri(rawResourceUri) ? rawResourceUri : undefined;
   const rawVisibility = ui?.visibility;
   if (resourceUri === undefined && !Array.isArray(rawVisibility)) return undefined;

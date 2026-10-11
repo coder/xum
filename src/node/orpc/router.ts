@@ -50,7 +50,11 @@ import {
   sendInteractionRoute,
   setStateRoute,
 } from "@/node/services/artifactInteractions";
-import { callMcpAppTool, getMcpAppView } from "@/node/services/mcpAppsOperations";
+import {
+  callMcpAppTool,
+  getMcpAppView,
+  readMcpAppServerResource,
+} from "@/node/services/mcpAppsOperations";
 import {
   listArtifactVersions,
   readArtifactVersion,
@@ -1697,6 +1701,10 @@ export const router = (authToken?: string) => {
         .input(schemas.mcpApps.callTool.input)
         .output(schemas.mcpApps.callTool.output)
         .handler(({ context, input, signal }) => callMcpAppTool(context, input, signal)),
+      readResource: t
+        .input(schemas.mcpApps.readResource.input)
+        .output(schemas.mcpApps.readResource.output)
+        .handler(({ context, input, signal }) => readMcpAppServerResource(context, input, signal)),
     },
     // Memory handlers run Effect generators via handlerGen (client aborts
     // interrupt the fiber); the wire contracts are unchanged.

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { isMcpAppResourceUri } from "@/common/utils/mcpApps";
+import { isMcpAppResourceUri, MCP_APP_READ_URI_MAX_CHARS } from "@/common/utils/mcpApps";
 
 /**
  * MCP Apps views in the Artifacts tab (artifacts experiment). The view HTML comes from the
@@ -56,6 +56,13 @@ export const McpAppToolCallRequestSchema = z.object({
   arguments: z.record(z.string(), z.unknown()),
   /** The user allowed this call in the confirm strip (required for model-visible tools). */
   consented: z.boolean(),
+});
+
+/** resources/read issued by a view; the server is the view's own (bound) server. */
+export const McpAppResourceReadRequestSchema = z.object({
+  workspaceId: z.string().min(1),
+  serverName: z.string().min(1),
+  uri: z.string().min(1).max(MCP_APP_READ_URI_MAX_CHARS),
 });
 
 export const McpAppToolCallResultSchema = z.discriminatedUnion("status", [

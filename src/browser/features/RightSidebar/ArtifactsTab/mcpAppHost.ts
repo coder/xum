@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MCP_APP_READ_URI_MAX_CHARS } from "@/common/utils/mcpApps";
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
 import { createBridgeRateLimiter } from "./artifactBridge";
 import type { GrantedMcpAppCsp } from "./mcpAppCsp";
@@ -10,9 +11,9 @@ import type { GrantedMcpAppCsp } from "./mcpAppCsp";
  *
  * Implemented view -> host methods: ui/initialize, ui/notifications/initialized, ping,
  * ui/notifications/size-changed, notifications/message, tools/call (own server only, visibility
- * and consent rules enforced by the backend), ui/open-link (https, after a confirm),
- * ui/message (inserted into the composer after a confirm, never sent). Every other request
- * gets -32601.
+ * and consent rules enforced by the backend), resources/read (own server only), ui/open-link
+ * (https, after a confirm), ui/message (inserted into the composer after a confirm, never sent).
+ * Every other request gets -32601.
  */
 
 export const MCP_APP_PROTOCOL_VERSION = "2026-01-26";
@@ -21,7 +22,10 @@ const INVALID_REQUEST = -32600;
 const INVALID_PARAMS = -32602;
 const REQUEST_FAILED = -32000;
 
-/** View-initiated tools/call budget, on top of the frame's message rate limit. */
+/**
+ * View-initiated tools/call + resources/read budget (shared: both reach the server), on top of
+ * the frame's message rate limit.
+ */
 const TOOL_CALLS_PER_WINDOW = 5;
 const TOOL_CALL_WINDOW_MS = 10_000;
 /**
@@ -64,11 +68,34 @@ const ToolCallParams = z.object({
   name: z.string().min(1).max(256),
   arguments: z.record(z.string(), z.unknown()).optional(),
 });
+const ReadResourceParams = z.object({ uri: z.string().min(1).max(MCP_APP_READ_URI_MAX_CHARS) });
 const OpenLinkParams = z.object({ url: z.string().max(4096) });
+const MESSAGE_TEXT_MAX_CHARS = 32_000;
+const TextBlock = z.object({ type: z.literal("text"), text: z.string() });
+/**
+ * The spec's single text block, or the content-block array of the ext-apps SDK and ChatGPT
+ * (`content: [{ type: "text", text }]`, optional `_meta["openai/message"]`). Non-text blocks
+ * are checked after parsing so they get a precise error. `_meta` is accepted and ignored: Xum
+ * never sends the message, whatever `_meta["openai/message"]` asks for.
+ */
 const MessageParams = z.object({
   role: z.literal("user"),
-  content: z.object({ type: z.literal("text"), text: z.string().max(32_000) }),
+  content: z.union([TextBlock, z.array(z.unknown()).min(1).max(64)]),
+  _meta: z.record(z.string(), z.unknown()).optional(),
 });
+
+/** The message text, or null when a block is not text or the text is too long. */
+function messageText(content: z.infer<typeof MessageParams>["content"]): string | null {
+  const blocks = Array.isArray(content) ? content : [content];
+  const texts: string[] = [];
+  for (const block of blocks) {
+    const parsed = TextBlock.safeParse(block);
+    if (!parsed.success) return null;
+    texts.push(parsed.data.text);
+  }
+  const text = texts.join("\n");
+  return text.length <= MESSAGE_TEXT_MAX_CHARS ? text : null;
+}
 
 export type McpAppConsentRequest =
   /** `args` are exactly what the backend receives once allowed, shown in the strip. */
@@ -101,6 +128,8 @@ export interface McpAppHostOptions {
     args: Record<string, unknown>,
     consented: boolean
   ) => Promise<McpAppToolCallResult>;
+  /** Backend resources/read, bound to the view's own server like callTool. */
+  readResource: (uri: string) => Promise<unknown>;
   requestConsent: (request: McpAppConsentRequest) => Promise<boolean>;
   insertIntoComposer: (text: string) => void;
   openExternalLink: (url: string) => void;
@@ -114,7 +143,7 @@ export function clampMcpAppHeight(height: number): number {
 }
 
 export function createMcpAppHost(options: McpAppHostOptions) {
-  const allowToolCall = createBridgeRateLimiter(TOOL_CALLS_PER_WINDOW, TOOL_CALL_WINDOW_MS);
+  const allowServerRequest = createBridgeRateLimiter(TOOL_CALLS_PER_WINDOW, TOOL_CALL_WINDOW_MS);
   const pendingHostRequests = new Map<string, (ok: boolean) => void>();
   let nextHostRequestId = 1;
   let initialized = false;
@@ -135,6 +164,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
           // Advertise only what is implemented.
           hostCapabilities: {
             serverTools: {},
+            serverResources: {},
             logging: {},
             openLinks: {},
             sandbox: { csp: options.grantedCsp },
@@ -148,7 +178,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
       case "tools/call": {
         const parsed = ToolCallParams.safeParse(params);
         if (!parsed.success) return fail(id, INVALID_PARAMS, "Invalid tools/call params");
-        if (!allowToolCall())
+        if (!allowServerRequest())
           return fail(id, REQUEST_FAILED, "Too many tool calls; try again shortly");
         const { name } = parsed.data;
         const args = parsed.data.arguments ?? {};
@@ -179,6 +209,20 @@ export function createMcpAppHost(options: McpAppHostOptions) {
           return fail(id, REQUEST_FAILED, error instanceof Error ? error.message : String(error));
         }
       }
+      case "resources/read": {
+        const parsed = ReadResourceParams.safeParse(params);
+        if (!parsed.success) return fail(id, INVALID_PARAMS, "Invalid resources/read params");
+        if (!allowServerRequest())
+          return fail(id, REQUEST_FAILED, "Too many server requests; try again shortly");
+        options.log("resources/read", { uri: parsed.data.uri });
+        try {
+          // The request names only a URI: options.readResource is bound to this view's server,
+          // so a view cannot read another server's resources.
+          return respond(id, await options.readResource(parsed.data.uri));
+        } catch (error) {
+          return fail(id, REQUEST_FAILED, error instanceof Error ? error.message : String(error));
+        }
+      }
       case "ui/open-link": {
         const parsed = OpenLinkParams.safeParse(params);
         let url: URL | null = null;
@@ -205,9 +249,8 @@ export function createMcpAppHost(options: McpAppHostOptions) {
       }
       case "ui/message": {
         const parsed = MessageParams.safeParse(params);
-        if (!parsed.success)
-          return fail(id, INVALID_PARAMS, "Only user text messages are supported");
-        const { text } = parsed.data.content;
+        const text = parsed.success ? messageText(parsed.data.content) : null;
+        if (text === null) return fail(id, INVALID_PARAMS, "Only user text messages are supported");
         // Never inserted unasked (the user may be typing) and never sent: the user confirms the
         // insert in the host strip, then reviews and sends it from the composer.
         if (!(await options.requestConsent({ kind: "message", text }))) {

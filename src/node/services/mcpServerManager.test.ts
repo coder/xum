@@ -709,6 +709,49 @@ describe("MCPServerManager", () => {
     expect(calls).toBe(1);
   });
 
+  test("a view's resources/read reaches only the named server", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-read");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({
+      apps: stdioConfig("apps-read"),
+      other: stdioConfig("apps-read-other"),
+    });
+    const reads: string[] = [];
+    const serveReads = (command: string) =>
+      servers.serve(command, {
+        tools: { show: testTool() },
+        apps: {
+          hasTool: () => true,
+          toolUi: () => undefined,
+          callToolForApp: () => Promise.reject(new Error("unused")),
+          readResource: (uri: string) => {
+            reads.push(`${command} ${uri}`);
+            return Promise.resolve({ contents: [{ uri, text: command }] });
+          },
+        },
+      });
+    serveReads("apps-read");
+    serveReads("apps-read-other");
+    const request = workspaceRequest("apps-read");
+    await manager.getToolsForWorkspace(request);
+
+    const result = await manager.readMcpAppServerResource(request.workspaceId, "apps", "ui://x/a");
+    expect(result).toEqual({ contents: [{ uri: "ui://x/a", text: "apps-read" }] });
+    expect(reads).toEqual(["apps-read ui://x/a"]);
+    // A server the workspace does not run is refused before any read.
+    const refused = await manager
+      .readMcpAppServerResource(request.workspaceId, "missing", "ui://x/a")
+      .then(
+        () => null,
+        (error: unknown) => error
+      );
+    expect(refused).toBeInstanceOf(Error);
+    expect(reads).toEqual(["apps-read ui://x/a"]);
+  });
+
   test("idle cleanup retries retired-only failures without another MCP request", async () => {
     using tmp = new DisposableTempDir("mcp-retired-idle");
     const f = await componentFixture(tmp.path);

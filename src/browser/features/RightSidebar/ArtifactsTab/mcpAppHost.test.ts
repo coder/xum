@@ -12,6 +12,7 @@ import {
 function setup(overrides: Partial<McpAppHostOptions> = {}) {
   const sent: Array<Record<string, unknown>> = [];
   const calls: Array<{ toolName: string; consented: boolean }> = [];
+  const reads: string[] = [];
   const consents: McpAppConsentRequest[] = [];
   const composer: string[] = [];
   const opened: string[] = [];
@@ -40,6 +41,11 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
         return Promise.resolve({ status: "rejected", reason: "not for apps" });
       return Promise.resolve({ status: "ok", result: { content: [] } });
     },
+    readResource: (uri) => {
+      reads.push(uri);
+      if (uri === "ui://missing") return Promise.reject(new Error("Resource not found"));
+      return Promise.resolve({ contents: [{ uri, mimeType: "text/plain", text: "data" }] });
+    },
     requestConsent: (request) => {
       consents.push(request);
       return Promise.resolve(true);
@@ -58,6 +64,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
     host,
     sent,
     calls,
+    reads,
     consents,
     composer,
     opened,
@@ -84,6 +91,7 @@ describe("MCP Apps host router", () => {
       protocolVersion: "2026-01-26",
       hostCapabilities: {
         serverTools: {},
+        serverResources: {},
         logging: {},
         openLinks: {},
         sandbox: { csp: { resourceDomains: [], connectDomains: [] } },
@@ -95,6 +103,7 @@ describe("MCP Apps host router", () => {
       "logging",
       "openLinks",
       "sandbox",
+      "serverResources",
       "serverTools",
     ]);
     await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
@@ -105,7 +114,7 @@ describe("MCP Apps host router", () => {
   test("unknown methods get -32601 and malformed messages are rejected", async () => {
     const t = setup();
     for (const [id, method] of [
-      [2, "resources/read"],
+      [2, "resources/subscribe"],
       [3, "ui/update-model-context"],
       [4, "ui/request-display-mode"],
       [5, "sampling/createMessage"],
@@ -218,5 +227,74 @@ describe("MCP Apps host router", () => {
     expect(teardown.method).toBe("ui/resource-teardown");
     await t.host.handleMessage({ jsonrpc: "2.0", id: teardown.id, result: {} });
     await done;
+  });
+
+  test("resources/read goes to the view's own server and returns its result", async () => {
+    const t = setup();
+    await t.request(1, "resources/read", { uri: "ui://charts/data.json" });
+    expect(t.reads).toEqual(["ui://charts/data.json"]);
+    expect(t.reply(1)?.result).toEqual({
+      contents: [{ uri: "ui://charts/data.json", mimeType: "text/plain", text: "data" }],
+    });
+    // The server's failure (e.g. a URI it does not serve) reaches the view as an error.
+    await t.request(2, "resources/read", { uri: "ui://missing" });
+    expect(t.reply(2)?.error).toEqual({ code: -32000, message: "Resource not found" });
+    await t.request(3, "resources/read", {});
+    expect((t.reply(3)?.error as { code: number }).code).toBe(-32602);
+    expect(t.reads).toHaveLength(2);
+  });
+
+  test("resources/read shares the tools/call budget", async () => {
+    const t = setup();
+    for (let id = 1; id <= 4; id++) await t.request(id, "tools/call", { name: "app_tool" });
+    await t.request(5, "resources/read", { uri: "ui://charts/a" });
+    await t.request(6, "resources/read", { uri: "ui://charts/b" });
+    expect(t.reads).toEqual(["ui://charts/a"]);
+    expect((t.reply(6)?.error as { code: number }).code).toBe(-32000);
+  });
+
+  test("ui/message accepts the content-block array form, after the same confirm", async () => {
+    const t = setup();
+    await t.request(1, "ui/message", {
+      role: "user",
+      content: [
+        { type: "text", text: "line one" },
+        { type: "text", text: "line two" },
+      ],
+      // ChatGPT's send hint is ignored: the text is only inserted, never sent.
+      _meta: { "openai/message": { send: true } },
+    });
+    expect(t.consents).toEqual([{ kind: "message", text: "line one\nline two" }]);
+    expect(t.composer).toEqual(["line one\nline two"]);
+    expect(t.reply(1)?.result).toEqual({});
+
+    const declined = setup({ requestConsent: () => Promise.resolve(false) });
+    await declined.request(2, "ui/message", {
+      role: "user",
+      content: [{ type: "text", text: "x" }],
+    });
+    expect(declined.composer).toEqual([]);
+  });
+
+  test("ui/message rejects non-text or empty content without asking", async () => {
+    const t = setup();
+    await t.request(1, "ui/message", {
+      role: "user",
+      content: [
+        { type: "text", text: "see" },
+        { type: "image", data: "AAAA", mimeType: "image/png" },
+      ],
+    });
+    await t.request(2, "ui/message", { role: "user", content: [] });
+    await t.request(3, "ui/message", {
+      role: "user",
+      content: [
+        { type: "text", text: "x".repeat(20_000) },
+        { type: "text", text: "x".repeat(20_000) },
+      ],
+    });
+    for (const id of [1, 2, 3]) expect((t.reply(id)?.error as { code: number }).code).toBe(-32602);
+    expect(t.consents).toEqual([]);
+    expect(t.composer).toEqual([]);
   });
 });

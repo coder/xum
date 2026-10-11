@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { ORPCContext } from "@/node/orpc/context";
 import type { McpAppResultRecord } from "./mcpAppResultStore";
-import { getMcpAppView } from "./mcpAppsOperations";
+import {
+  getMcpAppView,
+  MCP_APP_TOOL_RESULT_MAX_BYTES,
+  readMcpAppServerResource,
+} from "./mcpAppsOperations";
 
 const RECORD: McpAppResultRecord = {
   version: 1,
@@ -100,5 +104,41 @@ describe("getMcpAppView", () => {
     if (!result.success) throw new Error(result.error);
     expect(result.data.invocation).toBeNull();
     expect(result.data.resultAvailable).toBe(false);
+  });
+});
+
+describe("readMcpAppServerResource", () => {
+  function readContext(result: unknown) {
+    const reads: Array<{ serverName: string; uri: string }> = [];
+    const ctx = {
+      experimentsService: { isExperimentEnabled: () => true },
+      mcpServerManager: {
+        readMcpAppServerResource: (_workspaceId: string, serverName: string, uri: string) => {
+          reads.push({ serverName, uri });
+          return result instanceof Error ? Promise.reject(result) : Promise.resolve(result);
+        },
+      },
+    } as unknown as Pick<ORPCContext, "experimentsService" | "mcpServerManager">;
+    return { ctx, reads };
+  }
+  const input = { workspaceId: "ws", serverName: "charts", uri: "ui://charts/data" };
+
+  test("returns the named server's result", async () => {
+    const { ctx, reads } = readContext({ contents: [] });
+    expect(await readMcpAppServerResource(ctx, input)).toEqual({
+      success: true,
+      data: { contents: [] },
+    });
+    expect(reads).toEqual([{ serverName: "charts", uri: "ui://charts/data" }]);
+  });
+
+  test("refuses oversized results and reports server errors", async () => {
+    const big = { contents: [{ text: "x".repeat(MCP_APP_TOOL_RESULT_MAX_BYTES) }] };
+    expect((await readMcpAppServerResource(readContext(big).ctx, input)).success).toBe(false);
+    const failed = await readMcpAppServerResource(
+      readContext(new Error("not connected")).ctx,
+      input
+    );
+    expect(failed).toEqual({ success: false, error: "not connected" });
   });
 });
