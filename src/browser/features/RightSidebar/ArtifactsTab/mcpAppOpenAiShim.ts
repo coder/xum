@@ -15,9 +15,10 @@
  * Handshake: standard views initialize themselves, and the shim reads the host's replies and
  * notifications passively. The shim sends its own ui/initialize only when the view first uses
  * `window.openai` and no handshake was seen yet, so a standard-only view gets no extra
- * handshake. If the view's own client connects later, the host sends it the tool lifecycle
- * again, and the shim leaves teardown replies to that client. Members without a standard equivalent warn once; their Promises reject and
- * nothing throws. setWidgetState updates window.openai.widgetState in this page only: the state
+ * handshake. The host sends the tool lifecycle (tool-input, tool-result or tool-cancelled) once
+ * per frame, so if the view's own client connects after the shim, the shim replays the
+ * lifecycle it received to that client, in this page, and leaves teardown replies to it.
+ * Members without a standard equivalent warn once; their Promises reject and nothing throws. setWidgetState updates window.openai.widgetState in this page only: the state
  * lasts as long as the frame (a collapsed card or a move to the tab starts with null). Optional
  * extensions Xum lacks (uploadFile, selectFiles, getFileDownloadUrl, requestCheckout,
  * requestModal) are absent, so `if (window.openai?.selectFiles)` takes the view's fallback.
@@ -57,6 +58,8 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
   var parentWindow = window.parent;
   var dispatch = window.dispatchEvent.bind(window);
   var CustomEventCtor = window.CustomEvent;
+  var MessageEventCtor = window.MessageEvent;
+  var setTimer = window.setTimeout.bind(window);
   var warn = console.warn.bind(console);
   var media = typeof window.matchMedia === "function" ? window.matchMedia.bind(window) : null;
   var pending = new Map();
@@ -65,6 +68,9 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
   var ownHandshake = false;
   // A handshake reply that was not the shim's: the view's own MCP Apps client is connected.
   var standardClient = false;
+  // The tool lifecycle as the host sent it ({ data, origin }), for a client that connects late.
+  var lifecycle = [];
+  var replaying = false;
   var warned = {};
   var globals = {
     theme: "light",
@@ -120,15 +126,41 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
     return patch;
   }
 
+  // The view's own client connected after the shim's handshake took the host's one lifecycle:
+  // hand it what arrived so far, as the host's messages (the SDK checks only event.source).
+  // After this task, so the client has handled its initialize reply and sent initialized.
+  // Page-local: nothing reaches the host, and later messages reach the client directly.
+  function replayLifecycle() {
+    var messages = lifecycle.slice();
+    if (messages.length === 0) return;
+    setTimer(function () {
+      replaying = true;
+      try {
+        messages.forEach(function (message) {
+          dispatch(new MessageEventCtor("message", {
+            data: message.data,
+            origin: message.origin,
+            source: parentWindow
+          }));
+        });
+      } finally {
+        replaying = false;
+      }
+    }, 0);
+  }
+
   window.addEventListener("message", function (event) {
-    if (event.source !== parentWindow) return;
+    if (replaying || event.source !== parentWindow) return;
     var data = event.data;
     if (!data || typeof data !== "object" || data.jsonrpc !== "2.0") return;
     var params = data.params && typeof data.params === "object" ? data.params : {};
     if (data.method === undefined) {
       if (data.result && typeof data.result === "object" && data.result.hostContext) {
         handshakeSeen = true;
-        if (!pending.has(data.id)) standardClient = true;
+        if (!pending.has(data.id) && !standardClient) {
+          standardClient = true;
+          if (ownHandshake) replayLifecycle();
+        }
         setGlobals(fromHostContext(data.result.hostContext));
       }
       var settle = pending.get(data.id);
@@ -137,6 +169,13 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
         settle(data);
       }
       return;
+    }
+    if (
+      data.method === "ui/notifications/tool-input" ||
+      data.method === "ui/notifications/tool-result" ||
+      data.method === "ui/notifications/tool-cancelled"
+    ) {
+      lifecycle.push({ data: data, origin: event.origin });
     }
     switch (data.method) {
       case "ui/notifications/tool-input":
