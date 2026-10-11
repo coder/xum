@@ -62,6 +62,8 @@ export function writeNeutralSeed(outDir: string) {
     taskSettings: { preserveSubagentsUntilArchive: true },
     viewedSplashScreens: ["onboarding-wizard-v1"],
     userPreferences: { ui: { tutorialState } },
+    // Pinned: with no routePriority, a load derives one from any gateway credential in the env.
+    routePriority: ["direct"],
   };
   fs.writeFileSync(path.join(root, "config.json"), `${JSON.stringify(config, null, 2)}\n`);
   // 4 rows: user, assistant with a fenced ts block (P2's target line), user, assistant with a list.
@@ -74,10 +76,11 @@ export function writeNeutralSeed(outDir: string) {
 /** Every file under dir by relative path, as raw bytes. `.git/` is skipped: git may rewrite its index. */
 export function snapshotSeed(dir: string): Map<string, Buffer> {
   const files = new Map<string, Buffer>();
-  for (const entry of fs.readdirSync(dir, { recursive: true, withFileTypes: true })) {
-    const rel = path.relative(dir, path.join(entry.parentPath, entry.name));
-    if (entry.isFile() && !rel.split(path.sep).includes(".git")) {
-      files.set(rel, fs.readFileSync(path.join(dir, rel)));
+  // String entries, not Dirent.parentPath: that field needs Node 20.12, and the repo admits any Node 20.
+  for (const rel of fs.readdirSync(dir, { recursive: true, encoding: "utf8" })) {
+    const full = path.join(dir, rel);
+    if (!rel.split(path.sep).includes(".git") && fs.lstatSync(full).isFile()) {
+      files.set(rel, fs.readFileSync(full));
     }
   }
   return files;
