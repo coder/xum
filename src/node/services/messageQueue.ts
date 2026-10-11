@@ -261,6 +261,18 @@ function clearCallbacksFor(entry: QueueEntry): QueueClearCallbacks {
 }
 
 /**
+ * The texts a composer restore gets for an entry: the authored texts, except that a compaction
+ * entry's first text is its model-facing summarization prompt, so the user's command comes back
+ * instead. Texts queued behind it follow, so "/compact" plus a draft is re-sent as one /compact
+ * with that follow-up.
+ */
+function restoredTextsOf(entry: QueueEntry): readonly string[] {
+  return isCompactionMetadata(entry.muxMetadata)
+    ? [entry.muxMetadata.rawCommand, ...entry.authoredMessages.slice(1)]
+    : entry.authoredMessages;
+}
+
+/**
  * One dispatchable unit in the queue. Plain follow-up messages batch into a single
  * entry (joined text, accumulated file parts); "special" sends (compaction requests,
  * agent-skill invocations, workspace-turn follow-ups, callback-carrying internal
@@ -1112,7 +1124,7 @@ export class MessageQueue {
     return this.restorableEntries(this.entries).map((entry) => {
       const reviews = this.getReviewsForEntries([entry]);
       return {
-        text: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
+        text: this.getDisplayTextForEntries([entry], restoredTextsOf),
         ...(entry.fileParts.length > 0 ? { fileParts: entry.fileParts } : {}),
         ...(reviews ? { reviews } : {}),
         sendIds: entry.sendIdentities.map(({ id }) => id),
@@ -1154,7 +1166,7 @@ export class MessageQueue {
       ? {
           // Authored text, not the provider-facing message: reviews formatted into a message
           // come back as `reviews` below, so the composer would otherwise hold them twice.
-          text: this.getDisplayTextForEntries(restorable, (entry) => entry.authoredMessages),
+          text: this.getDisplayTextForEntries(restorable, restoredTextsOf),
           fileParts: this.getFilePartsForEntries(restorable),
           reviews: this.getReviewsForEntries(restorable),
         }
@@ -1381,7 +1393,7 @@ export class MessageQueue {
         // Kept so a re-send that is queued and refused again is held with the same display text.
         ...(authoredText !== entry.messages.join("\n") ? { authoredText } : {}),
       },
-      displayText: this.getDisplayTextForEntries([entry], (queued) => queued.authoredMessages),
+      displayText: this.getDisplayTextForEntries([entry], restoredTextsOf),
       attachmentCount: entry.fileParts.length,
       reviewCount,
       ...sendIdentitiesOf(entry),
