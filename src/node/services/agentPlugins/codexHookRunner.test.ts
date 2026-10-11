@@ -169,7 +169,7 @@ describe("PreToolUse", () => {
     onCancel.deps.isHookAllowed = () => new Promise(() => undefined);
     const cancel = new AbortController();
     setTimeout(() => cancel.abort(), 20);
-    const ctx = await runTool(onCancel.spine, "bash", {}, undefined, {
+    const ctx = await runTool(onCancel.spine, "bash", {}, undefined, undefined, {
       abortSignal: cancel.signal,
     });
     expect(ctx.executed).toBe(false);
