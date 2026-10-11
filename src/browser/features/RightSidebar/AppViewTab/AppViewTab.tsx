@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { AppWindow } from "lucide-react";
+import { mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { McpAppFrame } from "../ArtifactsTab/McpAppFrame";
 import {
   markMcpAppViewHosted,
@@ -38,7 +39,22 @@ export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string
     <span className="inline-flex min-w-0 items-center gap-1">
       <AppWindow className="h-3 w-3 shrink-0" />
       <span className="min-w-0 truncate">{ref?.label ?? "App view"}</span>
-      {ref != null && <span className="text-muted shrink-0 text-[10px]">{ref.serverName}</span>}
+      {ref != null && (
+        <span className="text-muted shrink-0 text-[10px]">
+          {mcpServerDisplayName(ref.serverName)}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** Tab tooltip of an app tab: the label and the full server key (the label shows its short form). */
+export function AppViewTabTooltip(props: { workspaceId: string; toolCallId: string | null }) {
+  const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
+  const ref = typeof view === "object" ? view : null;
+  return ref == null ? null : (
+    <span className="wrap-anywhere">
+      {ref.label} · {ref.serverName}
     </span>
   );
 }

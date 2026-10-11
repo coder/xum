@@ -9,7 +9,7 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider } from "@/browser/contexts/API";
 import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { createTestApiClient } from "@/browser/testUtils";
-import { AppViewTabLabel, AppViewTabPanel } from "./AppViewTab";
+import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab";
 
 describe("AppViewTabPanel", () => {
   let cleanupDom: (() => void) | null = null;
@@ -116,5 +116,31 @@ describe("AppViewTabPanel", () => {
       registered.mockRestore();
       state.mockRestore();
     }
+  });
+
+  test("a plugin view's tab shows its server part; the tooltip names the full key", () => {
+    const key = "plugin:0123456789abcdef:tray";
+    openMcpAppViewTab("ws-plugin", {
+      toolCallId: "call-p",
+      serverName: key,
+      resourceUri: "ui://tray/view",
+      toolName: "show",
+      label: "Parts tray",
+      arguments: {},
+      cancelled: false,
+      failed: false,
+    });
+    const view = render(
+      <APIProvider client={createTestApiClient({})}>
+        <div data-testid="label">
+          <AppViewTabLabel workspaceId="ws-plugin" toolCallId="call-p" />
+        </div>
+        <div data-testid="tooltip">
+          <AppViewTabTooltip workspaceId="ws-plugin" toolCallId="call-p" />
+        </div>
+      </APIProvider>
+    );
+    expect(view.getByTestId("label").textContent).toBe("Parts traytray");
+    expect(view.getByTestId("tooltip").textContent).toBe(`Parts tray · ${key}`);
   });
 });
