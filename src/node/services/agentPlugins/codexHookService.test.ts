@@ -303,6 +303,29 @@ describe("CodexPluginHookService", () => {
       expect(await send()).toEqual({ kind: "none" });
     });
 
+    test("a canceled send ends the startup wait at once", async () => {
+      await promptPlugin();
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(promptArgs());
+      let aborted = false;
+      const startServers = (signal: AbortSignal) =>
+        new Promise<boolean>((resolve) => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+            resolve(false);
+          });
+        });
+      const cancel = new AbortController();
+      setTimeout(() => cancel.abort(), 10);
+
+      const started = performance.now();
+      await service.prepareForPromptHooks(workspaceId, startServers, cancel.signal);
+
+      // The default hook timeout is far longer: only the cancellation ends the wait this soon.
+      expect(performance.now() - started).toBeLessThan(1_000);
+      expect(aborted).toBe(true);
+    });
+
     test("a failed startup is logged and the hooks still run", async () => {
       await promptPlugin();
       await trustAll("guard");

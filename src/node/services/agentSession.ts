@@ -874,7 +874,8 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   /** The message.send prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
   runMessageSendHooks?(
     workspaceId: string,
-    input: { text: string; origin: MessageSendOrigin }
+    input: { text: string; origin: MessageSendOrigin },
+    cancelSignal?: AbortSignal
   ): Promise<MessageSendHookOutcome>;
   /** The turn.stop prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
   runTurnStopHooks?(
@@ -4437,10 +4438,11 @@ export class AgentSession {
       return { kind: "none" };
     }
     const origin = resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin);
-    const outcome = await this.aiService.runMessageSendHooks(this.workspaceId, {
-      text: message,
-      origin,
-    });
+    const outcome = await this.aiService.runMessageSendHooks(
+      this.workspaceId,
+      { text: message, origin },
+      internal?.cancelSignal
+    );
     if (
       outcome.kind === "blocked" &&
       (internal?.synthetic === true || acceptanceOrigin !== "manual")

@@ -518,7 +518,8 @@ export class AIService extends EventEmitter {
    */
   async runMessageSendHooks(
     workspaceId: string,
-    input: { text: string; origin: MessageSendOrigin }
+    input: { text: string; origin: MessageSendOrigin },
+    cancelSignal?: AbortSignal
   ): Promise<MessageSendHookOutcome> {
     const snapshot = await this.captureRequestAssemblySnapshot(workspaceId).catch(
       (error: unknown) => {
@@ -534,9 +535,12 @@ export class AIService extends EventEmitter {
     }
     // Codex UserPromptSubmit hooks call their plugin's MCP server, which the turn only starts
     // after this chain: start it first (the turn's own startup, bounded), or the first prompt
-    // after a restart misses the hooks.
-    await codexPluginHookService.prepareForPromptHooks(workspaceId, (signal) =>
-      this.turnRequestBuilder.startWorkspaceMcpServers(workspaceId, signal)
+    // after a restart misses the hooks. A canceled send ends this wait; the hooks still run, so a
+    // send whose cancellation is disabled cannot skip them.
+    await codexPluginHookService.prepareForPromptHooks(
+      workspaceId,
+      (signal) => this.turnRequestBuilder.startWorkspaceMcpServers(workspaceId, signal),
+      cancelSignal
     );
     return runMessageSendHooks(eventSpine, workspaceId, input);
   }

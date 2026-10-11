@@ -109,27 +109,34 @@ export class CodexPluginHookService {
    * turn runs right after (`startServers`), bounded by the longest of those hooks' timeouts.
    * Without this, the first prompt after a restart reaches the hooks before their plugin's server
    * runs, and they fail open. A failed or slow startup is logged and the hooks run anyway (they
-   * then fail open as before). No-op when the workspace has no UserPromptSubmit hook.
+   * then fail open as before). No-op when the workspace has no UserPromptSubmit hook. A canceled
+   * send (`cancelSignal`) ends the wait at once.
    */
   async prepareForPromptHooks(
     workspaceId: string,
-    startServers: (signal: AbortSignal) => Promise<boolean>
+    startServers: (signal: AbortSignal) => Promise<boolean>,
+    cancelSignal?: AbortSignal
   ): Promise<void> {
     const budgetMs = this.registrations.get(workspaceId)?.promptHookBudgetMs;
-    if (budgetMs === undefined) return;
+    if (budgetMs === undefined || cancelSignal?.aborted === true) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const onCancel = () => controller.abort();
+    cancelSignal?.addEventListener("abort", onCancel, { once: true });
     try {
       const outcome = await Promise.race([
         startServers(controller.signal).then((ready) => (ready ? "started" : "not-ready")),
         new Promise<"timeout">((resolve) => {
           timer = setTimeout(() => {
-            controller.abort();
             resolve("timeout");
+            controller.abort();
           }, budgetMs);
         }),
+        new Promise<"canceled">((resolve) => {
+          controller.signal.addEventListener("abort", () => resolve("canceled"), { once: true });
+        }),
       ]);
-      if (outcome !== "started") {
+      if (outcome !== "started" && outcome !== "canceled") {
         log.warn("Plugin hooks: MCP startup before UserPromptSubmit did not finish", {
           workspaceId,
           outcome,
@@ -139,6 +146,7 @@ export class CodexPluginHookService {
       log.warn("Plugin hooks: MCP startup before UserPromptSubmit failed", { workspaceId, error });
     } finally {
       clearTimeout(timer);
+      cancelSignal?.removeEventListener("abort", onCancel);
     }
   }
 
