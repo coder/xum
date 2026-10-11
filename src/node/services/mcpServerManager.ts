@@ -4642,24 +4642,33 @@ export class MCPServerManager {
     return result.structuredContent;
   }
 
-  /** Read and validate a server's structured settings for one workspace (cached on success). */
+  /**
+   * Read and validate a server's structured settings for one workspace
+   * (cached on success). Null when the server has no `openai/settings`.
+   */
   async readSettings(
     workspaceId: string,
     serverName: string,
     options?: { signal?: AbortSignal; timeoutMs?: number }
-  ): Promise<MCPSettingsSnapshot> {
+  ): Promise<MCPSettingsSnapshot | null> {
+    const noSettings = Symbol("no settings");
     const snapshot = await this.invokeServerOperation(
       workspaceId,
       serverName,
       `MCP settings read for '${serverName}'`,
-      (instance) => this.callSettingsTool(instance, workspaceId, "readTool", {}, options),
+      (instance) =>
+        instance.settings?.settingsCapability() === undefined
+          ? Promise.resolve(noSettings)
+          : this.callSettingsTool(instance, workspaceId, "readTool", {}, options),
       (content) => {
+        if (content === noSettings) return null;
         const parsed = parseMCPSettingsReadResult(content);
         if ("error" in parsed) throw new Error(`MCP server '${serverName}': ${parsed.error}`);
         return parsed;
       },
       options
     );
+    if (snapshot === null) return null;
     for (const warning of snapshot.warnings)
       log.warn(`[MCP] Settings of '${serverName}': ${warning}`, { workspaceId });
     this.cacheSettings(workspaceId, serverName, snapshot.values);

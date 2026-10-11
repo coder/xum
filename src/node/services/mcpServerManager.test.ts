@@ -695,6 +695,7 @@ describe("MCPServerManager", () => {
     await manager.getToolsForWorkspace(request);
 
     const snapshot = await manager.readSettings("settings-ws", "cad");
+    if (snapshot === null) throw new Error("expected settings");
     expect(manager.getCachedSettings("settings-ws", "cad")).toEqual({ units: "in", grid: false });
     // An invalid value is refused before anything reaches the server.
     const refused = await manager
@@ -718,6 +719,13 @@ describe("MCPServerManager", () => {
       },
     ]);
     expect(manager.getCachedSettings("settings-ws", "cad")).toEqual(values);
+  });
+
+  test("settings: a server without the capability reads as null", async () => {
+    configService.listServers.mockResolvedValue({ plain: stdioConfig("settings-none") });
+    servers.serve("settings-none", { tools: { draw: testTool() } });
+    await manager.getToolsForWorkspace(workspaceRequest("settings-none-ws"));
+    expect(await manager.readSettings("settings-none-ws", "plain")).toBeNull();
   });
 
   test("an epoch retry never re-runs an MCP Apps view's tool call", async () => {

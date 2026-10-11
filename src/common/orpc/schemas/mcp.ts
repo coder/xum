@@ -348,3 +348,46 @@ export const MCPTestResultSchema = z.discriminatedUnion("success", [
     oauthChallenge: BearerChallengeSchema.optional(),
   }),
 ]);
+
+/** OpenAI structured settings (validated by common/utils/mcpSettings before it crosses IPC). */
+const MCPSettingValueSchema = z.union([z.string(), z.number(), z.boolean()]);
+const MCPSettingSchemaSchema = z.object({
+  title: z.string(),
+  description: z.string().optional(),
+  type: z.enum(["boolean", "string", "number", "integer"]),
+  enum: z.array(z.string()).optional(),
+  minLength: z.number().optional(),
+  maxLength: z.number().optional(),
+  pattern: z.string().optional(),
+  minimum: z.number().optional(),
+  maximum: z.number().optional(),
+  multipleOf: z.number().optional(),
+});
+export const MCPSettingsSnapshotSchema = z.object({
+  properties: z.record(z.string(), MCPSettingSchemaSchema),
+  values: z.record(z.string(), MCPSettingValueSchema),
+  layout: z.array(
+    z.object({
+      title: z.string(),
+      items: z.array(
+        z.discriminatedUnion("kind", [
+          z.object({ kind: z.literal("property"), property: z.string() }),
+          z.object({
+            kind: z.literal("tool"),
+            tool: z.string(),
+            description: z.string().optional(),
+          }),
+        ])
+      ),
+    })
+  ),
+  warnings: z.array(z.string()),
+});
+export const MCPSettingsReadParamsSchema = z.object({
+  workspaceId: z.string(),
+  serverName: z.string(),
+});
+export const MCPSettingsUpdateParamsSchema = MCPSettingsReadParamsSchema.extend({
+  /** Changed values only. */
+  set: z.record(z.string(), MCPSettingValueSchema),
+});

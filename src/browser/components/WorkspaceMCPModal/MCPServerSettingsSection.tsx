@@ -1,0 +1,181 @@
+import React, { useState } from "react";
+import { Loader2 } from "lucide-react";
+import { Button } from "@/browser/components/Button/Button";
+import { Input } from "@/browser/components/Input/Input";
+import { Select } from "@/browser/components/Select/Select";
+import { Switch } from "@/browser/components/Switch/Switch";
+import { useAPI } from "@/browser/contexts/API";
+import { getOwn } from "@/common/utils/getOwn";
+import {
+  validateMCPSettingValue,
+  type MCPSettingSchema,
+  type MCPSettingValue,
+  type MCPSettingsSnapshot,
+} from "@/common/utils/mcpSettings";
+
+interface MCPServerSettingsSectionProps {
+  workspaceId: string;
+  serverName: string;
+  snapshot: MCPSettingsSnapshot;
+}
+
+/**
+ * OpenAI structured settings (`openai/settings`) of one workspace server:
+ * native controls drawn from the server's schema, in its layout groups.
+ * Server strings render as plain text. Saves send only the changed values;
+ * a failed save shows the error and restores the last saved values.
+ */
+export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> = (props) => {
+  const { api } = useAPI();
+  const [saved, setSaved] = useState(props.snapshot.values);
+  const [draft, setDraft] = useState(props.snapshot.values);
+  // Number inputs keep their raw text so a half-typed "1." is not rewritten.
+  const [numberText, setNumberText] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const { properties } = props.snapshot;
+  const changed = Object.fromEntries(
+    Object.entries(draft).filter(([name, value]) => getOwn(saved, name) !== value)
+  );
+  const errors: Record<string, string> = {};
+  for (const [name, value] of Object.entries(draft)) {
+    const schema = getOwn(properties, name);
+    const message = schema && validateMCPSettingValue(schema, value);
+    if (message) errors[name] = `${schema.title} ${message}`;
+  }
+  const canSave = Object.keys(changed).length > 0 && Object.keys(errors).length === 0 && !saving;
+
+  const setValue = (name: string, value: MCPSettingValue) => setDraft({ ...draft, [name]: value });
+
+  const save = async () => {
+    if (!api) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await api.mcp.settings.update({
+        workspaceId: props.workspaceId,
+        serverName: props.serverName,
+        set: changed,
+      });
+      if (result.success) {
+        setSaved(result.data);
+        setDraft(result.data);
+      } else {
+        setError(result.error);
+        setDraft(saved);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setDraft(saved);
+    } finally {
+      setNumberText({});
+      setSaving(false);
+    }
+  };
+
+  const renderControl = (name: string, schema: MCPSettingSchema) => {
+    const value = getOwn(draft, name);
+    const label = `${schema.title} setting`;
+    if (schema.type === "boolean")
+      return (
+        <Switch
+          checked={value === true}
+          onCheckedChange={(checked) => setValue(name, checked)}
+          aria-label={label}
+        />
+      );
+    if (schema.type === "string" && schema.enum !== undefined)
+      return (
+        <Select
+          value={typeof value === "string" ? value : ""}
+          options={schema.enum}
+          onChange={(next) => setValue(name, next)}
+          aria-label={label}
+          className="w-40 max-w-full"
+        />
+      );
+    if (schema.type === "string")
+      return (
+        <Input
+          value={typeof value === "string" ? value : ""}
+          onChange={(event) => setValue(name, event.target.value)}
+          aria-label={label}
+          className="w-40 max-w-full"
+        />
+      );
+    return (
+      <Input
+        type="number"
+        value={getOwn(numberText, name) ?? String(value ?? "")}
+        min={schema.minimum}
+        max={schema.maximum}
+        step={schema.multipleOf ?? (schema.type === "integer" ? 1 : "any")}
+        onChange={(event) => {
+          setNumberText({ ...numberText, [name]: event.target.value });
+          // An empty or partial number stays invalid instead of becoming 0.
+          setValue(name, event.target.value.trim() === "" ? NaN : Number(event.target.value));
+        }}
+        aria-label={label}
+        className="w-28 max-w-full"
+      />
+    );
+  };
+
+  return (
+    <div className="mt-4 space-y-3 border-t pt-4" data-testid="mcp-server-settings">
+      <div className="text-sm font-medium">Settings</div>
+      {props.snapshot.layout.map((group) => (
+        <div key={group.title} className="space-y-2">
+          <div className="text-content-secondary text-xs font-medium wrap-anywhere">
+            {group.title}
+          </div>
+          {group.items.map((item) => {
+            if (item.kind === "tool")
+              return (
+                <div
+                  key={`tool:${item.tool}`}
+                  className="text-content-secondary flex items-center justify-between gap-3 text-xs opacity-60"
+                  aria-disabled="true"
+                >
+                  <span className="min-w-0 wrap-anywhere">{item.description ?? item.tool}</span>
+                  <span className="shrink-0">Opens in a later version</span>
+                </div>
+              );
+            const schema = getOwn(properties, item.property);
+            if (schema === undefined) return null;
+            return (
+              <div key={item.property} className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-sm wrap-anywhere">{schema.title}</div>
+                  {schema.description && (
+                    <div className="text-content-secondary text-xs wrap-anywhere">
+                      {schema.description}
+                    </div>
+                  )}
+                  {getOwn(errors, item.property) && (
+                    <div className="text-danger-soft text-xs" role="alert">
+                      {getOwn(errors, item.property)}
+                    </div>
+                  )}
+                </div>
+                <div className="shrink-0">{renderControl(item.property, schema)}</div>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+      {error && (
+        <div className="bg-danger-soft/10 text-danger-soft rounded-md p-2 text-xs wrap-anywhere">
+          {error}
+        </div>
+      )}
+      <div className="flex justify-end">
+        <Button size="sm" onClick={() => void save()} disabled={!canSave}>
+          {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+          Save settings
+        </Button>
+      </div>
+    </div>
+  );
+};

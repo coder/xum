@@ -14,6 +14,7 @@ import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { textContrast } from "@/browser/stories/helpers/contrast";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { MCPServerInfo } from "@/common/types/mcp";
+import type { MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
 
 import { WorkspaceMCPModal } from "./WorkspaceMCPModal";
 
@@ -62,6 +63,7 @@ interface WorkspaceMCPStoryOptions {
   };
   testResults?: Record<string, string[]>;
   preCacheTools?: boolean;
+  settings?: Record<string, MCPSettingsSnapshot>;
 }
 
 function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): APIClient {
@@ -127,6 +129,13 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     mcpServers,
     mcpOverrides,
     mcpTestResults,
+    // Copied per story: the mock update writes into its snapshot.
+    mcpSettings: new Map(
+      Object.entries(options.settings ?? {}).map(([name, snapshot]) => [
+        name,
+        structuredClone(snapshot),
+      ])
+    ),
   });
 }
 
@@ -525,4 +534,86 @@ export const WorkspaceMCPPluginServersNarrow: Story = {
     // the dialog instead of widening its scrollable content.
     await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth);
   },
+};
+
+/** CAD-style settings: every control kind, a layout group with a tool item, and "Other settings". */
+const CAD_SETTINGS: MCPSettingsSnapshot = {
+  properties: {
+    units: { type: "string", title: "Units", enum: ["mm", "in"] },
+    grid: { type: "boolean", title: "Show grid", description: "Draws a <b>grid</b> behind parts." },
+    zoom: { type: "integer", title: "Default zoom", minimum: 1, maximum: 5 },
+    prefix: { type: "string", title: "Part prefix", pattern: "^[A-Z]{2}$" },
+  },
+  values: { units: "mm", grid: true, zoom: 2, prefix: "BB" },
+  layout: [
+    {
+      title: "Display",
+      items: [
+        { kind: "property", property: "units" },
+        { kind: "property", property: "grid" },
+        { kind: "tool", tool: "cad.library", description: "Manage part libraries" },
+      ],
+    },
+    {
+      title: "Other settings",
+      items: [
+        { kind: "property", property: "zoom" },
+        { kind: "property", property: "prefix" },
+      ],
+    },
+  ],
+  warnings: [],
+};
+
+const settingsStoryOptions = (): WorkspaceMCPStoryOptions => ({
+  servers: { cad: { transport: "stdio", command: "bunx cad-mcp", disabled: false } },
+  testResults: { cad: ["draw_part"] },
+  settings: { cad: CAD_SETTINGS },
+});
+
+/** Shared play: settings load with Fetch Tools, render as text, validate, and send changes. */
+async function exerciseServerSettings(canvasElement: HTMLElement): Promise<void> {
+  const dialog = await findWorkspaceMCPDialog(canvasElement);
+  const modal = within(dialog);
+  await userEvent.click(await modal.findByRole("button", { name: "Fetch Tools" }));
+  const section = within(await modal.findByTestId("mcp-server-settings"));
+  await expect(section.findByText("Opens in a later version")).resolves.toBeInTheDocument();
+  // Server strings are text, never markup.
+  await expect(
+    section.findByText("Draws a <b>grid</b> behind parts.")
+  ).resolves.toBeInTheDocument();
+  const save = section.getByRole("button", { name: "Save settings" });
+  await expect(save).toBeDisabled();
+
+  const zoom = section.getByLabelText("Default zoom setting");
+  await userEvent.clear(zoom);
+  await userEvent.type(zoom, "9");
+  await expect(section.findByText("Default zoom must be at most 5")).resolves.toBeInTheDocument();
+  await expect(save).toBeDisabled();
+
+  await userEvent.clear(zoom);
+  await userEvent.type(zoom, "3");
+  await waitFor(() => expect(save).toBeEnabled());
+  await userEvent.click(save);
+  await waitFor(() => expect(save).toBeDisabled());
+  await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth);
+}
+
+export const WorkspaceMCPServerSettings: Story = {
+  render: () => renderWorkspaceMCPModal(settingsStoryOptions()),
+  play: async ({ canvasElement }) => exerciseServerSettings(canvasElement),
+};
+
+export const WorkspaceMCPServerSettingsNarrow: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    ...meta.parameters,
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => renderWorkspaceMCPModal(settingsStoryOptions()),
+  play: async ({ canvasElement }) => exerciseServerSettings(canvasElement),
 };

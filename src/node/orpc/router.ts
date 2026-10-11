@@ -204,6 +204,22 @@ async function passComputerUseRefusal<T>(request: Promise<T>): Promise<T> {
 }
 
 /** The draft merge's passive acceptance check (DraftService.update/beginSend). */
+/** Settings routes start the workspace's servers first, like MCP Apps views do. */
+async function runMcpSettingsRoute<T>(
+  context: ORPCContext,
+  workspaceId: string,
+  signal: AbortSignal | undefined,
+  run: () => Promise<T>
+): Promise<{ success: true; data: T } | { success: false; error: string }> {
+  try {
+    if (!context.mcpServerManager.hasWorkspaceRequestOptions(workspaceId))
+      await listWorkspaceMcpPrompts(context, workspaceId, signal);
+    return { success: true, data: await run() };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
 function sendAcceptanceOf(context: ORPCContext): SendAcceptance {
   return {
     acceptedSendIds: (workspaceId, sendIds) =>
@@ -1217,6 +1233,39 @@ export const router = (authToken?: string) => {
         }),
     },
     mcp: {
+      settings: {
+        read: t
+          .input(schemas.mcp.settings.read.input)
+          .output(schemas.mcp.settings.read.output)
+          .handler(({ context, input, signal }) =>
+            runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+              context.mcpServerManager.readSettings(input.workspaceId, input.serverName, {
+                signal,
+              })
+            )
+          ),
+        update: t
+          .input(schemas.mcp.settings.update.input)
+          .output(schemas.mcp.settings.update.output)
+          .handler(({ context, input, signal }) =>
+            // Validate against a fresh read: the renderer's schema can be stale.
+            runMcpSettingsRoute(context, input.workspaceId, signal, async () => {
+              const snapshot = await context.mcpServerManager.readSettings(
+                input.workspaceId,
+                input.serverName,
+                { signal }
+              );
+              if (snapshot === null)
+                throw new Error(`MCP server '${input.serverName}' has no settings`);
+              return context.mcpServerManager.updateSettings(
+                input.workspaceId,
+                input.serverName,
+                input.set,
+                snapshot.properties
+              );
+            })
+          ),
+      },
       designStatus: t
         .input(schemas.mcp.designStatus.input)
         .output(schemas.mcp.designStatus.output)

@@ -14,6 +14,8 @@ import {
   DialogTitle,
 } from "@/browser/components/Dialog/Dialog";
 import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
+import type { MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
+import { MCPServerSettingsSection } from "./MCPServerSettingsSection";
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import {
   MCPServerIdentityBadge,
@@ -54,6 +56,12 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   const [branding, setBranding] = useState<
     Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
   >({});
+  // OpenAI structured settings, read with each tool fetch (the fetch already
+  // connects the server). `fetchId` remounts the section on every refresh.
+  const [serverSettings, setServerSettings] = useState<
+    Record<string, { fetchId: number; snapshot: MCPSettingsSnapshot } | { error: string }>
+  >({});
+  const settingsFetchCount = useRef(0);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -120,6 +128,16 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
         }
         if (!result.success) {
           setError(`Failed to fetch tools for ${serverName}: ${result.error}`);
+        } else {
+          const read = await api.mcp.settings.read({ workspaceId, serverName });
+          const fetchId = ++settingsFetchCount.current;
+          setServerSettings((prev) => {
+            const { [serverName]: _stale, ...others } = prev;
+            if (!read.success) return { ...others, [serverName]: { error: read.error } };
+            return read.data === null
+              ? others
+              : { ...others, [serverName]: { fetchId, snapshot: read.data } };
+          });
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : `Failed to fetch tools for ${serverName}`);
@@ -464,6 +482,26 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                     {effectivelyEnabled && tools?.length === 0 && (
                       <div className="text-content-secondary mt-2 text-sm">No tools available</div>
                     )}
+
+                    {effectivelyEnabled &&
+                      (() => {
+                        const entry = getOwn(serverSettings, name);
+                        if (entry === undefined) return null;
+                        if ("error" in entry)
+                          return (
+                            <div className="text-content-secondary mt-4 border-t pt-4 text-xs wrap-anywhere">
+                              Settings unavailable: {entry.error}
+                            </div>
+                          );
+                        return (
+                          <MCPServerSettingsSection
+                            key={entry.fetchId}
+                            workspaceId={workspaceId}
+                            serverName={name}
+                            snapshot={entry.snapshot}
+                          />
+                        );
+                      })()}
                   </div>
                 );
               })}
