@@ -17,6 +17,7 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
   const reads: string[] = [];
   const modelContexts: string[] = [];
   const modeRequests: string[] = [];
+  const moves: string[] = [];
   let displayMode: McpAppDisplayMode = "inline";
   const consents: McpAppConsentRequest[] = [];
   const composer: string[] = [];
@@ -57,8 +58,10 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
     },
     setDisplayMode: (mode) => {
       modeRequests.push(mode);
-      displayMode = mode;
-      return mode;
+      return () => {
+        moves.push(mode);
+        displayMode = mode;
+      };
     },
     requestConsent: (request) => {
       consents.push(request);
@@ -74,6 +77,17 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
   const request = (id: number, method: string, params?: unknown) =>
     host.handleMessage({ jsonrpc: "2.0", id, method, params });
   const reply = (id: number) => sent.find((m) => m.id === id);
+  const answered = new Set<unknown>();
+  /** A display-mode request whose teardown the view answers, as the ext-apps SDK does. */
+  const requestMode = async (id: number, mode: string) => {
+    const done = request(id, "ui/request-display-mode", { mode });
+    const teardown = sent.find((m) => m.method === "ui/resource-teardown" && !answered.has(m.id));
+    if (teardown !== undefined) {
+      answered.add(teardown.id);
+      await host.handleMessage({ jsonrpc: "2.0", id: teardown.id, result: {} });
+    }
+    await done;
+  };
   return {
     host,
     sent,
@@ -81,6 +95,8 @@ function setup(overrides: Partial<McpAppHostOptions> = {}) {
     reads,
     modelContexts,
     modeRequests,
+    moves,
+    requestMode,
     setHostMode: (mode: McpAppDisplayMode) => (displayMode = mode),
     consents,
     composer,
@@ -361,10 +377,10 @@ describe("MCP Apps host router", () => {
       t.sent
         .filter((m) => m.method === "ui/notifications/host-context-changed")
         .map((m) => m.params);
-    await t.request(2, "ui/request-display-mode", { mode: "fullscreen" });
+    await t.requestMode(2, "fullscreen");
     expect(t.reply(2)?.result).toEqual({ mode: "fullscreen" });
     expect(changes()).toEqual([{ displayMode: "fullscreen" }]);
-    await t.request(3, "ui/request-display-mode", { mode: "inline" });
+    await t.requestMode(3, "inline");
     expect(t.reply(3)?.result).toEqual({ mode: "inline" });
     expect(t.modeRequests).toEqual(["fullscreen", "inline"]);
     // A change from outside the view (closing it in Artifacts) notifies once.
@@ -407,7 +423,7 @@ describe("MCP Apps host router", () => {
       });
       expect(t.reply(1)?.result).toMatchObject({ hostContext: { displayMode: told } });
       await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
-      await t.request(2, "ui/request-display-mode", { mode: "inline" });
+      await t.requestMode(2, "inline");
       if (told === "inline") {
         // Already inline for the view: nothing changes (the view stays in the Artifacts tab).
         expect(t.reply(2)?.result).toEqual({ mode: "inline" });
@@ -421,5 +437,32 @@ describe("MCP Apps host router", () => {
         expect(t.modeRequests).toEqual(["inline"]);
       }
     }
+  });
+
+  test("the requester gets its display-mode reply before the move unmounts it", async () => {
+    const t = setup();
+    await t.request(1, "ui/initialize", {});
+    await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    const done = t.request(2, "ui/request-display-mode", { mode: "fullscreen" });
+    // Reply and teardown are posted; the view has not answered the teardown yet: no move.
+    expect(t.sent.map((m) => m.id ?? m.method).slice(-3)).toEqual([
+      2,
+      "ui/notifications/host-context-changed",
+      "host-1",
+    ]);
+    expect(t.reply(2)?.result).toEqual({ mode: "fullscreen" });
+    expect(t.moves).toEqual([]);
+    await t.host.handleMessage({ jsonrpc: "2.0", id: "host-1", result: {} });
+    await done;
+    expect(t.moves).toEqual(["fullscreen"]);
+  });
+
+  test("a mode the host cannot show now returns the current mode and does not move", async () => {
+    const t = setup({ setDisplayMode: () => null });
+    await t.request(1, "ui/initialize", {});
+    await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    await t.request(2, "ui/request-display-mode", { mode: "fullscreen" });
+    expect(t.reply(2)?.result).toEqual({ mode: "inline" });
+    expect(t.sent.some((m) => m.method === "ui/resource-teardown")).toBe(false);
   });
 });

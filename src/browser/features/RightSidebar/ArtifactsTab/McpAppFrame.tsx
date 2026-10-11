@@ -18,7 +18,7 @@ import {
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
-import { openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
+import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
@@ -313,10 +313,16 @@ export function McpAppFrame(props: {
       },
       // Fullscreen from the card opens (or focuses) the view's tab, which takes over as its one
       // live instance; inline from the tab closes the tab, and the view returns to its card.
+      // Inline only while the card is expanded in the loaded transcript: a collapsed (or
+      // unloaded) card mounts no inline instance, so closing the tab would lose the view.
+      // The host runs the move later; skip it once this instance is gone (closed meanwhile).
       setDisplayMode: (mode) => {
-        if (mode === "fullscreen") openMcpAppViewTab(workspaceId, latest.current.view);
-        else latest.current.onClose?.();
-        return mode;
+        if (mode === "inline" && !isMcpAppViewHosted(workspaceId, toolCallId, "card")) return null;
+        return () => {
+          if (hostRef.current !== host) return;
+          if (mode === "fullscreen") openMcpAppViewTab(workspaceId, latest.current.view);
+          else latest.current.onClose?.();
+        };
       },
       log: (message, data) =>
         console.debug(`[MCP Apps] ${boundServerName}: ${message}`, data ?? ""),
