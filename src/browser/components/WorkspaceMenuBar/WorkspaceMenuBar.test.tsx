@@ -642,7 +642,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     terminal.remove();
   });
 
-  it("narrow \"Open in tab\" opens the Artifacts dialog on the requested view", () => {
+  it('narrow "Open in tab" opens the Artifacts dialog on the requested view', () => {
     stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
     setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
     const dialogSpy = spyOn(ArtifactsDialogModule, "ArtifactsDialog").mockImplementation(
