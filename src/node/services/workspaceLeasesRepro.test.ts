@@ -245,7 +245,7 @@ describe("turn preparation vs another backend's structural mutation", () => {
     const { b, leasesA, streamMessage } = await setup();
     // The spy is on the prototype, so it also sees every other live session in the test process
     // (late retries of earlier files' sessions): count only this session's tracker (#6185). Its
-    // tracker is the one recordFileState records into.
+    // tracker is the one recordFileState records this test's file into.
     const record = spyOn(FileChangeTracker.prototype, "record");
     const detect = spyOn(FileChangeTracker.prototype, "getChangedAttachments");
     let ownTracker: unknown;
@@ -261,8 +261,8 @@ describe("turn preparation vs another backend's structural mutation", () => {
         content: "original",
         timestamp: (await fs.stat(tracked)).mtimeMs,
       });
-      expect(record).toHaveBeenCalledTimes(1);
-      ownTracker = record.mock.contexts[0];
+      // By this test's own path: another live session can record files in the same window.
+      ownTracker = record.mock.contexts[record.mock.calls.findIndex(([file]) => file === tracked)];
       expect(ownTracker).toBeInstanceOf(FileChangeTracker);
       const entered = createDeferred<void>();
       const finish = createDeferred<void>();
