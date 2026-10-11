@@ -432,6 +432,40 @@ describe("on-send compaction follow-up", () => {
     }
   );
 
+  test("a queued /compact keeps each text's context with the row that carries that text", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rOwGx): text batched behind the request is part of this row, and
+    // the follow-up is sent later as its own row, so each gets its own hook run and context.
+    const { h, calls, streamed } = await setup((ctx) => {
+      ctx.additionalContext.push({ pluginId: "fake", text: `about ${ctx.text}` });
+    });
+    const followUpContent = { text: "then fix the bug", model: options.model, agentId: "exec" };
+    h.session.queueMessage("Summarize this conversation.", {
+      ...options,
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact\nthen fix the bug",
+        parsed: { followUpContent },
+      },
+    });
+    h.session.queueMessage("also keep the logs", options);
+
+    h.session.drainQueuedMessagesIfIdle();
+    await waitForCondition(() => streamed.length > 0);
+
+    expect(calls).toEqual([
+      { text: "then fix the bug", origin: "user" },
+      { text: "also keep the logs", origin: "user" },
+    ]);
+    const [request] = await userRows(h);
+    expect(request?.metadata?.pluginHookContext).toEqual([
+      { pluginId: "fake", text: "about also keep the logs" },
+    ]);
+    expect(getCompactionFollowUpContent(request?.metadata?.muxMetadata)).toMatchObject({
+      pluginSendHooksApplied: true,
+      pluginHookContext: [{ pluginId: "fake", text: "about then fix the bug" }],
+    });
+  });
+
   test("a client cannot mark a nested /compact follow-up as hooked, at any depth", () => {
     // Codex P1 (PRRT_kwDOPxxmWM6rOwGs): a follow-up's muxMetadata can be another compaction
     // request, whose follow-up redispatches later with the client's markers.
