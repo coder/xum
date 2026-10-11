@@ -28,6 +28,7 @@ import { EventEmitter } from "node:events";
 import type { Tool } from "ai";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
+import { getErrorMessage } from "@/common/utils/errors";
 
 // ---------------------------------------------------------------------------
 // Observer events (read-only fan-out)
@@ -284,7 +285,20 @@ export class EventSpine {
     return this.use(
       point,
       async (ctx, next) => {
-        await callback(ctx);
+        if (point === "message.send") {
+          // message.send consumers are independent plugin guards: one that throws is logged and
+          // skipped, so it cannot end the chain before a later plugin's block. Isolated here
+          // because only the spine dispatches per consumer; runMessageSendHooks sees one chain.
+          try {
+            await callback(ctx);
+          } catch (error) {
+            log.warn("Prompt hooks: a message.send consumer failed; running the next one", {
+              error: getErrorMessage(error),
+            });
+          }
+        } else {
+          await callback(ctx);
+        }
         if (!isBlocked(ctx)) {
           await next();
         }
