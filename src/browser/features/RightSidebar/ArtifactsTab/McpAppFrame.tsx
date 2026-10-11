@@ -20,6 +20,9 @@ import {
   type McpAppHostContext,
 } from "./mcpAppHost";
 import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
+import { appViewTabFor } from "../AppViewTab/appViewTabs";
+import { removeTabEverywhere } from "@/browser/utils/rightSidebarLayout";
+import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
@@ -326,8 +329,16 @@ export function McpAppFrame(props: {
         if (mode === "inline" && !isMcpAppViewHosted(workspaceId, toolCallId, "card")) return null;
         return () => {
           if (hostRef.current !== host) return;
-          if (mode === "fullscreen") openMcpAppViewTab(workspaceId, latest.current.view);
-          else latest.current.onClose?.();
+          if (mode === "fullscreen") {
+            openMcpAppViewTab(workspaceId, latest.current.view);
+            return;
+          }
+          latest.current.onClose?.();
+          // The phone sheet's close only closes the dialog: drop the stored tab too, or the
+          // card keeps its placeholder and the hidden sidebar mounts the view again.
+          updateRightSidebarLayout(workspaceId, (layout) =>
+            removeTabEverywhere(layout, appViewTabFor(toolCallId))
+          );
         };
       },
       log: (message, data) =>
