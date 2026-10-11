@@ -782,11 +782,64 @@ describe("MCPServerManager", () => {
     expect(reads).toBe(2);
   });
 
+  test("settings: a noStart read never starts or restarts the server", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-nostart") });
+    servers.serve("settings-nostart", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: { schema: { type: "object", properties: {} }, values: {} },
+          }),
+      },
+    });
+    await manager.getToolsForWorkspace(workspaceRequest("settings-nostart-ws"));
+    expect(servers.connectCount("settings-nostart")).toBe(1);
+    // The instance goes away, but the restart options stay (as after a config change).
+    await manager.stopServers("settings-nostart-ws", { retainRestartOptions: true });
+    const error = await manager
+      .readSettings("settings-nostart-ws", "cad", { noStart: true })
+      .catch((caught: unknown) => caught);
+    expect(String(error)).toContain("not connected");
+    expect(servers.connectCount("settings-nostart")).toBe(1);
+  });
+
   test("settings: a server without the capability reads as null", async () => {
     configService.listServers.mockResolvedValue({ plain: stdioConfig("settings-none") });
     servers.serve("settings-none", { tools: { draw: testTool() } });
     await manager.getToolsForWorkspace(workspaceRequest("settings-none-ws"));
     expect(await manager.readSettings("settings-none-ws", "plain")).toBeNull();
+  });
+
+  test("settings: a replaced server instance does not keep the old instance's cached values", async () => {
+    const settingsServer = (units: string) => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: { units: { type: "string", title: "Units" } } },
+              values: { units },
+            },
+          }),
+      },
+    });
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-v1") });
+    servers.serve("settings-v1", settingsServer("in"));
+    servers.serve("settings-v2", settingsServer("mm"));
+    const request = workspaceRequest("settings-replace-ws");
+    await manager.getToolsForWorkspace(request);
+    await manager.readSettings("settings-replace-ws", "cad");
+    expect(manager.getCachedSettings("settings-replace-ws", "cad")).toEqual({ units: "in" });
+
+    // Same workspace and server name, new configuration: the instance is replaced.
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-v2") });
+    await manager.getToolsForWorkspace(request);
+    expect(manager.getCachedSettings("settings-replace-ws", "cad")).toBeUndefined();
   });
 
   test("an epoch retry never re-runs an MCP Apps view's tool call", async () => {

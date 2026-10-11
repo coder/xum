@@ -4594,8 +4594,15 @@ export class MCPServerManager {
     return this.lastWorkspaceRequestOptions.has(workspaceId);
   }
 
-  /** Last settings values per workspace, then server. Memory only: the server persists them. */
-  private readonly settingsCache = new Map<string, Map<string, Record<string, MCPSettingValue>>>();
+  /**
+   * Last settings values per server instance, then workspace. Memory only: the server persists
+   * them. Keyed by the instance that returned them, so a replaced, recycled or removed server
+   * (every path that drops an instance) can never serve the old instance's values.
+   */
+  private readonly settingsCache = new WeakMap<
+    MCPServerInstance,
+    Map<string, Record<string, MCPSettingValue>>
+  >();
 
   /** Servers whose hook-time settings read already ran once (success or failure), per workspace. */
   private readonly hookSettingsReadAttempted = new Map<string, Set<string>>();
@@ -4636,7 +4643,7 @@ export class MCPServerManager {
             await this.callSettingsTool(instance, workspaceId, "readTool", {}, { timeoutMs })
           );
           if ("error" in parsed) throw new Error(parsed.error);
-          this.cacheSettings(workspaceId, name, parsed.values);
+          this.cacheSettings(instance, workspaceId, parsed.values);
           values = parsed.values;
         } catch (error) {
           log.warn(`[MCP] Settings read for plugin hooks failed for '${name}'; passing {}`, {
@@ -4650,23 +4657,24 @@ export class MCPServerManager {
     return settings;
   }
 
-  /** Last settings values read or saved for this workspace's server, if any. */
+  /** Last settings values read or saved for this workspace's current server instance, if any. */
   getCachedSettings(
     workspaceId: string,
     serverName: string
   ): Record<string, MCPSettingValue> | undefined {
-    return this.settingsCache.get(workspaceId)?.get(serverName);
+    const instance = this.workspaceServers.get(workspaceId)?.instances.get(serverName);
+    return instance === undefined ? undefined : this.settingsCache.get(instance)?.get(workspaceId);
   }
 
   private cacheSettings(
+    instance: MCPServerInstance,
     workspaceId: string,
-    serverName: string,
     values: Record<string, MCPSettingValue>
   ): void {
-    const byServer =
-      this.settingsCache.get(workspaceId) ?? new Map<string, Record<string, MCPSettingValue>>();
-    byServer.set(serverName, values);
-    this.settingsCache.set(workspaceId, byServer);
+    const byWorkspace =
+      this.settingsCache.get(instance) ?? new Map<string, Record<string, MCPSettingValue>>();
+    byWorkspace.set(workspaceId, values);
+    this.settingsCache.set(instance, byWorkspace);
   }
 
   /** Calls a settings tool with the workspace `_meta`; returns its structuredContent. */
@@ -4717,17 +4725,21 @@ export class MCPServerManager {
   async readSettings(
     workspaceId: string,
     serverName: string,
-    options?: { signal?: AbortSignal; timeoutMs?: number }
+    /** `noStart`: read only a running instance; never start or restart the server. */
+    options?: { signal?: AbortSignal; timeoutMs?: number; noStart?: boolean }
   ): Promise<MCPSettingsSnapshot | null> {
     const noSettings = Symbol("no settings");
+    let source: MCPServerInstance | undefined;
     const snapshot = await this.invokeServerOperation(
       workspaceId,
       serverName,
       `MCP settings read for '${serverName}'`,
-      (instance) =>
-        instance.settings?.settingsCapability() === undefined
-          ? Promise.resolve(noSettings)
-          : this.callSettingsTool(instance, workspaceId, "readTool", {}, options),
+      (instance) => {
+        if (instance.settings?.settingsCapability() === undefined)
+          return Promise.resolve(noSettings);
+        source = instance;
+        return this.callSettingsTool(instance, workspaceId, "readTool", {}, options);
+      },
       (content) => {
         if (content === noSettings) return null;
         const parsed = parseMCPSettingsReadResult(content);
@@ -4739,7 +4751,7 @@ export class MCPServerManager {
     if (snapshot === null) return null;
     for (const warning of snapshot.warnings)
       log.warn(`[MCP] Settings of '${serverName}': ${warning}`, { workspaceId });
-    this.cacheSettings(workspaceId, serverName, snapshot.values);
+    if (source !== undefined) this.cacheSettings(source, workspaceId, snapshot.values);
     return snapshot;
   }
 
@@ -4760,12 +4772,15 @@ export class MCPServerManager {
     }
     // One-shot dispatch, like callMcpAppTool: an epoch retry must not send the update twice.
     let dispatched: Promise<unknown> | null = null;
+    let source: MCPServerInstance | undefined;
     const values = await this.invokeServerOperation(
       workspaceId,
       serverName,
       `MCP settings update for '${serverName}'`,
-      (instance) =>
-        (dispatched ??= this.callSettingsTool(instance, workspaceId, "updateTool", { set })),
+      (instance) => {
+        source ??= instance;
+        return (dispatched ??= this.callSettingsTool(instance, workspaceId, "updateTool", { set }));
+      },
       (content) => {
         const warnings: string[] = [];
         const raw = content !== null && typeof content === "object" ? content : {};
@@ -4775,7 +4790,7 @@ export class MCPServerManager {
         return result;
       }
     );
-    this.cacheSettings(workspaceId, serverName, values);
+    if (source !== undefined) this.cacheSettings(source, workspaceId, values);
     return values;
   }
 
@@ -4861,9 +4876,11 @@ export class MCPServerManager {
     label: string,
     operation: (instance: MCPServerInstance) => Promise<R>,
     finalize: (result: R) => T,
-    options?: { signal?: AbortSignal }
+    /** `noStart`: skip the startup path, so only an already running instance is used. */
+    options?: { signal?: AbortSignal; noStart?: boolean }
   ): Promise<T> {
-    const lastOptions = this.lastWorkspaceRequestOptions.get(workspaceId);
+    const lastOptions =
+      options?.noStart === true ? undefined : this.lastWorkspaceRequestOptions.get(workspaceId);
     let stableSecrets: Record<string, string> | undefined;
     if (lastOptions !== undefined) {
       // First stabilize cached startup state against settings/trust/secret
@@ -5285,7 +5302,6 @@ export class MCPServerManager {
         (this.workspaceStopEpochs.get(workspaceId) ?? 0) + 1
       );
       this.lastWorkspaceRequestOptions.delete(workspaceId);
-      this.settingsCache.delete(workspaceId);
       this.hookSettingsReadAttempted.delete(workspaceId);
       this.workspaceOptionsMutationCounts.delete(workspaceId);
       this.latestWorkspaceOverrides.delete(workspaceId);

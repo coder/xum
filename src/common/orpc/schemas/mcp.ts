@@ -358,7 +358,6 @@ const MCPSettingSchemaSchema = z.object({
   enum: z.array(z.string()).optional(),
   minLength: z.number().optional(),
   maxLength: z.number().optional(),
-  pattern: z.string().optional(),
   minimum: z.number().optional(),
   maximum: z.number().optional(),
   multipleOf: z.number().optional(),
@@ -388,10 +387,13 @@ export const MCPSettingsReadParamsSchema = z.object({
   workspaceId: z.string(),
   serverName: z.string(),
 });
-export const MCPSettingsReadInputSchema = MCPSettingsReadParamsSchema.extend({
+/** One call for every server the dialog shows (bulk data in one IPC call). */
+export const MCPSettingsReadInputSchema = z.object({
+  workspaceId: z.string(),
+  serverNames: z.array(z.string()).max(256),
   /**
-   * Read only a server the workspace already runs; never start one (the
-   * workspace MCP dialog reads on open). Otherwise `{ notConnected: true }`.
+   * Read only servers the workspace already runs; never start or restart one
+   * (the workspace MCP dialog reads on open). Otherwise `{ notConnected: true }`.
    */
   ifConnected: z.boolean().optional(),
 });

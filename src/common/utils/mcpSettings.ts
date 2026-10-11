@@ -20,7 +20,8 @@ export type MCPSettingValue = string | number | boolean;
 
 export type MCPSettingSchema = { title: string; description?: string } & (
   | { type: "boolean" }
-  | { type: "string"; enum?: string[]; minLength?: number; maxLength?: number; pattern?: string }
+  // No `pattern`: Xum never runs a server's regex (see parseSchema).
+  | { type: "string"; enum?: string[]; minLength?: number; maxLength?: number }
   | { type: "number" | "integer"; minimum?: number; maximum?: number; multipleOf?: number }
 );
 
@@ -45,7 +46,11 @@ export interface MCPSettingsSnapshot {
 
 const MAX_TEXT = 1024;
 const MAX_VALUE_LENGTH = 4096;
-const MAX_PATTERN_LENGTH = 256;
+// Collection bounds: the renderer mounts one control per setting, so a server must not be
+// able to send an unbounded schema or layout. Excess entries are dropped with one warning.
+export const MAX_MCP_SETTINGS = 100;
+const MAX_LAYOUT_GROUPS = 20;
+const MAX_GROUP_ITEMS = 100;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -53,6 +58,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const isNonBlank = (value: unknown): value is string =>
   typeof value === "string" && value.trim().length > 0 && value.length <= MAX_TEXT;
+/** An enum option: any bounded string, "" included (the spec allows it, e.g. for "none"). */
+const isEnumOption = (value: unknown): value is string =>
+  typeof value === "string" && value.length <= MAX_TEXT;
+/** JSON Schema string length counts Unicode code points, not UTF-16 units. */
+const codePointLength = (value: string): number => [...value].length;
 const isLength = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 0;
 const isFiniteNumber = (value: unknown): value is number =>
@@ -83,26 +93,20 @@ function parseSchema(raw: unknown): MCPSettingSchema | undefined {
   if (raw.type === "boolean") return { ...base, type: "boolean" };
   if (raw.type === "string") {
     const enumValues = raw.enum;
-    if (enumValues !== undefined && !(Array.isArray(enumValues) && enumValues.every(isNonBlank)))
+    if (enumValues !== undefined && !(Array.isArray(enumValues) && enumValues.every(isEnumOption)))
       return undefined;
     if ([raw.minLength, raw.maxLength].some((n) => n !== undefined && !isLength(n)))
       return undefined;
-    if (raw.pattern !== undefined) {
-      if (typeof raw.pattern !== "string" || raw.pattern.length > MAX_PATTERN_LENGTH)
-        return undefined;
-      try {
-        new RegExp(raw.pattern, "u");
-      } catch {
-        return undefined;
-      }
-    }
+    // `pattern` is ignored on purpose. A server-chosen regex can backtrack for seconds on a
+    // short value, and RegExp.test blocks the thread it runs on (main process or renderer), so
+    // no timeout can stop it. The server validates its own values: a value that breaks its
+    // pattern comes back as the update tool's error, which the settings UI shows.
     return {
       ...base,
       type: "string",
       ...(enumValues !== undefined ? { enum: enumValues } : {}),
       ...(isLength(raw.minLength) ? { minLength: raw.minLength } : {}),
       ...(isLength(raw.maxLength) ? { maxLength: raw.maxLength } : {}),
-      ...(typeof raw.pattern === "string" ? { pattern: raw.pattern } : {}),
     };
   }
   if (raw.type === "number" || raw.type === "integer") {
@@ -127,18 +131,14 @@ export function validateMCPSettingValue(schema: MCPSettingSchema, value: unknown
     case "boolean":
       return typeof value === "boolean" ? null : "must be true or false";
     case "string": {
-      // Bounded input keeps a server-chosen pattern from stalling the main
-      // process with catastrophic backtracking.
       if (typeof value !== "string" || value.length > MAX_VALUE_LENGTH)
         return `must be text of at most ${MAX_VALUE_LENGTH} characters`;
       if (schema.enum !== undefined && !schema.enum.includes(value))
         return `must be one of: ${schema.enum.join(", ")}`;
-      if (schema.minLength !== undefined && value.length < schema.minLength)
+      if (schema.minLength !== undefined && codePointLength(value) < schema.minLength)
         return `must be at least ${schema.minLength} characters`;
-      if (schema.maxLength !== undefined && value.length > schema.maxLength)
+      if (schema.maxLength !== undefined && codePointLength(value) > schema.maxLength)
         return `must be at most ${schema.maxLength} characters`;
-      if (schema.pattern !== undefined && !new RegExp(schema.pattern, "u").test(value))
-        return "has the wrong format";
       return null;
     }
     case "number":
@@ -188,7 +188,10 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
     return { error: "the settings schema has no 'properties' object" };
   const warnings: string[] = [];
   const properties: Record<string, MCPSettingSchema> = {};
-  for (const [name, schema] of Object.entries(raw.schema.properties)) {
+  const declared = Object.entries(raw.schema.properties);
+  if (declared.length > MAX_MCP_SETTINGS)
+    warnings.push(`Only the first ${MAX_MCP_SETTINGS} settings are shown; ignoring the rest`);
+  for (const [name, schema] of declared.slice(0, MAX_MCP_SETTINGS)) {
     const parsed = parseSchema(schema);
     if (parsed !== undefined) properties[name] = parsed;
     else warnings.push(`Setting '${name}' has an unsupported schema; ignoring it`);
@@ -201,15 +204,22 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
 
   const layout: MCPSettingsGroup[] = [];
   const placed = new Set<string>();
-  for (const group of Array.isArray(raw.layout) ? raw.layout : []) {
+  const groups: unknown[] = Array.isArray(raw.layout) ? raw.layout : [];
+  if (groups.length > MAX_LAYOUT_GROUPS)
+    warnings.push(`Only the first ${MAX_LAYOUT_GROUPS} layout groups are used; ignoring the rest`);
+  for (const group of groups.slice(0, MAX_LAYOUT_GROUPS)) {
     if (!isRecord(group) || group.kind !== "group" || !isNonBlank(group.title)) {
       warnings.push("A settings layout group is malformed; ignoring it");
       continue;
     }
     const items: MCPSettingsLayoutItem[] = [];
-    for (const item of Array.isArray(group.items) ? group.items : []) {
+    const rawItems: unknown[] = Array.isArray(group.items) ? group.items : [];
+    if (rawItems.length > MAX_GROUP_ITEMS)
+      warnings.push(`'${group.title}' lists more than ${MAX_GROUP_ITEMS} items; ignoring the rest`);
+    for (const item of rawItems.slice(0, MAX_GROUP_ITEMS)) {
       if (isRecord(item) && item.kind === "property" && typeof item.property === "string") {
-        if (item.property in properties && !placed.has(item.property)) {
+        // Own properties only: "toString" or "constructor" must not resolve through the prototype.
+        if (Object.hasOwn(properties, item.property) && !placed.has(item.property)) {
           placed.add(item.property);
           items.push({ kind: "property", property: item.property });
         }
@@ -217,7 +227,9 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
         items.push({
           kind: "tool",
           tool: item.tool,
-          ...(typeof item.description === "string" ? { description: item.description } : {}),
+          ...(typeof item.description === "string" && item.description.length <= MAX_TEXT
+            ? { description: item.description }
+            : {}),
         });
       } else warnings.push(`A layout item in '${group.title}' is malformed; ignoring it`);
     }
