@@ -112,6 +112,21 @@ describe("loadPluginCodexHooks", () => {
     expect(warnings).toHaveLength(1);
   });
 
+  test("a hooks file path cannot take an inline source's hook keys", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-key-collision");
+    const document = { hooks: { Stop: [{ hooks: [scan] }] } };
+    const plugin = await writePlugin(
+      tmp.path,
+      { "plugin.json#hooks[1]": document },
+      { "com.openai": { hooks: ["plugin.json#hooks[1]", document] } }
+    );
+
+    const { hooks } = await loadPluginCodexHooks(plugin);
+
+    // Only the inline entry's key remains: the file path would have produced the same one.
+    expect(hooks.map((hook) => hook.source)).toEqual(["plugin.json#hooks[1]"]);
+  });
+
   test("a com.openai pointer replaces the default file instead of adding to it", async () => {
     using tmp = new DisposableTempDir("codex-hooks-pointer");
     const plugin = await writePlugin(

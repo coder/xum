@@ -187,6 +187,29 @@ describe("AgentPluginInstallService hook trust", () => {
     expect(await fsPromises.stat(trustFile()).catch(() => null)).toBeNull();
   });
 
+  test("a FIFO at the trust path trusts nothing instead of hanging", async () => {
+    if (process.platform === "win32") return;
+    await install();
+    await fsPromises.mkdir(path.dirname(trustFile()), { recursive: true });
+    using proc = execFileAsync("mkfifo", [trustFile()]);
+    await proc.result;
+
+    expect((await service.getHooks({ name: "guard" })).hooks[0]?.review).toBe("new");
+  });
+
+  test("a trust file from a newer Xum is kept, not rewritten", async () => {
+    await install();
+    const [hook] = (await service.getHooks({ name: "guard" })).hooks;
+    const newer = JSON.stringify({ version: 2, decisions: [{ key: hook.key, hash: hook.hash }] });
+    await fsPromises.mkdir(path.dirname(trustFile()), { recursive: true });
+    await fsPromises.writeFile(trustFile(), newer);
+
+    await expect(
+      service.setHookTrust({ name: "guard", key: hook.key, hash: hook.hash, state: "disabled" })
+    ).rejects.toThrow("newer Xum version");
+    expect(await fsPromises.readFile(trustFile(), "utf8")).toBe(newer);
+  });
+
   test("a malformed trust entry (a directory) does not block uninstall", async () => {
     await install();
     await fsPromises.mkdir(trustFile(), { recursive: true });
