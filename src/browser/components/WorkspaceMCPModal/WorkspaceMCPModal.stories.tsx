@@ -762,7 +762,7 @@ export const WorkspaceMCPServerSettingsUnsavedEnable: Story = {
     }),
   play: async ({ canvasElement }) => {
     const modal = within(await findWorkspaceMCPDialog(canvasElement));
-    await userEvent.click(modal.getByRole("switch", { name: "Toggle cad MCP server" }));
+    await userEvent.click(await modal.findByRole("switch", { name: "Toggle cad MCP server" }));
     await userEvent.click(await modal.findByRole("button", { name: "Fetch Tools" }));
     await expect(modal.findByText("draw_part")).resolves.toBeInTheDocument();
     await expect(modal.queryByTestId("mcp-server-settings")).toBeNull();
@@ -891,7 +891,7 @@ export const WorkspaceMCPServerSettingsSlowFirstRead: Story = {
     await fireEvent.click(
       within(canvasElement).getByRole("button", { name: "Change zoom on the server", hidden: true })
     );
-    await userEvent.click(modal.getAllByRole("button", { name: "Fetch Tools" })[0]);
+    await userEvent.click((await modal.findAllByRole("button", { name: "Fetch Tools" }))[0]);
     const cad = within(await modal.findByTestId("mcp-server-settings"));
     await expect(cad.getByLabelText("Default zoom setting")).toHaveValue(4);
     slowFirstReadGate.open();
