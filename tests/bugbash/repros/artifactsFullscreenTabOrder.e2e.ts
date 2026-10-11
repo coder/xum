@@ -19,6 +19,10 @@ test(
 
     await screen.getByRole("button", "Fullscreen").tap();
     await expect(screen.getByRole("button", "Exit fullscreen")).toBeVisible();
+    // Annotate renders and Download enables only once the selected file has loaded. Walking Tab
+    // earlier would skip them for loading, not for the reported defect.
+    await expect(screen.getByRole("button", "Annotate")).toBeVisible();
+    await expect(screen.getByRole("button", "Download artifact")).toBeEnabled();
 
     await screen.getByRole("combobox", "Artifact").focus();
     const stops: string[] = [];
