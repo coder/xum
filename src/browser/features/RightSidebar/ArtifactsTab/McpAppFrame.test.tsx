@@ -527,4 +527,56 @@ describe("McpAppFrame host strips", () => {
       window.removeEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, onInsert);
     }
   });
+
+  test("fullscreen from the card moves the view to its tab; inline from the tab closes it", async () => {
+    const opened: string[] = [];
+    const onOpen = (e: Event) =>
+      opened.push((e as CustomEvent<{ toolCallId: string }>).detail.toolCallId);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    let closed = 0;
+    try {
+      const run = async (variant: "inline" | undefined, mode: string) => {
+        const view = render(
+          <McpAppFrame workspaceId="ws" view={VIEW} variant={variant} onClose={() => closed++} />,
+          { wrapper: Wrapper }
+        );
+        const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+        const posted = capturePosted(frame);
+        postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+        await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+        postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+        postFromView(frame, {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "ui/request-display-mode",
+          params: { mode },
+        });
+        await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+        const initial = (
+          posted.find((m) => m.id === 1)?.result as {
+            hostContext: { displayMode: string; availableDisplayModes: string[] };
+          }
+        ).hostContext;
+        cleanup();
+        return { initial, reply: posted.find((m) => m.id === 2)?.result };
+      };
+      // The card instance is inline; fullscreen opens (or focuses) the view's tab.
+      const card = await run("inline", "fullscreen");
+      expect(card.initial).toMatchObject({
+        displayMode: "inline",
+        availableDisplayModes: ["inline", "fullscreen"],
+      });
+      expect(card.reply).toEqual({ mode: "fullscreen" });
+      expect(opened).toEqual(["call-1"]);
+      expect(closed).toBe(0);
+      // The tab instance is fullscreen; inline closes the tab (the card takes the view back).
+      const tab = await run(undefined, "inline");
+      expect(tab.initial.displayMode).toBe("fullscreen");
+      expect(tab.reply).toEqual({ mode: "inline" });
+      expect(closed).toBe(1);
+      expect(opened).toEqual(["call-1"]);
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    }
+  });
 });

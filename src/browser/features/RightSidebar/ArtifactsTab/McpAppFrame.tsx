@@ -18,7 +18,7 @@ import {
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
-import type { McpAppViewRef } from "./mcpAppViewsStore";
+import { openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
@@ -210,9 +210,9 @@ export function McpAppFrame(props: {
   const boundServerName = current?.view?.invocation?.serverName ?? serverName;
 
   // Values the long-lived host reads at message time.
-  const latest = useRef({ theme, view, result: current?.view ?? null });
+  const latest = useRef({ theme, view, result: current?.view ?? null, onClose: props.onClose });
   useEffect(() => {
-    latest.current = { theme, view, result: current?.view ?? null };
+    latest.current = { theme, view, result: current?.view ?? null, onClose: props.onClose };
   });
 
   useEffect(() => {
@@ -220,8 +220,10 @@ export function McpAppFrame(props: {
     const getHostContext = (): McpAppHostContext => ({
       theme: latest.current.theme,
       styles: { variables: readStyleVariables() },
-      displayMode: "inline",
-      availableDisplayModes: ["inline"],
+      // The mode follows where this instance lives: its app tab (or phone sheet) is the view's
+      // fullscreen, its tool card the inline mode. A move mounts a new instance there.
+      displayMode: inline ? "inline" : "fullscreen",
+      availableDisplayModes: ["inline", "fullscreen"],
       containerDimensions: {
         width: containerRef.current?.clientWidth ?? 0,
         // An inline container is as tall as the frame, so its own height is no limit.
@@ -308,6 +310,13 @@ export function McpAppFrame(props: {
         if (currentView.cancelled) {
           host.sendToolCancelled(currentView.failed ? "failed" : "interrupted");
         } else if (result?.resultAvailable) host.sendToolResult(result.result);
+      },
+      // Fullscreen from the card opens (or focuses) the view's tab, which takes over as its one
+      // live instance; inline from the tab closes the tab, and the view returns to its card.
+      setDisplayMode: (mode) => {
+        if (mode === "fullscreen") openMcpAppViewTab(workspaceId, latest.current.view);
+        else latest.current.onClose?.();
+        return mode;
       },
       log: (message, data) =>
         console.debug(`[MCP Apps] ${boundServerName}: ${message}`, data ?? ""),

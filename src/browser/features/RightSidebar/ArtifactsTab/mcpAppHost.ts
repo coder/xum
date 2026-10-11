@@ -15,9 +15,9 @@ import type { GrantedMcpAppCsp } from "./mcpAppCsp";
  * Implemented view -> host methods: ui/initialize, ui/notifications/initialized, ping,
  * ui/notifications/size-changed, notifications/message, tools/call (own server only, visibility
  * and consent rules enforced by the backend), resources/read (own server only), ui/open-link
- * (https, after a confirm), ui/message (inserted into the composer after a confirm, never sent)
- * and ui/update-model-context (stored per view for the workspace's next requests). Every other
- * request gets -32601.
+ * (https, after a confirm), ui/message (inserted into the composer after a confirm, never sent),
+ * ui/update-model-context (stored per view for the workspace's next requests) and
+ * ui/request-display-mode (inline / fullscreen). Every other request gets -32601.
  */
 
 export const MCP_APP_PROTOCOL_VERSION = "2026-01-26";
@@ -126,6 +126,14 @@ function modelContextText(params: z.infer<typeof ModelContextParams>): string | 
     : null;
 }
 
+export type McpAppDisplayMode = "inline" | "fullscreen" | "pip";
+const DisplayModeParams = z.object({ mode: z.string().max(32) });
+const InitializeParams = z.object({
+  appCapabilities: z
+    .object({ availableDisplayModes: z.array(z.string().max(32)).max(8).optional() })
+    .optional(),
+});
+
 export type McpAppConsentRequest =
   /** `args` are exactly what the backend receives once allowed, shown in the strip. */
   | { kind: "tool"; toolName: string; serverName: string; args: Record<string, unknown> }
@@ -137,8 +145,8 @@ export type McpAppConsentRequest =
 export interface McpAppHostContext {
   theme: "dark" | "light";
   styles: { variables: Record<string, string> };
-  displayMode: "inline";
-  availableDisplayModes: ["inline"];
+  displayMode: McpAppDisplayMode;
+  availableDisplayModes: McpAppDisplayMode[];
   containerDimensions: { width: number; maxHeight: number };
   locale: string;
   timeZone: string;
@@ -161,6 +169,11 @@ export interface McpAppHostOptions {
   readResource: (uri: string) => Promise<unknown>;
   /** Store the view's model context; it replaces the previous one ("" clears it). */
   updateModelContext: (text: string) => Promise<void>;
+  /**
+   * Switch to a mode from availableDisplayModes other than the current one; returns the
+   * resulting mode (what getHostContext reports from now on).
+   */
+  setDisplayMode: (mode: McpAppDisplayMode) => McpAppDisplayMode;
   requestConsent: (request: McpAppConsentRequest) => Promise<boolean>;
   insertIntoComposer: (text: string) => void;
   openExternalLink: (url: string) => void;
@@ -178,6 +191,27 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   const pendingHostRequests = new Map<string, (ok: boolean) => void>();
   let nextHostRequestId = 1;
   let initialized = false;
+  /** The view's appCapabilities.availableDisplayModes; undefined when it declared none. */
+  let viewDisplayModes: readonly string[] | undefined;
+  /** The mode the view was last told (initial context or host-context-changed). */
+  let notifiedDisplayMode: McpAppDisplayMode | undefined;
+
+  /**
+   * The mode the view is told. "The host MUST NOT switch the View to a display mode that does
+   * not appear in its appCapabilities.availableDisplayModes": a view shown in the Artifacts tab
+   * (fullscreen here) that did not declare fullscreen is told it is inline. No list means any.
+   */
+  const viewMode = (mode: McpAppDisplayMode): McpAppDisplayMode =>
+    mode === "inline" || viewDisplayModes === undefined || viewDisplayModes.includes(mode)
+      ? mode
+      : "inline";
+
+  const displayModeChanged = (hostMode: McpAppDisplayMode) => {
+    const mode = viewMode(hostMode);
+    if (!initialized || notifiedDisplayMode === undefined || mode === notifiedDisplayMode) return;
+    notifiedDisplayMode = mode;
+    notify("ui/notifications/host-context-changed", { displayMode: mode });
+  };
 
   const respond = (id: string | number, result: unknown) =>
     options.postToView({ jsonrpc: "2.0", id, result });
@@ -188,7 +222,14 @@ export function createMcpAppHost(options: McpAppHostOptions) {
 
   async function handleRequest(id: string | number, method: string, params: unknown) {
     switch (method) {
-      case "ui/initialize":
+      case "ui/initialize": {
+        const declared = InitializeParams.safeParse(params);
+        viewDisplayModes = declared.success
+          ? declared.data.appCapabilities?.availableDisplayModes
+          : undefined;
+        const context = options.getHostContext();
+        const hostContext = { ...context, displayMode: viewMode(context.displayMode) };
+        notifiedDisplayMode = hostContext.displayMode;
         respond(id, {
           protocolVersion: MCP_APP_PROTOCOL_VERSION,
           hostInfo: { name: "xum", version: "1.0.0" },
@@ -200,9 +241,10 @@ export function createMcpAppHost(options: McpAppHostOptions) {
             openLinks: {},
             sandbox: { csp: options.grantedCsp },
           },
-          hostContext: options.getHostContext(),
+          hostContext,
         });
         return;
+      }
       case "ping":
         respond(id, {});
         return;
@@ -266,6 +308,24 @@ export function createMcpAppHost(options: McpAppHostOptions) {
         } catch (error) {
           return fail(id, REQUEST_FAILED, error instanceof Error ? error.message : String(error));
         }
+      }
+      case "ui/request-display-mode": {
+        const parsed = DisplayModeParams.safeParse(params);
+        if (!parsed.success) return fail(id, INVALID_PARAMS, "Invalid display mode request");
+        const context = options.getHostContext();
+        const current = viewMode(context.displayMode);
+        const requested = context.availableDisplayModes.find((mode) => mode === parsed.data.mode);
+        // An unavailable mode, or one the view did not declare (the host MUST NOT switch to it),
+        // leaves the mode unchanged; the spec has the host return the current mode, not fail.
+        const mode =
+          requested !== undefined &&
+          requested !== current &&
+          (viewDisplayModes?.includes(requested) ?? true)
+            ? viewMode(options.setDisplayMode(requested))
+            : current;
+        respond(id, { mode });
+        displayModeChanged(mode);
+        return;
       }
       case "ui/open-link": {
         const parsed = OpenLinkParams.safeParse(params);
@@ -375,6 +435,8 @@ export function createMcpAppHost(options: McpAppHostOptions) {
     sendToolCancelled(reason: string) {
       notify("ui/notifications/tool-cancelled", { reason });
     },
+    /** The view's display mode changed (also from outside the view); notifies once per change. */
+    displayModeChanged,
     sendHostContextChanged(context: Partial<McpAppHostContext>) {
       // Context changes only make sense once the view has its initial context.
       if (!initialized) return;
