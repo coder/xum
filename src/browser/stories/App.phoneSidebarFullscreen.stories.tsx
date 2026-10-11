@@ -184,7 +184,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(sidebar).not.toBeVisible());
 
-    // A shortcut for a tab that does not exist (two tabs, Ctrl+9), or one pressed behind an open
+    // A shortcut past the last tab (the ninth, with two tabs), or one pressed behind an open
     // modal, leaves the chat in view. The handler requests the view synchronously, so one task
     // later a wrong request would already show.
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "9", code: "Digit9", ctrlKey: true }));
@@ -197,8 +197,8 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await new Promise((resolve) => setTimeout(resolve, 50));
     await expect(sidebar).not.toBeVisible();
 
-    // The tab shortcuts are the keyboard path to the Sidebar row: Ctrl+2 shows the view on the
-    // second tab (Browser).
+    // The tab shortcuts are the keyboard path to the Sidebar row: the second tab's shortcut
+    // shows the view on that tab (Browser).
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "2", code: "Digit2", ctrlKey: true }));
     await waitFor(() => expect(sidebar).toBeVisible());
     await expect(within(sidebar).getByRole("tab", { name: /Browser/ })).toHaveAttribute(
