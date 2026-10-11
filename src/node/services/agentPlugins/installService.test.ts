@@ -1912,8 +1912,6 @@ describe("AgentPluginInstallService", () => {
                   auth: {
                     type: "oauth",
                     client: { mode: "provided", clientId },
-                    authorizationUrl: "https://mcp.example.com/authorize",
-                    tokenUrl: "https://mcp.example.com/token",
                     authorizationServerBase: issuer,
                   },
                 },
@@ -2040,8 +2038,7 @@ describe("AgentPluginInstallService", () => {
           auth: {
             type: "oauth",
             client: { mode: "provided", clientId: "shared" },
-            authorizationUrl: `${issuer}/authorize`,
-            tokenUrl: `${issuer}/token`,
+            authorizationServerBase: issuer,
           },
         },
       },
@@ -2130,8 +2127,10 @@ describe("AgentPluginInstallService", () => {
       const auth = {
         type: "oauth",
         client: { mode: "provided", clientId },
-        authorizationUrl: "https://accounts.example.com/authorize",
-        tokenUrl: "https://accounts.example.com/token",
+        authorizationServerBase: "https://accounts.example.com/tenant",
+        // Not applied (discovery supplies them), so never listed as a sign-in host.
+        authorizationUrl: "https://evil.example.com/authorize",
+        tokenUrl: "https://evil.example.com/token",
       };
       await fsPromises.writeFile(
         path.join(remoteDir, "mcp.json"),
@@ -2155,6 +2154,9 @@ describe("AgentPluginInstallService", () => {
     expect(preview.mcpServers.map((server) => server.summary)).toEqual([
       "https://mcp.example.com/mcp\nSign-in at accounts.example.com",
     ]);
+    expect(preview.warnings.join("\n")).toContain(
+      "authorizationUrl, tokenUrl (discovery supplies the endpoints)"
+    );
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
 
     await writeAuth("client-b");
@@ -5675,9 +5677,8 @@ describe("describeSignInChanges", () => {
     identity: "",
     ...(secretDigest !== undefined ? { secretDigest } : {}),
   });
-  const endpoints = (host: string) => ({
-    authorizationUrl: `https://${host}/authorize`,
-    tokenUrl: `https://mcp.example.com/token`,
+  const discovery = (host: string, path = "/tenant") => ({
+    authorizationServerBase: `https://${host}${path}`,
   });
 
   test("names each changed field and never shows a secret", () => {
@@ -5685,7 +5686,7 @@ describe("describeSignInChanges", () => {
       describeSignInChanges(
         signIn({
           clientId: "a",
-          endpoints: endpoints("mcp.example.com"),
+          discovery: discovery("mcp.example.com"),
           baseScopes: ["docs:read"],
           resource: "https://r1",
         }),
@@ -5693,7 +5694,7 @@ describe("describeSignInChanges", () => {
           {
             clientId: "b",
             tokenEndpointAuthMethod: "client_secret_post",
-            endpoints: endpoints("accounts.example.com"),
+            discovery: discovery("accounts.example.com"),
             baseScopes: ["docs:read", "docs:write"],
             resource: "https://r2",
           },
@@ -5704,25 +5705,27 @@ describe("describeSignInChanges", () => {
       "Sign-in client changed (a → b)",
       "Token auth method added (client_secret_post)",
       "Sign-in at accounts.example.com (new)",
+      "Sign-in at mcp.example.com (removed)",
       "Scopes changed: + docs:write",
       "Resource changed (https://r1 → https://r2)",
       "Client secret added",
     ]);
   });
 
-  test("covers removals, same-host endpoint moves, and secret changes", () => {
-    const same = { ...endpoints("mcp.example.com"), tokenUrl: "https://mcp.example.com/v2" };
+  test("covers removals, same-host issuer moves, and secret changes", () => {
+    // Tenants share a host: a path move still shows.
+    const same = discovery("mcp.example.com", "/tenant-b");
     expect(
       describeSignInChanges(
         signIn(
-          { clientId: "a", endpoints: endpoints("mcp.example.com"), defaultScopes: ["x"] },
+          { clientId: "a", discovery: discovery("mcp.example.com"), defaultScopes: ["x"] },
           "d1"
         ),
-        signIn({ endpoints: same }, "d2")
+        signIn({ discovery: same }, "d2")
       )
     ).toEqual([
       "Sign-in client removed",
-      "Sign-in endpoints changed",
+      "Sign-in server changed",
       "Scopes changed: - x",
       "Client secret changed",
     ]);

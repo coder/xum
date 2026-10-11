@@ -462,10 +462,9 @@ async function readSignIn(
       : {}),
     identity: stableStringify({
       clientId: oauth?.clientId ?? null,
-      authorizationUrl: oauth?.endpoints?.authorizationUrl ?? null,
-      tokenUrl: oauth?.endpoints?.tokenUrl ?? null,
-      // Tokens were issued by this authorization server.
-      issuer: oauth?.endpoints?.issuer ?? null,
+      // Tokens were issued by this authorization server (discovery is pointed at it).
+      issuer: oauth?.discovery?.authorizationServerBase ?? null,
+      registrationUrl: oauth?.discovery?.registrationUrl ?? null,
       resource: oauth?.resource ?? null,
       baseScopes: oauth?.baseScopes ?? null,
       defaultScopes: oauth?.defaultScopes ?? null,
@@ -492,7 +491,7 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
   changed("Token auth method", a?.tokenEndpointAuthMethod, b?.tokenEndpointAuthMethod);
   const hosts = (oauth?: MCPServerOAuthConfig): Set<string> =>
     new Set(
-      [oauth?.endpoints?.authorizationUrl, oauth?.endpoints?.tokenUrl]
+      [oauth?.discovery?.authorizationServerBase, oauth?.discovery?.registrationUrl]
         .filter((url) => url !== undefined)
         .map((url) => new URL(url).host)
     );
@@ -501,9 +500,9 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
   for (const host of oldHosts) if (!newHosts.has(host)) lines.push(`Sign-in at ${host} (removed)`);
   if (
     lines.every((line) => !line.startsWith("Sign-in at")) &&
-    stableStringify(a?.endpoints ?? null) !== stableStringify(b?.endpoints ?? null)
+    stableStringify(a?.discovery ?? null) !== stableStringify(b?.discovery ?? null)
   )
-    lines.push("Sign-in endpoints changed");
+    lines.push("Sign-in server changed");
   const scopes = (oauth?: MCPServerOAuthConfig): string[] => [
     ...(oauth?.baseScopes ?? []),
     ...(oauth?.defaultScopes ?? []),
@@ -1931,16 +1930,9 @@ export class AgentPluginInstallService {
       // that differs from its host gets its own line. Exact host comparison:
       // no public-suffix list exists here to make parent-domain matching safe.
       const serverHost = new URL(info.url).host;
-      const endpoints = info.oauth?.endpoints;
       const discovery = info.oauth?.discovery;
       const authHosts = new Set(
-        [
-          endpoints?.authorizationUrl,
-          endpoints?.tokenUrl,
-          endpoints?.registrationUrl,
-          discovery?.authorizationServerBase,
-          discovery?.registrationUrl,
-        ]
+        [discovery?.authorizationServerBase, discovery?.registrationUrl]
           .filter((url) => url !== undefined)
           .map((url) => new URL(url).host)
           .filter((host) => host !== serverHost)

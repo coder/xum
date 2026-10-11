@@ -1,5 +1,4 @@
 import * as crypto from "crypto";
-import assert from "@/common/utils/assert";
 import { getOwn } from "@/common/utils/getOwn";
 import * as http from "http";
 import type { IncomingHttpHeaders } from "http";
@@ -157,45 +156,35 @@ function resolvePluginScope(
 }
 
 /**
- * Explicit plugin endpoints replace discovery: the SDK reads cached discovery
- * state before it discovers. The parser (openaiMcpAuth) already required https.
+ * A standalone authorizationServerBase only changes where discovery fetches metadata. The SDK
+ * refuses metadata whose `issuer` is not that URL (path included, RFC 8414 §3.3), so a
+ * tenant-A base never yields tenant-B endpoints. Plugins cannot override the authorization or
+ * token endpoints: follow-up #6142 binds such overrides to verified issuer metadata.
  */
 function pluginDiscoveryState(config?: MCPServerOAuthConfig): OAuthDiscoveryState | undefined {
-  const endpoints = config?.endpoints;
-  // A standalone authorizationServerBase: the SDK fetches (and issuer-checks) its metadata.
   const base = config?.discovery?.authorizationServerBase;
-  if (endpoints === undefined)
-    return base !== undefined ? { authorizationServerUrl: base } : undefined;
-  const issuer = endpoints.issuer ?? new URL(endpoints.tokenUrl).origin;
-  // toServerOAuthConfig drops overrides with split origins; a config that still has them
-  // is a bug (the code and PKCE verifier could reach another server's token endpoint).
-  assert(
-    [endpoints.authorizationUrl, endpoints.registrationUrl, issuer].every(
-      (url) => url === undefined || new URL(url).origin === new URL(endpoints.tokenUrl).origin
-    ),
-    "plugin OAuth endpoints must share one origin"
-  );
-  return {
-    authorizationServerUrl: issuer,
-    authorizationServerMetadata: {
-      issuer,
-      authorization_endpoint: endpoints.authorizationUrl,
-      token_endpoint: endpoints.tokenUrl,
-      ...(endpoints.registrationUrl !== undefined
-        ? { registration_endpoint: endpoints.registrationUrl }
-        : {}),
-      response_types_supported: ["code"],
-      code_challenge_methods_supported: ["S256"],
-    },
-  };
+  return base !== undefined ? { authorizationServerUrl: base } : undefined;
+}
+
+/**
+ * Whether `url` sits under the issuer identifier: same origin and a path inside the issuer's
+ * path (a whole segment, so `/tenant-a` does not cover `/tenant-ab`).
+ */
+function isUnderIssuer(url: string, issuer: string): boolean {
+  const target = new URL(url);
+  const base = new URL(issuer);
+  if (target.origin !== base.origin) return false;
+  const prefix = base.pathname.endsWith("/") ? base.pathname : `${base.pathname}/`;
+  return target.pathname === base.pathname || target.pathname.startsWith(prefix);
 }
 
 /**
  * The discovery state a sign-in starts from. A standalone registrationUrl replaces the
  * discovered registration endpoint, so discovery runs here first: the SDK registers with the
- * metadata it is given. SECURITY AUDIT: the URL must share the issuer's origin (the
- * authorizationServerBase's when set, else the discovered one), the same one-origin rule as
- * full endpoint overrides; otherwise it is dropped and plain discovery applies.
+ * metadata it is given. SECURITY AUDIT: the metadata is issuer-checked by the SDK, and the URL
+ * is kept only when it is the metadata's own registration_endpoint or sits under the full
+ * issuer URL (path prefix, not just origin: tenants can share one origin). Otherwise it is
+ * dropped and plain discovery applies.
  */
 async function pluginFlowDiscoveryState(
   config: MCPServerOAuthConfig,
@@ -203,8 +192,7 @@ async function pluginFlowDiscoveryState(
   serverUrlForDiscovery: string
 ): Promise<OAuthDiscoveryState | undefined> {
   const registrationUrl = config.discovery?.registrationUrl;
-  if (config.endpoints !== undefined || registrationUrl === undefined)
-    return pluginDiscoveryState(config);
+  if (registrationUrl === undefined) return pluginDiscoveryState(config);
   const base = config.discovery?.authorizationServerBase;
   try {
     const discovered =
@@ -220,10 +208,12 @@ async function pluginFlowDiscoveryState(
           });
     const metadata = discovered.authorizationServerMetadata;
     if (metadata === undefined) return pluginDiscoveryState(config);
-    const issuerOrigin = new URL(base ?? metadata.issuer).origin;
-    if (new URL(registrationUrl).origin !== issuerOrigin) {
-      log.warn("[MCP OAuth] Ignoring a plugin registrationUrl outside the issuer's origin", {
-        issuerOrigin,
+    if (
+      registrationUrl !== metadata.registration_endpoint &&
+      !isUnderIssuer(registrationUrl, metadata.issuer)
+    ) {
+      log.warn("[MCP OAuth] Ignoring a plugin registrationUrl outside the issuer", {
+        issuer: metadata.issuer,
       });
       return pluginDiscoveryState(config);
     }
@@ -293,14 +283,12 @@ function pluginResourceValidator(resource: string): (serverResource: URL) => Pro
 }
 
 /**
- * The issuer a plugin config pins: its endpoint overrides' (the issuer pluginDiscoveryState
- * builds), or its authorizationServerBase. Undefined when discovery picks the issuer: then it is
- * the server's own choice, which no plugin update changes, and the SDK's auth() already
- * discards credentials stamped by another issuer before a refresh (SEP-2352).
+ * The issuer a plugin config pins: its authorizationServerBase (the SDK verifies the metadata
+ * issuer is exactly that URL). Undefined when discovery picks the issuer: then it is the
+ * server's own choice, which no plugin update changes, and the SDK's auth() already discards
+ * credentials stamped by another issuer before a refresh (SEP-2352).
  */
 function pinnedIssuer(config: MCPServerOAuthConfig | undefined): string | undefined {
-  const endpoints = config?.endpoints;
-  if (endpoints !== undefined) return endpoints.issuer ?? new URL(endpoints.tokenUrl).origin;
   return config?.discovery?.authorizationServerBase;
 }
 
