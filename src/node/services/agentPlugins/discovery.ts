@@ -196,6 +196,8 @@ export interface AgentPluginInfo {
   skillsDir?: string;
   /** Canonical `mcp.json` path; present only when it exists, is a regular file, and stays inside the root (§6.2). */
   mcpConfigPath?: string;
+  /** "codex": the MCP file is in the Codex `.mcp.json` dialect (see loadPluginMcpServers). */
+  mcpConfigDialect?: "codex";
   /** Canonical `hooks.js` path (Tier-1 sandboxed plugin hooks); present only
    * when it exists, is a regular file, and stays inside the root. Resolved
    * with the same §6.2 component rules as mcp.json. */
@@ -473,6 +475,12 @@ async function discoverPluginAt(args: {
     ? "mcp.json"
     : CODEX_MCP_CONFIG_RELATIVE_PATH;
   const mcpConfigPath = await resolveComponent(contributes?.mcp ?? defaultMcpPath, "file");
+  // Lexical, before canonicalization: a Codex package's MCP file, or the
+  // `.mcp.json` default, is in the Codex dialect.
+  const mcpConfigDialect =
+    codexFallback || (contributes?.mcp === undefined && defaultMcpPath !== "mcp.json")
+      ? "codex"
+      : undefined;
   // A Codex-fallback package gets skills, MCP and com.openai only: no Xum
   // executable components (see normalizeCodexManifest's SECURITY AUDIT).
   const hooksPath = codexFallback
@@ -498,6 +506,7 @@ async function discoverPluginAt(args: {
     ...(openai.extension !== undefined ? { openai: openai.extension } : {}),
     ...(skillsDir !== undefined ? { skillsDir } : {}),
     ...(mcpConfigPath !== undefined ? { mcpConfigPath } : {}),
+    ...(mcpConfigPath !== undefined && mcpConfigDialect !== undefined ? { mcpConfigDialect } : {}),
     ...(hooksPath !== undefined ? { hooksPath } : {}),
     ...(agentsDir !== undefined ? { agentsDir } : {}),
     ...(workflowsDir !== undefined ? { workflowsDir } : {}),

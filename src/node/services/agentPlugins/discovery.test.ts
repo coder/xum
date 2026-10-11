@@ -1096,6 +1096,25 @@ describe("discoverAgentPlugins", () => {
     expect(result.plugins[0].mcpConfigPath).toBe(path.join(result.plugins[0].rootPath, "mcp.json"));
   });
 
+  test("a symlinked .mcp.json keeps the Codex dialect; a root mcp.json does not", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const linked = await writePlugin(container, "linked");
+    await fs.mkdir(path.join(linked, "config"));
+    await fs.writeFile(path.join(linked, "config", "server.json"), "{}", "utf8");
+    await fs.symlink("config/server.json", path.join(linked, ".mcp.json"));
+    await writePlugin(container, "portable", { mcpJson: "{}" });
+
+    const { plugins } = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const byName = new Map(plugins.map((p) => [p.name, p]));
+    expect(byName.get("linked")?.mcpConfigPath).toBe(
+      path.join(byName.get("linked")!.rootPath, "config", "server.json")
+    );
+    expect(byName.get("linked")?.mcpConfigDialect).toBe("codex");
+    expect(byName.get("portable")?.mcpConfigDialect).toBeUndefined();
+  });
+
   test("falls back to .mcp.json for a root-manifest plugin without mcp.json", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");

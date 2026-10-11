@@ -112,6 +112,12 @@ function readClient(
         `'${AUTH}.client.clientId' must be a non-empty string on a provided client; ignoring`
       );
   }
+  if (client.mode === "provided" && client.clientId === undefined) {
+    result.warnings.push(
+      `'${AUTH}.client.clientId' is required for a provided client; ignoring the client`
+    );
+    return undefined;
+  }
   if (raw.tokenEndpointAuthMethod !== undefined) {
     if (
       typeof raw.tokenEndpointAuthMethod === "string" &&
@@ -221,6 +227,8 @@ export function translateCodexMcpEntry(entry: Record<string, unknown>): {
   const ignored: string[] = [];
   const warnings: string[] = [];
   if (rest.type === "http") rest.type = "streamable-http";
+  // Codex stdio entries carry a `command` and no `type`.
+  if (rest.type === undefined && typeof rest.command === "string") rest.type = "stdio";
 
   const auth: Record<string, unknown> = {};
   if (oauth !== undefined) {
