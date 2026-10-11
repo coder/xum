@@ -25,8 +25,9 @@ export function stripClientPluginSendHookFields<T>(muxMetadata: T): T {
     strippedParsed = { ...(strippedParsed ?? parsed), [key]: rest };
   }
   if (strippedParsed === undefined) return muxMetadata;
+  const stripped = { ...muxMetadata, parsed: strippedParsed };
   // Same shape as the input minus optional fields, so it stays assignable to T.
-  return { ...muxMetadata, parsed: strippedParsed } as T;
+  return stripped as T;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
