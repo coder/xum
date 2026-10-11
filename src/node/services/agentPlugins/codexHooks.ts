@@ -248,8 +248,12 @@ function parseMatcherGroup(
     group.matcher !== "" &&
     !MATCHERLESS_CODEX_HOOK_EVENTS.has(event)
   ) {
-    if (typeof group.matcher !== "string" || !isValidHookMatcher(group.matcher)) {
-      warnings.push(`${source}: a '${event}' matcher is not a valid regex; ignoring its group`);
+    const error =
+      typeof group.matcher === "string" ? hookMatcherError(group.matcher) : "not a string";
+    if (typeof group.matcher !== "string" || error !== undefined) {
+      warnings.push(
+        `${source}: a '${event}' matcher is not a valid regex (${String(error)}); ignoring its group`
+      );
       return;
     }
     matcher = group.matcher;
@@ -337,27 +341,80 @@ function parseHandler(
  * - A list of names (only letters, digits, `_` and `|`, e.g. `Bash|Edit`) matches one of the
  *   names exactly, not as a substring.
  * - A leading inline-flag group of `i`, `m` and `s` (e.g. `(?i)`, `(?is)`) becomes RegExp flags.
- * Rust-only syntax that is not translated, so JavaScript rejects it (the group is dropped with a
- * warning) or reads it differently: inline flags after the start or negated (`(?-i)`), the `x`,
- * `U`, `u` and `R` flags, scoped flag groups `(?i:...)`, `\A` and `\z`, `(?P<name>...)`,
- * one-letter classes such as `\pL`, POSIX classes such as `[[:alpha:]]`, and the class set
- * operators `&&`, `--` and `~~`.
- * Callers handle match-all ("*", "" or no matcher) first. Throws a SyntaxError when JavaScript
- * cannot compile the pattern.
+ * Rust-only syntax is not translated. JavaScript rejects some of it: inline flags after the start
+ * or negated (`(?-i)`), the `x`, `U`, `u` and `R` flags, and `(?P<name>...)`. It would accept the
+ * rest and read it differently, so a guard would silently miss the tools it targets; Xum refuses
+ * that syntax instead (see rustOnlySyntax). Either way the group is dropped with a warning.
+ * Callers handle match-all ("*", "" or no matcher) first. Throws a SyntaxError for a pattern
+ * Xum cannot compile.
  */
 export function compileHookMatcher(pattern: string): RegExp {
   if (/^[A-Za-z0-9_|]+$/.test(pattern)) return new RegExp(`^(?:${pattern})$`);
+  const rustOnly = rustOnlySyntax(pattern);
+  if (rustOnly !== undefined) {
+    throw new SyntaxError(`${rustOnly} means something else in JavaScript`);
+  }
   const flags = /^\(\?([ims]+)\)/.exec(pattern);
   if (flags === null) return new RegExp(pattern);
   return new RegExp(pattern.slice(flags[0].length), [...new Set(flags[1])].join(""));
 }
 
-function isValidHookMatcher(pattern: string): boolean {
+/**
+ * The first construct that Rust `regex` and a JavaScript RegExp (without the `u` flag) both
+ * accept but read differently, or undefined:
+ * - an escaped letter or `<`/`>` that JavaScript reads as a literal: `\A` and `\z` anchors,
+ *   `\pL` and `\p{...}` classes, `\x{...}`, `\u{...}`, `\U...`, `\b{start}`, `\<`, `\>`;
+ * - inside a class, `[` (a nested or POSIX class such as `[[:alpha:]]`), the set operators
+ *   `&&`, `--` and `~~`, and a leading `]` (a literal in Rust, an empty class in JavaScript).
+ */
+function rustOnlySyntax(pattern: string): string | undefined {
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const char = pattern[i];
+    if (char === "\\") {
+      const escape = readEscape(pattern, i);
+      if (!isSameEscape(escape)) return `'${escape}'`;
+      if (/^\\[bB]$/.test(escape) && pattern[i + 2] === "{") return `'${escape}{...}'`;
+      i += escape.length - 1;
+      continue;
+    }
+    if (!inClass) {
+      if (char !== "[") continue;
+      inClass = true;
+      if (pattern[i + 1] === "^") i++;
+      if (pattern[i + 1] === "]") return "'[]...]'";
+      continue;
+    }
+    const pair = pattern.slice(i, i + 2);
+    if (char === "[" || pair === "&&" || pair === "--" || pair === "~~") {
+      return `'${char === "[" ? char : pair}' in a character class`;
+    }
+    if (char === "]") inClass = false;
+  }
+  return undefined;
+}
+
+/** The escape at `index`: `\` and one character, plus the hex digits of `\xhh` and `\uhhhh`. */
+function readEscape(pattern: string, index: number): string {
+  const hex = /^\\(?:x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4})/.exec(pattern.slice(index));
+  return hex?.[0] ?? pattern.slice(index, index + 2);
+}
+
+/** Escapes that both dialects read the same; escaped punctuation is a literal in both. */
+function isSameEscape(escape: string): boolean {
+  if (escape.length > 2) return true; // \xhh or \uhhhh
+  const char = escape.slice(1);
+  if (char === "<" || char === ">") return false;
+  return !/[A-Za-z]/.test(char) || "dDsSwWbBfnrtv".includes(char);
+}
+
+/** undefined when the matcher compiles, else why it does not. */
+function hookMatcherError(pattern: string): string | undefined {
   try {
     compileHookMatcher(pattern);
-    return true;
-  } catch {
-    return false;
+    return undefined;
+  } catch (error) {
+    return getErrorMessage(error);
   }
 }
 
