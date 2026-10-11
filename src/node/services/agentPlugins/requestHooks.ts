@@ -5,6 +5,7 @@ import type { DurableEventJournal } from "@/node/utils/journal/durableEventJourn
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { log } from "@/node/services/log";
+import { sideChatCapabilityGrants } from "@/node/services/sideChat";
 import { codexPluginHookService } from "./codexHookService";
 import { agentPluginHookService } from "./hookService";
 import { resolveAgentPluginsMcpContext } from "./mcpConfig";
@@ -39,6 +40,7 @@ export async function prepareWorkspaceRequestHooks(args: {
       mcp: args.mcpServerManager,
       notifyUser: (pluginName, message) =>
         log.info("Plugin hook message", { workspaceId: metadata.id, pluginName, message }),
+      sideChat: sideChatCapabilityGrants(metadata) != null,
     });
   }
 }
