@@ -61,6 +61,13 @@ describe("readOpenAIMcpAuth", () => {
     expect(JSON.stringify(result)).not.toContain("pw@");
   });
 
+  test("a provided client without a clientId is dropped with a warning", () => {
+    const result = readOpenAIMcpAuth(withAuth({ type: "oauth", client: { mode: "provided" } }));
+    expect(result.auth).toEqual({ type: "oauth" });
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toContain("client.clientId' is required");
+  });
+
   test("an unknown auth type ignores the whole block", () => {
     const result = readOpenAIMcpAuth(withAuth({ type: "magic", clientSecret: "s3cret" }));
     expect(result.auth).toBeUndefined();

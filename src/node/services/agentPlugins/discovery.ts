@@ -14,6 +14,7 @@ import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFi
 import { isMutationEpochUnreadable, readContainerMutationState } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginComponentImports } from "./registry";
 import {
+  isPlainObject,
   isValidAgentPluginName,
   validatePluginManifest,
   type AgentPluginManifest,
@@ -183,12 +184,20 @@ export interface AgentPluginInfo {
   /** Directory entry name under the container (lexical, pre-realpath). */
   dirName: string;
   manifest: AgentPluginManifest;
+  /**
+   * Found through `.codex-plugin/plugin.json`: only skills, MCP and the
+   * com.openai fields are honored (no hooks, agents, workflows, slash
+   * commands or `extensions.mux`).
+   */
+  codexFallback?: true;
   /** Validated `extensions["com.openai"]` (parsed and exposed only; nothing consumes it yet). */
   openai?: OpenAIPluginExtension;
   /** Canonical `skills/` directory; present only when it exists, is a directory, and stays inside the root (§6.2). */
   skillsDir?: string;
   /** Canonical `mcp.json` path; present only when it exists, is a regular file, and stays inside the root (§6.2). */
   mcpConfigPath?: string;
+  /** "codex": the MCP file is in the Codex `.mcp.json` dialect (see loadPluginMcpServers). */
+  mcpConfigDialect?: "codex";
   /** Canonical `hooks.js` path (Tier-1 sandboxed plugin hooks); present only
    * when it exists, is a regular file, and stays inside the root. Resolved
    * with the same §6.2 component rules as mcp.json. */
@@ -303,6 +312,45 @@ async function resolveComponentPath(args: {
   return canonical;
 }
 
+type ManifestCandidate =
+  | { status: "missing" }
+  | { status: "invalid"; message: string }
+  | { status: "ok"; raw: unknown };
+
+/** Read one manifest location with the shared containment and size caps. */
+async function readManifestCandidate(
+  rootReal: string,
+  relative: string
+): Promise<ManifestCandidate> {
+  let manifestReal: string;
+  try {
+    manifestReal = await ensurePathContained(rootReal, path.join(rootReal, relative));
+  } catch (error) {
+    // ENOTDIR: a `.codex-plugin` file is not a manifest directory either.
+    if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) {
+      return { status: "missing" };
+    }
+    return {
+      status: "invalid",
+      message: `${relative} resolves outside the plugin root: ${getErrorMessage(error)}`,
+    };
+  }
+  const stat = await fsPromises.stat(manifestReal).catch(() => null);
+  // A manifest of the wrong filesystem kind: not a plugin candidate.
+  if (!stat?.isFile()) return { status: "missing" };
+  if (stat.size > MAX_PLUGIN_MANIFEST_BYTES) {
+    return {
+      status: "invalid",
+      message: `${relative} is too large (${stat.size} bytes; max ${MAX_PLUGIN_MANIFEST_BYTES})`,
+    };
+  }
+  try {
+    return { status: "ok", raw: JSON.parse(await fsPromises.readFile(manifestReal, "utf8")) };
+  } catch (error) {
+    return { status: "invalid", message: `Failed to read ${relative}: ${getErrorMessage(error)}` };
+  }
+}
+
 async function discoverPluginAt(args: {
   pluginDir: string;
   containerPath: string;
@@ -330,60 +378,30 @@ async function discoverPluginAt(args: {
   // compatibility manifest, which goes through the same caps and containment.
   let manifestRelative = PLUGIN_MANIFEST_RELATIVE_PATH;
   let manifestPath = path.join(rootReal, manifestRelative);
-  let manifestReal: string | undefined;
+  let rawManifest: unknown;
+  let found = false;
   for (const candidate of [PLUGIN_MANIFEST_RELATIVE_PATH, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH]) {
     manifestRelative = candidate;
     manifestPath = path.join(rootReal, candidate);
-    try {
-      manifestReal = await ensurePathContained(rootReal, manifestPath);
-      break;
-    } catch (error) {
-      // ENOTDIR: a `.codex-plugin` file is not a manifest directory either.
-      if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) {
-        continue;
-      }
-      pushError(
-        manifestPath,
-        `${candidate} resolves outside the plugin root: ${getErrorMessage(error)}`
-      );
+    const read = await readManifestCandidate(rootReal, candidate);
+    if (read.status === "missing") continue;
+    if (read.status === "invalid") {
+      pushError(manifestPath, read.message);
       return null;
     }
+    rawManifest = read.raw;
+    found = true;
+    break;
   }
-  if (manifestReal === undefined) {
+  if (!found) {
     // No manifest → not a plugin (silent skip, e.g. Codex marketplace.json entries).
     return null;
   }
 
-  let manifestStat;
-  try {
-    manifestStat = await fsPromises.stat(manifestReal);
-  } catch {
-    return null;
-  }
-  if (!manifestStat.isFile()) {
-    // A manifest of the wrong filesystem kind: not a plugin candidate.
-    return null;
-  }
-  if (manifestStat.size > MAX_PLUGIN_MANIFEST_BYTES) {
-    pushError(
-      manifestPath,
-      `${manifestRelative} is too large (${manifestStat.size} bytes; max ${MAX_PLUGIN_MANIFEST_BYTES})`
-    );
-    return null;
-  }
-
-  let rawManifest: unknown;
-  try {
-    rawManifest = JSON.parse(await fsPromises.readFile(manifestReal, "utf8")) as unknown;
-  } catch (error) {
-    pushError(manifestPath, `Failed to read ${manifestRelative}: ${getErrorMessage(error)}`);
-    return null;
-  }
-
-  const normalized =
-    manifestRelative === CODEX_PLUGIN_MANIFEST_RELATIVE_PATH
-      ? normalizeCodexManifest(rawManifest)
-      : { manifest: rawManifest, warnings: [] };
+  const codexFallback = manifestRelative === CODEX_PLUGIN_MANIFEST_RELATIVE_PATH;
+  const normalized = codexFallback
+    ? normalizeCodexManifest(rawManifest)
+    : { manifest: rawManifest, warnings: [] };
   const validation = validatePluginManifest(normalized.manifest);
   if (!validation.ok) {
     const label =
@@ -394,10 +412,34 @@ async function discoverPluginAt(args: {
     return null;
   }
 
-  const openai = readOpenAIExtension(validation.manifest);
-  for (const warning of [...normalized.warnings, ...validation.warnings, ...openai.warnings]) {
+  for (const warning of [...normalized.warnings, ...validation.warnings]) {
     log.debug(`Agent plugin ${pluginDir}: ${warning}`);
     diagnostics.push({ path: manifestPath, scope, severity: "warning", message: warning });
+  }
+
+  // OpenAI settings: root `extensions["com.openai"]` when it is an object;
+  // otherwise a `.codex-plugin/plugin.json` next to it supplies them (the two
+  // are never merged). The overlay contributes nothing else.
+  let openaiSource: Pick<AgentPluginManifest, "extensions"> = validation.manifest;
+  let openaiPath = manifestPath;
+  if (!codexFallback && !isPlainObject(validation.manifest.extensions?.["com.openai"])) {
+    const overlayPath = path.join(rootReal, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
+    const overlay = await readManifestCandidate(rootReal, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
+    if (overlay.status === "invalid") {
+      diagnostics.push({ path: overlayPath, scope, severity: "warning", message: overlay.message });
+    } else if (overlay.status === "ok") {
+      const overlayManifest = normalizeCodexManifest(overlay.raw).manifest;
+      const extensions = isPlainObject(overlayManifest) ? overlayManifest.extensions : undefined;
+      if (isPlainObject(extensions) && extensions["com.openai"] !== undefined) {
+        openaiSource = { extensions: { "com.openai": extensions["com.openai"] } };
+        openaiPath = overlayPath;
+      }
+    }
+  }
+  const openai = readOpenAIExtension(openaiSource);
+  for (const warning of openai.warnings) {
+    log.debug(`Agent plugin ${pluginDir}: ${warning}`);
+    diagnostics.push({ path: openaiPath, scope, severity: "warning", message: warning });
   }
 
   // Defensive: the validator guarantees a spec-valid name.
@@ -433,11 +475,25 @@ async function discoverPluginAt(args: {
     ? "mcp.json"
     : CODEX_MCP_CONFIG_RELATIVE_PATH;
   const mcpConfigPath = await resolveComponent(contributes?.mcp ?? defaultMcpPath, "file");
-  const hooksPath = await resolveComponent(contributes?.hooks ?? "hooks.js", "file", {
-    maxBytes: MAX_PLUGIN_HOOK_SOURCE_BYTES,
-  });
-  const agentsDir = await resolveComponent(contributes?.agents ?? "agents", "directory");
-  const workflowsDir = await resolveComponent(contributes?.workflows ?? "workflows", "directory");
+  // Lexical, before canonicalization: a Codex package's MCP file, or the
+  // `.mcp.json` default, is in the Codex dialect.
+  const mcpConfigDialect =
+    codexFallback || (contributes?.mcp === undefined && defaultMcpPath !== "mcp.json")
+      ? "codex"
+      : undefined;
+  // A Codex-fallback package gets skills, MCP and com.openai only: no Xum
+  // executable components (see normalizeCodexManifest's SECURITY AUDIT).
+  const hooksPath = codexFallback
+    ? undefined
+    : await resolveComponent(contributes?.hooks ?? "hooks.js", "file", {
+        maxBytes: MAX_PLUGIN_HOOK_SOURCE_BYTES,
+      });
+  const agentsDir = codexFallback
+    ? undefined
+    : await resolveComponent(contributes?.agents ?? "agents", "directory");
+  const workflowsDir = codexFallback
+    ? undefined
+    : await resolveComponent(contributes?.workflows ?? "workflows", "directory");
 
   return {
     name: validation.manifest.name,
@@ -446,9 +502,11 @@ async function discoverPluginAt(args: {
     containerPath: args.containerPath,
     dirName: args.dirName,
     manifest: validation.manifest,
+    ...(codexFallback ? { codexFallback: true } : {}),
     ...(openai.extension !== undefined ? { openai: openai.extension } : {}),
     ...(skillsDir !== undefined ? { skillsDir } : {}),
     ...(mcpConfigPath !== undefined ? { mcpConfigPath } : {}),
+    ...(mcpConfigPath !== undefined && mcpConfigDialect !== undefined ? { mcpConfigDialect } : {}),
     ...(hooksPath !== undefined ? { hooksPath } : {}),
     ...(agentsDir !== undefined ? { agentsDir } : {}),
     ...(workflowsDir !== undefined ? { workflowsDir } : {}),
