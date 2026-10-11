@@ -331,6 +331,8 @@ export interface MockORPCClientOptions {
   mcpSettingsReadErrors?: Map<string, string>;
   /** When set, settings updates wait for this promise (stories hold a save in flight). */
   mcpSettingsUpdateGate?: { promise: Promise<void> };
+  /** When set, the first settings read takes its values, then waits for this promise. */
+  mcpSettingsFirstReadGate?: { promise: Promise<void> };
   /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
   mcpTestGate?: { promise: Promise<void> };
   /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
@@ -471,6 +473,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpSettingsReads,
     mcpSettingsReadErrors,
     mcpSettingsUpdateGate,
+    mcpSettingsFirstReadGate,
     mcpTestGate,
     mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
@@ -580,6 +583,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   };
 
   let createdWorkspaceCounter = 0;
+  let mcpSettingsReadCount = 0;
 
   const agentDefinitions: AgentDefinitionDescriptor[] =
     initialAgentDefinitions ??
@@ -1341,7 +1345,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcp: {
       settings: {
         // A copy, like IPC: a dialog that keeps an old read must not see later updates.
-        read: (input: { serverNames: string[]; ifConnected?: boolean }) => {
+        read: async (input: { serverNames: string[]; ifConnected?: boolean }) => {
+          const first = (mcpSettingsReadCount += 1) === 1;
           mcpSettingsReads?.push(input.serverNames);
           const readOne = (serverName: string) => {
             if (input.ifConnected === true && !mcpSettingsConnected.has(serverName))
@@ -1355,9 +1360,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               data: snapshot === undefined ? null : structuredClone(snapshot),
             };
           };
-          return Promise.resolve(
-            Object.fromEntries(input.serverNames.map((name) => [name, readOne(name)]))
-          );
+          const result = Object.fromEntries(input.serverNames.map((name) => [name, readOne(name)]));
+          if (first) await mcpSettingsFirstReadGate?.promise;
+          return result;
         },
         update: async (input: { serverName: string; set: Record<string, MCPSettingValue> }) => {
           await mcpSettingsUpdateGate?.promise;

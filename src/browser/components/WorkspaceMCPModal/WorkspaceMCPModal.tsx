@@ -14,7 +14,12 @@ import {
   DialogTitle,
 } from "@/browser/components/Dialog/Dialog";
 import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
-import { applySavedSettings, type ServerSettingsEntry } from "./serverSettingsEntries";
+import {
+  applySavedSettings,
+  SettingsRequests,
+  type ServerSettingsEntry,
+  type SettingsRequestScope,
+} from "./serverSettingsEntries";
 import { MCPServerSettingsSection } from "./MCPServerSettingsSection";
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import {
@@ -72,12 +77,13 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   >({});
   // OpenAI structured settings, read fresh on every open (connected servers
   // only) and with each tool fetch. `fetchId` remounts the section on every
-  // read; a save keeps it and only replaces the snapshot's values (onSaved).
+  // read; a save keeps it and only replaces the snapshot's values (beginSave).
   const [serverSettings, setServerSettings] = useState<Record<string, ServerSettingsEntry>>({});
   // Servers the SAVED overrides enable (as of this open). A settings read goes through the
   // backend's saved enablement, so a server enabled only in this unsaved dialog is not read.
   const savedEnabledServers = useRef(new Set<string>());
-  const settingsFetchCount = useRef(0);
+  // One rule for every settings result (read or save): only a server's latest request applies.
+  const [settingsRequests] = useState(() => new SettingsRequests());
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -92,16 +98,18 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   reloadCacheRef.current = reloadCache;
 
   /**
-   * Read servers' structured settings into `serverSettings`, in one IPC call. A read that
-   * started under an older open (generation) is dropped. `onOpen` reads only servers the
+   * Read servers' structured settings into `serverSettings`, in one IPC call. Each server's
+   * result applies only while its request is the latest (in `scope`, the open the caller began
+   * under; see SettingsRequests). `onOpen` reads only servers the
    * workspace already runs (opening the dialog never starts one; Fetch Tools does). A failed
    * read shows as "Settings unavailable": servers without settings read as null, not as errors.
    */
   const readServerSettings = useCallback(
-    // `generation`: the open the caller started under. A Fetch Tools that began before a
-    // reopen (or a workspace switch) must not install its read into the new dialog.
-    async (serverNames: string[], onOpen: boolean, generation: number) => {
-      if (!api || serverNames.length === 0 || generation !== loadGeneration.current) return;
+    async (serverNames: string[], onOpen: boolean, scope: SettingsRequestScope) => {
+      if (!api || serverNames.length === 0 || scope !== settingsRequests.current()) return;
+      const requests = serverNames.map(
+        (name) => [name, settingsRequests.take(scope, name)] as const
+      );
       let reads: Awaited<ReturnType<typeof api.mcp.settings.read>>;
       try {
         reads = await api.mcp.settings.read({ workspaceId, serverNames, ifConnected: onOpen });
@@ -109,15 +117,14 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
         const error = err instanceof Error ? err.message : String(err);
         reads = Object.fromEntries(serverNames.map((name) => [name, { success: false, error }]));
       }
-      if (generation !== loadGeneration.current) return;
       const updates = new Map<string, ServerSettingsEntry | null>();
-      for (const name of serverNames) {
+      for (const [name, request] of requests) {
         const read = getOwn(reads, name);
-        if (read === undefined) continue;
+        if (read === undefined || !request.isLatest()) continue;
         if (!read.success) updates.set(name, { error: read.error });
         else if (read.data === null) updates.set(name, null);
         else if ("notConnected" in read.data) updates.set(name, read.data);
-        else updates.set(name, { fetchId: ++settingsFetchCount.current, snapshot: read.data });
+        else updates.set(name, { fetchId: request.id, snapshot: read.data });
       }
       setServerSettings((prev) => {
         const next = Object.fromEntries(Object.entries(prev).filter(([n]) => !updates.has(n)));
@@ -125,7 +132,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
         return next;
       });
     },
-    [api, workspaceId]
+    [api, workspaceId, settingsRequests]
   );
   const readServerSettingsRef = useRef(readServerSettings);
   readServerSettingsRef.current = readServerSettings;
@@ -139,6 +146,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
 
     const loadData = async () => {
       loadGeneration.current += 1;
+      const settingsScope = settingsRequests.startOpen();
       setBranding({});
       // Settings from an earlier open are stale: the server persists them and
       // may have changed (or a save in that open replaced them).
@@ -155,6 +163,8 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
         setServers(projectServers ?? {});
         setOverrides(workspaceOverrides.overrides ?? {});
         setOverridesRevision(workspaceOverrides.revision);
+        // A later open began meanwhile (this load is stale): that open reads its own settings.
+        if (settingsScope !== settingsRequests.current()) return;
         // Settings show without Fetch Tools: read every server the saved
         // overrides enable and the workspace already runs. Not awaited: the
         // dialog renders now and each section appears when its read lands.
@@ -165,11 +175,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
             )
             .map(([name]) => name)
         );
-        void readServerSettingsRef.current(
-          [...savedEnabledServers.current],
-          true,
-          loadGeneration.current
-        );
+        void readServerSettingsRef.current([...savedEnabledServers.current], true, settingsScope);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load MCP configuration");
       } finally {
@@ -178,13 +184,14 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     };
 
     void loadData();
-  }, [open, api, projectPath, workspaceId]);
+  }, [open, api, projectPath, workspaceId, settingsRequests]);
 
   // Fetch/refresh tools for a server
   const fetchTools = useCallback(
     async (serverName: string) => {
       if (!api) return;
       const generation = loadGeneration.current;
+      const settingsScope = settingsRequests.current();
       setLoadingTools((prev) => ({ ...prev, [serverName]: true }));
       // A failed or unbranded refresh must not retain the previous test's identity.
       setBranding((prev) => {
@@ -205,7 +212,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
           // Enabled only in this unsaved dialog: the read would fail as "disabled". The
           // section appears after Save, on the next open.
           if (savedEnabledServers.current.has(serverName))
-            await readServerSettings([serverName], false, generation);
+            await readServerSettings([serverName], false, settingsScope);
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : `Failed to fetch tools for ${serverName}`);
@@ -213,7 +220,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
         setLoadingTools((prev) => ({ ...prev, [serverName]: false }));
       }
     },
-    [api, projectPath, workspaceId, setResult, readServerSettings]
+    [api, projectPath, workspaceId, setResult, readServerSettings, settingsRequests]
   );
 
   /**
@@ -570,11 +577,18 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                             workspaceId={workspaceId}
                             serverName={name}
                             snapshot={entry.snapshot}
-                            onSaved={(values) =>
-                              setServerSettings((prev) =>
-                                applySavedSettings(prev, name, entry.fetchId, values)
-                              )
-                            }
+                            beginSave={() => {
+                              const request = settingsRequests.take(
+                                settingsRequests.current(),
+                                name
+                              );
+                              return (values) => {
+                                if (request.isLatest())
+                                  setServerSettings((prev) =>
+                                    applySavedSettings(prev, name, values)
+                                  );
+                              };
+                            }}
                           />
                         );
                       })()}

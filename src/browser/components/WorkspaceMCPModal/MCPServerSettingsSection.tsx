@@ -19,11 +19,11 @@ interface MCPServerSettingsSectionProps {
   serverName: string;
   snapshot: MCPSettingsSnapshot;
   /**
-   * The values a successful save returned. The dialog keeps them as the
-   * snapshot's values, so a remount (server toggled off and on) starts from
-   * what the server stored, not from the first read.
+   * Called when a save starts (it takes the save's settings request); the returned callback
+   * gets the values a successful save returned. The dialog keeps them as the snapshot's
+   * values, so a remount (server toggled off and on) starts from what the server stored.
    */
-  onSaved: (values: MCPSettingsSnapshot["values"]) => void;
+  beginSave: () => (values: MCPSettingsSnapshot["values"]) => void;
 }
 
 /**
@@ -60,6 +60,7 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
     if (!api) return;
     setSaving(true);
     setError(null);
+    const onSaved = props.beginSave();
     try {
       const result = await api.mcp.settings.update({
         workspaceId: props.workspaceId,
@@ -69,7 +70,7 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
       if (result.success) {
         setSaved(result.data);
         setDraft(result.data);
-        props.onSaved(result.data);
+        onSaved(result.data);
       } else {
         setError(result.error);
         setDraft(saved);
