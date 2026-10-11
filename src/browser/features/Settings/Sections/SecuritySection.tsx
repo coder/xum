@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { ShieldCheck, ShieldOff } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
+import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAPI } from "@/browser/contexts/API";
 
@@ -21,6 +22,7 @@ export function SecuritySection() {
     try {
       setPendingPath(projectPath);
       await api.projects.setTrust({ projectPath, trusted: !currentlyTrusted });
+      publishProjectTrustChanged();
       await refreshProjects();
     } catch {
       // Best-effort — config refresh will reflect actual state

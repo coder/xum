@@ -160,6 +160,10 @@ export function parseMCPAppEntrypoints(meta: unknown): {
   return { types: [...types], skippedFile };
 }
 
+export function isMcpAppEntrypointKey(key: string): boolean {
+  return key.startsWith("entrypoint:");
+}
+
 /** The result-store key of an opened entry point (one view record per server, tool and type). */
 export function mcpAppEntrypointKey(
   serverName: string,

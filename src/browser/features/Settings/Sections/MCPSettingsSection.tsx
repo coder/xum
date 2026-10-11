@@ -1,4 +1,5 @@
 import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
+import { publishGlobalMcpEnablementChanged } from "@/browser/utils/workspaceMcpMutations";
 import {
   McpAppViewDomainsSection,
   unlistedMcpAppViewDomains,
@@ -999,6 +1000,7 @@ export const MCPSettingsSection: React.FC = () => {
           name,
           enabled,
         });
+        if (result.success) publishGlobalMcpEnablementChanged();
         if (!result.success) {
           // Revert on error
           setServers((prev) => ({

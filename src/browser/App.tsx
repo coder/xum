@@ -61,6 +61,10 @@ import {
 } from "@/constants/layout";
 import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
 import { buildCoreSources, type BuildSourcesParams } from "./utils/commands/sources";
+import {
+  useLoadMcpAppEntrypoints,
+  useMcpAppEntrypoints,
+} from "./features/RightSidebar/AppViewTab/mcpAppEntrypoints";
 
 import {
   getTopLevelProjectEntries,
@@ -330,6 +334,9 @@ function AppInner() {
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  // MCP App entry points open as app tabs, so the Artifacts experiment gates them too.
+  useLoadMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? null, artifactsEnabled);
+  const mcpAppEntrypoints = useMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? "");
   const sessionTapesEnabled = useExperimentValue(EXPERIMENT_IDS.SESSION_TAPES);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   const perfFlightRecorderEnabled = useExperimentValue(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER);
@@ -1073,6 +1080,7 @@ function AppInner() {
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
     artifactsEnabled,
+    mcpAppEntrypoints,
     perfFlightRecorderEnabled,
     sessionTapesEnabled,
     onArchiveMergedWorkspacesInProject: archiveMergedWorkspacesInProjectFromPalette,

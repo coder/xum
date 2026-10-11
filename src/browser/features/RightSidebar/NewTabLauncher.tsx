@@ -1,5 +1,12 @@
 import React from "react";
-import { MessagesSquare, Terminal as TerminalIcon, type LucideIcon } from "lucide-react";
+import {
+  AppWindow,
+  LayoutGrid,
+  MessagesSquare,
+  Terminal as TerminalIcon,
+  type LucideIcon,
+} from "lucide-react";
+import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 import { cn } from "@/common/lib/utils";
 import { formatKeybind, KEYBINDS, type Keybind } from "@/browser/utils/ui/keybinds";
 import { TAB_REGISTRY, type BaseTabType } from "./Tabs";
@@ -23,7 +30,20 @@ interface NewTabLauncherProps {
    */
   autoFocus: boolean;
   onAutoFocusConsumed: () => void;
+  /** MCP App entry points of the workspace's enabled servers (artifacts experiment). */
+  entrypoints?: readonly McpAppEntrypoint[];
+  /** Open (or focus) an entry point's app tab; resolves to an error message or null. */
+  onOpenEntrypoint?: (entrypoint: McpAppEntrypoint) => Promise<string | null>;
 }
+
+/**
+ * Entry point rows use a fixed lucide icon per type. Remote icons (a tool's `icons` or the
+ * server's) are not shown: they would load attacker-chosen URLs into the renderer.
+ */
+const ENTRYPOINT_ICONS: Record<McpAppEntrypoint["type"], LucideIcon> = {
+  global: LayoutGrid,
+  thread: AppWindow,
+};
 
 /**
  * The New tab (Codex-style empty tab): instead of showing every tool as an idle tab, the strip
@@ -33,6 +53,16 @@ interface NewTabLauncherProps {
 export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
   const listRef = React.useRef<HTMLDivElement>(null);
   const { autoFocus, onAutoFocusConsumed } = props;
+  const [opening, setOpening] = React.useState<string | null>(null);
+  const [openError, setOpenError] = React.useState<string | null>(null);
+  const openEntrypoint = async (entrypoint: McpAppEntrypoint) => {
+    if (props.onOpenEntrypoint == null) return;
+    setOpening(entrypoint.viewKey);
+    setOpenError(null);
+    const error = await props.onOpenEntrypoint(entrypoint);
+    setOpening(null);
+    setOpenError(error);
+  };
 
   // Moving DOM focus is a side effect on the rendered rows, so it runs after commit.
   React.useEffect(() => {
@@ -96,6 +126,26 @@ export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
             disabled={props.creatingSideChat}
           />
         )}
+        {props.entrypoints != null && props.entrypoints.length > 0 && (
+          <>
+            <h3 className="text-muted mt-3 px-2 text-[11px] font-medium">Plugin views</h3>
+            {props.entrypoints.map((entrypoint) => (
+              <LauncherRow
+                key={entrypoint.viewKey}
+                Icon={ENTRYPOINT_ICONS[entrypoint.type]}
+                name={entrypoint.title}
+                description={entrypoint.serverName}
+                onClick={() => void openEntrypoint(entrypoint)}
+                disabled={opening !== null}
+              />
+            ))}
+            {openError != null && (
+              <p role="alert" className="text-error px-2 text-[11px] break-words">
+                {openError}
+              </p>
+            )}
+          </>
+        )}
       </div>
     </div>
   );
@@ -129,7 +179,7 @@ const LauncherRow: React.FC<{
       />
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="text-foreground truncate text-xs font-medium">{props.name}</span>
-        <span id={descriptionId} className="text-muted text-[11px] leading-snug">
+        <span id={descriptionId} className="text-muted text-[11px] leading-snug break-words">
           {props.description}
         </span>
       </span>

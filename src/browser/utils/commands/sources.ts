@@ -48,6 +48,8 @@ import {
   transcriptViews,
   type McpAppViewRef,
 } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+import { openMcpAppEntrypoint } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
+import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 
 /**
  * The workspace's MCP App views (the loaded transcript's, then ones opened this session), each
@@ -183,8 +185,10 @@ export interface BuildSourcesParams {
   onStartWorkspaceCreation: (projectPath: string) => void;
   onStartMultiProjectWorkspaceCreation: () => void;
   multiProjectWorkspacesEnabled: boolean;
-  /** artifacts experiment: gates "Open Artifacts" and "Open File as Artifact…". */
+  /** artifacts experiment: gates "Open Artifacts", "Open File as Artifact…" and entry points. */
   artifactsEnabled?: boolean;
+  /** The selected workspace's MCP App entry points; undefined until listed. */
+  mcpAppEntrypoints?: readonly McpAppEntrypoint[];
   /** perfFlightRecorder experiment: gates "Report slowness". */
   perfFlightRecorderEnabled?: boolean;
   /** sessionTapes experiment: gates "Save open session tapes" and "Reveal session tapes folder". */
@@ -934,6 +938,19 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                   run: () => openMcpAppViewTab(wsId, view),
                 })
               ),
+              // One per MCP App entry point of an enabled server: opens its app tab (calling
+              // the tool with {}) or focuses the one it has.
+              ...(p.mcpAppEntrypoints ?? []).map((entrypoint) => ({
+                id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
+                title: `Open Plugin View: ${entrypoint.title}`,
+                subtitle: entrypoint.serverName,
+                section: section.navigation,
+                keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
+                run: async () => {
+                  if (!p.api) return;
+                  await openMcpAppEntrypoint(p.api, wsId, entrypoint);
+                },
+              })),
               {
                 id: CommandIds.navOpenFileAsArtifact(),
                 title: "Open File as Artifact…",

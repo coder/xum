@@ -6,9 +6,10 @@ import type { DisplayedMessage } from "@/common/types/message";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
 import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
-import { MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
+import { isMcpAppEntrypointKey, MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
 import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolStatus";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
+import { entrypointViewRef, useMcpAppEntrypoints } from "../AppViewTab/mcpAppEntrypoints";
 
 /**
  * MCP Apps views (artifacts experiment), per workspace, for app tabs and the command palette:
@@ -350,16 +351,25 @@ export function useMcpAppView(
       store.getWorkspaceState(workspaceId).loading ||
       store.getWorkspaceState(workspaceId).isHydratingTranscript
   );
-  const view = views.find((v) => v.toolCallId === toolCallId) ?? null;
+  // An entry point's view has no transcript row: it resolves from the listed entry points
+  // (so its tab remounts after a reload), and waits while they are being listed. Its key is not
+  // a tool call, so it never goes to the result-record lookup.
+  const entrypointKey = isMcpAppEntrypointKey(toolCallId);
+  const entrypoints = useMcpAppEntrypoints(workspaceId);
+  const entrypoint = entrypointKey ? entrypoints?.find((e) => e.viewKey === toolCallId) : undefined;
+  const view =
+    views.find((v) => v.toolCallId === toolCallId) ??
+    (entrypoint !== undefined ? entrypointViewRef(entrypoint) : null);
   const lookup = useSyncExternalStore(subscribe, () =>
     recordLookups.get(lookupKey(workspaceId, toolCallId))
   );
-  const lookUp = view === null && !loading && toolCallId !== "" && api != null;
+  const lookUp = view === null && !loading && toolCallId !== "" && !entrypointKey && api != null;
   // Fetching from the backend is an external side effect, so an effect, not render.
   useEffect(() => {
     if (lookUp) lookUpViewRecord(api, workspaceId, toolCallId);
   }, [lookUp, api, workspaceId, toolCallId]);
   if (view !== null) return view;
+  if (entrypointKey) return loading || entrypoints === undefined ? "loading" : null;
   // A failed lookup shows as unavailable until it is retried.
   return loading || (lookUp && lookup !== "missing" && lookup !== "failed") ? "loading" : null;
 }

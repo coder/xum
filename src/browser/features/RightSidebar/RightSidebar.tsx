@@ -127,11 +127,14 @@ import {
 import { SideChatTabTitle } from "./Tabs/TabLabels";
 import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab/AppViewTab";
 import {
+  appViewTabFor,
   appViewTabToolCallId,
   liveAppViewTabs,
   nextRecentAppViewTabs,
   withAppViewTab,
 } from "./AppViewTab/appViewTabs";
+import { useMcpAppEntrypoints } from "./AppViewTab/mcpAppEntrypoints";
+import { openMcpAppEntrypoint } from "./AppViewTab/openMcpAppEntrypoint";
 import { ReviewAssistedStatsReporter } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
 import {
   NewTabLabel,
@@ -434,6 +437,9 @@ interface RightSidebarTabsetNodeProps {
 
 const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) => {
   const tabsetBaseId = `${props.baseId}-${props.node.id}`;
+  const { api } = useAPI();
+  // Listed (artifacts experiment only) by App's loader; empty or undefined otherwise.
+  const entrypoints = useMcpAppEntrypoints(props.workspaceId);
 
   // Content container class comes from tab registry - each tab defines its own padding/overflow
   const tabsetContentClassName = cn(
@@ -741,6 +747,17 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
               creatingSideChat={props.creatingSideChat}
               autoFocus={props.launcherAutoFocusTabsetId === props.node.id}
               onAutoFocusConsumed={props.onLauncherAutoFocusConsumed}
+              entrypoints={entrypoints}
+              onOpenEntrypoint={(entrypoint) =>
+                api == null
+                  ? Promise.resolve("Not connected")
+                  : // Like a tool: the app tab replaces this New tab (or the open one is focused).
+                    openMcpAppEntrypoint(api, props.workspaceId, entrypoint, (view) =>
+                      props.setLayout((prev) =>
+                        openToolFromNewTab(prev, props.node.id, appViewTabFor(view.toolCallId))
+                      )
+                    )
+              }
             />
           </div>
         )}
