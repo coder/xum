@@ -87,6 +87,23 @@ describe("runMessageSendHooks", () => {
     });
   });
 
+  test("a throwing consumer cannot skip a later plugin's block", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rPqnn): one broken plugin must not bypass another's send policy.
+    const spine = new EventSpine();
+    spine.useBefore("message.send", () => {
+      throw new Error("broken plugin");
+    });
+    spine.useBefore("message.send", (ctx) => {
+      ctx.blocked = { pluginName: "guard", reason: "no secrets" };
+    });
+
+    expect(await runMessageSendHooks(spine, "ws", input)).toEqual({
+      kind: "blocked",
+      pluginName: "guard",
+      reason: "no secrets",
+    });
+  });
+
   test("a throwing consumer fails open: the message goes out unchanged", async () => {
     const spine = new EventSpine();
     spine.useBefore("message.send", (ctx) => {
