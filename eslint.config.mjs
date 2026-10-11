@@ -2070,6 +2070,16 @@ const SHIKI_RESTRICTION = {
   message:
     "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead.",
 };
+// Browser and common code must not value-import the @/common/orpc/schemas barrel (#5971).
+// Matches "@/common/orpc/schemas" and relative forms such as "../orpc/schemas", but not leaf
+// modules such as "@/common/orpc/schemas/runtime". Every later no-restricted-imports block that
+// matches browser or common files must include it, because that block replaces this one's options.
+const ORPC_SCHEMAS_BARREL_RESTRICTION = {
+  regex: "(^|/)orpc/schemas$",
+  allowTypeImports: true,
+  message:
+    "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine.",
+};
 
 export default defineConfig([
   {
@@ -2472,17 +2482,7 @@ export default defineConfig([
         "error",
         {
           paths: [AI_TOKENIZER_ENCODING_RESTRICTION],
-          patterns: [
-            SHIKI_RESTRICTION,
-            {
-              // Matches "@/common/orpc/schemas" and relative forms such as "../orpc/schemas",
-              // but not leaf modules such as "@/common/orpc/schemas/runtime".
-              regex: "(^|/)orpc/schemas$",
-              allowTypeImports: true,
-              message:
-                "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine.",
-            },
-          ],
+          patterns: [SHIKI_RESTRICTION, ORPC_SCHEMAS_BARREL_RESTRICTION],
         },
       ],
     },
@@ -2506,6 +2506,11 @@ export default defineConfig([
                 "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel.",
             },
           ],
+          patterns: [
+            ORPC_SCHEMAS_BARREL_RESTRICTION,
+            // Inside src/common/orpc, "./schemas" and "../schemas" are the barrel too.
+            { ...ORPC_SCHEMAS_BARREL_RESTRICTION, regex: "^\\.\\.?/schemas$" },
+          ],
         },
       ],
     },
@@ -2523,6 +2528,7 @@ export default defineConfig([
               message:
                 "Config schemas must not import from ORPC; use @/common/schemas/* or @/common/config/schemas/* instead.",
             },
+            ORPC_SCHEMAS_BARREL_RESTRICTION,
           ],
         },
       ],

@@ -35,6 +35,11 @@ describe("orpc schemas barrel guard", () => {
     ["src/browser/example.ts", 'import { X } from "../common/orpc/schemas";'],
     ["src/browser/example.ts", 'import { type A, X } from "@/common/orpc/schemas";'],
     ["src/browser/example.ts", 'export { X } from "@/common/orpc/schemas";'],
+    // Later blocks for these folders replace the main guard's options, so they restate it.
+    ["src/common/orpc/client.ts", 'import { X } from "@/common/orpc/schemas";'],
+    ["src/common/orpc/client.ts", 'import { X } from "./schemas";'],
+    ["src/common/orpc/schemas/api.ts", 'import { X } from "../schemas";'],
+    ["src/common/config/schemas/example.ts", 'import { X } from "@/common/orpc/schemas";'],
   ])("reports a value import in %s: %s", async (filePath, code) => {
     expect(await restrictedImports(filePath, code)).toEqual([barrelMessage]);
   });
@@ -47,6 +52,8 @@ describe("orpc schemas barrel guard", () => {
       'import { RuntimeModeSchema } from "@/common/orpc/schemas/runtime";',
     ],
     ["src/common/types/example.ts", 'import { RuntimeModeSchema } from "../orpc/schemas/runtime";'],
+    ["src/common/orpc/types.ts", 'import type * as schemas from "./schemas";'],
+    ["src/common/orpc/client.ts", 'import { RuntimeModeSchema } from "./schemas/runtime";'],
     // Backend code does not ship to the browser, so it may use the barrel.
     ["src/node/services/example.ts", 'import { X } from "@/common/orpc/schemas";'],
   ])("allows %s: %s", async (filePath, code) => {
