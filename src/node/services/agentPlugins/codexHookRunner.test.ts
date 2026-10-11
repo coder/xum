@@ -59,17 +59,19 @@ async function runTool(
   spine: EventSpine,
   toolName: string,
   args: unknown,
-  inputJsonSchema?: unknown
+  inputJsonSchema?: unknown,
+  opts: { abortSignal?: AbortSignal; result?: unknown } = {}
 ): Promise<ToolExecuteContext> {
   const ctx: ToolExecuteContext = {
     toolName,
     args,
     host: { runtime: new LocalRuntime("/tmp"), runtimeTempDir: "/tmp", cwd: "/w", workspaceId },
     ...(inputJsonSchema !== undefined ? { inputJsonSchema: () => inputJsonSchema } : {}),
+    ...(opts.abortSignal !== undefined ? { abortSignal: opts.abortSignal } : {}),
     executed: false,
   };
   await spine.run("tool.execute", ctx, (c) => {
-    c.result = { ran: c.args };
+    c.result = opts.result ?? { ran: c.args };
     c.executed = true;
   });
   return ctx;
@@ -126,6 +128,37 @@ describe("PreToolUse", () => {
 
     const isError = setup([hook("PreToolUse")], () => ({ ...deny, isError: true }));
     expect((await runTool(isError.spine, "bash", {})).executed).toBe(true);
+
+    const gateFails = setup([hook("PreToolUse")], () => deny);
+    gateFails.deps.isHookAllowed = () => Promise.reject(new Error("trust store unreadable"));
+    expect((await runTool(gateFails.spine, "bash", {})).executed).toBe(true);
+  });
+
+  test("a deny tagged for another event is malformed and fails open", async () => {
+    const { spine } = setup([hook("PreToolUse")], () =>
+      json({ hookSpecificOutput: { hookEventName: "PostToolUse", permissionDecision: "deny" } })
+    );
+    expect((await runTool(spine, "bash", {})).executed).toBe(true);
+  });
+
+  test("a cancel during a hook ends the hook call and the tool never starts", async () => {
+    const controller = new AbortController();
+    // The longest hook timeout: the run must end at the cancel, not when the hook times out.
+    const { spine } = setup([hook("PreToolUse", { timeoutSeconds: 30 })], () => {
+      controller.abort();
+      return new Promise(() => undefined);
+    });
+
+    const ctx = await runTool(spine, "bash", {}, undefined, { abortSignal: controller.signal });
+
+    expect(ctx.executed).toBe(false);
+    expect(ctx.blocked?.result).toEqual({ error: "Tool call interrupted while plugin hooks ran." });
+  });
+
+  test("the event carries the session cwd", async () => {
+    const { spine, calls } = setup([hook("PreToolUse", { input: { dir: "${cwd}" } })], () => null);
+    await runTool(spine, "bash", {});
+    expect(calls).toEqual([{ dir: "/w" }]);
   });
 
   test("updatedInput applies only with allow and a schema-valid value", async () => {
@@ -181,6 +214,40 @@ describe("PostToolUse", () => {
 
     expect(calls).toEqual([{ out: { ran: { script: "ls" } } }]);
     expect(ctx.result).toEqual({ error: "[plugin:guard] Output needs review." });
+  });
+
+  test("block keeps the context gathered so far for the model", async () => {
+    const context = (hookEventName: string, extra: Record<string, unknown> = {}) =>
+      json({ ...extra, hookSpecificOutput: { hookEventName, additionalContext: hookEventName } });
+    const { spine } = setup(
+      [hook("PreToolUse", { input: { event: "pre" } }), hook("PostToolUse")],
+      (input) =>
+        input.event === "pre"
+          ? context("PreToolUse")
+          : context("PostToolUse", { decision: "block", reason: "Review." })
+    );
+
+    const ctx = await runTool(spine, "bash", {});
+
+    expect(ctx.result).toEqual({
+      error: "[plugin:guard] Review.",
+      hook_output: "[plugin:guard] PreToolUse\n[plugin:guard] PostToolUse",
+    });
+  });
+
+  test("context on an MCP-shaped result also rides in its content, which the model reads", async () => {
+    const { spine } = setup([hook("PostToolUse")], () =>
+      json({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: "Note." } })
+    );
+    const mcpResult = { content: [{ type: "text", text: "out" }] };
+    const xumResult = { type: "content", value: [{ type: "text", text: "out" }] };
+
+    const raw = await runTool(spine, "mcp_x", {}, undefined, { result: mcpResult });
+    const converted = await runTool(spine, "mcp_x", {}, undefined, { result: xumResult });
+
+    const note = { type: "text", text: "[plugin:guard] Note." };
+    expect(raw.result).toMatchObject({ content: [mcpResult.content[0], note] });
+    expect(converted.result).toMatchObject({ value: [xumResult.value[0], note] });
   });
 });
 
