@@ -325,6 +325,8 @@ export interface MockORPCClientOptions {
   mcpSettings?: Map<string, MCPSettingsSnapshot>;
   /** Servers the workspace runs: `ifConnected` reads see only these; a plain read connects. */
   mcpSettingsConnected?: Set<string>;
+  /** Every mcp.settings.read call's server names, in order (stories assert batching). */
+  mcpSettingsReads?: string[][];
   /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
   mcpIcons?: Map<string, string>;
   /** Custom listBranches implementation (for testing non-git repos) */
@@ -460,6 +462,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpTestResults = new Map<string, MockMcpTestResult>(),
     mcpSettings,
     mcpSettingsConnected = new Set<string>(),
+    mcpSettingsReads,
     mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
     userPreferences: initialUserPreferences,
@@ -1329,15 +1332,21 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcp: {
       settings: {
         // A copy, like IPC: a dialog that keeps an old read must not see later updates.
-        read: (input: { serverName: string; ifConnected?: boolean }) => {
-          if (input.ifConnected === true && !mcpSettingsConnected.has(input.serverName))
-            return Promise.resolve({ success: true, data: { notConnected: true } });
-          mcpSettingsConnected.add(input.serverName);
-          const snapshot = mcpSettings?.get(input.serverName);
-          return Promise.resolve({
-            success: true,
-            data: snapshot === undefined ? null : structuredClone(snapshot),
-          });
+        read: (input: { serverNames: string[]; ifConnected?: boolean }) => {
+          mcpSettingsReads?.push(input.serverNames);
+          const readOne = (serverName: string) => {
+            if (input.ifConnected === true && !mcpSettingsConnected.has(serverName))
+              return { success: true, data: { notConnected: true } };
+            mcpSettingsConnected.add(serverName);
+            const snapshot = mcpSettings?.get(serverName);
+            return {
+              success: true,
+              data: snapshot === undefined ? null : structuredClone(snapshot),
+            };
+          };
+          return Promise.resolve(
+            Object.fromEntries(input.serverNames.map((name) => [name, readOne(name)]))
+          );
         },
         update: (input: { serverName: string; set: Record<string, MCPSettingValue> }) => {
           const snapshot = mcpSettings?.get(input.serverName);

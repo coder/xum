@@ -221,27 +221,44 @@ async function runMcpSettingsRoute<T>(
   }
 }
 
+type McpSettingsReadResult =
+  | { success: true; data: MCPSettingsSnapshot | { notConnected: true } | null }
+  | { success: false; error: string };
+
 /**
- * `mcp.settings.read`. With `ifConnected`, a server the workspace does not run
- * reads as `{ notConnected: true }` and is not started (checked before
- * runMcpSettingsRoute: its warm-up and the read start servers).
+ * `mcp.settings.read` for several servers in one call (concurrently). With `ifConnected`, a
+ * server the workspace does not run reads as `{ notConnected: true }`, and a running one is
+ * read with `noStart`: neither runMcpSettingsRoute's warm-up nor the manager's startup path
+ * runs, so the read never starts or restarts a server (an instance that closed meanwhile
+ * fails the read instead).
  */
 async function readMcpSettingsRoute(
   context: ORPCContext,
-  input: { workspaceId: string; serverName: string; ifConnected?: boolean },
+  input: { workspaceId: string; serverNames: string[]; ifConnected?: boolean },
   signal: AbortSignal | undefined
-): Promise<
-  | { success: true; data: MCPSettingsSnapshot | { notConnected: true } | null }
-  | { success: false; error: string }
-> {
-  if (
-    input.ifConnected === true &&
-    !context.mcpServerManager.isWorkspaceServerConnected(input.workspaceId, input.serverName)
-  )
-    return { success: true, data: { notConnected: true } };
-  return runMcpSettingsRoute(context, input.workspaceId, signal, () =>
-    context.mcpServerManager.readSettings(input.workspaceId, input.serverName, { signal })
+): Promise<Record<string, McpSettingsReadResult>> {
+  const manager = context.mcpServerManager;
+  const readOne = async (serverName: string): Promise<McpSettingsReadResult> => {
+    if (input.ifConnected !== true)
+      return runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+        manager.readSettings(input.workspaceId, serverName, { signal })
+      );
+    if (!manager.isWorkspaceServerConnected(input.workspaceId, serverName))
+      return { success: true, data: { notConnected: true } };
+    try {
+      const data = await manager.readSettings(input.workspaceId, serverName, {
+        signal,
+        noStart: true,
+      });
+      return { success: true, data };
+    } catch (error) {
+      return { success: false, error: getErrorMessage(error) };
+    }
+  };
+  const entries = await Promise.all(
+    [...new Set(input.serverNames)].map(async (name) => [name, await readOne(name)] as const)
   );
+  return Object.fromEntries(entries);
 }
 
 function sendAcceptanceOf(context: ORPCContext): SendAcceptance {

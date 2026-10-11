@@ -66,6 +66,7 @@ interface WorkspaceMCPStoryOptions {
   settings?: Record<string, MCPSettingsSnapshot>;
   /** Servers the workspace already runs (the dialog reads their settings on open). */
   settingsConnected?: string[];
+  settingsReads?: string[][];
 }
 
 function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): APIClient {
@@ -139,6 +140,7 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
       ])
     ),
     mcpSettingsConnected: new Set(options.settingsConnected ?? []),
+    mcpSettingsReads: options.settingsReads,
   });
 }
 
@@ -546,8 +548,10 @@ const CAD_SETTINGS: MCPSettingsSnapshot = {
     grid: { type: "boolean", title: "Show grid", description: "Draws a <b>grid</b> behind parts." },
     zoom: { type: "integer", title: "Default zoom", minimum: 1, maximum: 5 },
     prefix: { type: "string", title: "Part prefix", maxLength: 2 },
+    // "" is a valid enum option (the Select maps options to indexes).
+    finish: { type: "string", title: "Finish", enum: ["", "matte"] },
   },
-  values: { units: "mm", grid: true, zoom: 2, prefix: "BB" },
+  values: { units: "mm", grid: true, zoom: 2, prefix: "BB", finish: "" },
   layout: [
     {
       title: "Display",
@@ -562,6 +566,7 @@ const CAD_SETTINGS: MCPSettingsSnapshot = {
       items: [
         { kind: "property", property: "zoom" },
         { kind: "property", property: "prefix" },
+        { kind: "property", property: "finish" },
       ],
     },
   ],
@@ -605,8 +610,11 @@ async function exerciseServerSettings(canvasElement: HTMLElement): Promise<void>
   await userEvent.clear(zoom);
   await userEvent.type(zoom, "3");
   await waitFor(() => expect(save).toBeEnabled());
-  await userEvent.click(save);
+  await expect(section.getByLabelText("Finish setting")).toHaveTextContent("(empty)");
+  // The save shortcut (SAVE_EDIT) works from any control in the section.
+  await userEvent.keyboard("{Control>}{Enter}{/Control}");
   await waitFor(() => expect(save).toBeDisabled());
+  await expect(zoom).toHaveValue(3);
   await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth);
 }
 
@@ -641,6 +649,49 @@ export const WorkspaceMCPServerSettingsNotConnected: Story = {
     await userEvent.click(modal.getByRole("button", { name: "Fetch Tools" }));
     await expect(modal.findByTestId("mcp-server-settings")).resolves.toBeInTheDocument();
     await expect(modal.queryByText("Connect the server to see its settings")).toBeNull();
+  },
+};
+
+const settingsReads: string[][] = [];
+
+/** Opening the dialog reads every enabled server's settings in ONE IPC call. */
+export const WorkspaceMCPServerSettingsOneRead: Story = {
+  render: () => {
+    settingsReads.length = 0;
+    return renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      servers: {
+        cad: { transport: "stdio", command: "bunx cad-mcp", disabled: false },
+        lathe: { transport: "stdio", command: "bunx lathe-mcp", disabled: false },
+      },
+      settings: { cad: CAD_SETTINGS, lathe: CAD_SETTINGS },
+      settingsConnected: ["cad", "lathe"],
+      settingsReads,
+    });
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    await waitFor(() => expect(modal.getAllByTestId("mcp-server-settings")).toHaveLength(2));
+    await expect(settingsReads).toEqual([["cad", "lathe"]]);
+  },
+};
+
+/**
+ * A server enabled only in this unsaved dialog: Fetch Tools shows its tools, but its settings
+ * are not read (the backend's saved enablement would refuse the read as disabled).
+ */
+export const WorkspaceMCPServerSettingsUnsavedEnable: Story = {
+  render: () =>
+    renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      servers: { cad: { transport: "stdio", command: "bunx cad-mcp", disabled: true } },
+    }),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    await userEvent.click(modal.getByRole("switch", { name: "Toggle cad MCP server" }));
+    await userEvent.click(await modal.findByRole("button", { name: "Fetch Tools" }));
+    await expect(modal.findByText("draw_part")).resolves.toBeInTheDocument();
+    await expect(modal.queryByTestId("mcp-server-settings")).toBeNull();
   },
 };
 

@@ -4672,7 +4672,8 @@ export class MCPServerManager {
   async readSettings(
     workspaceId: string,
     serverName: string,
-    options?: { signal?: AbortSignal; timeoutMs?: number }
+    /** `noStart`: read only a running instance; never start or restart the server. */
+    options?: { signal?: AbortSignal; timeoutMs?: number; noStart?: boolean }
   ): Promise<MCPSettingsSnapshot | null> {
     const noSettings = Symbol("no settings");
     let source: MCPServerInstance | undefined;
@@ -4822,9 +4823,11 @@ export class MCPServerManager {
     label: string,
     operation: (instance: MCPServerInstance) => Promise<R>,
     finalize: (result: R) => T,
-    options?: { signal?: AbortSignal }
+    /** `noStart`: skip the startup path, so only an already running instance is used. */
+    options?: { signal?: AbortSignal; noStart?: boolean }
   ): Promise<T> {
-    const lastOptions = this.lastWorkspaceRequestOptions.get(workspaceId);
+    const lastOptions =
+      options?.noStart === true ? undefined : this.lastWorkspaceRequestOptions.get(workspaceId);
     let stableSecrets: Record<string, string> | undefined;
     if (lastOptions !== undefined) {
       // First stabilize cached startup state against settings/trust/secret

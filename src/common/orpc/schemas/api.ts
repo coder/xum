@@ -1135,14 +1135,17 @@ export const mcp = {
     read: {
       input: MCPSettingsReadInputSchema,
       /**
-       * Null when the server has no `openai/settings` capability;
+       * Per server name: null when the server has no `openai/settings` capability;
        * `{ notConnected: true }` when `ifConnected` found it not running.
        */
-      output: ResultSchema(
-        z
-          .union([MCPSettingsSnapshotSchema, z.object({ notConnected: z.literal(true) })])
-          .nullable(),
-        z.string()
+      output: z.record(
+        z.string(),
+        ResultSchema(
+          z
+            .union([MCPSettingsSnapshotSchema, z.object({ notConnected: z.literal(true) })])
+            .nullable(),
+          z.string()
+        )
       ),
     },
     update: {

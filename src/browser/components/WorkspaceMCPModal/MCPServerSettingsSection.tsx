@@ -5,6 +5,7 @@ import { Input } from "@/browser/components/Input/Input";
 import { Select } from "@/browser/components/Select/Select";
 import { Switch } from "@/browser/components/Switch/Switch";
 import { useAPI } from "@/browser/contexts/API";
+import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { getOwn } from "@/common/utils/getOwn";
 import {
   validateMCPSettingValue,
@@ -93,16 +94,22 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
           aria-label={label}
         />
       );
-    if (schema.type === "string" && schema.enum !== undefined)
+    if (schema.type === "string" && schema.enum !== undefined) {
+      // Option values are indexes: "" is a valid enum option, but not a valid Select value.
+      const options = schema.enum;
       return (
         <Select
-          value={typeof value === "string" ? value : ""}
-          options={schema.enum}
-          onChange={(next) => setValue(name, next)}
+          value={String(options.indexOf(typeof value === "string" ? value : ""))}
+          options={options.map((option, index) => ({
+            value: String(index),
+            label: option === "" ? "(empty)" : option,
+          }))}
+          onChange={(next) => setValue(name, options[Number(next)] ?? "")}
           aria-label={label}
           className="w-40 max-w-full"
         />
       );
+    }
     if (schema.type === "string")
       return (
         <Input
@@ -131,7 +138,15 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
   };
 
   return (
-    <div className="mt-4 space-y-3 border-t pt-4" data-testid="mcp-server-settings">
+    <div
+      className="mt-4 space-y-3 border-t pt-4"
+      data-testid="mcp-server-settings"
+      onKeyDown={(event) => {
+        if (!matchesKeybind(event, KEYBINDS.SAVE_EDIT)) return;
+        event.preventDefault();
+        if (canSave) void save();
+      }}
+    >
       <div className="text-sm font-medium">Settings</div>
       {props.snapshot.droppedSettingCount > 0 && (
         <div className="bg-warning/10 text-warning flex items-start gap-2 rounded-md px-3 py-2 text-xs">
@@ -187,7 +202,10 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
           {error}
         </div>
       )}
-      <div className="flex justify-end">
+      <div className="flex items-center justify-end gap-2">
+        <span className="text-muted mobile-hide-shortcut-hints text-[10px]">
+          {formatKeybind(KEYBINDS.SAVE_EDIT)} to save
+        </span>
         <Button size="sm" onClick={() => void save()} disabled={!canSave}>
           {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
           Save settings

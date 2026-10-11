@@ -730,6 +730,28 @@ describe("MCPServerManager", () => {
     expect(manager.isWorkspaceServerConnected("settings-connected-ws", "other")).toBe(false);
   });
 
+  test("settings: a noStart read never starts or restarts the server", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-nostart") });
+    servers.serve("settings-nostart", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: { schema: { type: "object", properties: {} }, values: {} },
+          }),
+      },
+    });
+    await manager.getToolsForWorkspace(workspaceRequest("settings-nostart-ws"));
+    expect(servers.connectCount("settings-nostart")).toBe(1);
+    // The instance goes away, but the restart options stay (as after a config change).
+    await manager.stopServers("settings-nostart-ws", { retainRestartOptions: true });
+    const read = manager.readSettings("settings-nostart-ws", "cad", { noStart: true });
+    await expect(read).rejects.toThrow("not connected");
+    expect(servers.connectCount("settings-nostart")).toBe(1);
+  });
+
   test("settings: a server without the capability reads as null", async () => {
     configService.listServers.mockResolvedValue({ plain: stdioConfig("settings-none") });
     servers.serve("settings-none", { tools: { draw: testTool() } });
