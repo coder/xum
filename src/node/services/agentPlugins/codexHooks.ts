@@ -110,6 +110,13 @@ export async function loadPluginCodexHooks(
       parseHooksDocument(entry, `plugin.json#hooks[${index}]`, hooks, warnings);
       continue;
     }
+    // A hook key is `<source>#<event>[group][handler]`, and an inline source is
+    // `plugin.json#hooks[i]`. A file path with `#` could produce an inline source's keys and
+    // share or overwrite its trust, so such paths are refused.
+    if (entry.includes("#")) {
+      warnings.push(`${entry}: a hooks file path must not contain '#'; ignoring it`);
+      continue;
+    }
     const content = await readHooksFile(plugin.rootPath, entry, pointer == null, warnings);
     if (content === undefined) continue;
     let document: unknown;
