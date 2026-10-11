@@ -108,10 +108,17 @@ async function reconcile(api: APIClient): Promise<void> {
   return reconciling;
 }
 
-function startFollowing(api: APIClient): void {
+/**
+ * Subscribe once for every follower. A subscription that rejects or ends while views are still
+ * mounted is restarted (and the restart reconciles once). A restart that is itself lost before it
+ * delivers any change stops there, with no timer and no loop: the store is then not following,
+ * and the next view that mounts subscribes again.
+ */
+function startFollowing(api: APIClient, restart = false): void {
   const state = { api, controller: new AbortController(), ready: false };
   following = state;
   const { signal } = state.controller;
+  let delivered = false;
   // One failed read (a transient IPC error) must not end the stream: the next change retries.
   const reconcileOnce = () => reconcile(api).catch(() => undefined);
   const follow = async () => {
@@ -122,15 +129,19 @@ function startFollowing(api: APIClient): void {
     await reconcileOnce();
     for await (const _ of changes) {
       if (signal.aborted) break;
+      delivered = true;
       await reconcileOnce();
     }
   };
-  // Ends with the abort when the last view unmounts. A lost subscription leaves views as they are,
-  // and the next view that mounts starts a new one.
+  // Ends with the abort when the last view unmounts.
   follow()
     .catch(() => undefined)
     .finally(() => {
-      if (following === state) following = null;
+      if (following !== state) return;
+      following = null;
+      if (!signal.aborted && followers.size > 0 && (!restart || delivered)) {
+        startFollowing(api, true);
+      }
     });
 }
 

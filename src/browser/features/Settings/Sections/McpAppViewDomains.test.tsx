@@ -36,12 +36,24 @@ let pushConfigChanged: () => void = () => undefined;
 let listCalls = 0;
 let listFailures = 0;
 let subscribeFailures = 0;
+// Subscriptions that end at once, before any event.
+let subscribeEndsAtOnce = 0;
+let subscribeCalls = 0;
 let subscriptions: AbortSignal[] = [];
 
 function api(): APIClient {
   const overrides: TestApiOverrides<APIClient> = {
     config: {
       onConfigChanged: (_input: void, options?: { signal?: AbortSignal }) => {
+        subscribeCalls++;
+        if (subscribeEndsAtOnce > 0) {
+          subscribeEndsAtOnce--;
+          // eslint-disable-next-line require-yield
+          async function* ended() {
+            await Promise.resolve();
+          }
+          return Promise.resolve(ended());
+        }
         if (subscribeFailures > 0) {
           subscribeFailures--;
           return Promise.reject(new Error("transient IPC failure"));
@@ -136,6 +148,8 @@ describe("MCP Apps allowed view domains", () => {
     listCalls = 0;
     listFailures = 0;
     subscribeFailures = 0;
+    subscribeEndsAtOnce = 0;
+    subscribeCalls = 0;
     subscriptions = [];
   });
   afterEach(() => {
@@ -230,36 +244,54 @@ describe("MCP Apps allowed view domains", () => {
     await waitFor(async () => expect(await frameCsp(view)).not.toContain(API_ORIGIN));
   });
 
-  test("a lost subscription is started again by the next view that mounts", async () => {
-    const frame = (count: number) => (
-      <ThemeProvider forcedTheme="dark">
-        <APIProvider client={client}>
-          {Array.from({ length: count }, (_, i) => (
-            <McpAppFrame key={i} workspaceId="ws" view={VIEW} variant={i ? "inline" : "panel"} />
-          ))}
-        </APIProvider>
-      </ThemeProvider>
-    );
+  // The app's own config subscription opens with the provider; these modes apply to the views'.
+  async function renderEmpty() {
     const view = renderWith(<></>);
     await act(() => Promise.resolve());
-    // The views' shared subscription (opened after the app's own) fails once.
-    subscribeFailures = 1;
-    view.rerender(frame(1));
+    return view;
+  }
+  const withFrame = () => (
+    <ThemeProvider forcedTheme="dark">
+      <APIProvider client={client}>
+        <McpAppFrame workspaceId="ws" view={VIEW} />
+      </APIProvider>
+    </ThemeProvider>
+  );
+  const settle = async () => {
+    for (let i = 0; i < 10; i++) await act(() => Promise.resolve());
+  };
+
+  for (const lost of ["rejects", "ends"] as const) {
+    test(`a revoke after the shared subscription ${lost} still reaches the mounted view`, async () => {
+      const view = await renderEmpty();
+      if (lost === "rejects") subscribeFailures = 1;
+      else subscribeEndsAtOnce = 1;
+      view.rerender(withFrame());
+      expect(await frameCsp(view)).toContain(`connect-src ${API_ORIGIN}`);
+      await settle();
+      // No second mount: the store restarted the subscription itself.
+      stored = [];
+      await act(async () => {
+        pushConfigChanged();
+        await Promise.resolve();
+      });
+      await waitFor(async () => expect(await frameCsp(view)).not.toContain(API_ORIGIN));
+    });
+  }
+
+  test("a subscription that always ends at once is not retried in a loop", async () => {
+    const view = await renderEmpty();
+    const before = subscribeCalls;
+    // Every one ends at once. The mock stops after 50, so a retry loop fails here instead of
+    // starving the test runner with microtasks.
+    subscribeEndsAtOnce = 50;
+    view.rerender(withFrame());
     expect(await frameCsp(view)).toContain(`connect-src ${API_ORIGIN}`);
-    await waitFor(() => expect(subscribeFailures).toBe(0));
-    view.rerender(frame(2));
-    await waitFor(() => expect(view.getAllByTestId("mcp-app-frame")).toHaveLength(2));
-    for (let i = 0; i < 5; i++) await act(() => Promise.resolve());
-    stored = [];
-    await act(async () => {
-      pushConfigChanged();
-      await Promise.resolve();
-    });
-    await waitFor(() => {
-      for (const element of view.getAllByTestId("mcp-app-frame")) {
-        expect(element.getAttribute("srcdoc")).not.toContain(API_ORIGIN);
-      }
-    });
+    await settle();
+    // The first subscription and one restart, then the store stops following.
+    expect(subscribeCalls - before).toBe(2);
+    await settle();
+    expect(subscribeCalls - before).toBe(2);
   });
 
   test("a failed revoke shows its error next to the entry and keeps it", async () => {
