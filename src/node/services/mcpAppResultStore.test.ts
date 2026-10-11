@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { MCP_APP_MODEL_CONTEXT_MAX_BYTES } from "@/common/utils/mcpApps";
@@ -114,5 +115,58 @@ describe("McpAppResultStore model context", () => {
     expect(refused).toBe(true);
     await fs.writeFile(path.join(tmp.path, "ws", MCP_APP_MODEL_CONTEXT_FILE), "{not json");
     expect(await new McpAppResultStore(sessionDir).getModelContexts("ws")).toEqual([]);
+  });
+
+  test("a cold read that finishes after an update does not bring back the old context", async () => {
+    using tmp = new DisposableTempDir("mcp-app-context");
+    const sessionDir = (id: string) => path.join(tmp.path, id);
+    await new McpAppResultStore(sessionDir).setModelContext("ws", view("c1", "old"));
+    const oldFile = await fs.readFile(
+      path.join(tmp.path, "ws", MCP_APP_MODEL_CONTEXT_FILE),
+      "utf8"
+    );
+    const store = new McpAppResultStore(sessionDir);
+    // The first (cold) read opened the file before the update and returns only after it.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const realReadFile = fs.readFile;
+    let reads = 0;
+    const readFile = spyOn(fs, "readFile").mockImplementation((async (...args: unknown[]) => {
+      reads += 1;
+      if (reads > 1) return (realReadFile as (...a: unknown[]) => Promise<string>)(...args);
+      await gate;
+      return oldFile;
+    }) as typeof fs.readFile);
+    try {
+      const coldRead = store.getModelContexts("ws");
+      await store.setModelContext("ws", view("c1", "new"));
+      release();
+      await coldRead;
+    } finally {
+      readFile.mockRestore();
+    }
+    expect((await store.getModelContexts("ws")).map((v) => v.text)).toEqual(["new"]);
+  });
+
+  test("queued updates of one view collapse into the newest write", async () => {
+    using tmp = new DisposableTempDir("mcp-app-context");
+    const store = new McpAppResultStore((id) => path.join(tmp.path, id));
+    const contextFile = path.join(tmp.path, "ws", MCP_APP_MODEL_CONTEXT_FILE);
+    const rename = spyOn(fsSync, "rename");
+    try {
+      await Promise.all(
+        ["a", "b", "c"].map((text) => store.setModelContext("ws", view("c1", text)))
+      );
+      const writes = rename.mock.calls.filter(([, to]) => String(to) === contextFile).length;
+      expect(writes).toBe(1);
+    } finally {
+      rename.mockRestore();
+    }
+    expect((await store.getModelContexts("ws")).map((v) => v.text)).toEqual(["c"]);
+    expect(
+      (await new McpAppResultStore((id) => path.join(tmp.path, id)).getModelContexts("ws")).map(
+        (v) => v.text
+      )
+    ).toEqual(["c"]);
   });
 });
