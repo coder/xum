@@ -119,8 +119,9 @@ export type MessageSendOrigin = "user" | "task" | "goal" | "plan-review" | "syst
 
 /**
  * `message.send` (the Codex UserPromptSubmit event): middleware sees each new message before Xum
- * saves it. Compaction requests never reach it. It cannot rewrite the text (Codex hooks cannot
- * either); it may add model-visible context for this turn, or block the send.
+ * saves it. A compaction request's own prompt never reaches it (only texts queued behind it). It
+ * cannot rewrite the text (Codex hooks cannot either); it may add model-visible context for this
+ * turn, or block the send.
  */
 export interface MessageSendContext {
   readonly workspaceId: string;

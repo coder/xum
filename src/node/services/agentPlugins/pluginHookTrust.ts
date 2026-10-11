@@ -3,8 +3,12 @@
  * hash, so a new or changed hook is skipped until the user trusts it, and installing a plugin
  * trusts none of its hooks. Xum stores one file per plugin instance:
  *
- *   <xumHome>/plugin-hook-trust/<instanceId>.json   { version: 1, hooks: { <key>: { hash, state } } }
+ *   <xumHome>/plugin-hook-trust/<instanceId>.json   { version: 1, installedAt, hooks: { <key>: { hash, state } } }
  *
+ * - Bound to one installation: `installedAt` must equal the registry entry's. Every install
+ *   writes a new one (older Xum builds too) and updates keep it, so a reinstall under the same
+ *   name and path never inherits trust, even when an older build uninstalled the plugin without
+ *   deleting this file.
  * - Keyed by the hook's location (`key`) with the trusted `hash`, so the UI can tell a changed
  *   hook (same key, other hash) from a new one. A record applies only while the hash matches.
  * - Not under `plugin-data/<instanceId>`: that directory is the plugin's own writable PLUGIN_DATA,
@@ -15,16 +19,20 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { z } from "zod";
+import { AgentPluginInstallEntrySchema } from "@/common/config/schemas/agentPluginInstalls";
 import type { PluginHookReviewState } from "@/common/orpc/schemas/agentPlugins";
 import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import type { PluginHookDefinition } from "./codexHooks";
+import { computePluginInstanceId } from "./mcpConfig";
+import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
 
 const TRUST_DIR = "plugin-hook-trust";
 
 const TrustRecordSchema = z.object({
   version: z.literal(1),
+  installedAt: z.string(),
   hooks: z.record(
     z.string(),
     z.object({ hash: z.string(), state: z.enum(["trusted", "disabled"]) })
@@ -39,11 +47,36 @@ export function getPluginHookTrustPath(xumHome: string, instanceId: string): str
   return path.join(xumHome, TRUST_DIR, `${instanceId}.json`);
 }
 
+const RegistryIdentitySchema = AgentPluginInstallEntrySchema.pick({
+  name: true,
+  installedAt: true,
+});
+
+/** The registry's `installedAt` for this instance; undefined when no managed install owns it. */
+async function readInstalledAt(xumHome: string, instanceId: string): Promise<string | undefined> {
+  const registryFile = path.join(xumHome, PLUGIN_REGISTRY_FILE_NAME);
+  const { rawEntries } = await readPluginRegistryDocument(registryFile, "lenient");
+  for (const raw of rawEntries) {
+    const entry = RegistryIdentitySchema.safeParse(raw);
+    if (!entry.success) continue;
+    // Same identity as the install service: the lexical install path.
+    if (computePluginInstanceId(path.join(xumHome, "plugins", entry.data.name)) === instanceId) {
+      return entry.data.installedAt;
+    }
+  }
+  return undefined;
+}
+
 export async function readPluginHookTrust(
   xumHome: string,
   instanceId: string
 ): Promise<PluginHookTrustRecord> {
-  const file = getPluginHookTrustPath(xumHome, instanceId);
+  const installedAt = await readInstalledAt(xumHome, instanceId);
+  if (installedAt === undefined) return {};
+  return readTrustFile(getPluginHookTrustPath(xumHome, instanceId), installedAt);
+}
+
+async function readTrustFile(file: string, installedAt: string): Promise<PluginHookTrustRecord> {
   let raw: string;
   try {
     raw = await fs.readFile(file, "utf8");
@@ -55,7 +88,8 @@ export async function readPluginHookTrust(
   }
   try {
     const parsed = TrustRecordSchema.safeParse(JSON.parse(raw));
-    if (parsed.success) return parsed.data.hooks;
+    // Trust recorded for an earlier install under this name never carries over.
+    if (parsed.success) return parsed.data.installedAt === installedAt ? parsed.data.hooks : {};
   } catch {
     // Malformed JSON: same as an invalid shape below.
   }
@@ -95,14 +129,17 @@ export async function setPluginHookTrust(
     writeLocks.set(file, lock);
   }
   await using _guard = await lock.acquire();
-  const hooks = { ...(await readPluginHookTrust(xumHome, instanceId)) };
+  const installedAt = await readInstalledAt(xumHome, instanceId);
+  if (installedAt === undefined) throw new Error("This plugin is not installed.");
+  const hooks = { ...(await readTrustFile(file, installedAt)) };
   if (decision.state === null) delete hooks[decision.key];
   else hooks[decision.key] = { hash: decision.hash, state: decision.state };
   await fs.mkdir(path.dirname(file), { recursive: true });
-  await writeFileAtomic(file, JSON.stringify({ version: 1, hooks }, null, 2));
+  await writeFileAtomic(file, JSON.stringify({ version: 1, installedAt, hooks }, null, 2));
 }
 
 /** Uninstall: a later install under the same name must not inherit trust. */
 export async function removePluginHookTrust(xumHome: string, instanceId: string): Promise<void> {
-  await fs.rm(getPluginHookTrustPath(xumHome, instanceId), { force: true });
+  // recursive: a directory here is malformed state and must not block the uninstall.
+  await fs.rm(getPluginHookTrustPath(xumHome, instanceId), { force: true, recursive: true });
 }
