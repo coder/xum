@@ -22,7 +22,11 @@ lines.on("line", (line) => {
         capabilities: {
           tools: {},
           experimental: {
-            "openai/settings": { readTool: "settings.read", updateTool: "settings.update" },
+            // SETTINGS_FIXTURE_HALF: a malformed readTool (only updateTool stays valid).
+            "openai/settings": {
+              readTool: process.env.SETTINGS_FIXTURE_HALF === "1" ? "" : "settings.read",
+              updateTool: "settings.update",
+            },
           },
         },
         serverInfo: { name: "settings-fixture", version: "1" },
