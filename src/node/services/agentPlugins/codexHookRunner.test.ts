@@ -140,6 +140,12 @@ describe("PreToolUse", () => {
     const gateFails = setup([hook("PreToolUse")], () => deny);
     gateFails.deps.isHookAllowed = () => Promise.reject(new Error("trust store unreadable"));
     expect((await runTool(gateFails.spine, "bash", {})).executed).toBe(true);
+
+    // A hung trust gate (a stalled filesystem) ends at the hook timeout too.
+    const gateHangs = setup([hook("PreToolUse", { timeoutSeconds: 0.05 })], () => deny);
+    gateHangs.deps.isHookAllowed = () => new Promise(() => undefined);
+    expect((await runTool(gateHangs.spine, "bash", {})).executed).toBe(true);
+    expect(gateHangs.calls).toEqual([]);
   });
 
   test("a deny tagged for another event is malformed and fails open", async () => {
