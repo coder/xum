@@ -55,6 +55,7 @@ import {
   matchesKeybind,
   KEYBINDS,
   formatKeybind,
+  isCommandPaletteTarget,
   isDialogOpen,
   isEditableElement,
   isBrowserViewportFocused,
@@ -1491,11 +1492,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
           );
           setCollapsed(false);
           // Only for a tab that exists (a shortcut past the last tab must not cover the chat),
-          // and not behind an open modal: the view would make it inert.
+          // and not from an open modal or the command palette: the view would make it inert.
           const container = sidebarContainerRef.current;
           if (
             target &&
             !isDialogOpen() &&
+            !isCommandPaletteTarget(e.target) &&
             container != null &&
             isRightSidebarResponsivelyHidden(container)
           ) {
@@ -1979,11 +1981,16 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         // The rendered tab, not the stored layout's: rendering can filter tabs out (Review in a
         // workspace without a repository). Falls back to any shown tab, then the close button,
         // so focus always lands inside.
+        // Matched by id prefix, not a selector built from the id: legacy workspace ids keep
+        // path characters (quotes) that would make querySelector throw with the page inert.
         if (!container.contains(document.activeElement)) {
-          const focusedPaneTabs = `[id^="${baseId}-${getBaseLayout().focusedTabsetId}-tab-"]`;
+          const focusedPanePrefix = `${baseId}-${getBaseLayout().focusedTabsetId}-tab-`;
+          const selectedTabs = Array.from(
+            container.querySelectorAll<HTMLElement>('[role="tab"][aria-selected="true"]')
+          );
           const target =
-            container.querySelector<HTMLElement>(`${focusedPaneTabs}[aria-selected="true"]`) ??
-            container.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]') ??
+            selectedTabs.find((tab) => tab.id.startsWith(focusedPanePrefix)) ??
+            selectedTabs[0] ??
             header.querySelector<HTMLElement>("button");
           target?.focus();
         }

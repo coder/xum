@@ -66,9 +66,9 @@ const LAYOUT: RightSidebarLayoutState = {
   root: { type: "tabset", id: "tabset-1", tabs: ["workflows"], activeTab: "workflows" },
 };
 
-function setup(layout: RightSidebarLayoutState = LAYOUT) {
+function setup(layout: RightSidebarLayoutState = LAYOUT, workspaceId = WORKSPACE_ID) {
   const client = setupSimpleChatStory({
-    workspaceId: WORKSPACE_ID,
+    workspaceId,
     workspaceName: "phone-sidebar",
     projectName: "xum",
     experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true, [EXPERIMENT_IDS.AGENT_BROWSER]: true },
@@ -86,7 +86,7 @@ function setup(layout: RightSidebarLayoutState = LAYOUT) {
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
   // Collapsed on a wide layout earlier: opening the full-screen view expands it.
   updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
-  updatePersistedState(getRightSidebarLayoutKey(WORKSPACE_ID), layout);
+  updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
   // The Browser tool polls for sessions; this story has none.
   client.browser = {
     ...client.browser,
@@ -185,7 +185,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await waitFor(() => expect(sidebar).not.toBeVisible());
 
     // A shortcut past the last tab (the ninth, with two tabs), or one pressed behind an open
-    // modal, leaves the chat in view. The handler requests the view synchronously, so one task
+    // modal or from the command palette, leaves the chat in view. The handler requests the view synchronously, so one task
     // later a wrong request would already show.
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "9", code: "Digit9", ctrlKey: true }));
     const modal = document.createElement("div");
@@ -194,6 +194,16 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     document.body.appendChild(modal);
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "2", code: "Digit2", ctrlKey: true }));
     modal.remove();
+    // The command palette is not a modal dialog to isDialogOpen(), so it has its own check.
+    const palette = document.createElement("div");
+    palette.setAttribute("cmdk-root", "");
+    const paletteInput = document.createElement("input");
+    palette.appendChild(paletteInput);
+    document.body.appendChild(palette);
+    paletteInput.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "2", code: "Digit2", ctrlKey: true, bubbles: true })
+    );
+    palette.remove();
     await new Promise((resolve) => setTimeout(resolve, 50));
     await expect(sidebar).not.toBeVisible();
 
@@ -246,11 +256,15 @@ const SPLIT_LAYOUT: RightSidebarLayoutState = {
   },
 };
 
-/** Opening the view focuses the focused pane's tab, so the pane stays focused. */
+/**
+ * Opening the view focuses the focused pane's tab, so the pane stays focused. The workspace id
+ * has a quote, as legacy ids built from paths can: finding the tab must not build a selector
+ * from it (querySelector would throw with the page already inert).
+ */
 export const SplitLayoutKeepsFocusedPane: AppStory = {
   decorators: [PhoneFrameDecorator],
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
-  render: () => <AppWithMocks setup={() => setup(SPLIT_LAYOUT)} />,
+  render: () => <AppWithMocks setup={() => setup(SPLIT_LAYOUT, 'xum-legacy"quoted')} />,
   play: async ({ canvasElement }) => {
     await waitForChatInputAutofocusDone(canvasElement);
     const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
