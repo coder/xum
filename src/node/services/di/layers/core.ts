@@ -69,6 +69,7 @@ import { InitStateManager } from "@/node/services/initStateManager";
 import { log } from "@/node/services/log";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
+import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService } from "@/node/services/memoryService";
@@ -605,6 +606,11 @@ export const CoreWiringLive: Layer.Layer<
 
     turnRequestBuilderBindings.mcpServerManager = mcpServerManager;
     streamManager.setMCPServerManager(mcpServerManager);
+    // Plugin hooks read their own MCP servers' structured settings. Core wiring, not desktop:
+    // the headless roots (`xum run`, `xum workflow`) build only CoreLive.
+    agentPluginHookService.setSettingsProvider((workspaceId, keyPrefix, timeoutMs) =>
+      mcpServerManager.getSettingsForPluginHooks(workspaceId, keyPrefix, timeoutMs)
+    );
     // MCP Apps views (artifacts experiment): host-only raw results live in the session dir.
     mcpServerManager.setMcpApps({
       isEnabled: () => aiService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
