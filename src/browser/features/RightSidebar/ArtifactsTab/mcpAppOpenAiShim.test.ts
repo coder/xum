@@ -88,7 +88,7 @@ async function runView(
     },
     readResource: () => Promise.reject(new Error("unused")),
     updateModelContext: () => Promise.resolve(),
-    setDisplayMode: (mode) => mode,
+    setDisplayMode: () => null,
     requestConsent: (request) => {
       consents.push(request);
       return Promise.resolve(options.consent ?? true);
@@ -124,8 +124,13 @@ describe("window.openai shim", () => {
   });
 
   test("toolOutput and toolResponseMetadata follow tool-result, with openai:set_globals", async () => {
-    const t = await runView(`${COLLECT_EVENTS} window.first = window.openai.toolOutput;`);
+    const t = await runView(
+      `${COLLECT_EVENTS} window.first = window.openai.toolOutput; window.firstInput = window.openai.toolInput;`
+    );
     expect((t.win as unknown as { first: unknown }).first).toBeNull();
+    // Before tool-input, toolInput is the Apps SDK's missing-input null, not empty arguments.
+    expect((t.win as unknown as { firstInput: unknown }).firstInput).toBeNull();
+    expect((t.win.openai as unknown as { toolInput: unknown }).toolInput).toEqual({ count: 2 });
     expect(t.win.openai.toolOutput).toEqual({ dice: [3, 5] });
     expect(t.win.openai.toolResponseMetadata).toEqual({ seed: 7 });
     expect(t.win.events).toContainEqual({ toolInput: { count: 2 } });

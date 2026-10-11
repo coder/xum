@@ -38,7 +38,9 @@ export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
     maxHeight: window.innerHeight,
     displayMode: "inline",
     safeArea: { insets: { top: 0, bottom: 0, left: 0, right: 0 } },
-    toolInput: {},
+    // null until ui/notifications/tool-input: the Apps SDK's "missing input" value, which
+    // approval-gated views read as pending (an empty object would read as empty arguments).
+    toolInput: null,
     toolOutput: null,
     toolResponseMetadata: null,
     widgetState: null
