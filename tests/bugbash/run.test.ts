@@ -499,3 +499,14 @@ test.each([
     expect(refusal).not.toMatch(/\/v1|sk-run-test/);
   }
 );
+
+test("U5: a rejection seen only in the probe's record (an unreadable 401 body) refuses too", async () => {
+  const { deps, calls, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  // probeApp reports 502 when the body is unreadable; the record keeps the upstream's 401.
+  deps.probeApp = () =>
+    Promise.resolve({ status: 502, records: [{ outcome: "kept", status: 401 }] });
+  const stop = new AbortController().signal;
+  expect(await runBugBash([...charters("a")], { ...ENV, BUGBASH_AI: "auto" }, stop, deps)).toBe(2);
+  expect(calls).toHaveLength(0);
+  expect(lines.find((line) => line.startsWith("make bug-bash:"))).toContain("(HTTP 401)");
+});

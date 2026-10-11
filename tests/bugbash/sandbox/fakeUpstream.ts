@@ -58,6 +58,9 @@ export async function startFakeUpstream(port = 0, onRequest?: (request: FakeRequ
       if (mode === "reset") return void req.socket.destroy();
       if (mode === "redirect") return res.writeHead(307, { location: "/redirected" }).end();
       // A rejected key: Anthropic's 401 (authentication) or 403 (permission) error shape.
+      // A gateway's rejection: 401 with an HTML body, not Anthropic's JSON error.
+      if (mode === "401html")
+        return res.writeHead(401, { "content-type": "text/html" }).end("<h1>Unauthorized</h1>");
       if (mode === "401" || mode === "403") {
         const type = mode === "401" ? "authentication_error" : "permission_error";
         const error = { type: "error", error: { type, message: "invalid x-api-key" } };

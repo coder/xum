@@ -528,7 +528,7 @@ export async function runBugBash(
     return 2;
   }
   // A rejected key too, in every mode: each explorer call would fail and keep its reservation.
-  const rejected = keyRejected(job0!, status);
+  const rejected = keyRejected(job0!, status, probeRecords);
   if (rejected != null) {
     err(`make bug-bash: ${rejected}`);
     return 2;
