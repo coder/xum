@@ -304,7 +304,13 @@ function issuersMatch(a: string, b: string): boolean {
  * must not use them, and must never refresh client A's token with client B. Sign-out on update
  * is only cleanup: a write from an old-identity flow or refresh that lands after it carries the
  * old client ID or issuer stamp, so it never matches the new config, and a later sign-in
- * overwrites it. Unstamped (pre-upgrade) credentials pass the issuer check, like in the SDK.
+ * overwrites it.
+ *
+ * SECURITY: with a pinned issuer, credentials must carry a matching issuer stamp (or a matching
+ * legacy `authorization_server` binding). Unstamped ones are refused and the user signs in
+ * again: the SDK would stamp them with the pinned issuer and post the refresh token there, so a
+ * plugin update that moves authorizationServerBase to another origin could collect it. Without
+ * a pinned issuer unstamped credentials pass, like in the SDK (non-plugin servers unchanged).
  *
  * Known limit: a change of only scopes or resource (same client, same issuer) keeps the old
  * tokens and their old grant until the server asks for re-authorization; the update-time
@@ -318,9 +324,13 @@ function storedClientMatches(
     return false;
   const issuer = pinnedIssuer(config);
   if (issuer === undefined) return true;
-  return [stored?.clientInformation?.issuer, stored?.tokens?.issuer].every(
-    (stamp) => stamp === undefined || issuersMatch(stamp, issuer)
-  );
+  // Each record the SDK reads must be bound to the pinned issuer: its SEP-2352 stamp, or for a
+  // pre-upgrade record its legacy authorization_server binding.
+  return [stored?.clientInformation, stored?.tokens].every((record) => {
+    if (record === undefined) return true;
+    const binding = record.issuer ?? record.authorization_server;
+    return binding !== undefined && issuersMatch(binding, issuer);
+  });
 }
 
 /** SECURITY AUDIT: the store (mcp-oauth.json) never receives a plugin client secret. */

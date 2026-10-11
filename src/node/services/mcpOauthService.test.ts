@@ -1072,10 +1072,88 @@ describe("McpOauthService OAuth flows", () => {
           discovery: { authorizationServerBase: "https://b.example.com" },
         })
       ).toBe(false);
-      // Only the tokens carry the stamp (an unstamped client record): still refused for B.
+      // Only the tokens carry the stamp: the unstamped client record is refused for any
+      // pinned issuer (A included), so the user signs in again.
       await service.dispose();
       service = new McpOauthService(config, mcpConfigService);
       await seed(null);
+      expect(await usable(pinned(issuerA))).toBe(false);
+      expect(await usable(pinned("https://b.example.com"))).toBe(false);
+    });
+
+    test("unstamped legacy credentials never serve a pinned issuer, and nothing is refreshed there", async () => {
+      const requests: string[] = [];
+      const server = createServer((req, res) => {
+        requests.push(`${req.method ?? ""} ${(req.url ?? "/").split("?")[0]}`);
+        if ((req.url ?? "").startsWith("/.well-known/oauth-authorization-server")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(authServerMetadata(`http://${req.headers.host ?? ""}`)));
+          return;
+        }
+        if ((req.url ?? "").startsWith("/token")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ access_token: "stolen", token_type: "Bearer" }));
+          return;
+        }
+        res.statusCode = 404;
+        res.end();
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("Failed to bind");
+        // An update moved authorizationServerBase to the (attacker's) origin.
+        const attacker = `http://127.0.0.1:${address.port}`;
+        await fs.writeFile(
+          getStoreFilePath(xumHome),
+          JSON.stringify({
+            version: 2,
+            entries: {
+              [serverUrl]: {
+                serverUrl,
+                updatedAtMs: Date.now(),
+                // Pre-upgrade: no SEP-2352 stamp and no legacy binding.
+                clientInformation: { client_id: "shared", client_secret: "registered-secret" },
+                tokens: { access_token: "old", token_type: "Bearer", refresh_token: "rt-legacy" },
+              },
+            },
+          })
+        );
+        const oauth = pinned(attacker);
+        expect(await service.getAuthProviderForServer({ serverUrl, oauth })).toBeUndefined();
+        expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(false);
+        expect(requests.filter((request) => request.startsWith("POST"))).toEqual([]);
+        // Without a pinned issuer (non-plugin servers) nothing changes.
+        expect(await service.hasAuthTokens({ serverUrl })).toBe(true);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    test("a legacy authorization_server binding to the pinned issuer still serves", async () => {
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: {
+                client_id: "shared",
+                authorization_server: issuerA,
+                token_endpoint: `${issuerA}/token`,
+              },
+              tokens: {
+                access_token: "at",
+                token_type: "Bearer",
+                authorization_server: issuerA,
+                token_endpoint: `${issuerA}/token`,
+              },
+            },
+          },
+        })
+      );
       expect(await usable(pinned(issuerA))).toBe(true);
       expect(await usable(pinned("https://b.example.com"))).toBe(false);
     });
