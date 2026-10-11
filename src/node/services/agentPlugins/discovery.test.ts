@@ -966,6 +966,108 @@ describe("discoverAgentPlugins", () => {
     expect(result.diagnostics).toEqual([]);
   });
 
+  test("discovers a Codex package with only .codex-plugin/plugin.json and .mcp.json", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "figma");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    await fs.mkdir(path.join(pluginDir, "skills"), { recursive: true });
+    await fs.writeFile(path.join(pluginDir, ".mcp.json"), "{}", "utf8");
+    // Shape copied from openai/plugins: no $schema, OpenAI fields at the top level.
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "figma",
+        skills: "./skills/",
+        apps: "./.app.json",
+        hooks: "./hooks.json",
+        interface: { displayName: "Figma", shortDescription: "Design", developerName: "Figma" },
+      }),
+      "utf8"
+    );
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.diagnostics).toEqual([]);
+    expect(result.plugins).toHaveLength(1);
+    const plugin = result.plugins[0];
+    expect(plugin.name).toBe("figma");
+    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "skills"));
+    expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, ".mcp.json"));
+    // Parsed and exposed only: no hook component resolves from the legacy key.
+    expect(plugin.hooksPath).toBeUndefined();
+    expect(plugin.openai).toEqual({ apps: "./.app.json", hooks: ["./hooks.json"] });
+    // `interface` is folded into the extension but kept opaque.
+    expect(plugin.manifest.extensions?.["com.openai"]).toMatchObject({
+      interface: { displayName: "Figma" },
+    });
+  });
+
+  test("root plugin.json and mcp.json win over the Codex fallbacks", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "root-plugin", { mcpJson: "{}" });
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "codex-name" }),
+      "utf8"
+    );
+    await fs.writeFile(path.join(pluginDir, ".mcp.json"), "{}", "utf8");
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins.map((p) => p.name)).toEqual(["root-plugin"]);
+    expect(result.plugins[0].mcpConfigPath).toBe(path.join(result.plugins[0].rootPath, "mcp.json"));
+  });
+
+  test("falls back to .mcp.json for a root-manifest plugin without mcp.json", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "dot-mcp");
+    await fs.writeFile(path.join(pluginDir, ".mcp.json"), "{}", "utf8");
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins[0].mcpConfigPath).toBe(
+      path.join(result.plugins[0].rootPath, ".mcp.json")
+    );
+  });
+
+  test("refuses a .codex-plugin/plugin.json symlink that escapes the plugin root", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const outside = path.join(tmp.path, "outside.json");
+    await fs.writeFile(outside, JSON.stringify({ name: "escaper" }), "utf8");
+    const codexDir = path.join(container, "escaper", ".codex-plugin");
+    await fs.mkdir(codexDir, { recursive: true });
+    await fs.symlink(outside, path.join(codexDir, "plugin.json"));
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toEqual([]);
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0].message).toContain("outside the plugin root");
+  });
+
+  test("invalid com.openai fields are dropped with warnings, never fatal", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    await writePlugin(container, "bad-openai", {
+      manifest: {
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "bad-openai",
+        extensions: { "com.openai": { apps: "../escape.json", onboardingSkill: 3 } },
+      },
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins.map((p) => p.name)).toEqual(["bad-openai"]);
+    expect(result.plugins[0].openai).toEqual({});
+    expect(result.diagnostics.map((d) => d.severity)).toEqual(["warning", "warning"]);
+  });
+
   test("a broken sibling plugin never affects a valid one", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");

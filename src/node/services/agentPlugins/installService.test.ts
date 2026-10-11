@@ -1643,6 +1643,31 @@ describe("AgentPluginInstallService", () => {
     });
   });
 
+  test("a Codex-layout repo installs, and its fallback files are under the consent receipt", async () => {
+    // Codex scaffold: only .codex-plugin/plugin.json and .mcp.json, no root files.
+    await fsPromises.mkdir(path.join(remoteDir, ".codex-plugin"));
+    await fsPromises.rename(
+      path.join(remoteDir, "plugin.json"),
+      path.join(remoteDir, ".codex-plugin", "plugin.json")
+    );
+    await fsPromises.rename(path.join(remoteDir, "mcp.json"), path.join(remoteDir, ".mcp.json"));
+    await commitAll(remoteDir, "codex layout");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.manifest).toMatchObject({ name: "demo-plugin" });
+    expect(preview.mcpServers.map((server) => server.serverName)).toEqual(["echo"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    const installedDir = path.join(pluginsDir(), "demo-plugin");
+    let reviewedHash = (await service.getComponents({ name: "demo-plugin" })).contentHash;
+    for (const file of [path.join(".codex-plugin", "plugin.json"), ".mcp.json"]) {
+      await fsPromises.appendFile(path.join(installedDir, file), "\n");
+      const refreshedHash = (await service.getComponents({ name: "demo-plugin" })).contentHash;
+      expect(refreshedHash).not.toBe(reviewedHash);
+      reviewedHash = refreshedHash;
+    }
+  });
+
   test("never overwrites: registry and directory collisions are clear errors", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });

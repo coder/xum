@@ -54,9 +54,11 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
+  CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
   discoverAgentPluginAt,
   discoverAgentPlugins,
   journalDerivedDiscoveryGate,
+  PLUGIN_MANIFEST_RELATIVE_PATH,
   setAgentPluginDiscoveryGate,
   type AgentPluginContainer,
   type AgentPluginInfo,
@@ -1142,7 +1144,11 @@ export class AgentPluginInstallService {
     plugin: AgentPluginInfo;
     warnings: string[];
   }> {
-    const hasManifest = await pathExists(path.join(stagedDir, "plugin.json"));
+    // Discovery reads `.codex-plugin/plugin.json` when the root manifest is
+    // absent; both live in the staged tree the consent receipt hashes.
+    const hasManifest =
+      (await pathExists(path.join(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH))) ||
+      (await pathExists(path.join(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH)));
     if (!hasManifest) {
       if (
         (await pathExists(path.join(stagedDir, ".claude-plugin", "plugin.json"))) ||
@@ -1153,7 +1159,7 @@ export class AgentPluginInstallService {
         );
       }
       throw new Error(
-        "No plugin.json found at the repository root. The repo is not an Agent Plugin — if the plugin lives in a subdirectory, monorepo subpath installs land in v2."
+        "No plugin.json (or .codex-plugin/plugin.json) found at the repository root. The repo is not an Agent Plugin — if the plugin lives in a subdirectory, monorepo subpath installs land in v2."
       );
     }
 
