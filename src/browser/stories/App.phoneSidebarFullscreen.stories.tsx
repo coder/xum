@@ -224,6 +224,13 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     );
     await waitFor(() => expect(sidebar).toBeVisible());
     await expect(await within(sidebar).findByText("Open a tool")).toBeVisible();
+    await waitFor(() => expect(sidebar.contains(document.activeElement)).toBe(true));
+
+    // A layout change that removes the focused tab, as pruning does once a tool turns out to be
+    // unavailable, keeps focus inside the view instead of dropping it on the inert page.
+    updatePersistedState(getRightSidebarLayoutKey(WORKSPACE_ID), LAYOUT);
+    await waitFor(() => expect(within(sidebar).queryByText("Open a tool")).toBeNull());
+    await waitFor(() => expect(sidebar.contains(document.activeElement)).toBe(true));
 
     // Widening the layout ends full-screen mode: the sidebar is back in its column. Only
     // possible when the window itself is wider than the narrow viewport breakpoint.

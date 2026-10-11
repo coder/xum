@@ -1964,6 +1964,33 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     const container = sidebarContainerRef.current;
     if (!fullscreen || onCloseFullscreen == null || header == null || container == null) return;
     let restoreOthers: (() => void) | null = null;
+    // The focused pane's shown tab. Focusing a tab also focuses its pane, so a split layout keeps
+    // the pane it had. It is found in the rendered DOM, not the stored layout, because rendering
+    // can filter tabs out (Review in a workspace without a repository). The match is by id prefix,
+    // not a selector built from the id: legacy workspace ids keep path characters (quotes) that
+    // would make querySelector throw with the page inert. Falls back to any shown tab, then the
+    // close button, so focus always lands inside.
+    const focusInside = () => {
+      const focusedPanePrefix = `${baseId}-${getBaseLayout().focusedTabsetId}-tab-`;
+      const selectedTabs = Array.from(
+        container.querySelectorAll<HTMLElement>('[role="tab"][aria-selected="true"]')
+      );
+      const target =
+        selectedTabs.find((tab) => tab.id.startsWith(focusedPanePrefix)) ??
+        selectedTabs[0] ??
+        header.querySelector<HTMLElement>("button");
+      target?.focus();
+    };
+    // Focus that falls out with a removed node (a tab pruned once its tool turns out to be
+    // unavailable, a closed tab) would sit on <body> with the rest of the page inert: bring it
+    // back. Only from <body>: a portaled menu opened from the view keeps its focus.
+    const focusObserver = new MutationObserver(() => {
+      if (restoreOthers == null) return;
+      if (document.activeElement == null || document.activeElement === document.body) {
+        focusInside();
+      }
+    });
+    focusObserver.observe(container, { childList: true, subtree: true });
     const closeIfWidened = () => {
       if (window.getComputedStyle(header).display === "none") {
         restoreOthers?.();
@@ -1974,26 +2001,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         // cannot lower `??=` and would skip this whole component.
         if (restoreOthers != null) return;
         restoreOthers = makeOthersInert(container);
-        // Focus was outside (the menu button, now inert): move it to the shown tab, so keyboard
-        // and screen reader users land in the view. A launcher or panel that took focus already
-        // (the New tab shortcut) keeps it. The focused pane's tab: focusing a tab focuses its
-        // pane, and a split layout must keep the pane it had.
-        // The rendered tab, not the stored layout's: rendering can filter tabs out (Review in a
-        // workspace without a repository). Falls back to any shown tab, then the close button,
-        // so focus always lands inside.
-        // Matched by id prefix, not a selector built from the id: legacy workspace ids keep
-        // path characters (quotes) that would make querySelector throw with the page inert.
-        if (!container.contains(document.activeElement)) {
-          const focusedPanePrefix = `${baseId}-${getBaseLayout().focusedTabsetId}-tab-`;
-          const selectedTabs = Array.from(
-            container.querySelectorAll<HTMLElement>('[role="tab"][aria-selected="true"]')
-          );
-          const target =
-            selectedTabs.find((tab) => tab.id.startsWith(focusedPanePrefix)) ??
-            selectedTabs[0] ??
-            header.querySelector<HTMLElement>("button");
-          target?.focus();
-        }
+        // Focus was outside (the menu button, now inert): move it into the view, so keyboard
+        // and screen reader users land there. A launcher or panel that took focus already (the
+        // New tab shortcut) keeps it.
+        if (!container.contains(document.activeElement)) focusInside();
       }
     };
     closeIfWidened();
@@ -2006,6 +2017,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       resizeObserver.observe(shell);
     }
     return () => {
+      focusObserver.disconnect();
       mql.removeEventListener("change", closeIfWidened);
       resizeObserver?.disconnect();
       restoreOthers?.();
