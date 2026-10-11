@@ -261,6 +261,11 @@ describe("Codex tool names", () => {
       toolName: "scan",
     });
     await runTool(spine, "other_scan", {}, undefined, { serverName: "other", toolName: "scan" });
+    // A user server whose name only looks like a plugin key keeps its whole name.
+    await runTool(spine, "user_scan", {}, undefined, {
+      serverName: "plugin:abc:scanner",
+      toolName: "scan",
+    });
 
     expect(calls).toEqual([{ name: "mcp__scanner__scan" }]);
   });
