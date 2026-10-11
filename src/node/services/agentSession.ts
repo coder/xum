@@ -1093,6 +1093,12 @@ interface SendMessageInternalOptions {
    */
   skipPromptHooks?: boolean;
   /**
+   * Texts sent after a queued compaction request and batched into it (MessageQueue joins them
+   * into the request's message). The message.send prompt hooks run on these texts only: the
+   * compaction prompt never reaches them, but separately sent user text must.
+   */
+  textBatchedBehindCompaction?: string;
+  /**
    * Task-attempt obligation for this send (see TurnAdmissionToken): notified of the coordinator's
    * admission inside the synchronous prepare callback. Its staleness is already composed into
    * `admissionStale` by WorkspaceService.
@@ -4417,8 +4423,9 @@ export class AgentSession {
   }
 
   /**
-   * Run the message.send prompt hooks once for this message. Compaction requests never reach
-   * them, and a send that already ran them (an on-send compaction follow-up) skips them.
+   * Run the message.send prompt hooks once for this message. A compaction request's own text
+   * never reaches them, only the texts batched behind it in the queue. A send that already ran
+   * them (an on-send compaction follow-up) skips them.
    *
    * Only a send a person made (typed, edited, queued, plan-review feedback) can be blocked.
    * Automatic senders (goals, tasks, wakes, follow-ups) retry a refused send, so a block would
@@ -4436,16 +4443,19 @@ export class AgentSession {
         ? { kind: "context", entries: applied.context }
         : { kind: "none" };
     }
+    const hookText = isCompactionRequestMetadata(muxMetadata)
+      ? internal?.textBatchedBehindCompaction
+      : message;
     if (
       internal?.skipPromptHooks === true ||
       this.aiService.runMessageSendHooks == null ||
-      isCompactionRequestMetadata(muxMetadata)
+      hookText == null
     ) {
       return { kind: "none" };
     }
     const origin = resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin);
     const outcome = await this.aiService.runMessageSendHooks(this.workspaceId, {
-      text: message,
+      text: hookText,
       origin,
     });
     if (
