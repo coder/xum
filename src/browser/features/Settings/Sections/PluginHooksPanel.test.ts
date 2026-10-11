@@ -9,4 +9,11 @@ describe("describePluginHookHandler", () => {
       describePluginHookHandler({ ...handler, timeoutSeconds: 86400 })
     );
   });
+
+  test("an omitted timeout reads as the runner default, not a number", () => {
+    const handler = { type: "mcp_tool" as const, server: "s", tool: "t", input: {} };
+    const summary = describePluginHookHandler(handler);
+    expect(summary).not.toContain("undefined");
+    expect(summary).not.toBe(describePluginHookHandler({ ...handler, timeoutSeconds: 30 }));
+  });
 });
