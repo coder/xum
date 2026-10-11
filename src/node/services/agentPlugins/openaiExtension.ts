@@ -114,6 +114,12 @@ const CODEX_CONTRIBUTES_KEYS = [
  * the root `plugin.json` parse stays strict. Codex manifests omit `$schema`
  * and keep OpenAI fields at the top level; an inline
  * `extensions["com.openai"]` value wins over a conflicting top-level one.
+ *
+ * SECURITY AUDIT: a Codex package was not written for Xum and is often
+ * unmanaged (`~/.agents/plugins`, a repo), so it gets no Xum-only behavior:
+ * `contributes` (slash commands, hooks/agents/workflows paths) and
+ * `extensions.mux` (hook tool grants) are dropped here. Discovery also skips
+ * the implicit hooks.js, agents/ and workflows/ defaults for these packages.
  */
 export function normalizeCodexManifest(raw: unknown): { manifest: unknown; warnings: string[] } {
   const warnings: string[] = [];
@@ -121,8 +127,17 @@ export function normalizeCodexManifest(raw: unknown): { manifest: unknown; warni
 
   const manifest: Record<string, unknown> = { ...raw };
   manifest.$schema ??= AGENT_PLUGIN_SCHEMA_ID_1_0_0;
+  if ("contributes" in raw) {
+    warnings.push("'contributes' is not supported in .codex-plugin/plugin.json; ignoring");
+    delete manifest.contributes;
+  }
 
   const extensions = isPlainObject(raw.extensions) ? { ...raw.extensions } : {};
+  if ("mux" in extensions) {
+    warnings.push("'extensions.mux' is not supported in .codex-plugin/plugin.json; ignoring");
+    delete extensions.mux;
+    manifest.extensions = extensions;
+  }
   const openai = isPlainObject(extensions[OPENAI_EXTENSION_NAMESPACE])
     ? { ...extensions[OPENAI_EXTENSION_NAMESPACE] }
     : {};
@@ -144,24 +159,18 @@ export function normalizeCodexManifest(raw: unknown): { manifest: unknown; warni
     manifest.extensions = extensions;
   }
 
-  // Only string paths map; other forms stay top-level and the validator
-  // reports them as unknown fields.
-  const contributes = isPlainObject(raw.contributes) ? { ...raw.contributes } : {};
-  let contributed = false;
+  // Only a string path (or a one-entry array) maps: Xum has one skills root.
+  // Other forms stay top-level and the validator reports them as unknown.
+  const contributes: Record<string, unknown> = {};
   for (const [codexKey, contributesKey] of CODEX_CONTRIBUTES_KEYS) {
-    if (typeof raw[codexKey] !== "string") continue;
-    if (contributesKey in contributes) {
-      warnings.push(
-        `Top-level '${codexKey}' conflicts with 'contributes.${contributesKey}'; using the contributes value`
-      );
-    } else {
-      // An unsafe path is passed through so the validator rejects it with its warning.
-      contributes[contributesKey] = normalizeOpenAIRelativePath(raw[codexKey]) ?? raw[codexKey];
-    }
+    const value: unknown = raw[codexKey];
+    const single: unknown = Array.isArray(value) && value.length === 1 ? value[0] : value;
+    if (typeof single !== "string") continue;
+    // An unsafe path is passed through so the validator rejects it with its warning.
+    contributes[contributesKey] = normalizeOpenAIRelativePath(single) ?? single;
     delete manifest[codexKey];
-    contributed = true;
   }
-  if (contributed) manifest.contributes = contributes;
+  if (Object.keys(contributes).length > 0) manifest.contributes = contributes;
 
   return { manifest, warnings };
 }
