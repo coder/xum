@@ -16,26 +16,12 @@
 @source "../node_modules/streamdown/dist/index.js";
 
 /* Geist Font Declarations */
-/* Latin-script text uses a subset of Geist Variable (68% of its bytes), so a Latin-only page never
-   downloads the full font. Every other character that Geist has (Cyrillic, Greek, most symbols)
-   goes to the full font, and the two ranges do not overlap. scripts/subset-geist-font.py
-   regenerates the subset (sha256 ce8b6557ddd8d03e2058996eb442f53ad9b03439a56dc3a65d35e85b1f480056)
-   and prints both ranges. License: fonts/Geist-OFL.txt, also embedded in the subset's name table. */
-@font-face {
-  font-family: "Geist";
-  src: url("./fonts/Geist-Latin-Variable.woff2") format("woff2");
-  font-weight: 100 900;
-  font-style: normal;
-  font-display: swap;
-  unicode-range: U+0000-036F, U+1E00-1EFF, U+2000-214F, U+2190-2199, U+2212, U+2215, U+2C60-2C7F, U+A720-A7FF, U+FB00-FB06, U+FEFF, U+FFFD;
-}
 @font-face {
   font-family: "Geist";
   src: url("../../../node_modules/geist/dist/fonts/geist-sans/Geist-Variable.woff2") format("woff2");
   font-weight: 100 900;
   font-style: normal;
   font-display: swap;
-  unicode-range: U+039B, U+03A9, U+03BB, U+03C0, U+0400-045F, U+0462-0463, U+046A-046B, U+0472-0475, U+0490-0493, U+0496-0497, U+049A-049B, U+04A2-04A3, U+04AE-04B3, U+04B6-04B7, U+04BA-04BB, U+04C0, U+04CF, U+04D8-04D9, U+04E2-04E3, U+04E8-04E9, U+04EE-04EF, U+0E3F, U+2153-2155, U+215B-215E, U+219D, U+21A9-21AA, U+21B0-21B1, U+21B3-21B5, U+21E4-21E5, U+21E7, U+2202, U+2206, U+220F, U+2211, U+221A, U+221E, U+222B, U+2248, U+2260, U+2264-2265, U+23CE, U+240B-240C, U+2460-2468, U+24EA, U+24FF, U+25B2-25B3, U+25B6-25B7, U+25BC-25BD, U+25C0-25C1, U+25CA-25CC, U+25CF, U+2639-263A, U+2776-277E, U+3003, U+3008-3011, U+3014-3017, U+301C, U+F8FF;
 }
 
 /* Used for file icons */
