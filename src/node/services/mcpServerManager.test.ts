@@ -720,6 +720,35 @@ describe("MCPServerManager", () => {
     expect(manager.getCachedSettings("settings-ws", "cad")).toEqual(values);
   });
 
+  test("settings: a replaced server instance does not keep the old instance's cached values", async () => {
+    const settingsServer = (units: string) => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: { units: { type: "string", title: "Units" } } },
+              values: { units },
+            },
+          }),
+      },
+    });
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-v1") });
+    servers.serve("settings-v1", settingsServer("in"));
+    servers.serve("settings-v2", settingsServer("mm"));
+    const request = workspaceRequest("settings-replace-ws");
+    await manager.getToolsForWorkspace(request);
+    await manager.readSettings("settings-replace-ws", "cad");
+    expect(manager.getCachedSettings("settings-replace-ws", "cad")).toEqual({ units: "in" });
+
+    // Same workspace and server name, new configuration: the instance is replaced.
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-v2") });
+    await manager.getToolsForWorkspace(request);
+    expect(manager.getCachedSettings("settings-replace-ws", "cad")).toBeUndefined();
+  });
+
   test("an epoch retry never re-runs an MCP Apps view's tool call", async () => {
     // A sibling's plugin mutation lands while the approved call runs: the epoch postflight
     // re-runs the operation, which must not call the (possibly mutating) tool again.
