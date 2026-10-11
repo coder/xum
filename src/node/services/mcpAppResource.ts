@@ -1,4 +1,8 @@
-import { MCP_APP_MIME_TYPE, MCP_APP_RESOURCE_MAX_BYTES } from "@/common/utils/mcpApps";
+import {
+  MCP_APP_MIME_TYPE,
+  MCP_APP_RESOURCE_MAX_BYTES,
+  MCP_APP_SKYBRIDGE_MIME_TYPE,
+} from "@/common/utils/mcpApps";
 import {
   McpAppCspDeclarationSchema,
   type McpAppCspDeclaration,
@@ -16,9 +20,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /**
  * Validate a resources/read result for an MCP Apps view and extract its HTML. Accepts only
- * the content for `uri` whose mimeType is exactly text/html;profile=mcp-app, as `text` or a
- * base64 `blob`, up to MCP_APP_RESOURCE_MAX_BYTES of decoded HTML. Throws with a user-facing
- * reason otherwise. Callers validate that `uri` is a ui:// URI before reading.
+ * the content for `uri` whose mimeType is exactly MCP_APP_MIME_TYPE or ChatGPT's
+ * MCP_APP_SKYBRIDGE_MIME_TYPE, as `text` or a base64 `blob`, up to MCP_APP_RESOURCE_MAX_BYTES
+ * of decoded HTML. Throws with a user-facing reason otherwise. Callers validate that `uri` is a
+ * ui:// URI before reading.
+ *
+ * Skybridge is accepted for every view, not only for one reached through
+ * `openai/outputTemplate`: the alias is resolved into a plain resourceUri at tool discovery, so
+ * this reader cannot tell which key named the view, and carrying that through would add a field
+ * to tool metadata, display snapshots and result records. Both types are HTML rendered in the
+ * same sandbox, so accepting either grants nothing extra. A skybridge template's
+ * `openai/widgetCSP` is not mapped: only `_meta.ui.csp` grants domains.
  */
 export function extractMcpAppResource(result: unknown, uri: string): McpAppResource {
   const contents = isRecord(result) && Array.isArray(result.contents) ? result.contents : [];
@@ -28,7 +40,7 @@ export function extractMcpAppResource(result: unknown, uri: string): McpAppResou
   if (content === undefined) {
     throw new Error(`The server returned no content for ${uri}`);
   }
-  if (content.mimeType !== MCP_APP_MIME_TYPE) {
+  if (content.mimeType !== MCP_APP_MIME_TYPE && content.mimeType !== MCP_APP_SKYBRIDGE_MIME_TYPE) {
     throw new Error(
       `View resource has mime type ${String(content.mimeType)}; expected ${MCP_APP_MIME_TYPE}`
     );
