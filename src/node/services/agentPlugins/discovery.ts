@@ -69,6 +69,36 @@ export interface PluginFileReadResult {
   modifiedTime: Date;
 }
 
+/** A plugin path that resolves into the plugin root's `.git` directory (#6161). */
+export class PluginGitPathError extends Error {
+  constructor() {
+    super("Path resolves into the plugin's .git directory.");
+    this.name = "PluginGitPathError";
+  }
+}
+
+/**
+ * Contained resolution of a path inside a plugin root (ensurePathContained), which also refuses
+ * the root's `.git` directory and anything under it. A staged clone still holds `.git` (its
+ * config can carry the remote's credentials), and a committed symlink into it passes plain
+ * containment, so a preview would disclose it as a hook or skill body (#6161). The one rule for
+ * every plugin component read: the contained reader, component resolution and the install
+ * preview's skill scan.
+ */
+export async function ensurePluginPathContained(
+  pluginRoot: string,
+  candidatePath: string,
+  options?: { allowMissing?: boolean }
+): Promise<string> {
+  const resolved = await ensurePathContained(pluginRoot, candidatePath, options);
+  const relative = path.relative(await fsPromises.realpath(pluginRoot), resolved);
+  // Case-insensitive: on macOS and Windows `.GIT` is the same directory.
+  if (relative.split(path.sep)[0].toLowerCase() === ".git") {
+    throw new PluginGitPathError();
+  }
+  return resolved;
+}
+
 /**
  * Read a consented plugin component file (hooks.js, mcp.json, agents/*.md,
  * SKILL.md + referenced skill files, workflows/*.js) through a bounded
@@ -104,26 +134,6 @@ export interface PluginFileReadResult {
  * pair post-open content with pre-open stat results. Over-blocking is safe —
  * the caller skips and re-measures on the next discovery.
  */
-/**
- * Contained resolution of a path inside a plugin root (ensurePathContained), which also refuses
- * the root's `.git` directory and anything under it. A staged clone still holds `.git` (its
- * config can carry the remote's credentials), and a committed symlink into it passes plain
- * containment, so a preview would disclose it as a hook or skill body (#6161). The one rule for
- * every plugin component read: the contained reader and component resolution.
- */
-export async function ensurePluginPathContained(
-  pluginRoot: string,
-  candidatePath: string
-): Promise<string> {
-  const resolved = await ensurePathContained(pluginRoot, candidatePath);
-  const relative = path.relative(await fsPromises.realpath(pluginRoot), resolved);
-  // Case-insensitive: on macOS and Windows `.GIT` is the same directory.
-  if (relative.split(path.sep)[0].toLowerCase() === ".git") {
-    throw new Error("Path resolves into the plugin's .git directory.");
-  }
-  return resolved;
-}
-
 export async function readPluginFileWithinRootCapped(args: {
   filePath: string;
   pluginRoot: string;

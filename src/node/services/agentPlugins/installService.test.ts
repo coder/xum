@@ -1476,6 +1476,8 @@ describe("AgentPluginInstallService", () => {
     const warnings = preview.warnings.join("\n");
     expect(warnings).toContain("hooks.js");
     expect(warnings).toContain(".git directory");
+    // The skill scan refuses the link by the .git rule itself, not only by a failed parse.
+    expect(warnings).toContain("skills/leak: resolves into the plugin's .git directory");
     // Nothing of the git config reaches the preview.
     expect(JSON.stringify(preview)).not.toContain("repositoryformatversion");
   });
