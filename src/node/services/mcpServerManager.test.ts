@@ -699,16 +699,11 @@ describe("MCPServerManager", () => {
     expect(manager.getCachedSettings("settings-ws", "cad")).toEqual({ units: "in", grid: false });
     // An invalid value is refused before anything reaches the server.
     const refused = await manager
-      .updateSettings("settings-ws", "cad", { units: "ft" }, snapshot.properties)
+      .updateSettings("settings-ws", "cad", { units: "ft" }, snapshot)
       .catch((error: unknown) => error);
     expect(refused).toBeInstanceOf(Error);
 
-    const values = await manager.updateSettings(
-      "settings-ws",
-      "cad",
-      { units: "mm" },
-      snapshot.properties
-    );
+    const values = await manager.updateSettings("settings-ws", "cad", { units: "mm" }, snapshot);
     expect(values).toEqual({ units: "mm", grid: false });
     expect(calls).toEqual([
       { name: "s.read", args: {}, meta: { "xum/workspaceId": "settings-ws" } },
@@ -988,6 +983,54 @@ describe("MCPServerManager", () => {
     servers.serve("settings-none", { tools: { draw: testTool() } });
     await manager.getToolsForWorkspace(workspaceRequest("settings-none-ws"));
     expect(await manager.readSettings("settings-none-ws", "plain")).toBeNull();
+  });
+
+  test("settings: an older read never overwrites a newer update in the cache; an update keeps omitted values", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-latest") });
+    let releaseRead: (() => void) | undefined;
+    servers.serve("settings-latest", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: (name) => {
+          const result = (values: Record<string, unknown>) => ({
+            content: [],
+            structuredContent: {
+              schema: {
+                type: "object",
+                properties: {
+                  units: { type: "string", title: "Units" },
+                  grid: { type: "boolean", title: "Grid" },
+                },
+              },
+              values,
+            },
+          });
+          // The update result omits `grid`.
+          if (name === "s.update") return Promise.resolve(result({ units: "in" }));
+          if (releaseRead !== undefined)
+            return Promise.resolve(result({ units: "mm", grid: true }));
+          return new Promise((resolve) => {
+            releaseRead = () => resolve(result({ units: "mm", grid: true }));
+          });
+        },
+      },
+    });
+    await manager.getToolsForWorkspace(workspaceRequest("settings-latest-ws"));
+    const slowRead = manager.readSettings("settings-latest-ws", "cad");
+    await waitFor(() => releaseRead !== undefined);
+    const prior = await manager.readSettings("settings-latest-ws", "cad");
+    if (prior === null) throw new Error("expected settings");
+    const values = await manager.updateSettings(
+      "settings-latest-ws",
+      "cad",
+      { units: "in" },
+      prior
+    );
+    expect(values).toEqual({ units: "in", grid: true });
+    releaseRead?.();
+    await slowRead;
+    expect(manager.getCachedSettings("settings-latest-ws", "cad")).toEqual(values);
   });
 
   test("settings: a replaced server instance does not keep the old instance's cached values", async () => {

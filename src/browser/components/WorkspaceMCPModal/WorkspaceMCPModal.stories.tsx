@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import type { FC, ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, userEvent, waitFor, within } from "@storybook/test";
+import { expect, fireEvent, userEvent, waitFor, within } from "@storybook/test";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
@@ -69,6 +69,7 @@ interface WorkspaceMCPStoryOptions {
   settingsReads?: string[][];
   settingsReadErrors?: Record<string, string>;
   settingsUpdateGate?: { promise: Promise<void> };
+  settingsFirstReadGate?: { promise: Promise<void> };
   testGate?: { promise: Promise<void> };
 }
 
@@ -146,6 +147,7 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     mcpSettingsReads: options.settingsReads,
     mcpSettingsReadErrors: new Map(Object.entries(options.settingsReadErrors ?? {})),
     mcpSettingsUpdateGate: options.settingsUpdateGate,
+    mcpSettingsFirstReadGate: options.settingsFirstReadGate,
     mcpTestGate: options.testGate,
   });
 }
@@ -591,8 +593,19 @@ const settingsStoryOptions = (): WorkspaceMCPStoryOptions => ({
  * Shared play: settings load on open (no Fetch Tools), render as text, note the
  * dropped setting, validate, and send changes.
  */
-async function exerciseServerSettings(canvasElement: HTMLElement): Promise<void> {
+async function exerciseServerSettings(
+  canvasElement: HTMLElement,
+  /** Forces the dialog to this width: the CI test runner plays at desktop size. */
+  narrowWidthPx?: number
+): Promise<void> {
   const dialog = await findWorkspaceMCPDialog(canvasElement);
+  if (narrowWidthPx !== undefined) {
+    // No transition: the dialog's duration-200 would animate the width change.
+    dialog.style.transition = "none";
+    dialog.style.width = `${narrowWidthPx}px`;
+    dialog.style.maxWidth = `${narrowWidthPx}px`;
+    await expect(dialog.getBoundingClientRect().width).toBeLessThanOrEqual(narrowWidthPx);
+  }
   const modal = within(dialog);
   const section = within(await modal.findByTestId("mcp-server-settings"));
   await expect(modal.getByRole("button", { name: "Fetch Tools" })).toBeInTheDocument();
@@ -640,7 +653,8 @@ export const WorkspaceMCPServerSettingsNarrow: Story = {
     },
   },
   render: () => renderWorkspaceMCPModal(settingsStoryOptions()),
-  play: async ({ canvasElement }) => exerciseServerSettings(canvasElement),
+  // The phone viewport (390px) minus the dialog's side margins.
+  play: async ({ canvasElement }) => exerciseServerSettings(canvasElement, 358),
 };
 
 /** Not running yet: the dialog does not start it on open; Fetch Tools connects it. */
@@ -819,10 +833,61 @@ export const WorkspaceMCPServerSettingsLateFetch: Story = {
     );
     await within(await findWorkspaceMCPDialog(canvasElement)).findByTestId("mcp-server-settings");
     await waitFor(() => expect(lateFetchReads).toHaveLength(2));
+    // The late Fetch Tools still runs (the component stayed mounted); its end clears the
+    // spinner, after its settings step, which must not read again.
+    const reopened = within(await findWorkspaceMCPDialog(canvasElement));
+    await expect(reopened.queryByRole("button", { name: /(Fetch|Refresh) Tools/ })).toBeNull();
     lateFetchGate.open();
-    // Let the late Fetch Tools continuation run; it must not read again.
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await expect(reopened.findByRole("button", { name: "Refresh Tools" })).resolves.toBeEnabled();
     await expect(lateFetchReads).toHaveLength(2);
+  },
+};
+
+const slowFirstReadGate = storyGate();
+const slowFirstReads: string[][] = [];
+
+/**
+ * The open's read is slow; meanwhile the server's zoom changes and Fetch Tools reads cad
+ * again. When the slow read lands (lathe's section appears), cad keeps the newer read.
+ */
+export const WorkspaceMCPServerSettingsSlowFirstRead: Story = {
+  render: () => {
+    slowFirstReads.length = 0;
+    return (
+      <WorkspaceMCPModalStoryShell
+        setup={() =>
+          setupWorkspaceMCPModalStory({
+            ...settingsStoryOptions(),
+            settingsReads: slowFirstReads,
+            servers: {
+              cad: { transport: "stdio", command: "bunx cad-mcp", disabled: false },
+              lathe: { transport: "stdio", command: "bunx lathe-mcp", disabled: false },
+            },
+            settings: { cad: CAD_SETTINGS, lathe: CAD_SETTINGS },
+            settingsConnected: ["cad", "lathe"],
+            settingsFirstReadGate: slowFirstReadGate,
+          })
+        }
+      >
+        <ReopenableWorkspaceMCPModal />
+      </WorkspaceMCPModalStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    // The open's read has taken its values (zoom 2) before the server's zoom changes.
+    await waitFor(() => expect(slowFirstReads).toHaveLength(1));
+    // The open modal hides the page from userEvent (aria-hidden, no pointer events).
+    await fireEvent.click(
+      within(canvasElement).getByRole("button", { name: "Change zoom on the server", hidden: true })
+    );
+    await userEvent.click(modal.getAllByRole("button", { name: "Fetch Tools" })[0]);
+    const cad = within(await modal.findByTestId("mcp-server-settings"));
+    await expect(cad.getByLabelText("Default zoom setting")).toHaveValue(4);
+    slowFirstReadGate.open();
+    await waitFor(() => expect(modal.getAllByTestId("mcp-server-settings")).toHaveLength(2));
+    const [cadAfter] = modal.getAllByTestId("mcp-server-settings");
+    await expect(within(cadAfter).getByLabelText("Default zoom setting")).toHaveValue(4);
   },
 };
 

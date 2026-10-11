@@ -53,6 +53,20 @@ const MAX_LAYOUT_GROUPS = 20;
 const MAX_GROUP_ITEMS = 100;
 /** Options one Select can show; a setting with more is dropped (counted as not shown). */
 export const MAX_MCP_SETTING_ENUM_OPTIONS = 100;
+/** Longest setting name, in code points: names are React keys and cross IPC. Longer = dropped. */
+export const MAX_MCP_SETTING_NAME = 128;
+/** Settings tool timeout in the dialog's bulk read: one hung server must not hold back the rest. */
+export const MCP_SETTINGS_READ_TIMEOUT_MS = 10_000;
+
+/**
+ * A settings error as sent to the renderer: at most MAX_TEXT UTF-16 units (about 1 KB), cut
+ * on a code point. Server error text is untrusted and otherwise unbounded.
+ */
+export function boundMCPSettingsError(message: string): string {
+  if (message.length <= MAX_TEXT) return message;
+  const cut = message.slice(0, MAX_TEXT);
+  return `${/[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut}…`;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -65,6 +79,9 @@ const isEnumOption = (value: unknown): value is string =>
   typeof value === "string" && value.length <= MAX_TEXT;
 /** JSON Schema string length counts Unicode code points, not UTF-16 units. */
 const codePointLength = (value: string): number => [...value].length;
+/** Longer than `max` code points; counts them only when the UTF-16 length cannot decide. */
+const exceedsCodePoints = (value: string, max: number): boolean =>
+  value.length > max && (value.length > 2 * max || codePointLength(value) > max);
 const isLength = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 0;
 const isFiniteNumber = (value: unknown): value is number =>
@@ -155,7 +172,7 @@ export function validateMCPSettingValue(schema: MCPSettingSchema, value: unknown
     case "boolean":
       return typeof value === "boolean" ? null : "must be true or false";
     case "string": {
-      if (typeof value !== "string" || value.length > MAX_VALUE_LENGTH)
+      if (typeof value !== "string" || exceedsCodePoints(value, MAX_VALUE_LENGTH))
         return `must be text of at most ${MAX_VALUE_LENGTH} characters`;
       if (schema.enum !== undefined && !schema.enum.includes(value))
         return `must be one of: ${schema.enum.join(", ")}`;
@@ -192,7 +209,7 @@ export function filterMCPSettingValues(
   raw: unknown,
   warnings: string[]
 ): Record<string, MCPSettingValue> {
-  const values: Record<string, MCPSettingValue> = {};
+  const values = Object.create(null) as Record<string, MCPSettingValue>;
   if (!isRecord(raw)) {
     warnings.push("'values' must be an object");
     return values;
@@ -213,15 +230,26 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
   if (!isRecord(raw.schema.properties))
     return { error: "the settings schema has no 'properties' object" };
   const warnings: string[] = [];
-  const properties: Record<string, MCPSettingSchema> = {};
-  const declared = Object.entries(raw.schema.properties);
-  if (declared.length > MAX_MCP_SETTINGS)
-    warnings.push(`Only the first ${MAX_MCP_SETTINGS} settings are shown; ignoring the rest`);
-  for (const [name, schema] of declared.slice(0, MAX_MCP_SETTINGS)) {
-    const parsed = parseSchema(schema);
+  // Null prototypes: a setting named "__proto__" must stay an own key, not hit the legacy setter.
+  const properties = Object.create(null) as Record<string, MCPSettingSchema>;
+  // A counting loop, not Object.entries: a server can declare any number of properties, and
+  // only the first MAX_MCP_SETTINGS are parsed. The rest are only counted (as dropped).
+  const declaredProperties = raw.schema.properties;
+  let declared = 0;
+  for (const name in declaredProperties) {
+    if (!Object.hasOwn(declaredProperties, name) || ++declared > MAX_MCP_SETTINGS) continue;
+    if (exceedsCodePoints(name, MAX_MCP_SETTING_NAME)) {
+      warnings.push(
+        `A setting name is longer than ${MAX_MCP_SETTING_NAME} characters; ignoring it`
+      );
+      continue;
+    }
+    const parsed = parseSchema(declaredProperties[name]);
     if (parsed !== undefined) properties[name] = parsed;
     else warnings.push(`Setting '${name}' has an unsupported schema; ignoring it`);
   }
+  if (declared > MAX_MCP_SETTINGS)
+    warnings.push(`Only the first ${MAX_MCP_SETTINGS} settings are shown; ignoring the rest`);
   const values = filterMCPSettingValues(properties, raw.values, warnings);
   // A property without a valid current value cannot be edited safely.
   for (const name of Object.keys(properties)) {
@@ -267,7 +295,6 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
       title: "Other settings",
       items: rest.map((property) => ({ kind: "property", property })),
     });
-  const droppedSettingCount =
-    Object.keys(raw.schema.properties).length - Object.keys(properties).length;
+  const droppedSettingCount = declared - Object.keys(properties).length;
   return { properties, values, layout, warnings, droppedSettingCount };
 }
