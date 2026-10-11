@@ -225,7 +225,8 @@ dev-server-sandbox: ## Start an isolated dev-server instance (fresh XUM_ROOT + f
 # the run) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. The app AI is BUGBASH_AI (default auto:
 # run.ts probes BUGBASH_APP_MODEL through the run's budget, and falls back to the mock when the
 # upstream is unavailable). The containers mount dist/. The checks (env, Docker, the image) run
-# before the build, so a missing one refuses in about a second, not after the build.
+# before the build, so a missing one refuses in about a second once the image is cached, not
+# after the build. The first run pulls the image (about 1.4 GB), which takes minutes.
 # Do not name a build goal (build-main, build-renderer, build-static) on the same make command line
 # as bug-bash or mcp-apps-e2e: under -j the top-level make and the inner $(MAKE) build it twice at once.
 bug-bash: ## Agent bug bash in the bug-bash sandbox: e2e explore charters x models (needs BUGBASH_BUDGET_USD)
