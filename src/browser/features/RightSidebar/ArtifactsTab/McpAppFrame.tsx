@@ -22,6 +22,7 @@ import {
 } from "./mcpAppHost";
 import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
 import {
+  beginMcpAppViewDomainsRequest,
   currentMcpAppViewDomainsSeq,
   publishMcpAppViewDomains,
   useMcpAppViewDomains,
@@ -238,6 +239,7 @@ export function McpAppFrame(props: {
   const allowDomains = async (origins: string[]) => {
     if (!api) return;
     try {
+      const requestSeq = beginMcpAppViewDomainsRequest();
       const result = await api.mcpApps.approveViewDomains({
         workspaceId,
         toolCallId,
@@ -248,7 +250,12 @@ export function McpAppFrame(props: {
         setDomainsDismissed({ toolCallId, error: result.error });
       } else if (approvalProjectPath != null) {
         // The new grant changes every such view's document: they reload under the wider policy.
-        publishMcpAppViewDomains(approvalProjectPath, boundServerName, result.data.approvedDomains);
+        publishMcpAppViewDomains(
+          approvalProjectPath,
+          boundServerName,
+          result.data.approvedDomains,
+          requestSeq
+        );
       }
     } catch (error) {
       // A failed write or a lost connection: the same visible failure as a refusal.
@@ -453,6 +460,13 @@ export function McpAppFrame(props: {
       )}
       {grant.notGranted.length > 0 && (
         <NoteBar>Not granted to this view: {grant.notGranted.join(", ")}</NoteBar>
+      )}
+      {grant.pending.length > 0 && current.view.invocation == null && (
+        // Without its result record nothing binds the view to a server, so no Allow is offered.
+        <NoteBar>
+          Blocked, and cannot be allowed because this view's tool result record is gone:{" "}
+          {grant.pending.map((origin) => new URL(origin).host).join(", ")}
+        </NoteBar>
       )}
       {domainsDismissed?.toolCallId === toolCallId && domainsDismissed.error != null && (
         <NoteBar>Could not allow the domains: {domainsDismissed.error}</NoteBar>

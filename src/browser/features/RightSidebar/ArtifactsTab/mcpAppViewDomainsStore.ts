@@ -8,9 +8,16 @@ import { useSyncExternalStore } from "react";
  *
  * Renderer memory only: nothing here is persisted, and the project config (read through getView)
  * stays the source of truth. Callers publish only the list a successful backend call returned.
+ *
+ * Responses can arrive out of order (two views approving at once), so each change carries the
+ * sequence taken when its request was sent (beginMcpAppViewDomainsRequest), and a list from an
+ * older request never replaces one from a newer request.
  */
 export interface McpAppViewDomainsEntry {
+  /** When the entry was published: compared with a frame's getView fetch. */
   seq: number;
+  /** When the request that returned `origins` was sent. */
+  requestSeq: number;
   origins: readonly string[];
 }
 
@@ -26,12 +33,20 @@ export function currentMcpAppViewDomainsSeq(): number {
   return seq;
 }
 
+/** Take a request's sequence just before it is sent; pass it to publishMcpAppViewDomains. */
+export function beginMcpAppViewDomainsRequest(): number {
+  return ++seq;
+}
+
 export function publishMcpAppViewDomains(
   projectPath: string,
   serverName: string,
-  origins: readonly string[]
+  origins: readonly string[],
+  requestSeq: number
 ): void {
-  entries.set(keyOf(projectPath, serverName), { seq: ++seq, origins });
+  const key = keyOf(projectPath, serverName);
+  if ((entries.get(key)?.requestSeq ?? 0) > requestSeq) return;
+  entries.set(key, { seq: ++seq, requestSeq, origins });
   for (const listener of listeners) listener();
 }
 

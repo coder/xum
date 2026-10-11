@@ -30,6 +30,8 @@ let invocation: McpAppView["invocation"] = null;
 let viewCsp: McpAppView["csp"] = {};
 let approvals: Array<{ serverName: string; origins: string[] }> = [];
 let approveFails: Error | null = null;
+// When set, each approve call waits for the test to resolve it with the list it returns.
+let approveDeferred: Array<(approvedDomains: string[]) => void> | null = null;
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -57,6 +59,14 @@ function Wrapper(props: { children: ReactNode }) {
       approveViewDomains: (input: { serverName: string; origins: string[] }) => {
         approvals.push({ serverName: input.serverName, origins: input.origins });
         if (approveFails) return Promise.reject(approveFails);
+        const deferred = approveDeferred;
+        if (deferred) {
+          return new Promise((resolve) =>
+            deferred.push((approvedDomains) =>
+              resolve({ success: true as const, data: { approvedDomains } })
+            )
+          );
+        }
         return Promise.resolve({
           success: true as const,
           data: { approvedDomains: input.origins },
@@ -152,6 +162,7 @@ describe("McpAppFrame", () => {
     viewCsp = {};
     approvals = [];
     approveFails = null;
+    approveDeferred = null;
     toolCalls = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -215,6 +226,50 @@ describe("McpAppFrame", () => {
       }
     });
     expect(view.queryAllByRole("button", { name: "Allow" })).toHaveLength(0);
+  });
+
+  test("an older approval response never replaces a newer one", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://a.example.com", "https://b.example.com"] };
+    const responders: Array<(approvedDomains: string[]) => void> = [];
+    approveDeferred = responders;
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws" view={VIEW} />
+        <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />
+      </>,
+      { wrapper: Wrapper }
+    );
+    await waitFor(() => expect(view.getAllByRole("button", { name: "Allow" })).toHaveLength(2));
+    const [first, second] = view.getAllByRole("button", { name: "Allow" });
+    await pressAllow(first);
+    await pressAllow(second);
+    await waitFor(() => expect(responders).toHaveLength(2));
+    // The backend wrote both; the second request's (complete) answer arrives first.
+    const both = ["https://a.example.com", "https://b.example.com"];
+    await act(async () => {
+      responders[1](both);
+      await Promise.resolve();
+    });
+    await act(async () => {
+      responders[0](["https://a.example.com"]);
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      for (const frame of view.getAllByTestId("mcp-app-frame")) {
+        expect(frame.getAttribute("srcdoc")).toContain("https://b.example.com");
+      }
+    });
+    expect(view.queryAllByRole("button", { name: "Allow" })).toHaveLength(0);
+  });
+
+  test("a view without its result record names its blocked domains and offers no Allow", async () => {
+    invocation = null;
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    const { view, frame } = await renderFrame();
+    expect(view.getByText(/api\.example\.com/)).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
+    expect(frame.getAttribute("srcdoc")).not.toContain("https://api.example.com");
   });
 
   test("a failed approval request shows its error instead of a silently armed strip", async () => {
