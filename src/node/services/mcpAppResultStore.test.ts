@@ -14,6 +14,7 @@ import {
   McpAppResultStore,
 } from "./mcpAppResultStore";
 import { DisposableTempDir } from "./tempDir";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 
 const entry = (toolCallId: string, result: unknown = { content: [] }) => ({
   toolCallId,
@@ -79,10 +80,15 @@ describe("McpAppResultStore model context", () => {
     toolName: "show",
     text,
   });
+  /** Session dirs under `tmp`, with the "ws" one created (a view's session always exists). */
+  const sessionsIn = async (tmp: DisposableTempDir) => {
+    await fs.mkdir(path.join(tmp.path, "ws"));
+    return (id: string) => path.join(tmp.path, id);
+  };
 
   test("each update replaces the view's previous one and survives a restart", async () => {
     using tmp = new DisposableTempDir("mcp-app-context");
-    const sessionDir = (id: string) => path.join(tmp.path, id);
+    const sessionDir = await sessionsIn(tmp);
     const store = new McpAppResultStore(sessionDir);
     await store.setModelContext("ws", view("c1", "first"));
     await store.setModelContext("ws", view("c2", "other view"));
@@ -101,7 +107,7 @@ describe("McpAppResultStore model context", () => {
 
   test("keeps the newest views, refuses oversized text and heals a corrupt file", async () => {
     using tmp = new DisposableTempDir("mcp-app-context");
-    const sessionDir = (id: string) => path.join(tmp.path, id);
+    const sessionDir = await sessionsIn(tmp);
     const store = new McpAppResultStore(sessionDir);
     for (let i = 0; i <= MCP_APP_MODEL_CONTEXT_MAX_VIEWS; i++) {
       await store.setModelContext("ws", view(`c${i}`, `view ${i}`));
@@ -147,7 +153,7 @@ describe("McpAppResultStore model context", () => {
 
   test("a cold read that finishes after an update does not bring back the old context", async () => {
     using tmp = new DisposableTempDir("mcp-app-context");
-    const sessionDir = (id: string) => path.join(tmp.path, id);
+    const sessionDir = await sessionsIn(tmp);
     await new McpAppResultStore(sessionDir).setModelContext("ws", view("c1", "old"));
     const oldFile = await fs.readFile(
       path.join(tmp.path, "ws", MCP_APP_MODEL_CONTEXT_FILE),
@@ -178,7 +184,8 @@ describe("McpAppResultStore model context", () => {
 
   test("queued updates of one view collapse into the newest write", async () => {
     using tmp = new DisposableTempDir("mcp-app-context");
-    const store = new McpAppResultStore((id) => path.join(tmp.path, id));
+    const sessionDir = await sessionsIn(tmp);
+    const store = new McpAppResultStore(sessionDir);
     const contextFile = path.join(tmp.path, "ws", MCP_APP_MODEL_CONTEXT_FILE);
     const rename = spyOn(fsSync, "rename");
     try {
@@ -192,9 +199,47 @@ describe("McpAppResultStore model context", () => {
     }
     expect((await store.getModelContexts("ws")).map((v) => v.text)).toEqual(["c"]);
     expect(
-      (await new McpAppResultStore((id) => path.join(tmp.path, id)).getModelContexts("ws")).map(
-        (v) => v.text
-      )
+      (await new McpAppResultStore(sessionDir).getModelContexts("ws")).map((v) => v.text)
     ).toEqual(["c"]);
+  });
+
+  test("a write for a removed workspace is refused and never recreates its session", async () => {
+    using tmp = new DisposableTempDir("mcp-app-context");
+    const rootDir = path.join(tmp.path, "root");
+    const sessionDir = await sessionsIn(tmp);
+    const store = new McpAppResultStore(sessionDir, rootDir);
+    await store.setModelContext("ws", view("c1", "before"));
+    // Removal published its tombstone; the session dir is not deleted yet.
+    const tombstone = workspaceRemovalTombstonePath(rootDir, "ws");
+    await fs.mkdir(path.dirname(tombstone), { recursive: true });
+    await fs.writeFile(tombstone, "{}");
+    const refusal = (workspaceId: string) =>
+      store.setModelContext(workspaceId, view("c1", "late")).then(
+        () => "written",
+        (error: unknown) => String(error)
+      );
+    expect(await refusal("ws")).toMatch(/removed/);
+    expect((await store.getModelContexts("ws")).map((v) => v.text)).toEqual(["before"]);
+    // A session dir that is already gone is not recreated.
+    expect(await refusal("gone")).toMatch(/no session/);
+    expect(fsSync.existsSync(sessionDir("gone"))).toBe(false);
+  });
+
+  test("two backends sharing the file keep each other's views", async () => {
+    using tmp = new DisposableTempDir("mcp-app-context");
+    const rootDir = path.join(tmp.path, "root");
+    const sessionDir = await sessionsIn(tmp);
+    const first = new McpAppResultStore(sessionDir, rootDir);
+    const second = new McpAppResultStore(sessionDir, rootDir);
+    // The second backend read the (empty) context before either write.
+    expect(await second.getModelContexts("ws")).toEqual([]);
+    await Promise.all([
+      first.setModelContext("ws", view("c1", "from first")),
+      second.setModelContext("ws", view("c2", "from second")),
+    ]);
+    for (const store of [first, second, new McpAppResultStore(sessionDir)]) {
+      const texts = (await store.getModelContexts("ws")).map((v) => v.text).sort();
+      expect(texts).toEqual(["from first", "from second"]);
+    }
   });
 });
