@@ -20,6 +20,27 @@ export function describePluginHookHandler(handler: PluginHookHandler): string {
     : `${handler.type}: ${handler.summary}`;
 }
 
+/** Shown characters of a hook's input: the review renders before the user trusts anything. */
+export const PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS = 16 * 1024;
+
+/**
+ * The hook input as the review shows it, size-bounded. The input is plugin-controlled and can be
+ * near the hooks-file limit: pretty-printing deeply nested values amplifies it many times over
+ * (about 12 MB for a 200 KiB input), which can freeze the renderer. Small inputs are
+ * pretty-printed, larger ones stay compact, and the shown text is cut with a note. The hash and
+ * the trust decision cover the full definition, not this text.
+ */
+export function formatPluginHookInput(input: Record<string, unknown>): string {
+  const compact = JSON.stringify(input);
+  // Pretty-print only while even the deepest indentation keeps the text small.
+  const full = compact.length <= 2048 ? JSON.stringify(input, null, 2) : compact;
+  if (full.length <= PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS) return full;
+  let shown = full.slice(0, PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS);
+  // Never end on half of a surrogate pair.
+  if (/[\uD800-\uDBFF]$/.test(shown)) shown = shown.slice(0, -1);
+  return `${shown}\n…truncated (${Math.ceil(full.length / 1024)} KB)`;
+}
+
 /** Why a hook can never run; null for a runnable hook. */
 export const PLUGIN_HOOK_STATUS_NOTE: Record<PluginHookStatus, string | null> = {
   runnable: null,
@@ -128,7 +149,7 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
                 <p className="text-foreground font-mono break-all">{summary}</p>
                 {Object.keys(input).length > 0 && (
                   <pre className="text-muted bg-background rounded p-1 font-mono break-all whitespace-pre-wrap">
-                    {JSON.stringify(input, null, 2)}
+                    {formatPluginHookInput(input)}
                   </pre>
                 )}
                 <p className="text-muted break-all">{hook.source}</p>
