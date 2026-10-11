@@ -12,6 +12,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
 import { buildMcpAppCsp, grantMcpAppCsp, MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
+import { MCP_APP_OPENAI_SHIM_SCRIPT } from "./mcpAppOpenAiShim";
 import {
   createMcpAppHost,
   type McpAppConsentRequest,
@@ -200,7 +201,7 @@ export function McpAppFrame(props: {
     current?.view && grant
       ? finalizeSandboxedDocument(parseArtifactHtml(current.view.html), {
           csp: buildMcpAppCsp(grant.granted),
-          bridgeScript: MCP_APP_PREAMBLE_SCRIPT,
+          bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, MCP_APP_OPENAI_SHIM_SCRIPT],
         })
       : null;
   const guard = useFrameNavigationGuard(srcDoc);

@@ -384,6 +384,8 @@ describe("MCP Apps host router", () => {
     await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
     await t.request(2, "ui/request-display-mode", { mode: "pip" });
     await t.request(3, "ui/request-display-mode", { mode: "theater" });
+    // The window.openai shim's later initialize (no list) keeps the view's declaration.
+    await t.request(6, "ui/initialize", { appCapabilities: {} });
     // The view did not declare fullscreen: the host must not switch it there.
     await t.request(4, "ui/request-display-mode", { mode: "fullscreen" });
     for (const id of [2, 3, 4]) expect(t.reply(id)?.result).toEqual({ mode: "inline" });

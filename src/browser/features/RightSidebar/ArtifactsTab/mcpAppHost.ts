@@ -224,9 +224,11 @@ export function createMcpAppHost(options: McpAppHostOptions) {
     switch (method) {
       case "ui/initialize": {
         const declared = InitializeParams.safeParse(params);
-        viewDisplayModes = declared.success
-          ? declared.data.appCapabilities?.availableDisplayModes
-          : undefined;
+        // A later initialize without a list (the window.openai shim's, mcpAppOpenAiShim.ts) keeps
+        // the view's own declaration: it must not widen the modes the view is told about.
+        viewDisplayModes =
+          (declared.success ? declared.data.appCapabilities?.availableDisplayModes : undefined) ??
+          viewDisplayModes;
         const context = options.getHostContext();
         const hostContext = { ...context, displayMode: viewMode(context.displayMode) };
         notifiedDisplayMode = hostContext.displayMode;

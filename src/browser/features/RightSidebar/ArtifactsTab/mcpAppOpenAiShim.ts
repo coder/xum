@@ -1,0 +1,196 @@
+/**
+ * ChatGPT compatibility for MCP Apps views: `window.openai` (Apps SDK) on top of the standard
+ * MCP Apps bridge, so a view built for ChatGPT renders in Xum. Injected as the second script of
+ * every view document, after MCP_APP_PREAMBLE_SCRIPT and before any view script.
+ *
+ * SECURITY AUDIT: the shim adds no host power. It runs inside the view's own sandboxed document
+ * (same opaque origin, same CSP) and only posts JSON-RPC messages the view could post itself
+ * (ui/initialize, tools/call, ui/message, ui/open-link, ui/request-display-mode,
+ * ui/notifications/*). Every check (frame gate, rate limits, visibility, consent, https-only
+ * links, composer-only messages) stays in the host (mcpAppHost.ts, the backend), which cannot
+ * tell shim messages from view messages. A view that redefines or tampers with `window.openai`
+ * only changes what it sees: the shim keeps its own references (parent window, dispatch, event
+ * constructor) from load and never reads `window.openai` back.
+ *
+ * Handshake: standard views initialize themselves, and the shim reads the host's replies and
+ * notifications passively. The shim sends its own ui/initialize only when the view first uses
+ * `window.openai` and no handshake was seen yet, so a standard-only view gets no extra
+ * handshake. Members without a standard equivalent warn once; their Promises reject (or
+ * resolve, for setWidgetState, which views call on every change) and nothing throws.
+ * Shapes: https://developers.openai.com/plugins/reference.md and the Apps SDK example types.
+ */
+export const MCP_APP_OPENAI_SHIM_SCRIPT = `(function () {
+  "use strict";
+  var parentWindow = window.parent;
+  var dispatch = window.dispatchEvent.bind(window);
+  var CustomEventCtor = window.CustomEvent;
+  var warn = console.warn.bind(console);
+  var media = typeof window.matchMedia === "function" ? window.matchMedia.bind(window) : null;
+  var pending = new Map();
+  var nextId = 1;
+  var handshakeSeen = false;
+  var ownHandshake = false;
+  var warned = {};
+  var globals = {
+    theme: "light",
+    userAgent: userAgentFor("desktop"),
+    locale: navigator.language || "en",
+    maxHeight: window.innerHeight,
+    displayMode: "inline",
+    safeArea: { insets: { top: 0, bottom: 0, left: 0, right: 0 } },
+    toolInput: {},
+    toolOutput: null,
+    toolResponseMetadata: null,
+    widgetState: null
+  };
+  setLang(globals.locale);
+
+  function post(message) {
+    parentWindow.postMessage(message, "*");
+  }
+  function setLang(locale) {
+    try { document.documentElement.lang = locale; } catch (error) {}
+  }
+  function matches(query) {
+    try { return media !== null && media(query).matches; } catch (error) { return false; }
+  }
+  function userAgentFor(platform) {
+    return {
+      device: { type: platform === "mobile" ? "mobile" : "desktop" },
+      capabilities: { hover: matches("(hover: hover)"), touch: matches("(pointer: coarse)") }
+    };
+  }
+  function setGlobals(patch) {
+    for (var key in patch) globals[key] = patch[key];
+    if (typeof patch.locale === "string") setLang(patch.locale);
+    try {
+      dispatch(new CustomEventCtor("openai:set_globals", { detail: { globals: patch } }));
+    } catch (error) {}
+  }
+  function fromHostContext(context) {
+    var patch = {};
+    if (!context || typeof context !== "object") return patch;
+    if (context.theme === "light" || context.theme === "dark") patch.theme = context.theme;
+    if (typeof context.locale === "string") patch.locale = context.locale;
+    if (typeof context.displayMode === "string") patch.displayMode = context.displayMode;
+    var dimensions = context.containerDimensions;
+    if (dimensions && typeof dimensions.maxHeight === "number") patch.maxHeight = dimensions.maxHeight;
+    var insets = context.safeAreaInsets;
+    if (insets && typeof insets === "object") patch.safeArea = { insets: insets };
+    if (typeof context.platform === "string") patch.userAgent = userAgentFor(context.platform);
+    return patch;
+  }
+
+  window.addEventListener("message", function (event) {
+    if (event.source !== parentWindow) return;
+    var data = event.data;
+    if (!data || typeof data !== "object" || data.jsonrpc !== "2.0") return;
+    var params = data.params && typeof data.params === "object" ? data.params : {};
+    if (data.method === undefined) {
+      if (data.result && typeof data.result === "object" && data.result.hostContext) {
+        handshakeSeen = true;
+        setGlobals(fromHostContext(data.result.hostContext));
+      }
+      var settle = pending.get(data.id);
+      if (settle !== undefined) {
+        pending.delete(data.id);
+        settle(data);
+      }
+      return;
+    }
+    switch (data.method) {
+      case "ui/notifications/tool-input":
+        setGlobals({ toolInput: params.arguments || {} });
+        return;
+      case "ui/notifications/tool-result":
+        setGlobals({
+          toolOutput: params.structuredContent === undefined ? null : params.structuredContent,
+          toolResponseMetadata: params._meta === undefined ? null : params._meta
+        });
+        return;
+      case "ui/notifications/host-context-changed":
+        setGlobals(fromHostContext(params));
+        return;
+      case "ui/resource-teardown":
+        // Only a view the shim connected has no SDK of its own to answer.
+        if (ownHandshake) post({ jsonrpc: "2.0", id: data.id, result: {} });
+        return;
+    }
+  });
+
+  function request(method, params) {
+    connect();
+    return new Promise(function (resolve, reject) {
+      var id = "xum-openai-" + nextId++;
+      pending.set(id, function (response) {
+        if (response.error) reject(new Error(String(response.error.message || "Request failed")));
+        else resolve(response.result);
+      });
+      post({ jsonrpc: "2.0", id: id, method: method, params: params });
+    });
+  }
+  function connect() {
+    if (handshakeSeen || ownHandshake) return;
+    ownHandshake = true;
+    request("ui/initialize", {
+      protocolVersion: "2026-01-26",
+      appInfo: { name: "xum-openai-shim", version: "1.0.0" },
+      appCapabilities: {}
+    }).then(function () {
+      post({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    }, function () {});
+  }
+  function warnOnce(name) {
+    if (warned[name]) return;
+    warned[name] = true;
+    warn("[Xum] window.openai." + name + " is not supported here");
+  }
+
+  var api = {
+    callTool: function (name, args) {
+      return request("tools/call", { name: String(name), arguments: args || {} });
+    },
+    sendFollowUpMessage: function (args) {
+      var prompt = String((args && args.prompt) || "");
+      return request("ui/message", { role: "user", content: [{ type: "text", text: prompt }] })
+        .then(function () {});
+    },
+    requestDisplayMode: function (args) {
+      return request("ui/request-display-mode", { mode: String((args && args.mode) || "") });
+    },
+    notifyIntrinsicHeight: function (height) {
+      connect();
+      var value = typeof height === "object" && height !== null ? height.height : height;
+      post({ jsonrpc: "2.0", method: "ui/notifications/size-changed", params: { height: Number(value) } });
+    },
+    openExternal: function (args) {
+      request("ui/open-link", { url: String((args && args.href) || "") }).catch(function () {});
+    },
+    setWidgetState: function () {
+      warnOnce("setWidgetState");
+      return Promise.resolve();
+    },
+    setOpenInAppUrl: function () {
+      warnOnce("setOpenInAppUrl");
+    }
+  };
+  ["requestModal", "requestClose", "uploadFile", "selectFiles", "getFileDownloadUrl", "requestCheckout"]
+    .forEach(function (name) {
+      api[name] = function () {
+        warnOnce(name);
+        return Promise.reject(new Error("window.openai." + name + " is not supported here"));
+      };
+    });
+  Object.keys(globals).forEach(function (key) {
+    Object.defineProperty(api, key, {
+      enumerable: true,
+      get: function () {
+        connect();
+        return globals[key];
+      }
+    });
+  });
+  try {
+    Object.defineProperty(window, "openai", { value: api, writable: true, configurable: true });
+  } catch (error) {}
+})();`;
