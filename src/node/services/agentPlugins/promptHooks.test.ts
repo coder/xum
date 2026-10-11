@@ -63,6 +63,30 @@ describe("runMessageSendHooks", () => {
     expect(seen).toEqual(["guard", "later:true"]);
   });
 
+  test("a send no plugin may block keeps the context added before an ignored block", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rN8CX).
+    const spine = new EventSpine();
+    spine.useBefore("message.send", (ctx) => {
+      ctx.additionalContext.push({ pluginId: "notes", text: "Read the runbook." });
+    });
+    spine.useBefore("message.send", (ctx) => {
+      ctx.blocked = { pluginName: "guard", reason: "no" };
+    });
+    spine.useBefore("message.send", (ctx) => {
+      ctx.additionalContext.push({ pluginId: "later", text: "Also this." });
+    });
+
+    expect(
+      await runMessageSendHooks(spine, "ws", { ...input, origin: "task", canBlock: false })
+    ).toEqual({
+      kind: "context",
+      entries: [
+        { pluginId: "notes", text: "Read the runbook." },
+        { pluginId: "later", text: "Also this." },
+      ],
+    });
+  });
+
   test("a throwing consumer fails open: the message goes out unchanged", async () => {
     const spine = new EventSpine();
     spine.useBefore("message.send", (ctx) => {
