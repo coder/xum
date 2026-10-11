@@ -380,17 +380,27 @@ describe("MCP Apps host router", () => {
     await t.requestMode(2, "fullscreen");
     expect(t.reply(2)?.result).toEqual({ mode: "fullscreen" });
     expect(changes()).toEqual([{ displayMode: "fullscreen" }]);
-    await t.requestMode(3, "inline");
-    expect(t.reply(3)?.result).toEqual({ mode: "inline" });
-    expect(t.modeRequests).toEqual(["fullscreen", "inline"]);
+    expect(t.moves).toEqual(["fullscreen"]);
+    // The move replaced that instance; the one in the tab (fullscreen) asks for inline.
+    const tab = setup();
+    tab.setHostMode("fullscreen");
+    await tab.request(1, "ui/initialize", {});
+    await tab.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    await tab.requestMode(2, "inline");
+    expect(tab.reply(2)?.result).toEqual({ mode: "inline" });
+    expect(tab.moves).toEqual(["inline"]);
     // A change from outside the view (closing it in Artifacts) notifies once.
-    t.host.displayModeChanged("inline");
-    t.host.displayModeChanged("fullscreen");
-    t.host.displayModeChanged("fullscreen");
-    expect(changes()).toEqual([
-      { displayMode: "fullscreen" },
+    const tabChanges = () =>
+      tab.sent
+        .filter((m) => m.method === "ui/notifications/host-context-changed")
+        .map((m) => m.params);
+    tab.host.displayModeChanged("fullscreen");
+    tab.host.displayModeChanged("inline");
+    tab.host.displayModeChanged("inline");
+    expect(tabChanges()).toEqual([
       { displayMode: "inline" },
       { displayMode: "fullscreen" },
+      { displayMode: "inline" },
     ]);
   });
 
@@ -454,6 +464,23 @@ describe("MCP Apps host router", () => {
     expect(t.moves).toEqual([]);
     await t.host.handleMessage({ jsonrpc: "2.0", id: "host-1", result: {} });
     await done;
+    expect(t.moves).toEqual(["fullscreen"]);
+  });
+
+  test("requests before a pending move runs are answered with the pending mode", async () => {
+    const t = setup();
+    await t.request(1, "ui/initialize", {});
+    await t.host.handleMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    const done = t.request(2, "ui/request-display-mode", { mode: "fullscreen" });
+    // The view got its reply and asks again before answering the teardown.
+    await t.request(3, "ui/request-display-mode", { mode: "inline" });
+    await t.request(4, "ui/request-display-mode", { mode: "fullscreen" });
+    expect(t.reply(3)?.result).toEqual({ mode: "fullscreen" });
+    expect(t.reply(4)?.result).toEqual({ mode: "fullscreen" });
+    await t.host.handleMessage({ jsonrpc: "2.0", id: "host-1", result: {} });
+    await done;
+    // One move, to the mode every reply named.
+    expect(t.modeRequests).toEqual(["fullscreen"]);
     expect(t.moves).toEqual(["fullscreen"]);
   });
 
