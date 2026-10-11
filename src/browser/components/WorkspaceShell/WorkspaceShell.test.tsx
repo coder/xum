@@ -81,15 +81,10 @@ void mock.module("@/browser/components/ChatPane/ChatPane", () => ({
   ChatPane: (props: {
     workspaceId: string;
     onOpenTerminal: () => void;
-    inactive?: boolean;
     sidebarTools?: readonly string[];
     onOpenSidebarTool?: (tool: string, returnFocusTo: HTMLElement | null) => void;
   }) => (
-    <div
-      data-testid="chat-pane"
-      data-inactive={String(props.inactive === true)}
-      data-sidebar-tools={props.sidebarTools?.join(",") ?? ""}
-    >
+    <div data-testid="chat-pane" data-sidebar-tools={props.sidebarTools?.join(",") ?? ""}>
       Chat pane for {props.workspaceId}
       <button type="button" onClick={() => props.onOpenTerminal()}>
         New terminal
@@ -362,24 +357,21 @@ describe("WorkspaceShell loading placeholders", () => {
   });
 
   describe("full-screen sidebar (phones)", () => {
-    it("opens the picked tool in the sidebar shown full-screen and inactivates the chat", () => {
+    it("opens the picked tool in the sidebar shown full-screen", () => {
       rightSidebarDisplay = "none";
       const view = render(<WorkspaceShell {...defaultProps} />);
       const sidebar = view.getByTestId("right-sidebar");
-      const chatPane = view.getByTestId("chat-pane");
       expect(sidebar.dataset.fullscreen).toBe("false");
 
       fireEvent.click(view.getByRole("button", { name: "Browser" }));
 
       expect(openSidebarToolMock).toHaveBeenCalledWith("browser");
       expect(sidebar.dataset.fullscreen).toBe("true");
-      expect(chatPane.dataset.inactive).toBe("true");
 
       // The stub keeps its inline display:none; the real CSS shows it full-screen.
       fireEvent.click(view.getByRole("button", { name: "Close sidebar", hidden: true }));
 
       expect(sidebar.dataset.fullscreen).toBe("false");
-      expect(chatPane.dataset.inactive).toBe("false");
     });
 
     it("closes on Escape and returns focus to the control that opened it", () => {

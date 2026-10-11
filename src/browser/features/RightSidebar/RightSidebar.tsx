@@ -62,6 +62,7 @@ import {
 import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { Button } from "@/browser/components/Button/Button";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
+import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import { cn } from "@/common/lib/utils";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { GoalSetError, GoalSnapshot, GoalStatus } from "@/common/types/goal";
@@ -145,7 +146,7 @@ import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
 import { SideChatPanel } from "./SideChatPanel";
 import { NewTabLauncher } from "./NewTabLauncher";
-import { getOrderedBaseTabIds } from "./Tabs/tabConfig";
+import { getOrderedBaseTabIds, type SidebarMenuItem } from "./Tabs/tabConfig";
 import { useExperimentGatedTab } from "./useExperimentGatedTab";
 
 interface SidebarContainerProps {
@@ -270,10 +271,10 @@ interface RightSidebarProps {
   onCloseFullscreen?: () => void;
   /** The New tab shortcut while the narrow layout hides the sidebar: show it full-screen. */
   onRequestFullscreen?: () => void;
-  /** Exposes "open this tool like the New tab launcher does" to the parent (the phone menu). */
-  openToolRef?: React.MutableRefObject<((tool: BaseTabType) => void) | null>;
-  /** Reports the tools the New tab launcher offers, so the phone menu lists the same ones. */
-  onLauncherToolsChange?: (tools: readonly BaseTabType[]) => void;
+  /** Exposes "open this item like the New tab launcher does" to the parent (the phone menu). */
+  openToolRef?: React.MutableRefObject<((item: SidebarMenuItem) => void) | null>;
+  /** Reports what the New tab launcher offers, so the phone menu lists the same items. */
+  onLauncherToolsChange?: (items: readonly SidebarMenuItem[]) => void;
 }
 
 /**
@@ -1936,38 +1937,58 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     debug: llmDebugLogsEnabled === true,
   };
   const launcherTools = getOrderedBaseTabIds().filter((tool) => toolAvailable[tool]);
-  // The phone menu lists these same tools; WorkspaceShell relays them (and ignores an unchanged
-  // list, so a re-render does not re-render the chat pane).
+  // The phone menu lists these same items, Side chat included where the launcher offers it;
+  // WorkspaceShell relays them (and ignores an unchanged list, so a re-render does not re-render
+  // the chat pane).
+  const canOpenSideChat = currentWorkspaceMetadata?.sideChatParentWorkspaceId == null;
   React.useEffect(() => {
-    onLauncherToolsChange?.(launcherTools);
-  }, [launcherTools, onLauncherToolsChange]);
+    onLauncherToolsChange?.(canOpenSideChat ? [...launcherTools, "side-chat"] : launcherTools);
+  }, [canOpenSideChat, launcherTools, onLauncherToolsChange]);
 
-  // The phone menu opens a tool here exactly like the New tab launcher does (it replaces the
-  // focused pane's New tab, or selects the tool where it is already open).
-  const openToolLikeLauncher = React.useCallback(
-    (tool: BaseTabType) => {
-      setCollapsed(false);
-      handleOpenToolFromNewTab(getBaseLayout().focusedTabsetId, tool);
-    },
-    [getBaseLayout, handleOpenToolFromNewTab, setCollapsed]
-  );
+  // The phone menu opens an item here exactly like the New tab launcher does (a tool replaces
+  // the focused pane's New tab, or is selected where it is already open).
+  const openToolLikeLauncher = (item: SidebarMenuItem) => {
+    setCollapsed(false);
+    const tabsetId = getBaseLayout().focusedTabsetId;
+    if (item === "side-chat") {
+      handleOpenSideChatFromNewTab(tabsetId);
+    } else {
+      handleOpenToolFromNewTab(tabsetId, item);
+    }
+  };
+  // The latest handler on every render: it reads this render's layout and side-chat state.
+  React.useEffect(() => {
+    if (openToolRef) openToolRef.current = openToolLikeLauncher;
+  });
   React.useEffect(() => {
     if (!openToolRef) return;
-    openToolRef.current = openToolLikeLauncher;
     return () => {
       openToolRef.current = null;
     };
-  }, [openToolRef, openToolLikeLauncher]);
+  }, [openToolRef]);
 
   // Full-screen mode only makes sense while the narrow layout hides the sidebar. Its header is
   // shown by the same CSS rules (globals.css), so a header that computes to display:none means
   // the layout widened (a rotated phone, a wider window): the sidebar is back in its column.
+  // While it covers the window, everything else is inert, so Tab, pointers and assistive tech
+  // stay inside it (the left sidebar and footer sit outside the chat pane).
   const fullscreenHeaderRef = React.useRef<HTMLDivElement>(null);
   React.useEffect(() => {
     const header = fullscreenHeaderRef.current;
-    if (!fullscreen || onCloseFullscreen == null || header == null) return;
+    const container = sidebarContainerRef.current;
+    if (!fullscreen || onCloseFullscreen == null || header == null || container == null) return;
+    let restoreOthers: (() => void) | null = null;
     const closeIfWidened = () => {
-      if (window.getComputedStyle(header).display === "none") onCloseFullscreen();
+      if (window.getComputedStyle(header).display === "none") {
+        restoreOthers?.();
+        restoreOthers = null;
+        onCloseFullscreen();
+      } else {
+        // Not `??=` (or the matching if-assignment that lint rewrites to it): React Compiler
+        // cannot lower `??=` and would skip this whole component.
+        if (restoreOthers != null) return;
+        restoreOthers = makeOthersInert(container);
+      }
     };
     closeIfWidened();
     const mql = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
@@ -1981,6 +2002,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => {
       mql.removeEventListener("change", closeIfWidened);
       resizeObserver?.disconnect();
+      restoreOthers?.();
     };
   }, [fullscreen, onCloseFullscreen]);
   const workspaceDisplayTitle =

@@ -13,7 +13,7 @@ import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { RightSidebar } from "@/browser/features/RightSidebar/RightSidebar";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
-import type { BaseTabType } from "@/browser/features/RightSidebar/Tabs/tabConfig";
+import type { SidebarMenuItem } from "@/browser/features/RightSidebar/Tabs/tabConfig";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 import { PopoverError } from "../PopoverError/PopoverError";
 import type { RuntimeConfig } from "@/common/types/runtime";
@@ -214,7 +214,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   }
   const sidebarFullscreen =
     fullscreenSidebarWorkspaceId === props.workspaceId && !isReviewImmersive;
-  const openSidebarToolRef = useRef<((tool: BaseTabType) => void) | null>(null);
+  const openSidebarToolRef = useRef<((tool: SidebarMenuItem) => void) | null>(null);
   // Focus returns here when the full-screen sidebar closes (the menu button, or wherever the
   // shortcut was pressed).
   const fullscreenReturnFocusRef = useRef<HTMLElement | null>(null);
@@ -222,7 +222,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
     fullscreenReturnFocusRef.current = returnFocusTo;
     setFullscreenSidebarWorkspaceId(props.workspaceId);
   };
-  const handleOpenSidebarTool = (tool: BaseTabType, returnFocusTo: HTMLElement | null) => {
+  const handleOpenSidebarTool = (tool: SidebarMenuItem, returnFocusTo: HTMLElement | null) => {
     openSidebarToolRef.current?.(tool);
     openSidebarFullscreen(returnFocusTo);
   };
@@ -233,7 +233,8 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   };
   const closeSidebarFullscreen = () => setFullscreenSidebarWorkspaceId(null);
   useEscapeToDismiss(sidebarFullscreen, closeSidebarFullscreen);
-  // After ChatPane drops `inert` (child effects run first), so the element can take focus.
+  // After RightSidebar lifts `inert` from the rest of the page (effect cleanups run before
+  // effects), so the element can take focus again.
   useEffect(() => {
     if (sidebarFullscreen) return;
     const target = fullscreenReturnFocusRef.current;
@@ -245,9 +246,9 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   // not re-render.
   const [sidebarTools, setSidebarTools] = useState<{
     workspaceId: string;
-    tools: readonly BaseTabType[];
+    tools: readonly SidebarMenuItem[];
   } | null>(null);
-  const handleLauncherToolsChange = (tools: readonly BaseTabType[]) => {
+  const handleLauncherToolsChange = (tools: readonly SidebarMenuItem[]) => {
     const workspaceId = props.workspaceId;
     setSidebarTools((prev) =>
       prev?.workspaceId === workspaceId &&
@@ -318,7 +319,6 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         runtimeConfig={props.runtimeConfig}
         onOpenTerminal={handleOpenTerminal}
         immersiveHidden={isReviewImmersive}
-        inactive={sidebarFullscreen}
         sidebarTools={
           sidebarTools?.workspaceId === props.workspaceId ? sidebarTools.tools : undefined
         }

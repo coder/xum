@@ -15,7 +15,7 @@ import {
   Square,
 } from "lucide-react";
 import React from "react";
-import { TAB_CONFIG, type BaseTabType } from "@/browser/features/RightSidebar/Tabs/tabConfig";
+import { TAB_CONFIG, type SidebarMenuItem } from "@/browser/features/RightSidebar/Tabs/tabConfig";
 import { TAB_ICONS } from "@/browser/features/RightSidebar/Tabs/tabIcons";
 
 interface WorkspaceActionButtonProps {
@@ -70,8 +70,8 @@ interface WorkspaceActionsMenuContentProps {
    * Small viewports only: the hidden right sidebar's tools, each opening the sidebar full-screen
    * on that tool. Listed with the other views, not under a heading of their own.
    */
-  sidebarTools?: readonly BaseTabType[] | null;
-  onOpenSidebarTool?: ((tool: BaseTabType) => void) | null;
+  sidebarTools?: readonly SidebarMenuItem[] | null;
+  onOpenSidebarTool?: ((item: SidebarMenuItem) => void) | null;
   /** Small viewports only: the Artifacts dialog (the right sidebar is hidden there). */
   onOpenArtifacts?: (() => void) | null;
   /** Stats dialog; only set while the right sidebar (home of the Stats tab) is hidden. */
@@ -190,11 +190,12 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
       )}
       {props.onOpenSidebarTool &&
         props.sidebarTools?.map((tool) => {
-          const ToolIcon = TAB_ICONS[tool];
+          // Side chat is the launcher's own row, not a tool tab: same label and icon as there.
+          const ToolIcon = tool === "side-chat" ? MessagesSquare : TAB_ICONS[tool];
           return (
             <WorkspaceActionButton
               key={tool}
-              label={TAB_CONFIG[tool].name}
+              label={tool === "side-chat" ? "Side chat" : TAB_CONFIG[tool].name}
               icon={<ToolIcon className="h-3 w-3 shrink-0" />}
               onClick={(e) => {
                 e.stopPropagation();

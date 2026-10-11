@@ -134,6 +134,8 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     // Stats, Timeline and Artifacts keep their own dialogs, so they get no tool row.
     await userEvent.click(moreButton);
     await expect(await page.findByTestId("workspace-sidebar-tool-browser")).toBeVisible();
+    // The launcher's Side chat row is offered too.
+    await expect(page.getByTestId("workspace-sidebar-tool-side-chat")).toBeVisible();
     for (const tool of ["costs", "timeline", "artifacts"]) {
       await expect(page.queryByTestId(`workspace-sidebar-tool-${tool}`)).not.toBeInTheDocument();
     }
@@ -145,7 +147,11 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
       "aria-selected",
       "true"
     );
+    // Everything behind the view is inert, not just the chat: the left sidebar and the footer
+    // sit outside the chat pane.
     await expect(chatPane.closest("[inert]")).not.toBeNull();
+    const expandLeftSidebar = canvas.getByRole("button", { name: "Expand sidebar", hidden: true });
+    await expect(expandLeftSidebar.closest("[inert]")).not.toBeNull();
     // Focus moves to the picked tool and stays there. The closing menu returns focus to the More
     // button on a timer, which must not win: the inert chat pane cannot take focus. Check again
     // after that timer had its turn.
@@ -160,6 +166,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await waitFor(() => expect(sidebar).not.toBeVisible());
     await waitFor(() => expect(moreButton).toHaveFocus());
     await expect(chatPane.closest("[inert]")).toBeNull();
+    await expect(expandLeftSidebar.closest("[inert]")).toBeNull();
 
     // Reopening shows the same panel instance, not a remounted copy.
     await pickMenuTool(canvasElement, "workflows");

@@ -73,7 +73,8 @@ import { ArtifactsDialog } from "@/browser/features/RightSidebar/ArtifactsTab/Ar
 import { StatsDialog } from "@/browser/features/RightSidebar/StatsDialog";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
-import type { BaseTabType, TabType } from "@/browser/types/rightSidebar";
+import type { TabType } from "@/browser/types/rightSidebar";
+import type { SidebarMenuItem } from "@/browser/features/RightSidebar/Tabs/tabConfig";
 import { useAgentSkills } from "@/browser/stores/AgentSkillsStore";
 
 interface WorkspaceMenuBarProps {
@@ -92,8 +93,8 @@ interface WorkspaceMenuBarProps {
    * Phones: the hidden right sidebar's tools (its New tab launcher's list). While the sidebar is
    * hidden, the More menu lists them and opens them in the sidebar shown full-screen.
    */
-  sidebarTools?: readonly BaseTabType[];
-  onOpenSidebarTool?: (tool: BaseTabType, returnFocusTo: HTMLElement | null) => void;
+  sidebarTools?: readonly SidebarMenuItem[];
+  onOpenSidebarTool?: (item: SidebarMenuItem, returnFocusTo: HTMLElement | null) => void;
   /** The full-screen sidebar is open: its visibility changed without a resize. */
   sidebarFullscreen?: boolean;
 }
@@ -102,7 +103,7 @@ interface WorkspaceMenuBarProps {
  * Tools that keep their own dialog or header button while the sidebar is hidden (Stats,
  * Timeline, Artifacts), so the menu's sidebar-tool rows leave them out.
  */
-const TOOLS_WITH_HIDDEN_SIDEBAR_DIALOGS: ReadonlySet<BaseTabType> = new Set([
+const TOOLS_WITH_HIDDEN_SIDEBAR_DIALOGS: ReadonlySet<SidebarMenuItem> = new Set([
   "costs",
   "timeline",
   "artifacts",
