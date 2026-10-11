@@ -2,10 +2,12 @@ import { useEffect } from "react";
 import { AppWindow } from "lucide-react";
 import { McpAppFrame } from "../ArtifactsTab/McpAppFrame";
 import {
+  appViewDetails,
   markMcpAppViewHosted,
   openMcpAppViewTab,
   useMcpAppView,
   useMcpAppViewHostedBy,
+  useMcpAppViews,
   type McpAppViewRef,
 } from "../ArtifactsTab/mcpAppViewsStore";
 import { Notice } from "../ArtifactsTab/SourceText";
@@ -30,15 +32,30 @@ export function AppViewInTabNotice(props: { workspaceId: string; view: McpAppVie
   );
 }
 
-/** Tab strip label of an app tab: the tool's title (or name), then its server. */
+/**
+ * Tab strip label of an app tab: the tool's title (or name), then its server. When another view
+ * of the workspace reads the same, the call's detail (outcome, arguments, `#n`) follows, so tabs
+ * of several calls of one tool stay apart.
+ */
 export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string | null }) {
   const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
+  const views = useMcpAppViews(props.workspaceId);
   const ref = typeof view === "object" ? view : null;
+  const ambiguous =
+    ref != null &&
+    views.some(
+      (v) =>
+        v.toolCallId !== ref.toolCallId && v.label === ref.label && v.serverName === ref.serverName
+    );
+  const detail = ambiguous
+    ? appViewDetails(views)[views.findIndex((v) => v.toolCallId === ref.toolCallId)]
+    : "";
   return (
     <span className="inline-flex min-w-0 items-center gap-1">
       <AppWindow className="h-3 w-3 shrink-0" />
       <span className="min-w-0 truncate">{ref?.label ?? "App view"}</span>
       {ref != null && <span className="text-muted shrink-0 text-[10px]">{ref.serverName}</span>}
+      {detail !== "" && <span className="text-muted min-w-0 truncate text-[10px]">{detail}</span>}
     </span>
   );
 }
