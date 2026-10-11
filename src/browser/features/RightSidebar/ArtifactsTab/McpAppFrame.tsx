@@ -9,6 +9,7 @@ import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
+import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
 import { buildMcpAppCsp, grantMcpAppCsp, MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
@@ -89,7 +90,9 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
       // The view chooses the tool name, so it is shown escaped (escapeControls); the call
       // itself still uses the name as given.
       return [
-        `Allow ${escapeControls(request.toolName, NAME_CONTROLS)} from ${request.serverName}?`,
+        // SECURITY: the server is the context of this grant; a plugin key keeps its instance
+        // marker so two plugins declaring the same server name stay distinct.
+        `Allow ${escapeControls(request.toolName, NAME_CONTROLS)} from ${mcpServerConsentName(request.serverName)}?`,
         "Allow",
         "Deny",
       ];
@@ -104,7 +107,10 @@ function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
   return (
     <div className="border-border-light flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-[11px]">
       <span className="text-muted min-w-0 flex-1 truncate">
-        App view from <span className="text-foreground">{props.serverName}</span>
+        App view from{" "}
+        <TooltipIfPresent tooltip={props.serverName}>
+          <span className="text-foreground">{mcpServerDisplayName(props.serverName)}</span>
+        </TooltipIfPresent>
       </span>
       <TooltipIfPresent tooltip="Close view">
         <button
@@ -423,7 +429,7 @@ export function McpAppFrame(props: {
           <iframe
             key={guard.frameKey}
             ref={frameRef}
-            title={`${view.label} (${serverName})`}
+            title={`${view.label} (${mcpServerDisplayName(serverName)})`}
             sandbox={ARTIFACT_IFRAME_SANDBOX}
             referrerPolicy="no-referrer"
             srcDoc={srcDoc}
