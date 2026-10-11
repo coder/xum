@@ -4585,6 +4585,11 @@ export class MCPServerManager {
    * connection), so a hook whose server is off, excluded or not yet started fails, and the
    * runner fails open. The caller builds `serverKey` from the hook's own plugin instance, so a
    * hook can never reach another plugin's or the user's servers.
+   *
+   * The cached enabled set only gates the cheap early refusal. The dispatch itself goes through
+   * invokeServerOperation (Codex PRRT_kwDOPxxmWM6rNIIg), like an MCP Apps tool call: it re-reads
+   * the overrides and runs inside the epoch and admission fences, so a server that another
+   * backend or a direct settings edit disabled after the last serve is refused.
    */
   async callToolForPluginHook(
     workspaceId: string,
@@ -4601,8 +4606,16 @@ export class MCPServerManager {
     if (instance === undefined || instance.isClosed) {
       throw new Error(`MCP server '${serverKey}' is not running`);
     }
-    this.markActivity(workspaceId);
-    return instance.callToolForHook(toolName, args, options);
+    // One-shot dispatch, as in callMcpAppTool: an epoch retry must not call the tool again.
+    let dispatched: Promise<unknown> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverKey,
+      `Plugin hook call '${serverKey}/${toolName}'`,
+      (current) => (dispatched ??= current.callToolForHook(toolName, args, options)),
+      (result) => result,
+      options
+    );
   }
 
   /**

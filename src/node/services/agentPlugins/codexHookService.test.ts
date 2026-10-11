@@ -14,7 +14,7 @@ import { CodexPluginHookService, type EnsureCodexHooksArgs } from "./codexHookSe
 import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { buildPluginServerKey, computePluginInstanceId } from "./mcpConfig";
-import { setPluginHookTrust } from "./pluginHookTrust";
+import { getPluginHookTrustPath, setPluginHookTrust } from "./pluginHookTrust";
 import { PLUGIN_REGISTRY_FILE_NAME } from "./registry";
 import { createTestPluginInstallEntry } from "./testFixtures";
 
@@ -191,6 +191,30 @@ describe("CodexPluginHookService", () => {
     expect(calledKeys).toHaveLength(1);
   });
 
+  test("a trusted hook that moves to another position runs again after re-registration", async () => {
+    await writePlugin("guard", "scanner");
+    await trustAll("guard");
+    await service.ensureWorkspaceHooks(args());
+    expect((await runBash()).executed).toBe(false);
+
+    // Same runnable hook (same hash), new trust key: a command group now precedes it.
+    await fs.writeFile(
+      path.join(pluginRoot("guard"), "hooks", "hooks.json"),
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [
+            { hooks: [{ type: "command", command: "true" }] },
+            { hooks: [{ type: "mcp_tool", server: "scanner", tool: "check" }] },
+          ],
+        },
+      })
+    );
+    await trustAll("guard");
+    await service.ensureWorkspaceHooks(args());
+    expect((await runBash()).executed).toBe(false);
+    expect(calledKeys).toHaveLength(2);
+  });
+
   test("a disabled plugin server fails open: the tool runs", async () => {
     await writePlugin("guard", "scanner");
     await trustAll("guard");
@@ -214,7 +238,23 @@ describe("CodexPluginHookService", () => {
 
   test("an unmanaged plugin's hooks never run, even with a trust record", async () => {
     await writePlugin("loose", "scanner", false);
-    await trustAll("loose");
+    // setPluginHookTrust refuses a plugin without a registry entry, so write the record directly.
+    const { hooks } = await loadPluginCodexHooks({
+      rootPath: await fs.realpath(pluginRoot("loose")),
+      manifest: { schemaId: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "loose" },
+    });
+    const trustFile = getPluginHookTrustPath(xumHome, instanceId("loose"));
+    await fs.mkdir(path.dirname(trustFile), { recursive: true });
+    await fs.writeFile(
+      trustFile,
+      JSON.stringify({
+        version: 1,
+        installedAt: new Date(0).toISOString(),
+        hooks: Object.fromEntries(
+          hooks.map((hook) => [hook.key, { hash: hook.hash, state: "trusted" }])
+        ),
+      })
+    );
     await service.ensureWorkspaceHooks(args());
 
     expect((await runBash()).executed).toBe(true);

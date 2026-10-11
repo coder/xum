@@ -74,8 +74,13 @@ export class CodexPluginHookService {
         hooks: entry.hooks.filter((hook) => hook.status === "runnable"),
       }))
       .filter((entry) => entry.hooks.length > 0);
+    // Key and hash: the per-call gate matches both, so a hook that only moved (new key, same
+    // hash) must re-register or its stale key is refused forever.
     const fingerprint = JSON.stringify(
-      runnable.map((entry) => [entry.plugin.rootPath, entry.hooks.map((hook) => hook.hash)])
+      runnable.map((entry) => [
+        entry.plugin.rootPath,
+        entry.hooks.map((hook) => [hook.key, hook.hash]),
+      ])
     );
     const existing = this.registrations.get(args.workspaceId);
     if (existing?.fingerprint === fingerprint) return;
