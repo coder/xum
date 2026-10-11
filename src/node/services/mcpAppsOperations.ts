@@ -18,26 +18,55 @@ import type {
 } from "@/common/orpc/schemas/mcpApps";
 import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getOwn } from "@/common/utils/getOwn";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { ORPCContext } from "@/node/orpc/context";
 import { displayConnectionKey } from "./mcpServerIdentity";
 
-type McpAppsContext = Pick<ORPCContext, "experimentsService" | "mcpServerManager" | "config">;
+export type McpAppsContext = Pick<
+  ORPCContext,
+  "experimentsService" | "mcpServerManager" | "config" | "mcpConfigService"
+>;
 
-/** The project a workspace belongs to, or null (unknown workspace). */
-function projectPathOf(context: McpAppsContext, workspaceId: string): string | null {
-  return context.config.findWorkspace(workspaceId)?.projectPath ?? null;
-}
-
-/** Origins the user allowed `serverName`'s views to reach in the workspace's project. */
-function approvedDomainsFor(
+/**
+ * The project whose `mcpAppViewDomains` hold `serverName`'s approvals for the workspace's views,
+ * or null when none can (unknown workspace, or no single owner project).
+ *
+ * A multi-project workspace is stored under the shared `_multi` bucket, which every
+ * multi-project workspace reads, so an approval there would reach views in unrelated
+ * workspaces. Its MCP config is resolved against its first project (attributionProjectPath), so
+ * a server defined by that project's repo config or a project plugin belongs to that project.
+ * A global server there has no single owner project: no approval applies and approving fails.
+ */
+async function approvalProjectPathOf(
   context: McpAppsContext,
   workspaceId: string,
   serverName: string
+): Promise<string | null> {
+  const workspace = context.config.findWorkspace(workspaceId);
+  if (workspace == null) return null;
+  if (workspace.projectPath !== MULTI_PROJECT_CONFIG_KEY) return workspace.projectPath;
+  const owner = workspace.attributionProjectPath;
+  if (owner == null || owner === MULTI_PROJECT_CONFIG_KEY) return null;
+  const server = getOwn(
+    await context.mcpConfigService.listForApi({ projectPath: owner, workspaceId }),
+    serverName
+  );
+  const fromProject =
+    server?.configLayer === "project" ||
+    (server?.configLayer === undefined && server?.plugin?.sourceScope === "project");
+  return fromProject ? owner : null;
+}
+
+/** Origins the user allowed `serverName`'s views to reach in `projectPath`. */
+function approvedDomainsIn(
+  context: McpAppsContext,
+  projectPath: string | null,
+  serverName: string
 ): string[] {
-  const projectPath = projectPathOf(context, workspaceId);
   if (projectPath === null) return [];
-  const project = context.config.loadConfigOrDefault().projects.get(projectPath);
-  return project?.mcpAppViewDomains?.[serverName] ?? [];
+  const domains = context.config.loadConfigOrDefault().projects.get(projectPath)?.mcpAppViewDomains;
+  return (domains && getOwn(domains, serverName)) ?? [];
 }
 
 /** Largest view-initiated tools/call or resources/read result returned to a view. */
@@ -94,17 +123,20 @@ export async function getMcpAppView(
       signal !== undefined ? { signal } : undefined
     );
     const result = record?.result ?? null;
+    const boundServerName = record?.serverName ?? input.serverName;
+    const approvalProjectPath = await approvalProjectPathOf(
+      context,
+      input.workspaceId,
+      boundServerName
+    );
     return {
       success: true,
       data: {
         ...resource,
         resultAvailable: result !== null,
         result,
-        approvedDomains: approvedDomainsFor(
-          context,
-          input.workspaceId,
-          record?.serverName ?? input.serverName
-        ),
+        approvedDomains: approvedDomainsIn(context, approvalProjectPath, boundServerName),
+        approvalProjectPath,
         invocation:
           record !== null
             ? {
@@ -218,33 +250,49 @@ export async function approveMcpAppViewDomains(
     input.workspaceId,
     input.toolCallId
   );
-  const projectPath = projectPathOf(context, input.workspaceId);
   if (
     record === null ||
-    projectPath === null ||
     (input.serverName !== record.serverName &&
       input.serverName !== displayConnectionKey(record.serverName))
   ) {
     return { success: false, error: "This view cannot be allowed more domains" };
+  }
+  const projectPath = await approvalProjectPathOf(context, input.workspaceId, record.serverName);
+  if (projectPath === null) {
+    return {
+      success: false,
+      error: "Domains can be allowed only for a server of this workspace's project",
+    };
   }
   const origins = input.origins.map(mcpAppGrantableOrigin);
   if (origins.some((origin) => origin === null)) {
     return { success: false, error: "Only https origins can be allowed" };
   }
   let approvedDomains: string[] = [];
+  let full = false;
   await context.config.editConfig((config) => {
     const project = config.projects.get(projectPath);
     if (!project) throw new Error(`Project not found: ${projectPath}`);
-    const current = project.mcpAppViewDomains?.[record.serverName] ?? [];
-    approvedDomains = [...new Set([...current, ...origins.filter((o) => o !== null)])].slice(
-      0,
-      MCP_APP_VIEW_DOMAINS_MAX
-    );
+    const domains = project.mcpAppViewDomains;
+    const current = (domains && getOwn(domains, record.serverName)) ?? [];
+    const merged = [...new Set([...current, ...origins.filter((o) => o !== null)])];
+    // Never drop a requested origin silently: the strip would ask again after a "success".
+    if (merged.length > MCP_APP_VIEW_DOMAINS_MAX) {
+      full = true;
+      return config;
+    }
+    approvedDomains = merged;
     project.mcpAppViewDomains = {
       ...project.mcpAppViewDomains,
       [record.serverName]: approvedDomains,
     };
     return config;
   });
+  if (full) {
+    return {
+      success: false,
+      error: `A server can be allowed at most ${MCP_APP_VIEW_DOMAINS_MAX} domains in a project`,
+    };
+  }
   return { success: true, data: { approvedDomains } };
 }
