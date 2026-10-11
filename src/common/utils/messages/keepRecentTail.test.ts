@@ -8,6 +8,7 @@ import {
   getKeepRecentTailStartHistorySequence,
   selectKeepRecentTailStartIndex,
 } from "./keepRecentTail";
+import { renderPluginHookContextEntry } from "./pluginHookContext";
 
 function userMessage(id: string, text: string, historySequence: number): MuxMessage {
   return createMuxMessage(id, "user", text, { historySequence, timestamp: 1 });
@@ -305,5 +306,19 @@ describe("excludeKeepRecentTailForCompactionRequest", () => {
     ];
 
     expect(excludeKeepRecentTailForCompactionRequest(messages)).toBe(messages);
+  });
+});
+
+describe("estimateMuxMessageTokens with prompt-hook context", () => {
+  it("counts the rendered hook context the request adds to a user row", () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rOv7f): compaction cuts and fits must see the provider-visible
+    // size, not only the typed parts.
+    const plain = createMuxMessage("u1", "user", "fix the bug");
+    const entry = { pluginId: "notes", text: "x".repeat(4_000) };
+    const hooked = createMuxMessage("u1", "user", "fix the bug", { pluginHookContext: [entry] });
+
+    expect(
+      estimateMuxMessageTokens(hooked) - estimateMuxMessageTokens(plain)
+    ).toBeGreaterThanOrEqual(Math.floor(renderPluginHookContextEntry(entry).length / 4));
   });
 });
