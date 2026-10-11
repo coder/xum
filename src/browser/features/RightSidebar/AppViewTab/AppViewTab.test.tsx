@@ -265,8 +265,12 @@ describe("app view details", () => {
     openMcpAppViewTab("ws-lone", view("lone", { count: 1 }));
     try {
       const label = (workspaceId: string, toolCallId: string) =>
-        render(<AppViewTabLabel workspaceId={workspaceId} toolCallId={toolCallId} />).container
-          .textContent;
+        // The label hook can ask the backend for a view outside the transcript (useAPI).
+        render(
+          <APIProvider client={createTestApiClient({})}>
+            <AppViewTabLabel workspaceId={workspaceId} toolCallId={toolCallId} />
+          </APIProvider>
+        ).container.textContent;
       const [older, newer] = [label("ws-details", "d-old"), label("ws-details", "d-new")];
       expect(older).not.toBe(newer);
       expect(older?.startsWith("Boarddice")).toBe(true);
