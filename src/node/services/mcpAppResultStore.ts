@@ -61,8 +61,13 @@ const McpAppModelContextSchema = z.object({
   updatedAt: z.number(),
 });
 export type McpAppModelContext = z.infer<typeof McpAppModelContextSchema>;
+/**
+ * Version 2: written only after the user allowed the view's context (McpAppFrame consent).
+ * Version 1 files hold context written before that consent existed and read as none.
+ */
+const MCP_APP_MODEL_CONTEXT_FILE_VERSION = 2;
 const McpAppModelContextFileSchema = z.object({
-  version: z.literal(1),
+  version: z.literal(MCP_APP_MODEL_CONTEXT_FILE_VERSION),
   views: z.array(McpAppModelContextSchema),
 });
 
@@ -75,8 +80,14 @@ export class McpAppResultStore {
   private readonly memory = new Map<string, McpAppResultRecord>();
   /** Queues this backend's model-context updates, so superseded ones skip the target lock. */
   private readonly modelContextLock = new AsyncMutex();
-  /** The newest queued setModelContext per workspace + view (see its coalescing note). */
-  private readonly latestModelContextUpdate = new Map<string, symbol>();
+  /**
+   * The newest queued setModelContext per workspace + view, and the outcome it shares with the
+   * updates it superseded (see its coalescing note).
+   */
+  private readonly latestModelContextUpdate = new Map<
+    string,
+    { ticket: symbol; outcome: ReturnType<typeof Promise.withResolvers<void>> }
+  >();
 
   /**
    * `rootDir` is the Xum root (`config.rootDir`): model-context writes take its session-dir
@@ -172,9 +183,11 @@ export class McpAppResultStore {
    * Replace a view's model context ("Each request overwrites the previous context sent by the
    * View", MCP Apps 2026-01-26); empty text removes it. Durable before it is visible.
    * Coalesced per view: an update still waiting for the lock when a newer update of the same
-   * view arrives is dropped without a write, because the newer one replaces it anyway. A view
-   * may send many updates a second, and every write is an fsync behind one lock shared by all
-   * workspaces, so obsolete updates must not queue up disk writes.
+   * view arrives is dropped without a write, because the newer one replaces it anyway. The
+   * dropped update resolves or rejects with the write that replaced it, so a caller never
+   * reports success for an update that was not stored. A view may send many updates a second,
+   * and every write is an fsync behind one lock shared by all workspaces, so obsolete updates
+   * must not queue up disk writes.
    *
    * The read-modify-write holds the session dir's target mutation lock (in-process mutex plus
    * cross-process file lock), like the other session-dir writers (ReviewStateService,
@@ -194,12 +207,35 @@ export class McpAppResultStore {
         : McpAppModelContextSchema.parse({ ...entry, updatedAt: Date.now() });
     const viewKey = `${workspaceId}\0${entry.toolCallId}`;
     const ticket = Symbol(viewKey);
-    this.latestModelContextUpdate.set(viewKey, ticket);
+    // Join the outcome of the queued update this one supersedes, if any.
+    const outcome =
+      this.latestModelContextUpdate.get(viewKey)?.outcome ?? Promise.withResolvers<void>();
+    this.latestModelContextUpdate.set(viewKey, { ticket, outcome });
+    {
+      await using _queue = await this.modelContextLock.acquire();
+      // A superseded update skips the write and waits (after leaving the queue, which the
+      // newer update needs) for the newer update's write below.
+      if (this.latestModelContextUpdate.get(viewKey)?.ticket === ticket) {
+        this.latestModelContextUpdate.delete(viewKey);
+        try {
+          await this.writeModelContext(workspaceId, entry.toolCallId, updated);
+          outcome.resolve();
+        } catch (error) {
+          outcome.reject(error);
+        }
+      }
+    }
+    await outcome.promise;
+  }
+
+  /** setModelContext's read-modify-write; call it from the model-context queue only. */
+  private async writeModelContext(
+    workspaceId: string,
+    toolCallId: string,
+    updated: McpAppModelContext | null
+  ): Promise<void> {
     const filePath = this.modelContextPath(workspaceId);
     const sessionDir = path.dirname(filePath);
-    await using _queue = await this.modelContextLock.acquire();
-    if (this.latestModelContextUpdate.get(viewKey) !== ticket) return;
-    this.latestModelContextUpdate.delete(viewKey);
     // Lock order: this queue, then the target lock. Nothing waits for the queue while holding
     // a target lock, so the nesting cannot deadlock.
     await withTargetMutationLock(this.rootDir, sessionDir, async () => {
@@ -219,11 +255,14 @@ export class McpAppResultStore {
       }
       // Re-read inside the lock: another backend may have written since this one last read.
       const others = (await this.getModelContexts(workspaceId)).filter(
-        (view) => view.toolCallId !== entry.toolCallId
+        (view) => view.toolCallId !== toolCallId
       );
       const views = updated === null ? others : [updated, ...others];
       const kept = views.slice(0, MCP_APP_MODEL_CONTEXT_MAX_VIEWS);
-      await writeFileAtomic(filePath, JSON.stringify({ version: 1, views: kept }));
+      await writeFileAtomic(
+        filePath,
+        JSON.stringify({ version: MCP_APP_MODEL_CONTEXT_FILE_VERSION, views: kept })
+      );
     });
   }
 

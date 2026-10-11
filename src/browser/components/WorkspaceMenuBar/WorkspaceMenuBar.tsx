@@ -105,13 +105,14 @@ const COLLAPSED_LEFT_SIDEBAR_MENU_BAR_STYLE = {
  * tab itself is reachable, and the dialog would only cover the workspace.
  *
  * `tabOnSidebarShown` is selected in the sidebar at that moment, so the sidebar shows the view the
- * user was reading. Only then, not when the dialog opens: the hidden sidebar stays mounted, so
+ * user was reading. A function is called at that moment, for a tab that depends on what the
+ * dialog shows by then. Only then, not when the dialog opens: the hidden sidebar stays mounted, so
  * selecting the tab earlier would render a second copy behind the dialog.
  */
 function useSidebarTabDialog(
   workspaceId: string,
   sidebarHidden: boolean,
-  tabOnSidebarShown?: TabType
+  tabOnSidebarShown?: TabType | (() => TabType | undefined)
 ): [boolean, (openWorkspaceId: string | null) => void] {
   const [openWorkspaceId, setOpenWorkspaceId] = useState<string | null>(null);
   if (openWorkspaceId !== null && openWorkspaceId !== workspaceId) {
@@ -127,8 +128,9 @@ function useSidebarTabDialog(
     if (!open || sidebarHidden) {
       return;
     }
-    if (tabOnSidebarShown) {
-      focusRightSidebarTab(workspaceId, tabOnSidebarShown);
+    const tab = typeof tabOnSidebarShown === "function" ? tabOnSidebarShown() : tabOnSidebarShown;
+    if (tab) {
+      focusRightSidebarTab(workspaceId, tab);
     }
     setOpenWorkspaceId(null);
   }, [open, sidebarHidden, tabOnSidebarShown, workspaceId]);

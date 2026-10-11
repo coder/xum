@@ -11,9 +11,14 @@ import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils"
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
-import { MCP_APP_WIDGET_STATE_MAX_BYTES } from "./mcpAppHost";
 import { McpAppFrame } from "./McpAppFrame";
 import { markMcpAppViewHosted, type McpAppViewRef } from "./mcpAppViewsStore";
+import { appViewTabFor, withAppViewTab } from "../AppViewTab/appViewTabs";
+import { collectAllTabs } from "@/browser/utils/rightSidebarLayout";
+import {
+  readRightSidebarLayout,
+  updateRightSidebarLayout,
+} from "@/browser/utils/rightSidebarTabFocus";
 
 // The card's display values: the aggregated tool name and the pre-sanitization arguments.
 const VIEW: McpAppViewRef = {
@@ -370,6 +375,21 @@ describe("McpAppFrame", () => {
     expect(args).toContain('"city": "Berlin"');
   });
 
+  test("the context consent strip shows the view's full context as plain text", async () => {
+    const { view, frame } = await renderFrame();
+    const text = `<b>bold</b> ${"y".repeat(2000)} END`;
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "ui/update-model-context",
+      params: { content: [{ type: "text", text }] },
+    });
+    await view.findByRole("alert");
+    const shown = view.getByTestId("mcp-app-consent-args");
+    expect(shown.textContent).toBe(text);
+    expect(shown.querySelector("b")).toBeNull();
+  });
+
   test("a plugin server shows its server part, and its instance marker where consent is asked", async () => {
     const key = "plugin:0123456789abcdef:tray";
     const view = render(<McpAppFrame workspaceId="ws" view={{ ...VIEW, serverName: key }} />, {
@@ -693,57 +713,19 @@ describe("McpAppFrame host strips", () => {
     }
   });
 
-  test("a view mounted again starts with the widget state it stored", async () => {
-    const mount = async () => {
-      const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
-        wrapper: Wrapper,
-      });
-      return (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
-    };
-    const first = await mount();
-    expect(first.getAttribute("srcdoc")).toContain("widgetState: null");
-    postFromView(first, {
-      jsonrpc: "2.0",
-      method: "xum/notifications/widget-state",
-      params: { state: { picked: "call-1 state" } },
+  test("the view document starts with the host context, fixed at mount", async () => {
+    const tree = <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />;
+    const view = render(tree, { wrapper: Wrapper });
+    const frame = await view.findByTestId("mcp-app-frame");
+    const srcdoc = frame.getAttribute("srcdoc") ?? "";
+    expect(srcdoc).toContain('"theme":"dark","displayMode":"inline"');
+    // A resize (or theme change) must not rebuild, and so reload, the view document.
+    Object.defineProperty(window, "innerHeight", { value: 333, configurable: true });
+    await act(async () => {
+      view.rerender(tree);
+      await Promise.resolve();
     });
-    cleanup();
-    // Collapsed and expanded again: the new document carries the state.
-    const second = await mount();
-    expect(second.getAttribute("srcdoc")).toContain('widgetState: {"picked":"call-1 state"}');
-  });
-
-  const mountView = async (workspaceId: string, view: McpAppViewRef = VIEW) => {
-    const rendered = render(
-      <McpAppFrame workspaceId={workspaceId} view={view} variant="inline" />,
-      {
-        wrapper: Wrapper,
-      }
-    );
-    return (await rendered.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
-  };
-  const sendWidgetState = (frame: HTMLIFrameElement, params: Record<string, unknown>) =>
-    postFromView(frame, { jsonrpc: "2.0", method: "xum/notifications/widget-state", params });
-
-  test("a widget state over the size cap is not stored; the earlier one stays", async () => {
-    const frame = await mountView("ws-cap");
-    sendWidgetState(frame, { state: { kept: 1 } });
-    sendWidgetState(frame, { state: { big: "x".repeat(MCP_APP_WIDGET_STATE_MAX_BYTES) } });
-    cleanup();
-    const again = await mountView("ws-cap");
-    expect(again.getAttribute("srcdoc")).toContain('widgetState: {"kept":1}');
-  });
-
-  test("widget state goes under the frame's own view, never a key named in the message", async () => {
-    const frame = await mountView("ws-key");
-    sendWidgetState(frame, { workspaceId: "ws-key", toolCallId: "call-2", state: { mine: 1 } });
-    cleanup();
-    // The other view starts empty; the sender gets its own state back.
-    const other = await mountView("ws-key", { ...VIEW, toolCallId: "call-2" });
-    expect(other.getAttribute("srcdoc")).toContain("widgetState: null");
-    cleanup();
-    const own = await mountView("ws-key");
-    expect(own.getAttribute("srcdoc")).toContain('widgetState: {"mine":1}');
+    expect(view.getByTestId("mcp-app-frame").getAttribute("srcdoc")).toBe(srcdoc);
   });
 
   test("fullscreen from the card moves the view to its tab; inline from the tab closes it", async () => {
@@ -809,7 +791,9 @@ describe("McpAppFrame host strips", () => {
       expect(noCard.initial.displayMode).toBe("fullscreen");
       expect(noCard.reply).toEqual({ mode: "fullscreen" });
       expect(closed).toBe(0);
-      // With an expanded card, inline closes the tab (the card takes the view back).
+      // With an expanded card, inline closes the tab (the card takes the view back). From the
+      // phone sheet, whose close only closes the dialog, the stored tab goes as well.
+      updateRightSidebarLayout("ws", (layout) => withAppViewTab(layout, "call-1"));
       const unmarkCard = markMcpAppViewHosted("ws", "call-1", "card");
       try {
         const tab = await run(undefined, "inline");
@@ -818,6 +802,9 @@ describe("McpAppFrame host strips", () => {
         unmarkCard();
       }
       expect(closed).toBe(1);
+      expect(collectAllTabs(readRightSidebarLayout("ws").root)).not.toContain(
+        appViewTabFor("call-1")
+      );
       expect(opened).toEqual(["call-1"]);
       expect(repliedAtMove).toEqual([true, true]);
     } finally {

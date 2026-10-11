@@ -20,13 +20,10 @@ import {
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
-import {
-  getMcpAppWidgetState,
-  isMcpAppViewHosted,
-  openMcpAppViewTab,
-  setMcpAppWidgetState,
-  type McpAppViewRef,
-} from "./mcpAppViewsStore";
+import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
+import { appViewTabFor } from "../AppViewTab/appViewTabs";
+import { removeTabEverywhere } from "@/browser/utils/rightSidebarLayout";
+import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import {
   beginMcpAppViewDomainsRequest,
   currentMcpAppViewDomainsSeq,
@@ -90,8 +87,6 @@ interface Loaded {
   error: string | null;
   /** currentMcpAppViewDomainsSeq() when the fetch started: newer approval changes win. */
   domainsSeq: number;
-  /** The view's window.openai widget state when it loaded; fixed, so the document is too. */
-  widgetState: string | null;
 }
 
 interface PendingConsent {
@@ -117,6 +112,8 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
       return [`Open a link to ${request.host}?`, "Open", "Cancel"];
     case "message":
       return ["Insert into message?", "Insert", "Dismiss"];
+    case "context":
+      return ["Share this view's context with the model in your next messages?", "Allow", "Deny"];
   }
 }
 
@@ -187,6 +184,15 @@ export function McpAppFrame(props: {
   }>();
   const { theme: themeMode } = useTheme();
   const theme: "light" | "dark" = isLightThemeMode(themeMode) ? "light" : "dark";
+  // The window.openai globals start with this host context. Fixed at mount: a theme change or
+  // a resize must not rebuild (reload) the view document; host-context-changed tells the view.
+  const [openAiSeed] = useState(() => ({
+    theme,
+    displayMode: props.variant === "inline" ? "inline" : "fullscreen",
+    locale: navigator.language,
+    platform: hostPlatform(),
+    maxHeight: props.variant === "inline" ? inlineMaxHeight() : null,
+  }));
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [consent, setConsent] = useState<PendingConsent | null>(null);
   // Set synchronously with `consent`, so a request arriving before the re-render sees the strip.
@@ -208,22 +214,15 @@ export function McpAppFrame(props: {
       .getView({ workspaceId, toolCallId, serverName, resourceUri }, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
-        const widgetState = getMcpAppWidgetState(workspaceId, toolCallId);
         setLoaded(
           result.success
-            ? { toolCallId, view: result.data, error: null, domainsSeq, widgetState }
-            : { toolCallId, view: null, error: result.error, domainsSeq, widgetState }
+            ? { toolCallId, view: result.data, error: null, domainsSeq }
+            : { toolCallId, view: null, error: result.error, domainsSeq }
         );
       })
       .catch((error: unknown) => {
         if (!controller.signal.aborted) {
-          setLoaded({
-            toolCallId,
-            view: null,
-            error: getErrorMessage(error),
-            domainsSeq,
-            widgetState: null,
-          });
+          setLoaded({ toolCallId, view: null, error: getErrorMessage(error), domainsSeq });
         }
       });
     return () => controller.abort();
@@ -292,7 +291,7 @@ export function McpAppFrame(props: {
     current?.view && grant
       ? finalizeSandboxedDocument(parseArtifactHtml(current.view.html), {
           csp: buildMcpAppCsp(grant.granted),
-          bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, mcpAppOpenAiShimScript(current.widgetState)],
+          bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, mcpAppOpenAiShimScript(openAiSeed)],
         })
       : null;
   const guard = useFrameNavigationGuard(srcDoc);
@@ -370,8 +369,6 @@ export function McpAppFrame(props: {
         });
         if (!result.success) throw new Error(result.error);
       },
-      // Keyed by this frame's own view only: the message carries no key the host would trust.
-      saveWidgetState: (json) => setMcpAppWidgetState(workspaceId, toolCallId, json),
       requestConsent: (request) =>
         new Promise<boolean>((resolve) => {
           // One strip at a time, and a shown strip is never replaced: a frame could otherwise
@@ -411,8 +408,16 @@ export function McpAppFrame(props: {
         if (mode === "inline" && !isMcpAppViewHosted(workspaceId, toolCallId, "card")) return null;
         return () => {
           if (hostRef.current !== host) return;
-          if (mode === "fullscreen") openMcpAppViewTab(workspaceId, latest.current.view);
-          else latest.current.onClose?.();
+          if (mode === "fullscreen") {
+            openMcpAppViewTab(workspaceId, latest.current.view);
+            return;
+          }
+          latest.current.onClose?.();
+          // The phone sheet's close only closes the dialog: drop the stored tab too, or the
+          // card keeps its placeholder and the hidden sidebar mounts the view again.
+          updateRightSidebarLayout(workspaceId, (layout) =>
+            removeTabEverywhere(layout, appViewTabFor(toolCallId))
+          );
         };
       },
       log: (message, data) =>
@@ -546,7 +551,9 @@ export function McpAppFrame(props: {
             {consent.request.kind === "tool" && (
               <ConsentArgs json={consentArgsJson(consent.request.args)} />
             )}
-            {consent.request.kind === "message" && <ConsentArgs json={consent.request.text} />}
+            {(consent.request.kind === "message" || consent.request.kind === "context") && (
+              <ConsentArgs json={consent.request.text} />
+            )}
             {consent.request.kind === "link" && <ConsentArgs json={consent.request.url} />}
           </div>
           <button
