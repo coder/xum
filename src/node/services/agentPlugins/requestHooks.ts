@@ -34,13 +34,13 @@ export async function prepareWorkspaceRequestHooks(args: {
     const { config, metadata } = args;
     await codexPluginHookService.ensureWorkspaceHooks({
       workspaceId: metadata.id,
+      sideChat: sideChatCapabilityGrants(metadata) != null,
       xumHome: config.rootDir,
       // A function, not a value: the gate re-reads trust before every hook call.
       isProjectTrusted: () => isWorkspaceProjectTrusted(config, metadata),
       mcp: args.mcpServerManager,
       notifyUser: (pluginName, message) =>
         log.info("Plugin hook message", { workspaceId: metadata.id, pluginName, message }),
-      sideChat: sideChatCapabilityGrants(metadata) != null,
     });
   }
 }
