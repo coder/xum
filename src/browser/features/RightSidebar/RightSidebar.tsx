@@ -1494,8 +1494,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             selectTabByIndex(canReviewDiffs ? prev : removeTabEverywhere(prev, "review"), tabIndex)
           );
           setCollapsed(false);
+          // Only for a tab that exists: Ctrl+9 with two tabs must not cover the chat.
           const container = sidebarContainerRef.current;
-          if (container != null && isRightSidebarResponsivelyHidden(container)) {
+          if (target && container != null && isRightSidebarResponsivelyHidden(container)) {
             onRequestFullscreen?.();
           }
           return;
@@ -1971,9 +1972,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         restoreOthers = makeOthersInert(container);
         // Focus was outside (the menu button, now inert): move it to the shown tab, so keyboard
         // and screen reader users land in the view. A launcher or panel that took focus already
-        // (the New tab shortcut) keeps it.
+        // (the New tab shortcut) keeps it. The focused pane's tab: focusing a tab focuses its
+        // pane, and a split layout must keep the pane it had.
         if (!container.contains(document.activeElement)) {
-          container.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus();
+          const shown = getBaseLayout();
+          const tabset = findTabset(shown.root, shown.focusedTabsetId);
+          if (tabset?.type === "tabset") {
+            document.getElementById(`${baseId}-${tabset.id}-tab-${tabset.activeTab}`)?.focus();
+          }
         }
       }
     };
@@ -1991,7 +1997,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       resizeObserver?.disconnect();
       restoreOthers?.();
     };
-  }, [fullscreen, onCloseFullscreen]);
+  }, [baseId, fullscreen, getBaseLayout, onCloseFullscreen]);
   const workspaceDisplayTitle =
     currentWorkspaceMetadata?.title ?? currentWorkspaceMetadata?.name ?? "";
 

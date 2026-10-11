@@ -66,7 +66,7 @@ const LAYOUT: RightSidebarLayoutState = {
   root: { type: "tabset", id: "tabset-1", tabs: ["workflows"], activeTab: "workflows" },
 };
 
-function setup() {
+function setup(layout: RightSidebarLayoutState = LAYOUT) {
   const client = setupSimpleChatStory({
     workspaceId: WORKSPACE_ID,
     workspaceName: "phone-sidebar",
@@ -86,7 +86,7 @@ function setup() {
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
   // Collapsed on a wide layout earlier: the full-screen view still shows it expanded.
   updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
-  updatePersistedState(getRightSidebarLayoutKey(WORKSPACE_ID), LAYOUT);
+  updatePersistedState(getRightSidebarLayoutKey(WORKSPACE_ID), layout);
   // The Browser tool polls for sessions; this story has none.
   client.browser = {
     ...client.browser,
@@ -182,6 +182,11 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(sidebar).not.toBeVisible());
 
+    // A shortcut for a tab that does not exist (two tabs, Ctrl+9) leaves the chat in view.
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "9", code: "Digit9", ctrlKey: true }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await expect(sidebar).not.toBeVisible();
+
     // The tab shortcuts are the keyboard path to the Sidebar row: Ctrl+2 shows the view on the
     // second tab (Browser).
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "2", code: "Digit2", ctrlKey: true }));
@@ -210,6 +215,46 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
       await expect(sidebar).toBeVisible();
       await expect(within(sidebar).queryByRole("button", { name: "Close sidebar" })).toBeNull();
     }
+  },
+};
+
+// Two panes, the second focused: Goal above, Workflows below.
+const SPLIT_LAYOUT: RightSidebarLayoutState = {
+  version: 1,
+  nextId: 4,
+  focusedTabsetId: "tabset-3",
+  openTabsOnly: true,
+  root: {
+    type: "split",
+    id: "split-2",
+    direction: "horizontal",
+    sizes: [50, 50],
+    children: [
+      { type: "tabset", id: "tabset-1", tabs: ["goal"], activeTab: "goal" },
+      { type: "tabset", id: "tabset-3", tabs: ["workflows"], activeTab: "workflows" },
+    ],
+  },
+};
+
+/** Opening the view focuses the focused pane's tab, so the pane stays focused. */
+export const SplitLayoutKeepsFocusedPane: AppStory = {
+  decorators: [PhoneFrameDecorator],
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={() => setup(SPLIT_LAYOUT)} />,
+  play: async ({ canvasElement }) => {
+    await waitForChatInputAutofocusDone(canvasElement);
+    const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
+    if (sidebar == null) throw new Error("right sidebar missing");
+    await openSidebarFromMenu(canvasElement);
+    await waitFor(() => expect(sidebar).toBeVisible());
+    const workflowsTab = within(sidebar).getByRole("tab", { name: /Workflows/ });
+    await waitFor(() => expect(workflowsTab).toHaveFocus());
+    // The New tab shortcut adds to the focused pane: still the Workflows pane, not Goal's.
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "n", code: "KeyN", ctrlKey: true, altKey: true })
+    );
+    const newTab = await within(sidebar).findByRole("tab", { name: /New tab/ });
+    await expect(newTab.closest('[role="tablist"]')?.contains(workflowsTab) ?? false).toBe(true);
   },
 };
 
