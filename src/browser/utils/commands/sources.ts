@@ -47,6 +47,7 @@ import {
   transcriptViews,
   type McpAppViewRef,
 } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+import { mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 
 /**
  * The workspace's MCP App views (the loaded transcript's, then ones opened this session), each
@@ -926,7 +927,10 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 ({ view, detail }) => ({
                   id: CommandIds.navOpenAppView(view.toolCallId),
                   title: `Open App View: ${view.label}`,
-                  subtitle: detail === "" ? view.serverName : `${view.serverName} · ${detail}`,
+                  subtitle:
+                    detail === ""
+                      ? mcpServerDisplayName(view.serverName)
+                      : `${mcpServerDisplayName(view.serverName)} · ${detail}`,
                   section: section.navigation,
                   keywords: ["app", "view", "mcp", "tab", view.serverName],
                   run: () => openMcpAppViewTab(wsId, view),
