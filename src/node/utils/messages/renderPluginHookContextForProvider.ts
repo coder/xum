@@ -1,4 +1,11 @@
-import type { MuxMessage, PluginHookContextEntry } from "@/common/types/message";
+import type { MuxMessage } from "@/common/types/message";
+import { renderPluginHookContextBlocks } from "@/common/utils/messages/pluginHookContext";
+
+// Existing importers keep this path; the rendering itself is shared with the token estimates.
+export {
+  PLUGIN_HOOK_CONTEXT_MAX_CHARS,
+  renderPluginHookContextEntry,
+} from "@/common/utils/messages/pluginHookContext";
 
 /**
  * Append each user row's prompt-hook context (MuxMetadata.pluginHookContext) to that row's
@@ -9,8 +16,9 @@ import type { MuxMessage, PluginHookContextEntry } from "@/common/types/message"
  * turns. Rendering it from chat.jsonl keeps the system prompt (the cached prefix) byte-stable and
  * lets replay rebuild the request with no extra envelope field.
  *
- * The blocks go inside the row's last text part: mergeConsecutiveUserMessages keeps one text part
- * per message, so a separate part would be dropped when this row merges with a neighbour.
+ * The blocks go inside the row's first text part: mergeConsecutiveUserMessages keeps only the
+ * first text part of each message, so a separate or later part (an inlined SVG attachment) would
+ * be dropped when this row merges with a neighbour.
  * A rendered row drops the metadata field, so a second pass renders nothing: the token-budget
  * history-ID tag must stay last, so the request assembler renders before it tags.
  *
@@ -23,73 +31,22 @@ export function renderPluginHookContextForProvider(messages: MuxMessage[]): MuxM
       return message;
     }
     changed = true;
-    const { pluginHookContext, ...metadata } = message.metadata;
-    const entries = readPersistedEntries(pluginHookContext);
-    if (entries.length === 0) return { ...message, metadata };
-    const blocks = entries.map(renderPluginHookContextEntry).join("\n");
-    const lastText = message.parts.findLastIndex((part) => part.type === "text");
+    const blocks = renderPluginHookContextBlocks(message);
+    const { pluginHookContext: _rendered, ...metadata } = message.metadata;
+    if (blocks == null) return { ...message, metadata };
+    const firstText = message.parts.findIndex((part) => part.type === "text");
     return {
       ...message,
       metadata,
       parts:
-        lastText === -1
+        firstText === -1
           ? [...message.parts, { type: "text" as const, text: blocks }]
           : message.parts.map((part, index) =>
-              index === lastText && part.type === "text"
+              index === firstText && part.type === "text"
                 ? { ...part, text: `${part.text}\n${blocks}` }
                 : part
             ),
     };
   });
   return changed ? rendered : messages;
-}
-
-/** The rendered block; promptHooks charges its full length against the per-message cap. */
-export function renderPluginHookContextEntry(entry: PluginHookContextEntry): string {
-  return `<plugin-hook-context plugin="${escapeMarkup(entry.pluginId)}">\n${escapeMarkup(entry.text)}\n</plugin-hook-context>`;
-}
-
-/**
- * Rendered context per message (the full blocks). promptHooks drops entries past it when it saves
- * them, and the read below applies it again (same cap as request.assemble).
- */
-export const PLUGIN_HOOK_CONTEXT_MAX_CHARS = 64 * 1024;
-
-/**
- * chat.jsonl is untrusted on read: the history reader checks only that metadata is an object.
- * A malformed value or entry is dropped, and entries past the cap are cut, so one bad row never
- * fails or overflows every later request.
- */
-function readPersistedEntries(value: unknown): PluginHookContextEntry[] {
-  if (!Array.isArray(value)) return [];
-  const entries: unknown[] = value;
-  const kept: PluginHookContextEntry[] = [];
-  let size = 0;
-  for (const entry of entries) {
-    if (
-      typeof entry !== "object" ||
-      entry === null ||
-      !("pluginId" in entry) ||
-      typeof entry.pluginId !== "string" ||
-      !("text" in entry) ||
-      typeof entry.text !== "string"
-    ) {
-      continue;
-    }
-    const valid = { pluginId: entry.pluginId, text: entry.text };
-    size += renderPluginHookContextEntry(valid).length;
-    // Same rule as the write side: the first entry past the cap ends the list.
-    if (size > PLUGIN_HOOK_CONTEXT_MAX_CHARS) break;
-    kept.push(valid);
-  }
-  return kept;
-}
-
-/** Plugin-authored text must not be able to close the block or forge another tag. */
-function escapeMarkup(text: string): string {
-  return text
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
 }

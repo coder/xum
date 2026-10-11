@@ -3026,6 +3026,27 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(await allRows(h))).toHaveLength(0);
   });
 
+  test("prompt-hook context counts toward the fresh-window ceiling", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rOv7o): the context is metadata on the row but text in the
+    // request, so a short message with large hook context must not pass the admission.
+    const h = await setup();
+    spyOn(contextLimits, "getEffectiveContextLimit").mockReturnValue(10000);
+    const unregister = eventSpine.useBefore(
+      "message.send",
+      (ctx) => {
+        ctx.additionalContext.push({ pluginId: "notes", text: "x".repeat(60_000) });
+      },
+      { workspaceId }
+    );
+    try {
+      const result = await h.session.sendMessage("Short request", options);
+      expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
+      expect(h.requests).toHaveLength(0);
+    } finally {
+      unregister();
+    }
+  });
+
   test.each([false, true])(
     "provider context_exceeded only retries without prior deltas (delta=%s)",
     async (hadDelta) => {
