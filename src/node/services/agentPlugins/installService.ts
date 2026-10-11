@@ -43,7 +43,7 @@ import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdo
 import { log } from "@/node/services/log";
 import type { MCPServerInfo, MCPServerOAuthConfig } from "@/common/types/mcp";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
-import { readPluginClientSecret } from "./openaiMcpAuth";
+import { readPluginClientSecrets } from "./openaiMcpAuth";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
@@ -425,10 +425,31 @@ interface SurfaceServer {
   signIn?: SurfaceSignIn;
 }
 
-async function readSignIn(url: string, oauth?: MCPServerOAuthConfig): Promise<SurfaceSignIn> {
+/** Per-scan memo: each `.mcp.json` is read and parsed once for all its servers. */
+type SecretReader = (
+  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>
+) => Promise<string | undefined>;
+
+function createSecretReader(): SecretReader {
+  const files = new Map<string, Promise<Map<string, string>>>();
+  return (source) => {
+    let secrets = files.get(source.mcpConfigPath);
+    if (secrets === undefined) {
+      secrets = readPluginClientSecrets(source).catch(() => new Map<string, string>());
+      files.set(source.mcpConfigPath, secrets);
+    }
+    return secrets.then((map) => map.get(source.serverName));
+  };
+}
+
+async function readSignIn(
+  url: string,
+  oauth: MCPServerOAuthConfig | undefined,
+  readSecret: SecretReader
+): Promise<SurfaceSignIn> {
   const secret =
     oauth?.clientSecretSource !== undefined
-      ? await readPluginClientSecret(oauth.clientSecretSource).catch(() => undefined)
+      ? await readSecret(oauth.clientSecretSource)
       : undefined;
   return {
     url,
@@ -440,6 +461,8 @@ async function readSignIn(url: string, oauth?: MCPServerOAuthConfig): Promise<Su
       clientId: oauth?.clientId ?? null,
       authorizationUrl: oauth?.endpoints?.authorizationUrl ?? null,
       tokenUrl: oauth?.endpoints?.tokenUrl ?? null,
+      // Tokens were issued by this authorization server.
+      issuer: oauth?.endpoints?.issuer ?? null,
       resource: oauth?.resource ?? null,
       baseScopes: oauth?.baseScopes ?? null,
       defaultScopes: oauth?.defaultScopes ?? null,
@@ -482,8 +505,10 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
     ...(oauth?.baseScopes ?? []),
     ...(oauth?.defaultScopes ?? []),
   ];
-  const added = scopes(b).filter((scope) => !scopes(a).includes(scope));
-  const removed = scopes(a).filter((scope) => !scopes(b).includes(scope));
+  // Sets: scope lists are plugin-controlled and can be long.
+  const [oldScopes, newScopes] = [new Set(scopes(a)), new Set(scopes(b))];
+  const added = [...newScopes].filter((scope) => !oldScopes.has(scope));
+  const removed = [...oldScopes].filter((scope) => !newScopes.has(scope));
   if (added.length + removed.length > 0)
     lines.push(
       `Scopes changed: ${[...added.map((x) => `+ ${x}`), ...removed.map((x) => `- ${x}`)].join(" ")}`
@@ -519,7 +544,7 @@ function manifestSummary(manifest: AgentPluginManifest): AgentPluginManifestSumm
 }
 
 export class AgentPluginInstallService {
-  private mcpOauthService: Pick<McpOauthService, "logout"> | undefined;
+  private mcpOauthService: Pick<McpOauthService, "logout" | "credentialKey"> | undefined;
   private readonly containerDir: string;
   private readonly stagingRoot: string;
   private readonly registryFile: string;
@@ -557,7 +582,7 @@ export class AgentPluginInstallService {
       /** Used to prune plugin server keys from per-workspace overrides on uninstall. */
       workspaceMcpOverridesService?: WorkspaceMcpOverridesService;
       /** Signs out plugin servers whose sign-in identity an update changes. */
-      mcpOauthService?: Pick<McpOauthService, "logout">;
+      mcpOauthService?: Pick<McpOauthService, "logout" | "credentialKey">;
       /** Test override for the staged-clone checkout quota. */
       stagingQuota?: { maxBytes: number; maxFiles: number };
       /** Test override for the recovery wait bound. */
@@ -1355,6 +1380,7 @@ export class AgentPluginInstallService {
     components: Set<string>;
   }> {
     const hook = this.collectHook(plugin);
+    const readSecret = createSecretReader();
     const skills = new Map<string, { fingerprint: string; display: string }>();
     for (const skill of await this.collectSkills(plugin, warnings)) {
       // EVERY model-visible advertisement field: description, whenToUse
@@ -1399,7 +1425,9 @@ export class AgentPluginInstallService {
       for (const info of Object.values(infos)) {
         assert(info.plugin !== undefined, "plugin server info must carry provenance");
         const signIn =
-          info.transport === "stdio" ? undefined : await readSignIn(info.url, info.oauth);
+          info.transport === "stdio"
+            ? undefined
+            : await readSignIn(info.url, info.oauth, readSecret);
         const fingerprint =
           info.transport === "stdio"
             ? JSON.stringify({
@@ -1517,13 +1545,26 @@ export class AgentPluginInstallService {
           before: currentServer.display,
           after: server.display,
         });
-        if (
-          server.signIn !== undefined &&
-          currentServer.signIn?.url === server.signIn.url &&
-          currentServer.signIn.identity !== server.signIn.identity
-        )
-          signInResets?.push(server.signIn.url);
       }
+    }
+    // Stored credentials are keyed by the normalized server URL, not the
+    // server name: match sign-ins by that key, so a renamed server or a
+    // respelled URL (`/mcp` vs `/mcp/`) with a new identity still resets.
+    const credentialKey = (url: string): string | null =>
+      this.mcpOauthService?.credentialKey(url) ?? null;
+    const currentIdentities = new Map<string, Set<string>>();
+    for (const server of current?.servers.values() ?? []) {
+      const key = server.signIn && credentialKey(server.signIn.url);
+      if (!key || !server.signIn) continue;
+      const identities = currentIdentities.get(key) ?? new Set<string>();
+      identities.add(server.signIn.identity);
+      currentIdentities.set(key, identities);
+    }
+    for (const server of staged.servers.values()) {
+      const key = server.signIn && credentialKey(server.signIn.url);
+      const identities = key ? currentIdentities.get(key) : undefined;
+      if (server.signIn && identities && !identities.has(server.signIn.identity))
+        signInResets?.push(server.signIn.url);
     }
     // Skill advertisements interpolate into the model-visible skill index on
     // every request, so a new skill — or a reworded description — can inject
@@ -2927,7 +2968,7 @@ export class AgentPluginInstallService {
 
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
   /** The OAuth service is built in a later DI layer than this service. */
-  setMcpOauthService(service: Pick<McpOauthService, "logout">): void {
+  setMcpOauthService(service: Pick<McpOauthService, "logout" | "credentialKey">): void {
     this.mcpOauthService = service;
   }
 
@@ -4296,11 +4337,12 @@ export class AgentPluginInstallService {
           // replaced tree. Servers restart on next use; default-disabled
           // state and workspace overrides are untouched (identity is the
           // lexical path).
-          await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
           // The new tree is in place: tokens issued to the old sign-in
-          // identity (client, endpoints, resource, scopes) must not be
+          // identity (client, endpoints, issuer, resource, scopes) must not be
           // refreshed with the new client. Signed out, the server asks again.
-          for (const serverUrl of signInResets) {
+          // Runs BEFORE the final stop, so a startup that raced the sign-out
+          // is invalidated too, and a failing stop cannot skip it.
+          for (const serverUrl of new Set(signInResets)) {
             const result = await this.mcpOauthService?.logout({ serverUrl });
             if (result?.success === false)
               log.warn("Could not sign out a plugin MCP server after its sign-in changed", {
@@ -4308,6 +4350,7 @@ export class AgentPluginInstallService {
                 error: result.error,
               });
           }
+          await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
         }
 
         log.info(

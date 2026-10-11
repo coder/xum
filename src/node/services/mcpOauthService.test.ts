@@ -767,6 +767,34 @@ describe("McpOauthService OAuth flows", () => {
     }
   });
 
+  test("logout cancels a sign-in flow already running for that server", async () => {
+    spyOn(mcpConfigService, "listServers").mockResolvedValue({
+      docs: {
+        transport: "http",
+        url: "http://127.0.0.1:9/mcp",
+        disabled: true,
+        oauth: {
+          clientId: "c",
+          endpoints: {
+            authorizationUrl: "http://127.0.0.1:9/authorize",
+            tokenUrl: "http://127.0.0.1:9/token",
+          },
+        },
+      },
+    });
+    const start = await service.startServerFlow({
+      projectPath,
+      serverName: "docs",
+      redirectUri: "https://x/cb",
+    });
+    if (!start.success) throw new Error(start.error);
+    await service.logout({ serverUrl: "http://127.0.0.1:9/mcp/" });
+    expect(await service.waitForServerFlow(start.data.flowId)).toEqual({
+      success: false,
+      error: "Signed out",
+    });
+  });
+
   test("stored tokens stay bound to the client they were issued to", async () => {
     const serverUrl = "https://example.com/mcp";
     await fs.writeFile(

@@ -21,7 +21,6 @@
  */
 import { checkResourceAllowed } from "@modelcontextprotocol/client";
 import type { MCPServerOAuthConfig } from "@/common/types/mcp";
-import { getOwn } from "@/common/utils/getOwn";
 import { MAX_PLUGIN_MANIFEST_BYTES, readPluginFileWithinRootCapped } from "./discovery";
 import { isPlainObject } from "./manifest";
 import { OPENAI_EXTENSION_NAMESPACE } from "./openaiExtension";
@@ -363,12 +362,16 @@ export function toServerOAuthConfig(
 }
 
 /**
- * Re-read a Codex `.mcp.json` client secret from the consented plugin file
- * (bounded, containment-checked read). The caller keeps it in memory only.
+ * Every client secret in a consented Codex `.mcp.json` (bounded,
+ * containment-checked read), keyed by server name. One read and parse
+ * serves all of the file's servers. The caller keeps the values in memory only.
  */
-export async function readPluginClientSecret(
-  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>
-): Promise<string | undefined> {
+export async function readPluginClientSecrets(
+  source: Pick<
+    NonNullable<MCPServerOAuthConfig["clientSecretSource"]>,
+    "pluginRoot" | "mcpConfigPath"
+  >
+): Promise<Map<string, string>> {
   const { content } = await readPluginFileWithinRootCapped({
     filePath: source.mcpConfigPath,
     pluginRoot: source.pluginRoot,
@@ -384,8 +387,18 @@ export async function readPluginClientSecret(
         ? raw.mcpServers
         : {}
       : raw;
-  const entry = getOwn(servers, source.serverName);
-  const oauth = isPlainObject(entry) ? entry.oauth : undefined;
-  const secret = isPlainObject(oauth) ? oauth.client_secret : undefined;
-  return typeof secret === "string" && secret.length > 0 ? secret : undefined;
+  const secrets = new Map<string, string>();
+  for (const [name, entry] of Object.entries(servers)) {
+    const oauth = isPlainObject(entry) ? entry.oauth : undefined;
+    const secret = isPlainObject(oauth) ? oauth.client_secret : undefined;
+    if (typeof secret === "string" && secret.length > 0) secrets.set(name, secret);
+  }
+  return secrets;
+}
+
+/** One server's client secret (see readPluginClientSecrets). */
+export async function readPluginClientSecret(
+  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>
+): Promise<string | undefined> {
+  return (await readPluginClientSecrets(source)).get(source.serverName);
 }

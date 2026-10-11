@@ -830,11 +830,25 @@ export class McpOauthService {
     };
   }
 
+  /** The credential-store key of a server URL (null for an invalid URL). */
+  credentialKey(serverUrl: string): string | null {
+    return normalizeServerUrlForComparison(serverUrl);
+  }
+
   async logout(input: { serverUrl: string }): Promise<Result<void, string>> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {
       return Ok(undefined);
     }
+    // A flow started before the sign-out must not save its credentials back.
+    await Promise.all([
+      ...[...this.desktopFlows]
+        .filter(([, flow]) => flow.serverUrlForStoreKey === normalizedServerUrl)
+        .map(([id]) => this.finishDesktopFlow(id, Err("Signed out"))),
+      ...[...this.serverFlows]
+        .filter(([, flow]) => flow.serverUrlForStoreKey === normalizedServerUrl)
+        .map(([id]) => this.finishServerFlow(id, Err("Signed out"))),
+    ]);
 
     try {
       await this.storeLock.withLock(this.storeFilePath, async () => {
