@@ -21,6 +21,7 @@
  * - file_read and every other built-in: no Codex counterpart is documented.
  */
 import { isPlainObject } from "./manifest";
+import { isCanonicalPluginServerKey } from "@/common/utils/mcp/pluginServerKey";
 
 /** Enumerable symbol on a served MCP tool: survives descriptor clones and object spreads. */
 export const MCP_TOOL_ORIGIN = Symbol.for("xum.mcpToolOrigin");
@@ -90,6 +91,8 @@ function codexNamePart(name: string): string {
 }
 
 function codexServerName(serverKey: string): string {
-  const plugin = /^plugin:[0-9a-f]+:(.+)$/.exec(serverKey);
-  return plugin ? plugin[1] : serverKey;
+  // Only the canonical plugin key is a plugin's own server: a user server may be named
+  // "plugin:abc:scanner", and its hooks must see that whole name.
+  if (!isCanonicalPluginServerKey(serverKey)) return serverKey;
+  return serverKey.slice(serverKey.indexOf(":", "plugin:".length) + 1);
 }

@@ -111,6 +111,22 @@ describe("PreToolUse", () => {
     expect(calls).toEqual([{ cmd: "rm -rf /" }]);
   });
 
+  test("matchers run in Codex's dialect: inline flags and whole-name lists", async () => {
+    const { spine, calls } = setup(
+      [
+        hook("PreToolUse", { matcher: "(?i)^BASH$", input: { n: "1" } }),
+        hook("PreToolUse", { matcher: "file_read|bash", input: { n: "2" } }),
+      ],
+      () => ({ content: [] })
+    );
+
+    await runTool(spine, "bash", {});
+    await runTool(spine, "bash_output", {});
+
+    // bash matches both; bash_output matches neither ("bash" in a name list is a whole name).
+    expect(calls.map((call) => call.n).sort()).toEqual(["1", "2"]);
+  });
+
   test("the trust gate runs before each call: a revoke stops the next call", async () => {
     const { spine, calls, state } = setup([hook("PreToolUse")], () => deny);
 
@@ -140,6 +156,12 @@ describe("PreToolUse", () => {
     const gateFails = setup([hook("PreToolUse")], () => deny);
     gateFails.deps.isHookAllowed = () => Promise.reject(new Error("trust store unreadable"));
     expect((await runTool(gateFails.spine, "bash", {})).executed).toBe(true);
+
+    // A hung trust gate (a stalled filesystem) ends at the hook timeout too.
+    const gateHangs = setup([hook("PreToolUse", { timeoutSeconds: 0.05 })], () => deny);
+    gateHangs.deps.isHookAllowed = () => new Promise(() => undefined);
+    expect((await runTool(gateHangs.spine, "bash", {})).executed).toBe(true);
+    expect(gateHangs.calls).toEqual([]);
   });
 
   test("a deny tagged for another event is malformed and fails open", async () => {
@@ -147,6 +169,39 @@ describe("PreToolUse", () => {
       json({ hookSpecificOutput: { hookEventName: "PostToolUse", permissionDecision: "deny" } })
     );
     expect((await runTool(spine, "bash", {})).executed).toBe(true);
+  });
+
+  test("a decision that is not an exact Codex enum value is malformed and fails open", async () => {
+    const outputs = [
+      json({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: " deny " } }),
+      json({ decision: " block ", reason: "x" }),
+      json({ decision: "Block", reason: "x" }),
+    ];
+    for (const output of outputs) {
+      const { spine } = setup([hook("PreToolUse")], () => output);
+      expect((await runTool(spine, "bash", {})).executed).toBe(true);
+    }
+  });
+
+  test("a deny keeps its own context and the context of earlier hooks", async () => {
+    const { spine } = setup(
+      [hook("PreToolUse", { input: { first: true } }), hook("PreToolUse")],
+      (input) =>
+        json({
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            additionalContext: input.first === true ? "First." : "Second.",
+            ...(input.first === true ? {} : { permissionDecision: "deny" }),
+          },
+        })
+    );
+
+    const ctx = await runTool(spine, "bash", {});
+
+    expect(ctx.blocked?.result).toEqual({
+      error: "Tool call blocked by plugin 'guard' hook: No reason given by the hook.",
+      hook_output: "[plugin:guard] First.\n[plugin:guard] Second.",
+    });
   });
 
   test("a cancel during a hook ends the hook call and the tool never starts", async () => {
@@ -262,6 +317,11 @@ describe("Codex tool names", () => {
       toolName: "scan",
     });
     await runTool(spine, "other_scan", {}, undefined, { serverName: "other", toolName: "scan" });
+    // A user server whose name only looks like a plugin key keeps its whole name.
+    await runTool(spine, "user_scan", {}, undefined, {
+      serverName: "plugin:abc:scanner",
+      toolName: "scan",
+    });
 
     expect(calls).toEqual([{ name: "mcp__scanner__scan" }]);
   });
@@ -364,7 +424,11 @@ describe("UserPromptSubmit and Stop", () => {
       json({ decision: "block", reason: "Contains a token." })
     );
     expect(
-      await runMessageSendHooks(block.spine, workspaceId, { text: "key=abc", origin: "user" })
+      await runMessageSendHooks(block.spine, workspaceId, {
+        text: "key=abc",
+        origin: "user",
+        canBlock: true,
+      })
     ).toEqual({
       kind: "blocked",
       pluginName: "guard",
@@ -376,11 +440,33 @@ describe("UserPromptSubmit and Stop", () => {
       content: [{ type: "text", text: "Ask for a repro first." }],
     }));
     expect(
-      await runMessageSendHooks(plain.spine, workspaceId, { text: "fix", origin: "user" })
+      await runMessageSendHooks(plain.spine, workspaceId, {
+        text: "fix",
+        origin: "user",
+        canBlock: true,
+      })
     ).toEqual({
       kind: "context",
       entries: [{ pluginId: "guard", text: "Ask for a repro first." }],
     });
+  });
+
+  test("prompt and Stop events carry the workspace cwd", async () => {
+    const prompt = setup([hook("UserPromptSubmit", { input: { dir: "${cwd}" } })], () => null);
+    await runMessageSendHooks(prompt.spine, workspaceId, {
+      text: "hi",
+      origin: "user",
+      canBlock: true,
+      cwd: "/w",
+    });
+    const stop = setup([hook("Stop", { input: { dir: "${cwd}" } })], () => null);
+    await runTurnStopHooks(stop.spine, workspaceId, {
+      messageId: "a1",
+      lastAssistantMessage: null,
+      stopHookActive: false,
+      cwd: "/w",
+    });
+    expect([...prompt.calls, ...stop.calls]).toEqual([{ dir: "/w" }, { dir: "/w" }]);
   });
 
   test("Stop: decision block continues with the reason; continue false halts", async () => {
@@ -410,6 +496,7 @@ describe("UserPromptSubmit and Stop", () => {
       runMessageSendHooks(setup([hook("UserPromptSubmit")], () => answer).spine, workspaceId, {
         text: "fix",
         origin: "user",
+        canBlock: true,
       });
     expect(await send(json({ decision: "block" }))).toEqual({ kind: "none" });
     expect(
@@ -430,7 +517,11 @@ describe("UserPromptSubmit and Stop", () => {
     };
     const prompt = setup([hook("UserPromptSubmit")], () => answer);
     expect(
-      await runMessageSendHooks(prompt.spine, workspaceId, { text: "fix", origin: "user" })
+      await runMessageSendHooks(prompt.spine, workspaceId, {
+        text: "fix",
+        origin: "user",
+        canBlock: true,
+      })
     ).toMatchObject({ kind: "blocked", reason: "Contains a token." });
     const stop = setup([hook("Stop")], () => ({
       content: [{ type: "text", text: JSON.stringify({ continue: false }) }],

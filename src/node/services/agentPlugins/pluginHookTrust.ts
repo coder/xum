@@ -25,6 +25,7 @@ import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import type { PluginHookDefinition } from "./codexHooks";
+import { isPlainObject } from "./manifest";
 import { computePluginInstanceId } from "./mcpConfig";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
 
@@ -73,26 +74,52 @@ export async function readPluginHookTrust(
 ): Promise<PluginHookTrustRecord> {
   const installedAt = await readInstalledAt(xumHome, instanceId);
   if (installedAt === undefined) return {};
-  return readTrustFile(getPluginHookTrustPath(xumHome, instanceId), installedAt);
+  const trust = await readTrustFile(getPluginHookTrustPath(xumHome, instanceId), installedAt);
+  return trust === "newer-version" ? {} : trust;
 }
 
-async function readTrustFile(file: string, installedAt: string): Promise<PluginHookTrustRecord> {
+/** Far above any real record; a larger file is malformed state. */
+const MAX_TRUST_FILE_BYTES = 1024 * 1024;
+
+/**
+ * The record for this install, `{}` when missing, malformed or for another install, and
+ * "newer-version" for a file a newer Xum wrote: reads trust none of it, writes must keep it.
+ */
+async function readTrustFile(
+  file: string,
+  installedAt: string
+): Promise<PluginHookTrustRecord | "newer-version"> {
   let raw: string;
   try {
-    raw = await fs.readFile(file, "utf8");
+    // O_NONBLOCK + fstat: a FIFO (or a symlink to one) must not hang the read, which can hold
+    // the plugin mutation lock. Only a bounded regular file is read.
+    await using handle = await fs.open(
+      file,
+      fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0)
+    );
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > MAX_TRUST_FILE_BYTES) {
+      log.warn("Plugin hook trust file is not a bounded regular file; trusting no hooks", { file });
+      return {};
+    }
+    raw = await handle.readFile("utf8");
   } catch (error) {
     if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
       log.warn("Plugin hook trust file is unreadable; trusting no hooks", { file, error });
     }
     return {};
   }
+  let json: unknown;
   try {
-    const parsed = TrustRecordSchema.safeParse(JSON.parse(raw));
-    // Trust recorded for an earlier install under this name never carries over.
-    if (parsed.success) return parsed.data.installedAt === installedAt ? parsed.data.hooks : {};
+    json = JSON.parse(raw);
   } catch {
-    // Malformed JSON: same as an invalid shape below.
+    json = undefined;
   }
+  const parsed = TrustRecordSchema.safeParse(json);
+  // Trust recorded for an earlier install under this name never carries over.
+  if (parsed.success) return parsed.data.installedAt === installedAt ? parsed.data.hooks : {};
+  const version = isPlainObject(json) ? json.version : undefined;
+  if (typeof version === "number" && version > 1) return "newer-version";
   log.warn("Plugin hook trust file is malformed; trusting no hooks", { file });
   return {};
 }
@@ -131,7 +158,12 @@ export async function setPluginHookTrust(
   await using _guard = await lock.acquire();
   const installedAt = await readInstalledAt(xumHome, instanceId);
   if (installedAt === undefined) throw new Error("This plugin is not installed.");
-  const hooks = { ...(await readTrustFile(file, installedAt)) };
+  const trust = await readTrustFile(file, installedAt);
+  // After a downgrade: rewriting the file as version 1 would drop every decision it holds.
+  if (trust === "newer-version") {
+    throw new Error("A newer Xum version saved this plugin's hook trust. Update Xum to change it.");
+  }
+  const hooks = { ...trust };
   if (decision.state === null) delete hooks[decision.key];
   else hooks[decision.key] = { hash: decision.hash, state: decision.state };
   await fs.mkdir(path.dirname(file), { recursive: true });

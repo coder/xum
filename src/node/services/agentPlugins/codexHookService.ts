@@ -16,11 +16,18 @@
  * workspace (MCPServerManager.callToolForPluginHook).
  */
 import * as path from "node:path";
+import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { eventSpine, type EventSpine } from "@/node/services/events/eventSpine";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import { discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
+import {
+  discoverAgentPlugins,
+  MAX_PLUGIN_MANIFEST_BYTES,
+  readPluginFileWithinRootCapped,
+  type AgentPluginInfo,
+} from "./discovery";
+import { validatePluginManifest, type AgentPluginManifest } from "./manifest";
 import { loadPluginCodexHooks, type PluginHookDefinition } from "./codexHooks";
 import {
   HOOK_DEFAULT_TIMEOUT_SECONDS,
@@ -41,6 +48,11 @@ export interface EnsureCodexHooksArgs {
   mcp: Pick<MCPServerManager, "callToolForPluginHook">;
   /** Shows a hook's systemMessage to the user (never the model). */
   notifyUser: (pluginName: string, message: string) => void;
+  /**
+   * A `/side` chat: its local-read-only ceiling excludes MCP, so no hook runs there, even when
+   * another path (prompt listing) started the plugin's server (Codex PRRT_kwDOPxxmWM6rN8JJ).
+   */
+  sideChat: boolean;
 }
 
 interface WorkspaceRegistration {
@@ -64,6 +76,11 @@ export class CodexPluginHookService {
       this.locks.set(args.workspaceId, lock);
     }
     await using _guard = await lock.acquire();
+    if (args.sideChat) {
+      this.registrations.get(args.workspaceId)?.unregister();
+      this.registrations.delete(args.workspaceId);
+      return;
+    }
     const plugins = await this.discoverManagedPlugins(args.xumHome);
     const loaded = await Promise.all(
       plugins.map(async (plugin) => ({ plugin, ...(await loadPluginCodexHooks(plugin)) }))
@@ -182,7 +199,11 @@ export class CodexPluginHookService {
         if (!args.isProjectTrusted()) return false;
         const trust = await readPluginHookTrust(args.xumHome, instanceId);
         if (!isPluginHookTrusted(trust, hook)) return false;
-        const current = await loadPluginCodexHooks(plugin);
+        // The CURRENT manifest decides which hooks file is declared (Codex PRRT_kwDOPxxmWM6rN77w):
+        // the discovery snapshot would keep a hook that plugin.json no longer points at.
+        const manifest = await readCurrentManifest(plugin.rootPath);
+        if (manifest === undefined) return false;
+        const current = await loadPluginCodexHooks({ rootPath: plugin.rootPath, manifest });
         const stillDeclared = current.hooks.some(
           (candidate) => candidate.key === hook.key && candidate.hash === hook.hash
         );
@@ -201,6 +222,29 @@ export class CodexPluginHookService {
         ),
       notifyUser: (message) => args.notifyUser(plugin.name, message),
     };
+  }
+}
+
+/**
+ * Re-read and validate plugin.json with discovery's limits (contained in the root, size-capped).
+ * undefined when it is missing, too large, unreadable or invalid: the gate then skips the hook.
+ */
+async function readCurrentManifest(rootPath: string): Promise<AgentPluginManifest | undefined> {
+  try {
+    const { content } = await readPluginFileWithinRootCapped({
+      filePath: path.join(rootPath, "plugin.json"),
+      pluginRoot: rootPath,
+      maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
+      label: "plugin.json",
+    });
+    const validation = validatePluginManifest(JSON.parse(content));
+    return validation.ok ? validation.manifest : undefined;
+  } catch (error) {
+    log.debug("Plugin hooks: plugin.json cannot be re-read; skipping the hook", {
+      rootPath,
+      error: getErrorMessage(error),
+    });
+    return undefined;
   }
 }
 

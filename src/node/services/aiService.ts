@@ -1,7 +1,6 @@
 import { createAssistantMessageId } from "@/node/services/utils/messageIds";
 import {
   eventSpine,
-  type MessageSendOrigin,
   type RequestAssemblySnapshot,
   type TurnStopContext,
 } from "./events/eventSpine";
@@ -10,6 +9,7 @@ import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import {
   runMessageSendHooks,
   runTurnStopHooks,
+  type MessageSendHookInput,
   type MessageSendHookOutcome,
   type TurnStopHookOutcome,
 } from "./agentPlugins/promptHooks";
@@ -518,7 +518,7 @@ export class AIService extends EventEmitter {
    */
   async runMessageSendHooks(
     workspaceId: string,
-    input: { text: string; origin: MessageSendOrigin },
+    input: MessageSendHookInput,
     cancelSignal?: AbortSignal
   ): Promise<MessageSendHookOutcome> {
     const snapshot = await this.captureRequestAssemblySnapshot(workspaceId).catch(
@@ -542,15 +542,34 @@ export class AIService extends EventEmitter {
       (signal) => this.turnRequestBuilder.startWorkspaceMcpServers(workspaceId, signal),
       cancelSignal
     );
-    return runMessageSendHooks(eventSpine, workspaceId, input);
+    // After the setup above, so the check sees the hooks it loaded.
+    const cwd = eventSpine.hasMiddleware("message.send")
+      ? await this.resolvePromptHookCwd(workspaceId)
+      : undefined;
+    return runMessageSendHooks(eventSpine, workspaceId, { ...input, cwd });
   }
 
   /** Run the turn.stop prompt-hook chain for one finished turn (fail-open). */
-  runTurnStopHooks(
+  async runTurnStopHooks(
     workspaceId: string,
     input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
   ): Promise<TurnStopHookOutcome> {
-    return runTurnStopHooks(eventSpine, workspaceId, input);
+    const cwd = eventSpine.hasMiddleware("turn.stop")
+      ? await this.resolvePromptHookCwd(workspaceId)
+      : undefined;
+    return runTurnStopHooks(eventSpine, workspaceId, { ...input, cwd });
+  }
+
+  /** The workspace path prompt hooks see as `cwd` (the tools' cwd); undefined when unreadable. */
+  private async resolvePromptHookCwd(workspaceId: string): Promise<string | undefined> {
+    try {
+      const metadata = await this.getWorkspaceMetadata(workspaceId);
+      if (!metadata.success) return undefined;
+      const context = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+      return context.success ? context.data.workspacePath : undefined;
+    } catch {
+      return undefined; // fail open: the hook runs without cwd
+    }
   }
 
   releaseMockStreamStartGate(workspaceId: string): void {

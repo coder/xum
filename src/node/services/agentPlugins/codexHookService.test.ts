@@ -98,6 +98,7 @@ describe("CodexPluginHookService", () => {
       },
     },
     notifyUser: () => undefined,
+    sideChat: false,
   });
 
   async function runBash(): Promise<ToolExecuteContext> {
@@ -215,6 +216,36 @@ describe("CodexPluginHookService", () => {
     expect(calledKeys).toHaveLength(2);
   });
 
+  test("a manifest edit that stops declaring the hooks file stops the next call", async () => {
+    await writePlugin("guard", "scanner");
+    await trustAll("guard");
+    await service.ensureWorkspaceHooks(args());
+    expect((await runBash()).executed).toBe(false);
+
+    // plugin.json now points at another hooks file; the old file stays on disk unchanged.
+    await fs.writeFile(
+      path.join(pluginRoot("guard"), "plugin.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "guard",
+        extensions: { "com.openai": { hooks: "hooks/other.json" } },
+      })
+    );
+    expect((await runBash()).executed).toBe(true);
+    expect(calledKeys).toHaveLength(1);
+  });
+
+  test("a side chat runs no hook, even a trusted one whose server is running", async () => {
+    await writePlugin("guard", "scanner");
+    await trustAll("guard");
+    await service.ensureWorkspaceHooks(args());
+    expect((await runBash()).executed).toBe(false);
+
+    await service.ensureWorkspaceHooks({ ...args(), sideChat: true });
+    expect((await runBash()).executed).toBe(true);
+    expect(calledKeys).toHaveLength(1);
+  });
+
   test("a disabled plugin server fails open: the tool runs", async () => {
     await writePlugin("guard", "scanner");
     await trustAll("guard");
@@ -292,7 +323,8 @@ describe("CodexPluginHookService", () => {
         },
       },
     });
-    const send = () => runMessageSendHooks(spine, workspaceId, { text: "key=abc", origin: "user" });
+    const send = () =>
+      runMessageSendHooks(spine, workspaceId, { text: "key=abc", origin: "user", canBlock: true });
 
     beforeEach(() => {
       serverRunning = false;

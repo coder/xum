@@ -130,6 +130,7 @@ describe("UserPromptSubmit hooks on the first prompt", () => {
     const outcome = await service.runMessageSendHooks(workspaceId, {
       text: "key=abc",
       origin: "user",
+      canBlock: true,
     });
 
     expect(outcome).toEqual({ kind: "blocked", pluginName: "guard", reason: "No secrets." });
@@ -144,6 +145,7 @@ describe("UserPromptSubmit hooks on the first prompt", () => {
     const outcome = await service.runMessageSendHooks(workspaceId, {
       text: "key=abc",
       origin: "user",
+      canBlock: true,
     });
 
     expect(getToolsForWorkspace).not.toHaveBeenCalled();
@@ -155,7 +157,11 @@ describe("UserPromptSubmit hooks on the first prompt", () => {
       hooks: { PreToolUse: [{ hooks: [{ type: "mcp_tool", server: "scanner", tool: "check" }] }] },
     });
 
-    await service.runMessageSendHooks(workspaceId, { text: "hello", origin: "user" });
+    await service.runMessageSendHooks(workspaceId, {
+      text: "hello",
+      origin: "user",
+      canBlock: true,
+    });
 
     expect(getToolsForWorkspace).not.toHaveBeenCalled();
   });
