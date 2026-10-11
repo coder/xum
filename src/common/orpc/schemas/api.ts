@@ -79,6 +79,8 @@ import {
   McpAppApproveDomainsRequestSchema,
   McpAppModelContextRequestSchema,
   McpAppResourceReadRequestSchema,
+  McpAppViewRecordRequestSchema,
+  McpAppViewRecordSchema,
   McpAppViewRequestSchema,
   McpAppViewSchema,
 } from "./mcpApps";
@@ -1482,6 +1484,11 @@ export const mcpApps = {
   getView: {
     input: McpAppViewRequestSchema,
     output: ResultSchema(McpAppViewSchema, z.string()),
+  },
+  /** The view of a tool call by its result record alone (a tab restored after a restart). */
+  getViewRecord: {
+    input: McpAppViewRecordRequestSchema,
+    output: ResultSchema(McpAppViewRecordSchema, z.string()),
   },
   callTool: {
     input: McpAppToolCallRequestSchema,

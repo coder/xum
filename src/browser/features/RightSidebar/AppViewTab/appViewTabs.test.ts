@@ -12,6 +12,7 @@ import {
   appViewTabToolCallId,
   liveAppViewTabs,
   MAX_LIVE_APP_VIEW_TABS,
+  nextRecentAppViewTabs,
   withAppViewTab,
 } from "./appViewTabs";
 
@@ -56,5 +57,44 @@ describe("app view tabs", () => {
     expect(live).toEqual(recent.slice(0, MAX_LIVE_APP_VIEW_TABS));
     // A closed tab drops out.
     expect(liveAppViewTabs(recent, [recent[1]])).toEqual([recent[1]]);
+  });
+
+  test("the stored activation order drops closed tabs and stays bounded", () => {
+    const opened = Array.from({ length: 10 }, (_, i) => appViewTabFor(`call-${i}`));
+    let recent: ReturnType<typeof nextRecentAppViewTabs> = [];
+    // Open and activate many views; each one closes the one before it.
+    for (const tab of opened) recent = nextRecentAppViewTabs(recent, tab, [tab, "costs"]);
+    expect(recent).toEqual([opened[9]]);
+    // With every tab still open, only the newest few are kept, newest first.
+    for (const tab of opened) recent = nextRecentAppViewTabs(recent, tab, opened);
+    expect(recent).toEqual(opened.slice(-MAX_LIVE_APP_VIEW_TABS).reverse());
+  });
+
+  test("a restored layout keeps only the first copy of an app tab", () => {
+    const tab = appViewTabFor("call-dup");
+    const restored = parseRightSidebarLayoutState({
+      version: 1,
+      openTabsOnly: true,
+      nextId: 3,
+      focusedTabsetId: "tabset-2",
+      root: {
+        type: "split",
+        id: "split-1",
+        direction: "horizontal",
+        sizes: [50, 50],
+        children: [
+          { type: "tabset", id: "tabset-1", tabs: ["costs", tab, tab], activeTab: tab },
+          { type: "tabset", id: "tabset-2", tabs: [tab, "review"], activeTab: tab },
+        ],
+      },
+    });
+    expect(collectAllTabs(restored.root).filter((t) => t === tab)).toHaveLength(1);
+    const first = findTabset(restored.root, "tabset-1");
+    const second = findTabset(restored.root, "tabset-2");
+    expect(first?.type === "tabset" && first.tabs).toEqual(["costs", tab]);
+    expect(second?.type === "tabset" && [second.tabs, second.activeTab]).toEqual([
+      ["review"],
+      "review",
+    ]);
   });
 });
