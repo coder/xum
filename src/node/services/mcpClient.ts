@@ -8,6 +8,7 @@ import {
 } from "@modelcontextprotocol/client";
 import { dynamicTool, jsonSchema, type JSONSchema7, type Tool } from "ai";
 import assert from "@/common/utils/assert";
+import { parseMCPSettingsCapability, type MCPSettingsCapability } from "@/common/utils/mcpSettings";
 import {
   isModelVisibleTool,
   MCP_APP_MIME_TYPE,
@@ -152,6 +153,18 @@ export interface MCPClientHandle {
   ): Promise<MCPRawCallToolResult>;
   /** MCP Apps only: resources/read for a view's ui:// resource. */
   readResource(uri: string, options?: { signal?: AbortSignal }): Promise<MCPReadResourceResult>;
+  /** The server's `openai/settings` capability, read once at connect. */
+  settingsCapability(): MCPSettingsCapability | undefined;
+  /**
+   * tools/call for the host's settings UI only (the model never sees these
+   * tools). `meta` becomes the request `_meta`.
+   */
+  callSettingsTool(
+    name: string,
+    args: Record<string, unknown>,
+    meta: Record<string, unknown>,
+    options?: { signal?: AbortSignal; timeoutMs?: number }
+  ): Promise<MCPRawCallToolResult>;
   close(): Promise<void>;
 }
 
@@ -297,6 +310,10 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     : config.transport;
 
   await client.connect(transport, config.prior !== undefined ? { prior: config.prior } : {});
+  const settings = parseMCPSettingsCapability(client.getServerCapabilities());
+  // Only the host reads and writes settings: hiding the tools keeps the model
+  // from changing what the user configured.
+  const settingsTools = new Set(settings ? [settings.readTool, settings.updateTool] : []);
 
   return {
     tools: async () => {
@@ -310,7 +327,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         listed.set(definition.name, ui);
         // MCP Apps: "Host MUST NOT include tools in the agent's tool list" when visibility
         // lacks "model". Such tools stay callable by their views (callToolForApp).
-        if (!isModelVisibleTool(ui)) continue;
+        if (!isModelVisibleTool(ui) || settingsTools.has(definition.name)) continue;
         const inputSchema = definition.inputSchema ?? { type: "object" };
         const tool = dynamicTool({
           description: definition.description,
@@ -392,6 +409,17 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         { uri },
         {
           timeout: RESOURCE_READ_TIMEOUT_MS,
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        }
+      );
+    },
+    settingsCapability: () => settings,
+    callSettingsTool: (name, args, meta, options) => {
+      assert(settingsTools.has(name), "callSettingsTool only calls the advertised settings tools");
+      return client.callTool(
+        { name, arguments: args, _meta: meta },
+        {
+          timeout: options?.timeoutMs ?? APP_TOOL_CALL_TIMEOUT_MS,
           ...(options?.signal !== undefined ? { signal: options.signal } : {}),
         }
       );
