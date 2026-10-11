@@ -12,6 +12,7 @@ import {
   appViewTabToolCallId,
   liveAppViewTabs,
   MAX_LIVE_APP_VIEW_TABS,
+  nextRecentAppViewTabs,
   withAppViewTab,
 } from "./appViewTabs";
 
@@ -56,6 +57,17 @@ describe("app view tabs", () => {
     expect(live).toEqual(recent.slice(0, MAX_LIVE_APP_VIEW_TABS));
     // A closed tab drops out.
     expect(liveAppViewTabs(recent, [recent[1]])).toEqual([recent[1]]);
+  });
+
+  test("the stored activation order drops closed tabs and stays bounded", () => {
+    const opened = Array.from({ length: 10 }, (_, i) => appViewTabFor(`call-${i}`));
+    let recent: ReturnType<typeof nextRecentAppViewTabs> = [];
+    // Open and activate many views; each one closes the one before it.
+    for (const tab of opened) recent = nextRecentAppViewTabs(recent, tab, [tab, "costs"]);
+    expect(recent).toEqual([opened[9]]);
+    // With every tab still open, only the newest few are kept, newest first.
+    for (const tab of opened) recent = nextRecentAppViewTabs(recent, tab, opened);
+    expect(recent).toEqual(opened.slice(-MAX_LIVE_APP_VIEW_TABS).reverse());
   });
 
   test("a restored layout keeps only the first copy of an app tab", () => {

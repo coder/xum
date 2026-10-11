@@ -118,7 +118,12 @@ import {
 } from "@/browser/utils/terminal";
 import { SideChatTabTitle } from "./Tabs/TabLabels";
 import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab/AppViewTab";
-import { appViewTabToolCallId, liveAppViewTabs, withAppViewTab } from "./AppViewTab/appViewTabs";
+import {
+  appViewTabToolCallId,
+  liveAppViewTabs,
+  nextRecentAppViewTabs,
+  withAppViewTab,
+} from "./AppViewTab/appViewTabs";
 import { ReviewAssistedStatsReporter } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
 import {
   NewTabLabel,
@@ -454,10 +459,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
   // when selected again. Render-time adjustment: the order only changes with the active tab.
   const [recentAppTabs, setRecentAppTabs] = React.useState<TabType[]>([]);
   if (getAppViewTabKey(props.node.activeTab) != null && recentAppTabs[0] !== props.node.activeTab) {
-    setRecentAppTabs([
-      props.node.activeTab,
-      ...recentAppTabs.filter((t) => t !== props.node.activeTab),
-    ]);
+    setRecentAppTabs(nextRecentAppViewTabs(recentAppTabs, props.node.activeTab, props.node.tabs));
   }
   const liveAppTabs = liveAppViewTabs(recentAppTabs, props.node.tabs);
 
