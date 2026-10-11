@@ -327,6 +327,12 @@ export interface MockORPCClientOptions {
   mcpSettingsConnected?: Set<string>;
   /** Every mcp.settings.read call's server names, in order (stories assert batching). */
   mcpSettingsReads?: string[][];
+  /** Servers whose settings read fails with this message. */
+  mcpSettingsReadErrors?: Map<string, string>;
+  /** When set, settings updates wait for this promise (stories hold a save in flight). */
+  mcpSettingsUpdateGate?: { promise: Promise<void> };
+  /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
+  mcpTestGate?: { promise: Promise<void> };
   /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
   mcpIcons?: Map<string, string>;
   /** Custom listBranches implementation (for testing non-git repos) */
@@ -463,6 +469,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpSettings,
     mcpSettingsConnected = new Set<string>(),
     mcpSettingsReads,
+    mcpSettingsReadErrors,
+    mcpSettingsUpdateGate,
+    mcpTestGate,
     mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
     userPreferences: initialUserPreferences,
@@ -1338,6 +1347,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             if (input.ifConnected === true && !mcpSettingsConnected.has(serverName))
               return { success: true, data: { notConnected: true } };
             mcpSettingsConnected.add(serverName);
+            const readError = mcpSettingsReadErrors?.get(serverName);
+            if (readError !== undefined) return { success: false, error: readError };
             const snapshot = mcpSettings?.get(serverName);
             return {
               success: true,
@@ -1348,12 +1359,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             Object.fromEntries(input.serverNames.map((name) => [name, readOne(name)]))
           );
         },
-        update: (input: { serverName: string; set: Record<string, MCPSettingValue> }) => {
+        update: async (input: { serverName: string; set: Record<string, MCPSettingValue> }) => {
+          await mcpSettingsUpdateGate?.promise;
           const snapshot = mcpSettings?.get(input.serverName);
-          if (snapshot === undefined)
-            return Promise.resolve({ success: false, error: "No settings mock" });
+          if (snapshot === undefined) return { success: false, error: "No settings mock" };
           snapshot.values = { ...snapshot.values, ...input.set };
-          return Promise.resolve({ success: true, data: snapshot.values });
+          return { success: true, data: snapshot.values };
         },
       },
       list: (input?: { projectPath?: string }) => {
@@ -1394,13 +1405,14 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         delete globalMcpServersState[input.name];
         return Promise.resolve({ success: true, data: undefined });
       },
-      test: (input: { projectPath?: string; name?: string }) => {
+      test: async (input: { projectPath?: string; name?: string }) => {
+        await mcpTestGate?.promise;
         if (input.name && mcpTestResults.has(input.name)) {
-          return Promise.resolve(mcpTestResults.get(input.name)!);
+          return mcpTestResults.get(input.name)!;
         }
 
         // Default: return empty tools.
-        return Promise.resolve({ success: true, tools: [] });
+        return { success: true, tools: [] };
       },
       icon: (input: { iconRef: string }) => Promise.resolve(mcpIcons.get(input.iconRef) ?? null),
       icons: (input: { iconRefs: string[] }) =>

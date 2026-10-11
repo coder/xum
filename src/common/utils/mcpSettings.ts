@@ -51,6 +51,8 @@ const MAX_VALUE_LENGTH = 4096;
 export const MAX_MCP_SETTINGS = 100;
 const MAX_LAYOUT_GROUPS = 20;
 const MAX_GROUP_ITEMS = 100;
+/** Options one Select can show; a setting with more is dropped (counted as not shown). */
+export const MAX_MCP_SETTING_ENUM_OPTIONS = 100;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -67,6 +69,21 @@ const isLength = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 0;
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value);
+
+/**
+ * Every non-blank tool name the capability advertises, also when the other member is
+ * malformed (so the host still hides it from the model). The settings UI needs both.
+ */
+export function advertisedMCPSettingsToolNames(capabilities: unknown): string[] {
+  if (!isRecord(capabilities)) return [];
+  const names: string[] = [];
+  for (const location of [capabilities.extensions, capabilities.experimental]) {
+    const raw = isRecord(location) ? location[MCP_SETTINGS_CAPABILITY] : undefined;
+    if (!isRecord(raw)) continue;
+    for (const name of [raw.readTool, raw.updateTool]) if (isNonBlank(name)) names.push(name);
+  }
+  return names;
+}
 
 /** `capabilities.extensions` (2026-07-28+) or legacy `capabilities.experimental`. */
 export function parseMCPSettingsCapability(
@@ -93,7 +110,14 @@ function parseSchema(raw: unknown): MCPSettingSchema | undefined {
   if (raw.type === "boolean") return { ...base, type: "boolean" };
   if (raw.type === "string") {
     const enumValues = raw.enum;
-    if (enumValues !== undefined && !(Array.isArray(enumValues) && enumValues.every(isEnumOption)))
+    if (
+      enumValues !== undefined &&
+      !(
+        Array.isArray(enumValues) &&
+        enumValues.length <= MAX_MCP_SETTING_ENUM_OPTIONS &&
+        enumValues.every(isEnumOption)
+      )
+    )
       return undefined;
     if ([raw.minLength, raw.maxLength].some((n) => n !== undefined && !isLength(n)))
       return undefined;
@@ -151,8 +175,10 @@ export function validateMCPSettingValue(schema: MCPSettingSchema, value: unknown
         return `must be at most ${schema.maximum}`;
       // Tolerate float error: 0.3 is a multiple of 0.1.
       if (schema.multipleOf !== undefined) {
+        // The quotient's float error grows with its magnitude (about 2e-6 at 1e10), so the
+        // tolerance does too: 1e-9 absolute below 1e3, ~1e-12 relative above.
         const ratio = value / schema.multipleOf;
-        if (Math.abs(ratio - Math.round(ratio)) > 1e-9)
+        if (Math.abs(ratio - Math.round(ratio)) > Math.max(1e-9, Math.abs(ratio) * 1e-12))
           return `must be a multiple of ${schema.multipleOf}`;
       }
       return null;
@@ -199,7 +225,7 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
   const values = filterMCPSettingValues(properties, raw.values, warnings);
   // A property without a valid current value cannot be edited safely.
   for (const name of Object.keys(properties)) {
-    if (!(name in values)) delete properties[name];
+    if (!Object.hasOwn(values, name)) delete properties[name];
   }
 
   const layout: MCPSettingsGroup[] = [];

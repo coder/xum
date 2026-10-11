@@ -8,7 +8,11 @@ import {
 } from "@modelcontextprotocol/client";
 import { dynamicTool, jsonSchema, type JSONSchema7, type Tool } from "ai";
 import assert from "@/common/utils/assert";
-import { parseMCPSettingsCapability, type MCPSettingsCapability } from "@/common/utils/mcpSettings";
+import {
+  advertisedMCPSettingsToolNames,
+  parseMCPSettingsCapability,
+  type MCPSettingsCapability,
+} from "@/common/utils/mcpSettings";
 import {
   isModelVisibleTool,
   MCP_APP_MIME_TYPE,
@@ -313,7 +317,8 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
   const settings = parseMCPSettingsCapability(client.getServerCapabilities());
   // Only the host reads and writes settings: hiding the tools keeps the model
   // from changing what the user configured.
-  const settingsTools = new Set(settings ? [settings.readTool, settings.updateTool] : []);
+  // Every advertised name, even from a half-malformed capability: hiding stays on.
+  const settingsTools = new Set(advertisedMCPSettingsToolNames(client.getServerCapabilities()));
 
   return {
     tools: async () => {
