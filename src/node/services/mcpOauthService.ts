@@ -291,15 +291,46 @@ function pluginResourceValidator(resource: string): (serverResource: URL) => Pro
 }
 
 /**
- * Stored credentials belong to the client they were issued to. A plugin with
- * another provided client (a second plugin at the same URL, or an update)
- * must not use them, and must never refresh client A's token with client B.
+ * The issuer a plugin config pins: its endpoint overrides' (the issuer pluginDiscoveryState
+ * builds), or its authorizationServerBase. Undefined when discovery picks the issuer: then it is
+ * the server's own choice, which no plugin update changes, and the SDK's auth() already
+ * discards credentials stamped by another issuer before a refresh (SEP-2352).
+ */
+function pinnedIssuer(config: MCPServerOAuthConfig | undefined): string | undefined {
+  const endpoints = config?.endpoints;
+  if (endpoints !== undefined) return endpoints.issuer ?? new URL(endpoints.tokenUrl).origin;
+  return config?.discovery?.authorizationServerBase;
+}
+
+/** The SDK's SEP-2352 comparison: one trailing slash of difference is the same issuer. */
+function issuersMatch(a: string, b: string): boolean {
+  return a === b || a.replace(/\/$/, "") === b.replace(/\/$/, "");
+}
+
+/**
+ * The use-time rule that decides whether stored credentials may serve a server: they belong
+ * to the client and the issuer that minted them. A plugin with another provided client, or one
+ * that pins another issuer (a second plugin at the same URL, an update, a remove and re-add),
+ * must not use them, and must never refresh client A's token with client B. Sign-out on update
+ * is only cleanup: a write from an old-identity flow or refresh that lands after it carries the
+ * old client ID or issuer stamp, so it never matches the new config, and a later sign-in
+ * overwrites it. Unstamped (pre-upgrade) credentials pass the issuer check, like in the SDK.
+ *
+ * Known limit: a change of only scopes or resource (same client, same issuer) keeps the old
+ * tokens and their old grant until the server asks for re-authorization; the update-time
+ * sign-out covers the normal path. Follow-up for scope coverage: #6141.
  */
 function storedClientMatches(
-  stored: MCPOAuthClientInformation | undefined,
+  stored: MCPOAuthStoredCredentials | null | undefined,
   config: MCPServerOAuthConfig | undefined
 ): boolean {
-  return config?.clientId === undefined || stored?.client_id === config.clientId;
+  if (config?.clientId !== undefined && stored?.clientInformation?.client_id !== config.clientId)
+    return false;
+  const issuer = pinnedIssuer(config);
+  if (issuer === undefined) return true;
+  return [stored?.clientInformation?.issuer, stored?.tokens?.issuer].every(
+    (stamp) => stamp === undefined || issuersMatch(stamp, issuer)
+  );
 }
 
 /** SECURITY AUDIT: the store (mcp-oauth.json) never receives a plugin client secret. */
@@ -950,9 +981,7 @@ export class McpOauthService {
 
     // The same guard as getAuthProviderForServer: status must not say "Logged in" for tokens
     // the connection will not use.
-    const tokens = storedClientMatches(creds?.clientInformation, input.oauth)
-      ? creds?.tokens
-      : undefined;
+    const tokens = storedClientMatches(creds, input.oauth) ? creds?.tokens : undefined;
     return {
       serverUrl: normalizedServerUrl,
       isLoggedIn: Boolean(tokens),
@@ -1010,7 +1039,7 @@ export class McpOauthService {
       return undefined;
     }
     // Tokens of another client: signed out for this plugin server.
-    if (!storedClientMatches(creds.clientInformation, input.oauth)) {
+    if (!storedClientMatches(creds, input.oauth)) {
       return undefined;
     }
 
@@ -1036,9 +1065,7 @@ export class McpOauthService {
 
     const creds = await this.getValidStoredCredentials({ serverUrl: normalizedServerUrl });
     return Boolean(
-      creds?.tokens &&
-      creds.clientInformation &&
-      storedClientMatches(creds.clientInformation, input.oauth)
+      creds?.tokens && creds.clientInformation && storedClientMatches(creds, input.oauth)
     );
   }
 
@@ -1629,7 +1656,7 @@ export class McpOauthService {
     return {
       tokens: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
-        if (!storedClientMatches(creds?.clientInformation, input.oauth)) return undefined;
+        if (!storedClientMatches(creds, input.oauth)) return undefined;
         // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         return creds?.tokens as unknown as MCPOAuthTokens | undefined;
       },
@@ -1682,7 +1709,7 @@ export class McpOauthService {
       },
       clientInformation: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
-        const stored = storedClientMatches(creds?.clientInformation, input.oauth)
+        const stored = storedClientMatches(creds, input.oauth)
           ? creds?.clientInformation
           : undefined;
         // Token refresh re-reads a plugin secret from its consented file.
