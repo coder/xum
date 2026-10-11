@@ -6,7 +6,12 @@
  */
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import assert from "node:assert";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type CompactionFollowUpRequest,
+  type MuxMessage,
+} from "@/common/types/message";
+import { SendMessageOptionsSchema } from "@/common/orpc/schemas/stream";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { computeSendDigest } from "./sendIds";
 import { eventSpine, type MessageSendContext } from "./events/eventSpine";
@@ -216,5 +221,86 @@ describe("message.send outcomes", () => {
     await send({ acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true });
 
     expect(calls.map((call) => call.origin)).toEqual(["user", "task", "task", "goal", "system"]);
+  });
+});
+
+describe("on-send compaction follow-up", () => {
+  test("the diverted send runs the hooks once and carries their context", async () => {
+    const { h, calls } = await setup(addContext);
+    setOnSendCompaction(h, true);
+
+    const result = await h.session.sendMessage("my token is abc", options);
+    expect(result.success).toBe(true);
+
+    expect(calls).toEqual([{ text: "my token is abc", origin: "user" }]);
+    const rows = await userRows(h);
+    expect(rows).toHaveLength(1);
+    const muxMetadata = rows[0]?.metadata?.muxMetadata;
+    assert(muxMetadata?.type === "compaction-request");
+    expect(muxMetadata.parsed.followUpContent).toMatchObject({
+      text: "my token is abc",
+      additionalSystemInstructions: "Ask for a reproduction first.",
+      pluginSendHooksApplied: true,
+    });
+  });
+
+  async function seedHandoff(
+    h: AgentSessionHarness,
+    pendingFollowUp: CompactionFollowUpRequest
+  ): Promise<void> {
+    for (const row of [
+      createMuxMessage("u0", "user", "original question"),
+      createMuxMessage("a0", "assistant", "original answer"),
+      createMuxMessage("summary", "assistant", "compacted summary", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+        muxMetadata: { type: "compaction-summary", pendingFollowUp },
+      }),
+    ]) {
+      assert((await h.historyService.appendToHistory(workspaceId, row)).success);
+    }
+  }
+
+  test("dispatching a follow-up whose hooks already ran does not run them again", async () => {
+    const { h, calls } = await setup(addContext);
+    setOnSendCompaction(h, false);
+    await seedHandoff(h, {
+      text: "my token is abc",
+      model: options.model,
+      agentId: "exec",
+      pluginSendHooksApplied: true,
+    });
+
+    expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+
+    expect(calls).toEqual([]);
+    expect(textOf((await userRows(h)).at(-1))).toBe("my token is abc");
+  });
+
+  test("a follow-up the hooks never saw (manual /compact) runs them as a system send", async () => {
+    const { h, calls } = await setup(() => undefined);
+    setOnSendCompaction(h, false);
+    await seedHandoff(h, { text: "then fix the bug", model: options.model, agentId: "exec" });
+
+    expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+
+    expect(calls).toEqual([{ text: "then fix the bug", origin: "system" }]);
+  });
+
+  test("a client cannot mark its /compact follow-up as already hooked", () => {
+    const parsed = SendMessageOptionsSchema.parse({
+      ...options,
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact",
+        parsed: { followUpContent: { text: "then deploy", pluginSendHooksApplied: true } },
+      },
+    });
+    expect(parsed.muxMetadata).toEqual({
+      type: "compaction-request",
+      rawCommand: "/compact",
+      parsed: { followUpContent: { text: "then deploy" } },
+    });
   });
 });

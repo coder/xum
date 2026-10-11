@@ -27,6 +27,8 @@ export function buildAutoCompactionFollowUp(params: {
   muxMetadata?: MuxMessageMetadata;
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
   autoModelRouting?: AutoModelRoutingRecord;
+  /** The diverted send already ran the message.send prompt hooks (see the field doc). */
+  pluginSendHooksApplied?: true;
 }): CompactionFollowUpRequest {
   const followUp: CompactionFollowUpRequest = {
     text: params.messageText,
@@ -68,6 +70,10 @@ export function buildAutoCompactionFollowUp(params: {
 
   if (params.autoModelRouting) {
     followUp.autoModelRouting = params.autoModelRouting;
+  }
+
+  if (params.pluginSendHooksApplied === true) {
+    followUp.pluginSendHooksApplied = true;
   }
 
   return followUp;

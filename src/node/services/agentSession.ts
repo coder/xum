@@ -1057,6 +1057,12 @@ interface SendMessageInternalOptions {
    * under the history write lock at the trigger append (see checkCompactionFollowUpStillPending).
    */
   compactionFollowUpSummary?: MuxMessage;
+  /**
+   * This send's text already went through the message.send prompt hooks (an on-send compaction
+   * follow-up re-sending the diverted message): the hooks run once per message, so the session
+   * skips them. Their context already sits in the preserved additionalSystemInstructions.
+   */
+  pluginSendHooksApplied?: true;
 }
 
 /**
@@ -4360,7 +4366,8 @@ export class AgentSession {
   }
 
   /**
-   * Run the message.send prompt hooks for this message. Compaction requests never reach them.
+   * Run the message.send prompt hooks once for this message. Compaction requests never reach
+   * them, and a send that already ran them (an on-send compaction follow-up) skips them.
    *
    * Only a send a person made (typed, edited, queued, plan-review feedback) can be blocked.
    * Automatic senders (goals, tasks, wakes, follow-ups) retry a refused send, so a block would
@@ -4372,7 +4379,11 @@ export class AgentSession {
     internal: SendMessageInternalOptions | undefined,
     acceptanceOrigin: TurnAcceptanceOrigin
   ): Promise<MessageSendHookOutcome> {
-    if (this.aiService.runMessageSendHooks == null || isCompactionRequestMetadata(muxMetadata)) {
+    if (
+      internal?.pluginSendHooksApplied === true ||
+      this.aiService.runMessageSendHooks == null ||
+      isCompactionRequestMetadata(muxMetadata)
+    ) {
       return { kind: "none" };
     }
     const origin = resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin);
@@ -5386,6 +5397,8 @@ export class AgentSession {
         muxMetadata: typedMuxMetadata,
         // Pre-gate decision: the follow-up re-gates against the post-compaction context.
         autoModelRouting: routedOptions.autoModelRoutingRecord,
+        // `message` already ran the prompt hooks: the follow-up must not run them again.
+        pluginSendHooksApplied: true,
         replacement: manualReplacement || automaticReplacement,
         cancelBeforeAcceptance,
       });
@@ -12335,6 +12348,8 @@ export class AgentSession {
       admissionStale: followUpAdmissionStale,
       turnAdmission,
       compactionFollowUpSummary: lastMessage,
+      // The diverted send already ran the prompt hooks.
+      ...(followUp.pluginSendHooksApplied === true ? { pluginSendHooksApplied: true } : {}),
     });
     if (!sendResult.success) {
       const heartbeatAfterSend = isHeartbeatFollowUp ? heartbeatState() : "on";
