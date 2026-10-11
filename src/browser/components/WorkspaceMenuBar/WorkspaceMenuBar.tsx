@@ -70,6 +70,8 @@ import {
 } from "@/constants/layout";
 import { TimelineDialog } from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 import { ArtifactsDialog } from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
+import { writeArtifactSelection } from "@/browser/features/RightSidebar/ArtifactsTab/artifactSelection";
+import { mcpAppSelectionKey } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
 import { StatsDialog } from "@/browser/features/RightSidebar/StatsDialog";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
@@ -419,10 +421,24 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       }
       setArtifactsDialogWorkspaceId(workspaceId);
     };
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+    // "Open in tab" asks for the view's app tab and persists no selection (openArtifact() does):
+    // select the view here, or the dialog would show whatever Artifacts showed last.
+    const appViewHandler = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspaceId: string; toolCallId: string }>).detail;
+      if (detail?.workspaceId !== workspaceId || !isTimelineSidebarHidden()) {
+        return;
+      }
+      writeArtifactSelection(workspaceId, {
+        scope: "artifact",
+        path: mcpAppSelectionKey(detail.toolCallId),
+        version: null,
+      });
+      setArtifactsDialogWorkspaceId(workspaceId);
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
     window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
     };
   }, [

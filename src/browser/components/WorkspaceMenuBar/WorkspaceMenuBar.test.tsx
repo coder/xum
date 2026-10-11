@@ -32,6 +32,11 @@ import * as WorkspaceTerminalIconModule from "../icons/WorkspaceTerminalIcon/Wor
 import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
 import * as TimelineDialogModule from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 import * as ArtifactsDialogModule from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
+import {
+  readArtifactSelection,
+  writeArtifactSelection,
+} from "@/browser/features/RightSidebar/ArtifactsTab/artifactSelection";
+import { mcpAppSelectionKey } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
 import * as StatsDialogModule from "@/browser/features/RightSidebar/StatsDialog";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
@@ -635,6 +640,27 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     });
     expect(lastOpen()).toBe(true);
     terminal.remove();
+  });
+
+  it("narrow \"Open in tab\" opens the Artifacts dialog on the requested view", () => {
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+    const dialogSpy = spyOn(ArtifactsDialogModule, "ArtifactsDialog").mockImplementation(
+      (() => null) as unknown as typeof ArtifactsDialogModule.ArtifactsDialog
+    );
+    writeArtifactSelection(workspaceId, { scope: "artifact", path: "old.md", version: null });
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    act(() => {
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: "call-1" })
+      );
+    });
+
+    expect((dialogSpy.mock.calls.at(-1) as Array<{ open: boolean }> | undefined)?.[0]?.open).toBe(
+      true
+    );
+    expect(readArtifactSelection(workspaceId).path).toBe(mcpAppSelectionKey("call-1"));
   });
 
   it("touch phones swap the header terminal button for Stats and Artifacts", () => {
