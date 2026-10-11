@@ -141,6 +141,39 @@ describe("PreToolUse", () => {
     expect((await runTool(spine, "bash", {})).executed).toBe(true);
   });
 
+  test("a decision that is not an exact Codex enum value is malformed and fails open", async () => {
+    const outputs = [
+      json({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: " deny " } }),
+      json({ decision: " block ", reason: "x" }),
+      json({ decision: "Block", reason: "x" }),
+    ];
+    for (const output of outputs) {
+      const { spine } = setup([hook("PreToolUse")], () => output);
+      expect((await runTool(spine, "bash", {})).executed).toBe(true);
+    }
+  });
+
+  test("a deny keeps its own context and the context of earlier hooks", async () => {
+    const { spine } = setup(
+      [hook("PreToolUse", { input: { first: true } }), hook("PreToolUse")],
+      (input) =>
+        json({
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            additionalContext: input.first === true ? "First." : "Second.",
+            ...(input.first === true ? {} : { permissionDecision: "deny" }),
+          },
+        })
+    );
+
+    const ctx = await runTool(spine, "bash", {});
+
+    expect(ctx.blocked?.result).toEqual({
+      error: "Tool call blocked by plugin 'guard' hook: No reason given by the hook.",
+      hook_output: "[plugin:guard] First.\n[plugin:guard] Second.",
+    });
+  });
+
   test("a cancel during a hook ends the hook call and the tool never starts", async () => {
     const controller = new AbortController();
     // The longest hook timeout: the run must end at the cancel, not when the hook times out.

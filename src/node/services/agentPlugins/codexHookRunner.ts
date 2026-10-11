@@ -125,11 +125,12 @@ async function runToolHooks(
     if (output.permissionDecision === "deny" || output.decision === "block") {
       const reason =
         output.permissionDecisionReason ?? output.reason ?? "No reason given by the hook.";
-      ctx.blocked = {
-        result: {
-          error: `Tool call blocked by plugin '${registration.pluginName}' hook: ${reason}`,
-        },
+      // Codex keeps the context of a blocking PreToolUse, and of the hooks before it.
+      if (output.additionalContext !== undefined) notes.push(output.additionalContext);
+      const result = {
+        error: `Tool call blocked by plugin '${registration.pluginName}' hook: ${reason}`,
       };
+      ctx.blocked = { result: notes.length > 0 ? annotate(result, notes, registration) : result };
       return;
     }
     if (output.updatedInput !== undefined) applyUpdatedInput(ctx, output, registration, hook);
@@ -316,6 +317,16 @@ export function parseHookOutput(result: unknown, eventName: string): HookOutput 
     throw new Error(`hookSpecificOutput is not tagged hookEventName "${eventName}"`);
   }
   const specific = isPlainObject(raw.hookSpecificOutput) ? raw.hookSpecificOutput : {};
+  // Codex's schemas allow only these exact values; anything else (" deny ", "Block") is malformed
+  // and fails open instead of becoming a policy action.
+  const oneOf = (value: unknown, allowed: string[]) =>
+    value == null || (typeof value === "string" && allowed.includes(value));
+  if (!oneOf(raw.decision, eventName === "PreToolUse" ? ["approve", "block"] : ["block"])) {
+    throw new Error(`invalid decision ${JSON.stringify(raw.decision)}`);
+  }
+  if (!oneOf(specific.permissionDecision, ["allow", "deny", "ask"])) {
+    throw new Error(`invalid permissionDecision ${JSON.stringify(specific.permissionDecision)}`);
+  }
   const text = (value: unknown) =>
     typeof value === "string" && value.trim() ? cut(value) : undefined;
   const output: HookOutput = {
