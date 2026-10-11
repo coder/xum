@@ -223,6 +223,24 @@ describe("McpAppFrame", () => {
     expect(args).toContain('"city": "Berlin"');
   });
 
+  test("a plugin server shows its server part, and its instance marker where consent is asked", async () => {
+    const key = "plugin:0123456789abcdef:tray";
+    const view = render(<McpAppFrame workspaceId="ws" view={{ ...VIEW, serverName: key }} />, {
+      wrapper: Wrapper,
+    });
+    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    expect(view.getByText("tray")).toBeTruthy();
+    expect(view.container.textContent).not.toContain("0123456789abcdef");
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "get_forecast", arguments: {} },
+    });
+    const strip = await view.findByRole("alert");
+    expect(strip.textContent).toContain("Allow get_forecast from tray (plugin 01234567)?");
+  });
+
   test("consent prompts name the server by the card's sanitized key, not the raw key", async () => {
     // A repo-defined server key can carry bidi/control characters; tool calls still go to the
     // raw key, but the prompt must not render it (it could reorder or disguise the question).
