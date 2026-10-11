@@ -8220,6 +8220,16 @@ export class AgentSession {
         return Ok(undefined);
       }
 
+      // Confirm the turn use lease before anything below writes history or reads the checkout
+      // (resumes and retries reach here without prepareMessage): a refused lease skips the resume's
+      // replacement acceptance (#5434), file-change detection, post-compaction attachments and the
+      // [CONTINUE] sentinel append (#4476, #5400), and fails below, where the request's user row
+      // and compaction request are known, so the refusal keeps its retry correlation.
+      const leaseRefusal = await this.confirmTurnUseLease();
+      if (isStreamStartAborted()) {
+        return Ok(undefined);
+      }
+
       if (preparation?.resumeReplacement) {
         // Stamp the actual committed tail before notices or a CONTINUE sentinel can invent
         // something resumable. Never search backward past an ineligible final row.
@@ -8238,21 +8248,28 @@ export class AgentSession {
         if (target.metadata?.contextBudgetRejected) return await refuseRejectedResume(target);
         if (target.role !== "assistant" && !this.shouldUseUserMessageForRetry(target))
           return Ok(undefined);
-        const accepted = await this.historyService.acceptCompactionReplacement(
-          this.workspaceId,
-          preparation.resumeReplacement,
-          { kind: "resume", message: target },
-          {
-            isCurrent: () => !isStreamStartAborted(),
-            onCommitted: () => {
-              preparation.durability = "accepted";
-              return undefined;
-            },
-          }
-        );
-        if (!accepted.success) return await fail(createUnknownSendMessageError(accepted.error));
-        if (accepted.data.kind !== "accepted") return Ok(undefined);
-        await this.retireCompactionReplacement(accepted.data.witness, preparation.admissionCapture);
+        // Accepting stamps the resumed row (a history rewrite) and retires the Stop: a resume
+        // refused by the lease leaves both as they were (#5434).
+        if (leaseRefusal == null) {
+          const accepted = await this.historyService.acceptCompactionReplacement(
+            this.workspaceId,
+            preparation.resumeReplacement,
+            { kind: "resume", message: target },
+            {
+              isCurrent: () => !isStreamStartAborted(),
+              onCommitted: () => {
+                preparation.durability = "accepted";
+                return undefined;
+              },
+            }
+          );
+          if (!accepted.success) return await fail(createUnknownSendMessageError(accepted.error));
+          if (accepted.data.kind !== "accepted") return Ok(undefined);
+          await this.retireCompactionReplacement(
+            accepted.data.witness,
+            preparation.admissionCapture
+          );
+        }
       } else if (
         preparation?.acceptanceOrigin === "automatic" &&
         (await (preparation.intent === "resume"
@@ -8270,15 +8287,8 @@ export class AgentSession {
       // abort or append failure therefore re-detects the same change (nothing is
       // dropped), while a successful append cannot produce a duplicate row.
       // Fresh candidates already fix the admitted rows; detect later edits on the next request.
-      // #4476: file-change detection and post-compaction attachments read the checkout, so the
-      // turn use lease is confirmed first (resumes and retries reach here without prepareMessage).
-      // A refused lease skips those reads (and the [CONTINUE] sentinel append) and fails below,
-      // where the request's user row and compaction request are known, so the refusal keeps its
-      // retry correlation.
-      const leaseRefusal = await this.confirmTurnUseLease();
-      if (isStreamStartAborted()) {
-        return Ok(undefined);
-      }
+      // #4476: file-change detection and post-compaction attachments read the checkout; the turn
+      // use lease was confirmed above, and a refused lease skips those reads too.
       const fileChangeDetection =
         preparedRequest || leaseRefusal != null
           ? { attachments: [], commit: () => undefined }
