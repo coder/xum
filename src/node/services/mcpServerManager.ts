@@ -4679,10 +4679,13 @@ export class MCPServerManager {
           this.cacheSettings(instance, workspaceId, parsed.values);
           return parsed.values;
         } catch (error) {
-          log.warn(`[MCP] Settings read for plugin hooks failed for '${instance.name}'; passing {}`, {
-            workspaceId,
-            error: getErrorMessage(error),
-          });
+          log.warn(
+            `[MCP] Settings read for plugin hooks failed for '${instance.name}'; passing {}`,
+            {
+              workspaceId,
+              error: getErrorMessage(error),
+            }
+          );
           return undefined;
         }
       })();

@@ -787,7 +787,12 @@ describe("MCPServerManager", () => {
     const pluginServer = (command: string, serverName: string) => ({
       ...stdioConfig(command),
       env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: path.join(tmp.path, "data") },
-      plugin: { pluginName: "cad", serverName, sourceScope: "global" as const, sourceLocation: "x" },
+      plugin: {
+        pluginName: "cad",
+        serverName,
+        sourceScope: "global" as const,
+        sourceLocation: "x",
+      },
     });
     configService.listServers.mockResolvedValue({
       "plugin:abc:a": pluginServer("hooks-join-a", "a"),
@@ -810,7 +815,10 @@ describe("MCPServerManager", () => {
                 : resolve({
                     content: [],
                     structuredContent: {
-                      schema: { type: "object", properties: { on: { type: "boolean", title: "On" } } },
+                      schema: {
+                        type: "object",
+                        properties: { on: { type: "boolean", title: "On" } },
+                      },
                       values: { on: true },
                     },
                   })
@@ -842,7 +850,12 @@ describe("MCPServerManager", () => {
       "plugin:abc:a": {
         ...stdioConfig("hooks-recycle"),
         env: { PLUGIN_ROOT: tmp.path, PLUGIN_DATA: path.join(tmp.path, "data") },
-        plugin: { pluginName: "cad", serverName: "a", sourceScope: "global" as const, sourceLocation: "x" },
+        plugin: {
+          pluginName: "cad",
+          serverName: "a",
+          sourceScope: "global" as const,
+          sourceLocation: "x",
+        },
       },
     });
     let fail = true;
@@ -864,16 +877,20 @@ describe("MCPServerManager", () => {
     });
     const request = workspaceRequest("hooks-recycle-ws");
     await manager.getToolsForWorkspace(request);
-    expect(await manager.getSettingsForPluginHooks("hooks-recycle-ws", "plugin:abc:", 100)).toEqual({
-      a: {},
-    });
+    expect(await manager.getSettingsForPluginHooks("hooks-recycle-ws", "plugin:abc:", 100)).toEqual(
+      {
+        a: {},
+      }
+    );
     // A plugin update recycles its servers; the new instance's settings are read again.
     fail = false;
     await manager.stopServersWithKeyPrefix("plugin:abc:");
     await manager.getToolsForWorkspace(request);
-    expect(await manager.getSettingsForPluginHooks("hooks-recycle-ws", "plugin:abc:", 100)).toEqual({
-      a: { on: true },
-    });
+    expect(await manager.getSettingsForPluginHooks("hooks-recycle-ws", "plugin:abc:", 100)).toEqual(
+      {
+        a: { on: true },
+      }
+    );
   });
 
   test("settings: a noStart read never starts or restarts the server", async () => {
