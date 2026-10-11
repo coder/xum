@@ -375,6 +375,31 @@ describe("turn.stop", () => {
     expect(calls.map((call) => call.lastAssistantMessage)).toEqual(["All green.", null]);
   });
 
+  test("a delegated workspace turn runs no Stop hook and ends once (WorkspaceTurnManager owns it)", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rQfGf): its handle settles from this stream end, like a sub-agent.
+    const calls: StopCall[] = [];
+    addConsumer(keepGoing, calls);
+    const { h, streams } = await setup({ session: { captureEvents: true } });
+
+    const sent = await h.session.sendMessage("delegated work", {
+      ...options,
+      muxMetadata: {
+        type: "workspace-turn-task",
+        taskHandleId: "wst_delegated",
+        ownerWorkspaceId: "owner-workspace",
+        turnId: "turn-delegated",
+      },
+    });
+    expect(sent.success).toBe(true);
+    await settle(h);
+
+    expect(calls).toEqual([]);
+    expect(streams()).toBe(1);
+    expect(await userTexts(h)).toEqual(["delegated work"]);
+    // TaskService settles the handle from each stream end: one stream end, one settlement.
+    expect(h.events.filter((event) => event.type === "stream-end")).toHaveLength(1);
+  });
+
   test("an interrupted turn does not run the hooks", async () => {
     const calls: StopCall[] = [];
     addConsumer(keepGoing, calls);
