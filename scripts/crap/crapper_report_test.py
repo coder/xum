@@ -334,3 +334,37 @@ def test_a_load_time_hit_inside_an_uncalled_arrow_is_not_a_run(tmp_path, capsys)
 
     assert coverage_of(capsys, tmp_path, arrow, "arrow", loaded) == 0.0
     assert coverage_of(capsys, tmp_path, arrow, "arrow", loaded, ran) == 1.0
+
+
+def test_comments_are_found_by_the_parse_not_by_line_prefixes(tmp_path, capsys):
+    view = write(
+        tmp_path,
+        "src/demo/view.tsx",
+        "export function View(props: { on: boolean }) {\n"
+        "  const glob = props.on ? \"src/**/*.ts\" : \"\";\n"
+        "  const items = [1].map((item) => {\n"
+        "    /* A comment that\n"
+        "       spans lines.\n"
+        "    */\n"
+        "    return item;\n"
+        "  });\n"
+        "  return (\n"
+        "    <div>\n"
+        "      {/* JSX comment */}\n"
+        "      {glob}{items}\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n",
+    )
+    # The map callback never ran (Bun lists its lines 4-8 at 0, lines 4-6 are
+    # its comment). Code lines: 1, 2, 3, 7, 9, 10, 12, 13; only 7 is a miss.
+    # The glob string's "/*" must not start a comment that hides later lines.
+    ran = lcov_file(
+        tmp_path,
+        "ran.info",
+        view,
+        "DA:1,1\nDA:2,1\nDA:3,1\nDA:4,0\nDA:5,0\nDA:6,0\nDA:7,0\nDA:8,0\n"
+        "DA:9,1\nDA:10,1\nDA:11,0\nDA:12,1\nDA:13,1\n",
+    )
+
+    assert coverage_of(capsys, tmp_path, view, "View", ran) == 0.875

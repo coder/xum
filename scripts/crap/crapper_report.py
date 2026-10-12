@@ -34,7 +34,7 @@ script merges them, because Crapper keeps only one record per source file: a
 later `SF:` record for the same file replaces the earlier one, so a line one
 shard hit and another missed could score as missed. Per function, it uses only
 the reports that ran the function and skips lines without code (see
-is_code_line): a shard that only loaded the file would otherwise add misses.
+code_lines): a shard that only loaded the file would otherwise add misses.
 """
 
 import argparse
@@ -48,7 +48,11 @@ from crapper.crap import make_entry
 from crapper.discover import is_test_file, language_of
 from crapper.languages import functions_in_file
 
-# Crapper's own module-name rule (src/a/b.ts -> a.b), private at the pinned SHA.
+from crapper.languages.treesitter import descendants, parse
+
+# Crapper's own module-name and grammar rules (src/a/b.ts -> a.b; .tsx -> tsx),
+# private at the pinned SHA.
+from crapper.languages.typescript import _grammar as typescript_grammar
 from crapper.languages.typescript import _module_namespace as module_namespace
 
 # Code under src/ that never ships. Mirrors isProductionSource() in
@@ -160,20 +164,26 @@ def load_coverage(lcov: list[Path], root: Path, files: list[str]) -> dict[str, l
 # 9-line function lists DA 1,4,6,7,9 when called and DA 1-8 at 0 when only
 # imported, so a line union scores the fully tested function 56%. Lines that
 # hold only comments or punctuation carry no code, so they never count.
-BLOCK_COMMENT = re.compile(r"/\*.*?\*/")
-LINE_COMMENT = re.compile(r"//.*$")
-PUNCTUATION_ONLY = re.compile(r"[\s})\];,]*")
+PUNCTUATION_ONLY = re.compile(r"[\s{}()\[\];,]*")
 
 
-def is_code_line(text: str) -> bool:
-    rest = BLOCK_COMMENT.sub(" ", text).strip()
-    if rest.startswith(("/*", "*")):
-        # Inside a block comment: only text after its end can be code.
-        end = rest.find("*/")
-        if end < 0:
-            return False
-        rest = rest[end + 2 :]
-    return PUNCTUATION_ONLY.fullmatch(LINE_COMMENT.sub("", rest)) is None
+def code_lines(source: str, grammar_path: str) -> list[bool]:
+    """Whether each line of `source` (split on newlines) holds code.
+
+    Comments come from the tree-sitter parse, not from the line text, so a
+    comment that spans lines, a JSX `{/* ... */}` and code after `*/` are all
+    classified right, and `/*` inside a string ("src/**/*.ts") starts nothing.
+    """
+
+    data, tree = parse(source, typescript_grammar(grammar_path))
+    masked = bytearray(data)
+    for node in descendants(tree.root_node):
+        if node.type == "comment":
+            for index in range(node.start_byte, node.end_byte):
+                if masked[index] != ord("\n"):
+                    masked[index] = ord(" ")
+    text = masked.decode("utf-8", errors="replace")
+    return [PUNCTUATION_ONLY.fullmatch(line) is None for line in text.split("\n")]
 
 
 def ran_function(span: dict[int, int]) -> bool:
@@ -189,9 +199,7 @@ def ran_function(span: dict[int, int]) -> bool:
     return bool(span) and span[min(span)] > 0
 
 
-def function_percent(
-    reports: list[dict[int, int]], start: int, end: int, source_lines: list[str]
-) -> float | None:
+def function_percent(reports: list[dict[int, int]], start: int, end: int, is_code: list[bool]) -> float | None:
     """Line coverage percent of lines start..end, or None when no report lists the file.
 
     Only the reports that ran the function count (see ran_function), so a
@@ -208,7 +216,7 @@ def function_percent(
         if not ran_function(span):
             continue
         for line, hits in span.items():
-            if line <= len(source_lines) and is_code_line(source_lines[line - 1]):
+            if line <= len(is_code) and is_code[line - 1]:
                 merged[line] = merged.get(line, 0) + hits
     if not merged:
         return 0.0
@@ -221,7 +229,6 @@ def score(
     rows: list[dict] = []
     for relative in files:
         source = (root / relative).read_text(encoding="utf-8", errors="replace")
-        source_lines = source.splitlines()
         language = language_of(relative)
         assert language is not None, relative
         # A renamed file is parsed (grammar), filtered and matched to coverage at
@@ -230,12 +237,19 @@ def score(
         shown = renames.get(relative, relative)
         old_module = module_namespace(relative, str(root))
         new_module = module_namespace(shown, str(root))
+        is_code: list[bool] | None = None
         for function in functions_in_file(language, source, relative, str(root)):
             percent = None
             if coverage is not None:
-                found = function_percent(
-                    coverage.get(relative, []), function.start_line, function.end_line, source_lines
-                )
+                if is_code is None:
+                    # Every scored src/ file is TypeScript or JavaScript today; other
+                    # grammars keep every listed line.
+                    is_code = (
+                        code_lines(source, relative)
+                        if language == "typescript"
+                        else [True] * len(source.split("\n"))
+                    )
+                found = function_percent(coverage.get(relative, []), function.start_line, function.end_line, is_code)
                 percent = 0.0 if found is None else found
             entry = make_entry(function, percent)
             assert entry.namespace.startswith(old_module), (entry.namespace, old_module)
