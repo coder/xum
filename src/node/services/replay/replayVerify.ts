@@ -583,10 +583,15 @@ export function auditStepPrefixesFromLog(
       return [];
     })
   );
+  // Only chat-turn runs carry requestHistorySequence (TurnRequestBuilder sets it with the turn's
+  // prompt-cache scope). Headless side calls (refinement, branch summaries, continuous compaction,
+  // intuition, evaluation) log runs without it: like the runtime monitor, ignore them, so they
+  // neither break nor replace the chat baseline. Older logs without the field are not audited.
   return auditStepPrefixes(
     recordedStepsFromLog(log),
     (step) =>
-      step.requestHistorySequence != null && compactionSequences.has(step.requestHistorySequence)
+      step.requestHistorySequence != null && compactionSequences.has(step.requestHistorySequence),
+    (step) => step.requestHistorySequence == null
   );
 }
 

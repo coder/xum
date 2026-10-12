@@ -33,16 +33,20 @@ export async function cacheAuditCommand(workspaceId: string): Promise<void> {
   );
 
   console.log(`\n=== Cache-bust audit for workspace: ${workspaceId} ===\n`);
-  if (envelopes.length === 0) {
-    console.log("No turn-envelope rows found in durable-events.jsonl — nothing to audit.");
-    return;
-  }
-
   // Usage pairing: assistant turns come from the FULL history (all compaction
   // epochs, like the envelopes). Envelopes carrying requestHistorySequence
   // join on that key; legacy envelopes fall back to tail alignment (both
   // sequences end at the most recent turn).
   const historyResult = await collectFullHistory(historyService, workspaceId);
+  if (envelopes.length === 0) {
+    console.log("No turn-envelope rows found in durable-events.jsonl — nothing to audit.");
+    // The step audit needs only devtools.jsonl, so older logs without envelopes still get it.
+    printStepPrefixAudit(
+      await auditRecordedStepPrefixes(sessionDir, historyResult.success ? historyResult.data : [])
+    );
+    return;
+  }
+
   const turns = historyResult.success ? collectAssistantTurns(historyResult.data) : [];
   const turnsBySeq = new Map<number, AssistantTurn>(
     turns.map((turn) => [turn.requestHistorySequence, turn])

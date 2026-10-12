@@ -206,6 +206,46 @@ describe("replayVerifySession pairing", () => {
     expect(result.stepPrefix).toEqual({ comparedPairs: 0, breaks: [] });
   });
 
+  test("a headless run without a request sequence is skipped by the step audit", async () => {
+    using tmp = new DisposableTempDir("replay-verify-headless");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    for (const userText of ["First.", "Second."]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+      });
+    }
+    // A side call (for example a branch summary) logs its own run between the turns, without a
+    // request sequence and with another prompt.
+    const [runLine, firstStepLine] = ctx.devtoolsLines;
+    const run = (JSON.parse(runLine) as { run: { requestHistorySequence?: number } }).run;
+    const step = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
+    const { requestHistorySequence: _seq, ...headlessRun } = { ...run, id: "headless-1" };
+    ctx.devtoolsLines.splice(
+      2,
+      0,
+      JSON.stringify({ type: "run", run: headlessRun }),
+      JSON.stringify({
+        type: "step",
+        step: {
+          ...step,
+          id: "headless-step",
+          runId: "headless-1",
+          input: {
+            ...step.input,
+            prompt: [{ role: "user", content: [{ type: "text", text: "Summarize." }] }],
+          },
+        },
+      })
+    );
+
+    const result = await verify(ctx);
+    // The two chat runs are compared with each other; the side call breaks nothing.
+    expect(result.stepPrefix).toEqual({ comparedPairs: 1, breaks: [] });
+  });
+
   test("a turn without an assistant row skips only itself", async () => {
     using tmp = new DisposableTempDir("replay-verify-missing-assistant");
     const ctx = createReplayFixtureSessionContext(tmp.path);

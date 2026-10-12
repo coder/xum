@@ -194,12 +194,15 @@ function isAnthropicStep(step: RecordedStepRequest): boolean {
 
 export function auditStepPrefixes(
   steps: readonly RecordedStepRequest[],
-  isSideRun: (step: RecordedStepRequest) => boolean = () => false
+  isSideRun: (step: RecordedStepRequest) => boolean = () => false,
+  /** Steps outside any chat turn (headless side calls): skipped without touching the baseline. */
+  isIgnored: (step: RecordedStepRequest) => boolean = () => false
 ): StepPrefixAudit {
   const breaks: StepPrefixBreak[] = [];
   let comparedPairs = 0;
   let previous: { step: RecordedStepRequest; blocks: PromptCacheBlock[] } | undefined;
   for (const step of steps) {
+    if (isIgnored(step)) continue;
     if (isSideRun(step)) {
       previous = undefined;
       continue;
