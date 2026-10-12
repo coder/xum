@@ -18263,13 +18263,15 @@ export class WorkspaceService
     );
   }
 
-  async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
-    // Perf harness replay mode (XUM_REPLAY_TAPES): real chat history stays untouched. Checked
-    // before any session or history work (clear, truncate).
-    if (isSessionTapeReplayMode()) {
-      return Err(SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE);
-    }
-    const effectivePercentage = percentage ?? 1.0;
+  /**
+   * Admission for truncateHistory, taken before the scope preflight and held across every
+   * await of the truncation. Returns the context-mutation admission guard, or null for a
+   * percentage <= 0 request, which only refuses while a turn is active.
+   */
+  private acquireTruncateHistoryAdmission(
+    workspaceId: string,
+    effectivePercentage: number
+  ): Result<Disposable | null> {
     // The admission guard is acquired BEFORE the scope preflight and held across every await
     // below: a turn admitted during any of them could snapshot the pre-truncation transcript
     // and stream across the mutation, and one admitted during the preflight itself could
@@ -18278,25 +18280,22 @@ export class WorkspaceService
     // that run's wake. The preflight cannot yet prove scope "none", so every request that
     // may remove rows (percentage > 0) pays the guard; percentage <= 0 is a deterministic
     // no-op that retires nothing and keeps the plain busy pre-check.
-    let admissionGuard: Disposable | null = null;
     if (effectivePercentage > 0) {
-      const guardResult = this.acquireContextMutationAdmissionGuard(
-        workspaceId,
-        "truncate history"
-      );
-      if (!guardResult.success) {
-        return Err(guardResult.error);
-      }
-      admissionGuard = guardResult.data;
-    } else if (
-      this.sessions.get(workspaceId)?.isBusy() ||
-      this.aiService.isStreaming(workspaceId)
-    ) {
+      return this.acquireContextMutationAdmissionGuard(workspaceId, "truncate history");
+    }
+    if (this.sessions.get(workspaceId)?.isBusy() || this.aiService.isStreaming(workspaceId)) {
       return Err(
         "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
       );
     }
-    using _admissionGuard = admissionGuard;
+    return Ok(null);
+  }
+
+  /** Which rows a truncation removes, decided up front; null when history cannot be read. */
+  private async classifyTruncationScope(
+    workspaceId: string,
+    effectivePercentage: number
+  ): Promise<"all" | "partial" | "none" | null> {
     // A token-proportional truncation below 100% can remove nothing (budget rounds to zero),
     // a proper prefix, or everything (historyService's full-delete fast path), and each scope
     // carries different obligations: an emptied transcript needs every full-clear guard, a
@@ -18305,20 +18304,36 @@ export class WorkspaceService
     // nothing, or active runs' wakes would settle superseded under an unchanged transcript.
     // Decide up front; historyService revalidates the dangerous drift directions under the
     // history write lock (refuseFullDelete / refuseRowRemoval / requireFullDelete below).
-    const truncationScope =
-      effectivePercentage >= 1.0
-        ? ("all" as const)
-        : effectivePercentage <= 0
-          ? ("none" as const)
-          : await this.historyService
-              .classifyTruncationRemoval(workspaceId, effectivePercentage)
-              .catch((error: unknown) => {
-                log.warn("History truncation scope preflight failed; refusing truncation", {
-                  workspaceId,
-                  error,
-                });
-                return null;
-              });
+    if (effectivePercentage >= 1.0) {
+      return "all";
+    }
+    if (effectivePercentage <= 0) {
+      return "none";
+    }
+    return await this.historyService
+      .classifyTruncationRemoval(workspaceId, effectivePercentage)
+      .catch((error: unknown) => {
+        log.warn("History truncation scope preflight failed; refusing truncation", {
+          workspaceId,
+          error,
+        });
+        return null;
+      });
+  }
+
+  async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
+    // Perf harness replay mode (XUM_REPLAY_TAPES): real chat history stays untouched. Checked
+    // before any session or history work (clear, truncate).
+    if (isSessionTapeReplayMode()) {
+      return Err(SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE);
+    }
+    const effectivePercentage = percentage ?? 1.0;
+    const admission = this.acquireTruncateHistoryAdmission(workspaceId, effectivePercentage);
+    if (!admission.success) {
+      return Err(admission.error);
+    }
+    using _admissionGuard = admission.data;
+    const truncationScope = await this.classifyTruncationScope(workspaceId, effectivePercentage);
     if (truncationScope == null) {
       // An unknown scope must not choose a side-effect set: labeling it a full clear would
       // discard goal/plan/retry state and advance the context epoch while rows may remain,
