@@ -18,6 +18,9 @@ export function renderPluginHookContextEntry(entry: PluginHookContextEntry): str
   return `<plugin-hook-context plugin="${escapeMarkup(entry.pluginId)}">\n${escapeMarkup(entry.text)}\n</plugin-hook-context>`;
 }
 
+/** Rendered length of an entry with an empty plugin ID and text: the block's wrapper. */
+const RENDERED_ENTRY_OVERHEAD = renderPluginHookContextEntry({ pluginId: "", text: "" }).length;
+
 /** A user row's rendered hook-context blocks, or undefined when it has none. */
 export function renderPluginHookContextBlocks(message: MuxMessage): string | undefined {
   if (message.role !== "user") return undefined;
@@ -54,6 +57,16 @@ function readPersistedEntries(value: unknown): PluginHookContextEntry[] {
       continue;
     }
     const valid = { pluginId: entry.pluginId, text: entry.text };
+    // Escaping never shrinks text, so the raw length plus the wrapper is a lower bound on the
+    // rendered block. Check it before rendering: a corrupted row can hold a string of any size,
+    // and escaping all of it first could exhaust memory on every request (Codex
+    // PRRT_kwDOPxxmWM6rZY1W).
+    if (
+      size + RENDERED_ENTRY_OVERHEAD + valid.pluginId.length + valid.text.length >
+      PLUGIN_HOOK_CONTEXT_MAX_CHARS
+    ) {
+      break;
+    }
     size += renderPluginHookContextEntry(valid).length;
     // Same rule as the write side: the first entry past the cap ends the list.
     if (size > PLUGIN_HOOK_CONTEXT_MAX_CHARS) break;

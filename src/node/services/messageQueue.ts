@@ -1414,11 +1414,13 @@ export class MessageQueue {
     }
 
     const joinedMessages = entry.messages.join("\n");
-    // A compaction entry stays open, so texts added after it join its request. Its first message
+    // A compaction entry stays open, so sends added after it join its request. Its first message
     // is the compaction request's own text (compaction always starts a new entry); the rest were
-    // sent separately and must still reach the message.send prompt hooks.
+    // sent separately and must still reach the message.send prompt hooks. An attachment-only add
+    // adds no message but is a send too: it reaches the hooks with empty text, like a direct
+    // attachment-only send (Codex PRRT_kwDOPxxmWM6rZqyv).
     const textBatchedBehindCompaction =
-      isCompactionMetadata(entry.muxMetadata) && entry.messages.length > 1
+      isCompactionMetadata(entry.muxMetadata) && (entry.addCount > 1 || entry.messages.length > 1)
         ? entry.messages.slice(1).join("\n")
         : undefined;
     const options = entry.latestOptions
