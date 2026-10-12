@@ -82,8 +82,53 @@ describe("new functions", () => {
     const split = (bigCc: number) => [row("big", bigCc, [1, 60]), row("piece", 12, [61, 99])];
     const piece = `${PATH}::demo.mod::piece`;
     expect(verdicts(base, split(25))).toEqual([["new-function", "warning", piece]]);
-    expect(verdicts(base, split(28))).toEqual([["new-function", "violation", piece]]);
+    // big lost 5, but piece holds 11 decision points: code was added, not moved.
     expect(verdicts(base, split(35))).toEqual([["new-function", "violation", piece]]);
+  });
+
+  describe("move relief", () => {
+    const base = [row("big", 40, [1, 99])];
+    const key = (name: string) => `${PATH}::demo.mod::${name}`;
+
+    test("warns on a pure move, whose total CC rises by 1", () => {
+      // 11 decision points leave big and land in piece (CC 12).
+      const head = [row("big", 29, [1, 60]), row("piece", 12, [61, 99])];
+      expect(verdicts(base, head)).toEqual([["new-function", "warning", key("piece")]]);
+    });
+
+    test("stays a violation when the moved step also grew", () => {
+      const head = [row("big", 30, [1, 60]), row("piece", 12, [61, 99])];
+      expect(verdicts(base, head)).toEqual([["new-function", "violation", key("piece")]]);
+    });
+
+    test("covers several pieces only when the drop pays for all of them", () => {
+      const head = [row("big", 20, [1, 50]), row("a", 11, [51, 75]), row("b", 11, [76, 99])];
+      expect(verdicts(base, head)).toEqual([
+        ["new-function", "warning", key("a")],
+        ["new-function", "warning", key("b")],
+      ]);
+      // The small helper's decision point is new code the drop of 11 no longer covers.
+      const withHelper = [
+        row("big", 29, [1, 50]),
+        row("piece", 12, [51, 90]),
+        row("h", 2, [91, 99]),
+      ];
+      expect(verdicts(base, withHelper)).toEqual([["new-function", "violation", key("piece")]]);
+    });
+
+    test("does not cover a step above the cap", () => {
+      const head = [row("big", 19, [1, 40]), row("piece", 22, [41, 99])];
+      expect(verdicts(base, head)).toEqual([["new-function", "violation", key("piece")]]);
+    });
+
+    test("does not cover a rename or new code paid for by an unrelated cut", () => {
+      expect(verdicts([row("f", 50, [1, 99])], [row("g", 50, [1, 99])])).toEqual([
+        ["new-function", "violation", key("g")],
+      ]);
+      expect(
+        verdicts([row("a", 10, [1, 20])], [row("a", 5, [1, 10]), row("feat", 12, [11, 40])])
+      ).toEqual([["new-function", "violation", key("feat")]]);
+    });
   });
 });
 

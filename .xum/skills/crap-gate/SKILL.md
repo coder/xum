@@ -41,6 +41,10 @@ VIOLATION floor-cc     src/x.ts:10-25 normalizeAgentId: CC 3 -> 4 (must not grow
 - When the changed files' total CC drops, `new-function` findings are warnings
   (net-extraction relief): splitting a hotspot is allowed even if one piece is
   still above 8.
+- Moving a step out of a function raises the total CC by 1. Such a move is
+  also a warning (move relief) when the kept functions lost at least as much
+  CC as the new functions hold decision points (CC − 1 each), and the new
+  function is at most CC 20. A rename gets no relief.
 - The function name and line range are in the report. Identity is
   `path::namespace::name`, so renaming a function makes it new.
 

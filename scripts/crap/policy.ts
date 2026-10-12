@@ -5,6 +5,7 @@ import {
   NEW_FUNCTION_MAX_SCORE,
   NEW_FUNCTION_ON_NET_DECREASE,
   TAX_WITHOUT_COVERAGE,
+  moveRelief,
   netExtractionRelief,
   type Severity,
 } from "./thresholds";
@@ -138,25 +139,59 @@ function compare(
   return null;
 }
 
+/** CC that kept functions lost, and the decision points of the new functions. */
+interface MoveTotals {
+  keptDrop: number;
+  newDecisions: number;
+}
+
+function moveTotals(
+  base: ReadonlyMap<string, FunctionRow>,
+  head: ReadonlyMap<string, FunctionRow>
+): MoveTotals {
+  let keptDrop = 0;
+  let newDecisions = 0;
+  for (const [key, row] of head) {
+    const before = base.get(key);
+    // A kept function that grew lowers the drop: it already has a floor violation.
+    if (before) keptDrop += before.complexity - row.complexity;
+    else newDecisions += row.complexity - 1;
+  }
+  return { keptDrop, newDecisions };
+}
+
+/** The relief note for a new function above the limit, or null when none applies. */
+function reliefNote(
+  head: FunctionRow,
+  totals: { base: number; head: number },
+  moves: MoveTotals
+): string | null {
+  if (netExtractionRelief(totals.base, totals.head)) {
+    return `net-extraction relief: total CC ${totals.base} -> ${totals.head}`;
+  }
+  if (moveRelief(moves.keptDrop, moves.newDecisions, head.complexity)) {
+    return `move relief: kept functions lost CC ${moves.keptDrop} >= ${moves.newDecisions} new decision points`;
+  }
+  return null;
+}
+
 function judgeNew(
   key: string,
   head: FunctionRow,
-  totals: { base: number; head: number }
+  totals: { base: number; head: number },
+  moves: MoveTotals
 ): Finding | null {
   const unit = head.crap === null ? "CC" : "CRAP";
   const score = head.crap ?? head.complexity;
   if (score <= NEW_FUNCTION_MAX_SCORE) return null;
-  const relieved = netExtractionRelief(totals.base, totals.head);
-  const relief = relieved
-    ? `, net-extraction relief: total CC ${totals.base} -> ${totals.head}`
-    : "";
+  const note = reliefNote(head, totals, moves);
   return {
     rule: "new-function",
-    severity: relieved ? NEW_FUNCTION_ON_NET_DECREASE : "violation",
+    severity: note ? NEW_FUNCTION_ON_NET_DECREASE : "violation",
     key,
     head,
     base: null,
-    message: `${where(head)}: new function ${unit} ${score} (max ${NEW_FUNCTION_MAX_SCORE}${relief})`,
+    message: `${where(head)}: new function ${unit} ${score} (max ${NEW_FUNCTION_MAX_SCORE}${note ? `, ${note}` : ""})`,
   };
 }
 
@@ -181,10 +216,14 @@ export function evaluate(
 ): Evaluation {
   const totals = { base: totalComplexity(baseRows), head: totalComplexity(headRows) };
   const base = keyRows(baseRows);
+  const heads = keyRows(headRows);
+  const moves = moveTotals(base, heads);
   const findings: Finding[] = [];
-  for (const [key, head] of keyRows(headRows)) {
+  for (const [key, head] of heads) {
     const before = base.get(key);
-    const finding = before ? compare(key, before, head, changed) : judgeNew(key, head, totals);
+    const finding = before
+      ? compare(key, before, head, changed)
+      : judgeNew(key, head, totals, moves);
     if (finding) findings.push(finding);
   }
   findings.sort((a, b) => a.key.localeCompare(b.key));

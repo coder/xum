@@ -27,7 +27,30 @@ export const TAX_WITHOUT_COVERAGE: Severity = "warning";
  */
 export const NEW_FUNCTION_ON_NET_DECREASE: Severity = "warning";
 
-/** Relief applies only to a strict decrease: an equal total is a pure move or a split. */
+/**
+ * Relief applies only to a strict decrease. A pure move raises the total by 1
+ * per new function (each function has a base CC of 1), so moves need
+ * moveRelief instead.
+ */
 export function netExtractionRelief(baseTotalCc: number, headTotalCc: number): boolean {
   return headTotalCc < baseTotalCc;
+}
+
+/**
+ * Move relief caps a moved step at this CC. It stops a PR from moving a whole
+ * hotspot body into a new function, which would reset its history. Natural
+ * lifecycle steps in the hotspots measure CC 10-20.
+ */
+export const MOVE_RELIEF_MAX_CC = 20;
+
+/**
+ * Move relief: moving a coherent step out of a hotspot is a refactor, not new
+ * code, even though it raises the total CC by 1. It applies when the CC that
+ * kept functions lost pays for every decision point of every new function
+ * (keptDrop >= sum of (CC - 1) over new functions) and this new function is at
+ * most MOVE_RELIEF_MAX_CC. A rename gets nothing, because no kept function
+ * shrinks.
+ */
+export function moveRelief(keptDrop: number, newDecisions: number, newCc: number): boolean {
+  return keptDrop >= newDecisions && newCc <= MOVE_RELIEF_MAX_CC;
 }
