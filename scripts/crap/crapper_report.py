@@ -164,7 +164,8 @@ def load_coverage(lcov: list[Path], root: Path, files: list[str]) -> dict[str, l
 # 9-line function lists DA 1,4,6,7,9 when called and DA 1-8 at 0 when only
 # imported, so a line union scores the fully tested function 56%. Lines that
 # hold only comments or punctuation carry no code, so they never count.
-PUNCTUATION_ONLY = re.compile(r"[\s{}()\[\];,]*")
+# Closers and separators only: a line of `[];` or `({});` can be a statement.
+PUNCTUATION_ONLY = re.compile(r"[\s})\];,]*")
 
 
 def code_lines(source: str, grammar_path: str) -> list[bool]:
@@ -173,15 +174,21 @@ def code_lines(source: str, grammar_path: str) -> list[bool]:
     Comments come from the tree-sitter parse, not from the line text, so a
     comment that spans lines, a JSX `{/* ... */}` and code after `*/` are all
     classified right, and `/*` inside a string ("src/**/*.ts") starts nothing.
+    A JSX expression that holds only comments counts as a comment, braces
+    included.
     """
 
     data, tree = parse(source, typescript_grammar(grammar_path))
     masked = bytearray(data)
     for node in descendants(tree.root_node):
-        if node.type == "comment":
-            for index in range(node.start_byte, node.end_byte):
-                if masked[index] != ord("\n"):
-                    masked[index] = ord(" ")
+        comment_only_jsx = node.type == "jsx_expression" and all(
+            child.type == "comment" for child in node.named_children
+        )
+        if node.type != "comment" and not comment_only_jsx:
+            continue
+        for index in range(node.start_byte, node.end_byte):
+            if masked[index] != ord("\n"):
+                masked[index] = ord(" ")
     text = masked.decode("utf-8", errors="replace")
     return [PUNCTUATION_ONLY.fullmatch(line) is None for line in text.split("\n")]
 

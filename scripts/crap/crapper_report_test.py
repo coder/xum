@@ -368,3 +368,35 @@ def test_comments_are_found_by_the_parse_not_by_line_prefixes(tmp_path, capsys):
     )
 
     assert coverage_of(capsys, tmp_path, view, "View", ran) == 0.875
+
+
+def test_empty_literal_lines_stay_code(tmp_path, capsys):
+    log = write(
+        tmp_path,
+        "src/demo/log.ts",
+        "export function log(on: boolean): void {\n"
+        "  if (on) {\n"
+        "    console.log(\n"
+        "      {},\n"
+        "      [],\n"
+        "    );\n"
+        "  }\n"
+        "  [];\n"
+        "}\n",
+    )
+    # The branch never ran. Its argument lines and the `[];` statement are code.
+    ran = lcov_file(tmp_path, "ran.info", log, "DA:1,1\nDA:2,1\nDA:3,0\nDA:4,0\nDA:5,0\nDA:8,1\n")
+
+    assert coverage_of(capsys, tmp_path, log, "log", ran) == 0.5
+
+
+def test_javascript_files_use_their_own_grammar_for_comments(tmp_path, capsys):
+    script = write(
+        tmp_path,
+        "src/demo/workflow.cjs",
+        "function step(items) {\n  return items.map((item) => {\n    // Skip empty items.\n\n    return item;\n  });\n}\n",
+    )
+    # The callback never ran. Code lines are 1, 2 and 5: only its `return` misses.
+    ran = lcov_file(tmp_path, "ran.info", script, "DA:1,1\nDA:2,1\nDA:3,0\nDA:4,0\nDA:5,0\nDA:6,0\nDA:7,1\n")
+
+    assert coverage_of(capsys, tmp_path, script, "step", ran) == 0.6667
