@@ -400,6 +400,42 @@ describe("createDisplayUsage", () => {
       });
     });
 
+    test("keeps Haiku 5.5 aggregates priced at its own rates without flagging them", () => {
+      const model = "anthropic:claude-haiku-5-5";
+      // One request under and one above the 100K threshold, so the sum mixes both tiers.
+      const short = createDisplayUsage(
+        { inputTokens: 50000, outputTokens: 500, totalTokens: 50500, cachedInputTokens: 20000 },
+        model
+      );
+      const long = createDisplayUsage(
+        { inputTokens: 150000, outputTokens: 800, totalTokens: 150800, cachedInputTokens: 90000 },
+        model,
+        { anthropic: { cacheCreationInputTokens: 10000 } }
+      );
+      const aggregate = sumUsageHistory([short!, long!])!;
+
+      const result = recomputeUsageCosts(aggregate, model, { aggregatedUsage: true });
+
+      expect(result.hasUnknownCosts).toBeUndefined();
+      expect(result).toEqual(aggregate);
+    });
+
+    test("flags a Haiku 5.5 aggregate once its costs no longer fit the effective rates", () => {
+      const aggregate = sumUsageHistory([
+        createDisplayUsage(
+          { inputTokens: 50000, outputTokens: 500, totalTokens: 50500 },
+          "anthropic:claude-haiku-5-5"
+        )!,
+      ])!;
+
+      // e.g. a mapping now resolves this runtime model to a pricier tiered model.
+      const result = recomputeUsageCosts(aggregate, "openai:gpt-6.1-sol", {
+        aggregatedUsage: true,
+      });
+
+      expect(result).toEqual({ ...aggregate, hasUnknownCosts: true });
+    });
+
     test("recomputes persisted GPT-6 Astra usage with the higher long-context tier", () => {
       const result = recomputeUsageCosts(
         {

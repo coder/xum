@@ -94,6 +94,47 @@ function calculateUsageCosts(modelStats: ModelStats, usage: UsageCostInputs): Us
   };
 }
 
+const STORED_COST_COMPONENTS = [
+  ["input", "inputCost"],
+  ["cached", "cachedCost"],
+  ["cacheCreate", "cacheCreateCost"],
+  ["output", "outputCost"],
+  ["reasoning", "reasoningCost"],
+] as const;
+
+/**
+ * Whether every stored component cost of an aggregate is one the current tiered rates can
+ * produce. Each request bills all of its tokens at either the base or the long-context rate,
+ * so a sum priced with these rates lies between "all base" and "all long-context" per
+ * component. Costs outside that band were priced by other rates (or are partial).
+ */
+function storedCostsMatchTieredRates(
+  usage: ChatUsageDisplay,
+  modelStats: ModelStats,
+  tokens: UsageCostInputs
+): boolean {
+  // Pin the threshold to force every component into one tier, reusing calculateUsageCosts'
+  // field mapping (a missing long-context rate falls back to the base rate there too).
+  const allBase = calculateUsageCosts(
+    { ...modelStats, tiered_pricing_threshold_tokens: Number.POSITIVE_INFINITY },
+    tokens
+  );
+  const allLong = calculateUsageCosts(
+    { ...modelStats, tiered_pricing_threshold_tokens: Number.NEGATIVE_INFINITY },
+    tokens
+  );
+
+  return STORED_COST_COMPONENTS.every(([component, costKey]) => {
+    const stored = usage[component].cost_usd;
+    if (stored === undefined) return false;
+    const low = Math.min(allBase[costKey], allLong[costKey]);
+    const high = Math.max(allBase[costKey], allLong[costKey]);
+    // Summing per-request float costs drifts slightly from tokens × rate.
+    const tolerance = high * 1e-9 + 1e-12;
+    return stored >= low - tolerance && stored <= high + tolerance;
+  });
+}
+
 /**
  * Create a display-friendly usage object from AI SDK usage
  *
@@ -273,14 +314,7 @@ export function recomputeUsageCosts(
   }
 
   // A sum across service tiers cannot be split back into per-tier tokens (#4787).
-  if (
-    serviceTier === "mixed" ||
-    (options?.aggregatedUsage === true && hasTieredPricing(modelStats))
-  ) {
-    // Aggregated `byModel` totals collapse many requests into one bucket. Tiered pricing is
-    // non-linear, so choosing a single tier from the sum can inflate costs once multiple
-    // sub-threshold requests add up past the long-context boundary. Preserve the stored costs
-    // and surface uncertainty instead of fabricating a repriced total.
+  if (serviceTier === "mixed") {
     return {
       ...usage,
       hasUnknownCosts: true,
@@ -291,13 +325,27 @@ export function recomputeUsageCosts(
     serviceTier !== undefined
       ? withServiceTierPricing(modelStats, metadataModel, serviceTier)
       : modelStats;
-  const costs = calculateUsageCosts(pricedStats, {
+  const tokens: UsageCostInputs = {
     inputTokens: usage.input.tokens,
     cachedTokens: usage.cached.tokens,
     cacheCreateTokens: usage.cacheCreate.tokens,
     outputTokens: usage.output.tokens,
     reasoningTokens: usage.reasoning.tokens,
-  });
+  };
+
+  if (options?.aggregatedUsage === true && hasTieredPricing(pricedStats)) {
+    // Aggregated `byModel` totals collapse many requests into one bucket. Tiered pricing is
+    // non-linear, so choosing a single tier from the sum can inflate costs once multiple
+    // sub-threshold requests add up past the long-context boundary. Preserve the stored costs.
+    // Only flag them as approximate when they could not have come from the current rates
+    // (e.g. a model mapping changed): flagging every tiered aggregate made sessions that used
+    // Haiku 5.5 (the only tiered Claude model) show "unknown pricing" after each reload.
+    return storedCostsMatchTieredRates(usage, pricedStats, tokens)
+      ? { ...usage }
+      : { ...usage, hasUnknownCosts: true };
+  }
+
+  const costs = calculateUsageCosts(pricedStats, tokens);
 
   return {
     input: {
