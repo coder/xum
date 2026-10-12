@@ -795,8 +795,8 @@ describe("step boundaries in built provider requests", () => {
     expect(shape(await build(history(twoSequentialCalls)))).toEqual(folded);
   });
 
-  it("ignores step indices that are unsorted, negative, fractional or not numbers", async () => {
-    for (const corrupted of [[0, 3, 2], [0, -1, 2], [0, 1.5], [0, "2"], "0,2", { 0: 2 }]) {
+  it("ignores step indices that are unsorted, negative, fractional, not numbers or miss 0", async () => {
+    for (const corrupted of [[0, 3, 2], [0, -1, 2], [0, 1.5], [0, "2"], "0,2", { 0: 2 }, [2], []]) {
       expect(shape(await build(history(twoSequentialCalls, corrupted)))).toEqual(folded);
     }
   });
