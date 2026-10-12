@@ -350,10 +350,10 @@ export function recomputeUsageCosts(
       options.pricedAsItself === true &&
       storedCostsMatchTieredRates(usage, pricedStats, tokens)
     ) {
-      // Clear a flag an earlier reprice set (e.g. under a since-removed mapping), as an
-      // exact reprice below does.
-      const { hasUnknownCosts: _staleFlag, ...current } = usage;
-      return current;
+      // Keep an existing flag: it can mark a genuinely partial sum (an unpriced request merged
+      // by sumUsageHistory) whose known part still fits the band. A flag from an earlier
+      // in-memory reprice is never persisted, so it heals on the next session load.
+      return { ...usage };
     }
     return { ...usage, hasUnknownCosts: true };
   }

@@ -419,13 +419,9 @@ describe("createDisplayUsage", () => {
       expect(result.hasUnknownCosts).toBeUndefined();
       expect(result).toEqual(aggregate);
 
-      // A flag left by an earlier reprice (e.g. under a since-removed mapping) clears.
-      const reflagged = recomputeUsageCosts(
-        { ...aggregate, hasUnknownCosts: true },
-        model,
-        options
-      );
-      expect(reflagged.hasUnknownCosts).toBeUndefined();
+      // A sum that already knows it is partial stays flagged even when its known part fits.
+      const partial = recomputeUsageCosts({ ...aggregate, hasUnknownCosts: true }, model, options);
+      expect(partial.hasUnknownCosts).toBe(true);
     });
 
     test("flags a Haiku 5.5 aggregate whose costs do not fit the effective rates", () => {
