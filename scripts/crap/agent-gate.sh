@@ -37,8 +37,10 @@ if [[ -z "$script" && -r "${XUM_TOOL_INPUT_PATH:-}" ]]; then
 fi
 # A `git ... commit` or `git ... push` at a command position (string start, a
 # newline, or after ; & | ( { ), so a quoted "git commit" in an echo does not
-# match.
-git_write="(^|[;&|({"$'\n'"])[[:space:]]*git[[:space:]]([^;&|]*[[:space:]])?(commit|push)([[:space:];&|)]|\$)"
+# match. Variable assignments and env/command/time/sudo may come first
+# (GIT_EDITOR=true git commit).
+cmd_prefix="([A-Za-z_][A-Za-z0-9_]*=[^[:space:];&|]*[[:space:]]+|(env|command|time|sudo)[[:space:]]+)*"
+git_write="(^|[;&|({"$'\n'"])[[:space:]]*${cmd_prefix}git[[:space:]]([^;&|]*[[:space:]])?(commit|push)([[:space:];&|)]|\$)"
 [[ "$script" =~ $git_write ]] || exit 0
 
 warn_skip() {

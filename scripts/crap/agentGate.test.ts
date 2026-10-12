@@ -92,6 +92,7 @@ test("block mode stops a regressing commit before it runs, unless it carries Cra
   expect(runGate(gate, "pre", "git commit -am 'grow' -m 'Crap-Debt: needs follow-up'").status).toBe(
     0
   );
+  expect(runGate(gate, "pre", "GIT_EDITOR=true env git commit -am x").status).toBe(1);
   // A message that mentions cd does not hide the commit from the gate.
   expect(runGate(gate, "pre", "git commit -am 'document cd usage'").status).toBe(1);
 
