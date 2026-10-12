@@ -36,7 +36,7 @@ import * as path from "node:path";
 import type { Readable } from "node:stream";
 import { receiveExport } from "./exportStream";
 import { PROXY_DIR } from "./inContainer";
-import { startProxy } from "./proxy";
+import { startProxy, UNREACHABLE } from "./proxy";
 import { Ledger, priced } from "./proxyPolicy";
 // prettier-ignore
 import { checkMountSource, containerEnv, exactStepRefusal, exploreRefusal, jobEnv, outputDir, plainFolders, stage } from "./inputs";
@@ -108,14 +108,15 @@ export interface ModelJob {
  * Reads a model-driven job from the host env, before any docker command. Refusal texts never
  * hold the key or the base URL.
  */
-export function modelJob(env: NodeJS.ProcessEnv): ModelJob {
+export function modelJob(env: NodeJS.ProcessEnv, modelVar = "BUGBASH_MODEL"): ModelJob {
   const spec = env.BUGBASH_MODEL ?? MCP_APPS_MODEL;
   const [provider, model] = spec.split(/:(.*)/s, 2);
+  // `modelVar` names the variable the user set (run.ts: a BUGBASH_MODELS entry).
+  const named = `${modelVar} ${JSON.stringify(spec)}`;
   if (provider !== "anthropic" || !model)
-    throw new Refusal(`BUGBASH_MODEL ${JSON.stringify(spec)}: only anthropic:<model> runs here`);
+    throw new Refusal(`${named}: only anthropic:<model> runs here`);
   // The proxy refuses every call of a model it cannot price, so the job could only fail.
-  if (!priced(model))
-    throw new Refusal(`BUGBASH_MODEL ${JSON.stringify(spec)}: the proxy has no price for it`);
+  if (!priced(model)) throw new Refusal(`${named}: the proxy has no price for it`);
   const budget = env.BUGBASH_BUDGET_USD ?? "";
   if (!/^\d+(\.\d+)?$/.test(budget) || !(Number(budget) > 0))
     throw new Refusal("set BUGBASH_BUDGET_USD: the most this run may spend at list price, in $");
@@ -134,6 +135,27 @@ export function modelJob(env: NodeJS.ProcessEnv): ModelJob {
 }
 
 const usd = (nanoUsd: number) => `$${(nanoUsd / 1e9).toFixed(4)}`;
+
+/** The text of an unreachable upstream. The host only: the base URL's path can hold a token. */
+export const cannotReach = (job: ModelJob) =>
+  `cannot reach ANTHROPIC_BASE_URL (${new URL(job.upstream.baseUrl).host})`;
+/**
+ * The text of a probe that the upstream answered 401 or 403: the key is rejected. No explorer
+ * can work with it, and every later call would keep its full reservation, so both callers refuse.
+ */
+export function keyRejected(job: ModelJob, status: number, records: object[]) {
+  // The upstream's own status from the call record too: a 401 with an HTML or empty body (a
+  // gateway's) makes the probe's response unreadable, and probeApp then reports 502.
+  const upstream = records.map((r) => (r as { status?: unknown }).status);
+  const rejected = [status, ...upstream].find((s) => s === 401 || s === 403);
+  return rejected == null
+    ? undefined
+    : `ANTHROPIC_API_KEY rejected by ${new URL(job.upstream.baseUrl).host} (HTTP ${rejected}): check the key`;
+}
+/** Whether the proxy released a probe call because it could not connect (proxy.ts). */
+export const probeUnreachable = (records: object[]) =>
+  records.some((r) => (r as { reason?: unknown }).reason === UNREACHABLE);
+
 /** The app AI probe's deadline: aiMode.ts's probe timeout. */
 const PROBE_MS = 10_000;
 
@@ -179,6 +201,43 @@ export async function probeApp(
     return { status, records };
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The Docker part of a preflight: the local daemon answers, it is supported, and the pinned
+ * image is present (pulled when missing). The Makefile runs it before the build, so a missing
+ * daemon refuses in about a second instead of after it. Throws a Refusal (or Stopped); leaves no
+ * folder. Returns the cleanup state: an `unknown` one (a process group still runs) outranks a
+ * refusal, as in launchJob, and the caller exits 3.
+ */
+export async function checkDocker(o: { root: string; stop: AbortSignal }): Promise<CleanupState> {
+  const session = new Session(o.stop, { root: o.root, log: logLine });
+  let failure: { error: unknown } | undefined;
+  try {
+    await session.ensureImage();
+  } catch (error) {
+    failure = { error };
+  }
+  const cleanup = await session.cleanup();
+  if (cleanup.startsWith("unknown")) {
+    if (failure) logLine(`preflight: ${String(failure.error)}`);
+    return cleanup;
+  }
+  // A stop during the check or its cleanup wins over a refusal or success: no build after it.
+  if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
+  if (failure) throw failure.error;
+  return cleanup;
+}
+
+/** Removes the per-checkout folder and its parent once empty: other jobs may still use them. */
+function removeEmptyParents(jobDir: string) {
+  for (const dir of [path.dirname(jobDir), path.dirname(path.dirname(jobDir))]) {
+    try {
+      fs.rmdirSync(dir);
+    } catch {
+      return; // not empty (another job), or already gone
+    }
   }
 }
 
@@ -365,9 +424,8 @@ function selfCheckRefusal(args: string[]): string | null {
   return null;
 }
 
-/** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
-export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
-  const log = o.log ?? logLine;
+/** The checks of a job that need no docker command. Throws a Refusal. */
+function checkJob(args: string[], o: LaunchOptions) {
   const dir = path.join(o.root, "tests/bugbash");
   const mcpApps = exactStepRefusal(args, o.cwd, dir, MCP_APPS_CONFIG) == null;
   const selfCheck = args[0] === "self-check";
@@ -387,6 +445,19 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   // First, before any docker command and before the container env exists.
   const ai = appAi(o.env, args[0] === "explore");
   const driven = mcpApps || selfCheck || args[0] === "explore" ? modelJob(o.env) : undefined;
+  return { dir, mcpApps, selfCheck, ai, driven };
+}
+
+/** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
+export async function preflight(args: string[], o: LaunchOptions): Promise<CleanupState> {
+  checkJob(args, o);
+  return checkDocker(o);
+}
+
+/** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
+export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
+  const log = o.log ?? logLine;
+  const { dir, mcpApps, selfCheck, ai, driven } = checkJob(args, o);
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -410,6 +481,8 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   // A call record that could not be written (a full disk): the proxy record is incomplete, so
   // the job must not look successful. The errno code only: the message can hold the path.
   let recordFault: string | undefined;
+  /** The MCP Apps probe's proxy fault: its own proxy, closed before the job's starts. */
+  let probeFault: string | undefined;
   // The first proxy fault stops this job at once (its proxy closes with the lifeline), so no
   // more paid calls go out on a wrong cost model or without a record.
   let faulted = false;
@@ -449,8 +522,16 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
           : `leftover: ${entry.job.name} owner ${ownerState(entry.job.owner)} (make bug-bash-sandbox-recover)`
       );
     const image = await session.ensureImage();
-    fs.mkdirSync(path.dirname(jobDir), { recursive: true, mode: 0o700 });
-    fs.mkdirSync(jobDir, { mode: 0o700 }); // EEXIST: not this job's folder, so cleanup keeps it
+    // Another job's cleanup can remove the empty per-checkout folder between the two mkdirs.
+    for (let attempt = 1; ; attempt++) {
+      fs.mkdirSync(path.dirname(jobDir), { recursive: true, mode: 0o700 });
+      try {
+        fs.mkdirSync(jobDir, { mode: 0o700 }); // EEXIST: not this job's folder, so cleanup keeps it
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT" || attempt === 3) throw error;
+      }
+    }
     made = true;
     const staged = path.join(jobDir, "stage");
     log(`${name} staged ${stage(o.root, staged)} files`);
@@ -472,6 +553,28 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     };
     const env = containerEnv(o.env, { ...jobEnv(output), ...host, ...modeEnv(ai), ...drivenEnv });
     plainFolders(dir, path.dirname(output), true);
+    // The MCP Apps suite fails every test without its explorer model, so one probe call of that
+    // model, through the job's ledger, refuses a dead upstream or key before the container starts.
+    // run.ts probes before its explore jobs; the self-check has a fake upstream.
+    if (mcpApps && driven) {
+      ledger = o.ledger ?? new Ledger(driven.budgetUsd);
+      // A bound miss in the probe is a proxy fault like any other: exit 5, and run-wide halt.
+      const probe = await probeApp(driven, driven.model, ledger, o.stop).catch((error: Error) => {
+        probeFault = error.message;
+        fault(probeFault);
+        throw error;
+      });
+      for (const entry of probe.records) record(entry);
+      if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
+      if (probe.status !== 200)
+        throw new Refusal(
+          probeUnreachable(probe.records)
+            ? `${cannotReach(driven)}: check the URL and the network`
+            : (keyRejected(driven, probe.status, probe.records) ??
+                `the ${driven.model} probe failed (HTTP ${probe.status}): check ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL and BUGBASH_BUDGET_USD`)
+        );
+      log(`${name} probe: ${driven.model} answered`);
+    }
     const proxyMount: string[] = [];
     if (driven) {
       // The socket's folder, read-only: connect() needs no write access to the mount (measured
@@ -479,7 +582,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       const proxyDir = path.join(jobDir, "proxy");
       fs.mkdirSync(proxyDir, { mode: 0o700 });
       fs.mkdirSync(path.join(staged, path.relative("/repo", PROXY_DIR))); // its mount point
-      ledger = o.ledger ?? new Ledger(driven.budgetUsd);
+      ledger ??= o.ledger ?? new Ledger(driven.budgetUsd);
       proxy = await startProxy({
         socketPath: path.join(proxyDir, "sock"),
         // The job folder: not mounted (only stage/ and proxy/ are), and one place to clean up.
@@ -549,7 +652,9 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   }
   const missed = await closeProxy();
   if (proxy && ledger) {
-    const { settled, kept, refused, refusedBy } = proxy.stats();
+    const { settled, kept, refused, released, refusedBy } = proxy.stats();
+    if (released > 0)
+      log(`${name} proxy: ${cannotReach(driven!)}: ${released} call(s) released at $0`);
     // A shared ledger's totals are the run's: run.ts reports them once.
     const { spentNanoUsd, capNanoUsd } = ledger.totals();
     const spent = o.ledger ? "" : `, ${usd(spentNanoUsd)} of ${usd(capNanoUsd)} at list price`;
@@ -560,6 +665,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   }
   const cleanup = await session.cleanup();
   if (made) fs.rmSync(jobDir, { recursive: true, force: true });
+  removeEmptyParents(jobDir);
   log(`${name} cleanup: ${cleanup}`);
   if (missed != null) log(`${name} ${missed}`);
   return {
@@ -567,7 +673,10 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     cleanup,
     // Read after cleanup: a stop seen before cleanup ended counts.
     ...(o.stop.aborted && { stopped: String(o.stop.reason) }),
-    ...(missed != null && { proxyFault: missed }),
+    // recordFault too: a probe record that was not written, before the job's proxy existed.
+    ...((missed ?? probeFault ?? recordFault) != null && {
+      proxyFault: missed ?? probeFault ?? recordFault,
+    }),
   };
 }
 
@@ -580,7 +689,19 @@ if (import.meta.main) {
   const args = given[0] === "--" ? given.slice(1) : given;
   const options = { root: ROOT, cwd: process.cwd(), env: process.env, stop: controller.signal };
   const recovering = args.length === 1 && args[0] === "--recover";
-  (recovering ? recover(options) : launch(args, options)).then(
+  // `--preflight -- <job args>`: the job's checks and the Docker check, then exit 0.
+  const checking = args[0] === "--preflight";
+  const job = checking ? args.slice(args[1] === "--" ? 2 : 1) : args;
+  const run = recovering
+    ? recover(options)
+    : checking
+      ? preflight(job, options).then((state) => {
+          if (!state.startsWith("unknown")) return 0;
+          logLine(`preflight cleanup: ${state}`);
+          return 3;
+        })
+      : launch(args, options);
+  run.then(
     (code) => process.exit(code),
     (error: unknown) => {
       if (error instanceof Stopped) {

@@ -147,6 +147,7 @@ test("control: exact-step repros still load and list", async () => {
 test("run.ts (make bug-bash) without a budget refuses before any app, e2e or model starts", async () => {
   const r = await run([process.execPath, "run.ts", "--only", "composer"], {
     E2E_NODE: path.join(bin, "e2e-node"),
+    BUGBASH_MODEL: "", // run.ts refuses a set BUGBASH_MODEL (it reads BUGBASH_MODELS)
   });
   expect({ status: r.status, started: r.started, modelRequests }).toEqual({
     status: 2,

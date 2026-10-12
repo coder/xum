@@ -3,16 +3,17 @@ import * as childProcess from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type RunDeps, runBugBash } from "./run";
+import { estimateRun, type RunDeps, runBugBash } from "./run";
 import type { JobOutcome, LaunchOptions } from "./sandbox/launch";
 import type { Ledger } from "./sandbox/proxyPolicy";
-import { Refusal } from "./sandbox/runner";
+import { Refusal, Stopped } from "./sandbox/runner";
 
 // run.ts with a fake launcher: no container, no proxy, no model. The launcher's own tests
 // (sandbox/runner.test.ts) cover the job itself.
 const ENV = {
   BUGBASH_MODELS: "anthropic:claude-sonnet-5-5",
-  BUGBASH_BUDGET_USD: "2",
+  // Above the recommended budget of every run here (estimateRun): up to 4 charters at once.
+  BUGBASH_BUDGET_USD: "10",
   ANTHROPIC_API_KEY: "sk-run-test",
   ANTHROPIC_BASE_URL: "http://127.0.0.1:9/v1",
 };
@@ -41,12 +42,15 @@ function fakeLaunch(
   const calls: Call[] = [];
   const lines: string[] = [];
   const probes: Ledger[] = [];
+  const probeModels: string[] = [];
   const deps: RunDeps = {
     // The app AI probe: 502 (the upstream failed) unless a test says otherwise.
-    probeApp: (_job, _model, ledger) => {
+    probeApp: (_job, model, ledger) => {
       probes.push(ledger);
+      probeModels.push(model);
       return Promise.resolve({ status: probeStatus, records: [{ outcome: "settled" }] });
     },
+    checkDocker: () => Promise.resolve("none"),
     launchJob: async (args, o) => {
       const call = { args, o };
       calls.push(call);
@@ -63,7 +67,7 @@ function fakeLaunch(
     },
     err: (line) => lines.push(line),
   };
-  return { deps, calls, lines, probes };
+  return { deps, calls, lines, probes, probeModels };
 }
 const until = (signal: AbortSignal): Promise<JobOutcome> =>
   new Promise((resolve) => {
@@ -90,7 +94,7 @@ test("B2: every charter runs through the launcher with one shared ledger, none o
     expect(spawn).not.toHaveBeenCalled();
     const findings = lines.find((line) => line.startsWith("Findings: "))!.slice(10);
     expect(fs.readFileSync(findings, "utf8")).toMatch(
-      /Cost: 0 proxied calls, 0 refused by the budget, \$0\.0000 of \$2\.0000 at list price/
+      /Cost: 0 proxied calls, 0 refused by the budget, \$0\.0000 of \$10\.0000 at list price/
     );
   } finally {
     spawn.mockRestore();
@@ -186,7 +190,16 @@ test.each([
   ["an unpriced app model", { BUGBASH_APP_MODEL: "anthropic:claude-x-9" }, /only a priced/],
   ["no budget", { BUGBASH_BUDGET_USD: "" }, /BUGBASH_BUDGET_USD/],
   ["no key", { ANTHROPIC_API_KEY: "" }, /ANTHROPIC_API_KEY/],
-  ["an OpenAI model", { BUGBASH_MODELS: "openai:gpt-6.1-sol" }, /only anthropic/],
+  [
+    "an OpenAI model",
+    { BUGBASH_MODELS: "openai:gpt-6.1-sol" },
+    /BUGBASH_MODELS entry "openai:gpt-6.1-sol": only anthropic/,
+  ],
+  [
+    "BUGBASH_MODEL, which run.ts would ignore",
+    { BUGBASH_MODEL: "anthropic:x" },
+    /use BUGBASH_MODELS/,
+  ],
 ])("B2: %s refuses (exit 2) before any job or folder", async (_name, over, message) => {
   const { deps, calls, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
   const stop = new AbortController().signal;
@@ -224,14 +237,20 @@ test.each([
   ["auto, upstream unavailable: the mock", {}, 502, 0],
   ["real, upstream unavailable: refused", { BUGBASH_AI: "real" }, 502, 2],
   ["auto, a rejected key: refused", {}, 401, 2],
-  ["mock: no probe", { BUGBASH_AI: "mock" }, 200, 0],
+  ["mock: the explorer model is probed, not the app model", { BUGBASH_AI: "mock" }, 200, 0],
 ])("B3: %s", async (_name, over, status, code) => {
-  const { deps, calls, probes } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }), status);
+  const { deps, calls, probes, probeModels } = fakeLaunch(
+    () => ({ code: 0, cleanup: "removed" }),
+    status
+  );
   const stop = new AbortController().signal;
   expect(await runBugBash([...charters("a")], { ...ENV, ...over }, stop, deps)).toBe(code);
   if (code === 0) expect(calls[0].o.env.BUGBASH_AI).toBe("mock");
   else expect(calls).toHaveLength(0);
-  expect(probes).toHaveLength("BUGBASH_AI" in over && over.BUGBASH_AI === "mock" ? 0 : 1);
+  // U2: one probe in every mode; a mock run probes the explorer's upstream instead.
+  expect(probes).toHaveLength(1);
+  const mock = "BUGBASH_AI" in over && over.BUGBASH_AI === "mock";
+  expect(probeModels).toEqual([mock ? "claude-sonnet-5-5" : "claude-haiku-4-5"]);
 });
 
 test("B3: a stop during the app AI probe ends the run before any job", async () => {
@@ -252,4 +271,242 @@ test("B3: a proxy fault in the probe stops the run before any job (exit 5)", asy
   const stop = new AbortController().signal;
   expect(await runBugBash([...charters("a")], ENV, stop, deps)).toBe(5);
   expect(calls).toHaveLength(0);
+});
+
+test("U1: a refusal the launcher returns (after docker started) names its reason", async () => {
+  // A returned refusal, as when `docker info` fails: once in the log, once on stderr.
+  const { deps, lines } = fakeLaunch((call) =>
+    call.args.includes("look at a")
+      ? { error: new Refusal("docker info: no daemon answered"), cleanup: "none" }
+      : { code: 0, cleanup: "removed" }
+  );
+  const stop = new AbortController().signal;
+  expect(await runBugBash([...charters("a", "b")], ENV, stop, deps)).toBe(2);
+  expect(lines).toContain(
+    "  a [anthropic:claude-sonnet-5-5]: refused: docker info: no daemon answered"
+  );
+  const runDir = lines.find((line) => line.includes(" -> "))!.split(" -> ")[1];
+  const log = path.join(runDir, "anthropic_claude-sonnet-5-5", "a.log");
+  expect(fs.readFileSync(log, "utf8")).toContain(
+    "sandbox refused: docker info: no daemon answered"
+  );
+});
+
+test("U1: a run whose every charter refuses, with no call made, keeps no run folder", async () => {
+  const { deps, lines } = fakeLaunch(() => ({
+    error: new Refusal("stale image"),
+    cleanup: "none",
+  }));
+  const stop = new AbortController().signal;
+  const env = { ...ENV, BUGBASH_AI: "mock" }; // no probe, so no proxied call
+  expect(await runBugBash([...charters("a", "b")], env, stop, deps)).toBe(2);
+  const runDir = lines.find((line) => line.includes(" -> "))!.split(" -> ")[1];
+  expect(fs.existsSync(runDir)).toBe(false);
+  expect(lines.filter((line) => line.endsWith("refused: stale image"))).toHaveLength(2);
+});
+
+test("U1: Docker is checked once, before the probe and any folder; --preflight stops there", async () => {
+  const dead = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  let checks = 0;
+  dead.deps.checkDocker = () => {
+    checks += 1;
+    return Promise.reject(new Refusal("docker info: no daemon answered"));
+  };
+  const stop = new AbortController().signal;
+  expect(await runBugBash([...charters("a", "b")], ENV, stop, dead.deps)).toBe(2);
+  expect(checks).toBe(1);
+  expect(dead.probes).toHaveLength(0);
+  expect(dead.calls).toHaveLength(0);
+  // The cost estimate prints first (U4); the only refusal is Docker's.
+  expect(dead.lines.filter((line) => line.startsWith("make bug-bash:"))).toEqual([
+    "make bug-bash: docker info: no daemon answered",
+  ]);
+
+  const live = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  let liveChecks = 0;
+  live.deps.checkDocker = () => {
+    liveChecks += 1;
+    return Promise.resolve("none");
+  };
+  expect(await runBugBash([...charters("a"), "--preflight"], ENV, stop, live.deps)).toBe(0);
+  expect(liveChecks).toBe(1);
+  expect(live.probes).toHaveLength(0);
+  expect(live.calls).toHaveLength(0);
+  expect(live.lines.some((line) => line.includes(" -> "))).toBe(false);
+});
+
+test("U1: a probe the budget refused (HTTP 402) blames the budget, not the key", async () => {
+  const { deps, calls, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }), 402);
+  deps.probeApp = () =>
+    Promise.resolve({
+      status: 402,
+      records: [{ outcome: "refused", reason: "budget: call does not fit the remaining budget" }],
+    });
+  const stop = new AbortController().signal;
+  expect(await runBugBash([...charters("a")], ENV, stop, deps)).toBe(2);
+  expect(calls).toHaveLength(0);
+  expect(lines.join("\n")).toMatch(/BUGBASH_BUDGET_USD \(\$10\) is too small to cover/);
+  expect(lines.join("\n")).not.toMatch(/Fix the key/);
+});
+
+test("U1: a stop during the Docker check exits with the signal; an unknown cleanup exits 3", async () => {
+  const stop = new AbortController();
+  const stopped = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  stopped.deps.checkDocker = () => {
+    stop.abort("SIGTERM");
+    return Promise.reject(new Stopped("SIGTERM"));
+  };
+  expect(await runBugBash([...charters("a")], ENV, stop.signal, stopped.deps)).toBe(143);
+  expect(stopped.calls).toHaveLength(0);
+
+  const unknown = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  unknown.deps.checkDocker = () => Promise.resolve("unknown: process groups 7 still run");
+  const live = new AbortController().signal;
+  expect(await runBugBash([...charters("a")], ENV, live, unknown.deps)).toBe(3);
+  expect(unknown.calls).toHaveLength(0);
+  expect(unknown.lines.join("\n")).toContain("process groups 7 still run");
+});
+
+test("U1: a launcher error or an unknown cleanup keeps the run folder and its logs", async () => {
+  const env = { ...ENV, BUGBASH_AI: "mock" };
+  const stop = new AbortController().signal;
+  for (const outcome of [
+    { error: new Error("launcher bug"), cleanup: "none" },
+    { error: new Refusal("x"), cleanup: "unknown: process groups 1 still run" },
+  ] as const) {
+    const { deps, lines } = fakeLaunch(() => outcome);
+    expect(await runBugBash([...charters("a")], env, stop, deps)).toBeGreaterThanOrEqual(3);
+    const runDir = lines.find((line) => line.includes(" -> "))!.split(" -> ")[1];
+    expect(fs.existsSync(path.join(runDir, "findings.md"))).toBe(true);
+  }
+});
+
+test.each([
+  ["auto", {}],
+  ["real", { BUGBASH_AI: "real" }],
+  ["mock", { BUGBASH_AI: "mock" }],
+])(
+  "U2: %s, an upstream the probe cannot reach refuses (exit 2) before any job or folder",
+  async (_mode, over) => {
+    const { deps, calls, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+    deps.probeApp = () =>
+      Promise.resolve({
+        status: 502,
+        records: [{ outcome: "released", status: 502, reason: "upstream: unreachable" }],
+      });
+    const stop = new AbortController().signal;
+    expect(await runBugBash([...charters("a")], { ...ENV, ...over }, stop, deps)).toBe(2);
+    expect(calls).toHaveLength(0);
+    // One refusal (after U4's estimate line). It names the variable and the host to check,
+    // never the URL's path.
+    const refusals = lines.filter((line) => line.startsWith("make bug-bash:"));
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toContain("ANTHROPIC_BASE_URL (127.0.0.1:9)");
+    expect(refusals[0]).not.toContain("/v1");
+  }
+);
+
+const SONNET = "anthropic:claude-sonnet-5-5";
+const OPUS = "anthropic:claude-opus-5-5";
+const run6 = { models: [SONNET], charters: 6, parallel: 8, maxSteps: 6, effort: "medium" };
+
+test("U4: the estimate scales the measured cost, and its headroom covers the calls in flight", () => {
+  const base = estimateRun(run6);
+  // Sonnet's measured $0.45 per charter; 6 calls in flight at Sonnet's worst bound.
+  expect(base.estimateUsd).toBeCloseTo(6 * 0.45);
+  expect(base.inFlight).toBe(6);
+  expect(base.recommendedUsd).toBe(Math.ceil(base.estimateUsd + base.headroomUsd));
+  expect(base.perModel[0].measured).toBe(true);
+  // Twice the steps cost twice as much; fewer at once need less headroom, not less estimate.
+  expect(estimateRun({ ...run6, maxSteps: 12 }).estimateUsd).toBeCloseTo(2 * base.estimateUsd);
+  const two = estimateRun({ ...run6, parallel: 2 });
+  expect(two.estimateUsd).toBeCloseTo(base.estimateUsd);
+  expect(two.headroomUsd).toBeCloseTo((base.headroomUsd * 2) / 6);
+  // An unmeasured model is a guess above its list-price share; its bound sets the headroom.
+  const both = estimateRun({ ...run6, models: [SONNET, OPUS] });
+  expect(both.perModel[1].measured).toBe(false);
+  expect(both.perModel[1].perJob).toBeGreaterThan(2 * base.perModel[0].perJob); // Opus is 2x list
+  expect(both.headroomUsd).toBeGreaterThan(base.headroomUsd * (8 / 6));
+  // A higher effort is an unmeasured guess that costs more; it reserves no more per call.
+  const high = estimateRun({ ...run6, effort: "high" });
+  expect(high.estimateUsd).toBeGreaterThan(base.estimateUsd);
+  expect(high.perModel[0].measured).toBe(false);
+  expect(high.headroomUsd).toBeCloseTo(base.headroomUsd);
+  // Low effort is not measured either, and it is not priced below medium.
+  const low = estimateRun({ ...run6, effort: "low" });
+  expect(low.perModel[0].measured).toBe(false);
+  expect(low.estimateUsd).toBeCloseTo(base.estimateUsd);
+  // A real app AI with a costlier model adds its share and its larger bound; Haiku adds nothing.
+  const opusApp = estimateRun({ ...run6, appModel: OPUS });
+  expect(opusApp.estimateUsd).toBeGreaterThan(base.estimateUsd);
+  expect(opusApp.headroomUsd).toBeGreaterThan(base.headroomUsd);
+  const haiku = estimateRun({ ...run6, appModel: "anthropic:claude-haiku-4-5" });
+  expect(haiku.recommendedUsd).toBe(base.recommendedUsd);
+});
+
+test("U4: the default runs Sonnet alone, and a budget below the estimate refuses before the probe", async () => {
+  const stop = new AbortController().signal;
+  const { BUGBASH_MODELS: _models, ...defaults } = ENV;
+  const six = charters("a", "b", "c", "d", "e", "f");
+  const need = estimateRun(run6).recommendedUsd;
+  const low = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  const below = { ...defaults, BUGBASH_BUDGET_USD: String(need - 1) };
+  expect(await runBugBash(six, below, stop, low.deps)).toBe(2);
+  expect(low.calls).toHaveLength(0);
+  expect(low.probes).toHaveLength(0);
+  // The refusal names the variable and the number to set.
+  const refusal = low.lines.find((line) => line.includes("BUGBASH_BUDGET_USD"))!;
+  expect(refusal).toContain(`$${need}`);
+
+  const enough = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  const at = { ...defaults, BUGBASH_BUDGET_USD: String(need) };
+  expect(await runBugBash(six, at, stop, enough.deps)).toBe(0);
+  expect(new Set(enough.calls.map((c) => c.o.env.BUGBASH_MODEL))).toEqual(new Set([SONNET]));
+  expect(enough.calls).toHaveLength(6);
+});
+
+test("U4: the run passes its effort and a possibly real app model to the estimate", async () => {
+  const stop = new AbortController().signal;
+  // A budget that fits medium effort with the Haiku app, but not high effort or an Opus app.
+  const fits = estimateRun({ ...run6, charters: 1 }).recommendedUsd;
+  const env = { ...ENV, BUGBASH_BUDGET_USD: String(fits) };
+  for (const [over, code] of [
+    [{}, 0],
+    [{ BUGBASH_EFFORT: "max" }, 2],
+    [{ BUGBASH_APP_MODEL: OPUS }, 2],
+    [{ BUGBASH_APP_MODEL: OPUS, BUGBASH_AI: "mock" }, 0], // a mock app makes no calls
+  ] as const) {
+    const { deps } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+    expect(await runBugBash([...charters("a")], { ...env, ...over }, stop, deps)).toBe(code);
+  }
+});
+
+test.each([
+  ["mock", 401],
+  ["auto", 401],
+  ["real", 403],
+])(
+  "U5: %s, a key the probe saw rejected (HTTP %d) refuses (exit 2) before any job",
+  async (mode, status) => {
+    const { deps, calls, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }), status);
+    const stop = new AbortController().signal;
+    expect(await runBugBash([...charters("a")], { ...ENV, BUGBASH_AI: mode }, stop, deps)).toBe(2);
+    expect(calls).toHaveLength(0);
+    // It names the key variable, the host and the status, never the URL's path or the key.
+    const refusal = lines.find((line) => line.startsWith("make bug-bash:"))!;
+    expect(refusal).toContain("ANTHROPIC_API_KEY");
+    expect(refusal).toContain(`127.0.0.1:9 (HTTP ${status})`);
+    expect(refusal).not.toMatch(/\/v1|sk-run-test/);
+  }
+);
+
+test("U5: a rejection seen only in the probe's record (an unreadable 401 body) refuses too", async () => {
+  const { deps, calls, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));
+  // probeApp reports 502 when the body is unreadable; the record keeps the upstream's 401.
+  deps.probeApp = () =>
+    Promise.resolve({ status: 502, records: [{ outcome: "kept", status: 401 }] });
+  const stop = new AbortController().signal;
+  expect(await runBugBash([...charters("a")], { ...ENV, BUGBASH_AI: "auto" }, stop, deps)).toBe(2);
+  expect(calls).toHaveLength(0);
+  expect(lines.find((line) => line.startsWith("make bug-bash:"))).toContain("(HTTP 401)");
 });
