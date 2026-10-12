@@ -40,6 +40,7 @@ import {
   isAsyncAskUserQuestionOutput,
 } from "@/common/utils/tools/askUserQuestionSummary";
 import type { DisplayedUserMessage } from "@/common/types/message";
+import { createSendId } from "@/common/utils/drafts";
 import { getErrorMessage } from "@/common/utils/errors";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 
@@ -239,10 +240,15 @@ export function AskUserQuestionToolCall(props: {
   const [activeIndex, setActiveIndex] = useState(() => cachedState?.activeIndex ?? 0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  // Non-blocking questions: the answer message was accepted, but may still be queued behind the
-  // running step. Only a note: the form stays until the answer row is durable, so a queued
-  // answer the user withdraws (Stop, queue clear) can simply be submitted again.
-  const [answersQueued, setAnswersQueued] = useState(false);
+  // Non-blocking questions: answers whose message the backend accepted. Like Codex, the question
+  // is then done from this card's view; the message is ordinary input, so a queued one the user
+  // withdraws (Stop) comes back to the composer like any queued message. This also covers a
+  // message batched into an earlier queued one, whose metadata the queue does not keep.
+  const [sentAnswers, setSentAnswers] = useState<Record<string, string> | null>(null);
+  // The idempotency id of the last unconfirmed answer send. A retry of the same message reuses
+  // it, so a lost success response cannot produce a second answer row (the backend never
+  // appends a second row for an id a row already carries).
+  const pendingAnswerSendRef = useRef<{ message: string; sendId: string } | null>(null);
 
   const workspaceStore = useWorkspaceStoreRaw();
   const workspaceState = useSyncExternalStore(
@@ -269,13 +275,19 @@ export function AskUserQuestionToolCall(props: {
   );
 
   // Codex-style questions (non-plan agents) returned without waiting: the tool is complete, but
-  // the questions stay answerable until an answer message for this tool call is in history.
+  // the questions stay answerable until they are answered from this card or an answer message
+  // for this tool call is in history. The latest such message is the user's final word.
   const isAsyncQuestion = isAsyncAskUserQuestionOutput(props.result);
   const deliveredAnswers = isAsyncQuestion
-    ? (workspaceState?.messages.find(
-        (message): message is DisplayedUserMessage =>
-          message.type === "user" && message.askUserQuestionAnswer?.toolCallId === props.toolCallId
-      )?.askUserQuestionAnswer?.answers ?? null)
+    ? (sentAnswers ??
+      [...(workspaceState?.messages ?? [])]
+        .reverse()
+        .find(
+          (message): message is DisplayedUserMessage =>
+            message.type === "user" &&
+            message.askUserQuestionAnswer?.toolCallId === props.toolCallId
+        )?.askUserQuestionAnswer?.answers ??
+      null)
     : null;
   const isAnswering = props.status === "executing" || (isAsyncQuestion && deliveredAnswers == null);
 
@@ -524,6 +536,9 @@ export function AskUserQuestionToolCall(props: {
           };
         })
       );
+      const pendingSend = pendingAnswerSendRef.current;
+      const sendId = pendingSend?.message === message ? pendingSend.sendId : createSendId();
+      pendingAnswerSendRef.current = { message, sendId };
       // Same barrier as the composer: the backend reads send preferences from config.json.
       flushUserPreferences()
         .then(() =>
@@ -532,6 +547,7 @@ export function AskUserQuestionToolCall(props: {
             message,
             options: {
               ...getSendOptionsFromStorage(workspaceId),
+              sendId,
               muxMetadata: {
                 type: "normal",
                 askUserQuestionAnswer: { toolCallId: props.toolCallId, answers },
@@ -549,7 +565,8 @@ export function AskUserQuestionToolCall(props: {
             );
             return;
           }
-          setAnswersQueued(true);
+          pendingAnswerSendRef.current = null;
+          setSentAnswers(answers);
         })
         .catch((error) => {
           setSubmitError(getErrorMessage(error));
@@ -978,11 +995,9 @@ export function AskUserQuestionToolCall(props: {
             {isAnswering && (
               <div className="flex items-center justify-between gap-3 border-t border-white/5 pt-2">
                 <div className="text-muted min-w-0 flex-1 text-[10px] italic">
-                  {!isAsyncQuestion
-                    ? "Tip: type a message in chat to cancel these questions."
-                    : answersQueued
-                      ? "Answers sent; they reach the agent after its current step."
-                      : "Your answers are sent to the agent as a message."}
+                  {isAsyncQuestion
+                    ? "Your answers are sent to the agent as a message."
+                    : "Tip: type a message in chat to cancel these questions."}
                 </div>
                 {isOnSummary ? (
                   <Button

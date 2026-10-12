@@ -336,19 +336,17 @@ describe("AskUserQuestionToolCall", () => {
       );
     }
 
-    test("sends the answers as a chat message and stays answerable until it lands", async () => {
+    test("sends the answers as a chat message and shows them once accepted", async () => {
       const view = renderAsyncQuestion();
 
       fireEvent.click(view.getByText("First"));
       fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
 
-      await waitFor(() => {
-        expect(sendMessage).toHaveBeenCalledTimes(1);
-        expect(view.getByRole("button", { name: "Submit answers" })).toHaveProperty(
-          "disabled",
-          false
-        );
-      });
+      // No answer row is in the transcript yet (it may be queued, or batched into another
+      // queued message without its metadata): the accepted send alone answers the card.
+      await waitFor(() => expect(view.getByText("User answered")).toBeTruthy());
+      expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
+      expect(sendMessage).toHaveBeenCalledTimes(1);
       const [input] = sendMessage.mock.calls[0] as [
         { workspaceId: string; options: { muxMetadata?: unknown } },
       ];
@@ -357,13 +355,30 @@ describe("AskUserQuestionToolCall", () => {
         type: "normal",
         askUserQuestionAnswer: { toolCallId: "ask-async", answers: { "Which option?": "First" } },
       });
-      // Accepted is not durable: a queued answer can be withdrawn, so the form stays until the
-      // answer row is in history.
-      expect(view.queryByText("User answered")).toBeNull();
       // Ordinary user input, like Codex: no blocked tool call to answer and no stream to resume.
       expect(answerAskUserQuestion).not.toHaveBeenCalled();
       expect(resumeStream).not.toHaveBeenCalled();
       expect(setAutoRetryEnabled).not.toHaveBeenCalled();
+    });
+
+    test("a retry after a lost response reuses the send id", async () => {
+      sendMessage.mockImplementationOnce(() => Promise.reject(new Error("connection lost")));
+      const view = renderAsyncQuestion();
+
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+      await waitFor(() => expect(view.getByText("connection lost")).toBeTruthy());
+
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+      await waitFor(() => expect(view.getByText("User answered")).toBeTruthy());
+
+      const sendIds = (sendMessage.mock.calls as Array<[{ options: { sendId?: string } }]>).map(
+        ([input]) => input.options.sendId
+      );
+      expect(sendIds).toHaveLength(2);
+      // The backend may have accepted the first send: the same id keeps it to one answer row.
+      expect(sendIds[0]).toBeTruthy();
+      expect(sendIds[1]).toBe(sendIds[0]);
     });
 
     test("names picked options by number, even when labels contain commas", async () => {
@@ -408,18 +423,15 @@ describe("AskUserQuestionToolCall", () => {
       expect(input.message).not.toContain("Alpha");
     });
 
-    test("shows the answers delivered in a later user message", () => {
+    test("shows the latest answers delivered in later user messages", () => {
+      const answerRow = (answer: string) => ({
+        type: "user",
+        askUserQuestionAnswer: { toolCallId: "ask-async", answers: { "Which option?": answer } },
+      });
+      // A correction sent after the first answer supersedes it.
       currentWorkspaceState = {
         ...currentWorkspaceState,
-        messages: [
-          {
-            type: "user",
-            askUserQuestionAnswer: {
-              toolCallId: "ask-async",
-              answers: { "Which option?": "Second" },
-            },
-          },
-        ],
+        messages: [answerRow("First"), answerRow("Second")],
       };
 
       const view = renderAsyncQuestion();
@@ -428,6 +440,7 @@ describe("AskUserQuestionToolCall", () => {
 
       expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
       expect(view.getByText("Second")).toBeTruthy();
+      expect(view.queryByText("First")).toBeNull();
     });
   });
 });
