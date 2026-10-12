@@ -1877,11 +1877,19 @@ export const CollapsedOverviewYieldsToTranscript: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByRole("button", { name: "Expand right sidebar" }, { timeout: 15_000 });
-    const card = canvasElement.querySelector<HTMLElement>(".right-sidebar-overview-card");
-    await expect(card).not.toBeNull();
+    // The header's button can show before the card: WorkspaceShell loads the sidebar lazily
+    // (#6081), so wait for the card to mount. It is hidden, so no role query can find it.
+    const card = await waitFor(
+      () => {
+        const element = canvasElement.querySelector<HTMLElement>(".right-sidebar-overview-card");
+        if (!element) throw new Error("Overview card not mounted yet");
+        return element;
+      },
+      { timeout: 15_000 }
+    );
     // Hidden by visibility, not display: the layout still shows the sidebar, so its shortcuts
     // keep expanding it rather than taking the narrow-layout fallbacks.
-    await expect(getComputedStyle(card!).visibility).toBe("hidden");
-    await expect(getComputedStyle(card!).display).not.toBe("none");
+    await expect(getComputedStyle(card).visibility).toBe("hidden");
+    await expect(getComputedStyle(card).display).not.toBe("none");
   },
 };
