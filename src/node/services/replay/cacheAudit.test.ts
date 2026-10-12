@@ -181,7 +181,8 @@ describe("auditStepPrefixes", () => {
     ]);
     expect(audit.comparedPairs).toBe(2);
     expect(audit.breaks).toMatchObject([
-      { stepId: "run-1-2", boundary: "step", comparison: { blockIndex: 2 } },
+      // System sentinel, system block, messages sentinel, "a", then "c".
+      { stepId: "run-1-2", boundary: "step", comparison: { blockIndex: 4 } },
     ]);
   });
 
