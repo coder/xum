@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { flushSync } from "react-dom";
 import { AppWindow, BarChart3, Bell, BellOff, Ellipsis, Info, Menu, Pencil } from "lucide-react";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -20,6 +21,7 @@ import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
 import {
   formatKeybind,
+  isBrowserViewportFocused,
   isDesktopViewportFocused,
   isDialogOpen,
   isEditableElement,
@@ -68,9 +70,6 @@ import {
   NARROW_VIEWPORT_MAX_WIDTH_PX,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
 } from "@/constants/layout";
-import { TimelineDialog } from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
-import { ArtifactsDialog } from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsDialog";
-import { StatsDialog } from "@/browser/features/RightSidebar/StatsDialog";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
 import type { TabType } from "@/browser/types/rightSidebar";
@@ -88,6 +87,13 @@ interface WorkspaceMenuBarProps {
   onToggleLeftSidebarCollapsed: () => void;
   /** Callback to open integrated terminal in sidebar (optional, falls back to popout) */
   onOpenTerminal?: (options?: TerminalSessionCreateOptions) => void;
+  /**
+   * Phones: while the narrow layout hides the right sidebar, the More menu's Sidebar row shows
+   * it full-screen. Focus returns to `returnFocusTo` when it closes.
+   */
+  onOpenSidebar?: (returnFocusTo: HTMLElement | null) => void;
+  /** The full-screen sidebar is open: its visibility changed without a resize. */
+  sidebarFullscreen?: boolean;
 }
 
 import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
@@ -95,44 +101,6 @@ import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorks
 const COLLAPSED_LEFT_SIDEBAR_MENU_BAR_STYLE = {
   paddingLeft: `${WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX}px`,
 } as const;
-
-/**
- * Open state of a dialog that stands in for a right-sidebar tab while that sidebar is hidden.
- * It closes for good when the workspace changes (e.g. the timeline's "Open child workspace"
- * action) and when the sidebar shows again (e.g. a phone rotated to landscape, #5793): there the
- * tab itself is reachable, and the dialog would only cover the workspace.
- *
- * `tabOnSidebarShown` is selected in the sidebar at that moment, so the sidebar shows the view the
- * user was reading. Only then, not when the dialog opens: the hidden sidebar stays mounted, so
- * selecting the tab earlier would render a second copy behind the dialog.
- */
-function useSidebarTabDialog(
-  workspaceId: string,
-  sidebarHidden: boolean,
-  tabOnSidebarShown?: TabType
-): [boolean, (openWorkspaceId: string | null) => void] {
-  const [openWorkspaceId, setOpenWorkspaceId] = useState<string | null>(null);
-  if (openWorkspaceId !== null && openWorkspaceId !== workspaceId) {
-    // Render-time adjustment (not an effect): clearing the state, instead of merely deriving
-    // open=false, keeps the dialog from reopening on the way back.
-    setOpenWorkspaceId(null);
-  }
-  const open = openWorkspaceId === workspaceId;
-  // An effect, not a render-time reset, because selecting the tab writes the persisted layout.
-  // Clearing the state (not deriving open=false) keeps the dialog closed when the sidebar hides
-  // again.
-  useEffect(() => {
-    if (!open || sidebarHidden) {
-      return;
-    }
-    if (tabOnSidebarShown) {
-      focusRightSidebarTab(workspaceId, tabOnSidebarShown);
-    }
-    setOpenWorkspaceId(null);
-  }, [open, sidebarHidden, tabOnSidebarShown, workspaceId]);
-  // The raw (stable) state setter, so the keyboard and event effects need no extra dependency.
-  return [open, setOpenWorkspaceId];
-}
 
 function setWorkspaceNotifyOnResponse(workspaceId: string, enabled: boolean): void {
   updateUserPreferences({
@@ -171,6 +139,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   leftSidebarCollapsed,
   onToggleLeftSidebarCollapsed,
   onOpenTerminal,
+  onOpenSidebar,
+  sidebarFullscreen = false,
 }) => {
   const { api } = useAPI();
   const { preflightArchiveWorkspace, archiveWorkspace, archivingWorkspaceIds, setWorkspacePinned } =
@@ -206,7 +176,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [debugLlmRequestOpen, setDebugLlmRequestOpen] = useState(false);
   const [mcpModalOpen, setMcpModalOpen] = useState(false);
   const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
-  // Keyed by workspace (same pattern as the timeline dialog below): consent is granted per
+  // Keyed by workspace: consent is granted per
   // recipient workspace, so switching workspaces while the dialog is open must close it
   // rather than let the switch be flipped against the workspace the user navigated to.
   const [unrelatedMessagingWorkspaceId, setUnrelatedMessagingWorkspaceId] = useState<string | null>(
@@ -292,25 +262,34 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // listener covers viewport transitions and the ResizeObserver covers the shell
   // container query (e.g. expanding the left sidebar squeezes the shell under 684px).
   const [timelineSidebarHidden, setTimelineSidebarHidden] = useState(false);
-  // The Timeline, Artifacts and Stats tabs live in the right sidebar, so small viewports reach
-  // them through these dialogs (see useSidebarTabDialog). Each selects its tab when the sidebar
-  // shows again, so the user keeps the view they were reading (#5767, #5795).
-  const [timelineDialogOpen, setTimelineDialogWorkspaceId] = useSidebarTabDialog(
-    workspaceId,
-    timelineSidebarHidden,
-    "timeline"
+  // While the sidebar is hidden, the Timeline, Stats and Artifacts entry points (header buttons,
+  // shortcuts, palette and "Open in Artifacts") open their tab in the sidebar itself, shown
+  // full-screen, like every other tab. They used to open dialogs of their own (#5767, #5795).
+  // Focus returns to `returnFocusTo` when the view closes.
+  // Already open (Shift+T from another full-screen tab): only switch the tab, so focus still
+  // returns to the control that opened the view. The switch unmounts the old tab's panel, so if
+  // focus was in it, it moves to the new tab instead of falling out of the view. flushSync
+  // commits the switch first, so that tab is in the DOM.
+  const openSidebarTab = useCallback(
+    (tab: TabType, returnFocusTo: HTMLElement | null) => {
+      if (onOpenSidebar == null) return;
+      if (!sidebarFullscreen) {
+        focusRightSidebarTab(workspaceId, tab);
+        onOpenSidebar(returnFocusTo);
+        return;
+      }
+      flushSync(() => focusRightSidebarTab(workspaceId, tab));
+      if (document.activeElement == null || document.activeElement === document.body) {
+        menuBarRef.current
+          ?.closest("[data-workspace-shell]")
+          ?.querySelector<HTMLElement>(`[role="tab"][aria-selected="true"][id$="-tab-${tab}"]`)
+          ?.focus();
+      }
+    },
+    [onOpenSidebar, sidebarFullscreen, workspaceId]
   );
-  // Only while its experiment is on: selecting the tab would otherwise add a disabled tab.
-  const [artifactsDialogOpen, setArtifactsDialogWorkspaceId] = useSidebarTabDialog(
-    workspaceId,
-    timelineSidebarHidden,
-    artifactsExperimentEnabled ? "artifacts" : undefined
-  );
-  const [statsDialogOpen, setStatsDialogWorkspaceId] = useSidebarTabDialog(
-    workspaceId,
-    timelineSidebarHidden,
-    "costs"
-  );
+  const activeElement = () =>
+    document.activeElement instanceof HTMLElement ? document.activeElement : null;
   useEffect(() => {
     const compute = () => setTimelineSidebarHidden(isTimelineSidebarHidden());
     compute();
@@ -326,43 +305,53 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       mql.removeEventListener("change", compute);
       resizeObserver?.disconnect();
     };
-  }, [isTimelineSidebarHidden]);
+    // sidebarFullscreen: opening or closing the full-screen sidebar changes its visibility
+    // without resizing the shell, so re-read it then too.
+  }, [isTimelineSidebarHidden, sidebarFullscreen]);
 
-  // The dialog is the only timeline entry point while the sidebar is hidden, and every
-  // operation needs a keyboard shortcut. Evaluated at keydown time so the gate tracks
-  // live viewport/layout changes without a resize subscription.
+  // Remote desktop and browser viewports own their keystrokes: in the full-screen view they can
+  // have focus, and a capital T or S typed there must not switch tabs.
+  const isViewportTarget = (target: EventTarget | null) =>
+    isDesktopViewportFocused(target) || isBrowserViewportFocused(target);
+
+  // The Timeline shortcut while the sidebar is hidden. Evaluated at keydown time so the gate
+  // tracks live viewport/layout changes without a resize subscription.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (
         !matchesKeybind(e, KEYBINDS.OPEN_TIMELINE_DIALOG) ||
         isDialogOpen() ||
         isEditableElement(e.target) ||
-        !isTimelineSidebarHidden()
+        isViewportTarget(e.target) ||
+        // Shown full-screen, the sidebar is visible, and the shortcut switches its tab.
+        !(isTimelineSidebarHidden() || sidebarFullscreen)
       ) {
         return;
       }
       e.preventDefault();
-      setTimelineDialogWorkspaceId(workspaceId);
+      openSidebarTab("timeline", activeElement());
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [isTimelineSidebarHidden, setTimelineDialogWorkspaceId, workspaceId]);
+  }, [isTimelineSidebarHidden, openSidebarTab, sidebarFullscreen]);
 
   // Stats while the sidebar is hidden: its shortcut, and the palette's "Add Tool: Stats" (which
   // also adds the tab to the hidden layout, so wide layouts keep their old behavior).
   useEffect(() => {
-    const open = () => setStatsDialogWorkspaceId(workspaceId);
+    const open = () => openSidebarTab("costs", activeElement());
     const onKeyDown = (e: KeyboardEvent) => {
       if (
         matchesKeybind(e, KEYBINDS.OPEN_STATS_DIALOG) &&
         !isDialogOpen() &&
         !isEditableElement(e.target) &&
-        isTimelineSidebarHidden()
+        !isViewportTarget(e.target) &&
+        (isTimelineSidebarHidden() || sidebarFullscreen)
       ) {
         e.preventDefault();
         open();
       }
     };
+    // The palette already selected the tab; only a hidden sidebar needs showing.
     const onPalette = (event: Event) => {
       const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
       if (detail?.workspaceId === workspaceId && isTimelineSidebarHidden()) open();
@@ -373,10 +362,10 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_STATS_DIALOG, onPalette);
     };
-  }, [isTimelineSidebarHidden, setStatsDialogWorkspaceId, workspaceId]);
+  }, [isTimelineSidebarHidden, openSidebarTab, sidebarFullscreen, workspaceId]);
 
   // Ctrl+Shift+K normally opens the Artifacts tab (RightSidebar owns that handler); while the
-  // sidebar is hidden it opens the dialog instead, the tab's only entry point there.
+  // sidebar is hidden it shows that tab full-screen instead.
   useEffect(() => {
     if (!artifactsExperimentEnabled) {
       return;
@@ -394,19 +383,14 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         return;
       }
       e.preventDefault();
-      setArtifactsDialogWorkspaceId(workspaceId);
+      openSidebarTab("artifacts", activeElement());
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [
-    artifactsExperimentEnabled,
-    isTimelineSidebarHidden,
-    setArtifactsDialogWorkspaceId,
-    workspaceId,
-  ]);
+  }, [artifactsExperimentEnabled, isTimelineSidebarHidden, openSidebarTab]);
 
   // "Open in Artifacts" on an MCP Apps tool card and openArtifact() (chat cards, file cards,
-  // Review, palette): while the sidebar is hidden, the dialog is the only place to show them
+  // Review, palette): while the sidebar is hidden, they show the Artifacts tab full-screen
   // (RightSidebar handles the same events on wider layouts).
   useEffect(() => {
     if (!artifactsExperimentEnabled) {
@@ -417,7 +401,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       if (detail?.workspaceId !== workspaceId || !isTimelineSidebarHidden()) {
         return;
       }
-      setArtifactsDialogWorkspaceId(workspaceId);
+      openSidebarTab("artifacts", activeElement());
     };
     window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
     window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
@@ -425,12 +409,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
     };
-  }, [
-    artifactsExperimentEnabled,
-    isTimelineSidebarHidden,
-    setArtifactsDialogWorkspaceId,
-    workspaceId,
-  ]);
+  }, [artifactsExperimentEnabled, isTimelineSidebarHidden, openSidebarTab, workspaceId]);
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
@@ -687,8 +666,10 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         align="end"
         sideOffset={6}
         // Size to the widest row ("Messages from other workspaces" + shortcut
-        // overflowed a fixed 240px), but never wider than the viewport.
-        className="w-max max-w-[calc(100vw-1rem)] !min-w-[240px] p-1"
+        // overflowed a fixed 240px), but never wider than the viewport. On short screens (a
+        // landscape phone) it scrolls within the room below the button instead of hiding its
+        // last actions.
+        className="max-h-(--radix-popover-content-available-height) w-max max-w-[calc(100vw-1rem)] !min-w-[240px] overflow-y-auto p-1"
         onClick={(event: React.MouseEvent<HTMLDivElement>) => {
           event.stopPropagation();
         }}
@@ -704,18 +685,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           onEnterImmersiveReview={
             hasRepository && !isTouchMobileScreen ? handleEnterImmersiveReview : null
           }
-          onOpenTimeline={
-            timelineSidebarHidden ? () => setTimelineDialogWorkspaceId(workspaceId) : null
-          }
-          // Touch phones show Stats and Artifacts in the header row instead (see below).
-          onOpenStats={
-            timelineSidebarHidden && !isPhoneHeader
-              ? () => setStatsDialogWorkspaceId(workspaceId)
-              : null
-          }
-          onOpenArtifacts={
-            artifactsExperimentEnabled && timelineSidebarHidden && !isPhoneHeader
-              ? () => setArtifactsDialogWorkspaceId(workspaceId)
+          onOpenSidebar={
+            timelineSidebarHidden && onOpenSidebar != null
+              ? () => onOpenSidebar(moreActionsButtonRef.current)
               : null
           }
           onOpenTerminal={isPhoneHeader ? handleOpenTerminal : null}
@@ -981,47 +953,47 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         {isPhoneHeader ? (
           // Touch phones: the terminal opens as a pop-out window, which mobile Safari does not
           // show, so the header row offers Stats and Artifacts (the hidden right sidebar's tabs)
-          // and New terminal moves into the More menu.
-          timelineSidebarHidden && (
-            <>
+          // and New terminal moves into the More menu. Not gated on the sidebar being hidden: at
+          // phone widths it always is, except while the full-screen view shows it, and the
+          // buttons must stay mounted then so focus can return to them when it closes.
+          <>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={(e) => openSidebarTab("costs", e.currentTarget)}
+                  className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0"
+                  aria-label="Stats"
+                  data-testid="workspace-header-stats-button"
+                >
+                  <BarChart3 className="h-3.5 w-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" align="center">
+                Stats
+              </TooltipContent>
+            </Tooltip>
+            {artifactsExperimentEnabled && (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
                     variant="ghost"
                     size="icon"
-                    onClick={() => setStatsDialogWorkspaceId(workspaceId)}
+                    onClick={(e) => openSidebarTab("artifacts", e.currentTarget)}
                     className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0"
-                    aria-label="Stats"
-                    data-testid="workspace-header-stats-button"
+                    aria-label="Artifacts"
+                    data-testid="workspace-header-artifacts-button"
                   >
-                    <BarChart3 className="h-3.5 w-3.5" />
+                    <AppWindow className="h-3.5 w-3.5" />
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" align="center">
-                  Stats
+                  Artifacts
                 </TooltipContent>
               </Tooltip>
-              {artifactsExperimentEnabled && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => setArtifactsDialogWorkspaceId(workspaceId)}
-                      className="text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0"
-                      aria-label="Artifacts"
-                      data-testid="workspace-header-artifacts-button"
-                    >
-                      <AppWindow className="h-3.5 w-3.5" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom" align="center">
-                    Artifacts
-                  </TooltipContent>
-                </Tooltip>
-              )}
-            </>
-          )
+            )}
+          </>
         ) : (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -1079,21 +1051,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         projectPath={projectPath}
         open={mcpModalOpen}
         onOpenChange={setMcpModalOpen}
-      />
-      <TimelineDialog
-        workspaceId={workspaceId}
-        open={timelineDialogOpen}
-        onOpenChange={(open) => setTimelineDialogWorkspaceId(open ? workspaceId : null)}
-      />
-      <StatsDialog
-        workspaceId={workspaceId}
-        open={statsDialogOpen}
-        onOpenChange={(open) => setStatsDialogWorkspaceId(open ? workspaceId : null)}
-      />
-      <ArtifactsDialog
-        workspaceId={workspaceId}
-        open={artifactsDialogOpen}
-        onOpenChange={(open) => setArtifactsDialogWorkspaceId(open ? workspaceId : null)}
       />
       <DebugLlmRequestModal
         workspaceId={workspaceId}
