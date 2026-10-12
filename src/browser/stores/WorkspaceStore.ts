@@ -81,6 +81,7 @@ import {
 } from "@/common/types/stream";
 import { MapStore } from "./MapStore";
 import { createDisplayUsage, recomputeUsageCosts } from "@/common/utils/tokens/displayUsage";
+import { getCacheHealth, type TurnCacheHealth } from "@/common/utils/tokens/cacheHealth";
 import { deriveTodoStatus } from "@/common/utils/todoList";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -393,7 +394,12 @@ export interface WorkspaceUsageState {
    * it over re-resolving the raw model against a refreshed providers config.
    */
   liveMetadataModel?: string;
+  /** Prompt-cache health of the most recent completed assistant turns, newest first. */
+  recentTurnCacheHealth?: TurnCacheHealth[];
 }
+
+/** Turns shown in the Costs tab's prompt-cache table; bounds work per usage bump. */
+const RECENT_TURN_CACHE_HEALTH_LIMIT = 10;
 
 /**
  * Consumer breakdown requiring tokenization (lazy calculation).
@@ -3377,6 +3383,32 @@ export class WorkspaceStore {
         return undefined;
       })();
 
+      // Turn totals (usage + accumulated providerMetadata) price exactly like the
+      // session ledger, so a turn's rewrite cost matches its share of the session cost.
+      const recentTurnCacheHealth: TurnCacheHealth[] = [];
+      for (
+        let i = messages.length - 1;
+        i >= 0 && recentTurnCacheHealth.length < RECENT_TURN_CACHE_HEALTH_LIMIT;
+        i--
+      ) {
+        const msg = messages[i];
+        const rawUsage = msg.role === "assistant" ? msg.metadata?.usage : undefined;
+        if (!rawUsage) continue;
+        const msgModel = msg.metadata?.model ?? model ?? "unknown";
+        const turnUsage = createDisplayUsage(
+          rawUsage,
+          msgModel,
+          msg.metadata?.providerMetadata,
+          msg.metadata?.metadataModel ?? this.resolveMetadataModel(msgModel)
+        );
+        if (!turnUsage) continue;
+        recentTurnCacheHealth.push({
+          messageId: msg.id,
+          timestamp: msg.metadata?.timestamp,
+          ...getCacheHealth(turnUsage),
+        });
+      }
+
       // Live streaming data (unchanged)
       const activeStreamId = aggregator.getActiveStreamMessageId();
       // Request-pinned identity stamped by the backend at stream start: a
@@ -3425,6 +3457,7 @@ export class WorkspaceStore {
         liveUsage,
         liveCostUsage,
         liveMetadataModel,
+        recentTurnCacheHealth,
       };
     });
   }

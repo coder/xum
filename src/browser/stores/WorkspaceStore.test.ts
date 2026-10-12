@@ -7647,6 +7647,56 @@ describe("WorkspaceStore", () => {
       expect(usage.lastContextUsage?.output.tokens).toBe(0);
       expect(usage.lastContextUsage?.model).toBe("claude-3-5-sonnet-20241022");
     });
+
+    it("derives per-turn prompt-cache health from completed assistant turns, newest first", async () => {
+      const workspaceId = "turn-cache-health-workspace";
+      const assistantTurn = (
+        id: string,
+        historySequence: number,
+        cache: { read: number; write: number }
+      ) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: {
+          historySequence,
+          timestamp: historySequence,
+          model: "anthropic:claude-sonnet-5-5",
+          usage: {
+            inputTokens: 1_000 + cache.read + cache.write,
+            cachedInputTokens: cache.read,
+            outputTokens: 10,
+          },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: cache.write } },
+        },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantTurn("cold-turn", 1, { read: 0, write: 30_000 }),
+        {
+          type: "message",
+          id: "user-turn",
+          role: "user",
+          parts: [{ type: "text", text: "next" }],
+          metadata: { historySequence: 2, timestamp: 2 },
+        },
+        assistantTurn("warm-turn", 3, { read: 29_000, write: 1_000 }),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => [turn.messageId, turn.coldStart])).toEqual([
+        ["warm-turn", false],
+        ["cold-turn", true],
+      ]);
+      expect(turns[0].readRatio).toBeCloseTo(29_000 / 31_000, 12);
+      expect(turns[1].rewriteCostUsd).toBeGreaterThan(0);
+    });
   });
 
   describe("mergeTimelineEvents", () => {

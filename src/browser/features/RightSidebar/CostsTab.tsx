@@ -12,6 +12,8 @@ import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { TOKEN_COMPONENT_COLORS, formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
+import { getCacheHealth } from "@/common/utils/tokens/cacheHealth";
+import { PromptCacheHealth } from "./PromptCacheHealth";
 
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import type { UsageViewMode } from "@/common/config/schemas/userPreferences";
@@ -330,6 +332,15 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
               </tbody>
             </table>
           )}
+          {/* Hidden for sessions that never touched a prompt cache (e.g. most non-Anthropic
+              providers report no cache tokens), where a 0% read share is noise. */}
+          {sessionUsage !== undefined &&
+            sessionUsage.cached.tokens + sessionUsage.cacheCreate.tokens > 0 && (
+              <PromptCacheHealth
+                session={getCacheHealth(sessionUsage)}
+                turns={usage.recentTurnCacheHealth ?? []}
+              />
+            )}
         </div>
       </div>
     </div>
