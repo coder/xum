@@ -82,6 +82,7 @@ import {
 import { MapStore } from "./MapStore";
 import { createDisplayUsage, recomputeUsageCosts } from "@/common/utils/tokens/displayUsage";
 import { getCacheHealth, type TurnCacheHealth } from "@/common/utils/tokens/cacheHealth";
+import { getAssistantMessageModelUsages } from "@/common/utils/tokens/messageModelUsages";
 import { deriveTodoStatus } from "@/common/utils/todoList";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -3383,8 +3384,9 @@ export class WorkspaceStore {
         return undefined;
       })();
 
-      // Turn totals (usage + accumulated providerMetadata) price exactly like the
-      // session ledger, so a turn's rewrite cost matches its share of the session cost.
+      // A turn sums every usage the session ledger charges for its message (its own
+      // usage plus model-backed tool and refused-attempt usage), so a turn's rewrite
+      // cost matches its share of the session cost.
       const recentTurnCacheHealth: TurnCacheHealth[] = [];
       for (
         let i = messages.length - 1;
@@ -3392,14 +3394,14 @@ export class WorkspaceStore {
         i--
       ) {
         const msg = messages[i];
-        const rawUsage = msg.role === "assistant" ? msg.metadata?.usage : undefined;
-        if (!rawUsage) continue;
-        const msgModel = msg.metadata?.model ?? model ?? "unknown";
-        const turnUsage = createDisplayUsage(
-          rawUsage,
-          msgModel,
-          msg.metadata?.providerMetadata,
-          msg.metadata?.metadataModel ?? this.resolveMetadataModel(msgModel)
+        // Compaction summaries keep `usage` but CompactionHandler strips their
+        // providerMetadata (cache-write counts included), so their cache health is unknown.
+        if (msg.role !== "assistant" || msg.metadata?.compacted) continue;
+        const turnUsage = sumUsageHistory(
+          getAssistantMessageModelUsages(msg.metadata, {
+            fallbackModel: model,
+            resolveMetadataModel: (msgModel) => this.resolveMetadataModel(msgModel),
+          }).map((entry) => entry.usage)
         );
         if (!turnUsage) continue;
         recentTurnCacheHealth.push({
