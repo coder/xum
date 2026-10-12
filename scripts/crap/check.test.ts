@@ -4,7 +4,7 @@
 // and scripts/test-unit-ci.sh skips it.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -133,9 +133,11 @@ test("a tool error exits 2, not 1", () => {
   expect(check("no-such-ref").status).toBe(2);
 
   write("src/demo/route.ts", `${BRANCHY}// edit\n`);
-  // A PATH with git but no uv: the scorer cannot start.
-  const noUv = { ...GIT_ENV, PATH: dirname(Bun.which("git") ?? "/usr/bin/git") };
-  expect(Bun.which("uv", { PATH: noUv.PATH })).toBeNull();
+  // A PATH with only git: package managers often install uv next to git.
+  const gitOnly = join(repo, ".bin");
+  mkdirSync(gitOnly);
+  symlinkSync(Bun.which("git") ?? "/usr/bin/git", join(gitOnly, "git"));
+  const noUv = { ...GIT_ENV, PATH: gitOnly };
   const result = check("HEAD", noUv);
   expect(result.status).toBe(2);
   expect(result.err).toContain("crap-check: tool error");
