@@ -797,6 +797,13 @@ export class WorkspaceGoalService {
   private readonly streamStartGenerations = new Map<string, number>();
   private nextGoalStreamStampSequence = 1;
   private goalContinuationBridge: GoalContinuationRuntimeBridge | null = null;
+  /**
+   * Goals a non-user initiator (the model) completed while paused. Auto-promotion skips them:
+   * promoting would arm the next queued goal's kickoff, so model output could undo the user's
+   * Pause. The user can still promote the next goal by hand. In memory only: after a restart a
+   * later completion mutation or stream end may promote again.
+   */
+  private readonly autoPromoteBlockedGoalIds = new Set<string>();
   private goalContinuationDispatcher: IdleDispatcher | null = null;
   private goalContinuationConsumerDisposer: (() => void) | null = null;
 
@@ -3327,6 +3334,20 @@ export class WorkspaceGoalService {
     });
   }
 
+  private blockAutoPromoteAfterPausedCompletion(
+    goal: GoalRecordV1,
+    previousStatus: GoalStatus,
+    initiator: GoalLifecycleInitiator | undefined
+  ): void {
+    if (
+      goal.status === "complete" &&
+      previousStatus === "paused" &&
+      (initiator ?? "user") !== "user"
+    ) {
+      this.autoPromoteBlockedGoalIds.add(goal.goalId);
+    }
+  }
+
   private emitStatusLifecycle(
     goal: GoalRecordV1,
     previousStatus: GoalStatus,
@@ -4124,6 +4145,7 @@ export class WorkspaceGoalService {
         }
         this.emitBudgetChanged(current, withEdits, input);
         this.emitBudgetLimited(input.workspaceId, withEdits, previousStatus);
+        this.blockAutoPromoteAfterPausedCompletion(withEdits, previousStatus, input.initiator);
         this.emitStatusLifecycle(withEdits, previousStatus, input.initiator ?? "user");
         // Lifecycle event: this is a rename, not a replace. Reuse
         // `goal_replaced` (same-objective semantics already overloaded for
@@ -4233,6 +4255,7 @@ export class WorkspaceGoalService {
           }
           this.emitBudgetChanged(current, updated, input);
           this.emitBudgetLimited(input.workspaceId, updated, previousStatus);
+          this.blockAutoPromoteAfterPausedCompletion(updated, previousStatus, input.initiator);
           this.emitStatusLifecycle(updated, previousStatus, input.initiator ?? "user");
           await this.maybeAutoPromoteOnComplete(input.workspaceId, updated, previousStatus, {
             stopVeto: () => discardIfUserStopLanded() != null,
@@ -5549,7 +5572,7 @@ export class WorkspaceGoalService {
       return;
     }
     const earlyGoal = await this.readGoalFile(workspaceId);
-    if (earlyGoal?.status !== "complete") {
+    if (earlyGoal?.status !== "complete" || this.autoPromoteBlockedGoalIds.has(earlyGoal.goalId)) {
       return;
     }
 
@@ -5579,7 +5602,7 @@ export class WorkspaceGoalService {
     try {
       await this.fileLocks.withLock(workspaceId, async () => {
         const current = await this.readGoalFile(workspaceId);
-        if (current?.status !== "complete") {
+        if (current?.status !== "complete" || this.autoPromoteBlockedGoalIds.has(current.goalId)) {
           return;
         }
         const board = await this.readBoard(workspaceId);
@@ -6132,6 +6155,9 @@ export class WorkspaceGoalService {
     options?: { stopVeto?: () => boolean }
   ): Promise<void> {
     if (completedGoal.status !== "complete" || previousStatus === "complete") {
+      return;
+    }
+    if (this.autoPromoteBlockedGoalIds.has(completedGoal.goalId)) {
       return;
     }
     const board = await this.readBoard(workspaceId);

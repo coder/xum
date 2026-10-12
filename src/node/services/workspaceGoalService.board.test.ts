@@ -204,6 +204,34 @@ describe("WorkspaceGoalService", () => {
       expect(completed).toBeDefined();
     });
 
+    // Promotion arms the next goal's kickoff: model output completing a paused goal must not
+    // undo the user's Pause that way. A user completion still promotes.
+    test.each([
+      { initiator: "model", promotes: false },
+      { initiator: "user", promotes: true },
+    ] as const)(
+      "completing a paused goal promotes the next goal only for the user ($initiator)",
+      async ({ initiator, promotes }) => {
+        const paused = await setGoalOk(service, { workspaceId, objective: "First" });
+        const queued = await service.addUpcomingGoal({ workspaceId, objective: "Second" });
+        await setGoalOk(service, { workspaceId, status: "paused" });
+
+        await setGoalOk(service, {
+          workspaceId,
+          status: "complete",
+          completionSummary: "Done while paused.",
+          initiator,
+        });
+
+        const board = await service.getGoalBoard(workspaceId);
+        const activeEntry = board.entries.find((e) => e.section === "active");
+        // Target assertion: the model's completion leaves the queued goal waiting.
+        expect(activeEntry?.goal.goalId).toBe(promotes ? queued.goalId : paused.goalId);
+        expect(activeEntry?.goal.status).toBe(promotes ? "active" : "complete");
+        expect(board.entries.some((e) => e.section === "upcoming")).toBe(!promotes);
+      }
+    );
+
     test("completeGoalFromSilentContinuation promotes the next upcoming goal", async () => {
       // #3326 Codex P2 (PRRT_kwDOPxxmWM6DMh9j): silent-continuation
       // completion must run the deferred auto-promote pass, otherwise

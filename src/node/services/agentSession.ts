@@ -433,16 +433,17 @@ const GOAL_INACTIVE_RETRY_REASON = "goal_inactive";
 
 /**
  * Whether a scheduled retry of a goal turn may still resend it: its goal is the current one and
- * still runs (active, or budget-limited for the wrap-up turn). A legacy row without a goal id
- * is checked by status only.
+ * is in the status that turn kind runs in (a continuation needs an active goal, a budget wrap-up
+ * a budget-limited one). A retry without a goal id fails closed: it cannot prove which goal it
+ * belongs to, so a replacement goal could run the old goal's prompt.
  */
 function isRetriedGoalStillRunning(
   goal: Pick<GoalRecordV1, "goalId" | "status"> | null,
+  goalKind: GoalSyntheticMessageKind,
   goalId: string | undefined
 ): boolean {
-  if (goal == null) return false;
-  if (goalId != null && goal.goalId !== goalId) return false;
-  return goal.status === "active" || goal.status === "budget_limited";
+  if (goal == null || goalId == null || goal.goalId !== goalId) return false;
+  return goal.status === (goalKind === GOAL_BUDGET_LIMIT_KIND ? "budget_limited" : "active");
 }
 
 function isHeartbeatTriggerMetadata(muxMetadata: MuxMessageMetadata | undefined): boolean {
@@ -2190,9 +2191,20 @@ export class AgentSession {
     // Without a goal service the goal's state is unknown: keep retrying as before.
     const goalService = this.workspaceGoalService;
     if (request.goalKind != null && goalService != null) {
-      const goal = await goalService.getGoal(this.workspaceId);
+      let goal: GoalRecordV1 | null;
+      try {
+        goal = await goalService.getGoal(this.workspaceId);
+      } catch (error) {
+        // A local read failure says nothing about the goal: keep the retry, checked again next time.
+        if (this.coordinator.closing || !isCurrent()) return;
+        await this.handleStreamFailureForAutoRetry(
+          { type: "unknown", message: `goal_read_failed: ${getErrorMessage(error)}` },
+          isCurrent
+        );
+        return;
+      }
       if (this.coordinator.closing || !isCurrent()) return;
-      if (!isRetriedGoalStillRunning(goal, request.goalId)) {
+      if (!isRetriedGoalStillRunning(goal, request.goalKind, request.goalId)) {
         // Retire through the manager: it also resets the attempt count, so the next goal's
         // first failure does not inherit this goal's backoff.
         this.retryManager.abandon(GOAL_INACTIVE_RETRY_REASON);

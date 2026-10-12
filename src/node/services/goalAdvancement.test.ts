@@ -68,6 +68,8 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
   /** When set, the next send fails before any stream with this error (and clears it). */
   let preStreamError: SendMessageError | null;
   let streamCalls: number;
+  /** When set, goal turns are sent without their goal id, like rows from before goal ids. */
+  let sendUnscopedGoalTurns: boolean;
 
   beforeEach(async () => {
     ({ config, historyService, cleanup } = await createTestHistoryService());
@@ -84,6 +86,7 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
     failureGate = null;
     preStreamError = null;
     streamCalls = 0;
+    sendUnscopedGoalTurns = false;
     const harness = await createAgentSessionHarness({
       workspaceId,
       config,
@@ -141,7 +144,7 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
           agentInitiated: true,
           goalContinuation: true,
           goalKind: input.kind,
-          goalId: input.goalId,
+          goalId: sendUnscopedGoalTurns ? undefined : input.goalId,
           admissionStale: input.admissionStale,
         });
         return result.success;
@@ -644,6 +647,77 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
         expect(scheduledAttempts[1]).toBe(scheduledAttempts[0]);
       } finally {
         stop();
+      }
+    });
+
+    // A continuation must not run once the goal reached its limit: the wrap-up turn owns that.
+    test("a continuation retry is dropped once the goal became budget-limited", async () => {
+      await goalTurnWithScheduledRetry();
+      const abandoned = recordAbandonReasons();
+      try {
+        await setGoalOk(service, { workspaceId, turnCap: 1 });
+        await service.attributeChildReport({
+          parentWorkspaceId: workspaceId,
+          childWorkspaceId: "child-a",
+          childCostCents: 0,
+        });
+        expect((await service.getGoal(workspaceId))?.status).toBe("budget_limited");
+        providerUp = true;
+        await settle(() => Promise.resolve(abandoned.reasons.length > 0), 5_000);
+        // Target assertion: the stale continuation did not run past the limit.
+        expect(abandoned.reasons).toEqual(["goal_inactive"]);
+        expect(streamCalls).toBe(1);
+      } finally {
+        abandoned.stop();
+      }
+    });
+
+    // Without a goal id the retry cannot prove its goal: a replacement must not run its prompt.
+    test("an unscoped goal retry fails closed", async () => {
+      sendUnscopedGoalTurns = true;
+      await goalTurnWithScheduledRetry();
+      const abandoned = recordAbandonReasons();
+      try {
+        providerUp = true;
+        await settle(() => Promise.resolve(abandoned.reasons.length > 0), 5_000);
+        expect(abandoned.reasons).toEqual(["goal_inactive"]);
+        expect(streamCalls).toBe(1);
+      } finally {
+        abandoned.stop();
+      }
+    });
+
+    // A local read failure says nothing about the goal: the retry must survive it.
+    test("a failed goal read keeps the retry scheduled", async () => {
+      await goalTurnWithScheduledRetry();
+      const abandoned = recordAbandonReasons();
+      // Fail only the retry's own goal read: arm the failure when the retry starts.
+      let failNextRead = false;
+      let failedReads = 0;
+      const realGetGoal = service.getGoal.bind(service);
+      const getGoal = spyOn(service, "getGoal").mockImplementation((id: string) => {
+        if (!failNextRead) return realGetGoal(id);
+        failNextRead = false;
+        failedReads += 1;
+        return Promise.reject(new Error("EIO"));
+      });
+      const stopStarting = session.onChatEvent(({ message }) => {
+        if (message.type === "auto-retry-starting") failNextRead = failedReads === 0;
+      });
+      try {
+        await settle(() => Promise.resolve(failedReads > 0), 5_000);
+        await settle(() => Promise.resolve(session.hasPendingAutoRetry()), 1_000);
+        // Target assertion: the failure rescheduled the retry instead of abandoning it.
+        expect(failedReads).toBe(1);
+        expect(session.hasPendingAutoRetry()).toBe(true);
+        expect(abandoned.reasons).toEqual([]);
+        providerUp = true;
+        await settle(() => Promise.resolve(streamCalls > 1), 10_000);
+        expect(streamCalls).toBe(2);
+      } finally {
+        stopStarting();
+        getGoal.mockRestore();
+        abandoned.stop();
       }
     });
 
