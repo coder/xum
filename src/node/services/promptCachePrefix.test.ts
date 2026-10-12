@@ -347,6 +347,33 @@ describe("fingerprintAnthropicRequest follows Anthropic's cache invalidation tab
     ).toBe("extends");
   });
 
+  test("changing the structured-output format breaks system", () => {
+    const format = (name: string) => ({
+      output_config: {
+        effort: "high",
+        format: { type: "json_schema", schema: { type: "object", properties: { [name]: {} } } },
+      },
+    });
+    expect(
+      expectBreak(
+        body(baseMessages(), TOOLS, undefined, format("a")),
+        body(baseMessages(), TOOLS, undefined, format("b"))
+      )
+    ).toMatchObject({ section: "system", blockIndex: SYSTEM_OPTIONS_INDEX });
+  });
+
+  test("a request with server-side context editing is unsupported on either side", () => {
+    const editing = {
+      context_management: { edits: [{ type: "clear_tool_uses_20250919" }] },
+    };
+    const plain = body(baseMessages());
+    const withEditing = body(baseMessages(), TOOLS, undefined, editing);
+    const unsupported = { kind: "unsupported", reason: "context_management" } as const;
+    expect(compare(plain, withEditing)).toEqual(unsupported);
+    expect(compare(withEditing, plain)).toEqual(unsupported);
+    expect(compare(withEditing, withEditing)).toEqual(unsupported);
+  });
+
   test("adding or changing a deferred tool extends the prefix", () => {
     const deferred = (description: string) => [
       ...TOOLS,

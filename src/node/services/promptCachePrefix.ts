@@ -12,8 +12,10 @@
  *    system and messages, so both stay out of this section.
  * 2. A system sentinel: each native web search / web fetch entry with its
  *    configuration, whether any document enables citations ("Toggling web
- *    search or citations: system and messages caches"), and the request
- *    `speed` (switching Fast mode invalidates system and messages).
+ *    search or citations: system and messages caches"), the request `speed`
+ *    (switching Fast mode invalidates system and messages), and the
+ *    structured-output `output_config.format` (Anthropic adds a system
+ *    prompt for it, so changing it invalidates system and messages).
  * 3. The leading system blocks.
  * 4. A messages sentinel: `thinking`, `output_config.effort` and
  *    `tool_choice` (which carries `disable_parallel_tool_use` on the wire),
@@ -36,7 +38,10 @@
  * tool's definition at its `tool_reference` block (a definition change of a
  * deferred tool that was already referenced is not detected). A cold start
  * with no reported break therefore means a cause outside the fingerprinted
- * body.
+ * body. Server-side context editing (`context_management`) clears older
+ * blocks by a strategy the body does not show, so a request that carries it
+ * is not modeled: comparing with it returns `unsupported`, and callers
+ * neither report a break nor use it as a baseline for one.
  */
 
 import { createHash } from "node:crypto";
@@ -58,7 +63,11 @@ export interface PromptCacheBlockSummary {
 export interface PromptCacheBlock extends PromptCacheBlockSummary {
   section: PromptCacheSection;
   hash: string;
+  /** Set on the single block of a request the fingerprint does not model (see Scope). */
+  unsupported?: PromptCacheUnsupportedReason;
 }
+
+export type PromptCacheUnsupportedReason = "context_management";
 
 export interface PromptCachePrefixBreak {
   kind: "break";
@@ -72,7 +81,10 @@ export interface PromptCachePrefixBreak {
   next?: PromptCacheBlockSummary;
 }
 
-export type PromptCachePrefixComparison = { kind: "extends" } | PromptCachePrefixBreak;
+export type PromptCachePrefixComparison =
+  | { kind: "extends" }
+  | PromptCachePrefixBreak
+  | { kind: "unsupported"; reason: PromptCacheUnsupportedReason };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -196,6 +208,12 @@ function dropDefaultToolCaller(block: unknown): unknown {
  * system messages inline).
  */
 export function fingerprintAnthropicRequest(body: Record<string, unknown>): PromptCacheBlock[] {
+  if (body.context_management != null) {
+    const unsupported = "context_management";
+    return [
+      { section: "tools", role: "request", type: "unsupported", length: 0, hash: "", unsupported },
+    ];
+  }
   const blocks: PromptCacheBlock[] = [];
   const toolNamesByCallId = new Map<string, string>();
   const push = (section: PromptCacheSection, role: string, value: unknown): void => {
@@ -270,6 +288,7 @@ export function fingerprintAnthropicRequest(body: Record<string, unknown>): Prom
     citations: allParts.some(enablesCitations),
     // Absent means standard speed, so an explicit "standard" is the same request.
     speed: typeof body.speed === "string" ? body.speed : "standard",
+    format: isRecord(body.output_config) ? (body.output_config.format ?? null) : null,
   });
   for (const part of contentOf(body.system)) push("system", "system", normalizeContentBlock(part));
   for (const message of messages.slice(0, leadingSystemCount)) {
@@ -295,11 +314,19 @@ function summarize(block: PromptCacheBlock): PromptCacheBlockSummary {
   return summary;
 }
 
-/** "extends" when every previous block starts the next request unchanged (identical included). */
+/**
+ * "extends" when every previous block starts the next request unchanged
+ * (identical included); "unsupported" when either request is one the
+ * fingerprint does not model.
+ */
 export function comparePromptCachePrefix(
   previous: readonly PromptCacheBlock[],
   next: readonly PromptCacheBlock[]
 ): PromptCachePrefixComparison {
+  const unsupported = [...previous, ...next].find(
+    (block) => block.unsupported != null
+  )?.unsupported;
+  if (unsupported != null) return { kind: "unsupported", reason: unsupported };
   let index = 0;
   while (
     index < previous.length &&
