@@ -95,6 +95,12 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
   const liveOutputView = liveOutput ?? EMPTY_LIVE_OUTPUT;
   const combinedLiveOutput = liveOutputView.combined;
 
+  // A blocking tool_pre or plugin tool.execute.before hook returns `{ error }` without
+  // `success` (#6044): that shape is model-visible and replayed, so the card reads the reason
+  // from any non-empty `error` instead of requiring `success: false`.
+  const errorText: unknown = result != null && "error" in result ? result.error : undefined;
+  const resultError = typeof errorText === "string" && errorText.length > 0 ? errorText : null;
+
   const isPending = status === "executing" || status === "pending";
   const backgroundProcessId =
     result && "backgroundProcessId" in result ? result.backgroundProcessId : null;
@@ -297,10 +303,10 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
 
           {result && (
             <>
-              {result.success === false && result.error && (
+              {resultError !== null && (
                 <DetailSection>
                   <DetailLabel>Error</DetailLabel>
-                  <ErrorBox>{result.error}</ErrorBox>
+                  <ErrorBox>{resultError}</ErrorBox>
                 </DetailSection>
               )}
 
