@@ -18,8 +18,11 @@ import {
 } from "@/node/services/promptCachePrefix";
 import type { TimelineRecorder } from "@/node/services/timelineRecorder";
 
-/** Workspaces whose latest fingerprints stay in memory; the least recent is dropped first. */
-const MAX_TRACKED_WORKSPACES = 128;
+/**
+ * Baselines kept in memory, one per workspace and route/model identity; the least recently
+ * observed is dropped first.
+ */
+const MAX_TRACKED_BASELINES = 128;
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const ONE_HOUR_MS = 60 * 60 * 1000;
@@ -98,10 +101,15 @@ export interface PromptCacheRouteIdentity {
 }
 
 export class PromptCachePrefixMonitor {
+  /**
+   * Keyed by workspace and route/model identity: each identity has its own cache entry, so
+   * switching Sonnet -> Opus -> Sonnet within the TTL still compares the second Sonnet request
+   * with the first.
+   */
   private readonly latest = new Map<
     string,
     {
-      routeKey: string;
+      workspaceId: string;
       scope: PromptCacheTurnScope;
       blocks: PromptCacheBlock[];
       observedAt: number;
@@ -128,7 +136,10 @@ export class PromptCachePrefixMonitor {
       },
       markCompaction: () => {
         skip = true;
-        this.latest.delete(workspaceId);
+        // Every identity's baseline: the compaction replaced the history all of them hold.
+        for (const [key, entry] of this.latest) {
+          if (entry.workspaceId === workspaceId) this.latest.delete(key);
+        }
       },
     };
   }
@@ -145,25 +156,25 @@ export class PromptCachePrefixMonitor {
   ): void {
     try {
       const workspaceId = scope.workspaceId;
-      const previous = this.latest.get(workspaceId);
+      const key = `${workspaceId}\0${identity.route}\0${identity.modelString}`;
+      const previous = this.latest.get(key);
       // Re-inserting keeps Map order equal to recency, so eviction drops the oldest.
-      this.latest.delete(workspaceId);
+      this.latest.delete(key);
       if (scope.skip) return;
-      const routeKey = `${identity.route}\0${identity.modelString}`;
       const blocks = fingerprintAnthropicRequest(body);
       const observedAt = this.now();
-      this.latest.set(workspaceId, {
-        routeKey,
+      this.latest.set(key, {
+        workspaceId,
         scope,
         blocks,
         observedAt,
         ttlMs: requestCacheTtlMs(body),
       });
-      if (this.latest.size > MAX_TRACKED_WORKSPACES) {
+      if (this.latest.size > MAX_TRACKED_BASELINES) {
         const oldest = this.latest.keys().next().value;
         if (oldest != null) this.latest.delete(oldest);
       }
-      if (previous?.routeKey !== routeKey) return;
+      if (previous == null) return;
       // A new context (clear, start here, rollover) or an expired cache entry makes this
       // request cold on purpose or by time: start a new baseline without reporting a break.
       if (previous.scope.contextEpoch !== scope.contextEpoch) return;

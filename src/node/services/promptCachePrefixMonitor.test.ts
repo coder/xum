@@ -217,6 +217,27 @@ describe("PromptCachePrefixMonitor through the Anthropic wire wrapper", () => {
     expect(events).toHaveLength(1);
   });
 
+  test("each route and model keeps its own baseline; a compaction clears all of them", async () => {
+    const events: TimelineEventDraft[] = [];
+    const monitor = new PromptCachePrefixMonitor();
+    const scope = () => monitor.createTurnScope("ws-1", recorderFor(events));
+    const opus = { route: "anthropic", modelString: "anthropic:claude-opus-5-5" };
+    // Sonnet -> Opus -> Sonnet: the second Sonnet request compares with the first.
+    await send(monitor, [
+      { scope: scope(), body: requestBody(SECRET_OUTPUT) },
+      { scope: scope(), body: requestBody("opus"), identity: opus },
+      { scope: scope(), body: requestBody("changed") },
+    ]);
+    expect(events).toMatchObject([{ data: { model: ANTHROPIC.modelString } }]);
+    // A compaction replaced the history every identity holds: neither reports afterwards.
+    scope().markCompaction();
+    await send(monitor, [
+      { scope: scope(), body: requestBody("summary") },
+      { scope: scope(), body: requestBody("summary on opus"), identity: opus },
+    ]);
+    expect(events).toHaveLength(1);
+  });
+
   test("a rejected or refused dispatch records nothing and keeps the baseline", async () => {
     const events: TimelineEventDraft[] = [];
     const monitor = new PromptCachePrefixMonitor();
