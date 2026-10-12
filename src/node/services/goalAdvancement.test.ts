@@ -687,7 +687,8 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       }
     });
 
-    // A local read failure says nothing about the goal: the retry must survive it.
+    // A local read failure says nothing about the goal: the retry must survive it. It waits for
+    // two real backoffs (the failed read reschedules at the next attempt), so about 6 s.
     test("a failed goal read keeps the retry scheduled", async () => {
       await goalTurnWithScheduledRetry();
       const abandoned = recordAbandonReasons();
@@ -719,7 +720,7 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
         getGoal.mockRestore();
         abandoned.stop();
       }
-    });
+    }, 20_000);
 
     test("control: a retry of a still-active goal's turn resends it", async () => {
       await goalTurnWithScheduledRetry();
