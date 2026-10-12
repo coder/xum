@@ -36,13 +36,14 @@ export function useArtifactInteractions(
   const [pendingByPath, setPendingByPath] = useState<ReadonlyMap<string, PendingArtifactSend>>(
     () => new Map()
   );
-  // Per-path `setState` writes: one request in flight, newer states replace the queued one, so
-  // concurrent saves cannot land out of order and the last state the frame sent wins.
-  const stateWritesRef = useRef(new Map<string, { queued: { state: unknown } | null }>());
-  // The last state each artifact's frame sent, by workspace and path. A reload (new version,
-  // version switch) can read the server while a write is still queued, so this tab's own newest
-  // state wins over that read.
-  const lastSentStateRef = useRef(new Map<string, unknown>());
+  // Per-artifact `setState` writes (by workspace and path): one request in flight, newer states
+  // replace the queued one, so concurrent saves cannot land out of order and the last state the
+  // frame sent wins. `latest` is that state. While an entry exists it overrides a server read: a
+  // frame rebuild (new version, version switch, Reload) can read before the write lands. The entry
+  // goes when the queue drains, so a failed write or another window's newer save is not hidden.
+  const stateWritesRef = useRef(
+    new Map<string, { latest: unknown; queued: { state: unknown } | null }>()
+  );
   // Paths with a shown strip, updated synchronously so back-to-back sends see it.
   const pendingPathsRef = useRef(new Set<string>());
   const [sendState, setSendState] = useState<{
@@ -62,23 +63,31 @@ export function useArtifactInteractions(
   useEffect(() => {
     if (!api || path == null || stateKey == null) return;
     const controller = new AbortController();
-    api.artifacts
-      .getState({ workspaceId, path }, { signal: controller.signal })
-      .then((result) => {
-        if (controller.signal.aborted) return;
-        const sent = lastSentStateRef.current;
-        const sentKey = `${workspaceId}\u0000${path}`;
-        const state = sent.has(sentKey)
-          ? sent.get(sentKey)
-          : result.success
-            ? result.data.state
-            : null;
-        setLoadedState({ key: stateKey, state });
-      })
-      .catch((error: unknown) => {
-        if (isAbortError(error) || controller.signal.aborted) return;
-        setLoadedState({ key: stateKey, state: null });
-      });
+    const writeKey = `${workspaceId}\u0000${path}`;
+    const load = () => {
+      const writingAtStart = stateWritesRef.current.has(writeKey);
+      api.artifacts
+        .getState({ workspaceId, path }, { signal: controller.signal })
+        .then((result) => {
+          if (controller.signal.aborted) return;
+          const writing = stateWritesRef.current.get(writeKey);
+          if (writing != null) {
+            setLoadedState({ key: stateKey, state: writing.latest });
+            return;
+          }
+          // The queue drained while this read was out: the read may predate the last write.
+          if (writingAtStart) {
+            load();
+            return;
+          }
+          setLoadedState({ key: stateKey, state: result.success ? result.data.state : null });
+        })
+        .catch((error: unknown) => {
+          if (isAbortError(error) || controller.signal.aborted) return;
+          setLoadedState({ key: stateKey, state: null });
+        });
+    };
+    load();
     return () => controller.abort();
   }, [api, workspaceId, path, stateKey]);
 
@@ -111,14 +120,17 @@ export function useArtifactInteractions(
     setState: (state) => {
       const writes = stateWritesRef.current;
       const writePath = target.path;
-      lastSentStateRef.current.set(`${workspaceId}\u0000${writePath}`, state);
-      const key = writePath;
+      const key = `${workspaceId}\u0000${writePath}`;
       const active = writes.get(key);
       if (active != null) {
+        active.latest = state;
         active.queued = { state };
         return;
       }
-      const entry: { queued: { state: unknown } | null } = { queued: null };
+      const entry: { latest: unknown; queued: { state: unknown } | null } = {
+        latest: state,
+        queued: null,
+      };
       writes.set(key, entry);
       const write = (next: unknown) => {
         // Best effort: a failed save does not stop the queue; the frame keeps its own copy.

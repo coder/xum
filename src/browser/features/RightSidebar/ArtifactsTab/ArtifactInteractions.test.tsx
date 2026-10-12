@@ -443,6 +443,25 @@ describe("artifact interactions in the Artifacts panel", () => {
     await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 5 }));
   });
 
+  test("once its write settles, a rebuild takes the server's state, not the tab's", async () => {
+    // The tab's own state overrides a server read only while its write is queued or in flight:
+    // afterwards another window's newer save (or a failed write) must not be hidden.
+    const shown = (reloadTick: number) => ({
+      path: HTML.path,
+      version: 2,
+      latestVersion: 2,
+      reloadTick,
+    });
+    const view = render(<InteractionsHarness target={shown(0)} />, { wrapper: Wrapper });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
+    act(() => hookHandlers?.setState?.({ step: 5 }));
+    await waitFor(() => expect(savedStates).toEqual([{ step: 5 }]));
+    await act(() => Promise.resolve());
+    persistedState = { step: 9 };
+    view.rerender(<InteractionsHarness target={shown(1)} />);
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 9 }));
+  });
+
   test("concurrent setState writes run one at a time and the last state wins", async () => {
     // A server that persists each write when its request settles: overlapping requests that
     // settle out of order would leave an older state on disk.
