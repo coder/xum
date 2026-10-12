@@ -30,11 +30,13 @@ import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import type { MockSessionUsage } from "@/browser/stories/mocks/orpc";
-import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
+import { AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
+import { createWorkspace } from "@/browser/stories/mocks/workspaces";
 import { blurActiveElement } from "@/browser/stories/storyPlayHelpers";
 import { setupSimpleChatStory, setupStreamingChatStory } from "@/browser/stories/helpers/chatSetup";
 import { setHunkFirstSeen } from "@/browser/stories/helpers/reviews";
-import { expandRightSidebar } from "@/browser/stories/helpers/uiState";
+import { collapseLeftSidebar, expandRightSidebar } from "@/browser/stories/helpers/uiState";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
@@ -1751,5 +1753,135 @@ export const TabsReachableUnderWideTitlebarInset: Story = {
     });
     await userEvent.click(review);
     await canvas.findByRole("tab", { name: /^review/i, selected: true });
+  },
+};
+
+const OVERVIEW_WORKSPACE_ID = "ws-overview";
+
+function overviewSideChat(id: string, title: string, createdAt: string): FrontendWorkspaceMetadata {
+  return {
+    ...createWorkspace({ id, name: id, projectName: "my-app", title, createdAt }),
+    sideChatParentWorkspaceId: OVERVIEW_WORKSPACE_ID,
+  };
+}
+
+/**
+ * The collapsed right sidebar (Codex desktop style): instead of a full-height rail it floats a
+ * bounded overview card over the chat's top-right corner, and the chat keeps the full width.
+ * Rendered in the whole app because the card is positioned against the workspace shell.
+ */
+export const CollapsedOverview: Story = {
+  globals: { viewport: { value: "desktop", isRotated: false } },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        // setupSimpleChatStory collapses the right sidebar, which is what this story shows.
+        const client = setupSimpleChatStory({
+          workspaceId: OVERVIEW_WORKSPACE_ID,
+          workspaceName: "feature/settlement-reconciler",
+          messages: [
+            createUserMessage("msg-1", "Why did the reconciler withdraw the hedge?", {
+              historySequence: 1,
+            }),
+            createAssistantMessage(
+              "msg-2",
+              "The order filled for about 49 seconds, then the reconciler reduced it from 25 to " +
+                "12 contracts and withdrew the rest. That was a per-order action, not a " +
+                "portfolio-wide revision cancellation.",
+              { historySequence: 2 }
+            ),
+          ],
+          gitStatus: { ahead: 3, dirty: 2, outgoingAdditions: 29692, outgoingDeletions: 6248 },
+          sessionUsage: {
+            byModel: {
+              "claude-opus-4-5": {
+                input: { tokens: 820_000, cost_usd: 4.1 },
+                cached: { tokens: 2_400_000, cost_usd: 1.2 },
+                cacheCreate: { tokens: 90_000, cost_usd: 0.56 },
+                output: { tokens: 64_000, cost_usd: 1.6 },
+                reasoning: { tokens: 21_000, cost_usd: 0.53 },
+                model: "claude-opus-4-5",
+              },
+            },
+            version: 1,
+          },
+          additionalWorkspaces: [
+            overviewSideChat("side-bq", "Give me the BQ migration", "2026-01-01T10:00:00.000Z"),
+            overviewSideChat(
+              "side-hedger",
+              "How real-time is the hedger?",
+              "2026-01-01T11:00:00.000Z"
+            ),
+          ],
+        });
+        collapseLeftSidebar();
+        return client;
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const card = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    const sideChats = await within(card).findByRole("region", { name: "Side chats" });
+    await within(sideChats).findByText("How real-time is the hedger?");
+    await waitFor(() =>
+      expect(within(card).getByRole("button", { name: /Changes/ })).toHaveTextContent("+29,692")
+    );
+    // The session's cost leads the card.
+    await within(card).findByRole("button", { name: /\$7\.99/ });
+    // The header's stand-in shows only where the card cannot.
+    await expect(canvas.queryByRole("button", { name: "Expand right sidebar" })).toBeNull();
+
+    // Bounded: the card is a fraction of the workspace's height, and the chat is not narrowed
+    // by a collapsed rail: it reaches the workspace's right edge.
+    const shell = canvasElement.querySelector<HTMLElement>("[data-workspace-shell]");
+    await expect(shell).not.toBeNull();
+    await waitFor(async () => {
+      const shellRect = shell!.getBoundingClientRect();
+      await expect(card.getBoundingClientRect().height).toBeLessThan(shellRect.height / 2);
+      await expect(canvas.getByRole("main").getBoundingClientRect().right).toBe(shellRect.right);
+    });
+    // The transcript makes room for the card: it sits as far from the card as from the left
+    // edge of the chat, instead of centering under it.
+    const transcript = canvas.getByRole("log", { name: "Conversation transcript" });
+    await waitFor(async () => {
+      const column = transcript.getBoundingClientRect();
+      const leftGap = column.left - canvas.getByRole("main").getBoundingClientRect().left;
+      const rightGap = card.getBoundingClientRect().left - column.right;
+      await expect(rightGap).toBeGreaterThan(0);
+      await expect(Math.abs(leftGap - rightGap)).toBeLessThanOrEqual(1);
+    });
+  },
+};
+
+/**
+ * Where the transcript column would lose width to the card (a 1000px workspace here), the card
+ * stays hidden and the header's expand button stands in for it.
+ */
+export const CollapsedOverviewYieldsToTranscript: Story = {
+  ...CollapsedOverview,
+  // Inside the meta's 1600px frame: a fixed width, so the test runner's window size cannot
+  // decide which of the two shows.
+  decorators: [
+    (Story: ComponentType) => (
+      <div style={{ width: 1000, height: "100%" }}>
+        <Story />
+      </div>
+    ),
+  ],
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["desktop"] } } },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("button", { name: "Expand right sidebar" }, { timeout: 15_000 });
+    const card = canvasElement.querySelector<HTMLElement>(".right-sidebar-overview-card");
+    await expect(card).not.toBeNull();
+    // Hidden by visibility, not display: the layout still shows the sidebar, so its shortcuts
+    // keep expanding it rather than taking the narrow-layout fallbacks.
+    await expect(getComputedStyle(card!).visibility).toBe("hidden");
+    await expect(getComputedStyle(card!).display).not.toBe("none");
   },
 };

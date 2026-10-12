@@ -14,6 +14,7 @@ import {
   buildArtifactBridgeScript,
   createBridgeRateLimiter,
 } from "./artifactBridge";
+import { MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
 
 // Identity is all the acceptance check uses, so plain objects stand in for windows.
 const frame: Window = Object.create(null) as Window;
@@ -390,6 +391,105 @@ describe("bridge annotate mode", () => {
     win.document.body.dispatchEvent(new win.MouseEvent("click", { bubbles: true }));
     expect(artifactSawClick).toBe(false);
     expect(posts).toEqual([expect.objectContaining({ xumArtifact: 1, type: "annotate" })]);
+    await win.happyDOM.close();
+  });
+});
+
+describe("in-page links", () => {
+  // A srcdoc frame resolves "#id" against the app's URL, so an unhandled click navigates the
+  // frame to the app and the navigation guard closes the artifact. The handler cancels it and
+  // jumps to the target itself. HTML artifacts and MCP App views both get it.
+  test.each([
+    ["HTML artifact bridge", buildArtifactBridgeScript("light")],
+    ["MCP App preamble", MCP_APP_PREAMBLE_SCRIPT],
+  ])("%s jumps to # targets inside the frame document", async (_name, script) => {
+    const win = new HappyWindow({ url: "http://localhost/workspace/abc" });
+    const doc = win.document;
+    doc.body.innerHTML = `
+      <a id="plain" href="#intro">Intro</a>
+      <a id="encoded" href=" #caf%C3%A9 ">Cafe</a>
+      <a id="stray-percent" href="#caf%C3%A9%">Stray percent</a>
+      <a id="raw-name" href="#legacy%20name"><span id="inner">Legacy</span></a>
+      <a id="decoded-name" href="#old%20name">Old</a>
+      <a id="top-link" href="#">Top</a>
+      <a id="missing" href="#nowhere">Missing</a>
+      <a id="external" href="https://example.com/#intro">External</a>
+      <a id="blank" href="#intro" target="_blank">New tab</a>
+      <a id="download" href="#intro" download>Download</a>
+      <a id="self" href="#intro" target="_SELF">Same frame</a>
+      <a id="no-href">Not a link</a>
+      <a id="own" href="#intro">Handled by the artifact</a>
+      <svg><a id="svg"><text>SVG</text></a></svg>
+      <h2 id="intro">Intro</h2><h2 id="café">Cafe</h2><h2 id="café%">Stray</h2>
+      <input name="legacy%20name"><a name="legacy%20name">Raw</a><a name="old name">Decoded</a>`;
+    doc
+      .getElementById("svg")!
+      .setAttributeNS("http://www.w3.org/1999/xlink", "xlink:href", "#intro");
+    const scrolled: string[] = [];
+    for (const element of Array.from(doc.querySelectorAll("h2, a, input"))) {
+      element.scrollIntoView = () => scrolled.push(element.textContent);
+    }
+    win.scrollTo = (() => scrolled.push("top")) as typeof win.scrollTo;
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
+    const run = new Function("window", "document", "CustomEvent", script) as (
+      window: unknown,
+      document: unknown,
+      customEvent: unknown
+    ) => void;
+    run(win, doc, win.CustomEvent);
+    // The artifact's own handler, which takes over one link.
+    doc.getElementById("own")!.addEventListener("click", (event) => event.preventDefault());
+    // A window listener added after the shim's runs after it: record what the shim decided, then
+    // stop Happy DOM from navigating.
+    const seen: { prevented: boolean | null } = { prevented: null };
+    win.addEventListener("click", (event) => {
+      seen.prevented = event.defaultPrevented;
+      event.preventDefault();
+    });
+    const click = (
+      id: string,
+      init: { ctrlKey?: boolean; button?: number } = {}
+    ): { prevented: boolean | null; scrolled: string[]; focused: string | null } => {
+      scrolled.length = 0;
+      seen.prevented = null;
+      doc.activeElement?.blur();
+      doc
+        .getElementById(id)!
+        .dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true, ...init }));
+      const active = doc.activeElement;
+      const focused = active == null || active === doc.body ? null : active.textContent;
+      return { prevented: seen.prevented, scrolled: [...scrolled], focused };
+    };
+
+    const jump = (text: string) => ({ prevented: true, scrolled: [text], focused: text });
+    expect(click("plain")).toEqual(jump("Intro"));
+    expect(click("encoded")).toEqual(jump("Cafe"));
+    // A "%" without two hex digits stays as it is; the valid escape still decodes.
+    expect(click("stray-percent")).toEqual(jump("Stray"));
+    // The raw fragment is tried before the decoded one, and only <a name> counts as a name.
+    expect(click("inner")).toEqual(jump("Raw"));
+    expect(click("decoded-name")).toEqual(jump("Decoded"));
+    expect(click("svg")).toEqual(jump("Intro"));
+    expect(click("self")).toEqual(jump("Intro"));
+    expect(click("top-link")).toEqual({ prevented: true, scrolled: ["top"], focused: null });
+    // Keyboard activation of "#": focus stays on the link, as in a browser.
+    const topLink = doc.getElementById("top-link");
+    if (!(topLink instanceof win.HTMLElement)) throw new Error("top-link is not an HTML element");
+    topLink.focus();
+    topLink.dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
+    expect(doc.activeElement?.id).toBe("top-link");
+    // No target: the navigation is still cancelled, and nothing moves (as in a browser).
+    expect(click("missing")).toEqual({ prevented: true, scrolled: [], focused: null });
+    // Left to the browser (and the navigation guards): other URLs, modified and non-left clicks.
+    const untouched = { prevented: false, scrolled: [], focused: null };
+    expect(click("external")).toEqual(untouched);
+    expect(click("blank")).toEqual(untouched);
+    expect(click("download")).toEqual(untouched);
+    expect(click("no-href")).toEqual(untouched);
+    expect(click("plain", { ctrlKey: true })).toEqual(untouched);
+    expect(click("plain", { button: 1 })).toEqual(untouched);
+    // The artifact's own preventDefault wins: the shim does not jump on top of it.
+    expect(click("own")).toEqual({ prevented: true, scrolled: [], focused: null });
     await win.happyDOM.close();
   });
 });
