@@ -1098,39 +1098,66 @@ body,
   display: none;
 }
 
-/* The collapsed right sidebar floats an overview card over the chat's top-right corner
-   (RightSidebar). It must not cover the transcript, so it shows only while the centered
-   transcript column (max-w-4xl: 56rem) leaves a gutter wide enough for it: the card (w-64: 16rem),
-   its inset (right-3: 0.75rem) and a 0.75rem gap, mirrored on the left because the column is
-   centered: 56rem + 2 × 17.5rem = 91rem of shell. A full-width transcript has no gutter at all.
-   visibility, not display: the container's display tells shortcuts whether the layout hides the
-   sidebar (isRightSidebarResponsivelyHidden), and a collapsed sidebar is not hidden by the layout:
-   its shortcuts still expand it. */
-@container workspace-shell (width < 91rem) {
-  .right-sidebar-overview-card {
-    visibility: hidden;
-  }
+/* -----------------------------------------------------------------------------
+ * Collapsed right sidebar: overview card vs. header stand-in
+ *
+ * The collapsed right sidebar is a card floating in the chat's top-right corner (RightSidebar).
+ * It never covers the transcript: where it shows, the chat reserves its width
+ * (--chat-reserved-inline-end, read by ChatPane's scrollport), so the transcript column, and
+ * the composer under it, center in the space left of the card, as far from the card as from the
+ * left edge. It shows only where the column keeps its full width beside it:
+ *
+ *   48rem column (--container-chat) + 2 × 15px chat gutter (1.875rem)
+ *   + 16rem card + 0.75rem inset = 66.625rem of workspace shell.
+ *
+ * Container queries take no var(), so that sum is spelled out below; keep it in step with the
+ * tokens. A full-width transcript has no column to make room beside, so it never shows the card.
+ * Everywhere else the header's expand button (WorkspaceMenuBar) stands in for it, except in the
+ * narrow layouts, which hide the sidebar itself (the workspace menu opens it there).
+ *
+ * visibility, not display: the card's display tells shortcuts whether the layout hides the sidebar
+ * (isRightSidebarResponsivelyHidden), and a collapsed sidebar is not hidden by the layout: its
+ * shortcuts still expand it.
+ * --------------------------------------------------------------------------- */
+
+[data-workspace-shell] {
+  --overview-card-width: 16rem;
+  --overview-card-inset: 0.75rem;
 }
 
-[data-transcript-full-width] .right-sidebar-overview-card {
+.right-sidebar-overview-card {
+  right: var(--overview-card-inset);
+  width: var(--overview-card-width);
   visibility: hidden;
 }
 
-/* Wherever the card is hidden, the header's expand button (WorkspaceMenuBar) stands in for it,
-   except in the narrow layouts, which hide the sidebar itself (the workspace menu opens it there). */
-@media (min-width: 769px) {
-  @container workspace-shell (684px < width < 91rem) {
-    .right-sidebar-overview-expand {
-      display: inline-flex !important;
-    }
-  }
+.right-sidebar-overview-expand {
+  display: none;
+}
 
+@media (min-width: 769px) {
   @container workspace-shell (width > 684px) {
-    [data-transcript-full-width] .right-sidebar-overview-expand {
-      display: inline-flex !important;
+    .right-sidebar-overview-expand {
+      display: inline-flex;
     }
   }
 }
+
+@container workspace-shell (width >= 66.625rem) {
+  [data-workspace-shell]:not([data-transcript-full-width]) > .right-sidebar-overview-card {
+    visibility: visible;
+  }
+
+  [data-workspace-shell]:not([data-transcript-full-width]) .right-sidebar-overview-expand {
+    display: none;
+  }
+
+  [data-workspace-shell]:not([data-transcript-full-width]):has(> .right-sidebar-overview-card)
+    > :not(.right-sidebar-overview-card) {
+    --chat-reserved-inline-end: calc(var(--overview-card-width) + var(--overview-card-inset));
+  }
+}
+
 /*
  * iPadOS/iOS keyboard accessory bar fix
  *

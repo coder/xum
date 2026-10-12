@@ -1845,12 +1845,22 @@ export const CollapsedOverview: Story = {
       await expect(card.getBoundingClientRect().height).toBeLessThan(shellRect.height / 2);
       await expect(canvas.getByRole("main").getBoundingClientRect().right).toBe(shellRect.right);
     });
+    // The transcript makes room for the card: it sits as far from the card as from the left
+    // edge of the chat, instead of centering under it.
+    const transcript = canvas.getByRole("log", { name: "Conversation transcript" });
+    await waitFor(async () => {
+      const column = transcript.getBoundingClientRect();
+      const leftGap = column.left - canvas.getByRole("main").getBoundingClientRect().left;
+      const rightGap = card.getBoundingClientRect().left - column.right;
+      await expect(rightGap).toBeGreaterThan(0);
+      await expect(Math.abs(leftGap - rightGap)).toBeLessThanOrEqual(1);
+    });
   },
 };
 
 /**
- * Where the centered transcript leaves no gutter for the card (a 1200px workspace here), the
- * card would cover messages, so it stays hidden and the header's expand button stands in for it.
+ * Where the transcript column would lose width to the card (a 1000px workspace here), the card
+ * stays hidden and the header's expand button stands in for it.
  */
 export const CollapsedOverviewYieldsToTranscript: Story = {
   ...CollapsedOverview,
@@ -1858,7 +1868,7 @@ export const CollapsedOverviewYieldsToTranscript: Story = {
   // decide which of the two shows.
   decorators: [
     (Story: ComponentType) => (
-      <div style={{ width: 1200, height: "100%" }}>
+      <div style={{ width: 1000, height: "100%" }}>
         <Story />
       </div>
     ),

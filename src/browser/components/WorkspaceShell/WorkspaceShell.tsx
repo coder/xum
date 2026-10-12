@@ -416,8 +416,8 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
       // Lets descendants (WorkspaceMenuBar's timeline gate) locate the shell that
       // owns the right-sidebar container query without prop-drilling layout state.
       data-workspace-shell=""
-      // A full-width transcript leaves no gutter, so globals.css never floats the collapsed
-      // right sidebar's overview card over it.
+      // A full-width transcript has no centered column for the collapsed right sidebar's overview
+      // card to sit beside, so globals.css keeps the card hidden (the header button stands in).
       data-transcript-full-width={chatTranscriptFullWidth || undefined}
       className={cn(
         "relative flex flex-1 flex-row bg-surface-primary text-light overflow-x-auto overflow-y-hidden [@media(max-width:768px)]:flex-col",

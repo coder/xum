@@ -1028,8 +1028,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       </div>
       {!isPhoneHeader && moreActionsMenu}
       {rightSidebarCollapsed && !isPhoneHeader && (
-        // Stands in for the collapsed sidebar's overview card where that card would cover the
-        // transcript: globals.css shows exactly one of the two (hidden by default here).
+        // Stands in for the collapsed sidebar's overview card where the card does not fit beside
+        // the transcript: globals.css shows exactly one of the two.
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
@@ -1042,7 +1042,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               }
               aria-label="Expand right sidebar"
               className={cn(
-                "right-sidebar-overview-expand text-muted hover:text-foreground ml-1 hidden h-6 w-6 shrink-0",
+                "right-sidebar-overview-expand text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0",
                 isDesktop && "titlebar-no-drag"
               )}
             >

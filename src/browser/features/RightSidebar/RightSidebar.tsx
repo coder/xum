@@ -228,16 +228,18 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
         immersiveHidden && "hidden",
         collapsed
           ? [
-              // Positioned against WorkspaceShell, just below the chat header (h-9 on
-              // desktop, h-8 otherwise). The height cap keeps the card clear of the composer
-              // on short windows; overflowing content scrolls inside the card.
-              "bg-surface-secondary absolute right-3 z-10 w-64 overflow-x-hidden overflow-y-auto rounded-lg border shadow-lg",
-              // globals.css hides the card wherever it would cover the transcript; the header's
-              // expand button (WorkspaceMenuBar) stands in for it there.
+              // Positioned against WorkspaceShell. The height cap keeps the card clear of the
+              // composer on short windows; overflowing content scrolls inside the card.
+              "bg-surface-secondary absolute z-10 overflow-x-hidden overflow-y-auto rounded-lg border shadow-lg",
+              // globals.css owns the card's width and right inset (the chat reserves exactly that
+              // room beside it) and shows it only where it fits beside the transcript; the
+              // header's expand button (WorkspaceMenuBar) stands in for it elsewhere.
               "right-sidebar-overview-card",
               // The 7rem floor keeps the stats/Expand row and a section reachable even in a
               // window too short for the composer clearance.
               "max-h-[max(7rem,min(32rem,calc(100%-12rem)))]",
+              // Below the header (h-9 on desktop, h-8 otherwise) by the card's right inset
+              // (0.75rem), so it sits evenly in the corner.
               isDesktop ? "top-12" : "top-11",
             ]
           : // No width transition: expanding swaps the floating card for the docked panel, and
