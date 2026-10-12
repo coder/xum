@@ -41,7 +41,11 @@ import { isAbortError } from "@/browser/utils/isAbortError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { makeSideChatTabType, type TabType } from "@/browser/types/rightSidebar";
 import { openArtifact } from "./ArtifactsTab/openArtifact";
-import { openMcpAppView, useMcpAppViews } from "./ArtifactsTab/mcpAppViewsStore";
+import {
+  appViewPickerDetails,
+  openMcpAppView,
+  useMcpAppViews,
+} from "./ArtifactsTab/mcpAppViewsStore";
 import { TAB_ICONS } from "./Tabs/tabIcons";
 
 /**
@@ -78,10 +82,15 @@ function getOverviewSideChats(
 }
 
 function getGoalStatus(goal: GoalSnapshot): { label: string; className?: string } {
+  const status = getGoalStatusLabel(goal);
   // Pending (mid-stream, unsaved) goals stay unaccented, like the Goal tab label, so the accent
-  // does not flicker during a stream.
-  const mode = isGoalPendingPersistence(goal) ? null : goalActiveMode(goal.status);
-  switch (mode) {
+  // does not flicker during a stream. The label still follows the queued status: a pause queued
+  // mid-stream reads "Paused", not "Active".
+  return isGoalPendingPersistence(goal) ? { label: status.label } : status;
+}
+
+function getGoalStatusLabel(goal: GoalSnapshot): { label: string; className?: string } {
+  switch (goalActiveMode(goal.status)) {
     case "running":
       return { label: "Active", className: "text-success" };
     case "paused":
@@ -89,7 +98,7 @@ function getGoalStatus(goal: GoalSnapshot): { label: string; className?: string 
     case "budget_limited":
       return { label: "Budget limit", className: "text-warning" };
     case null:
-      return { label: goal.status === "complete" ? "Complete" : "Active" };
+      return { label: "Complete" };
   }
 }
 
@@ -141,7 +150,6 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
   const metadata = workspaceMetadata.get(props.workspaceId) ?? null;
   const sidebarState = useOptionalWorkspaceSidebarState(props.workspaceId);
   const gitStatus = useGitStatus(props.workspaceId);
-  const stats = useSessionStats(props.workspaceId);
 
   const goal = sidebarState?.goal ?? null;
   const goalStatus = goal != null ? getGoalStatus(goal) : null;
@@ -166,37 +174,7 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
     <div className="divide-border-light flex flex-col divide-y px-3 pb-1.5 text-xs">
       {/* Stats lead the card (the Stats tab's session totals) and share a row with Expand. */}
       <div className="flex items-center gap-2 py-1.5">
-        {stats != null ? (
-          <OverviewRow
-            Icon={TAB_ICONS.costs}
-            numeric
-            label={
-              stats.cost != null
-                ? formatCostWithDollar(stats.cost)
-                : `${formatTokens(stats.tokens)} tokens`
-            }
-            labelAdornment={
-              stats.cost != null &&
-              stats.costIncomplete && (
-                // Same cue as the Stats tab: an unpriced model makes the total a lower bound.
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="text-warning" aria-label="Cost may be incomplete">
-                      ?
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent align="center">
-                    Cost may be incomplete — some models in this session have unknown pricing
-                  </TooltipContent>
-                </Tooltip>
-              )
-            }
-            detail={stats.cost != null && `${formatTokens(stats.tokens)} tokens`}
-            onClick={() => props.onOpenTab("costs")}
-          />
-        ) : (
-          <span className="flex-1" />
-        )}
+        <OverviewStats workspaceId={props.workspaceId} onOpen={() => props.onOpenTab("costs")} />
         <Tooltip>
           <TooltipTrigger asChild>
             <button
@@ -346,6 +324,44 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
 };
 
 /**
+ * The stats row. It owns the usage subscription, so live stream telemetry rerenders only this
+ * row, not the whole card.
+ */
+const OverviewStats: React.FC<{ workspaceId: string; onOpen: () => void }> = (props) => {
+  const stats = useSessionStats(props.workspaceId);
+  if (stats == null) return <span className="flex-1" />;
+  return (
+    <OverviewRow
+      Icon={TAB_ICONS.costs}
+      numeric
+      label={
+        stats.cost != null
+          ? formatCostWithDollar(stats.cost)
+          : `${formatTokens(stats.tokens)} tokens`
+      }
+      labelAdornment={
+        stats.cost != null &&
+        stats.costIncomplete && (
+          // Same cue as the Stats tab: an unpriced model makes the total a lower bound.
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="text-warning" aria-label="Cost may be incomplete">
+                ?
+              </span>
+            </TooltipTrigger>
+            <TooltipContent align="center">
+              Cost may be incomplete — some models in this session have unknown pricing
+            </TooltipContent>
+          </Tooltip>
+        )
+      }
+      detail={stats.cost != null && `${formatTokens(stats.tokens)} tokens`}
+      onClick={props.onOpen}
+    />
+  );
+};
+
+/**
  * The Artifacts tab's newest files and app views. Listed once when the card shows, then again
  * after the agent's file edits; the card is a glance, so it skips the tab's polling.
  */
@@ -384,9 +400,18 @@ const OverviewOutputs: React.FC<{
     [props.workspaceId]
   );
 
+  // Several calls of one MCP app tool share a label, so each row carries the Artifacts picker's
+  // detail (outcome, arguments, and `#n` for repeats) to tell them apart.
+  const appViewDetails = appViewPickerDetails(appViews);
   // Both lists come newest first. Each open selects the output, then hands the Artifacts tab
   // focus (the activated row unmounts as the sidebar expands).
-  const outputs = [
+  const outputs: Array<{
+    key: string;
+    Icon: LucideIcon;
+    label: string;
+    sub?: string | null;
+    open: () => void;
+  }> = [
     ...files.map((file) => ({
       key: `file:${file.path}`,
       Icon: FileText,
@@ -396,10 +421,11 @@ const OverviewOutputs: React.FC<{
         props.onOpenTab("artifacts");
       },
     })),
-    ...appViews.map((view) => ({
+    ...appViews.map((view, index) => ({
       key: `app:${view.toolCallId}`,
       Icon: TAB_ICONS.artifacts,
       label: view.label,
+      sub: appViewDetails[index] || null,
       open: () => {
         openMcpAppView(props.workspaceId, view);
         props.onOpenTab("artifacts");
@@ -415,6 +441,7 @@ const OverviewOutputs: React.FC<{
           key={output.key}
           Icon={output.Icon}
           label={output.label}
+          sub={output.sub}
           onClick={output.open}
         />
       ))}

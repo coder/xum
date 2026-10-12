@@ -43,6 +43,11 @@ void mock.module("@/browser/stores/GitStatusStore", () => ({
 }));
 
 import { OVERVIEW_MAX_LIST_ROWS, RightSidebarOverview } from "./RightSidebarOverview";
+import {
+  closeMcpAppView,
+  openMcpAppView,
+  type McpAppViewRef,
+} from "./ArtifactsTab/mcpAppViewsStore";
 
 const WORKSPACE_ID = "ws-main";
 
@@ -344,6 +349,54 @@ describe("RightSidebarOverview", () => {
     const goalRow = within(view.getByRole("region", { name: "Goal" })).getByRole("button");
     expect(goalRow.textContent).toContain("Active");
     expect(goalRow.textContent).not.toMatch(/\$|turns/);
+  });
+
+  test("a status change queued mid-stream keeps its label, without the accent", () => {
+    sidebarState = { goal: goal({ status: "paused", pendingPersistence: true }) };
+    const { view } = renderOverview([workspace({ id: WORKSPACE_ID })]);
+    const goalRow = within(view.getByRole("region", { name: "Goal" })).getByRole("button");
+    const status = within(goalRow).getByText("Paused");
+    expect(status.className).not.toContain("text-warning");
+  });
+
+  test("tells repeated MCP app calls apart and marks failed ones", async () => {
+    const client = createTestApiClient({
+      artifacts: {
+        list: () =>
+          Promise.resolve({
+            success: true as const,
+            data: { available: true as const, dir: "/a", entries: [], truncated: false },
+          }),
+      },
+    });
+    const appView = (toolCallId: string, failed = false): McpAppViewRef => ({
+      toolCallId,
+      serverName: "dice",
+      resourceUri: "ui://dice/roll",
+      toolName: "roll",
+      label: "Roll dice",
+      arguments: { sides: 6 },
+      cancelled: failed,
+      failed,
+    });
+    // Opened oldest first, so the newest ends up first, as the transcript lists them.
+    for (const view of [appView("call-1"), appView("call-2"), appView("call-3", true)]) {
+      openMcpAppView(WORKSPACE_ID, view);
+    }
+    try {
+      const { view } = renderOverview([workspace({ id: WORKSPACE_ID })], {
+        artifactsEnabled: true,
+        client,
+      });
+      const section = within(await view.findByRole("region", { name: "Outputs" }));
+      expect(section.getAllByRole("button").map((row) => row.textContent)).toEqual([
+        "Roll dicefailed · sides: 6",
+        "Roll dicesides: 6 · #2",
+        "Roll dicesides: 6 · #1",
+      ]);
+    } finally {
+      for (const id of ["call-1", "call-2", "call-3"]) closeMcpAppView(WORKSPACE_ID, id);
+    }
   });
 
   test("hides goal and activity when there is nothing to report", () => {
