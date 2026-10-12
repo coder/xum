@@ -719,8 +719,15 @@ if (import.meta.main) {
         logLine(error.message);
         process.exit(error.reason === "SIGINT" ? 130 : 143);
       }
-      logLine(`refused: ${error instanceof Error ? error.message : String(error)}`);
-      process.exit(error instanceof Refusal ? 2 : 1);
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof Refusal) {
+        logLine(`refused: ${message}`);
+        process.exit(2);
+      }
+      // An internal error exits 4, as run.ts maps it for a charter: e2e's own exit 1 means a
+      // failed test, so 1 must not also mean a launcher bug (#6094 item 17).
+      logLine(`error: ${message}`);
+      process.exit(4);
     }
   );
 }
