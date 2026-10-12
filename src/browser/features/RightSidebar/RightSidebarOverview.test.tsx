@@ -377,6 +377,50 @@ describe("RightSidebarOverview", () => {
     expect(status.className).not.toContain("text-warning");
   });
 
+  test("keeps a row for app views when files alone would fill the list", async () => {
+    const client = createTestApiClient({
+      artifacts: {
+        list: () =>
+          Promise.resolve({
+            success: true as const,
+            data: {
+              available: true as const,
+              dir: "/a",
+              entries: [artifact("a.md", 4), artifact("b.md", 3), artifact("c.md", 2)],
+              truncated: false,
+            },
+          }),
+      },
+    });
+    openMcpAppView(WORKSPACE_ID, {
+      toolCallId: "call-new",
+      serverName: "dice",
+      resourceUri: "ui://dice/roll",
+      toolName: "roll",
+      label: "Roll dice",
+      arguments: {},
+      cancelled: false,
+      failed: false,
+    });
+    try {
+      const { view } = renderOverview([workspace({ id: WORKSPACE_ID })], {
+        artifactsEnabled: true,
+        client,
+      });
+      const section = within(await view.findByRole("region", { name: "Outputs" }));
+      await waitFor(() =>
+        expect(section.getAllByRole("button").map((row) => row.textContent)).toEqual([
+          "a.md",
+          "b.md",
+          "Roll dice",
+          "1 more",
+        ])
+      );
+    } finally {
+      closeMcpAppView(WORKSPACE_ID, "call-new");
+    }
+  });
+
   test("tells repeated MCP app calls apart and marks failed ones", async () => {
     const client = createTestApiClient({
       artifacts: {

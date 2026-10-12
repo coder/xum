@@ -423,16 +423,23 @@ const OverviewOutputs: React.FC<{
   // Several calls of one MCP app tool share a label, so each row carries the Artifacts picker's
   // detail (outcome, arguments, and `#n` for repeats) to tell them apart.
   const appViewDetails = appViewPickerDetails(appViews);
-  // Both lists come newest first. Each open selects the output, then hands the Artifacts tab
-  // focus (the activated row unmounts as the sidebar expands).
-  const outputs: Array<{
+  // Both lists come newest first, but app views carry no time to merge them by. So that a new
+  // app result is never pushed out by files, each kind keeps at least one of the capped rows
+  // when it has any. Each open selects the output, then hands the Artifacts tab focus (the
+  // activated row unmounts as the sidebar expands).
+  const appRows =
+    appViews.length === 0
+      ? 0
+      : Math.min(appViews.length, Math.max(1, OVERVIEW_MAX_LIST_ROWS - files.length));
+  const fileRows = Math.min(files.length, OVERVIEW_MAX_LIST_ROWS - appRows);
+  const shown: Array<{
     key: string;
     Icon: LucideIcon;
     label: string;
     sub?: string | null;
     open: () => void;
   }> = [
-    ...files.map((file) => {
+    ...files.slice(0, fileRows).map((file) => {
       const slash = file.path.lastIndexOf("/");
       return {
         key: `file:${file.path}`,
@@ -446,7 +453,7 @@ const OverviewOutputs: React.FC<{
         },
       };
     }),
-    ...appViews.map((view, index) => ({
+    ...appViews.slice(0, appRows).map((view, index) => ({
       key: `app:${view.toolCallId}`,
       Icon: TAB_ICONS.artifacts,
       label: view.label,
@@ -457,11 +464,11 @@ const OverviewOutputs: React.FC<{
       },
     })),
   ];
-  if (outputs.length === 0) return null;
+  if (shown.length === 0) return null;
 
   return (
     <OverviewSection title="Outputs">
-      {outputs.slice(0, OVERVIEW_MAX_LIST_ROWS).map((output) => (
+      {shown.map((output) => (
         <OverviewRow
           key={output.key}
           Icon={output.Icon}
@@ -471,7 +478,7 @@ const OverviewOutputs: React.FC<{
         />
       ))}
       <MoreRow
-        count={outputs.length - OVERVIEW_MAX_LIST_ROWS}
+        count={files.length + appViews.length - shown.length}
         onClick={() => props.onOpenTab("artifacts")}
       />
     </OverviewSection>

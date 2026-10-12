@@ -159,6 +159,9 @@ function LazyRightSidebar(
     const empty = collapsed && kind === "loading";
     return (
       <div
+        // globals.css stops reserving the overview card's room beside the chat: a failed sidebar
+        // shows docked, at its expanded width, with no card.
+        data-right-sidebar-load-failed={kind === "failed" || undefined}
         className={cn(
           "bg-surface-primary flex flex-col overflow-hidden",
           props.immersiveHidden

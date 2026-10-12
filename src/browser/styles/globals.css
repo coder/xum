@@ -1153,8 +1153,11 @@ body,
   }
 
   /* Keyed on the collapsed state (WorkspaceShell), not on the card element, which mounts only
-     once the lazy sidebar chunk loads: the transcript must not shift when it does. */
-  [data-workspace-shell][data-right-sidebar-collapsed]:not([data-transcript-full-width])
+     once the lazy sidebar chunk loads: the transcript must not shift when it does. A chunk that
+     failed to load shows docked instead, with no card, so nothing is reserved then. */
+  [data-workspace-shell][data-right-sidebar-collapsed]:not([data-transcript-full-width]):not(
+      :has(> [data-right-sidebar-load-failed])
+    )
     > :not(.right-sidebar-overview-card) {
     --chat-reserved-inline-end: calc(var(--overview-card-width) + var(--overview-card-inset));
   }

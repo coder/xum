@@ -615,6 +615,8 @@ describe("WorkspaceShell loading placeholders", () => {
       await gate.fail();
       expect(box()?.contains(view.getByRole("alert"))).toBe(true);
       expect(box()?.style.width).not.toBe("0px");
+      // Docked, with no card: globals.css keys on this to stop reserving the card's room.
+      expect(box()?.hasAttribute("data-right-sidebar-load-failed")).toBe(true);
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
       consoleError.mockRestore();
     });
