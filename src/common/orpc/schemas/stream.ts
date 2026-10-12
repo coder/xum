@@ -15,6 +15,7 @@ import {
   MuxReasoningPartSchema,
   MuxTextPartSchema,
   MuxToolPartSchema,
+  PersistedToolModelUsageSchema,
 } from "./message";
 import type { MuxMessageMetadata } from "../../types/message";
 import type { AssistedReviewHunk } from "../../types/review";
@@ -334,6 +335,8 @@ export const StreamEndEventSchema = z.object({
       providerMetadata: z.record(z.string(), z.unknown()).optional(),
       // Last step's provider metadata (for context window cache display)
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
+      // Model-backed tool and refused-attempt usage, as persisted on the history row.
+      toolModelUsages: z.array(PersistedToolModelUsageSchema).optional(),
       finishReason: z.string().optional(),
       stopCause: StreamStopCauseSchema.optional(),
       duration: z.number().optional(),

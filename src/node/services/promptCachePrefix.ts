@@ -10,9 +10,10 @@
  * 1. Tool definitions. Deferred tools (`defer_loading`) are not part of the
  *    prefix, and native web search and web fetch entries only invalidate
  *    system and messages, so both stay out of this section.
- * 2. A system sentinel: which native web search / web fetch tools are present
- *    and whether any document enables citations ("Toggling web search or
- *    citations: system and messages caches").
+ * 2. A system sentinel: each native web search / web fetch entry with its
+ *    configuration, whether any document enables citations ("Toggling web
+ *    search or citations: system and messages caches"), and the request
+ *    `speed` (switching Fast mode invalidates system and messages).
  * 3. The leading system blocks.
  * 4. A messages sentinel: `thinking`, `output_config.effort` and
  *    `tool_choice` (which carries `disable_parallel_tool_use` on the wire),
@@ -27,6 +28,15 @@
  *
  * The AI SDK prompt form (DevTools records, the mux-gateway wire) carries no
  * call-level options, so its messages sentinel only reflects images.
+ *
+ * Scope: the fingerprint deliberately does not model the model id (callers
+ * compare only requests of one model and route: the runtime monitor's route
+ * key and the replay audit's model check), beta headers such as 1M context
+ * (they are not part of the body), or the inline expansion of a deferred
+ * tool's definition at its `tool_reference` block (a definition change of a
+ * deferred tool that was already referenced is not detected). A cold start
+ * with no reported break therefore means a cause outside the fingerprinted
+ * body.
  */
 
 import { createHash } from "node:crypto";
@@ -228,7 +238,8 @@ export function fingerprintAnthropicRequest(body: Record<string, unknown>): Prom
       : firstNonSystem;
   const allParts = messages.flatMap((message) => message.content);
 
-  const serverTools: string[] = [];
+  // Configuration, not only presence: changing an argument such as `max_uses` invalidates too.
+  const serverTools: Array<{ type: string; config: Record<string, unknown> }> = [];
   for (const tool of Array.isArray(body.tools) ? body.tools : []) {
     if (!isRecord(tool)) {
       push("tools", "tool", tool);
@@ -236,15 +247,20 @@ export function fingerprintAnthropicRequest(body: Record<string, unknown>): Prom
     }
     const serverTool = nativeServerToolType(tool);
     if (serverTool != null) {
-      serverTools.push(serverTool);
+      serverTools.push({ type: serverTool, config: withoutBlockMarker(tool) });
     } else if (tool.defer_loading !== true && !isDeferLoadingTool(tool)) {
       push("tools", "tool", withoutBlockMarker(tool));
     }
   }
   push("system", "request", {
     type: "system_options",
-    serverTools: serverTools.sort(),
+    serverTools: serverTools
+      .map((entry) => ({ ...entry, key: JSON.stringify(entry.config) }))
+      .sort((a, b) => a.type.localeCompare(b.type) || a.key.localeCompare(b.key))
+      .map((entry) => entry.config),
     citations: allParts.some(enablesCitations),
+    // Absent means standard speed, so an explicit "standard" is the same request.
+    speed: typeof body.speed === "string" ? body.speed : "standard",
   });
   for (const part of contentOf(body.system)) push("system", "system", normalizeContentBlock(part));
   for (const message of messages.slice(0, leadingSystemCount)) {
