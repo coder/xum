@@ -92,6 +92,15 @@ test("block mode stops a regressing commit before it runs, unless it carries Cra
   expect(runGate(gate, "pre", "git commit -am 'grow' -m 'Crap-Debt: needs follow-up'").status).toBe(
     0
   );
+  // A message that mentions cd does not hide the commit from the gate.
+  expect(runGate(gate, "pre", "git commit -am 'document cd usage'").status).toBe(1);
+
+  // Over 8 KB, Xum drops XUM_TOOL_INPUT_SCRIPT and the gate reads the JSON input file.
+  const input = join(dir, "input.json");
+  writeFileSync(input, JSON.stringify({ script: `${"# pad\n".repeat(2000)}git commit -am x` }));
+  const big = runGate(gate, "pre", "", { ...GIT_ENV, XUM_TOOL_INPUT_PATH: input });
+  expect(big.status).toBe(1);
+
   // The post phase belongs to warn mode.
   expect(runGate(gate, "post", "git commit -am 'grow route'")).toEqual({ status: 0, out: "" });
 });
@@ -119,7 +128,14 @@ test("other commands skip the check, and a broken gate never blocks", () => {
   expect(noBase.status).toBe(0);
   expect(noBase.out).toContain("crap-gate: skipped (no merge-base with origin/main)");
 
+  // origin/main at a clean HEAD, as after `git commit && git push origin main`.
   git("update-ref", "refs/remotes/origin/main", "HEAD");
+  git("stash", "-q");
+  const pushed = runGate(gate, "pre", "git push origin main");
+  expect(pushed.status).toBe(0);
+  expect(pushed.out).toContain("origin/main already contains HEAD");
+
+  git("stash", "pop", "-q");
   // git and coreutils, but no uv: the scorer fails to start (exit 2).
   const noUv = { ...GIT_ENV, PATH: `${dirname(process.execPath)}:/usr/bin:/bin` };
   expect(Bun.which("uv", { PATH: noUv.PATH })).toBeNull();

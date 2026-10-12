@@ -26,10 +26,16 @@ fi
 
 # Every tool call reaches this point, so up to the match below use only bash
 # builtins: no git, bun, uv or other process.
-# Xum omits input fields over 8 KB from the env; the input file always has them.
+# Xum omits input fields over 8 KB from the env. The input file always has
+# them, as JSON: decode the escapes that matter for matching (\\, \n, \t, \").
 script=${XUM_TOOL_INPUT_SCRIPT:-}
 if [[ -z "$script" && -r "${XUM_TOOL_INPUT_PATH:-}" ]]; then
   script=$(<"$XUM_TOOL_INPUT_PATH")
+  script=${script//\\\\/$'\x01'}
+  script=${script//\\n/$'\n'}
+  script=${script//\\t/$'\t'}
+  script=${script//\\\"/\"}
+  script=${script//$'\x01'/\\}
 fi
 # Any `git ... commit` or `git ... push` in the command. A false match only
 # costs one check run.
@@ -43,13 +49,21 @@ warn_skip() {
 
 # The gate checks the hook's checkout (the workspace). A command that changes
 # directory or points git elsewhere may commit to another repository.
-other_repo='(^|[;&|({[:space:]])(cd|pushd)[[:space:]]|git[[:space:]]+(-C|--git-dir|--work-tree)'
+# `cd` counts only at a command position, so a commit message that mentions it
+# does not skip the gate.
+other_repo="(^|[;&|({"$'\n'"])[[:space:]]*(cd|pushd)[[:space:]]|git[[:space:]]+(-C|--git-dir|--work-tree)"
 if [[ "$script" =~ $other_repo ]]; then
   warn_skip "the command may target another checkout; run make crap-check there"
 fi
 
 root=$(git rev-parse --show-toplevel 2>/dev/null) || warn_skip "not in a git checkout"
 base=$(git -C "$root" merge-base origin/main HEAD 2>/dev/null) || warn_skip "no merge-base with origin/main"
+# In warn mode a successful `git push origin main` has already moved
+# origin/main to HEAD, which leaves nothing to compare. Say so instead of passing.
+if [[ "$script" =~ git[[:space:]].*push && "$base" == "$(git -C "$root" rev-parse HEAD)" ]] \
+  && git -C "$root" diff --quiet HEAD --; then
+  warn_skip "origin/main already contains HEAD; run make crap-check BASE=<ref> to check pushed commits"
+fi
 command -v bun >/dev/null || warn_skip "bun not found"
 # GNU timeout; Homebrew's coreutils name it gtimeout on macOS.
 timeout_cmd=$(command -v timeout || command -v gtimeout) || warn_skip "no timeout or gtimeout command"
