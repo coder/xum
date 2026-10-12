@@ -79,6 +79,8 @@ import { type DurableEventJournal } from "@/node/utils/journal/durableEventJourn
 import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
+import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
+import type { PromptCacheTurnScope } from "./promptCachePrefixMonitor";
 import type { StreamManager } from "./streamManager";
 import {
   type ModelFallbackOptions,
@@ -1138,6 +1140,13 @@ export class TurnRequestBuilder {
             : {}),
       };
     };
+    // One scope per built turn: every model this turn creates (fallback hops included) shares it,
+    // so the prefix detector can tell a turn-boundary break from a mid-turn one.
+    const promptCacheScope: PromptCacheTurnScope = {
+      workspaceId,
+      recorder: this.dependencies.bindings.timelineService ?? NOOP_TIMELINE_RECORDER,
+      skip: false,
+    };
     const prepareModelSeed = async (options: {
       rawModelString: string;
       requestedThinkingLevel: ThinkingLevel | undefined;
@@ -1190,6 +1199,7 @@ export class TurnRequestBuilder {
           workspaceId,
           providersConfig: providersConfigSnapshot,
           getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier ?? userServiceTier,
+          promptCacheScope,
         }
       );
       if (options.recordTiming) {
@@ -1616,6 +1626,8 @@ export class TurnRequestBuilder {
       effectiveAgentId === "compact" ||
       muxMetadata?.type === "compaction-request" ||
       latestUserMessage?.metadata?.muxMetadata?.type === "compaction-request";
+    // Set before any request is sent: compaction prompts never extend the chat's prefix.
+    promptCacheScope.skip = isCompactionRequest;
     const tokenBudgetEnabled =
       !isCompactionRequest &&
       sessionHistoryEnabled &&

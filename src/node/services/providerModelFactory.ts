@@ -111,6 +111,11 @@ import {
 import { createOpenAIWebSocketTransportFetch } from "@/node/services/openAIWebSocketTransportFetch";
 import { log } from "@/node/services/log";
 import {
+  PromptCachePrefixMonitor,
+  type PromptCacheRouteIdentity,
+  type PromptCacheTurnScope,
+} from "@/node/services/promptCachePrefixMonitor";
+import {
   isSessionTapeReplayMode,
   SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
 } from "@/node/services/sessionTapes/sessionTapeReplaySource";
@@ -839,7 +844,11 @@ function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void 
 export function wrapFetchWithAnthropicCacheControl(
   baseFetch: typeof fetch,
   cacheTtl?: AnthropicCacheTtl | null,
-  options?: { injectCacheControl?: boolean }
+  options?: {
+    injectCacheControl?: boolean;
+    /** Sees the final JSON body before it is sent (prompt-cache prefix detection). */
+    observeFinalBody?: (body: Record<string, unknown>) => void;
+  }
 ): typeof fetch {
   const injectCacheControl = options?.injectCacheControl ?? true;
   const cachingFetch = async (
@@ -911,6 +920,11 @@ export function wrapFetchWithAnthropicCacheControl(
 
       // Update body with modified JSON
       const newBody = JSON.stringify(json);
+      try {
+        options?.observeFinalBody?.(json);
+      } catch {
+        // Observation is diagnostic only and must never block the request.
+      }
       const outHeaders = new Headers(init.headers);
       outHeaders.delete("content-length"); // Body size changed
       return baseFetch(input, { ...init, headers: outHeaders, body: newBody });
@@ -1472,6 +1486,8 @@ interface CreateModelOptions {
   routeContext?: RouteContext;
   /** Chat-local override, sampled at the next model call without changing other chats or routing. */
   getServiceTierOverride?: () => ServiceTier | undefined;
+  /** Chat turns only: enables prompt-cache prefix-break detection on Anthropic wires. */
+  promptCacheScope?: PromptCacheTurnScope;
   /**
    * Providers-config snapshot to create the model from. Passed by
    * resolveAndCreateModel so routing, the returned coderWire snapshot,
@@ -1521,6 +1537,7 @@ export class ProviderModelFactory {
   private readonly devToolsService?: DevToolsService;
   private readonly oauthServices?: OauthServiceBindings;
   private readonly providersConfigStore: ProvidersConfigStore;
+  private readonly promptCachePrefixMonitor = new PromptCachePrefixMonitor();
 
   constructor(
     config: Config,
@@ -1534,6 +1551,18 @@ export class ProviderModelFactory {
     this.oauthServices = oauthServices;
     this.devToolsService = devToolsService;
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
+  }
+
+  /** Final-body observer for an Anthropic wire, or undefined for requests outside a chat turn. */
+  private promptCacheObserver(
+    opts: CreateModelOptions | undefined,
+    identity: PromptCacheRouteIdentity
+  ): ((body: Record<string, unknown>) => void) | undefined {
+    const scope = opts?.promptCacheScope;
+    if (scope == null) {
+      return undefined;
+    }
+    return (body) => this.promptCachePrefixMonitor.observe(scope, identity, body);
   }
 
   private isProviderAvailableForRouting(
@@ -1939,7 +1968,13 @@ export class ProviderModelFactory {
                 fetch: wrapFetchWithAnthropicCacheControl(
                   customAdapterFetch,
                   effectiveAnthropicCacheTtl,
-                  { injectCacheControl: !disableBeta }
+                  {
+                    injectCacheControl: !disableBeta,
+                    observeFinalBody: self.promptCacheObserver(opts, {
+                      route: `custom:${providerName}`,
+                      modelString,
+                    }),
+                  }
                 ),
               });
               return Ok(provider(modelId));
@@ -1984,7 +2019,10 @@ export class ProviderModelFactory {
           const fetchWithCacheControl = wrapFetchWithAnthropicCacheControl(
             baseFetch,
             effectiveAnthropicCacheTtl,
-            { injectCacheControl: !disableBeta }
+            {
+              injectCacheControl: !disableBeta,
+              observeFinalBody: self.promptCacheObserver(opts, { route: "anthropic", modelString }),
+            }
           );
           const providerFetch = fetchWithCacheControl;
           const provider = createAnthropic({
@@ -2543,6 +2581,10 @@ export class ProviderModelFactory {
           const fetchWithCacheControl = isAnthropicModel
             ? wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl, {
                 injectCacheControl: !disableBeta,
+                observeFinalBody: self.promptCacheObserver(opts, {
+                  route: "mux-gateway",
+                  modelString,
+                }),
               })
             : baseFetch;
           const fetchWithAutoLogout = wrapFetchWithMuxGatewayAutoLogout(
@@ -2855,7 +2897,13 @@ export class ProviderModelFactory {
             const providerFetch = wrapFetchWithAnthropicCacheControl(
               coderFetch,
               effectiveAnthropicCacheTtl,
-              { injectCacheControl: !disableBeta }
+              {
+                injectCacheControl: !disableBeta,
+                observeFinalBody: self.promptCacheObserver(opts, {
+                  route: `coder:${gatewayProvider.name}`,
+                  modelString,
+                }),
+              }
             );
             const { createAnthropic } = yield* Effect.promise(async () =>
               PROVIDER_REGISTRY.anthropic()
