@@ -2394,6 +2394,11 @@ export class StreamManager {
         contextProviderMetadata,
         model: streamInfo.model,
         metadataModel: streamInfo.metadataModel,
+        // Same tool-model usage the committed partial gets below, so the renderer's
+        // per-turn cost views match history replay without a reload.
+        ...(streamInfo.toolModelUsages.length > 0
+          ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
+          : {}),
       },
       abortReason,
       abandonPartial,

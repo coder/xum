@@ -205,6 +205,17 @@ export const PersistedToolModelUsageSchema = z.object({
   providerMetadata: z.record(z.string(), z.unknown()).optional(),
 }) satisfies z.ZodType<PersistedToolModelUsage>;
 
+/**
+ * `toolModelUsages` list, parsed entry by entry: a malformed or legacy entry is dropped
+ * alone and its valid siblings survive (a whole-array parse would discard all of them).
+ */
+export const PersistedToolModelUsagesSchema = z.array(z.unknown()).transform((entries) =>
+  entries.flatMap((entry) => {
+    const parsed = PersistedToolModelUsageSchema.safeParse(entry);
+    return parsed.success ? [parsed.data] : [];
+  })
+);
+
 // XumMessage (simplified)
 export const MuxMessageSchema = z.object({
   id: z.string(),
@@ -235,7 +246,7 @@ export const MuxMessageSchema = z.object({
       providerMetadata: z.record(z.string(), z.unknown()).optional(),
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
       // Self-healing read path: a malformed persisted list must not fail the whole history parse.
-      toolModelUsages: z.array(PersistedToolModelUsageSchema).optional().catch(undefined),
+      toolModelUsages: PersistedToolModelUsagesSchema.optional().catch(undefined),
       stopCause: StreamStopCauseSchema.optional().catch(undefined),
       duration: z.number().optional(),
       ttftMs: z.number().optional(),
