@@ -81,7 +81,16 @@ import type {
   ExtensionMetadataService,
   ExtensionMetadataStreamingUpdate,
 } from "@/node/services/ExtensionMetadataService";
-import { coerceAgentStatus } from "@/node/utils/extensionMetadata";
+import {
+  isStreamAbortEvent,
+  isStreamEndEvent,
+  isStreamErrorEvent,
+  isStreamStartEvent,
+  isSuccessfulToolResult,
+  isToolCallEndEvent,
+  isWorkspaceEvent,
+  statusSetResultStatus,
+} from "@/node/services/aiServiceEventGuards";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
@@ -248,7 +257,7 @@ import type {
 } from "@/common/orpc/types";
 
 import type { z } from "zod";
-import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
+import type { SendMessageError } from "@/common/types/errors";
 // Aliased to avoid clashing with the private `formatSendMessageError` string formatter below.
 import {
   createStreamErrorMessage,
@@ -371,12 +380,6 @@ import {
   type GoalSyntheticMessageKind,
   type TaskTurnKind,
 } from "@/constants/goals";
-import type {
-  StreamStartEvent,
-  StreamEndEvent,
-  StreamAbortEvent,
-  ToolCallEndEvent,
-} from "@/common/types/stream";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type {
@@ -4486,28 +4489,6 @@ export class WorkspaceService
    * This tracks workspace recency and streaming status for VS Code extension integration.
    */
   private setupMetadataListeners(): void {
-    const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
-    const isWorkspaceEvent = (v: unknown): v is { workspaceId: string } =>
-      isObj(v) && "workspaceId" in v && typeof v.workspaceId === "string";
-    const isStreamStartEvent = (v: unknown): v is StreamStartEvent =>
-      isWorkspaceEvent(v) && "model" in v && typeof (v as { model: unknown }).model === "string";
-    const isStreamEndEvent = (v: unknown): v is StreamEndEvent =>
-      isWorkspaceEvent(v) &&
-      (!("metadata" in (v as Record<string, unknown>)) || isObj((v as StreamEndEvent).metadata));
-    const isStreamAbortEvent = (v: unknown): v is StreamAbortEvent => isWorkspaceEvent(v);
-    const isErrorEvent = (
-      v: unknown
-    ): v is { workspaceId: string; error: string; errorType?: StreamErrorType } =>
-      isWorkspaceEvent(v) && "error" in v && typeof (v as { error: unknown }).error === "string";
-    const isToolCallEndEvent = (v: unknown): v is ToolCallEndEvent =>
-      isWorkspaceEvent(v) &&
-      "toolName" in v &&
-      typeof (v as { toolName: unknown }).toolName === "string" &&
-      "result" in v;
-    const extractStatusSetResult = (result: unknown): WorkspaceAgentStatus | null =>
-      isObj(result) && result.success === true ? coerceAgentStatus(result) : null;
-    const isSuccessfulToolResult = (result: unknown): result is { success: true } =>
-      isObj(result) && result.success === true;
     // Update streaming status and recency on stream start
     this.aiService.on("stream-start", (data: unknown) => {
       if (isStreamStartEvent(data)) {
@@ -4551,7 +4532,7 @@ export class WorkspaceService
     });
 
     this.aiService.on("error", (data: unknown) => {
-      if (isErrorEvent(data)) {
+      if (isStreamErrorEvent(data)) {
         // Read the idle-compaction marker before stopStreamingStatus clears it, so a
         // mid-stream failure (e.g. provider rejecting the compaction model) stops the loop.
         if (this.idleCompactingWorkspaces.has(data.workspaceId)) {
@@ -4572,7 +4553,7 @@ export class WorkspaceService
       }
 
       if (data.toolName === "status_set") {
-        const agentStatus = extractStatusSetResult(data.result);
+        const agentStatus = statusSetResultStatus(data.result);
         if (!agentStatus) {
           return;
         }
@@ -4601,10 +4582,6 @@ export class WorkspaceService
   }
 
   private setupInitMetadataListeners(): void {
-    const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
-    const isWorkspaceEvent = (v: unknown): v is { workspaceId: string } =>
-      isObj(v) && "workspaceId" in v && typeof v.workspaceId === "string";
-
     // When init completes, refresh metadata so the UI can clear isInitializing and swap
     // "Cancel creation" back to the normal archive affordance.
     this.initStateManager.on("init-end", (event: unknown) => {
