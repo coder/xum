@@ -143,14 +143,22 @@ export const cannotReach = (job: ModelJob) =>
  * The text of a probe that the upstream answered 401 or 403: the key is rejected. No explorer
  * can work with it, and every later call would keep its full reservation, so both callers refuse.
  */
-export function keyRejected(job: ModelJob, status: number, records: object[]) {
+export function keyRejected(
+  job: ModelJob,
+  status: number,
+  records: object[],
+  probed?: { model: string; variable: string }
+) {
   // The upstream's own status from the call record too: a 401 with an HTML or empty body (a
   // gateway's) makes the probe's response unreadable, and probeApp then reports 502.
   const upstream = records.map((r) => (r as { status?: unknown }).status);
   const rejected = [status, ...upstream].find((s) => s === 401 || s === 403);
-  return rejected == null
-    ? undefined
-    : `ANTHROPIC_API_KEY rejected by ${new URL(job.upstream.baseUrl).host} (HTTP ${rejected}): check the key`;
+  if (rejected == null) return undefined;
+  const base = `ANTHROPIC_API_KEY rejected by ${new URL(job.upstream.baseUrl).host} (HTTP ${rejected}): check the key`;
+  // A 403 can also mean the key may not use the probed model (#6094 item 13).
+  return rejected === 403 && probed
+    ? `${base}, and its access to ${probed.model} (${probed.variable})`
+    : base;
 }
 /** Whether the proxy released a probe call because it could not connect (proxy.ts). */
 export const probeUnreachable = (records: object[]) =>
@@ -570,7 +578,10 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
         throw new Refusal(
           probeUnreachable(probe.records)
             ? `${cannotReach(driven)}: check the URL and the network`
-            : (keyRejected(driven, probe.status, probe.records) ??
+            : (keyRejected(driven, probe.status, probe.records, {
+                model: driven.model,
+                variable: "BUGBASH_MODEL",
+              }) ??
                 `the ${driven.model} probe failed (HTTP ${probe.status}): check ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL and BUGBASH_BUDGET_USD`)
         );
       log(`${name} probe: ${driven.model} answered`);

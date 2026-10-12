@@ -163,14 +163,6 @@ const ToolOutputUiOnlySchema = z.object({
       workspaceId: z.string().optional(),
     })
     .optional(),
-  /** attach_file registered an artifact version (Artifacts M4); UI-only, never sent to the model. */
-  artifact: z
-    .object({
-      id: z.string(),
-      version: z.number().int().positive(),
-      path: z.string(),
-    })
-    .optional(),
 });
 
 const ToolOutputUiOnlyFieldSchema = {
@@ -3132,7 +3124,7 @@ export const TOOL_DEFINITIONS = {
     resultSchema: ArtifactToolResultSchema,
     description:
       "When a result is ready to look at, publish its file under $XUM_SCRATCH_DIR/artifacts/ as a labeled version in the user's Artifacts tab, shown as a chat card. " +
-      "Republishing a path adds a version (identical bytes add none); unpublished changes get one unlabeled version at turn end.",
+      "Republishing a path adds a version (identical bytes add none); unpublished changes add no version.",
     schema: z
       .object({
         path: z.string().describe("Relative to $XUM_SCRATCH_DIR/artifacts, or absolute inside it."),

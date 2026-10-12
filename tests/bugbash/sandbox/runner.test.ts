@@ -1134,6 +1134,17 @@ test.each(["401", "401html"])(
   }
 );
 
+test("#6094 item 13: a 403 on an MCP Apps job's probe names the probed model and BUGBASH_MODEL", async () => {
+  const { code } = await mcpLaunch({ RUN: "proxycall" }, {}, undefined, "403");
+  expect(code).toBeInstanceOf(Refusal);
+  const message = (code as Error).message;
+  // A 403 can also mean the key may not use that model, so the refusal names it.
+  expect(message).toMatch(/\(HTTP 403\).*claude-sonnet-5-5 \(BUGBASH_MODEL\)/);
+  expect(message).not.toMatch(/\/v1|sk-host/);
+  expect(calls()).not.toMatch(/^run /m);
+  expectNothingLeft();
+});
+
 test("B1: a proxied call that costs more than its bound fails the job (exit 5)", async () => {
   const { code, logged } = await mcpLaunch({ RUN: "proxycall", CALL: "[fake:overbill]" });
   expect(code).toBe(5);

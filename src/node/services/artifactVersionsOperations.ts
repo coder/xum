@@ -1,16 +1,9 @@
-import * as fs from "fs/promises";
 import * as path from "path";
-import type {
-  ArtifactPin,
-  ArtifactVersionList,
-  ArtifactVersionSource,
-} from "@/common/orpc/schemas/artifacts";
+import type { ArtifactPin, ArtifactVersionList } from "@/common/orpc/schemas/artifacts";
 import type { ArtifactsIndexAttachment } from "@/common/types/attachment";
 import { getArtifactKind, type ArtifactKind } from "@/common/utils/artifactKind";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { isScratchDirOnHost } from "@/node/runtime/runtimeScratchDir";
-import { log } from "@/node/services/log";
-import { getErrorMessage } from "@/common/utils/errors";
 import {
   ARTIFACTS_DIR_NAME,
   buildArtifactReadResult,
@@ -21,28 +14,24 @@ import {
 } from "./artifactStore";
 import {
   assertArtifactsEnabled,
-  listArtifactsAtLocation,
   MAX_ARTIFACT_READ_BYTES,
   readArtifactBytesAtLocation,
   type ArtifactsContext,
-  type ArtifactsLocation,
   type AvailableArtifactsLocation,
 } from "./artifactsOperations";
 import {
   ARTIFACT_PUBLISH_INTERRUPTED,
   getArtifactId,
-  hasPublishSince,
   listArtifactIndexes,
   readArtifactIndex,
   readArtifactVersionBytes,
   recordArtifactVersion,
-  toPublicVersion,
   type RecordArtifactVersionResult,
 } from "./artifactVersionStore";
 
 /**
- * Version operations over the artifacts location abstraction: publishing (artifact tool,
- * attach_file), turn-end snapshots, and the listVersions/readVersion routes.
+ * Version operations over the artifacts location abstraction: publishing (the artifact tool,
+ * the only source of new versions) and the listVersions/readVersion routes.
  */
 
 /**
@@ -118,7 +107,6 @@ export async function publishArtifactVersion(params: {
   sessionDir: string;
   location: AvailableArtifactsLocation;
   relPath: string;
-  source: ArtifactVersionSource;
   label: string | null;
   kind?: ArtifactKind;
   pin?: ArtifactPin | null;
@@ -152,11 +140,9 @@ export async function publishArtifactVersion(params: {
       sessionDir: params.sessionDir,
       relPath: params.relPath,
       bytes: read.bytes,
-      source: params.source,
       label: params.label,
       kind: params.kind,
       pin: params.pin,
-      sourceModifiedMs: read.modifiedMs,
       abortSignal: params.abortSignal,
     });
   } catch (error) {
@@ -167,188 +153,6 @@ export async function publishArtifactVersion(params: {
     success: true,
     result,
     kind: result.version.kind ?? params.kind ?? getArtifactKind(params.relPath),
-  };
-}
-
-/** Kinds attach_file registers as artifact versions (rich, user-facing documents). */
-const ATTACH_FILE_ARTIFACT_KINDS: ReadonlySet<ArtifactKind> = new Set([
-  "html",
-  "markdown",
-  "json",
-  "svg",
-  "csv",
-  "mermaid",
-]);
-
-/**
- * attach_file registration: when the attached file sits inside the artifacts dir and is a rich
- * document kind, record the bytes attach_file already read (no second read) as a version.
- * Returns null when the file is not an artifact. Counts as a publish for the turn.
- */
-export async function registerAttachedArtifact(params: {
-  sessionDir: string;
-  location: AvailableArtifactsLocation;
-  /** Absolute path attach_file read, in the runtime's namespace. */
-  resolvedPath: string;
-  bytes: Buffer;
-  /** Expands a home-relative (`~/...`) remote artifacts dir; SSH only. */
-  resolveRuntimePath?: (p: string) => Promise<string>;
-  /** Checked under the index lock: a cancelled attach_file records nothing. */
-  abortSignal?: AbortSignal;
-}): Promise<{ id: string; version: number; path: string } | null> {
-  let relPath = resolveArtifactToolPath(params.location, params.resolvedPath);
-  if (
-    typeof relPath !== "string" &&
-    params.location.kind === "runtime" &&
-    params.location.dir.startsWith("~") &&
-    params.resolveRuntimePath != null
-  ) {
-    const dir = await params.resolveRuntimePath(params.location.dir);
-    relPath = resolveArtifactToolPath({ ...params.location, dir }, params.resolvedPath);
-  }
-  if (typeof relPath !== "string") return null;
-  if (!ATTACH_FILE_ARTIFACT_KINDS.has(getArtifactKind(relPath))) return null;
-  const recorded = await recordArtifactVersion({
-    sessionDir: params.sessionDir,
-    relPath,
-    bytes: params.bytes,
-    source: "attach_file",
-    label: path.posix.basename(relPath),
-    abortSignal: params.abortSignal,
-  });
-  return { id: recorded.artifactId, version: recorded.version.version, path: relPath };
-}
-
-/**
- * Host-maintained live artifacts that never get turn-end versions: the goal status board is
- * rewritten on goal events and every continuation turn, so snapshotting it would only add noise.
- */
-export const TURN_END_SNAPSHOT_EXCLUDED_PATHS: ReadonlySet<string> = new Set(["goal.status.html"]);
-
-/**
- * Turn-end snapshot (logical turn completed, never on abort/error): when nothing was published
- * during the turn, copy every artifact whose bytes differ from its latest version. One version per
- * file per turn, however often it was edited. Returns the paths that got a new version.
- */
-export async function snapshotArtifactsAtTurnEnd(params: {
-  sessionDir: string;
-  location: AvailableArtifactsLocation;
-  turnStartedAtMs: number;
-  abortSignal?: AbortSignal;
-  /** Host file identity at its last hash, by path (in memory: a restart re-hashes once). */
-  hashedIdentities?: Map<string, string>;
-}): Promise<string[]> {
-  const indexes = await listArtifactIndexes(params.sessionDir);
-  if (hasPublishSince(indexes, params.turnStartedAtMs)) return [];
-  const latestByPath = new Map(indexes.map((index) => [index.path, index.versions.at(-1)]));
-  const listing = await listArtifactsAtLocation(params.location, params.abortSignal);
-  const snapshotted: string[] = [];
-  for (const entry of listing.entries) {
-    if (params.abortSignal?.aborted) break;
-    if (TURN_END_SNAPSHOT_EXCLUDED_PATHS.has(entry.path)) continue;
-    if (entry.size > MAX_ARTIFACT_READ_BYTES) continue;
-    // Size and mtime alone cannot prove a file unchanged (`cp -p` keeps both), so host files are
-    // skipped only when size, mtime, ctime and inode all match their last hash: any rewrite moves
-    // ctime. Runtime stats have no ctime, so runtime files are always hashed (bounded by the
-    // per-file cap and the turn-end timeout).
-    const identity =
-      params.location.kind === "host" && params.hashedIdentities != null
-        ? await hostFileIdentity(params.location.dir, entry.path)
-        : null;
-    if (
-      identity != null &&
-      latestByPath.get(entry.path)?.size === entry.size &&
-      params.hashedIdentities?.get(entry.path) === identity.key
-    ) {
-      continue;
-    }
-    try {
-      const read = await readArtifactBytesAtLocation(
-        params.location,
-        entry.path,
-        MAX_ARTIFACT_READ_BYTES,
-        params.abortSignal
-      );
-      if (read.status !== "ok") continue;
-      // A read that finished after the turn-end bound fired must not write a version.
-      if (params.abortSignal?.aborted) break;
-      const recorded = await recordArtifactVersion({
-        sessionDir: params.sessionDir,
-        relPath: entry.path,
-        bytes: read.bytes,
-        source: "turn-end",
-        label: null,
-        sourceModifiedMs: read.modifiedMs,
-        abortSignal: params.abortSignal,
-      });
-      if (recorded.created) snapshotted.push(entry.path);
-      if (identity?.settled === true) params.hashedIdentities?.set(entry.path, identity.key);
-    } catch (error) {
-      log.debug("Turn-end artifact snapshot skipped a file", {
-        path: entry.path,
-        error: getErrorMessage(error),
-      });
-    }
-  }
-  return snapshotted;
-}
-
-/**
- * Identity of a host artifact, taken before it is read (a later change then never matches).
- * `settled`: its last change is at least 1 s old, so a rewrite on a coarse-timestamp filesystem
- * cannot keep the same ctime.
- */
-async function hostFileIdentity(
-  dir: string,
-  relPath: string
-): Promise<{ key: string; settled: boolean } | null> {
-  try {
-    const stat = await fs.lstat(path.join(dir, ...relPath.split("/")));
-    if (!stat.isFile()) return null;
-    return {
-      key: [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(":"),
-      settled: Date.now() >= Math.max(stat.mtimeMs, stat.ctimeMs) + 1000,
-    };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * AgentSession logical-turn hooks for turn-end snapshots. The turn start is kept in memory only:
- * after a restart mid-turn the first completion has no start and takes no snapshot (the next
- * turn catches the changes), which is safer than snapshotting across an unknown window.
- */
-export function createArtifactTurnSnapshotHooks(params: {
-  isEnabled: () => boolean;
-  sessionDir: string;
-  resolveLocation: () => Promise<ArtifactsLocation | null>;
-  now?: () => number;
-}): {
-  onLogicalTurnStarted: () => void;
-  onLogicalTurnCompleted: (abortSignal: AbortSignal) => Promise<void>;
-} {
-  const now = params.now ?? Date.now;
-  let turnStartedAtMs: number | undefined;
-  const hashedIdentities = new Map<string, string>();
-  return {
-    onLogicalTurnStarted: () => {
-      turnStartedAtMs = now();
-    },
-    onLogicalTurnCompleted: async (abortSignal) => {
-      const startedAtMs = turnStartedAtMs;
-      turnStartedAtMs = undefined;
-      if (startedAtMs == null || !params.isEnabled()) return;
-      const location = await params.resolveLocation();
-      if (location == null || location.kind === "unavailable" || abortSignal.aborted) return;
-      await snapshotArtifactsAtTurnEnd({
-        sessionDir: params.sessionDir,
-        location,
-        turnStartedAtMs: startedAtMs,
-        abortSignal,
-        hashedIdentities,
-      });
-    },
   };
 }
 
@@ -402,7 +206,7 @@ export async function listArtifactVersions(
       artifactId,
       path: input.path,
       pin: index?.pin ?? null,
-      versions: (index?.versions ?? []).map(toPublicVersion).reverse(),
+      versions: [...(index?.versions ?? [])].reverse(),
     },
   };
 }

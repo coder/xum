@@ -384,11 +384,13 @@ describe("McpAppFrame", () => {
       webkitRTCPeerConnection: class {},
       RTCDataChannel: class {},
       fetch: () => undefined,
+      // The preamble also installs the in-page link handler.
+      addEventListener: () => undefined,
     };
     // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
     const run = new Function("window", firstScript) as (window: unknown) => void;
     run(fakeWindow);
-    expect(Object.keys(fakeWindow)).toEqual(["fetch"]);
+    expect(Object.keys(fakeWindow)).toEqual(["fetch", "addEventListener"]);
   });
 
   test("the view mounts in desktop and browser mode and is told which platform it is on", async () => {

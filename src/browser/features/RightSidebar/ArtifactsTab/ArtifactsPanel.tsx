@@ -104,8 +104,8 @@ function parsePickerValue(value: string): { scope: ArtifactSelectionScope; path:
 const OTHER_FILES_TOGGLE_VALUE = "toggle-other-files";
 
 /**
- * Splits the live files for the picker: files with stored versions (published, snapshotted at
- * turn end, or attached) lead, and the rest go under a collapsed "Other files" group. Agents
+ * Splits the live files for the picker: files with stored versions (published with the artifact
+ * tool) lead, and the rest go under a collapsed "Other files" group. Agents
  * keep supporting files (for example screenshots that a published HTML artifact references) in
  * the same folder, and a flat newest-first list buried the file they published. Returns null
  * when only one kind exists: the picker then stays a flat list, so a folder with no stored
@@ -463,8 +463,8 @@ export function ArtifactsPanel(props: {
   const selectedArtifactPath = selected?.scope === "artifact" ? selected.path : null;
   const selectedVersionForFetch = selected?.scope === "artifact" ? selected.version : null;
 
-  // Versions of the selected artifact, refetched on every refresh: a publish or turn-end
-  // snapshot adds a version without changing the working file.
+  // Versions of the selected artifact, refetched on every refresh: a publish of unchanged bytes
+  // can still change a version's kind, and another backend can publish.
   useEffect(() => {
     if (!api || selectedArtifactPath == null) return;
     const path = selectedArtifactPath;
@@ -923,6 +923,7 @@ export function ArtifactsPanel(props: {
           path: selected.path,
           version: selected.version,
           latestVersion: versionList?.versions[0]?.version ?? null,
+          reloadTick,
         }
       : null
   );

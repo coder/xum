@@ -3,7 +3,7 @@ import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import type { WorkspaceSelection } from "@/browser/components/AgentListItem/AgentListItem";
@@ -41,11 +41,11 @@ let sends: Array<{ path: string; text: string; data?: unknown; version: number |
 let savedStates: unknown[] = [];
 interface SetStateResult {
   success: true;
-  data: { version: number };
+  data: undefined;
 }
 let setStateImpl: (state: unknown) => Promise<SetStateResult> = (state) => {
   savedStates.push(state);
-  return Promise.resolve({ success: true as const, data: { version: 0 } });
+  return Promise.resolve({ success: true as const, data: undefined });
 };
 let persistedState: unknown = { step: 1 };
 /** When set, getState waits for this promise (state still loading). */
@@ -91,7 +91,7 @@ function Wrapper(props: { children: ReactNode }) {
         }),
       getState: async () => {
         await stateGate;
-        return { success: true as const, data: { version: 0, state: persistedState } };
+        return { success: true as const, data: { state: persistedState } };
       },
       setState: (input: { state: unknown }) => setStateImpl(input.state),
       sendInteraction: (input: {
@@ -108,9 +108,12 @@ function Wrapper(props: { children: ReactNode }) {
       },
     },
   };
+  // One client per mount, like the app's: a new client on every render would make the hook
+  // refetch the state on any rerender and hide a missing refetch.
+  const [client] = useState(() => createTestApiClient(api));
   return (
     <ThemeProvider forcedTheme="dark">
-      <APIProvider client={createTestApiClient(api)}>{props.children}</APIProvider>
+      <APIProvider client={client}>{props.children}</APIProvider>
     </ThemeProvider>
   );
 }
@@ -154,7 +157,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     savedStates = [];
     setStateImpl = (state) => {
       savedStates.push(state);
-      return Promise.resolve({ success: true as const, data: { version: 0 } });
+      return Promise.resolve({ success: true as const, data: undefined });
     };
     persistedState = { step: 1 };
     stateGate = null;
@@ -342,7 +345,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(JSON.parse(JSON.parse(embedded ?? '"null"') as string)).toEqual(persistedState);
   });
 
-  test("setState from the frame is persisted for the displayed version", async () => {
+  test("setState from the frame is persisted for the artifact", async () => {
     const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
@@ -405,6 +408,69 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(sends[0]).toMatchObject({ text: "Held" });
   });
 
+  test("a new version waits for the tab's pending write, then loads the saved state", async () => {
+    // The state is per artifact, so v2 must start with what the user picked on v1. The rebuild
+    // reads the server only after this tab's write has landed, so it never gets a pre-write state.
+    let settleWrite: () => void = () => undefined;
+    setStateImpl = (state) =>
+      new Promise<SetStateResult>((resolve) => {
+        settleWrite = () => {
+          persistedState = state;
+          resolve({ success: true as const, data: undefined });
+        };
+      });
+    const live = (latestVersion: number) => ({ path: HTML.path, version: null, latestVersion });
+    const view = render(<InteractionsHarness target={live(1)} />, { wrapper: Wrapper });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
+    act(() => hookHandlers?.setState?.({ step: 4 }));
+    view.rerender(<InteractionsHarness target={live(2)} />);
+    await act(() => Promise.resolve());
+    // Still waiting: the frame is not rebuilt with a state the write may change.
+    expect(hookHandlers?.initialState).toBeUndefined();
+    await act(async () => {
+      settleWrite();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 4 }));
+  });
+
+  test("Reload hands the remounted frame the newest state", async () => {
+    // Bug bash: Reload remounts the viewer but not this hook, so the frame got the last load's
+    // state and lost the picks made since.
+    const shown = (reloadTick: number) => ({
+      path: HTML.path,
+      version: 2,
+      latestVersion: 2,
+      reloadTick,
+    });
+    const view = render(<InteractionsHarness target={shown(0)} />, { wrapper: Wrapper });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
+    act(() => hookHandlers?.setState?.({ step: 5 }));
+    await waitFor(() => expect(savedStates).toEqual([{ step: 5 }]));
+    persistedState = { step: 5 };
+    view.rerender(<InteractionsHarness target={shown(1)} />);
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 5 }));
+  });
+
+  test("once its write settles, a rebuild takes the server's state, not the tab's", async () => {
+    // The tab's own state overrides a server read only while its write is queued or in flight:
+    // afterwards another window's newer save (or a failed write) must not be hidden.
+    const shown = (reloadTick: number) => ({
+      path: HTML.path,
+      version: 2,
+      latestVersion: 2,
+      reloadTick,
+    });
+    const view = render(<InteractionsHarness target={shown(0)} />, { wrapper: Wrapper });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
+    act(() => hookHandlers?.setState?.({ step: 5 }));
+    await waitFor(() => expect(savedStates).toEqual([{ step: 5 }]));
+    await act(() => Promise.resolve());
+    persistedState = { step: 9 };
+    view.rerender(<InteractionsHarness target={shown(1)} />);
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 9 }));
+  });
+
   test("concurrent setState writes run one at a time and the last state wins", async () => {
     // A server that persists each write when its request settles: overlapping requests that
     // settle out of order would leave an older state on disk.
@@ -417,7 +483,7 @@ describe("artifact interactions in the Artifacts panel", () => {
           state,
           settle: () => {
             persisted = state;
-            resolve({ success: true as const, data: { version: 0 } });
+            resolve({ success: true as const, data: undefined });
           },
         };
         inFlight.push(request);
