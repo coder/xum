@@ -34,7 +34,7 @@ script merges them, because Crapper keeps only one record per source file: a
 later `SF:` record for the same file replaces the earlier one, so a line one
 shard hit and another missed could score as missed. Per function, it uses only
 the reports that ran the function and skips lines without code (see
-NON_CODE_LINE): a shard that only loaded the file would otherwise add misses.
+is_code_line): a shard that only loaded the file would otherwise add misses.
 """
 
 import argparse
@@ -158,13 +158,35 @@ def load_coverage(lcov: list[Path], root: Path, files: list[str]) -> dict[str, l
 # every line of a function that never ran (and of a nested callback that never
 # ran) at 0, blank, comment and brace lines included. Repro (Bun 1.3.12): a
 # 9-line function lists DA 1,4,6,7,9 when called and DA 1-8 at 0 when only
-# imported, so a line union scores the fully tested function 56%. Such lines
-# carry no code, so they never count.
-NON_CODE_LINE = re.compile(r"^\s*(?:$|//|/\*|\*|[})\];,\s]+$)")
+# imported, so a line union scores the fully tested function 56%. Lines that
+# hold only comments or punctuation carry no code, so they never count.
+BLOCK_COMMENT = re.compile(r"/\*.*?\*/")
+LINE_COMMENT = re.compile(r"//.*$")
+PUNCTUATION_ONLY = re.compile(r"[\s})\];,]*")
 
 
 def is_code_line(text: str) -> bool:
-    return NON_CODE_LINE.match(text) is None
+    rest = BLOCK_COMMENT.sub(" ", text).strip()
+    if rest.startswith(("/*", "*")):
+        # Inside a block comment: only text after its end can be code.
+        end = rest.find("*/")
+        if end < 0:
+            return False
+        rest = rest[end + 2 :]
+    return PUNCTUATION_ONLY.fullmatch(LINE_COMMENT.sub("", rest)) is None
+
+
+def ran_function(span: dict[int, int]) -> bool:
+    """Whether a report's lines of one function show that the function ran.
+
+    The first line a report lists in the function's range is its entry, hit
+    whenever the function runs. When it never ran, Bun lists that line at 0
+    but can still count a later line of the range as hit at load (Bun 1.3.12:
+    an uncalled `export const f = () => {...}` lists lines 1-4 at 0 and its
+    `return` line at 2), so a hit elsewhere proves nothing.
+    """
+
+    return bool(span) and span[min(span)] > 0
 
 
 def function_percent(
@@ -172,10 +194,10 @@ def function_percent(
 ) -> float | None:
     """Line coverage percent of lines start..end, or None when no report lists the file.
 
-    Only the reports with a hit inside the function count, so a process that
-    loaded the file but never ran the function adds no misses. Their hits are
-    summed per line, over code lines only. When no report hits the function,
-    it scores 0%.
+    Only the reports that ran the function count (see ran_function), so a
+    process that loaded the file but never ran the function adds no misses.
+    Their hits are summed per line, over code lines only. When no report ran
+    the function, it scores 0%.
     """
 
     if not reports:
@@ -183,7 +205,7 @@ def function_percent(
     spans = [{line: hits for line, hits in report.items() if start <= line <= end} for report in reports]
     merged: dict[int, int] = {}
     for span in spans:
-        if not any(hits > 0 for hits in span.values()):
+        if not ran_function(span):
             continue
         for line, hits in span.items():
             if line <= len(source_lines) and is_code_line(source_lines[line - 1]):

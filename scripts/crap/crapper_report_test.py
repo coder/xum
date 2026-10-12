@@ -155,10 +155,11 @@ def test_records_of_one_file_from_many_reports_merge_by_line(tmp_path, capsys):
     # checkout's absolute path, which is not --root.
     unit = tmp_path / "unit.info"
     unit.write_text(f"SF:{branchy}\nDA:2,1\nDA:3,1\nDA:5,2\nDA:6,0\nDA:10,0\nend_of_record\n", encoding="utf-8")
-    # Each later record misses a line an earlier one hit.
+    # Each later record misses a line an earlier one hit. Every report hits
+    # classify's entry (line 2), as any report that ran it does.
     integration = tmp_path / "integration.info"
     integration.write_text(
-        f"SF:/runner/work/xum/xum/{branchy}\nDA:2,0\nDA:6,4\nDA:7,0\nend_of_record\n"
+        f"SF:/runner/work/xum/xum/{branchy}\nDA:2,1\nDA:5,0\nDA:6,4\nDA:7,0\nend_of_record\n"
         f"SF:/runner/work/xum/xum/{branchy}\nDA:3,0\nDA:7,1\nend_of_record\n"
         # Jest on Windows.
         f"SF:C:\\a\\xum\\{branchy.replace('/', chr(92))}\nDA:10,1\nend_of_record\n"
@@ -296,3 +297,40 @@ def test_code_lines_only_a_loading_report_lists_do_not_count(tmp_path, capsys):
 
     # The old line union scored 3 of 6 lines: 0.5.
     assert coverage_of(capsys, tmp_path, call, "floor", ran, loaded) == 1.0
+
+
+def test_code_after_a_block_comment_counts(tmp_path, capsys):
+    guard = write(
+        tmp_path,
+        "src/demo/guard.ts",
+        "export function guard(x: number): number {\n"
+        "  if (x < 0) {\n"
+        "    /* ignore */ return 0;\n"
+        "  }\n"
+        "  /* Doubles x.\n"
+        "   * Twice. */ return x * 2;\n"
+        "}\n",
+    )
+    # The early return on line 3 never ran.
+    ran = lcov_file(tmp_path, "ran.info", guard, "DA:1,1\nDA:2,1\nDA:3,0\nDA:6,1\n")
+
+    assert coverage_of(capsys, tmp_path, guard, "guard", ran) == 0.75
+
+
+def test_a_load_time_hit_inside_an_uncalled_arrow_is_not_a_run(tmp_path, capsys):
+    arrow = write(
+        tmp_path,
+        "src/demo/arrow.ts",
+        "export const arrow = (x: number): number => {\n"
+        "  // comment\n"
+        "\n"
+        "  const y = x + 1;\n"
+        "  return y;\n"
+        "};\n",
+    )
+    # Bun 1.3.12, file imported and arrow never called.
+    loaded = lcov_file(tmp_path, "loaded.info", arrow, "DA:1,0\nDA:2,0\nDA:3,0\nDA:4,0\nDA:5,2\n")
+    ran = lcov_file(tmp_path, "ran.info", arrow, "DA:1,29\nDA:4,18\nDA:5,10\n")
+
+    assert coverage_of(capsys, tmp_path, arrow, "arrow", loaded) == 0.0
+    assert coverage_of(capsys, tmp_path, arrow, "arrow", loaded, ran) == 1.0
