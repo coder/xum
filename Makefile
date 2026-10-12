@@ -521,7 +521,7 @@ test-crap-scripts: ## Test the Crapper adapter (hand-counted fixtures) and crap-
 		[ $$attempt -lt 3 ] || exit 1; echo "grammar download failed, retrying ($$attempt/3)" >&2; sleep 10; \
 	done
 	@$(CRAP_PYTHON) -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
-	@bun test ./scripts/crap/check.test.ts
+	@bun test ./scripts/crap/check.test.ts ./scripts/crap/agentGate.test.ts
 
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# .xum/tool_pre - CRAP gate before agent `git commit` / `git push` (block mode only).
+# The mode constant and the rules live in scripts/crap/agent-gate.sh.
+[[ "$XUM_TOOL" == "bash" ]] || exit 0
+exec "${0%/*}/../scripts/crap/agent-gate.sh" pre

@@ -2104,6 +2104,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- CI runs `make static-check-full`, which adds the targets in its Makefile prerequisites (including docs link checking via `mintlify broken-links`) to `static-check`.",
       "- Xum sources `.xum/tool_env` before every `bash` tool call; in other harnesses, `source .xum/tool_env` first. Use `run_and_report <step_name> <command...>` when running multiple validation steps in one call.",
       "- Do not pipe/redirect/wrap `run_and_report` output; keep helper markers intact so Xum can show clean step status.",
+      "- CRAP gate: `make crap-check` scores the functions you changed. When it (or the report after an agent `git commit`/`git push`) names a function, read the `crap-gate` skill (`.xum/skills/crap-gate/SKILL.md`) before fixing it.",
       "- `./scripts/wait_pr_ready.sh <pr_number>` is the preferred tail-end helper after local validation and after you've exhausted useful local work.",
       "- `./scripts/wait_pr_checks.sh <pr_number>` is the checks watcher; `wait_pr_ready.sh` must execute `wait_pr_checks.sh --once` on each loop iteration.",
       "- `./scripts/wait_pr_codex.sh <pr_number>` is the Codex gate used by `wait_pr_ready.sh`.",
