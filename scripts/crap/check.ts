@@ -27,11 +27,17 @@ function git(root: string, args: string[]): string {
   return execFileSync("git", args, { cwd: root, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
 }
 
-function score(root: string, files: string[], lcov: readonly string[]): FunctionRow[] {
+function score(
+  root: string,
+  files: string[],
+  lcov: readonly string[],
+  renames: ReadonlyArray<[string, string]> = []
+): FunctionRow[] {
   // The adapter scores all of src/ when given no files, so never call it empty.
   if (files.length === 0) return [];
   const args = ["run", "--quiet", "--script", ADAPTER, "--root", root];
   for (const report of lcov) args.push("--lcov", report);
+  for (const [from, to] of renames) args.push("--rename", from, to);
   const out = execFileSync("uv", [...args, ...files], {
     encoding: "utf8",
     maxBuffer: 256 * 1024 * 1024,
@@ -65,7 +71,10 @@ function parseNameStatus(output: string): ChangedFile[] {
       i += 3;
     } else {
       const path = fields[i + 1];
-      files.push({ basePath: status === "A" ? null : path, headPath: status === "D" ? null : path });
+      files.push({
+        basePath: status === "A" ? null : path,
+        headPath: status === "D" ? null : path,
+      });
       i += 2;
     }
   }
@@ -90,11 +99,11 @@ function readDebt(root: string, base: string): DebtUse[] {
 }
 
 /**
- * Scores the base side in a temp tree. Each file goes at its HEAD path (a
- * renamed file's base content included), so Crapper derives the same paths and
- * namespaces as for the head and identities match. Deleted files keep their path.
- * Base LCOV records of a renamed file name its old path, so they do not match
- * and that file scores 0% at the base.
+ * Scores the base side in a temp tree that keeps the base paths, so the
+ * adapter applies its production filter and base coverage to the old path.
+ * A renamed file's functions are reported under the head path, so their
+ * identities match the head. A file renamed from a test or story into
+ * production has no base rows, and its functions count as new.
  */
 function scoreBase(
   root: string,
@@ -104,15 +113,20 @@ function scoreBase(
 ): FunctionRow[] {
   const tree = mkdtempSync(join(tmpdir(), "crap-base-"));
   try {
-    const targets: string[] = [];
-    for (const file of files) {
-      if (file.basePath === null) continue;
-      const target = file.headPath ?? file.basePath;
-      mkdirSync(dirname(join(tree, target)), { recursive: true });
-      writeFileSync(join(tree, target), execFileSync("git", ["show", `${base}:${file.basePath}`], { cwd: root }));
-      targets.push(target);
+    const paths: string[] = [];
+    const renames: Array<[string, string]> = [];
+    for (const { basePath, headPath } of files) {
+      if (basePath === null) continue;
+      mkdirSync(dirname(join(tree, basePath)), { recursive: true });
+      const blob = execFileSync("git", ["show", `${base}:${basePath}`], {
+        cwd: root,
+        maxBuffer: 256 * 1024 * 1024,
+      });
+      writeFileSync(join(tree, basePath), blob);
+      paths.push(basePath);
+      if (headPath !== null && headPath !== basePath) renames.push([basePath, headPath]);
     }
-    return score(tree, targets, lcov);
+    return score(tree, paths, lcov, renames);
   } finally {
     rmSync(tree, { recursive: true, force: true });
   }
@@ -171,12 +185,25 @@ function main(argv: string[]): number {
     `${values.base}^{commit}`,
   ]).trim();
   // The working tree is the head: unstaged edits count, untracked files do not.
-  const diffArgs = ["diff", "-M", "--no-color", "--no-ext-diff", base];
+  // Pin the output format against user config (diff.mnemonicPrefix,
+  // diff.noprefix, core.quotePath) so paths match the scorer's.
+  const diffArgs = [
+    "-c",
+    "core.quotePath=false",
+    "diff",
+    "-M",
+    "--default-prefix",
+    "--no-color",
+    "--no-ext-diff",
+    base,
+  ];
   const files = parseNameStatus(git(root, [...diffArgs, "--name-status", "-z"])).filter(
     (file) => file.headPath === null || existsSync(join(root, file.headPath))
   );
   const headPaths = files.flatMap((file) => (file.headPath ? [file.headPath] : []));
-  const pathspec = files.flatMap((file) => [file.basePath, file.headPath].filter((p) => p !== null));
+  const pathspec = files.flatMap((file) =>
+    [file.basePath, file.headPath].filter((p) => p !== null)
+  );
   const changed = parseChangedLines(git(root, [...diffArgs, "-U0", "--", ...new Set(pathspec)]));
   const { findings, totalComplexity } = evaluate(
     scoreBase(root, base, files, values["base-coverage"]),

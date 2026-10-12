@@ -68,6 +68,42 @@ test("a renamed file keeps its functions' identity", () => {
   expect(result.out).not.toContain("new-function");
 });
 
+test("a file renamed into production counts as new", () => {
+  git("mv", "src/demo/route.ts", "src/demo/route.test.ts");
+  git("commit", "-q", "-m", "make it a test");
+  git("mv", "src/demo/route.test.ts", "src/demo/route.ts");
+  git("commit", "-q", "-m", "back to production");
+
+  const result = check("HEAD~1");
+
+  expect(result.status).toBe(1);
+  expect(result.out).toContain(
+    "VIOLATION new-function src/demo/route.ts:1-12 route: new function CC 10"
+  );
+});
+
+test("a touched hotspot warns even with the user's diff prefix config", () => {
+  // CC 31: above the CRAP tax stage.
+  const hot = `export function hot(a: number) {
+${Array.from({ length: 30 }, (_, i) => `  if (a === ${i}) return ${i};`).join("\n")}
+  return -1;
+}
+`;
+  write("src/demo/hot.ts", hot);
+  git("add", ".");
+  git("commit", "-q", "-m", "hotspot");
+  write("src/demo/hot.ts", hot.replace("  return -1;", "  // why -1\n  return -1;"));
+  // With this, plain `git diff` prints `+++ w/src/...`.
+  git("config", "diff.mnemonicPrefix", "true");
+
+  const result = check("HEAD");
+
+  expect(result.status).toBe(0);
+  expect(result.out).toContain(
+    "warning   crap-tax     src/demo/hot.ts:1-34 hot: touched hotspot, CC 31 unchanged"
+  );
+});
+
 test("a CC gain fails, and a Crap-Debt trailer turns it into a listed warning", () => {
   write(
     "src/demo/route.ts",
