@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { findFirstViewFonts, firstViewFontPreloads } from "./staticAssets";
+import { findFirstViewFont, firstViewFontPreload } from "./staticAssets";
 
 // Shaped like the built CSS: Vite minifies it, so family names and URLs carry no quotes.
 const BUILT_CSS =
@@ -9,39 +9,27 @@ const BUILT_CSS =
   '@font-face{font-family:Geist Mono;src:url(./GeistMono-Variable-BJ0bRpLQ.woff2)format("woff2")}' +
   ".x{font-family:Geist,sans-serif}";
 
-describe("findFirstViewFonts", () => {
-  test("takes each first-view family's woff2 file from the built CSS", () => {
-    expect(findFirstViewFonts(BUILT_CSS)).toEqual({
-      sans: "Geist-Variable-C_ya05Eu.woff2",
-      mono: "GeistMono-Variable-BJ0bRpLQ.woff2",
-    });
+describe("findFirstViewFont", () => {
+  test("takes the Geist woff2 file from the built CSS, and no other family's", () => {
+    // Geist Mono, Seti and Nerd Font Symbols are in the same CSS: none of them is the first-view font.
+    expect(findFirstViewFont(BUILT_CSS)).toBe("Geist-Variable-C_ya05Eu.woff2");
   });
 
-  test("reads quoted names and URLs too, and leaves a missing family out", () => {
+  test("reads quoted names and URLs too, and finds nothing without a Geist rule", () => {
     const css = `@font-face { font-family: "Geist"; src: url("./Geist-Variable-AbCd1234.woff2") format("woff2"); }`;
-    expect(findFirstViewFonts(css)).toEqual({ sans: "Geist-Variable-AbCd1234.woff2" });
-    expect(findFirstViewFonts(".x{color:red}")).toEqual({});
+    expect(findFirstViewFont(css)).toBe("Geist-Variable-AbCd1234.woff2");
+    const monoOnly =
+      '@font-face{font-family:Geist Mono;src:url(./GeistMono-Variable-BJ0bRpLQ.woff2)format("woff2")}';
+    expect(findFirstViewFont(monoOnly)).toBeUndefined();
+    expect(findFirstViewFont(".x{color:red}")).toBeUndefined();
   });
 });
 
-describe("firstViewFontPreloads", () => {
-  const fonts = findFirstViewFonts(BUILT_CSS);
-
-  test("preloads Geist on every route, and Geist Mono only on workspace routes", () => {
-    expect(firstViewFontPreloads(fonts, "/")).toBe(
+describe("firstViewFontPreload", () => {
+  test("is one font preload link, or nothing when the CSS names no first-view font", () => {
+    expect(firstViewFontPreload(findFirstViewFont(BUILT_CSS))).toBe(
       '<link rel="preload" as="font" type="font/woff2" crossorigin href="./Geist-Variable-C_ya05Eu.woff2" />'
     );
-    const workspace = firstViewFontPreloads(fonts, "/workspace/a1b2c3d4e5");
-    expect(workspace).toContain('href="./Geist-Variable-C_ya05Eu.woff2"');
-    expect(workspace).toContain('href="./GeistMono-Variable-BJ0bRpLQ.woff2"');
-    expect(firstViewFontPreloads(fonts, "/project")).not.toContain("GeistMono");
-  });
-
-  test("never preloads a font the first view does not use", () => {
-    for (const route of ["/", "/workspace/a1b2c3d4e5", "/project"]) {
-      const links = firstViewFontPreloads(fonts, route);
-      expect(links, route).not.toContain("nerd-font-symbols");
-      expect(links, route).not.toContain("seti");
-    }
+    expect(firstViewFontPreload(undefined)).toBe("");
   });
 });

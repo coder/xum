@@ -59,11 +59,10 @@ import {
 import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { assert } from "@/common/utils/assert";
 import {
-  findFirstViewFonts,
-  firstViewFontPreloads,
+  findFirstViewFont,
+  firstViewFontPreload,
   isHashedStaticAssetName,
   PRECOMPRESSED_ENCODINGS,
-  type FirstViewFonts,
 } from "@/node/orpc/staticAssets";
 import { getAppProxyBasePathFromPathname, stripAppProxyBasePath } from "@/common/appProxyBasePath";
 
@@ -1036,20 +1035,20 @@ export async function createOrpcServer({
   });
 
   let rawSpaIndexHtml: string | null = null;
-  let firstViewFonts: FirstViewFonts = {};
+  let firstViewFont: string | undefined;
 
   // Static file serving (optional)
   if (serveStatic) {
     try {
       const indexHtmlPath = path.join(staticDir, "index.html");
       rawSpaIndexHtml = await fs.readFile(indexHtmlPath, "utf8");
-      // The font files come from the stylesheets index.html links, so a rebuild with new hashes needs
-      // no code change. A stylesheet that cannot be read only costs its preloads.
+      // The font file comes from the stylesheets index.html links, so a rebuild with new hashes needs
+      // no code change. A stylesheet that cannot be read only costs the preload.
       for (const [, href] of rawSpaIndexHtml.matchAll(
         /<link[^>]*rel="stylesheet"[^>]*href="\.?\/?([^"]+\.css)"/g
       )) {
         const css = await fs.readFile(path.join(staticDir, href), "utf8").catch(() => "");
-        firstViewFonts = { ...firstViewFonts, ...findFirstViewFonts(css) };
+        firstViewFont ??= findFirstViewFont(css);
       }
     } catch (error) {
       log.error("Failed to read index.html for SPA fallback:", error);
@@ -1658,7 +1657,7 @@ export async function createOrpcServer({
         // After the injected <base>, so the relative font URLs resolve under a proxy base path.
         const html = spaIndexHtml.replace(
           /<\/head>/i,
-          `${firstViewFontPreloads(firstViewFonts, req.path)}</head>`
+          `${firstViewFontPreload(firstViewFont)}</head>`
         );
         // Compressed per response, because the HTML is rewritten per request (base href, redirect).
         // br quality 5 takes about 0.15 ms for this page. Quality 11 blocks for about 10 ms.

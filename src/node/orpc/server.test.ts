@@ -598,18 +598,19 @@ describe("createOrpcServer SPA fallback compression and font preloads", () => {
     }
   });
 
-  test("adds the first-view font preloads to the response, never to dist/index.html", async () => {
+  test("preloads only Geist in the response, on every route, never in dist/index.html", async () => {
     const { server, tempDir, close } = await createStaticTestServer({ files });
     try {
       const preload = (file: string) =>
         `<link rel="preload" as="font" type="font/woff2" crossorigin href="./${file}" />`;
       const root = decode(await rawRequestBuffer(server.baseUrl, "/"));
       const workspace = decode(await rawRequestBuffer(server.baseUrl, "/workspace/a1b2c3d4e5"));
-      expect(root).toContain(preload("Geist-Variable-C_ya05Eu.woff2"));
-      expect(root).not.toContain("GeistMono-Variable");
-      expect(workspace).toContain(preload("Geist-Variable-C_ya05Eu.woff2"));
-      expect(workspace).toContain(preload("GeistMono-Variable-BJ0bRpLQ.woff2"));
       for (const html of [root, workspace]) {
+        expect(html).toContain(preload("Geist-Variable-C_ya05Eu.woff2"));
+        expect(html.match(/rel="preload" as="font"/g)).toHaveLength(1);
+        // Not even on /workspace, where code shows: on a throttled phone the Geist Mono preload
+        // competed with the app JS and made the page's content 0.28 s later (page-timing, #6216).
+        expect(html).not.toContain("GeistMono-Variable");
         // Not a first-view font, though it is a woff2 in the same CSS.
         expect(html).not.toContain("nerd-font-symbols");
         // After the injected <base>, so the relative font URLs resolve under a proxy base path.
