@@ -148,9 +148,15 @@ describe("WorkspaceService.planReviewSubmitFeedback", () => {
 
     const result = await harness.service.planReviewSubmitFeedback(workspaceId, feedback);
 
-    const raw =
-      "Plan review feedback was not sent: the agent is busy. Send it again once the current turn finishes.";
-    expect(result).toEqual(Err({ type: "send_failed", error: { type: "unknown", raw } }));
+    // The generic idle-only refusal, which plan review replaces with its own guidance.
+    const generic = await harness.service.sendMessage(workspaceId, "x", options, {
+      requireIdle: true,
+    });
+    expect(generic.success).toBe(false);
+    expect(result.success).toBe(false);
+    if (result.success || generic.success) return;
+    expect(result.error).toMatchObject({ type: "send_failed", error: { type: "unknown" } });
+    expect(result.error).not.toEqual({ type: "send_failed", error: generic.error });
     expect(session.queueMessage).not.toHaveBeenCalled();
     expect(session.sendMessage).not.toHaveBeenCalled();
     expect(await feedbackIds()).toEqual([]);
