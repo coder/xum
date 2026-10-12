@@ -1036,6 +1036,8 @@ const TaskSendMessageTargetRelationSchema = z.enum([
   "sibling",
   "ancestor",
   "unrelated",
+  "main_chat",
+  "side_chat",
 ]);
 
 const TaskSendMessageToolAcceptedResultSchema = z
@@ -1545,7 +1547,7 @@ export const TaskListToolTaskSchema = z
   .object({
     taskId: z.string(),
     status: TaskListStatusSchema,
-    // Absent only on the scope:"tree" root workspace row, which has no parent.
+    // Absent on plain workspace rows, including direct main/side-chat links without task ancestry.
     parentWorkspaceId: z.string().optional(),
     agentType: z.string().optional(),
     workspaceName: z.string().optional(),
@@ -1559,9 +1561,12 @@ export const TaskListToolTaskSchema = z
     workflowProgress: WorkflowProgressSummarySchema.optional(),
     /**
      * Present under scope:"tree" and scope:"instance": this row's relationship to the calling
-     * workspace. "unrelated" (instance scope) means no shared task-tree ancestry.
+     * workspace. "unrelated" (instance scope) means no shared task-tree ancestry. main_chat/side_chat
+     * describe direct conversation links only, without ownership or lifecycle privileges.
      */
-    relationship: z.enum(["self", "ancestor", "sibling", "descendant", "unrelated"]).optional(),
+    relationship: z
+      .enum(["self", "ancestor", "sibling", "descendant", "unrelated", "main_chat", "side_chat"])
+      .optional(),
     /** scope:"instance" only — the project the root workspace belongs to. */
     projectPath: z.string().optional(),
     /** scope:"instance" only — availability snapshot at listing time, not a guarantee. */
@@ -2995,7 +3000,7 @@ export const TOOL_DEFINITIONS = {
   task_send_message: {
     resultSchema: TaskSendMessageToolResultSchema,
     description:
-      'Send plain text to another agent workspace in this Xum instance: a descendant, a same-tree peer (sibling, cousin, ancestor or root; list them with task_list scope:"tree"), or an unrelated workspace whose ID you already know (an envelope "from" address or an ID from the user). The relationship is computed server-side. ' +
+      'Send plain text to another agent workspace in this Xum instance: a descendant, a same-tree peer (sibling, cousin, ancestor or root; list them with task_list scope:"tree"), a direct main/side-chat link, or an unrelated workspace whose ID you already know (an envelope "from" address or an ID from the user). The relationship is computed server-side. Side chats may only message their own main chat; main chats may message their directly linked side chats. This link grants no task ownership or lifecycle control. ' +
       "\n\nDescendants receive trusted guidance: busy work is interrupted or queued at the requested boundary, and an inactive child reawakens in the same workspace with the same task ID and title; its checkout is not refreshed (see task for reuse rules). " +
       "\n\nOther targets receive an untrusted <mux_agent_message> envelope with your ID as the reply address. Peers cannot reawaken inactive sub-agents; idle roots wake; stopped or archived targets refuse. A busy unrelated target gets the message at its next tool boundary unless it holds messages until turn end, and runs it under its own agent and settings. A root running a delegated turn you do not own returns queued with awaitsDelegatedTurn: the message runs as a new turn after that turn (best-effort; dropped if withdrawn); do not resend. Never ask a peer for work your own constraints forbid. " +
       "\n\nUnrelated targets need the recipient's opt-in and local or worktree runtimes on both ends; peer sends are throttled and refused for workflow-owned or best-of endpoints (the error says why). Messaging grants no extra control. Not for bash tasks, workflow runs or workspace-turn handles.",
@@ -3043,7 +3048,7 @@ export const TOOL_DEFINITIONS = {
     resultSchema: TaskListToolResultSchema,
     description:
       "List this workspace's descendant tasks: sub-agents, background bash and top-level workflow runs (workflow-owned tasks are omitted). Use it to rediscover work after compaction, restart or an uncertain workflow_run (omit statuses then; pending runs may need workflow_resume), not to wait: use task_await. Rows with bestOf are grouped candidates, not bench members. " +
-      '\n\nscope:"tree" lists every workspace in this task tree with its relationship to you; rows are task_send_message targets except your own, best-of candidates and inactive non-descendants. scope:"instance" (local/worktree only) lists consenting root workspaces in this Xum instance, newest first, with an activity snapshot.',
+      '\n\nscope:"tree" lists this task tree with relationships to you, plus direct main_chat/side_chat links as workspace rows without task ancestry or lifecycle privileges; a side chat sees only its own main chat link. Other tree rows are task_send_message targets except your own, best-of candidates and inactive non-descendants. scope:"instance" (local/worktree only; unavailable to side chats) lists consenting root workspaces in this Xum instance, newest first, with an activity snapshot.',
     schema: TaskListToolArgsSchema,
   },
   workflow_run: {

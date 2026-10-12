@@ -10,7 +10,13 @@
  * the sender shares no task-tree ancestry with the recipient (another root, or a sub-agent under
  * another root); it describes ancestry only and grants no authority beyond a sibling's.
  */
-export type AgentMessageRelationship = "sibling" | "descendant" | "unrelated";
+// Main/side labels describe a direct conversation link, not task ownership or user authority.
+export type AgentMessageRelationship =
+  | "sibling"
+  | "descendant"
+  | "unrelated"
+  | "main_chat"
+  | "side_chat";
 
 export interface AgentMessageEnvelope {
   /** Sender's tree target id — doubles as the reply address for task_send_message. */
@@ -28,7 +34,13 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 function isRelationship(value: unknown): value is AgentMessageRelationship {
-  return value === "sibling" || value === "descendant" || value === "unrelated";
+  return (
+    value === "sibling" ||
+    value === "descendant" ||
+    value === "unrelated" ||
+    value === "main_chat" ||
+    value === "side_chat"
+  );
 }
 
 /**

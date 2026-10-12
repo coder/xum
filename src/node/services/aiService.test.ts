@@ -625,6 +625,12 @@ describe("AIService side-chat tool ceiling", () => {
             allTools: {
               file_read: readTool,
               models_list: readTool,
+              task_list: readTool,
+              task_send_message: readTool,
+              task: mutatingTool,
+              task_stop: mutatingTool,
+              task_remove: mutatingTool,
+              task_retitle: mutatingTool,
               bash: mutatingTool,
               native_search: nativeTool,
             },
@@ -640,6 +646,8 @@ describe("AIService side-chat tool ceiling", () => {
           harness.service.turnRequestBuilderBindings.extraTools = {
             // Grants alone cannot distinguish a safe built-in from a same-name replacement.
             file_read: mutatingTool,
+            task_list: mutatingTool,
+            task_send_message: mutatingTool,
             extra_mutation: mutatingTool,
             code_execution: mutatingTool,
           };
@@ -709,7 +717,12 @@ describe("AIService side-chat tool ceiling", () => {
           for (const request of [started, fallback.data]) {
             const tools = request.tools ?? {};
             if (sideChat) {
-              expect(Object.keys(tools).sort()).toEqual(["file_read", "models_list"]);
+              expect(Object.keys(tools).sort()).toEqual([
+                "file_read",
+                "models_list",
+                "task_list",
+                "task_send_message",
+              ]);
               expect(started.toolSearchState).toBeUndefined();
               expect(buildRequiredToolPatterns(started.toolPolicy)).toHaveLength(0);
             } else {
@@ -725,10 +738,13 @@ describe("AIService side-chat tool ceiling", () => {
             expect(listServers).not.toHaveBeenCalled();
             expect(getToolsForWorkspace).not.toHaveBeenCalled();
             expect(beforeHook.every((names) => !names.includes("code_execution"))).toBe(true);
-            const execute = started.tools?.file_read?.execute;
-            if (!execute) throw new Error("Expected granted local read tool");
-            await execute({}, { toolCallId: "read", messages: [], context: undefined });
-            expect(read).toHaveBeenCalledTimes(1);
+            for (const name of ["file_read", "task_list", "task_send_message"]) {
+              const execute = started.tools?.[name]?.execute;
+              if (!execute) throw new Error(`Expected granted built-in tool: ${name}`);
+              await execute({}, { toolCallId: name, messages: [], context: undefined });
+            }
+            // Same-name extra tools must not replace the trusted built-in messaging tools either.
+            expect(read).toHaveBeenCalledTimes(3);
           } else {
             expect(getToolsForWorkspace).toHaveBeenCalledTimes(1);
             expect(beforeHook.every((names) => names.includes("code_execution"))).toBe(true);
