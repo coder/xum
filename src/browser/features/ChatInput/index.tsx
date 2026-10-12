@@ -430,8 +430,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // When a follow-up is queued during stream-start, it resolves immediately but shouldn't
   // clear the "in flight" state until all sends complete.
   const [sendingCount, setSendingCount] = useState(0);
-  // Of sendingCount: workspace sends that have taken their draft and are only settling now.
-  const [settlingSendCount, setSettlingSendCount] = useState(0);
   const sendModeMenuContainerRef = useRef<HTMLDivElement>(null);
   const [hideReviewsDuringSend, setHideReviewsDuringSend] = useState(false);
   const projectedWorkflowRunCardKeysRef = useRef(new Set<string>());
@@ -852,16 +850,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // keeps the composer in this same sending state while DraftStore retries it (idempotent sends).
   const isSending = sendingCount > 0 || draft.unresolvedSendCount > 0;
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
-  // A send locks the composer until it has taken its draft: before that, a second Send would
-  // submit the same text again. After that, a send that is only settling does not lock it while
-  // the backend runs a turn. The turn has two phases (WorkspaceStore: starting until stream-start,
-  // then interruptible), so both count: exempting only the first re-locked the composer at
-  // stream-start and dropped what the user was typing then (#5810).
-  const isTurnActive =
-    isStreamStarting || (variant === "workspace" && (props.canInterrupt ?? false));
-  const sendTakingDraft = sendingCount > settlingSendCount;
   const sendInFlightBlocksInput =
-    variant === "workspace" ? sendTakingDraft || (isSendInFlight && !isTurnActive) : isSendInFlight;
+    variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
@@ -2622,8 +2612,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       // typed or a restore put in meanwhile stays (#5226 item 12).
       // Null when the send failed before taking anything (nothing to put back) or succeeded.
       let taken: { text: string } | null = null;
-      // Set once this send has taken its draft (see sendTakingDraft).
-      let draftTaken = false;
       const putBackTaken = () => {
         if (taken === null) return;
         const { text } = taken;
@@ -2864,8 +2852,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           setAttachments((current) => current.filter(({ id }) => !sentAttachmentIds.has(id)));
         }
         setHideReviewsDuringSend(true);
-        draftTaken = true;
-        setSettlingSendCount((c) => c + 1);
         // Clear inline height style - VimTextArea's useLayoutEffect will handle sizing
         if (inputRef.current) {
           inputRef.current.style.height = "";
@@ -2997,7 +2983,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       };
       await runWithCatchFinally(sendPreparedMessage, restoreDraftOnError, () => {
         setSendingCount((c) => c - 1);
-        if (draftTaken) setSettlingSendCount((c) => c - 1);
         setHideReviewsDuringSend(false);
       });
     };
