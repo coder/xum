@@ -121,13 +121,22 @@ describe("new functions", () => {
       expect(verdicts(base, head)).toEqual([["new-function", "violation", key("piece")]]);
     });
 
-    test("does not cover a rename or new code paid for by an unrelated cut", () => {
+    test("does not cover a rename, or new code that a smaller cut does not pay for", () => {
       expect(verdicts([row("f", 50, [1, 99])], [row("g", 50, [1, 99])])).toEqual([
         ["new-function", "violation", key("g")],
       ]);
       expect(
         verdicts([row("a", 10, [1, 20])], [row("a", 5, [1, 10]), row("feat", 12, [11, 40])])
       ).toEqual([["new-function", "violation", key("feat")]]);
+    });
+
+    test("is aggregate, like net-extraction relief: a large enough cut pays for new code", () => {
+      // The gate cannot tell a move from a cut plus new code. Net-extraction
+      // relief already warns at a cut of 13; move relief warns at 11.
+      const head = [row("existing", 19, [1, 20]), row("feature", 12, [21, 40])];
+      expect(verdicts([row("existing", 30, [1, 40])], head)).toEqual([
+        ["new-function", "warning", key("feature")],
+      ]);
     });
   });
 });

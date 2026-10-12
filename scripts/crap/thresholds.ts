@@ -48,8 +48,11 @@ export const MOVE_RELIEF_MAX_CC = 20;
  * code, even though it raises the total CC by 1. It applies when the CC that
  * kept functions lost pays for every decision point of every new function
  * (keptDrop >= sum of (CC - 1) over new functions) and this new function is at
- * most MOVE_RELIEF_MAX_CC. A rename gets nothing, because no kept function
- * shrinks.
+ * most MOVE_RELIEF_MAX_CC. A rename alone gets nothing, because no kept
+ * function shrinks. Like net-extraction relief, this is aggregate: it cannot
+ * tell a move from an unrelated cut plus new code. It accepts a cut smaller
+ * than net-extraction relief needs, by the number of new functions plus 1.
+ * The finding stays a warning in the report, not a silent pass.
  */
 export function moveRelief(keptDrop: number, newDecisions: number, newCc: number): boolean {
   return keptDrop >= newDecisions && newCc <= MOVE_RELIEF_MAX_CC;
