@@ -67,6 +67,7 @@ export function summary(
     "",
     coverage,
     "Unit reports cover the shared-process suites only (isolated suites run without coverage). No base coverage: the CRAP tax compares CC and only warns.",
+    "`.tsx` coverage comes from Bun unit tests only, because Jest does not collect `.tsx` coverage yet: a component only Jest UI tests render scores 0%.",
     "",
   ];
   if (report === null) {
