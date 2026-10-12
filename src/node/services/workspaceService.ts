@@ -85,8 +85,6 @@ import { coerceAgentStatus } from "@/node/utils/extensionMetadata";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
-import { resolveArtifactsLocation } from "@/node/services/artifactsOperations";
-import { createArtifactTurnSnapshotHooks } from "@/node/services/artifactVersionsOperations";
 import { ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE } from "@/common/constants/artifactInteractions";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
@@ -5455,20 +5453,7 @@ export class WorkspaceService
 
   private createSession(workspaceId: string): AgentSession {
     if (this.shuttingDown) throw new Error("Server is shutting down");
-    // Artifacts M4: snapshot changed artifacts when a logical turn completes unpublished.
-    const artifactTurnHooks = createArtifactTurnSnapshotHooks({
-      isEnabled: () => this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
-      sessionDir: path.join(this.config.sessionsDir, workspaceId),
-      resolveLocation: async () => {
-        const metadata = await this.getInfo(workspaceId);
-        return metadata
-          ? resolveArtifactsLocation(this.config.sessionsDir, workspaceId, metadata)
-          : null;
-      },
-    });
     return new AgentSession({
-      onLogicalTurnStarted: artifactTurnHooks.onLogicalTurnStarted,
-      onLogicalTurnCompleted: artifactTurnHooks.onLogicalTurnCompleted,
       contextManagement: this.contextManagement,
       effectRunner: this.effectRunner,
       appFiberScope: this.appFiberScope,
@@ -20983,6 +20968,11 @@ export class WorkspaceService
     }
   }
 
+  /** Cancel the workspace session's scheduled auto-retry of this goal's automatic turn. */
+  abandonGoalAutoRetry(workspaceId: string, goalId: string): void {
+    this.sessions.get(workspaceId)?.abandonGoalAutoRetry(goalId);
+  }
+
   async getGoalContinuationKickoffSendOptions(
     workspaceId: string
   ): Promise<SendMessageOptions | null> {
@@ -21038,6 +21028,10 @@ export class WorkspaceService
             },
           ]
         : undefined,
+      // A `/goal` sent before any chat message leaves the workspace without AI settings: the
+      // kickoff must then use the user's configured default model, as the composer does, not
+      // the built-in one (bug bash: the kickoff ran on a model the user had not picked).
+      defaultModel: config.defaultModel,
       definitionContext: await this.getAgentDefinitionContext(workspaceId),
     });
 

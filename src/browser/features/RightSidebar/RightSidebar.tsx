@@ -150,6 +150,7 @@ import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
 import { SideChatPanel } from "./SideChatPanel";
 import { NewTabLauncher } from "./NewTabLauncher";
+import { RightSidebarOverview } from "./RightSidebarOverview";
 import { getOrderedBaseTabIds } from "./Tabs/tabConfig";
 import { useExperimentGatedTab } from "./useExperimentGatedTab";
 
@@ -157,9 +158,7 @@ interface SidebarContainerProps {
   collapsed: boolean;
   /** Custom width from drag-resize (unified across all tabs) */
   customWidth?: number;
-  /** Whether actively dragging resize handle (disables transition) */
-  isResizing?: boolean;
-  /** Whether running in Electron desktop mode (hides border when collapsed) */
+  /** Whether running in Electron desktop mode (taller header, so the collapsed card sits lower) */
   isDesktop?: boolean;
   /** Hide + inactivate sidebar while immersive review overlay is active. */
   immersiveHidden?: boolean;
@@ -176,14 +175,17 @@ interface SidebarContainerProps {
  * SidebarContainer - Main sidebar wrapper with dynamic width
  *
  * Width priority (first match wins):
- * 1. collapsed (20px) - Shows collapse button only
+ * 1. collapsed - A bounded floating overview card (fixed width, content height) over the chat's
+ *    top-right corner instead of a full-height rail, so the chat keeps the whole width
  * 2. customWidth - From drag-resize (unified width from AIView)
  * 3. default (400px) - Fallback when no custom width set
+ *
+ * The collapsed card stays this same element (landmark, container ref, responsive-hide class) so
+ * shortcut handlers and visibility checks treat both forms alike.
  */
 const SidebarContainer: React.FC<SidebarContainerProps> = ({
   collapsed,
   customWidth,
-  isResizing,
   isDesktop,
   immersiveHidden = false,
   fullscreen = false,
@@ -192,7 +194,7 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
   role,
   "aria-label": ariaLabel,
 }) => {
-  const width = collapsed ? "20px" : customWidth ? `${customWidth}px` : "400px";
+  const width = customWidth ? `${customWidth}px` : "400px";
 
   React.useEffect(() => {
     const container = containerRef.current;
@@ -216,7 +218,7 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
       ref={containerRef}
       aria-hidden={immersiveHidden || undefined}
       className={cn(
-        "bg-surface-primary border-l border-border-light flex flex-col overflow-hidden flex-shrink-0",
+        "border-border-light flex flex-col",
         // Hide on mobile touch devices - too narrow for useful interaction
         "mobile-hide-right-sidebar",
         // globals.css shows the hidden sidebar full-screen, only while the narrow layout hides it.
@@ -224,13 +226,27 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
         // Immersive review renders its own full-screen overlay, so hiding the underlying
         // sidebar container cuts layout/paint cost without discarding its React state.
         immersiveHidden && "hidden",
-        !isResizing && "transition-[width] duration-200",
-        collapsed && "sticky right-0 z-10 shadow-[-2px_0_4px_rgba(0,0,0,0.2)]",
-        // In desktop mode, hide the left border when collapsed to avoid
-        // visual separation in the titlebar area (overlay buttons zone)
-        isDesktop && collapsed && "border-l-0"
+        collapsed
+          ? [
+              // Positioned against WorkspaceShell. The height cap keeps the card clear of the
+              // composer on short windows; overflowing content scrolls inside the card.
+              "bg-surface-secondary absolute z-10 overflow-x-hidden overflow-y-auto rounded-lg border shadow-lg",
+              // globals.css owns the card's width and right inset (the chat reserves exactly that
+              // room beside it) and shows it only where it fits beside the transcript; the
+              // header's expand button (WorkspaceMenuBar) stands in for it elsewhere.
+              "right-sidebar-overview-card",
+              // The 7rem floor keeps the stats/Expand row and a section reachable even in a
+              // window too short for the composer clearance.
+              "max-h-[max(7rem,min(32rem,calc(100%-12rem)))]",
+              // Below the header (h-9 on desktop, h-8 otherwise) by the card's right inset
+              // (0.75rem), so it sits evenly in the corner.
+              isDesktop ? "top-12" : "top-11",
+            ]
+          : // No width transition: expanding swaps the floating card for the docked panel, and
+            // animating the width between those two layouts reads as the card stretching.
+            "bg-surface-primary flex-shrink-0 overflow-hidden border-l"
       )}
-      style={{ width, maxWidth: "100%" }}
+      style={collapsed ? undefined : { width, maxWidth: "100%" }}
       role={role}
       aria-label={ariaLabel}
     >
@@ -1869,7 +1885,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   const sideChatCreationPending = React.useRef(false);
   const [creatingSideChat, setCreatingSideChat] = React.useState(false);
-  const handleOpenSideChatFromNewTab = (tabsetId: string) => {
+  // A side chat cannot start another side chat.
+  const canStartSideChat = currentWorkspaceMetadata?.sideChatParentWorkspaceId == null;
+  // `tabsetId`: the New tab launcher that asked, replaced by the chat. Without it (the collapsed
+  // overview card) the chat opens like /side does, as a tab in the focused pane.
+  const handleStartSideChat = (tabsetId?: string) => {
     if (api == null || sideChatCreationPending.current) return;
     // Lock before React commits the disabled row so rapid clicks cannot create duplicates.
     sideChatCreationPending.current = true;
@@ -1887,6 +1907,54 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         setCreatingSideChat(false);
       });
   };
+
+  // Rows of the collapsed overview card reopen the sidebar on the tab they summarize.
+  const handleOpenTabFromOverview = (tab: TabType) => {
+    setCollapsed(false);
+    if (tab === "review") {
+      // Also focuses the Review panel, so its keyboard navigation works right away.
+      selectOrOpenReviewTab();
+      return;
+    }
+    setLayout((prev) => selectOrAddTab(prev, tab));
+    if (tab === "artifacts") {
+      // The panel claims focus once it renders, so its keyboard shortcuts work right away.
+      setAutoFocusArtifacts(true);
+      return;
+    }
+    if (isTerminalTab(tab)) {
+      focusTerminalTab(tab);
+      return;
+    }
+    // Side chats hand typing to their composer once it is ready; other tabs focus their tab.
+    setTabToFocus(tab);
+  };
+
+  // Every way out of the card lands keyboard focus in the sidebar: the activated row unmounts
+  // with the card, and focus would otherwise fall back to the page body.
+  // Reads the rendered layout, which drops tabs this workspace cannot show (Review without a
+  // repository), so Expand always lands on a tab that renders.
+  const handleExpandFromOverview = () => {
+    handleOpenTabFromOverview(getFocusedActiveTab(layout, NEW_TAB));
+  };
+  // The header's stand-in for the card (where the card would cover the transcript). The ref keeps
+  // the listener subscribed once per workspace while it still calls the latest handler.
+  const expandFromOverviewRef = React.useRef(handleExpandFromOverview);
+  React.useEffect(() => {
+    expandFromOverviewRef.current = handleExpandFromOverview;
+  });
+  React.useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR>).detail;
+      if (detail?.workspaceId !== workspaceId) return;
+      expandFromOverviewRef.current();
+    };
+    window.addEventListener(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, handler);
+    return () => window.removeEventListener(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, handler);
+  }, [workspaceId]);
+  // The card's terminal count and the layout's terminal tabs sync separately (restored sessions
+  // reach the layout after the count), so the Terminals row opens only once a tab exists for it.
+  const overviewTerminalTab = collectAllTabs(layout.root).find(isTerminalTab);
 
   const handleOpenToolFromNewTab = React.useCallback(
     (tabsetId: string, tool: BaseTabType) => {
@@ -2263,11 +2331,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         onAddNewTab={handleAddNewTab}
         onOpenToolFromNewTab={handleOpenToolFromNewTab}
         onOpenTerminalFromNewTab={handleOpenTerminalFromNewTab}
-        onOpenSideChatFromNewTab={
-          currentWorkspaceMetadata?.sideChatParentWorkspaceId != null
-            ? undefined
-            : handleOpenSideChatFromNewTab
-        }
+        onOpenSideChatFromNewTab={canStartSideChat ? handleStartSideChat : undefined}
         creatingSideChat={creatingSideChat}
         onCloseTab={closeNonTerminalTab}
         isOnlyTabset={layout.root.type === "tabset"}
@@ -2315,7 +2379,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       />
       <SidebarContainer
         collapsed={collapsed}
-        isResizing={isResizing}
         isDesktop={isDesktopMode()}
         immersiveHidden={immersiveHidden}
         fullscreen={fullscreen}
@@ -2381,10 +2444,19 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
           </div>
         )}
         {collapsed && (
-          <SidebarCollapseButton
-            collapsed={collapsed}
-            onToggle={() => setCollapsed(!collapsed)}
-            side="right"
+          <RightSidebarOverview
+            workspaceId={workspaceId}
+            onExpand={handleExpandFromOverview}
+            onOpenTab={handleOpenTabFromOverview}
+            onOpenTerminals={
+              overviewTerminalTab != null
+                ? () => handleOpenTabFromOverview(overviewTerminalTab)
+                : undefined
+            }
+            onNewSideChat={canStartSideChat ? () => handleStartSideChat() : undefined}
+            creatingSideChat={creatingSideChat}
+            artifactsEnabled={artifactsExperimentEnabled}
+            unreadAssisted={unreadAssisted}
           />
         )}
       </SidebarContainer>
