@@ -141,7 +141,8 @@ function FullscreenSidebarClose(props: { onClose?: () => void }) {
 }
 
 /**
- * RightSidebar, keeping its box (collapsed: its 20 px rail) while its chunk loads or after it fails.
+ * RightSidebar, keeping its box while its chunk loads or after it fails. Collapsed, the sidebar takes
+ * no room (its overview card floats over the chat), so the loading box is empty and zero-width.
  * Under immersive review the box covers the workspace above the (still empty) review overlay, so the
  * loading and failure states stay visible.
  */
@@ -150,28 +151,32 @@ function LazyRightSidebar(
 ) {
   const { held, ...sidebarProps } = props;
   const collapsed = readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
-  // The failure state takes the expanded width even when collapsed: the 20 px rail would clip its
-  // Reload button, and the rail's expand control is part of the sidebar that failed to load.
-  const frame = (state: React.ReactNode, kind: "loading" | "failed") => (
-    <div
-      className={cn(
-        "bg-surface-primary flex flex-col overflow-hidden",
-        props.immersiveHidden
-          ? "absolute inset-0 z-[51] items-center justify-center gap-3"
-          : "border-l border-border-light flex-shrink-0 mobile-hide-right-sidebar",
-        props.fullscreen && "right-sidebar-fullscreen items-center justify-center gap-3"
-      )}
-      style={
-        props.immersiveHidden
-          ? undefined
-          : { width: collapsed && kind === "loading" ? 20 : props.width, maxWidth: "100%" }
-      }
-    >
-      {state}
-      {kind === "failed" && <SidebarInput held={held} mode="failed" />}
-      {props.fullscreen && <FullscreenSidebarClose onClose={props.onCloseFullscreen} />}
-    </div>
-  );
+  // The failure state takes the expanded width even when collapsed: it needs room for its Reload
+  // button, and the card's expand control is part of the sidebar that failed to load. The empty
+  // loading box keeps its element (not display:none), so shortcut routing still sees a sidebar
+  // the layout shows (isWorkspaceRightSidebarHidden).
+  const frame = (state: React.ReactNode, kind: "loading" | "failed") => {
+    const empty = collapsed && kind === "loading";
+    return (
+      <div
+        className={cn(
+          "bg-surface-primary flex flex-col overflow-hidden",
+          props.immersiveHidden
+            ? "absolute inset-0 z-[51] items-center justify-center gap-3"
+            : "flex-shrink-0 mobile-hide-right-sidebar",
+          !props.immersiveHidden && !empty && "border-l border-border-light",
+          props.fullscreen && "right-sidebar-fullscreen items-center justify-center gap-3"
+        )}
+        style={
+          props.immersiveHidden ? undefined : { width: empty ? 0 : props.width, maxWidth: "100%" }
+        }
+      >
+        {state}
+        {kind === "failed" && <SidebarInput held={held} mode="failed" />}
+        {props.fullscreen && <FullscreenSidebarClose onClose={props.onCloseFullscreen} />}
+      </div>
+    );
+  };
   const pending = (
     <>
       <SidebarInput held={held} mode="hold" />

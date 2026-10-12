@@ -480,13 +480,13 @@ describe("WorkspaceShell loading placeholders", () => {
   // T3 #5971: RightSidebar is code-split. Until its chunk loads, the shell keeps the sidebar's
   // place, and nothing meant for the sidebar is lost.
   describe("while the sidebar chunk loads", () => {
-    it("keeps the sidebar's box, the collapsed rail when collapsed", () => {
+    it("keeps the sidebar's box, empty when collapsed (the card floats, so it takes no room)", () => {
       gateSidebar();
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
       const view = render(<WorkspaceShell {...defaultProps} />);
       const box = view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
       expect(view.queryByTestId("right-sidebar")).toBeNull();
-      expect(box?.style.width).toBe("20px");
+      expect(box?.style.width).toBe("0px");
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
     });
 
@@ -605,10 +605,10 @@ describe("WorkspaceShell loading placeholders", () => {
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
       const view = render(<WorkspaceShell {...defaultProps} />);
       const box = () => view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
-      expect(box()?.style.width).toBe("20px");
+      expect(box()?.style.width).toBe("0px");
       await gate.fail();
       expect(box()?.contains(view.getByRole("alert"))).toBe(true);
-      expect(box()?.style.width).not.toBe("20px");
+      expect(box()?.style.width).not.toBe("0px");
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
       consoleError.mockRestore();
     });
