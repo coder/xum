@@ -11575,6 +11575,32 @@ export class WorkspaceService
   }
 
   /**
+   * Labels for the counted in-flight operations (bash exec, attachment staging, file
+   * completion, fork, MCP prompt discovery, refine) that archive and interrupt gates
+   * refuse on, in a fixed order so both gates report them alike.
+   */
+  private inFlightOperationLabels(workspaceId: string): string[] {
+    const counts: Array<[count: number, label: string]> = [
+      [this.preflightExecCounts.get(workspaceId) ?? 0, "a bash command executing"],
+      [this.preflightStagingCounts.get(workspaceId) ?? 0, "an attachment transfer in progress"],
+      [
+        this.preflightFileCompletionCounts.get(workspaceId) ?? 0,
+        "a file completion refresh in progress",
+      ],
+      [this.preflightForkCounts.get(workspaceId) ?? 0, "a fork of this workspace in progress"],
+      [
+        this.mcpPromptDiscoveries.get(workspaceId)?.size ?? 0,
+        "an MCP prompt discovery in progress",
+      ],
+      [
+        this.refineExclusionCounts.get(workspaceId) ?? 0,
+        "a refine apply or publication in progress",
+      ],
+    ];
+    return counts.filter(([count]) => count > 0).map(([, label]) => label);
+  }
+
+  /**
    * Arm the archive admission gate BEFORE a destructive pre-archive step (interrupt_active
    * turn interruption) and validate that no live user activity is already in flight. The
    * sink's refuseLiveUserActivity gate runs only inside archiveUnlocked — after the caller
@@ -11660,24 +11686,7 @@ export class WorkspaceService
         activityLabels.push("an active stream not attributable to the delegated turns");
       }
     }
-    if ((this.preflightExecCounts.get(workspaceId) ?? 0) > 0) {
-      activityLabels.push("a bash command executing");
-    }
-    if ((this.preflightStagingCounts.get(workspaceId) ?? 0) > 0) {
-      activityLabels.push("an attachment transfer in progress");
-    }
-    if ((this.preflightFileCompletionCounts.get(workspaceId) ?? 0) > 0) {
-      activityLabels.push("a file completion refresh in progress");
-    }
-    if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
-      activityLabels.push("a fork of this workspace in progress");
-    }
-    if ((this.mcpPromptDiscoveries.get(workspaceId)?.size ?? 0) > 0) {
-      activityLabels.push("an MCP prompt discovery in progress");
-    }
-    if ((this.refineExclusionCounts.get(workspaceId) ?? 0) > 0) {
-      activityLabels.push("a refine apply or publication in progress");
-    }
+    activityLabels.push(...this.inFlightOperationLabels(workspaceId));
     // In-flight native-terminal/editor opens passed their own archive guards before this
     // hold armed and surface only through the pending-open counters until their durable
     // markers persist; the sink's untrackable-app check would refuse on them after the
@@ -12118,24 +12127,7 @@ export class WorkspaceService
         if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
           activityLabels.push("a message send in progress");
         }
-        if ((this.preflightExecCounts.get(workspaceId) ?? 0) > 0) {
-          activityLabels.push("a bash command executing");
-        }
-        if ((this.preflightStagingCounts.get(workspaceId) ?? 0) > 0) {
-          activityLabels.push("an attachment transfer in progress");
-        }
-        if ((this.preflightFileCompletionCounts.get(workspaceId) ?? 0) > 0) {
-          activityLabels.push("a file completion refresh in progress");
-        }
-        if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
-          activityLabels.push("a fork of this workspace in progress");
-        }
-        if ((this.mcpPromptDiscoveries.get(workspaceId)?.size ?? 0) > 0) {
-          activityLabels.push("an MCP prompt discovery in progress");
-        }
-        if ((this.refineExclusionCounts.get(workspaceId) ?? 0) > 0) {
-          activityLabels.push("a refine apply or publication in progress");
-        }
+        activityLabels.push(...this.inFlightOperationLabels(workspaceId));
         if (liveActivity.queuedMessages) activityLabels.push("queued messages");
         if (liveActivity.backgroundBashProcesses) {
           activityLabels.push("running background bash processes");
