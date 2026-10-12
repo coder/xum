@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createMuxMessage, type PluginHookContextEntry } from "@/common/types/message";
 import { prepareMessagesForProvider } from "@/node/services/messagePipeline";
 import { PLUGIN_HOOK_CONTEXT_MAX_CHARS } from "./renderPluginHookContextForProvider";
@@ -96,6 +96,36 @@ describe("plugin hook context in provider requests", () => {
 
     expect(text).toContain('plugin="first"');
     expect(text).not.toContain('plugin="second"');
+  });
+
+  test("an oversized persisted entry is dropped before it is escaped, and the request builds", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rZY1W): a corrupted row with a huge escapable string must not be
+    // escaped in full (four replaceAll passes over it) on every request.
+    const huge = "<".repeat(PLUGIN_HOOK_CONTEXT_MAX_CHARS * 16);
+    const messages = [
+      createMuxMessage("u1", "user", "one", {
+        pluginHookContext: [
+          { pluginId: "fits", text: "Ask first." },
+          { pluginId: "huge", text: huge },
+        ],
+      }),
+    ];
+    const replaceAll = spyOn(String.prototype, "replaceAll");
+
+    try {
+      const [text] = userTexts(
+        await prepareMessagesForProvider({ ...baseOptions, messagesWithSentinel: messages })
+      );
+
+      expect(text).toContain('plugin="fits"');
+      expect(text).not.toContain('plugin="huge"');
+      const escapedHuge = replaceAll.mock.contexts.filter(
+        (context) => String(context).length > PLUGIN_HOOK_CONTEXT_MAX_CHARS
+      );
+      expect(escapedHuge).toHaveLength(0);
+    } finally {
+      replaceAll.mockRestore();
+    }
   });
 
   test("the context goes in the text part that merging keeps, before an inlined SVG", async () => {
