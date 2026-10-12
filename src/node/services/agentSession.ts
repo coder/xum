@@ -541,11 +541,24 @@ function compactionFollowUpText(muxMetadata: CompactionRequestMetadata): string 
   const followUp = muxMetadata.parsed[compactionFollowUpKey(muxMetadata)];
   if (followUp == null) return undefined;
   const text: unknown = followUp.text;
+  const hasText = typeof text === "string" && text.trim().length > 0;
+  const hasReviews = (followUp.reviews?.length ?? 0) > 0;
+  // Legacy continueMessage follow-ups carried attachments as imageParts.
+  const files: unknown =
+    "fileParts" in followUp
+      ? followUp.fileParts
+      : "imageParts" in followUp
+        ? followUp.imageParts
+        : undefined;
+  const hasFiles = Array.isArray(files) && files.length > 0;
+  // A follow-up with no text, reviews or files sends nothing the hooks could check. An
+  // attachment-only one reaches them with empty text, like a direct attachment-only send.
+  if (!hasText && !hasReviews && !hasFiles) return undefined;
   const prompt = prepareUserMessageForSend({
     text: typeof text === "string" ? text : "",
     reviews: followUp.reviews,
   }).finalText;
-  return prompt.trim().length > 0 ? prompt : undefined;
+  return prompt.trim().length > 0 || hasFiles ? prompt : undefined;
 }
 
 /**
@@ -4550,7 +4563,9 @@ export class AgentSession {
         : undefined;
     if (followUp?.kind === "blocked") return followUp;
     const request =
-      batchedText != null && batchedText.trim().length > 0
+      // Empty text with attachments behind the request is still a send (Codex
+      // PRRT_kwDOPxxmWM6rZqyv): the queue reports it as "".
+      batchedText != null
         ? this.assertSendHookOutcome(await run(batchedText), canBlock)
         : ({ kind: "none" } as const);
     if (request.kind === "blocked" || followUp == null) return request;
