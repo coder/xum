@@ -32,7 +32,9 @@ Crapper's own coverage command ignores every report when it fails.
 Pass every LCOV report (unit and integration shards) as its own --lcov. This
 script merges them, because Crapper keeps only one record per source file: a
 later `SF:` record for the same file replaces the earlier one, so a line one
-shard hit and another missed could score as missed.
+shard hit and another missed could score as missed. Per function, it uses only
+the reports that ran the function and skips lines without code (see
+NON_CODE_LINE): a shard that only loaded the file would otherwise add misses.
 """
 
 import argparse
@@ -42,7 +44,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from crapper.coverage import CoverageBundle, FileCoverage
 from crapper.crap import make_entry
 from crapper.discover import is_test_file, language_of
 from crapper.languages import functions_in_file
@@ -115,50 +116,90 @@ def repo_relative(sf_path: str, root: Path, files: list[str]) -> str | None:
     return max(matches, key=len) if matches else None
 
 
-def merge_lcov(texts: list[str], root: Path, files: list[str]) -> dict[str, dict[int, int]]:
-    """Line hits per repo-relative file, summed over every record of that file.
+def hits_per_report(texts: list[str], root: Path, files: list[str]) -> dict[str, list[dict[int, int]]]:
+    """Line hits per repo-relative file, one map per report that lists the file.
+
+    Records of one file inside one report are summed. Reports stay apart so
+    function_percent can pick, per function, the reports that ran it.
 
     Coverage is line-only: Bun's LCOV has no BRDA records, and Crapper prefers
     branch data when a file has any, so Jest-only branch records would hide
     the unit-test line hits of the same function.
     """
 
-    merged: dict[str, dict[int, int]] = {}
-    lines: dict[int, int] | None = None
+    merged: dict[str, list[dict[int, int]]] = {}
     for text in texts:
+        report: dict[str, dict[int, int]] = {}
+        lines: dict[int, int] | None = None
         for raw in text.splitlines():
             record = raw.strip()
             if record.startswith("SF:"):
                 file = repo_relative(record[3:], root, files)
-                lines = None if file is None else merged.setdefault(file, {})
+                lines = None if file is None else report.setdefault(file, {})
             elif record == "end_of_record":
                 lines = None
             elif lines is not None and record.startswith("DA:"):
                 line, hits = record[3:].split(",")[:2]
                 lines[int(line)] = lines.get(int(line), 0) + int(hits)
+        for file, lines_hit in report.items():
+            merged.setdefault(file, []).append(lines_hit)
     return merged
 
 
-def load_coverage(lcov: list[Path], root: Path, files: list[str]) -> CoverageBundle | None:
+def load_coverage(lcov: list[Path], root: Path, files: list[str]) -> dict[str, list[dict[int, int]]] | None:
     if not lcov:
         return None
     texts = [path.read_text(encoding="utf-8", errors="replace") for path in lcov]
-    bundle = CoverageBundle()
-    for file, hits in merge_lcov(texts, root, files).items():
-        record = FileCoverage()
-        record.update({line: (1 if count > 0 else 0, 1) for line, count in hits.items()})
-        bundle.lcov[file] = record
-    # Lets Crapper refuse a short LCOV path that only suffix-matches a longer file.
-    bundle.bind_sources(files)
-    return bundle
+    return hits_per_report(texts, root, files)
+
+
+# Bun lists a function's lines in two ways. A process that runs the function
+# lists only its executable lines. A process that only loads the file lists
+# every line of a function that never ran (and of a nested callback that never
+# ran) at 0, blank, comment and brace lines included. Repro (Bun 1.3.12): a
+# 9-line function lists DA 1,4,6,7,9 when called and DA 1-8 at 0 when only
+# imported, so a line union scores the fully tested function 56%. Such lines
+# carry no code, so they never count.
+NON_CODE_LINE = re.compile(r"^\s*(?:$|//|/\*|\*|[})\];,\s]+$)")
+
+
+def is_code_line(text: str) -> bool:
+    return NON_CODE_LINE.match(text) is None
+
+
+def function_percent(
+    reports: list[dict[int, int]], start: int, end: int, source_lines: list[str]
+) -> float | None:
+    """Line coverage percent of lines start..end, or None when no report lists the file.
+
+    Only the reports with a hit inside the function count, so a process that
+    loaded the file but never ran the function adds no misses. Their hits are
+    summed per line, over code lines only. When no report hits the function,
+    it scores 0%.
+    """
+
+    if not reports:
+        return None
+    spans = [{line: hits for line, hits in report.items() if start <= line <= end} for report in reports]
+    merged: dict[int, int] = {}
+    for span in spans:
+        if not any(hits > 0 for hits in span.values()):
+            continue
+        for line, hits in span.items():
+            if line <= len(source_lines) and is_code_line(source_lines[line - 1]):
+                merged[line] = merged.get(line, 0) + hits
+    if not merged:
+        return 0.0
+    return 100.0 * sum(1 for hits in merged.values() if hits > 0) / len(merged)
 
 
 def score(
-    root: Path, files: list[str], bundle: CoverageBundle | None, renames: dict[str, str]
+    root: Path, files: list[str], coverage: dict[str, list[dict[int, int]]] | None, renames: dict[str, str]
 ) -> list[dict]:
     rows: list[dict] = []
     for relative in files:
         source = (root / relative).read_text(encoding="utf-8", errors="replace")
+        source_lines = source.splitlines()
         language = language_of(relative)
         assert language is not None, relative
         # A renamed file is parsed (grammar), filtered and matched to coverage at
@@ -169,8 +210,10 @@ def score(
         new_module = module_namespace(shown, str(root))
         for function in functions_in_file(language, source, relative, str(root)):
             percent = None
-            if bundle is not None:
-                found = bundle.percent_for(function)
+            if coverage is not None:
+                found = function_percent(
+                    coverage.get(relative, []), function.start_line, function.end_line, source_lines
+                )
                 percent = 0.0 if found is None else found
             entry = make_entry(function, percent)
             assert entry.namespace.startswith(old_module), (entry.namespace, old_module)
