@@ -154,6 +154,10 @@ const DESKTOP_ONLY_CLASSES = new Set([
   "mobile-sidebar",
   "mobile-sidebar-collapsed",
   "mobile-sticky-header",
+  // The phone full-screen right sidebar: shown only inside those same narrow-shell hide rules,
+  // which the webview never applies.
+  "right-sidebar-fullscreen",
+  "right-sidebar-fullscreen-header",
   // Project sidebar only: the webview shows one workspace and no project sidebar.
   "react-colorful",
   "section-color-picker",

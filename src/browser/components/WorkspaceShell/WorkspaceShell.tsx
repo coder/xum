@@ -1,18 +1,27 @@
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
-import React, { useCallback, useRef } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@/common/lib/utils";
+import { Button } from "../Button/Button";
 import { LazyFeature } from "../LazyFeature/LazyFeature";
 import {
   LEFT_SIDEBAR_WIDTH_KEY,
+  RIGHT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getReviewImmersiveKey,
 } from "@/common/constants/storage";
 import { useResizableSidebar } from "@/browser/hooks/useResizableSidebar";
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { RightSidebar } from "@/browser/features/RightSidebar/RightSidebar";
+import {
+  readPersistedState,
+  updatePersistedState,
+  usePersistedState,
+} from "@/browser/hooks/usePersistedState";
+import { guardCloseTab, holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
+import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
+import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
+import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { PopoverError } from "../PopoverError/PopoverError";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
@@ -84,6 +93,95 @@ interface WorkspaceShellProps {
 const LoadingAnimation = React.lazy(() =>
   import("../LoadingAnimation/LoadingAnimation").then((m) => ({ default: m.LoadingAnimation }))
 );
+
+// T3 #5971: the right sidebar and its panels are off the first load.
+const RightSidebar = React.lazy(async () => ({
+  default: (await import("@/browser/features/RightSidebar/RightSidebar")).RightSidebar,
+}));
+
+/**
+ * While the sidebar chunk loads: hold its input. Once it has mounted: replay that input. After it
+ * failed: only keep Cmd/Ctrl+W from closing the window (the held input is never replayed).
+ */
+function SidebarInput(props: { held: HeldSidebarInput[]; mode: "hold" | "replay" | "failed" }) {
+  useEffect(() => {
+    if (props.mode === "failed") return guardCloseTab();
+    if (props.mode === "hold") return holdSidebarInput(props.held);
+    // An effect of RightSidebar's next sibling, so it runs after RightSidebar's own listeners exist.
+    for (const replay of props.held.splice(0)) replay();
+  }, [props.held, props.mode]);
+  return null;
+}
+
+/**
+ * The full-screen sidebar's Close button while its chunk loads or after it fails (phones, where
+ * Escape is rarely at hand). Like RightSidebar's full-screen view, it makes the covered workspace
+ * inert and moves focus in.
+ */
+function FullscreenSidebarClose(props: { onClose?: () => void }) {
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const button = buttonRef.current;
+    const view = button?.closest<HTMLElement>(".right-sidebar-fullscreen");
+    if (button == null || view == null) return;
+    const restoreOthers = makeOthersInert(view);
+    button.focus();
+    return restoreOthers;
+  }, []);
+  return (
+    <Button ref={buttonRef} variant="outline" size="sm" onClick={props.onClose}>
+      Close
+    </Button>
+  );
+}
+
+/**
+ * RightSidebar, keeping its box (collapsed: its 20 px rail) while its chunk loads or after it fails.
+ * Under immersive review the box covers the workspace above the (still empty) review overlay, so the
+ * loading and failure states stay visible.
+ */
+function LazyRightSidebar(
+  props: React.ComponentProps<typeof RightSidebar> & { held: HeldSidebarInput[] }
+) {
+  const { held, ...sidebarProps } = props;
+  const collapsed = readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+  // The failure state takes the expanded width even when collapsed: the 20 px rail would clip its
+  // Reload button, and the rail's expand control is part of the sidebar that failed to load.
+  const frame = (state: React.ReactNode, kind: "loading" | "failed") => (
+    <div
+      className={cn(
+        "bg-surface-primary flex flex-col overflow-hidden",
+        props.immersiveHidden
+          ? "absolute inset-0 z-[51] items-center justify-center gap-3"
+          : "border-l border-border-light flex-shrink-0 mobile-hide-right-sidebar",
+        props.fullscreen && "right-sidebar-fullscreen items-center justify-center gap-3"
+      )}
+      style={
+        props.immersiveHidden
+          ? undefined
+          : { width: collapsed && kind === "loading" ? 20 : props.width, maxWidth: "100%" }
+      }
+    >
+      {state}
+      {kind === "failed" && <SidebarInput held={held} mode="failed" />}
+      {props.fullscreen && <FullscreenSidebarClose onClose={props.onCloseFullscreen} />}
+    </div>
+  );
+  const pending = (
+    <>
+      <SidebarInput held={held} mode="hold" />
+      {(props.fullscreen === true || props.immersiveHidden === true) && (
+        <span role="status">Loading sidebar...</span>
+      )}
+    </>
+  );
+  return (
+    <LazyFeature name="Sidebar" frame={frame} fallback={pending}>
+      <RightSidebar {...sidebarProps} />
+      <SidebarInput held={held} mode="replay" />
+    </LazyFeature>
+  );
+}
 
 const WorkspacePlaceholder: React.FC<{
   title: string;
@@ -170,6 +268,16 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
 
   const { width: sidebarWidth, isResizing, startResize } = sidebar;
   const addTerminalRef = useRef<((options?: TerminalSessionCreateOptions) => void) | null>(null);
+  // Input held while the sidebar chunk loads belongs to its workspace: a switch drops it (render-time
+  // reset), so a queued terminal never runs its command in the next workspace.
+  const [held, setHeld] = useState(() => ({
+    workspaceId: props.workspaceId,
+    inputs: [] as HeldSidebarInput[],
+  }));
+  if (held.workspaceId !== props.workspaceId) {
+    setHeld({ workspaceId: props.workspaceId, inputs: [] });
+  }
+  const heldSidebarInput = held.inputs;
   const openTerminalPopout = useOpenTerminal();
   const handleOpenTerminal = useCallback(
     (options?: TerminalSessionCreateOptions) => {
@@ -178,11 +286,13 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
       // sidebar itself rather than a touch-only media query.
       if (isWorkspaceRightSidebarHidden(shellRef.current)) {
         void openTerminalPopout(props.workspaceId, props.runtimeConfig, options);
+      } else if (addTerminalRef.current) {
+        addTerminalRef.current(options);
       } else {
-        addTerminalRef.current?.(options);
+        heldSidebarInput.push(() => addTerminalRef.current?.(options)); // sidebar chunk still loading
       }
     },
-    [openTerminalPopout, props.workspaceId, props.runtimeConfig]
+    [openTerminalPopout, props.workspaceId, props.runtimeConfig, heldSidebarInput]
   );
 
   const reviews = useReviews(props.workspaceId);
@@ -198,6 +308,62 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const [isReviewImmersive] = usePersistedState(getReviewImmersiveKey(props.workspaceId), false, {
     listener: true,
   });
+
+  // Phones: the narrow layout hides the right sidebar, so the workspace menu's Sidebar row shows
+  // the sidebar itself full-screen, on whatever tab it shows (the New tab launcher lists the
+  // tools). The real sidebar (not a copy in a dialog) keeps its tabs and panel state. Keyed by workspace: a switch closes it for good
+  // (render-time reset, so it does not reopen on the way back). Immersive review covers the
+  // workspace on its own, so it wins and closes it.
+  const [fullscreenSidebarWorkspaceId, setFullscreenSidebarWorkspaceId] = useState<string | null>(
+    null
+  );
+  // Immersive review closes it for good too: it is not reopened once immersive review ends.
+  if (
+    fullscreenSidebarWorkspaceId !== null &&
+    (fullscreenSidebarWorkspaceId !== props.workspaceId || isReviewImmersive)
+  ) {
+    setFullscreenSidebarWorkspaceId(null);
+  }
+  const sidebarFullscreen = fullscreenSidebarWorkspaceId === props.workspaceId;
+  // Focus returns here when the full-screen sidebar closes (the menu button, or wherever the
+  // shortcut was pressed).
+  const fullscreenReturnFocusRef = useRef<HTMLElement | null>(null);
+  const openSidebarFullscreen = (returnFocusTo: HTMLElement | null) => {
+    fullscreenReturnFocusRef.current = returnFocusTo;
+    // Opening the sidebar expands it, like every other way to open it (tab shortcuts, "Open in
+    // Artifacts"). A collapsed sidebar would unmount its panels each time the view closes.
+    updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+    setFullscreenSidebarWorkspaceId(props.workspaceId);
+  };
+  const handleRequestSidebarFullscreen = () => {
+    openSidebarFullscreen(
+      document.activeElement instanceof HTMLElement ? document.activeElement : null
+    );
+  };
+  const closeSidebarFullscreen = () => setFullscreenSidebarWorkspaceId(null);
+  // Layer 1: the full-screen sidebar is drawn above the narrow-screen drawer (layer 0), so it
+  // answers Escape first when both are open.
+  useEscapeToDismiss(sidebarFullscreen, closeSidebarFullscreen, 1);
+  // The Timeline's "Reveal in transcript" scrolls to and highlights a message in the chat behind
+  // the view, so close the view to show it (the phone Timeline dialog did the same).
+  useEffect(() => {
+    if (!sidebarFullscreen) return;
+    const workspaceId = props.workspaceId;
+    const handleReveal = (event: Event) => {
+      const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR>).detail;
+      if (detail?.workspaceId === workspaceId) setFullscreenSidebarWorkspaceId(null);
+    };
+    window.addEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, handleReveal);
+    return () => window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, handleReveal);
+  }, [sidebarFullscreen, props.workspaceId]);
+  // After RightSidebar lifts `inert` from the rest of the page (effect cleanups run before
+  // effects), so the element can take focus again.
+  useEffect(() => {
+    if (sidebarFullscreen) return;
+    const target = fullscreenReturnFocusRef.current;
+    fullscreenReturnFocusRef.current = null;
+    if (target?.isConnected) target.focus();
+  }, [sidebarFullscreen]);
   const backgroundBashError = useBackgroundBashError();
 
   const shouldKeepChatPaneMountedDuringHydration =
@@ -259,9 +425,12 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         runtimeConfig={props.runtimeConfig}
         onOpenTerminal={handleOpenTerminal}
         immersiveHidden={isReviewImmersive}
+        onOpenSidebar={openSidebarFullscreen}
+        sidebarFullscreen={sidebarFullscreen}
       />
 
-      <RightSidebar
+      <LazyRightSidebar
+        held={heldSidebarInput}
         key={props.workspaceId}
         workspaceId={props.workspaceId}
         workspacePath={props.namedWorkspacePath}
@@ -273,6 +442,9 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         isCreating={props.isInitializing === true}
         immersiveHidden={isReviewImmersive}
         addTerminalRef={addTerminalRef}
+        fullscreen={sidebarFullscreen}
+        onCloseFullscreen={closeSidebarFullscreen}
+        onRequestFullscreen={handleRequestSidebarFullscreen}
       />
 
       {/* Portal target for immersive review mode overlay */}

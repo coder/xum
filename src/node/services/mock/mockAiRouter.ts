@@ -28,6 +28,12 @@ export interface MockAiRouterReply {
   /** Optional: delay before mock tool calls begin (useful for interaction-driven queue tests). */
   toolCallDelayMs?: number;
 
+  /**
+   * Optional: keep the stream open before its first tool call until the test calls
+   * `aiService.releaseMockToolCalls(workspaceId)`, so the test acts mid-stream without a race.
+   */
+  holdToolCalls?: boolean;
+
   /** Optional: mock tool calls to emit before assistant text streaming. */
   toolCalls?: MockAiToolCall[];
 
@@ -207,7 +213,9 @@ function buildPermissionExecReply(): MockAiRouterReply {
 function buildParallelToolStepReply(): MockAiRouterReply {
   return {
     assistantText: "Finished both sibling tool calls before continuing.",
-    toolCallDelayMs: 10_000,
+    // The test queues a follow-up while this turn streams, then releases the tool calls. A
+    // fixed delay here raced that step under load (#6143).
+    holdToolCalls: true,
     toolCalls: [
       {
         toolCallId: "tool-parallel-step-a",
@@ -493,6 +501,9 @@ const defaultHandlers: MockAiRouterHandler[] = [
     respond: () => buildPermissionExecReply(),
   },
   {
+    // This reply sets holdToolCalls: a hand-typed `[mock:tool:parallel-step]` prompt (a bug
+    // bash, a dogfood run) keeps streaming with no tool call until a test calls
+    // aiService.releaseMockToolCalls(workspaceId), or the user presses Stop.
     match: (request) => hasMockMarker(request.latestUserText, "tool:parallel-step"),
     respond: () => buildParallelToolStepReply(),
   },

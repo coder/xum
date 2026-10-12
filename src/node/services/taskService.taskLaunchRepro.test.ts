@@ -327,13 +327,19 @@ describe("task launch races", () => {
         name: "the check before the sanitize step",
         forked: true,
         arm: (s, unreadable) => {
-          // The first publication after the launch recorded the fork's checkout on the row.
+          // The first publication after the launch recorded the fork's checkout on the row. Only
+          // that one: the failure recording publishes the row again, and a second spell there
+          // made every later lenient read empty, hiding the recorded failure (#6092).
           const realEmit = s.taskService.emitWorkspaceMetadata.bind(s.taskService);
+          let armed = false;
           spyOn(s.taskService, "emitWorkspaceMetadata").mockImplementation(async (id) => {
             const forkRecorded =
               findWorkspaceInConfig(s.config, CHILD)?.taskBaseCommitShaByProjectPath != null;
             await realEmit(id);
-            if (id === CHILD && forkRecorded) unreadable();
+            if (id === CHILD && forkRecorded && !armed) {
+              armed = true;
+              unreadable();
+            }
           });
         },
       },
@@ -375,12 +381,11 @@ describe("task launch races", () => {
 
         await spawn(s.taskService);
         await s.launched;
+        // markTaskLaunchFailed has returned: its write and publication are done (#6092).
+        await s.launchFailureRecorded;
 
         // Target assertion: the failed launch is recorded, so the row leaves `starting`.
-        await waitUntil(
-          () => findWorkspaceInConfig(s.config, CHILD)?.taskStatus === "interrupted",
-          "the failed launch to be recorded"
-        );
+        expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("interrupted");
         expect(findWorkspaceInConfig(s.config, CHILD)?.taskLaunchError).toBe(
           "config.json is unreadable"
         );
