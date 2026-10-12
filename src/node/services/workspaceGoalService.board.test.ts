@@ -232,6 +232,30 @@ describe("WorkspaceGoalService", () => {
       }
     );
 
+    test("reopening a goal lifts the promotion block for its next completion", async () => {
+      await setGoalOk(service, { workspaceId, objective: "First" });
+      const queued = await service.addUpcomingGoal({ workspaceId, objective: "Second" });
+      await setGoalOk(service, { workspaceId, status: "paused" });
+      await setGoalOk(service, {
+        workspaceId,
+        status: "complete",
+        completionSummary: "Done while paused.",
+        initiator: "model",
+      });
+      // The user reopens the goal: it keeps its id.
+      await setGoalOk(service, { workspaceId, status: "active" });
+      await setGoalOk(service, {
+        workspaceId,
+        status: "complete",
+        completionSummary: "Done after reopening.",
+        initiator: "model",
+      });
+
+      const board = await service.getGoalBoard(workspaceId);
+      // Target assertion: the completion from active promotes as usual.
+      expect(board.entries.find((e) => e.section === "active")?.goal.goalId).toBe(queued.goalId);
+    });
+
     test("completeGoalFromSilentContinuation promotes the next upcoming goal", async () => {
       // #3326 Codex P2 (PRRT_kwDOPxxmWM6DMh9j): silent-continuation
       // completion must run the deferred auto-promote pass, otherwise

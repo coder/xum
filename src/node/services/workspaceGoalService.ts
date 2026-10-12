@@ -3334,16 +3334,19 @@ export class WorkspaceGoalService {
     });
   }
 
-  private blockAutoPromoteAfterPausedCompletion(
+  /**
+   * Keep `autoPromoteBlockedGoalIds` in step with a status write: block a goal that a non-user
+   * completed while paused, and lift the block once the goal leaves `complete` (the user reopened
+   * it: their consent is fresh, so a later completion promotes as usual).
+   */
+  private updateAutoPromoteBlock(
     goal: GoalRecordV1,
     previousStatus: GoalStatus,
     initiator: GoalLifecycleInitiator | undefined
   ): void {
-    if (
-      goal.status === "complete" &&
-      previousStatus === "paused" &&
-      (initiator ?? "user") !== "user"
-    ) {
+    if (goal.status !== "complete") {
+      this.autoPromoteBlockedGoalIds.delete(goal.goalId);
+    } else if (previousStatus === "paused" && (initiator ?? "user") !== "user") {
       this.autoPromoteBlockedGoalIds.add(goal.goalId);
     }
   }
@@ -4145,7 +4148,7 @@ export class WorkspaceGoalService {
         }
         this.emitBudgetChanged(current, withEdits, input);
         this.emitBudgetLimited(input.workspaceId, withEdits, previousStatus);
-        this.blockAutoPromoteAfterPausedCompletion(withEdits, previousStatus, input.initiator);
+        this.updateAutoPromoteBlock(withEdits, previousStatus, input.initiator);
         this.emitStatusLifecycle(withEdits, previousStatus, input.initiator ?? "user");
         // Lifecycle event: this is a rename, not a replace. Reuse
         // `goal_replaced` (same-objective semantics already overloaded for
@@ -4255,7 +4258,7 @@ export class WorkspaceGoalService {
           }
           this.emitBudgetChanged(current, updated, input);
           this.emitBudgetLimited(input.workspaceId, updated, previousStatus);
-          this.blockAutoPromoteAfterPausedCompletion(updated, previousStatus, input.initiator);
+          this.updateAutoPromoteBlock(updated, previousStatus, input.initiator);
           this.emitStatusLifecycle(updated, previousStatus, input.initiator ?? "user");
           await this.maybeAutoPromoteOnComplete(input.workspaceId, updated, previousStatus, {
             stopVeto: () => discardIfUserStopLanded() != null,
