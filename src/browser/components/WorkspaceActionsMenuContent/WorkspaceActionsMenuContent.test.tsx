@@ -2,7 +2,10 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 
-import { WorkspaceActionsMenuContent } from "./WorkspaceActionsMenuContent";
+import {
+  WORKSPACE_ACTIONS_MENU_POPUP_PROPS,
+  WorkspaceActionsMenuContent,
+} from "./WorkspaceActionsMenuContent";
 
 describe("WorkspaceActionsMenuContent keyboard navigation (#6103)", () => {
   let cleanupDom: (() => void) | null = null;
@@ -21,20 +24,23 @@ describe("WorkspaceActionsMenuContent keyboard navigation (#6103)", () => {
     const onConfigureMcp = mock(() => undefined);
     const onConfigureHeartbeat = mock(() => undefined);
     const onArchiveChat = mock(() => undefined);
+    // Both callers spread these props on the PopoverContent that holds the rows.
     const view = render(
-      <WorkspaceActionsMenuContent
-        onConfigureMcp={onConfigureMcp}
-        onConfigureHeartbeat={onConfigureHeartbeat}
-        onArchiveChat={onArchiveChat}
-        onCloseMenu={() => undefined}
-      />
+      <div {...WORKSPACE_ACTIONS_MENU_POPUP_PROPS}>
+        <WorkspaceActionsMenuContent
+          onConfigureMcp={onConfigureMcp}
+          onConfigureHeartbeat={onConfigureHeartbeat}
+          onArchiveChat={onArchiveChat}
+          onCloseMenu={() => undefined}
+        />
+      </div>
     );
     return { view, onConfigureHeartbeat };
   }
 
   test("ArrowDown and ArrowUp move focus between the menu items and stop at the ends", () => {
     const { view } = renderMenu();
-    const menu = view.getByRole("menu");
+    const menu = view.getByRole("menu", { name: "Workspace actions" });
     const items = [/Configure MCP servers/, /Configure heartbeat/, /Archive chat/].map((name) =>
       view.getByRole("menuitem", { name })
     );
@@ -59,7 +65,7 @@ describe("WorkspaceActionsMenuContent keyboard navigation (#6103)", () => {
 
   test("activating the item reached with the arrow keys runs that item's action", () => {
     const { view, onConfigureHeartbeat } = renderMenu();
-    const menu = view.getByRole("menu");
+    const menu = view.getByRole("menu", { name: "Workspace actions" });
     const items = view.getAllByRole("menuitem");
 
     items[0].focus();

@@ -1,5 +1,5 @@
 import type { ComponentType } from "react";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
 import { createGitStatusExecutor } from "@/browser/stories/helpers/git";
 import {
@@ -170,10 +170,15 @@ export const ArchivingPhone: AppStory = {
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await userEvent.click(await canvas.findByTestId("workspace-more-actions"));
-    await userEvent.click(
-      await waitFor(() => within(document.body).getByRole("menuitem", { name: /Archive chat/ }))
+    const trigger = await canvas.findByTestId("workspace-more-actions");
+    await expect(trigger).toHaveAttribute("aria-haspopup", "menu");
+    await userEvent.click(trigger);
+    // The popup is one menu, not a menu nested in Radix Popover's default dialog (#6103).
+    const menu = await waitFor(() =>
+      within(document.body).getByRole("menu", { name: "Workspace actions" })
     );
+    await expect(within(document.body).queryByRole("dialog")).toBeNull();
+    await userEvent.click(within(menu).getByRole("menuitem", { name: /Archive chat/ }));
 
     await waitFor(() => {
       const bar = canvas.getByTestId("workspace-menu-bar").getBoundingClientRect();

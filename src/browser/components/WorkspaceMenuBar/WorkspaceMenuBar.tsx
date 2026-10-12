@@ -51,7 +51,11 @@ import { isDesktopMode, DESKTOP_TITLEBAR_HEIGHT_CLASS } from "@/browser/hooks/us
 import { DebugLlmRequestModal } from "../DebugLlmRequestModal/DebugLlmRequestModal";
 import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
 import { PopoverError } from "../PopoverError/PopoverError";
-import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
+import {
+  WORKSPACE_ACTIONS_MENU_POPUP_PROPS,
+  WORKSPACE_ACTIONS_MENU_TRIGGER_PROPS,
+  WorkspaceActionsMenuContent,
+} from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
@@ -635,7 +639,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     <Popover open={moreMenuOpen} onOpenChange={setMoreMenuOpen}>
       <Tooltip {...(moreMenuOpen ? { open: false } : {})}>
         <TooltipTrigger asChild>
-          <PopoverTrigger asChild>
+          <PopoverTrigger asChild {...WORKSPACE_ACTIONS_MENU_TRIGGER_PROPS}>
             <Button
               ref={moreActionsButtonRef}
               variant="ghost"
@@ -662,6 +666,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       </Tooltip>
 
       <PopoverContent
+        {...WORKSPACE_ACTIONS_MENU_POPUP_PROPS}
         side="bottom"
         align="end"
         sideOffset={6}
