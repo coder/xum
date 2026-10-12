@@ -10517,21 +10517,7 @@ export class TaskService implements AgentTaskIntegration {
         code: "refused" as const,
         reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
       };
-      const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean => {
-        // Unrelated roots can send here too; archive must win before the root lifecycle shortcut.
-        if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) return true;
-        if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) {
-          // Root workspaces have no task lifecycle to go terminal.
-          return false;
-        }
-        const status = workspace.taskStatus ?? "running";
-        return (
-          !this.hasLiveRunningExecution(workspace, senderWorkspaceId) &&
-          status !== "running" &&
-          status !== "awaiting_report"
-        );
-      };
-      if (isInactivePeerSender(senderEntry.workspace)) {
+      if (this.isInactivePeerMessagingEndpoint(senderEntry.workspace, senderWorkspaceId)) {
         return Err(senderInactiveRefusal);
       }
 
@@ -10560,15 +10546,15 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
 
-      const legacyArchived = isWorkspaceArchived(
-        targetEntry.workspace.archivedAt,
-        targetEntry.workspace.unarchivedAt
-      );
-      if (legacyArchived) {
+      const targetUnavailable =
+        targetEntry.workspace.pendingRemoval != null ||
+        isWorkspaceArchived(targetEntry.workspace.archivedAt, targetEntry.workspace.unarchivedAt);
+      if (targetUnavailable) {
         return Err({
           code: "not_active" as const,
           taskStatus: targetEntry.workspace.taskStatus ?? "unknown",
-          message: "Target workspace is archived; only its parent can restore and reawaken it.",
+          message:
+            "Target workspace is archived or being removed; it cannot receive peer messages.",
         });
       }
 
@@ -10970,7 +10956,7 @@ export class TaskService implements AgentTaskIntegration {
         if (
           freshSender == null ||
           senderChainInterrupted() ||
-          isInactivePeerSender(freshSender.workspace)
+          this.isInactivePeerMessagingEndpoint(freshSender.workspace, senderWorkspaceId)
         ) {
           admissionRefusal = senderInactiveRefusal;
           return true;
@@ -11012,16 +10998,17 @@ export class TaskService implements AgentTaskIntegration {
           admissionRefusal = unrelatedRuntimeRefusal;
           return true;
         }
-        // Archive is reversible-only but stops delivery: a target archived after the initial
-        // check (archive does not synchronize with in-flight guarded sends) must refuse here
-        // rather than accept or queue a peer turn behind the archive boundary.
+        // Closing a side chat claims removal before tearing down its session; neither an
+        // in-flight reply nor queued input may wake it behind that discard/archive boundary.
         if (
+          freshEntry.workspace.pendingRemoval != null ||
           isWorkspaceArchived(freshEntry.workspace.archivedAt, freshEntry.workspace.unarchivedAt)
         ) {
           admissionRefusal = {
             code: "not_active" as const,
             taskStatus: freshEntry.workspace.taskStatus ?? "unknown",
-            message: "Target workspace is archived; only its parent can restore and reawaken it.",
+            message:
+              "Target workspace is archived or being removed; it cannot receive peer messages.",
           };
           return true;
         }
@@ -16343,6 +16330,27 @@ export class TaskService implements AgentTaskIntegration {
     };
   }
 
+  /** Shared by peer admission and linked-chat discovery so discarded/inactive chats never wake peers. */
+  private isInactivePeerMessagingEndpoint(
+    workspace: WorkspaceConfigEntry,
+    workspaceId: string
+  ): boolean {
+    // Removal claims the row before stopping its session. A winding-down side-chat tool call
+    // must not wake the main chat while that row still exists, including at final admission.
+    if (
+      workspace.pendingRemoval != null ||
+      isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+    )
+      return true;
+    if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) return false;
+    const status = workspace.taskStatus ?? "running";
+    return (
+      !this.hasLiveRunningExecution(workspace, workspaceId) &&
+      status !== "running" &&
+      status !== "awaiting_report"
+    );
+  }
+
   private isPeerMessagingRestricted(index: AgentTaskIndex, workspaceId: string): boolean {
     return (
       this.isBestOfChainUsingIndex(index, workspaceId) ||
@@ -16372,7 +16380,7 @@ export class TaskService implements AgentTaskIntegration {
     const caller = findWorkspaceEntry(cfg, workspaceId)?.workspace;
     if (caller == null) return [];
     if (
-      isWorkspaceArchived(caller.archivedAt, caller.unarchivedAt) ||
+      this.isInactivePeerMessagingEndpoint(caller, workspaceId) ||
       this.isPeerMessagingRestricted(index, workspaceId)
     )
       return [];
@@ -16381,7 +16389,7 @@ export class TaskService implements AgentTaskIntegration {
       const info = this.getRelatedChatInfo(caller, candidate);
       if (
         info == null ||
-        isWorkspaceArchived(candidate.archivedAt, candidate.unarchivedAt) ||
+        this.isInactivePeerMessagingEndpoint(candidate, info.workspaceId) ||
         this.isPeerMessagingRestricted(index, info.workspaceId)
       ) {
         return [];

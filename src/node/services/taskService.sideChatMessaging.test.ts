@@ -3,6 +3,8 @@ import * as path from "node:path";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { Err, Ok } from "@/common/types/result";
 import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
+import type { Config, Workspace } from "@/node/config";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import {
   createTestConfig,
@@ -15,6 +17,7 @@ import {
   createTaskServiceHarness,
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
+  registerLiveWorkspaceTurnHandle,
 } from "@/node/services/taskService.shared.testHarness";
 
 const runtimes: RuntimeConfig[] = [
@@ -199,6 +202,152 @@ describe("TaskService side-chat messaging", () => {
       expect(sendMessage).not.toHaveBeenCalled();
     });
   }
+
+  async function updateWorkspace(config: Config, id: string, updates: Partial<Workspace>) {
+    await config.editConfig((cfg) => {
+      const entry = findWorkspaceEntry(cfg, id);
+      if (entry == null) throw new Error(`Missing test workspace: ${id}`);
+      Object.assign(entry.workspace, updates);
+      return cfg;
+    });
+  }
+
+  test.each([
+    ["queued", false],
+    ["starting", false],
+    ["reported", false],
+    ["interrupted", false],
+    ["running", true],
+    ["awaiting_report", true],
+  ] as const)(
+    "advertises an agent owner in %s only when peer admission allows it",
+    async (taskStatus, visible) => {
+      const { config } = await setup();
+      await updateWorkspace(config, "main", { parentWorkspaceId: "unrelated", taskStatus });
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      expect((taskService.listTaskTreeAgents("side").relatedChats ?? []).length > 0).toBe(visible);
+      if (!visible) {
+        expect(
+          await taskService.sendAgentTreeMessage("side", "main", "cannot reactivate")
+        ).toMatchObject({
+          success: false,
+          error: { code: "not_active", taskStatus },
+        });
+        expect(sendMessage).not.toHaveBeenCalled();
+      }
+    }
+  );
+
+  test("only an accepted live continuation makes a terminal agent owner discoverable", async () => {
+    const { config } = await setup();
+    await updateWorkspace(config, "main", {
+      parentWorkspaceId: "unrelated",
+      taskStatus: "reported",
+      taskExecutionId: "wst_continuation",
+      taskExecutionStatus: "running",
+    });
+    const { taskService } = createTaskServiceHarness(config);
+    expect(taskService.listTaskTreeAgents("side").relatedChats).toBeUndefined();
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
+      "main",
+      "wst_continuation",
+      "unrelated",
+      "reserved"
+    );
+    expect(taskService.listTaskTreeAgents("side").relatedChats).toBeUndefined();
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
+      "main",
+      "wst_continuation",
+      "unrelated",
+      "accepted"
+    );
+    expect(taskService.listTaskTreeAgents("side").relatedChats).toEqual([
+      { workspaceId: "main", title: "main", relationship: "main_chat" },
+    ]);
+  });
+
+  async function markDiscarding(config: Config) {
+    await updateWorkspace(config, "side", {
+      pendingRemoval: {
+        removalId: "discard-side-chat",
+        instanceId: "test-instance",
+        pid: process.pid,
+        identity: {
+          birth: null,
+          bootId: null,
+          pidNs: null,
+          machineId: null,
+          platform: process.platform,
+          hostname: null,
+        },
+        at: new Date().toISOString(),
+      },
+    });
+  }
+
+  test("a side chat already being discarded cannot discover or wake its main chat", async () => {
+    const { config } = await setup();
+    await markDiscarding(config);
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    expect(taskService.listTaskTreeAgents("side").relatedChats).toBeUndefined();
+    expect(taskService.listTaskTreeAgents("main").relatedChats ?? []).not.toContainEqual(
+      expect.objectContaining({ workspaceId: "side" })
+    );
+    expect(await taskService.sendAgentTreeMessage("side", "main", "too late")).toMatchObject({
+      success: false,
+      error: { code: "refused" },
+    });
+    expect(
+      await taskService.sendAgentTreeMessage("main", "side", "too late to reply")
+    ).toMatchObject({
+      success: false,
+      error: { code: "not_active" },
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["side", "main"],
+    ["main", "side"],
+  ])("discarding a side chat fences queued %s → %s dispatch", async (sender, target) => {
+    const { config } = await setup();
+    const sendMessage = mock((...args: Parameters<WorkspaceHost["sendMessage"]>) => {
+      expect(args[3]?.admissionStale?.()).toBe(false);
+      return Promise.resolve(Ok(undefined));
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    expect(await taskService.sendAgentTreeMessage(sender, target, "queued")).toMatchObject({
+      success: true,
+      data: { delivery: "queued" },
+    });
+    const admissionStale = sendMessage.mock.calls[0][3]?.admissionStale;
+    await markDiscarding(config);
+    expect(admissionStale?.()).toBe(true);
+  });
+
+  test.each([
+    ["side", "main", "refused"],
+    ["main", "side", "not_active"],
+  ])("discard during preparation refuses %s → %s with %s", async (sender, target, code) => {
+    const { config } = await setup();
+    const sendMessage = mock(async (...args: Parameters<WorkspaceHost["sendMessage"]>) => {
+      expect(args[3]?.admissionStale?.()).toBe(false);
+      await markDiscarding(config);
+      expect(args[3]?.admissionStale?.()).toBe(true);
+      return Err("discarded before admission");
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    expect(await taskService.sendAgentTreeMessage(sender, target, "do not wake")).toMatchObject({
+      success: false,
+      error: { code },
+    });
+  });
 
   test("rechecks the direct chat link at final turn admission", async () => {
     const { config } = await setup();
