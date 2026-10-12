@@ -175,6 +175,21 @@ describe("RightSidebarOverview", () => {
     expect(opened).toEqual(["costs"]);
   });
 
+  test("marks the cost as incomplete when some usage has unknown pricing", () => {
+    workspaceUsage = { totalTokens: 0, sessionTotal: usage(1_000, 1.25) };
+    const complete = renderOverview([workspace({ id: WORKSPACE_ID })]);
+    expect(complete.view.queryByLabelText("Cost may be incomplete")).toBeNull();
+    cleanup();
+
+    workspaceUsage = {
+      totalTokens: 0,
+      sessionTotal: { ...usage(1_000, 1.25), hasUnknownCosts: true },
+    };
+    const partial = renderOverview([workspace({ id: WORKSPACE_ID })]);
+    const stats = partial.view.getByRole("button", { name: /\$1\.25/ });
+    expect(within(stats).getByLabelText("Cost may be incomplete")).toBeTruthy();
+  });
+
   test("shows no stats before the session has usage", () => {
     const { view } = renderOverview([workspace({ id: WORKSPACE_ID })]);
     expect(view.queryByRole("button", { name: /\$/ })).toBeNull();
@@ -353,10 +368,12 @@ describe("RightSidebarOverview", () => {
         "1 more",
       ]);
 
+      // An output selects itself, then asks for the Artifacts tab (which takes focus).
       fireEvent.click(rows[0]);
       expect(openedArtifacts).toEqual(["reports/summary.md"]);
-      fireEvent.click(rows[3]);
       expect(opened).toEqual(["artifacts"]);
+      fireEvent.click(rows[3]);
+      expect(opened).toEqual(["artifacts", "artifacts"]);
       cleanup();
 
       // With the experiment off the card neither lists nor shows outputs.

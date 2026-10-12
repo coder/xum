@@ -100,8 +100,13 @@ function getGoalLimits(goal: GoalSnapshot): string | null {
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
-/** Session cost and tokens, as the Stats tab totals them (persisted session plus live stream). */
-function useSessionStats(workspaceId: string): { cost?: number; tokens: number } | null {
+/**
+ * Session cost and tokens, as the Stats tab totals them (persisted session plus live stream).
+ * `costIncomplete`: some usage has unknown pricing, so `cost` is only the priced part.
+ */
+function useSessionStats(
+  workspaceId: string
+): { cost?: number; costIncomplete: boolean; tokens: number } | null {
   const usage = useWorkspaceUsage(workspaceId);
   const parts: ChatUsageDisplay[] = [];
   if (usage.sessionTotal) parts.push(usage.sessionTotal);
@@ -114,7 +119,7 @@ function useSessionStats(workspaceId: string): { cost?: number; tokens: number }
     total.cacheCreate.tokens +
     total.output.tokens +
     total.reasoning.tokens;
-  return { cost: getTotalCost(total), tokens };
+  return { cost: getTotalCost(total), costIncomplete: total.hasUnknownCosts === true, tokens };
 }
 
 /**
@@ -153,6 +158,22 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
             Icon={TAB_ICONS.costs}
             label={
               stats.cost != null ? formatCostWithDollar(stats.cost) : formatTokens(stats.tokens)
+            }
+            labelAdornment={
+              stats.cost != null &&
+              stats.costIncomplete && (
+                // Same cue as the Stats tab: an unpriced model makes the total a lower bound.
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="text-warning" aria-label="Cost may be incomplete">
+                      ?
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent align="center">
+                    Cost may be incomplete — some models in this session have unknown pricing
+                  </TooltipContent>
+                </Tooltip>
+              )
             }
             detail={stats.cost != null && `${formatTokens(stats.tokens)} tokens`}
             onClick={() => props.onOpenTab("costs")}
@@ -334,19 +355,26 @@ const OverviewOutputs: React.FC<{
     [props.workspaceId]
   );
 
-  // Files come newest first; app views in transcript order, so newest last.
+  // Both lists come newest first. Each open selects the output, then hands the Artifacts tab
+  // focus (the activated row unmounts as the sidebar expands).
   const outputs = [
     ...files.map((file) => ({
       key: `file:${file.path}`,
       Icon: FileText,
       label: file.path.split("/").pop() ?? file.path,
-      open: () => openArtifact({ workspaceId: props.workspaceId, path: file.path }),
+      open: () => {
+        openArtifact({ workspaceId: props.workspaceId, path: file.path });
+        props.onOpenTab("artifacts");
+      },
     })),
-    ...[...appViews].reverse().map((view) => ({
+    ...appViews.map((view) => ({
       key: `app:${view.toolCallId}`,
       Icon: TAB_ICONS.artifacts,
       label: view.label,
-      open: () => openMcpAppView(props.workspaceId, view),
+      open: () => {
+        openMcpAppView(props.workspaceId, view);
+        props.onOpenTab("artifacts");
+      },
     })),
   ];
   if (outputs.length === 0) return null;
@@ -397,6 +425,8 @@ const MoreRow: React.FC<{ count: number; onClick: () => void }> = (props) =>
 const OverviewRow: React.FC<{
   Icon?: LucideIcon;
   label: string;
+  /** Inline after the label, outside its truncation. */
+  labelAdornment?: React.ReactNode;
   detail?: React.ReactNode;
   /** A second, muted line under the label. */
   sub?: string | null;
@@ -409,8 +439,11 @@ const OverviewRow: React.FC<{
         <props.Icon className="text-muted h-3.5 w-3.5 shrink-0" aria-hidden="true" />
       )}
       <span className="flex min-w-0 flex-1 flex-col">
-        <span className={cn("truncate", props.muted ? "text-muted" : "text-foreground")}>
-          {props.label}
+        <span className="flex min-w-0 items-center gap-1">
+          <span className={cn("truncate", props.muted ? "text-muted" : "text-foreground")}>
+            {props.label}
+          </span>
+          {props.labelAdornment}
         </span>
         {props.sub != null && (
           <span className="text-muted counter-nums truncate text-[11px]">{props.sub}</span>

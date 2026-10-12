@@ -1910,6 +1910,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       return;
     }
     setLayout((prev) => selectOrAddTab(prev, tab));
+    if (tab === "artifacts") {
+      // The panel claims focus once it renders, so its keyboard shortcuts work right away.
+      setAutoFocusArtifacts(true);
+      return;
+    }
     // Side chats hand typing to their composer once it is ready; other tabs focus their tab.
     setTabToFocus(tab);
   };
