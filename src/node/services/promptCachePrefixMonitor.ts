@@ -21,6 +21,18 @@ import type { TimelineRecorder } from "@/node/services/timelineRecorder";
 /** Workspaces whose latest fingerprints stay in memory; the least recent is dropped first. */
 const MAX_TRACKED_WORKSPACES = 128;
 
+const FIVE_MINUTES_MS = 5 * 60 * 1000;
+const ONE_HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * The cache lifetime the request asked for: 1h when any cache marker sets `ttl: "1h"`, else
+ * Anthropic's 5-minute default. After that, the baseline's cache entry is gone, so a later
+ * request is cold by expiry and a difference is not reported as a prefix break.
+ */
+function requestCacheTtlMs(body: Record<string, unknown>): number {
+  return JSON.stringify(body).includes('"ttl":"1h"') ? ONE_HOUR_MS : FIVE_MINUTES_MS;
+}
+
 /**
  * One chat turn's requests. TurnRequestBuilder creates one per built turn
  * through {@link PromptCachePrefixMonitor.createTurnScope}; side calls
@@ -41,6 +53,13 @@ export interface PromptCacheTurnScope {
    * baseline in place and the next Anthropic turn would report a break.
    */
   markCompaction(): void;
+  /**
+   * Identifies the context the turn was built from (the first history row of the request).
+   * `/clear`, "start here" and context rollovers replace that row, and the next request is
+   * meant to differ from the old baseline, so a different epoch resets the baseline silently.
+   */
+  readonly contextEpoch: string | undefined;
+  setContextEpoch(epoch: string | undefined): void;
 }
 
 /** Requests compare only within one wire route and effective model. */
@@ -52,16 +71,31 @@ export interface PromptCacheRouteIdentity {
 export class PromptCachePrefixMonitor {
   private readonly latest = new Map<
     string,
-    { routeKey: string; scope: PromptCacheTurnScope; blocks: PromptCacheBlock[] }
+    {
+      routeKey: string;
+      scope: PromptCacheTurnScope;
+      blocks: PromptCacheBlock[];
+      observedAt: number;
+      ttlMs: number;
+    }
   >();
+
+  constructor(private readonly now: () => number = Date.now) {}
 
   createTurnScope(workspaceId: string, recorder: TimelineRecorder): PromptCacheTurnScope {
     let skip = false;
+    let contextEpoch: string | undefined;
     return {
       workspaceId,
       recorder,
       get skip() {
         return skip;
+      },
+      get contextEpoch() {
+        return contextEpoch;
+      },
+      setContextEpoch: (epoch) => {
+        contextEpoch = epoch;
       },
       markCompaction: () => {
         skip = true;
@@ -88,12 +122,23 @@ export class PromptCachePrefixMonitor {
       if (scope.skip) return;
       const routeKey = `${identity.route}\0${identity.modelString}`;
       const blocks = fingerprintAnthropicRequest(body);
-      this.latest.set(workspaceId, { routeKey, scope, blocks });
+      const observedAt = this.now();
+      this.latest.set(workspaceId, {
+        routeKey,
+        scope,
+        blocks,
+        observedAt,
+        ttlMs: requestCacheTtlMs(body),
+      });
       if (this.latest.size > MAX_TRACKED_WORKSPACES) {
         const oldest = this.latest.keys().next().value;
         if (oldest != null) this.latest.delete(oldest);
       }
       if (previous?.routeKey !== routeKey) return;
+      // A new context (clear, start here, rollover) or an expired cache entry makes this
+      // request cold on purpose or by time: start a new baseline without reporting a break.
+      if (previous.scope.contextEpoch !== scope.contextEpoch) return;
+      if (observedAt - previous.observedAt > previous.ttlMs) return;
 
       const comparison = comparePromptCachePrefix(previous.blocks, blocks);
       if (comparison.kind === "extends") return;
