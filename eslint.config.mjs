@@ -2545,6 +2545,8 @@ export default defineConfig([
       "**/*.testHarness.{ts,tsx}",
       "**/*.stories.{ts,tsx}",
       "**/*.bench.{ts,tsx}",
+      "**/*.testUtils.{ts,tsx}",
+      "src/**/test[A-Z]*.{ts,tsx}",
       "src/browser/stories/**",
     ],
     rules: {
