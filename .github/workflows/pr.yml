@@ -424,6 +424,7 @@ jobs:
           name: bugbash-repro-failures
           path: |
             tests/bugbash/.e2e/repros*/artifacts/**/failure/
+            tests/bugbash/.e2e/repros*/artifacts/**/screenshots/*-failure.png
             tests/bugbash/.e2e/repros*/report.json
             tests/bugbash/.e2e/logs/app.log
           if-no-files-found: ignore
