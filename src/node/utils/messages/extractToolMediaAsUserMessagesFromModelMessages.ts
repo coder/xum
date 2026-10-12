@@ -27,6 +27,8 @@ type ToolResultOutput = ToolResultPart["output"];
  *
  * This helper rewrites tool-result outputs to replace supported attachment payloads with small
  * text placeholders, and inserts a synthetic user message containing the extracted attachments.
+ * After a deferred server tool call the attachments stay inside the tool result instead (see
+ * holdsDeferredProviderToolCall).
  */
 export async function extractToolMediaAsUserMessagesFromModelMessages(
   messages: ModelMessage[]
@@ -64,6 +66,12 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
     if (message.role !== "assistant" && message.role !== "tool") continue;
     for (const part of message.content) {
       if (part.type !== "tool-result") continue;
+      // Media an earlier step already inlined into a tool result (deferred
+      // server tool, see holdsDeferredProviderToolCall) stays where it is, so
+      // it reserves its share of the request-wide cap.
+      if (part.output.type === "content") {
+        reservedMediaParts += part.output.value.filter(isSyntheticToolMediaPart).length;
+      }
       const extracted = extractAttachmentsFromToolOutput(part.output as unknown);
       if (extracted == null) continue;
       extractionsByPart.set(part, extracted);
@@ -91,7 +99,7 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
 
   const result: ModelMessage[] = [];
 
-  for (const message of messages) {
+  for (const [messageIndex, message] of messages.entries()) {
     if (message.role === "user" && Array.isArray(message.content)) {
       result.push(evictSyntheticMediaParts(message, evictedSyntheticParts));
       continue;
@@ -105,42 +113,48 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
       continue;
     }
 
+    // A deferred server tool keeps the previous assistant turn open: the user
+    // message after it may hold only tool_result blocks, so the media rides
+    // inside the tool results instead of in a synthetic user message.
+    const inlineMedia =
+      message.role === "tool" && holdsDeferredProviderToolCall(messages[messageIndex - 1]);
+
     let keptAttachments: ExtractedToolAttachment[] = [];
     let totalExtracted = 0;
     let omittedForMessage = 0;
     let changedMessage = false;
 
-    const newContent = message.content.map((part) => {
-      if (part.type !== "tool-result") {
-        return part;
-      }
-      const extracted = extractionsByPart.get(part);
-      if (extracted === undefined) {
-        return part;
-      }
+    const newContent = await Promise.all(
+      message.content.map(async (part) => {
+        if (part.type !== "tool-result") {
+          return part;
+        }
+        const extracted = extractionsByPart.get(part);
+        if (extracted === undefined) {
+          return part;
+        }
 
-      changedMessage = true;
-      totalExtracted += extracted.attachments.length;
-      // Over the request-wide cap: chronologically OLDEST attachments are
-      // omitted, and their per-item output placeholders are coalesced so a
-      // flooded transcript cannot keep megabytes of placeholder JSON in
-      // every request (r29 security).
-      const omittedHere = Math.min(capState.omitRemaining, extracted.attachments.length);
-      capState.omitRemaining -= omittedHere;
-      omittedForMessage += omittedHere;
-      keptAttachments = [...keptAttachments, ...extracted.attachments.slice(omittedHere)];
-
-      return {
-        ...part,
+        changedMessage = true;
+        totalExtracted += extracted.attachments.length;
+        // Over the request-wide cap: chronologically OLDEST attachments are
+        // omitted, and their per-item output placeholders are coalesced so a
+        // flooded transcript cannot keep megabytes of placeholder JSON in
+        // every request (r29 security).
+        const omittedHere = Math.min(capState.omitRemaining, extracted.attachments.length);
+        capState.omitRemaining -= omittedHere;
+        omittedForMessage += omittedHere;
+        const keptHere = extracted.attachments.slice(omittedHere);
         // Excess per-item placeholders (cap omission OR same-payload dedup —
         // r31) are coalesced; unchanged when placeholders match emitted
         // attachments 1:1.
-        output: coalesceAttachmentPlaceholders(
-          extracted.newOutput,
-          extracted.attachments.length - omittedHere
-        ) as ToolResultOutput,
-      };
-    });
+        const output = coalesceAttachmentPlaceholders(extracted.newOutput, keptHere.length);
+        if (inlineMedia) {
+          return { ...part, output: await createInlineMediaOutput(output, keptHere, omittedHere) };
+        }
+        keptAttachments = [...keptAttachments, ...keptHere];
+        return { ...part, output: output as ToolResultOutput };
+      })
+    );
 
     // The content arrays are structurally identical for both roles, but the
     // union needs the role-specific rebuild.
@@ -157,7 +171,7 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
             }
         : message
     );
-    if (totalExtracted > 0) {
+    if (totalExtracted > 0 && !inlineMedia) {
       result.push(
         await createSyntheticUserMessage(keptAttachments, omittedForMessage, totalExtracted)
       );
@@ -165,6 +179,79 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
   }
 
   return result;
+}
+
+/**
+ * True when an assistant message holds a provider-executed tool call (an
+ * Anthropic `server_tool_use`, e.g. web_search) whose result is not in the same
+ * message. Claude can call a server tool alongside a client tool; the API then
+ * returns before running the server tool and runs it once the client results
+ * arrive. Until then the turn is open: the next user message must contain only
+ * `tool_result` blocks, and anything after them (text, images) ends the turn and
+ * fails with "`web_search` tool use with id ... was found without a
+ * corresponding `web_search_tool_result` block". The result arrives at the
+ * start of the NEXT assistant message, so this shape stays stable in every
+ * later step of the turn.
+ */
+function holdsDeferredProviderToolCall(message: ModelMessage | undefined): boolean {
+  if (message?.role !== "assistant" || !Array.isArray(message.content)) return false;
+  const resolved = new Set(
+    message.content.flatMap((part) => (part.type === "tool-result" ? [part.toolCallId] : []))
+  );
+  return message.content.some(
+    (part) =>
+      part.type === "tool-call" && part.providerExecuted === true && !resolved.has(part.toolCallId)
+  );
+}
+
+type ContentOutputItem = Extract<ToolResultOutput, { type: "content" }>["value"][number];
+
+/**
+ * Provider-ready tool-result output that carries the extracted attachments
+ * itself (Anthropic accepts images and documents inside `tool_result`). The
+ * placeholder-rewritten output keeps the text the model would otherwise see.
+ */
+async function createInlineMediaOutput(
+  output: unknown,
+  keptAttachments: ExtractedToolAttachment[],
+  omittedCount: number
+): Promise<ToolResultOutput> {
+  const record = output as { type?: unknown; value?: unknown };
+  const value: ContentOutputItem[] =
+    record.type === "content" && Array.isArray(record.value)
+      ? [...(record.value as ContentOutputItem[])]
+      : [
+          {
+            type: "text",
+            text:
+              (record.type === "text" || record.type === "error-text") &&
+              typeof record.value === "string"
+                ? record.value
+                : JSON.stringify(record.type === "json" ? record.value : output),
+          },
+        ];
+  if (omittedCount > 0) {
+    value.push({ type: "text", text: createOmittedToolAttachmentText(omittedCount) });
+  }
+  for (const attachment of keptAttachments) {
+    const providerReadyAttachment = await prepareExtractedToolAttachmentForProvider(attachment);
+    if (providerReadyAttachment.type === "text") {
+      value.push({ type: "text", text: providerReadyAttachment.text });
+      continue;
+    }
+    const prepared = providerReadyAttachment.attachment;
+    value.push({
+      type: "file",
+      mediaType: prepared.mediaType,
+      data: { type: "data", data: prepared.data },
+      ...(prepared.filename
+        ? { filename: sanitizeAnthropicDocumentFilename(prepared.filename) }
+        : {}),
+      // Counted as reserved media on later steps (see the pass-1 scan).
+      providerOptions: SYNTHETIC_TOOL_MEDIA_PART_METADATA,
+    });
+  }
+  return { type: "content", value };
 }
 
 /**
