@@ -10333,6 +10333,22 @@ export class WorkspaceService
     }
   }
 
+  /**
+   * Deliver a chat event through the given session when there is one, else on the bus. Callers
+   * pass the session they already hold, so the event goes where their own work went.
+   */
+  private publishChatEvent(
+    workspaceId: string,
+    session: AgentSession | undefined,
+    message: WorkspaceChatMessage
+  ): void {
+    if (session) {
+      session.emitChatEvent(message);
+    } else {
+      this.emit("chat", { workspaceId, message });
+    }
+  }
+
   /** Deliver workspace metadata through the workspace's session when one exists, else on the bus. */
   private publishWorkspaceMetadata(
     workspaceId: string,
@@ -18482,12 +18498,7 @@ export class WorkspaceService
         historySequences: deletedSequences,
       };
       // Emit through the session so ORPC subscriptions receive the event
-      if (session) {
-        session.emitChatEvent(deleteMessage);
-      } else {
-        // Fallback to direct emit (legacy path)
-        this.emit("chat", { workspaceId, message: deleteMessage });
-      }
+      this.publishChatEvent(workspaceId, session, deleteMessage);
     }
 
     // On full clear (the plan file is already deleted), also clear file change tracking
@@ -18672,11 +18683,7 @@ export class WorkspaceService
       session?.clearUsageState();
 
       const typedBoundaryMessage = { ...boundaryMessage, type: "message" as const };
-      if (session) {
-        session.emitChatEvent(typedBoundaryMessage);
-      } else {
-        this.emit("chat", { workspaceId, message: typedBoundaryMessage });
-      }
+      this.publishChatEvent(workspaceId, session, typedBoundaryMessage);
 
       try {
         await this.workspaceGoalService?.requireUserAcknowledgment(workspaceId);
@@ -18956,9 +18963,7 @@ export class WorkspaceService
         if (cancellationError) {
           if (deletedSequences.length > 0) {
             const deleted: DeleteMessage = { type: "delete", historySequences: deletedSequences };
-            const session = this.sessions.get(workspaceId);
-            if (session) session.emitChatEvent(deleted);
-            else this.emit("chat", { workspaceId, message: deleted });
+            this.publishChatEvent(workspaceId, this.sessions.get(workspaceId), deleted);
           }
           return Err(cancellationError);
         }
@@ -18989,20 +18994,12 @@ export class WorkspaceService
           type: "delete",
           historySequences: deletedSequences,
         };
-        if (session) {
-          session.emitChatEvent(deleteMessage);
-        } else {
-          this.emit("chat", { workspaceId, message: deleteMessage });
-        }
+        this.publishChatEvent(workspaceId, session, deleteMessage);
       }
 
       // Add type: "message" for discriminated union (XumMessage doesn't have it)
       const typedSummaryMessage = { ...messageToAppend, type: "message" as const };
-      if (session) {
-        session.emitChatEvent(typedSummaryMessage);
-      } else {
-        this.emit("chat", { workspaceId, message: typedSummaryMessage });
-      }
+      this.publishChatEvent(workspaceId, session, typedSummaryMessage);
 
       // Optional cleanup when the caller explicitly requests it (the plan file itself was
       // deleted before the commit). Note: the propose_plan UI keeps the plan file on disk; this
