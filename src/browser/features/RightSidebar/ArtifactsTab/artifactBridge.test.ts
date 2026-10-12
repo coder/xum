@@ -380,6 +380,8 @@ describe("in-page links", () => {
       <a id="top-link" href="#">Top</a>
       <a id="missing" href="#nowhere">Missing</a>
       <a id="external" href="https://example.com/#intro">External</a>
+      <a id="blank" href="#intro" target="_blank">New tab</a>
+      <a id="self" href="#intro" target="_SELF">Same frame</a>
       <a id="no-href">Not a link</a>
       <a id="own" href="#intro">Handled by the artifact</a>
       <svg><a id="svg"><text>SVG</text></a></svg>
@@ -402,7 +404,8 @@ describe("in-page links", () => {
     run(win, doc, win.CustomEvent);
     // The artifact's own handler, which takes over one link.
     doc.getElementById("own")!.addEventListener("click", (event) => event.preventDefault());
-    // Last listener: record what the shim decided, then stop Happy DOM from navigating.
+    // A window listener added after the shim's runs after it: record what the shim decided, then
+    // stop Happy DOM from navigating.
     const seen: { prevented: boolean | null } = { prevented: null };
     win.addEventListener("click", (event) => {
       seen.prevented = event.defaultPrevented;
@@ -432,12 +435,14 @@ describe("in-page links", () => {
     expect(click("inner")).toEqual(jump("Raw"));
     expect(click("decoded-name")).toEqual(jump("Decoded"));
     expect(click("svg")).toEqual(jump("Intro"));
+    expect(click("self")).toEqual(jump("Intro"));
     expect(click("top-link")).toEqual({ prevented: true, scrolled: ["top"], focused: null });
     // No target: the navigation is still cancelled, and nothing moves (as in a browser).
     expect(click("missing")).toEqual({ prevented: true, scrolled: [], focused: null });
     // Left to the browser (and the navigation guards): other URLs, modified and non-left clicks.
     const untouched = { prevented: false, scrolled: [], focused: null };
     expect(click("external")).toEqual(untouched);
+    expect(click("blank")).toEqual(untouched);
     expect(click("no-href")).toEqual(untouched);
     expect(click("plain", { ctrlKey: true })).toEqual(untouched);
     expect(click("plain", { button: 1 })).toEqual(untouched);
