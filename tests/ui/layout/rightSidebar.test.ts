@@ -424,6 +424,74 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
+  // #6117 covered a close that leaves tabs in the pane. These cover the close of a pane's last
+  // tab: the pane empties (or collapses), and focus must still land on a tab, not <body>.
+  const closeByKeyboard = (close: HTMLElement) => {
+    close.focus();
+    // A focused button turns Enter into a click on itself.
+    fireEvent.click(close);
+  };
+  const activeTabDescription = () => {
+    const active = document.activeElement;
+    return active?.getAttribute("role") === "tab"
+      ? `tab ${active.getAttribute("aria-controls") ?? ""}`
+      : (active?.tagName ?? "none");
+  };
+
+  test("closing the only pane's last tab by keyboard focuses the New tab", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs"]));
+    try {
+      closeByKeyboard(
+        await findRequiredElement(
+          sidebar,
+          'button[aria-label="Close Stats"]',
+          "Close Stats not found"
+        )
+      );
+      await findSidebarPanel(sidebar, "-panel-new");
+      await waitFor(() => expect(activeTabDescription()).toMatch(/^tab .*-panel-new$/));
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("closing a split pane's last tab by keyboard focuses the other pane's tab", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      const layout: RightSidebarLayoutState = {
+        version: 1,
+        openTabsOnly: true,
+        nextId: 3,
+        focusedTabsetId: "tabset-2",
+        root: {
+          type: "split",
+          id: "split-1",
+          direction: "vertical",
+          sizes: [50, 50],
+          children: [
+            { type: "tabset", id: "tabset-1", tabs: ["costs"], activeTab: "costs" },
+            { type: "tabset", id: "tabset-2", tabs: ["review"], activeTab: "review" },
+          ],
+        },
+      };
+      updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
+    });
+    try {
+      closeByKeyboard(
+        await findRequiredElement(
+          sidebar,
+          'button[aria-label="Close Review"]',
+          "Close Review not found"
+        )
+      );
+      await waitFor(() => {
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+      });
+      await waitFor(() => expect(activeTabDescription()).toMatch(/^tab .*-panel-costs$/));
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
   test("Close Tab leaves the tab alone while the interactive browser has focus", async () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() =>
       seedLayout(["costs", "review"], "review")
