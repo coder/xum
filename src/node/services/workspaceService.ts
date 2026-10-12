@@ -18340,6 +18340,87 @@ export class WorkspaceService
       });
   }
 
+  /**
+   * Full-clear precondition, run under the admission guard and refine lock: refuse while a
+   * turn is active, and discard any pending auto-retry so it cannot replay the cleared context.
+   */
+  private async settleTurnWorkBeforeFullClear(
+    workspaceId: string,
+    session: AgentSession | undefined
+  ): Promise<Result<void>> {
+    // Recheck under the guard + lock: the admission block refuses ordinary
+    // turn starts during the awaits above, but in-turn compaction retries
+    // bypass admission gating when they cross a transient idle gap.
+    if (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
+      return Err(
+        "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
+      );
+    }
+    // r41: a retry scheduled before this clear would replay the discarded
+    // context after the guard releases — cancel it and drop the partial
+    // durably before the transcript goes away.
+    if (session) {
+      const retryDiscard = await session.discardAutoRetryForContextMutation();
+      if (!retryDiscard.success) {
+        return Err(
+          `Cannot clear history: pending retry state could not be discarded (${retryDiscard.error})`
+        );
+      }
+    }
+    return Ok(undefined);
+  }
+
+  /**
+   * After a full clear: require goal acknowledgment and durably discard the context derived
+   * from the cleared transcript (file state, post-compaction carryover, sandbox kernel state).
+   */
+  private async discardContextStateAfterFullClear(workspaceId: string): Promise<Result<void>> {
+    // A full chat clear removes the context the goal loop was using; require
+    // one user re-engagement before later continuation slices resume it.
+    try {
+      await this.workspaceGoalService?.requireUserAcknowledgment(workspaceId);
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+    this.sessions.get(workspaceId)?.clearFileState();
+    // Same new-segment invariant as resetContext: pre-clear read/skill
+    // carryover must not be injected after the transcript is gone, and the
+    // discard must be durable before the clear reports success (a stale
+    // persisted file would re-inject pre-clear context after a restart).
+    try {
+      await this.getOrCreateSession(workspaceId).clearPostCompactionState();
+    } catch (error) {
+      return Err(
+        `History was cleared, but the persisted post-compaction carryover could not be ` +
+          `durably discarded (${getErrorMessage(error)}). Pre-clear read/skill context may ` +
+          `be re-injected after a restart; retry once the session storage is writable.`
+      );
+    }
+    // The persistent RLM sandbox holds context DERIVED from the cleared
+    // transcript (vars populated by code execution), and its latest durable
+    // snapshot would restore it after a restart — later turns could read
+    // data from the supposedly cleared context through the kernel. Same
+    // durable invalidation + partial-failure posture as resetContext.
+    try {
+      await sandboxHostService.discardScope(
+        workspaceId,
+        path.join(this.config.sessionsDir, workspaceId)
+      );
+    } catch (error) {
+      log.error(
+        `Failed to durably invalidate sandbox state for ${workspaceId} after history clear; ` +
+          `the sandbox kernel stays unavailable until invalidation succeeds`,
+        error
+      );
+      return Err(
+        `History was cleared, but the sandbox kernel state could not be durably invalidated ` +
+          `(${getErrorMessage(error)}). The sandbox stays unavailable and cleared variables ` +
+          `may reappear after a restart; retry once the session storage is writable.`
+      );
+    }
+    return Ok(undefined);
+  }
+
   async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
     // Perf harness replay mode (XUM_REPLAY_TAPES): real chat history stays untouched. Checked
     // before any session or history work (clear, truncate).
@@ -18382,26 +18463,10 @@ export class WorkspaceService
       refineLock = refineLockResult.data;
     }
     await using _refineLock = refineLock;
-    // Recheck under the guard + lock: the admission block refuses ordinary
-    // turn starts during the awaits above, but in-turn compaction retries
-    // bypass admission gating when they cross a transient idle gap.
-    if (
-      isFullClear &&
-      (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId))
-    ) {
-      return Err(
-        "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
-      );
-    }
-    // r41: a retry scheduled before this clear would replay the discarded
-    // context after the guard releases — cancel it and drop the partial
-    // durably before the transcript goes away.
-    if (isFullClear && session) {
-      const retryDiscard = await session.discardAutoRetryForContextMutation();
-      if (!retryDiscard.success) {
-        return Err(
-          `Cannot clear history: pending retry state could not be discarded (${retryDiscard.error})`
-        );
+    if (isFullClear) {
+      const ready = await this.settleTurnWorkBeforeFullClear(workspaceId, session);
+      if (!ready.success) {
+        return ready;
       }
     }
     // Kernel workflow run references belong to the conversation this truncation mutates: a
@@ -18503,48 +18568,9 @@ export class WorkspaceService
 
     // On full clear (the plan file is already deleted), also clear file change tracking
     if (isFullClear) {
-      // A full chat clear removes the context the goal loop was using; require
-      // one user re-engagement before later continuation slices resume it.
-      try {
-        await this.workspaceGoalService?.requireUserAcknowledgment(workspaceId);
-      } catch (error) {
-        return Err(getErrorMessage(error));
-      }
-      this.sessions.get(workspaceId)?.clearFileState();
-      // Same new-segment invariant as resetContext: pre-clear read/skill
-      // carryover must not be injected after the transcript is gone, and the
-      // discard must be durable before the clear reports success (a stale
-      // persisted file would re-inject pre-clear context after a restart).
-      try {
-        await this.getOrCreateSession(workspaceId).clearPostCompactionState();
-      } catch (error) {
-        return Err(
-          `History was cleared, but the persisted post-compaction carryover could not be ` +
-            `durably discarded (${getErrorMessage(error)}). Pre-clear read/skill context may ` +
-            `be re-injected after a restart; retry once the session storage is writable.`
-        );
-      }
-      // The persistent RLM sandbox holds context DERIVED from the cleared
-      // transcript (vars populated by code execution), and its latest durable
-      // snapshot would restore it after a restart — later turns could read
-      // data from the supposedly cleared context through the kernel. Same
-      // durable invalidation + partial-failure posture as resetContext.
-      try {
-        await sandboxHostService.discardScope(
-          workspaceId,
-          path.join(this.config.sessionsDir, workspaceId)
-        );
-      } catch (error) {
-        log.error(
-          `Failed to durably invalidate sandbox state for ${workspaceId} after history clear; ` +
-            `the sandbox kernel stays unavailable until invalidation succeeds`,
-          error
-        );
-        return Err(
-          `History was cleared, but the sandbox kernel state could not be durably invalidated ` +
-            `(${getErrorMessage(error)}). The sandbox stays unavailable and cleared variables ` +
-            `may reappear after a restart; retry once the session storage is writable.`
-        );
+      const discarded = await this.discardContextStateAfterFullClear(workspaceId);
+      if (!discarded.success) {
+        return discarded;
       }
     }
 
