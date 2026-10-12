@@ -66,4 +66,18 @@ describe("BashToolCall", () => {
     cleanup();
     expect(renderExpanded({ error: "" }).queryByText("Error")).toBeNull();
   });
+
+  test("a primitive result (0, false) renders without throwing", () => {
+    for (const result of [0, false]) {
+      const view = renderExpanded(result);
+      expect(view.getByText("Script")).toBeDefined();
+      expect(view.queryByText("Error")).toBeNull();
+      cleanup();
+    }
+  });
+
+  test("the SDK JSON container shape still shows the hook's reason", () => {
+    const view = renderExpanded({ type: "json", value: { error: "Blocked by hook: wrapped" } });
+    expect(view.getByText("Blocked by hook: wrapped")).toBeDefined();
+  });
 });
