@@ -70,26 +70,33 @@ export interface RecordedStepRequest {
   stepId: string;
   stepNumber: number;
   modelId: string;
+  /** AI SDK provider id, e.g. "anthropic.messages"; null when the SDK did not report one. */
+  provider: string | null;
   prompt: unknown;
   tools: unknown;
   requestHistorySequence?: number;
+}
+
+/** One parse of devtools.jsonl, shared by the first-request replay and the step audit. */
+export interface DevtoolsLogSnapshot {
+  runs: Array<{ run: DevToolsRun; steps: DevToolsStep[] }>;
+  /** Steps of known runs in the order the log recorded them (overlapping runs interleave). */
+  stepsInLogOrder: Array<{ run: DevToolsRun; step: DevToolsStep }>;
+  stepUsageUpdates: Map<string, DevToolsUsage | null>;
 }
 
 /**
  * Tolerant devtools.jsonl reader (self-heal doctrine): malformed lines and
  * unknown entry types are skipped. Returns runs in log order with their steps.
  */
-async function readDevtoolsLog(sessionDir: string): Promise<{
-  runs: Array<{ run: DevToolsRun; steps: DevToolsStep[] }>;
-  stepUsageUpdates: Map<string, DevToolsUsage | null>;
-}> {
+export async function readDevtoolsLog(sessionDir: string): Promise<DevtoolsLogSnapshot> {
   const runs = new Map<string, { run: DevToolsRun; steps: DevToolsStep[] }>();
   const stepUsageUpdates = new Map<string, DevToolsUsage | null>();
   let raw: string;
   try {
     raw = await fs.readFile(path.join(sessionDir, DEVTOOLS_LOG_FILE_NAME), "utf-8");
   } catch {
-    return { runs: [], stepUsageUpdates };
+    return { runs: [], stepsInLogOrder: [], stepUsageUpdates };
   }
 
   const orphanSteps: DevToolsStep[] = [];
@@ -111,13 +118,17 @@ async function readDevtoolsLog(sessionDir: string): Promise<{
       stepUsageUpdates.set(entry.stepId, entry.update.usage);
     }
   }
+  const stepsInLogOrder: DevtoolsLogSnapshot["stepsInLogOrder"] = [];
   for (const step of orphanSteps) {
-    runs.get(step.runId)?.steps.push(step);
+    const owner = runs.get(step.runId);
+    if (owner == null) continue;
+    owner.steps.push(step);
+    stepsInLogOrder.push({ run: owner.run, step });
   }
   for (const { steps } of runs.values()) {
     steps.sort((a, b) => a.stepNumber - b.stepNumber);
   }
-  return { runs: [...runs.values()], stepUsageUpdates };
+  return { runs: [...runs.values()], stepsInLogOrder, stepUsageUpdates };
 }
 
 /**
@@ -127,7 +138,11 @@ async function readDevtoolsLog(sessionDir: string): Promise<{
  * step 0 — the request assembled from chat.jsonl.
  */
 export async function readRecordedRequests(sessionDir: string): Promise<RecordedProviderRequest[]> {
-  const { runs, stepUsageUpdates } = await readDevtoolsLog(sessionDir);
+  return recordedRequestsFromLog(await readDevtoolsLog(sessionDir));
+}
+
+function recordedRequestsFromLog(log: DevtoolsLogSnapshot): RecordedProviderRequest[] {
+  const { runs, stepUsageUpdates } = log;
   const requests: RecordedProviderRequest[] = [];
   for (const { run, steps } of runs) {
     const step = steps.at(0);
@@ -149,28 +164,33 @@ export async function readRecordedRequests(sessionDir: string): Promise<Recorded
   return requests;
 }
 
-/** Every recorded step with an input, runs in log order and steps in step order. */
-export async function readRecordedSteps(sessionDir: string): Promise<RecordedStepRequest[]> {
-  const { runs } = await readDevtoolsLog(sessionDir);
-  return runs.flatMap(({ run, steps }) =>
-    steps.flatMap((step) =>
-      step.input == null
-        ? []
-        : [
-            {
-              runId: run.id,
-              stepId: step.id,
-              stepNumber: step.stepNumber,
-              modelId: step.modelId,
-              prompt: step.input.prompt,
-              tools: step.input.tools,
-              ...(run.requestHistorySequence != null
-                ? { requestHistorySequence: run.requestHistorySequence }
-                : {}),
-            },
-          ]
-    )
+/**
+ * Every recorded step with an input, in the order the log recorded them. Overlapping runs in one
+ * workspace interleave (A0, B0, A1), and that order is the order the provider saw the requests.
+ */
+export function recordedStepsFromLog(log: DevtoolsLogSnapshot): RecordedStepRequest[] {
+  return log.stepsInLogOrder.flatMap(({ run, step }) =>
+    step.input == null
+      ? []
+      : [
+          {
+            runId: run.id,
+            stepId: step.id,
+            stepNumber: step.stepNumber,
+            modelId: step.modelId,
+            provider: step.provider,
+            prompt: step.input.prompt,
+            tools: step.input.tools,
+            ...(run.requestHistorySequence != null
+              ? { requestHistorySequence: run.requestHistorySequence }
+              : {}),
+          },
+        ]
   );
+}
+
+export async function readRecordedSteps(sessionDir: string): Promise<RecordedStepRequest[]> {
+  return recordedStepsFromLog(await readDevtoolsLog(sessionDir));
 }
 
 /** First structural difference between two JSON values (depth-first). */
@@ -537,24 +557,44 @@ function pairSessionTurns(
  * so they are keyed on the compaction request row: the newest row the run was
  * built from.
  */
+export function auditStepPrefixesFromLog(
+  log: DevtoolsLogSnapshot,
+  historyMessages: MuxMessage[]
+): StepPrefixAudit {
+  const compactionSequences = new Set(
+    historyMessages.flatMap((message) => {
+      const metadata = message.metadata;
+      // A compaction request row, or a compact-agent turn: the resume path sends agentId
+      // "compact" without a request row, and its run carries that turn's request sequence.
+      if (
+        message.role === "user" &&
+        metadata?.muxMetadata?.type === "compaction-request" &&
+        metadata.historySequence != null
+      ) {
+        return [metadata.historySequence];
+      }
+      if (
+        message.role === "assistant" &&
+        metadata?.agentId === "compact" &&
+        metadata.requestHistorySequence != null
+      ) {
+        return [metadata.requestHistorySequence];
+      }
+      return [];
+    })
+  );
+  return auditStepPrefixes(
+    recordedStepsFromLog(log),
+    (step) =>
+      step.requestHistorySequence != null && compactionSequences.has(step.requestHistorySequence)
+  );
+}
+
 export async function auditRecordedStepPrefixes(
   sessionDir: string,
   historyMessages: MuxMessage[]
 ): Promise<StepPrefixAudit> {
-  const compactionSequences = new Set(
-    historyMessages.flatMap((message) =>
-      message.role === "user" &&
-      message.metadata?.muxMetadata?.type === "compaction-request" &&
-      message.metadata.historySequence != null
-        ? [message.metadata.historySequence]
-        : []
-    )
-  );
-  return auditStepPrefixes(
-    await readRecordedSteps(sessionDir),
-    (step) =>
-      step.requestHistorySequence != null && compactionSequences.has(step.requestHistorySequence)
-  );
+  return auditStepPrefixesFromLog(await readDevtoolsLog(sessionDir), historyMessages);
 }
 
 /** Narrow the persisted envelope string to the AnthropicCacheTtl union. */
@@ -580,12 +620,14 @@ export async function replayVerifySession(params: {
   const envelopes = events.filter(
     (event): event is TurnEnvelopeEvent => event.kind === "turn-envelope"
   );
-  const recorded = await readRecordedRequests(params.sessionDir);
+  // One snapshot for both checks: a live log can grow between two reads.
+  const devtoolsLog = await readDevtoolsLog(params.sessionDir);
+  const recorded = recordedRequestsFromLog(devtoolsLog);
   const turns = collectAssistantTurns(params.historyMessages);
 
   const notes: string[] = [];
   const pairings = pairSessionTurns(envelopes, recorded, turns, notes);
-  const stepPrefix = await auditRecordedStepPrefixes(params.sessionDir, params.historyMessages);
+  const stepPrefix = auditStepPrefixesFromLog(devtoolsLog, params.historyMessages);
 
   const results: ReplayVerifyTurnResult[] = [];
   for (const [i, pairing] of pairings.entries()) {

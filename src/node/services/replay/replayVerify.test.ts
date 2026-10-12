@@ -28,6 +28,7 @@ import {
 } from "./replayFixture";
 import {
   collectFullHistory,
+  readRecordedSteps,
   replayVerifySession,
   type ReplayVerifySessionResult,
 } from "./replayVerify";
@@ -114,7 +115,10 @@ describe("replayVerifySession pairing", () => {
     const firstStep = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
     const firstPrompt = firstStep.input?.prompt as unknown[];
     const toolCall = { type: "tool-call", toolCallId: "t1", toolName: "bash", input: {} };
-    ctx.devtoolsLines.push(
+    // Insert it where it was sent: after turn 1's first step, before turn 2's run.
+    ctx.devtoolsLines.splice(
+      2,
+      0,
       JSON.stringify({
         type: "step",
         step: {
@@ -144,6 +148,62 @@ describe("replayVerifySession pairing", () => {
         },
       },
     ]);
+  });
+
+  test("the step audit keeps the log order of overlapping runs", async () => {
+    using tmp = new DisposableTempDir("replay-verify-step-order");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    for (const userText of ["First.", "Second."]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+      });
+    }
+    // Run 1 sends a later step after run 2 started: the log order is A0, B0, A1.
+    const [, firstStepLine] = ctx.devtoolsLines;
+    const firstStep = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
+    ctx.devtoolsLines.push(
+      JSON.stringify({ type: "step", step: { ...firstStep, id: "step-1b", stepNumber: 1 } })
+    );
+    await flushReplayFixtureDevtools(ctx);
+
+    const steps = await readRecordedSteps(ctx.sessionDir);
+    expect(steps.map((step) => `${step.runId}:${step.stepNumber}`)).toEqual([
+      "run-1:0",
+      "run-2:0",
+      "run-1:1",
+    ]);
+  });
+
+  test("a compact-agent turn without a compaction request row is skipped", async () => {
+    using tmp = new DisposableTempDir("replay-verify-compact-agent");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    await appendReplayFixtureTurn(ctx, {
+      userText: "First.",
+      assistantText: "Done.",
+      systemPrompt: SYSTEM_PROMPT,
+      tools: tools(),
+    });
+    // The resume path runs the compact agent (another system prompt) with no request row.
+    await appendReplayFixtureTurn(ctx, {
+      userText: "Summarize.",
+      assistantText: "Summary.",
+      agentId: "compact",
+      systemPrompt: "You are running a compaction pass.",
+      tools: tools(),
+    });
+    await appendReplayFixtureTurn(ctx, {
+      userText: "Next.",
+      assistantText: "Done.",
+      systemPrompt: SYSTEM_PROMPT,
+      tools: tools(),
+    });
+
+    const result = await verify(ctx);
+    // The compact run is skipped and resets the baseline, so nothing is compared or broken.
+    expect(result.stepPrefix).toEqual({ comparedPairs: 0, breaks: [] });
   });
 
   test("a turn without an assistant row skips only itself", async () => {

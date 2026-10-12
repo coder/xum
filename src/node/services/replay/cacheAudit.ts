@@ -185,8 +185,13 @@ export interface StepPrefixAudit {
  * uncached. The turn envelope comparison above only sees prefix inputs; this
  * also catches a rebuild that changes history bytes (lost step boundaries,
  * truncated tool results). Pairs across a model change are not compared, and
- * a side run (compaction) is skipped and resets the baseline.
+ * a side run (compaction) or a non-Anthropic step is skipped and resets the baseline.
  */
+/** AI SDK Anthropic provider ids start with "anthropic" (e.g. "anthropic.messages"). */
+function isAnthropicStep(step: RecordedStepRequest): boolean {
+  return step.provider?.startsWith("anthropic") === true;
+}
+
 export function auditStepPrefixes(
   steps: readonly RecordedStepRequest[],
   isSideRun: (step: RecordedStepRequest) => boolean = () => false
@@ -199,10 +204,16 @@ export function auditStepPrefixes(
       previous = undefined;
       continue;
     }
+    // Block order and normalization are Anthropic's, like the runtime detector, which
+    // observes only Anthropic wires: other providers neither break nor extend the chain.
+    if (!isAnthropicStep(step)) {
+      previous = undefined;
+      continue;
+    }
     // The DevTools record is the AI SDK prompt (system messages inline), the
     // same shape the gateway wire carries.
     const blocks = fingerprintAnthropicRequest({ tools: step.tools, prompt: step.prompt });
-    if (previous?.step.modelId === step.modelId) {
+    if (previous?.step.modelId === step.modelId && previous.step.provider === step.provider) {
       comparedPairs++;
       const comparison = comparePromptCachePrefix(previous.blocks, blocks);
       if (comparison.kind === "break") {

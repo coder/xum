@@ -158,12 +158,14 @@ describe("auditStepPrefixes", () => {
     runId: string,
     stepNumber: number,
     texts: string[],
-    modelId = "anthropic:claude-sonnet-4-5"
+    modelId = "anthropic:claude-sonnet-4-5",
+    provider: string | null = "anthropic.messages"
   ): RecordedStepRequest => ({
     runId,
     stepId: `${runId}-${stepNumber}`,
     stepNumber,
     modelId,
+    provider,
     tools: [],
     prompt: [
       { role: "system", content: "You are Xum." },
@@ -194,5 +196,21 @@ describe("auditStepPrefixes", () => {
       (recorded) => recorded.runId === "compact"
     );
     expect(audit).toEqual({ comparedPairs: 0, breaks: [] });
+  });
+
+  test("only Anthropic steps on one route are compared", () => {
+    const model = "anthropic:claude-sonnet-4-5";
+    const audit = auditStepPrefixes([
+      step("run-1", 0, ["a"], model),
+      // Another route for the same model id: not compared, but it becomes the baseline.
+      step("run-2", 0, ["x"], model, "anthropic.gateway"),
+      // Non-Anthropic steps are never compared, even when they would "break" by Anthropic rules,
+      // and they reset the baseline.
+      step("run-3", 0, ["y"], "openai:gpt-6", "openai.responses"),
+      step("run-3", 1, ["y2"], "openai:gpt-6", "openai.responses"),
+      step("run-4", 0, ["z"], model),
+      step("run-4", 1, ["z", "w"], model),
+    ]);
+    expect(audit).toEqual({ comparedPairs: 1, breaks: [] });
   });
 });

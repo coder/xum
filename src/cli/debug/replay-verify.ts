@@ -88,6 +88,8 @@ export async function replayVerifyCommand(workspaceId: string): Promise<void> {
       "No verifiable turns found. Replay verification needs turn-envelope rows " +
         "(durable-events.jsonl) AND recorded requests (devtools.jsonl via llmDebugLogs)."
     );
+    // The step audit needs only devtools.jsonl, so older logs without envelopes still get it.
+    printStepPrefixAudit(result.stepPrefix);
     return;
   }
 
