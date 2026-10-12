@@ -413,14 +413,22 @@ describe("createDisplayUsage", () => {
         { anthropic: { cacheCreationInputTokens: 10000 } }
       );
       const aggregate = sumUsageHistory([short!, long!])!;
+      const options = { aggregatedUsage: true, pricedAsItself: true };
 
-      const result = recomputeUsageCosts(aggregate, model, { aggregatedUsage: true });
-
+      const result = recomputeUsageCosts(aggregate, model, options);
       expect(result.hasUnknownCosts).toBeUndefined();
       expect(result).toEqual(aggregate);
+
+      // A flag left by an earlier reprice (e.g. under a since-removed mapping) clears.
+      const reflagged = recomputeUsageCosts(
+        { ...aggregate, hasUnknownCosts: true },
+        model,
+        options
+      );
+      expect(reflagged.hasUnknownCosts).toBeUndefined();
     });
 
-    test("flags a Haiku 5.5 aggregate once its costs no longer fit the effective rates", () => {
+    test("flags a Haiku 5.5 aggregate whose costs do not fit the effective rates", () => {
       const aggregate = sumUsageHistory([
         createDisplayUsage(
           { inputTokens: 50000, outputTokens: 500, totalTokens: 50500 },
@@ -428,9 +436,28 @@ describe("createDisplayUsage", () => {
         )!,
       ])!;
 
-      // e.g. a mapping now resolves this runtime model to a pricier tiered model.
+      // Same bucket, but its rates now differ (e.g. corrected in an app update).
       const result = recomputeUsageCosts(aggregate, "openai:gpt-6.1-sol", {
         aggregatedUsage: true,
+        pricedAsItself: true,
+      });
+
+      expect(result).toEqual({ ...aggregate, hasUnknownCosts: true });
+    });
+
+    test("flags a mapped aggregate even when its costs fit the new model's rates", () => {
+      // Haiku 5.5's own costs trivially fit its band; under a "Treat as" mapping the stored
+      // costs may come from another model whose rates also land in it.
+      const aggregate = sumUsageHistory([
+        createDisplayUsage(
+          { inputTokens: 50000, outputTokens: 500, totalTokens: 50500 },
+          "anthropic:claude-haiku-5-5"
+        )!,
+      ])!;
+
+      const result = recomputeUsageCosts(aggregate, "anthropic:claude-haiku-5-5", {
+        aggregatedUsage: true,
+        pricedAsItself: false,
       });
 
       expect(result).toEqual({ ...aggregate, hasUnknownCosts: true });

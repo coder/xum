@@ -725,8 +725,11 @@ function repriceSessionUsage(
     const resolved = resolveModelForMetadata(model, config);
     // `byModel` is a session-long aggregate, so tiered models cannot be safely repriced from
     // the summed token totals alone. recomputeUsageCosts() preserves those stored costs and marks
-    // them approximate only when they do not fit the effective model's tiered rates.
-    usage.byModel[model] = recomputeUsageCosts(entry, resolved, { aggregatedUsage: true });
+    // them approximate unless the bucket prices as itself and they fit its tiered rates.
+    usage.byModel[model] = recomputeUsageCosts(entry, resolved, {
+      aggregatedUsage: true,
+      pricedAsItself: resolved === model,
+    });
   }
   if (
     usage.lastRequest &&

@@ -20,6 +20,11 @@ interface UsageCostInputs {
 
 interface RecomputeUsageCostsOptions {
   aggregatedUsage?: boolean;
+  /**
+   * The usage bucket's own model is `metadataModel` (no "Treat as" mapping), so its stored
+   * costs were priced by `metadataModel`'s rates rather than by some other model's.
+   */
+  pricedAsItself?: boolean;
 }
 
 interface UsageCosts {
@@ -337,12 +342,20 @@ export function recomputeUsageCosts(
     // Aggregated `byModel` totals collapse many requests into one bucket. Tiered pricing is
     // non-linear, so choosing a single tier from the sum can inflate costs once multiple
     // sub-threshold requests add up past the long-context boundary. Preserve the stored costs.
-    // Only flag them as approximate when they could not have come from the current rates
-    // (e.g. a model mapping changed): flagging every tiered aggregate made sessions that used
-    // Haiku 5.5 (the only tiered Claude model) show "unknown pricing" after each reload.
-    return storedCostsMatchTieredRates(usage, pricedStats, tokens)
-      ? { ...usage }
-      : { ...usage, hasUnknownCosts: true };
+    // Flagging every tiered aggregate made sessions that used Haiku 5.5 (the only tiered
+    // Claude model) show "unknown pricing" after each reload, so stored costs count as
+    // current when the bucket prices as itself and they fit its rates. A fit alone only
+    // proves plausibility: under a mapping, another model's costs can land in the band too.
+    if (
+      options.pricedAsItself === true &&
+      storedCostsMatchTieredRates(usage, pricedStats, tokens)
+    ) {
+      // Clear a flag an earlier reprice set (e.g. under a since-removed mapping), as an
+      // exact reprice below does.
+      const { hasUnknownCosts: _staleFlag, ...current } = usage;
+      return current;
+    }
+    return { ...usage, hasUnknownCosts: true };
   }
 
   const costs = calculateUsageCosts(pricedStats, tokens);
