@@ -248,9 +248,13 @@ jobs:
         env:
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_TOTAL: ${{ strategy.job-total }}
-      # Quality / CRAP merges every shard's report; keep them only briefly.
+      # Quality / CRAP merges every shard's report; keep them only briefly. A
+      # failed shard's report is incomplete, so it uploads none and the summary
+      # shows partial coverage. Informational: an upload error must not fail
+      # this required job.
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        if: ${{ success() && github.event_name == 'pull_request' }}
+        continue-on-error: true
         with:
           name: crap-lcov-unit-${{ matrix.shard }}
           path: coverage/lcov.info
@@ -330,9 +334,13 @@ jobs:
           BACKEND: ${{ needs.changes.outputs.backend }}
           BROWSER: ${{ needs.changes.outputs.browser }}
           SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
-      # Quality / CRAP merges every shard's report; keep them only briefly.
+      # Quality / CRAP merges every shard's report; keep them only briefly. A
+      # failed shard's report is incomplete, so it uploads none and the summary
+      # shows partial coverage. Informational: an upload error must not fail
+      # this required job.
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        if: ${{ success() && github.event_name == 'pull_request' }}
+        continue-on-error: true
         with:
           name: crap-lcov-integration-${{ matrix.shard }}
           path: coverage/lcov.info
@@ -359,6 +367,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
+      # The checkout is the merge commit at depth 1, so check.ts sees no PR
+      # commits and reads no Crap-Debt trailers here: in CI the crap-debt
+      # label is the escape hatch (trailers are for the local hook).
       - name: Fetch the PR base
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}

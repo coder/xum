@@ -66,7 +66,7 @@ export function summary(
     "## Quality / CRAP (informational)",
     "",
     coverage,
-    "No base coverage: the CRAP tax compares CC and only warns.",
+    "Unit reports cover the shared-process suites only (isolated suites run without coverage). No base coverage: the CRAP tax compares CC and only warns.",
     "",
   ];
   if (report === null) {
