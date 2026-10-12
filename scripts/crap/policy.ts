@@ -60,13 +60,18 @@ export function keyRows(rows: readonly FunctionRow[]): Map<string, FunctionRow> 
 
 const HUNK_HEADER = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
 
-/** Parses `git diff -U0` output into head-side line spans. */
+/**
+ * Parses `git diff -U0 --default-prefix` output (with `core.quotePath=false`)
+ * into head-side line spans. Git ends a `+++` path that contains a space with
+ * a tab. It still quotes a path with a tab, quote, backslash or control
+ * character: such files get no spans, so the CRAP tax skips them.
+ */
 export function parseChangedLines(diff: string): ChangedLines {
   const changed: ChangedLines = new Map();
   let spans: Array<[number, number]> | null = null;
   for (const line of diff.split("\n")) {
     if (line.startsWith("+++ ")) {
-      const target = line.slice(4);
+      const target = line.slice(4).replace(/\t$/, "");
       spans = target === "/dev/null" ? null : [];
       if (spans) changed.set(target.replace(/^b\//, ""), spans);
       continue;
@@ -142,7 +147,9 @@ function judgeNew(
   const score = head.crap ?? head.complexity;
   if (score <= NEW_FUNCTION_MAX_SCORE) return null;
   const relieved = netExtractionRelief(totals.base, totals.head);
-  const relief = relieved ? `, net-extraction relief: total CC ${totals.base} -> ${totals.head}` : "";
+  const relief = relieved
+    ? `, net-extraction relief: total CC ${totals.base} -> ${totals.head}`
+    : "";
   return {
     rule: "new-function",
     severity: relieved ? NEW_FUNCTION_ON_NET_DECREASE : "violation",

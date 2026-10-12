@@ -125,6 +125,14 @@ describe("CRAP tax", () => {
     const between = parseChangedLines(`+++ b/${PATH}\n@@ -21,3 +20,0 @@\n`);
     expect(verdicts([left, right], [left, right], between)).toEqual([]);
   });
+
+  test("a path with a space keeps its spans despite Git's trailing tab", () => {
+    const spaced = { ...row("big", 40, [10, 90]), path: "src/demo/a b.ts" };
+    const diff = parseChangedLines("+++ b/src/demo/a b.ts\t\n@@ -50 +50 @@\n");
+    expect(evaluate([spaced], [spaced], diff).findings.map((finding) => finding.rule)).toEqual([
+      "crap-tax",
+    ]);
+  });
 });
 
 test("duplicate keys pair up by start-line order", () => {
