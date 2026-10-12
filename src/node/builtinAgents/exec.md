@@ -30,9 +30,10 @@ tools:
     # Use tools.remove in child agents to restrict specific tools
     - .*
   remove:
-    # Exec mode doesn't use planning tools
+    # Exec mode doesn't use planning tools. ask_user_question stays available so
+    # interactive exec turns can resolve genuinely balanced decisions with the user
+    # (sub-agents still lose it via the runtime hard-deny in resolveToolPolicy).
     - propose_plan
-    - ask_user_question
     # Global config and catalog tools stay out of general-purpose agents
     - mux_agents_.*
     - agent_skill_write

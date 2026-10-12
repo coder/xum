@@ -106,7 +106,7 @@ import {
 } from "@/constants/agentMessaging";
 
 // -----------------------------------------------------------------------------
-// ask_user_question (plan-mode interactive questions)
+// ask_user_question (interactive questions for top-level agents)
 // -----------------------------------------------------------------------------
 
 export const AskUserQuestionOptionSchema = z
@@ -2938,7 +2938,7 @@ export const TOOL_DEFINITIONS = {
   ask_user_question: {
     ptcExcluded: "Requires UI interaction",
     description:
-      "Plan mode: ask multiple-choice questions and wait for the answers. " +
+      "Ask multiple-choice questions and wait for the answers. " +
       "ONLY for genuinely balanced decisions hinging on user context or preference absent from the conversation and repo; if one option is clearly best, proceed with it and state the assumption. " +
       "Keep options open (no 'recommended' pick). Ask open questions here, not as a text list. 'Other' is added automatically.",
     schema: AskUserQuestionToolArgsSchema,
