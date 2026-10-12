@@ -485,9 +485,11 @@ export function parseHookOutput(result: unknown, eventName: string): HookOutput 
   }
   if (!isPlainObject(raw)) return null;
   // Codex's schema requires hookSpecificOutput.hookEventName to name this event; an output
-  // tagged for another event (or untagged) is malformed and fails open.
+  // tagged for another event (or untagged) is malformed and fails open. Codex reads JSON null on
+  // every optional field as absent (serde `Option`), so each check below treats null as omitted:
+  // a serializer that writes null defaults (`"hookSpecificOutput": null`) must not void a block.
   if (
-    raw.hookSpecificOutput !== undefined &&
+    raw.hookSpecificOutput != null &&
     !(isPlainObject(raw.hookSpecificOutput) && raw.hookSpecificOutput.hookEventName === eventName)
   ) {
     throw new Error(`hookSpecificOutput is not tagged hookEventName "${eventName}"`);
@@ -525,7 +527,7 @@ export function parseHookOutput(result: unknown, eventName: string): HookOutput 
     reason: text(raw.reason),
     permissionDecision: text(specific.permissionDecision),
     permissionDecisionReason: text(specific.permissionDecisionReason),
-    ...(specific.updatedInput !== undefined ? { updatedInput: specific.updatedInput } : {}),
+    ...(specific.updatedInput != null ? { updatedInput: specific.updatedInput } : {}),
     additionalContext: text(specific.additionalContext),
   };
   return Object.fromEntries(
