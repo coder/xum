@@ -124,7 +124,10 @@ function scoreBase(
       });
       writeFileSync(join(tree, basePath), blob);
       paths.push(basePath);
-      if (headPath !== null && headPath !== basePath) renames.push([basePath, headPath]);
+      // A rename to an unscored type (foo.ts -> foo.txt) is a removal.
+      if (headPath !== null && headPath !== basePath && SCORED.test(headPath)) {
+        renames.push([basePath, headPath]);
+      }
     }
     return score(tree, paths, lcov, renames);
   } finally {

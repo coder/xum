@@ -68,6 +68,13 @@ test("a renamed file keeps its functions' identity", () => {
   expect(result.out).not.toContain("new-function");
 });
 
+test("a file renamed to an unscored type counts as removed", () => {
+  git("mv", "src/demo/route.ts", "src/demo/route.txt");
+  git("commit", "-q", "-m", "retire");
+
+  expect(check("HEAD~1").status).toBe(0);
+});
+
 test("a file renamed into production counts as new", () => {
   git("mv", "src/demo/route.ts", "src/demo/route.test.ts");
   git("commit", "-q", "-m", "make it a test");
