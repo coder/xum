@@ -196,6 +196,22 @@ describe("comparePromptCachePrefix", () => {
     });
   });
 
+  test("a system message's Anthropic options count; its cache marker does not", () => {
+    const withOptions = (anthropic: object) => ({
+      tools: TOOLS,
+      prompt: [
+        { role: "system", content: "You are Xum.", providerOptions: { anthropic } },
+        { role: "user", content: [{ type: "text", text: "Hi" }] },
+      ],
+    });
+    const marked = withOptions({ cacheControl: { type: "ephemeral" } });
+    expect(compare(marked, withOptions({})).kind).toBe("extends");
+    expect(compare(marked, withOptions({ clearAt: 2 }))).toMatchObject({
+      kind: "break",
+      section: "system",
+    });
+  });
+
   test("a shorter next request breaks with no next block", () => {
     const comparison = expectBreak(body(baseMessages()), body(baseMessages().slice(0, 2)));
     expect(comparison).toMatchObject({
