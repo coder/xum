@@ -3,7 +3,7 @@ import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import type { WorkspaceSelection } from "@/browser/components/AgentListItem/AgentListItem";
@@ -108,9 +108,12 @@ function Wrapper(props: { children: ReactNode }) {
       },
     },
   };
+  // One client per mount, like the app's: a new client on every render would make the hook
+  // refetch the state on any rerender and hide a missing refetch.
+  const [client] = useState(() => createTestApiClient(api));
   return (
     <ThemeProvider forcedTheme="dark">
-      <APIProvider client={createTestApiClient(api)}>{props.children}</APIProvider>
+      <APIProvider client={client}>{props.children}</APIProvider>
     </ThemeProvider>
   );
 }
@@ -420,6 +423,24 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(writes).toBe(1);
     view.rerender(<InteractionsHarness target={live(2)} />);
     await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 4 }));
+  });
+
+  test("Reload hands the remounted frame the newest state", async () => {
+    // Bug bash: Reload remounts the viewer but not this hook, so the frame got the last load's
+    // state and lost the picks made since.
+    const shown = (reloadTick: number) => ({
+      path: HTML.path,
+      version: 2,
+      latestVersion: 2,
+      reloadTick,
+    });
+    const view = render(<InteractionsHarness target={shown(0)} />, { wrapper: Wrapper });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
+    act(() => hookHandlers?.setState?.({ step: 5 }));
+    await waitFor(() => expect(savedStates).toEqual([{ step: 5 }]));
+    persistedState = { step: 5 };
+    view.rerender(<InteractionsHarness target={shown(1)} />);
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 5 }));
   });
 
   test("concurrent setState writes run one at a time and the last state wins", async () => {

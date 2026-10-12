@@ -12,6 +12,8 @@ export interface ArtifactInteractionTarget {
   path: string;
   version: number | null;
   latestVersion: number | null;
+  /** Bumped when the panel remounts the viewer (Reload): the new frame needs the newest state. */
+  reloadTick?: number;
 }
 
 /**
@@ -48,12 +50,12 @@ export function useArtifactInteractions(
     sending: boolean;
     error: string | null;
   }>({ path: "", sending: false, error: null });
-  // The state is per artifact, but a new version or a version switch rebuilds the frame, so the
-  // key still changes then: the rebuild must read the newest state, not the first load's.
+  // The state is per artifact, but a new version, a version switch or Reload rebuilds the frame,
+  // so the key still changes then: the rebuild must read the newest state, not the first load's.
   const stateKey =
     target == null
       ? null
-      : `${target.path}\u0000${target.version ?? `live:${target.latestVersion ?? 0}`}`;
+      : `${target.path}\u0000${target.version ?? `live:${target.latestVersion ?? 0}`}\u0000${target.reloadTick ?? 0}`;
   const [loadedState, setLoadedState] = useState<{ key: string; state: unknown } | null>(null);
 
   const path = target?.path ?? null;

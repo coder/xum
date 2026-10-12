@@ -923,6 +923,7 @@ export function ArtifactsPanel(props: {
           path: selected.path,
           version: selected.version,
           latestVersion: versionList?.versions[0]?.version ?? null,
+          reloadTick,
         }
       : null
   );
