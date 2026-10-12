@@ -240,8 +240,8 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * and the desktop app refuses the navigation (subframeNavigation.ts). CSP `base-uri 'none'`
  * rules out a `<base>` fix.
  *
- * So a plain left click on a link for this document (`href`, or SVG `xlink:href`, no `target`
- * other than `_self`) whose raw value starts with `#` is cancelled, and the script does the browser's fragment steps itself: the target is an id or
+ * So a plain left click on a link for this document (`href`, or SVG `xlink:href`, no `download`,
+ * no `target` other than `_self`) whose raw value starts with `#` is cancelled, and the script does the browser's fragment steps itself: the target is an id or
  * an `<a name>`, raw first and then percent-decoded, else the top for `#` and `#top`. It is
  * scrolled into view and focused, or, when it cannot take focus, given `tabindex="-1"` until it
  * loses focus, so the next Tab continues after it. A native fragment navigation
@@ -268,7 +268,9 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
       for (var i = 0; i < path.length; i++) {
         var node = path[i];
         if (!node || node.nodeType !== 1 || (node.localName !== "a" && node.localName !== "area")) continue;
-        // A link for another browsing context (target="_blank") never navigated this document.
+        // A download link, or one for another browsing context (target="_blank"), never navigated
+        // this document.
+        if (node.hasAttribute("download")) return null;
         var linkTarget = node.getAttribute("target");
         if (linkTarget !== null && linkTarget !== "" && linkTarget.toLowerCase() !== "_self") return null;
         var href = node.getAttribute("href");

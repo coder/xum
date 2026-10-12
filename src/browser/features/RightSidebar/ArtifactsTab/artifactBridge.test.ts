@@ -381,6 +381,7 @@ describe("in-page links", () => {
       <a id="missing" href="#nowhere">Missing</a>
       <a id="external" href="https://example.com/#intro">External</a>
       <a id="blank" href="#intro" target="_blank">New tab</a>
+      <a id="download" href="#intro" download>Download</a>
       <a id="self" href="#intro" target="_SELF">Same frame</a>
       <a id="no-href">Not a link</a>
       <a id="own" href="#intro">Handled by the artifact</a>
@@ -443,6 +444,7 @@ describe("in-page links", () => {
     const untouched = { prevented: false, scrolled: [], focused: null };
     expect(click("external")).toEqual(untouched);
     expect(click("blank")).toEqual(untouched);
+    expect(click("download")).toEqual(untouched);
     expect(click("no-href")).toEqual(untouched);
     expect(click("plain", { ctrlKey: true })).toEqual(untouched);
     expect(click("plain", { button: 1 })).toEqual(untouched);
