@@ -47,7 +47,7 @@ Providers also read from environment variables as fallback:
 | Google         | `GOOGLE_GENERATIVE_AI_API_KEY` or `GOOGLE_API_KEY` |
 | xAI            | `XAI_API_KEY`                                      |
 | OpenRouter     | `OPENROUTER_API_KEY`                               |
-| meta           | `META_MODEL_API_KEY`                               |
+| meta           | `META_MODEL_API_KEY` or `MODEL_API_KEY`            |
 | DeepSeek       | `DEEPSEEK_API_KEY`                                 |
 | Moonshot AI    | `MOONSHOT_API_KEY`                                 |
 | Z.ai           | `ZAI_API_KEY`                                      |
@@ -134,7 +134,8 @@ For advanced options not exposed in the UI, edit `~/.xum/providers.jsonc` direct
 ### Meta
 
 Configure **Meta** in Settings → Providers with a Meta Model API key, or set
-`META_MODEL_API_KEY`. The default endpoint is `https://api.meta.ai/v1`.
+`MODEL_API_KEY` as in Meta's quickstart. `META_MODEL_API_KEY` is also supported
+and takes precedence when both are set. The default endpoint is `https://api.meta.ai/v1`.
 Select **Muse Wonder** (`meta:muse-wonder-1.0`), or use `/model wonder`.
 
 Muse Wonder is in preview with a 1,048,576-token context window. Xum uses a

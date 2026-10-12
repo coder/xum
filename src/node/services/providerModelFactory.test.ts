@@ -1357,7 +1357,13 @@ describe("ProviderModelFactory Meta", () => {
     return { openai: options.openai };
   };
 
-  unsetEnvForEachTest("META_MODEL_API_KEY", "META_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL");
+  unsetEnvForEachTest(
+    "META_MODEL_API_KEY",
+    "MODEL_API_KEY",
+    "META_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL"
+  );
 
   it("never uses ambient OpenAI credentials for Meta", async () => {
     process.env.OPENAI_API_KEY = "openai-only-key";

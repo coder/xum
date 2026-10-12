@@ -158,18 +158,45 @@ describe("hasAnyConfiguredProvider", () => {
 });
 
 describe("resolveProviderCredentials - Meta", () => {
-  it("resolves and bootstraps Meta credentials without borrowing OpenAI's key", () => {
-    const env = { META_MODEL_API_KEY: " meta-test-key ", OPENAI_API_KEY: "other-provider-key" };
-    expect(resolveProviderCredentials("meta", {}, env)).toMatchObject({
-      isConfigured: true,
-      apiKey: "meta-test-key",
-      apiKeySource: "env",
-    });
-    expect(buildProvidersFromEnv(env).meta).toEqual({ apiKey: "meta-test-key" });
+  it.each(["META_MODEL_API_KEY", "MODEL_API_KEY"])(
+    "resolves and bootstraps Meta via %s without borrowing OpenAI's key",
+    (key) => {
+      const env = { [key]: " meta-test-key ", OPENAI_API_KEY: "other-provider-key" };
+      expect(resolveProviderCredentials("meta", {}, env)).toMatchObject({
+        isConfigured: true,
+        apiKey: "meta-test-key",
+        apiKeySource: "env",
+      });
+      expect(buildProvidersFromEnv(env).meta).toEqual({ apiKey: "meta-test-key" });
+      expect(
+        resolveProviderCredentials("meta", {}, { OPENAI_API_KEY: "other-provider-key" })
+          .isConfigured
+      ).toBe(false);
+      expect(providerSecretEnvVarNames()).toContain(key);
+    }
+  );
+
+  it("prefers the namespaced Meta key and falls back when it is empty", () => {
     expect(
-      resolveProviderCredentials("meta", {}, { OPENAI_API_KEY: "other-provider-key" }).isConfigured
-    ).toBe(false);
-    expect(providerSecretEnvVarNames()).toContain("META_MODEL_API_KEY");
+      resolveProviderCredentials(
+        "meta",
+        {},
+        {
+          META_MODEL_API_KEY: "namespaced-key",
+          MODEL_API_KEY: "official-key",
+        }
+      ).apiKey
+    ).toBe("namespaced-key");
+    expect(
+      resolveProviderCredentials(
+        "meta",
+        {},
+        {
+          META_MODEL_API_KEY: " ",
+          MODEL_API_KEY: "official-key",
+        }
+      ).apiKey
+    ).toBe("official-key");
   });
 
   it("prefers saved Meta credentials and excludes disabled Meta from auto-routing", () => {

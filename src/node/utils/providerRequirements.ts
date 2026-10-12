@@ -65,7 +65,8 @@ export const PROVIDER_ENV_VARS: Partial<
     apiKey: ["OPENROUTER_API_KEY"],
   },
   meta: {
-    apiKey: ["META_MODEL_API_KEY"],
+    // Prefer the namespaced key when both are set, but accept Meta's quickstart variable.
+    apiKey: ["META_MODEL_API_KEY", "MODEL_API_KEY"],
   },
   deepseek: {
     apiKey: ["DEEPSEEK_API_KEY"],
