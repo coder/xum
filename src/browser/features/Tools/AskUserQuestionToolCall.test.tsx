@@ -1,7 +1,7 @@
 import "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import { APIProvider } from "@/browser/contexts/API";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { createTestApiClient } from "@/browser/testUtils";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
@@ -25,6 +25,7 @@ let currentWorkspaceState: {
   canInterrupt: boolean;
   messages: Array<{
     type: string;
+    toolCallId?: string;
     compactionRequest?: { parsed: unknown };
     askUserQuestionAnswer?: { toolCallId: string; answers: Record<string, string> };
   }>;
@@ -34,6 +35,8 @@ let currentWorkspaceState: {
   canInterrupt: false,
   messages: [],
 };
+
+let transcriptCaughtUp = true;
 
 function createDeferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -124,6 +127,11 @@ describe("AskUserQuestionToolCall", () => {
       canInterrupt: false,
       messages: [],
     };
+
+    transcriptCaughtUp = true;
+    spyOn(actualWorkspaceStore.workspaceStore, "isWorkspaceTranscriptCaughtUp").mockImplementation(
+      () => transcriptCaughtUp
+    );
 
     answerAskUserQuestion.mockClear();
     sendMessage.mockClear();
@@ -441,6 +449,73 @@ describe("AskUserQuestionToolCall", () => {
       expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
       expect(view.getByText("Second")).toBeTruthy();
       expect(view.queryByText("First")).toBeNull();
+    });
+
+    test("a later answer row overrides this card's own accepted answer", async () => {
+      const view = renderAsyncQuestion();
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+      await waitFor(() => expect(view.getByText("User answered")).toBeTruthy());
+
+      // Another client sent a correction.
+      currentWorkspaceState = {
+        ...currentWorkspaceState,
+        messages: [
+          {
+            type: "user",
+            askUserQuestionAnswer: {
+              toolCallId: "ask-async",
+              answers: { "Which option?": "Second" },
+            },
+          },
+        ],
+      };
+      view.rerender(
+        <TooltipProvider>
+          <AskUserQuestionToolCall
+            args={{ questions }}
+            result={asyncResult}
+            status="completed"
+            toolCallId="ask-async"
+            workspaceId="ws-ask"
+          />
+        </TooltipProvider>
+      );
+
+      expect(view.getByText("Second")).toBeTruthy();
+      expect(view.queryByText("First")).toBeNull();
+    });
+
+    test("does not send while the transcript is still replaying", async () => {
+      transcriptCaughtUp = false;
+      const view = renderAsyncQuestion();
+
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+      await waitFor(() =>
+        expect(view.getByRole("button", { name: "Submit answers" })).toHaveProperty(
+          "disabled",
+          false
+        )
+      );
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(view.queryByText("User answered")).toBeNull();
+    });
+
+    test("closes unanswered questions that left the agent's context", () => {
+      // A compaction (or Start Here, reset) after the question removed it from the model's
+      // context; numbered answers would mean nothing to the model.
+      currentWorkspaceState = {
+        ...currentWorkspaceState,
+        messages: [{ type: "tool", toolCallId: "ask-async" }, { type: "compaction-boundary" }],
+      };
+
+      const view = renderAsyncQuestion();
+      fireEvent.click(view.getByText("ask_user_question"));
+
+      expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
+      expect(view.getByText(/no longer in the agent/)).toBeTruthy();
     });
   });
 });

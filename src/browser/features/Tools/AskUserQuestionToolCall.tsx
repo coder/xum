@@ -6,6 +6,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { flushUserPreferences } from "@/browser/stores/AppConfigStore";
+import { useHostTranscriptMutationCheck } from "@/browser/utils/transcriptBarrier";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { useAutoResizeTextarea } from "@/browser/hooks/useAutoResizeTextarea";
@@ -231,6 +233,7 @@ export function AskUserQuestionToolCall(props: {
   workspaceId?: string;
 }): JSX.Element {
   const { api } = useAPI();
+  const isTranscriptMutationAllowed = useHostTranscriptMutationCheck();
 
   const argsAnswers = props.args.answers ?? {};
 
@@ -278,18 +281,30 @@ export function AskUserQuestionToolCall(props: {
   // the questions stay answerable until they are answered from this card or an answer message
   // for this tool call is in history. The latest such message is the user's final word.
   const isAsyncQuestion = isAsyncAskUserQuestionOutput(props.result);
+  const transcript = workspaceState?.messages ?? [];
+  // A durable row wins over this card's local send (another client may have sent a correction);
+  // the local send covers an answer whose metadata the queue dropped by batching it.
   const deliveredAnswers = isAsyncQuestion
-    ? (sentAnswers ??
-      [...(workspaceState?.messages ?? [])]
+    ? ([...transcript]
         .reverse()
         .find(
           (message): message is DisplayedUserMessage =>
             message.type === "user" &&
             message.askUserQuestionAnswer?.toolCallId === props.toolCallId
-        )?.askUserQuestionAnswer?.answers ??
-      null)
+        )?.askUserQuestionAnswer?.answers ?? sentAnswers)
     : null;
-  const isAnswering = props.status === "executing" || (isAsyncQuestion && deliveredAnswers == null);
+  // The answer names questions and options by number only, so it means nothing to the model once
+  // a compaction, Start Here or reset dropped this tool call from its context.
+  const ownRowIndex = transcript.findIndex(
+    (message) => message.type === "tool" && message.toolCallId === props.toolCallId
+  );
+  const leftAgentContext =
+    isAsyncQuestion &&
+    ownRowIndex !== -1 &&
+    transcript.slice(ownRowIndex + 1).some((message) => message.type === "compaction-boundary");
+  const isAnswering =
+    props.status === "executing" ||
+    (isAsyncQuestion && deliveredAnswers == null && !leftAgentContext);
 
   // A question awaiting answers must never be hidden behind a collapsed "tools"
   // preference, so force it open while answerable. forceExpanded only overrides the
@@ -541,8 +556,13 @@ export function AskUserQuestionToolCall(props: {
       pendingAnswerSendRef.current = { message, sendId };
       // Same barrier as the composer: the backend reads send preferences from config.json.
       flushUserPreferences()
-        .then(() =>
-          api.workspace.sendMessage({
+        .then(() => {
+          // The composer's dispatch-time barrier: while the transcript replays, this card may be
+          // a stale copy of a question that was edited away or moved behind a boundary.
+          if (!isTranscriptMutationAllowed(workspaceId)) {
+            throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+          }
+          return api.workspace.sendMessage({
             workspaceId,
             message,
             options: {
@@ -553,8 +573,8 @@ export function AskUserQuestionToolCall(props: {
                 askUserQuestionAnswer: { toolCallId: props.toolCallId, answers },
               },
             },
-          })
-        )
+          });
+        })
         .then((result) => {
           if (!result.success) {
             const formatted = formatSendMessageError(result.error);
@@ -952,6 +972,11 @@ export function AskUserQuestionToolCall(props: {
 
             {!isAnswering && (
               <div className="flex flex-col gap-2">
+                {leftAgentContext && successResult == null && (
+                  <div className="text-muted text-[11px] italic">
+                    Not answered. These questions are no longer in the agent&apos;s context.
+                  </div>
+                )}
                 {successResult && (
                   <div className="flex flex-col gap-1.5">
                     <div className="text-secondary text-[10px] tracking-wide uppercase">

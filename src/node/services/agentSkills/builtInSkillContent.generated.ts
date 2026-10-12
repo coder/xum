@@ -3782,7 +3782,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "In Plan and Exec modes, the agent may call `ask_user_question` to ask up to 4 structured multiple-choice questions when it needs clarification (for example, before finalizing a plan or when an implementation choice depends on your preference).",
       "",
       "- **Plan Mode** waits for your answers before it continues.",
-      "- **Exec Mode** does not wait. The agent keeps working on its best assumption, and the questions stay open in the chat. When you submit answers, Xum sends them to the agent as a message after its current step, or starts a new turn if the agent has already finished. Typing a normal chat message does not cancel these questions.",
+      "- **Exec Mode** does not wait. The agent keeps working on its best assumption, and the questions stay open in the chat. When you submit answers, Xum sends them to the agent as a message after its current step, or starts a new turn if the agent has already finished. Typing a normal chat message does not cancel these questions. Questions still open when a compaction or **Start Here** removes them from the agent's context close unanswered.",
       "",
       "What you’ll see:",
       "",
