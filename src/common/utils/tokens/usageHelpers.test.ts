@@ -389,6 +389,21 @@ describe("Anthropic 1h-TTL cache-write share", () => {
     expect(getAnthropicCacheWrite1hTokens(mixedOldRow, 9_000)).toBe(4_500);
   });
 
+  test("a malformed 5m share keeps the 5m price instead of scaling the 1h share", () => {
+    const malformed = (fiveMinute: unknown) => ({
+      anthropic: {
+        cacheCreationInputTokens: 100,
+        usage: {
+          cache_creation: { ephemeral_5m_input_tokens: fiveMinute, ephemeral_1h_input_tokens: 10 },
+        },
+      },
+    });
+    expect(getAnthropicCacheWrite1hTokens(malformed(-1), 100)).toBe(0);
+    expect(getAnthropicCacheWrite1hTokens(malformed("90"), 100)).toBe(0);
+    // An absent 5m share still means the whole reported split is 1h.
+    expect(getAnthropicCacheWrite1hTokens(malformed(undefined), 100)).toBe(100);
+  });
+
   test("reports no 1h share without a split", () => {
     expect(
       getAnthropicCacheWrite1hTokens({ anthropic: { cacheCreationInputTokens: 900 } }, 900)
