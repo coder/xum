@@ -336,6 +336,10 @@ import {
   UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
 import {
+  canonicalGoalDefaultsOverride,
+  sameGoalDefaultsOverride,
+} from "@/common/utils/goals/resolveGoalSetIntent";
+import {
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
   type ThinkingLevel,
@@ -9723,35 +9727,18 @@ export class WorkspaceService
       // Drop the whole record when every field is null — keeps the
       // config.json minimal and makes "no override" the canonical state
       // that resolves to global defaults.
-      const allNull =
-        override.defaultBudgetCents == null &&
-        override.defaultTurnCap == null &&
-        override.alwaysRequireExplicitBudget == null;
+      const next = canonicalGoalDefaultsOverride(override);
 
       // No-op fast path from a snapshot read: skip the queued write entirely when the
       // override already matches. Race-safe — equivalent to a serialized write of the
       // identical value landing first, and skipping cannot resurrect removed entries.
-      {
-        const snapshotEntry = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
-          projectPath,
-          workspaceId: normalizedWorkspaceId,
-          workspacePath,
-        });
-        const prior = snapshotEntry?.goalDefaults;
-        if (snapshotEntry && allNull && prior == null) {
-          return Ok(undefined);
-        }
-        if (
-          snapshotEntry &&
-          !allNull &&
-          prior != null &&
-          (prior.defaultBudgetCents ?? null) === (override.defaultBudgetCents ?? null) &&
-          (prior.defaultTurnCap ?? null) === (override.defaultTurnCap ?? null) &&
-          (prior.alwaysRequireExplicitBudget ?? null) ===
-            (override.alwaysRequireExplicitBudget ?? null)
-        ) {
-          return Ok(undefined);
-        }
+      const snapshotEntry = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
+        projectPath,
+        workspaceId: normalizedWorkspaceId,
+        workspacePath,
+      });
+      if (snapshotEntry && sameGoalDefaultsOverride(snapshotEntry.goalDefaults, next)) {
+        return Ok(undefined);
       }
 
       // Compare against the FRESH entry inside the serialized editConfig transform
@@ -9768,32 +9755,15 @@ export class WorkspaceService
           writeResult = Err(this.workspaceNotFoundError());
           return freshConfig;
         }
-
-        const prior = workspaceEntry.goalDefaults;
-        if (allNull) {
-          if (prior == null) {
-            writeResult = Ok({ changed: false });
-            return freshConfig;
-          }
+        if (sameGoalDefaultsOverride(workspaceEntry.goalDefaults, next)) {
+          writeResult = Ok({ changed: false });
+          return freshConfig;
+        }
+        if (next == null) {
           delete workspaceEntry.goalDefaults;
         } else {
-          const next: WorkspaceGoalDefaultsOverride = {
-            defaultBudgetCents: override.defaultBudgetCents ?? null,
-            defaultTurnCap: override.defaultTurnCap ?? null,
-            alwaysRequireExplicitBudget: override.alwaysRequireExplicitBudget ?? null,
-          };
-          const unchanged =
-            prior != null &&
-            (prior.defaultBudgetCents ?? null) === next.defaultBudgetCents &&
-            (prior.defaultTurnCap ?? null) === next.defaultTurnCap &&
-            (prior.alwaysRequireExplicitBudget ?? null) === next.alwaysRequireExplicitBudget;
-          if (unchanged) {
-            writeResult = Ok({ changed: false });
-            return freshConfig;
-          }
           workspaceEntry.goalDefaults = next;
         }
-
         writeResult = Ok({ changed: true });
         return freshConfig;
       });
