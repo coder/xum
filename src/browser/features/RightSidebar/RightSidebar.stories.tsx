@@ -1833,6 +1833,8 @@ export const CollapsedOverview: Story = {
     );
     // The session's cost leads the card.
     await within(card).findByRole("button", { name: /\$7\.99/ });
+    // The header's stand-in shows only where the card cannot.
+    await expect(canvas.queryByRole("button", { name: "Expand right sidebar" })).toBeNull();
 
     // Bounded: the card is a fraction of the workspace's height, and the chat is not narrowed
     // by a collapsed rail: it reaches the workspace's right edge.
@@ -1843,5 +1845,33 @@ export const CollapsedOverview: Story = {
       await expect(card.getBoundingClientRect().height).toBeLessThan(shellRect.height / 2);
       await expect(canvas.getByRole("main").getBoundingClientRect().right).toBe(shellRect.right);
     });
+  },
+};
+
+/**
+ * Where the centered transcript leaves no gutter for the card (a 1200px workspace here), the
+ * card would cover messages, so it stays hidden and the header's expand button stands in for it.
+ */
+export const CollapsedOverviewYieldsToTranscript: Story = {
+  ...CollapsedOverview,
+  // Inside the meta's 1600px frame: a fixed width, so the test runner's window size cannot
+  // decide which of the two shows.
+  decorators: [
+    (Story: ComponentType) => (
+      <div style={{ width: 1200, height: "100%" }}>
+        <Story />
+      </div>
+    ),
+  ],
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["desktop"] } } },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("button", { name: "Expand right sidebar" }, { timeout: 15_000 });
+    const card = canvasElement.querySelector<HTMLElement>(".right-sidebar-overview-card");
+    await expect(card).not.toBeNull();
+    // Hidden by visibility, not display: the layout still shows the sidebar, so its shortcuts
+    // keep expanding it rather than taking the narrow-layout fallbacks.
+    await expect(getComputedStyle(card!).visibility).toBe("hidden");
+    await expect(getComputedStyle(card!).display).not.toBe("none");
   },
 };

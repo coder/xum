@@ -12,6 +12,7 @@ import {
 import { useResizableSidebar } from "@/browser/hooks/useResizableSidebar";
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
+import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
 import {
   readPersistedState,
   updatePersistedState,
@@ -39,6 +40,10 @@ import { ChatPane } from "../ChatPane/ChatPane";
 
 // ChatPane uses tailwind `min-w-96`.
 const CHAT_PANE_MIN_WIDTH_PX = 384;
+const WORKSPACE_SHELL_CONTAINER_STYLE = {
+  containerType: "inline-size",
+  containerName: "workspace-shell",
+} as const;
 
 const RIGHT_SIDEBAR_DEFAULT_WIDTH_PX = 400;
 const RIGHT_SIDEBAR_MIN_WIDTH_PX = 300;
@@ -221,6 +226,7 @@ const WorkspacePlaceholder: React.FC<{
 export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const shellRef = useRef<HTMLDivElement>(null);
   const shellSize = useResizeObserver(shellRef);
+  const chatTranscriptFullWidth = useChatTranscriptFullWidth();
 
   // WorkspaceShell switches to flex-col at this breakpoint, so in that stacked mode the
   // right sidebar doesn't need to "leave room" for ChatPane beside it.
@@ -410,11 +416,16 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
       // Lets descendants (WorkspaceMenuBar's timeline gate) locate the shell that
       // owns the right-sidebar container query without prop-drilling layout state.
       data-workspace-shell=""
+      // A full-width transcript leaves no gutter, so globals.css never floats the collapsed
+      // right sidebar's overview card over it.
+      data-transcript-full-width={chatTranscriptFullWidth || undefined}
       className={cn(
         "relative flex flex-1 flex-row bg-surface-primary text-light overflow-x-auto overflow-y-hidden [@media(max-width:768px)]:flex-col",
         props.className
       )}
-      style={{ containerType: "inline-size" }}
+      // Named so the header (inside ChatPane, which may hold containers of its own) can query
+      // the shell's width too: see the overview card rules in globals.css.
+      style={WORKSPACE_SHELL_CONTAINER_STYLE}
     >
       {/* Keep the transcript viewport mounted across workspace switches so the browser doesn't
           visually tear the pane while the new workspace content hydrates. ChatPane resets its

@@ -232,6 +232,9 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
               // desktop, h-8 otherwise). The height cap keeps the card clear of the composer
               // on short windows; overflowing content scrolls inside the card.
               "bg-surface-secondary absolute right-3 z-10 w-64 overflow-x-hidden overflow-y-auto rounded-lg border shadow-lg",
+              // globals.css hides the card wherever it would cover the transcript; the header's
+              // expand button (WorkspaceMenuBar) stands in for it there.
+              "right-sidebar-overview-card",
               // The 7rem floor keeps the stats/Expand row and a section reachable even in a
               // window too short for the composer clearance.
               "max-h-[max(7rem,min(32rem,calc(100%-12rem)))]",
@@ -1930,6 +1933,21 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const handleExpandFromOverview = () => {
     handleOpenTabFromOverview(getFocusedActiveTab(getBaseLayout(), NEW_TAB));
   };
+  // The header's stand-in for the card (where the card would cover the transcript). The ref keeps
+  // the listener subscribed once per workspace while it still calls the latest handler.
+  const expandFromOverviewRef = React.useRef(handleExpandFromOverview);
+  React.useEffect(() => {
+    expandFromOverviewRef.current = handleExpandFromOverview;
+  });
+  React.useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR>).detail;
+      if (detail?.workspaceId !== workspaceId) return;
+      expandFromOverviewRef.current();
+    };
+    window.addEventListener(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, handler);
+    return () => window.removeEventListener(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, handler);
+  }, [workspaceId]);
   const handleOpenTerminalsFromOverview = () => {
     const terminal = collectAllTabs(getBaseLayout().root).find(isTerminalTab);
     if (terminal != null) {
