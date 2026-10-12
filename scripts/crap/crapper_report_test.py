@@ -99,7 +99,7 @@ def test_complexity_and_line_ranges_match_hand_counts(tmp_path, capsys):
     assert all(row["coverage"] is None and row["crap"] is None for row in rows)
 
 
-def test_only_production_files_under_src_are_scored(tmp_path, capsys):
+def test_only_existing_production_files_under_src_are_scored(tmp_path, capsys):
     kept = write(tmp_path, "src/demo/branchy.ts", BRANCHY)
     skipped = [
         write(tmp_path, relative, BRANCHY)
@@ -107,13 +107,14 @@ def test_only_production_files_under_src_are_scored(tmp_path, capsys):
             "src/demo/branchy.test.ts",
             "src/demo/branchy.stories.tsx",
             "src/demo/branchy.testHarness.ts",
+            "src/demo/branchy.bench.ts",
             "src/browser/stories/mocks.ts",
             "src/demo/types.d.ts",
             "scripts/tool.ts",
         )
     ]
 
-    rows = run(capsys, tmp_path, kept, *skipped)
+    rows = run(capsys, tmp_path, kept, "src/demo/deleted.ts", *skipped)
 
     assert {row["path"] for row in rows} == {kept}
 
@@ -148,12 +149,14 @@ def test_records_of_one_file_from_many_reports_merge_by_line(tmp_path, capsys):
     # The second report also repeats the file inside itself, under the CI
     # checkout's absolute path, which is not --root.
     unit = tmp_path / "unit.info"
-    unit.write_text(f"SF:{branchy}\nDA:2,1\nDA:3,1\nDA:5,2\nDA:6,0\nend_of_record\n", encoding="utf-8")
+    unit.write_text(f"SF:{branchy}\nDA:2,1\nDA:3,1\nDA:5,2\nDA:6,0\nDA:10,0\nend_of_record\n", encoding="utf-8")
     # Each later record misses a line an earlier one hit.
     integration = tmp_path / "integration.info"
     integration.write_text(
         f"SF:/runner/work/xum/xum/{branchy}\nDA:2,0\nDA:6,4\nDA:7,0\nend_of_record\n"
-        f"SF:/runner/work/xum/xum/{branchy}\nDA:3,0\nDA:7,1\nDA:10,1\nend_of_record\n"
+        f"SF:/runner/work/xum/xum/{branchy}\nDA:3,0\nDA:7,1\nend_of_record\n"
+        # Jest on Windows.
+        f"SF:C:\\a\\xum\\{branchy.replace('/', chr(92))}\nDA:10,1\nend_of_record\n"
         "SF:/runner/work/xum/xum/src/other.ts\nDA:1,1\nend_of_record\n",
         encoding="utf-8",
     )

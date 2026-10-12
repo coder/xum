@@ -499,7 +499,9 @@ CRAP_REPORT := uv run --quiet --script scripts/crap/crapper_report.py
 
 crap: ## Score every production src/ function with Crapper into .metrics/crap.json [COVERAGE="<lcov>..."]
 	@mkdir -p .metrics
-	@$(CRAP_REPORT) --top 20 $(foreach lcov,$(COVERAGE),--lcov $(lcov)) > .metrics/crap.json
+	@# Replace the last snapshot only after the report succeeds.
+	@$(CRAP_REPORT) --top 20 $(foreach lcov,$(COVERAGE),--lcov $(lcov)) > .metrics/crap.json.tmp
+	@mv .metrics/crap.json.tmp .metrics/crap.json
 	@echo "Wrote .metrics/crap.json"
 
 test-crap-scripts: ## Test the Crapper adapter against hand-counted fixtures

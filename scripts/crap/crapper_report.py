@@ -37,6 +37,7 @@ shard hit and another missed could score as missed.
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -47,7 +48,14 @@ from crapper.discover import is_test_file, language_of
 from crapper.languages import functions_in_file
 
 # Code under src/ that never ships. Crapper already skips `*.test.ts(x)`.
-NON_PRODUCTION_SUFFIXES = (".stories.tsx", ".stories.ts", ".testHarness.ts", ".testHarness.tsx")
+NON_PRODUCTION_SUFFIXES = (
+    ".stories.tsx",
+    ".stories.ts",
+    ".testHarness.ts",
+    ".testHarness.tsx",
+    ".bench.ts",
+    ".bench.tsx",
+)
 NON_PRODUCTION_DIRS = ("src/browser/stories/",)
 
 
@@ -80,7 +88,8 @@ def repo_relative(sf_path: str, root: Path, files: list[str]) -> str | None:
     path = sf_path.strip().replace("\\", "/").removeprefix("file://")
     while path.startswith("./"):
         path = path[2:]
-    if not path.startswith("/"):
+    # A Windows drive path (C:/checkout/src/a.ts) is absolute too.
+    if not (path.startswith("/") or re.match(r"^[A-Za-z]:/", path)):
         return path if path in files else None
     try:
         relative = Path(path).relative_to(root).as_posix()
@@ -181,7 +190,8 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     root = args.root.resolve()
     candidates = args.files or tracked_src_files(root)
-    files = sorted({path for path in candidates if is_production(path)})
+    # A raw changed-file list can name deleted files: there is nothing to score.
+    files = sorted({path for path in candidates if is_production(path) and (root / path).is_file()})
     rows = score(root, files, load_coverage(args.lcov, root, files))
     json.dump(rows, sys.stdout)
     sys.stdout.write("\n")
