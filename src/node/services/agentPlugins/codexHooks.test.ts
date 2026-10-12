@@ -360,6 +360,29 @@ describe("loadPluginCodexHooks", () => {
     expect(warnings[1]).toMatch(/'\[' in a character class/);
   });
 
+  test("warnings name the refused matcher and the bad field of each handler", async () => {
+    // Bug bash (hooks-warnings-big): two broken handlers in one event gave the same warning.
+    using tmp = new DisposableTempDir("codex-hooks-warning-names");
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": {
+        hooks: {
+          PreToolUse: [
+            { matcher: "\\A(?:Bash|Edit)\\z", hooks: [scan] },
+            { matcher: "^Bash$", hooks: [{ ...scan, tool: "bad_timeout", timeout: "ten" }] },
+            { matcher: "^Bash$", hooks: [{ type: "mcp_tool", server: " ", tool: "blank_server" }] },
+          ],
+        },
+      },
+    });
+
+    const { warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(warnings).toHaveLength(3);
+    expect(warnings[0]).toContain('ignoring its group "\\\\A(?:Bash|Edit)\\\\z"');
+    expect(warnings[1]).toContain(`('timeout' of tool "bad_timeout")`);
+    expect(warnings[2]).toContain(`('server' of tool "blank_server")`);
+  });
+
   test("compileHookMatcher reads matchers as Codex does", () => {
     const matching = (pattern: string, names: string[]) => {
       const matcher = compileHookMatcher(pattern);
