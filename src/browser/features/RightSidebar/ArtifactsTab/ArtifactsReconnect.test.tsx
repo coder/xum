@@ -1,0 +1,336 @@
+// Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
+import "../../../../../tests/ui/dom";
+
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { act, cleanup, render, waitFor } from "@testing-library/react";
+import { useState, type ReactNode } from "react";
+import { installDom } from "../../../../../tests/ui/dom";
+import { APIContext, type APIClient, type UseAPIResult } from "@/browser/contexts/API";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
+import { getArtifactKind } from "@/common/utils/artifactKind";
+import { ArtifactsPanel } from "./ArtifactsPanel";
+import { CanvasArtifact } from "./CanvasArtifact";
+import { McpAppFrame } from "./McpAppFrame";
+import type { McpAppViewRef } from "./mcpAppViewsStore";
+
+/*
+ * A dropped backend connection: while it is down, useAPI() returns `api: null`; the reconnect
+ * returns a NEW client. Neither may rebuild or remount what the Artifacts tab already shows:
+ * a rebuilt frame loses the in-page state of a dynamic artifact.
+ */
+
+function ok(path: string, content: string): ArtifactReadResult {
+  return {
+    status: "ok",
+    path,
+    kind: getArtifactKind(path),
+    size: content.length,
+    modifiedMs: 1,
+    encoding: "utf8",
+    content,
+  };
+}
+
+const VIEW: McpAppViewRef = {
+  toolCallId: "call-1",
+  serverName: "charts",
+  resourceUri: "ui://charts/view",
+  toolName: "charts_show_chart",
+  label: "Show chart",
+  arguments: {},
+  cancelled: false,
+  failed: false,
+};
+
+let files: Record<string, ArtifactReadResult> = {};
+let persistedState: unknown = null;
+let savedStates: unknown[] = [];
+let assetReads: string[] = [];
+let listCalls = 0;
+let getStateCalls = 0;
+let getViewCalls = 0;
+/** Every request but getState fails with this error while set (a backend still starting). */
+let failWith: string | null = null;
+
+function fail() {
+  return Promise.resolve({ success: false as const, error: failWith ?? "" });
+}
+
+/** A fresh client, as each reconnect creates. */
+function createClient(): APIClient {
+  const api: TestApiOverrides<APIClient> = {
+    artifacts: {
+      list: () => {
+        listCalls += 1;
+        if (failWith != null) return fail();
+        return Promise.resolve({
+          success: true as const,
+          data: {
+            available: true as const,
+            dir: "/scratch/artifacts",
+            entries: [{ path: "app.html", kind: "html" as const, size: 10, modifiedMs: 1 }],
+            truncated: false,
+          },
+        });
+      },
+      read: (input: { path: string; maxBytes?: number | null }) => {
+        if (input.maxBytes != null) assetReads.push(input.path);
+        if (failWith != null) return fail();
+        const file = files[input.path];
+        return Promise.resolve(
+          file
+            ? { success: true as const, data: file }
+            : { success: false as const, error: `Artifact not found: ${input.path}` }
+        );
+      },
+      listVersions: (input: { path: string }) => {
+        if (failWith != null) return fail();
+        return Promise.resolve({
+          success: true as const,
+          data: {
+            artifactId: "id",
+            path: input.path,
+            pin: null,
+            versions: [
+              {
+                version: 1,
+                label: null,
+                source: "publish" as const,
+                createdAtMs: 1,
+                sha256: "x",
+                size: 10,
+                path: input.path,
+              },
+            ],
+          },
+        });
+      },
+      listPinned: () =>
+        Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
+      listShelf: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { project: { available: true as const, entries: [] }, global: [] },
+        }),
+      capabilities: () => Promise.resolve({ agentBrowserAvailable: true }),
+      getState: () => {
+        getStateCalls += 1;
+        return Promise.resolve({ success: true as const, data: { state: persistedState } });
+      },
+      setState: (input: { state: unknown }) => {
+        savedStates.push(input.state);
+        persistedState = input.state;
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
+    },
+    mcpApps: {
+      getView: () => {
+        getViewCalls += 1;
+        return Promise.resolve({
+          success: true as const,
+          data: {
+            html: "<p>view</p>",
+            csp: {},
+            prefersBorder: null,
+            resultAvailable: true,
+            result: { content: [] },
+            invocation: null,
+          },
+        });
+      },
+    },
+  };
+  return createTestApiClient(api);
+}
+
+let setConnection: (api: APIClient | null) => void = () => undefined;
+const noop = () => undefined;
+
+/** The API context as ManagedAPIProvider reports it: connected, or reconnecting with no client. */
+function ConnectionWrapper(props: { children: ReactNode }) {
+  const [api, setApi] = useState<APIClient | null>(() => createClient());
+  setConnection = setApi;
+  const value: UseAPIResult =
+    api != null
+      ? { status: "connected", api, error: null, authenticate: noop, retry: noop }
+      : {
+          status: "reconnecting",
+          api: null,
+          error: null,
+          attempt: 1,
+          authenticate: noop,
+          retry: noop,
+        };
+  return (
+    <ThemeProvider forcedTheme="dark">
+      <APIContext.Provider value={value}>{props.children}</APIContext.Provider>
+    </ThemeProvider>
+  );
+}
+
+/** Let pending requests and the renders they cause settle. */
+async function flush() {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+  });
+}
+
+async function dropConnection() {
+  act(() => setConnection(null));
+  await flush();
+}
+
+/** Reconnects and waits until the panel re-listed through the new client. */
+async function reconnect() {
+  const before = listCalls;
+  act(() => setConnection(createClient()));
+  await waitFor(() => expect(listCalls).toBeGreaterThan(before));
+  await flush();
+}
+
+/** Identity check without printing the whole DOM node on failure. */
+function expectSameFrame(current: HTMLElement | null, frame: HTMLIFrameElement) {
+  expect(current === frame ? "same frame" : current == null ? "no frame" : "new frame").toBe(
+    "same frame"
+  );
+}
+
+function postFromFrame(frame: HTMLIFrameElement, data: unknown) {
+  const event = new window.Event("message");
+  Object.defineProperty(event, "data", { value: data });
+  Object.defineProperty(event, "source", { value: frame.contentWindow });
+  act(() => {
+    window.dispatchEvent(event);
+  });
+}
+
+describe("Artifacts tab across a dropped connection", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    window.localStorage.clear();
+    files = { "app.html": ok("app.html", "<button>Count</button>") };
+    persistedState = null;
+    savedStates = [];
+    assetReads = [];
+    listCalls = 0;
+    getStateCalls = 0;
+    getViewCalls = 0;
+    failWith = null;
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("an interactive artifact keeps its frame, and states set while offline are saved", async () => {
+    persistedState = { step: 1 };
+    const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    await flush();
+    const srcdoc = frame.getAttribute("srcdoc");
+    const statesRead = getStateCalls;
+    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
+    await waitFor(() => expect(savedStates).toEqual([{ step: 2 }]));
+
+    await dropConnection();
+    expectSameFrame(view.queryByTestId("artifact-frame"), frame);
+    expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
+    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 3 } });
+
+    await reconnect();
+    await waitFor(() => expect(savedStates).toEqual([{ step: 2 }, { step: 3 }]));
+    expectSameFrame(view.queryByTestId("artifact-frame"), frame);
+    expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
+    // The frame owns its state once built: the new client does not read it again.
+    expect(getStateCalls).toBe(statesRead);
+  });
+
+  test("an HTML artifact with inlined assets keeps its document", async () => {
+    files["app.html"] = ok("app.html", '<link rel="stylesheet" href="style.css"><p>x</p>');
+    files["style.css"] = ok("style.css", "p{color:red}");
+    const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const srcdoc = frame.getAttribute("srcdoc");
+    expect(srcdoc).toContain("p{color:red}");
+
+    await dropConnection();
+    expectSameFrame(view.queryByTestId("artifact-frame"), frame);
+    expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
+
+    await reconnect();
+    expectSameFrame(view.queryByTestId("artifact-frame"), frame);
+    expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
+    expect(assetReads).toEqual(["style.css"]);
+  });
+
+  test("failed refreshes after a reconnect keep the artifact on screen", async () => {
+    persistedState = { step: 1 };
+    const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    await flush();
+    const srcdoc = frame.getAttribute("srcdoc");
+    const statesRead = getStateCalls;
+
+    await dropConnection();
+    failWith = "Backend is starting";
+    await reconnect();
+    // The error is shown, but beside the artifact, not instead of it.
+    expect(view.getAllByText("Backend is starting").length).toBeGreaterThan(0);
+    expectSameFrame(view.queryByTestId("artifact-frame"), frame);
+    expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
+
+    // The next refresh (poll) succeeds: the error goes away and the frame still stays.
+    failWith = null;
+    await waitFor(() => expect(view.queryByText("Backend is starting")).toBeNull(), {
+      timeout: 5000,
+    });
+    await flush();
+    expectSameFrame(view.queryByTestId("artifact-frame"), frame);
+    expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
+    expect(getStateCalls).toBe(statesRead);
+  });
+
+  test("an MCP App view keeps its frame and host", async () => {
+    const view = render(<McpAppFrame workspaceId="ws-r" view={VIEW} />, {
+      wrapper: ConnectionWrapper,
+    });
+    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const posted: Array<{ method?: string }> = [];
+    frame.contentWindow!.postMessage = ((message: { method?: string }) => {
+      posted.push(message);
+    }) as Window["postMessage"];
+
+    await dropConnection();
+    act(() => setConnection(createClient()));
+    await flush();
+    expectSameFrame(view.queryByTestId("mcp-app-frame"), frame);
+    // A torn-down host would have told the view to tear down.
+    expect(posted.map((message) => message.method)).not.toContain("ui/resource-teardown");
+    expect(getViewCalls).toBe(1);
+  });
+
+  test("a canvas keeps the data of its file references while offline", async () => {
+    files["data/s.json"] = ok("data/s.json", JSON.stringify({ series: [{ q: "Q1", v: 1 }] }));
+    const content = JSON.stringify({
+      $xum: "canvas",
+      blocks: [
+        { type: "chart", kind: "bar", data: "data/s.json#/series", x: "q", y: "v", title: "Q" },
+      ],
+    });
+    const view = render(
+      <CanvasArtifact content={content} path="board.canvas.json" workspaceId="ws-r" />,
+      { wrapper: ConnectionWrapper }
+    );
+    expect(await view.findByText("Q")).toBeTruthy();
+
+    await dropConnection();
+    expect(view.queryByText(/File references are not available here/)).toBeNull();
+    expect(view.getByText("Q")).toBeTruthy();
+  });
+});

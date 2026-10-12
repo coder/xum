@@ -72,8 +72,34 @@ const ARTIFACTS_POLL_MS = 3000;
 interface ReadState {
   /** Identifies what was read (see Selection/readKey), so stale reads are never shown. */
   key: string;
+  /** With `error` set too: a re-read of the same key failed, and this is the last good result. */
   result: ArtifactReadResult | null;
   error: string | null;
+}
+
+interface VersionsState {
+  path: string;
+  list: ArtifactVersionList | null;
+  /** Why listVersions failed; shown instead of a stored version that cannot be resolved. */
+  error: string | null;
+}
+
+/**
+ * A failed read. A re-read of the same key (Reload aside, the content is unchanged) keeps the
+ * result already shown: a request that fails right after a reconnect must not swap a live
+ * artifact for an error and then remount it once a retry succeeds.
+ */
+function keepReadResult(prev: ReadState | null, key: string, error: string): ReadState {
+  return prev?.key === key && prev.result != null
+    ? { key, result: prev.result, error }
+    : { key, result: null, error };
+}
+
+/** A failed listVersions keeps the list it already had for the path (see keepReadResult). */
+function keepVersionList(prev: VersionsState | null, path: string, error: string): VersionsState {
+  return prev?.path === path && prev.list != null
+    ? { path, list: prev.list, error: null }
+    : { path, list: null, error };
 }
 
 /**
@@ -266,8 +292,11 @@ export function ArtifactsPanel(props: {
   const [reloadTick, setReloadTick] = useState(0);
   const [readState, setReadState] = useState<ReadState | null>(null);
   // Whether the latest preview read failed: the next successful re-list (poll or file event)
-  // retries it, so a transient error does not stick until the selection changes.
+  // retries it, so a transient error does not stick until the selection changes. The retry
+  // re-reads through retryTick, not reloadTick: reloadTick remounts the viewer, and a read that
+  // failed right after a reconnect still has the last good content on screen.
   const readFailedRef = useRef(false);
+  const [retryTick, setRetryTick] = useState(0);
   // path -> modifiedMs the user has seen. Seeded with the first listing so only changes made
   // while the tab is open get a dot.
   const [seen, setSeen] = useState<ReadonlyMap<string, number> | null>(null);
@@ -306,12 +335,7 @@ export function ArtifactsPanel(props: {
   const listInFlightRef = useRef(false);
   const [pinned, setPinned] = useState<PinnedArtifactFiles | null>(null);
   const [shelf, setShelf] = useState<ArtifactShelfListing | null>(null);
-  const [versionsState, setVersionsState] = useState<{
-    path: string;
-    list: ArtifactVersionList | null;
-    /** Why listVersions failed; shown instead of a stored version that cannot be resolved. */
-    error: string | null;
-  } | null>(null);
+  const [versionsState, setVersionsState] = useState<VersionsState | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   // The "Other files" picker group (groupArtifactEntries). Not persisted: it starts collapsed.
   const [otherFilesExpanded, setOtherFilesExpanded] = useState(false);
@@ -354,7 +378,7 @@ export function ArtifactsPanel(props: {
         setListing(result.data);
         if (readFailedRef.current) {
           readFailedRef.current = false;
-          setReloadTick((tick) => tick + 1);
+          setRetryTick((tick) => tick + 1);
         }
         const entries = result.data.available ? result.data.entries : [];
         setSeen((prev) => prev ?? new Map(entries.map((e) => [e.path, e.modifiedMs])));
@@ -382,7 +406,11 @@ export function ArtifactsPanel(props: {
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
-        setPinned({ available: false, reason: getErrorMessage(error) });
+        // A request that fails in transit (a backend still starting after a reconnect) keeps
+        // the files already listed, so a selected pinned file stays on screen.
+        setPinned((prev) =>
+          prev?.available === true ? prev : { available: false, reason: getErrorMessage(error) }
+        );
       });
     return () => controller.abort();
   }, [api, props.workspaceId, refreshTick]);
@@ -400,8 +428,9 @@ export function ArtifactsPanel(props: {
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
-        // A failed shelf listing hides the group; the rest of the tab keeps working.
-        setShelf(null);
+        // A failed first shelf listing hides the group; the rest of the tab keeps working. A
+        // later failure (in transit, e.g. after a reconnect) keeps the entries already listed,
+        // so a selected shelf copy stays on screen: nothing to set.
       });
     return () => controller.abort();
   }, [api, props.workspaceId, refreshTick]);
@@ -473,15 +502,15 @@ export function ArtifactsPanel(props: {
       .listVersions({ workspaceId: props.workspaceId, path }, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
-        setVersionsState(
-          result.success
-            ? { path, list: result.data, error: null }
-            : { path, list: null, error: result.error }
-        );
+        if (result.success) {
+          setVersionsState({ path, list: result.data, error: null });
+        } else {
+          setVersionsState((prev) => keepVersionList(prev, path, result.error));
+        }
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
-        setVersionsState({ path, list: null, error: getErrorMessage(error) });
+        setVersionsState((prev) => keepVersionList(prev, path, getErrorMessage(error)));
       });
     return () => controller.abort();
   }, [api, props.workspaceId, selectedArtifactPath, selectedVersionForFetch, refreshTick]);
@@ -576,18 +605,18 @@ export function ArtifactsPanel(props: {
           }
         } else {
           readFailedRef.current = true;
-          setReadState({ key: request.key, result: null, error: result.error });
+          setReadState((prev) => keepReadResult(prev, request.key, result.error));
         }
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
         readFailedRef.current = true;
-        setReadState({ key: request.key, result: null, error: getErrorMessage(error) });
+        setReadState((prev) => keepReadResult(prev, request.key, getErrorMessage(error)));
       });
     return () => controller.abort();
     // readKey identifies the request (scope, path, mtime or version): re-read when it changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, props.workspaceId, readKey, reloadTick]);
+  }, [api, props.workspaceId, readKey, reloadTick, retryTick]);
 
   // Nothing left to show: close fullscreen so it cannot pop back when a file reappears.
   if (fullscreen && selected == null && listing != null && !waitingForPinned) {
@@ -1374,7 +1403,9 @@ export function ArtifactsPanel(props: {
         <div className="min-h-0 flex-1 overflow-auto">{viewerBody}</div>
       </>
     );
-  } else if (listError != null && !storedVersionSelected) {
+  } else if (listError != null && listing == null && !storedVersionSelected) {
+    // Only with nothing listed yet: a failed re-list (a backend still starting after a reconnect)
+    // keeps the last listing, and the error line below sits beside the artifact instead.
     body = withAppPicker(<div className="text-danger p-4 text-xs">{listError}</div>);
   } else if (listing == null && !storedVersionSelected) {
     body = withAppPicker(<div className="text-muted p-4 text-xs">Loading…</div>);
@@ -1403,6 +1434,11 @@ export function ArtifactsPanel(props: {
         {listError != null && (
           <div className="text-danger border-border-light border-b px-3 py-1 text-[11px]">
             {listError}
+          </div>
+        )}
+        {currentRead?.result != null && currentRead.error != null && (
+          <div className="text-danger border-border-light border-b px-3 py-1 text-[11px]">
+            {currentRead.error}
           </div>
         )}
         {listing?.available === true && listing.truncated && (

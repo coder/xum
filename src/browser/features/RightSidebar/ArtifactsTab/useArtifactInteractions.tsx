@@ -7,6 +7,16 @@ import { ArtifactSendStrip, type PendingArtifactSend } from "./ArtifactSendStrip
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 
+/** One artifact's `setState` queue (see stateWritesRef). */
+interface StateWrites {
+  queued: { state: unknown } | null;
+  drained: Promise<void>;
+  /** Set while the queue waits for a connection; sends the queued state. */
+  resume: (() => void) | null;
+}
+
+const OFFLINE_SEND_ERROR = "Xum is reconnecting. Send again once it is back.";
+
 /** The artifact on screen: `version` null is the live file, `latestVersion` its newest copy. */
 export interface ArtifactInteractionTarget {
   path: string;
@@ -41,9 +51,19 @@ export function useArtifactInteractions(
   // frame sent wins. `drained` settles when the queue empties: a frame rebuild (new version,
   // version switch, Reload) reads the server only after this tab's own writes have landed, so the
   // server stays the one source of truth and no read can return a pre-write state.
-  const stateWritesRef = useRef(
-    new Map<string, { queued: { state: unknown } | null; drained: Promise<void> }>()
-  );
+  // While Xum reconnects the API is null: writes then wait in the queue, and `resume` sends them
+  // once a client is back, so a state set during a dropped connection is not lost.
+  const stateWritesRef = useRef(new Map<string, StateWrites>());
+  const apiRef = useRef(api);
+  useEffect(() => {
+    apiRef.current = api;
+    if (!api) return;
+    for (const entry of stateWritesRef.current.values()) {
+      const resume = entry.resume;
+      entry.resume = null;
+      resume?.();
+    }
+  }, [api]);
   // Paths with a shown strip, updated synchronously so back-to-back sends see it.
   const pendingPathsRef = useRef(new Set<string>());
   const [sendState, setSendState] = useState<{
@@ -60,8 +80,12 @@ export function useArtifactInteractions(
   const [loadedState, setLoadedState] = useState<{ key: string; state: unknown } | null>(null);
 
   const path = target?.path ?? null;
+  // Read once per key. A reconnect brings a new client but must not read the state again: the
+  // frame owns its state once built, and a new state object would rebuild the frame, dropping
+  // whatever the page held.
+  const stateLoaded = stateKey != null && loadedState?.key === stateKey;
   useEffect(() => {
-    if (!api || path == null || stateKey == null) return;
+    if (!api || path == null || stateKey == null || stateLoaded) return;
     const controller = new AbortController();
     const pendingWrites = stateWritesRef.current.get(`${workspaceId}\u0000${path}`);
     (pendingWrites?.drained ?? Promise.resolve())
@@ -78,7 +102,7 @@ export function useArtifactInteractions(
         setLoadedState({ key: stateKey, state: null });
       });
     return () => controller.abort();
-  }, [api, workspaceId, path, stateKey]);
+  }, [api, workspaceId, path, stateKey, stateLoaded]);
 
   // Owned here, not by the strip, so the Send shortcut honors the same arming delay as the
   // button (confirmArming.ts).
@@ -86,7 +110,9 @@ export function useArtifactInteractions(
     target == null ? null : (pendingByPath.get(target.path)?.id ?? null)
   );
 
-  if (target == null || !api) {
+  // Not `!api`: the API is null while Xum reconnects, and dropping the handlers then rebuilt the
+  // frame without its state. Offline, writes wait in the queue and Send reports the drop.
+  if (target == null) {
     return { handlers: undefined, strip: null, handleKeyDown: () => false };
   }
 
@@ -117,26 +143,33 @@ export function useArtifactInteractions(
       }
       let markDrained: () => void = () => undefined;
       const drained = new Promise<void>((resolve) => (markDrained = resolve));
-      const entry: { queued: { state: unknown } | null; drained: Promise<void> } = {
-        queued: null,
-        drained,
-      };
+      const entry: StateWrites = { queued: { state }, drained, resume: null };
       writes.set(key, entry);
-      const write = (next: unknown) => {
-        // Best effort: a failed save does not stop the queue; the frame keeps its own copy.
-        const settle = () => {
-          const queued = entry.queued;
-          if (queued == null) {
-            writes.delete(key);
-            markDrained();
-            return;
+      const writeNext = () => {
+        const queued = entry.queued;
+        if (queued == null) {
+          writes.delete(key);
+          markDrained();
+          return;
+        }
+        const client = apiRef.current;
+        if (client == null) {
+          entry.resume = writeNext;
+          return;
+        }
+        entry.queued = null;
+        client.artifacts.setState({ workspaceId, path: writePath, state: queued.state }).then(
+          writeNext,
+          () => {
+            // Best effort: a failed save does not stop the queue; the frame keeps its own copy.
+            // A write cut off by a dropped connection is sent again after the reconnect, unless a
+            // newer state replaced it meanwhile.
+            if (apiRef.current !== client && entry.queued == null) entry.queued = queued;
+            writeNext();
           }
-          entry.queued = null;
-          write(queued.state);
-        };
-        api.artifacts.setState({ workspaceId, path: writePath, state: next }).then(settle, settle);
+        );
       };
-      write(state);
+      writeNext();
     },
   };
 
@@ -152,6 +185,10 @@ export function useArtifactInteractions(
   const send = () => {
     if (pending == null) return;
     const forPath = target.path;
+    if (!api) {
+      setSendState({ path: forPath, sending: false, error: OFFLINE_SEND_ERROR });
+      return;
+    }
     setSendState({ path: forPath, sending: true, error: null });
     api.artifacts
       .sendInteraction({
