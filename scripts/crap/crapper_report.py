@@ -14,7 +14,7 @@
 
 Usage (through uv, which reads the pins above):
 
-    uv run --script scripts/crap/crapper_report.py [--root DIR] [--lcov FILE]
+    uv run --script scripts/crap/crapper_report.py [--root DIR] [--lcov FILE]...
         [--top N] [FILE ...]
 
 With no FILE, it scores every production file that git tracks under `src/`.
@@ -28,6 +28,11 @@ array sorted by path and start line:
 CC. Both are null without --lcov. With --lcov, a function the report does not
 mention scores 0% coverage (Crapper's rule). This script never runs tests:
 Crapper's own coverage command ignores every report when it fails.
+
+Pass every LCOV report (unit and integration shards) as its own --lcov. This
+script merges them, because Crapper keeps only one record per source file: a
+later `SF:` record for the same file replaces the earlier one, so a line one
+shard hit and another missed could score as missed.
 """
 
 import argparse
@@ -36,7 +41,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from crapper.coverage import CoverageBundle, parse_lcov
+from crapper.coverage import CoverageBundle, FileCoverage
 from crapper.crap import make_entry
 from crapper.discover import is_test_file, language_of
 from crapper.languages import functions_in_file
@@ -64,10 +69,62 @@ def tracked_src_files(root: Path) -> list[str]:
     return [path for path in out.decode("utf-8").split("\0") if path]
 
 
-def load_coverage(lcov: Path | None, files: list[str]) -> CoverageBundle | None:
-    if lcov is None:
+def repo_relative(sf_path: str, root: Path, files: list[str]) -> str | None:
+    """Maps an LCOV `SF:` path to one of `files`, or None for other files.
+
+    Bun writes repo-relative paths, Jest absolute ones from the CI checkout,
+    which can differ from `root`. An absolute path matches the scored file it
+    ends with, longest first.
+    """
+
+    path = sf_path.strip().replace("\\", "/").removeprefix("file://")
+    while path.startswith("./"):
+        path = path[2:]
+    if not path.startswith("/"):
+        return path if path in files else None
+    try:
+        relative = Path(path).relative_to(root).as_posix()
+        if relative in files:
+            return relative
+    except ValueError:
+        pass
+    matches = [file for file in files if path.endswith("/" + file)]
+    return max(matches, key=len) if matches else None
+
+
+def merge_lcov(texts: list[str], root: Path, files: list[str]) -> dict[str, dict[int, int]]:
+    """Line hits per repo-relative file, summed over every record of that file.
+
+    Coverage is line-only: Bun's LCOV has no BRDA records, and Crapper prefers
+    branch data when a file has any, so Jest-only branch records would hide
+    the unit-test line hits of the same function.
+    """
+
+    merged: dict[str, dict[int, int]] = {}
+    lines: dict[int, int] | None = None
+    for text in texts:
+        for raw in text.splitlines():
+            record = raw.strip()
+            if record.startswith("SF:"):
+                file = repo_relative(record[3:], root, files)
+                lines = None if file is None else merged.setdefault(file, {})
+            elif record == "end_of_record":
+                lines = None
+            elif lines is not None and record.startswith("DA:"):
+                line, hits = record[3:].split(",")[:2]
+                lines[int(line)] = lines.get(int(line), 0) + int(hits)
+    return merged
+
+
+def load_coverage(lcov: list[Path], root: Path, files: list[str]) -> CoverageBundle | None:
+    if not lcov:
         return None
-    bundle = CoverageBundle(lcov=parse_lcov(lcov.read_text(encoding="utf-8", errors="replace")))
+    texts = [path.read_text(encoding="utf-8", errors="replace") for path in lcov]
+    bundle = CoverageBundle()
+    for file, hits in merge_lcov(texts, root, files).items():
+        record = FileCoverage()
+        record.update({line: (1 if count > 0 else 0, 1) for line, count in hits.items()})
+        bundle.lcov[file] = record
     # Lets Crapper refuse a short LCOV path that only suffix-matches a longer file.
     bundle.bind_sources(files)
     return bundle
@@ -118,14 +175,14 @@ def print_top(rows: list[dict], count: int) -> None:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", type=Path, default=Path("."))
-    parser.add_argument("--lcov", type=Path)
+    parser.add_argument("--lcov", type=Path, action="append", default=[])
     parser.add_argument("--top", type=int, default=0, help="also print the worst N to stderr")
     parser.add_argument("files", nargs="*")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     candidates = args.files or tracked_src_files(root)
     files = sorted({path for path in candidates if is_production(path)})
-    rows = score(root, files, load_coverage(args.lcov, files))
+    rows = score(root, files, load_coverage(args.lcov, root, files))
     json.dump(rows, sys.stdout)
     sys.stdout.write("\n")
     if args.top > 0:

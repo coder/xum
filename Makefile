@@ -497,9 +497,9 @@ test-bench-scripts: ## Test the Terminal-Bench result checker and agent adapter 
 # adapter's inline script header, so no virtualenv is committed or reused.
 CRAP_REPORT := uv run --quiet --script scripts/crap/crapper_report.py
 
-crap: ## Score every production src/ function with Crapper into .metrics/crap.json [COVERAGE=<lcov>]
+crap: ## Score every production src/ function with Crapper into .metrics/crap.json [COVERAGE="<lcov>..."]
 	@mkdir -p .metrics
-	@$(CRAP_REPORT) --top 20 $(if $(COVERAGE),--lcov $(COVERAGE)) > .metrics/crap.json
+	@$(CRAP_REPORT) --top 20 $(foreach lcov,$(COVERAGE),--lcov $(lcov)) > .metrics/crap.json
 	@echo "Wrote .metrics/crap.json"
 
 test-crap-scripts: ## Test the Crapper adapter against hand-counted fixtures

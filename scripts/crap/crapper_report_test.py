@@ -139,3 +139,27 @@ def test_lcov_lines_give_fraction_coverage_and_crap(tmp_path, capsys):
     assert by_name["pick"]["coverage"] == 0.0
     # 3^2 * 1^3 + 3
     assert by_name["pick"]["crap"] == 12.0
+
+
+def test_records_of_one_file_from_many_reports_merge_by_line(tmp_path, capsys):
+    branchy = write(tmp_path, "src/demo/branchy.ts", BRANCHY)
+    # Crapper alone keeps one record per file. Unit and integration shards each
+    # hit part of classify (lines 2-10), and together they hit all six lines.
+    # The second report also repeats the file inside itself, under the CI
+    # checkout's absolute path, which is not --root.
+    unit = tmp_path / "unit.info"
+    unit.write_text(f"SF:{branchy}\nDA:2,1\nDA:3,1\nDA:5,2\nDA:6,0\nend_of_record\n", encoding="utf-8")
+    # Each later record misses a line an earlier one hit.
+    integration = tmp_path / "integration.info"
+    integration.write_text(
+        f"SF:/runner/work/xum/xum/{branchy}\nDA:2,0\nDA:6,4\nDA:7,0\nend_of_record\n"
+        f"SF:/runner/work/xum/xum/{branchy}\nDA:3,0\nDA:7,1\nDA:10,1\nend_of_record\n"
+        "SF:/runner/work/xum/xum/src/other.ts\nDA:1,1\nend_of_record\n",
+        encoding="utf-8",
+    )
+
+    rows = run(capsys, tmp_path, "--lcov", str(unit), "--lcov", str(integration), branchy)
+
+    classify = next(row for row in rows if row["name"] == "classify")
+    assert classify["coverage"] == 1.0
+    assert classify["crap"] == 6.0
