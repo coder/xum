@@ -24,6 +24,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 other_routes=(
   $'scripts/check-startup-imports.test.ts\tmake check-startup-imports (static-check), right before its analyzer'
   $'scripts/check-test-seam-comments.test.ts\tmake check-test-seam-comments (static-check), right before its checker'
+  $'scripts/crap/check.test.ts\tmake test-crap-scripts (static-check-full): needs uv, which Test / Unit does not install'
   $'tests/ui/domIsolation.radixOrder.child.test.tsx\tspawned in a fresh process by tests/ui/domIsolation.test.ts'
   $'vscode/src/api/orpcConnection.integration.test.ts\tnot in CI: needs a live xum server; run with TEST_INTEGRATION=1 bun test ./vscode/src/api/'
 )

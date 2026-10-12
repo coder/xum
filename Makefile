@@ -91,7 +91,7 @@ include fmt.mk
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck static-check static-check-full
-.PHONY: crap test-crap-scripts
+.PHONY: crap crap-check test-crap-scripts
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
 .PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
@@ -504,9 +504,15 @@ crap: ## Score every production src/ function with Crapper into .metrics/crap.js
 	@mv .metrics/crap.json.tmp .metrics/crap.json
 	@echo "Wrote .metrics/crap.json"
 
+# The script exits 0 pass, 1 violations, 2 tool error; make reports any failure
+# as 2, so hooks and CI call the script directly.
+crap-check: ## CRAP gate on files changed since BASE (default: merge-base with origin/main) [COVERAGE="<lcov>..."] [CRAP_CHECK_ARGS=--json]
+	@bun scripts/crap/check.ts --base "$(or $(BASE),$$(git merge-base origin/main HEAD))" \
+		$(foreach lcov,$(COVERAGE),--coverage $(lcov)) $(CRAP_CHECK_ARGS)
+
 CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --quiet --no-project --with pytest --with-requirements scripts/crap/crapper_report.py python
 
-test-crap-scripts: ## Test the Crapper adapter against hand-counted fixtures
+test-crap-scripts: ## Test the Crapper adapter (hand-counted fixtures) and crap-check end to end (needs uv)
 	@# tree-sitter-language-pack downloads its grammars from GitHub releases on
 	@# first use. This target is in static-check-full (Required), so retry a
 	@# transient failure there (seen: HTTP 504) before the tests use them.
@@ -515,6 +521,7 @@ test-crap-scripts: ## Test the Crapper adapter against hand-counted fixtures
 		[ $$attempt -lt 3 ] || exit 1; echo "grammar download failed, retrying ($$attempt/3)" >&2; sleep 10; \
 	done
 	@$(CRAP_PYTHON) -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
+	@bun test ./scripts/crap/check.test.ts
 
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh
