@@ -434,6 +434,7 @@ export function computeAgentPluginContainers(args: {
   if (args.projectRoot !== undefined && projectTrusted && path.isAbsolute(args.projectRoot)) {
     containers.push(
       ...listProjectMetadataRelativePaths("plugins").map((relativePath) => ({
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         path: path.join(args.projectRoot!, relativePath),
         scope: "project" as const,
       })),

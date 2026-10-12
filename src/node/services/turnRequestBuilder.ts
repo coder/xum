@@ -2165,6 +2165,7 @@ export class TurnRequestBuilder {
                 : undefined,
             taskAdapterFactory: (runId, workflowName) =>
               createProductionWorkflowTaskAdapter({
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
                 taskService: this.dependencies.bindings.taskService!,
                 parentWorkspaceId: workspaceId,
                 workflowRunId: runId,

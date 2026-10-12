@@ -27,6 +27,7 @@ function isPlainRecord(value: object): value is Record<string, unknown> {
 
 function hasUnsafeText(value: string): boolean {
   for (const char of value) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const code = char.codePointAt(0)!;
     if (
       (code < 32 && code !== 9 && code !== 10 && code !== 13) ||
@@ -54,6 +55,7 @@ function getTextSafetyStats(value: string): TextSafetyStats {
   let replacementCount = 0;
 
   for (const char of value) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const code = char.codePointAt(0)!;
     if (code === 0) {
       nulCount += 1;
@@ -94,6 +96,7 @@ function escapePreview(value: string, maxChars: number): string {
     if (escaped.length >= maxChars) {
       break;
     }
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const code = char.codePointAt(0)!;
     if (char === "\n") {
       escaped += "\\n";

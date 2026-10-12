@@ -5649,6 +5649,7 @@ export class TaskService implements AgentTaskIntegration {
     // Workflow cancellation is authoritative even when a child has its own Stop or question.
     for (const task of startupTasks()) {
       await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         task.id!,
         config,
         "startup-inactive-workflow-owner-prepass",
@@ -5662,16 +5663,19 @@ export class TaskService implements AgentTaskIntegration {
       await Promise.all(
         candidates.map(
           async (task) =>
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             [task.id, await this.workspaceService.getStartupRecoveryState(task.id!)] as const
         )
       )
     );
     for (const task of candidates) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const id = task.id!;
       if (states.get(id) !== "stopped") continue;
       await this.withTaskTreeLifecycleLock(id, async () => {
         if (this.aiService.isStreaming(id) || this.workspaceService.isBusyForMessage(id)) return;
         const stopped = await this.stopDescendantAgentTaskUnderLifecycleLock(
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           task.parentWorkspaceId!,
           id,
           false
@@ -5695,6 +5699,7 @@ export class TaskService implements AgentTaskIntegration {
     config = this.config.loadConfigOrDefault();
     taskIndex = this.buildAgentTaskIndex(config);
     const eligible = startupTasks().filter(
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       (task) => states.has(task.id) && !["blocked", "stopped"].includes(states.get(task.id)!)
     );
     const awaitingReportTasks = eligible.filter(
@@ -5706,8 +5711,10 @@ export class TaskService implements AgentTaskIntegration {
 
     const admitRecovery = async (task: (typeof eligible)[number], reason: string) => {
       if (
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         !(await this.admitTaskDesktopRecovery(task.id!)) ||
         (await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           task.id!,
           config,
           reason,
@@ -5716,6 +5723,7 @@ export class TaskService implements AgentTaskIntegration {
       )
         return false;
       // Earlier recovery awaits can finish other candidates; verify live status at each dispatch.
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const latest = findWorkspaceEntry(this.config.loadConfigOrDefault(), task.id!)?.workspace;
       return latest != null && latest.taskStatus === task.taskStatus;
     };
@@ -5997,6 +6005,7 @@ export class TaskService implements AgentTaskIntegration {
       if (isWorkspaceArchived(task.archivedAt, task.unarchivedAt)) continue;
       // A reported task that is streaming again (a client reactivated it) may be committing;
       // the continuation refresh that runs when that turn ends generates its artifact.
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       if (this.aiService.isStreaming(task.id!)) continue;
       try {
         let artifacts = patchArtifactsByParent.get(task.parentWorkspaceId);
@@ -6006,6 +6015,7 @@ export class TaskService implements AgentTaskIntegration {
           );
           patchArtifactsByParent.set(task.parentWorkspaceId, artifacts);
         }
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const artifact = artifacts.artifactsByChildTaskId[task.id!];
         if (artifact != null && artifact.status !== "pending") continue;
 
@@ -6013,6 +6023,7 @@ export class TaskService implements AgentTaskIntegration {
         // with (reported tasks x config size) on large deployments.
         await this.gitPatchArtifactService.maybeStartGeneration(
           task.parentWorkspaceId,
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           task.id!,
           (wsId) => this.requestReportedTaskCleanupRecheck(wsId),
           { config }
@@ -6142,6 +6153,7 @@ export class TaskService implements AgentTaskIntegration {
     );
     await Promise.all(
       candidates.map(async (task) => {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const taskId = task.id!;
         const use = await leases.findForeignUse(taskId);
         if (use == null) return;
@@ -15065,6 +15077,7 @@ export class TaskService implements AgentTaskIntegration {
       })),
     ];
     while (stack.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const next = stack.pop()!;
       const entry = index.byId.get(next.taskId);
       const workflowOwned = next.workflowOwned || entry?.workflowTask != null;
@@ -15490,6 +15503,7 @@ export class TaskService implements AgentTaskIntegration {
         this.getTaskDepthFromParentById(index.parentById, a)
     );
     return taskIds.map((taskId) => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const entry = index.byId.get(taskId)!;
       return {
         workspaceId: taskId,
@@ -15646,6 +15660,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     while (stack.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const next = stack.pop()!;
       const entry = index.byId.get(next.taskId);
       if (!entry) continue;
@@ -15767,6 +15782,7 @@ export class TaskService implements AgentTaskIntegration {
     const visited = new Set([workspaceId]);
     const stack: string[] = [...(index.childrenByParent.get(workspaceId) ?? [])];
     while (stack.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const next = stack.pop()!;
       if (visited.has(next)) {
         continue;
@@ -16509,6 +16525,7 @@ export class TaskService implements AgentTaskIntegration {
       })),
     ];
     while (stack.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const next = stack.pop()!;
       const entry = index.byId.get(next.taskId);
       const workflowOwned = next.workflowOwned || entry?.workflowTask != null;

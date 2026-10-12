@@ -5146,6 +5146,7 @@ export class MCPServerManager {
     const start = Date.now();
     const projectPathProvided =
       typeof input.projectPath === "string" && input.projectPath.trim().length > 0;
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const resolvedProjectPath = projectPathProvided ? input.projectPath! : this.config.rootDir;
     const trusted = projectPathProvided
       ? isProjectTrusted(this.config, resolvedProjectPath)

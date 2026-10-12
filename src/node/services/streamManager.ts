@@ -3785,6 +3785,7 @@ export class StreamManager {
         toolName: event.toolName,
         result: event.result ?? (event.error ? { error: event.error } : undefined),
         ...(mcpServer ? { mcpServer } : {}),
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         timestamp: event.endTime!,
         parentToolCallId: event.parentToolCallId,
       });

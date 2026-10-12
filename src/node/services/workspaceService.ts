@@ -5529,6 +5529,7 @@ export class WorkspaceService
     const metadataUnsubscribe = session.onMetadataEvent((event) => {
       this.emit("metadata", {
         workspaceId: event.workspaceId,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         metadata: event.metadata!,
       });
     });
@@ -6461,8 +6462,10 @@ export class WorkspaceService
         break;
       }
 
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       if (!createResult!.success || !createResult!.workspacePath) {
         initLogger.logComplete(-1);
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         return Err(createResult!.error ?? "Failed to create workspace");
       }
 
@@ -6512,6 +6515,7 @@ export class WorkspaceService
       // entry for a live sibling and skip its own sanitization.
       // A deferred worktree has no files yet; it is sanitized once
       // materialized, before its init hook (see materializeDeferredCheckout).
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const pendingMaterialization = createResult!.pendingMaterialization;
       const sanitizeAtRegistration =
         (finalRuntimeConfig.type === "local" || finalRuntimeConfig.type === "worktree") &&
@@ -6535,6 +6539,7 @@ export class WorkspaceService
             // Force is what removes an unpopulated or hook-dirtied checkout, and its `branch -D`
             // is safe only on a branch this creation made.
             checkout:
+              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
               createResult!.createdBranch === true ? "force-delete" : "force-delete-keep-branch",
           });
         // #4745: nothing references this checkout before the registration write lands; undo the
@@ -6579,6 +6584,7 @@ export class WorkspaceService
             config.projects.set(owningProjectPath, projectConfig);
           }
           projectConfig.workspaces.push({
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             path: createResult!.workspacePath!,
             id: workspaceId,
             name: finalWorkspaceName,
@@ -6636,6 +6642,7 @@ export class WorkspaceService
         if (sanitizeAtRegistration) {
           const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
             workspaceId,
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             createResult!.workspacePath
           );
           if (sanitizeError !== undefined) {
@@ -6671,6 +6678,7 @@ export class WorkspaceService
           const unrelatedWorkspaceConsent = await this.grantCreationUnrelatedWorkspaceConsent(
             owningProjectPath,
             workspaceId,
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             createResult!.workspacePath
           );
           completeMetadata = { ...completeMetadata, unrelatedWorkspaceConsent };
@@ -6698,6 +6706,7 @@ export class WorkspaceService
           projectPath: owningProjectPath,
           branchName: finalBranchName,
           trunkBranch: normalizedTrunkBranch,
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           workspacePath: createResult!.workspacePath,
           initLogger,
           env: createEnv,
@@ -6718,6 +6727,7 @@ export class WorkspaceService
                 initParams,
                 pending: pendingMaterialization,
                 initAbortController,
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
                 createdBranch: createResult!.createdBranch === true,
                 // Removal, failed checkout or failed sanitization: the default never applies.
               }).finally(() => this.clearPendingDefaultUnrelatedConsent(workspaceId))
@@ -6746,6 +6756,7 @@ export class WorkspaceService
       return Ok({
         metadata: this.enrichFrontendMetadata(completeMetadata),
         // Lets a caller that undoes this creation keep a branch it merely reused (#4819).
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         createdBranch: createResult!.createdBranch === true,
       });
     } catch (error) {
@@ -8478,7 +8489,9 @@ export class WorkspaceService
       if (removedMetadata || persistedWorkspace) {
         await this.syncCodeWorkspaceFiles(
           removedMetadata ?? {
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             projectPath: persistedWorkspace!.projectPath,
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             projects: persistedWorkspace!.projects,
           },
           removedWorkspaceRoots
@@ -9530,7 +9543,8 @@ export class WorkspaceService
           ? (settings.whenBusy ?? undefined)
           : currentSettings?.whenBusy;
         const nextEnabled = hasEnabledUpdate
-          ? settings.enabled!
+          ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+            settings.enabled!
           : (currentSettings?.enabled ?? true);
         // Sparse like trigger/whenBusy: absent follows the global default at read time, so a
         // later global change applies too (#5692). Null clears; an absent key preserves.
@@ -12441,6 +12455,7 @@ export class WorkspaceService
         // Pass acknowledgedUntrackedPaths to capture so it re-verifies at capture time,
         // closing the remaining race window between the final confirmation check and the
         // actual snapshot capture work.
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const captureResult = await this.worktreeArchiveSnapshotService!.captureSnapshotForArchive({
           workspaceId,
           workspaceMetadata: beforeArchiveMetadata,
@@ -20645,6 +20660,7 @@ export class WorkspaceService
       });
 
       // Execute the script
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const result = (await bashTool.execute!(
         {
           script: scriptToExecute,

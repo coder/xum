@@ -60,6 +60,7 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
       const existing = merged.get(key);
       merged.set(
         key,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         existing ? sumUsageHistory([existing, usage.liveCostUsage])! : usage.liveCostUsage
       );
     }

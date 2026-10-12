@@ -287,6 +287,7 @@ export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   ...Object.fromEntries(
     Object.values(KNOWN_MODELS)
       .filter((model) => Boolean(model.tokenizerOverride))
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       .map((model) => [model.id, model.tokenizerOverride!])
   ),
 };

@@ -1800,10 +1800,13 @@ export class HistoryService {
       try {
         // Preserve the existing recovery hashes and tombstone protocol, but leave no await
         // between the final ownership check and the complete destructive transaction.
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         renameSync(staged.get(markerPath)!, markerPath);
         renameSync(archivePath, `${archivePath}.truncate`);
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         if (archive !== null) renameSync(staged.get(archivePath)!, archivePath);
         if (chat === null) rmSync(chatPath, { force: true });
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         else renameSync(staged.get(chatPath)!, chatPath);
         committed = true;
       } catch (error) {
@@ -4327,6 +4330,7 @@ export class HistoryService {
               "summary"
           )
             return Ok({ kind: "skipped" });
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           const trigger = messages.at(-1)!;
           if (
             new Set(messages.map((message) => message.id)).size !== messages.length ||
@@ -4393,12 +4397,15 @@ export class HistoryService {
             matches.length !== 1 ||
             !row ||
             !this.isCompactionReplacementRow(row) ||
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             !matchesTarget(row.message!)
           )
             return Ok({ kind: "skipped" });
           // Stamp the verified disk row so normalization never erases persisted fields.
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           messages = [row.message!];
         }
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const trigger = messages.at(-1)!;
         // Ordinary input records the rejection without gaining authority to replace a Stop.
         if (
@@ -4416,6 +4423,7 @@ export class HistoryService {
           return Ok(accepted);
         }
         if (replacementNonce !== null) {
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           if (!(await verifyIdentities!())) return Ok({ kind: "skipped" });
           if (verifyExistingWitness) {
             // A failed sidecar retirement must not make explicit Retry inert. Reuse the

@@ -1027,6 +1027,7 @@ export class WorkspaceStore {
           };
           const existing = current.byModel[normalizedModel];
           // CRITICAL: Accumulate, don't overwrite (same logic as backend)
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           current.byModel[normalizedModel] = existing ? sumUsageHistory([existing, usage])! : usage;
           current.lastRequest = { model: normalizedModel, usage, timestamp: Date.now() };
           this.sessionUsage.set(workspaceId, current);
@@ -1165,6 +1166,7 @@ export class WorkspaceStore {
 
       for (const [model, usage] of Object.entries(usageDelta.byModelDelta)) {
         const existing = current.byModel[model];
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
       }
 
@@ -2062,6 +2064,7 @@ export class WorkspaceStore {
 
     (async () => {
       try {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const subscribedIterator = await this.client!.workspace.stats.subscribe(
           { workspaceId },
           { signal }
@@ -2212,6 +2215,7 @@ export class WorkspaceStore {
     let recencyChanged = false;
 
     for (const workspaceId of this.aggregators.keys()) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const aggregator = this.aggregators.get(workspaceId)!;
       const currentRecency = aggregator.getRecencyTimestamp();
       const cachedRecency = this.recencyCache.get(workspaceId);
@@ -4861,9 +4865,11 @@ export class WorkspaceStore {
       this.workspaceCreatedAt.set(workspaceId, createdAt);
     } else if (unarchivedAt) {
       // Update unarchivedAt on existing aggregator (e.g., after restore from archive)
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       this.aggregators.get(workspaceId)!.setUnarchivedAt(unarchivedAt);
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     return this.aggregators.get(workspaceId)!;
   }
 

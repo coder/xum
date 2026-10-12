@@ -191,6 +191,7 @@ export class SessionUsageService {
       const current = await this.readFile(workspaceId);
       const existing = current.byModel[model];
       // CRITICAL: Accumulate, don't overwrite
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
       if (options?.skipLastRequestUpdate !== true) {
         current.lastRequest = { model, usage, timestamp: Date.now() };
@@ -520,6 +521,7 @@ export class SessionUsageService {
 
       for (const [model, usage] of entries) {
         const existing = current.byModel[model];
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
       }
 
@@ -691,6 +693,7 @@ export class SessionUsageService {
     ): void => {
       const model = usageBucketKey(rawModel, metadataModel);
       const existing = result.byModel[model];
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       result.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
     };
 
@@ -746,7 +749,8 @@ export class SessionUsageService {
         if (historicalUsage) {
           const existing = result.byModel.historical;
           result.byModel.historical = existing
-            ? sumUsageHistory([existing, historicalUsage])!
+            ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+              sumUsageHistory([existing, historicalUsage])!
             : historicalUsage;
         }
 

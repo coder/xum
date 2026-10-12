@@ -2535,6 +2535,23 @@ export default defineConfig([
     },
   },
   {
+    // Production code must not add non-null assertions: `x!` hides a missing
+    // check, and the CRAP gate (.xum/skills/crap-gate) forbids trading `?.`/`??`
+    // for `!` to lower complexity. Each site from before the ban carries an
+    // inline disable comment; reportUnusedDisableDirectives flags a stale one.
+    files: ["src/**/*.{ts,tsx}"],
+    ignores: [
+      "**/*.test.{ts,tsx}",
+      "**/*.testHarness.{ts,tsx}",
+      "**/*.stories.{ts,tsx}",
+      "**/*.bench.{ts,tsx}",
+      "src/browser/stories/**",
+    ],
+    rules: {
+      "@typescript-eslint/no-non-null-assertion": "error",
+    },
+  },
+  {
     // Renderer process (frontend) architectural boundary - prevent Node.js API usage
     files: ["src/**/*.ts", "src/**/*.tsx"],
     ignores: [
