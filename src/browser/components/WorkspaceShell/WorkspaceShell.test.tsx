@@ -55,7 +55,11 @@ function gateSidebar() {
 }
 // What the stub sidebar's own window listeners received, in order.
 const sidebarInput: string[] = [];
-const SIDEBAR_EVENT_TYPES = [CUSTOM_EVENTS.OPEN_GOAL_TAB, CUSTOM_EVENTS.OPEN_ARTIFACT];
+const SIDEBAR_EVENT_TYPES = [
+  CUSTOM_EVENTS.OPEN_GOAL_TAB,
+  CUSTOM_EVENTS.OPEN_ARTIFACT,
+  CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
+];
 
 // Restore every module stubbed below (including the per-test WorkspaceStore double) after
 // this suite so the stubs cannot leak into later files.
@@ -518,6 +522,16 @@ describe("WorkspaceShell loading placeholders", () => {
       fireEvent.keyDown(document.body, { key: "K", ctrlKey: true, shiftKey: true });
       fireEvent.keyDown(document.body, { key: "I", shiftKey: true });
       const closeTab = fireEvent.keyDown(document.body, { key: "w", ctrlKey: true });
+      const newTab = new window.KeyboardEvent("keydown", {
+        key: "n",
+        code: "KeyN",
+        ctrlKey: true,
+        altKey: true,
+        bubbles: true,
+      });
+      // happy-dom infers AltGraph from any Ctrl+Alt chord; model physical Ctrl+Alt here.
+      Object.defineProperty(newTab, "getModifierState", { value: () => false });
+      fireEvent(document.body, newTab);
       const typed = fireEvent.keyDown(input, { key: "I", shiftKey: true });
       // Not held: its sender opens the side chat full-screen when no sidebar claims the event.
       let sideChatSeen = 0;
@@ -534,6 +548,9 @@ describe("WorkspaceShell loading placeholders", () => {
       window.dispatchEvent(
         createCustomEvent(CUSTOM_EVENTS.OPEN_ARTIFACT, { workspaceId: "w" } as never)
       );
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, { workspaceId: "w" })
+      );
       fireEvent.click(view.getByRole("button", { name: "New terminal" }));
       expect(typed).toBe(true); // Shift+I in a text field stays a typed letter
       expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([[], 0]);
@@ -545,8 +562,10 @@ describe("WorkspaceShell loading placeholders", () => {
         "key:ctrl+K",
         "key:I",
         "key:ctrl+w",
+        "key:ctrl+n",
         CUSTOM_EVENTS.OPEN_GOAL_TAB,
         CUSTOM_EVENTS.OPEN_ARTIFACT,
+        CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
       ]);
       expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([["artifact"], 1]);
       expect(sideChatSeen).toBe(1); // and not replayed
@@ -577,6 +596,20 @@ describe("WorkspaceShell loading placeholders", () => {
 
       fireEvent.click(view.getByRole("button", { name: "Close" }));
       expect(isInert(view.getByTestId("chat-pane"))).toBe(false);
+      consoleError.mockRestore();
+    });
+
+    it("shows a failed collapsed sidebar at its expanded width, so Reload is not clipped", async () => {
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      const gate = gateSidebar();
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      const box = () => view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
+      expect(box()?.style.width).toBe("20px");
+      await gate.fail();
+      expect(box()?.contains(view.getByRole("alert"))).toBe(true);
+      expect(box()?.style.width).not.toBe("20px");
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
       consoleError.mockRestore();
     });
 

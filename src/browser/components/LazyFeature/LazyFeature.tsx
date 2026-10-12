@@ -12,7 +12,7 @@ interface LazyFeatureProps {
    * Wraps the loading and the failure fallback. For a page-level boundary: the loaded page holds
    * the one `main` landmark, so these states must hold it too (#6017, #6025).
    */
-  frame?: (state: ReactNode) => ReactNode;
+  frame?: (state: ReactNode, kind: "loading" | "failed") => ReactNode;
   children: ReactNode;
 }
 
@@ -42,9 +42,9 @@ export function LazyFeature(props: LazyFeatureProps) {
   return (
     <ErrorBoundary
       workspaceInfo={props.name}
-      fallback={frame(<ReloadFallback name={props.name} />)}
+      fallback={frame(<ReloadFallback name={props.name} />, "failed")}
     >
-      <Suspense fallback={frame(props.fallback ?? null)}>{props.children}</Suspense>
+      <Suspense fallback={frame(props.fallback ?? null, "loading")}>{props.children}</Suspense>
     </ErrorBoundary>
   );
 }

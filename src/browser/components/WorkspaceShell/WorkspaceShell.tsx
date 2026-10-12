@@ -141,7 +141,9 @@ function LazyRightSidebar(
 ) {
   const { held, ...sidebarProps } = props;
   const collapsed = readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
-  const frame = (state: React.ReactNode) => (
+  // The failure state takes the expanded width even when collapsed: the 20 px rail would clip its
+  // Reload button, and the rail's expand control is part of the sidebar that failed to load.
+  const frame = (state: React.ReactNode, kind: "loading" | "failed") => (
     <div
       className={cn(
         "bg-surface-primary flex flex-col overflow-hidden",
@@ -153,7 +155,7 @@ function LazyRightSidebar(
       style={
         props.immersiveHidden
           ? undefined
-          : { width: collapsed ? 20 : props.width, maxWidth: "100%" }
+          : { width: collapsed && kind === "loading" ? 20 : props.width, maxWidth: "100%" }
       }
     >
       {state}

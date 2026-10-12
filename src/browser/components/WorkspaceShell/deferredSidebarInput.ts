@@ -4,6 +4,7 @@ import {
   isEditableElement,
   KEYBINDS,
   matchesKeybind,
+  matchesNewSidebarTabKeybind,
 } from "@/browser/utils/ui/keybinds";
 
 /** Replays one held input. WorkspaceShell queues these while the right sidebar's chunk loads. */
@@ -14,6 +15,7 @@ export type HeldSidebarInput = () => void;
 // at once and opens the side chat full-screen when no sidebar claims it, as on a narrow layout.
 const SIDEBAR_EVENTS = [
   CUSTOM_EVENTS.OPEN_GOAL_TAB,
+  CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
   CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
   CUSTOM_EVENTS.OPEN_ARTIFACT,
   CUSTOM_EVENTS.OPEN_REVIEW_IMMERSIVE,
@@ -35,6 +37,7 @@ export function holdSidebarInput(held: HeldSidebarInput[]): () => void {
   const holdKey = (e: KeyboardEvent) => {
     const sidebarKey =
       SIDEBAR_KEYBINDS.some((keybind) => matchesKeybind(e, keybind)) ||
+      matchesNewSidebarTabKeybind(e) || // its own matcher: AltGr does not count
       // Shift+I types a letter in a text field, where the sidebar ignores it.
       (matchesKeybind(e, KEYBINDS.TOGGLE_REVIEW_IMMERSIVE) && !isEditableElement(e.target));
     if (!sidebarKey) return;
