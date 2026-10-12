@@ -691,7 +691,10 @@ describe("WorkspaceShell loading placeholders", () => {
       const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
       const gate = gateSidebar();
       render(<WorkspaceShell {...defaultProps} />);
-      const menuBar: string[] = []; // stands in for WorkspaceMenuBar's phone listeners
+      // Stands in for WorkspaceMenuBar's phone listeners, subscribed after the hold (it re-subscribes
+      // whenever the full-screen view opens or closes). For an event dispatched on window, Chromium
+      // runs window listeners in registration order, so only a later listener is held from.
+      const menuBar: string[] = [];
       const onEvent = (e: Event) => menuBar.push(e.type);
       window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onEvent);
       window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onEvent);
