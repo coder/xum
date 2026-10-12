@@ -14,20 +14,35 @@ const FOLLOW_UP_KEYS = ["followUpContent", "continueMessage"] as const;
 
 export function stripClientPluginSendHookFields<T>(muxMetadata: T): T {
   if (!isRecord(muxMetadata)) return muxMetadata;
+  // A compaction summary's pending follow-up (workspace.replaceChatHistory rows): recovery
+  // dispatches it after a restart and trusts the same markers (Codex PRRT_kwDOPxxmWM6rZbml).
+  const pending = stripFollowUp(muxMetadata.pendingFollowUp);
   const parsed = muxMetadata.parsed;
-  if (!isRecord(parsed)) return muxMetadata;
   let strippedParsed: Record<string, unknown> | undefined;
-  for (const key of FOLLOW_UP_KEYS) {
-    const followUp = parsed[key];
-    if (!isRecord(followUp)) continue;
-    if (!("pluginSendHooksApplied" in followUp) && !("pluginHookContext" in followUp)) continue;
-    const { pluginSendHooksApplied: _applied, pluginHookContext: _context, ...rest } = followUp;
-    strippedParsed = { ...(strippedParsed ?? parsed), [key]: rest };
+  if (isRecord(parsed)) {
+    for (const key of FOLLOW_UP_KEYS) {
+      const followUp = stripFollowUp(parsed[key]);
+      if (followUp !== undefined)
+        strippedParsed = { ...(strippedParsed ?? parsed), [key]: followUp };
+    }
   }
-  if (strippedParsed === undefined) return muxMetadata;
-  const stripped = { ...muxMetadata, parsed: strippedParsed };
+  if (strippedParsed === undefined && pending === undefined) return muxMetadata;
+  const stripped = {
+    ...muxMetadata,
+    ...(strippedParsed !== undefined ? { parsed: strippedParsed } : {}),
+    ...(pending !== undefined ? { pendingFollowUp: pending } : {}),
+  };
   // Same shape as the input minus optional fields, so it stays assignable to T.
   return stripped as T;
+}
+
+/** The follow-up without the hook markers, or undefined when it has none to strip. */
+function stripFollowUp(followUp: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(followUp)) return undefined;
+  if (!("pluginSendHooksApplied" in followUp) && !("pluginHookContext" in followUp))
+    return undefined;
+  const { pluginSendHooksApplied: _applied, pluginHookContext: _context, ...rest } = followUp;
+  return rest;
 }
 
 /** Refusal for {@link isNestedCompactionFollowUp} sends. */

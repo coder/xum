@@ -349,7 +349,6 @@ describe("PreToolUse", () => {
       });
     const cases: Array<[unknown, unknown, unknown]> = [
       [rewrite("allow", { script: "ls" }), schema, { script: "ls" }],
-      [rewrite("allow", { script: 1 }), schema, { script: "x" }],
       [json({ hookSpecificOutput: { updatedInput: { script: "ls" } } }), schema, { script: "x" }],
     ];
     // MCP schemas: local $ref/$defs (2020-12 by default) and a draft-07 declaration.
@@ -362,13 +361,26 @@ describe("PreToolUse", () => {
     const draft7 = { $schema: "http://json-schema.org/draft-07/schema#", ...schema };
     cases.push(
       [rewrite("allow", { script: "ls" }), refSchema, { script: "ls" }],
-      [rewrite("allow", { script: "" }), refSchema, { script: "x" }],
       [rewrite("allow", { script: "ls" }), draft7, { script: "ls" }]
     );
     for (const [output, toolSchema, expected] of cases) {
       const { spine } = setup([hook("PreToolUse")], () => output);
       const ctx = await runTool(spine, "bash", { script: "x" }, toolSchema);
       expect(ctx.result).toEqual({ ran: expected });
+    }
+    // A rewrite that does not match the schema is denied too: the guard allowed only the
+    // rewritten call (Codex PRRT_kwDOPxxmWM6rb3ih).
+    for (const [output, toolSchema] of [
+      [rewrite("allow", { script: 1 }), schema],
+      [rewrite("allow", { script: "" }), refSchema],
+    ] as const) {
+      const { spine } = setup([hook("PreToolUse")], () => output);
+      const ctx = await runTool(spine, "bash", { script: "x" }, toolSchema);
+      expect(ctx.executed).toBe(false);
+      expect(ctx.blocked?.result).toEqual({
+        error:
+          "Tool call blocked by plugin 'guard' hook: its rewrite of this call does not match the tool's input.",
+      });
     }
     // No schema to check the rewrite against: the call is denied, never run with the original
     // arguments the guard meant to replace (Codex PRRT_kwDOPxxmWM6rRKxR).
