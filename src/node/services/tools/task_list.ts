@@ -14,7 +14,7 @@ import { TaskListToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools
 import { isWorkspaceArchived } from "@/common/utils/archive";
 
 import { isNestedWorkflowRun } from "@/common/types/workflow";
-import type { TaskService } from "@/node/services/taskService";
+import type { TaskService, TaskTreeAgentsResult } from "@/node/services/taskService";
 import type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Config } from "@/node/config";
@@ -231,6 +231,22 @@ function shouldHideArchivedWorkspaceTurn(
   );
 }
 
+/** Direct links are plain messaging addresses, not owned tasks or execution handles. */
+function relatedChatRows(
+  tree: TaskTreeAgentsResult,
+  includeWorkspaces: boolean
+): TaskListToolSuccessResult["tasks"] {
+  if (!includeWorkspaces || tree.callerPeerMessagingRestricted === true) return [];
+  return (tree.relatedChats ?? []).map((chat) => ({
+    taskId: chat.workspaceId,
+    status: "workspace" as const,
+    ...(chat.title != null ? { title: chat.title } : {}),
+    relationship: chat.relationship,
+    // Depth 0 is the plain workspace-row convention, not task ancestry.
+    depth: 0,
+  }));
+}
+
 /**
  * scope:"tree" — peer-discovery view: every agent workspace in the caller's task tree plus the
  * root workspace row and direct main/side-chat messaging links. Workflow runs, workspace turns,
@@ -269,19 +285,7 @@ async function executeTreeScope(
     });
   }
 
-  // Related conversations are messaging addresses, never descendants: depth 0 is the plain
-  // workspace row convention, not ancestry. Do not add parent IDs or execution handles.
-  if (statusFilter.has("workspace") && tree.callerPeerMessagingRestricted !== true) {
-    for (const chat of tree.relatedChats ?? []) {
-      tasks.push({
-        taskId: chat.workspaceId,
-        status: "workspace",
-        ...(chat.title != null ? { title: chat.title } : {}),
-        relationship: chat.relationship,
-        depth: 0,
-      });
-    }
-  }
+  tasks.push(...relatedChatRows(tree, statusFilter.has("workspace")));
 
   const resolveAgentExecution =
     taskService.getDescendantAgentTaskExecutionSnapshot?.bind(taskService);
