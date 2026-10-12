@@ -1152,7 +1152,9 @@ body,
     display: none;
   }
 
-  [data-workspace-shell]:not([data-transcript-full-width]):has(> .right-sidebar-overview-card)
+  /* Keyed on the collapsed state (WorkspaceShell), not on the card element, which mounts only
+     once the lazy sidebar chunk loads: the transcript must not shift when it does. */
+  [data-workspace-shell][data-right-sidebar-collapsed]:not([data-transcript-full-width])
     > :not(.right-sidebar-overview-card) {
     --chat-reserved-inline-end: calc(var(--overview-card-width) + var(--overview-card-inset));
   }

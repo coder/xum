@@ -232,6 +232,12 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const shellRef = useRef<HTMLDivElement>(null);
   const shellSize = useResizeObserver(shellRef);
   const chatTranscriptFullWidth = useChatTranscriptFullWidth();
+  // Marks the shell so globals.css reserves the collapsed overview card's room beside the chat
+  // from the first paint, read from state rather than from the card element: the sidebar chunk
+  // loads lazily, and keying on the card would shift the transcript once it mounts.
+  const [rightSidebarCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
+    listener: true,
+  });
 
   // WorkspaceShell switches to flex-col at this breakpoint, so in that stacked mode the
   // right sidebar doesn't need to "leave room" for ChatPane beside it.
@@ -424,6 +430,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
       // A full-width transcript has no centered column for the collapsed right sidebar's overview
       // card to sit beside, so globals.css keeps the card hidden (the header button stands in).
       data-transcript-full-width={chatTranscriptFullWidth || undefined}
+      data-right-sidebar-collapsed={rightSidebarCollapsed || undefined}
       className={cn(
         "relative flex flex-1 flex-row bg-surface-primary text-light overflow-x-auto overflow-y-hidden [@media(max-width:768px)]:flex-col",
         props.className
