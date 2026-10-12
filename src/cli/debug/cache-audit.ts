@@ -5,13 +5,14 @@ import {
   collapseEnvelopesToFinalPerSequence,
 } from "@/node/services/replay/cacheAudit";
 import {
+  auditRecordedStepPrefixes,
   collectAssistantTurns,
   collectFullHistory,
   type AssistantTurn,
   type TurnEnvelopeEvent,
 } from "@/node/services/replay/replayVerify";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
-import { resolveReplaySessionDir } from "./replay-verify";
+import { printStepPrefixAudit, resolveReplaySessionDir } from "./replay-verify";
 
 /**
  * Debug command: diff consecutive turn-envelope rows and attribute
@@ -91,7 +92,11 @@ export async function cacheAuditCommand(workspaceId: string): Promise<void> {
 
   console.log(
     `\n${bustedTurns}/${audit.length - 1} follow-up turns busted the prompt prefix` +
-      (bustedTokens > 0 ? ` (~${bustedTokens.toLocaleString()} tokens re-processed)` : "") +
-      `\n`
+      (bustedTokens > 0 ? ` (~${bustedTokens.toLocaleString()} tokens re-processed)` : "")
+  );
+  // Envelopes only see prefix inputs (system prompt, tools, model); the step
+  // audit also catches history bytes that changed between requests.
+  printStepPrefixAudit(
+    await auditRecordedStepPrefixes(sessionDir, historyResult.success ? historyResult.data : [])
   );
 }

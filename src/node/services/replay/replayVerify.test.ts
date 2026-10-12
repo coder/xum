@@ -13,6 +13,7 @@ import * as fs from "node:fs/promises";
 import { describe, expect, test } from "bun:test";
 import { tool, type Tool } from "ai";
 import { z } from "zod";
+import type { DevToolsStep } from "@/common/types/devtools";
 import { createMuxMessage } from "@/common/types/message";
 import { TOOL_SEARCH_TOOL_NAME } from "@/common/utils/tools/toolCatalog";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -93,6 +94,56 @@ describe("replayVerifySession pairing", () => {
     // actually be model-visible in the recorded request.
     const devtoolsRaw = ctx.devtoolsLines.join("\n");
     expect(devtoolsRaw).toContain("1. do the thing");
+  });
+
+  test("the prefix rule checks every recorded step, not only each turn's first", async () => {
+    using tmp = new DisposableTempDir("replay-verify-step-prefix");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    for (const userText of ["First.", "Second."]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+      });
+    }
+    // Record a tool step inside turn 1 that chat.jsonl does not keep, so the
+    // turn 2 rebuild drops it: each run's first request still verifies, but
+    // turn 2 no longer extends turn 1's last step.
+    const [, firstStepLine] = ctx.devtoolsLines;
+    const firstStep = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
+    const firstPrompt = firstStep.input?.prompt as unknown[];
+    const toolCall = { type: "tool-call", toolCallId: "t1", toolName: "bash", input: {} };
+    ctx.devtoolsLines.push(
+      JSON.stringify({
+        type: "step",
+        step: {
+          ...firstStep,
+          id: "step-1b",
+          stepNumber: 1,
+          input: {
+            ...firstStep.input,
+            prompt: [...firstPrompt, { role: "assistant", content: [toolCall] }],
+          },
+        },
+      })
+    );
+
+    const result = await verify(ctx);
+    expect(result.turns.map((turn) => turn.status)).toEqual(["PASS", "PASS"]);
+    expect(result.stepPrefix.comparedPairs).toBe(2);
+    expect(result.stepPrefix.breaks).toMatchObject([
+      {
+        runId: "run-2",
+        stepNumber: 0,
+        boundary: "turn",
+        comparison: {
+          section: "messages",
+          previous: { role: "assistant", type: "tool-call", toolName: "bash" },
+          next: { role: "assistant", type: "text" },
+        },
+      },
+    ]);
   });
 
   test("a turn without an assistant row skips only itself", async () => {

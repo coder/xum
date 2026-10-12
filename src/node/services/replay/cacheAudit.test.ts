@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
-import { auditCacheBusts, collapseEnvelopesToFinalPerSequence } from "./cacheAudit";
-import type { TurnEnvelopeEvent } from "./replayVerify";
+import {
+  auditCacheBusts,
+  auditStepPrefixes,
+  collapseEnvelopesToFinalPerSequence,
+} from "./cacheAudit";
+import type { RecordedStepRequest, TurnEnvelopeEvent } from "./replayVerify";
 
 function makeEnvelope(
   seq: number,
@@ -146,5 +150,49 @@ describe("collapseEnvelopesToFinalPerSequence", () => {
       keyed,
       legacyB,
     ]);
+  });
+});
+
+describe("auditStepPrefixes", () => {
+  const step = (
+    runId: string,
+    stepNumber: number,
+    texts: string[],
+    modelId = "anthropic:claude-sonnet-4-5"
+  ): RecordedStepRequest => ({
+    runId,
+    stepId: `${runId}-${stepNumber}`,
+    stepNumber,
+    modelId,
+    tools: [],
+    prompt: [
+      { role: "system", content: "You are Xum." },
+      ...texts.map((text) => ({ role: "user", content: [{ type: "text", text }] })),
+    ],
+  });
+
+  test("a mid-turn step that rewrites history breaks at the step boundary", () => {
+    const audit = auditStepPrefixes([
+      step("run-1", 0, ["a"]),
+      step("run-1", 1, ["a", "b"]),
+      step("run-1", 2, ["a", "c"]),
+    ]);
+    expect(audit.comparedPairs).toBe(2);
+    expect(audit.breaks).toMatchObject([
+      { stepId: "run-1-2", boundary: "step", comparison: { blockIndex: 2 } },
+    ]);
+  });
+
+  test("a model change is not compared and a side run resets the baseline", () => {
+    const audit = auditStepPrefixes(
+      [
+        step("run-1", 0, ["a"]),
+        step("run-2", 0, ["x"], "anthropic:claude-opus-4-5"),
+        step("compact", 0, ["summarize"], "anthropic:claude-opus-4-5"),
+        step("run-3", 0, ["summary"], "anthropic:claude-opus-4-5"),
+      ],
+      (recorded) => recorded.runId === "compact"
+    );
+    expect(audit).toEqual({ comparedPairs: 0, breaks: [] });
   });
 });

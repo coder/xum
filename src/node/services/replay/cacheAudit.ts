@@ -11,7 +11,14 @@
  */
 
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
-import type { TurnEnvelopeEvent } from "./replayVerify";
+import {
+  comparePromptCachePrefix,
+  describePromptCacheBreak,
+  fingerprintAnthropicRequest,
+  type PromptCacheBlock,
+  type PromptCachePrefixBreak,
+} from "@/node/services/promptCachePrefix";
+import type { RecordedStepRequest, TurnEnvelopeEvent } from "./replayVerify";
 
 export interface CacheAuditCause {
   kind: "system-prompt" | "toolset" | "model" | "thinking-level" | "provider-options";
@@ -153,4 +160,63 @@ export function auditCacheBusts(
       ...(approxBustedTokens !== undefined ? { approxBustedTokens } : {}),
     };
   });
+}
+
+export interface StepPrefixBreak {
+  runId: string;
+  stepId: string;
+  stepNumber: number;
+  /** "turn": a run's first step broke the previous run's last step; "step": a later step did. */
+  boundary: "turn" | "step";
+  comparison: PromptCachePrefixBreak;
+  description: string;
+}
+
+export interface StepPrefixAudit {
+  /** Consecutive request pairs held to the prefix rule. */
+  comparedPairs: number;
+  breaks: StepPrefixBreak[];
+}
+
+/**
+ * The prefix rule over every recorded step, not only each turn's first: each
+ * request must start with every block of the workspace's previous request, or
+ * the provider re-processes the conversation from the first differing block
+ * uncached. The turn envelope comparison above only sees prefix inputs; this
+ * also catches a rebuild that changes history bytes (lost step boundaries,
+ * truncated tool results). Pairs across a model change are not compared, and
+ * a side run (compaction) is skipped and resets the baseline.
+ */
+export function auditStepPrefixes(
+  steps: readonly RecordedStepRequest[],
+  isSideRun: (step: RecordedStepRequest) => boolean = () => false
+): StepPrefixAudit {
+  const breaks: StepPrefixBreak[] = [];
+  let comparedPairs = 0;
+  let previous: { step: RecordedStepRequest; blocks: PromptCacheBlock[] } | undefined;
+  for (const step of steps) {
+    if (isSideRun(step)) {
+      previous = undefined;
+      continue;
+    }
+    // The DevTools record is the AI SDK prompt (system messages inline), the
+    // same shape the gateway wire carries.
+    const blocks = fingerprintAnthropicRequest({ tools: step.tools, prompt: step.prompt });
+    if (previous?.step.modelId === step.modelId) {
+      comparedPairs++;
+      const comparison = comparePromptCachePrefix(previous.blocks, blocks);
+      if (comparison.kind === "break") {
+        breaks.push({
+          runId: step.runId,
+          stepId: step.stepId,
+          stepNumber: step.stepNumber,
+          boundary: previous.step.runId === step.runId ? "step" : "turn",
+          comparison,
+          description: describePromptCacheBreak(comparison),
+        });
+      }
+    }
+    previous = { step, blocks };
+  }
+  return { comparedPairs, breaks };
 }
