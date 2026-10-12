@@ -222,12 +222,21 @@ export function fingerprintAnthropicRequest(body: Record<string, unknown>): Prom
     Array.isArray(content) ? content : content != null ? [content] : [];
 
   const rawMessages: unknown = Array.isArray(body.messages) ? body.messages : body.prompt;
-  const messages = (Array.isArray(rawMessages) ? (rawMessages as unknown[]) : []).map(
-    (message) => ({
+  const messages = (Array.isArray(rawMessages) ? (rawMessages as unknown[]) : []).map((message) => {
+    const content = contentOf(isRecord(message) ? message.content : message);
+    // Message-level Anthropic options (prompt form: a system message's `clearAt`, `effort`,
+    // `toolChanges`) are serialized into its wire blocks, so they count as a leading block.
+    const options = isRecord(message)
+      ? withoutBlockMarker({ providerOptions: message.providerOptions })
+      : {};
+    return {
       role: (isRecord(message) ? label(message.role) : undefined) ?? "unknown",
-      content: contentOf(isRecord(message) ? message.content : message),
-    })
-  );
+      content:
+        Object.keys(options).length > 0
+          ? [{ type: "message-options", ...options }, ...content]
+          : content,
+    };
+  });
   // Only the prompt form's leading system messages are the top-level system
   // prompt; a later one is a mid-conversation system message.
   const firstNonSystem = messages.findIndex((message) => message.role !== "system");
