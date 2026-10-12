@@ -7,10 +7,14 @@ export type MuxMessageWithStepStarts = Omit<MuxMessage, "parts"> & {
   parts: Array<MuxMessage["parts"][number] | StepStartUIPart>;
 };
 
-/** Indices this helper can trust: non-negative safe integers in strictly ascending order. */
+/**
+ * Indices this helper can trust: safe integers in strictly ascending order that start at 0.
+ * Every producer seeds the list with 0 (the first step), so a list without it is corrupted.
+ */
 function isTrustedStepStartList(indices: unknown): indices is number[] {
   return (
     Array.isArray(indices) &&
+    indices[0] === 0 &&
     indices.every(
       (index: unknown, position) =>
         typeof index === "number" &&
@@ -35,7 +39,7 @@ function isTrustedStepStartList(indices: unknown): indices is number[] {
  *
  * Applied for every provider: every provider's in-turn steps used this split, so the rebuild
  * now matches what each provider already accepted. Rows without indices, or with indices that
- * are not strictly ascending non-negative integers (corrupted history), keep the old shape.
+ * are not strictly ascending integers starting at 0 (corrupted history), keep the old shape.
  * Indices outside the row's parts are skipped, and 0 needs no boundary.
  */
 export function insertStepStartPartsForSdk(messages: MuxMessage[]): MuxMessageWithStepStarts[] {
