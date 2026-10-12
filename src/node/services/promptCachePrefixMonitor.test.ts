@@ -42,6 +42,8 @@ interface SentRequest {
   outcome?: "reject" | 529;
   /** False when prompt caching is off (disableBetaFeatures): markers are stripped. */
   injectCacheControl?: boolean;
+  /** The TTL the wire wrapper writes into the cache markers. */
+  cacheTtl?: "1h";
 }
 
 /** Sends each request through its own wrapped fetch, like the requests of one workspace. */
@@ -53,7 +55,7 @@ async function send(monitor: PromptCachePrefixMonitor, requests: SentRequest[]):
         : Promise.resolve(new Response("{}", { status: request.outcome ?? 200 }));
     const fetchImpl = wrapFetchWithAnthropicCacheControl(
       Object.assign(baseFetch, fetch) as typeof fetch,
-      null,
+      request.cacheTtl ?? null,
       {
         injectCacheControl: request.injectCacheControl ?? true,
         observeFinalBody: (b) => monitor.observe(request.scope, request.identity ?? ANTHROPIC, b),
@@ -160,6 +162,58 @@ describe("PromptCachePrefixMonitor through the Anthropic wire wrapper", () => {
     // Within the TTL and in the same context, the same difference is still reported.
     now += 60 * 1000;
     await send(monitor, [{ scope: scope("row-9"), body: requestBody("changed again") }]);
+    expect(events).toHaveLength(1);
+  });
+
+  test("the TTL comes from cache markers, not from a ttl field in a tool schema", async () => {
+    const events: TimelineEventDraft[] = [];
+    let now = 0;
+    const monitor = new PromptCachePrefixMonitor(() => now);
+    const scope = () => monitor.createTurnScope("ws-1", recorderFor(events));
+    const withSchemaTtl = (toolOutput: string) => {
+      const parsed = JSON.parse(requestBody(toolOutput)) as {
+        tools: Array<Record<string, unknown>>;
+      };
+      parsed.tools[0].input_schema = {
+        type: "object",
+        properties: { retention: { type: "object", default: { ttl: "1h" } } },
+      };
+      return JSON.stringify(parsed);
+    };
+    // The markers keep the 5-minute default, so 6 minutes later the entry has expired.
+    await send(monitor, [{ scope: scope(), body: withSchemaTtl(SECRET_OUTPUT) }]);
+    now = 6 * 60 * 1000;
+    await send(monitor, [{ scope: scope(), body: withSchemaTtl("changed after expiry") }]);
+    expect(events).toEqual([]);
+    // A real 1h marker keeps the entry: the same gap still reports the difference.
+    const hourMonitor = new PromptCachePrefixMonitor(() => now);
+    const hourScope = () => hourMonitor.createTurnScope("ws-1", recorderFor(events));
+    await send(hourMonitor, [
+      { scope: hourScope(), body: requestBody(SECRET_OUTPUT), cacheTtl: "1h" },
+    ]);
+    now += 6 * 60 * 1000;
+    await send(hourMonitor, [{ scope: hourScope(), body: requestBody("changed"), cacheTtl: "1h" }]);
+    expect(events).toHaveLength(1);
+  });
+
+  test("a context-editing request records nothing and replaces the baseline", async () => {
+    const events: TimelineEventDraft[] = [];
+    const monitor = new PromptCachePrefixMonitor();
+    const scope = () => monitor.createTurnScope("ws-1", recorderFor(events));
+    const editing = (toolOutput: string) =>
+      JSON.stringify({
+        ...(JSON.parse(requestBody(toolOutput)) as object),
+        context_management: { edits: [{ type: "clear_tool_uses_20250919" }] },
+      });
+    await send(monitor, [
+      { scope: scope(), body: requestBody(SECRET_OUTPUT) },
+      { scope: scope(), body: editing("cleared by the server") },
+      // Compared with the editing request, not with the first one.
+      { scope: scope(), body: requestBody("after editing") },
+    ]);
+    expect(events).toEqual([]);
+    // The baseline is a supported request again, so a difference is reported.
+    await send(monitor, [{ scope: scope(), body: requestBody("changed") }]);
     expect(events).toHaveLength(1);
   });
 

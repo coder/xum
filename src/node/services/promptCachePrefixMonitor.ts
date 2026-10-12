@@ -24,13 +24,42 @@ const MAX_TRACKED_WORKSPACES = 128;
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const ONE_HOUR_MS = 60 * 60 * 1000;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The marker of one block: wire `cache_control`, or the prompt form's `providerOptions.anthropic.cacheControl`. */
+function markerTtl(block: unknown): unknown {
+  if (!isRecord(block)) return undefined;
+  const providerOptions = isRecord(block.providerOptions) ? block.providerOptions : {};
+  const anthropic = isRecord(providerOptions.anthropic) ? providerOptions.anthropic : {};
+  const marker = block.cache_control ?? anthropic.cacheControl;
+  return isRecord(marker) ? marker.ttl : undefined;
+}
+
 /**
  * The cache lifetime the request asked for: 1h when any cache marker sets `ttl: "1h"`, else
  * Anthropic's 5-minute default. After that, the baseline's cache entry is gone, so a later
- * request is cold by expiry and a difference is not reported as a prefix break.
+ * request is cold by expiry and a difference is not reported as a prefix break. Only the
+ * places a marker can sit are read (tools, system blocks, messages, their content blocks and
+ * the blocks inside a tool_result): a `ttl` field in a tool schema or tool input is data.
  */
 function requestCacheTtlMs(body: Record<string, unknown>): number {
-  return JSON.stringify(body).includes('"ttl":"1h"') ? ONE_HOUR_MS : FIVE_MINUTES_MS;
+  const asArray = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+  const messages = [...asArray(body.messages), ...asArray(body.prompt)];
+  const contentBlocks = messages.flatMap((message) =>
+    isRecord(message) ? asArray(message.content) : []
+  );
+  const markable = [
+    ...asArray(body.tools),
+    ...asArray(body.system),
+    ...messages,
+    ...contentBlocks,
+    ...contentBlocks.flatMap((block) =>
+      isRecord(block) && block.type === "tool_result" ? asArray(block.content) : []
+    ),
+  ];
+  return markable.some((block) => markerTtl(block) === "1h") ? ONE_HOUR_MS : FIVE_MINUTES_MS;
 }
 
 /**
@@ -141,7 +170,9 @@ export class PromptCachePrefixMonitor {
       if (observedAt - previous.observedAt > previous.ttlMs) return;
 
       const comparison = comparePromptCachePrefix(previous.blocks, blocks);
-      if (comparison.kind === "extends") return;
+      // "unsupported" (context editing on either side): the fingerprint cannot tell, so record
+      // nothing. The request above already replaced the baseline.
+      if (comparison.kind !== "break") return;
       const { kind: _kind, ...breakData } = comparison;
       const promptCacheBreak = {
         ...breakData,
