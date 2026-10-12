@@ -128,7 +128,9 @@ export function getAnthropicCacheWrite1hTokens(
   const oneHour = split?.ephemeral_1h_input_tokens;
   if (!isTokenCount(oneHour) || oneHour === 0) return 0;
   const fiveMinute = split?.ephemeral_5m_input_tokens;
-  const reported = oneHour + (isTokenCount(fiveMinute) ? fiveMinute : 0);
+  // A present but malformed 5m share makes the split unreliable: keep the 5m price.
+  if (fiveMinute != null && !isTokenCount(fiveMinute)) return 0;
+  const reported = oneHour + (fiveMinute ?? 0);
   if (reported === cacheWriteTokens) return oneHour;
   return Math.min(cacheWriteTokens, Math.round((cacheWriteTokens * oneHour) / reported));
 }
