@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { getCacheHealth } from "./cacheHealth";
 import { createDisplayUsage } from "./displayUsage";
+import { sumUsageHistory } from "./usageAggregator";
 
 const MODEL = "anthropic:claude-sonnet-5-5";
 
@@ -47,6 +48,27 @@ describe("getCacheHealth", () => {
     const fiveMinute = turn({ uncached: 1_000, read: 0, write: 20_000 });
     const oneHour = turn({ uncached: 1_000, read: 0, write: 20_000, write1h: 20_000 });
     expect(oneHour.rewriteCostUsd).toBeGreaterThan(fiveMinute.rewriteCostUsd ?? Infinity);
+  });
+
+  test("reports an unknown rewrite cost when any summed usage is unpriced", () => {
+    const unpriced = createDisplayUsage(
+      { inputTokens: 21_000, cachedInputTokens: 0, outputTokens: 100 },
+      "custom:unpriced-model",
+      { anthropic: { cacheCreationInputTokens: 20_000 } }
+    );
+    const priced = createDisplayUsage(
+      { inputTokens: 21_000, cachedInputTokens: 0, outputTokens: 100 },
+      MODEL,
+      { anthropic: { cacheCreationInputTokens: 20_000 } }
+    );
+    if (unpriced === undefined || priced === undefined) throw new Error("expected usage");
+    // The sum prices the unpriced writes at $0 and marks the total as incomplete.
+    for (const parts of [[unpriced], [priced, unpriced]]) {
+      const sum = sumUsageHistory(parts);
+      if (sum === undefined) throw new Error("expected a sum");
+      expect(getCacheHealth(sum).rewriteCostUsd).toBeUndefined();
+    }
+    expect(getCacheHealth(priced).rewriteCostUsd).toBeGreaterThan(0);
   });
 
   test("reports no read share for a turn without prompt tokens", () => {
