@@ -34,10 +34,8 @@ describe("ask_user_question tool", () => {
     const result: unknown = await Promise.resolve(tool.execute!(args, toolOptions("ask-async")));
 
     expect(isAsyncAskUserQuestionOutput(result)).toBe(true);
-    expect(askUserQuestionManager.hasAsync(workspaceId, "ask-async")).toBe(true);
     // Nothing blocks on the user: there is no pending (blocking) entry to answer or cancel.
     expect(askUserQuestionManager.getLatestPending(workspaceId)).toBeNull();
-    askUserQuestionManager.deleteAsync(workspaceId, "ask-async");
   });
 
   it("still waits for the answers in plan agents", async () => {
@@ -58,6 +56,5 @@ describe("ask_user_question tool", () => {
     expect(result).toMatchObject({
       ui_only: { ask_user_question: { answers: { "Which option?": "First" } } },
     });
-    expect(askUserQuestionManager.hasAsync(workspaceId, "ask-plan")).toBe(false);
   });
 });

@@ -37,8 +37,8 @@ export const createAskUserQuestionTool: ToolFactory = (config: ToolConfiguration
       // best judgment. The card stays answerable, and WorkspaceService.answerAskUserQuestion
       // delivers the answers as a steering user message (after the current step, or as a new turn
       // when idle). Plan agents still block: their next step is a plan that needs the answers.
+      // No in-memory state: the persisted tool output (partial or history) identifies the question.
       if (config.planFileOnly !== true) {
-        askUserQuestionManager.registerAsync(config.workspaceId, toolCallId);
         return {
           summary: ASK_USER_QUESTION_ASYNC_SUMMARY,
           ui_only: {

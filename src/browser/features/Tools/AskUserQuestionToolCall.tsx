@@ -235,9 +235,10 @@ export function AskUserQuestionToolCall(props: {
   const [activeIndex, setActiveIndex] = useState(() => cachedState?.activeIndex ?? 0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  // Non-blocking questions: answers accepted by the backend but not yet in history (queued
-  // behind the running step), so the card stops offering the form right away.
-  const [submittedAnswers, setSubmittedAnswers] = useState<Record<string, string> | null>(null);
+  // Non-blocking questions: the backend accepted the answers, which may still be queued behind
+  // the running step. Only a note: the form stays until the answer row is durable, so a queued
+  // answer the user withdraws (Stop, queue clear) can simply be submitted again.
+  const [answersQueued, setAnswersQueued] = useState(false);
 
   const workspaceStore = useWorkspaceStoreRaw();
   const workspaceState = useSyncExternalStore(
@@ -264,13 +265,13 @@ export function AskUserQuestionToolCall(props: {
   );
 
   // Codex-style questions (non-plan agents) returned without waiting: the tool is complete, but
-  // the questions stay answerable until an answer message for this tool call exists.
+  // the questions stay answerable until an answer message for this tool call is in history.
   const isAsyncQuestion = isAsyncAskUserQuestionOutput(props.result);
   const deliveredAnswers = isAsyncQuestion
     ? (workspaceState?.messages.find(
         (message): message is DisplayedUserMessage =>
           message.type === "user" && message.askUserQuestionAnswer?.toolCallId === props.toolCallId
-      )?.askUserQuestionAnswer?.answers ?? submittedAnswers)
+      )?.askUserQuestionAnswer?.answers ?? null)
     : null;
   const isAnswering = props.status === "executing" || (isAsyncQuestion && deliveredAnswers == null);
 
@@ -515,7 +516,7 @@ export function AskUserQuestionToolCall(props: {
         // The backend already sent the answers as a steering message (it starts a turn when
         // idle); there is no blocked stream to resume.
         if (isAsyncQuestion) {
-          setSubmittedAnswers(answers);
+          setAnswersQueued(true);
           return;
         }
 
@@ -925,9 +926,11 @@ export function AskUserQuestionToolCall(props: {
             {isAnswering && (
               <div className="flex items-center justify-between gap-3 border-t border-white/5 pt-2">
                 <div className="text-muted min-w-0 flex-1 text-[10px] italic">
-                  {isAsyncQuestion
-                    ? "Your answers are sent to the agent as a message."
-                    : "Tip: type a message in chat to cancel these questions."}
+                  {!isAsyncQuestion
+                    ? "Tip: type a message in chat to cancel these questions."
+                    : answersQueued
+                      ? "Answers sent; they reach the agent after its current step."
+                      : "Your answers are sent to the agent as a message."}
                 </div>
                 {isOnSummary ? (
                   <Button

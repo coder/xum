@@ -269,6 +269,7 @@ import type {
 import { isDynamicToolPart } from "@/common/types/toolParts";
 import {
   ASK_USER_QUESTION_ANSWER_DEDUPE_PREFIX,
+  ASK_USER_QUESTION_ANSWER_METADATA_RESERVED_MESSAGE,
   buildAskUserQuestionAnswerMessage,
   buildAskUserQuestionSummary,
   isAsyncAskUserQuestionOutput,
@@ -477,7 +478,11 @@ import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpO
 
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createBashTool } from "@/node/services/tools/bash";
-import type { AskUserQuestionToolSuccessResult, BashToolResult } from "@/common/types/tools";
+import type {
+  AskUserQuestionQuestion,
+  AskUserQuestionToolSuccessResult,
+  BashToolResult,
+} from "@/common/types/tools";
 import { secretsToRecord } from "@/common/types/secrets";
 
 import {
@@ -15814,6 +15819,15 @@ export class WorkspaceService
     ) {
       return Err({ type: "unknown", raw: ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE });
     }
+    // Answer metadata marks a question answered (card state, repeat refusal), so only the
+    // answer-delivery path may set it; a forged row would lock out the real answer.
+    if (
+      internal?.askUserQuestionAnswer !== true &&
+      (options.muxMetadata as { askUserQuestionAnswer?: unknown } | undefined)
+        ?.askUserQuestionAnswer != null
+    ) {
+      return Err({ type: "unknown", raw: ASK_USER_QUESTION_ANSWER_METADATA_RESERVED_MESSAGE });
+    }
 
     let resumedInterruptedTask = false;
     // The attempt this call's own reawaken won: its failure rollback is CAS'd on it.
@@ -17592,62 +17606,80 @@ export class WorkspaceService
    * Codex-style answers to a non-blocking ask_user_question (answerDelivery "message"): send them
    * as a user message with the "tool-end" queue mode, so they steer the running turn after its
    * current step, or start a turn when the workspace is idle. Returns null when the tool call is
-   * not a non-blocking question, so the caller falls back to the blocking-question paths.
+   * not a non-blocking question in the current context, so the caller falls back to the
+   * blocking-question paths (which report it as not answerable).
+   *
+   * The question is looked up only in persisted state from the latest context boundary (history
+   * plus partial.json, which a live stream flushes within its partial-write throttle): a card
+   * from before a compaction or reset is not answerable, and there is no in-memory registry to
+   * outlive a boundary or drift from what was actually delivered.
    */
   private async tryDeliverAsyncAskUserQuestionAnswer(
     workspaceId: string,
     toolCallId: string,
     answers: Record<string, string>
   ): Promise<Result<void> | null> {
-    if (!askUserQuestionManager.hasAsync(workspaceId, toolCallId)) {
-      // After a restart (or once answered) the registry has no entry: the persisted tool output
-      // identifies the question, and a delivered answer in history makes a repeat an error.
-      const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
-      if (!historyResult.success) {
-        return null;
+    const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!historyResult.success) {
+      return null;
+    }
+    const partial = await this.historyService.readPartial(workspaceId);
+    const messages = partial ? [...historyResult.data, partial] : historyResult.data;
+
+    let questions: AskUserQuestionQuestion[] | undefined;
+    for (const message of messages) {
+      for (const part of message.parts) {
+        if (
+          isDynamicToolPart(part) &&
+          part.toolCallId === toolCallId &&
+          part.toolName === "ask_user_question" &&
+          part.state === "output-available" &&
+          isAsyncAskUserQuestionOutput(part.output)
+        ) {
+          const parsedArgs = AskUserQuestionToolArgsSchema.safeParse(part.input);
+          if (parsedArgs.success) {
+            questions = parsedArgs.data.questions;
+          }
+        }
       }
-      const partial = await this.historyService.readPartial(workspaceId);
-      const messages = partial ? [...historyResult.data, partial] : historyResult.data;
-      const isAsyncQuestion = messages.some((message) =>
-        message.parts.some(
-          (part) =>
-            isDynamicToolPart(part) &&
-            part.toolCallId === toolCallId &&
-            part.toolName === "ask_user_question" &&
-            part.state === "output-available" &&
-            isAsyncAskUserQuestionOutput(part.output)
-        )
-      );
-      if (!isAsyncQuestion) {
-        return null;
-      }
-      const alreadyAnswered = messages.some(
-        (message) =>
-          message.role === "user" &&
-          parseAskUserQuestionAnswerMetadata(message.metadata?.muxMetadata?.askUserQuestionAnswer)
-            ?.toolCallId === toolCallId
-      );
-      if (alreadyAnswered) {
-        return Err("These questions were already answered");
-      }
+    }
+    if (questions == null) {
+      return null;
+    }
+
+    // Only a delivered (durable) answer counts: a queued one the user withdrew (Stop, queue
+    // clear) leaves no row, so the card stays answerable and a retry sends again.
+    const alreadyAnswered = messages.some(
+      (message) =>
+        message.role === "user" &&
+        parseAskUserQuestionAnswerMetadata(message.metadata?.muxMetadata?.askUserQuestionAnswer)
+          ?.toolCallId === toolCallId
+    );
+    if (alreadyAnswered) {
+      return Err("These questions were already answered");
     }
 
     const sendOptions = await this.getDefaultSendOptions(workspaceId);
     const sendResult = await this.sendMessage(
       workspaceId,
-      buildAskUserQuestionAnswerMessage(answers),
+      buildAskUserQuestionAnswerMessage(toolCallId, questions, answers),
       {
         ...sendOptions,
         queueDispatchMode: "tool-end",
         muxMetadata: { type: "normal", askUserQuestionAnswer: { toolCallId, answers } },
       },
-      // A repeat while the first answer is still queued is a quiet no-op.
-      { queueDedupeKey: `${ASK_USER_QUESTION_ANSWER_DEDUPE_PREFIX}${toolCallId}` }
+      {
+        askUserQuestionAnswer: true,
+        // A repeat while the answer is still queued is a quiet no-op. The removable key also
+        // seals the entry: batched into another queued message it would lose its answer
+        // metadata (only the first entry's survives) or change that message's dispatch mode.
+        queueDedupeKey: `${ASK_USER_QUESTION_ANSWER_DEDUPE_PREFIX}${toolCallId}`,
+        removableQueueDedupeKey: true,
+      }
     );
     if (!sendResult.success) {
       return Err(this.formatSendMessageError(sendResult.error));
     }
-    askUserQuestionManager.deleteAsync(workspaceId, toolCallId);
     return Ok(undefined);
   }
 

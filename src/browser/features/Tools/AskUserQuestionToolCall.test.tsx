@@ -341,10 +341,15 @@ describe("AskUserQuestionToolCall", () => {
           toolCallId: "ask-async",
           answers: { "Which option?": "First" },
         });
-        expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
+        expect(view.getByRole("button", { name: "Submit answers" })).toHaveProperty(
+          "disabled",
+          false
+        );
       });
-      expect(view.getByText("User answered")).toBeTruthy();
-      // The backend delivered the answers as a message: there is no blocked stream to resume.
+      // Accepted is not durable: a queued answer can be withdrawn, so the form stays until the
+      // answer row is in history.
+      expect(view.queryByText("User answered")).toBeNull();
+      // The backend sends the answers as a message: there is no blocked stream to resume.
       expect(resumeStream).not.toHaveBeenCalled();
       expect(setAutoRetryEnabled).not.toHaveBeenCalled();
     });

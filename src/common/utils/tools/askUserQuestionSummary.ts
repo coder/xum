@@ -1,4 +1,5 @@
 import type { AskUserQuestionAnswerMetadata } from "@/common/types/message";
+import type { AskUserQuestionQuestion } from "@/common/types/tools";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 
 /**
@@ -10,17 +11,87 @@ export const ASK_USER_QUESTION_ASYNC_SUMMARY =
   "continue working with your best judgment and state the assumptions you make. If the user " +
   "answers, the answers arrive later as a user message; adjust your work to them then.";
 
+/** Generic sends that carry `muxMetadata.askUserQuestionAnswer` are refused with this. */
+export const ASK_USER_QUESTION_ANSWER_METADATA_RESERVED_MESSAGE =
+  "ask_user_question answer metadata is reserved for answers submitted from the question card.";
+
 /** Queue dedupe key prefix for answer deliveries; the suffix is the tool call id. */
 export const ASK_USER_QUESTION_ANSWER_DEDUPE_PREFIX = "ask-user-question-answer:";
 
-/** User-message text that delivers the answers to a non-blocking ask_user_question. */
-export function buildAskUserQuestionAnswerMessage(answers: Record<string, string>): string {
-  const lines = Object.entries(answers).map(([question, answer]) => {
-    const trimmed = answer.trim();
-    return `- ${question}\n  Answer: ${trimmed.length > 0 ? trimmed : "(skipped)"}`;
+/**
+ * Splits one answer string (as built by the question card: selected labels joined with ", ",
+ * then any "Other" text) into option indices and the user's own free text. Labels may contain
+ * commas, so labels are matched over runs of comma-separated segments, not single tokens.
+ */
+function parseAnswerSelection(
+  question: AskUserQuestionQuestion,
+  answer: string
+): { optionNumbers: number[]; otherText: string } {
+  const trimmed = answer.trim();
+  const labels = question.options.map((option) => option.label);
+  const wholeMatch = labels.indexOf(trimmed);
+  if (trimmed.length === 0 || wholeMatch !== -1) {
+    return { optionNumbers: wholeMatch === -1 ? [] : [wholeMatch + 1], otherText: "" };
+  }
+  if (!question.multiSelect) {
+    return { optionNumbers: [], otherText: trimmed };
+  }
+
+  const segments = trimmed.split(",");
+  const optionNumbers: number[] = [];
+  const otherSegments: string[] = [];
+  let position = 0;
+  while (position < segments.length) {
+    const matchIndex = labels.findIndex((label) => {
+      const span = label.split(",").length;
+      return (
+        segments
+          .slice(position, position + span)
+          .join(",")
+          .trim() === label
+      );
+    });
+    if (matchIndex === -1) {
+      otherSegments.push(segments[position]);
+      position += 1;
+    } else {
+      optionNumbers.push(matchIndex + 1);
+      position += labels[matchIndex].split(",").length;
+    }
+  }
+  return { optionNumbers, otherText: otherSegments.join(",").trim() };
+}
+
+/**
+ * User-message text that delivers the answers to a non-blocking ask_user_question.
+ *
+ * SECURITY: question text and option labels are model-authored, so they must not be promoted
+ * into a user-role message (repository or tool content could plant instructions in them).
+ * The message refers to questions and options by number, and includes only the text the user
+ * typed for "Other"; the model reads the wording from its own tool call.
+ */
+export function buildAskUserQuestionAnswerMessage(
+  toolCallId: string,
+  questions: readonly AskUserQuestionQuestion[],
+  answers: Record<string, string>
+): string {
+  const lines = questions.map((question, index) => {
+    const { optionNumbers, otherText } = parseAnswerSelection(
+      question,
+      answers[question.question] ?? ""
+    );
+    const parts: string[] = [];
+    if (optionNumbers.length > 0) {
+      parts.push(`${optionNumbers.length > 1 ? "options" : "option"} ${optionNumbers.join(", ")}`);
+    }
+    if (otherText.length > 0) {
+      parts.push(`other: ${JSON.stringify(otherText)}`);
+    }
+    return `- Question ${index + 1}: ${parts.length > 0 ? parts.join("; ") : "skipped"}`;
   });
   return [
-    "Answers to your earlier ask_user_question:",
+    `The user answered your ask_user_question (tool call ${toolCallId}). ` +
+      "Questions and options are numbered as in that call:",
     ...lines,
     "Revisit any work that assumed differently.",
   ].join("\n");
