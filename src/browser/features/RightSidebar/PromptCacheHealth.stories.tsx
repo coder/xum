@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, within } from "@storybook/test";
 
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
 import type { TurnCacheHealth } from "@/common/utils/tokens/cacheHealth";
 import { PromptCacheHealth } from "./PromptCacheHealth";
@@ -58,6 +58,9 @@ const meta = {
   title: "Features/RightSidebar/PromptCacheHealth",
   component: PromptCacheHealth,
   args: { session: SESSION, turns: TURNS },
+  // Play contracts only: the Pixel file budget is full, and RightSidebar's
+  // CostsTabWithCacheCreate already snapshots this section inside the real Costs tab.
+  parameters: { ...lightweightMeta.parameters, pixel: PIXEL_DISABLED },
 } satisfies Meta<typeof PromptCacheHealth>;
 
 export default meta;
@@ -80,11 +83,6 @@ export const SidebarWidth: Story = {
 export const PhoneWidth: Story = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
-  },
-  parameters: {
-    pixel: {
-      matrix: { viewports: ["phone"] },
-    },
   },
   render: (args) => (
     <div className="bg-background text-light font-primary w-full p-2 text-[13px]">
