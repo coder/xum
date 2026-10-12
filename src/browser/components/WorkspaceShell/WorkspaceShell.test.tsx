@@ -620,6 +620,8 @@ describe("WorkspaceShell loading placeholders", () => {
       await gate.fail();
       expect(view.getByRole("alert").textContent).toContain("Sidebar failed to load.");
       expect(view.getByTestId("chat-pane")).toBeTruthy();
+      // RightSidebar never mounts, so the shell keeps Cmd/Ctrl+W from closing the window.
+      expect(fireEvent.keyDown(document.body, { key: "w", ctrlKey: true })).toBe(false);
       consoleError.mockRestore();
     });
   });

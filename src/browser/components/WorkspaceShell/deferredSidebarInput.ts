@@ -65,3 +65,15 @@ export function holdSidebarInput(held: HeldSidebarInput[]): () => void {
     for (const type of SIDEBAR_EVENTS) window.removeEventListener(type, holdEvent, true);
   };
 }
+
+/**
+ * After the sidebar chunk failed to load: RightSidebar never mounts, so keep its guard that stops
+ * Cmd/Ctrl+W from closing the window. Returns the cleanup.
+ */
+export function guardCloseTab(): () => void {
+  const guard = (e: KeyboardEvent) => {
+    if (matchesKeybind(e, KEYBINDS.CLOSE_TAB)) e.preventDefault();
+  };
+  window.addEventListener("keydown", guard);
+  return () => window.removeEventListener("keydown", guard);
+}

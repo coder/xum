@@ -17,7 +17,7 @@ import {
   updatePersistedState,
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
-import { holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
+import { guardCloseTab, holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
@@ -99,9 +99,13 @@ const RightSidebar = React.lazy(async () => ({
   default: (await import("@/browser/features/RightSidebar/RightSidebar")).RightSidebar,
 }));
 
-/** While the sidebar chunk loads: hold its input. Once it has mounted: replay that input. */
-function SidebarInput(props: { held: HeldSidebarInput[]; mode: "hold" | "replay" }) {
+/**
+ * While the sidebar chunk loads: hold its input. Once it has mounted: replay that input. After it
+ * failed: only keep Cmd/Ctrl+W from closing the window (the held input is never replayed).
+ */
+function SidebarInput(props: { held: HeldSidebarInput[]; mode: "hold" | "replay" | "failed" }) {
   useEffect(() => {
+    if (props.mode === "failed") return guardCloseTab();
     if (props.mode === "hold") return holdSidebarInput(props.held);
     // An effect of RightSidebar's next sibling, so it runs after RightSidebar's own listeners exist.
     for (const replay of props.held.splice(0)) replay();
@@ -159,6 +163,7 @@ function LazyRightSidebar(
       }
     >
       {state}
+      {kind === "failed" && <SidebarInput held={held} mode="failed" />}
       {props.fullscreen && <FullscreenSidebarClose onClose={props.onCloseFullscreen} />}
     </div>
   );
