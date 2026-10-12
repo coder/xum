@@ -363,34 +363,38 @@ describe("bridge annotate mode", () => {
 
 describe("in-page links", () => {
   // A srcdoc frame resolves "#id" against the app's URL, so an unhandled click navigates the
-  // frame to the app and the navigation guard closes the artifact. HTML artifacts and MCP App
-  // views both get the handler.
+  // frame to the app and the navigation guard closes the artifact. The handler replays the
+  // fragment against the frame's own URL instead (a same-document navigation). HTML artifacts
+  // and MCP App views both get it.
   test.each([
     ["HTML artifact bridge", buildArtifactBridgeScript("light")],
     ["MCP App preamble", MCP_APP_PREAMBLE_SCRIPT],
-  ])("%s scrolls to the target instead of navigating", async (_name, script) => {
+  ])("%s keeps # links inside the frame document", async (_name, script) => {
     const win = new HappyWindow({ url: "http://localhost/workspace/abc" });
     const doc = win.document;
     doc.body.innerHTML = `
       <a id="plain" href="#intro">Intro</a>
-      <a id="encoded" href="#caf%C3%A9">Cafe</a>
-      <a id="legacy" href="#old"><span id="inner">Old</span></a>
-      <a id="top-link" href="#top">Top</a>
+      <a id="encoded" href=" #caf%C3%A9 ">Cafe</a>
+      <a id="parent" href="#old"><span id="inner">Old</span></a>
+      <a id="top-link" href="#">Top</a>
       <a id="external" href="https://example.com/#intro">External</a>
+      <a id="no-href">Not a link</a>
       <a id="own" href="#intro">Handled by the artifact</a>
-      <h2 id="intro">Intro</h2><h2 id="café">Cafe</h2><input name="old"><a name="old">Old</a>`;
-    const scrolled: string[] = [];
-    for (const element of Array.from(doc.querySelectorAll("h2, a, input"))) {
-      element.scrollIntoView = () => scrolled.push(`${element.localName}:${element.textContent}`);
-    }
-    win.scrollTo = (() => scrolled.push("top")) as typeof win.scrollTo;
+      <svg><a id="svg"><text>SVG</text></a></svg>`;
+    doc
+      .getElementById("svg")!
+      .setAttributeNS("http://www.w3.org/1999/xlink", "xlink:href", "#intro");
+    // The frame's own URL, already at a fragment from an earlier jump.
+    const replaced: string[] = [];
+    const location = { href: "about:srcdoc#earlier", replace: (url: string) => replaced.push(url) };
     // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
-    const run = new Function("window", "document", "CustomEvent", script) as (
+    const run = new Function("window", "document", "CustomEvent", "location", script) as (
       window: unknown,
       document: unknown,
-      customEvent: unknown
+      customEvent: unknown,
+      location: unknown
     ) => void;
-    run(win, doc, win.CustomEvent);
+    run(win, doc, win.CustomEvent, location);
     // The artifact's own handler, which takes over one link.
     doc.getElementById("own")!.addEventListener("click", (event) => event.preventDefault());
     // Last listener: record what the shim decided, then stop Happy DOM from navigating.
@@ -402,26 +406,30 @@ describe("in-page links", () => {
     const click = (
       id: string,
       init: { ctrlKey?: boolean; button?: number } = {}
-    ): { prevented: boolean | null; scrolled: string[] } => {
-      scrolled.length = 0;
+    ): { prevented: boolean | null; replaced: string[] } => {
+      replaced.length = 0;
       seen.prevented = null;
       doc
         .getElementById(id)!
         .dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true, ...init }));
-      return { prevented: seen.prevented, scrolled: [...scrolled] };
+      return { prevented: seen.prevented, replaced: [...replaced] };
     };
 
-    expect(click("plain")).toEqual({ prevented: true, scrolled: ["h2:Intro"] });
-    expect(click("encoded")).toEqual({ prevented: true, scrolled: ["h2:Cafe"] });
-    // A click on a child of the link; the name lookup skips the <input name="old">.
-    expect(click("inner")).toEqual({ prevented: true, scrolled: ["a:Old"] });
-    expect(click("top-link")).toEqual({ prevented: true, scrolled: ["top"] });
+    const jump = (url: string) => ({ prevented: true, replaced: [url] });
+    expect(click("plain")).toEqual(jump("about:srcdoc#intro"));
+    // The raw fragment, trimmed like a URL, is left for the browser's own lookup to decode.
+    expect(click("encoded")).toEqual(jump("about:srcdoc#caf%C3%A9"));
+    expect(click("inner")).toEqual(jump("about:srcdoc#old"));
+    expect(click("top-link")).toEqual(jump("about:srcdoc#"));
+    expect(click("svg")).toEqual(jump("about:srcdoc#intro"));
     // Left to the browser (and the navigation guards): other URLs, modified and non-left clicks.
-    expect(click("external")).toEqual({ prevented: false, scrolled: [] });
-    expect(click("plain", { ctrlKey: true })).toEqual({ prevented: false, scrolled: [] });
-    expect(click("plain", { button: 1 })).toEqual({ prevented: false, scrolled: [] });
-    // The artifact's own preventDefault wins: the shim does not scroll on top of it.
-    expect(click("own")).toEqual({ prevented: true, scrolled: [] });
+    const untouched = { prevented: false, replaced: [] };
+    expect(click("external")).toEqual(untouched);
+    expect(click("no-href")).toEqual(untouched);
+    expect(click("plain", { ctrlKey: true })).toEqual(untouched);
+    expect(click("plain", { button: 1 })).toEqual(untouched);
+    // The artifact's own preventDefault wins: the shim does not navigate on top of it.
+    expect(click("own")).toEqual({ prevented: true, replaced: [] });
     await win.happyDOM.close();
   });
 });

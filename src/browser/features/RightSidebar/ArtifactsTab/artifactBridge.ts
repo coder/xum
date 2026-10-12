@@ -232,43 +232,38 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
 
 /**
  * Frame script (a statement, run inside the bridge's IIFE and the MCP App preamble) that makes
- * in-page links (`<a href="#section">`) scroll instead of navigate.
+ * in-page links (`<a href="#section">`) jump within the artifact instead of navigating away.
  *
  * Why: a srcdoc frame resolves relative URLs against the parent page, so `#section` becomes
  * `<app URL>#section`: a cross-document navigation to the Xum app, not a fragment jump. The
  * navigation guard (frameNavigationGuard.tsx) then closes the artifact as "navigated away",
  * and the desktop app refuses the navigation (subframeNavigation.ts). CSP `base-uri 'none'`
- * rules out a `<base>` fix. So plain left clicks on a link whose raw href starts with `#`
- * are cancelled and the target is scrolled into view, the way the browser would have:
- * element by id (raw, then percent-decoded), else `<a name>`, else the top for `#` and `#top`.
- * `scrollIntoView` instead of `location.hash`: no history entry, and `:target` does not apply.
+ * rules out a `<base>` fix. So a plain left click on a link (`href`, or SVG `xlink:href`)
+ * whose raw value starts with `#` is cancelled and replayed against the frame's own URL:
+ * `location.replace("about:srcdoc#section")`. That is a same-document fragment navigation, so
+ * the browser runs its own fragment steps (id and `<a name>` lookup, decoding, `#`/`#top`,
+ * focus, `:target`, `hashchange`). The frame loads nothing and the desktop guard sees no
+ * navigation. `replace` adds no history entry, so the app's Back button is unaffected.
  *
- * SECURITY AUDIT: it only ever cancels a navigation, it never starts one, so both navigation
- * guards stay as they are. It registers on window in the bubble phase, so the artifact's own
- * element and document handlers run first, and one that calls preventDefault keeps the click.
- * Annotate mode stops the click in the capture phase before it gets here.
+ * SECURITY AUDIT: the only URL it navigates to is the document's own URL with a new fragment,
+ * which cannot leave the document, so both navigation guards stay as they are. It registers on
+ * window in the bubble phase, so the artifact's own element and document handlers run first,
+ * and one that calls preventDefault keeps the click. Annotate mode stops the click in the
+ * capture phase before it gets here.
  */
 export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `window.addEventListener("click", function (event) {
     if (event.defaultPrevented || event.button !== 0) return;
     if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
     var target = event.target;
-    var link = target && typeof target.closest === "function" ? target.closest("a[href], area[href]") : null;
+    var link = target && typeof target.closest === "function" ? target.closest("a, area") : null;
     if (!link) return;
-    var href = String(link.getAttribute("href")).trim();
+    var href = link.getAttribute("href");
+    if (href === null) href = link.getAttributeNS("http://www.w3.org/1999/xlink", "href");
+    if (href === null) return;
+    href = href.trim();
     if (href.charAt(0) !== "#") return;
     event.preventDefault();
-    var raw = href.slice(1);
-    var decoded = raw;
-    try { decoded = decodeURIComponent(raw); } catch (error) {}
-    var element = document.getElementById(raw) || document.getElementById(decoded);
-    if (!element) {
-      var named = document.getElementsByName(decoded);
-      for (var i = 0; i < named.length && !element; i++) {
-        if (named[i].localName === "a") element = named[i];
-      }
-    }
-    if (element) element.scrollIntoView();
-    else if (decoded === "" || decoded.toLowerCase() === "top") window.scrollTo(0, 0);
+    location.replace(location.href.replace(/#.*$/, "") + href);
   });`;
 
 export function buildArtifactBridgeScript(
