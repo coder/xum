@@ -20,11 +20,6 @@ interface UsageCostInputs {
 
 interface RecomputeUsageCostsOptions {
   aggregatedUsage?: boolean;
-  /**
-   * The usage bucket's own model is `metadataModel` (no "Treat as" mapping), so its stored
-   * costs were priced by `metadataModel`'s rates rather than by some other model's.
-   */
-  pricedAsItself?: boolean;
 }
 
 interface UsageCosts {
@@ -97,47 +92,6 @@ function calculateUsageCosts(modelStats: ModelStats, usage: UsageCostInputs): Us
     outputCost: usage.outputTokens * outputRate,
     reasoningCost: usage.reasoningTokens * outputRate,
   };
-}
-
-const STORED_COST_COMPONENTS = [
-  ["input", "inputCost"],
-  ["cached", "cachedCost"],
-  ["cacheCreate", "cacheCreateCost"],
-  ["output", "outputCost"],
-  ["reasoning", "reasoningCost"],
-] as const;
-
-/**
- * Whether every stored component cost of an aggregate is one the current tiered rates can
- * produce. Each request bills all of its tokens at either the base or the long-context rate,
- * so a sum priced with these rates lies between "all base" and "all long-context" per
- * component. Costs outside that band were priced by other rates (or are partial).
- */
-function storedCostsMatchTieredRates(
-  usage: ChatUsageDisplay,
-  modelStats: ModelStats,
-  tokens: UsageCostInputs
-): boolean {
-  // Pin the threshold to force every component into one tier, reusing calculateUsageCosts'
-  // field mapping (a missing long-context rate falls back to the base rate there too).
-  const allBase = calculateUsageCosts(
-    { ...modelStats, tiered_pricing_threshold_tokens: Number.POSITIVE_INFINITY },
-    tokens
-  );
-  const allLong = calculateUsageCosts(
-    { ...modelStats, tiered_pricing_threshold_tokens: Number.NEGATIVE_INFINITY },
-    tokens
-  );
-
-  return STORED_COST_COMPONENTS.every(([component, costKey]) => {
-    const stored = usage[component].cost_usd;
-    if (stored === undefined) return false;
-    const low = Math.min(allBase[costKey], allLong[costKey]);
-    const high = Math.max(allBase[costKey], allLong[costKey]);
-    // Summing per-request float costs drifts slightly from tokens × rate.
-    const tolerance = high * 1e-9 + 1e-12;
-    return stored >= low - tolerance && stored <= high + tolerance;
-  });
 }
 
 /**
@@ -292,8 +246,7 @@ export function createDisplayUsage(
  * persisted session cost aggregates without discarding the raw token counts.
  *
  * Pass `{ aggregatedUsage: true }` for buckets like session `byModel` totals that may span
- * many requests. Tiered pricing is non-linear, so those aggregates cannot be safely repriced
- * from summed tokens alone.
+ * many requests. Tiered pricing is non-linear, so those aggregates keep their recorded costs.
  */
 export function recomputeUsageCosts(
   usage: ChatUsageDisplay,
@@ -318,47 +271,29 @@ export function recomputeUsageCosts(
     };
   }
 
-  // A sum across service tiers cannot be split back into per-tier tokens (#4787).
-  if (serviceTier === "mixed") {
-    return {
-      ...usage,
-      hasUnknownCosts: true,
-    };
+  // A sum cannot be split back into per-request tiers: neither service tiers (#4787) nor
+  // context-window tiers, where pricing the summed prompt would bill every request at the
+  // long-context rate. Each request was priced at its own tiers when recorded, so keep those
+  // costs. They are known, not "unknown": that warning is reserved for unpriced models, and
+  // flagging tiered sums showed it for every session that used Haiku 5.5.
+  if (
+    serviceTier === "mixed" ||
+    (options?.aggregatedUsage === true && hasTieredPricing(modelStats))
+  ) {
+    return usage;
   }
 
   const pricedStats =
     serviceTier !== undefined
       ? withServiceTierPricing(modelStats, metadataModel, serviceTier)
       : modelStats;
-  const tokens: UsageCostInputs = {
+  const costs = calculateUsageCosts(pricedStats, {
     inputTokens: usage.input.tokens,
     cachedTokens: usage.cached.tokens,
     cacheCreateTokens: usage.cacheCreate.tokens,
     outputTokens: usage.output.tokens,
     reasoningTokens: usage.reasoning.tokens,
-  };
-
-  if (options?.aggregatedUsage === true && hasTieredPricing(pricedStats)) {
-    // Aggregated `byModel` totals collapse many requests into one bucket. Tiered pricing is
-    // non-linear, so choosing a single tier from the sum can inflate costs once multiple
-    // sub-threshold requests add up past the long-context boundary. Preserve the stored costs.
-    // Flagging every tiered aggregate made sessions that used Haiku 5.5 (the only tiered
-    // Claude model) show "unknown pricing" after each reload, so stored costs count as
-    // current when the bucket prices as itself and they fit its rates. A fit alone only
-    // proves plausibility: under a mapping, another model's costs can land in the band too.
-    if (
-      options.pricedAsItself === true &&
-      storedCostsMatchTieredRates(usage, pricedStats, tokens)
-    ) {
-      // Keep an existing flag: it can mark a genuinely partial sum (an unpriced request merged
-      // by sumUsageHistory) whose known part still fits the band. A flag from an earlier
-      // in-memory reprice is never persisted, so it heals on the next session load.
-      return { ...usage };
-    }
-    return { ...usage, hasUnknownCosts: true };
-  }
-
-  const costs = calculateUsageCosts(pricedStats, tokens);
+  });
 
   return {
     input: {

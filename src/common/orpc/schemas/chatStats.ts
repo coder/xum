@@ -35,6 +35,9 @@ export const ChatUsageDisplaySchema = z.object({
   costsIncluded: z.boolean().optional(),
   // Without it, the schema would strip the tier and repricing would drop the premium (#4787).
   serviceTier: z.enum(["flex", "fast", "ultrafast", "unknown", "mixed"]).optional(),
+  // Merged sums of unpriced requests hold numeric partial costs, so only this flag keeps the
+  // unknown-pricing warning across IPC.
+  hasUnknownCosts: z.boolean().optional(),
 });
 
 export const ChatStatsSchema = z.object({

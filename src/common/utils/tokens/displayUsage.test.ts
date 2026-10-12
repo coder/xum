@@ -380,83 +380,17 @@ describe("createDisplayUsage", () => {
       expect(result!.output.cost_usd).toBeCloseTo(0.0225);
     });
 
-    test("preserves aggregate GPT-6.1 Sol totals during repricing and flags them as approximate", () => {
-      const aggregate = {
-        input: { tokens: 200000, cost_usd: 1 },
-        cached: { tokens: 100000, cost_usd: 0.05 },
-        cacheCreate: { tokens: 0, cost_usd: 0 },
-        output: { tokens: 1000, cost_usd: 0.03 },
-        reasoning: { tokens: 0, cost_usd: 0 },
-        model: "openai:gpt-6.1-sol",
-      };
-
-      const result = recomputeUsageCosts(aggregate, "openai:gpt-6.1-sol", {
-        aggregatedUsage: true,
-      });
-
-      expect(result).toEqual({
-        ...aggregate,
-        hasUnknownCosts: true,
-      });
-    });
-
-    test("keeps Haiku 5.5 aggregates priced at its own rates without flagging them", () => {
+    test("keeps the recorded costs of a tiered aggregate without an unknown-pricing flag", () => {
       const model = "anthropic:claude-haiku-5-5";
-      // One request under and one above the 100K threshold, so the sum mixes both tiers.
-      const short = createDisplayUsage(
-        { inputTokens: 50000, outputTokens: 500, totalTokens: 50500, cachedInputTokens: 20000 },
-        model
-      );
-      const long = createDisplayUsage(
-        { inputTokens: 150000, outputTokens: 800, totalTokens: 150800, cachedInputTokens: 90000 },
-        model,
-        { anthropic: { cacheCreationInputTokens: 10000 } }
-      );
-      const aggregate = sumUsageHistory([short!, long!])!;
-      const options = { aggregatedUsage: true, pricedAsItself: true };
+      // Each request is under Haiku 5.5's 100K threshold; their sum is not.
+      const request = () =>
+        createDisplayUsage({ inputTokens: 80000, outputTokens: 500, totalTokens: 80500 }, model)!;
+      const aggregate = sumUsageHistory([request(), request()])!;
 
-      const result = recomputeUsageCosts(aggregate, model, options);
-      expect(result.hasUnknownCosts).toBeUndefined();
+      const result = recomputeUsageCosts(aggregate, model, { aggregatedUsage: true });
+
       expect(result).toEqual(aggregate);
-
-      // A sum that already knows it is partial stays flagged even when its known part fits.
-      const partial = recomputeUsageCosts({ ...aggregate, hasUnknownCosts: true }, model, options);
-      expect(partial.hasUnknownCosts).toBe(true);
-    });
-
-    test("flags a Haiku 5.5 aggregate whose costs do not fit the effective rates", () => {
-      const aggregate = sumUsageHistory([
-        createDisplayUsage(
-          { inputTokens: 50000, outputTokens: 500, totalTokens: 50500 },
-          "anthropic:claude-haiku-5-5"
-        )!,
-      ])!;
-
-      // Same bucket, but its rates now differ (e.g. corrected in an app update).
-      const result = recomputeUsageCosts(aggregate, "openai:gpt-6.1-sol", {
-        aggregatedUsage: true,
-        pricedAsItself: true,
-      });
-
-      expect(result).toEqual({ ...aggregate, hasUnknownCosts: true });
-    });
-
-    test("flags a mapped aggregate even when its costs fit the new model's rates", () => {
-      // Haiku 5.5's own costs trivially fit its band; under a "Treat as" mapping the stored
-      // costs may come from another model whose rates also land in it.
-      const aggregate = sumUsageHistory([
-        createDisplayUsage(
-          { inputTokens: 50000, outputTokens: 500, totalTokens: 50500 },
-          "anthropic:claude-haiku-5-5"
-        )!,
-      ])!;
-
-      const result = recomputeUsageCosts(aggregate, "anthropic:claude-haiku-5-5", {
-        aggregatedUsage: true,
-        pricedAsItself: false,
-      });
-
-      expect(result).toEqual({ ...aggregate, hasUnknownCosts: true });
+      expect(result.hasUnknownCosts).toBeUndefined();
     });
 
     test("recomputes persisted GPT-6 Astra usage with the higher long-context tier", () => {
@@ -819,12 +753,20 @@ describe("repricing keeps the billed service tier (#4787)", () => {
     expect(total(repriced)).toBeCloseTo(total(aggregate), 12);
   });
 
-  test("keeps the stored costs, marked approximate, of an aggregate that mixes tiers", () => {
+  test("keeps the recorded costs of an aggregate that mixes tiers", () => {
     const aggregate = sumUsageHistory([priced(MODEL, "priority"), priced(MODEL)]);
     if (aggregate === undefined) throw new Error("expected an aggregate");
-    expect(recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true })).toEqual({
-      ...aggregate,
-      hasUnknownCosts: true,
-    });
+    expect(recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true })).toEqual(aggregate);
+  });
+
+  test("an unpriced model's sum keeps its unknown-pricing flag through the schema", () => {
+    const unpriced = () =>
+      createDisplayUsage(
+        { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
+        "openai:some-unknown-model"
+      )!;
+    // Merging turns the unknown costs into numeric partial sums; only the flag remains.
+    const merged = ChatUsageDisplaySchema.parse(sumUsageHistory([unpriced(), unpriced()]));
+    expect(sumUsageHistory([merged])?.hasUnknownCosts).toBe(true);
   });
 });
