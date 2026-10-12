@@ -28,13 +28,19 @@ function baseMessages(): Message[] {
 }
 
 /** Mirrors the wire wrapper: cache markers on the last tool, the system block and the last block. */
-function body(messages: Message[], tools: object[] = TOOLS, system = "You are Xum.") {
+function body(
+  messages: Message[],
+  tools: object[] = TOOLS,
+  system = "You are Xum.",
+  options: Record<string, unknown> = {}
+) {
   const marked = structuredClone(messages);
   Object.assign(marked.at(-1)?.content.at(-1) ?? {}, MARKER);
   return {
     tools: tools.map((tool, index) => (index === tools.length - 1 ? { ...tool, ...MARKER } : tool)),
     system: [{ type: "text", text: system, ...MARKER }],
     messages: marked,
+    ...options,
   };
 }
 
@@ -51,8 +57,13 @@ function expectBreak(previous: Record<string, unknown>, next: Record<string, unk
   return comparison satisfies PromptCachePrefixBreak;
 }
 
-// Blocks before the conversation's third content block: 2 tools, 1 system, user text, tool_use.
-const FIRST_RESULT_INDEX = 5;
+// Block order: 2 tools, the system sentinel, 1 system block, the messages
+// sentinel, then the user text, the tool_use and the tool_result.
+const SYSTEM_OPTIONS_INDEX = TOOLS.length;
+const SYSTEM_INDEX = SYSTEM_OPTIONS_INDEX + 1;
+const MESSAGE_OPTIONS_INDEX = SYSTEM_INDEX + 1;
+const FIRST_TOOL_USE_INDEX = MESSAGE_OPTIONS_INDEX + 2;
+const FIRST_RESULT_INDEX = FIRST_TOOL_USE_INDEX + 1;
 
 describe("comparePromptCachePrefix", () => {
   test("an appended step extends the prefix even though the cache markers moved", () => {
@@ -129,7 +140,7 @@ describe("comparePromptCachePrefix", () => {
     expect(expectBreak(body(baseMessages()), body(baseMessages(), tools))).toMatchObject({
       section: "tools",
       blockIndex: TOOLS.length,
-      previous: { role: "system", type: "text" },
+      previous: { role: "request", type: "system_options" },
       next: { role: "tool", type: "tool", toolName: "mcp_search" },
     });
   });
@@ -137,7 +148,7 @@ describe("comparePromptCachePrefix", () => {
   test("an edited system block breaks in the system section without leaking its text", () => {
     const edited = body(baseMessages(), TOOLS, "You are Xum. Today is Monday.");
     const comparison = expectBreak(body(baseMessages()), edited);
-    expect(comparison).toMatchObject({ section: "system", blockIndex: TOOLS.length });
+    expect(comparison).toMatchObject({ section: "system", blockIndex: SYSTEM_INDEX });
     expect(describePromptCacheBreak(comparison)).not.toContain("Monday");
   });
 
@@ -181,7 +192,7 @@ describe("comparePromptCachePrefix", () => {
     });
     expect(compare(body(programmatic), body(rebuilt))).toMatchObject({
       kind: "break",
-      blockIndex: TOOLS.length + 2,
+      blockIndex: FIRST_TOOL_USE_INDEX,
     });
   });
 
@@ -192,5 +203,203 @@ describe("comparePromptCachePrefix", () => {
       previous: { type: "tool_result" },
     });
     expect(comparison.next).toBeUndefined();
+  });
+});
+
+describe("fingerprintAnthropicRequest follows Anthropic's cache invalidation table", () => {
+  test.each([
+    ["thinking", { thinking: { type: "enabled", budget_tokens: 4096 } }],
+    ["output_config.effort", { output_config: { effort: "high" } }],
+    ["tool_choice", { tool_choice: { type: "any" } }],
+    [
+      "disable_parallel_tool_use",
+      { tool_choice: { type: "auto", disable_parallel_tool_use: true } },
+    ],
+  ])("changing %s breaks the messages cache, not tools or system", (_name, options) => {
+    expect(
+      expectBreak(body(baseMessages()), body(baseMessages(), TOOLS, undefined, options))
+    ).toMatchObject({
+      section: "messages",
+      blockIndex: MESSAGE_OPTIONS_INDEX,
+      previous: { role: "request", type: "message_options" },
+    });
+  });
+
+  test("adding the first image breaks the messages cache; a later image extends", () => {
+    const screenshot = {
+      type: "image",
+      source: { type: "base64", media_type: "image/png", data: "AA" },
+    };
+    const withImage = [
+      ...baseMessages(),
+      { role: "assistant", content: [call("c2", "computer")] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "c2", content: [screenshot] }],
+      },
+    ];
+    expect(expectBreak(body(baseMessages()), body(withImage))).toMatchObject({
+      section: "messages",
+      blockIndex: MESSAGE_OPTIONS_INDEX,
+    });
+    const another = [...withImage, { role: "user", content: [screenshot] }];
+    expect(compare(body(withImage), body(another)).kind).toBe("extends");
+
+    // The prompt form shows images as file parts with an image media type.
+    const promptForm = (extra: unknown[]) => ({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }, ...extra],
+    });
+    const file = { type: "file", mediaType: "image/png", data: "AA" };
+    expect(
+      expectBreak(promptForm([]), promptForm([{ role: "user", content: [file] }]))
+    ).toMatchObject({
+      section: "messages",
+      previous: { type: "message_options" },
+    });
+  });
+
+  test("toggling native web search or citations breaks system, keeping every tool block", () => {
+    const webSearch = { type: "web_search_20250305", name: "web_search", max_uses: 5 };
+    expect(
+      expectBreak(body(baseMessages()), body(baseMessages(), [...TOOLS, webSearch]))
+    ).toMatchObject({ section: "system", blockIndex: SYSTEM_OPTIONS_INDEX });
+
+    const promptTools = (extra: object[]) => ({
+      tools: [{ type: "function", name: "bash", inputSchema: { type: "object" } }, ...extra],
+      prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    });
+    const providerTool = {
+      type: "provider",
+      id: "anthropic.web_fetch_20250910",
+      name: "web_fetch",
+      args: {},
+    };
+    expect(expectBreak(promptTools([]), promptTools([providerTool]))).toMatchObject({
+      section: "system",
+      blockIndex: 1,
+    });
+
+    const document = (citations: boolean) => [
+      {
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: { type: "text", media_type: "text/plain", data: "notes" },
+            ...(citations ? { citations: { enabled: true } } : {}),
+          },
+        ],
+      },
+    ];
+    expect(expectBreak(body(document(false)), body(document(true)))).toMatchObject({
+      section: "system",
+      blockIndex: SYSTEM_OPTIONS_INDEX,
+    });
+  });
+
+  test("adding or changing a deferred tool extends the prefix", () => {
+    const deferred = (description: string) => [
+      ...TOOLS,
+      { name: "zulip_send", description, input_schema: { type: "object" }, defer_loading: true },
+    ];
+    expect(compare(body(baseMessages()), body(baseMessages(), deferred("v1"))).kind).toBe(
+      "extends"
+    );
+    expect(
+      compare(body(baseMessages(), deferred("v1")), body(baseMessages(), deferred("v2"))).kind
+    ).toBe("extends");
+
+    const promptDeferred = {
+      type: "function",
+      name: "zulip_send",
+      inputSchema: { type: "object" },
+      providerOptions: { anthropic: { deferLoading: true } },
+    };
+    const promptBody = (tools: object[]) => ({
+      tools: [{ type: "function", name: "bash", inputSchema: { type: "object" } }, ...tools],
+      prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    });
+    expect(compare(promptBody([]), promptBody([promptDeferred])).kind).toBe("extends");
+  });
+
+  test("a cache_control field inside a tool schema or tool input is application data", () => {
+    const schema = (value: string) => [
+      TOOLS[0],
+      {
+        name: "bash",
+        input_schema: {
+          type: "object",
+          properties: { cache_control: { type: "string", description: value } },
+        },
+      },
+    ];
+    expect(
+      expectBreak(body(baseMessages(), schema("a")), body(baseMessages(), schema("b")))
+    ).toMatchObject({ section: "tools", blockIndex: 1 });
+
+    const input = (value: string) => [
+      { role: "user", content: [{ type: "text", text: "go" }] },
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "c1", name: "bash", input: { cacheControl: value } }],
+      },
+      { role: "user", content: [result("c1", "ok")] },
+    ];
+    expect(expectBreak(body(input("a")), body(input("b")))).toMatchObject({
+      section: "messages",
+      blockIndex: FIRST_TOOL_USE_INDEX,
+    });
+  });
+
+  test("an appended mid-conversation system message extends the prefix in place", () => {
+    const prompt = (extra: unknown[]) => ({
+      prompt: [
+        { role: "system", content: "You are Xum." },
+        { role: "user", content: [{ type: "text", text: "hi" }] },
+        { role: "assistant", content: [{ type: "text", text: "hello" }] },
+        ...extra,
+      ],
+    });
+    const reminder = { role: "system", content: "From now on, answer in French." };
+    expect(compare(prompt([]), prompt([reminder])).kind).toBe("extends");
+    // A changed leading system message still breaks the system section.
+    const edited = prompt([]);
+    edited.prompt[0] = { role: "system", content: "You are Xum. Today is Monday." };
+    expect(expectBreak(prompt([]), edited)).toMatchObject({ section: "system", blockIndex: 1 });
+  });
+
+  test("only the anthropic providerOptions namespace counts", () => {
+    const toolResult = (providerOptions: object) => ({
+      prompt: [
+        { role: "user", content: [{ type: "text", text: "find it" }] },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "c1",
+              toolName: "tool_search",
+              output: {},
+              providerOptions,
+            },
+          ],
+        },
+      ],
+    });
+    expect(
+      compare(
+        toolResult({ mux: { rawToolSearchOutput: "{}" } }),
+        toolResult({ mux: { rawToolSearchOutput: '{"changed":true}' } })
+      ).kind
+    ).toBe("extends");
+    expect(
+      expectBreak(
+        toolResult({ anthropic: { type: "tool-reference" } }),
+        toolResult({ anthropic: { type: "tool-reference", toolName: "zulip_send" } })
+      )
+    ).toMatchObject({
+      section: "messages",
+      previous: { type: "tool-result", toolName: "tool_search" },
+    });
   });
 });
