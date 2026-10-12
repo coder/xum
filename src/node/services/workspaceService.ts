@@ -18349,8 +18349,9 @@ export class WorkspaceService
     session: AgentSession | undefined
   ): Promise<Result<void>> {
     // Recheck under the guard + lock: the admission block refuses ordinary
-    // turn starts during the awaits above, but in-turn compaction retries
-    // bypass admission gating when they cross a transient idle gap.
+    // turn starts during truncateHistory's earlier awaits (scope preflight,
+    // refine drain and lock), but in-turn compaction retries bypass admission
+    // gating when they cross a transient idle gap.
     if (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
       return Err(
         "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
@@ -18488,10 +18489,11 @@ export class WorkspaceService
         );
       }
       // In-turn compaction retries bypass admission gating across a transient idle gap (see
-      // the full-clear recheck above), and this retirement is the last await before the
-      // rewrite for BOTH row-removing scopes: revalidate here or a retry admitted during it
-      // would have its history truncated underneath the stream. Refusing after retirement is
-      // the documented fail-safe direction (dropped wake, retrievable via resume).
+      // the full-clear recheck in settleTurnWorkBeforeFullClear), and this retirement is the
+      // last await before the rewrite for BOTH row-removing scopes: revalidate here or a retry
+      // admitted during it would have its history truncated underneath the stream. Refusing
+      // after retirement is the documented fail-safe direction (dropped wake, retrievable via
+      // resume).
       if (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
         return Err(
           "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
