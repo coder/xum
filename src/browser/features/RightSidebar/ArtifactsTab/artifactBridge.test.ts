@@ -438,6 +438,12 @@ describe("in-page links", () => {
     expect(click("svg")).toEqual(jump("Intro"));
     expect(click("self")).toEqual(jump("Intro"));
     expect(click("top-link")).toEqual({ prevented: true, scrolled: ["top"], focused: null });
+    // Keyboard activation of "#": focus stays on the link, as in a browser.
+    const topLink = doc.getElementById("top-link");
+    if (!(topLink instanceof win.HTMLElement)) throw new Error("top-link is not an HTML element");
+    topLink.focus();
+    topLink.dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
+    expect(doc.activeElement?.id).toBe("top-link");
     // No target: the navigation is still cancelled, and nothing moves (as in a browser).
     expect(click("missing")).toEqual({ prevented: true, scrolled: [], focused: null });
     // Left to the browser (and the navigation guards): other URLs, modified and non-left clicks.

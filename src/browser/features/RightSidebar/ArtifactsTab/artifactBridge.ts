@@ -298,8 +298,8 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
       var target = findTarget(raw) || findTarget(decoded);
       if (!target) {
         if (raw !== "" && decoded.toLowerCase() !== "top") return;
+        // The top of the document: no focusing steps, so focus stays on the link (as in HTML).
         window.scrollTo(0, 0);
-        if (document.activeElement && typeof document.activeElement.blur === "function") document.activeElement.blur();
         return;
       }
       target.scrollIntoView();
@@ -310,7 +310,10 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
         target.focus({ preventScroll: true });
         // Still unfocusable (disabled, inert): no blur will come to remove the attribute.
         if (document.activeElement !== target) target.removeAttribute("tabindex");
-        else target.addEventListener("blur", function () { target.removeAttribute("tabindex"); }, { once: true });
+        // Only our own value: a focus handler (roving tabindex) may have set its own meanwhile.
+        else target.addEventListener("blur", function () {
+          if (target.getAttribute("tabindex") === "-1") target.removeAttribute("tabindex");
+        }, { once: true });
       }
     }
     window.addEventListener("click", function (event) {
