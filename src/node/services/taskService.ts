@@ -1042,6 +1042,8 @@ export type AgentTreeTargetRelation =
   | "target_descendant"
   | "target_ancestor"
   | "peer"
+  | "target_main_chat"
+  | "target_side_chat"
   | "target_unrelated";
 
 export type SendAgentTreeMessageError = SendAgentTaskMessageError | AgentPeerMessageAdmissionError;
@@ -1065,7 +1067,7 @@ type TreeMessageSpec =
       senderWorkspaceId: string;
       targetId: string;
       message: string;
-      targetRelation: "peer" | "target_ancestor" | "target_unrelated";
+      targetRelation: Exclude<AgentTreeTargetRelation, "target_descendant">;
       queueDispatchMode?: TaskMessageQueueDispatchMode;
       /** Set on the retry of a message that waited for a delegated turn (#4997). */
       awaitedDelegatedTurn?: PeerDelegatedTurnWait;
@@ -1141,6 +1143,12 @@ export interface TaskTreeAgentsResult {
    */
   callerPeerMessagingRestricted?: true;
   tasks: TreeAgentTaskInfo[];
+  /** Direct chat links only; these grant no task ancestry or lifecycle authority. */
+  relatedChats?: Array<{
+    workspaceId: string;
+    title?: string;
+    relationship: "main_chat" | "side_chat";
+  }>;
 }
 
 export interface InstanceWorkspacesResult {
@@ -10136,7 +10144,7 @@ export class TaskService implements AgentTaskIntegration {
     senderWorkspaceId: string,
     targetId: string,
     message: string,
-    queueDispatchMode?: TaskMessageQueueDispatchMode
+    queueDispatchMode: TaskMessageQueueDispatchMode = "tool-end"
   ): Promise<
     Result<
       SendAgentTaskMessageResult & { relation: AgentTreeTargetRelation },
@@ -10153,13 +10161,15 @@ export class TaskService implements AgentTaskIntegration {
 
     const cfg = this.config.loadConfigOrDefault();
     const relation = this.resolveAgentTreeTargetRelation(
+      cfg,
       this.buildAgentTaskIndex(cfg).parentById,
       senderWorkspaceId,
       targetId
     );
     if (relation == null) {
-      // Self-sends are out of scope; cross-tree targets take the untrusted peer path.
-      return Err({ code: "invalid_scope" as const });
+      // Private side chats must look like unknown IDs to anyone outside their direct link.
+      // Only self-sends reveal an invalid scope; discovery does not advertise private chats.
+      return Err({ code: senderWorkspaceId === targetId ? "invalid_scope" : "not_found" });
     }
 
     if (relation === "target_descendant") {
@@ -10168,7 +10178,7 @@ export class TaskService implements AgentTaskIntegration {
         senderWorkspaceId,
         targetId,
         message,
-        queueDispatchMode: queueDispatchMode ?? "tool-end",
+        queueDispatchMode,
       });
       return result.success ? Ok({ ...result.data, relation }) : result;
     }
@@ -10465,7 +10475,7 @@ export class TaskService implements AgentTaskIntegration {
 
       // Re-verify under the target's event lock: tree membership may have changed since routing.
       if (
-        this.resolveAgentTreeTargetRelation(index.parentById, senderWorkspaceId, targetId) !==
+        this.resolveAgentTreeTargetRelation(cfg, index.parentById, senderWorkspaceId, targetId) !==
         relation
       ) {
         return Err({ code: "invalid_scope" as const });
@@ -10494,8 +10504,8 @@ export class TaskService implements AgentTaskIntegration {
       // Preserve remote/container isolation without changing the existing same-tree policy.
       if (
         relation === "target_unrelated" &&
-        (!this.isLocalUnrelatedMessagingEndpoint(senderEntry.workspace) ||
-          !this.isLocalUnrelatedMessagingEndpoint(targetEntry.workspace))
+        (!this.isUnrelatedMessagingEndpoint(senderEntry.workspace) ||
+          !this.isUnrelatedMessagingEndpoint(targetEntry.workspace))
       ) {
         return Err(unrelatedRuntimeRefusal);
       }
@@ -10566,7 +10576,6 @@ export class TaskService implements AgentTaskIntegration {
       // queued prompts or reactivate terminal tasks without rerouting their report ownership.
       const targetIsAgentTask =
         coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
-      const unrelatedRoot = relation === "target_unrelated" && !targetIsAgentTask;
       // A root running a delegated workspace turn stays owner-only (#4997). Only the turn's OWNER
       // may CONTINUE it (correlation resolved below): the owner already steers the turn through
       // follow-ups. Any other sender, an opted-in unrelated root or a same-tree descendant, waits
@@ -10860,7 +10869,7 @@ export class TaskService implements AgentTaskIntegration {
           serviceTier: resumeOptions.serviceTier,
           muxMetadata: triggerMuxMetadata,
         };
-      } else if (unrelatedRoot || awaitedDelegatedTurn != null) {
+      } else if (!targetIsAgentTask || awaitedDelegatedTurn != null) {
         assert(!targetIsAgentTask);
         // Honor the recipient's selected identity (including plan), not the sender's or an
         // older history row. Without a selection, the shared history → exec fallback applies.
@@ -10971,6 +10980,19 @@ export class TaskService implements AgentTaskIntegration {
           admissionRefusal = { code: "not_found" as const };
           return true;
         }
+        // A side-chat link authorizes only its own main chat, not a permanent cross-runtime
+        // grant. Recheck after preparation and again when queued input dispatches.
+        if (
+          this.resolveAgentTreeTargetRelation(
+            freshCfg,
+            this.buildAgentTaskIndex(freshCfg).parentById,
+            senderWorkspaceId,
+            targetId
+          ) !== relation
+        ) {
+          admissionRefusal = { code: "invalid_scope" as const };
+          return true;
+        }
         // An off/on cycle is a new grant, not permission to revive previously queued input.
         // Recheck through the final synchronous session gate as well as after preparation awaits.
         if (
@@ -10984,8 +11006,8 @@ export class TaskService implements AgentTaskIntegration {
         // Runtime can change during preparation or while queued; recheck both ends at dispatch.
         if (
           relation === "target_unrelated" &&
-          (!this.isLocalUnrelatedMessagingEndpoint(freshSender.workspace) ||
-            !this.isLocalUnrelatedMessagingEndpoint(freshEntry.workspace))
+          (!this.isUnrelatedMessagingEndpoint(freshSender.workspace) ||
+            !this.isUnrelatedMessagingEndpoint(freshEntry.workspace))
         ) {
           admissionRefusal = unrelatedRuntimeRefusal;
           return true;
@@ -15970,6 +15992,13 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
+  private isUnrelatedMessagingEndpoint(workspace: WorkspaceConfigEntry): boolean {
+    return (
+      workspace.sideChatParentWorkspaceId == null &&
+      this.isLocalUnrelatedMessagingEndpoint(workspace)
+    );
+  }
+
   private isLocalUnrelatedMessagingEndpoint(workspace: WorkspaceConfigEntry): boolean {
     let runtimeConfig = workspace.runtimeConfig;
     if (runtimeConfig === undefined) {
@@ -15987,11 +16016,54 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Relation of `targetId` to `senderWorkspaceId`, or null for self-sends. Different trees
-   * route as unrelated peers. Only parentWorkspaceId chains define ancestry;
-   * workspace-turn ownership tags are a separate, unchanged graph.
+   * Side chats share their owner's runtime, but are not task children. Keep this direct-link
+   * permission separate from ancestry so neither chat gains lifecycle or trusted-guidance power,
+   * and a side chat cannot bridge isolated top-level workspaces (even with unrelated consent).
    */
+  private resolveDirectChatRelation(
+    sender: WorkspaceConfigEntry,
+    target: WorkspaceConfigEntry
+  ): "target_main_chat" | "target_side_chat" | null {
+    if (
+      sender.sideChatParentWorkspaceId != null &&
+      target.sideChatParentWorkspaceId == null &&
+      sender.sideChatParentWorkspaceId === target.id
+    ) {
+      return "target_main_chat";
+    }
+    if (
+      target.sideChatParentWorkspaceId != null &&
+      sender.sideChatParentWorkspaceId == null &&
+      target.sideChatParentWorkspaceId === sender.id
+    ) {
+      return "target_side_chat";
+    }
+    return null;
+  }
+
+  /** Relation for messaging only; side-chat links never enter the task ownership graph. */
   private resolveAgentTreeTargetRelation(
+    cfg: ProjectsConfig,
+    parentById: Map<string, string>,
+    senderWorkspaceId: string,
+    targetId: string
+  ): AgentTreeTargetRelation | null {
+    const sender = findWorkspaceEntry(cfg, senderWorkspaceId);
+    const target = findWorkspaceEntry(cfg, targetId);
+    if (sender == null || target == null) {
+      return this.resolveTaskAncestryRelation(parentById, senderWorkspaceId, targetId);
+    }
+    if (
+      sender.workspace.sideChatParentWorkspaceId == null &&
+      target.workspace.sideChatParentWorkspaceId == null
+    ) {
+      return this.resolveTaskAncestryRelation(parentById, senderWorkspaceId, targetId);
+    }
+    return this.resolveDirectChatRelation(sender.workspace, target.workspace);
+  }
+
+  /** Only task parent chains grant ancestry; chat links and workspace-turn ownership do not. */
+  private resolveTaskAncestryRelation(
     parentById: Map<string, string>,
     senderWorkspaceId: string,
     targetId: string
@@ -16061,7 +16133,7 @@ export class TaskService implements AgentTaskIntegration {
     const cfg = this.config.loadConfigOrDefault();
     const caller = findWorkspaceEntry(cfg, callerWorkspaceId);
     // Instance discovery must not bridge the runtime boundary closed by unrelated messaging.
-    if (caller == null || !this.isLocalUnrelatedMessagingEndpoint(caller.workspace)) {
+    if (caller == null || !this.isUnrelatedMessagingEndpoint(caller.workspace)) {
       return { rows: [], totalMatching: 0, callerPeerMessagingRestricted: true };
     }
     const index = this.buildAgentTaskIndex(cfg);
@@ -16089,7 +16161,7 @@ export class TaskService implements AgentTaskIntegration {
           // Same-tree visibility is unchanged; hide unrelated roots before matching or probing them.
           (id !== callerRoot &&
             getValidUnrelatedWorkspaceConsent(workspace.unrelatedWorkspaceConsent) == null) ||
-          !this.isLocalUnrelatedMessagingEndpoint(workspace) ||
+          !this.isUnrelatedMessagingEndpoint(workspace) ||
           isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
           this.interruptedParentWorkspaceIds.has(id) ||
           this.isWorkspaceStopInProgress(id) ||
@@ -16163,8 +16235,7 @@ export class TaskService implements AgentTaskIntegration {
     // chain — advertising root/sibling/ancestor rows to such a caller would direct it at
     // targets it can never message. Descendant guidance stays valid, so those rows survive.
     const callerWorkflowOwned = this.isWorkflowOwnedTaskUsingIndex(index, workspaceId);
-    const callerRestricted =
-      this.isBestOfChainUsingIndex(index, workspaceId) || callerWorkflowOwned;
+    const callerRestricted = this.isPeerMessagingRestricted(index, workspaceId);
     const rootWorkspaceId = this.resolveRootWorkspaceIdUsingParentById(
       index.parentById,
       workspaceId
@@ -16255,8 +16326,11 @@ export class TaskService implements AgentTaskIntegration {
       rootEntry != null &&
       isWorkspaceArchived(rootEntry.workspace.archivedAt, rootEntry.workspace.unarchivedAt);
 
+    const relatedChats = this.listRelatedChats(cfg, index, workspaceId);
+
     return {
       rootWorkspaceId,
+      ...(relatedChats.length > 0 ? { relatedChats } : {}),
       ...(rootTitle != null ? { rootTitle } : {}),
       rootRelationship: rootWorkspaceId === workspaceId ? "self" : "ancestor",
       ...(rootArchived ? { rootArchived: true as const } : {}),
@@ -16267,6 +16341,53 @@ export class TaskService implements AgentTaskIntegration {
       ...(callerRestricted ? { callerPeerMessagingRestricted: true as const } : {}),
       tasks,
     };
+  }
+
+  private isPeerMessagingRestricted(index: AgentTaskIndex, workspaceId: string): boolean {
+    return (
+      this.isBestOfChainUsingIndex(index, workspaceId) ||
+      this.isWorkflowOwnedTaskUsingIndex(index, workspaceId)
+    );
+  }
+
+  private getRelatedChatInfo(
+    caller: WorkspaceConfigEntry,
+    candidate: WorkspaceConfigEntry
+  ): NonNullable<TaskTreeAgentsResult["relatedChats"]>[number] | undefined {
+    const relation = this.resolveDirectChatRelation(caller, candidate);
+    if (relation == null || candidate.id == null) return undefined;
+    return {
+      workspaceId: candidate.id,
+      title: coerceNonEmptyString(candidate.title) ?? coerceNonEmptyString(candidate.name),
+      relationship: relation === "target_main_chat" ? "main_chat" : "side_chat",
+    };
+  }
+
+  /** Discover direct chat links only, without joining task ownership or instance discovery. */
+  private listRelatedChats(
+    cfg: ProjectsConfig,
+    index: AgentTaskIndex,
+    workspaceId: string
+  ): NonNullable<TaskTreeAgentsResult["relatedChats"]> {
+    const caller = findWorkspaceEntry(cfg, workspaceId)?.workspace;
+    if (caller == null) return [];
+    if (
+      isWorkspaceArchived(caller.archivedAt, caller.unarchivedAt) ||
+      this.isPeerMessagingRestricted(index, workspaceId)
+    )
+      return [];
+    const candidates = Array.from(cfg.projects.values()).flatMap((project) => project.workspaces);
+    return candidates.flatMap((candidate) => {
+      const info = this.getRelatedChatInfo(caller, candidate);
+      if (
+        info == null ||
+        isWorkspaceArchived(candidate.archivedAt, candidate.unarchivedAt) ||
+        this.isPeerMessagingRestricted(index, info.workspaceId)
+      ) {
+        return [];
+      }
+      return [info];
+    });
   }
 
   // --- Internal orchestration ---
