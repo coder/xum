@@ -1878,7 +1878,7 @@ export const CollapsedOverviewYieldsToTranscript: Story = {
     const canvas = within(canvasElement);
     await canvas.findByRole("button", { name: "Expand right sidebar" }, { timeout: 15_000 });
     // The header's button can show before the card: WorkspaceShell loads the sidebar lazily
-    // (#6081), so wait for the card to mount. It is hidden, so no role query can find it.
+    // (#6206), so wait for the card to mount. It is hidden, so no role query can find it.
     const card = await waitFor(
       () => {
         const element = canvasElement.querySelector<HTMLElement>(".right-sidebar-overview-card");
