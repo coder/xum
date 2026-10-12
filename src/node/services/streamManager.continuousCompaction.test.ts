@@ -977,6 +977,64 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(serialized).not.toContain("removed thinking");
   });
 
+  it("prefix replay keeps a native search in place, as the main request does (#5887)", async () => {
+    const journal = journalFixture();
+    journal.preparation.modelString = "anthropic:claude-opus-5-5";
+    journal.preparation.effectiveThinkingLevel = "high";
+    const nativeSearch = createMuxMessage("native-search", "assistant", "", undefined, [
+      {
+        type: "reasoning",
+        text: "plan",
+        providerOptions: { anthropic: { signature: "sig-plan" } },
+      },
+      {
+        type: "dynamic-tool",
+        toolCallId: "srvtoolu_1",
+        toolName: "web_search",
+        state: "output-available",
+        input: { query: "xum" },
+        providerExecuted: true,
+        output: [
+          {
+            type: "web_search_result",
+            url: "https://example.com/xum",
+            title: "Xum",
+            pageAge: null,
+            encryptedContent: "enc-1",
+          },
+        ],
+      },
+      {
+        type: "reasoning",
+        text: "read",
+        providerOptions: { anthropic: { signature: "sig-read" } },
+      },
+      { type: "text", text: "kept answer" },
+    ]);
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("user-1", "user", "search"),
+      nativeSearch,
+      createMuxMessage("user-2", "user", "next"),
+    ];
+    const { deferLoadingToolNames: _deferred, ...preparation } = journal.preparation;
+    const expected = await assemblePromptPayload({
+      ...preparation,
+      workspaceId,
+      history: journal.prefixSourceRows,
+      systemMessage: "",
+      postCompactionAttachments: journal.postCompactionAttachments,
+    });
+    const actual = (await rebuildContinuousPrefix(journal, workspaceId)).filter(
+      (message) => message.role !== "system"
+    );
+    expect(actual).toEqual(expected.messages.filter((message) => message.role !== "system"));
+    const serialized = JSON.stringify(actual);
+    expect(serialized).toContain('"providerExecuted":true');
+    expect(serialized).toContain("enc-1");
+    expect(serialized).toContain("sig-read");
+  });
+
   it("prefix replay keeps the thinking after a server tool out, tool pairs intact (#5887)", async () => {
     const journal = journalFixture();
     journal.preparation.modelString = "anthropic:claude-opus-5-5";

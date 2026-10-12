@@ -160,6 +160,10 @@ export async function summarizeContinuousCompaction(args: {
     const messages = await prepareMessagesForProvider({
       messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
       replayReceiptMessages: args.receiptRows,
+      // The summary request declares no tools, and native server-tool blocks without the
+      // declared tool are not proven to be accepted (#5887). Headless and one-shot: sending
+      // the client pair (and so no thinking after it) costs no cache the turn would reuse.
+      nativeServerToolReplay: false,
       effectiveAgentId: "compact",
       toolNamesForSentinel: [],
       postCompactionAttachments: null,

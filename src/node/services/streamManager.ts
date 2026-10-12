@@ -126,7 +126,12 @@ import type { SessionUsageService } from "./sessionUsageService";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
 import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
-import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
+import { stripEncryptedContent } from "@/common/utils/messages/stripEncryptedContent";
+import {
+  isNativeAnthropicReplayable,
+  rowCiphertextChars,
+  toStoredServerToolPart,
+} from "@/common/utils/messages/anthropicNativeServerTools";
 import { countAnthropicInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
 import { stripAnthropicReasoning } from "@/browser/utils/messages/modelMessageTransform";
@@ -922,9 +927,9 @@ interface WorkspaceStreamInfo {
   // original start timestamp even after they gain output.
   toolCompletionTimestamps: Map<string, number>;
 
-  // Anthropic server tools (web_search, ...) called in this row (#5887). Xum stores them as
-  // client tool calls without their encrypted results, so history replays them as a
-  // tool_use/tool_result pair: thinking after one is bound to a prefix never sent again.
+  // Anthropic server tools (web_search, ...) called in this row (#5887). History replays
+  // only successful web searches natively; any other one replays as a tool_use/tool_result
+  // pair, so thinking after it is bound to a prefix never sent again.
   anthropicServerToolCallIds?: Set<string>;
 
   // Workflow tools can create the durable run before their stream part is stored. Keep the exact
@@ -2188,8 +2193,9 @@ export class StreamManager {
   }
 
   /**
-   * #5887 containment: thinking that follows an Anthropic server tool in this row cannot
-   * replay as the API returned it (see anthropicServerToolCallIds). Write the same receipt
+   * #5887 containment: thinking that follows an Anthropic server tool that history does not
+   * replay natively (anything but a successful web_search, see isNativeAnthropicReplayable)
+   * cannot replay as the API returned it. Write the same receipt
    * as the signature repair, so later requests in the context segment send no thinking
    * (removing every thinking block is valid; a gap or a put-back block is not). It rides
    * on the partial write that stores this reasoning part (every reasoning append schedules
@@ -2204,13 +2210,19 @@ export class StreamManager {
     // provider keeps the parts (and the IDs) but its reasoning replays nothing Anthropic.
     if (!isAnthropicMessagesModel(streamInfo.request.model)) return;
     // Read the parts, not only the ID set: a retry that drops parts drops the server tool too.
+    // A server tool that history replays natively keeps the thinking after it valid (#5887),
+    // so only the others count.
     const followsServerTool = streamInfo.parts.some(
-      (part) => part.type === "dynamic-tool" && serverToolIds.has(part.toolCallId)
+      (part) =>
+        part.type === "dynamic-tool" &&
+        serverToolIds.has(part.toolCallId) &&
+        !isNativeAnthropicReplayable(part)
     );
     if (!followsServerTool) {
-      // Every recorded server tool's part is gone. The tool-call case records an ID and
-      // stores its part before any later reasoning, so the IDs are stale: drop them, or
-      // every later reasoning delta would scan all parts again (perf).
+      // Every recorded server tool's part is gone or replays natively (a stored result does
+      // not change). The tool-call case records an ID and stores its part before any later
+      // reasoning, so the IDs are spent: drop them, or every later reasoning delta would scan
+      // all parts again (perf).
       streamInfo.anthropicServerToolCallIds = undefined;
       return;
     }
@@ -3540,16 +3552,32 @@ export class StreamManager {
       ? this.toolCallDisplayRegistry.take(streamInfo.executionScope, toolCallId)
       : undefined;
 
+    // The output the renderer receives: the stored one, so ciphertext the stored part dropped
+    // never crosses IPC either.
+    let emittedOutput = output;
     if (existingPartIndex !== -1) {
       const existingPart = streamInfo.parts[existingPartIndex];
       if (existingPart.type === "dynamic-tool") {
-        streamInfo.parts[existingPartIndex] = {
-          ...existingPart,
-          ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
-          ...(mcpServer ? { mcpServer } : {}),
-          state: "output-available" as const,
-          output,
-        };
+        // A provider-executed part keeps its native identity only when history can replay
+        // it natively (#5887); any other result is stored as the client pair it was before.
+        const stored = toStoredServerToolPart(
+          {
+            ...existingPart,
+            ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
+            ...(mcpServer ? { mcpServer } : {}),
+            state: "output-available" as const,
+            output,
+          },
+          {
+            // Nothing arrived between the call and its result (see toStoredServerToolPart).
+            resultFollowsCall: existingPartIndex === streamInfo.parts.length - 1,
+            // The call part itself holds no output yet, so it adds nothing to this sum.
+            rowCiphertextChars:
+              existingPart.providerExecuted === true ? rowCiphertextChars(streamInfo.parts) : 0,
+          }
+        );
+        streamInfo.parts[existingPartIndex] = stored;
+        if (stored.state === "output-available") emittedOutput = stored.output;
       }
     } else {
       // Fallback: if the matching tool-call part is missing, still persist output so the UI
@@ -3592,7 +3620,7 @@ export class StreamManager {
       messageId: streamInfo.messageId,
       toolCallId,
       toolName,
-      result: output,
+      result: emittedOutput,
       ...(mcpServer ? { mcpServer } : {}),
       ...(providerExecuted === true ? { providerExecuted: true } : {}),
       timestamp: completionTimestamp,
@@ -4760,10 +4788,10 @@ export class StreamManager {
                   toolName: part.toolName,
                   input: part.input,
                 });
-                if (
+                const anthropicServerTool =
                   part.providerExecuted === true &&
-                  isAnthropicMessagesModel(streamInfo.request.model)
-                ) {
+                  isAnthropicMessagesModel(streamInfo.request.model);
+                if (anthropicServerTool) {
                   (streamInfo.anthropicServerToolCallIds ??= new Set()).add(part.toolCallId);
                 }
 
@@ -4780,6 +4808,8 @@ export class StreamManager {
                   // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
                   input: part.input,
                   timestamp: nextPartTimestamp(streamInfo),
+                  // History replays Anthropic server tools natively (#5887).
+                  ...(anthropicServerTool ? { providerExecuted: true } : {}),
                 };
 
                 // Emit using shared logic (ensures replay consistency)
@@ -4807,9 +4837,21 @@ export class StreamManager {
                   providerExecuted?: boolean;
                 };
 
-                // Strip encrypted content from web search results before storing
+                // Strip encrypted content from web search results before storing, except for
+                // Anthropic server tools: native replay must send the ciphertext back as the API
+                // returned it, or the thinking after the search no longer matches (#5887).
+                // Keyed on the stored part's flag, so ciphertext is never kept on a part that
+                // replays as a client pair (an orphan result has no stored call part).
+                const keepCiphertext = streamInfo.parts.some(
+                  (stored) =>
+                    stored.type === "dynamic-tool" &&
+                    stored.toolCallId === toolResultPart.toolCallId &&
+                    stored.providerExecuted === true
+                );
                 const strippedOutput = stripInternalToolResultFields(
-                  stripEncryptedContent(toolResultPart.output)
+                  keepCiphertext
+                    ? toolResultPart.output
+                    : stripEncryptedContent(toolResultPart.output)
                 );
 
                 // Tool call completed successfully

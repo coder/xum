@@ -1800,6 +1800,83 @@ describe("AgentSession continuous compaction wiring", () => {
     expect(JSON.stringify(requests[0].prompt)).toContain("earlier thinking");
   });
 
+  test("the summary sends a native search as a client pair and the thinking after it not at all (#5887)", async () => {
+    // The summary request declares no tools; native server-tool blocks there are unproven.
+    const { h, args } = await summarySetup();
+    const opus = "anthropic:claude-opus-5-5";
+    const requests: LanguageModelV3CallOptions[] = [];
+    const sdkModel = new MockLanguageModelV3({
+      doStream: (request) => {
+        requests.push(request);
+        return Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) });
+      },
+    });
+    const anthropicConfig = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({ anthropic: anthropicConfig });
+    spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok({
+        ...pinnedSummaryModel(sdkModel, opus),
+        wireProviderName: "anthropic",
+        optionsRouteProvider: "anthropic" as const,
+        optionsProvidersConfig: { anthropic: anthropicConfig },
+      })
+    );
+    const nativeSearch: MuxMessage = {
+      id: "assistant-search",
+      role: "assistant",
+      metadata: { thinkingLevel: "high" },
+      parts: [
+        {
+          type: "reasoning",
+          text: "plan",
+          providerOptions: { anthropic: { signature: "sig-plan" } },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: "srvtoolu_1",
+          toolName: "web_search",
+          state: "output-available",
+          input: { query: "xum" },
+          providerExecuted: true,
+          output: [
+            {
+              type: "web_search_result",
+              url: "https://example.com/xum",
+              title: "Xum",
+              pageAge: null,
+              encryptedContent: "enc-1",
+            },
+          ],
+        },
+        {
+          type: "reasoning",
+          text: "bound thinking",
+          providerOptions: { anthropic: { signature: "sig-read" } },
+        },
+        { type: "text", text: "earlier answer" },
+      ],
+    };
+    const head = [...args.head, nativeSearch, createMuxMessage("next", "user", "next step")];
+    await summarizeContinuousCompaction({
+      ...args,
+      head,
+      receiptRows: head,
+      compactOptions: { ...args.compactOptions, model: opus, thinkingLevel: "high" },
+    });
+
+    const parts = requests[0].prompt.flatMap((message) =>
+      Array.isArray(message.content)
+        ? (message.content as unknown as Array<Record<string, unknown>>)
+        : []
+    );
+    expect(parts.filter((part) => part.providerExecuted === true)).toEqual([]);
+    expect(parts.filter((part) => part.type === "tool-call")).toHaveLength(1);
+    const prompt = JSON.stringify(requests[0].prompt);
+    expect(prompt).not.toContain("bound thinking");
+    expect(prompt).not.toContain("enc-1");
+    expect(prompt).toContain("earlier answer");
+  });
+
   test("a receipt in the retained tail keeps the head's Anthropic thinking out of the summary (#5996)", async () => {
     const { h, args } = await summarySetup();
     const opus = "anthropic:claude-opus-5-5";

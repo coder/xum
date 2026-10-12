@@ -50,6 +50,9 @@ const MuxToolPartBase = z.object({
   workflowRun: WorkflowRunToolAttachmentSchema.optional(),
   // Host-authored display data must not enter the model-visible output.
   mcpServer: MCPToolCallDisplaySchema.optional().catch(undefined),
+  // The provider ran the tool server-side (Anthropic web_search, ...). Stored only for the
+  // Anthropic Messages wire, so history can replay it natively (#5887).
+  providerExecuted: z.boolean().optional(),
 });
 
 /**

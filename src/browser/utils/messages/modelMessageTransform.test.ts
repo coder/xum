@@ -427,6 +427,33 @@ describe("modelMessageTransform", () => {
       expect(result.valid).toBe(true);
     });
 
+    it("accepts a provider-executed call whose result rides in the same message (#5887)", () => {
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "search" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "srvtoolu_1",
+              toolName: "web_search",
+              input: { query: "xum" },
+              providerExecuted: true,
+            },
+            {
+              type: "tool-result",
+              toolCallId: "srvtoolu_1",
+              toolName: "web_search",
+              output: { type: "json", value: [] },
+            },
+            { type: "text", text: "found it" },
+          ],
+        },
+      ];
+
+      expect(validateAnthropicCompliance(messages)).toEqual({ valid: true });
+    });
+
     it("should detect tool calls without results", () => {
       const assistantMsg1: AssistantModelMessage = {
         role: "assistant",
