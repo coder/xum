@@ -364,16 +364,16 @@ jobs:
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
+      # Depth 2 brings the merge commit's parents. The first parent is the base
+      # GitHub built the merge ref on. pull_request.base.sha can differ (a
+      # stacked PR's base branch merges into its own test ref, main moves), and
+      # then the report scores other PRs' changes. check.ts sees no PR commits
+      # and reads no Crap-Debt trailers here: in CI the crap-debt label is the
+      # escape hatch (trailers are for the local hook).
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      # The checkout is the merge commit at depth 1, so check.ts sees no PR
-      # commits and reads no Crap-Debt trailers here: in CI the crap-debt
-      # label is the escape hatch (trailers are for the local hook).
-      - name: Fetch the PR base
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          fetch-depth: 2
       - uses: oven-sh/setup-bun@b7a1c7ccf290d58743029c4f6903da283811b979 # v2.1.0
         with:
           bun-version: 1.3.12
@@ -387,7 +387,7 @@ jobs:
           path: coverage-shards
       - name: CRAP report
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: HEAD^1
           LCOV_DIR: coverage-shards
           # Shard counts of the test-unit and test-integration matrices above.
           EXPECTED_UNIT: "6"

@@ -3,7 +3,7 @@
 // The job is informational, so this script always exits 0: a violation, a
 // missing artifact or a broken scorer is reported, never a failed check.
 //
-// Env: BASE_SHA, LCOV_DIR (one folder per `crap-lcov-<lane>-<shard>` artifact),
+// Env: BASE_REF, LCOV_DIR (one folder per `crap-lcov-<lane>-<shard>` artifact),
 // EXPECTED_UNIT and EXPECTED_INTEGRATION (shard counts), CRAP_DEBT_LABEL
 // ("true" when the PR has the crap-debt label), GITHUB_STEP_SUMMARY.
 import { spawnSync } from "node:child_process";
@@ -109,7 +109,7 @@ function main(): void {
   };
   const { artifacts, files } = lcovFiles(env.LCOV_DIR ?? "coverage-shards");
   const status = coverageStatus(artifacts, expected);
-  const args = [join(import.meta.dir, "check.ts"), "--base", env.BASE_SHA ?? "", "--json"];
+  const args = [join(import.meta.dir, "check.ts"), "--base", env.BASE_REF ?? "", "--json"];
   for (const file of files) args.push("--coverage", file);
   if (env.CRAP_DEBT_LABEL === "true") args.push("--debt", "crap-debt PR label");
   const run = spawnSync(process.execPath, args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
