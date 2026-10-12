@@ -158,16 +158,15 @@ export function useArtifactInteractions(
           return;
         }
         entry.queued = null;
-        client.artifacts.setState({ workspaceId, path: writePath, state: queued.state }).then(
-          writeNext,
-          () => {
+        client.artifacts
+          .setState({ workspaceId, path: writePath, state: queued.state })
+          .then(writeNext, () => {
             // Best effort: a failed save does not stop the queue; the frame keeps its own copy.
             // A write cut off by a dropped connection is sent again after the reconnect, unless a
             // newer state replaced it meanwhile.
             if (apiRef.current !== client && entry.queued == null) entry.queued = queued;
             writeNext();
-          }
-        );
+          });
       };
       writeNext();
     },
