@@ -205,36 +205,37 @@ describe("WorkspaceGoalService", () => {
     });
 
     // Promotion arms the next goal's kickoff: model output completing a paused goal must not
-    // undo the user's Pause that way. A user completion still promotes.
+    // undo the user's Pause that way, so the model's completion is refused while goals are
+    // queued. A user completion still promotes.
     test.each([
       { initiator: "model", promotes: false },
       { initiator: "user", promotes: true },
     ] as const)(
-      "completing a paused goal promotes the next goal only for the user ($initiator)",
+      "completing a paused goal with goals queued is the user's call ($initiator)",
       async ({ initiator, promotes }) => {
         const paused = await setGoalOk(service, { workspaceId, objective: "First" });
         const queued = await service.addUpcomingGoal({ workspaceId, objective: "Second" });
         await setGoalOk(service, { workspaceId, status: "paused" });
 
-        await setGoalOk(service, {
+        const result = await service.setGoal({
           workspaceId,
           status: "complete",
           completionSummary: "Done while paused.",
           initiator,
         });
 
+        // Target assertion: the model's completion is refused and nothing is promoted.
+        expect(result.success).toBe(promotes);
+        if (!result.success) expect(result.error.type).toBe("invalid_transition");
         const board = await service.getGoalBoard(workspaceId);
         const activeEntry = board.entries.find((e) => e.section === "active");
-        // Target assertion: the model's completion leaves the queued goal waiting.
         expect(activeEntry?.goal.goalId).toBe(promotes ? queued.goalId : paused.goalId);
-        expect(activeEntry?.goal.status).toBe(promotes ? "active" : "complete");
-        expect(board.entries.some((e) => e.section === "upcoming")).toBe(!promotes);
+        expect(activeEntry?.goal.status).toBe(promotes ? "active" : "paused");
       }
     );
 
-    test("reopening a goal lifts the promotion block for its next completion", async () => {
-      await setGoalOk(service, { workspaceId, objective: "First" });
-      const queued = await service.addUpcomingGoal({ workspaceId, objective: "Second" });
+    test("the model completes a paused goal when no goal is queued", async () => {
+      await setGoalOk(service, { workspaceId, objective: "Solo" });
       await setGoalOk(service, { workspaceId, status: "paused" });
       await setGoalOk(service, {
         workspaceId,
@@ -242,18 +243,7 @@ describe("WorkspaceGoalService", () => {
         completionSummary: "Done while paused.",
         initiator: "model",
       });
-      // The user reopens the goal: it keeps its id.
-      await setGoalOk(service, { workspaceId, status: "active" });
-      await setGoalOk(service, {
-        workspaceId,
-        status: "complete",
-        completionSummary: "Done after reopening.",
-        initiator: "model",
-      });
-
-      const board = await service.getGoalBoard(workspaceId);
-      // Target assertion: the completion from active promotes as usual.
-      expect(board.entries.find((e) => e.section === "active")?.goal.goalId).toBe(queued.goalId);
+      expect((await service.getGoal(workspaceId))?.status).toBe("complete");
     });
 
     test("completeGoalFromSilentContinuation promotes the next upcoming goal", async () => {
