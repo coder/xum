@@ -15,7 +15,7 @@ test(
     await openPlayground(app, screen, browser);
 
     await screen.getByRole("button", "Workspace actions").tap();
-    await screen.getByRole("button", "Sidebar").tap();
+    await screen.getByRole("menuitem", "Sidebar").tap();
     await screen.getByRole("button", "New tab").tap();
     // The launcher row's name includes its description.
     await screen.getByRole("button", /^Stats\b/).tap();

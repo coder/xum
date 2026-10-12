@@ -28,7 +28,9 @@ function WorkspaceActionButton(props: WorkspaceActionButtonProps) {
   return (
     <button
       type="button"
-      className="text-content-secondary bg-surface-primary hover:bg-hover block w-full rounded-sm px-2 py-1.5 text-left text-xs whitespace-nowrap"
+      role="menuitem"
+      // focus:bg-hover marks the row the arrow keys reached, like the hover state (#6103).
+      className="text-content-secondary bg-surface-primary hover:bg-hover focus:bg-hover block w-full rounded-sm px-2 py-1.5 text-left text-xs whitespace-nowrap outline-none"
       onClick={props.onClick}
       data-testid={props.testId}
     >
@@ -85,8 +87,21 @@ interface WorkspaceActionsMenuContentProps {
  * Keeping these actions centralized prevents menu drift between entry points.
  */
 export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentProps> = (props) => {
+  // ArrowDown/ArrowUp move focus between the rows and stop at the ends, as in
+  // ArtifactVersionMenu. Tab still works. The popover focuses the first row when it opens (#6103).
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault();
+    const items = Array.from(
+      event.currentTarget.querySelectorAll<HTMLElement>('[role="menuitem"]')
+    );
+    const index = items.findIndex((item) => item === document.activeElement);
+    const next = event.key === "ArrowDown" ? index + 1 : index - 1;
+    items[Math.min(Math.max(next, 0), items.length - 1)]?.focus();
+  };
+
   return (
-    <>
+    <div role="menu" aria-label="Workspace actions" onKeyDown={handleKeyDown}>
       {props.onEditTitle && (
         <WorkspaceActionButton
           label="Edit chat title"
@@ -245,6 +260,6 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
           }}
         />
       )}
-    </>
+    </div>
   );
 };
