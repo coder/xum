@@ -670,6 +670,73 @@ function mergeAgentAISettings(
   };
 }
 
+interface AgentAISettingsUpdateOptions {
+  persistSelectedAgentId?: boolean;
+  pinIntent?: AiSelectionIntent;
+  pinsOnly?: boolean;
+}
+
+interface AgentAISettingsUpdatePlan {
+  /** The merged settings to store for the agent, or undefined to leave its bucket alone. */
+  nextAgentSettings: WorkspaceAgentAISettings | undefined;
+  /** The task's pins after the update; the same reference when nothing is pinned. */
+  nextPins: TaskAiPins | undefined;
+  /** Whether the update selects the agent as the workspace's current agent. */
+  selectAgent: boolean;
+}
+
+// Pins apply only to new-style agent tasks (taskAiPins present; legacy tasks stay
+// frozen) and only for the task's own agent. Same reference = nothing to pin.
+function nextTaskAiPins(
+  entry: Workspace,
+  agentId: string,
+  aiSettings: WorkspaceAgentAISettings | null,
+  pinIntent: AiSelectionIntent | undefined
+): TaskAiPins | undefined {
+  if (
+    pinIntent == null ||
+    aiSettings == null ||
+    entry.taskAiPins == null ||
+    agentId !== resolveTaskAgentIdForResume(entry)
+  ) {
+    return entry.taskAiPins;
+  }
+  return applyAiSelectionIntentToPins(entry.taskAiPins, pinIntent, aiSettings);
+}
+
+/**
+ * What persisting `aiSettings` for `agentId` writes to `entry`. The snapshot fast path and
+ * the serialized write both plan with it, so they always agree on what changes.
+ */
+function planAgentAISettingsUpdate(
+  entry: Workspace,
+  agentId: string,
+  aiSettings: WorkspaceAgentAISettings | null,
+  options: AgentAISettingsUpdateOptions | undefined
+): AgentAISettingsUpdatePlan {
+  const pinsOnly = options?.pinsOnly === true;
+  const prev = entry.aiSettingsByAgent?.[agentId];
+  return {
+    nextAgentSettings:
+      aiSettings != null && !pinsOnly ? mergeAgentAISettings(prev, aiSettings) : undefined,
+    nextPins: nextTaskAiPins(entry, agentId, aiSettings, options?.pinIntent),
+    selectAgent: !pinsOnly && options?.persistSelectedAgentId === true,
+  };
+}
+
+function agentAISettingsUpdateChanges(
+  entry: Workspace,
+  agentId: string,
+  plan: AgentAISettingsUpdatePlan
+): boolean {
+  return (
+    (plan.nextAgentSettings != null &&
+      !isDeepStrictEqual(entry.aiSettingsByAgent?.[agentId], plan.nextAgentSettings)) ||
+    (plan.selectAgent && entry.agentId !== agentId) ||
+    plan.nextPins !== entry.taskAiPins
+  );
+}
+
 interface HeartbeatWorkspaceConfigEntry {
   normalizedWorkspaceId: string;
   /** Project/workspace paths so editConfig transforms can re-find the FRESH entry. */
@@ -13457,47 +13524,26 @@ export class WorkspaceService
     // settings bucket. Persist whatever agent ID the caller chose so legacy Ask
     // settings can fade out naturally instead of being mixed into Auto.
 
-    // Pins apply only to new-style agent tasks (taskAiPins present; legacy tasks stay
-    // frozen) and only for the task's own agent. Same reference = nothing to pin.
-    const computeNextPins = (entry: Workspace): TaskAiPins | undefined => {
-      const pinIntent = options?.pinIntent;
-      if (
-        pinIntent == null ||
-        aiSettings == null ||
-        entry.taskAiPins == null ||
-        normalizedAgentId !== resolveTaskAgentIdForResume(entry)
-      ) {
-        return entry.taskAiPins;
-      }
-      return applyAiSelectionIntentToPins(entry.taskAiPins, pinIntent, aiSettings);
-    };
-
     // Hot path: this runs on every message send, so skip the queued write when a
     // snapshot read already shows no change. Skipping is race-safe — it is equivalent
     // to a serialized write of the identical value landing first, and not writing can
     // never resurrect concurrently removed entries.
-    {
-      const snapshotEntry = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
-        projectPath,
-        workspaceId,
-        workspacePath,
-      });
-      if (!snapshotEntry) {
-        return Err(this.workspaceNotFoundError());
-      }
-      const prev = snapshotEntry.aiSettingsByAgent?.[normalizedAgentId];
-      const aiSettingsChanged =
-        options?.pinsOnly !== true &&
-        aiSettings != null &&
-        !isDeepStrictEqual(prev, mergeAgentAISettings(prev, aiSettings));
-      const selectedAgentChanged =
-        options?.pinsOnly !== true &&
-        options?.persistSelectedAgentId === true &&
-        snapshotEntry.agentId !== normalizedAgentId;
-      const pinsChanged = computeNextPins(snapshotEntry) !== snapshotEntry.taskAiPins;
-      if (!aiSettingsChanged && !selectedAgentChanged && !pinsChanged) {
-        return Ok(false);
-      }
+    const snapshotEntry = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
+      projectPath,
+      workspaceId,
+      workspacePath,
+    });
+    if (!snapshotEntry) {
+      return Err(this.workspaceNotFoundError());
+    }
+    const snapshotPlan = planAgentAISettingsUpdate(
+      snapshotEntry,
+      normalizedAgentId,
+      aiSettings,
+      options
+    );
+    if (!agentAISettingsUpdateChanges(snapshotEntry, normalizedAgentId, snapshotPlan)) {
+      return Ok(false);
     }
 
     // Compare/merge against the FRESH entry inside the serialized editConfig transform
@@ -13515,36 +13561,29 @@ export class WorkspaceService
         return freshConfig;
       }
 
-      const prev = workspaceEntry.aiSettingsByAgent?.[normalizedAgentId];
-      const nextAgentSettings =
-        aiSettings != null && options?.pinsOnly !== true
-          ? mergeAgentAISettings(prev, aiSettings)
-          : undefined;
-      const aiSettingsChanged =
-        nextAgentSettings != null && !isDeepStrictEqual(prev, nextAgentSettings);
-      const selectedAgentChanged =
-        options?.pinsOnly !== true &&
-        options?.persistSelectedAgentId === true &&
-        workspaceEntry.agentId !== normalizedAgentId;
-      const nextPins = computeNextPins(workspaceEntry);
-      const pinsChanged = nextPins !== workspaceEntry.taskAiPins;
-      if (!aiSettingsChanged && !selectedAgentChanged && !pinsChanged) {
+      const plan = planAgentAISettingsUpdate(
+        workspaceEntry,
+        normalizedAgentId,
+        aiSettings,
+        options
+      );
+      if (!agentAISettingsUpdateChanges(workspaceEntry, normalizedAgentId, plan)) {
         writeResult = Ok(false);
         return freshConfig;
       }
 
-      if (pinsChanged) {
-        workspaceEntry.taskAiPins = nextPins;
+      if (plan.nextPins !== workspaceEntry.taskAiPins) {
+        workspaceEntry.taskAiPins = plan.nextPins;
       }
 
-      if (nextAgentSettings != null) {
+      if (plan.nextAgentSettings != null) {
         workspaceEntry.aiSettingsByAgent = {
           ...(workspaceEntry.aiSettingsByAgent ?? {}),
-          [normalizedAgentId]: nextAgentSettings,
+          [normalizedAgentId]: plan.nextAgentSettings,
         };
       }
 
-      if (options?.persistSelectedAgentId === true && options?.pinsOnly !== true) {
+      if (plan.selectAgent) {
         workspaceEntry.agentId = normalizedAgentId;
       }
 
