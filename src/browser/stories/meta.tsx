@@ -9,6 +9,13 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import type { FC, ReactNode } from "react";
 import { useRef } from "react";
 import { AppLoader } from "../components/AppLoader/AppLoader";
+// App renders its pages through React.lazy (#6206). Its early chunk import runs only on a
+// /workspace/ route, and a story runs at /iframe.html, so each App story's first render waited
+// for the page chunk, and a busy runner timed out the transcript queries (#6231). Importing the
+// pages here puts them in the story bundle, so React.lazy resolves them at once.
+import "@/browser/components/AIView/AIView";
+import "@/browser/components/ProjectPage/ProjectPage";
+import "@/browser/components/ScratchPage/ScratchPage";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
