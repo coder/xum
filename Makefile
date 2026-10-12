@@ -504,9 +504,17 @@ crap: ## Score every production src/ function with Crapper into .metrics/crap.js
 	@mv .metrics/crap.json.tmp .metrics/crap.json
 	@echo "Wrote .metrics/crap.json"
 
+CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --quiet --no-project --with pytest --with-requirements scripts/crap/crapper_report.py python
+
 test-crap-scripts: ## Test the Crapper adapter against hand-counted fixtures
-	@PYTHONDONTWRITEBYTECODE=1 uv run --quiet --no-project --with pytest --with-requirements scripts/crap/crapper_report.py \
-		python -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
+	@# tree-sitter-language-pack downloads its grammars from GitHub releases on
+	@# first use. This target is in static-check-full (Required), so retry a
+	@# transient failure there (seen: HTTP 504) before the tests use them.
+	@for attempt in 1 2 3; do \
+		$(CRAP_PYTHON) -c 'from tree_sitter_language_pack import download; download(["typescript", "tsx", "javascript"])' && break; \
+		[ $$attempt -lt 3 ] || exit 1; echo "grammar download failed, retrying ($$attempt/3)" >&2; sleep 10; \
+	done
+	@$(CRAP_PYTHON) -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
 
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh
