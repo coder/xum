@@ -196,6 +196,37 @@ describe("comparePromptCachePrefix", () => {
     });
   });
 
+  test("unsigned reasoning the SDK drops is not a block; signed thinking is", () => {
+    // The rebuild puts an unsigned "..." reasoning part before tool calls
+    // (ensureAnthropicThinkingBeforeToolCalls); the AI SDK drops it before the wire.
+    const promptWith = (reasoning: object[]) => ({
+      tools: TOOLS,
+      prompt: [
+        { role: "user", content: [{ type: "text", text: "Read it" }] },
+        {
+          role: "assistant",
+          content: [
+            ...reasoning,
+            { type: "tool-call", toolCallId: "c1", toolName: "bash", input: {} },
+          ],
+        },
+      ],
+    });
+    const placeholder = { type: "reasoning", text: "..." };
+    expect(compare(promptWith([]), promptWith([placeholder])).kind).toBe("extends");
+    expect(
+      compare(
+        promptWith([]),
+        promptWith([{ ...placeholder, providerOptions: { anthropic: { cacheControl: {} } } }])
+      ).kind
+    ).toBe("extends");
+
+    const signed = { ...placeholder, providerOptions: { anthropic: { signature: "sig" } } };
+    expect(compare(promptWith([]), promptWith([signed]))).toMatchObject({ kind: "break" });
+    const redacted = { ...placeholder, providerOptions: { anthropic: { redactedData: "x" } } };
+    expect(compare(promptWith([]), promptWith([redacted]))).toMatchObject({ kind: "break" });
+  });
+
   test("a system message's Anthropic options count; its cache marker does not", () => {
     const withOptions = (anthropic: object) => ({
       tools: TOOLS,

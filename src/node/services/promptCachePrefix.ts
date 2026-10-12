@@ -205,6 +205,18 @@ function dropDefaultToolCaller(block: unknown): unknown {
 }
 
 /**
+ * The AI SDK Anthropic converter sends a prompt-form `reasoning` part only as a signed
+ * `thinking` block or a `redacted_thinking` block. A part with neither (the `"..."`
+ * placeholder ensureAnthropicThinkingBeforeToolCalls adds before tool calls on rebuild) is
+ * dropped with a warning, so it never reaches Anthropic and must not count as a block.
+ */
+function isUnsentReasoning(part: unknown): boolean {
+  if (!isRecord(part) || part.type !== "reasoning") return false;
+  const anthropic = isRecord(part.providerOptions) ? part.providerOptions.anthropic : undefined;
+  return !isRecord(anthropic) || (anthropic.signature == null && anthropic.redactedData == null);
+}
+
+/**
  * Fingerprint a final Anthropic request body: the Messages API form (`tools`,
  * `system`, `messages`) or the AI SDK prompt form (`tools`, `prompt` with
  * system messages inline).
@@ -304,7 +316,7 @@ export function fingerprintAnthropicRequest(body: Record<string, unknown>): Prom
     images: allParts.some((part) => someBlock(part, isImage)),
   });
   for (const message of messages.slice(leadingSystemCount)) {
-    for (const part of message.content) {
+    for (const part of message.content.filter((entry) => !isUnsentReasoning(entry))) {
       push("messages", message.role, normalizeContentBlock(part));
     }
   }
