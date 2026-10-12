@@ -251,8 +251,10 @@ function parseMatcherGroup(
     const error =
       typeof group.matcher === "string" ? hookMatcherError(group.matcher) : "not a string";
     if (typeof group.matcher !== "string" || error !== undefined) {
+      // Name the matcher: a plugin can have several groups per event, and the warning must say
+      // which one Xum refused.
       warnings.push(
-        `${source}: a '${event}' matcher is not a valid regex (${String(error)}); ignoring its group`
+        `${source}: a '${event}' matcher is not a valid regex (${String(error)}); ignoring its group ${quoteForWarning(group.matcher)}`
       );
       return;
     }
@@ -295,20 +297,32 @@ function parseHandler(
     warnings.push(`${where}: a hook handler must be an object; ignoring it`);
     return undefined;
   }
+  let invalid = "";
   switch (raw.type) {
     case "mcp_tool": {
       const { server, tool, input, timeout, statusMessage } = raw;
       // Codex skips a blank (whitespace-only) server or tool, so no blank target looks runnable.
-      if (typeof server !== "string" || server.trim().length === 0) break;
-      if (typeof tool !== "string" || tool.trim().length === 0) break;
-      if (input !== undefined && !isPlainObject(input)) break;
+      if (typeof server !== "string" || server.trim().length === 0) {
+        invalid = "server";
+        break;
+      }
+      if (typeof tool !== "string" || tool.trim().length === 0) {
+        invalid = "tool";
+        break;
+      }
+      if (input !== undefined && !isPlainObject(input)) {
+        invalid = "input";
+        break;
+      }
       // Codex raises a timeout below one second (including 0) to one second instead of dropping
       // the hook. Finite: `1e400` parses to Infinity.
       if (
         timeout !== undefined &&
         !(typeof timeout === "number" && Number.isFinite(timeout) && timeout >= 0)
-      )
+      ) {
+        invalid = "timeout";
         break;
+      }
       return {
         type: "mcp_tool",
         server,
@@ -320,7 +334,10 @@ function parseHandler(
       };
     }
     case "command":
-      if (typeof raw.command !== "string") break;
+      if (typeof raw.command !== "string") {
+        invalid = "command";
+        break;
+      }
       return { type: "command", summary: raw.command };
     case "prompt":
     case "agent":
@@ -329,10 +346,19 @@ function parseHandler(
       warnings.push(`${where}: unknown handler type; ignoring it`);
       return undefined;
   }
+  // Name the bad field and, when it has one, the handler's tool: two broken handlers in one
+  // event must not produce the same warning.
+  const tool = typeof raw.tool === "string" ? ` of tool ${quoteForWarning(raw.tool)}` : "";
   warnings.push(
-    `${where}: a '${String(raw.type)}' handler has missing or invalid fields; ignoring it`
+    `${where}: a '${String(raw.type)}' handler has missing or invalid fields ('${invalid}'${tool}); ignoring it`
   );
   return undefined;
+}
+
+/** A plugin-written value inside a warning: quoted and cut, so a long value cannot flood it. */
+function quoteForWarning(value: unknown): string {
+  const text = typeof value === "string" ? value : String(JSON.stringify(value));
+  return JSON.stringify(text.length > 80 ? `${text.slice(0, 80)}…` : text);
 }
 
 /**
