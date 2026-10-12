@@ -138,6 +138,30 @@ describe("WorkspaceService remove rolls child patch artifacts into the parent", 
     expect(await fsPromises.stat(parentMbox).catch(() => null)).toBeNull();
   });
 
+  test("never copies an mbox for an index key that escapes the parent session dir", async () => {
+    // The reader keeps the map key, not the entry's own childTaskId. This key resolves to
+    // <sessions>/escaped, outside the parent's dir but still inside the test's temp root.
+    const escapingKey = "../../escaped";
+    const inChild = getSubagentGitPatchMboxPath(childDir, "safe", storageKey);
+    await writeMbox(inChild, "patch");
+    await fsPromises.writeFile(
+      getSubagentGitPatchArtifactsFilePath(childDir),
+      JSON.stringify({
+        version: 2,
+        artifactsByChildTaskId: { [escapingKey]: artifact("safe", childDir, 10, inChild) },
+      })
+    );
+    const escapedDir = path.dirname(
+      getSubagentGitPatchMboxPath(parentDir, escapingKey, storageKey)
+    );
+    expect(path.relative(parentDir, escapedDir).startsWith("..")).toBe(true);
+    expect(path.relative(harness.rootDir, escapedDir).startsWith("..")).toBe(false);
+
+    await removeChild();
+
+    expect(await fsPromises.stat(escapedDir).catch(() => null)).toBeNull();
+  });
+
   test("an entry without an mbox is merged without copying anything", async () => {
     await writeIndex(childDir, [artifact("task-none", childDir, 10, null)]);
 
