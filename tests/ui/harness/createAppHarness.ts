@@ -14,6 +14,7 @@ import {
 import { detectDefaultTrunkBranch } from "@/node/git";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { APIClient } from "@/browser/contexts/API";
 
 import { installDom } from "../dom";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
@@ -54,6 +55,8 @@ export async function createAppHarness(options?: {
    * workspace-scoped persisted state (e.g. draft attachments).
    */
   beforeRender?: (workspaceId: string) => void;
+  /** Replace the client the app renders with, e.g. a trackApiCalls wrapper of `client`. */
+  wrapApiClient?: (client: APIClient) => APIClient;
 }): Promise<AppHarness> {
   const repoPath = await createTempGitRepo();
   const env = await createTestEnvironment();
@@ -92,7 +95,7 @@ export async function createAppHarness(options?: {
 
     cleanupDom = installDom();
     options?.beforeRender?.(workspaceId);
-    view = renderApp({ apiClient: env.orpc, metadata });
+    view = renderApp({ apiClient: options?.wrapApiClient?.(env.orpc) ?? env.orpc, metadata });
 
     await setupWorkspaceView(view, metadata, workspaceId);
     await waitForWorkspaceChatToRender(view.container);

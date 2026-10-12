@@ -48,7 +48,7 @@ export function BaseSelectorPopover({
   "data-testid": testId,
 }: BaseSelectorPopoverProps) {
   const [isOpen, setIsOpen] = useState(false);
-  const [inputValue, setInputValue] = useState(value);
+  const [inputValue, setInputValue] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const apiState = useOptionalAPI();
@@ -60,19 +60,17 @@ export function BaseSelectorPopover({
   } | null>(null);
 
   const handleOpenChange = (open: boolean) => {
+    // Clear the search on open to show all suggestions. The input exists only while open, so
+    // it needs no copy of `value`: copying it on every change replaced the typed search when a
+    // base arrived while the list was open (#6168).
+    if (open) setInputValue("");
     setIsOpen(open);
     onOpenChange?.(open);
   };
 
-  // Sync input with external value changes
-  useEffect(() => {
-    setInputValue(value);
-  }, [value]);
-
-  // Clear search and focus input when dropdown opens
+  // Focus the input when the dropdown opens
   useEffect(() => {
     if (isOpen) {
-      setInputValue(""); // Clear to show all suggestions
       setTimeout(() => inputRef.current?.focus(), 0);
     }
   }, [isOpen]);

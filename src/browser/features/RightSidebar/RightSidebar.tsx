@@ -1,4 +1,5 @@
 import React from "react";
+import { X } from "lucide-react";
 import {
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_TAB_KEY,
@@ -11,7 +12,10 @@ import { trimRecordToChars } from "@/browser/utils/boundedPersistedValue";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import {
+  DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
+  isDesktopMode,
+} from "@/browser/hooks/useDesktopTitlebar";
 import {
   readPersistedState,
   updatePersistedState,
@@ -51,6 +55,7 @@ import {
   matchesKeybind,
   KEYBINDS,
   formatKeybind,
+  isCommandPaletteTarget,
   isDialogOpen,
   isEditableElement,
   isBrowserViewportFocused,
@@ -59,6 +64,9 @@ import {
   matchesNewSidebarTabKeybind,
 } from "@/browser/utils/ui/keybinds";
 import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
+import { Button } from "@/browser/components/Button/Button";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
+import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import { cn } from "@/common/lib/utils";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { GoalSetError, GoalSnapshot, GoalStatus } from "@/common/types/goal";
@@ -155,6 +163,8 @@ interface SidebarContainerProps {
   isDesktop?: boolean;
   /** Hide + inactivate sidebar while immersive review overlay is active. */
   immersiveHidden?: boolean;
+  /** Phones: show the narrow-layout-hidden sidebar full-screen (see RightSidebarProps). */
+  fullscreen?: boolean;
   /** The container element, for shortcut handlers that must know whether it is visible. */
   containerRef: React.RefObject<HTMLDivElement>;
   children: React.ReactNode;
@@ -176,6 +186,7 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
   isResizing,
   isDesktop,
   immersiveHidden = false,
+  fullscreen = false,
   containerRef,
   children,
   role,
@@ -208,6 +219,8 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
         "bg-surface-primary border-l border-border-light flex flex-col overflow-hidden flex-shrink-0",
         // Hide on mobile touch devices - too narrow for useful interaction
         "mobile-hide-right-sidebar",
+        // globals.css shows the hidden sidebar full-screen, only while the narrow layout hides it.
+        fullscreen && "right-sidebar-fullscreen",
         // Immersive review renders its own full-screen overlay, so hiding the underlying
         // sidebar container cuts layout/paint cost without discarding its React state.
         immersiveHidden && "hidden",
@@ -253,6 +266,15 @@ interface RightSidebarProps {
   addTerminalRef?: React.MutableRefObject<
     ((options?: TerminalSessionCreateOptions) => void) | null
   >;
+  /**
+   * Phones: the narrow layout hides this sidebar, so the workspace menu shows it full-screen
+   * instead. WorkspaceShell owns the state; the CSS applies it only while the layout hides the
+   * sidebar, and the sidebar asks to close once the layout no longer does.
+   */
+  fullscreen?: boolean;
+  onCloseFullscreen?: () => void;
+  /** Sidebar shortcuts while the narrow layout hides the sidebar: show it full-screen. */
+  onRequestFullscreen?: () => void;
 }
 
 /**
@@ -382,6 +404,8 @@ interface RightSidebarTabsetNodeProps {
   onRequestTerminalFocus: (sessionId: string) => void;
   /** Callback to clear the auto-focus state after it's been consumed */
   onAutoFocusConsumed: () => void;
+  /** False in the phone full-screen view: phones show no keyboard shortcuts. */
+  showTabShortcuts: boolean;
 }
 
 const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) => {
@@ -464,7 +488,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
       KEYBINDS.SIDEBAR_TAB_9,
     ];
     const keybindStr =
-      tabPosition !== undefined && tabPosition < keybinds.length
+      props.showTabShortcuts && tabPosition !== undefined && tabPosition < keybinds.length
         ? formatKeybind(keybinds[tabPosition])
         : undefined;
 
@@ -774,6 +798,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   isCreating = false,
   immersiveHidden = false,
   addTerminalRef,
+  fullscreen = false,
+  onCloseFullscreen,
+  onRequestFullscreen,
 }) => {
   // Trigger for focusing Review panel (preserves hunk selection)
   const [focusTrigger, _setFocusTrigger] = React.useState(0);
@@ -815,6 +842,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const terminalCreateError = usePopoverError();
 
   // Manual collapse state (persisted globally)
+  // WorkspaceShell expands it when it opens the phone full-screen view (see there).
   const [collapsed, setCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
     listener: true,
   });
@@ -1295,9 +1323,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   // "Open in Artifacts" on an MCP Apps tool card and openArtifact() (chat cards, file cards,
   // Review, palette) persist their selection, then ask for the tab like OPEN_GOAL_TAB. On small
-  // viewports WorkspaceMenuBar opens the Artifacts dialog instead; this handler then stays out,
-  // so a view never mounts twice (dialog plus a hidden sidebar copy, each running the app's
-  // init and tool calls).
+  // viewports WorkspaceMenuBar shows the tab in the full-screen sidebar instead; this handler
+  // then stays out, so one event never acts twice.
   React.useEffect(() => {
     if (!artifactsExperimentEnabled) return;
     const handleOpenArtifactsTab = (event: Event) => {
@@ -1318,8 +1345,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   // Global shortcut: open (and un-collapse) the Artifacts tab. Works from the chat input
   // too, because Ctrl+Shift+K inserts nothing there. While the narrow layout hides the
-  // sidebar, WorkspaceMenuBar opens the Artifacts dialog instead; this handler then stays out,
-  // so one keystroke never acts twice.
+  // sidebar, WorkspaceMenuBar shows the tab in the full-screen sidebar instead; this handler then
+  // stays out, so one keystroke never acts twice.
   React.useEffect(() => {
     if (!artifactsExperimentEnabled) return;
     const handler = (e: KeyboardEvent) => {
@@ -1417,7 +1444,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   }, [canReviewDiffs, selectOrOpenReviewTab, setCollapsed, setIsReviewImmersive, workspaceId]);
 
   // Keyboard shortcuts for tab switching by position (Cmd/Ctrl+1-9)
-  // Auto-expands sidebar if collapsed
+  // Auto-expands sidebar if collapsed. While the narrow layout hides the sidebar, they show it
+  // full-screen on that tab where the parent can (phones): the keyboard path to the workspace
+  // menu's Sidebar row.
   React.useEffect(() => {
     const tabKeybinds = [
       KEYBINDS.SIDEBAR_TAB_1,
@@ -1461,6 +1490,18 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             selectTabByIndex(canReviewDiffs ? prev : removeTabEverywhere(prev, "review"), tabIndex)
           );
           setCollapsed(false);
+          // Only for a tab that exists (a shortcut past the last tab must not cover the chat),
+          // and not from an open modal or the command palette: the view would make it inert.
+          const container = sidebarContainerRef.current;
+          if (
+            target &&
+            !isDialogOpen() &&
+            !isCommandPaletteTarget(e.target) &&
+            container != null &&
+            isRightSidebarResponsivelyHidden(container)
+          ) {
+            onRequestFullscreen?.();
+          }
           return;
         }
       }
@@ -1471,6 +1512,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   }, [
     canReviewDiffs,
     initialActiveTab,
+    onRequestFullscreen,
     setAutoFocusTerminalSession,
     setCollapsed,
     setLayout,
@@ -1557,11 +1599,27 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const closeNonTerminalTab = React.useCallback(
     (tabsetId: string, tab: TabType) => {
       const prev = getBaseLayout();
-      const nextLayout = closeTabInTabset(prev, tabsetId, tab);
+      // #6117: the closed tab's button (with its X) and panel unmount, so focus inside them
+      // would fall to <body> and the next Tab would start over from the top of the page.
+      const closedTabHeldFocus = [
+        `${baseId}-${tabsetId}-tab-${tab}`,
+        `${baseId}-${tabsetId}-panel-${tab}`,
+      ].some((id) => document.getElementById(id)?.contains(document.activeElement) === true);
+      let nextLayout = closeTabInTabset(prev, tabsetId, tab);
+      if (!closedTabHeldFocus) {
+        setLayout(() => nextLayout);
+        focusTerminalTab(getTabRevealedByClose(prev, nextLayout, tabsetId, tab));
+        return;
+      }
+      // Keep focus in this tabset when it survives (the focus effect looks in the focused one).
+      const survivor = findTabset(nextLayout.root, tabsetId);
+      if (survivor?.type === "tabset") nextLayout = setFocusedTabset(nextLayout, tabsetId);
       setLayout(() => nextLayout);
-      focusTerminalTab(getTabRevealedByClose(prev, nextLayout, tabsetId, tab));
+      const target = getFocusedActiveTab(nextLayout, NEW_TAB);
+      if (isTerminalTab(target)) focusTerminalTab(target);
+      else setTabToFocus(target);
     },
-    [focusTerminalTab, getBaseLayout, setLayout]
+    [baseId, focusTerminalTab, getBaseLayout, setLayout]
   );
 
   const { workspaceMetadata: allWorkspaceMetadata, loaded: workspaceMetadataLoaded } =
@@ -1858,9 +1916,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     const handler = (e: KeyboardEvent) => {
       if (!matchesNewSidebarTabKeybind(e)) return;
       const container = sidebarContainerRef.current;
+      // The narrow layout hides the sidebar, so there is no strip to add a tab to. Where the
+      // parent can show it full-screen (phones), the shortcut opens the New tab there instead,
+      // so this view has a shortcut like every other operation.
+      const hidden = container != null && isRightSidebarResponsivelyHidden(container);
       if (
-        // The narrow layout hides the sidebar; there is no strip to add a tab to.
-        (container != null && isRightSidebarResponsivelyHidden(container)) ||
+        (hidden && onRequestFullscreen == null) ||
         isDialogOpen() ||
         // Remote viewports and terminals own their keystrokes.
         isTerminalFocused(e.target) ||
@@ -1870,11 +1931,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         return;
       }
       e.preventDefault();
+      if (hidden) onRequestFullscreen?.();
       handleAddNewTab();
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [handleAddNewTab]);
+  }, [handleAddNewTab, onRequestFullscreen]);
 
   // The command palette's "Right Sidebar: New Tab" (it hides itself while the sidebar is
   // responsively hidden, so no layout guard is needed here).
@@ -1906,6 +1968,78 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     debug: llmDebugLogsEnabled === true,
   };
   const launcherTools = getOrderedBaseTabIds().filter((tool) => toolAvailable[tool]);
+  // Full-screen mode only makes sense while the narrow layout hides the sidebar. Its header is
+  // shown by the same CSS rules (globals.css), so a header that computes to display:none means
+  // the layout widened (a rotated phone, a wider window): the sidebar is back in its column.
+  // While it covers the window, everything else is inert, so Tab, pointers and assistive tech
+  // stay inside it (the left sidebar and footer sit outside the chat pane).
+  const fullscreenHeaderRef = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    const header = fullscreenHeaderRef.current;
+    const container = sidebarContainerRef.current;
+    if (!fullscreen || onCloseFullscreen == null || header == null || container == null) return;
+    let restoreOthers: (() => void) | null = null;
+    // The focused pane's shown tab. Focusing a tab also focuses its pane, so a split layout keeps
+    // the pane it had. It is found in the rendered DOM, not the stored layout, because rendering
+    // can filter tabs out (Review in a workspace without a repository). The match is by id prefix,
+    // not a selector built from the id: legacy workspace ids keep path characters (quotes) that
+    // would make querySelector throw with the page inert. Falls back to any shown tab, then the
+    // close button, so focus always lands inside.
+    const focusInside = () => {
+      const focusedPanePrefix = `${baseId}-${getBaseLayout().focusedTabsetId}-tab-`;
+      const selectedTabs = Array.from(
+        container.querySelectorAll<HTMLElement>('[role="tab"][aria-selected="true"]')
+      );
+      const target =
+        selectedTabs.find((tab) => tab.id.startsWith(focusedPanePrefix)) ??
+        selectedTabs[0] ??
+        header.querySelector<HTMLElement>("button");
+      target?.focus();
+    };
+    // Focus that falls out with a removed node (a tab pruned once its tool turns out to be
+    // unavailable, a closed tab) would sit on <body> with the rest of the page inert: bring it
+    // back. Only from <body>: a portaled menu opened from the view keeps its focus.
+    const focusObserver = new MutationObserver(() => {
+      if (restoreOthers == null) return;
+      if (document.activeElement == null || document.activeElement === document.body) {
+        focusInside();
+      }
+    });
+    focusObserver.observe(container, { childList: true, subtree: true });
+    const closeIfWidened = () => {
+      if (window.getComputedStyle(header).display === "none") {
+        restoreOthers?.();
+        restoreOthers = null;
+        onCloseFullscreen();
+      } else {
+        // Not `??=` (or the matching if-assignment that lint rewrites to it): React Compiler
+        // cannot lower `??=` and would skip this whole component.
+        if (restoreOthers != null) return;
+        restoreOthers = makeOthersInert(container);
+        // Focus was outside (the menu button, now inert): move it into the view, so keyboard
+        // and screen reader users land there. A launcher or panel that took focus already (the
+        // New tab shortcut) keeps it.
+        if (!container.contains(document.activeElement)) focusInside();
+      }
+    };
+    closeIfWidened();
+    const mql = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    mql.addEventListener("change", closeIfWidened);
+    const shell = sidebarContainerRef.current?.closest("[data-workspace-shell]");
+    let resizeObserver: ResizeObserver | undefined;
+    if (shell instanceof HTMLElement && typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(closeIfWidened);
+      resizeObserver.observe(shell);
+    }
+    return () => {
+      focusObserver.disconnect();
+      mql.removeEventListener("change", closeIfWidened);
+      resizeObserver?.disconnect();
+      restoreOthers?.();
+    };
+  }, [baseId, fullscreen, getBaseLayout, onCloseFullscreen]);
+  const workspaceDisplayTitle =
+    currentWorkspaceMetadata?.title ?? currentWorkspaceMetadata?.name ?? "";
 
   // Expose handleAddTerminal to parent via ref (for Cmd/Ctrl+T keybind)
   React.useEffect(() => {
@@ -2110,6 +2244,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       <RightSidebarTabsetNode
         key={node.id}
         node={node}
+        showTabShortcuts={!fullscreen}
         baseId={baseId}
         workspaceId={workspaceId}
         workspacePath={workspacePath}
@@ -2183,15 +2318,45 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         isResizing={isResizing}
         isDesktop={isDesktopMode()}
         immersiveHidden={immersiveHidden}
+        fullscreen={fullscreen}
         containerRef={sidebarContainerRef}
         customWidth={width} // Unified width from AIView (applies to all tabs)
         role="complementary"
         aria-label="Workspace insights"
       >
+        {fullscreen && (
+          // Shown only by the full-screen CSS (globals.css); also the probe for "layout widened".
+          <div
+            ref={fullscreenHeaderRef}
+            className={cn(
+              // It covers the window's top edge, so on Windows/Linux and macOS desktop it must
+              // keep clear of the native window controls and stay a drag region, like the
+              // workspace header.
+              "right-sidebar-fullscreen-header border-border-light titlebar-safe-left titlebar-safe-left-gutter-4 titlebar-safe-right titlebar-safe-right-gutter-2 shrink-0 items-center justify-between gap-2 border-b py-1",
+              isDesktopMode() && cn(DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS, "titlebar-drag")
+            )}
+          >
+            <span className="text-foreground min-w-0 truncate text-sm font-medium">
+              {workspaceDisplayTitle}
+            </span>
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn(
+                "text-muted hover:text-foreground h-8 w-8 shrink-0",
+                isDesktopMode() && "titlebar-no-drag"
+              )}
+              aria-label="Close sidebar"
+              onClick={onCloseFullscreen}
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        )}
         {!collapsed && (
           <div className="flex min-h-0 min-w-0 flex-1 flex-row">
-            {/* Resize handle (left edge) */}
-            {onStartResize && (
+            {/* Resize handle (left edge); full-screen mode has nothing to resize. */}
+            {onStartResize && !fullscreen && (
               <div
                 className={cn(
                   "w-0.5 flex-shrink-0 z-10 transition-[background] duration-150 cursor-col-resize",
@@ -2204,11 +2369,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
             <div className="flex min-h-0 min-w-0 flex-1 flex-col">
               {renderLayoutNode(layout.root)}
-              <SidebarCollapseButton
-                collapsed={collapsed}
-                onToggle={() => setCollapsed(!collapsed)}
-                side="right"
-              />
+              {/* Full-screen mode closes from its header instead. */}
+              {!fullscreen && (
+                <SidebarCollapseButton
+                  collapsed={collapsed}
+                  onToggle={() => setCollapsed(!collapsed)}
+                  side="right"
+                />
+              )}
             </div>
           </div>
         )}
