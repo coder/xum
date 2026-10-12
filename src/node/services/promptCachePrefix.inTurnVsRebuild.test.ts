@@ -189,6 +189,20 @@ function withoutCacheControl(value: unknown): unknown {
  * Index of the first `messages` entry where `next` stops repeating `previous`
  * (byte-wise JSON, cache markers removed), or -1 when `previous` is a prefix.
  */
+const MONITOR_WAKE = "[bash monitor] The background job finished.";
+
+/**
+ * True when `next` ends with a message carrying `text` that `previous` never sent. Once the
+ * prefix matches, that message must come after every message of `previous`. This holds while a
+ * break shortens the rebuilt list too (merged steps, coalesced polls).
+ */
+function sendsAfter(previous: WireBody, next: WireBody, text: string): boolean {
+  return (
+    !JSON.stringify(previous.messages).includes(text) &&
+    JSON.stringify(next.messages.at(-1) ?? null).includes(text)
+  );
+}
+
 function firstPrefixDivergence(previous: WireBody, next: WireBody): number {
   const a = previous.messages.map((m) => JSON.stringify(withoutCacheControl(m)));
   const b = next.messages.map((m) => JSON.stringify(withoutCacheControl(m)));
@@ -299,7 +313,7 @@ async function expectNextTurnExtendsLastStep(params: {
   const firstTurnBodies = await runTurn(anthropic, params.tools, params.firstTurn);
   expect(firstTurnBodies.length).toBe(params.firstTurn.length);
   // A monitor wake: the next trigger is one appended user row, nothing else changes.
-  await appendUser("[bash monitor] The background job finished.");
+  await appendUser(MONITOR_WAKE);
   const [nextFirst] = await runTurn(
     anthropic,
     params.tools,
@@ -309,6 +323,9 @@ async function expectNextTurnExtendsLastStep(params: {
 
   expect(withoutCacheControl(nextFirst.system)).toEqual(withoutCacheControl(lastStep.system));
   expect(withoutCacheControl(nextFirst.tools)).toEqual(withoutCacheControl(lastStep.tools));
+  // A request that dropped the new trigger would match the previous one exactly, so check it
+  // is sent after the previous request's messages before checking the prefix.
+  expect(sendsAfter(lastStep, nextFirst, MONITOR_WAKE)).toBe(true);
   // Target assertion: the index of the first message the next turn changed (-1 = none).
   expect(firstPrefixDivergence(lastStep, nextFirst)).toBe(-1);
 }
@@ -561,7 +578,7 @@ async function hotMemoryChangeKeepsHistoryCached(): Promise<void> {
     endTurn,
     "\n\n<hot_memories>\nA\n</hot_memories>"
   );
-  await appendUser("[bash monitor] The background job finished.");
+  await appendUser(MONITOR_WAKE);
   const [second] = await runTurn(
     anthropic,
     tools,
@@ -569,6 +586,7 @@ async function hotMemoryChangeKeepsHistoryCached(): Promise<void> {
     "\n\n<hot_memories>\nB\n</hot_memories>"
   );
 
+  expect(sendsAfter(first, second, MONITOR_WAKE)).toBe(true);
   const previous = wireBlocks(first);
   const next = wireBlocks(second);
   const firstChanged = previous.findIndex((block, index) => block !== next[index]);
