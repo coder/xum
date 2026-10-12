@@ -54,6 +54,8 @@ let getStateCalls = 0;
 let getViewCalls = 0;
 /** Every request but getState fails with this error while set (a backend still starting). */
 let failWith: string | null = null;
+/** The artifacts the listing returns. */
+let listEntries = [{ path: "app.html", kind: "html" as const, size: 10, modifiedMs: 1 }];
 /** Only listVersions fails while set. */
 let failVersions = false;
 /** getState answers unsuccessfully while set. */
@@ -76,7 +78,7 @@ function createClient(): APIClient {
           data: {
             available: true as const,
             dir: "/scratch/artifacts",
-            entries: [{ path: "app.html", kind: "html" as const, size: 10, modifiedMs: 1 }],
+            entries: listEntries,
             truncated: false,
           },
         });
@@ -234,6 +236,7 @@ describe("Artifacts tab across a dropped connection", () => {
     failWith = null;
     failVersions = false;
     failGetState = false;
+    listEntries = [{ path: "app.html", kind: "html" as const, size: 10, modifiedMs: 1 }];
     sends = [];
   });
 
@@ -357,6 +360,9 @@ describe("Artifacts tab across a dropped connection", () => {
     await flush();
     expect(frame.getAttribute("srcdoc")).not.toContain("zq-persisted");
     const statesRead = getStateCalls;
+    // A lasting failure is not retried against the same client.
+    await flush();
+    expect(getStateCalls).toBe(statesRead);
 
     failGetState = false;
     await dropConnection();
@@ -439,5 +445,17 @@ describe("Artifacts tab across a dropped connection", () => {
     await waitFor(() => expect(assetReads.length).toBe(reads + 1));
     await flush();
     expect(view.queryByText(/Could not read/)).toBeNull();
+  });
+
+  test("a failed refresh of an empty listing shows the error, not an empty folder", async () => {
+    listEntries = [];
+    const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
+    expect(await view.findByText(/No artifacts yet/)).toBeTruthy();
+
+    await dropConnection();
+    failWith = "Backend is starting";
+    await reconnect();
+    expect(view.getByText("Backend is starting")).toBeTruthy();
+    expect(view.queryByText(/No artifacts yet/)).toBeNull();
   });
 });

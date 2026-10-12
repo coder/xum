@@ -1417,9 +1417,14 @@ export function ArtifactsPanel(props: {
         <div className="min-h-0 flex-1 overflow-auto">{viewerBody}</div>
       </>
     );
-  } else if (listError != null && listing == null && !storedVersionSelected) {
-    // Only with nothing listed yet: a failed re-list (a backend still starting after a reconnect)
-    // keeps the last listing, and the error line below sits beside the artifact instead.
+  } else if (
+    listError != null &&
+    (listing == null || (selected == null && !waitingForPinned)) &&
+    !storedVersionSelected
+  ) {
+    // Only with nothing on screen: a failed re-list (a backend still starting after a reconnect)
+    // keeps the last listing, and the error line below sits beside the artifact instead. With
+    // nothing selected, "No artifacts yet" would present the failed refresh as an empty folder.
     body = withAppPicker(<div className="text-danger p-4 text-xs">{listError}</div>);
   } else if (listing == null && !storedVersionSelected) {
     body = withAppPicker(<div className="text-muted p-4 text-xs">Loading…</div>);
