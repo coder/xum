@@ -1,10 +1,11 @@
-// Tests scripts/crap/agent-gate.sh (the .xum/tool_pre and tool_post CRAP gate)
+// Tests scripts/crap/agent-gate.sh (the CRAP gate behind .xum/tool_post)
 // in throwaway git repos, in both modes. Like check.test.ts it needs uv, so
 // `make test-crap-scripts` runs it and Test / Unit skips it.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -15,10 +16,12 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-const TOOL_PRE = join(import.meta.dir, "../../.xum/tool_pre");
+const REPO = join(import.meta.dir, "../..");
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
 const SHIPPED_MODE = "CRAP_GATE_MODE=warn\n";
 
+// Tests that run the real scorer get a 60 s budget: each run takes about a
+// second, more on a loaded runner, and bun's default is 5 s per test.
 let dir: string;
 let repo: string;
 
@@ -108,7 +111,7 @@ test("block mode stops a regressing commit before it runs, unless it carries Cra
   const after = runGate(gate, "post", "git commit -am grow -m 'Crap-Debt: needs follow-up'");
   expect(after.status).toBe(0);
   expect(after.out).toContain("warning   floor-cc     src/route.ts:1-5 route: CC 2 -> 5");
-});
+}, 60_000);
 
 test("warn mode lets the commit run and reports after it", () => {
   const gate = gateIn("warn");
@@ -117,7 +120,7 @@ test("warn mode lets the commit run and reports after it", () => {
   const reported = runGate(gate, "post", "git commit -am 'grow route'");
   expect(reported.status).toBe(0);
   expect(reported.out).toContain("VIOLATION floor-cc     src/route.ts:1-5 route: CC 2 -> 5");
-});
+}, 60_000);
 
 test("other commands skip the check, and a broken gate never blocks", () => {
   const gate = gateIn("block");
@@ -164,7 +167,7 @@ test("other commands skip the check, and a broken gate never blocks", () => {
     status: 0,
     out: "crap-gate: skipped (no timeout or gtimeout command). The gate never blocks on its own failure.\n",
   });
-});
+}, 60_000);
 
 test("a scorer that ignores SIGTERM is killed before Xum's hook limit", () => {
   const gate = gateIn("block");
@@ -186,8 +189,17 @@ test("a scorer that ignores SIGTERM is killed before Xum's hook limit", () => {
   expect(Date.now() - started).toBeLessThan(10_000);
 }, 15_000);
 
-test("non-commit calls and the shipped warn-mode tool_pre start no process", () => {
-  // tool_pre runs before every tool call. A PATH with only bash makes any
+test("warn mode ships no project tool_pre that would replace the user's own", () => {
+  // Xum runs the project's .xum/tool_pre instead of ~/.xum/tool_pre.
+  const mode = /^CRAP_GATE_MODE=(\w+)$/m.exec(
+    readFileSync(join(import.meta.dir, "agent-gate.sh"), "utf8")
+  )?.[1];
+  expect(mode).toBe("warn");
+  expect(existsSync(join(REPO, ".xum/tool_pre"))).toBe(false);
+});
+
+test("non-commit calls start no process", () => {
+  // The hooks run around every tool call. A PATH with only bash makes any
   // git, bun, uv (or grep, cat, dirname) call fail loudly.
   const onlyBash = join(dir, "only-bash");
   mkdirSync(onlyBash);
@@ -197,8 +209,8 @@ test("non-commit calls and the shipped warn-mode tool_pre start no process", () 
   for (const [hook, phase, tool, script] of [
     [shippedGate, "post", "bash", "ls -la && make test"],
     [shippedGate, "post", "file_read", "git commit -am x"],
-    [TOOL_PRE, "", "bash", "git commit -am x"],
-    [TOOL_PRE, "", "file_edit_insert", ""],
+    [shippedGate, "pre", "bash", "git commit -am x"],
+    [join(REPO, ".xum/tool_post"), "", "file_read", ""],
   ]) {
     const result = spawnSync(hook, phase ? [phase] : [], {
       cwd: repo,

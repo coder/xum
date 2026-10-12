@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# CRAP gate for agent `git commit` and `git push` calls (.xum/tool_pre and
-# .xum/tool_post call it with "pre" or "post"). See .xum/skills/crap-gate.
+# CRAP gate for agent `git commit` and `git push` calls. .xum/tool_post calls
+# it with "post"; block mode also needs a .xum/tool_pre that calls it with
+# "pre". See .xum/skills/crap-gate.
+#
+# Warn mode ships no .xum/tool_pre: Xum runs the project's tool_pre instead of
+# the user's ~/.xum/tool_pre, so shipping one would silently drop a user's own
+# pre-hook policy in this repo. Before switching to block, add a tool_pre that
+# also runs the user's hook:
+#   [[ "$XUM_TOOL" == "bash" ]] || exit 0
+#   exec "${0%/*}/../scripts/crap/agent-gate.sh" pre
 #
 # Xum shows a tool_pre's output only when it blocks (non-zero exit), so:
 #   block: tool_pre runs the check and exits 1 on violations; the agent sees
