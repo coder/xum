@@ -5,7 +5,15 @@
 import type { OpenAICyberAccessProgram } from "../types/openaiAccessPrograms";
 import { formatModelDisplayName } from "../utils/ai/modelDisplay";
 
-type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek" | "moonshotai" | "zai";
+type ModelProvider =
+  | "anthropic"
+  | "openai"
+  | "google"
+  | "xai"
+  | "meta"
+  | "deepseek"
+  | "moonshotai"
+  | "zai";
 
 interface KnownModelDefinition {
   /** Provider identifier used by SDK factories */
@@ -209,6 +217,12 @@ const MODEL_DEFINITIONS = {
     // K3's tokenizer isn't published in ai-tokenizer yet; reuse Kimi K2 (the newest
     // Moonshot tokenizer available) for approximate counting.
     tokenizerOverride: "moonshotai/kimi-k2",
+  },
+  // Only the public Muse Wonder API model, not Muse Code's Wonder Full variant.
+  MUSE_WONDER: {
+    provider: "meta",
+    providerModelId: "muse-wonder-1.0",
+    aliases: ["muse", "wonder", "muse-wonder"],
   },
   GLM_53_FLASH: {
     provider: "zai",

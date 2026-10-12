@@ -26,6 +26,7 @@ const envKeys = [
   "GOOGLE_BASE_URL",
   "XAI_API_KEY",
   "XAI_BASE_URL",
+  "META_MODEL_API_KEY",
   "OPENROUTER_API_KEY",
   "DEEPSEEK_API_KEY",
   "MOONSHOT_API_KEY",
@@ -320,6 +321,7 @@ it.each(["unchanged", "key", "abort"])(
 const httpAdapters = [
   "google",
   "xai",
+  "meta",
   "deepseek",
   "moonshotai",
   "openrouter",

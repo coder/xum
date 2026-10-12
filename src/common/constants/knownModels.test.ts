@@ -41,6 +41,8 @@ describe("Known Models Integration", () => {
     ["gemini", /^google:gemini-.*pro/],
     ["gemini-flash", /^google:gemini-.*flash/],
     ["grok", /^xai:grok-/],
+    ["muse", /^meta:muse-wonder-/],
+    ["wonder", /^meta:muse-wonder-/],
     ["deepseek", /^deepseek:deepseek-.*pro/],
     ["kimi", /^moonshotai:kimi-/],
     ["glm", /^zai:glm-/],

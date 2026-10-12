@@ -64,6 +64,9 @@ export const PROVIDER_ENV_VARS: Partial<
   openrouter: {
     apiKey: ["OPENROUTER_API_KEY"],
   },
+  meta: {
+    apiKey: ["META_MODEL_API_KEY"],
+  },
   deepseek: {
     apiKey: ["DEEPSEEK_API_KEY"],
   },

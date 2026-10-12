@@ -37,6 +37,28 @@ interface ModelData {
 }
 
 export const modelsExtra: Record<string, ModelData> = {
+  // Muse Wonder preview: https://dev.meta.ai/docs/models and
+  // https://dev.meta.ai/docs/pricing-rate-limits.md (no long-context premium).
+  // models.dev supplies the practical output cap; reasoning stays private.
+  // Wonder Full is Muse Code-only and must not be advertised as an API model.
+  "meta/muse-wonder-1.0": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 131072,
+    input_cost_per_token: 0.000004,
+    cache_read_input_token_cost: 0.0000002,
+    output_cost_per_token: 0.00002,
+    litellm_provider: "meta",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+    supported_endpoints: ["/v1/responses", "/v1/chat/completions", "/v1/messages"],
+  },
+
   // Grok 4.7 - Released September 21, 2026. xAI's frontier coding and knowledge-work
   // model. Identical rates and limits to Grok 4.6: $2/M input, $0.50/M cached input,
   // $6/M output, all doubled once a prompt reaches the 200K long-context threshold

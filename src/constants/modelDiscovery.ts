@@ -16,6 +16,7 @@ export const MODEL_DISCOVERY_BASE_URLS: Partial<Record<ProviderName, string>> = 
   openai: "https://api.openai.com/v1",
   google: "https://generativelanguage.googleapis.com/v1beta",
   xai: "https://api.x.ai/v1",
+  meta: "https://api.meta.ai/v1",
   deepseek: "https://api.deepseek.com",
   moonshotai: "https://api.moonshot.ai/v1",
   openrouter: "https://openrouter.ai/api/v1",

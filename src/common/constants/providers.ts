@@ -19,6 +19,7 @@ export type ProviderName =
   | "openai"
   | "google"
   | "xai"
+  | "meta"
   | "deepseek"
   | "moonshotai"
   | "zai"
@@ -146,6 +147,14 @@ export const PROVIDER_DEFINITIONS = {
     displayName: "xAI",
     import: () => import("@ai-sdk/xai"),
     factoryName: "createXai",
+    requiresApiKey: true,
+    kind: "direct",
+  },
+  meta: {
+    displayName: "Meta",
+    // Meta's Responses API uses the OpenAI SDK; keep its providerOptions namespace intact.
+    import: () => import("@ai-sdk/openai"),
+    factoryName: "createOpenAI",
     requiresApiKey: true,
     kind: "direct",
   },

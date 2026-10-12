@@ -6,6 +6,8 @@ import { describe, expect, it } from "bun:test";
 
 import type { ProvidersConfig } from "@/node/config";
 import {
+  buildProvidersFromEnv,
+  providerSecretEnvVarNames,
   hasAnyConfiguredProvider,
   isProviderAutoRouteEligible,
   resolveCustomProviderCredentials,
@@ -152,6 +154,32 @@ describe("hasAnyConfiguredProvider", () => {
     };
 
     expect(hasAnyConfiguredProvider(providers)).toBe(false);
+  });
+});
+
+describe("resolveProviderCredentials - Meta", () => {
+  it("resolves and bootstraps Meta credentials without borrowing OpenAI's key", () => {
+    const env = { META_MODEL_API_KEY: " meta-test-key ", OPENAI_API_KEY: "other-provider-key" };
+    expect(resolveProviderCredentials("meta", {}, env)).toMatchObject({
+      isConfigured: true,
+      apiKey: "meta-test-key",
+      apiKeySource: "env",
+    });
+    expect(buildProvidersFromEnv(env).meta).toEqual({ apiKey: "meta-test-key" });
+    expect(
+      resolveProviderCredentials("meta", {}, { OPENAI_API_KEY: "other-provider-key" }).isConfigured
+    ).toBe(false);
+    expect(providerSecretEnvVarNames()).toContain("META_MODEL_API_KEY");
+  });
+
+  it("prefers saved Meta credentials and excludes disabled Meta from auto-routing", () => {
+    const env = { META_MODEL_API_KEY: "env-key" };
+    expect(resolveProviderCredentials("meta", { apiKey: "saved-key" }, env)).toMatchObject({
+      apiKey: "saved-key",
+      apiKeySource: "config",
+    });
+    expect(isProviderAutoRouteEligible("meta", {}, env)).toBe(true);
+    expect(isProviderAutoRouteEligible("meta", { enabled: false }, env)).toBe(false);
   });
 });
 

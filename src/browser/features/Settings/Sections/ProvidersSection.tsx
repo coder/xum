@@ -333,6 +333,7 @@ const PROVIDER_KEY_URLS: Partial<Record<ProviderName, string>> = {
   openai: "https://platform.openai.com/api-keys",
   google: "https://aistudio.google.com/app/apikey",
   xai: "https://console.x.ai/team/default/api-keys",
+  meta: "https://dev.meta.ai/docs",
   deepseek: "https://platform.deepseek.com/api_keys",
   moonshotai: "https://platform.moonshot.ai/console/api-keys",
   zai: "https://z.ai/manage-apikey/apikey-list",
