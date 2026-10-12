@@ -275,6 +275,11 @@ export interface GoalContinuationRuntimeBridge {
     options: SendMessageOptions,
     isCurrent: () => boolean
   ): Promise<string | null>;
+  /**
+   * Cancel a scheduled auto-retry of this goal's automatic turn. Pause and completion call it
+   * so the retry stops resending the goal's prompt and its countdown clears at once.
+   */
+  abandonGoalAutoRetry?(workspaceId: string, goalId: string): void;
 }
 
 type PendingGoalContinuationSource = "stream_end" | "kickoff" | "budget_wrapup" | "stream_error";
@@ -4414,6 +4419,7 @@ export class WorkspaceGoalService {
       this.recordGoalSet(input.workspaceId, result.data, { notifyBoard: false });
     }
     if (completing) {
+      this.goalContinuationBridge?.abandonGoalAutoRetry?.(input.workspaceId, result.data.goalId);
       this.timelineRecorder.record(input.workspaceId, {
         kind: "goal.completed",
         source: {
@@ -4440,6 +4446,7 @@ export class WorkspaceGoalService {
         return result;
       }
       this.pendingContinuationCandidates.delete(input.workspaceId);
+      this.goalContinuationBridge?.abandonGoalAutoRetry?.(input.workspaceId, result.data.goalId);
       const pauseBoundaryReady = await this.appendGoalPauseBoundaryIfNeeded(
         input.workspaceId,
         result.data.goalId

@@ -20983,6 +20983,11 @@ export class WorkspaceService
     }
   }
 
+  /** Cancel the workspace session's scheduled auto-retry of this goal's automatic turn. */
+  abandonGoalAutoRetry(workspaceId: string, goalId: string): void {
+    this.sessions.get(workspaceId)?.abandonGoalAutoRetry(goalId);
+  }
+
   async getGoalContinuationKickoffSendOptions(
     workspaceId: string
   ): Promise<SendMessageOptions | null> {
@@ -21038,6 +21043,10 @@ export class WorkspaceService
             },
           ]
         : undefined,
+      // A `/goal` sent before any chat message leaves the workspace without AI settings: the
+      // kickoff must then use the user's configured default model, as the composer does, not
+      // the built-in one (bug bash: the kickoff ran on a model the user had not picked).
+      defaultModel: config.defaultModel,
       definitionContext: await this.getAgentDefinitionContext(workspaceId),
     });
 

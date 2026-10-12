@@ -154,6 +154,8 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
         hasQueuedMessages: session.hasPendingManualFollowUp() || session.hasPendingUserInput(),
       }),
       getKickoffSendOptions: () => Promise.resolve(SEND_OPTIONS),
+      // Mirrors WorkspaceService.abandonGoalAutoRetry.
+      abandonGoalAutoRetry: (_workspaceId, goalId) => session.abandonGoalAutoRetry(goalId),
     });
   });
 
@@ -549,6 +551,84 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       expect(
         await restarted.checkGoalContinuationEligibility(workspaceId, Date.now() + 120_000)
       ).toMatchObject({ eligible: true });
+    });
+  });
+
+  // A retryable failure of a goal turn leaves it to RetryManager, whose retry resends the goal's
+  // prompt. Ending the goal must end that retry too (bug bash: the countdown kept going and the
+  // retries kept resending after the user paused and completed the goal).
+  describe("auto-retry of a failed goal turn", () => {
+    async function goalTurnWithScheduledRetry(): Promise<GoalRecordV1> {
+      failureType = "network";
+      const goal = await setGoalOk(service, { workspaceId, objective: "Ship G4" });
+      expect(await dispatchAt(Date.now())).toBe(true);
+      await settle(() => Promise.resolve(session.hasPendingAutoRetry()), 1_000);
+      expect(session.hasPendingAutoRetry()).toBe(true);
+      expect(streamCalls).toBe(1);
+      return goal;
+    }
+
+    function recordAbandonReasons(): { reasons: string[]; stop: () => void } {
+      const reasons: string[] = [];
+      const stop = session.onChatEvent(({ message }) => {
+        if (message.type === "auto-retry-abandoned") reasons.push(message.reason);
+      });
+      return { reasons, stop };
+    }
+
+    for (const [label, endGoal] of [
+      [
+        "a pause",
+        (goal: GoalRecordV1) =>
+          setGoalOk(service, { workspaceId, status: "paused", expectedGoalId: goal.goalId }),
+      ],
+      [
+        "a completion",
+        (goal: GoalRecordV1) =>
+          setGoalOk(service, {
+            workspaceId,
+            status: "complete",
+            completionSummary: "Done.",
+            expectedGoalId: goal.goalId,
+          }),
+      ],
+    ] as const) {
+      test(`${label} cancels the goal turn's scheduled retry at once`, async () => {
+        const goal = await goalTurnWithScheduledRetry();
+        const abandoned = recordAbandonReasons();
+        try {
+          await endGoal(goal);
+          // Target assertion: the countdown ends now, not at the next retry.
+          expect(session.hasPendingAutoRetry()).toBe(false);
+          expect(abandoned.reasons).toEqual(["goal_inactive"]);
+        } finally {
+          abandoned.stop();
+        }
+      });
+    }
+
+    test("a retry that fires after the goal was cleared resends nothing", async () => {
+      await goalTurnWithScheduledRetry();
+      const abandoned = recordAbandonReasons();
+      try {
+        // Clearing does not cancel the retry: the retry itself must see that the goal is gone.
+        await service.clearGoal(workspaceId);
+        expect(session.hasPendingAutoRetry()).toBe(true);
+        providerUp = true;
+        await settle(() => Promise.resolve(abandoned.reasons.length > 0), 5_000);
+        // Target assertion: the retry dropped the goal turn instead of resending it.
+        expect(abandoned.reasons).toEqual(["goal_inactive"]);
+        expect(streamCalls).toBe(1);
+      } finally {
+        abandoned.stop();
+      }
+    });
+
+    test("control: a retry of a still-active goal's turn resends it", async () => {
+      await goalTurnWithScheduledRetry();
+      providerUp = true;
+      await settle(() => Promise.resolve(streamCalls > 1), 5_000);
+      expect(streamCalls).toBe(2);
     });
   });
 
