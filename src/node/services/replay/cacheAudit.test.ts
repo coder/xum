@@ -206,15 +206,30 @@ describe("auditStepPrefixes", () => {
     const model = "anthropic:claude-sonnet-4-5";
     const audit = auditStepPrefixes([
       step("run-1", 0, ["a"], model),
-      // Another route for the same model id: not compared, but it becomes the baseline.
+      // Another route for the same model id: not compared, and it keeps its own baseline.
       step("run-2", 0, ["x"], model, "anthropic.gateway"),
       // Non-Anthropic steps are never compared, even when they would "break" by Anthropic rules.
       step("run-3", 0, ["y"], "openai:gpt-6", "openai.responses"),
       step("run-3", 1, ["y2"], "openai:gpt-6", "openai.responses"),
-      step("run-4", 0, ["z"], model),
-      step("run-4", 1, ["z", "w"], model),
+      step("run-4", 0, ["a", "z"], model),
+      step("run-4", 1, ["a", "z", "w"], model),
     ]);
-    expect(audit).toMatchObject({ comparedPairs: 1, breaks: [] });
+    expect(audit).toMatchObject({ comparedPairs: 2, breaks: [] });
+  });
+
+  test("a model switch keeps each model's baseline", () => {
+    const opus = "anthropic:claude-opus-4-5";
+    const audit = auditStepPrefixes([
+      step("run-1", 0, ["a"]),
+      step("run-2", 0, ["x"], opus),
+      step("run-3", 0, ["x", "y"], opus),
+      // Back on Sonnet within the TTL: compared with run-1, not lost to the Opus baseline.
+      step("run-4", 0, ["b"]),
+    ]);
+    expect(audit).toMatchObject({
+      comparedPairs: 2,
+      breaks: [{ runId: "run-4", boundary: "turn" }],
+    });
   });
 
   test("a non-Anthropic step keeps the last Anthropic step as the baseline", () => {

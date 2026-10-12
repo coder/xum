@@ -186,9 +186,10 @@ export interface StepPrefixAudit {
  * the provider re-processes the conversation from the first differing block
  * uncached. The turn envelope comparison above only sees prefix inputs; this
  * also catches a rebuild that changes history bytes (lost step boundaries,
- * truncated tool results). Pairs across a model change or a context epoch
- * change are not compared, and a side run (compaction) is skipped and resets
- * the baseline. A non-Anthropic step is skipped and keeps the last Anthropic
+ * truncated tool results). Each provider and model keeps its own baseline, like
+ * the runtime monitor, so Sonnet -> Opus -> Sonnet compares the two Sonnet
+ * requests. Pairs across a context epoch change are not compared, and a side
+ * run (compaction) is skipped and resets every baseline. A non-Anthropic step is skipped and keeps the last Anthropic
  * baseline, as the runtime monitor (which observes only Anthropic wires) does.
  * A pair with a request the fingerprint does not model (`unsupported`) is not
  * counted, and that request becomes the baseline.
@@ -289,17 +290,21 @@ export function auditStepPrefixes(
   const breaks: StepPrefixBreak[] = [];
   let auditedSteps = 0;
   let comparedPairs = 0;
-  let previous: { step: RecordedStepRequest; blocks: PromptCacheBlock[] } | undefined;
+  // Keyed by provider and model: a model switch must not discard the other model's
+  // baseline while its cache entry is still live.
+  const baselines = new Map<string, { step: RecordedStepRequest; blocks: PromptCacheBlock[] }>();
   for (const step of steps) {
     if (isIgnored(step)) continue;
     auditedSteps++;
     if (isSideRun(step)) {
-      previous = undefined;
+      baselines.clear();
       continue;
     }
     // Block order and normalization are Anthropic's, like the runtime detector, which
     // observes only Anthropic wires: other providers neither break nor replace the baseline.
     if (!isAnthropicStep(step)) continue;
+    const baselineKey = `${step.provider ?? ""}\u0000${step.modelId}`;
+    let previous = baselines.get(baselineKey);
     // `/clear`, "start here" or a rollover replaced the context: a new baseline, no break.
     // Runs from older binaries carry no epoch and keep the old behavior.
     if (
@@ -325,7 +330,7 @@ export function auditStepPrefixes(
       prompt: step.prompt,
       ...wireOptionsFromStep(step),
     });
-    if (previous?.step.modelId === step.modelId && previous.step.provider === step.provider) {
+    if (previous != null) {
       const comparison = comparePromptCachePrefix(previous.blocks, blocks);
       if (comparison.kind !== "unsupported") comparedPairs++;
       if (comparison.kind === "break") {
@@ -339,7 +344,7 @@ export function auditStepPrefixes(
         });
       }
     }
-    previous = { step, blocks };
+    baselines.set(baselineKey, { step, blocks });
   }
   return { auditedSteps, comparedPairs, breaks };
 }
