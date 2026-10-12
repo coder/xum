@@ -410,8 +410,8 @@ function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
 
 /**
  * Same-turn message transforms applied before every provider step: strip workflow run records
- * from same-turn tool results (history-level redaction in applyToolOutputRedaction can't see
- * these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
+ * and redact binary-like strings in same-turn tool results (history-level redaction in
+ * applyToolOutputRedaction can't see these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
  * (messagePipeline's neutralizer only sees persisted history), then extract supported
  * attachments out of tool-result JSON so providers don't treat them as text. Idempotent on an
  * already-transformed prefix. The settled-step budget floor reuses it so it measures exactly the

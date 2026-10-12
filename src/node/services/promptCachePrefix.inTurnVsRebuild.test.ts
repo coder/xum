@@ -434,25 +434,46 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
     );
   });
 
-  // applyToolOutputRedaction (rebuild only) runs sanitizeUnknownForProviderOutput, which cuts
-  // every string over 12,000 chars and appends "[truncated provider-output; ...]". In-turn
-  // steps send the tool's full string (StreamManager transformStepMessages mirrors only the
-  // ui_only and workflow-record strips), so a long file_read/bash/memory/web_fetch result
-  // changes bytes at the next turn.
+  // The rebuild (applyToolOutputRedaction) used to cut every string over 12,000 chars while
+  // in-turn steps sent the tool's full string, so a long file_read/bash/memory/web_fetch result
+  // changed bytes at the next turn. Both paths now run sanitizeUnknownForProviderOutput, which
+  // keeps the full length.
   test("tool results with a string over 12,000 chars keep the prefix", async () => {
     const bigRead = tool({
       description: "file_read tool",
       inputSchema: z.object({ script: z.string() }),
       execute: () => Promise.resolve({ success: true, content: "line\n".repeat(2_600) }),
     });
-    await expectReproFailure(
-      () =>
-        expectNextTurnExtendsLastStep({
-          tools: { file_read: bigRead, probe: plainTool("probe") },
-          firstTurn: toolThenTextTurn("file_read", "call-1"),
-        }),
-      divergesAt(2)
+    await expectNextTurnExtendsLastStep({
+      tools: { file_read: bigRead, probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("file_read", "call-1"),
+    });
+  });
+
+  // Binary-like text (NUL, U+FFFD, dense control characters) is redacted in both paths, so the
+  // in-turn step sends the same redaction the next turn's rebuild does.
+  test("binary-like tool results keep the prefix", async () => {
+    const binaryRead = tool({
+      description: "bash tool",
+      inputSchema: z.object({ script: z.string() }),
+      execute: () =>
+        Promise.resolve({ success: true, output: "PNG\u0000\u0001\ufffd\u001b[0m body" }),
+    });
+    const anthropic = createScriptedAnthropic();
+    await appendUser("Start the job and wait for it.");
+    const [, afterTool] = await runTurn(
+      anthropic,
+      { bash: binaryRead },
+      toolThenTextTurn("bash", "call-1")
     );
+    // The in-turn step after the tool call already carries the redaction, not the raw bytes.
+    const sent = JSON.stringify(afterTool.messages);
+    expect(sent).toContain("[redacted binary-like provider-output;");
+    expect(sent).not.toContain("\\u0000");
+    await expectNextTurnExtendsLastStep({
+      tools: { bash: binaryRead, probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("bash", "call-2"),
+    });
   });
 
   // modelMessageTransform.ts coalesceConsecutiveNoProgressTaskAwaitPairs keeps only the
