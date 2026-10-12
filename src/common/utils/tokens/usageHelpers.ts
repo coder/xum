@@ -88,6 +88,51 @@ export function withCacheWriteMetadata(
   };
 }
 
+function isTokenCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+/**
+ * Anthropic cache-write tokens written at the 1-hour TTL, out of
+ * `cacheWriteTokens` (the request's or turn's `cacheCreationInputTokens`).
+ *
+ * Anthropic bills 1h writes at 2x base input, 5m writes at 1.25x, and reports the
+ * split per response in the raw `usage.cache_creation`. That raw object comes from
+ * the last step only, so {@link accumulateProviderMetadata} sums the 1h share of a
+ * multi-step turn into `cacheCreation1hInputTokens`, which wins when present.
+ * Rows from older builds carry only the last step's split: Xum sends one TTL per
+ * request (providers config `anthropic.cacheTtl`), so the last step's 1h share is
+ * scaled to the turn total. No split (other providers, old rows) returns 0, which
+ * keeps the 5m price.
+ */
+export function getAnthropicCacheWrite1hTokens(
+  providerMetadata: Record<string, unknown> | undefined,
+  cacheWriteTokens: number
+): number {
+  if (cacheWriteTokens <= 0) return 0;
+  const anthropic = providerMetadata?.anthropic as
+    | {
+        cacheCreation1hInputTokens?: unknown;
+        usage?: {
+          cache_creation?: {
+            ephemeral_5m_input_tokens?: unknown;
+            ephemeral_1h_input_tokens?: unknown;
+          } | null;
+        } | null;
+      }
+    | undefined;
+  const summed = anthropic?.cacheCreation1hInputTokens;
+  if (isTokenCount(summed)) return Math.min(summed, cacheWriteTokens);
+
+  const split = anthropic?.usage?.cache_creation;
+  const oneHour = split?.ephemeral_1h_input_tokens;
+  if (!isTokenCount(oneHour) || oneHour === 0) return 0;
+  const fiveMinute = split?.ephemeral_5m_input_tokens;
+  const reported = oneHour + (isTokenCount(fiveMinute) ? fiveMinute : 0);
+  if (reported === cacheWriteTokens) return oneHour;
+  return Math.min(cacheWriteTokens, Math.round((cacheWriteTokens * oneHour) / reported));
+}
+
 /**
  * Add two LanguageModelV2Usage values together.
  * Handles undefined first argument and undefined fields within usage objects.
@@ -130,6 +175,11 @@ export function accumulateProviderMetadata(
       ?.cacheCreationInputTokens ?? 0;
 
   const totalCacheCreate = existingCacheCreate + stepCacheCreate;
+  // The step's raw `anthropic.usage` replaces the earlier one, so carry the summed
+  // 1h-TTL share explicitly (priced at 2x input instead of 1.25x).
+  const totalCacheCreate1h =
+    getAnthropicCacheWrite1hTokens(existing, existingCacheCreate) +
+    getAnthropicCacheWrite1hTokens(step, stepCacheCreate);
   const existingXaiCostTicks =
     (existing.xai as { costInUsdTicks?: number } | undefined)?.costInUsdTicks ?? 0;
   const stepXaiCostTicks =
@@ -151,6 +201,7 @@ export function accumulateProviderMetadata(
       anthropic: {
         ...(step.anthropic as Record<string, unknown> | undefined),
         cacheCreationInputTokens: totalCacheCreate,
+        ...(totalCacheCreate1h > 0 && { cacheCreation1hInputTokens: totalCacheCreate1h }),
       },
     }),
     ...(totalXaiCostTicks > 0 && {

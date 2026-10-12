@@ -216,10 +216,10 @@ export const modelsExtra: Record<string, ModelData> = {
   // Claude Opus 5.5 - Released September 22, 2026
   // Official pricing: $4/M input, $20/M output (20% below Opus 5), 5-minute cache
   // write $5/M (1.25x input), cache read $0.20/M (0.05x input). The 1-hour cache
-  // write tier ($8/M, 2x input) and fast mode ($8/$40) have no field/entry here,
-  // matching the Opus 5 treatment. Native 1M context, 128K max output, effort
-  // ladder low..max with native xhigh; thinking cannot be disabled (default
-  // effort medium). https://platform.claude.com/docs/en/models/opus-5-5/overview
+  // write tier ($8/M, 2x input) has no field (displayUsage derives it from input) and
+  // fast mode ($8/$40) has no entry, matching the Opus 5 treatment. Native 1M context,
+  // 128K max output, effort ladder low..max with native xhigh; thinking cannot be
+  // disabled (default effort medium). https://platform.claude.com/docs/en/models/opus-5-5/overview
   "claude-opus-5-5": {
     max_input_tokens: 1000000,
     max_output_tokens: 128000,
@@ -319,9 +319,11 @@ export const modelsExtra: Record<string, ModelData> = {
   },
 
   // Claude Sonnet 5.5 - Released September 28, 2026
-  // Official pricing, identical to Sonnet 5: $2/M input, $10/M output, 5-minute cache write
-  // $2.50/M (1.25x input), cache read $0.20/M (0.1x input). The 1-hour cache-write tier
-  // ($4/M, 2x input) has no field here, matching the other Claude entries. Native 1M context,
+  // Official pricing: $2/M input, $10/M output, 5-minute cache write $2.50/M (1.25x input),
+  // cache read $0.10/M (0.05x input, half of Sonnet 5's 0.1x per the prompt-caching pricing
+  // table). The 1-hour cache-write tier ($4/M, 2x input) has no field: displayUsage derives
+  // it from the input rate.
+  // https://platform.claude.com/docs/en/build-with-claude/prompt-caching#pricing Native 1M context,
   // 128K max output, effort low..max with native xhigh; thinking cannot be disabled.
   // https://platform.claude.com/docs/en/models/sonnet-5-5/overview
   "claude-sonnet-5-5": {
@@ -330,7 +332,7 @@ export const modelsExtra: Record<string, ModelData> = {
     input_cost_per_token: 0.000002, // $2 per million input tokens
     output_cost_per_token: 0.00001, // $10 per million output tokens
     cache_creation_input_token_cost: 0.0000025, // $2.50 per million tokens (1.25× input)
-    cache_read_input_token_cost: 0.0000002, // $0.20 per million tokens (0.1× input)
+    cache_read_input_token_cost: 0.0000001, // $0.10 per million tokens (0.05× input)
     litellm_provider: "anthropic",
     mode: "chat",
     supports_function_calling: true,
@@ -602,8 +604,9 @@ export const modelsExtra: Record<string, ModelData> = {
   // Official tiered pricing, split at 100K prompt tokens (5x above):
   //   <=100K: $0.10/M input, $0.50/M output, 5-minute cache write $0.125/M, cache read $0.01/M
   //   >100K:  $0.50/M input, $2.50/M output, 5-minute cache write $0.625/M, cache read $0.05/M
-  // The 1-hour cache-write tier ($0.20/M, $1/M above 100K) has no field here, matching the
-  // other Claude entries. Native 1M context, 128K max output, adaptive thinking only.
+  // The 1-hour cache-write tier ($0.20/M, $1/M above 100K) has no field: displayUsage
+  // derives it as 2x the tier's input rate. Native 1M context, 128K max output, adaptive
+  // thinking only.
   // https://platform.claude.com/docs/en/models/haiku-5-5/overview
   "claude-haiku-5-5": {
     max_input_tokens: 1000000,

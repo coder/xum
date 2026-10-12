@@ -577,6 +577,103 @@ describe("createDisplayUsage", () => {
   });
 });
 
+describe("Anthropic 1h-TTL cache-write pricing", () => {
+  const CACHE_WRITE = 40_000;
+  // Raw Anthropic usage as the SDK surfaces it on providerMetadata.anthropic.usage.
+  const metadata = (split?: { fiveMinute: number; oneHour: number }) => ({
+    anthropic: {
+      cacheCreationInputTokens: CACHE_WRITE,
+      ...(split && {
+        usage: {
+          cache_creation: {
+            ephemeral_5m_input_tokens: split.fiveMinute,
+            ephemeral_1h_input_tokens: split.oneHour,
+          },
+        },
+      }),
+    },
+  });
+  const display = (
+    model: string,
+    meta: Record<string, unknown> | undefined,
+    inputTokens = CACHE_WRITE + 10_000
+  ) => {
+    const usage = createDisplayUsage({ inputTokens, outputTokens: 500 }, model, meta);
+    if (usage === undefined) throw new Error("expected display usage");
+    return usage;
+  };
+  const cacheWriteCost = (usage: ReturnType<typeof display>) => {
+    const cost = usage.cacheCreate.cost_usd;
+    if (cost === undefined) throw new Error("expected a priced cache write");
+    return cost;
+  };
+
+  test("prices a 1h write at 2x the response's own input rate, above the 5m rate", () => {
+    // Haiku 5.5 crosses its 100K tier, so the 1h rate must follow the tier's input rate.
+    for (const [model, inputTokens] of [
+      ["anthropic:claude-sonnet-5-5", undefined],
+      ["anthropic:claude-opus-4-8", undefined],
+      ["anthropic:claude-haiku-5-5", 150_000],
+    ] as const) {
+      const fiveMinute = display(model, metadata(), inputTokens);
+      const oneHour = display(
+        model,
+        metadata({ fiveMinute: 0, oneHour: CACHE_WRITE }),
+        inputTokens
+      );
+      const inputRate = (oneHour.input.cost_usd ?? NaN) / oneHour.input.tokens;
+      expect(oneHour.cacheCreate1hTokens).toBe(CACHE_WRITE);
+      expect(cacheWriteCost(oneHour) / CACHE_WRITE).toBeCloseTo(2 * inputRate, 15);
+      expect(cacheWriteCost(oneHour)).toBeGreaterThan(cacheWriteCost(fiveMinute));
+      expect(getTotalCost(oneHour)).toBeGreaterThan(getTotalCost(fiveMinute) ?? Infinity);
+    }
+  });
+
+  test("keeps the 5m price when no 1h split is reported", () => {
+    const model = "anthropic:claude-sonnet-5-5";
+    const noSplit = display(model, metadata());
+    const allFiveMinute = display(model, metadata({ fiveMinute: CACHE_WRITE, oneHour: 0 }));
+    expect(noSplit.cacheCreate1hTokens).toBeUndefined();
+    expect(allFiveMinute.cacheCreate1hTokens).toBeUndefined();
+    expect(cacheWriteCost(allFiveMinute)).toBe(cacheWriteCost(noSplit));
+    // A malformed persisted split self-heals to the 5m price instead of a negative count.
+    const malformed = display(model, {
+      anthropic: {
+        cacheCreationInputTokens: CACHE_WRITE,
+        usage: { cache_creation: { ephemeral_1h_input_tokens: -5 } },
+      },
+    });
+    expect(cacheWriteCost(malformed)).toBe(cacheWriteCost(noSplit));
+  });
+
+  test("prices each part of a mixed 5m/1h split at its own rate", () => {
+    const model = "anthropic:claude-sonnet-5-5";
+    const fiveMinuteRate = cacheWriteCost(display(model, metadata())) / CACHE_WRITE;
+    const oneHourRate =
+      cacheWriteCost(display(model, metadata({ fiveMinute: 0, oneHour: CACHE_WRITE }))) /
+      CACHE_WRITE;
+    const mixed = display(model, metadata({ fiveMinute: 30_000, oneHour: 10_000 }));
+    expect(mixed.cacheCreate1hTokens).toBe(10_000);
+    expect(cacheWriteCost(mixed)).toBeCloseTo(30_000 * fiveMinuteRate + 10_000 * oneHourRate, 12);
+  });
+
+  test("repricing and session aggregates keep the 1h premium", () => {
+    const model = "anthropic:claude-sonnet-5-5";
+    const mixed = display(model, metadata({ fiveMinute: 30_000, oneHour: 10_000 }));
+    const parsed = ChatUsageDisplaySchema.parse(mixed);
+    expect(getTotalCost(recomputeUsageCosts(parsed, model))).toBeCloseTo(
+      getTotalCost(mixed) ?? NaN,
+      12
+    );
+
+    const aggregate = sumUsageHistory([mixed, display(model, metadata())]);
+    if (aggregate === undefined) throw new Error("expected an aggregate");
+    expect(aggregate.cacheCreate1hTokens).toBe(10_000);
+    const repriced = recomputeUsageCosts(aggregate, model, { aggregatedUsage: true });
+    expect(getTotalCost(repriced)).toBeCloseTo(getTotalCost(aggregate) ?? NaN, 12);
+  });
+});
+
 describe("OpenAI service-tier pricing (#4352)", () => {
   const tierMetadata = (tier: string | undefined) =>
     tier === undefined ? undefined : { openai: { serviceTier: tier } };

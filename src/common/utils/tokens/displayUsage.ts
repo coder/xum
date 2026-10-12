@@ -8,12 +8,22 @@
 import { getModelStats, type ModelStats } from "./modelStats";
 import { readReportedServiceTier, withServiceTierPricing } from "./serviceTierPricing";
 import type { ChatUsageDisplay } from "./usageAggregator";
-import type { AiSdkUsageLike } from "./usageHelpers";
+import { getAnthropicCacheWrite1hTokens, type AiSdkUsageLike } from "./usageHelpers";
+
+/**
+ * Anthropic bills 1-hour-TTL cache writes at 2x base input (5-minute writes use the
+ * model's `cache_creation_input_token_cost`, 1.25x). The catalog has no 1h field, so
+ * the rate derives from the input rate of the same context tier and service tier.
+ * https://platform.claude.com/docs/en/build-with-claude/prompt-caching#pricing
+ */
+const CACHE_WRITE_1H_INPUT_MULTIPLIER = 2;
 
 interface UsageCostInputs {
   inputTokens: number;
   cachedTokens: number;
   cacheCreateTokens: number;
+  /** Share of cacheCreateTokens written at the 1h TTL (0 when unreported). */
+  cacheCreate1hTokens: number;
   outputTokens: number;
   reasoningTokens: number;
 }
@@ -88,7 +98,9 @@ function calculateUsageCosts(modelStats: ModelStats, usage: UsageCostInputs): Us
   return {
     inputCost: usage.inputTokens * inputRate,
     cachedCost: usage.cachedTokens * cachedRate,
-    cacheCreateCost: usage.cacheCreateTokens * cacheCreateRate,
+    cacheCreateCost:
+      (usage.cacheCreateTokens - usage.cacheCreate1hTokens) * cacheCreateRate +
+      usage.cacheCreate1hTokens * inputRate * CACHE_WRITE_1H_INPUT_MULTIPLIER,
     outputCost: usage.outputTokens * outputRate,
     reasoningCost: usage.reasoningTokens * outputRate,
   };
@@ -131,6 +143,7 @@ export function createDisplayUsage(
   // Math.max guards against pre-v6 historical data where inputTokens already excluded
   // cache tokens (subtraction would go negative).
   const inputTokens = Math.max(0, rawInputTokens - cachedTokens - cacheCreateTokens);
+  const cacheCreate1hTokens = getAnthropicCacheWrite1hTokens(providerMetadata, cacheCreateTokens);
 
   // Extract reasoning tokens with fallback to provider metadata (OpenAI-specific)
   const reasoningTokens =
@@ -172,6 +185,7 @@ export function createDisplayUsage(
       inputTokens,
       cachedTokens,
       cacheCreateTokens,
+      cacheCreate1hTokens,
       outputTokens: outputWithoutReasoning,
       reasoningTokens,
     });
@@ -215,6 +229,8 @@ export function createDisplayUsage(
     ...(costsIncluded ? { costsIncluded: true } : {}),
     // Persisted so a later repricing uses the same tier (#4787).
     ...(serviceTier !== undefined && serviceTier !== "standard" ? { serviceTier } : {}),
+    // Persisted so a later repricing keeps the 1h-TTL write premium.
+    ...(cacheCreate1hTokens > 0 ? { cacheCreate1hTokens } : {}),
     input: {
       tokens: inputTokens,
       cost_usd: inputCost,
@@ -256,7 +272,12 @@ export function recomputeUsageCosts(
 ): ChatUsageDisplay {
   const modelStats = getModelStats(metadataModel);
   const serviceTier = usage.serviceTier;
-  const tierField = serviceTier !== undefined ? { serviceTier } : {};
+  const carriedFields = {
+    ...(serviceTier !== undefined ? { serviceTier } : {}),
+    ...(usage.cacheCreate1hTokens !== undefined
+      ? { cacheCreate1hTokens: usage.cacheCreate1hTokens }
+      : {}),
+  };
 
   if (!modelStats) {
     // Unknown model — strip costs and flag as unknown
@@ -268,7 +289,7 @@ export function recomputeUsageCosts(
       reasoning: { tokens: usage.reasoning.tokens },
       model: usage.model,
       hasUnknownCosts: true,
-      ...tierField,
+      ...carriedFields,
     };
   }
 
@@ -295,6 +316,11 @@ export function recomputeUsageCosts(
     inputTokens: usage.input.tokens,
     cachedTokens: usage.cached.tokens,
     cacheCreateTokens: usage.cacheCreate.tokens,
+    // Self-healing: clamp a malformed persisted share into [0, cacheCreate tokens].
+    cacheCreate1hTokens: Math.min(
+      usage.cacheCreate.tokens,
+      Math.max(0, usage.cacheCreate1hTokens ?? 0)
+    ),
     outputTokens: usage.output.tokens,
     reasoningTokens: usage.reasoning.tokens,
   });
@@ -321,6 +347,6 @@ export function recomputeUsageCosts(
       cost_usd: costs.reasoningCost,
     },
     model: usage.model,
-    ...tierField,
+    ...carriedFields,
   };
 }

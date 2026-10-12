@@ -3,6 +3,7 @@ import {
   addUsage,
   accumulateProviderMetadata,
   accumulateStepsProviderMetadata,
+  getAnthropicCacheWrite1hTokens,
   normalizeUsage,
   withCacheWriteMetadata,
 } from "./usageHelpers";
@@ -354,6 +355,46 @@ describe("accumulateProviderMetadata", () => {
       someOtherProvider: { field: "value" },
       anthropic: { cacheCreationInputTokens: 100 },
     });
+  });
+});
+
+describe("Anthropic 1h-TTL cache-write share", () => {
+  const step = (fiveMinute: number, oneHour: number) => ({
+    anthropic: {
+      cacheCreationInputTokens: fiveMinute + oneHour,
+      usage: {
+        cache_creation: {
+          ephemeral_5m_input_tokens: fiveMinute,
+          ephemeral_1h_input_tokens: oneHour,
+        },
+      },
+    },
+  });
+
+  test("sums each step's 1h share across a multi-step turn", () => {
+    // The raw usage of the last step replaces the earlier one, so the sum must be carried.
+    const turn = accumulateProviderMetadata(step(1_000, 3_000), step(500, 1_500));
+    expect(getAnthropicCacheWrite1hTokens(turn, 6_000)).toBe(4_500);
+    const threeSteps = accumulateProviderMetadata(turn, step(2_000, 0));
+    expect(getAnthropicCacheWrite1hTokens(threeSteps, 8_000)).toBe(4_500);
+  });
+
+  test("scales an old row's last-step split to the turn total", () => {
+    // Pre-fix multi-step rows kept the summed total but only the last step's raw split.
+    const oldRow = { anthropic: { ...step(0, 2_000).anthropic, cacheCreationInputTokens: 9_000 } };
+    expect(getAnthropicCacheWrite1hTokens(oldRow, 9_000)).toBe(9_000);
+    const mixedOldRow = {
+      anthropic: { ...step(1_000, 1_000).anthropic, cacheCreationInputTokens: 9_000 },
+    };
+    expect(getAnthropicCacheWrite1hTokens(mixedOldRow, 9_000)).toBe(4_500);
+  });
+
+  test("reports no 1h share without a split", () => {
+    expect(
+      getAnthropicCacheWrite1hTokens({ anthropic: { cacheCreationInputTokens: 900 } }, 900)
+    ).toBe(0);
+    expect(getAnthropicCacheWrite1hTokens(undefined, 900)).toBe(0);
+    expect(getAnthropicCacheWrite1hTokens(step(0, 900), 0)).toBe(0);
   });
 });
 

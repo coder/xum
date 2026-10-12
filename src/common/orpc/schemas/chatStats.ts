@@ -29,6 +29,8 @@ export const ChatUsageDisplaySchema = z.object({
   input: ChatUsageComponentSchema,
   cached: ChatUsageComponentSchema,
   cacheCreate: ChatUsageComponentSchema,
+  // Without it, the schema would strip the 1h-TTL share and repricing would drop its premium.
+  cacheCreate1hTokens: z.number().optional(),
   output: ChatUsageComponentSchema,
   reasoning: ChatUsageComponentSchema,
   model: z.string().optional(),
