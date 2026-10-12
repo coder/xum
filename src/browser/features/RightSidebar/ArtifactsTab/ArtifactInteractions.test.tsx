@@ -12,6 +12,7 @@ import {
   type WorkspaceContext as WorkspaceContextValue,
 } from "@/browser/contexts/WorkspaceContext";
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
+import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
@@ -448,6 +449,10 @@ describe("window.xum.openWorkspace", () => {
   let opened: string[] = [];
   let activation = { isActive: true };
   const active = createWorkspace({ id: "a1b2c3d4e5", name: "fix-bug", projectName: "xum" });
+  const turnTarget = {
+    ...createWorkspace({ id: "b2c3d4e5f6", name: "side-task", projectName: "xum" }),
+    tags: { [WORKSPACE_TURN_TASK_TAGS.handle]: "wst_side_task" },
+  };
   const archived = {
     ...createWorkspace({ id: "0f0f0f0f0f", name: "old", projectName: "xum" }),
     archivedAt: "2026-01-01T00:00:00.000Z",
@@ -458,6 +463,7 @@ describe("window.xum.openWorkspace", () => {
     const value = {
       workspaceMetadata: new Map([
         [active.id, active],
+        [turnTarget.id, turnTarget],
         [archived.id, archived],
       ]),
       loading: false,
@@ -506,6 +512,12 @@ describe("window.xum.openWorkspace", () => {
     postFromFrame(frame, open(active.id));
     expect(opened).toEqual([active.id]);
     expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
+  });
+
+  test("a workspace-turn task handle opens the workspace it created", async () => {
+    const { frame } = await renderClickedFrame();
+    postFromFrame(frame, open("wst_side_task"));
+    expect(opened).toEqual([turnTarget.id]);
   });
 
   test("an unknown or archived ID does not switch and shows a host notice", async () => {

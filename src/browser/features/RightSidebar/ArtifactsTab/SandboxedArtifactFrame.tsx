@@ -7,7 +7,9 @@ import {
 } from "@/browser/contexts/WorkspaceContext";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { useAppConfig, useUserPreferences } from "@/browser/stores/AppConfigStore";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createArtifactAssetLoader } from "./artifactAssets";
 import {
@@ -65,6 +67,23 @@ function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
   const activation = (navigator as Navigator & { userActivation?: { isActive?: boolean } })
     .userActivation;
   return frame != null && document.activeElement === frame && activation?.isActive === true;
+}
+
+/**
+ * The workspace an artifact names: a workspace ID (sub-agent task IDs are workspace IDs), or a
+ * workspace-turn task handle (`wst_...`), which tags the workspace it created, as the task
+ * tool's Open resolves it (TaskToolCall.tsx).
+ */
+function findArtifactWorkspace(
+  workspaces: ReadonlyMap<string, FrontendWorkspaceMetadata> | undefined,
+  id: string
+): FrontendWorkspaceMetadata | undefined {
+  const direct = workspaces?.get(id);
+  if (direct != null) return direct;
+  for (const metadata of workspaces?.values() ?? []) {
+    if (metadata.tags?.[WORKSPACE_TURN_TASK_TAGS.handle] === id) return metadata;
+  }
+  return undefined;
 }
 
 /** Denied until the saved preferences load, so a user who turned CDN scripts off never runs one. */
@@ -174,7 +193,7 @@ export function SandboxedArtifactFrame(props: {
           // copies stay read-only. Ignored without a gesture, with no notice, so a script cannot
           // spam the notice either.
           if (interactions == null || !hasLiveUserGesture(frameRef.current)) break;
-          const target = workspaces?.get(message.workspaceId);
+          const target = findArtifactWorkspace(workspaces, message.workspaceId);
           if (
             target == null ||
             setSelectedWorkspace == null ||
