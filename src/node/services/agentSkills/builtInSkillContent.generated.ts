@@ -9734,7 +9734,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- `send` never sends on its own. Xum shows the text above the artifact with **Send** and **Dismiss**. Only your click or the Send shortcut sends it, and Send waits a moment after the message appears.",
       '- A sent message arrives as your message, labeled "from artifact". If the agent is busy, it arrives at the next tool step. A message you sent survives an app restart, even if it was still waiting for the agent. A message you have not sent yet does not.',
       "- `setState` saves a small JSON value for the current version. The agent sees it in `artifact_list`.",
-      "- `openWorkspace` switches Xum to the workspace with that ID. A sub-agent's task ID from the `task` tool works too. Call it from a click or key handler: Xum ignores it unless you just clicked or typed inside the artifact. For an unknown or archived workspace, nothing switches and Xum shows a short notice above the artifact. The artifact never gets an answer, so it cannot learn which workspaces exist.",
+      "- `openWorkspace` switches Xum to the workspace with that ID. A sub-agent's task ID from the `task` tool works too. Call it from a click or key handler: Xum ignores it unless you just clicked or typed inside the artifact. For an unknown or archived workspace, nothing switches and Xum shows a short notice above the artifact. The artifact never gets an answer, and no workspace list or title reaches it. Pinned files and shelf copies cannot switch workspaces.",
       "",
       "## Canvases",
       "",

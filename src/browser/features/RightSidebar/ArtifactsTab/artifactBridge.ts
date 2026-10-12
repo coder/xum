@@ -25,9 +25,10 @@ import {
  *   the frame size. The host also ignores it unless annotate mode is on.
  * - Frame -> host (openWorkspace): `{ type: "openWorkspace", workspaceId }`
  *   (window.xum.openWorkspace) asks the host to switch the app to that workspace. The host
- *   honours it only right after the user clicked or typed inside this frame, and only for an
- *   active workspace (SandboxedArtifactFrame.tsx). The frame never gets a reply: no workspace
- *   list, title or existence answer reaches it.
+ *   honours it only for an interactive artifact (not pinned files or shelf copies), right after
+ *   the user clicked or typed inside this frame, and only for an active workspace
+ *   (SandboxedArtifactFrame.tsx). The frame never gets a reply, so no workspace list or title
+ *   reaches it.
  * - Host -> frame: `{ type: "theme", theme: "dark" | "light" }`, sent after load and on theme
  *   change; the artifact may read it, and the host never injects its own CSS.
  *   `{ type: "annotate", enabled }` switches the shim's click-to-pin capture on or off (clicks
@@ -52,11 +53,11 @@ export const ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND = 20;
 const bridgeEnvelope = { xumArtifact: z.literal(ARTIFACT_BRIDGE_VERSION) };
 
 /**
- * Longest workspace ID the bridge accepts. New IDs are 10 hex characters; legacy IDs are
- * `<project>-<dir>` basenames. The host's lookup in its active-workspace map is the real gate;
- * this cap and the character set only keep junk out before it.
+ * Longest workspace ID the bridge accepts. New IDs are 10 hex characters, but legacy IDs are
+ * `<project>-<dir>` basenames with any characters, so there is no character set. The host's
+ * lookup in its active-workspace map is the real gate; this cap only keeps junk out before it.
  */
-export const ARTIFACT_WORKSPACE_ID_MAX_CHARS = 128;
+export const ARTIFACT_WORKSPACE_ID_MAX_CHARS = 1024;
 
 const ArtifactKeyMessageSchema = z
   .object({
@@ -114,10 +115,7 @@ const ArtifactOpenWorkspaceMessageSchema = z
   .object({
     ...bridgeEnvelope,
     type: z.literal("openWorkspace"),
-    workspaceId: z
-      .string()
-      .max(ARTIFACT_WORKSPACE_ID_MAX_CHARS)
-      .regex(/^[A-Za-z0-9._-]+$/),
+    workspaceId: z.string().min(1).max(ARTIFACT_WORKSPACE_ID_MAX_CHARS),
   })
   .strict();
 

@@ -170,8 +170,10 @@ export function SandboxedArtifactFrame(props: {
           interactions?.setState?.(message.state);
           break;
         case "openWorkspace": {
-          // Ignored without a gesture, with no notice, so a script cannot spam the notice either.
-          if (!hasLiveUserGesture(frameRef.current)) break;
+          // Like send/setState, only for interactive artifacts: pinned checkout files and shelf
+          // copies stay read-only. Ignored without a gesture, with no notice, so a script cannot
+          // spam the notice either.
+          if (interactions == null || !hasLiveUserGesture(frameRef.current)) break;
           const target = workspaces?.get(message.workspaceId);
           if (
             target == null ||

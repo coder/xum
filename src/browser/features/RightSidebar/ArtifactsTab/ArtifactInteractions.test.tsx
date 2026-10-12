@@ -16,6 +16,7 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { ArtifactsPanel } from "./ArtifactsPanel";
+import { openArtifact } from "./openArtifact";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { useArtifactInteractions, type ArtifactInteractionTarget } from "./useArtifactInteractions";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
@@ -30,6 +31,10 @@ const HTML: ArtifactReadResult = {
   encoding: "utf8",
   content: "<button>Ship</button>",
 };
+
+/** A pinned checkout file (read-only: no send, setState or openWorkspace). */
+const PINNED: ArtifactReadResult = { ...HTML, path: "docs/pinned.html" };
+let pinnedHtml = false;
 
 let sends: Array<{ path: string; text: string; data?: unknown; version: number | null }> = [];
 let savedStates: unknown[] = [];
@@ -67,7 +72,16 @@ function Wrapper(props: { children: ReactNode }) {
           data: { artifactId: "id", path: input.path, pin: null, versions: [] },
         }),
       listPinned: () =>
-        Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
+        Promise.resolve({
+          success: true as const,
+          data: {
+            available: true as const,
+            files: pinnedHtml
+              ? [{ path: PINNED.path, kind: PINNED.kind, size: PINNED.size, modifiedMs: 1 }]
+              : [],
+          },
+        }),
+      readPinned: () => Promise.resolve({ success: true as const, data: PINNED }),
       capabilities: () => Promise.resolve({ agentBrowserAvailable: true }),
       listShelf: () =>
         Promise.resolve({
@@ -474,6 +488,7 @@ describe("window.xum.openWorkspace", () => {
     window.localStorage.clear();
     opened = [];
     activation = { isActive: true };
+    pinnedHtml = false;
     Object.defineProperty(window.navigator, "userActivation", {
       configurable: true,
       get: () => activation,
@@ -515,6 +530,23 @@ describe("window.xum.openWorkspace", () => {
     // Activation from typing elsewhere in the app: focus is not in the frame.
     activation = { isActive: true };
     act(() => view.getByTestId("artifacts-panel").focus());
+    postFromFrame(frame, open(active.id));
+    postFromFrame(frame, open("ffffffffff"));
+    expect(opened).toEqual([]);
+    expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
+  });
+
+  test("a pinned file stays read-only: it cannot switch workspaces", async () => {
+    pinnedHtml = true;
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: WorkspaceWrapper });
+    await view.findByTestId("artifact-frame");
+    act(() => openArtifact({ workspaceId: "ws-i", path: PINNED.path, pinned: true }));
+    await waitFor(() =>
+      expect(view.getByRole("combobox", { name: "Artifact" }).textContent).toContain(PINNED.path)
+    );
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    await waitFor(() => expect(frame.title).toBe(PINNED.path));
+    act(() => frame.focus());
     postFromFrame(frame, open(active.id));
     postFromFrame(frame, open("ffffffffff"));
     expect(opened).toEqual([]);

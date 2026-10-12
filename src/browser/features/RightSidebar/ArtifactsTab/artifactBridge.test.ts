@@ -129,21 +129,19 @@ describe("openWorkspace messages", () => {
   const open = (workspaceId: unknown) => ({ xumArtifact: 1, type: "openWorkspace", workspaceId });
 
   test("accepts a workspace ID", () => {
-    for (const workspaceId of ["a1b2c3d4e5", "legacy-project_branch.2"]) {
+    // Legacy IDs are `<project>-<dir>` basenames, which can hold spaces and other characters.
+    for (const workspaceId of ["a1b2c3d4e5", "My Project-feature branch"]) {
       expect(accept(open(workspaceId))).toMatchObject({ type: "openWorkspace", workspaceId });
     }
   });
 
-  test("refuses a missing, non-string, empty, oversize or odd ID and extra fields", () => {
+  test("refuses a missing, non-string, empty or oversize ID and extra fields", () => {
     for (const data of [
       { xumArtifact: 1, type: "openWorkspace" },
       open(42),
       open(["a1b2c3d4e5"]),
       open(""),
       open("a".repeat(ARTIFACT_WORKSPACE_ID_MAX_CHARS + 1)),
-      open("../a1b2c3d4e5"),
-      open("a1b2 c3d4e5"),
-      open("<img src=x>"),
       { ...open("a1b2c3d4e5"), title: "Fix the bug" },
     ]) {
       expect(accept(data)).toBeNull();
