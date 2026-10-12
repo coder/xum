@@ -2193,7 +2193,9 @@ export class AgentSession {
       const goal = await goalService.getGoal(this.workspaceId);
       if (this.coordinator.closing || !isCurrent()) return;
       if (!isRetriedGoalStillRunning(goal, request.goalId)) {
-        this.emitRetryEvent({ type: "auto-retry-abandoned", reason: GOAL_INACTIVE_RETRY_REASON });
+        // Retire through the manager: it also resets the attempt count, so the next goal's
+        // first failure does not inherit this goal's backoff.
+        this.retryManager.abandon(GOAL_INACTIVE_RETRY_REASON);
         return;
       }
     }

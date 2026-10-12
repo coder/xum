@@ -624,6 +624,29 @@ describe("goal advancement after automatic work ends or is abandoned (G4)", () =
       }
     });
 
+    // The dropped retry must not leave its backoff behind for the next goal.
+    test("a dropped retry resets the backoff for the next goal's failure", async () => {
+      const scheduledAttempts: number[] = [];
+      const stop = session.onChatEvent(({ message }) => {
+        if (message.type === "auto-retry-scheduled") scheduledAttempts.push(message.attempt);
+      });
+      try {
+        await goalTurnWithScheduledRetry();
+        await service.clearGoal(workspaceId);
+        await settle(() => Promise.resolve(!session.hasPendingAutoRetry()), 5_000);
+        expect(session.hasPendingAutoRetry()).toBe(false);
+        // A new goal's kickoff fails the same way.
+        await setGoalOk(service, { workspaceId, objective: "Ship G5" });
+        expect(await dispatchAt(Date.now())).toBe(true);
+        await settle(() => Promise.resolve(scheduledAttempts.length > 1), 1_000);
+        // Target assertion: the new goal's first retry starts at the first attempt.
+        expect(scheduledAttempts).toHaveLength(2);
+        expect(scheduledAttempts[1]).toBe(scheduledAttempts[0]);
+      } finally {
+        stop();
+      }
+    });
+
     test("control: a retry of a still-active goal's turn resends it", async () => {
       await goalTurnWithScheduledRetry();
       providerUp = true;
