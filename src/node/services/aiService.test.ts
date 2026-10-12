@@ -793,15 +793,19 @@ describe("AIService turn engine events", () => {
     /** Message id of a turn whose DevTools run metadata AIService is tracking. */
     trackedMessageId: string;
     clearPendingRunMetadataSpy: ReturnType<typeof mock>;
+    setPendingRunMetadataSpy: ReturnType<typeof mock>;
     [Symbol.dispose]: () => void;
   }> {
     const xumHome = new DisposableTempDir(tempDirName);
     const clearPendingRunMetadataSpy = mock(
       (_workspaceId: string, _metadataId?: string) => undefined
     );
+    const setPendingRunMetadataSpy = mock(
+      (_workspaceId: string, _metadataId: string, _metadata: unknown) => undefined
+    );
     const devToolsService = {
       enabled: true,
-      setPendingRunMetadata: mock(() => undefined),
+      setPendingRunMetadata: setPendingRunMetadataSpy,
       clearPendingRunMetadata: clearPendingRunMetadataSpy,
     } as unknown as DevToolsService;
     let setEventSinkSpy: ReturnType<typeof spyOn<StreamManager, "setEventSink">> | undefined;
@@ -845,6 +849,7 @@ describe("AIService turn engine events", () => {
       emitEngineEvent: sink,
       trackedMessageId,
       clearPendingRunMetadataSpy,
+      setPendingRunMetadataSpy,
       [Symbol.dispose]: () => xumHome[Symbol.dispose](),
     };
   }
@@ -861,6 +866,16 @@ describe("AIService turn engine events", () => {
 
   afterEach(() => {
     mock.restore();
+  });
+
+  it("queues the context epoch the prompt-cache monitor uses with the run metadata", async () => {
+    using harness = await createForwardingHarness("ai-service-context-epoch-run-metadata");
+    // The replay step audit resets its baseline when this changes (`/clear`, "start here").
+    expect(harness.setPendingRunMetadataSpy).toHaveBeenCalledWith(
+      workspaceId,
+      "stream-token",
+      expect.objectContaining({ contextEpoch: "user-message" })
+    );
   });
 
   it("forwards stream-abort without mutating a workspace partial", async () => {

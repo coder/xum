@@ -203,7 +203,7 @@ describe("replayVerifySession pairing", () => {
 
     const result = await verify(ctx);
     // The compact run is skipped and resets the baseline, so nothing is compared or broken.
-    expect(result.stepPrefix).toEqual({ comparedPairs: 0, breaks: [] });
+    expect(result.stepPrefix).toMatchObject({ comparedPairs: 0, breaks: [] });
   });
 
   test("a headless run without a request sequence is skipped by the step audit", async () => {
@@ -243,7 +243,48 @@ describe("replayVerifySession pairing", () => {
 
     const result = await verify(ctx);
     // The two chat runs are compared with each other; the side call breaks nothing.
-    expect(result.stepPrefix).toEqual({ comparedPairs: 1, breaks: [] });
+    expect(result.stepPrefix).toMatchObject({ comparedPairs: 1, breaks: [] });
+  });
+
+  test("a healed duplicate run header keeps the first header and its steps", async () => {
+    using tmp = new DisposableTempDir("replay-verify-duplicate-run");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    for (const userText of ["First.", "Second."]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+      });
+    }
+    // DevToolsService re-appends a header without the run metadata when a retention-evicted
+    // run logs another step; that step extends the run's first step.
+    const [runLine, firstStepLine] = ctx.devtoolsLines;
+    const run = (JSON.parse(runLine) as { run: { requestHistorySequence?: number } }).run;
+    const step = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
+    const { requestHistorySequence: _seq, ...healedRun } = run;
+    const prompt = step.input?.prompt as unknown[];
+    ctx.devtoolsLines.splice(
+      2,
+      0,
+      JSON.stringify({ type: "run", run: healedRun }),
+      JSON.stringify({
+        type: "step",
+        step: {
+          ...step,
+          id: "step-1b",
+          stepNumber: 1,
+          input: {
+            ...step.input,
+            prompt: [...prompt, { role: "assistant", content: [{ type: "text", text: "Hm." }] }],
+          },
+        },
+      })
+    );
+
+    const result = await verify(ctx);
+    // run-1 step 0 -> run-1 step 1 -> run-2: the healed step is audited, not dropped as headless.
+    expect(result.stepPrefix).toMatchObject({ auditedSteps: 3, comparedPairs: 2 });
   });
 
   test("a step that failed before reaching the provider is not an audited request", async () => {
@@ -280,7 +321,7 @@ describe("replayVerifySession pairing", () => {
     );
 
     const result = await verify(ctx);
-    expect(result.stepPrefix).toEqual({ comparedPairs: 1, breaks: [] });
+    expect(result.stepPrefix).toMatchObject({ comparedPairs: 1, breaks: [] });
   });
 
   test("a turn without an assistant row skips only itself", async () => {

@@ -173,6 +173,8 @@ export interface StepPrefixBreak {
 }
 
 export interface StepPrefixAudit {
+  /** Chat-turn steps the audit read (ignored side calls excluded). */
+  auditedSteps: number;
   /** Consecutive request pairs held to the prefix rule. */
   comparedPairs: number;
   breaks: StepPrefixBreak[];
@@ -184,12 +186,49 @@ export interface StepPrefixAudit {
  * the provider re-processes the conversation from the first differing block
  * uncached. The turn envelope comparison above only sees prefix inputs; this
  * also catches a rebuild that changes history bytes (lost step boundaries,
- * truncated tool results). Pairs across a model change are not compared, and
- * a side run (compaction) or a non-Anthropic step is skipped and resets the baseline.
+ * truncated tool results). Pairs across a model change or a context epoch
+ * change are not compared, and a side run (compaction) is skipped and resets
+ * the baseline. A non-Anthropic step is skipped and keeps the last Anthropic
+ * baseline, as the runtime monitor (which observes only Anthropic wires) does.
+ * A pair with a request the fingerprint does not model (`unsupported`) is not
+ * counted, and that request becomes the baseline.
  */
 /** AI SDK Anthropic provider ids start with "anthropic" (e.g. "anthropic.messages"). */
 function isAnthropicStep(step: RecordedStepRequest): boolean {
   return step.provider?.startsWith("anthropic") === true;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The cache-key call options of a recorded step, in the body fields the fingerprint reads.
+ * The AI SDK maps them 1:1 onto the wire (`thinking`, `effort` -> `output_config.effort`,
+ * `speed`, `contextManagement` -> `context_management`, the call's `toolChoice` plus
+ * `disableParallelToolUse` -> `tool_choice`). The audit compares recorded steps only with
+ * each other, so the values keep their AI SDK shape. Structured-output formats are not in the
+ * DevTools record and stay unmodeled here.
+ */
+function wireOptionsFromStep(step: RecordedStepRequest): Record<string, unknown> {
+  const providerOptions = isRecord(step.providerOptions) ? step.providerOptions : {};
+  const anthropic = isRecord(providerOptions.anthropic) ? providerOptions.anthropic : {};
+  const toolChoice =
+    step.toolChoice != null || anthropic.disableParallelToolUse != null
+      ? {
+          choice: step.toolChoice ?? null,
+          disableParallelToolUse: anthropic.disableParallelToolUse,
+        }
+      : undefined;
+  return {
+    ...(anthropic.thinking != null ? { thinking: anthropic.thinking } : {}),
+    ...(anthropic.effort != null ? { output_config: { effort: anthropic.effort } } : {}),
+    ...(anthropic.speed != null ? { speed: anthropic.speed } : {}),
+    ...(anthropic.contextManagement != null
+      ? { context_management: anthropic.contextManagement }
+      : {}),
+    ...(toolChoice != null ? { tool_choice: toolChoice } : {}),
+  };
 }
 
 export function auditStepPrefixes(
@@ -199,26 +238,38 @@ export function auditStepPrefixes(
   isIgnored: (step: RecordedStepRequest) => boolean = () => false
 ): StepPrefixAudit {
   const breaks: StepPrefixBreak[] = [];
+  let auditedSteps = 0;
   let comparedPairs = 0;
   let previous: { step: RecordedStepRequest; blocks: PromptCacheBlock[] } | undefined;
   for (const step of steps) {
     if (isIgnored(step)) continue;
+    auditedSteps++;
     if (isSideRun(step)) {
       previous = undefined;
       continue;
     }
     // Block order and normalization are Anthropic's, like the runtime detector, which
-    // observes only Anthropic wires: other providers neither break nor extend the chain.
-    if (!isAnthropicStep(step)) {
+    // observes only Anthropic wires: other providers neither break nor replace the baseline.
+    if (!isAnthropicStep(step)) continue;
+    // `/clear`, "start here" or a rollover replaced the context: a new baseline, no break.
+    // Runs from older binaries carry no epoch and keep the old behavior.
+    if (
+      previous?.step.contextEpoch != null &&
+      step.contextEpoch != null &&
+      previous.step.contextEpoch !== step.contextEpoch
+    ) {
       previous = undefined;
-      continue;
     }
     // The DevTools record is the AI SDK prompt (system messages inline), the
     // same shape the gateway wire carries.
-    const blocks = fingerprintAnthropicRequest({ tools: step.tools, prompt: step.prompt });
+    const blocks = fingerprintAnthropicRequest({
+      tools: step.tools,
+      prompt: step.prompt,
+      ...wireOptionsFromStep(step),
+    });
     if (previous?.step.modelId === step.modelId && previous.step.provider === step.provider) {
-      comparedPairs++;
       const comparison = comparePromptCachePrefix(previous.blocks, blocks);
+      if (comparison.kind !== "unsupported") comparedPairs++;
       if (comparison.kind === "break") {
         breaks.push({
           runId: step.runId,
@@ -232,5 +283,5 @@ export function auditStepPrefixes(
     }
     previous = { step, blocks };
   }
-  return { comparedPairs, breaks };
+  return { auditedSteps, comparedPairs, breaks };
 }

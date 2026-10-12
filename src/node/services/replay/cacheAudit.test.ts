@@ -159,8 +159,10 @@ describe("auditStepPrefixes", () => {
     stepNumber: number,
     texts: string[],
     modelId = "anthropic:claude-sonnet-4-5",
-    provider: string | null = "anthropic.messages"
+    provider: string | null = "anthropic.messages",
+    extra: Partial<RecordedStepRequest> = {}
   ): RecordedStepRequest => ({
+    ...extra,
     runId,
     stepId: `${runId}-${stepNumber}`,
     stepNumber,
@@ -196,7 +198,7 @@ describe("auditStepPrefixes", () => {
       ],
       (recorded) => recorded.runId === "compact"
     );
-    expect(audit).toEqual({ comparedPairs: 0, breaks: [] });
+    expect(audit).toMatchObject({ comparedPairs: 0, breaks: [] });
   });
 
   test("only Anthropic steps on one route are compared", () => {
@@ -205,13 +207,63 @@ describe("auditStepPrefixes", () => {
       step("run-1", 0, ["a"], model),
       // Another route for the same model id: not compared, but it becomes the baseline.
       step("run-2", 0, ["x"], model, "anthropic.gateway"),
-      // Non-Anthropic steps are never compared, even when they would "break" by Anthropic rules,
-      // and they reset the baseline.
+      // Non-Anthropic steps are never compared, even when they would "break" by Anthropic rules.
       step("run-3", 0, ["y"], "openai:gpt-6", "openai.responses"),
       step("run-3", 1, ["y2"], "openai:gpt-6", "openai.responses"),
       step("run-4", 0, ["z"], model),
       step("run-4", 1, ["z", "w"], model),
     ]);
-    expect(audit).toEqual({ comparedPairs: 1, breaks: [] });
+    expect(audit).toMatchObject({ comparedPairs: 1, breaks: [] });
+  });
+
+  test("a non-Anthropic step keeps the last Anthropic step as the baseline", () => {
+    const audit = auditStepPrefixes([
+      step("run-1", 0, ["a"]),
+      step("run-2", 0, ["x"], "openai:gpt-6", "openai.responses"),
+      step("run-3", 0, ["b"]),
+    ]);
+    expect(audit).toMatchObject({
+      comparedPairs: 1,
+      breaks: [{ runId: "run-3", boundary: "turn" }],
+    });
+  });
+
+  test("a context epoch change starts a new baseline; runs without an epoch still compare", () => {
+    expect(
+      auditStepPrefixes([
+        step("run-1", 0, ["a"], undefined, undefined, { contextEpoch: "row-1" }),
+        step("run-2", 0, ["cleared"], undefined, undefined, { contextEpoch: "row-9" }),
+      ])
+    ).toMatchObject({ comparedPairs: 0, breaks: [] });
+    expect(
+      auditStepPrefixes([step("run-1", 0, ["a"]), step("run-2", 0, ["cleared"])])
+    ).toMatchObject({ comparedPairs: 1, breaks: [{ runId: "run-2" }] });
+  });
+
+  test.each([
+    ["thinking", { providerOptions: { anthropic: { thinking: { type: "adaptive" } } } }],
+    ["effort", { providerOptions: { anthropic: { effort: "high" } } }],
+    ["tool choice", { toolChoice: { type: "required" } }],
+    ["parallel tool use", { providerOptions: { anthropic: { disableParallelToolUse: true } } }],
+  ])("a recorded %s change breaks the messages section", (_name, extra) => {
+    const audit = auditStepPrefixes([
+      step("run-1", 0, ["a"]),
+      step("run-2", 0, ["a", "b"], undefined, undefined, extra),
+    ]);
+    expect(audit.breaks).toMatchObject([
+      { comparison: { section: "messages", previous: { type: "message_options" } } },
+    ]);
+  });
+
+  test("a context-editing step is not compared and becomes the baseline", () => {
+    const editing = { providerOptions: { anthropic: { contextManagement: { edits: [] } } } };
+    const audit = auditStepPrefixes([
+      step("run-1", 0, ["a"]),
+      step("run-2", 0, ["edited"], undefined, undefined, editing),
+      step("run-3", 0, ["after"]),
+      step("run-4", 0, ["changed"]),
+    ]);
+    // Only run-3 -> run-4 is compared; the pairs with the editing step are unsupported.
+    expect(audit).toMatchObject({ comparedPairs: 1, breaks: [{ runId: "run-4" }] });
   });
 });

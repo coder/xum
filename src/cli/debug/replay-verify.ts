@@ -37,6 +37,13 @@ export function resolveReplaySessionDir(workspaceId: string): {
 /** Print the prefix rule over every recorded step (shared with cache-audit). */
 export function printStepPrefixAudit(audit: StepPrefixAudit): void {
   console.log(`\n--- Prompt-cache prefix rule over every recorded step ---`);
+  if (audit.auditedSteps === 0) {
+    console.log(
+      "No chat-turn runs in devtools.jsonl: only side calls, or runs recorded by an older " +
+        "binary without requestHistorySequence. Nothing to audit.\n"
+    );
+    return;
+  }
   for (const found of audit.breaks) {
     console.log(
       `PREFIX BREAK  run ${found.runId} step ${found.stepNumber} (${found.boundary} boundary): ` +

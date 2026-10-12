@@ -74,7 +74,12 @@ export interface RecordedStepRequest {
   provider: string | null;
   prompt: unknown;
   tools: unknown;
+  /** The step's AI SDK call options: they carry thinking, effort and tool choice. */
+  providerOptions?: unknown;
+  toolChoice?: unknown;
   requestHistorySequence?: number;
+  /** See DevToolsRun.contextEpoch; absent on runs recorded by older binaries. */
+  contextEpoch?: string;
 }
 
 /** One parse of devtools.jsonl, shared by the first-request replay and the step audit. */
@@ -114,7 +119,10 @@ export async function readDevtoolsLog(sessionDir: string): Promise<DevtoolsLogSn
       continue;
     }
     if (entry.type === "run") {
-      runs.set(entry.run.id, { run: entry.run, steps: [] });
+      // DevToolsService appends a healed duplicate header (without the run metadata) when a
+      // retention-evicted run logs another step. The first header carries the metadata, so
+      // keep it; the duplicate's steps attach to it by run id below.
+      if (!runs.has(entry.run.id)) runs.set(entry.run.id, { run: entry.run, steps: [] });
     } else if (entry.type === "step") {
       orphanSteps.push(entry.step);
     } else if (entry.type === "step-update") {
@@ -192,9 +200,14 @@ export function recordedStepsFromLog(log: DevtoolsLogSnapshot): RecordedStepRequ
             provider: step.provider,
             prompt: step.input.prompt,
             tools: step.input.tools,
+            ...(step.input.providerOptions != null
+              ? { providerOptions: step.input.providerOptions }
+              : {}),
+            ...(step.input.toolChoice != null ? { toolChoice: step.input.toolChoice } : {}),
             ...(run.requestHistorySequence != null
               ? { requestHistorySequence: run.requestHistorySequence }
               : {}),
+            ...(run.contextEpoch != null ? { contextEpoch: run.contextEpoch } : {}),
           },
         ]
   );
