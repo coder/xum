@@ -47,24 +47,35 @@ from crapper.crap import make_entry
 from crapper.discover import is_test_file, language_of
 from crapper.languages import functions_in_file
 
-# Code under src/ that never ships. Crapper already skips `*.test.ts(x)`.
-NON_PRODUCTION_SUFFIXES = (
-    ".stories.tsx",
-    ".stories.ts",
-    ".testHarness.ts",
-    ".testHarness.tsx",
-    ".bench.ts",
-    ".bench.tsx",
+# Code under src/ that never ships. Mirrors isProductionSource() in
+# scripts/check-test-seam-comments.ts (keep the two in step), plus bench files.
+# Crapper's is_test_file() also skips test/, tests/, spec/ and *.test.* files.
+SUPPORT_DIRS = {"__tests__", "__mocks__", "test", "tests", "testing", "mocks", "stories"}
+SUPPORT_NAMES = (
+    re.compile(r"\.(?:test|spec)[\w-]*\.[cm]?[jt]sx?$"),
+    re.compile(r"\.(?:stories|generated|bench)\.[cm]?[jt]sx?$"),
+    re.compile(r"^test[A-Z_.-]"),
+    re.compile(r"Test(?:Helpers?|Harness|Utils|Fixtures?|Overlay|Child)\b"),
+    re.compile(r"\.\w*[fF]ixtures?\.[cm]?[jt]sx?$"),
 )
-NON_PRODUCTION_DIRS = ("src/browser/stories/",)
 
 
 def is_production(relative: str) -> bool:
     if not relative.startswith("src/") or language_of(relative) is None:
         return False
-    if is_test_file(relative) or relative.endswith(NON_PRODUCTION_SUFFIXES):
+    if is_test_file(relative) or relative == "src/version.ts":
         return False
-    return not relative.startswith(NON_PRODUCTION_DIRS)
+    *dirs, name = relative.split("/")
+    if SUPPORT_DIRS.intersection(dirs):
+        return False
+    return not any(pattern.search(name) for pattern in SUPPORT_NAMES)
+
+
+def normalize(relative: str) -> str:
+    path = relative.replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path
 
 
 def tracked_src_files(root: Path) -> list[str]:
@@ -189,7 +200,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("files", nargs="*")
     args = parser.parse_args(argv)
     root = args.root.resolve()
-    candidates = args.files or tracked_src_files(root)
+    candidates = [normalize(path) for path in args.files] or tracked_src_files(root)
     # A raw changed-file list can name deleted files: there is nothing to score.
     files = sorted({path for path in candidates if is_production(path) and (root / path).is_file()})
     rows = score(root, files, load_coverage(args.lcov, root, files))

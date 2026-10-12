@@ -108,13 +108,18 @@ def test_only_existing_production_files_under_src_are_scored(tmp_path, capsys):
             "src/demo/branchy.stories.tsx",
             "src/demo/branchy.testHarness.ts",
             "src/demo/branchy.bench.ts",
+            "src/demo/testUtils.ts",
+            "src/demo/fileLockTestHelpers.ts",
+            "src/demo/lock.testChild.ts",
+            "src/demo/__mocks__/fs.ts",
+            "src/version.ts",
             "src/browser/stories/mocks.ts",
             "src/demo/types.d.ts",
             "scripts/tool.ts",
         )
     ]
 
-    rows = run(capsys, tmp_path, kept, "src/demo/deleted.ts", *skipped)
+    rows = run(capsys, tmp_path, f"./{kept}", "src/demo/deleted.ts", *skipped)
 
     assert {row["path"] for row in rows} == {kept}
 
