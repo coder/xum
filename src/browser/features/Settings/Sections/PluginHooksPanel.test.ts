@@ -30,11 +30,13 @@ describe("formatPluginHookInput", () => {
     for (let depth = 0; depth < 40; depth++) nested = [nested];
     const input = { a: nested, b: "x".repeat(100_000) };
 
-    const shown = formatPluginHookInput(input);
+    const { shown, full } = formatPluginHookInput(input);
 
     expect(shown.length).toBeLessThan(PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS + 64);
     expect(shown).toMatch(/\n…truncated \(\d+ KB\)$/);
     expect(shown.startsWith(JSON.stringify(input).slice(0, 100))).toBe(true);
+    // Codex P1 (PRRT_kwDOPxxmWM6rgooU): the full input stays reviewable, compact.
+    expect(full).toBe(JSON.stringify(input));
   });
 
   test("the cut never splits a surrogate pair", () => {
@@ -43,13 +45,16 @@ describe("formatPluginHookInput", () => {
     const input = {
       a: "x".repeat(PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS - prefix - 1) + "\u{1F600}".repeat(10),
     };
-    const shown = formatPluginHookInput(input).split("\n…truncated")[0];
+    const shown = formatPluginHookInput(input).shown.split("\n…truncated")[0];
     expect(shown.length).toBe(PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS - 1);
     expect(shown.endsWith("x")).toBe(true);
   });
 
   test("a small input stays pretty-printed in full", () => {
     const input = { path: "${tool_input.path}", n: [1, 2] };
-    expect(formatPluginHookInput(input)).toBe(JSON.stringify(input, null, 2));
+    expect(formatPluginHookInput(input)).toEqual({
+      shown: JSON.stringify(input, null, 2),
+      full: null,
+    });
   });
 });
