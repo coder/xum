@@ -23,6 +23,11 @@ import {
  * - Frame -> host (M5b annotate): `{ type: "annotate", x, y, selector?, quote?, prefix?,
  *   suffix? }`, posted by the shim only while the host has annotate mode on; x/y are fractions of
  *   the frame size. The host also ignores it unless annotate mode is on.
+ * - Frame -> host (openWorkspace): `{ type: "openWorkspace", workspaceId }`
+ *   (window.xum.openWorkspace) asks the host to switch the app to that workspace. The host
+ *   honours it only right after the user clicked or typed inside this frame, and only for an
+ *   active workspace (SandboxedArtifactFrame.tsx). The frame never gets a reply: no workspace
+ *   list, title or existence answer reaches it.
  * - Host -> frame: `{ type: "theme", theme: "dark" | "light" }`, sent after load and on theme
  *   change; the artifact may read it, and the host never injects its own CSS.
  *   `{ type: "annotate", enabled }` switches the shim's click-to-pin capture on or off (clicks
@@ -45,6 +50,13 @@ export const ARTIFACT_BRIDGE_VERSION = 1;
 export const ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND = 20;
 
 const bridgeEnvelope = { xumArtifact: z.literal(ARTIFACT_BRIDGE_VERSION) };
+
+/**
+ * Longest workspace ID the bridge accepts. New IDs are 10 hex characters; legacy IDs are
+ * `<project>-<dir>` basenames. The host's lookup in its active-workspace map is the real gate;
+ * this cap and the character set only keep junk out before it.
+ */
+export const ARTIFACT_WORKSPACE_ID_MAX_CHARS = 128;
 
 const ArtifactKeyMessageSchema = z
   .object({
@@ -98,8 +110,20 @@ const ArtifactAnnotateMessageSchema = z
   })
   .strict();
 
+const ArtifactOpenWorkspaceMessageSchema = z
+  .object({
+    ...bridgeEnvelope,
+    type: z.literal("openWorkspace"),
+    workspaceId: z
+      .string()
+      .max(ARTIFACT_WORKSPACE_ID_MAX_CHARS)
+      .regex(/^[A-Za-z0-9._-]+$/),
+  })
+  .strict();
+
 export const ArtifactFrameToHostMessageSchema = z.discriminatedUnion("type", [
   ArtifactKeyMessageSchema,
+  ArtifactOpenWorkspaceMessageSchema,
   ArtifactSendMessageSchema,
   ArtifactSetStateMessageSchema,
   ArtifactAnnotateMessageSchema,
@@ -205,8 +229,8 @@ export function postArtifactAnnotateMode(frameWindow: Window | null | undefined,
  * Source of the inline <script> injected as the frame's first script (inline, so the CSP's
  * 'unsafe-inline' allows it). It forwards Escape and Shift+F to the host and exposes a
  * read-only `window.xum.theme`, updated from theme messages, plus a `xumthemechange` event;
- * `window.xum.send` / `window.xum.setState`, and a read-only `window.xum.state` with a
- * `xumstatechange` event. It also mirrors the theme into `data-xum-theme` on the root element,
+ * `window.xum.send` / `window.xum.setState` / `window.xum.openWorkspace`, and a read-only
+ * `window.xum.state` with a `xumstatechange` event. It also mirrors the theme into `data-xum-theme` on the root element,
  * so plain CSS (the goal status board, which has no scripts) can follow the app theme instead
  * of the OS preference. While the host has annotate mode on, a capture-phase click listener
  * swallows clicks and reports the point (plus any selected text) instead.
@@ -258,6 +282,10 @@ export function buildArtifactBridgeScript(
     var message = { xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "send", text: String(text) };
     if (data !== undefined) message.data = clone(data);
     host.postMessage(message, "*");
+  };
+  // openWorkspace() only asks; the host switches only after a user gesture in this frame.
+  api.openWorkspace = function (workspaceId) {
+    host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "openWorkspace", workspaceId: String(workspaceId) }, "*");
   };
   var stateFlushTimer = null;
   var lastStatePostAt = 0;

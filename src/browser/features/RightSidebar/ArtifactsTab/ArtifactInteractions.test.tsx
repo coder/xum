@@ -6,6 +6,12 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import type { WorkspaceSelection } from "@/browser/components/AgentListItem/AgentListItem";
+import {
+  WorkspaceContext,
+  type WorkspaceContext as WorkspaceContextValue,
+} from "@/browser/contexts/WorkspaceContext";
+import { createWorkspace } from "@/browser/stories/mocks/workspaces";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
@@ -13,6 +19,7 @@ import { ArtifactsPanel } from "./ArtifactsPanel";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { useArtifactInteractions, type ArtifactInteractionTarget } from "./useArtifactInteractions";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
+import { ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND } from "./artifactBridge";
 
 const HTML: ArtifactReadResult = {
   status: "ok",
@@ -419,5 +426,111 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(inFlight).toEqual([]);
     expect(persisted).toEqual({ step: 3 });
     expect(maxInFlight).toBe(1);
+  });
+});
+
+describe("window.xum.openWorkspace", () => {
+  let cleanupDom: (() => void) | null = null;
+  let opened: string[] = [];
+  let activation = { isActive: true };
+  const active = createWorkspace({ id: "a1b2c3d4e5", name: "fix-bug", projectName: "xum" });
+  const archived = {
+    ...createWorkspace({ id: "0f0f0f0f0f", name: "old", projectName: "xum" }),
+    archivedAt: "2026-01-01T00:00:00.000Z",
+  };
+  const open = (workspaceId: unknown) => ({ xumArtifact: 1, type: "openWorkspace", workspaceId });
+
+  function WorkspaceWrapper(props: { children: ReactNode }) {
+    const value = {
+      workspaceMetadata: new Map([
+        [active.id, active],
+        [archived.id, archived],
+      ]),
+      loading: false,
+      loaded: true,
+      loadError: null,
+      setSelectedWorkspace: (selection: WorkspaceSelection | null) => {
+        if (selection != null) opened.push(selection.workspaceId);
+      },
+    } as unknown as WorkspaceContextValue;
+    return (
+      <Wrapper>
+        <WorkspaceContext.Provider value={value}>{props.children}</WorkspaceContext.Provider>
+      </Wrapper>
+    );
+  }
+
+  /** The panel with the user's click inside the frame: focus on the iframe, activation live. */
+  async function renderClickedFrame() {
+    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: WorkspaceWrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    act(() => frame.focus());
+    expect(document.activeElement).toBe(frame);
+    return { view, frame };
+  }
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    window.localStorage.clear();
+    opened = [];
+    activation = { isActive: true };
+    Object.defineProperty(window.navigator, "userActivation", {
+      configurable: true,
+      get: () => activation,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("a click in the frame opens an active workspace through the app's navigation", async () => {
+    const { view, frame } = await renderClickedFrame();
+    postFromFrame(frame, open(active.id));
+    expect(opened).toEqual([active.id]);
+    expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
+  });
+
+  test("an unknown or archived ID does not switch and shows a host notice", async () => {
+    const { view, frame } = await renderClickedFrame();
+    postFromFrame(frame, open("ffffffffff"));
+    expect(opened).toEqual([]);
+    expect(view.getByTestId("artifact-open-workspace-notice")).toBeTruthy();
+    postFromFrame(frame, open(archived.id));
+    expect(opened).toEqual([]);
+    // A later valid open clears the notice.
+    postFromFrame(frame, open(active.id));
+    expect(opened).toEqual([active.id]);
+    expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
+  });
+
+  test("without a user gesture in the frame nothing happens, not even a notice", async () => {
+    const { view, frame } = await renderClickedFrame();
+    // A script-only call: no live user activation.
+    activation = { isActive: false };
+    postFromFrame(frame, open(active.id));
+    postFromFrame(frame, open("ffffffffff"));
+    // Activation from typing elsewhere in the app: focus is not in the frame.
+    activation = { isActive: true };
+    act(() => view.getByTestId("artifacts-panel").focus());
+    postFromFrame(frame, open(active.id));
+    postFromFrame(frame, open("ffffffffff"));
+    expect(opened).toEqual([]);
+    expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
+  });
+
+  test("invalid shapes, other windows and messages over the rate limit never switch", async () => {
+    const { view, frame } = await renderClickedFrame();
+    postFromFrame(frame, open(42));
+    postFromFrame(frame, { ...open(active.id), title: "x" });
+    act(() => {
+      window.dispatchEvent(messageEvent(open(active.id), window));
+    });
+    for (let i = 0; i < ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND; i++) postFromFrame(frame, "junk");
+    postFromFrame(frame, open(active.id));
+    expect(opened).toEqual([]);
+    expect(view.queryByTestId("artifact-open-workspace-notice")).toBeNull();
   });
 });

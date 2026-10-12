@@ -10,6 +10,7 @@ import {
   acceptArtifactFrameMessage,
   ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND,
   ARTIFACT_STATE_POST_INTERVAL_MS,
+  ARTIFACT_WORKSPACE_ID_MAX_CHARS,
   buildArtifactBridgeScript,
   createBridgeRateLimiter,
 } from "./artifactBridge";
@@ -70,7 +71,7 @@ describe("acceptArtifactFrameMessage", () => {
 function runBridgeScript() {
   const listeners = new Map<string, (event: unknown) => void>();
   const posted: unknown[] = [];
-  const fakeWindow = {
+  const fakeWindow: { xum?: { openWorkspace: (id: unknown) => void } } & Record<string, unknown> = {
     parent: { postMessage: (message: unknown) => posted.push(message) },
     addEventListener: (type: string, listener: (event: unknown) => void) => {
       listeners.set(type, listener);
@@ -98,7 +99,7 @@ function runBridgeScript() {
       metaKey: false,
       altKey: false,
     });
-  return { keydown, posted };
+  return { keydown, posted, xum: fakeWindow.xum };
 }
 
 describe("bridge script keys", () => {
@@ -119,6 +120,41 @@ describe("bridge script keys", () => {
     expect(bridge.posted).toEqual([]);
     bridge.keydown("F", div, true);
     expect(bridge.posted).toEqual([{ xumArtifact: 1, type: "key", key: "F", shiftKey: true }]);
+  });
+});
+
+describe("openWorkspace messages", () => {
+  const accept = (data: unknown) =>
+    acceptArtifactFrameMessage({ source: frame, data }, frame, () => true);
+  const open = (workspaceId: unknown) => ({ xumArtifact: 1, type: "openWorkspace", workspaceId });
+
+  test("accepts a workspace ID", () => {
+    for (const workspaceId of ["a1b2c3d4e5", "legacy-project_branch.2"]) {
+      expect(accept(open(workspaceId))).toMatchObject({ type: "openWorkspace", workspaceId });
+    }
+  });
+
+  test("refuses a missing, non-string, empty, oversize or odd ID and extra fields", () => {
+    for (const data of [
+      { xumArtifact: 1, type: "openWorkspace" },
+      open(42),
+      open(["a1b2c3d4e5"]),
+      open(""),
+      open("a".repeat(ARTIFACT_WORKSPACE_ID_MAX_CHARS + 1)),
+      open("../a1b2c3d4e5"),
+      open("a1b2 c3d4e5"),
+      open("<img src=x>"),
+      { ...open("a1b2c3d4e5"), title: "Fix the bug" },
+    ]) {
+      expect(accept(data)).toBeNull();
+    }
+  });
+
+  test("window.xum.openWorkspace posts the ID as a string and returns nothing", () => {
+    const bridge = runBridgeScript();
+    expect(bridge.xum?.openWorkspace("a1b2c3d4e5")).toBeUndefined();
+    bridge.xum?.openWorkspace(42);
+    expect(bridge.posted).toEqual([open("a1b2c3d4e5"), open("42")]);
   });
 });
 
