@@ -542,7 +542,11 @@ describe("prompt-cache prefix: volatile system tail", () => {
   // when the tail changes, but every message after the tail still misses, so a tail
   // change re-writes the whole conversation.
   test("a hot-memory change in the volatile tail costs only the tail", async () => {
-    await expectReproFailure(hotMemoryChangeKeepsHistoryCached, divergesAt(2));
+    await expectReproFailure(hotMemoryChangeKeepsHistoryCached, {
+      matcher: "toBe",
+      expected: "0",
+      received: "1",
+    });
   });
 });
 
@@ -568,7 +572,13 @@ async function hotMemoryChangeKeepsHistoryCached(): Promise<void> {
   const previous = wireBlocks(first);
   const next = wireBlocks(second);
   const firstChanged = previous.findIndex((block, index) => block !== next[index]);
-  // Contract: everything but the changed tail keeps its cache, so the earliest change
-  // may only be the tail itself, placed after the previous request's last message.
-  expect(firstChanged).toBe(-1);
+  // Anthropic reuses the cache up to the first changed block. Contract: only the tail itself
+  // may fall outside that prefix. A fix can keep the old tail in place (no change at all) or
+  // move it behind the history (the change starts at the tail), and both pass.
+  const cachedBlocks = firstChanged < 0 ? previous.length : firstChanged;
+  const uncachedNonTailBlocks = previous
+    .slice(cachedBlocks)
+    .filter((block) => !block.includes("<hot_memories>")).length;
+  // Target assertion: today the tail sits before the history, so the user message misses.
+  expect(uncachedNonTailBlocks).toBe(0);
 }
