@@ -269,6 +269,24 @@ describe("RightSidebarOverview", () => {
     expect(opened).toEqual(["side:side-new", "side:side-old"]);
   });
 
+  test("numbers side chats that share a title, oldest first", () => {
+    const { view } = renderOverview([
+      workspace({ id: WORKSPACE_ID }),
+      sideChat("side-a", 30),
+      sideChat("side-b", 20, "Unique question"),
+      sideChat("side-c", 10),
+    ]);
+    const section = within(view.getByRole("region", { name: "Side chats" }));
+    const rows = section
+      .getAllByRole("button")
+      .filter((button) => button.getAttribute("aria-label") !== "New side chat");
+    expect(rows.map((row) => row.textContent)).toEqual([
+      "New chat#2",
+      "Unique question",
+      "New chat#1",
+    ]);
+  });
+
   test("an empty side chat section is only its heading and the new-chat button", () => {
     const startable = renderOverview([workspace({ id: WORKSPACE_ID })]);
     const section = startable.view.getByRole("region", { name: "Side chats" });

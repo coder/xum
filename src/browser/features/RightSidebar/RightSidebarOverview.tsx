@@ -81,6 +81,25 @@ function getOverviewSideChats(
     .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
 }
 
+/**
+ * Second line per side chat (same order): `#n` when its title is shared, so several untitled
+ * chats ("New chat") read apart. `#1` is the oldest, so a number stays with its chat as newer ones
+ * arrive.
+ */
+function getSideChatOrdinals(labels: readonly string[]): Array<string | null> {
+  const total = new Map<string, number>();
+  for (const label of labels) total.set(label, (total.get(label) ?? 0) + 1);
+  const seen = new Map<string, number>();
+  // Labels are newest first: the first one met is the newest, number `total`.
+  return labels.map((label) => {
+    const count = total.get(label) ?? 0;
+    if (count < 2) return null;
+    const met = seen.get(label) ?? 0;
+    seen.set(label, met + 1);
+    return `#${count - met}`;
+  });
+}
+
 function getGoalStatus(goal: GoalSnapshot): { label: string; className?: string } {
   const status = getGoalStatusLabel(goal);
   // Pending (mid-stream, unsaved) goals stay unaccented, like the Goal tab label, so the accent
@@ -158,6 +177,10 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
   const branch =
     gitStatus != null && gitStatus.branch.length > 0 ? gitStatus.branch : metadata?.name;
   const sideChats = getOverviewSideChats(workspaceMetadata, props.workspaceId);
+  const sideChatLabels = sideChats.map((chat) =>
+    chat.title != null && chat.title.length > 0 ? chat.title : SIDE_CHAT_INITIAL_TITLE
+  );
+  const sideChatOrdinals = getSideChatOrdinals(sideChatLabels);
   const showSideChats = sideChats.length > 0 || props.onNewSideChat != null;
   // The first side chat past the cap once the user listed them all, else null (capped list).
   const [revealedSideChatId, setRevealedSideChatId] = React.useState<string | null>(null);
@@ -267,15 +290,12 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
           {(revealedSideChatId != null
             ? sideChats
             : sideChats.slice(0, OVERVIEW_MAX_LIST_ROWS)
-          ).map((sideChat) => (
+          ).map((sideChat, index) => (
             <OverviewRow
               key={sideChat.id}
               Icon={MessageCircle}
-              label={
-                sideChat.title != null && sideChat.title.length > 0
-                  ? sideChat.title
-                  : SIDE_CHAT_INITIAL_TITLE
-              }
+              label={sideChatLabels[index]}
+              sub={sideChatOrdinals[index]}
               focusOnMount={sideChat.id === revealedSideChatId}
               onClick={() => props.onOpenTab(makeSideChatTabType(sideChat.id))}
             />
@@ -479,7 +499,8 @@ const OverviewSection: React.FC<{
 /** The rows a capped list leaves out, as one row that leads to the full list. */
 const MoreRow: React.FC<{ count: number; onClick: () => void }> = (props) =>
   props.count > 0 ? (
-    <OverviewRow label={`${props.count} more`} muted onClick={props.onClick} />
+    // A live count (new outputs and side chats arrive while the card shows).
+    <OverviewRow label={`${props.count} more`} muted numeric onClick={props.onClick} />
   ) : null;
 
 /** One line of the card: a button when it leads somewhere, plain text otherwise. */

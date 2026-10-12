@@ -59,6 +59,7 @@ const SIDEBAR_EVENT_TYPES = [
   CUSTOM_EVENTS.OPEN_GOAL_TAB,
   CUSTOM_EVENTS.OPEN_ARTIFACT,
   CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
+  CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR,
 ];
 
 // Restore every module stubbed below (including the per-test WorkspaceStore double) after
@@ -551,6 +552,10 @@ describe("WorkspaceShell loading placeholders", () => {
       window.dispatchEvent(
         createCustomEvent(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, { workspaceId: "w" })
       );
+      // The header's stand-in for the collapsed overview card.
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, { workspaceId: "w" })
+      );
       fireEvent.click(view.getByRole("button", { name: "New terminal" }));
       expect(typed).toBe(true); // Shift+I in a text field stays a typed letter
       expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([[], 0]);
@@ -566,6 +571,7 @@ describe("WorkspaceShell loading placeholders", () => {
         CUSTOM_EVENTS.OPEN_GOAL_TAB,
         CUSTOM_EVENTS.OPEN_ARTIFACT,
         CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
+        CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR,
       ]);
       expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([["artifact"], 1]);
       expect(sideChatSeen).toBe(1); // and not replayed

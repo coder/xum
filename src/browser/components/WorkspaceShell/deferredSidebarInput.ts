@@ -16,6 +16,8 @@ export type HeldSidebarInput = () => void;
 const SIDEBAR_EVENTS = [
   CUSTOM_EVENTS.OPEN_GOAL_TAB,
   CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
+  // The header's stand-in for the collapsed overview card: the only expand control while loading.
+  CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR,
   CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
   CUSTOM_EVENTS.OPEN_ARTIFACT,
   CUSTOM_EVENTS.OPEN_REVIEW_IMMERSIVE,
