@@ -16,8 +16,8 @@ export interface ArtifactInteractionTarget {
 
 /**
  * Host side of artifact interactions for the Artifacts panel (M5b): one pending confirm strip per
- * artifact (sends arriving while it is shown are ignored), the persisted `window.xum.state` of the displayed version,
- * and the handlers the viewer passes to the frame. Returns `handlers: undefined` when nothing
+ * artifact (sends arriving while it is shown are ignored), the persisted `window.xum.state` of the
+ * artifact (one state for all its versions), and the handlers the viewer passes to the frame. Returns `handlers: undefined` when nothing
  * interactive is selected (pinned files, MCP Apps views). `handleKeyDown` runs the strip's
  * shortcuts; the panel calls it for keys pressed inside the panel, and it returns true when it
  * handled the key.
@@ -34,9 +34,13 @@ export function useArtifactInteractions(
   const [pendingByPath, setPendingByPath] = useState<ReadonlyMap<string, PendingArtifactSend>>(
     () => new Map()
   );
-  // Per-target `setState` writes: one request in flight, newer states replace the queued one, so
+  // Per-path `setState` writes: one request in flight, newer states replace the queued one, so
   // concurrent saves cannot land out of order and the last state the frame sent wins.
   const stateWritesRef = useRef(new Map<string, { queued: { state: unknown } | null }>());
+  // The last state each artifact's frame sent, by workspace and path. A reload (new version,
+  // version switch) can read the server while a write is still queued, so this tab's own newest
+  // state wins over that read.
+  const lastSentStateRef = useRef(new Map<string, unknown>());
   // Paths with a shown strip, updated synchronously so back-to-back sends see it.
   const pendingPathsRef = useRef(new Set<string>());
   const [sendState, setSendState] = useState<{
@@ -44,7 +48,8 @@ export function useArtifactInteractions(
     sending: boolean;
     error: string | null;
   }>({ path: "", sending: false, error: null });
-  // A live view's state follows the newest stored version, so a new version reloads it.
+  // The state is per artifact, but a new version or a version switch rebuilds the frame, so the
+  // key still changes then: the rebuild must read the newest state, not the first load's.
   const stateKey =
     target == null
       ? null
@@ -52,22 +57,28 @@ export function useArtifactInteractions(
   const [loadedState, setLoadedState] = useState<{ key: string; state: unknown } | null>(null);
 
   const path = target?.path ?? null;
-  const version = target?.version ?? null;
   useEffect(() => {
     if (!api || path == null || stateKey == null) return;
     const controller = new AbortController();
     api.artifacts
-      .getState({ workspaceId, path, version }, { signal: controller.signal })
+      .getState({ workspaceId, path }, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
-        setLoadedState({ key: stateKey, state: result.success ? result.data.state : null });
+        const sent = lastSentStateRef.current;
+        const sentKey = `${workspaceId}\u0000${path}`;
+        const state = sent.has(sentKey)
+          ? sent.get(sentKey)
+          : result.success
+            ? result.data.state
+            : null;
+        setLoadedState({ key: stateKey, state });
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
         setLoadedState({ key: stateKey, state: null });
       });
     return () => controller.abort();
-  }, [api, workspaceId, path, version, stateKey]);
+  }, [api, workspaceId, path, stateKey]);
 
   // Owned here, not by the strip, so the Send shortcut honors the same arming delay as the
   // button (confirmArming.ts).
@@ -98,8 +109,8 @@ export function useArtifactInteractions(
     setState: (state) => {
       const writes = stateWritesRef.current;
       const writePath = target.path;
-      const writeVersion = target.version;
-      const key = `${writePath}\u0000${writeVersion ?? "live"}`;
+      lastSentStateRef.current.set(`${workspaceId}\u0000${writePath}`, state);
+      const key = writePath;
       const active = writes.get(key);
       if (active != null) {
         active.queued = { state };
@@ -118,9 +129,7 @@ export function useArtifactInteractions(
           entry.queued = null;
           write(queued.state);
         };
-        api.artifacts
-          .setState({ workspaceId, path: writePath, version: writeVersion, state: next })
-          .then(settle, settle);
+        api.artifacts.setState({ workspaceId, path: writePath, state: next }).then(settle, settle);
       };
       write(state);
     },

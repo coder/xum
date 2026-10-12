@@ -19,7 +19,8 @@ import {
  *   message enter fullscreen: the artifact's script can post these without a key press).
  * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) only fills the
  *   host-owned confirm strip, never sends by itself; `{ type: "setState", state }`
- *   (window.xum.setState) is persisted per artifact version. Text and JSON sizes are capped.
+ *   (window.xum.setState) is persisted per artifact, for all its versions. Text and JSON sizes
+ *   are capped.
  * - Frame -> host (M5b annotate): `{ type: "annotate", x, y, selector?, quote?, prefix?,
  *   suffix? }`, posted by the shim only while the host has annotate mode on; x/y are fractions of
  *   the frame size. The host also ignores it unless annotate mode is on.

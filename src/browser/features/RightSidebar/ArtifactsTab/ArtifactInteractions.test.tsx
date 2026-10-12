@@ -41,11 +41,11 @@ let sends: Array<{ path: string; text: string; data?: unknown; version: number |
 let savedStates: unknown[] = [];
 interface SetStateResult {
   success: true;
-  data: { version: number };
+  data: undefined;
 }
 let setStateImpl: (state: unknown) => Promise<SetStateResult> = (state) => {
   savedStates.push(state);
-  return Promise.resolve({ success: true as const, data: { version: 0 } });
+  return Promise.resolve({ success: true as const, data: undefined });
 };
 let persistedState: unknown = { step: 1 };
 /** When set, getState waits for this promise (state still loading). */
@@ -91,7 +91,7 @@ function Wrapper(props: { children: ReactNode }) {
         }),
       getState: async () => {
         await stateGate;
-        return { success: true as const, data: { version: 0, state: persistedState } };
+        return { success: true as const, data: { state: persistedState } };
       },
       setState: (input: { state: unknown }) => setStateImpl(input.state),
       sendInteraction: (input: {
@@ -154,7 +154,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     savedStates = [];
     setStateImpl = (state) => {
       savedStates.push(state);
-      return Promise.resolve({ success: true as const, data: { version: 0 } });
+      return Promise.resolve({ success: true as const, data: undefined });
     };
     persistedState = { step: 1 };
     stateGate = null;
@@ -342,7 +342,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(JSON.parse(JSON.parse(embedded ?? '"null"') as string)).toEqual(persistedState);
   });
 
-  test("setState from the frame is persisted for the displayed version", async () => {
+  test("setState from the frame is persisted for the artifact", async () => {
     const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
@@ -405,6 +405,23 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(sends[0]).toMatchObject({ text: "Held" });
   });
 
+  test("a new version reloads the frame with the newest state, not the first load's", async () => {
+    // The state is per artifact, so v2 must start with what the user picked on v1. The server
+    // read can still return the old state while the write is queued.
+    let writes = 0;
+    setStateImpl = () => {
+      writes++;
+      return new Promise<SetStateResult>(() => undefined);
+    };
+    const live = (latestVersion: number) => ({ path: HTML.path, version: null, latestVersion });
+    const view = render(<InteractionsHarness target={live(1)} />, { wrapper: Wrapper });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
+    act(() => hookHandlers?.setState?.({ step: 4 }));
+    expect(writes).toBe(1);
+    view.rerender(<InteractionsHarness target={live(2)} />);
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 4 }));
+  });
+
   test("concurrent setState writes run one at a time and the last state wins", async () => {
     // A server that persists each write when its request settles: overlapping requests that
     // settle out of order would leave an older state on disk.
@@ -417,7 +434,7 @@ describe("artifact interactions in the Artifacts panel", () => {
           state,
           settle: () => {
             persisted = state;
-            resolve({ success: true as const, data: { version: 0 } });
+            resolve({ success: true as const, data: undefined });
           },
         };
         inFlight.push(request);
