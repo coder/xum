@@ -21,7 +21,8 @@ import {
   type ChatUsageDisplay,
 } from "@/common/utils/tokens/usageAggregator";
 import { formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
-import { formatHeartbeatIntervalShort } from "@/constants/heartbeat";
+import { formatHeartbeatIntervalShort, HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
+import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { SIDE_CHAT_INITIAL_TITLE } from "@/constants/workspaceDefaults";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { useOptionalAPI } from "@/browser/contexts/API";
@@ -121,7 +122,11 @@ function useSessionStats(
     total.cacheCreate.tokens +
     total.output.tokens +
     total.reasoning.tokens;
-  return { cost: getTotalCost(total), costIncomplete: total.hasUnknownCosts === true, tokens };
+  const costIncomplete = total.hasUnknownCosts === true;
+  const cost = getTotalCost(total);
+  // The sum counts unpriced usage as $0, so a session with nothing priced has no cost to show
+  // (only its tokens), rather than a misleading "$0.00".
+  return { cost: costIncomplete && cost === 0 ? undefined : cost, costIncomplete, tokens };
 }
 
 /**
@@ -151,6 +156,10 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
   const workflowRuns = sidebarState?.activeWorkflowRunCount ?? 0;
   const terminals = sidebarState?.terminalSessionCount ?? 0;
   const heartbeat = metadata?.heartbeat?.enabled === true ? metadata.heartbeat : null;
+  // A heartbeat without its own interval follows the global default, as the scheduler does.
+  const defaultHeartbeatIntervalMs = useAppConfig((config) => config.heartbeatDefaultIntervalMs);
+  const heartbeatIntervalMs =
+    heartbeat?.intervalMs ?? defaultHeartbeatIntervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS;
   const showActivity = workflowRuns > 0 || terminals > 0 || heartbeat != null;
 
   return (
@@ -162,7 +171,9 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
             Icon={TAB_ICONS.costs}
             numeric
             label={
-              stats.cost != null ? formatCostWithDollar(stats.cost) : formatTokens(stats.tokens)
+              stats.cost != null
+                ? formatCostWithDollar(stats.cost)
+                : `${formatTokens(stats.tokens)} tokens`
             }
             labelAdornment={
               stats.cost != null &&
@@ -325,10 +336,7 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
             <OverviewRow
               Icon={HeartPulse}
               label="Heartbeat"
-              detail={
-                heartbeat.intervalMs != null &&
-                `Every ${formatHeartbeatIntervalShort(heartbeat.intervalMs)}`
-              }
+              detail={`Every ${formatHeartbeatIntervalShort(heartbeatIntervalMs)}`}
             />
           )}
         </OverviewSection>

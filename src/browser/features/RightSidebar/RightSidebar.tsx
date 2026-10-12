@@ -232,7 +232,9 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
               // desktop, h-8 otherwise). The height cap keeps the card clear of the composer
               // on short windows; overflowing content scrolls inside the card.
               "bg-surface-secondary absolute right-3 z-10 w-64 overflow-x-hidden overflow-y-auto rounded-lg border shadow-lg",
-              "max-h-[min(32rem,calc(100%-12rem))]",
+              // The 7rem floor keeps the stats/Expand row and a section reachable even in a
+              // window too short for the composer clearance.
+              "max-h-[max(7rem,min(32rem,calc(100%-12rem)))]",
               isDesktop ? "top-12" : "top-11",
             ]
           : // No width transition: expanding swaps the floating card for the docked panel, and

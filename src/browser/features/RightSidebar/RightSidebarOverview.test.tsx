@@ -13,6 +13,7 @@ import {
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
 import { createTestApiClient } from "@/browser/testUtils";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { formatHeartbeatIntervalShort, HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
 import type { ArtifactEntry } from "@/common/orpc/schemas/artifacts";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
 import type { GoalSnapshot } from "@/common/types/goal";
@@ -195,6 +196,23 @@ describe("RightSidebarOverview", () => {
     expect(within(stats).getByLabelText("Cost may be incomplete")).toBeTruthy();
   });
 
+  test("labels the tokens when no usage is priced", () => {
+    const none = { tokens: 0 };
+    workspaceUsage = {
+      totalTokens: 0,
+      sessionTotal: {
+        input: { tokens: 1_200 },
+        cached: none,
+        cacheCreate: none,
+        output: none,
+        reasoning: none,
+        hasUnknownCosts: true,
+      },
+    };
+    const { view } = renderOverview([workspace({ id: WORKSPACE_ID })]);
+    expect(view.getByRole("button", { name: "1.2k tokens" })).toBeTruthy();
+  });
+
   test("shows no stats before the session has usage", () => {
     const { view } = renderOverview([workspace({ id: WORKSPACE_ID })]);
     expect(view.queryByRole("button", { name: /\$/ })).toBeNull();
@@ -343,6 +361,16 @@ describe("RightSidebarOverview", () => {
     ]);
     const activity = view.getByRole("region", { name: "Activity" });
     expect(activity.textContent).toContain("Every 5m");
+  });
+
+  test("a heartbeat without its own interval shows the default cadence", () => {
+    const { view } = renderOverview([
+      workspace({ id: WORKSPACE_ID, heartbeat: { enabled: true } }),
+    ]);
+    const activity = view.getByRole("region", { name: "Activity" });
+    expect(activity.textContent).toContain(
+      `Every ${formatHeartbeatIntervalShort(HEARTBEAT_DEFAULT_INTERVAL_MS)}`
+    );
   });
 
   test("lists the newest outputs when Artifacts is on, and opens the picked one", async () => {
