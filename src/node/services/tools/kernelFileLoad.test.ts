@@ -306,7 +306,12 @@ describe("createKernelFileLoader Codex hook rewrites", () => {
         runtime,
         hooks: { runtime, cwd: tmp.path, runtimeTempDir: tmp.path, workspaceId: "kernel-range-ws" },
       });
-      await expect(load({ path: "secret.txt" })).rejects.toThrow(/does not match the tool's input/);
+      const refused: unknown = await load({ path: "secret.txt" }).then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(refused).toBeInstanceOf(Error);
+      expect(String(refused)).toMatch(/does not match the tool's input/);
     } finally {
       unregister();
     }
