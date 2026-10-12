@@ -3401,8 +3401,9 @@ export class WorkspaceStore {
         // providerMetadata (cache-write counts included), so their cache health is unknown.
         if (msg.role !== "assistant" || msg.metadata?.compacted) continue;
         const turnUsage = sumUsageHistory(
+          // No fallback to the current model: a row without a record-time model stays
+          // "unknown" (rewrite cost "-"), as in SessionUsageService's history rebuild.
           getAssistantMessageModelUsages(msg.metadata, {
-            fallbackModel: model,
             resolveMetadataModel: (msgModel) => this.resolveMetadataModel(msgModel),
           }).map((entry) => entry.usage)
         );
