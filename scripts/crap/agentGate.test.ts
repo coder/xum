@@ -101,8 +101,12 @@ test("block mode stops a regressing commit before it runs, unless it carries Cra
   const big = runGate(gate, "pre", "", { ...GIT_ENV, XUM_TOOL_INPUT_PATH: input });
   expect(big.status).toBe(1);
 
-  // The post phase belongs to warn mode.
-  expect(runGate(gate, "post", "git commit -am 'grow route'")).toEqual({ status: 0, out: "" });
+  // After a commit that carries Crap-Debt, block mode's post phase shows the
+  // downgraded findings: the passing pre phase could not.
+  git("commit", "-q", "-am", "grow", "-m", "Crap-Debt: needs follow-up");
+  const after = runGate(gate, "post", "git commit -am grow -m 'Crap-Debt: needs follow-up'");
+  expect(after.status).toBe(0);
+  expect(after.out).toContain("warning   floor-cc     src/route.ts:1-5 route: CC 2 -> 5");
 });
 
 test("warn mode lets the commit run and reports after it", () => {
@@ -117,7 +121,12 @@ test("warn mode lets the commit run and reports after it", () => {
 test("other commands skip the check, and a broken gate never blocks", () => {
   const gate = gateIn("block");
   expect(runGate(gate, "pre", "git log --oneline")).toEqual({ status: 0, out: "" });
-  for (const elsewhere of ["cd ../other && git commit -am x", "git -C ../other commit -am x"]) {
+  expect(runGate(gate, "pre", 'echo "do not run git commit yet"')).toEqual({ status: 0, out: "" });
+  for (const elsewhere of [
+    "cd ../other && git commit -am x",
+    "git -C ../other commit -am x",
+    "git -c color.ui=false -C ../other commit -am x",
+  ]) {
     const skipped = runGate(gate, "pre", elsewhere);
     expect(skipped.status).toBe(0);
     expect(skipped.out).toContain("may target another checkout");
@@ -155,6 +164,26 @@ test("other commands skip the check, and a broken gate never blocks", () => {
     out: "crap-gate: skipped (no timeout or gtimeout command). The gate never blocks on its own failure.\n",
   });
 });
+
+test("a scorer that ignores SIGTERM is killed before Xum's hook limit", () => {
+  const gate = gateIn("block");
+  // A bun that traps TERM and hangs, in front of the real tools.
+  const stuck = join(dir, "stuck");
+  mkdirSync(stuck);
+  writeFileSync(join(stuck, "bun"), "#!/usr/bin/env bash\ntrap '' TERM\nsleep 12\n", {
+    mode: 0o755,
+  });
+  const started = Date.now();
+  const result = runGate(gate, "pre", "git commit -am x", {
+    ...GIT_ENV,
+    PATH: `${stuck}:${process.env.PATH}`,
+  });
+  expect(result).toEqual({
+    status: 0,
+    out: "crap-gate: skipped (timed out after 8s). The gate never blocks on its own failure.\n",
+  });
+  expect(Date.now() - started).toBeLessThan(10_000);
+}, 15_000);
 
 test("non-commit calls and the shipped warn-mode tool_pre start no process", () => {
   // tool_pre runs before every tool call. A PATH with only bash makes any

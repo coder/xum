@@ -4,7 +4,9 @@
 #
 # Xum shows a tool_pre's output only when it blocks (non-zero exit), so:
 #   block: tool_pre runs the check and exits 1 on violations; the agent sees
-#          the report as the tool error and the command does not run.
+#          the report as the tool error and the command does not run. A
+#          report with warnings only (a touched hotspot, a Crap-Debt) is
+#          printed by tool_post after the command, which runs the check again.
 #   warn:  tool_post runs the check after the command and prints the report;
 #          Xum appends it to the tool result as hook_output.
 # Switching modes is this one line.
@@ -18,11 +20,7 @@ set -uo pipefail
 
 phase=${1:-}
 [[ "${XUM_TOOL:-}" == "bash" ]] || exit 0
-if [[ "$CRAP_GATE_MODE" == "block" ]]; then
-  [[ "$phase" == "pre" ]] || exit 0
-else
-  [[ "$phase" == "post" ]] || exit 0
-fi
+[[ "$phase" == "post" || ("$phase" == "pre" && "$CRAP_GATE_MODE" == "block") ]] || exit 0
 
 # Every tool call reaches this point, so up to the match below use only bash
 # builtins: no git, bun, uv or other process.
@@ -37,9 +35,10 @@ if [[ -z "$script" && -r "${XUM_TOOL_INPUT_PATH:-}" ]]; then
   script=${script//\\\"/\"}
   script=${script//$'\x01'/\\}
 fi
-# Any `git ... commit` or `git ... push` in the command. A false match only
-# costs one check run.
-git_write='(^|[^[:alnum:]_./-])git[[:space:]]([^;&|]*[[:space:]])?(commit|push)([[:space:];&|)]|$)'
+# A `git ... commit` or `git ... push` at a command position (string start, a
+# newline, or after ; & | ( { ), so a quoted "git commit" in an echo does not
+# match.
+git_write="(^|[;&|({"$'\n'"])[[:space:]]*git[[:space:]]([^;&|]*[[:space:]])?(commit|push)([[:space:];&|)]|\$)"
 [[ "$script" =~ $git_write ]] || exit 0
 
 warn_skip() {
@@ -51,7 +50,9 @@ warn_skip() {
 # directory or points git elsewhere may commit to another repository.
 # `cd` counts only at a command position, so a commit message that mentions it
 # does not skip the gate.
-other_repo="(^|[;&|({"$'\n'"])[[:space:]]*(cd|pushd)[[:space:]]|git[[:space:]]+(-C|--git-dir|--work-tree)"
+# A repository selector anywhere in a git command's options counts, also after
+# other globals (git -c x=y -C dir commit).
+other_repo="(^|[;&|({"$'\n'"])[[:space:]]*(cd|pushd)[[:space:]]|git[[:space:]]([^;&|]*[[:space:]])?(-C|--git-dir|--work-tree)"
 if [[ "$script" =~ $other_repo ]]; then
   warn_skip "the command may target another checkout; run make crap-check there"
 fi
@@ -76,24 +77,30 @@ while IFS= read -r reason; do
   [[ -n "$reason" ]] && args+=(--debt "$reason")
 done < <(grep -oE 'Crap-Debt:[^"'"'"']*' <<<"$script" | sed -E 's/^Crap-Debt:[[:space:]]*//')
 
-report=$(cd "$root" && "$timeout_cmd" "$CRAP_GATE_TIMEOUT_SECS" bun "$(dirname "${BASH_SOURCE[0]}")/check.ts" "${args[@]}" 2>&1)
+# -k: SIGKILL half a second after SIGTERM, so a scorer that ignores TERM still
+# ends before Xum's 10 s hook limit. Output goes to a file, not a pipe: a
+# leftover descendant holding a pipe would keep this hook waiting past it.
+out=$(mktemp) || warn_skip "mktemp failed"
+trap 'rm -f "$out"' EXIT
+(cd "$root" && "$timeout_cmd" -k 0.5 "$CRAP_GATE_TIMEOUT_SECS" bun "$(dirname "${BASH_SOURCE[0]}")/check.ts" "${args[@]}") >"$out" 2>&1 </dev/null
 status=$?
+report=$(<"$out")
 case $status in
   0)
-    # Warnings only (a touched hotspot). In block mode a passing tool_pre's
+    # Warnings only (a touched hotspot, a Crap-Debt). A passing tool_pre's
     # output is not shown, so print it only after the command.
-    [[ "$CRAP_GATE_MODE" == "warn" && "$report" == *"warning "* ]] && printf '%s\n' "$report"
+    [[ "$phase" == "post" && "$report" == *"warning "* ]] && printf '%s\n' "$report"
     exit 0
     ;;
   1)
     printf '%s\n' "$report"
-    if [[ "$CRAP_GATE_MODE" == "block" ]]; then
+    if [[ "$phase" == "pre" ]]; then
       echo "crap-gate: blocked. Fix the violations above (see .xum/skills/crap-gate), or add a 'Crap-Debt: <reason>' trailer to the commit."
       exit 1
     fi
-    echo "crap-gate: warn mode, the command ran. Fix the violations above in a follow-up commit (see .xum/skills/crap-gate)."
+    echo "crap-gate: the command ran. Fix the violations above in a follow-up commit (see .xum/skills/crap-gate)."
     exit 0
     ;;
-  124) warn_skip "timed out after ${CRAP_GATE_TIMEOUT_SECS}s" ;;
+  124 | 137) warn_skip "timed out after ${CRAP_GATE_TIMEOUT_SECS}s" ;;
   *) warn_skip "tool error: ${report##*$'\n'}" ;;
 esac
