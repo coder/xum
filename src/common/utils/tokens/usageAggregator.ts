@@ -77,7 +77,12 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
     if (usage.costsIncluded) anyCostsIncluded = true;
     if (usage.hasUnknownCosts) hasIncompleteCosts = true;
     serviceTiers.add(usage.serviceTier ?? "standard");
-    cacheCreate1hTokens += usage.cacheCreate1hTokens ?? 0;
+    // Clamp each entry's share to its own writes: a malformed persisted share must not claim
+    // later 5m writes of the same aggregate (the backend sums rows without repricing them first).
+    const share = usage.cacheCreate1hTokens ?? 0;
+    cacheCreate1hTokens += Number.isFinite(share)
+      ? Math.min(usage.cacheCreate.tokens, Math.max(0, share))
+      : 0;
     // Iterate over each component and sum tokens and costs
     const componentKeys: Array<"input" | "cached" | "cacheCreate" | "output" | "reasoning"> = [
       "input",
