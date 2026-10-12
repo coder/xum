@@ -27,9 +27,6 @@ test(
     await expect(frame.getByText("Scrolled")).toBeVisible();
     await frame.getByRole("link", "Back to top").tap();
     await expect(frame.getByText("At the top")).toBeVisible();
-    // Setup's container stops propagation, so the link's click never reaches window's bubble phase.
-    await frame.getByRole("link", "Setup").tap();
-    await expect(frame.getByText("Scrolled")).toBeVisible();
     await expect(screen.getByText("This artifact navigated away", { exact: false })).toBeHidden();
     await expect(screen.getByTestId("artifact-frame")).toBeVisible();
   }

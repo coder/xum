@@ -364,8 +364,7 @@ describe("bridge annotate mode", () => {
 describe("in-page links", () => {
   // A srcdoc frame resolves "#id" against the app's URL, so an unhandled click navigates the
   // frame to the app and the navigation guard closes the artifact. The handler cancels it and
-  // jumps to the target itself. HTML artifacts and MCP App views both get it. Its stopPropagation
-  // path needs a native click (microtasks between listeners): the bug-bash repro covers it.
+  // jumps to the target itself. HTML artifacts and MCP App views both get it.
   test.each([
     ["HTML artifact bridge", buildArtifactBridgeScript("light")],
     ["MCP App preamble", MCP_APP_PREAMBLE_SCRIPT],
@@ -375,6 +374,7 @@ describe("in-page links", () => {
     doc.body.innerHTML = `
       <a id="plain" href="#intro">Intro</a>
       <a id="encoded" href=" #caf%C3%A9 ">Cafe</a>
+      <a id="stray-percent" href="#caf%C3%A9%">Stray percent</a>
       <a id="raw-name" href="#legacy%20name"><span id="inner">Legacy</span></a>
       <a id="decoded-name" href="#old%20name">Old</a>
       <a id="top-link" href="#">Top</a>
@@ -383,7 +383,7 @@ describe("in-page links", () => {
       <a id="no-href">Not a link</a>
       <a id="own" href="#intro">Handled by the artifact</a>
       <svg><a id="svg"><text>SVG</text></a></svg>
-      <h2 id="intro">Intro</h2><h2 id="café">Cafe</h2>
+      <h2 id="intro">Intro</h2><h2 id="café">Cafe</h2><h2 id="café%">Stray</h2>
       <input name="legacy%20name"><a name="legacy%20name">Raw</a><a name="old name">Decoded</a>`;
     doc
       .getElementById("svg")!
@@ -426,6 +426,8 @@ describe("in-page links", () => {
     const jump = (text: string) => ({ prevented: true, scrolled: [text], focused: text });
     expect(click("plain")).toEqual(jump("Intro"));
     expect(click("encoded")).toEqual(jump("Cafe"));
+    // A "%" without two hex digits stays as it is; the valid escape still decodes.
+    expect(click("stray-percent")).toEqual(jump("Stray"));
     // The raw fragment is tried before the decoded one, and only <a name> counts as a name.
     expect(click("inner")).toEqual(jump("Raw"));
     expect(click("decoded-name")).toEqual(jump("Decoded"));

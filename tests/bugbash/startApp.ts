@@ -374,18 +374,14 @@ async function seed(
   return workspaceId;
 }
 
-/**
- * Contents, two tall sections, and a status line its own script updates on scroll. The Setup
- * link sits in a container that stops propagation (a clickable card), and Usage links back to
- * the top.
- */
+/** Contents, two tall sections with a link back to the top, and a status line its own script updates on scroll. */
 const GUIDE_ARTIFACT_HTML = `<!doctype html>
 <html>
   <body>
     <p id="status" style="position: fixed; top: 0; right: 8px">At the top</p>
     <h1>Guide</h1>
     <nav>
-      <span onclick="event.stopPropagation()"><a href="#setup">Setup</a></span>
+      <a href="#setup">Setup</a>
       <a href="#usage">Usage</a>
     </nav>
     <h2 id="setup" style="margin-top: 1500px">Setup</h2>

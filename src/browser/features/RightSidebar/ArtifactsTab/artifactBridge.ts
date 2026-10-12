@@ -249,12 +249,12 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * do this for free, but WebKit fires the iframe's `load` event for it, which the navigation
  * guard must treat as leaving the document.
  *
- * Ordering: the decision runs when the click reaches window in the bubble phase, after the
- * artifact's own handlers, so one that calls preventDefault keeps the click. A handler that
- * stops propagation instead would hide the click from window, so the capture-phase listener
- * wraps that event's stopPropagation methods to run the decision after the stopping handler
- * returns. The link is found through composedPath, so links in open shadow roots count too.
- * Annotate mode stops the click in the capture phase before either listener sees it.
+ * It decides when the click reaches window in the bubble phase, after the artifact's own
+ * handlers, so one that calls preventDefault keeps the click. The link is found through
+ * composedPath, so links in open shadow roots count too. Annotate mode stops the click in the
+ * capture phase first. Known limits (#6219), where the click still leaves the document as
+ * before: a handler that stops the click's propagation hides it from window, and a target
+ * inside a closed <details> is not revealed first.
  *
  * SECURITY AUDIT: it only cancels a navigation and scrolls or focuses inside the document; it
  * never navigates, so both navigation guards stay as they are.
@@ -285,8 +285,10 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
       return null;
     }
     function jump(raw) {
-      var decoded = raw;
-      try { decoded = decodeURIComponent(raw); } catch (error) {}
+      // Like URL percent-decoding: a "%" without two hex digits stays as it is.
+      var decoded = raw.replace(/(?:%[0-9A-Fa-f]{2})+/g, function (run) {
+        try { return decodeURIComponent(run); } catch (error) { return run; }
+      });
       var target = findTarget(raw) || findTarget(decoded);
       if (!target) {
         if (raw !== "" && decoded.toLowerCase() !== "top") return;
@@ -299,32 +301,18 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
       // tabIndex cannot tell (an <a> without href reports 0), so check whether focus moved.
       if (document.activeElement !== target && !target.hasAttribute("tabindex")) {
         target.setAttribute("tabindex", "-1");
-        target.addEventListener("blur", function () { target.removeAttribute("tabindex"); }, { once: true });
         target.focus({ preventScroll: true });
+        // Still unfocusable (disabled, inert): no blur will come to remove the attribute.
+        if (document.activeElement !== target) target.removeAttribute("tabindex");
+        else target.addEventListener("blur", function () { target.removeAttribute("tabindex"); }, { once: true });
       }
     }
-    var settled = new WeakSet();
-    function settle(event, fragment) {
-      if (settled.has(event)) return;
-      settled.add(event);
-      if (event.defaultPrevented) return;
-      event.preventDefault();
-      jump(fragment);
-    }
     window.addEventListener("click", function (event) {
+      if (event.defaultPrevented) return;
       var fragment = fragmentOf(event);
       if (fragment === null) return;
-      ["stopPropagation", "stopImmediatePropagation"].forEach(function (name) {
-        var stop = event[name];
-        event[name] = function () {
-          stop.call(event);
-          queueMicrotask(function () { settle(event, fragment); });
-        };
-      });
-    }, true);
-    window.addEventListener("click", function (event) {
-      var fragment = fragmentOf(event);
-      if (fragment !== null) settle(event, fragment);
+      event.preventDefault();
+      jump(fragment);
     });
   })();`;
 
