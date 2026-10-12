@@ -16,7 +16,7 @@ export interface CacheHealth {
   /** cache read / (cache read + cache write + uncached input); undefined without prompt tokens. */
   readRatio: number | undefined;
   cacheWriteTokens: number;
-  /** Cache-write tokens at their billed 5m/1h rates; undefined when pricing is unknown. */
+  /** Cache-write tokens at their billed 5m/1h rates; undefined when any pricing is unknown. */
   rewriteCostUsd: number | undefined;
   coldStart: boolean;
 }
@@ -37,7 +37,9 @@ export function getCacheHealth(usage: ChatUsageDisplay): CacheHealth {
   return {
     readRatio: promptTokens > 0 ? usage.cached.tokens / promptTokens : undefined,
     cacheWriteTokens: usage.cacheCreate.tokens,
-    rewriteCostUsd: usage.cacheCreate.cost_usd,
+    // sumUsageHistory counts an unpriced entry as $0 and only sets hasUnknownCosts, so
+    // that flag must hide the cost too: "-" instead of a free-looking "$0.00".
+    rewriteCostUsd: usage.hasUnknownCosts === true ? undefined : usage.cacheCreate.cost_usd,
     coldStart:
       promptTokens > 0 && usage.cacheCreate.tokens > promptTokens * COLD_START_CACHE_WRITE_SHARE,
   };

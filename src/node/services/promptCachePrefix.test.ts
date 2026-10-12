@@ -297,6 +297,40 @@ describe("fingerprintAnthropicRequest follows Anthropic's cache invalidation tab
     });
   });
 
+  test("changing a native server tool's configuration breaks system, keeping every tool block", () => {
+    const webSearch = (maxUses: number) => ({
+      type: "web_search_20250305",
+      name: "web_search",
+      max_uses: maxUses,
+      ...MARKER,
+    });
+    expect(
+      expectBreak(
+        body(baseMessages(), [...TOOLS, webSearch(5)]),
+        body(baseMessages(), [...TOOLS, webSearch(10)])
+      )
+    ).toMatchObject({ section: "system", blockIndex: SYSTEM_OPTIONS_INDEX });
+    // The cache marker is not configuration. body() marks the last tool, so the
+    // server tool goes first here.
+    const { cache_control: _marker, ...unmarked } = webSearch(5);
+    expect(
+      compare(
+        body(baseMessages(), [webSearch(5), ...TOOLS]),
+        body(baseMessages(), [unmarked, ...TOOLS])
+      ).kind
+    ).toBe("extends");
+  });
+
+  test("switching Fast mode breaks system; an explicit standard speed is the default", () => {
+    expect(
+      expectBreak(body(baseMessages()), body(baseMessages(), TOOLS, undefined, { speed: "fast" }))
+    ).toMatchObject({ section: "system", blockIndex: SYSTEM_OPTIONS_INDEX });
+    expect(
+      compare(body(baseMessages()), body(baseMessages(), TOOLS, undefined, { speed: "standard" }))
+        .kind
+    ).toBe("extends");
+  });
+
   test("adding or changing a deferred tool extends the prefix", () => {
     const deferred = (description: string) => [
       ...TOOLS,
