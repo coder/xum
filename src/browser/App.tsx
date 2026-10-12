@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useRef, useState } from "react";
+import React, { useEffect, useCallback, useRef, useState } from "react";
 import { useRouter } from "./contexts/RouterContext";
 import { useLocation } from "react-router-dom";
 import "./styles/globals.css";
@@ -8,9 +8,13 @@ import type { WorkspaceSelection } from "./components/ProjectSidebar/ProjectSide
 import { LeftSidebar } from "./components/LeftSidebar/LeftSidebar";
 import { ProjectCreateModal } from "./components/ProjectCreateModal/ProjectCreateModal";
 import { MultiProjectWorkspaceCreateModal } from "./components/MultiProjectWorkspaceCreateModal/MultiProjectWorkspaceCreateModal";
-import { AIView } from "./components/AIView/AIView";
+import type * as AIViewModule from "./components/AIView/AIView";
 import { ErrorBoundary } from "./components/ErrorBoundary/ErrorBoundary";
-import { usePersistedState, updatePersistedState } from "./hooks/usePersistedState";
+import {
+  readPersistedState,
+  usePersistedState,
+  updatePersistedState,
+} from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { useComputerUse } from "./hooks/useComputerUse";
 import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
@@ -74,6 +78,7 @@ import {
   getProjectScopeId,
   getWorkspaceLastReadKey,
   EXPANDED_PROJECTS_KEY,
+  LAST_VISITED_ROUTE_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_WIDTH_KEY,
 } from "@/common/constants/storage";
@@ -88,12 +93,10 @@ import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinki
 import { getAutoRouting, getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
-import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isLocalProjectRuntime, isWorktreeRuntime } from "@/common/types/runtime";
 import type { WorkspaceCreatedOptions } from "@/browser/features/ChatInput/types";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
 
 import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
 import { AboutDialogProvider, useAboutDialog } from "./contexts/AboutDialogContext";
@@ -127,13 +130,65 @@ import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import { prependInitialAppProxyBasePath } from "@/browser/utils/frontendBasePath";
+import {
+  prependInitialAppProxyBasePath,
+  stripInitialAppProxyBasePathFromPathname,
+} from "@/browser/utils/frontendBasePath";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 import { WorkspaceActiveGoalsWarningToast } from "@/browser/components/ActiveGoalsWarningToast/ActiveGoalsWarningToast";
 import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { markAppShellReady } from "@/browser/utils/perf/appShellReady";
 import { Err, Ok } from "@/common/types/result";
+
+// T3 #5971 (route split): each page is its own chunk. The workspace page's ErrorBoundary sits inside
+// its chunk, so a failed chunk load reaches PageArea's LazyFeature (Reload, which can recover).
+let aiViewChunk: Promise<typeof AIViewModule> | undefined;
+const loadAIView = () => (aiViewChunk ??= import("./components/AIView/AIView"));
+const AIView = React.lazy(async () => {
+  const { AIView: View } = await loadAIView();
+  return {
+    default: (props: React.ComponentProps<typeof View> & { errorScope: string }) => (
+      <ErrorBoundary workspaceInfo={props.errorScope}>
+        <View {...props} />
+      </ErrorBoundary>
+    ),
+  };
+});
+const ProjectPage = React.lazy(async () => ({
+  default: (await import("@/browser/components/ProjectPage/ProjectPage")).ProjectPage,
+}));
+const ScratchPage = React.lazy(async () => ({
+  default: (await import("@/browser/components/ScratchPage/ScratchPage")).ScratchPage,
+}));
+// AppLoader renders App only after the workspace metadata loads, so on a workspace route start the
+// page chunk now, while the entry still boots. A dynamic import: `/` (first run) loads nothing more.
+const startupRoute =
+  window.location.protocol === "file:"
+    ? readPersistedState<string | null>(LAST_VISITED_ROUTE_KEY, null)
+    : stripInitialAppProxyBasePathFromPathname(window.location.pathname);
+if (startupRoute?.startsWith("/workspace/")) loadAIView().catch(() => undefined); // React.lazy reports it
+
+/** The page column. While a page chunk loads or after it fails, it holds the page's one `main`. */
+function PageArea(props: { children: React.ReactNode }) {
+  const frame = (state: React.ReactNode) => (
+    <main className="mobile-layout flex min-w-0 flex-1 items-center justify-center overflow-hidden">
+      {state}
+    </main>
+  );
+  return (
+    <div className="mobile-layout flex flex-1 overflow-hidden">
+      <LazyFeature
+        name="Page"
+        frame={frame}
+        fallback={<LoadingScreen statusText="Opening page..." />}
+      >
+        {props.children}
+      </LazyFeature>
+    </div>
+  );
+}
 
 function RootRouteShell(props: {
   leftSidebarCollapsed: boolean;
@@ -1450,7 +1505,7 @@ function AppInner() {
         <div className="mobile-main-content flex min-w-0 flex-1 flex-col overflow-hidden">
           <WindowsToolchainBanner />
           <RosettaBanner />
-          <div className="mobile-layout flex flex-1 overflow-hidden">
+          <PageArea>
             {/* Settings and analytics are modals over whatever page they were opened from, so the
                 page stays mounted underneath them. */}
             {selectedWorkspace ? (
@@ -1473,22 +1528,19 @@ function AppInner() {
                 const workspacePath =
                   currentMetadata.namedWorkspacePath ?? selectedWorkspace.namedWorkspacePath ?? "";
                 return (
-                  <ErrorBoundary
-                    workspaceInfo={`${selectedWorkspace.projectName}/${workspaceName}`}
-                  >
-                    <AIView
-                      workspaceId={selectedWorkspace.workspaceId}
-                      projectPath={selectedWorkspace.projectPath}
-                      projectName={selectedWorkspace.projectName}
-                      leftSidebarCollapsed={sidebarCollapsed}
-                      onToggleLeftSidebarCollapsed={handleToggleSidebar}
-                      workspaceName={workspaceName}
-                      namedWorkspacePath={workspacePath}
-                      runtimeConfig={currentMetadata.runtimeConfig}
-                      incompatibleRuntime={currentMetadata.incompatibleRuntime}
-                      isInitializing={currentMetadata.isInitializing === true}
-                    />
-                  </ErrorBoundary>
+                  <AIView
+                    errorScope={`${selectedWorkspace.projectName}/${workspaceName}`}
+                    workspaceId={selectedWorkspace.workspaceId}
+                    projectPath={selectedWorkspace.projectPath}
+                    projectName={selectedWorkspace.projectName}
+                    leftSidebarCollapsed={sidebarCollapsed}
+                    onToggleLeftSidebarCollapsed={handleToggleSidebar}
+                    workspaceName={workspaceName}
+                    namedWorkspacePath={workspacePath}
+                    runtimeConfig={currentMetadata.runtimeConfig}
+                    incompatibleRuntime={currentMetadata.incompatibleRuntime}
+                    isInitializing={currentMetadata.isInitializing === true}
+                  />
                 );
               })()
             ) : currentWorkspaceId ? (
@@ -1543,7 +1595,7 @@ function AppInner() {
                 onToggleLeftSidebarCollapsed={handleToggleSidebar}
               />
             )}
-          </div>
+          </PageArea>
         </div>
         <WorkspaceActiveGoalsWarningToast />
         <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />

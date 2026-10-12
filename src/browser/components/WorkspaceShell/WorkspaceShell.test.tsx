@@ -1,11 +1,11 @@
 import "../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getReviewImmersiveKey } from "@/common/constants/storage";
+import { getReviewImmersiveKey, RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import type { MutableRefObject } from "react";
+import { useEffect, type MutableRefObject } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as RealLottieModule from "lottie-react";
@@ -36,6 +36,26 @@ const addReviewMock = mock(() => undefined);
 const addTerminalMock = mock(() => undefined);
 // Inline display of the stub right sidebar: "none" stands in for the narrow-layout CSS hide.
 let rightSidebarDisplay = "flex";
+// While set and pending, the stub suspends: it stands in for the sidebar's chunk still loading.
+let sidebarGate: { promise: Promise<void>; state: "pending" | "loaded" | "failed" } | null = null;
+function gateSidebar() {
+  let settle!: (state: "loaded" | "failed") => void;
+  const gate = {
+    promise: new Promise<void>((resolve) => (settle = resolve as never)),
+    state: "pending",
+  };
+  sidebarGate = gate as NonNullable<typeof sidebarGate>;
+  const finish = (state: "loaded" | "failed") =>
+    act(async () => {
+      gate.state = state;
+      settle(state);
+      await gate.promise;
+    });
+  return { load: () => finish("loaded"), fail: () => finish("failed") };
+}
+// What the stub sidebar's own window listeners received, in order.
+const sidebarInput: string[] = [];
+const SIDEBAR_EVENT_TYPES = [CUSTOM_EVENTS.OPEN_GOAL_TAB, CUSTOM_EVENTS.OPEN_ARTIFACT];
 
 // Restore every module stubbed below (including the per-test WorkspaceStore double) after
 // this suite so the stubs cannot leak into later files.
@@ -101,7 +121,25 @@ void mock.module("@/browser/features/RightSidebar/RightSidebar", () => ({
     fullscreen?: boolean;
     onCloseFullscreen?: () => void;
   }) => {
+    // The Suspense protocol: a pending lazy chunk throws its promise.
+    // eslint-disable-next-line @typescript-eslint/only-throw-error
+    if (sidebarGate?.state === "pending") throw sidebarGate.promise;
+    if (sidebarGate?.state === "failed")
+      throw new Error("Failed to fetch dynamically imported module");
     props.addTerminalRef.current = addTerminalMock;
+    // Like RightSidebar, it subscribes to its shortcuts and events in an effect.
+    useEffect(() => {
+      const onKey = (e: KeyboardEvent) => {
+        if (e.ctrlKey || e.shiftKey) sidebarInput.push(`key:${e.ctrlKey ? "ctrl+" : ""}${e.key}`);
+      };
+      const onEvent = (e: Event) => sidebarInput.push(e.type);
+      window.addEventListener("keydown", onKey);
+      for (const type of SIDEBAR_EVENT_TYPES) window.addEventListener(type, onEvent);
+      return () => {
+        window.removeEventListener("keydown", onKey);
+        for (const type of SIDEBAR_EVENT_TYPES) window.removeEventListener(type, onEvent);
+      };
+    }, []);
     return (
       <div
         data-testid="right-sidebar"
@@ -228,6 +266,8 @@ describe("WorkspaceShell loading placeholders", () => {
     addReviewMock.mockClear();
     addTerminalMock.mockClear();
     rightSidebarDisplay = "flex";
+    sidebarGate = null;
+    sidebarInput.length = 0;
   });
 
   it("keeps the chat pane mounted during hydration in web mode", () => {
@@ -422,6 +462,80 @@ describe("WorkspaceShell loading placeholders", () => {
         updatePersistedState(getReviewImmersiveKey(defaultProps.workspaceId), false);
       });
       expect(view.getByTestId("right-sidebar").dataset.fullscreen).toBe("false");
+    });
+  });
+
+  // T3 #5971: RightSidebar is code-split. Until its chunk loads, the shell keeps the sidebar's
+  // place, and nothing meant for the sidebar is lost.
+  describe("while the sidebar chunk loads", () => {
+    it("keeps the sidebar's box, the collapsed rail when collapsed", () => {
+      gateSidebar();
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      const box = view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
+      expect(view.queryByTestId("right-sidebar")).toBeNull();
+      expect(box?.style.width).toBe("20px");
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+    });
+
+    it("shows a loading sidebar full-screen on phones, closable with Close and Escape", () => {
+      gateSidebar();
+      rightSidebarDisplay = "none";
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      fireEvent.click(view.getByRole("button", { name: "Sidebar" }));
+      expect(view.getByRole("status").textContent).toBe("Loading sidebar...");
+
+      fireEvent.click(view.getByRole("button", { name: "Close" }));
+      expect(view.queryByRole("status")).toBeNull();
+
+      fireEvent.click(view.getByRole("button", { name: "Sidebar" }));
+      fireEvent.keyDown(document.body, { key: "Escape", code: "Escape" });
+      expect(view.queryByRole("status")).toBeNull();
+    });
+
+    it("delivers its shortcuts, events and terminal requests once, after it mounts", async () => {
+      const gate = gateSidebar();
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      const otherListener: string[] = []; // e.g. WorkspaceMenuBar, which also handles OPEN_ARTIFACT
+      const onArtifact = () => otherListener.push("artifact");
+      window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onArtifact);
+      const input = document.createElement("input");
+      document.body.appendChild(input);
+
+      fireEvent.keyDown(document.body, { key: "2", ctrlKey: true });
+      fireEvent.keyDown(document.body, { key: "K", ctrlKey: true, shiftKey: true });
+      fireEvent.keyDown(document.body, { key: "I", shiftKey: true });
+      const typed = fireEvent.keyDown(input, { key: "I", shiftKey: true });
+      window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId: "w" }));
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_ARTIFACT, { workspaceId: "w" } as never)
+      );
+      fireEvent.click(view.getByRole("button", { name: "New terminal" }));
+      expect(typed).toBe(true); // Shift+I in a text field stays a typed letter
+      expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([[], 0]);
+
+      await gate.load();
+
+      expect(sidebarInput).toEqual([
+        "key:ctrl+2",
+        "key:ctrl+K",
+        "key:I",
+        CUSTOM_EVENTS.OPEN_GOAL_TAB,
+        CUSTOM_EVENTS.OPEN_ARTIFACT,
+      ]);
+      expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([["artifact"], 1]);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onArtifact);
+      input.remove();
+    });
+
+    it("offers a reload in the sidebar's place when its chunk fails", async () => {
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      const gate = gateSidebar();
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      await gate.fail();
+      expect(view.getByRole("alert").textContent).toContain("Sidebar failed to load.");
+      expect(view.getByTestId("chat-pane")).toBeTruthy();
+      consoleError.mockRestore();
     });
   });
 });
