@@ -365,8 +365,32 @@ async function seed(
     JSON.stringify({ users: 1200, churn: 0.031, regions: ["eu", "us"] }, null, 2)
   );
   fs.writeFileSync(path.join(artifactsDir, "notes.txt"), "Plain text artifact.\n");
+  // An HTML artifact with in-page "#" links (repros/artifactsInPageLinks.e2e.ts). Dated an hour
+  // back so it lists last and the newest artifact stays the one the tab opens by default.
+  const guide = path.join(artifactsDir, "guide.html");
+  fs.writeFileSync(guide, GUIDE_ARTIFACT_HTML);
+  const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  fs.utimesSync(guide, anHourAgo, anHourAgo);
   return workspaceId;
 }
+
+/** Contents, two tall sections, and a status line its own script updates on scroll. */
+const GUIDE_ARTIFACT_HTML = `<!doctype html>
+<html>
+  <body>
+    <p id="status" style="position: fixed; top: 0; right: 8px">At the top</p>
+    <h1>Guide</h1>
+    <nav><a href="#setup">Setup</a> <a href="#usage">Usage</a></nav>
+    <h2 id="setup" style="margin-top: 1500px">Setup</h2>
+    <h2 id="usage" style="margin-top: 1500px; margin-bottom: 1500px">Usage</h2>
+    <script>
+      addEventListener("scroll", function () {
+        document.getElementById("status").textContent = scrollY > 0 ? "Scrolled" : "At the top";
+      });
+    </script>
+  </body>
+</html>
+`;
 
 async function main(): Promise<void> {
   const port = parsePort(process.argv.slice(2));
