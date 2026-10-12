@@ -16,6 +16,11 @@ test(
     const edit = await sendMessageForEdit(screen, browser, MESSAGE);
 
     const composer = screen.getByRole("textbox", "Message");
+    // The Edit action shows while the reply may still stream, and the composer turns off for a
+    // moment at stream-start until the send settles; a fill then is dropped silently (#5810).
+    // Once the turn has ended (no Stop) and the composer is on, it stays on.
+    await expect(screen.getByRole("button", /^Stop/)).toBeHidden({ timeout: 20_000 });
+    await expect(composer).toBeEnabled();
     await composer.fill("unsent draft");
     await edit.tap();
     const editBox = screen.getByRole("textbox", "Edit message");
