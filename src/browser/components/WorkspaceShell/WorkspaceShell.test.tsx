@@ -183,6 +183,14 @@ void mock.module("@/browser/components/ConnectionStatusToast/ConnectionStatusToa
 
 import { WorkspaceShell, estimateWorkspaceShellFallbackWidthPx } from "./WorkspaceShell";
 
+/** Inert itself or under an inert ancestor (makeOthersInert marks the covered siblings). */
+function isInert(element: HTMLElement): boolean {
+  for (let node: HTMLElement | null = element; node != null; node = node.parentElement) {
+    if (node.inert) return true;
+  }
+  return false;
+}
+
 const defaultProps = {
   workspaceId: "workspace-1",
   projectPath: "/projects/demo",
@@ -484,8 +492,12 @@ describe("WorkspaceShell loading placeholders", () => {
       const view = render(<WorkspaceShell {...defaultProps} />);
       fireEvent.click(view.getByRole("button", { name: "Sidebar" }));
       expect(view.getByRole("status").textContent).toBe("Loading sidebar...");
+      // Like the loaded full-screen sidebar: focus moves in, and the covered chat is inert.
+      expect(document.activeElement).toBe(view.getByRole("button", { name: "Close" }));
+      expect(isInert(view.getByTestId("chat-pane"))).toBe(true);
 
       fireEvent.click(view.getByRole("button", { name: "Close" }));
+      expect(isInert(view.getByTestId("chat-pane"))).toBe(false);
       expect(view.queryByRole("status")).toBeNull();
 
       fireEvent.click(view.getByRole("button", { name: "Sidebar" }));
@@ -505,7 +517,19 @@ describe("WorkspaceShell loading placeholders", () => {
       fireEvent.keyDown(document.body, { key: "2", ctrlKey: true });
       fireEvent.keyDown(document.body, { key: "K", ctrlKey: true, shiftKey: true });
       fireEvent.keyDown(document.body, { key: "I", shiftKey: true });
+      const closeTab = fireEvent.keyDown(document.body, { key: "w", ctrlKey: true });
       const typed = fireEvent.keyDown(input, { key: "I", shiftKey: true });
+      // Not held: its sender opens the side chat full-screen when no sidebar claims the event.
+      let sideChatSeen = 0;
+      const onSideChat = () => sideChatSeen++;
+      window.addEventListener(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, onSideChat);
+      const sideChatUnclaimed = window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, {
+          workspaceId: defaultProps.workspaceId,
+          sideChatWorkspaceId: "side-1",
+        } as never)
+      );
+      expect([closeTab, sideChatUnclaimed, sideChatSeen]).toEqual([false, true, 1]); // Ctrl+W keeps the window open
       window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId: "w" }));
       window.dispatchEvent(
         createCustomEvent(CUSTOM_EVENTS.OPEN_ARTIFACT, { workspaceId: "w" } as never)
@@ -520,12 +544,40 @@ describe("WorkspaceShell loading placeholders", () => {
         "key:ctrl+2",
         "key:ctrl+K",
         "key:I",
+        "key:ctrl+w",
         CUSTOM_EVENTS.OPEN_GOAL_TAB,
         CUSTOM_EVENTS.OPEN_ARTIFACT,
       ]);
       expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([["artifact"], 1]);
+      expect(sideChatSeen).toBe(1); // and not replayed
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, onSideChat);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onArtifact);
       input.remove();
+    });
+
+    it("drops a held terminal request when the workspace changes before it mounts", async () => {
+      const gate = gateSidebar();
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      fireEvent.click(view.getByRole("button", { name: "New terminal" }));
+      view.rerender(<WorkspaceShell {...defaultProps} workspaceId="workspace-2" />);
+
+      await gate.load();
+
+      expect(addTerminalMock.mock.calls.length).toBe(0);
+    });
+
+    it("keeps Close in the full-screen sidebar when its chunk fails", async () => {
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      const gate = gateSidebar();
+      rightSidebarDisplay = "none";
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      fireEvent.click(view.getByRole("button", { name: "Sidebar" }));
+      await gate.fail();
+      expect(view.getByRole("alert").textContent).toContain("Sidebar failed to load.");
+
+      fireEvent.click(view.getByRole("button", { name: "Close" }));
+      expect(isInert(view.getByTestId("chat-pane"))).toBe(false);
+      consoleError.mockRestore();
     });
 
     it("offers a reload in the sidebar's place when its chunk fails", async () => {

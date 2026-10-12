@@ -66,6 +66,25 @@ describeIntegration("lazy page load failure (UI)", () => {
       expect(alert.querySelector("button")?.textContent).toBe("Reload");
       // The rest of the app stays usable: the project sidebar is still there.
       expect(view.container.querySelector(`[data-project-path="${projectPath}"]`)).not.toBeNull();
+
+      // Another kind of page gets a fresh boundary: the scratch page renders, not the old failure.
+      fireEvent.click(
+        await waitFor(() => {
+          const button = view.container.querySelector<HTMLElement>(
+            '[aria-label="New scratch chat"]'
+          );
+          if (!button) throw new Error("New scratch chat button not found");
+          return button;
+        })
+      );
+      await waitFor(
+        () => {
+          if (view.container.querySelector('[role="alert"]')) throw new Error("Failure state kept");
+          if (!view.container.querySelector("main textarea"))
+            throw new Error("Scratch page not rendered yet");
+        },
+        { timeout: 30_000 }
+      );
     } finally {
       errorSpy.mockRestore();
       await cleanupView(view, cleanupDom);

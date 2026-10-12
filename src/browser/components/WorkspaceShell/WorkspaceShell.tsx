@@ -18,6 +18,7 @@ import {
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
+import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
@@ -108,7 +109,33 @@ function SidebarInput(props: { held: HeldSidebarInput[]; mode: "hold" | "replay"
   return null;
 }
 
-/** RightSidebar, keeping its box (collapsed: its 20 px rail) while its chunk loads or after it fails. */
+/**
+ * The full-screen sidebar's Close button while its chunk loads or after it fails (phones, where
+ * Escape is rarely at hand). Like RightSidebar's full-screen view, it makes the covered workspace
+ * inert and moves focus in.
+ */
+function FullscreenSidebarClose(props: { onClose?: () => void }) {
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const button = buttonRef.current;
+    const view = button?.closest<HTMLElement>(".right-sidebar-fullscreen");
+    if (button == null || view == null) return;
+    const restoreOthers = makeOthersInert(view);
+    button.focus();
+    return restoreOthers;
+  }, []);
+  return (
+    <Button ref={buttonRef} variant="outline" size="sm" onClick={props.onClose}>
+      Close
+    </Button>
+  );
+}
+
+/**
+ * RightSidebar, keeping its box (collapsed: its 20 px rail) while its chunk loads or after it fails.
+ * Under immersive review the box covers the workspace above the (still empty) review overlay, so the
+ * loading and failure states stay visible.
+ */
 function LazyRightSidebar(
   props: React.ComponentProps<typeof RightSidebar> & { held: HeldSidebarInput[] }
 ) {
@@ -117,22 +144,27 @@ function LazyRightSidebar(
   const frame = (state: React.ReactNode) => (
     <div
       className={cn(
-        "bg-surface-primary border-l border-border-light flex flex-col flex-shrink-0 overflow-hidden mobile-hide-right-sidebar",
+        "bg-surface-primary flex flex-col overflow-hidden",
+        props.immersiveHidden
+          ? "absolute inset-0 z-[51] items-center justify-center gap-3"
+          : "border-l border-border-light flex-shrink-0 mobile-hide-right-sidebar",
         props.fullscreen && "right-sidebar-fullscreen items-center justify-center gap-3"
       )}
-      style={{ width: collapsed ? 20 : props.width, maxWidth: "100%" }}
+      style={
+        props.immersiveHidden
+          ? undefined
+          : { width: collapsed ? 20 : props.width, maxWidth: "100%" }
+      }
     >
       {state}
+      {props.fullscreen && <FullscreenSidebarClose onClose={props.onCloseFullscreen} />}
     </div>
   );
   const pending = (
     <>
       <SidebarInput held={held} mode="hold" />
-      {props.fullscreen && <span role="status">Loading sidebar...</span>}
-      {props.fullscreen && (
-        <Button variant="outline" size="sm" onClick={props.onCloseFullscreen}>
-          Close
-        </Button>
+      {(props.fullscreen === true || props.immersiveHidden === true) && (
+        <span role="status">Loading sidebar...</span>
       )}
     </>
   );
@@ -229,7 +261,16 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
 
   const { width: sidebarWidth, isResizing, startResize } = sidebar;
   const addTerminalRef = useRef<((options?: TerminalSessionCreateOptions) => void) | null>(null);
-  const [heldSidebarInput] = useState<HeldSidebarInput[]>(() => []);
+  // Input held while the sidebar chunk loads belongs to its workspace: a switch drops it (render-time
+  // reset), so a queued terminal never runs its command in the next workspace.
+  const [held, setHeld] = useState(() => ({
+    workspaceId: props.workspaceId,
+    inputs: [] as HeldSidebarInput[],
+  }));
+  if (held.workspaceId !== props.workspaceId) {
+    setHeld({ workspaceId: props.workspaceId, inputs: [] });
+  }
+  const heldSidebarInput = held.inputs;
   const openTerminalPopout = useOpenTerminal();
   const handleOpenTerminal = useCallback(
     (options?: TerminalSessionCreateOptions) => {

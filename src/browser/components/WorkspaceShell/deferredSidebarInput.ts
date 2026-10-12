@@ -10,10 +10,10 @@ import {
 export type HeldSidebarInput = () => void;
 
 // Input that only RightSidebar (or, on phones, WorkspaceMenuBar) acts on. Keep in sync with the
-// window listeners in RightSidebar.tsx.
+// window listeners in RightSidebar.tsx. Not OPEN_SIDE_CHAT_TAB: its sender reads the dispatch result
+// at once and opens the side chat full-screen when no sidebar claims it, as on a narrow layout.
 const SIDEBAR_EVENTS = [
   CUSTOM_EVENTS.OPEN_GOAL_TAB,
-  CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB,
   CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
   CUSTOM_EVENTS.OPEN_ARTIFACT,
   CUSTOM_EVENTS.OPEN_REVIEW_IMMERSIVE,
@@ -22,6 +22,7 @@ const SIDEBAR_EVENTS = [
 const SIDEBAR_KEYBINDS = [
   ...([1, 2, 3, 4, 5, 6, 7, 8, 9] as const).map((n) => KEYBINDS[`SIDEBAR_TAB_${n}`]),
   KEYBINDS.OPEN_ARTIFACTS_TAB,
+  KEYBINDS.CLOSE_TAB,
 ];
 
 /**
@@ -36,7 +37,10 @@ export function holdSidebarInput(held: HeldSidebarInput[]): () => void {
       SIDEBAR_KEYBINDS.some((keybind) => matchesKeybind(e, keybind)) ||
       // Shift+I types a letter in a text field, where the sidebar ignores it.
       (matchesKeybind(e, KEYBINDS.TOGGLE_REVIEW_IMMERSIVE) && !isEditableElement(e.target));
-    if (!sidebarKey || isDialogOpen()) return;
+    if (!sidebarKey) return;
+    // Like RightSidebar: Cmd/Ctrl+W must not close the window, even while a dialog is open.
+    if (matchesKeybind(e, KEYBINDS.CLOSE_TAB)) e.preventDefault();
+    if (isDialogOpen()) return;
     e.preventDefault();
     e.stopImmediatePropagation();
     const { target, key, code, ctrlKey, shiftKey, altKey, metaKey } = e;

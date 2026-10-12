@@ -168,10 +168,18 @@ const startupRoute =
   window.location.protocol === "file:"
     ? readPersistedState<string | null>(LAST_VISITED_ROUTE_KEY, null)
     : stripInitialAppProxyBasePathFromPathname(window.location.pathname);
-if (startupRoute?.startsWith("/workspace/")) loadAIView().catch(() => undefined); // React.lazy reports it
+// `typeof`: a corrupted or legacy persisted route can parse to a non-string (RouterContext checks it
+// the same way), and this runs during module evaluation, where a throw would stop the app.
+if (typeof startupRoute === "string" && startupRoute.startsWith("/workspace/")) {
+  loadAIView().catch(() => undefined); // React.lazy reports it
+}
 
-/** The page column. While a page chunk loads or after it fails, it holds the page's one `main`. */
-function PageArea(props: { children: React.ReactNode }) {
+/**
+ * The page column. While a page chunk loads or after it fails, it holds the page's one `main`.
+ * `pageKey` names the kind of page: a new kind gets a fresh boundary, so a page that failed to load
+ * or render does not keep its failure state over the next page.
+ */
+function PageArea(props: { pageKey: string; children: React.ReactNode }) {
   const frame = (state: React.ReactNode) => (
     <main className="mobile-layout flex min-w-0 flex-1 items-center justify-center overflow-hidden">
       {state}
@@ -180,6 +188,7 @@ function PageArea(props: { children: React.ReactNode }) {
   return (
     <div className="mobile-layout flex flex-1 overflow-hidden">
       <LazyFeature
+        key={props.pageKey}
         name="Page"
         frame={frame}
         fallback={<LoadingScreen statusText="Opening page..." />}
@@ -1505,7 +1514,17 @@ function AppInner() {
         <div className="mobile-main-content flex min-w-0 flex-1 flex-col overflow-hidden">
           <WindowsToolchainBanner />
           <RosettaBanner />
-          <PageArea>
+          <PageArea
+            pageKey={
+              selectedWorkspace || currentWorkspaceId
+                ? "workspace"
+                : creationProjectPath === SCRATCH_PROJECT_CONFIG_KEY
+                  ? "scratch"
+                  : creationProjectPath
+                    ? "project"
+                    : "root"
+            }
+          >
             {/* Settings and analytics are modals over whatever page they were opened from, so the
                 page stays mounted underneath them. */}
             {selectedWorkspace ? (
