@@ -83,6 +83,8 @@ export interface DevtoolsLogSnapshot {
   /** Steps of known runs in the order the log recorded them (overlapping runs interleave). */
   stepsInLogOrder: Array<{ run: DevToolsRun; step: DevToolsStep }>;
   stepUsageUpdates: Map<string, DevToolsUsage | null>;
+  /** Steps whose finalization recorded an error (aborted or rejected calls). */
+  failedStepIds: Set<string>;
 }
 
 /**
@@ -96,10 +98,11 @@ export async function readDevtoolsLog(sessionDir: string): Promise<DevtoolsLogSn
   try {
     raw = await fs.readFile(path.join(sessionDir, DEVTOOLS_LOG_FILE_NAME), "utf-8");
   } catch {
-    return { runs: [], stepsInLogOrder: [], stepUsageUpdates };
+    return { runs: [], stepsInLogOrder: [], stepUsageUpdates, failedStepIds: new Set() };
   }
 
   const orphanSteps: DevToolsStep[] = [];
+  const failedStepIds = new Set<string>();
   for (const line of raw.split("\n")) {
     if (!line.trim()) {
       continue;
@@ -114,8 +117,13 @@ export async function readDevtoolsLog(sessionDir: string): Promise<DevtoolsLogSn
       runs.set(entry.run.id, { run: entry.run, steps: [] });
     } else if (entry.type === "step") {
       orphanSteps.push(entry.step);
-    } else if (entry.type === "step-update" && entry.update.usage !== undefined) {
-      stepUsageUpdates.set(entry.stepId, entry.update.usage);
+    } else if (entry.type === "step-update") {
+      if (entry.update.usage !== undefined) {
+        stepUsageUpdates.set(entry.stepId, entry.update.usage);
+      }
+      if (entry.update.error != null) {
+        failedStepIds.add(entry.stepId);
+      }
     }
   }
   const stepsInLogOrder: DevtoolsLogSnapshot["stepsInLogOrder"] = [];
@@ -128,7 +136,7 @@ export async function readDevtoolsLog(sessionDir: string): Promise<DevtoolsLogSn
   for (const { steps } of runs.values()) {
     steps.sort((a, b) => a.stepNumber - b.stepNumber);
   }
-  return { runs: [...runs.values()], stepsInLogOrder, stepUsageUpdates };
+  return { runs: [...runs.values()], stepsInLogOrder, stepUsageUpdates, failedStepIds };
 }
 
 /**
@@ -170,7 +178,10 @@ function recordedRequestsFromLog(log: DevtoolsLogSnapshot): RecordedProviderRequ
  */
 export function recordedStepsFromLog(log: DevtoolsLogSnapshot): RecordedStepRequest[] {
   return log.stepsInLogOrder.flatMap(({ run, step }) =>
-    step.input == null
+    // A step that failed without usage never produced a cache read or write (aborted or
+    // rejected before Anthropic processed it), so like the runtime monitor it is not a request.
+    step.input == null ||
+    (log.failedStepIds.has(step.id) && log.stepUsageUpdates.get(step.id) == null)
       ? []
       : [
           {
