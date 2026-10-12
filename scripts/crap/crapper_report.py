@@ -40,13 +40,15 @@ import json
 import re
 import subprocess
 import sys
-from dataclasses import replace
 from pathlib import Path
 
 from crapper.coverage import CoverageBundle, FileCoverage
 from crapper.crap import make_entry
 from crapper.discover import is_test_file, language_of
 from crapper.languages import functions_in_file
+
+# Crapper's own module-name rule (src/a/b.ts -> a.b), private at the pinned SHA.
+from crapper.languages.typescript import _module_namespace as module_namespace
 
 # Code under src/ that never ships. Mirrors isProductionSource() in
 # scripts/check-test-seam-comments.ts (keep the two in step), plus bench files.
@@ -157,22 +159,26 @@ def score(
     rows: list[dict] = []
     for relative in files:
         source = (root / relative).read_text(encoding="utf-8", errors="replace")
-        # A renamed file is read, filtered and matched to coverage at its own
-        # path, but named after its new path, so its functions keep their identity.
+        language = language_of(relative)
+        assert language is not None, relative
+        # A renamed file is parsed (grammar), filtered and matched to coverage at
+        # its own path, but named after its new path and module, so its functions
+        # keep their identity.
         shown = renames.get(relative, relative)
-        language = language_of(shown)
-        assert language is not None, shown
-        for function in functions_in_file(language, source, shown, str(root)):
+        old_module = module_namespace(relative, str(root))
+        new_module = module_namespace(shown, str(root))
+        for function in functions_in_file(language, source, relative, str(root)):
             percent = None
             if bundle is not None:
-                found = bundle.percent_for(replace(function, path=relative))
+                found = bundle.percent_for(function)
                 percent = 0.0 if found is None else found
             entry = make_entry(function, percent)
+            assert entry.namespace.startswith(old_module), (entry.namespace, old_module)
             rows.append(
                 {
                     "path": shown,
                     "name": entry.name,
-                    "namespace": entry.namespace,
+                    "namespace": new_module + entry.namespace[len(old_module) :],
                     "startLine": function.start_line,
                     "endLine": function.end_line,
                     "complexity": entry.complexity,

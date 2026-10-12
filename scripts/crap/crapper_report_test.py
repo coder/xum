@@ -182,3 +182,19 @@ def test_rename_reports_new_path_with_old_path_coverage(tmp_path, capsys):
 
     pick = next(row for row in rows if row["name"] == "pick")
     assert (pick["path"], pick["namespace"], pick["coverage"]) == ("src/lib/picker.ts", "lib.picker", 1.0)
+
+
+def test_rename_parses_with_the_old_files_grammar(tmp_path, capsys):
+    # The JavaScript grammar finds no function in this TypeScript source.
+    typed = (
+        "export function f<T extends { a?: number }>(x: T): number {\n"
+        "  const y = x as unknown as { a: number };\n"
+        "  if (y.a > 1) return 1;\n"
+        "  return x.a ?? 0;\n"
+        "}\n"
+    )
+    old = write(tmp_path, "src/demo/typed.ts", typed)
+
+    rows = run(capsys, tmp_path, "--rename", old, "src/demo/typed.js", old)
+
+    assert summary(rows) == [("src/demo/typed.js", "demo.typed", "f", 1, 5, 3)]
