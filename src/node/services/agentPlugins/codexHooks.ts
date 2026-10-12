@@ -352,10 +352,19 @@ function parseHandler(
   return undefined;
 }
 
-/** A plugin-written value inside a warning: quoted and cut, so a long value cannot flood it. */
+/**
+ * A plugin-written value inside a warning: a string is quoted and cut, so a long value cannot
+ * flood it. Any other value is named by its type and never serialized: `JSON.stringify` throws a
+ * RangeError on a value nested about 100,000 levels deep (it fits in a hooks file), and that throw
+ * would fail the plugin's whole hook load instead of dropping one group.
+ */
 function quoteForWarning(value: unknown): string {
-  const text = typeof value === "string" ? value : String(JSON.stringify(value));
-  return JSON.stringify(text.length > 80 ? `${text.slice(0, 80)}…` : text);
+  if (typeof value === "string") {
+    return JSON.stringify(value.length > 80 ? `${value.slice(0, 80)}…` : value);
+  }
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  return typeof value === "object" ? "an object" : `a ${typeof value}`;
 }
 
 /**
