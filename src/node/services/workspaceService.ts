@@ -278,6 +278,7 @@ import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestio
 import {
   AskUserQuestionToolArgsSchema,
   AskUserQuestionToolResultSchema,
+  type SubagentGitPatchArtifact,
 } from "@/common/utils/tools/toolDefinitions";
 import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
@@ -1741,6 +1742,114 @@ async function collectReferencedStagedAttachmentPaths(input: {
   });
 }
 
+interface ChildPatchRollupTarget {
+  parentWorkspaceId: string;
+  parentSessionDir: string;
+  childWorkspaceId: string;
+  childSessionDir: string;
+}
+
+type ChildPatchArtifactEntries = Array<[string, SubagentGitPatchArtifact]>;
+
+/**
+ * Copy each child task's patch artifact dir into the parent session dir (only when the parent
+ * has none yet), refusing any source or destination outside its session dir.
+ */
+async function copyChildPatchArtifactDirs(
+  params: ChildPatchRollupTarget,
+  childEntries: ChildPatchArtifactEntries
+): Promise<void> {
+  for (const [taskId, childEntry] of childEntries) {
+    if (!taskId) continue;
+
+    for (const projectArtifact of childEntry.projectArtifacts) {
+      if (!projectArtifact.mboxPath) {
+        continue;
+      }
+
+      const srcDir = path.dirname(projectArtifact.mboxPath);
+      const destDir = path.dirname(
+        getSubagentGitPatchMboxPath(params.parentSessionDir, taskId, projectArtifact.storageKey)
+      );
+
+      if (!isPathInsideDir(params.childSessionDir, srcDir)) {
+        log.error("Refusing to roll up patch artifact outside child session dir", {
+          parentWorkspaceId: params.parentWorkspaceId,
+          childWorkspaceId: params.childWorkspaceId,
+          taskId,
+          childSessionDir: params.childSessionDir,
+          srcDir,
+        });
+        continue;
+      }
+
+      if (!isPathInsideDir(params.parentSessionDir, destDir)) {
+        log.error("Refusing to roll up patch artifact outside parent session dir", {
+          parentWorkspaceId: params.parentWorkspaceId,
+          childWorkspaceId: params.childWorkspaceId,
+          taskId,
+          parentSessionDir: params.parentSessionDir,
+          destDir,
+        });
+        continue;
+      }
+
+      await copyDirIfMissingBestEffort({
+        srcDir,
+        destDir,
+        logContext: {
+          parentWorkspaceId: params.parentWorkspaceId,
+          childWorkspaceId: params.childWorkspaceId,
+          artifact: "subagent-patches",
+          taskId,
+          projectPath: projectArtifact.projectPath,
+        },
+      });
+    }
+  }
+}
+
+/**
+ * Merge the child's patch artifact index into the parent's: an entry replaces the parent's
+ * only when it is newer, and its mbox paths point at the parent's copies.
+ */
+async function mergeChildPatchArtifactIndex(
+  params: ChildPatchRollupTarget,
+  childEntries: ChildPatchArtifactEntries
+): Promise<void> {
+  await updateSubagentGitPatchArtifactsFile({
+    workspaceId: params.parentWorkspaceId,
+    workspaceSessionDir: params.parentSessionDir,
+    update: (parentFile) => {
+      for (const [taskId, childEntry] of childEntries) {
+        if (!taskId) continue;
+        const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
+
+        const childUpdated = coerceUpdatedAtMs(childEntry);
+        const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
+
+        if (!existing || childUpdated > existingUpdated) {
+          parentFile.artifactsByChildTaskId[taskId] = {
+            ...childEntry,
+            childTaskId: taskId,
+            parentWorkspaceId: params.parentWorkspaceId,
+            projectArtifacts: childEntry.projectArtifacts.map((projectArtifact) => ({
+              ...projectArtifact,
+              mboxPath: projectArtifact.mboxPath
+                ? getSubagentGitPatchMboxPath(
+                    params.parentSessionDir,
+                    taskId,
+                    projectArtifact.storageKey
+                  )
+                : undefined,
+            })),
+          };
+        }
+      }
+    },
+  });
+}
+
 async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
   parentWorkspaceId: string;
   parentSessionDir: string;
@@ -1890,87 +1999,10 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
     const childArtifacts = await readSubagentGitPatchArtifactsFile(params.childSessionDir);
     const childEntries = Object.entries(childArtifacts.artifactsByChildTaskId);
 
-    for (const [taskId, childEntry] of childEntries) {
-      if (!taskId) continue;
-
-      for (const projectArtifact of childEntry.projectArtifacts) {
-        if (!projectArtifact.mboxPath) {
-          continue;
-        }
-
-        const srcDir = path.dirname(projectArtifact.mboxPath);
-        const destDir = path.dirname(
-          getSubagentGitPatchMboxPath(params.parentSessionDir, taskId, projectArtifact.storageKey)
-        );
-
-        if (!isPathInsideDir(params.childSessionDir, srcDir)) {
-          log.error("Refusing to roll up patch artifact outside child session dir", {
-            parentWorkspaceId: params.parentWorkspaceId,
-            childWorkspaceId: params.childWorkspaceId,
-            taskId,
-            childSessionDir: params.childSessionDir,
-            srcDir,
-          });
-          continue;
-        }
-
-        if (!isPathInsideDir(params.parentSessionDir, destDir)) {
-          log.error("Refusing to roll up patch artifact outside parent session dir", {
-            parentWorkspaceId: params.parentWorkspaceId,
-            childWorkspaceId: params.childWorkspaceId,
-            taskId,
-            parentSessionDir: params.parentSessionDir,
-            destDir,
-          });
-          continue;
-        }
-
-        await copyDirIfMissingBestEffort({
-          srcDir,
-          destDir,
-          logContext: {
-            parentWorkspaceId: params.parentWorkspaceId,
-            childWorkspaceId: params.childWorkspaceId,
-            artifact: "subagent-patches",
-            taskId,
-            projectPath: projectArtifact.projectPath,
-          },
-        });
-      }
-    }
+    await copyChildPatchArtifactDirs(params, childEntries);
 
     if (childEntries.length > 0) {
-      await updateSubagentGitPatchArtifactsFile({
-        workspaceId: params.parentWorkspaceId,
-        workspaceSessionDir: params.parentSessionDir,
-        update: (parentFile) => {
-          for (const [taskId, childEntry] of childEntries) {
-            if (!taskId) continue;
-            const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
-
-            const childUpdated = coerceUpdatedAtMs(childEntry);
-            const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
-
-            if (!existing || childUpdated > existingUpdated) {
-              parentFile.artifactsByChildTaskId[taskId] = {
-                ...childEntry,
-                childTaskId: taskId,
-                parentWorkspaceId: params.parentWorkspaceId,
-                projectArtifacts: childEntry.projectArtifacts.map((projectArtifact) => ({
-                  ...projectArtifact,
-                  mboxPath: projectArtifact.mboxPath
-                    ? getSubagentGitPatchMboxPath(
-                        params.parentSessionDir,
-                        taskId,
-                        projectArtifact.storageKey
-                      )
-                    : undefined,
-                })),
-              };
-            }
-          }
-        },
-      });
+      await mergeChildPatchArtifactIndex(params, childEntries);
     }
   } catch (error: unknown) {
     log.error("Failed to roll up subagent patch artifacts into parent", {
