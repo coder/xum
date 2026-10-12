@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fsPromises from "fs/promises";
 import path from "path";
+import { resolveHostCredentialEnv } from "@/node/runtime/credentialForwarding";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import {
   createWorkspaceServiceHarness,
@@ -51,8 +52,8 @@ describe.skipIf(process.platform === "win32")("WorkspaceService.getDevcontainerI
   let hostWorkspacePath: string;
   let binDir: string;
   let dockerLog: string;
-  const originalPath = process.env.PATH;
-  const originalHome = process.env.HOME;
+  // Tests change PATH, HOME and credential variables; afterEach restores the whole environment.
+  const originalEnv = { ...process.env };
 
   beforeEach(async () => {
     harness = await createWorkspaceServiceHarness();
@@ -68,13 +69,14 @@ describe.skipIf(process.platform === "win32")("WorkspaceService.getDevcontainerI
       }),
       projectWorkspace(projectPath, "local", "local-ws", { runtimeConfig: { type: "local" } }),
     ]);
-    process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
+    process.env.PATH = `${binDir}${path.delimiter}${originalEnv.PATH ?? ""}`;
   });
 
   afterEach(async () => {
-    process.env.PATH = originalPath;
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
+    for (const key of Object.keys(process.env)) {
+      if (!(key in originalEnv)) delete process.env[key];
+    }
+    Object.assign(process.env, originalEnv);
     await harness.cleanup();
   });
 
@@ -131,6 +133,10 @@ describe.skipIf(process.platform === "win32")("WorkspaceService.getDevcontainerI
     await fsPromises.mkdir(home);
     await fsPromises.writeFile(path.join(home, ".gitconfig"), "[user]\n\tname = t\n");
     process.env.HOME = home;
+    // Keep the host's own credentials out of the fake CLI's arguments.
+    for (const key of [...Object.keys(resolveHostCredentialEnv()), "GH_TOKEN", "SSH_AUTH_SOCK"]) {
+      delete process.env[key];
+    }
     await harness.config.editConfig((config) => {
       config.projects.get(projectPath)!.workspaces[0].runtimeConfig = {
         type: "devcontainer",
