@@ -2,7 +2,7 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { act, cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIContext, type APIClient, type UseAPIResult } from "@/browser/contexts/API";
@@ -11,6 +11,7 @@ import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils"
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ArtifactsPanel } from "./ArtifactsPanel";
+import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { CanvasArtifact } from "./CanvasArtifact";
 import { McpAppFrame } from "./McpAppFrame";
 import type { McpAppViewRef } from "./mcpAppViewsStore";
@@ -53,6 +54,11 @@ let getStateCalls = 0;
 let getViewCalls = 0;
 /** Every request but getState fails with this error while set (a backend still starting). */
 let failWith: string | null = null;
+/** Only listVersions fails while set. */
+let failVersions = false;
+/** getState answers unsuccessfully while set. */
+let failGetState = false;
+let sends: Array<{ version: number | null }> = [];
 
 function fail() {
   return Promise.resolve({ success: false as const, error: failWith ?? "" });
@@ -87,6 +93,7 @@ function createClient(): APIClient {
       },
       listVersions: (input: { path: string }) => {
         if (failWith != null) return fail();
+        if (failVersions) return Promise.resolve({ success: false as const, error: "no list" });
         return Promise.resolve({
           success: true as const,
           data: {
@@ -117,12 +124,17 @@ function createClient(): APIClient {
       capabilities: () => Promise.resolve({ agentBrowserAvailable: true }),
       getState: () => {
         getStateCalls += 1;
+        if (failGetState) return Promise.resolve({ success: false as const, error: "starting" });
         return Promise.resolve({ success: true as const, data: { state: persistedState } });
       },
       setState: (input: { state: unknown }) => {
         savedStates.push(input.state);
         persistedState = input.state;
         return Promise.resolve({ success: true as const, data: undefined });
+      },
+      sendInteraction: (input: { version: number | null }) => {
+        sends.push({ version: input.version });
+        return Promise.resolve({ success: true as const, data: { id: "i1" } });
       },
     },
     mcpApps: {
@@ -220,6 +232,9 @@ describe("Artifacts tab across a dropped connection", () => {
     getStateCalls = 0;
     getViewCalls = 0;
     failWith = null;
+    failVersions = false;
+    failGetState = false;
+    sends = [];
   });
 
   afterEach(() => {
@@ -332,5 +347,97 @@ describe("Artifacts tab across a dropped connection", () => {
     await dropConnection();
     expect(view.queryByText(/File references are not available here/)).toBeNull();
     expect(view.getByText("Q")).toBeTruthy();
+  });
+
+  test("a failed state read is retried with the next client", async () => {
+    persistedState = { marker: "zq-persisted" };
+    failGetState = true;
+    const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    await flush();
+    expect(frame.getAttribute("srcdoc")).not.toContain("zq-persisted");
+    const statesRead = getStateCalls;
+
+    failGetState = false;
+    await dropConnection();
+    await reconnect();
+    await waitFor(() => expect(getStateCalls).toBeGreaterThan(statesRead));
+    // The frame is built again, now with the persisted state.
+    await waitFor(() =>
+      expect(view.getByTestId("artifact-frame").getAttribute("srcdoc")).toContain("zq-persisted")
+    );
+  });
+
+  test("a state set while offline is saved even if the panel unmounts first", async () => {
+    const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    await flush();
+    await dropConnection();
+    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { marker: "zq-offline" } });
+    // A tab switch unmounts the panel before the connection is back.
+    view.unmount();
+    expect(savedStates).toEqual([]);
+
+    // Reopening the tab (connected again) sends the held write before reading the state.
+    const reopened = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
+    await reopened.findByTestId("artifact-frame");
+    await waitFor(() => expect(savedStates).toEqual([{ marker: "zq-offline" }]));
+    await waitFor(() =>
+      expect(reopened.getByTestId("artifact-frame").getAttribute("srcdoc")).toContain("zq-offline")
+    );
+  });
+
+  test("Send does not record a version from a version list whose refresh failed", async () => {
+    const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    await flush();
+    failVersions = true;
+    await dropConnection();
+    await reconnect();
+    // The kept list still keys the frame, so it is not rebuilt.
+    expectSameFrame(view.queryByTestId("artifact-frame"), frame);
+
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship" });
+    const sendButton = (await view.findByRole("button", { name: "Send" })) as HTMLButtonElement;
+    await waitFor(() => expect(sendButton.disabled).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS + 1000,
+    });
+    fireEvent.click(sendButton);
+    // Null: the server resolves the version, instead of the outdated newest one (1).
+    await waitFor(() => expect(sends).toEqual([{ version: null }]));
+  });
+
+  test("a canvas keeps its data through a refresh made while offline", async () => {
+    files["data/s.json"] = ok("data/s.json", JSON.stringify({ series: [{ q: "Q1", v: 1 }] }));
+    const content = JSON.stringify({
+      $xum: "canvas",
+      blocks: [
+        { type: "chart", kind: "bar", data: "data/s.json#/series", x: "q", y: "v", title: "Q" },
+      ],
+    });
+    const element = (reloadToken: number) => (
+      <CanvasArtifact
+        content={content}
+        path="board.canvas.json"
+        workspaceId="ws-r"
+        reloadToken={reloadToken}
+      />
+    );
+    const view = render(element(0), { wrapper: ConnectionWrapper });
+    expect(await view.findByText("Q")).toBeTruthy();
+    const reads = assetReads.length;
+
+    await dropConnection();
+    view.rerender(element(1));
+    await flush();
+    // The re-read waits for the connection instead of reporting the file as missing.
+    expect(view.queryByText(/Could not read/)).toBeNull();
+    expect(view.getByText("Q")).toBeTruthy();
+    expect(assetReads.length).toBe(reads);
+
+    act(() => setConnection(createClient()));
+    await waitFor(() => expect(assetReads.length).toBe(reads + 1));
+    await flush();
+    expect(view.queryByText(/Could not read/)).toBeNull();
   });
 });

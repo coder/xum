@@ -82,6 +82,11 @@ interface VersionsState {
   list: ArtifactVersionList | null;
   /** Why listVersions failed; shown instead of a stored version that cannot be resolved. */
   error: string | null;
+  /**
+   * The list is from before a refresh that failed. It still renders stored versions and keeps
+   * the frame's state key, but its newest version may be outdated, so nothing records it.
+   */
+  stale: boolean;
 }
 
 /**
@@ -98,8 +103,8 @@ function keepReadResult(prev: ReadState | null, key: string, error: string): Rea
 /** A failed listVersions keeps the list it already had for the path (see keepReadResult). */
 function keepVersionList(prev: VersionsState | null, path: string, error: string): VersionsState {
   return prev?.path === path && prev.list != null
-    ? { path, list: prev.list, error: null }
-    : { path, list: null, error };
+    ? { path, list: prev.list, error: null, stale: true }
+    : { path, list: null, error, stale: false };
 }
 
 /**
@@ -442,15 +447,19 @@ export function ArtifactsPanel(props: {
     }, props.workspaceId);
   }, [props.workspaceId]);
 
-  // Writes by scripts or other tools emit no event, so poll while the window is visible.
+  // Writes by scripts or other tools emit no event, so poll while the window is visible. Not
+  // while Xum reconnects: each poll re-reads canvas data files, and those reads wait for the
+  // connection (useArtifactAssetReader), so ticks during an outage would only pile them up.
+  const online = api != null;
   useEffect(() => {
+    if (!online) return;
     const interval = window.setInterval(() => {
       if (document.visibilityState === "visible" && !listInFlightRef.current) {
         setRefreshTick((tick) => tick + 1);
       }
     }, ARTIFACTS_POLL_MS);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [online]);
 
   const entries: ArtifactEntry[] = listing?.available === true ? listing.entries : [];
   const pinnedFiles: PinnedArtifactFile[] = pinned?.available === true ? pinned.files : [];
@@ -503,7 +512,7 @@ export function ArtifactsPanel(props: {
       .then((result) => {
         if (controller.signal.aborted) return;
         if (result.success) {
-          setVersionsState({ path, list: result.data, error: null });
+          setVersionsState({ path, list: result.data, error: null, stale: false });
         } else {
           setVersionsState((prev) => keepVersionList(prev, path, result.error));
         }
@@ -518,6 +527,12 @@ export function ArtifactsPanel(props: {
   const versionList =
     selected?.scope === "artifact" && versionsState?.path === selected.path
       ? versionsState.list
+      : null;
+  // The newest stored version, for actions that record a version (Send, annotations, Pin to
+  // Shelf). Null while the list is stale: Send then resolves the version on the server.
+  const latestKnownVersion =
+    selected?.scope === "artifact" && versionsState?.path === selected.path && !versionsState.stale
+      ? (versionList?.versions[0]?.version ?? null)
       : null;
   const versionListError =
     selected?.scope === "artifact" && versionsState?.path === selected.path
@@ -778,7 +793,7 @@ export function ArtifactsPanel(props: {
   // following the live file) to the shelf.
   const pinToShelf = (scope: ArtifactShelfScope) => {
     if (!api || selected?.scope !== "artifact" || versionList == null) return;
-    const version = selected.version ?? versionList.versions[0]?.version;
+    const version = selected.version ?? latestKnownVersion;
     if (version == null) return;
     api.artifacts
       .pinToShelf({
@@ -805,7 +820,7 @@ export function ArtifactsPanel(props: {
   // before the list arrives that version is unknown.
   const annotationVersionKnown =
     selected?.scope === "artifact" &&
-    (selected.version != null || versionsState?.path === selected.path);
+    (selected.version != null || (versionsState?.path === selected.path && !versionsState.stale));
   const annotateResult =
     selectedApp == null &&
     selected?.scope === "artifact" &&
@@ -819,9 +834,7 @@ export function ArtifactsPanel(props: {
     annotateResult == null ? null : getArtifactAnnotationSupport(annotateResult.kind);
   const annotating = annotateMode && annotateSupport != null;
   const annotationVersion =
-    selected?.scope === "artifact"
-      ? (selected.version ?? versionList?.versions[0]?.version ?? 0)
-      : 0;
+    selected?.scope === "artifact" ? (selected.version ?? latestKnownVersion ?? 0) : 0;
   const pickKey = readKey ?? "";
   const pendingPick = annotating && annotationPick?.key === pickKey ? annotationPick.pick : null;
   const openAnnotation = (pick: ArtifactAnnotationPick) =>
@@ -952,6 +965,7 @@ export function ArtifactsPanel(props: {
           path: selected.path,
           version: selected.version,
           latestVersion: versionList?.versions[0]?.version ?? null,
+          latestVersionStale: versionsState?.stale === true,
           reloadTick,
         }
       : null

@@ -27,24 +27,41 @@ async function readArtifactAsset(api: APIClient, workspaceId: string, path: stri
  * It also keeps its identity across a dropped connection. The API is `null` while Xum reconnects
  * and a new client afterwards; a reader tied to either rebuilt every HTML artifact twice (losing
  * its in-page state) and blanked canvas file blocks. So the reader reads through the latest
- * client, and a read made while offline fails like a missing file.
+ * client. A read made while offline waits for the reconnect, and a read the drop cut off runs
+ * again on the next client: answering either with "missing" would cache the file as not found
+ * and replace data already on screen with an error.
  */
 export function useArtifactAssetReader(workspaceId: string | null): ArtifactAssetReader | null {
   const { api } = useAPI();
-  const apiRef = useRef(api);
+  const connectionRef = useRef<{ api: APIClient | null; waiters: Array<() => void> }>({
+    api,
+    waiters: [],
+  });
   useEffect(() => {
-    apiRef.current = api;
+    const connection = connectionRef.current;
+    connection.api = api;
+    if (!api) return;
+    const waiters = connection.waiters;
+    connection.waiters = [];
+    for (const wake of waiters) wake();
   }, [api]);
-  return useMemo(
-    () =>
-      workspaceId == null
-        ? null
-        : (path: string) => {
-            const client = apiRef.current;
-            return client == null
-              ? Promise.resolve(null)
-              : readArtifactAsset(client, workspaceId, path);
-          },
-    [workspaceId]
-  );
+  return useMemo(() => {
+    if (workspaceId == null) return null;
+    const connection = connectionRef.current;
+    const nextClient = (): Promise<APIClient> =>
+      connection.api != null
+        ? Promise.resolve(connection.api)
+        : new Promise((resolve) => connection.waiters.push(() => resolve(nextClient())));
+    return async (path: string) => {
+      for (;;) {
+        const client = await nextClient();
+        try {
+          return await readArtifactAsset(client, workspaceId, path);
+        } catch (error) {
+          // Only a read the connection drop cut off is retried; each retry needs a new client.
+          if (connection.api === client) throw error;
+        }
+      }
+    };
+  }, [workspaceId]);
 }
