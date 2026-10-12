@@ -1627,6 +1627,8 @@ export class TurnRequestBuilder {
     // Before any request is sent: compaction prompts never extend the chat's prefix, and
     // the baseline must clear even when the compaction model is not on an Anthropic route.
     if (isCompactionRequest) promptCacheScope.markCompaction();
+    // The context the request is built from: a cleared or replaced history starts a new baseline.
+    promptCacheScope.setContextEpoch(providerRequestMessages[0]?.id);
     const tokenBudgetEnabled =
       !isCompactionRequest &&
       sessionHistoryEnabled &&

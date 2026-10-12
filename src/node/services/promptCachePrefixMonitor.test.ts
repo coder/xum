@@ -138,6 +138,31 @@ describe("PromptCachePrefixMonitor through the Anthropic wire wrapper", () => {
     expect(events).toEqual([]);
   });
 
+  test("a new context or an expired cache entry starts a new baseline without an event", async () => {
+    const events: TimelineEventDraft[] = [];
+    let now = 0;
+    const monitor = new PromptCachePrefixMonitor(() => now);
+    const scope = (epoch: string) => {
+      const turn = monitor.createTurnScope("ws-1", recorderFor(events));
+      turn.setContextEpoch(epoch);
+      return turn;
+    };
+    // `/clear` or "start here": the next turn is built from another first row.
+    await send(monitor, [
+      { scope: scope("row-1"), body: requestBody(SECRET_OUTPUT) },
+      { scope: scope("row-9"), body: requestBody("cleared") },
+    ]);
+    expect(events).toEqual([]);
+    // Past the 5-minute TTL the old entry is gone: a later difference is expiry, not a break.
+    now = 6 * 60 * 1000;
+    await send(monitor, [{ scope: scope("row-9"), body: requestBody("changed after expiry") }]);
+    expect(events).toEqual([]);
+    // Within the TTL and in the same context, the same difference is still reported.
+    now += 60 * 1000;
+    await send(monitor, [{ scope: scope("row-9"), body: requestBody("changed again") }]);
+    expect(events).toHaveLength(1);
+  });
+
   test("a rejected or refused dispatch records nothing and keeps the baseline", async () => {
     const events: TimelineEventDraft[] = [];
     const monitor = new PromptCachePrefixMonitor();
