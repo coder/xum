@@ -427,6 +427,8 @@ jobs:
             tests/bugbash/.e2e/repros*/artifacts/**/screenshots/*-failure.png
             tests/bugbash/.e2e/repros*/report.json
             tests/bugbash/.e2e/logs/app.log
+          # Every path is under the hidden .e2e folder, which upload-artifact skips by default.
+          include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 14
 
