@@ -7697,6 +7697,51 @@ describe("WorkspaceStore", () => {
       expect(turns[0].readRatio).toBeCloseTo(29_000 / 31_000, 12);
       expect(turns[1].rewriteCostUsd).toBeGreaterThan(0);
     });
+
+    it("counts tool-model usage in a turn's cache health and skips compaction summaries", async () => {
+      const workspaceId = "turn-cache-health-tools-workspace";
+      const MODEL = "anthropic:claude-sonnet-5-5";
+      const coldToolUsage = {
+        toolName: "task",
+        model: MODEL,
+        usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10 },
+        providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+      };
+      const assistantRow = (id: string, historySequence: number, metadata: object) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: { historySequence, timestamp: historySequence, model: MODEL, ...metadata },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantRow("tool-only-turn", 1, { toolModelUsages: [coldToolUsage] }),
+        assistantRow("mixed-turn", 2, {
+          usage: { inputTokens: 31_000, cachedInputTokens: 29_000, outputTokens: 10 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 1_000 } },
+          toolModelUsages: [coldToolUsage],
+        }),
+        // CompactionHandler keeps the summary's usage but strips its providerMetadata.
+        assistantRow("compaction-summary", 3, {
+          usage: { inputTokens: 40_000, cachedInputTokens: 0, outputTokens: 500 },
+          compacted: "user",
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        }),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => [turn.messageId, turn.cacheWriteTokens, turn.coldStart])).toEqual([
+        ["mixed-turn", 31_000, false],
+        ["tool-only-turn", 30_000, true],
+      ]);
+    });
   });
 
   describe("mergeTimelineEvents", () => {
