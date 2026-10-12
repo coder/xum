@@ -392,6 +392,9 @@ const OverviewOutputs: React.FC<{
   const api = useOptionalAPI()?.api ?? null;
   const appViews = useMcpAppViews(props.workspaceId);
   const [files, setFiles] = React.useState<readonly ArtifactEntry[]>([]);
+  // The backend capped its walk (entry limit, depth, unreadable folders): more files exist than
+  // `files` holds, so the "more" row cannot give an exact count.
+  const [filesTruncated, setFilesTruncated] = React.useState(false);
   const [refreshTick, setRefreshTick] = React.useState(0);
 
   React.useEffect(() => {
@@ -402,11 +405,14 @@ const OverviewOutputs: React.FC<{
       .then((result) => {
         if (controller.signal.aborted) return;
         // A failed listing hides the section; the Artifacts tab reports the error.
-        setFiles(result.success && result.data.available ? result.data.entries : []);
+        const listing = result.success && result.data.available ? result.data : null;
+        setFiles(listing?.entries ?? []);
+        setFilesTruncated(listing?.truncated === true);
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
         setFiles([]);
+        setFilesTruncated(false);
       });
     return () => controller.abort();
   }, [api, props.workspaceId, refreshTick]);
@@ -479,6 +485,7 @@ const OverviewOutputs: React.FC<{
       ))}
       <MoreRow
         count={files.length + appViews.length - shown.length}
+        atLeast={filesTruncated}
         onClick={() => props.onOpenTab("artifacts")}
       />
     </OverviewSection>
@@ -504,11 +511,22 @@ const OverviewSection: React.FC<{
 );
 
 /** The rows a capped list leaves out, as one row that leads to the full list. */
-const MoreRow: React.FC<{ count: number; onClick: () => void }> = (props) =>
-  props.count > 0 ? (
-    // A live count (new outputs and side chats arrive while the card shows).
-    <OverviewRow label={`${props.count} more`} muted numeric onClick={props.onClick} />
-  ) : null;
+const MoreRow: React.FC<{
+  count: number;
+  /** Only a lower bound is known (a truncated listing): "3+ more", or "More" when none counted. */
+  atLeast?: boolean;
+  onClick: () => void;
+}> = (props) => {
+  if (props.count <= 0 && props.atLeast !== true) return null;
+  const label =
+    props.atLeast === true
+      ? props.count > 0
+        ? `${props.count}+ more`
+        : "More"
+      : `${props.count} more`;
+  // A live count (new outputs and side chats arrive while the card shows).
+  return <OverviewRow label={label} muted numeric onClick={props.onClick} />;
+};
 
 /** One line of the card: a button when it leads somewhere, plain text otherwise. */
 const OverviewRow: React.FC<{

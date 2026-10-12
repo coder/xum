@@ -377,6 +377,32 @@ describe("RightSidebarOverview", () => {
     expect(status.className).not.toContain("text-warning");
   });
 
+  test("a truncated listing says more outputs exist without claiming a count", async () => {
+    const client = createTestApiClient({
+      artifacts: {
+        list: () =>
+          Promise.resolve({
+            success: true as const,
+            data: {
+              available: true as const,
+              dir: "/a",
+              entries: [artifact("a.md", 2), artifact("b.md", 1)],
+              truncated: true,
+            },
+          }),
+      },
+    });
+    const { view, opened } = renderOverview([workspace({ id: WORKSPACE_ID })], {
+      artifactsEnabled: true,
+      client,
+    });
+    const section = within(await view.findByRole("region", { name: "Outputs" }));
+    const rows = section.getAllByRole("button");
+    expect(rows.map((row) => row.textContent)).toEqual(["a.md", "b.md", "More"]);
+    fireEvent.click(rows[2]);
+    expect(opened).toEqual(["artifacts"]);
+  });
+
   test("keeps a row for app views when files alone would fill the list", async () => {
     const client = createTestApiClient({
       artifacts: {

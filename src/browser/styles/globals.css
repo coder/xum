@@ -1143,6 +1143,12 @@ body,
   }
 }
 
+/* At any width: a sidebar whose chunk failed to load shows docked with its Reload button and never
+   listens for the stand-in's event, so the stand-in would do nothing. */
+[data-workspace-shell]:has(> [data-right-sidebar-load-failed]) .right-sidebar-overview-expand {
+  display: none;
+}
+
 @container workspace-shell (width >= 66.625rem) {
   [data-workspace-shell]:not([data-transcript-full-width]) > .right-sidebar-overview-card {
     visibility: visible;
