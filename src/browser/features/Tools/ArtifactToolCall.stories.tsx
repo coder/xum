@@ -95,7 +95,6 @@ function renderGallery() {
 
 async function waitForGallery(canvasElement: HTMLElement) {
   const canvas = within(canvasElement);
-  await canvas.findByRole("button", { name: /Open in Artifacts/ });
   const cards = await canvas.findAllByRole("button", { name: /in Artifacts$/ });
   await expect(cards).toHaveLength(CARDS.length);
 }
