@@ -3794,7 +3794,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "Availability:",
       "",
       "- `ask_user_question` is available to top-level agents in **Plan Mode** and **Exec Mode**.",
-      "- Sub-agents and headless `xum run` sessions cannot call `ask_user_question`, since no one can answer it there.",
+      "- Sub-agents, headless `xum run` sessions, and ACP editor prompts cannot call `ask_user_question`, since they have no way to answer it.",
       "",
       "## UI Features",
       "",

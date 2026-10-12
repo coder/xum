@@ -93,6 +93,14 @@ const ACP_DELEGATION_CANDIDATE_TOOLS = [
   "file_edit_insert",
   "bash",
 ] as const;
+/**
+ * ACP clients have no answer path for ask_user_question (it waits on Xum's desktop/mobile
+ * form), so an ACP prompt that called it would hang until cancelled. Deny it per turn, like
+ * headless `xum run`, now that Exec (the default ACP mode) exposes it.
+ */
+const ACP_TOOL_POLICY: NonNullable<SendMessageOptions["toolPolicy"]> = [
+  { regex_match: "ask_user_question", action: "disable" },
+];
 const DEFAULT_DISCONNECT_CLEANUP_MAX_WAIT_MS = 10_000;
 /**
  * Xum does not implement the session/close RPC yet. Keep idle sessions bounded so
@@ -739,6 +747,7 @@ export class MuxAgent implements Agent {
         message: args.message,
         options: {
           ...optionsWithPromptCorrelation,
+          toolPolicy: [...(optionsWithPromptCorrelation.toolPolicy ?? []), ...ACP_TOOL_POLICY],
           fileParts:
             args.fileParts != null && args.fileParts.length > 0 ? args.fileParts : undefined,
         },
