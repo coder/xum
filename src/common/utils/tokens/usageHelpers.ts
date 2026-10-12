@@ -100,10 +100,11 @@ function isTokenCount(value: unknown): value is number {
  * split per response in the raw `usage.cache_creation`. That raw object comes from
  * the last step only, so {@link accumulateProviderMetadata} sums the 1h share of a
  * multi-step turn into `cacheCreation1hInputTokens`, which wins when present.
- * Rows from older builds carry only the last step's split: Xum sends one TTL per
- * request (providers config `anthropic.cacheTtl`), so the last step's 1h share is
- * scaled to the turn total. No split (other providers, old rows) returns 0, which
- * keeps the 5m price.
+ * Rows from older builds carry only the last step's split. That split is used only
+ * when it covers the whole `cacheWriteTokens`: earlier steps can have a different
+ * 5m/1h mix (Anthropic server tools can write at 5m even with a 1h TTL configured),
+ * so extrapolating the last step would misprice the turn. No usable split (other
+ * providers, old multi-step rows) returns 0, which keeps the 5m price.
  */
 export function getAnthropicCacheWrite1hTokens(
   providerMetadata: Record<string, unknown> | undefined,
@@ -131,8 +132,7 @@ export function getAnthropicCacheWrite1hTokens(
   // A present but malformed 5m share makes the split unreliable: keep the 5m price.
   if (fiveMinute != null && !isTokenCount(fiveMinute)) return 0;
   const reported = oneHour + (fiveMinute ?? 0);
-  if (reported === cacheWriteTokens) return oneHour;
-  return Math.min(cacheWriteTokens, Math.round((cacheWriteTokens * oneHour) / reported));
+  return reported === cacheWriteTokens ? oneHour : 0;
 }
 
 /**

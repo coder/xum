@@ -5279,6 +5279,50 @@ describe("WorkspaceStore", () => {
       expect(state.muxMessages.map((message) => message.id)).toEqual(["msg-older", "msg-newer"]);
     });
 
+    it("shows older assistant turns in prompt-cache health after loading an older page", async () => {
+      const workspaceId = "history-pagination-cache-health";
+      const assistantTurn = (id: string, historySequence: number): WorkspaceChatMessage => ({
+        type: "message",
+        id,
+        role: "assistant",
+        parts: [{ type: "text", text: id }],
+        metadata: {
+          historySequence,
+          timestamp: historySequence,
+          model: "anthropic:claude-sonnet-5-5",
+          usage: { inputTokens: 2_000, outputTokens: 10, totalTokens: 2_010 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 1_500 } },
+        },
+      });
+
+      mockOnChat.mockImplementation(async function* (
+        _input?: { workspaceId: string; mode?: unknown },
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+        yield assistantTurn("newer-turn", 5);
+        await Promise.resolve();
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: true };
+        await waitForAbortSignal(options?.signal);
+      });
+      mockHistoryLoadMore.mockResolvedValueOnce({
+        messages: [assistantTurn("older-turn", 3)],
+        nextCursor: null,
+        hasOlder: false,
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+      const turnIds = () =>
+        (store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? []).map(
+          (turn) => turn.messageId
+        );
+      expect(turnIds()).toEqual(["newer-turn"]);
+
+      await store.loadOlderHistory(workspaceId);
+
+      expect(turnIds()).toEqual(["newer-turn", "older-turn"]);
+    });
+
     it("exposes loadingOlderHistory while requests are in flight and ignores concurrent loads", async () => {
       const workspaceId = "history-pagination-workspace-3";
 

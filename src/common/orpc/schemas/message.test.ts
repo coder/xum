@@ -51,6 +51,23 @@ describe("MuxMessageSchema mcpPromptSnapshot parsing", () => {
   });
 });
 
+describe("MuxMessageSchema toolModelUsages parsing", () => {
+  test("drops a malformed tool usage alone and keeps its valid siblings", () => {
+    const valid = {
+      toolName: "task",
+      model: "anthropic:claude-sonnet-5-5",
+      usage: { inputTokens: 7, outputTokens: 1, totalTokens: 8 },
+    };
+    const parse = (toolModelUsages: unknown) =>
+      MuxMessageSchema.parse({ ...createMessage(), metadata: { toolModelUsages } }).metadata
+        ?.toolModelUsages;
+
+    expect(parse([valid, { toolName: "legacy" }, null, valid])).toEqual([valid, valid]);
+    // A value that is not a list at all is still dropped instead of failing the row.
+    expect(parse("corrupt")).toBeUndefined();
+  });
+});
+
 describe("MuxMessageSchema step boundaries", () => {
   test("preserves step indices and continuous summary metadata across replay", () => {
     const metadata = {
