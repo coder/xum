@@ -238,33 +238,95 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * `<app URL>#section`: a cross-document navigation to the Xum app, not a fragment jump. The
  * navigation guard (frameNavigationGuard.tsx) then closes the artifact as "navigated away",
  * and the desktop app refuses the navigation (subframeNavigation.ts). CSP `base-uri 'none'`
- * rules out a `<base>` fix. So a plain left click on a link (`href`, or SVG `xlink:href`)
- * whose raw value starts with `#` is cancelled and replayed against the frame's own URL:
- * `location.replace("about:srcdoc#section")`. That is a same-document fragment navigation, so
- * the browser runs its own fragment steps (id and `<a name>` lookup, decoding, `#`/`#top`,
- * focus, `:target`, `hashchange`). The frame loads nothing and the desktop guard sees no
- * navigation. `replace` adds no history entry, so the app's Back button is unaffected.
+ * rules out a `<base>` fix.
  *
- * SECURITY AUDIT: the only URL it navigates to is the document's own URL with a new fragment,
- * which cannot leave the document, so both navigation guards stay as they are. It registers on
- * window in the bubble phase, so the artifact's own element and document handlers run first,
- * and one that calls preventDefault keeps the click. Annotate mode stops the click in the
- * capture phase before it gets here.
+ * So a plain left click on a link (`href`, or SVG `xlink:href`) whose raw value starts with `#`
+ * is cancelled, and the script does the browser's fragment steps itself: the target is an id or
+ * an `<a name>`, raw first and then percent-decoded, else the top for `#` and `#top`. It is
+ * scrolled into view and focused, or, when it cannot take focus, given `tabindex="-1"` until it
+ * loses focus, so the next Tab continues after it. A native fragment navigation
+ * (`location.replace("about:srcdoc#x")`, `location.hash`, `<base href="about:srcdoc">`) would
+ * do this for free, but WebKit fires the iframe's `load` event for it, which the navigation
+ * guard must treat as leaving the document.
+ *
+ * Ordering: the decision runs when the click reaches window in the bubble phase, after the
+ * artifact's own handlers, so one that calls preventDefault keeps the click. A handler that
+ * stops propagation instead would hide the click from window, so the capture-phase listener
+ * wraps that event's stopPropagation methods to run the decision after the stopping handler
+ * returns. The link is found through composedPath, so links in open shadow roots count too.
+ * Annotate mode stops the click in the capture phase before either listener sees it.
+ *
+ * SECURITY AUDIT: it only cancels a navigation and scrolls or focuses inside the document; it
+ * never navigates, so both navigation guards stay as they are.
  */
-export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `window.addEventListener("click", function (event) {
-    if (event.defaultPrevented || event.button !== 0) return;
-    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
-    var target = event.target;
-    var link = target && typeof target.closest === "function" ? target.closest("a, area") : null;
-    if (!link) return;
-    var href = link.getAttribute("href");
-    if (href === null) href = link.getAttributeNS("http://www.w3.org/1999/xlink", "href");
-    if (href === null) return;
-    href = href.trim();
-    if (href.charAt(0) !== "#") return;
-    event.preventDefault();
-    location.replace(location.href.replace(/#.*$/, "") + href);
-  });`;
+export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
+    var XLINK = "http://www.w3.org/1999/xlink";
+    function fragmentOf(event) {
+      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return null;
+      var path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
+      for (var i = 0; i < path.length; i++) {
+        var node = path[i];
+        if (!node || node.nodeType !== 1 || (node.localName !== "a" && node.localName !== "area")) continue;
+        var href = node.getAttribute("href");
+        if (href === null) href = node.getAttributeNS(XLINK, "href");
+        if (href === null) return null;
+        href = href.trim();
+        return href.charAt(0) === "#" ? href.slice(1) : null;
+      }
+      return null;
+    }
+    // HTML's "find a potential indicated element": an id first, then an <a name>.
+    function findTarget(fragment) {
+      if (fragment === "") return null;
+      var element = document.getElementById(fragment);
+      if (element) return element;
+      var named = document.getElementsByName(fragment);
+      for (var i = 0; i < named.length; i++) if (named[i].localName === "a") return named[i];
+      return null;
+    }
+    function jump(raw) {
+      var decoded = raw;
+      try { decoded = decodeURIComponent(raw); } catch (error) {}
+      var target = findTarget(raw) || findTarget(decoded);
+      if (!target) {
+        if (raw !== "" && decoded.toLowerCase() !== "top") return;
+        window.scrollTo(0, 0);
+        if (document.activeElement && typeof document.activeElement.blur === "function") document.activeElement.blur();
+        return;
+      }
+      target.scrollIntoView();
+      target.focus({ preventScroll: true });
+      // tabIndex cannot tell (an <a> without href reports 0), so check whether focus moved.
+      if (document.activeElement !== target && !target.hasAttribute("tabindex")) {
+        target.setAttribute("tabindex", "-1");
+        target.addEventListener("blur", function () { target.removeAttribute("tabindex"); }, { once: true });
+        target.focus({ preventScroll: true });
+      }
+    }
+    var settled = new WeakSet();
+    function settle(event, fragment) {
+      if (settled.has(event)) return;
+      settled.add(event);
+      if (event.defaultPrevented) return;
+      event.preventDefault();
+      jump(fragment);
+    }
+    window.addEventListener("click", function (event) {
+      var fragment = fragmentOf(event);
+      if (fragment === null) return;
+      ["stopPropagation", "stopImmediatePropagation"].forEach(function (name) {
+        var stop = event[name];
+        event[name] = function () {
+          stop.call(event);
+          queueMicrotask(function () { settle(event, fragment); });
+        };
+      });
+    }, true);
+    window.addEventListener("click", function (event) {
+      var fragment = fragmentOf(event);
+      if (fragment !== null) settle(event, fragment);
+    });
+  })();`;
 
 export function buildArtifactBridgeScript(
   initialTheme: ArtifactTheme,

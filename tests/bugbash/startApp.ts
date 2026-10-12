@@ -374,15 +374,23 @@ async function seed(
   return workspaceId;
 }
 
-/** Contents, two tall sections, and a status line its own script updates on scroll. */
+/**
+ * Contents, two tall sections, and a status line its own script updates on scroll. The Setup
+ * link sits in a container that stops propagation (a clickable card), and Usage links back to
+ * the top.
+ */
 const GUIDE_ARTIFACT_HTML = `<!doctype html>
 <html>
   <body>
     <p id="status" style="position: fixed; top: 0; right: 8px">At the top</p>
     <h1>Guide</h1>
-    <nav><a href="#setup">Setup</a> <a href="#usage">Usage</a></nav>
+    <nav>
+      <span onclick="event.stopPropagation()"><a href="#setup">Setup</a></span>
+      <a href="#usage">Usage</a>
+    </nav>
     <h2 id="setup" style="margin-top: 1500px">Setup</h2>
-    <h2 id="usage" style="margin-top: 1500px; margin-bottom: 1500px">Usage</h2>
+    <h2 id="usage" style="margin-top: 1500px">Usage</h2>
+    <p style="margin-bottom: 1500px"><a href="#top">Back to top</a></p>
     <script>
       addEventListener("scroll", function () {
         document.getElementById("status").textContent = scrollY > 0 ? "Scrolled" : "At the top";
