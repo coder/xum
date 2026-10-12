@@ -104,6 +104,7 @@ function renderOverview(
 ) {
   const opened: TabType[] = [];
   let expanded = 0;
+  let terminalOpens = 0;
   let newSideChats = 0;
   const value: WorkspaceMetadataContextValue = {
     workspaceMetadata: new Map(workspaces.map((meta) => [meta.id, meta])),
@@ -120,6 +121,9 @@ function renderOverview(
             expanded += 1;
           }}
           onOpenTab={(tab) => opened.push(tab)}
+          onOpenTerminals={() => {
+            terminalOpens += 1;
+          }}
           onNewSideChat={
             options.canStartSideChat === false
               ? undefined
@@ -141,6 +145,7 @@ function renderOverview(
     view,
     opened,
     expandCount: () => expanded,
+    terminalOpenCount: () => terminalOpens,
     newSideChatCount: () => newSideChats,
   };
 }
@@ -229,8 +234,16 @@ describe("RightSidebarOverview", () => {
 
     fireEvent.click(rows[0]);
     expect(opened).toEqual(["side:side-new"]);
+
+    // A hidden side chat may have no open tab, so "more" lists every chat in the card and hands
+    // focus to the first one it revealed, instead of expanding the sidebar.
     fireEvent.click(rows[3]);
-    expect(expandCount()).toBe(1);
+    expect(expandCount()).toBe(0);
+    const revealed = section.getByRole("button", { name: "Oldest question" });
+    expect(document.activeElement).toBe(revealed);
+    expect(section.queryByRole("button", { name: /more$/ })).toBeNull();
+    fireEvent.click(revealed);
+    expect(opened).toEqual(["side:side-new", "side:side-old"]);
   });
 
   test("an empty side chat section is only its heading and the new-chat button", () => {
@@ -273,6 +286,13 @@ describe("RightSidebarOverview", () => {
     expect(opened).toEqual(["review"]);
   });
 
+  test("shows flagged hunks before git status has loaded", () => {
+    const { view } = renderOverview([workspace({ id: WORKSPACE_ID })], { unreadAssisted: 1 });
+    const changes = view.getByRole("button", { name: /Changes/ });
+    expect(within(changes).getByLabelText("1 unread agent-flagged hunk")).toBeTruthy();
+    expect(changes.textContent).not.toContain("+");
+  });
+
   test("leaves out changes for scratch workspaces, which have no repository", () => {
     const { view } = renderOverview([workspace({ id: WORKSPACE_ID, kind: "scratch" })]);
     expect(view.queryByRole("button", { name: /Changes/ })).toBeNull();
@@ -284,7 +304,7 @@ describe("RightSidebarOverview", () => {
       activeWorkflowRunCount: 2,
       terminalSessionCount: 1,
     };
-    const { view, opened, expandCount } = renderOverview([workspace({ id: WORKSPACE_ID })]);
+    const { view, opened, terminalOpenCount } = renderOverview([workspace({ id: WORKSPACE_ID })]);
 
     const goalRow = within(view.getByRole("region", { name: "Goal" })).getByRole("button");
     expect(goalRow.textContent).toContain("Ship the overview card");
@@ -297,7 +317,7 @@ describe("RightSidebarOverview", () => {
     fireEvent.click(activity.getByRole("button", { name: /Terminals/ }));
 
     expect(opened).toEqual(["goal", "workflows"]);
-    expect(expandCount()).toBe(1);
+    expect(terminalOpenCount()).toBe(1);
   });
 
   test("a goal without limits shows no limits line", () => {

@@ -1915,8 +1915,26 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setAutoFocusArtifacts(true);
       return;
     }
+    if (isTerminalTab(tab)) {
+      focusTerminalTab(tab);
+      return;
+    }
     // Side chats hand typing to their composer once it is ready; other tabs focus their tab.
     setTabToFocus(tab);
+  };
+
+  // Every way out of the card lands keyboard focus in the sidebar: the activated row unmounts
+  // with the card, and focus would otherwise fall back to the page body.
+  const handleExpandFromOverview = () => {
+    handleOpenTabFromOverview(getFocusedActiveTab(getBaseLayout(), NEW_TAB));
+  };
+  const handleOpenTerminalsFromOverview = () => {
+    const terminal = collectAllTabs(getBaseLayout().root).find(isTerminalTab);
+    if (terminal != null) {
+      handleOpenTabFromOverview(terminal);
+    } else {
+      handleExpandFromOverview();
+    }
   };
 
   const handleOpenToolFromNewTab = React.useCallback(
@@ -2409,8 +2427,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         {collapsed && (
           <RightSidebarOverview
             workspaceId={workspaceId}
-            onExpand={() => setCollapsed(false)}
+            onExpand={handleExpandFromOverview}
             onOpenTab={handleOpenTabFromOverview}
+            onOpenTerminals={handleOpenTerminalsFromOverview}
             onNewSideChat={canStartSideChat ? () => handleStartSideChat() : undefined}
             creatingSideChat={creatingSideChat}
             artifactsEnabled={artifactsExperimentEnabled}

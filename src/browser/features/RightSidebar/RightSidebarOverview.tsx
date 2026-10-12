@@ -55,6 +55,8 @@ interface RightSidebarOverviewProps {
   onExpand: () => void;
   /** Reopen the full sidebar on this tab (added to the focused pane when it is not open). */
   onOpenTab: (tab: TabType) => void;
+  /** Reopen the full sidebar on a terminal tab. */
+  onOpenTerminals: () => void;
   /** Start a side chat; absent where side chats cannot start (a side chat itself). */
   onNewSideChat?: () => void;
   creatingSideChat: boolean;
@@ -144,6 +146,8 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
     gitStatus != null && gitStatus.branch.length > 0 ? gitStatus.branch : metadata?.name;
   const sideChats = getOverviewSideChats(workspaceMetadata, props.workspaceId);
   const showSideChats = sideChats.length > 0 || props.onNewSideChat != null;
+  // The first side chat past the cap once the user listed them all, else null (capped list).
+  const [revealedSideChatId, setRevealedSideChatId] = React.useState<string | null>(null);
   const workflowRuns = sidebarState?.activeWorkflowRunCount ?? 0;
   const terminals = sidebarState?.terminalSessionCount ?? 0;
   const heartbeat = metadata?.heartbeat?.enabled === true ? metadata.heartbeat : null;
@@ -156,6 +160,7 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
         {stats != null ? (
           <OverviewRow
             Icon={TAB_ICONS.costs}
+            numeric
             label={
               stats.cost != null ? formatCostWithDollar(stats.cost) : formatTokens(stats.tokens)
             }
@@ -214,14 +219,19 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
             Icon={TAB_ICONS.review}
             label="Changes"
             detail={
-              gitStatus != null && (
+              (gitStatus != null || props.unreadAssisted > 0) && (
                 <span className="counter-nums flex items-center gap-1.5">
-                  <span className="text-success-light">
-                    +{gitStatus.outgoingAdditions.toLocaleString()}
-                  </span>
-                  <span className="text-danger-light">
-                    -{gitStatus.outgoingDeletions.toLocaleString()}
-                  </span>
+                  {gitStatus != null && (
+                    <>
+                      <span className="text-success-light">
+                        +{gitStatus.outgoingAdditions.toLocaleString()}
+                      </span>
+                      <span className="text-danger-light">
+                        -{gitStatus.outgoingDeletions.toLocaleString()}
+                      </span>
+                    </>
+                  )}
+                  {/* Reported apart from git status, so it shows even before that loads. */}
                   {props.unreadAssisted > 0 && (
                     <span
                       className="text-review-accent inline-flex items-center gap-0.5"
@@ -265,7 +275,10 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
             )
           }
         >
-          {sideChats.slice(0, OVERVIEW_MAX_LIST_ROWS).map((sideChat) => (
+          {(revealedSideChatId != null
+            ? sideChats
+            : sideChats.slice(0, OVERVIEW_MAX_LIST_ROWS)
+          ).map((sideChat) => (
             <OverviewRow
               key={sideChat.id}
               Icon={MessageCircle}
@@ -274,10 +287,18 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
                   ? sideChat.title
                   : SIDE_CHAT_INITIAL_TITLE
               }
+              focusOnMount={sideChat.id === revealedSideChatId}
               onClick={() => props.onOpenTab(makeSideChatTabType(sideChat.id))}
             />
           ))}
-          <MoreRow count={sideChats.length - OVERVIEW_MAX_LIST_ROWS} onClick={props.onExpand} />
+          {revealedSideChatId == null && (
+            // Closed side chats have no tab to reopen, so "more" lists them here instead
+            // (the card scrolls past its height cap) and moves focus to the first one shown.
+            <MoreRow
+              count={sideChats.length - OVERVIEW_MAX_LIST_ROWS}
+              onClick={() => setRevealedSideChatId(sideChats[OVERVIEW_MAX_LIST_ROWS]?.id ?? null)}
+            />
+          )}
         </OverviewSection>
       )}
 
@@ -297,7 +318,7 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
               Icon={SquareTerminal}
               label="Terminals"
               detail={<span className="counter-nums">{terminals}</span>}
-              onClick={props.onExpand}
+              onClick={props.onOpenTerminals}
             />
           )}
           {heartbeat != null && (
@@ -431,8 +452,19 @@ const OverviewRow: React.FC<{
   /** A second, muted line under the label. */
   sub?: string | null;
   muted?: boolean;
+  /** The label is a live number (cost, tokens): tabular digits keep it from jittering. */
+  numeric?: boolean;
+  /** Take keyboard focus when it mounts (the row replaces the control that revealed it). */
+  focusOnMount?: boolean;
   onClick?: () => void;
 }> = (props) => {
+  const buttonRef = React.useRef<HTMLButtonElement>(null);
+  const focusOnMount = props.focusOnMount === true;
+  // Moving DOM focus is a side effect on the committed row, so it runs after mount.
+  React.useEffect(() => {
+    if (focusOnMount) buttonRef.current?.focus();
+  }, [focusOnMount]);
+
   const content = (
     <>
       {props.Icon != null && (
@@ -440,7 +472,13 @@ const OverviewRow: React.FC<{
       )}
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="flex min-w-0 items-center gap-1">
-          <span className={cn("truncate", props.muted ? "text-muted" : "text-foreground")}>
+          <span
+            className={cn(
+              "truncate",
+              props.muted ? "text-muted" : "text-foreground",
+              props.numeric === true && "counter-nums"
+            )}
+          >
             {props.label}
           </span>
           {props.labelAdornment}
@@ -460,6 +498,7 @@ const OverviewRow: React.FC<{
   }
   return (
     <button
+      ref={buttonRef}
       type="button"
       onClick={props.onClick}
       className={cn(
