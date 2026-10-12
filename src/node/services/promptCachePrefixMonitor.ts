@@ -22,19 +22,25 @@ import type { TimelineRecorder } from "@/node/services/timelineRecorder";
 const MAX_TRACKED_WORKSPACES = 128;
 
 /**
- * One chat turn's requests. TurnRequestBuilder creates one per built turn;
- * side calls (titles, status, memory, refine) create models without one and
- * are never tracked.
+ * One chat turn's requests. TurnRequestBuilder creates one per built turn
+ * through {@link PromptCachePrefixMonitor.createTurnScope}; side calls
+ * (titles, status, memory, refine) create models without one and are never
+ * tracked.
  */
 export interface PromptCacheTurnScope {
   readonly workspaceId: string;
   readonly recorder: TimelineRecorder;
+  /** True after {@link markCompaction}: this turn's requests record nothing. */
+  readonly skip: boolean;
   /**
    * Compaction rebuilds the prompt by design (another system prompt, then a
-   * summary instead of history). TurnRequestBuilder sets this before any
-   * request is sent; such requests record nothing and drop the baseline.
+   * summary instead of history). TurnRequestBuilder calls this before any
+   * request is sent. It also clears the workspace baseline at once, whatever
+   * model or route the compaction uses: only Anthropic routes observe, so a
+   * non-Anthropic compaction would otherwise leave the pre-compaction
+   * baseline in place and the next Anthropic turn would report a break.
    */
-  skip: boolean;
+  markCompaction(): void;
 }
 
 /** Requests compare only within one wire route and effective model. */
@@ -49,7 +55,26 @@ export class PromptCachePrefixMonitor {
     { routeKey: string; scope: PromptCacheTurnScope; blocks: PromptCacheBlock[] }
   >();
 
-  /** Never throws: a detector failure must not affect the request. */
+  createTurnScope(workspaceId: string, recorder: TimelineRecorder): PromptCacheTurnScope {
+    let skip = false;
+    return {
+      workspaceId,
+      recorder,
+      get skip() {
+        return skip;
+      },
+      markCompaction: () => {
+        skip = true;
+        this.latest.delete(workspaceId);
+      },
+    };
+  }
+
+  /**
+   * Call only after the request was dispatched: a request that never reached
+   * Anthropic cannot create or break a cache entry. Never throws: a detector
+   * failure must not affect the request.
+   */
   observe(
     scope: PromptCacheTurnScope,
     identity: PromptCacheRouteIdentity,
