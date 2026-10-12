@@ -513,10 +513,13 @@ function compactionTextForSendHooks(
   manual: boolean
 ): string | undefined {
   const followUpText = manual ? compactionFollowUpPrompt(muxMetadata) : undefined;
-  const texts = [followUpText, internal?.textBatchedBehindCompaction].filter(
-    (text): text is string => typeof text === "string" && text.trim().length > 0
-  );
-  return texts.length > 0 ? texts.join("\n") : undefined;
+  const batchedText = internal?.textBatchedBehindCompaction;
+  // Undefined means no user content at all. Attachment-only content is content: it reaches the
+  // hooks with empty text, like a direct attachment-only send (Codex PRRT_kwDOPxxmWM6rZqyv).
+  if (followUpText === undefined && batchedText === undefined) return undefined;
+  return [followUpText, batchedText]
+    .filter((text): text is string => typeof text === "string" && text.trim().length > 0)
+    .join("\n");
 }
 
 /**
@@ -529,6 +532,18 @@ function compactionFollowUpPrompt(muxMetadata: CompactionRequestMetadata): strin
   const followUp = muxMetadata.parsed.followUpContent ?? muxMetadata.parsed.continueMessage;
   if (followUp == null) return undefined;
   const text: unknown = followUp.text;
+  const hasText = typeof text === "string" && text.trim().length > 0;
+  const hasReviews = (followUp.reviews?.length ?? 0) > 0;
+  // Legacy continueMessage follow-ups carried attachments as imageParts.
+  const files: unknown =
+    "fileParts" in followUp
+      ? followUp.fileParts
+      : "imageParts" in followUp
+        ? followUp.imageParts
+        : undefined;
+  const hasFiles = Array.isArray(files) && files.length > 0;
+  // A follow-up with no text, reviews or files sends nothing the hooks could check.
+  if (!hasText && !hasReviews && !hasFiles) return undefined;
   return prepareUserMessageForSend({
     text: typeof text === "string" ? text : "",
     reviews: followUp.reviews,
