@@ -470,7 +470,9 @@ const OverviewOutputs: React.FC<{
       },
     })),
   ];
-  if (shown.length === 0) return null;
+  // A truncated walk can end before reaching any file (only a too-deep or unreadable folder), yet
+  // outputs still exist: keep the section for its "More" row.
+  if (shown.length === 0 && !filesTruncated) return null;
 
   return (
     <OverviewSection title="Outputs">
