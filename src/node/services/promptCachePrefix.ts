@@ -1,25 +1,43 @@
 /**
  * Anthropic prompt-cache prefix fingerprints.
  *
- * Anthropic caches a request as ordered blocks: tools, then system blocks,
- * then every message content block. A request reuses the cache up to the
- * first block that differs, so a follow-up request stays warm only when the
- * previous request's blocks are a prefix of its own. This module reduces a
- * final wire body to that block list (hashes plus content-free metadata) and
- * finds the first block that broke the prefix.
+ * Anthropic caches a request as an ordered prefix: tools, then system, then
+ * messages, and a change at one level invalidates that level and every later
+ * one. This module reduces a final wire body to an ordered block list (hashes
+ * plus content-free metadata) that follows Anthropic's cache invalidation
+ * table (https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-use-with-prompt-caching#what-invalidates-your-cache):
  *
- * cache_control markers move to the newest block on every request, so they
- * are removed before hashing.
+ * 1. Tool definitions. Deferred tools (`defer_loading`) are not part of the
+ *    prefix, and native web search and web fetch entries only invalidate
+ *    system and messages, so both stay out of this section.
+ * 2. A system sentinel: which native web search / web fetch tools are present
+ *    and whether any document enables citations ("Toggling web search or
+ *    citations: system and messages caches").
+ * 3. The leading system blocks.
+ * 4. A messages sentinel: `thinking`, `output_config.effort` and
+ *    `tool_choice` (which carries `disable_parallel_tool_use` on the wire),
+ *    and whether any image is present ("Messages cache").
+ * 5. Every message content block in order. A mid-conversation `role:
+ *    "system"` message stays in place: it extends the cached prefix.
+ *
+ * A request reuses the cache up to the first differing block, so a follow-up
+ * request stays warm only when the previous request's blocks are a prefix of
+ * its own. cache_control markers move to the newest block on every request,
+ * so they are removed before hashing, but only where Anthropic accepts them.
+ *
+ * The AI SDK prompt form (DevTools records, the mux-gateway wire) carries no
+ * call-level options, so its messages sentinel only reflects images.
  */
 
 import { createHash } from "node:crypto";
+import { isDeferLoadingTool } from "@/common/utils/tools/toolCatalog";
 
 export const PROMPT_CACHE_SECTIONS = ["tools", "system", "messages"] as const;
 export type PromptCacheSection = (typeof PROMPT_CACHE_SECTIONS)[number];
 
 /** Content-free description of one block: safe to log and to record on the timeline. */
 export interface PromptCacheBlockSummary {
-  /** "tool" for tool definitions, "system", or the message role. */
+  /** "tool" for tool definitions, "system", "request" for a sentinel, or the message role. */
   role: string;
   type: string;
   /** Serialized length in characters, without cache markers. */
@@ -55,26 +73,75 @@ function label(value: unknown): string | undefined {
 }
 
 /**
- * Drop `cache_control` (Anthropic wire) and `providerOptions.anthropic.cacheControl`
- * (gateway prompt form) at every depth. A wrapper emptied only by a removed
- * marker is dropped too, so a marked block hashes like the unmarked one.
+ * The parts of one block Anthropic sees, without its cache marker: drop
+ * block-level `cache_control` (Messages API) and reduce `providerOptions` to
+ * the `anthropic` namespace without `cacheControl` (AI SDK prompt form; other
+ * namespaces such as `mux` never reach the wire). Nested application JSON
+ * (tool schemas, tool input) is left untouched.
  */
-function stripCacheMarkers(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripCacheMarkers);
-  if (!isRecord(value)) return value;
-  const stripped: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value)) {
-    if (key === "cache_control" || key === "cacheControl") continue;
-    const strippedChild = stripCacheMarkers(child);
-    const emptied =
-      (key === "providerOptions" || key === "anthropic") &&
-      isRecord(child) &&
-      Object.keys(child).length > 0 &&
-      isRecord(strippedChild) &&
-      Object.keys(strippedChild).length === 0;
-    if (!emptied) stripped[key] = strippedChild;
+function withoutBlockMarker(block: Record<string, unknown>): Record<string, unknown> {
+  const { cache_control: _marker, providerOptions, ...rest } = block;
+  const anthropic = isRecord(providerOptions) ? providerOptions.anthropic : undefined;
+  if (!isRecord(anthropic)) return rest;
+  const { cacheControl: _cacheControl, ...anthropicRest } = anthropic;
+  return Object.keys(anthropicRest).length > 0
+    ? { ...rest, providerOptions: { anthropic: anthropicRest } }
+    : rest;
+}
+
+/** A message content block as Anthropic sees it, including the blocks nested in a tool result. */
+function normalizeContentBlock(part: unknown): unknown {
+  // A string content is one text block on the wire, so `content: "hi"` and
+  // `content: [{ type: "text", text: "hi" }, ...]` share a prefix.
+  if (typeof part === "string") return { type: "text", text: part };
+  if (!isRecord(part)) return part;
+  const block = withoutBlockMarker(part);
+  // Blocks inside a wire tool_result accept their own cache_control.
+  if (block.type === "tool_result" && Array.isArray(block.content)) {
+    block.content = (block.content as unknown[]).map((nested) =>
+      isRecord(nested) ? withoutBlockMarker(nested) : nested
+    );
   }
-  return stripped;
+  return dropDefaultToolCaller(block);
+}
+
+const NATIVE_SERVER_TOOL = /^(anthropic\.)?web_(search|fetch)_\d+$/;
+
+/** Native web search / web fetch: wire `type: "web_search_20250305"`, prompt form `id: "anthropic.web_search_20250305"`. */
+function nativeServerToolType(tool: Record<string, unknown>): string | undefined {
+  const id = typeof tool.id === "string" ? tool.id : tool.type;
+  return typeof id === "string" && NATIVE_SERVER_TOOL.test(id)
+    ? id.replace(/^anthropic\./, "")
+    : undefined;
+}
+
+function isImage(part: Record<string, unknown>): boolean {
+  const mediaType = part.mediaType ?? part.media_type;
+  return (
+    part.type === "image" ||
+    (typeof part.type === "string" && part.type.startsWith("image-")) ||
+    (typeof mediaType === "string" && mediaType.startsWith("image/"))
+  );
+}
+
+/** Images in a content block: the block itself, or inside a tool result (screenshots). */
+function containsImage(part: unknown): boolean {
+  if (!isRecord(part)) return false;
+  if (isImage(part)) return true;
+  // Wire tool_result.content, or the prompt form's tool-result `output: { type: "content", value }`.
+  const nested = Array.isArray(part.content)
+    ? part.content
+    : isRecord(part.output) && Array.isArray(part.output.value)
+      ? part.output.value
+      : [];
+  return nested.some((item) => isRecord(item) && isImage(item));
+}
+
+function enablesCitations(part: unknown): boolean {
+  if (!isRecord(part)) return false;
+  const anthropic = isRecord(part.providerOptions) ? part.providerOptions.anthropic : undefined;
+  const citations = part.citations ?? (isRecord(anthropic) ? anthropic.citations : undefined);
+  return isRecord(citations) && citations.enabled === true;
 }
 
 /**
@@ -115,26 +182,16 @@ function dropDefaultToolCaller(block: unknown): unknown {
 
 /**
  * Fingerprint a final Anthropic request body: the Messages API form (`tools`,
- * `system`, `messages`) or the gateway's AI SDK prompt form (`tools`, `prompt`
- * with system messages inline).
+ * `system`, `messages`) or the AI SDK prompt form (`tools`, `prompt` with
+ * system messages inline).
  */
 export function fingerprintAnthropicRequest(body: Record<string, unknown>): PromptCacheBlock[] {
+  const blocks: PromptCacheBlock[] = [];
   const toolNamesByCallId = new Map<string, string>();
-  const sections: Record<PromptCacheSection, PromptCacheBlock[]> = {
-    tools: [],
-    system: [],
-    messages: [],
-  };
-  const add = (section: PromptCacheSection, role: string, part: unknown): void => {
-    // A string content is one text block on the wire, so `content: "hi"` and
-    // `content: [{ type: "text", text: "hi" }, ...]` share a prefix.
-    const normalized =
-      typeof part === "string"
-        ? { type: "text", text: part }
-        : dropDefaultToolCaller(stripCacheMarkers(part));
-    const serialized = JSON.stringify(normalized) ?? "null";
-    const record = isRecord(normalized) ? normalized : {};
-    const type = label(record.type) ?? (section === "tools" ? "tool" : typeof normalized);
+  const push = (section: PromptCacheSection, role: string, value: unknown): void => {
+    const serialized = JSON.stringify(value) ?? "null";
+    const record = isRecord(value) ? value : {};
+    const type = label(record.type) ?? (section === "tools" ? "tool" : typeof value);
     const named = section === "tools" || type.endsWith("tool_use");
     let toolName = label(record.toolName) ?? (named ? label(record.name) : undefined);
     const callId = label(record.id) ?? label(record.toolCallId);
@@ -142,7 +199,7 @@ export function fingerprintAnthropicRequest(body: Record<string, unknown>): Prom
     const resultId = label(record.tool_use_id);
     toolName ??= resultId != null ? toolNamesByCallId.get(resultId) : undefined;
     const hash = createHash("sha256").update(`${section}\0${role}\0${serialized}`).digest("hex");
-    sections[section].push({
+    blocks.push({
       section,
       role,
       type,
@@ -151,21 +208,61 @@ export function fingerprintAnthropicRequest(body: Record<string, unknown>): Prom
       hash: hash.slice(0, 16),
     });
   };
-  const addContent = (section: PromptCacheSection, role: string, content: unknown): void => {
-    for (const part of Array.isArray(content) ? content : content != null ? [content] : []) {
-      add(section, role, part);
-    }
-  };
+  const contentOf = (content: unknown): unknown[] =>
+    Array.isArray(content) ? content : content != null ? [content] : [];
 
-  for (const tool of Array.isArray(body.tools) ? body.tools : []) add("tools", "tool", tool);
-  addContent("system", "system", body.system);
-  const messages: unknown = Array.isArray(body.messages) ? body.messages : body.prompt;
-  for (const message of Array.isArray(messages) ? (messages as unknown[]) : []) {
-    const role = (isRecord(message) ? label(message.role) : undefined) ?? "unknown";
-    const content = isRecord(message) ? message.content : message;
-    addContent(role === "system" ? "system" : "messages", role, content);
+  const rawMessages: unknown = Array.isArray(body.messages) ? body.messages : body.prompt;
+  const messages = (Array.isArray(rawMessages) ? (rawMessages as unknown[]) : []).map(
+    (message) => ({
+      role: (isRecord(message) ? label(message.role) : undefined) ?? "unknown",
+      content: contentOf(isRecord(message) ? message.content : message),
+    })
+  );
+  // Only the prompt form's leading system messages are the top-level system
+  // prompt; a later one is a mid-conversation system message.
+  const firstNonSystem = messages.findIndex((message) => message.role !== "system");
+  const leadingSystemCount = Array.isArray(body.messages)
+    ? 0
+    : firstNonSystem === -1
+      ? messages.length
+      : firstNonSystem;
+  const allParts = messages.flatMap((message) => message.content);
+
+  const serverTools: string[] = [];
+  for (const tool of Array.isArray(body.tools) ? body.tools : []) {
+    if (!isRecord(tool)) {
+      push("tools", "tool", tool);
+      continue;
+    }
+    const serverTool = nativeServerToolType(tool);
+    if (serverTool != null) {
+      serverTools.push(serverTool);
+    } else if (tool.defer_loading !== true && !isDeferLoadingTool(tool)) {
+      push("tools", "tool", withoutBlockMarker(tool));
+    }
   }
-  return [...sections.tools, ...sections.system, ...sections.messages];
+  push("system", "request", {
+    type: "system_options",
+    serverTools: serverTools.sort(),
+    citations: allParts.some(enablesCitations),
+  });
+  for (const part of contentOf(body.system)) push("system", "system", normalizeContentBlock(part));
+  for (const message of messages.slice(0, leadingSystemCount)) {
+    for (const part of message.content) push("system", "system", normalizeContentBlock(part));
+  }
+  push("messages", "request", {
+    type: "message_options",
+    thinking: body.thinking ?? null,
+    effort: isRecord(body.output_config) ? (body.output_config.effort ?? null) : null,
+    toolChoice: body.tool_choice ?? null,
+    images: allParts.some(containsImage),
+  });
+  for (const message of messages.slice(leadingSystemCount)) {
+    for (const part of message.content) {
+      push("messages", message.role, normalizeContentBlock(part));
+    }
+  }
+  return blocks;
 }
 
 function summarize(block: PromptCacheBlock): PromptCacheBlockSummary {

@@ -10,13 +10,12 @@ import {
 const SECRET_OUTPUT = "SECRET-FILE-CONTENTS ".repeat(800);
 const ANTHROPIC = { route: "anthropic", modelString: "anthropic:claude-sonnet-5-5" };
 
-function scope(events: TimelineEventDraft[], skip = false): PromptCacheTurnScope {
-  const recorder = {
+function recorderFor(events: TimelineEventDraft[]) {
+  return {
     record: (_workspaceId: string, draft: TimelineEventDraft) => void events.push(draft),
     closeWorkspace: () => Promise.resolve(),
     reopenWorkspace: () => undefined,
   };
-  return { workspaceId: "ws-1", recorder, skip };
 }
 
 function requestBody(toolOutput: string, extraMessages: unknown[] = []): string {
@@ -35,34 +34,51 @@ function requestBody(toolOutput: string, extraMessages: unknown[] = []): string 
   });
 }
 
+interface SentRequest {
+  scope: PromptCacheTurnScope;
+  body: string;
+  identity?: PromptCacheRouteIdentity;
+  /** "reject": the dispatch fails before reaching Anthropic (auth refresh, connection error). */
+  outcome?: "reject" | 529;
+  /** False when prompt caching is off (disableBetaFeatures): markers are stripped. */
+  injectCacheControl?: boolean;
+}
+
 /** Sends each request through its own wrapped fetch, like the requests of one workspace. */
-async function send(
-  monitor: PromptCachePrefixMonitor,
-  requests: Array<{
-    scope: PromptCacheTurnScope;
-    body: string;
-    identity?: PromptCacheRouteIdentity;
-  }>
-): Promise<void> {
+async function send(monitor: PromptCachePrefixMonitor, requests: SentRequest[]): Promise<void> {
   for (const request of requests) {
+    const baseFetch = () =>
+      request.outcome === "reject"
+        ? Promise.reject(new Error("connect ECONNREFUSED"))
+        : Promise.resolve(new Response("{}", { status: request.outcome ?? 200 }));
     const fetchImpl = wrapFetchWithAnthropicCacheControl(
-      Object.assign(() => Promise.resolve(new Response("{}")), fetch) as typeof fetch,
+      Object.assign(baseFetch, fetch) as typeof fetch,
       null,
-      { observeFinalBody: (b) => monitor.observe(request.scope, request.identity ?? ANTHROPIC, b) }
+      {
+        injectCacheControl: request.injectCacheControl ?? true,
+        observeFinalBody: (b) => monitor.observe(request.scope, request.identity ?? ANTHROPIC, b),
+      }
     );
-    await fetchImpl("https://api.anthropic.com/v1/messages", {
+    const sent = fetchImpl("https://api.anthropic.com/v1/messages", {
       method: "POST",
       body: request.body,
     });
+    const outcome = await sent.then(
+      () => "sent",
+      (error: unknown) => (error instanceof Error ? error.message : "rejected")
+    );
+    expect(outcome).toBe(request.outcome === "reject" ? "connect ECONNREFUSED" : "sent");
   }
 }
 
 describe("PromptCachePrefixMonitor through the Anthropic wire wrapper", () => {
   test("records one content-free event when the next turn truncates a tool result", async () => {
     const events: TimelineEventDraft[] = [];
-    await send(new PromptCachePrefixMonitor(), [
-      { scope: scope(events), body: requestBody(SECRET_OUTPUT) },
-      { scope: scope(events), body: requestBody(SECRET_OUTPUT.slice(0, 12_000)) },
+    const monitor = new PromptCachePrefixMonitor();
+    const scope = () => monitor.createTurnScope("ws-1", recorderFor(events));
+    await send(monitor, [
+      { scope: scope(), body: requestBody(SECRET_OUTPUT) },
+      { scope: scope(), body: requestBody(SECRET_OUTPUT.slice(0, 12_000)) },
     ]);
 
     expect(events).toHaveLength(1);
@@ -75,9 +91,10 @@ describe("PromptCachePrefixMonitor through the Anthropic wire wrapper", () => {
         promptCacheBreak: {
           section: "messages",
           boundary: "turn",
-          blockIndex: 4,
-          previousBlockCount: 5,
-          nextBlockCount: 5,
+          // 1 tool, the system sentinel, 1 system block, the messages sentinel, 3 message blocks.
+          blockIndex: 6,
+          previousBlockCount: 7,
+          nextBlockCount: 7,
           previous: { role: "user", type: "tool_result", toolName: "read_file" },
           next: { role: "user", type: "tool_result", toolName: "read_file" },
         },
@@ -88,20 +105,61 @@ describe("PromptCachePrefixMonitor through the Anthropic wire wrapper", () => {
 
   test("an extending step, a compaction request and a route change record nothing", async () => {
     const events: TimelineEventDraft[] = [];
-    const turn = scope(events);
+    const monitor = new PromptCachePrefixMonitor();
+    const scope = () => monitor.createTurnScope("ws-1", recorderFor(events));
+    const turn = scope();
+    const compaction = scope();
+    compaction.markCompaction();
     const nextStep = [{ role: "assistant", content: [{ type: "text", text: "Done." }] }];
-    await send(new PromptCachePrefixMonitor(), [
+    await send(monitor, [
       { scope: turn, body: requestBody("short") },
       { scope: turn, body: requestBody("short", nextStep) },
       // Compaction sends another prompt and drops the baseline, so the first
       // post-compaction request has nothing to compare with.
-      { scope: scope(events, true), body: requestBody("compaction prompt") },
-      { scope: scope(events), body: requestBody("summary") },
+      { scope: compaction, body: requestBody("compaction prompt") },
+      { scope: scope(), body: requestBody("summary") },
       {
-        scope: scope(events),
+        scope: scope(),
         body: requestBody("other model"),
-        identity: { route: "mux-gateway", modelString: "mux-gateway:anthropic/claude-opus-5-5" },
+        identity: { route: "coder:anthropic", modelString: "coder:anthropic/claude-opus-5-5" },
       },
+    ]);
+    expect(events).toEqual([]);
+  });
+
+  test("a compaction on another provider still clears the Anthropic baseline", async () => {
+    const events: TimelineEventDraft[] = [];
+    const monitor = new PromptCachePrefixMonitor();
+    const scope = () => monitor.createTurnScope("ws-1", recorderFor(events));
+    await send(monitor, [{ scope: scope(), body: requestBody("before compaction") }]);
+    // An OpenAI compaction sends no Anthropic request, so nothing is observed.
+    scope().markCompaction();
+    await send(monitor, [{ scope: scope(), body: requestBody("summary") }]);
+    expect(events).toEqual([]);
+  });
+
+  test("a rejected or refused dispatch records nothing and keeps the baseline", async () => {
+    const events: TimelineEventDraft[] = [];
+    const monitor = new PromptCachePrefixMonitor();
+    const scope = () => monitor.createTurnScope("ws-1", recorderFor(events));
+    const baseline = requestBody(SECRET_OUTPUT);
+    await send(monitor, [
+      { scope: scope(), body: baseline },
+      { scope: scope(), body: requestBody("never sent"), outcome: "reject" },
+      { scope: scope(), body: requestBody("overloaded"), outcome: 529 },
+      // Extends the baseline; it would break against the rejected body.
+      { scope: scope(), body: baseline },
+    ]);
+    expect(events).toEqual([]);
+  });
+
+  test("with prompt caching off, requests are not observed", async () => {
+    const events: TimelineEventDraft[] = [];
+    const monitor = new PromptCachePrefixMonitor();
+    const scope = () => monitor.createTurnScope("ws-1", recorderFor(events));
+    await send(monitor, [
+      { scope: scope(), body: requestBody(SECRET_OUTPUT), injectCacheControl: false },
+      { scope: scope(), body: requestBody("rewritten"), injectCacheControl: false },
     ]);
     expect(events).toEqual([]);
   });

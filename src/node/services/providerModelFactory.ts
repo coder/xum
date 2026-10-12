@@ -110,6 +110,7 @@ import {
 } from "@/node/services/languageModelCleanup";
 import { createOpenAIWebSocketTransportFetch } from "@/node/services/openAIWebSocketTransportFetch";
 import { log } from "@/node/services/log";
+import type { TimelineRecorder } from "@/node/services/timelineRecorder";
 import {
   PromptCachePrefixMonitor,
   type PromptCacheRouteIdentity,
@@ -846,7 +847,11 @@ export function wrapFetchWithAnthropicCacheControl(
   cacheTtl?: AnthropicCacheTtl | null,
   options?: {
     injectCacheControl?: boolean;
-    /** Sees the final JSON body before it is sent (prompt-cache prefix detection). */
+    /**
+     * Sees the final JSON body once the request was dispatched (prompt-cache
+     * prefix detection). Not called when cache markers are stripped: with
+     * prompt caching off there is no cache to break.
+     */
     observeFinalBody?: (body: Record<string, unknown>) => void;
   }
 ): typeof fetch {
@@ -860,8 +865,10 @@ export function wrapFetchWithAnthropicCacheControl(
       return baseFetch(input, init);
     }
 
+    let json: Record<string, unknown>;
+    let newBody: string;
     try {
-      const json = JSON.parse(init.body) as Record<string, unknown>;
+      json = JSON.parse(init.body) as Record<string, unknown>;
 
       if (!injectCacheControl) {
         stripAnthropicCacheControlMarkers(json);
@@ -919,19 +926,27 @@ export function wrapFetchWithAnthropicCacheControl(
       }
 
       // Update body with modified JSON
-      const newBody = JSON.stringify(json);
-      try {
-        options?.observeFinalBody?.(json);
-      } catch {
-        // Observation is diagnostic only and must never block the request.
-      }
-      const outHeaders = new Headers(init.headers);
-      outHeaders.delete("content-length"); // Body size changed
-      return baseFetch(input, { ...init, headers: outHeaders, body: newBody });
+      newBody = JSON.stringify(json);
     } catch {
       // If JSON parsing fails we can't touch the body; forward unchanged.
       return baseFetch(input, init);
     }
+    const outHeaders = new Headers(init.headers);
+    outHeaders.delete("content-length"); // Body size changed
+    // Outside the try above: a rejected dispatch must not be re-sent unchanged.
+    const response = await baseFetch(input, { ...init, headers: outHeaders, body: newBody });
+    // Observe only a request Anthropic accepted: one that rejected before
+    // reaching it (auth refresh, connection error) or that it refused
+    // (overloaded, rate limited) neither creates nor breaks a cache entry, so
+    // it must not move the baseline or record a break.
+    if (injectCacheControl && response.ok) {
+      try {
+        options?.observeFinalBody?.(json);
+      } catch {
+        // Observation is diagnostic only and must never affect the request.
+      }
+    }
+    return response;
   };
 
   return Object.assign(cachingFetch, baseFetch) as typeof fetch;
@@ -1551,6 +1566,14 @@ export class ProviderModelFactory {
     this.oauthServices = oauthServices;
     this.devToolsService = devToolsService;
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
+  }
+
+  /** A chat turn's prompt-cache scope (see PromptCachePrefixMonitor.createTurnScope). */
+  createPromptCacheTurnScope(
+    workspaceId: string,
+    recorder: TimelineRecorder
+  ): PromptCacheTurnScope {
+    return this.promptCachePrefixMonitor.createTurnScope(workspaceId, recorder);
   }
 
   /** Final-body observer for an Anthropic wire, or undefined for requests outside a chat turn. */
@@ -2580,11 +2603,8 @@ export class ProviderModelFactory {
           // skip injection when beta features are off.
           const fetchWithCacheControl = isAnthropicModel
             ? wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl, {
+                // No prefix observer: the inner file-part normalization rewrites the body after this wrapper.
                 injectCacheControl: !disableBeta,
-                observeFinalBody: self.promptCacheObserver(opts, {
-                  route: "mux-gateway",
-                  modelString,
-                }),
               })
             : baseFetch;
           const fetchWithAutoLogout = wrapFetchWithMuxGatewayAutoLogout(

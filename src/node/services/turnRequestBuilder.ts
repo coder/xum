@@ -80,7 +80,6 @@ import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
 import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
-import type { PromptCacheTurnScope } from "./promptCachePrefixMonitor";
 import type { StreamManager } from "./streamManager";
 import {
   type ModelFallbackOptions,
@@ -1142,11 +1141,10 @@ export class TurnRequestBuilder {
     };
     // One scope per built turn: every model this turn creates (fallback hops included) shares it,
     // so the prefix detector can tell a turn-boundary break from a mid-turn one.
-    const promptCacheScope: PromptCacheTurnScope = {
+    const promptCacheScope = this.dependencies.providerModelFactory.createPromptCacheTurnScope(
       workspaceId,
-      recorder: this.dependencies.bindings.timelineService ?? NOOP_TIMELINE_RECORDER,
-      skip: false,
-    };
+      this.dependencies.bindings.timelineService ?? NOOP_TIMELINE_RECORDER
+    );
     const prepareModelSeed = async (options: {
       rawModelString: string;
       requestedThinkingLevel: ThinkingLevel | undefined;
@@ -1626,8 +1624,9 @@ export class TurnRequestBuilder {
       effectiveAgentId === "compact" ||
       muxMetadata?.type === "compaction-request" ||
       latestUserMessage?.metadata?.muxMetadata?.type === "compaction-request";
-    // Set before any request is sent: compaction prompts never extend the chat's prefix.
-    promptCacheScope.skip = isCompactionRequest;
+    // Before any request is sent: compaction prompts never extend the chat's prefix, and
+    // the baseline must clear even when the compaction model is not on an Anthropic route.
+    if (isCompactionRequest) promptCacheScope.markCompaction();
     const tokenBudgetEnabled =
       !isCompactionRequest &&
       sessionHistoryEnabled &&
