@@ -424,6 +424,15 @@ export class AgentStatusService {
           );
           if (recorded) {
             this.requestAnalyticsIngest?.(workspaceId);
+            // #6118: this spend bypasses the stream, so tell the open chat about it, as the
+            // bash AI proxy does; otherwise the footer total misses it until a reload.
+            this.workspaceService.emitChatEvent(workspaceId, {
+              type: "session-usage-delta",
+              workspaceId,
+              sourceWorkspaceId: workspaceId,
+              byModelDelta: { [recorded.model]: recorded.usage },
+              timestamp: Date.now(),
+            });
           }
         },
       });
