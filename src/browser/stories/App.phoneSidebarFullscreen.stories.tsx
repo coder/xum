@@ -118,6 +118,15 @@ async function openSidebarFromMenu(canvasElement: HTMLElement) {
   await userEvent.click(await page.findByTestId("workspace-open-sidebar"));
 }
 
+/** The right sidebar is a lazy chunk (T3 #5971), so it mounts after the chat input. */
+async function findRightSidebar(canvasElement: HTMLElement): Promise<HTMLElement> {
+  return waitFor(() => {
+    const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
+    if (sidebar == null) throw new Error("right sidebar missing");
+    return sidebar;
+  });
+}
+
 export const FullScreenFromWorkspaceMenu: AppStory = {
   decorators: [PhoneFrameDecorator],
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
@@ -126,8 +135,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await waitForChatInputAutofocusDone(canvasElement);
     const canvas = within(canvasElement);
     const page = within(canvasElement.ownerDocument.body);
-    const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
-    if (sidebar == null) throw new Error("right sidebar missing");
+    const sidebar = await findRightSidebar(canvasElement);
     const moreButton = canvas.getByTestId("workspace-more-actions");
     const chatPane = canvas.getByRole("log", { name: "Conversation transcript" });
     await waitFor(() => expect(sidebar).not.toBeVisible());
@@ -274,8 +282,7 @@ export const SplitLayoutKeepsFocusedPane: AppStory = {
   render: () => <AppWithMocks setup={() => setup(SPLIT_LAYOUT, 'xum-legacy"quoted')} />,
   play: async ({ canvasElement }) => {
     await waitForChatInputAutofocusDone(canvasElement);
-    const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
-    if (sidebar == null) throw new Error("right sidebar missing");
+    const sidebar = await findRightSidebar(canvasElement);
     await openSidebarFromMenu(canvasElement);
     await waitFor(() => expect(sidebar).toBeVisible());
     const workflowsTab = within(sidebar).getByRole("tab", { name: /Workflows/ });
@@ -304,8 +311,7 @@ export const FullScreenSidebarOnPhone: AppStory = {
   },
   play: async ({ canvasElement }) => {
     await waitForChatInputAutofocusDone(canvasElement);
-    const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
-    if (sidebar == null) throw new Error("right sidebar missing");
+    const sidebar = await findRightSidebar(canvasElement);
     await openSidebarFromMenu(canvasElement);
     await waitFor(() => expect(sidebar).toBeVisible());
     await within(sidebar).findByText(RUN_NAME);
