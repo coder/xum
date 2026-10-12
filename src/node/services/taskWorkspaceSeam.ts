@@ -363,11 +363,6 @@ export interface SendMessageInternalOptions {
    */
   artifactInteraction?: true;
   /**
-   * Set only by WorkspaceService's non-blocking ask_user_question answer delivery. Generic sends
-   * refuse `muxMetadata.askUserQuestionAnswer`, so a question cannot be marked answered by others.
-   */
-  askUserQuestionAnswer?: true;
-  /**
    * Idempotent sends: the ids a re-send carries (a held Retry reuses its original ids). Absent on
    * a new manual send: WorkspaceService assigns its id at entry. An automatic send carries only
    * the ids set here (a task launch's brief id); nothing is minted for it.

@@ -34,10 +34,9 @@ export const createAskUserQuestionTool: ToolFactory = (config: ToolConfiguration
       assert(toolCallId, "ask_user_question requires toolCallId");
 
       // Codex-style flow outside plan agents: return at once so the agent keeps working with its
-      // best judgment. The card stays answerable, and WorkspaceService.answerAskUserQuestion
-      // delivers the answers as a steering user message (after the current step, or as a new turn
-      // when idle). Plan agents still block: their next step is a plan that needs the answers.
-      // No in-memory state: the persisted tool output (partial or history) identifies the question.
+      // best judgment. The card stays answerable and sends the answers as an ordinary user
+      // message (it steers after the current step, or starts a new turn when idle). Plan agents
+      // still block: their next step is a plan that needs the answers.
       if (config.planFileOnly !== true) {
         return {
           summary: ASK_USER_QUESTION_ASYNC_SUMMARY,

@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { flushUserPreferences } from "@/browser/stores/AppConfigStore";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { useAutoResizeTextarea } from "@/browser/hooks/useAutoResizeTextarea";
@@ -34,7 +35,10 @@ import type {
   ToolErrorResult,
 } from "@/common/types/tools";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
-import { isAsyncAskUserQuestionOutput } from "@/common/utils/tools/askUserQuestionSummary";
+import {
+  buildAskUserQuestionAnswerMessage,
+  isAsyncAskUserQuestionOutput,
+} from "@/common/utils/tools/askUserQuestionSummary";
 import type { DisplayedUserMessage } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
@@ -235,8 +239,8 @@ export function AskUserQuestionToolCall(props: {
   const [activeIndex, setActiveIndex] = useState(() => cachedState?.activeIndex ?? 0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  // Non-blocking questions: the backend accepted the answers, which may still be queued behind
-  // the running step. Only a note: the form stays until the answer row is durable, so a queued
+  // Non-blocking questions: the answer message was accepted, but may still be queued behind the
+  // running step. Only a note: the form stays until the answer row is durable, so a queued
   // answer the user withdraws (Stop, queue clear) can simply be submitted again.
   const [answersQueued, setAnswersQueued] = useState(false);
 
@@ -501,6 +505,61 @@ export function AskUserQuestionToolCall(props: {
       return;
     }
 
+    if (isAsyncQuestion) {
+      // Codex-style: answers to a non-blocking question are ordinary user input, sent like a
+      // composer message. The default queue mode steers a running turn after its current step;
+      // an idle workspace starts a new turn. The metadata only lets this card show the answers.
+      const message = buildAskUserQuestionAnswerMessage(
+        props.toolCallId,
+        props.args.questions.map((q) => {
+          const draft = draftAnswers[q.question];
+          if (!draft || !isQuestionAnswered(q, draft)) {
+            return { optionNumbers: [], otherText: "" };
+          }
+          return {
+            optionNumbers: draft.selected
+              .map((label) => q.options.findIndex((option) => option.label === label) + 1)
+              .filter((optionNumber) => optionNumber > 0),
+            otherText: draft.selected.includes(OTHER_VALUE) ? draft.otherText : "",
+          };
+        })
+      );
+      // Same barrier as the composer: the backend reads send preferences from config.json.
+      flushUserPreferences()
+        .then(() =>
+          api.workspace.sendMessage({
+            workspaceId,
+            message,
+            options: {
+              ...getSendOptionsFromStorage(workspaceId),
+              muxMetadata: {
+                type: "normal",
+                askUserQuestionAnswer: { toolCallId: props.toolCallId, answers },
+              },
+            },
+          })
+        )
+        .then((result) => {
+          if (!result.success) {
+            const formatted = formatSendMessageError(result.error);
+            setSubmitError(
+              formatted.resolutionHint
+                ? `${formatted.message} ${formatted.resolutionHint}`
+                : formatted.message
+            );
+            return;
+          }
+          setAnswersQueued(true);
+        })
+        .catch((error) => {
+          setSubmitError(getErrorMessage(error));
+        })
+        .finally(() => {
+          setIsSubmitting(false);
+        });
+      return;
+    }
+
     api.workspace
       .answerAskUserQuestion({
         workspaceId,
@@ -510,13 +569,6 @@ export function AskUserQuestionToolCall(props: {
       .then(async (result) => {
         if (!result.success) {
           setSubmitError(result.error);
-          return;
-        }
-
-        // The backend already sent the answers as a steering message (it starts a turn when
-        // idle); there is no blocked stream to resume.
-        if (isAsyncQuestion) {
-          setAnswersQueued(true);
           return;
         }
 

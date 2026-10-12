@@ -1,5 +1,4 @@
 import type { AskUserQuestionAnswerMetadata } from "@/common/types/message";
-import type { AskUserQuestionQuestion } from "@/common/types/tools";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 
 /**
@@ -11,59 +10,16 @@ export const ASK_USER_QUESTION_ASYNC_SUMMARY =
   "continue working with your best judgment and state the assumptions you make. If the user " +
   "answers, the answers arrive later as a user message; adjust your work to them then.";
 
-/** Generic sends that carry `muxMetadata.askUserQuestionAnswer` are refused with this. */
-export const ASK_USER_QUESTION_ANSWER_METADATA_RESERVED_MESSAGE =
-  "ask_user_question answer metadata is reserved for answers submitted from the question card.";
-
-/** Queue dedupe key prefix for answer deliveries; the suffix is the tool call id. */
-export const ASK_USER_QUESTION_ANSWER_DEDUPE_PREFIX = "ask-user-question-answer:";
-
-/**
- * Splits one answer string (as built by the question card: selected labels joined with ", ",
- * then any "Other" text) into option indices and the user's own free text. Labels may contain
- * commas, so labels are matched over runs of comma-separated segments, not single tokens.
- */
-function parseAnswerSelection(
-  question: AskUserQuestionQuestion,
-  answer: string
-): { optionNumbers: number[]; otherText: string } {
-  const trimmed = answer.trim();
-  const labels = question.options.map((option) => option.label);
-  const wholeMatch = labels.indexOf(trimmed);
-  if (trimmed.length === 0 || wholeMatch !== -1) {
-    return { optionNumbers: wholeMatch === -1 ? [] : [wholeMatch + 1], otherText: "" };
-  }
-  if (!question.multiSelect) {
-    return { optionNumbers: [], otherText: trimmed };
-  }
-
-  const segments = trimmed.split(",");
-  const optionNumbers: number[] = [];
-  const otherSegments: string[] = [];
-  let position = 0;
-  while (position < segments.length) {
-    const matchIndex = labels.findIndex((label) => {
-      const span = label.split(",").length;
-      return (
-        segments
-          .slice(position, position + span)
-          .join(",")
-          .trim() === label
-      );
-    });
-    if (matchIndex === -1) {
-      otherSegments.push(segments[position]);
-      position += 1;
-    } else {
-      optionNumbers.push(matchIndex + 1);
-      position += labels[matchIndex].split(",").length;
-    }
-  }
-  return { optionNumbers, otherText: otherSegments.join(",").trim() };
+/** One question's answer as picked on the card: 1-based option numbers plus the user's own text. */
+export interface AskUserQuestionSelection {
+  optionNumbers: number[];
+  otherText: string;
 }
 
 /**
- * User-message text that delivers the answers to a non-blocking ask_user_question.
+ * User-message text that delivers the answers to a non-blocking ask_user_question. The card
+ * sends it like a typed chat message (Codex answers its async questions with ordinary user
+ * input): it steers a running turn after the current step, or starts a new turn when idle.
  *
  * SECURITY: question text and option labels are model-authored, so they must not be promoted
  * into a user-role message (repository or tool content could plant instructions in them).
@@ -72,18 +28,15 @@ function parseAnswerSelection(
  */
 export function buildAskUserQuestionAnswerMessage(
   toolCallId: string,
-  questions: readonly AskUserQuestionQuestion[],
-  answers: Record<string, string>
+  selections: readonly AskUserQuestionSelection[]
 ): string {
-  const lines = questions.map((question, index) => {
-    const { optionNumbers, otherText } = parseAnswerSelection(
-      question,
-      answers[question.question] ?? ""
-    );
+  const lines = selections.map((selection, index) => {
     const parts: string[] = [];
+    const { optionNumbers } = selection;
     if (optionNumbers.length > 0) {
       parts.push(`${optionNumbers.length > 1 ? "options" : "option"} ${optionNumbers.join(", ")}`);
     }
+    const otherText = selection.otherText.trim();
     if (otherText.length > 0) {
       parts.push(`other: ${JSON.stringify(otherText)}`);
     }

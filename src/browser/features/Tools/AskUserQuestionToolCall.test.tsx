@@ -73,9 +73,15 @@ const setAutoRetryEnabled = mock((input: unknown) => {
 
 // Inject the client through the real provider: a module mock of contexts/API is process-wide
 // and leaks this partial client into later-evaluated suites.
+const sendMessageData: Record<string, never> = {};
+const sendMessage = mock((_input: unknown) =>
+  Promise.resolve({ success: true as const, data: sendMessageData })
+);
+
 const apiClient = createTestApiClient({
   workspace: {
     answerAskUserQuestion,
+    sendMessage,
     resumeStream,
     setAutoRetryEnabled,
   },
@@ -120,6 +126,7 @@ describe("AskUserQuestionToolCall", () => {
     };
 
     answerAskUserQuestion.mockClear();
+    sendMessage.mockClear();
     resumeStream.mockClear();
     setAutoRetryEnabled.mockClear();
   });
@@ -329,29 +336,76 @@ describe("AskUserQuestionToolCall", () => {
       );
     }
 
-    test("stays answerable after the tool completes and does not resume a stream", async () => {
+    test("sends the answers as a chat message and stays answerable until it lands", async () => {
       const view = renderAsyncQuestion();
 
       fireEvent.click(view.getByText("First"));
       fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
 
       await waitFor(() => {
-        expect(answerAskUserQuestion).toHaveBeenCalledWith({
-          workspaceId: "ws-ask",
-          toolCallId: "ask-async",
-          answers: { "Which option?": "First" },
-        });
+        expect(sendMessage).toHaveBeenCalledTimes(1);
         expect(view.getByRole("button", { name: "Submit answers" })).toHaveProperty(
           "disabled",
           false
         );
       });
+      const [input] = sendMessage.mock.calls[0] as [
+        { workspaceId: string; options: { muxMetadata?: unknown } },
+      ];
+      expect(input.workspaceId).toBe("ws-ask");
+      expect(input.options.muxMetadata).toEqual({
+        type: "normal",
+        askUserQuestionAnswer: { toolCallId: "ask-async", answers: { "Which option?": "First" } },
+      });
       // Accepted is not durable: a queued answer can be withdrawn, so the form stays until the
       // answer row is in history.
       expect(view.queryByText("User answered")).toBeNull();
-      // The backend sends the answers as a message: there is no blocked stream to resume.
+      // Ordinary user input, like Codex: no blocked tool call to answer and no stream to resume.
+      expect(answerAskUserQuestion).not.toHaveBeenCalled();
       expect(resumeStream).not.toHaveBeenCalled();
       expect(setAutoRetryEnabled).not.toHaveBeenCalled();
+    });
+
+    test("names picked options by number, even when labels contain commas", async () => {
+      const partsQuestion = {
+        header: "Parts",
+        question: "Which parts?",
+        options: [
+          { label: "Alpha", description: "a" },
+          { label: "Alpha, Beta", description: "b" },
+        ],
+        multiSelect: true,
+      };
+      const view = renderWithProviders(
+        <AskUserQuestionToolCall
+          args={{ questions: [partsQuestion], answers: { "Which parts?": "Alpha, Beta" } }}
+          result={{
+            ...asyncResult,
+            ui_only: {
+              ask_user_question: {
+                questions: [partsQuestion],
+                answers: {},
+                answerDelivery: "message",
+              },
+            },
+          }}
+          status="completed"
+          toolCallId="ask-parts"
+          workspaceId="ws-ask"
+        />
+      );
+
+      // The prefill picks "Alpha" plus the Other text "Beta": flattened, that reads exactly like
+      // the second label, so the message must come from the picks, not the answer string.
+      expect(view.getByDisplayValue("Beta")).toBeTruthy();
+      fireEvent.click(view.getByRole("button", { name: "Next" }));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+      await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(1));
+      const [input] = sendMessage.mock.calls[0] as [{ message: string }];
+      expect(input.message).toContain('- Question 1: option 1; other: "Beta"');
+      // Labels are model-authored: none may be promoted into the user-role text.
+      expect(input.message).not.toContain("Alpha");
     });
 
     test("shows the answers delivered in a later user message", () => {

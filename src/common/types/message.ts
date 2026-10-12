@@ -578,8 +578,10 @@ interface MuxMessageMetadataBase {
   /** Set by the backend only: this user message came from an artifact (Artifacts M5b). */
   artifactInteraction?: ArtifactInteractionMetadata;
   /**
-   * Set by the backend only: this user message delivers the answers to a non-blocking
-   * ask_user_question (answerDelivery "message"). The question card reads it to show the answers.
+   * Set by the question card: this user message delivers the answers to a non-blocking
+   * ask_user_question (answerDelivery "message"). A display hint only, like Codex dropping a
+   * pending question once its reply is in history: the card shows these answers instead of the
+   * form. Nothing gates on it, so a missing or forged value only changes which card looks open.
    */
   askUserQuestionAnswer?: AskUserQuestionAnswerMetadata;
   /** Command prefix to highlight in UI (e.g., "/compact -m sonnet" or "/react-effects") */
