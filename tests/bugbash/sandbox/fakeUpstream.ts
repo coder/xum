@@ -2,7 +2,7 @@
  * A loopback fake of Anthropic's Messages API for the bug-bash provider proxy (#5714): the proxy
  * tests, the sandbox self-check and the zero-cost dogfood run against it, so nothing is billed.
  * Every answer reports FAKE_USAGE. A marker in the request picks a misbehavior:
- * `[fake:redirect]` (a 307 to /redirected), `[fake:529]` (overloaded), `[fake:cut]` (the
+ * `[fake:redirect]` (a 307 to /redirected), `[fake:401]` and `[fake:403]` (a rejected key), `[fake:529]` (overloaded), `[fake:cut]` (the
  * connection drops before message_stop), `[fake:nostop]` (the stream ends cleanly without it), `[fake:hang]` (the stream starts and never ends), `[fake:slow]` (the stream pauses 300 ms after
  * message_start), `[fake:stall]`
  * (no answer at all), `[fake:overbill]` (a JSON answer whose usage exceeds any small bound), `[fake:huge]` (a stream above the proxy's response cap). Otherwise a
@@ -54,7 +54,20 @@ export async function startFakeUpstream(port = 0, onRequest?: (request: FakeRequ
       const model = parsed.model ?? "claude-haiku-4-5";
       const headers = { "request-id": "req_fake", "x-fake-internal": "dropped by the proxy" };
       if (mode === "stall") return;
+      // The request arrived, then the connection drops without an answer.
+      if (mode === "reset") return void req.socket.destroy();
       if (mode === "redirect") return res.writeHead(307, { location: "/redirected" }).end();
+      // A rejected key: Anthropic's 401 (authentication) or 403 (permission) error shape.
+      // A gateway's rejection: 401 with an HTML body, not Anthropic's JSON error.
+      if (mode === "401html")
+        return res.writeHead(401, { "content-type": "text/html" }).end("<h1>Unauthorized</h1>");
+      if (mode === "401" || mode === "403") {
+        const type = mode === "401" ? "authentication_error" : "permission_error";
+        const error = { type: "error", error: { type, message: "invalid x-api-key" } };
+        return res
+          .writeHead(Number(mode), { ...headers, "content-type": "application/json" })
+          .end(JSON.stringify(error));
+      }
       if (mode === "529") {
         const error = { type: "error", error: { type: "overloaded_error", message: "Overloaded" } };
         return res

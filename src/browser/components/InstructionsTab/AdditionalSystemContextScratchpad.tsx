@@ -260,9 +260,12 @@ export function ChatInstructionsPanel(props: { workspaceId: string }) {
       <div className="mb-2 flex items-baseline justify-between gap-3">
         <div>
           <h3 className="text-xs font-medium">{CHAT_INSTRUCTIONS_LABEL}</h3>
+          {/* Chat-scoped: the text lives in this chat's session folder
+              (additionalSystemContext.ts), and forks and side chats start with a copy
+              (workspaceService.ts). Both strings in this file name the same scope (#6104). */}
           <p className="text-muted mt-0.5 text-[10px]">
-            Workspace-scoped instructions appended to the system prompt for every chat turn. Toggle
-            off to keep the text around without sending it.
+            Chat-scoped instructions appended to the system prompt on every turn of this chat. Forks
+            and side chats start with a copy. Toggle off to keep the text around without sending it.
           </p>
         </div>
       </div>
