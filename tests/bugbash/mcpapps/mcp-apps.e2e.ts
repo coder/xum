@@ -8,9 +8,12 @@
  */
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
+import { openPlayground } from "../repros/helpers";
 
 /** The dice view of the one expanded card. Its frame title is "<tool> (<server>)". */
 const DICE_FRAME = 'iframe[title="demo_app_show_dice_board (demo-app)"]';
+/** The seeded 4d6 call (mcpapps/seed.ts). */
+const DICE_4D6_CALL_ID = "call-dice-4d6";
 
 describe("MCP Apps views", { tags: ["mcp-apps"] }, () => {
   test("an expanded app call shows its view; the toggle adds the raw JSON below it", async ({
@@ -76,12 +79,19 @@ describe("MCP Apps views", { tags: ["mcp-apps"] }, () => {
     await expect(screen.getByText(/count must be 1\.\.20/)).toBeVisible({ timeout: 15_000 });
   });
 
-  test("the card buttons show keyboard focus", async ({ app, agent, screen, browser }) => {
-    await app.open();
-    await agent.act(
-      "open the 'Bug bash playground' workspace and expand the demo_app_show_dice_board tool card of the 4d6 roll"
-    );
-    await agent.act("move keyboard focus to that card's 'Show input/output' button with Tab");
+  // Exact steps, no agent (#6096): while focus is inside the cross-origin view, e2e's screen
+  // tree marks no node focused, so an explorer read its own Tabs as doing nothing and stopped.
+  test("the card buttons show keyboard focus", async ({ app, screen, browser }) => {
+    await openPlayground(app, screen, browser);
+    const card = browser.locator(`[data-tool-call-id="${DICE_4D6_CALL_ID}"]`);
+    await card.getByText("demo_app_show_dice_board").tap();
+    // The Tab count below needs the view's buttons in place.
+    await expect(browser.frameLocator(DICE_FRAME).getByText("4d6 = 15")).toBeVisible({
+      timeout: 15_000,
+    });
+    await card.getByRole("button", "Open in Artifacts").focus();
+    // Measured at 1440x900 and 390x844: Tabs 1-4 cross the view's four buttons, Tab 5 leaves it.
+    for (let tab = 0; tab < 5; tab++) await browser.keyboard.press("Tab");
     const toggle = screen.getByRole("button", "Show input/output");
     await expect(toggle).toBeFocused();
     // globals.css removes the browser outline: the button must draw its own focus style.

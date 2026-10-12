@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import {
   Download,
   Maximize2,
@@ -251,17 +252,13 @@ const SELECTION_EXTENDING_KEYS = new Set([
 /**
  * Artifacts tab (experiment: "artifacts"): files the agent writes to
  * $XUM_SCRATCH_DIR/artifacts, listed newest first with a preview of the selected one.
- * `inDialog` is set by the small-viewport dialog, which is already near full screen and whose
- * focus trap would fight a second full-screen overlay, so fullscreen is not offered there.
  */
 export function ArtifactsPanel(props: {
   workspaceId: string;
-  inDialog?: boolean;
   /** Take focus once rendered (the tab was opened by shortcut), then report it consumed. */
   autoFocus?: boolean;
   onAutoFocusConsumed?: () => void;
 }) {
-  const allowFullscreen = props.inDialog !== true;
   const { api } = useAPI();
   const [listing, setListing] = useState<ArtifactListing | null>(null);
   const [listError, setListError] = useState<string | null>(null);
@@ -597,7 +594,7 @@ export function ArtifactsPanel(props: {
     setFullscreen(false);
   }
   // Fullscreen only makes sense with something selected.
-  const showFullscreen = allowFullscreen && fullscreen && selected != null;
+  const showFullscreen = fullscreen && selected != null;
   // The comment box sits at the selection's screen position, which the layout change moves:
   // left open, it floated over the sidebar far from its text. Annotate mode itself stays on.
   const setFullscreenMode = (next: boolean) => {
@@ -632,7 +629,18 @@ export function ArtifactsPanel(props: {
       }
     });
     observer.observe(document.body, { childList: true, subtree: true });
+    // A hidden ancestor hides the pinned panel too (the phone sidebar, hidden again after its
+    // full-screen view closed on a rotation), which would leave the rest of the app inert
+    // behind nothing. Leave fullscreen once the panel has no box.
+    const sizeObserver = new ResizeObserver(() => {
+      if (panel.getClientRects().length > 0) return;
+      // setFullscreenMode's steps; its state setters are stable, so the effect needs no deps.
+      setAnnotationPick(null);
+      setFullscreen(false);
+    });
+    sizeObserver.observe(panel);
     return () => {
+      sizeObserver.disconnect();
       observer.disconnect();
       restore();
       // Back to the opener when it is still a control of this panel, else to the panel, so J/K
@@ -862,7 +870,7 @@ export function ArtifactsPanel(props: {
     if (interactions.handleKeyDown(e)) return;
     if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
       e.preventDefault();
-      if (selected && allowFullscreen) setFullscreenMode(!showFullscreen);
+      if (selected) setFullscreenMode(!showFullscreen);
     } else if (matchesKeybind(e, KEYBINDS.NEXT_ARTIFACT)) {
       e.preventDefault();
       keepFocusForShortcuts(e.target);
@@ -1283,23 +1291,21 @@ export function ArtifactsPanel(props: {
           <Download className="h-3.5 w-3.5" />
         </button>
       </TooltipIfPresent>
-      {allowFullscreen && (
-        <TooltipIfPresent tooltip={showFullscreen ? "Exit fullscreen" : "Fullscreen"}>
-          <button
-            type="button"
-            aria-label={showFullscreen ? "Exit fullscreen" : "Fullscreen"}
-            disabled={selected == null}
-            onClick={() => setFullscreenMode(!showFullscreen)}
-            className={toolbarButtonClassName}
-          >
-            {showFullscreen ? (
-              <Minimize2 className="h-3.5 w-3.5" />
-            ) : (
-              <Maximize2 className="h-3.5 w-3.5" />
-            )}
-          </button>
-        </TooltipIfPresent>
-      )}
+      <TooltipIfPresent tooltip={showFullscreen ? "Exit fullscreen" : "Fullscreen"}>
+        <button
+          type="button"
+          aria-label={showFullscreen ? "Exit fullscreen" : "Fullscreen"}
+          disabled={selected == null}
+          onClick={() => setFullscreenMode(!showFullscreen)}
+          className={toolbarButtonClassName}
+        >
+          {showFullscreen ? (
+            <Minimize2 className="h-3.5 w-3.5" />
+          ) : (
+            <Maximize2 className="h-3.5 w-3.5" />
+          )}
+        </button>
+      </TooltipIfPresent>
       <TooltipIfPresent tooltip="Reload">
         <button
           type="button"
@@ -1437,40 +1443,4 @@ export function ArtifactsPanel(props: {
       {annotationPopover}
     </div>
   );
-}
-
-/**
- * Makes every element outside `element` inert (no focus, pointer input or accessibility tree),
- * walking up to <body> and marking the siblings at each level. Returns the undo. Elements that
- * were already inert are left alone, and so are elements whose `inert` someone else changes
- * meanwhile. Nodes added later (portaled menus and tooltips opened from the fullscreen toolbar)
- * stay interactive.
- */
-function makeOthersInert(element: HTMLElement): () => void {
-  const marked = new Set<HTMLElement>();
-  for (let node: HTMLElement = element; node !== document.body; ) {
-    const parent = node.parentElement;
-    // The panel must be attached under <body>; anything else means the walk is wrong.
-    if (parent == null) throw new Error("makeOthersInert: element is not inside <body>");
-    for (const sibling of parent.children) {
-      if (sibling === node || !(sibling instanceof HTMLElement) || sibling.inert) continue;
-      sibling.inert = true;
-      marked.add(sibling);
-    }
-    node = parent;
-  }
-  // Another component that sets or clears `inert` on one of these meanwhile (ChatPane does under
-  // immersive review) owns it from then on: the undo must not clear its state (#5715).
-  const forget = (records: MutationRecord[]) => {
-    for (const record of records) {
-      if (record.target instanceof HTMLElement) marked.delete(record.target);
-    }
-  };
-  const observer = new MutationObserver(forget);
-  for (const sibling of marked) observer.observe(sibling, { attributeFilter: ["inert"] });
-  return () => {
-    forget(observer.takeRecords());
-    observer.disconnect();
-    for (const sibling of marked) sibling.inert = false;
-  };
 }

@@ -171,8 +171,8 @@ export const CUSTOM_EVENTS = {
   REVEAL_TIMELINE_ANCHOR: "mux:revealTimelineAnchor",
 
   /**
-   * The palette asked for the Stats tool. WorkspaceMenuBar opens the Stats dialog only while the
-   * right sidebar is hidden (#5767). Detail: { workspaceId: string }
+   * The palette asked for the Stats tool. Only while the right sidebar is hidden, WorkspaceMenuBar
+   * shows the Stats tab in the full-screen sidebar (#5767). Detail: { workspaceId: string }
    */
   OPEN_STATS_DIALOG: "mux:openStatsDialog",
 

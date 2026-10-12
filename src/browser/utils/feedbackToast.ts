@@ -19,11 +19,15 @@ export function showFeedbackToast(feedback: FeedbackToast): void {
 
   // Analytics view does not mount ChatInput, so keep a basic alert fallback
   // for command palette actions that need user feedback.
-  // A composer behind an open modal (Settings, Analytics) cannot show its toast.
+  // A composer behind an open modal (Settings, Analytics) cannot show its toast, nor can one
+  // under an inert page: the phone full-screen right sidebar covers the composer and makes the
+  // rest of the page inert, so its toast would be neither visible nor clickable.
+  const composer =
+    typeof document !== "undefined"
+      ? document.querySelector('[data-component="ChatInputSection"]')
+      : null;
   const hasChatInputToastHost =
-    typeof document !== "undefined" &&
-    !isDialogOpen() &&
-    document.querySelector('[data-component="ChatInputSection"]') !== null;
+    composer !== null && !isDialogOpen() && composer.closest("[inert]") === null;
 
   if (hasChatInputToastHost) {
     window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, feedback));
