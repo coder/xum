@@ -17,7 +17,7 @@ import {
   updatePersistedState,
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
-import { guardCloseTab, holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
+import { guardSidebarKeys, holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
@@ -34,6 +34,7 @@ import {
   LEFT_SIDEBAR_DEFAULT_WIDTH_PX,
   LEFT_SIDEBAR_MAX_WIDTH_PX,
   LEFT_SIDEBAR_MIN_WIDTH_PX,
+  NARROW_VIEWPORT_MAX_WIDTH_PX,
 } from "@/constants/layout";
 import { ChatPane } from "../ChatPane/ChatPane";
 
@@ -101,11 +102,15 @@ const RightSidebar = React.lazy(async () => ({
 
 /**
  * While the sidebar chunk loads: hold its input. Once it has mounted: replay that input. After it
- * failed: only keep Cmd/Ctrl+W from closing the window (the held input is never replayed).
+ * failed: replay that input once too (on phones the menu bar acts on the artifact events, and it
+ * then opens the failure state), and keep the sidebar shortcuts' browser defaults guarded.
  */
 function SidebarInput(props: { held: HeldSidebarInput[]; mode: "hold" | "replay" | "failed" }) {
   useEffect(() => {
-    if (props.mode === "failed") return guardCloseTab();
+    if (props.mode === "failed") {
+      for (const replay of props.held.splice(0)) replay();
+      return guardSidebarKeys();
+    }
     if (props.mode === "hold") return holdSidebarInput(props.held);
     // An effect of RightSidebar's next sibling, so it runs after RightSidebar's own listeners exist.
     for (const replay of props.held.splice(0)) replay();
@@ -128,6 +133,26 @@ function FullscreenSidebarClose(props: { onClose?: () => void }) {
     button.focus();
     return restoreOthers;
   }, []);
+  // Like RightSidebar's closeIfWidened: once the layout widens, the CSS no longer shows this view
+  // full-screen (`position: fixed` lives only in the narrow rules), so close it and lift `inert`.
+  const onClose = props.onClose;
+  useEffect(() => {
+    const view = buttonRef.current?.closest<HTMLElement>(".right-sidebar-fullscreen");
+    if (view == null || onClose == null) return;
+    const closeIfWidened = () => {
+      if (window.getComputedStyle(view).position !== "fixed") onClose();
+    };
+    const mql = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    mql.addEventListener("change", closeIfWidened);
+    const resizeObserver =
+      typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(closeIfWidened);
+    const shell = view.closest("[data-workspace-shell]");
+    if (shell != null) resizeObserver?.observe(shell);
+    return () => {
+      mql.removeEventListener("change", closeIfWidened);
+      resizeObserver?.disconnect();
+    };
+  }, [onClose]);
   return (
     <Button ref={buttonRef} variant="outline" size="sm" onClick={props.onClose}>
       Close

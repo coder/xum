@@ -624,5 +624,91 @@ describe("WorkspaceShell loading placeholders", () => {
       expect(fireEvent.keyDown(document.body, { key: "w", ctrlKey: true })).toBe(false);
       consoleError.mockRestore();
     });
+
+    it("closes the phone full-screen fallback when the layout widens before the chunk loads", () => {
+      gateSidebar();
+      rightSidebarDisplay = "none";
+      // Stands in for globals.css: the full-screen view is `position: fixed` only in the narrow
+      // layout. Removing this rule is the widen.
+      const narrowLayout = document.createElement("style");
+      narrowLayout.textContent = ".right-sidebar-fullscreen { position: fixed; }";
+      document.head.appendChild(narrowLayout);
+      const mediaQuery = new EventTarget();
+      spyOn(window, "matchMedia").mockImplementation(
+        () => Object.assign(mediaQuery, { matches: true }) as unknown as MediaQueryList
+      );
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      const opener = view.getByRole("button", { name: "Sidebar" });
+      fireEvent.click(opener);
+      expect(isInert(view.getByTestId("chat-pane"))).toBe(true);
+
+      // A media change that leaves the layout narrow keeps the view.
+      act(() => void mediaQuery.dispatchEvent(new Event("change")));
+      expect(view.getByRole("status").textContent).toBe("Loading sidebar...");
+
+      narrowLayout.remove();
+      act(() => void mediaQuery.dispatchEvent(new Event("change")));
+      expect(view.queryByRole("status")).toBeNull();
+      expect(isInert(view.getByTestId("chat-pane"))).toBe(false);
+      expect(document.activeElement).toBe(opener);
+    });
+
+    it("guards every sidebar shortcut after its chunk fails, but not typed Shift+I", async () => {
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      const gate = gateSidebar();
+      render(<WorkspaceShell {...defaultProps} />);
+      await gate.fail();
+      const tabs = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) =>
+        fireEvent.keyDown(document.body, { key: String(n), ctrlKey: true })
+      );
+      const newTab = new window.KeyboardEvent("keydown", {
+        key: "n",
+        code: "KeyN",
+        ctrlKey: true,
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      // happy-dom infers AltGraph from any Ctrl+Alt chord; model physical Ctrl+Alt here.
+      Object.defineProperty(newTab, "getModifierState", { value: () => false });
+      expect({
+        tabs,
+        artifacts: fireEvent.keyDown(document.body, { key: "K", ctrlKey: true, shiftKey: true }),
+        closeTab: fireEvent.keyDown(document.body, { key: "w", ctrlKey: true }),
+        newTab: fireEvent(document.body, newTab),
+        typedShiftI: fireEvent.keyDown(document.body, { key: "I", shiftKey: true }),
+      }).toEqual({
+        tabs: Array<boolean>(9).fill(false),
+        artifacts: false,
+        closeTab: false,
+        newTab: false,
+        typedShiftI: true,
+      });
+      consoleError.mockRestore();
+    });
+
+    it("releases the held events once when its chunk fails, so the menu bar still gets them", async () => {
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      const gate = gateSidebar();
+      render(<WorkspaceShell {...defaultProps} />);
+      const menuBar: string[] = []; // stands in for WorkspaceMenuBar's phone listeners
+      const onEvent = (e: Event) => menuBar.push(e.type);
+      window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onEvent);
+      window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onEvent);
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_ARTIFACT, { workspaceId: "w" } as never)
+      );
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId: "w" } as never)
+      );
+      expect(menuBar).toEqual([]); // held while the chunk loads
+
+      await gate.fail();
+
+      expect(menuBar).toEqual([CUSTOM_EVENTS.OPEN_ARTIFACT, CUSTOM_EVENTS.OPEN_MCP_APP_VIEW]);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onEvent);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onEvent);
+      consoleError.mockRestore();
+    });
   });
 });
