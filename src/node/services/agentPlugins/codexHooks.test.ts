@@ -270,6 +270,25 @@ describe("loadPluginCodexHooks", () => {
     expect(warnings[0]).toMatch(/nests deeper than \d+ levels; ignoring a handler/);
   });
 
+  test("a non-string matcher nested too deeply to serialize drops its group; siblings load", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-deep-matcher");
+    // Under the 256 KiB file cap, but deeper than JSON.stringify can recurse.
+    const depth = 100_000;
+    const deepMatcher = `${"[".repeat(depth)}${"]".repeat(depth)}`;
+    const valid = JSON.stringify({ matcher: "Bash", hooks: [scan] });
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": `{"hooks":{"PreToolUse":[{"matcher":${deepMatcher},"hooks":[${JSON.stringify(scan)}]},${valid}]}}`,
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.matcher)).toEqual(["Bash"]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(
+      /matcher is not a valid regex \(not a string\); ignoring its group/
+    );
+  });
+
   test("Codex matchers: a leading inline-flag group loads; untranslated Rust syntax drops its group", async () => {
     using tmp = new DisposableTempDir("codex-hooks-rust-regex");
     const plugin = await writePlugin(tmp.path, {
