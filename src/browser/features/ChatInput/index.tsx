@@ -850,8 +850,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // keeps the composer in this same sending state while DraftStore retries it (idempotent sends).
   const isSending = sendingCount > 0 || draft.unresolvedSendCount > 0;
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
+  // Once the backend runs the turn, a send still settling does not lock the composer. The turn has
+  // two phases (WorkspaceStore: starting until stream-start, then interruptible), so both count:
+  // exempting only the first re-locked the composer at stream-start and dropped what the user
+  // was typing then (#5810).
+  const isTurnActive =
+    isStreamStarting || (variant === "workspace" && (props.canInterrupt ?? false));
   const sendInFlightBlocksInput =
-    variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
+    variant === "workspace" ? isSendInFlight && !isTurnActive : isSendInFlight;
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
