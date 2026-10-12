@@ -374,6 +374,51 @@ describe("fingerprintAnthropicRequest follows Anthropic's cache invalidation tab
     expect(compare(withEditing, withEditing)).toEqual(unsupported);
   });
 
+  test("the first cited document inside a tool result breaks system", () => {
+    const cited = {
+      type: "search_result",
+      source: "https://example.com",
+      title: "Example",
+      content: [{ type: "text", text: "notes" }],
+      citations: { enabled: true },
+    };
+    const withResult = [
+      ...baseMessages(),
+      { role: "assistant", content: [call("c2", "search")] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "c2", content: [cited] }] },
+    ];
+    expect(expectBreak(body(baseMessages()), body(withResult))).toMatchObject({
+      section: "system",
+      blockIndex: SYSTEM_OPTIONS_INDEX,
+    });
+
+    // Prompt form: the tool-result output holds a document part with citations enabled.
+    const promptForm = (extra: unknown[]) => ({
+      prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }, ...extra],
+    });
+    const document = {
+      type: "file-data",
+      data: "notes",
+      mediaType: "text/plain",
+      providerOptions: { anthropic: { citations: { enabled: true } } },
+    };
+    const toolResult = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "c1",
+          toolName: "search",
+          output: { type: "content", value: [document] },
+        },
+      ],
+    };
+    expect(expectBreak(promptForm([]), promptForm([toolResult]))).toMatchObject({
+      section: "system",
+      previous: { type: "system_options" },
+    });
+  });
+
   test("adding or changing a deferred tool extends the prefix", () => {
     const deferred = (description: string) => [
       ...TOOLS,

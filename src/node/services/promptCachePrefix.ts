@@ -146,21 +146,23 @@ function isImage(part: Record<string, unknown>): boolean {
   );
 }
 
-/** Images in a content block: the block itself, or inside a tool result (screenshots). */
-function containsImage(part: unknown): boolean {
+/**
+ * Whether a content block, or a block inside its tool result, matches: wire
+ * `tool_result.content`, or the prompt form's tool-result `output: { type: "content", value }`.
+ * Tool results hold documents, search results and images (screenshots).
+ */
+function someBlock(part: unknown, matches: (block: Record<string, unknown>) => boolean): boolean {
   if (!isRecord(part)) return false;
-  if (isImage(part)) return true;
-  // Wire tool_result.content, or the prompt form's tool-result `output: { type: "content", value }`.
-  const nested = Array.isArray(part.content)
+  if (matches(part)) return true;
+  const nested: unknown[] = Array.isArray(part.content)
     ? part.content
     : isRecord(part.output) && Array.isArray(part.output.value)
       ? part.output.value
       : [];
-  return nested.some((item) => isRecord(item) && isImage(item));
+  return nested.some((item) => isRecord(item) && matches(item));
 }
 
-function enablesCitations(part: unknown): boolean {
-  if (!isRecord(part)) return false;
+function enablesCitations(part: Record<string, unknown>): boolean {
   const anthropic = isRecord(part.providerOptions) ? part.providerOptions.anthropic : undefined;
   const citations = part.citations ?? (isRecord(anthropic) ? anthropic.citations : undefined);
   return isRecord(citations) && citations.enabled === true;
@@ -285,7 +287,7 @@ export function fingerprintAnthropicRequest(body: Record<string, unknown>): Prom
       .map((entry) => ({ ...entry, key: JSON.stringify(entry.config) }))
       .sort((a, b) => a.type.localeCompare(b.type) || a.key.localeCompare(b.key))
       .map((entry) => entry.config),
-    citations: allParts.some(enablesCitations),
+    citations: allParts.some((part) => someBlock(part, enablesCitations)),
     // Absent means standard speed, so an explicit "standard" is the same request.
     speed: typeof body.speed === "string" ? body.speed : "standard",
     format: isRecord(body.output_config) ? (body.output_config.format ?? null) : null,
@@ -299,7 +301,7 @@ export function fingerprintAnthropicRequest(body: Record<string, unknown>): Prom
     thinking: body.thinking ?? null,
     effort: isRecord(body.output_config) ? (body.output_config.effort ?? null) : null,
     toolChoice: body.tool_choice ?? null,
-    images: allParts.some(containsImage),
+    images: allParts.some((part) => someBlock(part, isImage)),
   });
   for (const message of messages.slice(leadingSystemCount)) {
     for (const part of message.content) {
