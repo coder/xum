@@ -50,3 +50,23 @@ test("a composer behind an open modal dialog is no toast host, so the message al
   expect(alerts).toEqual(["Settings could not be saved"]);
   expect(toasts).toEqual([]);
 });
+
+test("a composer under an inert page (a full-screen view covers it) is no toast host", () => {
+  // The phone full-screen right sidebar makes the rest of the page inert and covers it, so a
+  // toast in the composer would be neither visible nor clickable.
+  const view = render(
+    <div data-testid="page">
+      <div data-component="ChatInputSection" />
+    </div>
+  );
+  view.getByTestId("page").setAttribute("inert", "");
+  const alerts: unknown[] = [];
+  window.alert = (message: unknown) => alerts.push(message);
+  const toasts: unknown[] = [];
+  window.addEventListener(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, (event) => toasts.push(event));
+
+  showFeedbackToast({ type: "error", message: "Side chat failed" });
+
+  expect(alerts).toEqual(["Side chat failed"]);
+  expect(toasts).toEqual([]);
+});

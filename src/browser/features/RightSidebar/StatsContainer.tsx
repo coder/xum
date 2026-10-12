@@ -37,8 +37,8 @@ interface StatsContainerProps {
 }
 
 export function StatsContainer(props: StatsContainerProps) {
-  // listener: the Stats dialog (#5767) can mount a second copy next to the hidden sidebar's, and
-  // both must show the same choice. The panels' view preferences listen for the same reason.
+  // listener: every mounted copy shows the same choice. The panels' view preferences listen for
+  // the same reason.
   const [subTab, setSubTab] = usePersistedState<StatsSubTab>(STATS_CONTAINER_SUB_TAB_KEY, "cost", {
     listener: true,
   });
