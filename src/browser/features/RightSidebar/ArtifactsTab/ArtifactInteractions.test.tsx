@@ -50,6 +50,10 @@ let setStateImpl: (state: unknown) => Promise<SetStateResult> = (state) => {
 let persistedState: unknown = { step: 1 };
 /** When set, getState waits for this promise (state still loading). */
 let stateGate: Promise<void> | null = null;
+/** When true, getState rejects (a transport failure). */
+let getStateFails = false;
+/** When set, the next getState answers with this state once (a read served before a write). */
+let staleStateOnce: unknown = undefined;
 /** When set, sendInteraction resolves only after this promise (send in flight). */
 let sendGate: Promise<void> | null = null;
 
@@ -91,7 +95,13 @@ function Wrapper(props: { children: ReactNode }) {
         }),
       getState: async () => {
         await stateGate;
-        return { success: true as const, data: { state: persistedState } };
+        if (getStateFails) throw new Error("getState transport failure");
+        const stale = staleStateOnce;
+        staleStateOnce = undefined;
+        return {
+          success: true as const,
+          data: { state: stale !== undefined ? stale : persistedState },
+        };
       },
       setState: (input: { state: unknown }) => setStateImpl(input.state),
       sendInteraction: (input: {
@@ -161,6 +171,8 @@ describe("artifact interactions in the Artifacts panel", () => {
     };
     persistedState = { step: 1 };
     stateGate = null;
+    getStateFails = false;
+    staleStateOnce = undefined;
     sendGate = null;
   });
 
@@ -460,6 +472,47 @@ describe("artifact interactions in the Artifacts panel", () => {
     persistedState = { step: 9 };
     view.rerender(<InteractionsHarness target={shown(1)} />);
     await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 9 }));
+  });
+
+  test("a failed read during a pending write keeps the tab's newest state", async () => {
+    setStateImpl = () => new Promise<SetStateResult>(() => undefined);
+    const live = (latestVersion: number) => ({ path: HTML.path, version: null, latestVersion });
+    const view = render(<InteractionsHarness target={live(1)} />, { wrapper: Wrapper });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
+    act(() => hookHandlers?.setState?.({ step: 6 }));
+    getStateFails = true;
+    view.rerender(<InteractionsHarness target={live(2)} />);
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 6 }));
+  });
+
+  test("a read that outlives a draining write reads again instead of keeping a pre-write state", async () => {
+    // The read starts while the write is in flight and answers with the server's pre-write state
+    // after the write has landed, so the hook must read once more.
+    let settleWrite: () => void = () => undefined;
+    setStateImpl = (state) =>
+      new Promise<SetStateResult>((resolve) => {
+        settleWrite = () => {
+          persistedState = state;
+          resolve({ success: true as const, data: undefined });
+        };
+      });
+    const live = (latestVersion: number) => ({ path: HTML.path, version: null, latestVersion });
+    const view = render(<InteractionsHarness target={live(1)} />, { wrapper: Wrapper });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 1 }));
+    act(() => hookHandlers?.setState?.({ step: 7 }));
+    let openGate: () => void = () => undefined;
+    stateGate = new Promise<void>((resolve) => (openGate = resolve));
+    staleStateOnce = { step: 1 };
+    view.rerender(<InteractionsHarness target={live(2)} />);
+    await act(async () => {
+      settleWrite();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      openGate();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(hookHandlers?.initialState).toEqual({ step: 7 }));
   });
 
   test("concurrent setState writes run one at a time and the last state wins", async () => {

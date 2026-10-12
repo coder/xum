@@ -84,7 +84,9 @@ export function useArtifactInteractions(
         })
         .catch((error: unknown) => {
           if (isAbortError(error) || controller.signal.aborted) return;
-          setLoadedState({ key: stateKey, state: null });
+          // A failed read must not drop a state this tab is still saving.
+          const writing = stateWritesRef.current.get(writeKey);
+          setLoadedState({ key: stateKey, state: writing != null ? writing.latest : null });
         });
     };
     load();
