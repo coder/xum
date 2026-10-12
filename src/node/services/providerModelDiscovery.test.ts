@@ -318,6 +318,18 @@ it.each(["unchanged", "key", "abort"])(
   }
 );
 
+it("matches Meta inference's /v1 normalization for a bare proxy origin", async () => {
+  save("meta", { baseUrl: new URL(server.url).origin });
+  respond = (request) =>
+    new URL(request.url).pathname === "/v1/models"
+      ? Response.json({ data: [{ id: "muse-wonder-1.0" }] })
+      : new Response("not found", { status: 404 });
+  expect(await service.discoverModels("meta")).toEqual({
+    status: "ok",
+    modelIds: ["muse-wonder-1.0"],
+  });
+});
+
 const httpAdapters = [
   "google",
   "xai",
