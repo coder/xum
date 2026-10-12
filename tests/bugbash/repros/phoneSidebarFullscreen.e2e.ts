@@ -12,7 +12,7 @@ test(
     await openPlayground(app, screen, browser);
 
     await screen.getByRole("button", "Workspace actions").tap();
-    await screen.getByRole("menuitem", "Sidebar").tap();
+    await screen.getByRole("button", "Sidebar").tap();
     await expect(screen.getByRole("button", "Close sidebar")).toBeVisible();
 
     // The view covers the whole page, so every Tab stop must be one of its own controls (or the
@@ -43,7 +43,7 @@ test(
     // The bug bash found Side chat missing at phone width. The menu's Sidebar row shows the
     // sidebar, and its New tab launcher lists Side chat with the tools.
     await screen.getByRole("button", "Workspace actions").tap();
-    await screen.getByRole("menuitem", "Sidebar").tap();
+    await screen.getByRole("button", "Sidebar").tap();
     await screen.getByRole("button", "New tab").tap();
     await expect(screen.getByRole("button", "Side chat")).toBeVisible();
   }

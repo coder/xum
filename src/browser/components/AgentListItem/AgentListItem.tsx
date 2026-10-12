@@ -73,11 +73,7 @@ import {
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedDropEdge } from "@/browser/utils/ui/pinnedReorder";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
-import {
-  WORKSPACE_ACTIONS_MENU_POPUP_PROPS,
-  WORKSPACE_ACTIONS_MENU_TRIGGER_PROPS,
-  WorkspaceActionsMenuContent,
-} from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
+import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceActionsOptional } from "@/browser/contexts/WorkspaceContext";
@@ -1197,7 +1193,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                     />
                   </PopoverAnchor>
                 )}
-                <PopoverTrigger asChild {...WORKSPACE_ACTIONS_MENU_TRIGGER_PROPS}>
+                <PopoverTrigger asChild>
                   <button
                     ref={overflowMenuButtonRef}
                     className={cn(
@@ -1215,7 +1211,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 </PopoverTrigger>
 
                 <PopoverContent
-                  {...WORKSPACE_ACTIONS_MENU_POPUP_PROPS}
                   ref={setOverflowMenuContentRef}
                   align={ctxMenu.position ? "start" : "end"}
                   side={ctxMenu.position ? "right" : "bottom"}
