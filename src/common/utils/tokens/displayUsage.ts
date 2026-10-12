@@ -272,11 +272,16 @@ export function recomputeUsageCosts(
 ): ChatUsageDisplay {
   const modelStats = getModelStats(metadataModel);
   const serviceTier = usage.serviceTier;
+  // Self-healing: clamp a malformed persisted 1h share into [0, cacheCreate tokens] and
+  // persist the clamped value, so a bad share cannot leak into later aggregates.
+  const rawCacheCreate1hTokens = usage.cacheCreate1hTokens;
+  const cacheCreate1hTokens =
+    rawCacheCreate1hTokens !== undefined && Number.isFinite(rawCacheCreate1hTokens)
+      ? Math.min(usage.cacheCreate.tokens, Math.max(0, rawCacheCreate1hTokens))
+      : 0;
   const carriedFields = {
     ...(serviceTier !== undefined ? { serviceTier } : {}),
-    ...(usage.cacheCreate1hTokens !== undefined
-      ? { cacheCreate1hTokens: usage.cacheCreate1hTokens }
-      : {}),
+    ...(cacheCreate1hTokens > 0 ? { cacheCreate1hTokens } : {}),
   };
 
   if (!modelStats) {
@@ -302,8 +307,10 @@ export function recomputeUsageCosts(
     // non-linear, so choosing a single tier from the sum can inflate costs once multiple
     // sub-threshold requests add up past the long-context boundary. Preserve the stored costs
     // and surface uncertainty instead of fabricating a repriced total.
+    const { cacheCreate1hTokens: _storedShare, ...storedUsage } = usage;
     return {
-      ...usage,
+      ...storedUsage,
+      ...carriedFields,
       hasUnknownCosts: true,
     };
   }
@@ -316,11 +323,7 @@ export function recomputeUsageCosts(
     inputTokens: usage.input.tokens,
     cachedTokens: usage.cached.tokens,
     cacheCreateTokens: usage.cacheCreate.tokens,
-    // Self-healing: clamp a malformed persisted share into [0, cacheCreate tokens].
-    cacheCreate1hTokens: Math.min(
-      usage.cacheCreate.tokens,
-      Math.max(0, usage.cacheCreate1hTokens ?? 0)
-    ),
+    cacheCreate1hTokens,
     outputTokens: usage.output.tokens,
     reasoningTokens: usage.reasoning.tokens,
   });

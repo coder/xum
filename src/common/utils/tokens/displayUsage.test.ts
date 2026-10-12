@@ -672,6 +672,32 @@ describe("Anthropic 1h-TTL cache-write pricing", () => {
     const repriced = recomputeUsageCosts(aggregate, model, { aggregatedUsage: true });
     expect(getTotalCost(repriced)).toBeCloseTo(getTotalCost(aggregate) ?? NaN, 12);
   });
+
+  test("repricing repairs a malformed 1h share instead of carrying it into later sums", () => {
+    const model = "anthropic:claude-sonnet-5-5";
+    const write = (tokens: number, oneHour: number) =>
+      display(model, {
+        anthropic: {
+          cacheCreationInputTokens: tokens,
+          usage: {
+            cache_creation: {
+              ephemeral_5m_input_tokens: tokens - oneHour,
+              ephemeral_1h_input_tokens: oneHour,
+            },
+          },
+        },
+      });
+    // A persisted row claims 100 1h tokens out of only 10 cache-write tokens.
+    const corrupt = { ...write(10, 10), cacheCreate1hTokens: 100 };
+    const repaired = recomputeUsageCosts(corrupt, model);
+    const later = sumUsageHistory([repaired, write(90, 0)]);
+    const expected = sumUsageHistory([write(10, 10), write(90, 0)]);
+    if (later === undefined || expected === undefined) throw new Error("expected aggregates");
+    expect(recomputeUsageCosts(later, model).cacheCreate.cost_usd).toBeCloseTo(
+      expected.cacheCreate.cost_usd ?? NaN,
+      12
+    );
+  });
 });
 
 describe("OpenAI service-tier pricing (#4352)", () => {
