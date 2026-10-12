@@ -167,6 +167,8 @@ interface ActiveStream {
   streamInfoParts: CompletedMessagePart[];
   toolCompletionTimestamps: Map<string, number>;
   lastEventTimestamp: number;
+  /** Set when a tool-start holds the stream; released by the test or by cancellation. */
+  toolCallRelease?: ReturnType<typeof Promise.withResolvers<void>>;
 }
 
 export class MockAiStreamPlayer {
@@ -211,6 +213,16 @@ export class MockAiStreamPlayer {
       return;
     }
     gate.resolve();
+  }
+
+  /**
+   * Release a stream held before its tool calls (reply.holdToolCalls). Throws when the workspace
+   * has no such stream: a test that releases nothing has the wrong idea of the stream state.
+   */
+  releaseToolCalls(workspaceId: string): void {
+    const release = this.activeStreams.get(workspaceId)?.toolCallRelease;
+    if (!release) throw new Error(`No mock stream in ${workspaceId} holds its tool calls`);
+    release.resolve();
   }
 
   private getStreamStartGate(workspaceId: string): StreamStartGate {
@@ -621,6 +633,9 @@ export class MockAiStreamPlayer {
       streamInfoParts: [],
       toolCompletionTimestamps: new Map(),
       lastEventTimestamp: 0,
+      ...(events.some((event) => event.kind === "tool-start" && event.holdUntilReleased) && {
+        toolCallRelease: Promise.withResolvers<void>(),
+      }),
     });
 
     let nextEventIndex = 0;
@@ -910,6 +925,12 @@ export class MockAiStreamPlayer {
         break;
       }
       case "tool-start": {
+        if (event.holdUntilReleased) {
+          assert(active.toolCallRelease, "a held tool-start has a release");
+          // The event queue waits here, so the stream stays open with no tool call yet.
+          await active.toolCallRelease.promise;
+          if (active.cancelled) return;
+        }
         // Mock streams use the same tokenization logic as real streams for consistency
         const inputText = JSON.stringify(event.args);
         const tokens = await tokenizeWithMockModel(inputText, "tool-call args");
@@ -1110,6 +1131,8 @@ export class MockAiStreamPlayer {
 
   private cancelTimers(active: ActiveStream): void {
     active.cancelled = true;
+    // A held tool-start blocks the event queue, and stopping joins that queue.
+    active.toolCallRelease?.resolve();
 
     if (active.partialWriteTimer) {
       clearTimeout(active.partialWriteTimer);

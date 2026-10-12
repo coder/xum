@@ -827,6 +827,29 @@ export class HistoryService {
     this.config = config;
   }
 
+  private readonly emptyErroredReplyDeletedListeners = new Set<
+    (workspaceId: string, historySequences: number[]) => void
+  >();
+
+  /**
+   * Called after commitPartial deleted the history rows of a reply that failed with no output
+   * (one row, or every duplicate of its id in corrupted history).
+   * No caller asked for that delete, so no caller tells the client. A client that keeps the row
+   * sends it as evidence with its next edit, and the edit is refused (#6116).
+   * Returns the unsubscribe function.
+   */
+  onEmptyErroredReplyDeleted(
+    listener: (workspaceId: string, historySequences: number[]) => void
+  ): () => void {
+    this.emptyErroredReplyDeletedListeners.add(listener);
+    return () => this.emptyErroredReplyDeletedListeners.delete(listener);
+  }
+
+  /** Test-visible: how many onEmptyErroredReplyDeleted listeners are subscribed. */
+  get emptyErroredReplyDeletedListenerCount(): number {
+    return this.emptyErroredReplyDeletedListeners.size;
+  }
+
   private readonly continuousJournals = new Map<string, ContinuousCompactionJournalStore>();
 
   getContinuousCompactionJournal(workspaceId: string): ContinuousCompactionJournalStore {
@@ -3437,18 +3460,42 @@ export class HistoryService {
     if ((await this.readPartial(workspaceId)) == null) {
       return Ok(undefined);
     }
-    return this.withRecoveredHistoryWriteResultLock(
+    let deletedSequences: number[] = [];
+    const committed = await this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to commit partial",
       (assertStillOwned) =>
-        this.commitPartialUnderWriteLock(workspaceId, expectedMessageId, assertStillOwned)
+        this.commitPartialUnderWriteLock(
+          workspaceId,
+          expectedMessageId,
+          assertStillOwned,
+          (sequences) => (deletedSequences = sequences)
+        )
     );
+    // Notify after the locks are released (listeners publish to clients), and also when a later
+    // step failed: the rows are gone, and a retry finds the partial orphaned and reports nothing.
+    if (deletedSequences.length > 0) {
+      for (const listener of this.emptyErroredReplyDeletedListeners) {
+        // One failing session must neither skip the others nor fail this commit.
+        try {
+          listener(workspaceId, deletedSequences);
+        } catch (error) {
+          log.warn("Empty errored reply delete listener failed", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
+      }
+    }
+    return committed;
   }
 
+  /** `recordDeleted` receives the sequences of the empty errored reply rows it deleted. */
   private async commitPartialUnderWriteLock(
     workspaceId: string,
-    expectedMessageId?: string,
-    assertStillOwned?: () => Promise<void>
+    expectedMessageId: string | undefined,
+    assertStillOwned: (() => Promise<void>) | undefined,
+    recordDeleted: (historySequences: number[]) => void
   ): Promise<Result<void>> {
     try {
       let partial = await this.readPartial(workspaceId);
@@ -3577,6 +3624,15 @@ export class HistoryService {
           !deleteMessageResult.error.includes("not found in history")
         ) {
           return deleteMessageResult;
+        }
+        if (deleteMessageResult.success) {
+          // The delete is by id: corrupted history can hold duplicates at other sequences,
+          // including before the latest boundary, so report what the delete removed.
+          assert(
+            deleteMessageResult.data.length > 0,
+            "the deleted rows include the partial's own row"
+          );
+          recordDeleted(deleteMessageResult.data);
         }
       }
 
@@ -5497,7 +5553,9 @@ export class HistoryService {
    */
   async deleteMessage(workspaceId: string, messageId: string): Promise<Result<void>> {
     return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to delete message", () =>
-      this.deleteMessageUnderWriteLock(workspaceId, messageId)
+      this.deleteMessageUnderWriteLock(workspaceId, messageId).then((result) =>
+        result.success ? Ok(undefined) : result
+      )
     );
   }
 
@@ -5539,8 +5597,14 @@ export class HistoryService {
   private async deleteMessageUnderWriteLock(
     workspaceId: string,
     messageId: string
-  ): Promise<Result<void>> {
+  ): Promise<Result<number[]>> {
     invalidateHistoryAppendProvenance();
+    // The sequences of the removed rows (every row with this id), for callers that publish them.
+    const sequencesOf = (removed: readonly MuxMessage[]) =>
+      removed.flatMap((msg) => {
+        const seq = msg.id === messageId ? msg.metadata?.historySequence : undefined;
+        return isNonNegativeInteger(seq) ? [seq] : [];
+      });
     try {
       // Structural rewrite requires full file content
       const { rows, messages } = await this.readHistoryForRewrite(
@@ -5574,7 +5638,7 @@ export class HistoryService {
           messages.length
         );
         await writeFileAtomic(this.getChatArchivePath(workspaceId), archiveEntries);
-        return Ok(undefined);
+        return Ok(sequencesOf(archiveMessages));
       }
 
       const historyPath = this.getChatHistoryPath(workspaceId);
@@ -5623,7 +5687,7 @@ export class HistoryService {
         this.sequenceCounters.set(workspaceId, nextSeq);
       }
 
-      return Ok(undefined);
+      return Ok(sequencesOf(messages));
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to delete message: ${message}`);

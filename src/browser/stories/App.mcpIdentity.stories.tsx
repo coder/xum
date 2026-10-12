@@ -190,7 +190,9 @@ export const WorkspaceModalAfterFetch: AppStory = {
   ...SettingsBeforeTest,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await canvas.findByTestId("settings-button", {}, { timeout: 10000 });
+    // The workspace menu bar owns this shortcut, and it mounts with the lazy workspace page
+    // (T3 #5971), after the settings button.
+    await canvas.findByTestId("workspace-more-actions", {}, { timeout: 10000 });
     await userEvent.keyboard("{Control>}{Shift>}m{/Shift}{/Control}");
     const dialog = await within(document.body).findByRole("dialog");
     const row = rowContaining(
