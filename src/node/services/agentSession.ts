@@ -427,7 +427,6 @@ type ResolvedSendMessageOptions = SendMessageOptions & {
   autoModelRoutingRecord?: AutoModelRoutingRecord;
 };
 
-/** A heartbeat's own row: its turn, or the compaction that a compact heartbeat runs first. */
 /** Auto-retry abandon reason when the retried turn's goal no longer runs. */
 const GOAL_INACTIVE_RETRY_REASON = "goal_inactive";
 
@@ -446,6 +445,7 @@ function isRetriedGoalStillRunning(
   return goal.status === (goalKind === GOAL_BUDGET_LIMIT_KIND ? "budget_limited" : "active");
 }
 
+/** A heartbeat's own row: its turn, or the compaction that a compact heartbeat runs first. */
 function isHeartbeatTriggerMetadata(muxMetadata: MuxMessageMetadata | undefined): boolean {
   return (
     muxMetadata?.type === "heartbeat-request" ||
