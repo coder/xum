@@ -2540,14 +2540,19 @@ export default defineConfig([
     // for `!` to lower complexity. Each site from before the ban carries an
     // inline disable comment; reportUnusedDisableDirectives flags a stale one.
     files: ["src/**/*.{ts,tsx}"],
+    // These globs must match isProductionSource() in
+    // scripts/check-test-seam-comments.ts, the repo's one definition of
+    // production code (the CRAP gate uses it too), plus benchmarks. Change both
+    // together; do not add conventions that isProductionSource() does not have.
     ignores: [
-      "**/*.test.{ts,tsx}",
-      "**/*.testHarness.{ts,tsx}",
-      "**/*.stories.{ts,tsx}",
-      "**/*.bench.{ts,tsx}",
-      "**/*.testUtils.{ts,tsx}",
-      "src/**/test[A-Z]*.{ts,tsx}",
-      "src/browser/stories/**",
+      "src/**/{__tests__,__mocks__,test,tests,testing,mocks,stories}/**",
+      "src/**/*.@(test|spec)*([a-zA-Z0-9_-]).{ts,tsx}",
+      "src/**/*.@(stories|generated).{ts,tsx}",
+      "src/**/test[A-Z_.-]*",
+      "src/**/*Test@(Helper|Helpers|Harness|Utils|Fixture|Fixtures|Overlay|Child)[!a-zA-Z0-9_]*",
+      "src/**/*.*([a-zA-Z0-9_])[fF]ixture?(s).{ts,tsx}",
+      "src/version.ts",
+      "src/**/*.bench.{ts,tsx}",
     ],
     rules: {
       "@typescript-eslint/no-non-null-assertion": "error",
