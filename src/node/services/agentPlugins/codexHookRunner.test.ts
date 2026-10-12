@@ -185,6 +185,46 @@ describe("PreToolUse", () => {
     expect((await runTool(spine, "bash", {})).executed).toBe(true);
   });
 
+  test("JSON null on an optional field is absent (Codex): a block or deny still holds", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rgpoH): a serializer that writes null defaults must not void a guard.
+    const nulls = { continue: null, stopReason: null, systemMessage: null, suppressOutput: null };
+    const outputs = [
+      json({ ...nulls, decision: "block", reason: "no rm", hookSpecificOutput: null }),
+      json({
+        ...nulls,
+        decision: null,
+        reason: null,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: "no rm",
+          updatedInput: null,
+          additionalContext: null,
+        },
+      }),
+    ];
+    for (const output of outputs) {
+      const { spine } = setup([hook("PreToolUse")], () => output);
+      const ctx = await runTool(spine, "bash", { script: "rm -rf /" });
+      expect(ctx.blocked?.result).toEqual({
+        error: "Tool call blocked by plugin 'guard' hook: no rm",
+      });
+    }
+
+    // An allow with updatedInput: null is an allow without a rewrite: the original call runs.
+    const allow = setup([hook("PreToolUse")], () =>
+      json({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          updatedInput: null,
+        },
+      })
+    );
+    const ran = await runTool(allow.spine, "bash", { script: "ls" });
+    expect(ran.result).toEqual({ ran: { script: "ls" } });
+  });
+
   test("a decision that is not an exact Codex enum value is malformed and fails open", async () => {
     const outputs = [
       json({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: " deny " } }),
@@ -583,6 +623,21 @@ describe("UserPromptSubmit and Stop", () => {
       kind: "context",
       entries: [{ pluginId: "guard", text: "Ask for a repro first." }],
     });
+  });
+
+  test("UserPromptSubmit: hookSpecificOutput: null is absent (Codex), so the block holds", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rgpoH): before, the null made the output malformed and the
+    // prompt was sent.
+    const { spine } = setup([hook("UserPromptSubmit")], () =>
+      json({ decision: "block", reason: "secret detected", hookSpecificOutput: null })
+    );
+    expect(
+      await runMessageSendHooks(spine, workspaceId, {
+        text: "key=abc",
+        origin: "user",
+        canBlock: true,
+      })
+    ).toEqual({ kind: "blocked", pluginName: "guard", reason: "secret detected" });
   });
 
   test("prompt and Stop events carry the workspace cwd", async () => {
