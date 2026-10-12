@@ -3115,9 +3115,15 @@ export class WorkspaceGoalService {
       if (completionSummary == null || completionSummary.length === 0) {
         throw new WorkspaceGoalTransitionError("Completion summary is required.");
       }
-      if (current.status !== "active" && current.status !== "budget_limited") {
+      // Paused goals may complete directly: the work can finish while the loop
+      // is paused, and completion never re-arms continuations.
+      if (
+        current.status !== "active" &&
+        current.status !== "budget_limited" &&
+        current.status !== "paused"
+      ) {
         throw new WorkspaceGoalTransitionError(
-          "Cannot complete a goal that is not active or budget-limited."
+          "Cannot complete a goal that is not active, paused or budget-limited."
         );
       }
     }
