@@ -206,20 +206,69 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * The cache-key call options of a recorded step, in the body fields the fingerprint reads.
  * The AI SDK maps them 1:1 onto the wire (`thinking`, `effort` -> `output_config.effort`,
  * `speed`, `contextManagement` -> `context_management`, the call's `toolChoice` plus
- * `disableParallelToolUse` -> `tool_choice`). The audit compares recorded steps only with
- * each other, so the values keep their AI SDK shape. Structured-output formats are not in the
+ * `disableParallelToolUse` -> `tool_choice` in the provider's wire shape, see
+ * wireToolChoice). The audit compares recorded steps only with each other, so the other
+ * values keep their AI SDK shape. Structured-output formats are not in the
  * DevTools record and stay unmodeled here.
  */
+/**
+ * The wire `tool_choice` the AI SDK Anthropic provider sends (its prepareTools): with no
+ * call tool choice, `{ type: "auto", disable_parallel_tool_use }` only when that option is
+ * truthy, so an omitted value and `false` are the same request. Models that reject forced
+ * tool use downgrade "required" and "tool" to "auto"; the record does not show that, so
+ * those keep their own value.
+ */
+function wireToolChoice(choice: unknown, disableParallelToolUse: unknown): unknown {
+  if (!isRecord(choice)) {
+    return disableParallelToolUse === true
+      ? { type: "auto", disable_parallel_tool_use: true }
+      : undefined;
+  }
+  switch (choice.type) {
+    case "none":
+      return undefined;
+    case "required":
+      return { type: "any", disable_parallel_tool_use: disableParallelToolUse };
+    case "tool":
+      return {
+        type: "tool",
+        name: choice.toolName,
+        disable_parallel_tool_use: disableParallelToolUse,
+      };
+    default:
+      return { type: "auto", disable_parallel_tool_use: disableParallelToolUse };
+  }
+}
+
+const FIVE_MINUTES_MS = 5 * 60 * 1000;
+const ONE_HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * The cache lifetime a recorded step asked for, from its prompt-form cache markers
+ * (`providerOptions.anthropic.cacheControl.ttl` on tools, messages and content parts), else
+ * Anthropic's 5-minute default, as the runtime monitor reads it from the wire markers.
+ */
+function stepCacheTtlMs(step: RecordedStepRequest): number {
+  const asArray = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+  const messages = asArray(step.prompt);
+  const markable = [
+    ...asArray(step.tools),
+    ...messages,
+    ...messages.flatMap((message) => (isRecord(message) ? asArray(message.content) : [])),
+  ];
+  const isHourMarker = (entry: unknown): boolean => {
+    const providerOptions = isRecord(entry) ? entry.providerOptions : undefined;
+    const anthropic = isRecord(providerOptions) ? providerOptions.anthropic : undefined;
+    const marker = isRecord(anthropic) ? anthropic.cacheControl : undefined;
+    return isRecord(marker) && marker.ttl === "1h";
+  };
+  return markable.some(isHourMarker) ? ONE_HOUR_MS : FIVE_MINUTES_MS;
+}
+
 function wireOptionsFromStep(step: RecordedStepRequest): Record<string, unknown> {
   const providerOptions = isRecord(step.providerOptions) ? step.providerOptions : {};
   const anthropic = isRecord(providerOptions.anthropic) ? providerOptions.anthropic : {};
-  const toolChoice =
-    step.toolChoice != null || anthropic.disableParallelToolUse != null
-      ? {
-          choice: step.toolChoice ?? null,
-          disableParallelToolUse: anthropic.disableParallelToolUse,
-        }
-      : undefined;
+  const toolChoice = wireToolChoice(step.toolChoice, anthropic.disableParallelToolUse);
   return {
     ...(anthropic.thinking != null ? { thinking: anthropic.thinking } : {}),
     ...(anthropic.effort != null ? { output_config: { effort: anthropic.effort } } : {}),
@@ -257,6 +306,15 @@ export function auditStepPrefixes(
       previous?.step.contextEpoch != null &&
       step.contextEpoch != null &&
       previous.step.contextEpoch !== step.contextEpoch
+    ) {
+      previous = undefined;
+    }
+    // The previous step's cache entry expired before this one started: cold by time, like the
+    // runtime monitor, so start a new baseline without a break. An unreadable time compares.
+    if (
+      previous != null &&
+      Date.parse(step.startedAt) - Date.parse(previous.step.startedAt) >
+        stepCacheTtlMs(previous.step)
     ) {
       previous = undefined;
     }

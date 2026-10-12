@@ -162,6 +162,7 @@ describe("auditStepPrefixes", () => {
     provider: string | null = "anthropic.messages",
     extra: Partial<RecordedStepRequest> = {}
   ): RecordedStepRequest => ({
+    startedAt: "2026-10-12T10:00:00.000Z",
     ...extra,
     runId,
     stepId: `${runId}-${stepNumber}`,
@@ -265,5 +266,53 @@ describe("auditStepPrefixes", () => {
     ]);
     // Only run-3 -> run-4 is compared; the pairs with the editing step are unsupported.
     expect(audit).toMatchObject({ comparedPairs: 1, breaks: [{ runId: "run-4" }] });
+  });
+
+  test("a gap longer than the previous step's cache TTL starts a new baseline", () => {
+    const at = (minutes: number, extra: Partial<RecordedStepRequest> = {}) => ({
+      startedAt: new Date(Date.UTC(2026, 9, 12, 10, minutes)).toISOString(),
+      ...extra,
+    });
+    // 5-minute default: 6 minutes later the entry has expired, so no break.
+    expect(
+      auditStepPrefixes([
+        step("run-1", 0, ["a"], undefined, undefined, at(0)),
+        step("run-2", 0, ["changed"], undefined, undefined, at(6)),
+      ])
+    ).toMatchObject({ comparedPairs: 0, breaks: [] });
+    // A 1h marker on the previous step keeps the entry, so the same gap still compares.
+    const hourMarked = {
+      ...step("run-1", 0, ["a"], undefined, undefined, at(0)),
+      tools: [
+        {
+          type: "function",
+          name: "bash",
+          inputSchema: { type: "object" },
+          providerOptions: { anthropic: { cacheControl: { type: "ephemeral", ttl: "1h" } } },
+        },
+      ],
+    };
+    expect(
+      auditStepPrefixes([hourMarked, step("run-2", 0, ["changed"], undefined, undefined, at(6))])
+    ).toMatchObject({ comparedPairs: 1, breaks: [{ runId: "run-2" }] });
+  });
+
+  test("an omitted and a false disableParallelToolUse are the same request", () => {
+    const parallel = (value: boolean) => ({
+      providerOptions: { anthropic: { disableParallelToolUse: value } },
+    });
+    expect(
+      auditStepPrefixes([
+        step("run-1", 0, ["a"]),
+        step("run-2", 0, ["a", "b"], undefined, undefined, parallel(false)),
+      ])
+    ).toMatchObject({ comparedPairs: 1, breaks: [] });
+    // An explicit "auto" choice is sent on the wire, so it differs from no choice.
+    expect(
+      auditStepPrefixes([
+        step("run-1", 0, ["a"]),
+        step("run-2", 0, ["a", "b"], undefined, undefined, { toolChoice: { type: "auto" } }),
+      ]).breaks
+    ).toHaveLength(1);
   });
 });

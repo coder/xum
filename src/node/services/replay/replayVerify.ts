@@ -69,6 +69,8 @@ export interface RecordedStepRequest {
   runId: string;
   stepId: string;
   stepNumber: number;
+  /** ISO start time: the audit treats a gap longer than the cache TTL as an expired entry. */
+  startedAt: string;
   modelId: string;
   /** AI SDK provider id, e.g. "anthropic.messages"; null when the SDK did not report one. */
   provider: string | null;
@@ -196,6 +198,7 @@ export function recordedStepsFromLog(log: DevtoolsLogSnapshot): RecordedStepRequ
             runId: run.id,
             stepId: step.id,
             stepNumber: step.stepNumber,
+            startedAt: step.startedAt,
             modelId: step.modelId,
             provider: step.provider,
             prompt: step.input.prompt,
