@@ -20,9 +20,9 @@
  *
  * No network: the fetch is local and scripted.
  *
- * The control passes. Every other case is a repro wrapped in expectReproFailure: it passes while
- * the break still exists, at the pinned divergence index, and fails with "repro passed" once a
- * fix removes it. That makes the fix PR turn the repro into a plain test, so CI keeps each fixed
+ * The control and the fixed mechanisms are plain tests. Every other case is a repro wrapped in
+ * expectReproFailure: it passes while the break still exists, at the pinned divergence index,
+ * and fails with "repro passed" once a fix removes it. That makes the fix PR turn the repro into a plain test, so CI keeps each fixed
  * mechanism fixed.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -485,34 +485,29 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
     );
   });
 
-  // The rebuild has no step boundaries: StreamManager persists `stepStartPartIndices` in
-  // metadata but no `step-start` parts, and nothing in the request path reads the indices,
-  // so convertToModelMessages starts a new assistant message only where text or reasoning
-  // follows a tool part. A step that opens with a tool call (no thinking block, no text;
-  // common with adaptive thinking) is folded into the previous step's tool_use block: two
-  // sequential calls replay as one parallel call.
+  // StreamManager persists step boundaries only as `metadata.stepStartPartIndices`, and
+  // convertToModelMessages starts a new assistant message only at a `step-start` part. Without
+  // insertStepStartPartsForSdk, a step that opens with a tool call (no thinking block, no text;
+  // common with adaptive thinking) folded into the previous step's tool_use block: two
+  // sequential calls replayed as one parallel call and the prefix diverged at message 1.
   test("a step that opens with a tool call keeps its own assistant message", async () => {
-    await expectReproFailure(
-      () =>
-        expectNextTurnExtendsLastStep({
-          tools: { bash: plainTool("bash"), probe: plainTool("probe") },
-          firstTurn: [
-            [
-              messageStart(),
-              ...textBlock(0, "First."),
-              ...toolUseBlock(1, "call-1", "bash", { script: "a" }),
-              ...finish("tool_use"),
-            ],
-            [
-              messageStart(),
-              ...toolUseBlock(0, "call-2", "bash", { script: "b" }),
-              ...finish("tool_use"),
-            ],
-            [messageStart(), ...textBlock(0, "Done."), ...finish("end_turn")],
-          ],
-        }),
-      divergesAt(1)
-    );
+    await expectNextTurnExtendsLastStep({
+      tools: { bash: plainTool("bash"), probe: plainTool("probe") },
+      firstTurn: [
+        [
+          messageStart(),
+          ...textBlock(0, "First."),
+          ...toolUseBlock(1, "call-1", "bash", { script: "a" }),
+          ...finish("tool_use"),
+        ],
+        [
+          messageStart(),
+          ...toolUseBlock(0, "call-2", "bash", { script: "b" }),
+          ...finish("tool_use"),
+        ],
+        [messageStart(), ...textBlock(0, "Done."), ...finish("end_turn")],
+      ],
+    });
   });
 
   // A thrown tool error reaches the in-turn step as an AI SDK tool-error
