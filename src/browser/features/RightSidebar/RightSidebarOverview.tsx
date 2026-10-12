@@ -60,8 +60,8 @@ interface RightSidebarOverviewProps {
   onExpand: () => void;
   /** Reopen the full sidebar on this tab (added to the focused pane when it is not open). */
   onOpenTab: (tab: TabType) => void;
-  /** Reopen the full sidebar on a terminal tab. */
-  onOpenTerminals: () => void;
+  /** Reopen the full sidebar on a terminal tab; absent until the layout has one. */
+  onOpenTerminals?: () => void;
   /** Start a side chat; absent where side chats cannot start (a side chat itself). */
   onNewSideChat?: () => void;
   creatingSideChat: boolean;
@@ -412,15 +412,20 @@ const OverviewOutputs: React.FC<{
     sub?: string | null;
     open: () => void;
   }> = [
-    ...files.map((file) => ({
-      key: `file:${file.path}`,
-      Icon: FileText,
-      label: file.path.split("/").pop() ?? file.path,
-      open: () => {
-        openArtifact({ workspaceId: props.workspaceId, path: file.path });
-        props.onOpenTab("artifacts");
-      },
-    })),
+    ...files.map((file) => {
+      const slash = file.path.lastIndexOf("/");
+      return {
+        key: `file:${file.path}`,
+        Icon: FileText,
+        label: file.path.slice(slash + 1),
+        // The folder tells apart files of the same name (reports/summary.md, drafts/summary.md).
+        sub: slash > 0 ? file.path.slice(0, slash) : null,
+        open: () => {
+          openArtifact({ workspaceId: props.workspaceId, path: file.path });
+          props.onOpenTab("artifacts");
+        },
+      };
+    }),
     ...appViews.map((view, index) => ({
       key: `app:${view.toolCallId}`,
       Icon: TAB_ICONS.artifacts,

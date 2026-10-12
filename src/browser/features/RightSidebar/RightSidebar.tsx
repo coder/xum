@@ -1932,8 +1932,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   // Every way out of the card lands keyboard focus in the sidebar: the activated row unmounts
   // with the card, and focus would otherwise fall back to the page body.
+  // Reads the rendered layout, which drops tabs this workspace cannot show (Review without a
+  // repository), so Expand always lands on a tab that renders.
   const handleExpandFromOverview = () => {
-    handleOpenTabFromOverview(getFocusedActiveTab(getBaseLayout(), NEW_TAB));
+    handleOpenTabFromOverview(getFocusedActiveTab(layout, NEW_TAB));
   };
   // The header's stand-in for the card (where the card would cover the transcript). The ref keeps
   // the listener subscribed once per workspace while it still calls the latest handler.
@@ -1950,14 +1952,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     window.addEventListener(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, handler);
     return () => window.removeEventListener(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, handler);
   }, [workspaceId]);
-  const handleOpenTerminalsFromOverview = () => {
-    const terminal = collectAllTabs(getBaseLayout().root).find(isTerminalTab);
-    if (terminal != null) {
-      handleOpenTabFromOverview(terminal);
-    } else {
-      handleExpandFromOverview();
-    }
-  };
+  // The card's terminal count and the layout's terminal tabs sync separately (restored sessions
+  // reach the layout after the count), so the Terminals row opens only once a tab exists for it.
+  const overviewTerminalTab = collectAllTabs(layout.root).find(isTerminalTab);
 
   const handleOpenToolFromNewTab = React.useCallback(
     (tabsetId: string, tool: BaseTabType) => {
@@ -2451,7 +2448,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             workspaceId={workspaceId}
             onExpand={handleExpandFromOverview}
             onOpenTab={handleOpenTabFromOverview}
-            onOpenTerminals={handleOpenTerminalsFromOverview}
+            onOpenTerminals={
+              overviewTerminalTab != null
+                ? () => handleOpenTabFromOverview(overviewTerminalTab)
+                : undefined
+            }
             onNewSideChat={canStartSideChat ? () => handleStartSideChat() : undefined}
             creatingSideChat={creatingSideChat}
             artifactsEnabled={artifactsExperimentEnabled}

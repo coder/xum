@@ -441,7 +441,8 @@ describe("RightSidebarOverview", () => {
               entries: [
                 artifact("reports/summary.md", 4),
                 artifact("plan.md", 3),
-                artifact("notes.md", 2),
+                // Same name as the newest, in another folder.
+                artifact("drafts/summary.md", 2),
                 artifact("old.md", 1),
               ],
               truncated: false,
@@ -462,10 +463,11 @@ describe("RightSidebarOverview", () => {
       });
       const section = within(await view.findByRole("region", { name: "Outputs" }));
       const rows = section.getAllByRole("button");
+      // Rows show the file name, and the folder under it so same-named files read apart.
       expect(rows.map((row) => row.textContent)).toEqual([
-        "summary.md",
+        "summary.mdreports",
         "plan.md",
-        "notes.md",
+        "summary.mddrafts",
         "1 more",
       ]);
 
