@@ -161,11 +161,18 @@ interface ChatPaneProps {
   onOpenTerminal: (options?: TerminalSessionCreateOptions) => void;
   /** Hide + inactivate chat pane while immersive review overlay is active. */
   immersiveHidden?: boolean;
+  /** Phones: show the hidden right sidebar full-screen (see WorkspaceShell). */
+  onOpenSidebar?: (returnFocusTo: HTMLElement | null) => void;
+  sidebarFullscreen?: boolean;
 }
 
 export type ChatPaneContentProps = Omit<
   ChatPaneProps,
-  "leftSidebarCollapsed" | "onToggleLeftSidebarCollapsed" | "immersiveHidden"
+  | "leftSidebarCollapsed"
+  | "onToggleLeftSidebarCollapsed"
+  | "immersiveHidden"
+  | "onOpenSidebar"
+  | "sidebarFullscreen"
 > & {
   /**
    * Rendered inside another surface (the /side chat tab in the right sidebar) rather than as
@@ -295,6 +302,8 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
               namedWorkspacePath={props.namedWorkspacePath}
               runtimeConfig={props.runtimeConfig}
               onOpenTerminal={props.onOpenTerminal}
+              onOpenSidebar={props.onOpenSidebar}
+              sidebarFullscreen={props.sidebarFullscreen}
             />
           </PerfRenderMarker>
 

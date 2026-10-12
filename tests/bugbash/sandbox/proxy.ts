@@ -48,7 +48,8 @@ const RESPONSE_HEADERS = /^(content-type|request-id|retry-after|anthropic-rateli
 
 /** One line per call for the launcher log. */
 export interface CallRecord {
-  outcome: "refused" | "settled" | "kept";
+  /** released: the upstream could not be reached, so the call never left the host ($0). */
+  outcome: "refused" | "settled" | "kept" | "released";
   /** The settled usage cost more than the reservation: the cost model is wrong. */
   boundExceeded?: true;
   status: number;
@@ -128,7 +129,7 @@ export async function startProxy(options: ProxyOptions) {
   }
   const deadlineMs = options.deadlineMs ?? DEADLINE_MS;
   const calls = new Set<{ abort: AbortController; done: Promise<void> }>();
-  const counts = { refused: 0, settled: 0, kept: 0, boundExceeded: 0 };
+  const counts = { refused: 0, settled: 0, kept: 0, released: 0, boundExceeded: 0 };
   /**
    * Refusals per category: the reason up to its first quoted (container-chosen) name, so the
    * keys come from the fixed reason texts of this file and proxyPolicy.ts and stay few.
@@ -188,6 +189,7 @@ export async function startProxy(options: ProxyOptions) {
     let usage: unknown;
     let status = 502;
     let reason: string | undefined;
+    let unreachable = false;
     try {
       const upstream = await fetch(`${options.upstream.baseUrl}/v1/messages`, {
         method: "POST",
@@ -227,14 +229,23 @@ export async function startProxy(options: ProxyOptions) {
       if (status !== 200 || abort.signal.aborted) return;
       if (sse) usage = parser.stopped && !parser.lowered ? parser.usage : undefined;
       else usage = (JSON.parse(Buffer.concat(json).toString()) as { usage?: unknown }).usage;
-    } catch {
+    } catch (error) {
       // Fixed texts only: fetch errors can name the upstream host and other details.
-      reason = abort.signal.aborted ? "aborted: deadline, client or close" : "upstream: failed";
+      unreachable = !abort.signal.aborted && !res.headersSent && noConnection(error);
+      reason = abort.signal.aborted
+        ? "aborted: deadline, client or close"
+        : unreachable
+          ? UNREACHABLE
+          : "upstream: failed";
       if (!res.headersSent && !res.destroyed) reply(502, reason);
       else res.destroy();
     } finally {
       const record = { model, status, reason, reservedNanoUsd: maxCostNanoUsd };
-      if (usage === undefined) {
+      if (unreachable) {
+        // No connection, so no request reached the provider: nothing to pay for.
+        options.ledger.release(id);
+        log({ outcome: "released", ...record });
+      } else if (usage === undefined) {
         options.ledger.keep(id);
         log({ outcome: "kept", ...record });
       } else {
@@ -393,6 +404,22 @@ export async function startProxy(options: ProxyOptions) {
     },
     stats: () => ({ ...counts, inFlight: calls.size, refusedBy: { ...refusedBy } }),
   };
+}
+
+/** The reason of a released call: the launcher turns it into "cannot reach ANTHROPIC_BASE_URL". */
+export const UNREACHABLE = "upstream: unreachable";
+
+/**
+ * Connection errors that come before any request byte is sent: Bun's fetch reports a refused
+ * connection and a failed DNS lookup as ConnectionRefused, Node's as a cause with an errno.
+ * A reset or a close after the connection is not here: the provider may have the request.
+ */
+const NO_CONNECTION = new Set(["ConnectionRefused", "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]);
+function noConnection(error: unknown): boolean {
+  const code = (e: unknown) => (e as { code?: unknown } | null)?.code;
+  return [code(error), code((error as { cause?: unknown } | null)?.cause)].some(
+    (c) => typeof c === "string" && NO_CONNECTION.has(c)
+  );
 }
 
 function replyError(res: http.ServerResponse, status: number, message: string) {
