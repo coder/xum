@@ -139,6 +139,11 @@ import {
   HEADLESS_USAGE_FILE_NAME,
 } from "@/common/constants/paths";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import {
+  normalizeRepoRootProjectPath,
+  resolveExecuteBashScript,
+  selectRepoRootProject,
+} from "@/node/services/executeBashTargets";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { generateGitStatusScript, parseGitStatusScriptOutput } from "@/common/utils/git/gitStatus";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
@@ -153,7 +158,6 @@ import {
   type PlanFileLocation,
 } from "@/node/utils/runtime/planLocation";
 import { detectDefaultTrunkBranch, listLocalBranches } from "@/node/git";
-import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { extractEditedFilePaths } from "@/common/utils/messages/extractEditedFiles";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import {
@@ -1117,15 +1121,6 @@ function registrationErrorWithLeftovers(
 ): unknown {
   if (rollback == null || rollback.leftovers.length === 0) return error;
   return new Error(withRollbackLeftovers(getErrorMessage(error), rollback.leftovers));
-}
-
-function normalizeRepoRootProjectPath(projectPath: string | null | undefined): string {
-  const normalizedPath = projectPath?.replaceAll("\\", "/").trim() ?? "";
-  if (!normalizedPath) {
-    return "";
-  }
-
-  return stripTrailingSlashes(path.posix.normalize(normalizedPath));
 }
 
 function buildArchiveLossyUntrackedFilesConfirmation(
@@ -20686,17 +20681,11 @@ export class WorkspaceService
       // Read trust state so tool_env is sourced only when the shared execution environment is trusted.
       const configSnapshot = this.config.loadConfigOrDefault();
 
-      let scriptToExecute = script;
-      if (command != null) {
-        if (command !== "git") {
-          return Err("executeBash command mode only supports git");
-        }
-
-        const commandArgs = args ?? [];
-        scriptToExecute = [shellQuote(command), ...commandArgs.map((arg) => shellQuote(arg))].join(
-          " "
-        );
+      const scriptResult = resolveExecuteBashScript(script, command, args);
+      if (!scriptResult.success) {
+        return Err(scriptResult.error);
       }
+      const scriptToExecute = scriptResult.data;
 
       // Multi-project script mode must stay at the shared container root so sibling repos remain
       // addressable even when task/child workspaces persist their primary-project checkout path.
@@ -20718,17 +20707,11 @@ export class WorkspaceService
         assert(cwdForExecution?.length, "Single-project repo-root execution requires a repo cwd");
       }
       if (multiProjectRuntimes && requiresRepoRootCwd) {
-        const repoRootRuntime = requestedRepoRootProjectPath
-          ? multiProjectRuntimes.find(
-              (runtimeEntry) =>
-                normalizeRepoRootProjectPath(runtimeEntry.projectPath) ===
-                requestedRepoRootProjectPath
-            )
-          : (multiProjectRuntimes.find(
-              (runtimeEntry) =>
-                normalizeRepoRootProjectPath(runtimeEntry.projectPath) ===
-                normalizeRepoRootProjectPath(metadata.projectPath)
-            ) ?? multiProjectRuntimes[0]);
+        const repoRootRuntime = selectRepoRootProject(
+          multiProjectRuntimes,
+          requestedRepoRootProjectPath,
+          metadata.projectPath
+        );
         if (!repoRootRuntime) {
           return Err(
             requestedRepoRootProjectPath
