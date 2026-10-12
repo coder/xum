@@ -2,12 +2,13 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, within } from "@storybook/test";
 
 import { lightweightMeta } from "@/browser/stories/meta.js";
+import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
 import type { TurnCacheHealth } from "@/common/utils/tokens/cacheHealth";
 import { PromptCacheHealth } from "./PromptCacheHealth";
 
 const MINUTE = 60_000;
-// Relative to render time so the "Nm ago" labels stay stable across snapshot runs.
-const now = Date.now();
+// The table shows absolute times, so a fixed timestamp keeps snapshots stable.
+const now = STABLE_TIMESTAMP;
 
 const TURNS: TurnCacheHealth[] = [
   {

@@ -1,5 +1,5 @@
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
-import { formatRelativeTimeCompact } from "@/browser/utils/ui/dateTime";
+import { formatTimestamp } from "@/browser/utils/ui/dateTime";
 import type { CacheHealth, TurnCacheHealth } from "@/common/utils/tokens/cacheHealth";
 import { formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
 import { formatCostWithDollar } from "@/common/utils/tokens/usageAggregator";
@@ -76,7 +76,8 @@ export function PromptCacheHealth(props: PromptCacheHealthProps) {
               <tr key={turn.messageId}>
                 <td className="text-foreground py-1 pr-2">
                   <span className="flex items-center gap-1.5 whitespace-nowrap">
-                    {turn.timestamp === undefined ? "-" : formatRelativeTimeCompact(turn.timestamp)}
+                    {/* Absolute time: a relative label would go stale while the tab stays open. */}
+                    {turn.timestamp === undefined ? "-" : formatTimestamp(turn.timestamp)}
                     {turn.coldStart && <span className="text-warning">cold</span>}
                   </span>
                 </td>
