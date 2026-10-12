@@ -25,6 +25,8 @@ interface SkillIndicatorProps {
   unavailableSources?: AgentSkillUnavailableSource[];
   /** Runtime skill load failures (agent_skill_read returned an error) */
   skillLoadErrors?: SkillLoadError[];
+  /** The skill list has not answered yet: keep the button's slot so the header does not shift. */
+  loading?: boolean;
   className?: string;
 }
 
@@ -215,7 +217,11 @@ export const SkillIndicator: React.FC<SkillIndicatorProps> = (props) => {
 
   // Don't render if there's nothing to show.
   if (totalCount === 0 && errorCount === 0) {
-    return null;
+    // While the list loads, hold the button's slot: the header's right-aligned group would
+    // otherwise move every button before this one when the list arrives, under the pointer (#6221).
+    return props.loading ? (
+      <span aria-hidden="true" className={cn("h-6 w-6 shrink-0", props.className)} />
+    ) : null;
   }
 
   const ariaLabelParts: string[] = [];

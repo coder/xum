@@ -73,7 +73,7 @@ import {
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
 import type { TabType } from "@/browser/types/rightSidebar";
-import { useAgentSkills } from "@/browser/stores/AgentSkillsStore";
+import { useAgentSkills, useAgentSkillsLoaded } from "@/browser/stores/AgentSkillsStore";
 
 interface WorkspaceMenuBarProps {
   workspaceId: string;
@@ -187,6 +187,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   }
   const unrelatedMessagingModalOpen = unrelatedMessagingWorkspaceId === workspaceId;
   const skillList = useAgentSkills({ workspaceId, disableWorkspaceAgents: false });
+  const skillListLoaded = useAgentSkillsLoaded({ workspaceId, disableWorkspaceAgents: false });
   const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuBarRef = useRef<HTMLDivElement | null>(null);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
@@ -930,6 +931,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           invalidSkills={skillList.invalidSkills}
           unavailableSources={skillList.unavailableSources}
           skillLoadErrors={skillLoadErrors}
+          loading={!skillListLoaded}
         />
         {editorError && <span className="text-danger-soft text-xs">{editorError}</span>}
         <div className="max-[480px]:hidden">
