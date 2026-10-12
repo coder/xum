@@ -34,6 +34,7 @@ import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { getAuthenticPlanReviewRecord } from "@/common/utils/planReview/planReviewEnvelope";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
+import { parseAskUserQuestionAnswerMetadata } from "@/common/utils/tools/askUserQuestionSummary";
 
 /**
  * Check if a tool result indicates success (for tools that return { success: boolean })
@@ -448,6 +449,7 @@ function buildUserDisplayedMessages(options: {
       compactionRequest,
       reviews: muxMeta?.reviews,
       artifactInteraction: toArtifactInteractionDisplay(muxMeta?.artifactInteraction),
+      askUserQuestionAnswer: parseAskUserQuestionAnswerMetadata(muxMeta?.askUserQuestionAnswer),
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
       // Only genuine machine rows get collapsed; corrupted metadata must not hide human input.
       contextBudgetWarning:

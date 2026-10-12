@@ -145,6 +145,8 @@ export type SkillsCatalogReadToolResult =
 export interface AskUserQuestionUiOnlyPayload {
   questions: AskUserQuestionQuestion[];
   answers: Record<string, string>;
+  /** "message": asked without waiting; answers arrive later as a steering user message. */
+  answerDelivery?: "message";
 }
 
 export interface FileEditUiOnlyPayload {

@@ -15,6 +15,34 @@ interface PendingAskUserQuestionInternal extends PendingAskUserQuestion {
 
 export class AskUserQuestionManager {
   private pendingByWorkspace = new Map<string, Map<string, PendingAskUserQuestionInternal>>();
+  /**
+   * Non-blocking questions asked by this process and not yet answered. A live stream's tool
+   * output may not have reached partial.json yet, so answering checks here first; after a
+   * restart this is empty and the persisted tool output identifies the question instead.
+   */
+  private asyncByWorkspace = new Map<string, Set<string>>();
+
+  registerAsync(workspaceId: string, toolCallId: string): void {
+    assert(workspaceId.length > 0, "workspaceId must be non-empty");
+    assert(toolCallId.length > 0, "toolCallId must be non-empty");
+    let toolCallIds = this.asyncByWorkspace.get(workspaceId);
+    if (!toolCallIds) {
+      toolCallIds = new Set();
+      this.asyncByWorkspace.set(workspaceId, toolCallIds);
+    }
+    toolCallIds.add(toolCallId);
+  }
+
+  hasAsync(workspaceId: string, toolCallId: string): boolean {
+    return this.asyncByWorkspace.get(workspaceId)?.has(toolCallId) === true;
+  }
+
+  deleteAsync(workspaceId: string, toolCallId: string): void {
+    const toolCallIds = this.asyncByWorkspace.get(workspaceId);
+    if (!toolCallIds) return;
+    toolCallIds.delete(toolCallId);
+    if (toolCallIds.size === 0) this.asyncByWorkspace.delete(workspaceId);
+  }
 
   registerPending(
     workspaceId: string,

@@ -562,6 +562,13 @@ export interface ArtifactInteractionMetadata {
   data?: unknown;
 }
 
+/** Answers to a non-blocking ask_user_question, delivered as a user message. */
+export interface AskUserQuestionAnswerMetadata {
+  toolCallId: string;
+  /** Keyed by question text; an empty string means the user skipped that question. */
+  answers: Record<string, string>;
+}
+
 /** Base fields common to all metadata types */
 interface MuxMessageMetadataBase {
   /** Correlates a rollover continuation without replacing its original attribution. */
@@ -570,6 +577,11 @@ interface MuxMessageMetadataBase {
   reviews?: ReviewNoteDataForDisplay[];
   /** Set by the backend only: this user message came from an artifact (Artifacts M5b). */
   artifactInteraction?: ArtifactInteractionMetadata;
+  /**
+   * Set by the backend only: this user message delivers the answers to a non-blocking
+   * ask_user_question (answerDelivery "message"). The question card reads it to show the answers.
+   */
+  askUserQuestionAnswer?: AskUserQuestionAnswerMetadata;
   /** Command prefix to highlight in UI (e.g., "/compact -m sonnet" or "/react-effects") */
   commandPrefix?: string;
   /**
@@ -1361,6 +1373,8 @@ export type DisplayedMessage =
       reviews?: ReviewNoteDataForDisplay[];
       /** Message sent from an artifact (from muxMetadata); drives the "from artifact" pill. */
       artifactInteraction?: ArtifactInteractionMetadata;
+      /** Answers to a non-blocking ask_user_question (from muxMetadata). */
+      askUserQuestionAnswer?: AskUserQuestionAnswerMetadata;
       /** Present when this synthetic turn is a background bash monitor wake-up. */
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];

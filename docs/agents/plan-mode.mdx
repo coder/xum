@@ -89,6 +89,9 @@ After these steps, each root has its own tree, and a clear in one leaves the oth
 
 In Plan and Exec modes, the agent may call `ask_user_question` to ask up to 4 structured multiple-choice questions when it needs clarification (for example, before finalizing a plan or when an implementation choice depends on your preference).
 
+- **Plan Mode** waits for your answers before it continues.
+- **Exec Mode** does not wait. The agent keeps working on its best assumption, and the questions stay open in the chat. When you submit answers, Xum sends them to the agent as a message after its current step, or starts a new turn if the agent has already finished. Typing a normal chat message does not cancel these questions.
+
 What you’ll see:
 
 - An inline “tool call card” in the chat with a small form (single-select or multi-select).
@@ -97,7 +100,7 @@ What you’ll see:
 How to respond:
 
 - **Recommended:** answer in the form and click **Submit answers**.
-- **Optional:** you can also just type a normal chat message. This will **cancel** the pending `ask_user_question` tool call and your message will be sent as a regular chat message.
+- **Optional (Plan Mode):** you can also just type a normal chat message. This will **cancel** the pending `ask_user_question` tool call and your message will be sent as a regular chat message.
 
 Availability:
 

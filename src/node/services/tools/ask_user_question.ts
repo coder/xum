@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { tool } from "ai";
 
 import type { AskUserQuestionToolResult } from "@/common/types/tools";
-import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestionSummary";
+import {
+  ASK_USER_QUESTION_ASYNC_SUMMARY,
+  buildAskUserQuestionSummary,
+} from "@/common/utils/tools/askUserQuestionSummary";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { askUserQuestionManager } from "@/node/services/askUserQuestionManager";
@@ -29,6 +32,24 @@ export const createAskUserQuestionTool: ToolFactory = (config: ToolConfiguration
 
       assert(config.workspaceId, "ask_user_question requires a workspaceId");
       assert(toolCallId, "ask_user_question requires toolCallId");
+
+      // Codex-style flow outside plan agents: return at once so the agent keeps working with its
+      // best judgment. The card stays answerable, and WorkspaceService.answerAskUserQuestion
+      // delivers the answers as a steering user message (after the current step, or as a new turn
+      // when idle). Plan agents still block: their next step is a plan that needs the answers.
+      if (config.planFileOnly !== true) {
+        askUserQuestionManager.registerAsync(config.workspaceId, toolCallId);
+        return {
+          summary: ASK_USER_QUESTION_ASYNC_SUMMARY,
+          ui_only: {
+            ask_user_question: {
+              questions: args.questions,
+              answers: {},
+              answerDelivery: "message",
+            },
+          },
+        };
+      }
 
       const pendingPromise = askUserQuestionManager.registerPending(
         config.workspaceId,

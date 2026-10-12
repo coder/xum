@@ -267,7 +267,13 @@ import type {
   WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import { isDynamicToolPart } from "@/common/types/toolParts";
-import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestionSummary";
+import {
+  ASK_USER_QUESTION_ANSWER_DEDUPE_PREFIX,
+  buildAskUserQuestionAnswerMessage,
+  buildAskUserQuestionSummary,
+  isAsyncAskUserQuestionOutput,
+  parseAskUserQuestionAnswerMetadata,
+} from "@/common/utils/tools/askUserQuestionSummary";
 import {
   AskUserQuestionToolArgsSchema,
   AskUserQuestionToolResultSchema,
@@ -17384,6 +17390,17 @@ export class WorkspaceService
       askUserQuestionManager.answer(workspaceId, toolCallId, answers);
       return Ok(undefined);
     } catch (error) {
+      // Non-blocking questions have no pending entry by design: their answers reach the agent
+      // as a steering message, not as the (already returned) tool result.
+      const asyncDelivery = await this.tryDeliverAsyncAskUserQuestionAnswer(
+        workspaceId,
+        toolCallId,
+        answers
+      );
+      if (asyncDelivery != null) {
+        return asyncDelivery;
+      }
+
       // Fallback path: app restart (or other process death) means the in-memory
       // AskUserQuestionManager has no pending entry anymore.
       //
@@ -17569,6 +17586,69 @@ export class WorkspaceService
         return Err(errorMessage);
       }
     }
+  }
+
+  /**
+   * Codex-style answers to a non-blocking ask_user_question (answerDelivery "message"): send them
+   * as a user message with the "tool-end" queue mode, so they steer the running turn after its
+   * current step, or start a turn when the workspace is idle. Returns null when the tool call is
+   * not a non-blocking question, so the caller falls back to the blocking-question paths.
+   */
+  private async tryDeliverAsyncAskUserQuestionAnswer(
+    workspaceId: string,
+    toolCallId: string,
+    answers: Record<string, string>
+  ): Promise<Result<void> | null> {
+    if (!askUserQuestionManager.hasAsync(workspaceId, toolCallId)) {
+      // After a restart (or once answered) the registry has no entry: the persisted tool output
+      // identifies the question, and a delivered answer in history makes a repeat an error.
+      const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!historyResult.success) {
+        return null;
+      }
+      const partial = await this.historyService.readPartial(workspaceId);
+      const messages = partial ? [...historyResult.data, partial] : historyResult.data;
+      const isAsyncQuestion = messages.some((message) =>
+        message.parts.some(
+          (part) =>
+            isDynamicToolPart(part) &&
+            part.toolCallId === toolCallId &&
+            part.toolName === "ask_user_question" &&
+            part.state === "output-available" &&
+            isAsyncAskUserQuestionOutput(part.output)
+        )
+      );
+      if (!isAsyncQuestion) {
+        return null;
+      }
+      const alreadyAnswered = messages.some(
+        (message) =>
+          message.role === "user" &&
+          parseAskUserQuestionAnswerMetadata(message.metadata?.muxMetadata?.askUserQuestionAnswer)
+            ?.toolCallId === toolCallId
+      );
+      if (alreadyAnswered) {
+        return Err("These questions were already answered");
+      }
+    }
+
+    const sendOptions = await this.getDefaultSendOptions(workspaceId);
+    const sendResult = await this.sendMessage(
+      workspaceId,
+      buildAskUserQuestionAnswerMessage(answers),
+      {
+        ...sendOptions,
+        queueDispatchMode: "tool-end",
+        muxMetadata: { type: "normal", askUserQuestionAnswer: { toolCallId, answers } },
+      },
+      // A repeat while the first answer is still queued is a quiet no-op.
+      { queueDedupeKey: `${ASK_USER_QUESTION_ANSWER_DEDUPE_PREFIX}${toolCallId}` }
+    );
+    if (!sendResult.success) {
+      return Err(this.formatSendMessageError(sendResult.error));
+    }
+    askUserQuestionManager.deleteAsync(workspaceId, toolCallId);
+    return Ok(undefined);
   }
 
   answerDelegatedToolCall(workspaceId: string, toolCallId: string, result: unknown): Result<void> {

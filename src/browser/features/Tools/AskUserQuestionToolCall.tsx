@@ -34,6 +34,8 @@ import type {
   ToolErrorResult,
 } from "@/common/types/tools";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
+import { isAsyncAskUserQuestionOutput } from "@/common/utils/tools/askUserQuestionSummary";
+import type { DisplayedUserMessage } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 
@@ -225,14 +227,6 @@ export function AskUserQuestionToolCall(props: {
 }): JSX.Element {
   const { api } = useAPI();
 
-  // A live, blocking question must never be hidden behind a collapsed "tools"
-  // preference, so force it open while executing. forceExpanded only overrides the
-  // initial seed; once answered the row follows the sticky preference like any tool.
-  const { expanded, toggleExpanded } = useToolExpansion(false, {
-    forceExpanded: props.status === "executing",
-  });
-  const statusDisplay = getStatusDisplay(props.status);
-
   const argsAnswers = props.args.answers ?? {};
 
   // Restore from cache if available (survives workspace switches)
@@ -241,6 +235,9 @@ export function AskUserQuestionToolCall(props: {
   const [activeIndex, setActiveIndex] = useState(() => cachedState?.activeIndex ?? 0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // Non-blocking questions: answers accepted by the backend but not yet in history (queued
+  // behind the running step), so the card stops offering the form right away.
+  const [submittedAnswers, setSubmittedAnswers] = useState<Record<string, string> | null>(null);
 
   const workspaceStore = useWorkspaceStoreRaw();
   const workspaceState = useSyncExternalStore(
@@ -265,6 +262,26 @@ export function AskUserQuestionToolCall(props: {
       }
     }
   );
+
+  // Codex-style questions (non-plan agents) returned without waiting: the tool is complete, but
+  // the questions stay answerable until an answer message for this tool call exists.
+  const isAsyncQuestion = isAsyncAskUserQuestionOutput(props.result);
+  const deliveredAnswers = isAsyncQuestion
+    ? (workspaceState?.messages.find(
+        (message): message is DisplayedUserMessage =>
+          message.type === "user" && message.askUserQuestionAnswer?.toolCallId === props.toolCallId
+      )?.askUserQuestionAnswer?.answers ?? submittedAnswers)
+    : null;
+  const isAnswering = props.status === "executing" || (isAsyncQuestion && deliveredAnswers == null);
+
+  // A question awaiting answers must never be hidden behind a collapsed "tools"
+  // preference, so force it open while answerable. forceExpanded only overrides the
+  // initial seed; once answered the row follows the sticky preference like any tool.
+  const { expanded, toggleExpanded } = useToolExpansion(false, {
+    forceExpanded: isAnswering,
+  });
+  const statusDisplay = getStatusDisplay(props.status);
+
   const autoRetryRollbackWorkspaceIdRef = useRef<string | null>(null);
   const autoRetryRollbackPendingRef = useRef(false);
   const autoRetryRollbackArmedRef = useRef(false);
@@ -392,13 +409,13 @@ export function AskUserQuestionToolCall(props: {
 
   // Sync draft state to cache so it survives workspace switches
   useEffect(() => {
-    if (props.status === "executing") {
+    if (isAnswering) {
       draftStateCache.set(props.toolCallId, { draftAnswers, activeIndex });
     } else {
-      // Clean up cache when tool completes
+      // Clean up cache once the questions are answered (or the tool failed)
       draftStateCache.delete(props.toolCallId);
     }
-  }, [props.toolCallId, props.status, draftAnswers, activeIndex]);
+  }, [props.toolCallId, isAnswering, draftAnswers, activeIndex]);
 
   const resultUnwrapped = useMemo(() => {
     if (!props.result) {
@@ -410,9 +427,15 @@ export function AskUserQuestionToolCall(props: {
 
   const uiOnlyPayload = getToolOutputUiOnly(resultUnwrapped)?.ask_user_question;
 
-  const successResult =
+  const toolResultPayload =
     uiOnlyPayload ??
     (resultUnwrapped && isAskUserQuestionPayload(resultUnwrapped) ? resultUnwrapped : null);
+  // A non-blocking question's tool result carries no answers; they come from the answer message.
+  const successResult = isAsyncQuestion
+    ? deliveredAnswers != null
+      ? { questions: props.args.questions, answers: deliveredAnswers }
+      : null
+    : toolResultPayload;
 
   const errorResult =
     resultUnwrapped && isToolErrorResult(resultUnwrapped) ? resultUnwrapped : null;
@@ -431,10 +454,10 @@ export function AskUserQuestionToolCall(props: {
 
   // Focus submit button when reaching summary so Enter submits
   useEffect(() => {
-    if (props.status === "executing" && isOnSummary) {
+    if (isAnswering && isOnSummary) {
       submitButtonRef.current?.focus();
     }
-  }, [isOnSummary, props.status]);
+  }, [isOnSummary, isAnswering]);
 
   const currentQuestion = isOnSummary
     ? null
@@ -486,6 +509,13 @@ export function AskUserQuestionToolCall(props: {
       .then(async (result) => {
         if (!result.success) {
           setSubmitError(result.error);
+          return;
+        }
+
+        // The backend already sent the answers as a steering message (it starts a turn when
+        // idle); there is no blocked stream to resume.
+        if (isAsyncQuestion) {
+          setSubmittedAnswers(answers);
           return;
         }
 
@@ -577,9 +607,11 @@ export function AskUserQuestionToolCall(props: {
         <ToolIcon toolName="ask_user_question" />
         <div className="flex min-w-0 flex-1 flex-col">
           <ToolName>{title}</ToolName>
-          {props.status === "executing" && (
+          {isAnswering && (
             <div className="text-secondary text-[10px] leading-tight">
-              Answer below, or type a message in chat to cancel.
+              {isAsyncQuestion
+                ? "The agent keeps working; your answers reach it after its current step."
+                : "Answer below, or type a message in chat to cancel."}
             </div>
           )}
         </div>
@@ -589,7 +621,7 @@ export function AskUserQuestionToolCall(props: {
       {expanded && (
         <ToolDetails>
           <div className="flex flex-col gap-3">
-            {props.status === "executing" && (
+            {isAnswering && (
               <div className="flex flex-col gap-3">
                 <div className="flex flex-wrap items-center gap-1.5">
                   {props.args.questions.map((q, idx) => {
@@ -848,7 +880,7 @@ export function AskUserQuestionToolCall(props: {
               </div>
             )}
 
-            {props.status !== "executing" && (
+            {!isAnswering && (
               <div className="flex flex-col gap-2">
                 {successResult && (
                   <div className="flex flex-col gap-1.5">
@@ -890,10 +922,12 @@ export function AskUserQuestionToolCall(props: {
               </div>
             )}
 
-            {props.status === "executing" && (
+            {isAnswering && (
               <div className="flex items-center justify-between gap-3 border-t border-white/5 pt-2">
                 <div className="text-muted min-w-0 flex-1 text-[10px] italic">
-                  Tip: type a message in chat to cancel these questions.
+                  {isAsyncQuestion
+                    ? "Your answers are sent to the agent as a message."
+                    : "Tip: type a message in chat to cancel these questions."}
                 </div>
                 {isOnSummary ? (
                   <Button

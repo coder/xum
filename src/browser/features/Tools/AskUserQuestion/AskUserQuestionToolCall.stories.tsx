@@ -171,6 +171,55 @@ export const AskUserQuestionCompleted: AppStory = {
 };
 
 /**
+ * Non-blocking (Exec) question: the tool already returned and the agent kept working, but the
+ * questions stay answerable; answers are delivered later as a steering message.
+ */
+export const AskUserQuestionNonBlocking: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const questions = [
+          {
+            question: "Which approach should we take?",
+            header: "Approach",
+            options: [
+              { label: "A", description: "Approach A" },
+              { label: "B", description: "Approach B" },
+            ],
+            multiSelect: false,
+          },
+        ];
+        return setupSimpleChatStory({
+          messages: [
+            createUserMessage("msg-1", "Please implement the feature", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 60000,
+            }),
+            createAssistantMessage("msg-2", "Assuming approach A while you decide.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 55000,
+              toolCalls: [
+                createGenericTool(
+                  "call-ask-async",
+                  "ask_user_question",
+                  { questions },
+                  {
+                    summary: "Questions shown to the user.",
+                    ui_only: {
+                      ask_user_question: { questions, answers: {}, answerDelivery: "message" },
+                    },
+                  }
+                ),
+              ],
+            }),
+          ],
+        });
+      }}
+    />
+  ),
+};
+
+/**
  * Test "Other" option with auto-resizing textarea.
  * Shows the textarea expanded with multi-line content to demonstrate auto-resize.
  */

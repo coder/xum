@@ -148,6 +148,12 @@ export const AskUserQuestionQuestionSchema = z
 const AskUserQuestionUiOnlySchema = z.object({
   questions: z.array(AskUserQuestionQuestionSchema),
   answers: z.record(z.string(), z.string()),
+  /**
+   * "message": the tool returned without waiting (non-plan agents keep working, Codex-style).
+   * The questions stay answerable in the UI, and the answers reach the agent later as a steering
+   * user message instead of as this tool's result. Absent: a blocking question, answered in place.
+   */
+  answerDelivery: z.literal("message").optional(),
 });
 
 const ToolOutputUiOnlySchema = z.object({
@@ -2938,7 +2944,8 @@ export const TOOL_DEFINITIONS = {
   ask_user_question: {
     ptcExcluded: "Requires UI interaction",
     description:
-      "Ask multiple-choice questions and wait for the answers. " +
+      "Ask multiple-choice questions. Plan mode waits for the answers; other modes return at once " +
+      "and the answers arrive later as a user message, so keep working on your best assumption. " +
       "ONLY for genuinely balanced decisions hinging on user context or preference absent from the conversation and repo; if one option is clearly best, proceed with it and state the assumption. " +
       "Keep options open (no 'recommended' pick). Ask open questions here, not as a text list. 'Other' is added automatically.",
     schema: AskUserQuestionToolArgsSchema,

@@ -23,7 +23,11 @@ let currentWorkspaceState: {
   autoRetryStatus: { type: "auto-retry-scheduled" | "auto-retry-starting" } | null;
   isStreamStarting: boolean;
   canInterrupt: boolean;
-  messages: Array<{ type: string; compactionRequest?: { parsed: unknown } }>;
+  messages: Array<{
+    type: string;
+    compactionRequest?: { parsed: unknown };
+    askUserQuestionAnswer?: { toolCallId: string; answers: Record<string, string> };
+  }>;
 } = {
   autoRetryStatus: null,
   isStreamStarting: false,
@@ -291,6 +295,80 @@ describe("AskUserQuestionToolCall", () => {
       workspaceId: "ws-ask",
       enabled: false,
       persist: false,
+    });
+  });
+
+  describe("non-blocking questions", () => {
+    const questions = [
+      {
+        header: "Choice",
+        question: "Which option?",
+        options: [
+          { label: "First", description: "Use first" },
+          { label: "Second", description: "Use second" },
+        ],
+        multiSelect: false,
+      },
+    ];
+    const asyncResult = {
+      summary: "Questions shown to the user.",
+      ui_only: {
+        ask_user_question: { questions, answers: {}, answerDelivery: "message" as const },
+      },
+    };
+
+    function renderAsyncQuestion() {
+      return renderWithProviders(
+        <AskUserQuestionToolCall
+          args={{ questions }}
+          result={asyncResult}
+          status="completed"
+          toolCallId="ask-async"
+          workspaceId="ws-ask"
+        />
+      );
+    }
+
+    test("stays answerable after the tool completes and does not resume a stream", async () => {
+      const view = renderAsyncQuestion();
+
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+      await waitFor(() => {
+        expect(answerAskUserQuestion).toHaveBeenCalledWith({
+          workspaceId: "ws-ask",
+          toolCallId: "ask-async",
+          answers: { "Which option?": "First" },
+        });
+        expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
+      });
+      expect(view.getByText("User answered")).toBeTruthy();
+      // The backend delivered the answers as a message: there is no blocked stream to resume.
+      expect(resumeStream).not.toHaveBeenCalled();
+      expect(setAutoRetryEnabled).not.toHaveBeenCalled();
+    });
+
+    test("shows the answers delivered in a later user message", () => {
+      currentWorkspaceState = {
+        ...currentWorkspaceState,
+        messages: [
+          {
+            type: "user",
+            askUserQuestionAnswer: {
+              toolCallId: "ask-async",
+              answers: { "Which option?": "Second" },
+            },
+          },
+        ],
+      };
+
+      const view = renderAsyncQuestion();
+      // Answered questions follow the collapsed tool preference; expand to read the answers.
+      fireEvent.click(view.getByText("ask_user_question"));
+
+      expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
+      expect(view.getByText("Second")).toBeTruthy();
     });
   });
 });
