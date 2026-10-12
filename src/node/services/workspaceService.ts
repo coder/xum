@@ -10287,12 +10287,7 @@ export class WorkspaceService
 
       const enrichedMetadata = this.enrichFrontendMetadata(updatedMetadata);
 
-      const session = this.sessions.get(workspaceId);
-      if (session) {
-        session.emitMetadata(enrichedMetadata);
-      } else {
-        this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
-      }
+      this.publishWorkspaceMetadata(workspaceId, enrichedMetadata);
       const sharedDescendantIds = allMetadataUpdated
         .filter(
           (metadata) =>
@@ -10338,6 +10333,19 @@ export class WorkspaceService
     }
   }
 
+  /** Deliver workspace metadata through the workspace's session when one exists, else on the bus. */
+  private publishWorkspaceMetadata(
+    workspaceId: string,
+    metadata: FrontendWorkspaceMetadata | null
+  ): void {
+    const session = this.sessions.get(workspaceId);
+    if (session) {
+      session.emitMetadata(metadata);
+    } else {
+      this.emit("metadata", { workspaceId, metadata });
+    }
+  }
+
   private async emitCurrentWorkspaceMetadata(workspaceId: string): Promise<void> {
     await this.emitCurrentWorkspaceMetadataBatch([workspaceId]);
   }
@@ -10353,12 +10361,7 @@ export class WorkspaceService
       const enrichedMetadata = this.enrichMaybeFrontendMetadata(
         metadataById.get(workspaceId) ?? null
       );
-      const session = this.sessions.get(workspaceId);
-      if (session) {
-        session.emitMetadata(enrichedMetadata);
-      } else {
-        this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
-      }
+      this.publishWorkspaceMetadata(workspaceId, enrichedMetadata);
     }
   }
 
@@ -12218,12 +12221,7 @@ export class WorkspaceService
           const updatedMetadata = allMetadata.find((m) => m.id === workspaceId);
           if (updatedMetadata) {
             const enrichedMetadata = this.enrichFrontendMetadata(updatedMetadata);
-            const session = this.sessions.get(workspaceId);
-            if (session) {
-              session.emitMetadata(enrichedMetadata);
-            } else {
-              this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
-            }
+            this.publishWorkspaceMetadata(workspaceId, enrichedMetadata);
           }
         } catch (error) {
           log.debug("Failed to emit metadata after init cancellation during archive", {
@@ -12560,12 +12558,7 @@ export class WorkspaceService
       const updatedMetadata = allMetadata.find((m) => m.id === workspaceId);
       if (updatedMetadata) {
         const enrichedMetadata = this.enrichFrontendMetadata(updatedMetadata);
-        const session = this.sessions.get(workspaceId);
-        if (session) {
-          session.emitMetadata(enrichedMetadata);
-        } else {
-          this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
-        }
+        this.publishWorkspaceMetadata(workspaceId, enrichedMetadata);
       }
 
       // Lifecycle hooks run after we persist archivedAt.
@@ -12847,12 +12840,7 @@ export class WorkspaceService
       const updatedMetadata = allMetadata.find((m) => m.id === workspaceId);
       if (updatedMetadata) {
         const enrichedMetadata = this.enrichFrontendMetadata(updatedMetadata);
-        const session = this.sessions.get(workspaceId);
-        if (session) {
-          session.emitMetadata(enrichedMetadata);
-        } else {
-          this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
-        }
+        this.publishWorkspaceMetadata(workspaceId, enrichedMetadata);
       }
 
       let hookMetadata: WorkspaceMetadata | undefined = updatedMetadata;
@@ -13619,12 +13607,7 @@ export class WorkspaceService
       const updatedMetadata = await this.config.findWorkspaceMetadata(workspaceId);
       const enrichedMetadata = this.enrichMaybeFrontendMetadata(updatedMetadata);
 
-      const session = this.sessions.get(workspaceId);
-      if (session) {
-        session.emitMetadata(enrichedMetadata);
-      } else {
-        this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
-      }
+      this.publishWorkspaceMetadata(workspaceId, enrichedMetadata);
     }
 
     return Ok(true);
