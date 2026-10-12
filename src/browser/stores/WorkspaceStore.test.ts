@@ -7807,6 +7807,40 @@ describe("WorkspaceStore", () => {
       expect(turns[1].rewriteCostUsd).toBeGreaterThan(0);
     });
 
+    it("leaves a legacy turn without a record-time model unpriced instead of using the current model", async () => {
+      const workspaceId = "turn-cache-health-legacy-model";
+      const assistantRow = (id: string, historySequence: number, model?: string) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: {
+          historySequence,
+          timestamp: historySequence,
+          ...(model !== undefined ? { model } : {}),
+          usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+        },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantRow("legacy-turn", 1),
+        // The newest row makes Sonnet 5.5 the workspace's current (priced) model.
+        assistantRow("priced-turn", 2, "anthropic:claude-sonnet-5-5"),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => turn.messageId)).toEqual(["priced-turn", "legacy-turn"]);
+      expect(turns[0].rewriteCostUsd).toBeGreaterThan(0);
+      expect(turns[1].cacheWriteTokens).toBe(30_000);
+      expect(turns[1].rewriteCostUsd).toBeUndefined();
+    });
+
     it("counts tool-model usage in a turn's cache health and skips compaction summaries", async () => {
       const workspaceId = "turn-cache-health-tools-workspace";
       const MODEL = "anthropic:claude-sonnet-5-5";

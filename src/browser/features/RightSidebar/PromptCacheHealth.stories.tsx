@@ -80,13 +80,31 @@ export const SidebarWidth: Story = {
   },
 };
 
+/** Pixel's phone viewport width. */
+const PHONE_WIDTH_PX = 390;
+
 export const PhoneWidth: Story = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
   },
+  // The Storybook test runner ignores `globals.viewport` and plays at desktop size, so the
+  // wrapper itself pins the phone width for the overflow check below.
   render: (args) => (
-    <div className="bg-background text-light font-primary w-full p-2 text-[13px]">
+    <div
+      data-testid="phone-width-frame"
+      className="bg-background text-light font-primary p-2 text-[13px]"
+      style={{ width: PHONE_WIDTH_PX }}
+    >
       <PromptCacheHealth {...args} />
     </div>
   ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = canvas.getByTestId("phone-width-frame");
+    const table = canvas.getByTestId("prompt-cache-turns");
+    await expect(frame.getBoundingClientRect().width).toBe(PHONE_WIDTH_PX);
+    // No right-edge overflow: neither the table nor its frame scrolls sideways.
+    await expect(table.scrollWidth).toBeLessThanOrEqual(table.clientWidth);
+    await expect(frame.scrollWidth).toBeLessThanOrEqual(frame.clientWidth);
+  },
 };
