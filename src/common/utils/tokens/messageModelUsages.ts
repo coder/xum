@@ -41,8 +41,6 @@ function isPersistedToolModelUsage(value: unknown): value is PersistedToolModelU
 export function getAssistantMessageModelUsages(
   metadata: MuxMetadata | undefined,
   options?: {
-    /** Model for a message row without `metadata.model` (default "unknown"). */
-    fallbackModel?: string;
     /** Pricing model for a usage without a persisted `metadataModel`. */
     resolveMetadataModel?: (model: string) => string;
   }
@@ -66,7 +64,8 @@ export function getAssistantMessageModelUsages(
 
   if (metadata?.usage) {
     push(
-      metadata.model ?? options?.fallbackModel ?? "unknown",
+      // A row without a record-time model stays unpriced rather than borrowing another one.
+      metadata.model ?? "unknown",
       metadata.usage,
       metadata.providerMetadata,
       metadata.metadataModel,
