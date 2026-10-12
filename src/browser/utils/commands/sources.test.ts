@@ -1065,7 +1065,13 @@ test("goal palette commands match the Paused lifecycle state", () => {
     getVisibleGoalTitles({
       selectedWorkspaceState: makeWorkspaceState(makeGoalSnapshot("paused")),
     })
-  ).toEqual(["Goal: Clear", "Goal: Open panel", "Goal: Resume", "Goal: Set objective"]);
+  ).toEqual([
+    "Goal: Clear",
+    "Goal: Mark complete",
+    "Goal: Open panel",
+    "Goal: Resume",
+    "Goal: Set objective",
+  ]);
 });
 
 test("goal palette commands match the BudgetLimited lifecycle state", () => {
