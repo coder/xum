@@ -3414,6 +3414,71 @@ describe("WorkspaceStore", () => {
       expect(usage.liveMetadataModel).toBe("anthropic:claude-sonnet-4-20250514");
       expect(usage.liveCostUsage?.input.cost_usd).toBeGreaterThan(0);
     });
+
+    it("keeps tool-model usage on replayed rows and live stream-end for turn cache health", async () => {
+      const workspaceId = "live-tool-usage-cache-health";
+      const MODEL = "anthropic:claude-sonnet-5-5";
+      const coldToolUsage = {
+        toolName: "task",
+        model: MODEL,
+        usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10, totalTokens: 31_010 },
+        providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+      };
+      const warmUsage = {
+        inputTokens: 1_000,
+        cachedInputTokens: 900,
+        outputTokens: 10,
+        totalTokens: 1_010,
+      };
+      // Every event goes through the onChat output schema, which strips unknown fields.
+      const wire = (event: unknown) => WorkspaceChatMessageSchema.parse(event);
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+
+      await send(
+        wire({
+          type: "message",
+          id: "replayed-turn",
+          role: "assistant",
+          parts: [{ type: "text", text: "replayed" }],
+          metadata: {
+            historySequence: 1,
+            timestamp: 1,
+            model: MODEL,
+            usage: warmUsage,
+            toolModelUsages: [coldToolUsage],
+          },
+        }),
+        caughtUpEvent(),
+        wire({
+          type: "stream-start",
+          workspaceId,
+          messageId: "live-turn",
+          historySequence: 2,
+          model: MODEL,
+          startTime: 2,
+        }),
+        wire({
+          type: "stream-end",
+          workspaceId,
+          messageId: "live-turn",
+          metadata: {
+            model: MODEL,
+            historySequence: 2,
+            timestamp: 3,
+            usage: warmUsage,
+            toolModelUsages: [coldToolUsage],
+          },
+          parts: [],
+        })
+      );
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => [turn.messageId, turn.cacheWriteTokens])).toEqual([
+        ["live-turn", 30_000],
+        ["replayed-turn", 30_000],
+      ]);
+    });
   });
 
   describe("session usage refresh on activation", () => {
