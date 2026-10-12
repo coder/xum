@@ -1021,7 +1021,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               // place, or is selected where it is already open.
               updateRightSidebarLayout(wsId, (s) => openToolFromNewTab(s, s.focusedTabsetId, tool));
               // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
-              // opens the Stats dialog instead; with the sidebar visible it ignores the event.
+              // shows it in the full-screen sidebar; with the sidebar visible it ignores the event.
               // "costs" is the Stats tab's id.
               if (tool === "costs") {
                 window.dispatchEvent(

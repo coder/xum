@@ -97,7 +97,7 @@ include fmt.mk
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal bench bench-compare first-load-js bug-bash mcp-apps-e2e
+.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing bug-bash mcp-apps-e2e
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -222,9 +222,16 @@ dev-server-sandbox: ## Start an isolated dev-server instance (fresh XUM_ROOT + f
 # bug-bash runs each e2e explore charter in its own bug-bash sandbox container (tests/bugbash/run.ts,
 # #5714): a model picks its actions, so it never runs on the host. The explorers reach their models
 # through a provider proxy per job, so the host needs BUGBASH_BUDGET_USD (one list-price cap for
-# the run) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. The app AI is the mock (run.ts refuses
-# another BUGBASH_AI). The containers mount dist/.
-bug-bash: build-main build-renderer build-static ## Agent bug bash in the bug-bash sandbox: e2e explore charters x models (needs BUGBASH_BUDGET_USD)
+# the run) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. The app AI is BUGBASH_AI (default auto:
+# run.ts probes BUGBASH_APP_MODEL through the run's budget, and falls back to the mock when the
+# upstream is unavailable). The containers mount dist/. The checks (env, Docker, the image) run
+# before the build, so a missing one refuses in about a second once the image is cached, not
+# after the build. The first run pulls the image (about 1.4 GB), which takes minutes.
+# Do not name a build goal (build-main, build-renderer, build-static) on the same make command line
+# as bug-bash or mcp-apps-e2e: under -j the top-level make and the inner $(MAKE) build it twice at once.
+bug-bash: ## Agent bug bash in the bug-bash sandbox: e2e explore charters x models (needs BUGBASH_BUDGET_USD)
+	@bun tests/bugbash/run.ts --preflight $(BUGBASH_ARGS)
+	@$(MAKE) --no-print-directory build-main build-renderer build-static
 	@bun tests/bugbash/run.ts $(BUGBASH_ARGS)
 
 # The bug-bash sandbox image (tests/bugbash/sandbox/build.sh, #5714). Each prints one value on
@@ -277,11 +284,15 @@ test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash 
 # The MCP Apps suite runs only in the bug-bash sandbox (tests/bugbash/sandbox/launch.ts, #5714).
 # agent.act steps reach BUGBASH_MODEL through a provider proxy for the job, so the host needs
 # BUGBASH_BUDGET_USD (a list-price cap) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. Its seed
-# writes the MCP chat directly, so the app AI stays the mock. The container mounts dist/.
-mcp-apps-e2e: build-main build-renderer build-static ## MCP Apps e2e suite in the bug-bash sandbox (needs BUGBASH_BUDGET_USD)
+# writes the MCP chat directly, so the app AI stays the mock. The container mounts dist/. As in
+# bug-bash, the checks run before the build, and no build goal may share its make command line.
+MCP_APPS_LAUNCH = cd tests/bugbash && BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="MCP Apps suite" bun sandbox/launch.ts
+mcp-apps-e2e: ## MCP Apps e2e suite in the bug-bash sandbox (needs BUGBASH_BUDGET_USD)
+	@$(MCP_APPS_LAUNCH) --preflight -- run --config e2e.mcpapps.config.ts --output .e2e/mcp-apps-preflight $(MCP_APPS_E2E_ARGS)
+	@$(MAKE) --no-print-directory build-main build-renderer build-static
 	@# The app AI is pinned to the mock, also over an exported BUGBASH_AI_RESOLVED. The shell PID
 	@# keeps two runs that start in the same second apart (their output and proxy record).
-	@cd tests/bugbash && BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="MCP Apps suite" bun sandbox/launch.ts -- run --config e2e.mcpapps.config.ts --output .e2e/mcp-apps-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(MCP_APPS_E2E_ARGS)
+	@$(MCP_APPS_LAUNCH) -- run --config e2e.mcpapps.config.ts --output .e2e/mcp-apps-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(MCP_APPS_E2E_ARGS)
 
 rlm-eval: ## Run the RLM lever eval against a running dev-server sandbox (see scripts/rlm-eval/run.ts header)
 	@bun run scripts/rlm-eval/run.ts $(RLM_EVAL_ARGS)
@@ -780,6 +791,9 @@ bench-compare: node_modules/.installed src/version.ts ## Compare *.bench.ts resu
 
 first-load-js: ## Report first-load JS bytes of dist/ (run make build-renderer first)
 	@bun scripts/perf/firstLoadJs.ts dist
+
+page-timing: node_modules/.installed ## Paired mobile UCS/IR timing of two built trees (PAGE_TIMING_ARGS; see scripts/perf/pageTiming.ts)
+	@node --import tsx scripts/perf/pageTiming.ts $(PAGE_TIMING_ARGS)
 
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.

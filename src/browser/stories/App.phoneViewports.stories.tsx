@@ -590,11 +590,11 @@ const TIMELINE_DIALOG_EVENTS: TimelineEvent[] = [
 ];
 
 /**
- * Timeline on small viewports: the right sidebar (the timeline's usual home) is
- * hidden at phone widths, so the workspace actions menu offers a Timeline entry
- * that opens the panel in a dialog instead.
+ * Timeline on small viewports: the right sidebar (the timeline's usual home) is hidden at phone
+ * widths, so the workspace actions menu's Sidebar row shows it full-screen, and its New tab
+ * launcher opens the Timeline.
  */
-export const IPhone16eTimelineDialog: AppStory = {
+export const IPhone16eTimeline: AppStory = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
   },
@@ -622,30 +622,19 @@ export const IPhone16eTimelineDialog: AppStory = {
   play: async ({ canvasElement }) => {
     await stabilizePhoneViewportStory(canvasElement);
 
-    // The Timeline menu action is gated on `window.matchMedia`, which the fixed-width
-    // decorator cannot move; only assert where the viewport is genuinely narrow (Pixel's
-    // phone viewport). The test-runner executes at desktop window size and skips here.
-    if (!window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches) {
-      return;
-    }
-
+    // No viewport gate: the fixed-width decorator hides the sidebar through the shell's container
+    // query, so the Sidebar row shows even where the test runner plays at desktop width.
     const canvas = within(canvasElement);
     await userEvent.click(await canvas.findByTestId("workspace-more-actions"));
     await userEvent.click(
-      await waitFor(() => within(document.body).getByTestId("workspace-timeline-button"))
+      await waitFor(() => within(document.body).getByTestId("workspace-open-sidebar"))
     );
-
-    // The dialog portals to document.body, outside the story canvas.
-    await waitFor(
-      () => {
-        const dialog = document.querySelector('[data-testid="timeline-dialog"]');
-        if (!dialog) {
-          throw new Error("Timeline dialog did not open");
-        }
-        within(dialog as HTMLElement).getByText(
-          "Wired the mobile timeline dialog behind the workspace actions menu"
-        );
-      },
+    // A new workspace's sidebar shows its New tab launcher.
+    const sidebar = await canvas.findByRole("complementary", { name: "Workspace insights" });
+    await userEvent.click(await within(sidebar).findByRole("button", { name: /^Timeline/ }));
+    await within(sidebar).findByText(
+      "Wired the mobile timeline dialog behind the workspace actions menu",
+      undefined,
       { timeout: 10_000 }
     );
 
@@ -655,9 +644,9 @@ export const IPhone16eTimelineDialog: AppStory = {
 
 /**
  * Stats on small viewports (#5767): like the Timeline, the Stats tab lives in the hidden right
- * sidebar, so the workspace actions menu opens it in a dialog instead.
+ * sidebar. Its shortcut shows that tab in the full-screen sidebar.
  */
-export const IPhone16eStatsDialog: AppStory = {
+export const IPhone16eStats: AppStory = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
   },
@@ -675,30 +664,33 @@ export const IPhone16eStatsDialog: AppStory = {
   ),
   decorators: [IPhone16eDecorator],
   // No Pixel capture: the snapshot budget (scripts/check-storybook-snapshot-budget.mjs) is full.
-  // The play asserts the dialog instead.
+  // The play asserts the full-screen Stats tab instead.
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     await stabilizePhoneViewportStory(canvasElement);
 
     // No viewport gate: the fixed-width decorator hides the sidebar through the shell's container
-    // query, so the Stats entry shows even where the test runner plays at desktop width.
+    // query, so the shortcut works even where the test runner plays at desktop width.
     const canvas = within(canvasElement);
-    await userEvent.click(await canvas.findByTestId("workspace-more-actions"));
-    await userEvent.click(
-      await waitFor(() => within(document.body).getByTestId("workspace-stats-button"))
-    );
+    await canvas.findByTestId("workspace-more-actions");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "S", shiftKey: true }));
 
-    // The dialog portals to document.body and shows the same sub-tabs as the Stats tab.
-    await waitFor(
-      () => {
-        const dialog = document.querySelector('[data-testid="stats-dialog"]');
-        if (!dialog) {
-          throw new Error("Stats dialog did not open");
-        }
-        within(dialog as HTMLElement).getByRole("button", { name: "Timing" });
-      },
+    // The full-screen sidebar shows the Stats tab with its sub-tabs.
+    const sidebar = await canvas.findByRole("complementary", { name: "Workspace insights" });
+    await waitFor(() => expect(sidebar).toBeVisible());
+    const timing = await within(sidebar).findByRole(
+      "button",
+      { name: "Timing" },
       { timeout: 10_000 }
     );
+
+    // With the view open, the Timeline shortcut switches its tab. Focus was in the Stats panel,
+    // which the switch unmounts, so it moves to the Timeline tab instead of leaving the view.
+    timing.focus();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "T", shiftKey: true }));
+    const timelineTab = within(sidebar).getByRole("tab", { name: /Timeline/ });
+    await expect(timelineTab).toHaveAttribute("aria-selected", "true");
+    await expect(timelineTab).toHaveFocus();
 
     blurActiveElement();
   },
