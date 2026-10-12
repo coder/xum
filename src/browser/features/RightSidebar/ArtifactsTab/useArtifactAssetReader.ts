@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { ARTIFACT_ASSET_LIMITS, type ArtifactAssetReader } from "./artifactAssets";
 
 async function readArtifactAsset(api: APIClient, workspaceId: string, path: string) {
@@ -48,18 +49,25 @@ export function useArtifactAssetReader(workspaceId: string | null): ArtifactAsse
   return useMemo(() => {
     if (workspaceId == null) return null;
     const connection = connectionRef.current;
-    const nextClient = (): Promise<APIClient> =>
-      connection.api != null
+    // The connected client, other than `previous` (the client a cut-off read used).
+    const nextClient = (previous: APIClient | null): Promise<APIClient> =>
+      connection.api != null && connection.api !== previous
         ? Promise.resolve(connection.api)
-        : new Promise((resolve) => connection.waiters.push(() => resolve(nextClient())));
+        : new Promise((resolve) => connection.waiters.push(() => resolve(nextClient(previous))));
     return async (path: string) => {
+      let previous: APIClient | null = null;
       for (;;) {
-        const client = await nextClient();
+        const client = await nextClient(previous);
         try {
           return await readArtifactAsset(client, workspaceId, path);
         } catch (error) {
-          // Only a read the connection drop cut off is retried; each retry needs a new client.
-          if (connection.api === client) throw error;
+          // Only a read the connection drop cut off is retried, once a new client is there. The
+          // socket close rejects it as an abort before React publishes `api: null`, so the client
+          // may still look current; the reader passes no signal, so no other abort reaches here.
+          // Waiting for a different client keeps a closed socket's instant rejections from
+          // looping.
+          if (connection.api === client && !isAbortError(error)) throw error;
+          previous = client;
         }
       }
     };

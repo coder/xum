@@ -54,6 +54,8 @@ let getStateCalls = 0;
 let getViewCalls = 0;
 /** Every request but getState fails with this error while set (a backend still starting). */
 let failWith: string | null = null;
+/** The next asset read rejects as the socket close does (an abort), while its client looks live. */
+let cutOffNextAssetRead = false;
 /** The artifacts the listing returns. */
 let listEntries = [{ path: "app.html", kind: "html" as const, size: 10, modifiedMs: 1 }];
 /** Only listVersions fails while set. */
@@ -85,6 +87,12 @@ function createClient(): APIClient {
       },
       read: (input: { path: string; maxBytes?: number | null }) => {
         if (input.maxBytes != null) assetReads.push(input.path);
+        if (input.maxBytes != null && cutOffNextAssetRead) {
+          cutOffNextAssetRead = false;
+          return Promise.reject(
+            Object.assign(new Error("WebSocket closed"), { name: "AbortError" })
+          );
+        }
         if (failWith != null) return fail();
         const file = files[input.path];
         return Promise.resolve(
@@ -236,6 +244,7 @@ describe("Artifacts tab across a dropped connection", () => {
     failWith = null;
     failVersions = false;
     failGetState = false;
+    cutOffNextAssetRead = false;
     listEntries = [{ path: "app.html", kind: "html" as const, size: 10, modifiedMs: 1 }];
     sends = [];
   });
@@ -457,5 +466,30 @@ describe("Artifacts tab across a dropped connection", () => {
     await reconnect();
     expect(view.getByText("Backend is starting")).toBeTruthy();
     expect(view.queryByText(/No artifacts yet/)).toBeNull();
+  });
+
+  test("an asset read the socket close cuts off runs again on the next client", async () => {
+    files["data/s.json"] = ok("data/s.json", JSON.stringify({ series: [{ q: "Q1", v: 1 }] }));
+    cutOffNextAssetRead = true;
+    const content = JSON.stringify({
+      $xum: "canvas",
+      blocks: [
+        { type: "chart", kind: "bar", data: "data/s.json#/series", x: "q", y: "v", title: "Q" },
+      ],
+    });
+    const view = render(
+      <CanvasArtifact content={content} path="board.canvas.json" workspaceId="ws-r" />,
+      { wrapper: ConnectionWrapper }
+    );
+    await flush();
+    // The abort lands before the API turns null: the read waits instead of failing.
+    expect(assetReads).toEqual(["data/s.json"]);
+    expect(view.queryByText(/Could not read/)).toBeNull();
+
+    await dropConnection();
+    act(() => setConnection(createClient()));
+    await waitFor(() => expect(assetReads).toEqual(["data/s.json", "data/s.json"]));
+    expect(await view.findByText("Q")).toBeTruthy();
+    expect(view.queryByText(/Could not read/)).toBeNull();
   });
 });
