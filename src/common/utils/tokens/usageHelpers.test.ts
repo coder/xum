@@ -379,14 +379,13 @@ describe("Anthropic 1h-TTL cache-write share", () => {
     expect(getAnthropicCacheWrite1hTokens(threeSteps, 8_000)).toBe(4_500);
   });
 
-  test("scales an old row's last-step split to the turn total", () => {
-    // Pre-fix multi-step rows kept the summed total but only the last step's raw split.
+  test("keeps an old multi-step row at the 5m price instead of extrapolating its last step", () => {
+    // Pre-fix multi-step rows kept the summed total but only the last step's raw split,
+    // and earlier steps can have a different 5m/1h mix.
     const oldRow = { anthropic: { ...step(0, 2_000).anthropic, cacheCreationInputTokens: 9_000 } };
-    expect(getAnthropicCacheWrite1hTokens(oldRow, 9_000)).toBe(9_000);
-    const mixedOldRow = {
-      anthropic: { ...step(1_000, 1_000).anthropic, cacheCreationInputTokens: 9_000 },
-    };
-    expect(getAnthropicCacheWrite1hTokens(mixedOldRow, 9_000)).toBe(4_500);
+    expect(getAnthropicCacheWrite1hTokens(oldRow, 9_000)).toBe(0);
+    // A split that covers the whole total is exact and still priced.
+    expect(getAnthropicCacheWrite1hTokens(step(1_000, 1_000), 2_000)).toBe(1_000);
   });
 
   test("a malformed 5m share keeps the 5m price instead of scaling the 1h share", () => {
@@ -401,7 +400,7 @@ describe("Anthropic 1h-TTL cache-write share", () => {
     expect(getAnthropicCacheWrite1hTokens(malformed(-1), 100)).toBe(0);
     expect(getAnthropicCacheWrite1hTokens(malformed("90"), 100)).toBe(0);
     // An absent 5m share still means the whole reported split is 1h.
-    expect(getAnthropicCacheWrite1hTokens(malformed(undefined), 100)).toBe(100);
+    expect(getAnthropicCacheWrite1hTokens(malformed(undefined), 10)).toBe(10);
   });
 
   test("reports no 1h share without a split", () => {
