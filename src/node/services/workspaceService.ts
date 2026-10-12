@@ -91,6 +91,7 @@ import { ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE } from "@/common/constan
 import {
   isNestedCompactionFollowUp,
   NESTED_COMPACTION_FOLLOW_UP_MESSAGE,
+  stripClientPluginSendHookFields,
 } from "@/common/utils/messages/pluginSendHookFields";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
@@ -18695,6 +18696,17 @@ export class WorkspaceService
     // pending follow-up that recovery dispatches. Refused before anything is cleared.
     if (carriesPlanReviewMetadata(summaryMessage.metadata?.muxMetadata)) {
       return Err(PLAN_REVIEW_METADATA_RESERVED_MESSAGE);
+    }
+    // Hook markers on a summary's pending follow-up say its message.send hooks already ran.
+    // Only Xum's own compaction may set them: a client-supplied row would make recovery skip
+    // the hooks (or forge their context) after a restart. Copy-on-write.
+    const clientMuxMetadata = summaryMessage.metadata?.muxMetadata;
+    const sanitizedMuxMetadata = stripClientPluginSendHookFields(clientMuxMetadata);
+    if (sanitizedMuxMetadata !== clientMuxMetadata) {
+      summaryMessage = {
+        ...summaryMessage,
+        metadata: { ...summaryMessage.metadata, muxMetadata: sanitizedMuxMetadata },
+      };
     }
     // Support both new enum ("user"|"idle") and legacy boolean (true)
     const isCompaction = !!summaryMessage.metadata?.compacted;

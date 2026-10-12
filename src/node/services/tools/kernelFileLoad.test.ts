@@ -263,4 +263,57 @@ describe("createKernelFileLoader Codex hook rewrites", () => {
       unregister();
     }
   });
+
+  it("denies a rewrite that narrows the read to a range (Codex PRRT_kwDOPxxmWM6rb3ih)", async () => {
+    // mux.load reads whole files only: a range rewrite must refuse the load, never load the
+    // whole file the guard meant to narrow.
+    using tmp = new DisposableTempDir("kernel-load-range-rewrite");
+    await fs.writeFile(nodePath.join(tmp.path, "secret.txt"), "line1\nline2\nsecret\n", "utf8");
+    const unregister = registerCodexPluginHooks(eventSpine, {
+      workspaceId: "kernel-range-ws",
+      pluginName: "guard",
+      order: 0,
+      hooks: [
+        {
+          key: "hooks/hooks.json#PreToolUse[0][0]",
+          hash: "h".repeat(64),
+          event: "PreToolUse",
+          matcher: "^file_read$",
+          handler: { type: "mcp_tool", server: "guard", tool: "check", input: {} },
+          status: "runnable",
+          source: "hooks/hooks.json",
+        },
+      ],
+      deps: {
+        isHookAllowed: () => Promise.resolve(true),
+        callPluginTool: () =>
+          Promise.resolve({
+            structuredContent: {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "allow",
+                updatedInput: { path: "secret.txt", offset: 1, limit: 1 },
+              },
+            },
+          }),
+        notifyUser: () => undefined,
+      },
+    });
+    try {
+      const runtime = new LocalRuntime(tmp.path);
+      const load = createKernelFileLoader({
+        cwd: tmp.path,
+        runtime,
+        hooks: { runtime, cwd: tmp.path, runtimeTempDir: tmp.path, workspaceId: "kernel-range-ws" },
+      });
+      const refused: unknown = await load({ path: "secret.txt" }).then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(refused).toBeInstanceOf(Error);
+      expect(String(refused)).toMatch(/does not match the tool's input/);
+    } finally {
+      unregister();
+    }
+  });
 });
