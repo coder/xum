@@ -41,9 +41,18 @@ warn_skip() {
   exit 0
 }
 
+# The gate checks the hook's checkout (the workspace). A command that changes
+# directory or points git elsewhere may commit to another repository.
+other_repo='(^|[;&|({[:space:]])(cd|pushd)[[:space:]]|git[[:space:]]+(-C|--git-dir|--work-tree)'
+if [[ "$script" =~ $other_repo ]]; then
+  warn_skip "the command may target another checkout; run make crap-check there"
+fi
+
 root=$(git rev-parse --show-toplevel 2>/dev/null) || warn_skip "not in a git checkout"
 base=$(git -C "$root" merge-base origin/main HEAD 2>/dev/null) || warn_skip "no merge-base with origin/main"
 command -v bun >/dev/null || warn_skip "bun not found"
+# GNU timeout; Homebrew's coreutils name it gtimeout on macOS.
+timeout_cmd=$(command -v timeout || command -v gtimeout) || warn_skip "no timeout or gtimeout command"
 
 # Head is the working tree, not the staged commit: unstaged edits count and
 # untracked files do not, so the report can differ slightly from the commit.
@@ -51,9 +60,9 @@ command -v bun >/dev/null || warn_skip "bun not found"
 args=(--base "$base")
 while IFS= read -r reason; do
   [[ -n "$reason" ]] && args+=(--debt "$reason")
-done < <(grep -oE 'Crap-Debt:[^"'"'"'\n]*' <<<"$script" | sed -E 's/^Crap-Debt:[[:space:]]*//')
+done < <(grep -oE 'Crap-Debt:[^"'"'"']*' <<<"$script" | sed -E 's/^Crap-Debt:[[:space:]]*//')
 
-report=$(cd "$root" && timeout "$CRAP_GATE_TIMEOUT_SECS" bun "$(dirname "${BASH_SOURCE[0]}")/check.ts" "${args[@]}" 2>&1)
+report=$(cd "$root" && "$timeout_cmd" "$CRAP_GATE_TIMEOUT_SECS" bun "$(dirname "${BASH_SOURCE[0]}")/check.ts" "${args[@]}" 2>&1)
 status=$?
 case $status in
   0)

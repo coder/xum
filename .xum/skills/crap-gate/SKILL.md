@@ -49,8 +49,11 @@ VIOLATION floor-cc     src/x.ts:10-25 normalizeAgentId: CC 3 -> 4 (must not grow
 1. Shrink the function. Extract pure logic into a named function with its own
    tests. In React, move state and effects into a named hook, or a part of the
    tree into a child component, each with its own tests.
-2. Test it. Coverage lowers CRAP. A test must assert behavior that would fail
-   if the code broke.
+2. Test it. Coverage lowers CRAP, so this repairs only reports with coverage
+   (`--coverage <lcov>`, the CI job's new-function findings). The hook and a
+   plain `make crap-check` score CC alone: tests cannot clear their `floor-cc`
+   or `new-function` findings, so shrink the function instead. A test must
+   assert behavior that would fail if the code broke.
 
 ## Anti-gaming rules
 

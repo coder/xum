@@ -88,7 +88,10 @@ test("block mode stops a regressing commit before it runs, unless it carries Cra
   expect(blocked.status).toBe(1);
   expect(blocked.out).toContain("VIOLATION floor-cc     src/route.ts:1-5 route: CC 2 -> 5");
 
-  expect(runGate(gate, "pre", "git commit -am 'grow' -m 'Crap-Debt: hotfix'").status).toBe(0);
+  // A reason with the letter n (a past parser stopped there and lost the reason).
+  expect(runGate(gate, "pre", "git commit -am 'grow' -m 'Crap-Debt: needs follow-up'").status).toBe(
+    0
+  );
   // The post phase belongs to warn mode.
   expect(runGate(gate, "post", "git commit -am 'grow route'")).toEqual({ status: 0, out: "" });
 });
@@ -105,6 +108,11 @@ test("warn mode lets the commit run and reports after it", () => {
 test("other commands skip the check, and a broken gate never blocks", () => {
   const gate = gateIn("block");
   expect(runGate(gate, "pre", "git log --oneline")).toEqual({ status: 0, out: "" });
+  for (const elsewhere of ["cd ../other && git commit -am x", "git -C ../other commit -am x"]) {
+    const skipped = runGate(gate, "pre", elsewhere);
+    expect(skipped.status).toBe(0);
+    expect(skipped.out).toContain("may target another checkout");
+  }
 
   git("update-ref", "-d", "refs/remotes/origin/main");
   const noBase = runGate(gate, "pre", "git push");
@@ -118,6 +126,18 @@ test("other commands skip the check, and a broken gate never blocks", () => {
   const broken = runGate(gate, "pre", "git commit -am x", noUv);
   expect(broken.status).toBe(0);
   expect(broken.out).toContain("crap-gate: skipped (tool error");
+
+  // git and bun but no timeout (stock macOS).
+  const noTimeout = join(dir, "no-timeout");
+  mkdirSync(noTimeout);
+  for (const tool of ["bash", "git", "bun", "dirname", "grep", "sed"]) {
+    symlinkSync(Bun.which(tool) ?? `/usr/bin/${tool}`, join(noTimeout, tool));
+  }
+  const unbounded = runGate(gate, "pre", "git commit -am x", { ...GIT_ENV, PATH: noTimeout });
+  expect(unbounded).toEqual({
+    status: 0,
+    out: "crap-gate: skipped (no timeout or gtimeout command). The gate never blocks on its own failure.\n",
+  });
 });
 
 test("non-commit calls and the shipped warn-mode tool_pre start no process", () => {
