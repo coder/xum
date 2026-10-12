@@ -23,22 +23,35 @@ export function describePluginHookHandler(handler: PluginHookHandler): string {
 /** Shown characters of a hook's input: the review renders before the user trusts anything. */
 export const PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS = 16 * 1024;
 
+/** The hook input as the review shows it; `full` is set only when `shown` is cut. */
+export interface PluginHookInputView {
+  shown: string;
+  /** The complete input as compact JSON, for "Show full input"; null when nothing was cut. */
+  full: string | null;
+}
+
 /**
  * The hook input as the review shows it, size-bounded. The input is plugin-controlled and can be
  * near the hooks-file limit: pretty-printing deeply nested values amplifies it many times over
  * (about 12 MB for a 200 KiB input), which can freeze the renderer. Small inputs are
  * pretty-printed, larger ones stay compact, and the shown text is cut with a note. The hash and
- * the trust decision cover the full definition, not this text.
+ * the trust decision cover the full definition, so a cut input also returns its full compact
+ * JSON: the review must offer it before Trust (a plugin can pad the input and hide arguments after
+ * the cut). Compact JSON is bounded by the hooks-file limit, so showing it in full stays cheap.
  */
-export function formatPluginHookInput(input: Record<string, unknown>): string {
+export function formatPluginHookInput(input: Record<string, unknown>): PluginHookInputView {
   const compact = JSON.stringify(input);
   // Pretty-print only while even the deepest indentation keeps the text small.
   const full = compact.length <= 2048 ? JSON.stringify(input, null, 2) : compact;
-  if (full.length <= PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS) return full;
+  if (full.length <= PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS) return { shown: full, full: null };
   let shown = full.slice(0, PLUGIN_HOOK_INPUT_DISPLAY_MAX_CHARS);
   // Never end on half of a surrogate pair.
   if (/[\uD800-\uDBFF]$/.test(shown)) shown = shown.slice(0, -1);
-  return `${shown}\n…truncated (${Math.ceil(full.length / 1024)} KB)`;
+  return { shown: `${shown}\n…truncated (${kilobytes(full)} KB)`, full: compact };
+}
+
+function kilobytes(text: string): number {
+  return Math.ceil(text.length / 1024);
 }
 
 /** Why a hook can never run; null for a runnable hook. */
@@ -65,6 +78,9 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
   const [loadAttempt, setLoadAttempt] = useState(0);
+  // Hooks (key and hash) whose cut input the user expanded. Keyed by the hash too: a changed
+  // definition must be expanded again before it can be trusted.
+  const [expandedInputs, setExpandedInputs] = useState<ReadonlySet<string>>(() => new Set());
   const name = props.name;
 
   useEffect(() => {
@@ -134,6 +150,11 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
             const note = PLUGIN_HOOK_STATUS_NOTE[hook.status];
             const summary = describePluginHookHandler(hook.handler);
             const input = hook.handler.type === "mcp_tool" ? hook.handler.input : {};
+            const inputView = formatPluginHookInput(input);
+            const expandKey = `${hook.key}\0${hook.hash}`;
+            const expanded = expandedInputs.has(expandKey);
+            // Trust covers the full definition: it waits until the user can have read all of it.
+            const mustExpand = inputView.full !== null && !expanded;
             return (
               <li
                 key={hook.key}
@@ -149,8 +170,20 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
                 <p className="text-foreground font-mono break-all">{summary}</p>
                 {Object.keys(input).length > 0 && (
                   <pre className="text-muted bg-background rounded p-1 font-mono break-all whitespace-pre-wrap">
-                    {formatPluginHookInput(input)}
+                    {expanded && inputView.full !== null ? inputView.full : inputView.shown}
                   </pre>
+                )}
+                {mustExpand && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={() =>
+                      setExpandedInputs((previous) => new Set(previous).add(expandKey))
+                    }
+                  >
+                    Show full input ({kilobytes(inputView.full ?? "")} KB)
+                  </Button>
                 )}
                 <p className="text-muted break-all">{hook.source}</p>
                 {note !== null ? (
@@ -163,12 +196,17 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
                         it.
                       </p>
                     )}
+                    {mustExpand && hook.review !== "trusted" && (
+                      <p className="text-muted">
+                        Show the full input to review it before trusting.
+                      </p>
+                    )}
                     <div className="flex flex-wrap gap-2">
                       {hook.review !== "trusted" && (
                         <Button
                           size="sm"
                           className={cn("h-7 px-2 text-xs")}
-                          disabled={busy}
+                          disabled={busy || mustExpand}
                           onClick={() => void decide(hook, "trusted")}
                           aria-label={`Trust ${hook.event} hook ${summary}`}
                         >
