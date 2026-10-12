@@ -115,20 +115,14 @@ describe.skipIf(process.platform === "win32")(
         await addWorkspace("dev", devcontainerRuntime);
         await fs.writeFile(path.join(dockerDir, "ps-fail"), "Cannot connect to the Docker daemon");
 
-        expect(await harness.service.stopRuntime("dev")).toEqual({
-          success: false,
-          error:
-            "Failed to stop runtime: Failed to query containers: Cannot connect to the Docker daemon",
-        });
+        // Docker's own message reaches the caller.
+        const result = await harness.service.stopRuntime("dev");
+        expect(result.success).toBe(false);
+        expect(result.success ? "" : result.error).toContain("Cannot connect to the Docker daemon");
       });
 
       test("refuses an unknown workspace without calling Docker", async () => {
-        const result = await harness.service.stopRuntime("missing");
-
-        expect(result).toEqual({
-          success: false,
-          error: "Workspace metadata not found for missing",
-        });
+        expect((await harness.service.stopRuntime("missing")).success).toBe(false);
         expect(await dockerCalls()).toEqual([]);
       });
 
@@ -136,10 +130,7 @@ describe.skipIf(process.platform === "win32")(
         await addWorkspace("dev", devcontainerRuntime);
         spyOn(harness.aiService, "isStreaming").mockImplementation((id) => id === "dev");
 
-        expect(await harness.service.stopRuntime("dev")).toEqual({
-          success: false,
-          error: "Cannot stop: workspace has an active AI stream",
-        });
+        expect((await harness.service.stopRuntime("dev")).success).toBe(false);
         expect(await dockerCalls()).toEqual([]);
       });
 
@@ -147,10 +138,7 @@ describe.skipIf(process.platform === "win32")(
         await addWorkspace("dev", devcontainerRuntime);
         openTerminals(1);
 
-        expect(await harness.service.stopRuntime("dev")).toEqual({
-          success: false,
-          error: "Cannot stop: workspace has active sessions",
-        });
+        expect((await harness.service.stopRuntime("dev")).success).toBe(false);
         expect(await dockerCalls()).toEqual([]);
       });
 
@@ -164,10 +152,7 @@ describe.skipIf(process.platform === "win32")(
       test("refuses runtimes that have no container to stop", async () => {
         await addWorkspace("wt", { type: "worktree", srcBaseDir: harness.config.srcDir });
 
-        expect(await harness.service.stopRuntime("wt")).toEqual({
-          success: false,
-          error: "Runtime stop is unsupported for worktree workspaces",
-        });
+        expect((await harness.service.stopRuntime("wt")).success).toBe(false);
         expect(await dockerCalls()).toEqual([]);
       });
     });

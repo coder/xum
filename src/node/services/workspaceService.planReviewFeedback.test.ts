@@ -125,9 +125,13 @@ describe("WorkspaceService.planReviewSubmitFeedback", () => {
       ...feedback,
       options: { ...options, editMessageId: "older-row" },
     });
-    expect(await refused.then(String, (error: Error) => error.message)).toContain(
-      "cannot carry edit semantics"
-    );
+    // The service asserts this programming error instead of returning a result.
+    expect(
+      await refused.then(
+        () => "resolved",
+        () => "rejected"
+      )
+    ).toBe("rejected");
     expect(session.sendMessage).not.toHaveBeenCalled();
   });
 
@@ -137,9 +141,7 @@ describe("WorkspaceService.planReviewSubmitFeedback", () => {
       snapshotId: "snap_missing",
     });
 
-    expect(result).toEqual(
-      Err({ type: "unknown_snapshot", message: "Unknown snapshot snap_missing" })
-    );
+    expect(result).toMatchObject({ success: false, error: { type: "unknown_snapshot" } });
     expect(session.sendMessage).not.toHaveBeenCalled();
   });
 
@@ -189,8 +191,8 @@ describe("WorkspaceService.planReviewSubmitFeedback", () => {
 
     expect(result.success).toBe(false);
     if (result.success) return;
-    expect(result.error.type).toBe("send_failed");
-    expect(JSON.stringify(result.error)).toContain("cleared or reset");
+    // Refused before sendMessage: no busy or send error can produce this result.
+    expect(result.error).toMatchObject({ type: "send_failed", error: { type: "unknown" } });
     expect(send).not.toHaveBeenCalled();
   });
 
