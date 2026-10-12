@@ -5820,15 +5820,18 @@ export class MCPServerManager {
             ) {
               throw revoked(`server '${serverName}'`);
             }
+            // Object.hasOwn, not `in`: a tool named after an Object.prototype member
+            // (constructor, toString) would otherwise pass an allowlist that excludes it (Codex
+            // PRRT_kwDOPxxmWM6rb5ps).
             if (
-              !(
-                toolName in
+              !Object.hasOwn(
                 this.applyToolAllowlist(
                   serverName,
                   { [toolName]: tool },
                   info.toolAllowlist,
                   overrides
-                )
+                ),
+                toolName
               )
             ) {
               throw revoked(`tool '${serverName}/${toolName}'`);

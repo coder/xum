@@ -299,7 +299,15 @@ function applyUpdatedInput(
     return;
   }
   if (!matchesToolSchema(schema, updated)) {
+    // Deny, as for a missing schema: the hook allowed only its rewrite, so running the original
+    // arguments would bypass it (a mux.load guard that narrows a read to a range, Codex
+    // PRRT_kwDOPxxmWM6rb3ih).
     warn(registration, hook, "returned updatedInput that does not match the tool's input schema");
+    ctx.blocked = {
+      result: {
+        error: `Tool call blocked by plugin '${registration.pluginName}' hook: its rewrite of this call does not match the tool's input.`,
+      },
+    };
     return;
   }
   ctx.args = updated;

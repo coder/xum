@@ -742,6 +742,28 @@ describe("MCPServerManager", () => {
     expect(canCall("other")).toBe(false);
   });
 
+  test("an allowlist that excludes a hook tool named after an Object member refuses it", async () => {
+    // Codex PRRT_kwDOPxxmWM6rb5ps: `"constructor" in {}` is true through the prototype.
+    const key = "plugin:aaaaaaaaaaaaaaaa:guard";
+    configService.listServers.mockResolvedValue({ [key]: stdioConfig("hook-guard") });
+    servers.serve("hook-guard", {
+      tools: { constructor: testTool(), check: testTool() },
+      callToolForHook: () => Promise.resolve({ content: [] }),
+    });
+    const workspaceId = "ws-hook-proto-name";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    await manager.applyWorkspaceOverrides(workspaceId, { toolAllowlist: { [key]: ["check"] } });
+    const signal = new AbortController().signal;
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      manager.callToolForPluginHook(workspaceId, key, "constructor", {}, { signal })
+    ).rejects.toThrow("disabled");
+    expect(await manager.callToolForPluginHook(workspaceId, key, "check", {}, { signal })).toEqual({
+      content: [],
+    });
+  });
+
   test("a plugin hook call re-checks enablement at dispatch: a server disabled after the serve is refused", async () => {
     // A direct edit of the override document (or another backend's save) disables the hook's
     // server after the serve that started it; the cached enabled set still lists it.
