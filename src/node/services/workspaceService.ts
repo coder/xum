@@ -12668,6 +12668,88 @@ export class WorkspaceService
     return await this.unarchiveUnlocked(workspaceId);
   }
 
+  /**
+   * Best effort (#4748): put unarchivedAt back to its value before this unarchive, unless a
+   * later edit already replaced it. A failed rollback must not replace the restore error, and
+   * the UI still needs what disk now says.
+   */
+  private async rollBackUnarchive(target: {
+    workspaceId: string;
+    projectPath: string;
+    workspacePath: string;
+    previousUnarchivedAt: string | undefined;
+    persistedUnarchivedAt: string;
+  }): Promise<void> {
+    const { workspaceId, projectPath, workspacePath, previousUnarchivedAt, persistedUnarchivedAt } =
+      target;
+    await this.config
+      .editConfig((config) => {
+        const projectConfig = config.projects.get(projectPath);
+        const workspaceEntry =
+          projectConfig?.workspaces.find((w) => w.id === workspaceId) ??
+          projectConfig?.workspaces.find((w) => w.path === workspacePath);
+        if (workspaceEntry?.unarchivedAt === persistedUnarchivedAt) {
+          if (previousUnarchivedAt === undefined) {
+            delete workspaceEntry.unarchivedAt;
+          } else {
+            workspaceEntry.unarchivedAt = previousUnarchivedAt;
+          }
+        }
+        return config;
+      })
+      .catch((rollbackError: unknown) => {
+        log.warn("Failed to roll back unarchive after a failed snapshot restore", {
+          workspaceId,
+          error: getErrorMessage(rollbackError),
+        });
+      });
+    await this.emitCurrentWorkspaceMetadata(workspaceId);
+  }
+
+  /**
+   * Restore the worktree archive snapshot of a workspace whose unarchive just persisted. When
+   * the restore fails, the unarchive is rolled back (unarchivedAt goes back to its previous
+   * value, if no later edit replaced it) so the workspace stays archived with its snapshot.
+   */
+  private async restoreArchiveSnapshotAfterUnarchive(
+    snapshotService: WorktreeArchiveSnapshotLifecycleService,
+    target: {
+      workspaceId: string;
+      projectPath: string;
+      workspacePath: string;
+      hookMetadata: WorkspaceMetadata;
+      previousUnarchivedAt: string | undefined;
+      persistedUnarchivedAt: string | undefined;
+    }
+  ): Promise<Result<void>> {
+    const { workspaceId, hookMetadata, persistedUnarchivedAt } = target;
+    // Durable before restore can recreate the checkout: a crash before rehydration finishes
+    // leaves the workspace unarchived, so only the startup sweep can finish the job (#4850).
+    await this.markStagedAttachmentRehydrationPending(workspaceId, hookMetadata);
+    const restoreResult = await snapshotService.restoreSnapshotAfterUnarchive({
+      workspaceId,
+      workspaceMetadata: hookMetadata,
+    });
+    if (!restoreResult.success) {
+      log.debug("Failed to restore worktree archive snapshot during unarchive", {
+        workspaceId,
+        error: restoreResult.error,
+      });
+      // The workspace goes back to archived; the next unarchive marks it again.
+      await this.clearStagedAttachmentRehydrationPending(workspaceId);
+      if (persistedUnarchivedAt) {
+        await this.rollBackUnarchive({ ...target, persistedUnarchivedAt });
+      }
+      return Err(restoreResult.error);
+    }
+    if (restoreResult.data === "restored") {
+      await this.rehydrateStagedAttachmentsAfterSnapshotRestore(workspaceId, hookMetadata);
+    } else {
+      await this.clearStagedAttachmentRehydrationPending(workspaceId);
+    }
+    return Ok(undefined);
+  }
+
   private async unarchiveUnlocked(workspaceId: string): Promise<Result<void>> {
     let releaseMutationGate: (() => Promise<void>) | undefined;
     let releaseUnarchiveLease: (() => Promise<void>) | undefined;
@@ -12795,53 +12877,19 @@ export class WorkspaceService
       }
 
       if (this.worktreeArchiveSnapshotService && hookMetadata) {
-        // Durable before restore can recreate the checkout: a crash before rehydration finishes
-        // leaves the workspace unarchived, so only the startup sweep can finish the job (#4850).
-        await this.markStagedAttachmentRehydrationPending(workspaceId, hookMetadata);
-        const restoreResult =
-          await this.worktreeArchiveSnapshotService.restoreSnapshotAfterUnarchive({
+        const restored = await this.restoreArchiveSnapshotAfterUnarchive(
+          this.worktreeArchiveSnapshotService,
+          {
             workspaceId,
-            workspaceMetadata: hookMetadata,
-          });
-        if (!restoreResult.success) {
-          log.debug("Failed to restore worktree archive snapshot during unarchive", {
-            workspaceId,
-            error: restoreResult.error,
-          });
-          // The workspace goes back to archived; the next unarchive marks it again.
-          await this.clearStagedAttachmentRehydrationPending(workspaceId);
-          if (persistedUnarchivedAt) {
-            // Best effort (#4748): a failed rollback must not replace the restore error, and the
-            // UI still needs what disk now says.
-            await this.config
-              .editConfig((config) => {
-                const projectConfig = config.projects.get(projectPath);
-                const workspaceEntry =
-                  projectConfig?.workspaces.find((w) => w.id === workspaceId) ??
-                  projectConfig?.workspaces.find((w) => w.path === workspacePath);
-                if (workspaceEntry && workspaceEntry.unarchivedAt === persistedUnarchivedAt) {
-                  if (previousUnarchivedAt === undefined) {
-                    delete workspaceEntry.unarchivedAt;
-                  } else {
-                    workspaceEntry.unarchivedAt = previousUnarchivedAt;
-                  }
-                }
-                return config;
-              })
-              .catch((rollbackError: unknown) => {
-                log.warn("Failed to roll back unarchive after a failed snapshot restore", {
-                  workspaceId,
-                  error: getErrorMessage(rollbackError),
-                });
-              });
-            await this.emitCurrentWorkspaceMetadata(workspaceId);
+            projectPath,
+            workspacePath,
+            hookMetadata,
+            previousUnarchivedAt,
+            persistedUnarchivedAt,
           }
-          return Err(restoreResult.error);
-        }
-        if (restoreResult.data === "restored") {
-          await this.rehydrateStagedAttachmentsAfterSnapshotRestore(workspaceId, hookMetadata);
-        } else {
-          await this.clearStagedAttachmentRehydrationPending(workspaceId);
+        );
+        if (!restored.success) {
+          return restored;
         }
       }
 
