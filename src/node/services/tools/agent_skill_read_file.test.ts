@@ -339,11 +339,18 @@ describe("agent_skill_read_file", () => {
       using tempDir = new TestTempDir("test-agent-skill-read-file-huge-line");
       const tool = await createLongLineTool(tempDir, `short\n${"y".repeat(20_000)}\nlast`);
 
-      // The oversized line is the second row of this window, not the first.
-      const huge = await executeReadFile(tool, { name: "long-lines", filePath: "playbook.md" });
-      expect(huge.success).toBe(false);
-      if (!huge.success) {
-        expect(huge.error).toContain("Line 2");
+      // The oversized line is the second row of the whole-file window and the
+      // first (only) row of the window that pages straight to it.
+      for (const window of [{}, { offset: 2, limit: 1 }]) {
+        const huge = await executeReadFile(tool, {
+          name: "long-lines",
+          filePath: "playbook.md",
+          ...window,
+        });
+        expect(huge.success).toBe(false);
+        if (!huge.success) {
+          expect(huge.error).toContain("Line 2");
+        }
       }
 
       // The lines around it stay readable.
