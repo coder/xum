@@ -55,6 +55,7 @@ import {
 import type { TodoItem } from "@/common/types/tools";
 import type { GoalSnapshot } from "@/common/types/goal";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { revealTimelineTarget } from "@/browser/utils/timelineReveal";
 import type {
   TimelineEvent,
@@ -5599,6 +5600,86 @@ describe("WorkspaceStore", () => {
         cursor: { beforeHistorySequence: 6, beforeMessageId: "live-compaction-summary" },
         windowed: true,
       });
+    });
+  });
+
+  // A whole message that arrives live, after catch-up, updates every view that reads whole
+  // messages: the draft's pending sends, the last prompt, usage and the recency order.
+  describe("live whole messages after catch-up", () => {
+    it("resolves the draft send and refreshes prompt, usage and recency", async () => {
+      const workspaceId = "live-user-message";
+      const send = openChat(workspaceId);
+      const onSendEvent = spyOn(getDraftStore(), "onSendEvent");
+      try {
+        createAndAddWorkspace(store, workspaceId);
+        await send(createHistoryMessageEvent("msg-1", 1), caughtUpEvent());
+        const promptListener = mock(() => undefined);
+        const usageListener = mock(() => undefined);
+        const recencyListener = mock(() => undefined);
+        store.subscribeLastUserPrompt(workspaceId, promptListener);
+        store.subscribeUsage(workspaceId, usageListener);
+        store.subscribeDerived(recencyListener);
+
+        // Newer than the workspace's createdAt (now), so the recency order moves.
+        const timestamp = Date.now() + 60_000;
+        await send({
+          type: "message",
+          id: "msg-2",
+          role: "user",
+          parts: [{ type: "text", text: "live prompt" }],
+          metadata: { historySequence: 2, timestamp, sendIds: ["send-1"] },
+        });
+
+        expect(onSendEvent).toHaveBeenCalledWith(workspaceId, ["send-1"]);
+        expect(store.getWorkspaceLastUserPromptInfo(workspaceId)?.text).toBe("live prompt");
+        expect(promptListener).toHaveBeenCalled();
+        expect(usageListener).toHaveBeenCalled();
+        expect(recencyListener).toHaveBeenCalled();
+        expect(store.getWorkspaceRecency()[workspaceId]).toBe(timestamp);
+      } finally {
+        onSendEvent.mockRestore();
+      }
+    });
+
+    it("resets pagination for a compaction summary without a boundary flag", async () => {
+      const workspaceId = "live-compaction-summary-metadata";
+      const send = openChat(workspaceId);
+      let resolveLoadMore: ((value: LoadMoreResponse) => void) | undefined;
+      mockHistoryLoadMore.mockReturnValueOnce(
+        new Promise<LoadMoreResponse>((resolve) => {
+          resolveLoadMore = resolve;
+        })
+      );
+      createAndAddWorkspace(store, workspaceId);
+      await send(createHistoryMessageEvent("msg-newer", 5), {
+        type: "caught-up",
+        historyReplayStatus: "complete",
+        hasOlderHistory: true,
+      });
+      const loadOlder = store.loadOlderHistory(workspaceId);
+
+      await send({
+        type: "message",
+        id: "live-summary",
+        role: "assistant",
+        parts: [{ type: "text", text: "Compacted summary" }],
+        metadata: {
+          historySequence: 6,
+          timestamp: 6,
+          muxMetadata: { type: "compaction-summary" },
+        },
+      });
+      resolveLoadMore?.({
+        messages: [createHistoryMessageEvent("msg-stale-older", 3)],
+        nextCursor: { beforeHistorySequence: 3, beforeMessageId: "msg-stale-older" },
+        hasOlder: true,
+      });
+      await loadOlder;
+
+      // The refreshed pagination makes the in-flight page stale, so it is not merged.
+      expect(
+        store.getWorkspaceState(workspaceId).muxMessages.map((message) => message.id)
+      ).not.toContain("msg-stale-older");
     });
   });
 

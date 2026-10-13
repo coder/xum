@@ -6,6 +6,7 @@ import type { MuxMessage, DisplayedMessage, QueuedMessage } from "@/common/types
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isGoalPendingPersistence, type GoalSnapshot } from "@/common/types/goal";
 import type {
+  ChatMuxMessage,
   HeldInput,
   HistoryEditPrecondition,
   WorkspaceActivitySnapshot,
@@ -5313,6 +5314,36 @@ export class WorkspaceStore {
     this.processStreamEvent(workspaceId, aggregator, data);
   }
 
+  /** Applies a whole message that arrived live, after the history caught up. */
+  private applyLiveMuxMessage(
+    workspaceId: string,
+    aggregator: StreamingMessageAggregator,
+    data: ChatMuxMessage
+  ): void {
+    applyWorkspaceChatEventToAggregator(aggregator, data);
+    // The row that accepts a send carries its id: resolve that send's draft entry.
+    if (data.role === "user" && Array.isArray(data.metadata?.sendIds)) {
+      getDraftStore().onSendEvent(workspaceId, data.metadata.sendIds);
+    }
+
+    const muxMeta = data.metadata?.muxMetadata as { type?: string } | undefined;
+    const isCompactionBoundarySummary =
+      data.role === "assistant" &&
+      (data.metadata?.compactionBoundary === true || muxMeta?.type === "compaction-summary");
+
+    if (isCompactionBoundarySummary) {
+      // Live compaction prunes older messages inside the aggregator; refresh the
+      // pagination cursor so "Load more" starts from the new oldest visible sequence.
+      this.historyPagination.set(workspaceId, this.deriveHistoryPaginationState(aggregator));
+    }
+
+    // Whole messages can change the last human prompt; token/tool deltas cannot.
+    this.lastUserPromptStore.bump(workspaceId);
+    this.states.bump(workspaceId);
+    this.usageStore.bump(workspaceId);
+    this.checkAndBumpRecencyIfChanged();
+  }
+
   private processStreamEvent(
     workspaceId: string,
     aggregator: StreamingMessageAggregator,
@@ -5415,28 +5446,7 @@ export class WorkspaceStore {
         transient.historicalMessages.push(data);
       } else {
         // Process live events immediately (after history loaded)
-        applyWorkspaceChatEventToAggregator(aggregator, data);
-        // The row that accepts a send carries its id: resolve that send's draft entry.
-        if (data.role === "user" && Array.isArray(data.metadata?.sendIds)) {
-          getDraftStore().onSendEvent(workspaceId, data.metadata.sendIds);
-        }
-
-        const muxMeta = data.metadata?.muxMetadata as { type?: string } | undefined;
-        const isCompactionBoundarySummary =
-          data.role === "assistant" &&
-          (data.metadata?.compactionBoundary === true || muxMeta?.type === "compaction-summary");
-
-        if (isCompactionBoundarySummary) {
-          // Live compaction prunes older messages inside the aggregator; refresh the
-          // pagination cursor so "Load more" starts from the new oldest visible sequence.
-          this.historyPagination.set(workspaceId, this.deriveHistoryPaginationState(aggregator));
-        }
-
-        // Whole messages can change the last human prompt; token/tool deltas cannot.
-        this.lastUserPromptStore.bump(workspaceId);
-        this.states.bump(workspaceId);
-        this.usageStore.bump(workspaceId);
-        this.checkAndBumpRecencyIfChanged();
+        this.applyLiveMuxMessage(workspaceId, aggregator, data);
       }
       return;
     }
