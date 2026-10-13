@@ -8,7 +8,7 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import type { ReactElement, ReactNode } from "react";
 
-import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 
@@ -81,10 +81,10 @@ function ApiWrapper(props: { children: ReactNode }) {
   return <APIProvider client={apiClient}>{props.children}</APIProvider>;
 }
 
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualWorkspaceStore =
-  require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
+// Snapshot the real exports before this file mocks the module. Do not load a second copy with
+// require("...WorkspaceStore?real=1"): Bun's LCOV keeps only the last-loaded copy of a file, so a
+// later second copy replaces WorkspaceStore.test.ts's coverage of WorkspaceStore.ts in the shard.
+const actualWorkspaceStore = { ...RealWorkspaceStoreModule };
 
 // The overlay also changes the store identity, so it must stay local to this suite.
 restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...actualWorkspaceStore }]]);

@@ -112,11 +112,20 @@ export async function deliverMessages(): Promise<void> {
   for (let i = 0; i < 10; i++) await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
-/** Advances fake time by `ms` in 50 ms steps, delivering messages after each step. */
-export async function advanceFakeTime(ms: number, stopWhen: () => boolean = () => false) {
+/**
+ * Advances fake time by `ms` in `stepMs` steps (default 50), delivering messages after each step.
+ * Long waits across the 5 s budget or the 20 s start limit pass a coarser step: every step costs
+ * real macrotask hops, and 50 ms steps over minutes made one test outrun bun's 5 s test timeout
+ * on a loaded CI runner.
+ */
+export async function advanceFakeTime(
+  ms: number,
+  stopWhen: () => boolean = () => false,
+  stepMs = 50
+) {
   await deliverMessages();
-  for (let elapsed = 0; elapsed < ms && !stopWhen(); elapsed += 50) {
-    fakeTimers.advanceTimersByTime(Math.min(50, ms - elapsed));
+  for (let elapsed = 0; elapsed < ms && !stopWhen(); elapsed += stepMs) {
+    fakeTimers.advanceTimersByTime(Math.min(stepMs, ms - elapsed));
     await deliverMessages();
   }
 }
@@ -125,12 +134,12 @@ export async function advanceFakeTime(ms: number, stopWhen: () => boolean = () =
  * How `promise` settles while fake time advances by up to `ms`. "pending" when it has not
  * settled by then (never a hung test).
  */
-export async function settleWithin<T>(promise: Promise<T>, ms: number) {
+export async function settleWithin<T>(promise: Promise<T>, ms: number, stepMs = 50) {
   let outcome: { value: T } | { error: string } | "pending" = "pending";
   promise.then(
     (value) => (outcome = { value }),
     (error: unknown) => (outcome = { error: String(error) })
   );
-  await advanceFakeTime(ms, () => outcome !== "pending");
+  await advanceFakeTime(ms, () => outcome !== "pending", stepMs);
   return outcome;
 }
