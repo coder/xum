@@ -51,6 +51,11 @@ import {
 import type { TodoItem } from "@/common/types/tools";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import { revealTimelineTarget } from "@/browser/utils/timelineReveal";
+import type {
+  TimelineEvent,
+  TimelinePage,
+  TimelineSubscriptionEvent,
+} from "@/common/orpc/schemas/timeline";
 import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import {
   findRenderedRefineProposalHash,
@@ -7132,39 +7137,35 @@ describe("WorkspaceStore", () => {
   // The timeline panel reads one refcounted backend subscription per workspace: its snapshot is
   // the newest page, live batches merge into it, and older pages load from the snapshot cursor.
   describe("workspace timeline", () => {
-    const timelineEvent = (seq: number) => ({
-      v: 1 as const,
+    const timelineEvent = (seq: number): TimelineEvent => ({
+      v: 1,
       seq,
       id: `event-${seq}`,
       ts: seq,
-      kind: "turn.completed" as const,
-      source: { system: "workspace" as const },
+      kind: "turn.completed",
+      source: { system: "workspace" },
     });
-    type TimelineUpdate =
-      | {
-          type: "snapshot";
-          events: Array<ReturnType<typeof timelineEvent>>;
-          nextCursor: number | null;
-          hasOlder: boolean;
-        }
-      | { type: "appended"; events: Array<ReturnType<typeof timelineEvent>> };
-    type TimelinePage = Omit<Extract<TimelineUpdate, { type: "snapshot" }>, "type">;
 
-    let feed: ControllableAsyncIterable<TimelineUpdate>;
+    // Inputs come from the store's client contract, payloads from the shared timeline schema,
+    // so a change on either side of the IPC boundary breaks these tests at compile time.
+    type TimelineClient = NonNullable<
+      Parameters<WorkspaceStore["setClient"]>[0]
+    >["workspace"]["timeline"];
+    let feed: ControllableAsyncIterable<TimelineSubscriptionEvent>;
     let subscribeSignals: AbortSignal[];
     const mockTimelineSubscribe = mock(
-      (_input: { workspaceId: string }, options?: { signal?: AbortSignal }) => {
+      (_input: Parameters<TimelineClient["subscribe"]>[0], options?: { signal?: AbortSignal }) => {
         if (options?.signal) subscribeSignals.push(options.signal);
         return Promise.resolve(feed.iterable);
       }
     );
     const mockTimelineList = mock(
-      (_input: { workspaceId: string; cursor: number }): Promise<TimelinePage> =>
+      (_input: Parameters<TimelineClient["list"]>[0]): Promise<TimelinePage> =>
         Promise.resolve({ events: [], nextCursor: null, hasOlder: false })
     );
 
     beforeEach(() => {
-      feed = createControllableAsyncIterable<TimelineUpdate>();
+      feed = createControllableAsyncIterable<TimelineSubscriptionEvent>();
       subscribeSignals = [];
       mockTimelineSubscribe.mockClear();
       mockTimelineList.mockClear();
@@ -7278,7 +7279,7 @@ describe("WorkspaceStore", () => {
     it("closes a subscription that opens after its listener left", async () => {
       const workspaceId = "timeline-late-open";
       const onReturn = mock(() => undefined);
-      feed = createControllableAsyncIterable<TimelineUpdate>({ onReturn });
+      feed = createControllableAsyncIterable<TimelineSubscriptionEvent>({ onReturn });
       let openSubscription!: () => void;
       mockTimelineSubscribe.mockImplementationOnce(
         () =>
