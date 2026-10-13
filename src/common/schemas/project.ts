@@ -4,6 +4,7 @@ import {
   AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
   AgentMessageDispatchModeSchema,
   BestOfGroupSchema,
+  MESSAGING_TAG_DESCRIPTION,
   ProjectRefSchema,
   UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
   WorkflowTaskMetadataSchema,
@@ -140,6 +141,9 @@ export const WorkspaceConfigSchema = z.object({
   }),
   unrelatedWorkspaceConsent: z.string().optional().meta({
     description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
+  }),
+  messagingTag: z.string().optional().meta({
+    description: MESSAGING_TAG_DESCRIPTION,
   }),
   unrelatedWorkspaceConsentPending: z.literal(true).optional().meta({
     description:

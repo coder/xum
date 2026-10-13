@@ -1927,6 +1927,28 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         publishWorkspaceMetadata(next);
         return Promise.resolve({ success: true as const, data: undefined });
       },
+      setMessagingTag: (input: { workspaceId: string; tag: string | null }) => {
+        const current = workspaceMap.get(input.workspaceId);
+        if (!current) {
+          return Promise.resolve({ success: false as const, error: "Workspace not found" });
+        }
+        // Same rules as the backend: null/empty clears; otherwise trim, strip one leading
+        // @, lowercase, and reject anything that is not a valid tag.
+        const { messagingTag: _previous, ...rest } = current;
+        if (input.tag === null || input.tag.trim() === "") {
+          publishWorkspaceMetadata(rest);
+          return Promise.resolve({ success: true as const, data: undefined });
+        }
+        const normalized = input.tag.trim().replace(/^@/, "").toLowerCase();
+        if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(normalized)) {
+          return Promise.resolve({
+            success: false as const,
+            error: "Invalid messaging tag",
+          });
+        }
+        publishWorkspaceMetadata({ ...rest, messagingTag: normalized });
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       setAgentMessageDispatchMode: (input: {
         workspaceId: string;
         mode: "tool-end" | "turn-end";

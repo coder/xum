@@ -95,6 +95,7 @@ import {
 } from "@/common/schemas/project";
 import {
   getValidAgentMessageDispatchMode,
+  getValidMessagingTag,
   getValidUnrelatedWorkspaceConsent,
 } from "@/common/orpc/schemas/workspace";
 import {
@@ -4081,6 +4082,8 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              // Fail closed: a corrupted/invalid tag publishes as absent (untagged).
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
               agentMessageDispatchMode: getValidAgentMessageDispatchMode(
                 workspace.agentMessageDispatchMode
               ),
@@ -4390,6 +4393,8 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              // Fail closed: a corrupted/invalid tag publishes as absent (untagged).
+              messagingTag: getValidMessagingTag(workspace.messagingTag),
               agentMessageDispatchMode: getValidAgentMessageDispatchMode(
                 workspace.agentMessageDispatchMode
               ),
@@ -4474,6 +4479,7 @@ export class Config {
             unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
               workspace.unrelatedWorkspaceConsent
             ),
+            messagingTag: getValidMessagingTag(workspace.messagingTag),
             agentMessageDispatchMode: getValidAgentMessageDispatchMode(
               workspace.agentMessageDispatchMode
             ),
@@ -4708,6 +4714,7 @@ export class Config {
         unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
           metadata.unrelatedWorkspaceConsent
         ),
+        messagingTag: getValidMessagingTag(metadata.messagingTag),
         agentMessageDispatchMode: getValidAgentMessageDispatchMode(
           metadata.agentMessageDispatchMode
         ),

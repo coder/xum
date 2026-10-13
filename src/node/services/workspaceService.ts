@@ -397,7 +397,9 @@ import { SendMessageOptionsSchema } from "@/common/orpc/schemas";
 import {
   type AgentMessageDispatchMode,
   getValidAgentMessageDispatchMode,
+  getValidMessagingTag,
   getValidUnrelatedWorkspaceConsent,
+  normalizeMessagingTag,
 } from "@/common/orpc/schemas/workspace";
 import type {
   ArchiveLossyUntrackedFilesConfirmation,
@@ -8998,6 +9000,7 @@ export class WorkspaceService
       | "setHeartbeatSettings"
       | "unsetHeartbeatSettings"
       | "setUnrelatedWorkspaceConsent"
+      | "setMessagingTag"
       | "setAgentMessageDispatchMode"
       | "executeHeartbeat"
   ): Result<HeartbeatWorkspaceConfigEntry, string> {
@@ -9254,6 +9257,94 @@ export class WorkspaceService
       return Ok(undefined);
     } catch (error) {
       return Err(`Failed to update unrelated workspace consent: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
+   * User-only messaging tag for a root chat: chats sharing a tag may message each other
+   * (TaskService resolves that relation). Only the settings UI calls this — no agent tool may
+   * set a tag, and it is never routed through the generic `tags` map. `null`/empty clears the
+   * tag (absent is the only untagged representation); an invalid tag is rejected before any
+   * write. Side chats and sub-agent children are refused: tagging is root-chat only. This
+   * never mints or changes unrelated-workspace consent. Like the consent switch, Ok means
+   * committed to config AND published on the metadata channel; recency is not bumped.
+   */
+  async setMessagingTag(workspaceId: string, tag: string | null): Promise<Result<void, string>> {
+    try {
+      assert(tag === null || typeof tag === "string", "setMessagingTag requires a string or null");
+      const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "setMessagingTag");
+      if (!resolved.success) {
+        return Err(resolved.error);
+      }
+      const { normalizedWorkspaceId, projectPath, workspacePath, workspaceEntry } = resolved.data;
+      // Root chats only: a side chat is discarded with its main chat, and a child's parent
+      // owns its messaging — tagging either would create a link that outlives its meaning.
+      if (workspaceEntry.sideChatParentWorkspaceId != null) {
+        return Err("Messaging tags can only be set on a root chat, not a side chat.");
+      }
+      if (workspaceEntry.parentWorkspaceId != null) {
+        return Err("Messaging tags can only be set on a root chat, not a sub-agent chat.");
+      }
+
+      // Validate before any write: an invalid tag must not persist or publish.
+      const clearsTag = tag === null || tag.trim() === "";
+      const normalizedTag = clearsTag ? null : normalizeMessagingTag(tag);
+      if (!clearsTag && normalizedTag === null) {
+        return Err(
+          "Invalid messaging tag: use 1-32 characters, starting with a letter or digit, " +
+            "followed by letters, digits, hyphens, or underscores (an optional leading @ is allowed)."
+        );
+      }
+
+      // Mutate inside the serialized editConfig transform against the FRESH entry (see
+      // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
+      let outcome: Result<void, string> = Err(this.workspaceNotFoundError());
+      await this.config.editConfig((freshConfig) => {
+        const entry = this.findFreshWorkspaceEntry(freshConfig, {
+          projectPath,
+          workspaceId: normalizedWorkspaceId,
+          workspacePath,
+        });
+        if (!entry) {
+          outcome = Err(this.workspaceNotFoundError());
+          return freshConfig;
+        }
+        // Re-check on the fresh entry: it may have become a child/side chat since resolution.
+        if (entry.sideChatParentWorkspaceId != null) {
+          outcome = Err("Messaging tags can only be set on a root chat, not a side chat.");
+          return freshConfig;
+        }
+        if (entry.parentWorkspaceId != null) {
+          outcome = Err("Messaging tags can only be set on a root chat, not a sub-agent chat.");
+          return freshConfig;
+        }
+        outcome = Ok(undefined);
+        if (normalizedTag === null) {
+          delete entry.messagingTag;
+        } else {
+          entry.messagingTag = normalizedTag;
+        }
+        return freshConfig;
+      });
+      if (!outcome.success) {
+        return Err(outcome.error);
+      }
+      // Belt and braces (same as the dispatch-mode setter): the write must read back as the
+      // validated tag, never as a malformed value another writer slipped in.
+      const persisted = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
+        projectPath,
+        workspaceId: normalizedWorkspaceId,
+        workspacePath,
+      });
+      if (getValidMessagingTag(persisted?.messagingTag) !== (normalizedTag ?? undefined)) {
+        return Err("Failed to save messaging tag: the config write did not persist.");
+      }
+      // Publish after every successful write, including no-ops (same reason as consent above):
+      // Ok means committed AND published, so the UI only moves after this ack.
+      await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to update messaging tag: ${getErrorMessage(error)}`);
     }
   }
 

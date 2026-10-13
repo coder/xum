@@ -22,6 +22,12 @@ The command takes no arguments and opens the side chat without sending a message
 - **Disposable**: closing the tab (its close button, middle-click, or <kbd>Ctrl+W</kbd> / <kbd>Cmd+W</kbd> while it is focused) discards that side chat. Removing or archiving the main workspace discards its side chats too. Open side-chat tabs survive app restarts and stay out of the workspace list.
 - **Multiple conversations**: run `/side` again in the main chat to open another independent tab. Closing one leaves the others intact. Side chats can't be nested, and workspace commands such as `/fork`, `/compact` and `/goal` are not available inside them.
 
+## Linking separate chats with a messaging tag
+
+Side chats link only to their own main chat. To let two separate root chats exchange agent messages instead, give them the same **messaging tag**: open **Workspace actions → Messages from other workspaces** on each chat and enter the same tag (for example `@research`). Chats that share a tag can find and message each other, including remote and container chats.
+
+Tags are yours alone to set: agents cannot create, change, or clear them, and a chat carries at most one. Removing a chat's tag (clearing the field in the same dialog) revokes its link — it can no longer be reached through that tag, though messages already received stay in its transcript.
+
 When the right sidebar is hidden (narrow windows and phones), the side chat takes over the chat view instead. Press <kbd>Esc</kbd> (or <kbd>Ctrl+C</kbd> in Vim mode) when it is idle, or click **Return to main chat**, to go back; leaving discards it.
 
 Side chats are available for local, worktree and SSH workspaces.

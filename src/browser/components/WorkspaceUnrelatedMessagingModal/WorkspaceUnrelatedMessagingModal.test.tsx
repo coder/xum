@@ -3,6 +3,7 @@ import "../../../../tests/ui/dom";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { installDom } from "../../../../tests/ui/dom";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
@@ -72,6 +73,8 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        messagingTag={undefined}
+        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
 
@@ -105,6 +108,8 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        messagingTag={undefined}
+        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
     expect(consentSwitch(view).getAttribute("aria-checked")).toBe("true");
@@ -130,6 +135,8 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        messagingTag={undefined}
+        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
 
@@ -161,6 +168,8 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        messagingTag={undefined}
+        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
 
@@ -183,6 +192,101 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
     expect(view.queryByRole("alert")).toBeNull();
   });
 
+  test("the tag input shows on every runtime, displays the @tag, and saves on blur", async () => {
+    const onSetMessagingTag = mock((_tag: string | null) =>
+      Promise.resolve(Ok(undefined) as Result<void, string>)
+    );
+    const renderModal = (messagingTag: string | undefined) => (
+      <WorkspaceUnrelatedMessagingModal
+        open={true}
+        onOpenChange={() => undefined}
+        // Remote runtimes hide consent, but tag linking is the point there: never gated.
+        consentSupported={false}
+        enabled={false}
+        onSetEnabled={() => Promise.resolve(Ok(undefined))}
+        holdUntilTurnEnd={false}
+        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        messagingTag={messagingTag}
+        onSetMessagingTag={onSetMessagingTag}
+      />
+    );
+    const view = render(renderModal("research"));
+    const input = () => view.getByLabelText(/messaging tag/i) as HTMLInputElement;
+    expect(input().value).toBe("@research");
+
+    // userEvent, not fireEvent.input: the latter does not reliably update controlled
+    // input state in happy-dom (see SshPromptDialog.test.tsx).
+    const user = userEvent.setup({ document: view.container.ownerDocument });
+    await user.click(input());
+    await user.clear(input());
+    await user.type(input(), "@Deep-Dive ");
+    fireEvent.blur(input());
+    await waitFor(() => {
+      expect(onSetMessagingTag).toHaveBeenCalledTimes(1);
+    });
+    expect(onSetMessagingTag.mock.calls[0]?.[0]).toBe("@Deep-Dive ");
+    // Ack alone does not rewrite the input; only the republished metadata does.
+    view.rerender(renderModal("deep-dive"));
+    expect(input().value).toBe("@deep-dive");
+  });
+
+  test("clearing the tag input removes the tag", async () => {
+    const onSetMessagingTag = mock((_tag: string | null) =>
+      Promise.resolve(Ok(undefined) as Result<void, string>)
+    );
+    const view = render(
+      <WorkspaceUnrelatedMessagingModal
+        open={true}
+        onOpenChange={() => undefined}
+        consentSupported={true}
+        enabled={false}
+        onSetEnabled={() => Promise.resolve(Ok(undefined))}
+        holdUntilTurnEnd={false}
+        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        messagingTag={"research"}
+        onSetMessagingTag={onSetMessagingTag}
+      />
+    );
+    const input = () => view.getByLabelText(/messaging tag/i) as HTMLInputElement;
+    const user = userEvent.setup({ document: view.container.ownerDocument });
+    await user.click(input());
+    await user.clear(input());
+    fireEvent.blur(input());
+    await waitFor(() => {
+      expect(onSetMessagingTag).toHaveBeenCalledTimes(1);
+    });
+    expect(onSetMessagingTag.mock.calls[0]?.[0]).toBeNull();
+  });
+
+  test("a rejected tag save surfaces the error and reverts to the persisted tag", async () => {
+    const onSetMessagingTag = mock((_tag: string | null) =>
+      Promise.resolve(Err("Invalid messaging tag") as Result<void, string>)
+    );
+    const view = render(
+      <WorkspaceUnrelatedMessagingModal
+        open={true}
+        onOpenChange={() => undefined}
+        consentSupported={true}
+        enabled={false}
+        onSetEnabled={() => Promise.resolve(Ok(undefined))}
+        holdUntilTurnEnd={false}
+        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        messagingTag={"research"}
+        onSetMessagingTag={onSetMessagingTag}
+      />
+    );
+    const input = () => view.getByLabelText(/messaging tag/i) as HTMLInputElement;
+    const user = userEvent.setup({ document: view.container.ownerDocument });
+    await user.click(input());
+    await user.clear(input());
+    await user.type(input(), "@bad tag!");
+    fireEvent.blur(input());
+    const alert = await waitFor(() => view.getByRole("alert"));
+    expect(alert.textContent).toContain("Invalid messaging tag");
+    expect(input().value).toBe("@research");
+    expect(input().disabled).toBe(false);
+  });
+
   test("renders nothing while closed", () => {
     const view = render(
       <WorkspaceUnrelatedMessagingModal
@@ -193,6 +297,8 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        messagingTag={undefined}
+        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
     expect(view.queryByRole("switch", { name: CONSENT_NAME })).toBeNull();
@@ -212,6 +318,8 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={hold}
         onSetHoldUntilTurnEnd={onSetHoldUntilTurnEnd}
+        messagingTag={undefined}
+        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
     const view = render(renderModal(false));
@@ -244,6 +352,8 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => pending.promise}
+        messagingTag={undefined}
+        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
     expect(view.queryByRole("switch", { name: CONSENT_NAME })).toBeNull();

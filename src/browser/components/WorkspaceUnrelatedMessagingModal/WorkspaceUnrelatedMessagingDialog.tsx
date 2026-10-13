@@ -13,7 +13,10 @@ interface WorkspaceUnrelatedMessagingDialogProps {
   workspaceId: string;
   runtimeConfig: RuntimeConfig | undefined;
   workspace:
-    | Pick<FrontendWorkspaceMetadata, "unrelatedWorkspaceConsent" | "agentMessageDispatchMode">
+    | Pick<
+        FrontendWorkspaceMetadata,
+        "unrelatedWorkspaceConsent" | "agentMessageDispatchMode" | "messagingTag"
+      >
     | undefined;
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -40,6 +43,14 @@ export function WorkspaceUnrelatedMessagingDialog(props: WorkspaceUnrelatedMessa
       onSetEnabled={(enabled) =>
         api
           ? api.workspace.setUnrelatedWorkspaceConsent({ workspaceId, enabled })
+          : Promise.resolve({ success: false as const, error: "Not connected to server" })
+      }
+      // Tag state likewise comes only from published metadata; the tag row shows on every
+      // runtime because remote/container chats are the point of tag linking.
+      messagingTag={props.workspace?.messagingTag}
+      onSetMessagingTag={(tag) =>
+        api
+          ? api.workspace.setMessagingTag({ workspaceId, tag })
           : Promise.resolve({ success: false as const, error: "Not connected to server" })
       }
       holdUntilTurnEnd={props.workspace?.agentMessageDispatchMode === "turn-end"}
