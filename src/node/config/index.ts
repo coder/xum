@@ -1932,8 +1932,12 @@ export class Config {
         configLoadFailureStates.delete(this.configFile);
         return config;
       }
+      // The last load decides the alias-conflict gate (#5929): a missing or corrupt file has
+      // no merged rows to protect, and the corrupt-file gate below covers the latter.
+      aliasConflictBackupFailures.delete(this.configFile);
       configLoadFailureStates.delete(this.configFile);
     } catch (error) {
+      aliasConflictBackupFailures.delete(this.configFile);
       this.handleConfigLoadFailure(rawBytes, error);
       if (options?.throwOnError) throw error;
     }

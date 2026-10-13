@@ -1249,6 +1249,29 @@ describe("Config", () => {
       }
     );
 
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "lets edits through again once the conflicting config is gone",
+      async () => {
+        writeProjects(conflictCases[0][1]());
+        const configFile = path.join(tempDir, "config.json");
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          config.loadConfigOrDefault();
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+        }
+        try {
+          // The user moves the conflicting file aside: nothing is left to protect.
+          fs.renameSync(configFile, path.join(tempDir, "moved-aside.json"));
+          await config.setUpdateChannel("nightly");
+          expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+        } finally {
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
     // #5929 repro: a same-id conflict must not cost the rows that only one alias holds.
     for (const [name, buildStored] of conflictCases) {
       it(`keeps the rows outside the conflict for ${name}`, async () => {
