@@ -58,13 +58,32 @@ const WORKER_START_TIMEOUT_MS = 20_000;
 const START_TIMEOUT_MARKER = "HIGHLIGHT_WORKER_START_TIMEOUT";
 // The worker fired `onerror` (its script failed to load, or it crashed) while a call waited.
 const WORKER_DIED_MARKER = "HIGHLIGHT_WORKER_DIED";
+// The worker fired `onerror` before it was ready (a script that failed to load): a start failure,
+// as transient as a start time-out (#6309).
+const START_FAILED_MARKER = "HIGHLIGHT_WORKER_START_FAILED";
 
 /**
- * True when the worker did not start in time. Transient, unlike a budget timeout: the input is
- * not marked, so callers must not cache their plain-text fallback for it either.
+ * True when the worker did not start: it timed out, or it died before it was ready. Transient,
+ * unlike a budget timeout: the input is not marked, so callers must not cache their plain-text
+ * fallback for it either, and highlightCode retries it once a worker is ready.
  */
-export function isHighlightStartTimeout(error: unknown): boolean {
+export function isHighlightStartFailure(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.message === START_TIMEOUT_MARKER || error.message === START_FAILED_MARKER)
+  );
+}
+
+function isHighlightStartTimeout(error: unknown): boolean {
   return error instanceof Error && error.message === START_TIMEOUT_MARKER;
+}
+
+/** A failure whose worker is already ended: it did not start, or it died mid-call. */
+function isWorkerGoneFailure(error: unknown): boolean {
+  return (
+    isHighlightStartFailure(error) ||
+    (error instanceof Error && error.message === WORKER_DIED_MARKER)
+  );
 }
 
 // Inputs that previously exceeded the time budget. We don't ship them to a
@@ -135,9 +154,10 @@ const preparedLanguages = new Set<string>();
 // input (#6303). A set, not one long-pending promise raced by every call: each race would add a
 // reaction to that promise, kept (with its result) for the worker's whole life.
 let workerCalls: Set<(error: Error) => void> | null = null;
-// After a start time-out: one shared start of the next worker that every request whose worker did
-// not start waits on, then retries once (#6303). Null when none is pending.
-let workerRecovery: Promise<void> | null = null;
+// After a start failure: per language, one shared start of the next worker that every request of
+// that language whose worker did not start waits on, then retries once (#6303). Per language, so
+// one grammar's failed recovery does not end another language's wait (#6309).
+const workerRecoveries = new Map<string, Promise<void>>();
 
 /**
  * Tear down the current worker so the next call to `getWorkerAPI` builds a
@@ -329,6 +349,17 @@ async function raceTimeout<T>(call: () => Promise<T>, ms: number, marker: string
 }
 
 /**
+ * The error a failed `prepare` rejects with. A start time-out ends the worker that did not start.
+ * A worker that died before it was ready (onerror already recycled it) is a start failure, not a
+ * highlight failure, so it is retried like a time-out and never cached as plain text (#6309).
+ */
+function startError(e: unknown, startingWorker: Worker | undefined): unknown {
+  if (isHighlightStartTimeout(e)) recycleWorker(startingWorker);
+  if (e instanceof Error && e.message === WORKER_DIED_MARKER) return new Error(START_FAILED_MARKER);
+  return e;
+}
+
+/**
  * Get the worker ready for `language` (start it, load Shiki and the grammar) within
  * WORKER_START_TIMEOUT_MS. Runs at the front of the queue before the budget starts. A worker
  * that does not start in time is ended; the next request starts a new one.
@@ -345,8 +376,7 @@ async function prepareWorker(language: string): Promise<void> {
       START_TIMEOUT_MARKER
     );
   } catch (e) {
-    if (isHighlightStartTimeout(e)) recycleWorker(startingWorker);
-    throw e;
+    throw startError(e, startingWorker);
   }
   if (worker === startingWorker) preparedLanguages.add(language);
 }
@@ -413,10 +443,14 @@ function enqueue<T>(job: () => Promise<T>): Promise<T> {
  * not one each, and a worker that never starts ends the wait instead of looping.
  */
 function whenWorkerRecovered(language: string): Promise<void> {
-  workerRecovery ??= enqueue(() => prepareWorker(language)).finally(() => {
-    workerRecovery = null;
-  });
-  return workerRecovery;
+  let recovery = workerRecoveries.get(language);
+  if (!recovery) {
+    recovery = enqueue(() => prepareWorker(language)).finally(() => {
+      workerRecoveries.delete(language);
+    });
+    workerRecoveries.set(language, recovery);
+  }
+  return recovery;
 }
 
 /**
@@ -457,11 +491,12 @@ function reportHighlightFailure(e: unknown, language: string, codeLength: number
       `[highlightWorkerClient] highlight exceeded ${HIGHLIGHT_TIMEOUT_MS}ms budget for ${language}; ` +
         `rendering as plain text and skipping this input henceforth (${codeLength} chars)`
     );
-  } else if (isHighlightStartTimeout(e)) {
-    // The input is not marked: the next render highlights on a new worker (#6292).
+  } else if (isWorkerGoneFailure(e)) {
+    // The worker is already ended (a start time-out, or onerror), and the input is not marked
+    // (#6292, #6303): log why, but do not recycle again, which could hit a newer worker.
     console.warn(
-      `[highlightWorkerClient] worker did not start within ${WORKER_START_TIMEOUT_MS}ms; ` +
-        `rendering ${language} as plain text until a worker is ready`
+      `[highlightWorkerClient] worker did not start or died (${String(e)}); ` +
+        `rendering ${language} as plain text`
     );
   } else {
     // Non-timeout error — the worker may be in an indeterminate state. Recycle so the next call
@@ -504,7 +539,7 @@ export async function highlightCode(
     // A worker that did not start says nothing about this input. The caller shows plain text
     // meanwhile and has no reason to ask again, so retry here, once, after a worker is ready:
     // a mounted block then highlights without a remount (#6303).
-    if (!isHighlightStartTimeout(e)) throw e;
+    if (!isHighlightStartFailure(e)) throw e;
     signal?.throwIfAborted();
     await whenWorkerRecovered(language);
     return requestHighlight(code, language, theme, signal);
@@ -570,6 +605,6 @@ export function __resetForTests(): void {
   workerHighlightQueue = Promise.resolve();
   workerStructurallyUnavailable = false;
   warnedVscodeWorkerDisabled = false;
-  workerRecovery = null;
+  workerRecoveries.clear();
   timedOutInputs.clear();
 }

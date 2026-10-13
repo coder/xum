@@ -567,14 +567,32 @@ describe("highlightCode worker start-up", () => {
 
   // #6303 item 3: Comlink's releaseProxy drops a pending call without rejecting it, so a call to
   // a worker that fired `onerror` waited out its limit (20 s, or 5 s and a marked input).
-  it("a worker whose script fails rejects at once and does not mark the input", async () => {
+  // #6309: a worker that died before it was ready is a start failure, retried like a start
+  // time-out, not a highlight failure whose plain-text fallback a diff would cache.
+  it("a worker whose script fails is recovered at once, and the input highlights", async () => {
     const created = plan([{ errorAfterMs: 100 }, 0]);
     const outcome = await settleWithin(highlightCode("const a = 1;", "typescript", "dark"), 1_000);
-    expect(outcome).toEqual({ error: "Error: HIGHLIGHT_WORKER_DIED" });
-    expect(await settleWithin(highlightCode("const a = 1;", "typescript", "dark"), 250)).toEqual({
-      value: html("const a = 1;"),
-    });
+    expect(outcome).toEqual({ value: html("const a = 1;") });
     expect(created).toHaveLength(2);
+  });
+
+  it("a diff whose worker dies while starting rejects instead of returning a cacheable fallback", async () => {
+    plan([{ errorAfterMs: 100 }, { errorAfterMs: 100 }]);
+    const chunks = groupDiffLines(["+const a = 1;"], 1, 1);
+    const outcome = await settleWithin(highlightDiffChunks(chunks, "typescript", "dark"), 1_000);
+    expect(outcome).toEqual({ error: "Error: HIGHLIGHT_WORKER_START_FAILED" });
+  });
+
+  // #6309: one language's failed recovery must not end another language's wait.
+  it("each language waits on its own recovery start", async () => {
+    const created = plan([null, null, null, 0]);
+    const ts = highlightCode("const a = 1;", "typescript", "dark");
+    const py = highlightCode("a = 1", "python", "dark");
+    const both = Promise.allSettled([ts, py]);
+    expect(await settleWithin(both, 120_000)).not.toBe("pending");
+    await expect(ts).rejects.toThrow("HIGHLIGHT_WORKER_START_TIMEOUT");
+    await expect(py).resolves.toBe(html("a = 1"));
+    expect(created).toHaveLength(4);
   });
 
   it("a worker that crashes during a highlight rejects at once and does not mark the input", async () => {

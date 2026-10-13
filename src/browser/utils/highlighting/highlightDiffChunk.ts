@@ -1,4 +1,4 @@
-import { highlightCode, isHighlightStartTimeout } from "./highlightWorkerClient";
+import { highlightCode, isHighlightStartFailure } from "./highlightWorkerClient";
 import { isLightThemeMode } from "./shiki-shared";
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import type { DiffChunk } from "./diffChunking";
@@ -237,7 +237,7 @@ function fallbackAfterHighlightError(
   language: string,
   lineCount: number
 ): HighlightedChunk[] {
-  if (isHighlightStartTimeout(error)) throw error;
+  if (isHighlightStartFailure(error)) throw error;
   console.warn(`Syntax highlighting failed for language ${language} (${lineCount} lines):`, error);
   return chunks.map(createFallbackChunk);
 }
