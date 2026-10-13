@@ -578,8 +578,15 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
     // Sidebar collapsed, or a collapsed project or section: the header edits it.
     row.remove();
-    fireEvent.keyDown(window, { key: "F2" });
-    expect(view.getByTestId("workspace-title-input")).toBeTruthy();
+    const focused = view.getByRole("button", { name: "Workspace details" });
+    focused.focus();
+    fireEvent.keyDown(focused, { key: "F2" });
+    const input = view.getByTestId("workspace-title-input");
+
+    // Escape gives focus back to the control that had it before F2.
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(view.queryByTestId("workspace-title-input")).toBeNull();
+    expect(document.activeElement).toBe(focused);
   });
 
   it("offers the hidden sidebar as one row, and opens it full-screen", () => {
