@@ -292,6 +292,143 @@ describe("reasoning replay in built provider requests", () => {
       expect(serialized).toContain("assistant-2 answer");
     });
 
+    // Two steps (each thinks, then acts), as StreamManager persists them.
+    const twoStepTurn = (id: string, metadata: MuxMessage["metadata"] = {}): MuxMessage => ({
+      id,
+      role: "assistant",
+      metadata: { timestamp: 1001, stepStartPartIndices: [0, 3], ...metadata },
+      parts: [
+        {
+          type: "reasoning",
+          text: `${id} step-0 thinking`,
+          providerOptions: { anthropic: { signature: `sig_${id}_0` } },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: `${id}-call`,
+          toolName: "bash",
+          state: "output-available",
+          input: { script: "ls" },
+          output: { success: true, output: "ok" },
+        },
+        { type: "text", text: `${id} step-0 text` },
+        {
+          type: "reasoning",
+          text: `${id} step-1 thinking`,
+          providerOptions: { anthropic: { signature: `sig_${id}_1` } },
+        },
+        { type: "text", text: `${id} answer` },
+      ],
+    });
+    const replayedTexts = async (history: MuxMessage[], receiptRows?: MuxMessage[]) =>
+      reasoningRequestParts(
+        await prepareMessagesForProvider({
+          messagesWithSentinel: history,
+          replayReceiptMessages: receiptRows,
+          effectiveAgentId: "exec",
+          toolNamesForSentinel: [],
+          providerForMessages: "anthropic",
+          effectiveThinkingLevel: "medium",
+          modelString: "anthropic:claude-opus-5-5",
+          workspaceId: "test-ws",
+        })
+      ).map((part) => part.text);
+    const withReceiptOn = (receipt: MuxMessage): MuxMessage[] => [
+      createMuxMessage("user-1", "user", "first", { timestamp: 1000 }),
+      signedTurn("assistant-1"),
+      createMuxMessage("user-2", "user", "second", { timestamp: 1002 }),
+      receipt,
+      createMuxMessage("user-3", "user", "third", { timestamp: 1004 }),
+      signedTurn("assistant-3"),
+      createMuxMessage("user-4", "user", "fourth", { timestamp: 1006 }),
+    ];
+
+    it("keeps the thinking the receipt's turn sent after its strip, and every later row's", async () => {
+      // Mechanism 11: the turn stripped earlier thinking from step 1 on, and kept sending
+      // step 1's block. Stripping it on the next turn rewrote the previous turn's tail.
+      const receipt = {
+        anthropicThinkingReplay: "off" as const,
+        anthropicThinkingReplayFromStep: 1,
+      };
+      expect(await replayedTexts(withReceiptOn(twoStepTurn("assistant-2", receipt)))).toEqual([
+        "assistant-2 step-1 thinking",
+        "assistant-3 thinking",
+      ]);
+      // A repair at the turn start (step 0) keeps the whole receipt row.
+      expect(
+        await replayedTexts(
+          withReceiptOn(
+            twoStepTurn("assistant-2", { ...receipt, anthropicThinkingReplayFromStep: 0 })
+          )
+        )
+      ).toEqual([
+        "assistant-2 step-0 thinking",
+        "assistant-2 step-1 thinking",
+        "assistant-3 thinking",
+      ]);
+    });
+
+    it("an old receipt without a point still strips the whole segment", async () => {
+      expect(
+        await replayedTexts(
+          withReceiptOn(twoStepTurn("assistant-2", { anthropicThinkingReplay: "off" }))
+        )
+      ).toEqual([]);
+    });
+
+    it("a step point on a row without step boundaries strips the whole segment", async () => {
+      const row = twoStepTurn("assistant-2", {
+        anthropicThinkingReplay: "off",
+        anthropicThinkingReplayFromStep: 1,
+      });
+      // Missing or corrupted (not ascending from 0) boundaries cannot place the point.
+      for (const stepStartPartIndices of [undefined, [3, 0]]) {
+        const history = withReceiptOn({
+          ...row,
+          metadata: { ...row.metadata, stepStartPartIndices },
+        });
+        expect(await replayedTexts(history)).toEqual([]);
+      }
+    });
+
+    it("a server-tool receipt strips its whole row and never puts a block back", async () => {
+      // #5887: "end" covers every step of the row, and a later step point never undoes it.
+      const ended = twoStepTurn("assistant-2", {
+        anthropicThinkingReplay: "off",
+        anthropicThinkingReplayFromStep: "end",
+      });
+      expect(await replayedTexts(withReceiptOn(ended))).toEqual(["assistant-3 thinking"]);
+      // The latest receipt decides: a later repair keeps only what came after it.
+      const history = withReceiptOn(ended);
+      history[5] = {
+        ...twoStepTurn("assistant-3"),
+        metadata: {
+          ...twoStepTurn("assistant-3").metadata,
+          anthropicThinkingReplay: "off",
+          anthropicThinkingReplayFromStep: 1,
+        },
+      };
+      expect(await replayedTexts(history)).toEqual(["assistant-3 step-1 thinking"]);
+    });
+
+    it("an empty receipt row the request leaves out still keeps the rows after it", async () => {
+      // #5886: a repair whose turn produced no output leaves an empty receipt row, which
+      // request building filters (callers pass the unfiltered rows as replayReceiptMessages).
+      const emptyReceipt: MuxMessage = {
+        id: "assistant-2",
+        role: "assistant",
+        metadata: {
+          timestamp: 1003,
+          anthropicThinkingReplay: "off",
+          anthropicThinkingReplayFromStep: 0,
+        },
+        parts: [],
+      };
+      const rows = withReceiptOn(emptyReceipt);
+      const sent = rows.filter((row) => row.id !== "assistant-2");
+      expect(await replayedTexts(sent, rows)).toEqual(["assistant-3 thinking"]);
+    });
+
     const boundaries: Array<{ kind: string; row: MuxMessage }> = [
       {
         kind: "compaction",
@@ -317,6 +454,10 @@ describe("reasoning replay in built provider requests", () => {
         const history: MuxMessage[] = [
           createMuxMessage("user-1", "user", "first", { timestamp: 1000 }),
           signedTurn("assistant-1", { anthropicThinkingReplay: "off" }),
+          signedTurn("assistant-1b", {
+            anthropicThinkingReplay: "off",
+            anthropicThinkingReplayFromStep: "end",
+          }),
           boundary.row,
           createMuxMessage("user-2", "user", "second", { timestamp: 1002 }),
           signedTurn("assistant-2"),

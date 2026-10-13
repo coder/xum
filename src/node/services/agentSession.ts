@@ -202,6 +202,7 @@ import {
   type MuxMessageMetadata,
   type MuxFilePart,
   type MuxMessage,
+  type MuxMetadata,
   type StartupRetrySendOptions,
   type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
@@ -760,7 +761,10 @@ interface AgentSessionActiveStreamInfo {
   >;
   stepStartIndices?: readonly number[];
   currentStepStartIndex?: number;
-  initialMetadata?: { systemMessageTokens?: number; anthropicThinkingReplay?: "off" };
+  initialMetadata?: Pick<
+    MuxMetadata,
+    "systemMessageTokens" | "anthropicThinkingReplay" | "anthropicThinkingReplayFromStep"
+  >;
   toolCompletionTimestamps: Map<string, number>;
 }
 
