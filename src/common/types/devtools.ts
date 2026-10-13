@@ -48,6 +48,30 @@ export interface DevToolsStep {
    * did not report the field (other providers, header not sent, older rows).
    */
   inputTransformations: AnthropicInputTransformation[] | null;
+  /**
+   * What the Anthropic cache wrapper saw on the wire for this step, written at finalization.
+   * The replay audit holds recorded steps to the runtime prompt-cache monitor's rules with it.
+   * Absent on non-Anthropic wires, on the steps of older binaries, and when DevTools did not
+   * track the request.
+   */
+  promptCacheWire?: DevToolsPromptCacheWire;
+}
+
+/** The facts the runtime prompt-cache monitor keys and filters on, for one recorded step. */
+export interface DevToolsPromptCacheWire {
+  /** Route identity, as the monitor keys baselines (e.g. "anthropic", "coder:<instance>"). */
+  route: string;
+  /** The effective model string the monitor keys baselines by. */
+  modelString: string;
+  /** False when cache markers were stripped (beta features off): no cache entry exists. */
+  cacheMarkersInjected: boolean;
+  /** True once the provider answered (any HTTP status); false when the fetch itself failed. */
+  dispatched: boolean;
+  /**
+   * ISO time the last attempt's OK response arrived: the monitor's observation time. Absent
+   * when no attempt got an OK response; such a request neither creates nor breaks a cache entry.
+   */
+  observedAt?: string;
 }
 
 /**

@@ -1,4 +1,5 @@
 import { CREDENTIAL_URL_PARAMETER_NAMES } from "@/common/config/schemas/settingsBackup";
+import type { DevToolsPromptCacheWire } from "@/common/types/devtools";
 import assert from "@/common/utils/assert";
 
 /**
@@ -24,6 +25,9 @@ const capturedRequestHeaders = new Map<string, Record<string, string>>();
  * never leaves this module.
  */
 const capturedRequestBodies = new Map<string, string>();
+
+/** Prompt-cache wire facts keyed by step ID (see recordPromptCacheWire). */
+const capturedPromptCacheWires = new Map<string, DevToolsPromptCacheWire>();
 
 /**
  * Steps whose abort already ran cleanup. A provider can still reach its fetch afterwards, and
@@ -191,7 +195,31 @@ export function discardCapturedRequestBody(stepId: string): void {
 /** Abort cleanup: drops the body and refuses later captures until the step settles. */
 export function closeCapturedRequestBody(stepId: string): void {
   capturedRequestBodies.delete(stepId);
+  capturedPromptCacheWires.delete(stepId);
   closedCaptureSteps.add(stepId);
+}
+
+/**
+ * Called by the Anthropic cache wrapper after each fetch attempt of a DevTools-tracked request
+ * (the synthetic step-id header is still present at that layer). The last attempt wins, as it
+ * is the one the provider acted on. No-op for untracked requests and aborted steps.
+ */
+export function recordPromptCacheWire(
+  headers: HeadersInit | undefined,
+  wire: DevToolsPromptCacheWire
+): void {
+  const stepId = new Headers(headers).get(DEVTOOLS_STEP_ID_HEADER)?.trim();
+  if (stepId == null || stepId.length === 0 || closedCaptureSteps.has(stepId)) {
+    return;
+  }
+  capturedPromptCacheWires.set(stepId, wire);
+}
+
+/** Called by the middleware when it finalizes a step: returns (and cleans up) its wire facts. */
+export function consumePromptCacheWire(stepId: string): DevToolsPromptCacheWire | undefined {
+  const wire = capturedPromptCacheWires.get(stepId);
+  capturedPromptCacheWires.delete(stepId);
+  return wire;
 }
 
 /**

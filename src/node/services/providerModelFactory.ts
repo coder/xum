@@ -100,6 +100,7 @@ import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coder
 import type { DevToolsService } from "@/node/services/devToolsService";
 import {
   captureAndStripDevToolsHeader,
+  recordPromptCacheWire,
   resolveDevToolsCaptureBody,
 } from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware } from "@/node/services/devToolsMiddleware";
@@ -830,6 +831,44 @@ function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void 
 }
 
 /**
+ * One fetch attempt of the Anthropic cache wrapper, recording its outcome on the request's
+ * DevTools step when the wrapper knows its route (see recordPromptCacheWire).
+ */
+async function fetchRecordingPromptCacheWire(
+  baseFetch: typeof fetch,
+  input: Parameters<typeof fetch>[0],
+  init: RequestInit,
+  wire: {
+    /** The caller's headers: they still carry the synthetic DevTools step id. */
+    stepHeaders: HeadersInit | undefined;
+    options: { routeIdentity?: PromptCacheRouteIdentity } | undefined;
+    cacheMarkersInjected: boolean;
+  }
+): Promise<Response> {
+  const routeIdentity = wire.options?.routeIdentity;
+  if (routeIdentity == null) return baseFetch(input, init);
+  const record = (outcome: { dispatched: boolean; observedAt?: string }) =>
+    recordPromptCacheWire(wire.stepHeaders, {
+      ...routeIdentity,
+      cacheMarkersInjected: wire.cacheMarkersInjected,
+      ...outcome,
+    });
+  let response: Response;
+  try {
+    response = await baseFetch(input, init);
+  } catch (error) {
+    record({ dispatched: false });
+    throw error;
+  }
+  // Taken when the monitor observes (right after this returns), so the audit measures the
+  // cache TTL from the same time.
+  record(
+    response.ok ? { dispatched: true, observedAt: new Date().toISOString() } : { dispatched: true }
+  );
+  return response;
+}
+
+/**
  * Wrap fetch to normalize Anthropic cache_control directly on the final request body.
  *
  * This keeps routed Anthropic payloads aligned with Xum's manual cache markers
@@ -853,6 +892,12 @@ export function wrapFetchWithAnthropicCacheControl(
      * markers are stripped: with prompt caching off there is no cache to break.
      */
     observeFinalBody?: (body: Record<string, unknown>, requestUrl: string) => void;
+    /**
+     * The route identity the prompt-cache monitor keys this wire by. When set, each attempt
+     * of a DevTools-tracked request records it with the dispatch outcome on the step, so the
+     * replay audit can apply the monitor's rules (see recordPromptCacheWire).
+     */
+    routeIdentity?: PromptCacheRouteIdentity;
   }
 ): typeof fetch {
   const injectCacheControl = options?.injectCacheControl ?? true;
@@ -934,7 +979,12 @@ export function wrapFetchWithAnthropicCacheControl(
     const outHeaders = new Headers(init.headers);
     outHeaders.delete("content-length"); // Body size changed
     // Outside the try above: a rejected dispatch must not be re-sent unchanged.
-    const response = await baseFetch(input, { ...init, headers: outHeaders, body: newBody });
+    const response = await fetchRecordingPromptCacheWire(
+      baseFetch,
+      input,
+      { ...init, headers: outHeaders, body: newBody },
+      { stepHeaders: init.headers, options, cacheMarkersInjected: injectCacheControl }
+    );
     // Observe only a request Anthropic accepted: one that rejected before
     // reaching it (auth refresh, connection error) or that it refused
     // (overloaded, rate limited) neither creates nor breaks a cache entry, so
@@ -2007,6 +2057,7 @@ export class ProviderModelFactory {
               // Honor beta disablement like the built-in Anthropic path: strict
               // ZDR proxies reject cache_control when beta features are off.
               const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+              const customRoute = { route: `custom:${providerName}`, modelString };
               const provider = createAnthropic({
                 baseURL: normalizeAnthropicBaseURL(credentials.baseURL),
                 apiKey: isolatedApiKey,
@@ -2016,10 +2067,8 @@ export class ProviderModelFactory {
                   effectiveAnthropicCacheTtl,
                   {
                     injectCacheControl: !disableBeta,
-                    observeFinalBody: self.promptCacheObserver(opts, {
-                      route: `custom:${providerName}`,
-                      modelString,
-                    }),
+                    observeFinalBody: self.promptCacheObserver(opts, customRoute),
+                    routeIdentity: customRoute,
                   }
                 ),
               });
@@ -2061,13 +2110,15 @@ export class ProviderModelFactory {
           // Use getProviderFetch to preserve any user-configured custom fetch (e.g., proxies)
           const baseFetch = getProviderFetch(providerConfig);
           const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+          const anthropicRoute = { route: "anthropic", modelString };
           // Wrap for cache_control normalization; skip injection when beta features are off.
           const fetchWithCacheControl = wrapFetchWithAnthropicCacheControl(
             baseFetch,
             effectiveAnthropicCacheTtl,
             {
               injectCacheControl: !disableBeta,
-              observeFinalBody: self.promptCacheObserver(opts, { route: "anthropic", modelString }),
+              observeFinalBody: self.promptCacheObserver(opts, anthropicRoute),
+              routeIdentity: anthropicRoute,
             }
           );
           const providerFetch = fetchWithCacheControl;
@@ -2631,6 +2682,7 @@ export class ProviderModelFactory {
                   route: "mux-gateway",
                   modelString,
                 }),
+                routeIdentity: { route: "mux-gateway", modelString },
               })
             : baseFetch;
           const fetchWithAutoLogout = wrapFetchWithMuxGatewayAutoLogout(
@@ -2938,6 +2990,7 @@ export class ProviderModelFactory {
           const gatewayBaseUrl = coderAibridgeBaseUrl(deploymentUrl, gatewayProvider.name);
           if (wire === "anthropic") {
             const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+            const coderRoute = { route: `coder:${gatewayProvider.name}`, modelString };
             // Same cache_control normalization as direct Anthropic / mux-gateway:
             // the bridge forwards origin-shaped payloads to the real Anthropic API.
             const providerFetch = wrapFetchWithAnthropicCacheControl(
@@ -2945,10 +2998,8 @@ export class ProviderModelFactory {
               effectiveAnthropicCacheTtl,
               {
                 injectCacheControl: !disableBeta,
-                observeFinalBody: self.promptCacheObserver(opts, {
-                  route: `coder:${gatewayProvider.name}`,
-                  modelString,
-                }),
+                observeFinalBody: self.promptCacheObserver(opts, coderRoute),
+                routeIdentity: coderRoute,
               }
             );
             const { createAnthropic } = yield* Effect.promise(async () =>

@@ -324,6 +324,81 @@ describe("replayVerifySession pairing", () => {
     expect(result.stepPrefix).toMatchObject({ comparedPairs: 1, breaks: [] });
   });
 
+  test("a step whose stream failed after its OK response is audited from its wire facts", async () => {
+    using tmp = new DisposableTempDir("replay-verify-wire-facts");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    for (const userText of ["First.", "Second."]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+      });
+    }
+    // Turn 1's second step got its OK response (the monitor observed it, so Anthropic cached
+    // its prompt), then the stream failed without usage. Its prompt ends with an answer the
+    // next turn does not replay, so the next turn breaks against it, as the monitor reports.
+    const [, firstStepLine] = ctx.devtoolsLines;
+    const firstStep = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
+    const wire = {
+      route: "anthropic",
+      modelString: REPLAY_FIXTURE_MODEL,
+      cacheMarkersInjected: true,
+      dispatched: true,
+      observedAt: firstStep.startedAt,
+    };
+    ctx.devtoolsLines.splice(
+      2,
+      0,
+      JSON.stringify({
+        type: "step",
+        step: {
+          ...firstStep,
+          id: "step-cut",
+          stepNumber: 1,
+          input: {
+            ...firstStep.input,
+            prompt: [
+              ...(firstStep.input?.prompt as unknown[]),
+              { role: "assistant", content: [{ type: "text", text: "partial" }] },
+            ],
+          },
+        },
+      }),
+      JSON.stringify({
+        type: "step-update",
+        stepId: "step-cut",
+        update: { error: "stream cut", promptCacheWire: wire },
+      })
+    );
+
+    // Every step of this route carries its wire facts, as the cache wrapper records them.
+    for (const line of [...ctx.devtoolsLines]) {
+      const entry = JSON.parse(line) as { type: string; step?: DevToolsStep };
+      if (entry.type !== "step" || entry.step == null || entry.step.id === "step-cut") continue;
+      ctx.devtoolsLines.push(
+        JSON.stringify({
+          type: "step-update",
+          stepId: entry.step.id,
+          update: { promptCacheWire: { ...wire, observedAt: entry.step.startedAt } },
+        })
+      );
+    }
+
+    const result = await verify(ctx);
+    expect(result.stepPrefix).toMatchObject({
+      comparedPairs: 2,
+      breaks: [{ runId: "run-2", boundary: "turn" }],
+    });
+    // A damaged wire record falls back to the old rule, which drops a failed step without usage.
+    ctx.devtoolsLines[3] = JSON.stringify({
+      type: "step-update",
+      stepId: "step-cut",
+      update: { error: "stream cut", promptCacheWire: { ...wire, observedAt: 42 } },
+    });
+    expect((await verify(ctx)).stepPrefix).toMatchObject({ comparedPairs: 1, breaks: [] });
+  });
+
   test("a turn without an assistant row skips only itself", async () => {
     using tmp = new DisposableTempDir("replay-verify-missing-assistant");
     const ctx = createReplayFixtureSessionContext(tmp.path);

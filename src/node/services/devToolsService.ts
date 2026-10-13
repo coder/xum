@@ -301,7 +301,9 @@ export class DevToolsService extends EventEmitter {
    *
    * This bridges the timing gap between policy resolution in AIService (before
    * any provider call) and lazy run creation in DevTools middleware (on first
-   * provider invocation). Metadata is consumed exactly once by createRun.
+   * provider invocation). createRun applies it to every run that carries the
+   * metadata ID: the primary run and each refusal-fallback run (a new model, so a
+   * new run) of the same turn. AIService clears it when the turn ends.
    */
   setPendingRunMetadata(
     workspaceId: string,
@@ -378,14 +380,12 @@ export class DevToolsService extends EventEmitter {
     const byWorkspace = this.pendingRunMetadata.get(workspaceId);
     const normalizedMetadataId = metadataId?.trim();
     if (byWorkspace && normalizedMetadataId != null && normalizedMetadataId.length > 0) {
+      // Kept for the turn's later runs: a fallback run without the chat-turn metadata looks
+      // like a headless side call to the replay audit, which then drops the fallback model's
+      // steps and baseline. clearPendingRunMetadata drops it at the turn's end.
       const pendingMetadata = byWorkspace.get(normalizedMetadataId);
       if (pendingMetadata != null) {
         Object.assign(run, pendingMetadata);
-        byWorkspace.delete(normalizedMetadataId);
-      }
-
-      if (byWorkspace.size === 0) {
-        this.pendingRunMetadata.delete(workspaceId);
       }
     }
 
