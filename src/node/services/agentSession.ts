@@ -1406,7 +1406,10 @@ export class AgentSession {
    */
   /** Track compaction requests that already retried with truncation. */
   private readonly compactionRetryAttempts = new Set<string>();
-  /** Compaction request id -> the input budget scale its one retry trims to. */
+  /**
+   * Compaction request id -> the input budget scale its one retry trims to. Set only while the
+   * automatic retry starts its stream (see maybeRetryCompactionOnContextExceeded).
+   */
   private readonly compactionRetryBudgetScales = new Map<string, number>();
   /**
    * Active compaction request metadata for retry decisions (cleared on stream end/abort).
@@ -8863,7 +8866,6 @@ export class AgentSession {
       openaiTruncation,
       budgetScale,
     } = this.resolveCompactionRetryPlan(context);
-    if (budgetScale != null) this.compactionRetryBudgetScales.set(context.id, budgetScale);
     log.info(`Compaction hit context limit; retrying once with ${retryLabel}`, {
       workspaceId: this.workspaceId,
       model: context.modelString,
@@ -8926,6 +8928,12 @@ export class AgentSession {
     );
 
     let retryResult: Result<void, SendMessageError>;
+    // The half budget belongs to this automatic retry only. A later user resume of the same
+    // compaction row reuses its request ID, and can run on a larger model or a changed history,
+    // so it must trim to the normal budget. streamWithHistory reads the scale when it builds the
+    // request, and the builder keeps it for its refusal-fallback rebuilds, so the entry can go
+    // once the stream started, failed to start, or was skipped.
+    if (budgetScale != null) this.compactionRetryBudgetScales.set(context.id, budgetScale);
     try {
       retryResult = await this.streamWithHistory(
         preparedTurn,
@@ -8946,6 +8954,7 @@ export class AgentSession {
         context.admissionCapture
       );
     } finally {
+      this.compactionRetryBudgetScales.delete(context.id);
       if (this.coordinator.isCurrentTurn(preparedTurn)) {
         this.coordinator.finishPreparation(preparedTurn);
       }
