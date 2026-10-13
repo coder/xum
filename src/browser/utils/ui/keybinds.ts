@@ -329,18 +329,34 @@ export function formatKeybind(keybind: Keybind): string {
     if (keybind.meta) parts.push("Meta");
   }
 
-  // Add the key (handle special cases, then capitalize single letters)
-  let key: string;
-  if (keybind.key === " ") {
-    key = "Space";
-  } else if (keybind.key.length === 1) {
-    key = keybind.key.toUpperCase();
-  } else {
-    key = keybind.key;
-  }
-  parts.push(key);
+  parts.push(formatKeyName(keybind.key));
 
   return isMac() ? parts.join("\u00B7") : parts.join("+"); // · on Mac, + elsewhere
+}
+
+/**
+ * Format a keybind as an `aria-keyshortcuts` value, so assistive technology can announce a
+ * shortcut that is otherwise only shown in a tooltip. Uses the same modifier as formatKeybind.
+ */
+export function formatKeybindForAria(keybind: Keybind): string {
+  const commandOnMac =
+    isMac() &&
+    keybind.ctrl === true &&
+    keybind.meta !== true &&
+    keybind.macCtrlBehavior !== "control";
+  const modifiers: Array<[boolean | undefined, string]> = [
+    [keybind.ctrl && !commandOnMac, "Control"],
+    [keybind.alt, "Alt"],
+    [keybind.shift, "Shift"],
+    [keybind.meta === true || commandOnMac, "Meta"],
+  ];
+  const names = modifiers.filter(([enabled]) => enabled === true).map(([, name]) => name);
+  return [...names, formatKeyName(keybind.key)].join("+");
+}
+
+function formatKeyName(key: string): string {
+  if (key === " ") return "Space";
+  return key.length === 1 ? key.toUpperCase() : key;
 }
 
 /**
@@ -396,6 +412,10 @@ export const KEYBINDS = {
 
   /** Save edit (Cmd/Ctrl+Enter) */
   SAVE_EDIT: { key: "Enter", ctrl: true },
+
+  /** Toggle a Markdown file between rendered preview and the editor (memory file view) */
+  // macOS uses Cmd so that the Control chord keeps its native text-editing meaning in the textarea.
+  TOGGLE_MARKDOWN_PREVIEW: { key: "e", ctrl: true, macCtrlBehavior: "command" },
 
   /** Interrupt active stream (destructive - stops AI generation) */
   // Vim mode: Ctrl+C (familiar from terminal interrupt)

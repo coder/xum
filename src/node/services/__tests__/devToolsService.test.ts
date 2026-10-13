@@ -218,6 +218,28 @@ describe("DevToolsService", () => {
       expect(run2?.toolPolicy).toBeUndefined();
     });
 
+    it("applies a turn's metadata to its refusal-fallback run until the turn clears it", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const metadataId = "turn-stream-token";
+      service.setPendingRunMetadata("ws-1", metadataId, {
+        requestHistorySequence: 7,
+        contextEpoch: "row-1",
+      });
+      // The fallback model has its own middleware, so its run is a second createRun with the
+      // same request metadata ID header.
+      await service.createRun("ws-1", makeRun("primary", "2025-06-01T00:00:00Z"), metadataId);
+      await service.createRun("ws-1", makeRun("fallback", "2025-06-01T00:00:10Z"), metadataId);
+      // Turn end (stream-end / error / abort): AIService clears the pending entry.
+      service.clearPendingRunMetadata("ws-1", metadataId);
+      await service.createRun("ws-1", makeRun("later", "2025-06-01T00:01:00Z"), metadataId);
+
+      const runs = await service.getRuns("ws-1");
+      const byId = (id: string) => runs.find((run) => run.id === id);
+      expect(byId("primary")).toMatchObject({ requestHistorySequence: 7, contextEpoch: "row-1" });
+      expect(byId("fallback")).toMatchObject({ requestHistorySequence: 7, contextEpoch: "row-1" });
+      expect(byId("later")?.requestHistorySequence).toBeUndefined();
+    });
+
     it("stores pending metadata per metadata id for overlapping requests", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
       const policyA = [{ regex_match: "propose_plan", action: "require" as const }];

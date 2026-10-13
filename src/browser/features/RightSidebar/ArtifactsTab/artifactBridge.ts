@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { KEYBINDS } from "@/browser/utils/ui/keybinds";
+import type { Keybind } from "@/common/types/keybind";
 import {
   ARTIFACT_ANNOTATION_CONTEXT_CHARS,
   ARTIFACT_ANNOTATION_QUOTE_MAX_CHARS,
@@ -14,9 +16,13 @@ import {
  * (experiment: "artifacts"). Security-owned contract:
  *
  * - Every message is an object `{ xumArtifact: 1, type, ... }`, validated with zod.
- * - Frame -> host (M3): `{ type: "key", key: "Escape" | "F", shiftKey }`, so Escape and
+ * - Frame -> host (M3): `{ type: "key", key: "Escape" | "F" | "C", shiftKey }`, so Escape and
  *   Shift+F can exit fullscreen while focus is inside the frame (the host never lets a frame
  *   message enter fullscreen: the artifact's script can post these without a key press).
+ *   "C" is the annotate shortcut (KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE), which a click into the
+ *   frame (focus then sits in it) made unreachable from the keyboard. It can turn annotate mode
+ *   on, so the host honours it only during a live user gesture in this frame
+ *   (hasLiveUserGesture, SandboxedArtifactFrame.tsx).
  * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) only fills the
  *   host-owned confirm strip, never sends by itself; `{ type: "setState", state }`
  *   (window.xum.setState) is persisted per artifact, for all its versions. Text and JSON sizes
@@ -64,7 +70,7 @@ const ArtifactKeyMessageSchema = z
   .object({
     ...bridgeEnvelope,
     type: z.literal("key"),
-    key: z.enum(["Escape", "F"]),
+    key: z.enum(["Escape", "F", "C"]),
     shiftKey: z.boolean(),
   })
   .strict();
@@ -348,6 +354,49 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
     });
   })();`;
 
+/**
+ * The annotate key the frame forwards, lowercased, from the keybind the panel and Settings use,
+ * so the three cannot drift. The shim checks only a key with no modifiers, so a keybind with
+ * modifiers or a `code` turns forwarding off (null) rather than forwarding the wrong key. Not
+ * an assert: this module loads with the app, and startup must never crash. The shim tests send
+ * the keybind's key, so such a change fails them.
+ */
+function plainSingleKey(keybind: Keybind): string | null {
+  const plain =
+    keybind.key.length === 1 &&
+    keybind.code == null &&
+    !keybind.ctrl &&
+    !keybind.shift &&
+    !keybind.alt &&
+    !keybind.meta;
+  return plain ? keybind.key.toLowerCase() : null;
+}
+const ANNOTATE_FRAME_KEY = plainSingleKey(KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE);
+
+/**
+ * The annotate key is forwarded (as "C") only once the key event has finished dispatching, so
+ * every handler in the artifact (window listeners registered after this one included) has run:
+ * an artifact that uses that key itself (a game, a keyboard widget) calls preventDefault or
+ * stopPropagation and keeps it.
+ * window.setTimeout reads the final defaultPrevented; it is not a timing guess. The exit keys
+ * keep their capture-phase listener.
+ */
+const ANNOTATE_KEY_LISTENER =
+  ANNOTATE_FRAME_KEY == null
+    ? ""
+    : `
+  window.addEventListener("keydown", function (event) {
+    // Auto-repeat would toggle the mode at the repeat rate and spend the frame's message budget,
+    // so a held key could drop its send/setState messages.
+    if (event.repeat || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    if (typeof event.key !== "string" || event.key.toLowerCase() !== ${JSON.stringify(ANNOTATE_FRAME_KEY)}) return;
+    if (isEditable(keyTarget(event))) return;
+    window.setTimeout(function () {
+      if (event.defaultPrevented) return;
+      host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: "C", shiftKey: false }, "*");
+    }, 0);
+  });`;
+
 export function buildArtifactBridgeScript(
   initialTheme: ArtifactTheme,
   initialState: unknown = null
@@ -474,6 +523,11 @@ export function buildArtifactBridgeScript(
     }
     host.postMessage(message, "*");
   }, true);
+  // The innermost target: a key typed in an input inside an open shadow root reaches window
+  // retargeted to the shadow host, which is not editable.
+  function keyTarget(event) {
+    return typeof event.composedPath === "function" ? event.composedPath()[0] || event.target : event.target;
+  }
   function isEditable(target) {
     if (!target || target.nodeType !== 1) return false;
     var tag = target.tagName;
@@ -485,11 +539,12 @@ export function buildArtifactBridgeScript(
     // Escape is checked before the editable exclusion: keys inside the frame never reach the
     // host, so this is the only way to leave fullscreen while an artifact input has focus.
     if (event.key === "Escape") key = "Escape";
-    else if (isEditable(event.target)) return;
+    else if (isEditable(keyTarget(event))) return;
     else if (plain && event.shiftKey && (event.key === "F" || event.key === "f")) key = "F";
     if (key === null) return;
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: key, shiftKey: event.shiftKey }, "*");
   }, true);
+  ${ANNOTATE_KEY_LISTENER}
   ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
 }
