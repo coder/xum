@@ -1186,14 +1186,16 @@ const playDomainsStrip = async (canvasElement: HTMLElement) => {
 export const McpAppViewDomainsLaptop: Story = {
   globals: { viewport: { value: "laptop1200", isRotated: false } },
   // Dark only: both widths are captured, and the strip uses shared theme tokens (Pixel budget).
-  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["laptop"] } } },
+  // Play only: the stack adds no Pixel snapshots (shared cap).
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => renderMcpAppView(MCP_APP_VIEW_HTML, DOMAINS_CSP),
   play: ({ canvasElement }) => playDomainsStrip(canvasElement),
 };
 export const McpAppViewDomainsPhone: Story = {
   globals: { viewport: { value: "phone390", isRotated: false } },
   // Dark only: both widths are captured, and the strip uses shared theme tokens (Pixel budget).
-  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
+  // Play only: the stack adds no Pixel snapshots (shared cap).
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => renderMcpAppView(MCP_APP_VIEW_HTML, DOMAINS_CSP),
   play: ({ canvasElement }) => playDomainsStrip(canvasElement),
 };
