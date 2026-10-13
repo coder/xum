@@ -69,8 +69,9 @@ export function useWorkflowRuns(workspaceId: string): UseWorkflowRunsResult {
       setLoading(true);
     }
 
+    // Without a client nothing is loaded yet, so `loading` stays as it is: still true before the
+    // first snapshot of this workspace (the tab must not show its empty state, then flip to runs).
     if (!api) {
-      setLoading(false);
       return;
     }
 

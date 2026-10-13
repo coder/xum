@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import type { DisplayedMessage, MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { ChatMuxMessage } from "@/common/orpc/types";
@@ -90,6 +90,8 @@ const SubagentTranscriptViewer: React.FC<{
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [messages, setMessages] = useState<MuxMessage[] | null>(null);
+  // True once a transcript is on screen: a re-read (a new API client) then keeps it shown.
+  const hasTranscriptRef = useRef(false);
 
   // The header's model and thinking level belong to the transcript this viewer shows.
   useEffect(() => {
@@ -112,6 +114,12 @@ const SubagentTranscriptViewer: React.FC<{
       return;
     }
 
+    // Without a transcript on screen, show the loading state (the dialog may have opened while
+    // there was no client).
+    if (!hasTranscriptRef.current) {
+      setIsLoading(true);
+    }
+
     let cancelled = false;
 
     const run = async () => {
@@ -127,6 +135,7 @@ const SubagentTranscriptViewer: React.FC<{
         setModel(transcript.model);
         setThinkingLevel(transcript.thinkingLevel);
         setIsLoading(false);
+        hasTranscriptRef.current = true;
       } catch (err: unknown) {
         // A lost connection (or this effect's own cleanup) is not a transcript error: keep what
         // is shown for the next client.

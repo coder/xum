@@ -184,6 +184,40 @@ describe.each([...GAP_MODES])("live feeds across a dropped connection (%s)", (mo
   });
 });
 
+describe.each([...GAP_MODES])("the Workflows tab opened while reconnecting (%s)", (mode) => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(async () => {
+    cleanupDom = installDom();
+    harness = createConnectionHarness(mode, serverOverrides);
+    scriptNames = () => Promise.resolve(["deploy"]);
+    // The tab opens during the gap: no snapshot has landed yet.
+    await harness.drop();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("shows its loading state, not the empty state, until the first snapshot lands", async () => {
+    workflowSnapshot = () => Promise.resolve([]);
+    const view = render(<WorkflowsTab workspaceId="ws-1" />, { wrapper: Wrapper });
+    await flush();
+
+    const next = deferred<string[]>();
+    workflowSnapshot = () => next.promise;
+    await reconnect();
+    expect(view.queryByText("Loading workflow runs…")).not.toBeNull();
+    expect(view.queryByText("deploy")).toBeNull();
+
+    next.resolve([]);
+    await view.findByText("deploy");
+    expect(view.queryByText("Loading workflow runs…")).toBeNull();
+  });
+});
+
 describe("live feeds of another workspace", () => {
   let cleanupDom: (() => void) | null = null;
 

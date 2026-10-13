@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import assert from "@/common/utils/assert";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { MarkdownCore } from "@/browser/features/Messages/MarkdownCore";
 import { PlanMarkdownContainer } from "@/browser/features/Messages/MarkdownRenderer";
 import {
@@ -30,6 +30,27 @@ export const PlanFileDialog: React.FC<PlanFileDialogProps> = (props) => (
   </Dialog>
 );
 
+type PlanRead =
+  | { status: "ok"; content: string; path: string }
+  | { status: "error"; error: string }
+  /** Cut off by a lost connection (an abort): not a plan error. */
+  | { status: "lost" };
+
+async function readPlan(api: APIClient, workspaceId: string): Promise<PlanRead> {
+  try {
+    const result = await api.workspace.getPlanContent({ workspaceId });
+    if (!result.success) {
+      return { status: "error", error: result.error };
+    }
+    assert(result.data.path.length > 0, "Plan path should be non-empty");
+    return { status: "ok", content: result.data.content, path: result.data.path };
+  } catch (error: unknown) {
+    return isAbortError(error)
+      ? { status: "lost" }
+      : { status: "error", error: getErrorMessage(error) };
+  }
+}
+
 function usePlanFile(workspaceId: string) {
   const { api } = useAPI();
 
@@ -51,42 +72,30 @@ function usePlanFile(workspaceId: string) {
       return;
     }
 
+    // A read with a client replaces the offline error. Without a plan on screen, it shows
+    // "Loading plan…" (the dialog may have opened while there was no client).
+    setError(null);
+    if (!hasPlanRef.current) {
+      setIsLoading(true);
+    }
+
     let cancelled = false;
 
-    const run = async () => {
-      try {
-        const result = await api.workspace.getPlanContent({ workspaceId });
-
-        if (cancelled) {
-          return;
-        }
-
-        if (!result.success) {
-          setError(result.error);
-          setIsLoading(false);
-          return;
-        }
-
-        assert(result.data.path.length > 0, "Plan path should be non-empty");
-
-        setError(null);
-        setContent(result.data.content);
-        setPath(result.data.path);
-        setIsLoading(false);
-        hasPlanRef.current = true;
-      } catch (error: unknown) {
-        // A lost connection (or this effect's own cleanup) is not a plan error: keep what is
-        // shown for the next client.
-        if (cancelled || isAbortError(error)) {
-          return;
-        }
-
-        setError(getErrorMessage(error));
-        setIsLoading(false);
+    void readPlan(api, workspaceId).then((read) => {
+      // A lost connection (or this effect's own cleanup) keeps what is shown for the next client.
+      if (cancelled || read.status === "lost") {
+        return;
       }
-    };
-
-    void run();
+      setIsLoading(false);
+      if (read.status === "error") {
+        setError(read.error);
+        return;
+      }
+      setError(null);
+      setContent(read.content);
+      setPath(read.path);
+      hasPlanRef.current = true;
+    });
 
     return () => {
       cancelled = true;

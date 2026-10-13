@@ -194,6 +194,57 @@ describe.each([...GAP_MODES])("dialogs across a dropped connection (%s)", (mode)
   });
 });
 
+describe.each([...GAP_MODES])("dialogs opened while reconnecting (%s)", (mode) => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(async () => {
+    cleanupDom = installDom();
+    harness = createConnectionHarness(mode, serverOverrides);
+    // The dialog opens during the gap: nothing is shown yet.
+    await harness.drop();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("the plan dialog shows its loading state once a client reads the plan", async () => {
+    answerPlan = () => Promise.resolve(planResult("unused"));
+    const view = render(<PlanFileDialog open onOpenChange={noop} workspaceId="ws-1" />, {
+      wrapper: Wrapper,
+    });
+    await flush();
+
+    const next = deferred<unknown>();
+    answerPlan = () => next.promise;
+    await reconnect();
+    expect(view.queryByText("Loading plan…")).not.toBeNull();
+    expect(view.queryByTestId("plan-file-dialog-error")).toBeNull();
+
+    next.resolve(planResult("Plan A"));
+    await view.findByText("Plan A");
+  });
+
+  test("the transcript dialog shows its loading state once a client reads the transcript", async () => {
+    answerTranscript = () => Promise.resolve(transcriptResult("low"));
+    const view = render(<SubagentTranscriptDialog open onOpenChange={noop} taskId="task-1" />, {
+      wrapper: Wrapper,
+    });
+    await flush();
+
+    const next = deferred<unknown>();
+    answerTranscript = () => next.promise;
+    await reconnect();
+    expect(view.queryByText(/Loading transcript/)).not.toBeNull();
+    expect(view.queryByText("No transcript loaded")).toBeNull();
+
+    next.resolve(transcriptResult("high"));
+    await view.findByText("thinking: high");
+  });
+});
+
 describe("dialogs opened on other data", () => {
   let cleanupDom: (() => void) | null = null;
 
