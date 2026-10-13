@@ -266,6 +266,23 @@ const CACHE_BREAK_EVENTS: TimelineEvent[] = [
       },
     },
   }),
+  makeEvent("cache-break-options", "cache.prefix_break", 20, {
+    data: {
+      model: "anthropic:claude-opus-5-5",
+      description:
+        "Prompt cache prefix broke in messages at block 34 of 80: request message_options (174 chars) -> request message_options (173 chars); changed options: effort xhigh -> high",
+      promptCacheBreak: {
+        section: "messages",
+        boundary: "step",
+        blockIndex: 34,
+        previousBlockCount: 80,
+        nextBlockCount: 81,
+        previous: { role: "request", type: "message_options", length: 174 },
+        next: { role: "request", type: "message_options", length: 173 },
+        changedOptions: [{ key: "effort", previous: "xhigh", next: "high" }],
+      },
+    },
+  }),
 ];
 
 const STORY_STORE: TimelineWorkspaceStore = {

@@ -77,6 +77,13 @@ interface ProxyRoute {
   defaultUpstream: string;
   /** Env names a project secret can set; any one of them turns the pair off for this provider. */
   envNames: readonly string[];
+  /**
+   * A secret that sets `secretKeyName` mixes with the `hostRouteNames` that bash still inherits
+   * from the Xum process (secrets replace only the names they set): a direct-API key next to a
+   * gateway URL or token gets a 403 from the gateway (#6356).
+   */
+  secretKeyName: string;
+  hostRouteNames: readonly string[];
   /** Paths that bill tokens: a 2xx answer without usage is logged as uncounted. */
   billable: readonly string[];
   allowed: ReadonlyArray<{ method: string; path: string | RegExp }>;
@@ -89,6 +96,8 @@ const ROUTES: readonly ProxyRoute[] = [
     prefix: "/anthropic",
     defaultUpstream: "https://api.anthropic.com/v1",
     envNames: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"],
+    secretKeyName: "ANTHROPIC_API_KEY",
+    hostRouteNames: ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"],
     billable: ["/v1/messages"],
     allowed: [
       { method: "POST", path: "/v1/messages" },
@@ -116,6 +125,8 @@ const ROUTES: readonly ProxyRoute[] = [
       "OPENAI_ORG_ID",
       "OPENAI_PROJECT_ID",
     ],
+    secretKeyName: "OPENAI_API_KEY",
+    hostRouteNames: ["OPENAI_BASE_URL", "OPENAI_API_BASE"],
     billable: ["/v1/responses", "/v1/chat/completions"],
     allowed: [
       { method: "POST", path: "/v1/responses" },
@@ -200,6 +211,36 @@ export interface BashAiProxyServiceOptions {
   onUsageRecorded: (workspaceId: string, recorded: RecordedUsage) => void;
 }
 
+/** Why the caller adds no proxy variables in a workspace (turnRequestBuilder decides). */
+export type BashAiProxyBlockReason = "untrusted" | "kill_switch";
+
+const BLOCK_REASON_TEXT: Record<BashAiProxyBlockReason, string> = {
+  untrusted: "the project is not trusted",
+  kill_switch: "XUM_DISABLE_PROJECT_AUTOMATION=1 is set",
+};
+
+/**
+ * The host vars of `route` that a bash command gets next to a provider key from secrets: the
+ * ones the Xum process env sets and the secrets do not replace.
+ */
+function hostNamesMixedWithSecretKey(
+  route: ProxyRoute,
+  runtime: RuntimeMode,
+  secretKeys: readonly string[]
+): string[] {
+  // SSH, Coder, Docker and devcontainer commands get the env of another machine or container.
+  if (runtime !== "local" && runtime !== "worktree") return [];
+  if (!secretKeys.includes(route.secretKeyName)) return [];
+  return route.hostRouteNames.filter(
+    (name) => !secretKeys.includes(name) && (process.env[name]?.trim() ?? "") !== ""
+  );
+}
+
+/** Key of the per-workspace, per-provider log dedupe maps (loggedSkips, warnedMixes). */
+function skipLogKey(workspaceId: string, provider: BashAiProxyProvider): string {
+  return `${workspaceId}\0${provider}`;
+}
+
 type RequestInitWithDispatcher = RequestInit & { dispatcher?: Dispatcher };
 
 // Same outbound behavior as chat requests (providerModelFactory): honor HTTP(S)_PROXY and never
@@ -225,6 +266,10 @@ export class BashAiProxyService {
   /** The forward last saved per SSH host, to skip redundant writes. */
   private readonly savedForwards = new Map<string, PersistedForward>();
   private restoring: Promise<unknown> | undefined;
+  /** Last skip reason logged per workspace and provider (noteSkip). */
+  private readonly loggedSkips = new Map<string, string>();
+  /** Last host env mix warned per workspace and provider (warnOnHostEnvMix). */
+  private readonly warnedMixes = new Map<string, string>();
 
   constructor(private readonly options: BashAiProxyServiceOptions) {
     this.state = new ProxyStateStore(options.rootDir);
@@ -244,6 +289,7 @@ export class BashAiProxyService {
    * cannot reach loopback, the listener failed, or Xum has no key for a provider. A provider
    * whose env names appear in `secretKeys` is skipped as a whole, so a command never gets a
    * proxy URL paired with a real key (project secrets override xumEnv in the bash tool).
+   * A skipped provider is logged with its reason (noteSkip).
    */
   async envFor(
     workspaceId: string,
@@ -251,6 +297,8 @@ export class BashAiProxyService {
     secretKeys: readonly string[]
   ): Promise<Record<string, string>> {
     assert(workspaceId.length > 0, "envFor requires a workspaceId");
+    // Independent of the switch: the mix happens with the proxy on or off.
+    this.warnOnHostEnvMix(workspaceId, runtime, secretKeys);
     if (!this.options.isEnabled()) {
       this.forwards.closeOwned();
       return {};
@@ -258,18 +306,105 @@ export class BashAiProxyService {
     // Decide the routes first: an SSH forward costs a connection and up to 10 s on a first turn,
     // so a workspace that would get no variables never opens one.
     const routes = ROUTES.filter(
-      (route) =>
-        !route.envNames.some((name) => secretKeys.includes(name)) &&
-        this.upstreamFor(route) !== undefined // nothing to pay with
+      (route) => !this.noteSkip(workspaceId, route.provider, this.skipReasonFor(route, secretKeys))
     );
     if (routes.length === 0) return {};
     const port = await this.ensureStarted();
     if (port === undefined) return {};
     const origin = await this.originFor(workspaceId, runtime, port);
-    if (origin === undefined) return {};
+    if (origin === undefined) return this.noteUnreachable(workspaceId, runtime, routes);
     const env: Record<string, string> = {};
-    for (const route of routes) Object.assign(env, route.env(origin, this.keyFor(workspaceId)));
+    for (const route of routes) {
+      // The provider gets its variables: its next skip logs again.
+      this.loggedSkips.delete(skipLogKey(workspaceId, route.provider));
+      Object.assign(env, route.env(origin, this.keyFor(workspaceId)));
+    }
     return env;
+  }
+
+  /**
+   * The caller adds no proxy variables in this workspace (untrusted project, or the project
+   * automation kill switch). Only logs why, so a user who turned the switch on can find out.
+   */
+  noteBlocked(workspaceId: string, reason: BashAiProxyBlockReason): void {
+    assert(workspaceId.length > 0, "noteBlocked requires a workspaceId");
+    if (!this.options.isEnabled()) return;
+    for (const route of ROUTES) {
+      this.noteSkip(workspaceId, route.provider, BLOCK_REASON_TEXT[reason]);
+    }
+  }
+
+  /** Logs why commands of this runtime cannot reach the proxy; returns envFor()'s empty env. */
+  private noteUnreachable(
+    workspaceId: string,
+    runtime: RuntimeMode,
+    routes: readonly ProxyRoute[]
+  ): Record<string, string> {
+    // originFor() gives no origin for Docker and devcontainer at all, and for SSH and Coder when
+    // another backend may share the Xum home or the reverse forward is not up.
+    const reason =
+      runtime === "docker" || runtime === "devcontainer"
+        ? `${runtime} commands have no route to Xum`
+        : "no SSH reverse forward to this host (a shared Xum home, or the forward failed)";
+    for (const route of routes) this.noteSkip(workspaceId, route.provider, reason);
+    return {};
+  }
+
+  /** Why envFor() gives a provider no variables, or undefined when it gets them. */
+  private skipReasonFor(route: ProxyRoute, secretKeys: readonly string[]): string | undefined {
+    // A secret comes first: it is the reason to fix even when Xum also has no key.
+    const secretName = route.envNames.find((name) => secretKeys.includes(name));
+    if (secretName !== undefined) return `a secret sets ${secretName}`;
+    if (this.upstreamFor(route) === undefined)
+      return "Xum has no API key for it, or it is disabled";
+    return undefined;
+  }
+
+  /**
+   * Logs a skipped provider (#6357) once per workspace and provider, not on every turn. A new
+   * reason logs again, and so does the next skip after the provider got its variables (envFor
+   * clears the entry then). Returns whether the provider is skipped (a reason is given).
+   */
+  private noteSkip(
+    workspaceId: string,
+    provider: BashAiProxyProvider,
+    reason: string | undefined
+  ): boolean {
+    if (reason === undefined) return false;
+    const key = skipLogKey(workspaceId, provider);
+    if (this.loggedSkips.get(key) === reason) return true;
+    this.loggedSkips.set(key, reason);
+    log.info(`[bash-ai-proxy] skipped ${provider}: ${reason}; its bash AI calls stay uncounted`, {
+      workspaceId,
+    });
+    return true;
+  }
+
+  /**
+   * Warns (#6356) when a secret sets a provider key while the Xum process env, which Local and
+   * Worktree commands inherit (LocalBaseRuntime.exec), routes that provider elsewhere. Logs
+   * names only, never values. Once per workspace and provider, like noteSkip().
+   */
+  private warnOnHostEnvMix(
+    workspaceId: string,
+    runtime: RuntimeMode,
+    secretKeys: readonly string[]
+  ): void {
+    for (const route of ROUTES) {
+      const key = skipLogKey(workspaceId, route.provider);
+      const hostNames = hostNamesMixedWithSecretKey(route, runtime, secretKeys);
+      if (hostNames.length === 0) {
+        this.warnedMixes.delete(key);
+        continue;
+      }
+      const detail = hostNames.join(", ");
+      if (this.warnedMixes.get(key) === detail) continue;
+      this.warnedMixes.set(key, detail);
+      log.warn(
+        `[bash] a secret sets ${route.secretKeyName}, but bash also inherits ${detail} from the Xum process; a gateway can reject that key`,
+        { workspaceId }
+      );
+    }
   }
 
   /**

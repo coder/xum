@@ -295,6 +295,37 @@ function deletionCreatesRawReset(
   return createdReset();
 }
 
+/**
+ * #5886: the Anthropic thinking-replay receipt (MuxMetadata.anthropicThinkingReplay) must
+ * outlive a turn that produced no output, or the next turn replays the removed thinking and
+ * pays one more 400. Returns the stored row with only the partial's receipt added (its parts
+ * stay as they are, and an empty row never reaches the provider or shows as a reply), or
+ * undefined when there is nothing to add. A later strip of the same turn moves the receipt's
+ * point, so a changed point is copied too.
+ */
+function withPartialReplayReceipt(
+  existing: MuxMessage,
+  partial: MuxMessage
+): MuxMessage | undefined {
+  const receipt = partial.metadata;
+  if (receipt?.anthropicThinkingReplay !== "off") return undefined;
+  const stored = existing.metadata;
+  if (
+    stored?.anthropicThinkingReplay === "off" &&
+    stored.anthropicThinkingReplayFromStep === receipt.anthropicThinkingReplayFromStep
+  ) {
+    return undefined;
+  }
+  return {
+    ...existing,
+    metadata: {
+      ...stored,
+      anthropicThinkingReplay: "off",
+      anthropicThinkingReplayFromStep: receipt.anthropicThinkingReplayFromStep,
+    },
+  };
+}
+
 function stripContextUsage(message: MuxMessage): MuxMessage {
   if (!message.metadata) {
     return message;
@@ -3598,25 +3629,19 @@ export class HistoryService {
         // write, before this partial was deleted, #5886).
         existingMessage.metadata?.anthropicThinkingReplay !== "off";
 
-      // #5886: the Anthropic thinking-repair receipt (MuxMetadata.anthropicThinkingReplay)
-      // must outlive a turn that produced no output, or the next turn replays the removed
-      // thinking and pays one more 400. Add only the receipt to the stored row: its parts
-      // stay as they are, and an empty row never reaches the provider or shows as a reply.
-      const keepsReplayReceipt =
-        !shouldCommit &&
-        partial.metadata?.anthropicThinkingReplay === "off" &&
-        existingMessage.metadata?.anthropicThinkingReplay !== "off";
+      // #5886: the receipt must outlive a turn that produced no output (see
+      // withPartialReplayReceipt).
+      const receiptRow = shouldCommit
+        ? undefined
+        : withPartialReplayReceipt(existingMessage, partial);
 
       if (shouldCommit) {
         const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, partial);
         if (!updateResult.success) {
           return updateResult;
         }
-      } else if (keepsReplayReceipt) {
-        const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, {
-          ...existingMessage,
-          metadata: { ...existingMessage.metadata, anthropicThinkingReplay: "off" },
-        });
+      } else if (receiptRow) {
+        const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, receiptRow);
         if (!updateResult.success) {
           return updateResult;
         }

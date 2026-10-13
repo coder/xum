@@ -134,6 +134,15 @@ const promptCacheBlockShape = {
   toolName: z.string().min(1).optional(),
 };
 
+// A request option that changed in an options block: small enums, booleans and short JSON for
+// `thinking` / `toolChoice`. `serverTools` and `format` carry only the key.
+const promptCacheOptionValue = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+const promptCacheChangedOptionShape = {
+  key: z.string().min(1),
+  previous: promptCacheOptionValue.optional(),
+  next: promptCacheOptionValue.optional(),
+};
+
 const promptCacheBreakShape = {
   section: z.enum(["tools", "system", "messages"]),
   // "turn": the first request of a new turn broke the previous turn's prefix; "step": a later
@@ -144,6 +153,8 @@ const promptCacheBreakShape = {
   nextBlockCount: z.number().int().nonnegative(),
   previous: z.object(promptCacheBlockShape).strict(),
   next: z.object(promptCacheBlockShape).strict().optional(),
+  // Absent on rows written before it existed and on breaks outside an options block.
+  changedOptions: z.array(z.object(promptCacheChangedOptionShape).strict()).optional(),
 };
 
 const timelineEventDataShape = {
@@ -210,6 +221,7 @@ export const TimelineStoredEventSchema = z.object({
           boundary: z.string().min(1),
           previous: z.object(promptCacheBlockShape),
           next: z.object(promptCacheBlockShape).optional(),
+          changedOptions: z.array(z.object(promptCacheChangedOptionShape)).optional(),
         })
         .optional(),
     })

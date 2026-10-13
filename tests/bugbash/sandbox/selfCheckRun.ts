@@ -94,7 +94,7 @@ export async function runSelfCheck(
       // The fake upstream: no key or provider leaves this host.
       ANTHROPIC_API_KEY: "selfcheck-fake-key",
       ANTHROPIC_BASE_URL: `${upstream.baseUrl}/v1`,
-      BUGBASH_MODEL: "anthropic:claude-haiku-4-5",
+      BUGBASH_MODEL: "anthropic:claude-haiku-5-5",
       PATH: process.env.PATH,
       HOME: process.env.HOME,
     };

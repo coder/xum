@@ -51,7 +51,7 @@ export async function startFakeUpstream(port = 0, onRequest?: (request: FakeRequ
       onRequest?.(request);
       const mode = /\[fake:(\w+)\]/.exec(body)?.[1] ?? state.mode;
       const parsed = JSON.parse(body || "{}") as { model?: string; stream?: boolean };
-      const model = parsed.model ?? "claude-haiku-4-5";
+      const model = parsed.model ?? "claude-haiku-5-5";
       const headers = { "request-id": "req_fake", "x-fake-internal": "dropped by the proxy" };
       if (mode === "stall") return;
       // The request arrived, then the connection drops without an answer.
