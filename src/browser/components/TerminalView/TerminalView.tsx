@@ -405,7 +405,7 @@ export function TerminalView({
 
     // Send initial resize to sync PTY dimensions
     const { cols, rows } = term;
-    void router.resize(sessionId, cols, rows);
+    router.syncSize(sessionId, cols, rows);
 
     return unsubscribe;
   }, [visible, terminalReady, sessionId, router, handleExit]);

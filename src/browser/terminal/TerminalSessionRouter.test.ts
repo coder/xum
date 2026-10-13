@@ -208,6 +208,23 @@ describe("TerminalSessionRouter across reconnects", () => {
     expect(second.resizes).toEqual([{ cols: 100, rows: 30 }]);
   });
 
+  // The view already shows its initial size: a request lost with the connection must not drop it.
+  test("an initial size lost with the connection is sent again after a reconnect", async () => {
+    const first = fakeServer("first");
+    const router = new TerminalSessionRouter(first.client);
+    router.subscribe("t1", recorder().callbacks);
+    await settle();
+    first.holdNextResize();
+    router.syncSize("t1", 120, 40);
+    first.settleResize(new Error("connection lost"));
+    await settle();
+
+    const second = fakeServer("second");
+    router.setClient(second.client);
+    await settle();
+    expect(second.resizes).toEqual([{ cols: 120, rows: 40 }]);
+  });
+
   test("a subscriber that joins during a reattach gets the new screen once", async () => {
     const first = fakeServer("first");
     const router = new TerminalSessionRouter(first.client);

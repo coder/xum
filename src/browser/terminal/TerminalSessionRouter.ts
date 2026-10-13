@@ -332,6 +332,25 @@ export class TerminalSessionRouter {
     );
   }
 
+  /**
+   * Send a size the view already has (its initial size). Unlike `resize()`, the size is kept
+   * whatever the request does: the view will not go back, so a reattach must replay it, also
+   * when the connection drops while the request is in flight.
+   */
+  syncSize(sessionId: string, cols: number, rows: number): void {
+    this.sizes.set(sessionId, { cols, rows });
+    this.withClient(
+      () => undefined,
+      (api) => {
+        api.terminal
+          .resize({ sessionId, cols, rows })
+          .catch((err: unknown) =>
+            console.debug(`[TerminalRouter] Initial size for ${sessionId} not sent:`, err)
+          );
+      }
+    );
+  }
+
   /** Runs `run` on the current client, or `offline` while the connection is down. */
   private withClient<T>(offline: () => T, run: (api: APIClient) => T): T {
     return this.api == null ? offline() : run(this.api);

@@ -32,6 +32,7 @@ interface MockRouter {
     typeof mock<(sessionId: string, callbacks: TerminalSubscribeCallbacks) => () => void>
   >;
   resize: ReturnType<typeof mock<(sessionId: string, cols: number, rows: number) => Promise<void>>>;
+  syncSize: ReturnType<typeof mock<(sessionId: string, cols: number, rows: number) => void>>;
   sendInput: ReturnType<typeof mock<(sessionId: string, data: string) => void>>;
 }
 
@@ -138,6 +139,7 @@ function createRouter(): MockRouter {
       return unsubscribeMock;
     }),
     resize: mock((_sessionId: string, _cols: number, _rows: number) => Promise.resolve()),
+    syncSize: mock((_sessionId: string, _cols: number, _rows: number) => undefined),
     sendInput: mock((_sessionId: string, _data: string) => undefined),
   };
 }
