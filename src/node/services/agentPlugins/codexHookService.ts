@@ -22,13 +22,7 @@ import { eventSpine, type EventSpine } from "@/node/services/events/eventSpine";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
-import {
-  discoverAgentPlugins,
-  MAX_PLUGIN_MANIFEST_BYTES,
-  readPluginFileWithinRootCapped,
-  type AgentPluginInfo,
-} from "./discovery";
-import { validatePluginManifest, type AgentPluginManifest } from "./manifest";
+import { discoverAgentPluginAt, discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
 import { loadPluginCodexHooks, type PluginHookDefinition } from "./codexHooks";
 import {
   HOOK_DEFAULT_TIMEOUT_SECONDS,
@@ -216,9 +210,9 @@ export class CodexPluginHookService {
         if (!isPluginHookTrusted(trust, hook)) return false;
         // The CURRENT manifest decides which hooks file is declared (Codex PRRT_kwDOPxxmWM6rN77w):
         // the discovery snapshot would keep a hook that plugin.json no longer points at.
-        const manifest = await readCurrentManifest(plugin.rootPath);
-        if (manifest === undefined) return false;
-        const current = await loadPluginCodexHooks({ rootPath: plugin.rootPath, manifest });
+        const now = await rediscover(plugin);
+        if (now === undefined) return false;
+        const current = await loadPluginCodexHooks(now);
         const stillDeclared = current.hooks.some(
           (candidate) => candidate.key === hook.key && candidate.hash === hook.hash
         );
@@ -252,22 +246,22 @@ function instanceIdOf(plugin: AgentPluginInfo): string {
 }
 
 /**
- * Re-read and validate plugin.json with discovery's limits (contained in the root, size-capped).
- * undefined when it is missing, too large, unreadable or invalid: the gate then skips the hook.
+ * The plugin as discovery reads it now: the same manifest choice (root plugin.json, or
+ * .codex-plugin/plugin.json), Codex normalization, com.openai overlay and limits as the
+ * registration snapshot (Codex PRRT_kwDOPxxmWM6r2lvb: a Codex-only package has no root
+ * plugin.json). undefined when it is gone or no longer a valid plugin: the gate then skips the
+ * hook.
  */
-async function readCurrentManifest(rootPath: string): Promise<AgentPluginManifest | undefined> {
+async function rediscover(plugin: AgentPluginInfo): Promise<AgentPluginInfo | undefined> {
   try {
-    const { content } = await readPluginFileWithinRootCapped({
-      filePath: path.join(rootPath, "plugin.json"),
-      pluginRoot: rootPath,
-      maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
-      label: "plugin.json",
+    const { plugin: now } = await discoverAgentPluginAt({
+      pluginDir: path.join(plugin.containerPath, plugin.dirName),
+      scope: plugin.scope,
     });
-    const validation = validatePluginManifest(JSON.parse(content));
-    return validation.ok ? validation.manifest : undefined;
+    return now ?? undefined;
   } catch (error) {
-    log.debug("Plugin hooks: plugin.json cannot be re-read; skipping the hook", {
-      rootPath,
+    log.debug("Plugin hooks: the plugin cannot be re-read; skipping the hook", {
+      rootPath: plugin.rootPath,
       error: getErrorMessage(error),
     });
     return undefined;

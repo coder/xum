@@ -58,10 +58,8 @@ async function setup(hooksDocument: unknown, metadataOverrides: Partial<Workspac
     path.join(root, PLUGIN_REGISTRY_FILE_NAME),
     JSON.stringify({ plugins: [createTestPluginInstallEntry("guard")] })
   );
-  const { hooks } = await loadPluginCodexHooks({
-    rootPath: await fs.realpath(pluginRoot),
-    manifest: { schemaId: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "guard" },
-  });
+  // No com.openai extension: the default hooks/hooks.json.
+  const { hooks } = await loadPluginCodexHooks({ rootPath: await fs.realpath(pluginRoot) });
   for (const hook of hooks) {
     await setPluginHookTrust(root, computePluginInstanceId(pluginRoot), {
       key: hook.key,
