@@ -3,6 +3,7 @@ import type { Config } from "@/node/config";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { sideChatCapabilityGrants } from "@/node/services/sideChat";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { eventSpine } from "@/node/services/events/eventSpine";
@@ -37,8 +38,11 @@ export async function prepareWorkspaceRequestHooks(args: {
       workspaceId: metadata.id,
       sideChat: sideChatCapabilityGrants(metadata) != null,
       xumHome: config.rootDir,
-      // A function, not a value: the gate re-reads trust before every hook call.
-      isProjectTrusted: () => isWorkspaceProjectTrusted(config, metadata),
+      // A function, not a value: the gate re-reads trust before every hook call. Every project of
+      // the workspace must be trusted: hooks run MCP tools in the runtime they all share, the
+      // rule for the repo's own tool hooks too (Codex PRRT_kwDOPxxmWM6r_vUC).
+      isProjectTrusted: () =>
+        isWorkspaceTrustedForSharedExecution(metadata, config.loadConfigOrDefault().projects),
       mcp: args.mcpServerManager,
       notifyUser: (pluginName, message) =>
         eventSpine.emit("plugin.hook.notice", { workspaceId: metadata.id, pluginName, message }),
