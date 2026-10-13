@@ -90,35 +90,44 @@ test("a focus move in flight is not taken over by the element", () => {
 });
 
 // #6291: a focusout can name a node that stays in the page but never takes focus (made inert or
-// hidden in a focusout handler). No focusin follows, so the guard must not outlive the move's task.
-test("a focus move that never lands stops guarding after its task", async () => {
+// hidden in a focusout handler). Neither a focusin nor a mutation follows: setting inert changes
+// only an attribute, which the observer does not watch. The guard must not outlive the move's task.
+test("a focus move that never lands returns focus to the element after its task", async () => {
   const { panel, first, second } = buildPanel();
   const stop = refocusFallenFocus(panel);
   first.focus();
   first.blur();
   first.dispatchEvent(new window.FocusEvent("focusout", { bubbles: true, relatedTarget: second }));
-  // Same task: the move may still land, so the guard holds.
-  deliverMutation();
+  second.inert = true;
   expect(document.activeElement).toBe(document.body);
 
-  // A later task: no focusin came and no further mutation comes. The skipped mutation is checked
-  // again when the guard expires, so focus does not stay on <body>.
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
   expect(second.isConnected).toBe(true);
   expect(document.activeElement).toBe(panel);
   stop();
 });
 
-// The expiry rechecks only a mutation the guard skipped: a focusout alone (a click on blank
-// space) keeps waiting for a mutation, as before #6291.
-test("an expired focus move with no skipped mutation does not take focus", async () => {
+test("a focus move that lands keeps its focus after the guard's task", async () => {
   const { panel, first, second } = buildPanel();
   const stop = refocusFallenFocus(panel);
   first.focus();
+  second.focus();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  expect(document.activeElement).toBe(second);
+  stop();
+});
+
+// Focus that leaves to nowhere (relatedTarget null) is not a guarded move: it still waits for a
+// mutation, as before #6291.
+test("focus that leaves to nowhere waits for a mutation", async () => {
+  const { panel, first } = buildPanel();
+  const stop = refocusFallenFocus(panel);
+  first.focus();
   first.blur();
-  first.dispatchEvent(new window.FocusEvent("focusout", { bubbles: true, relatedTarget: second }));
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
   expect(document.activeElement).toBe(document.body);
+  deliverMutation();
+  expect(document.activeElement).toBe(panel);
   stop();
 });
 
