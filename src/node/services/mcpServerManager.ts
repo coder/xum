@@ -35,7 +35,11 @@ import {
   type MCPSettingValue,
   type MCPSettingsSnapshot,
 } from "@/common/utils/mcpSettings";
-import type { McpAppResultRecord, McpAppResultStore } from "@/node/services/mcpAppResultStore";
+import type {
+  McpAppModelContext,
+  McpAppResultRecord,
+  McpAppResultStore,
+} from "@/node/services/mcpAppResultStore";
 import { extractMcpAppResource, type McpAppResource } from "@/node/services/mcpAppResource";
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
 import { isAppCallableTool, isMcpAppResourceUri, isModelVisibleTool } from "@/common/utils/mcpApps";
@@ -4256,8 +4260,11 @@ export class MCPServerManager {
       let hasOauthTokens = false;
       if (this.mcpOauthService) {
         try {
+          // Client-bound like getAuthProviderForServer: tokens of another client must not
+          // count, or signing in as the configured client would not recycle the instance.
           hasOauthTokens = await this.mcpOauthService.hasAuthTokens({
             serverUrl: info.url,
+            ...(info.oauth !== undefined ? { oauth: info.oauth } : {}),
           });
         } catch (error) {
           log.debug("[MCP] Failed to resolve MCP OAuth status", { name, error });
@@ -4271,6 +4278,9 @@ export class MCPServerManager {
           url: info.url,
           headers,
           hasOauthTokens,
+          // Plugin OAuth settings are captured by the auth provider at start:
+          // a change must recycle the instance. Holds no secret value.
+          oauth: info.oauth ?? null,
         };
       } catch {
         // Missing secrets or invalid header config. Keep signature stable but avoid leaking details.
@@ -4279,6 +4289,7 @@ export class MCPServerManager {
           url: info.url,
           headers: null,
           hasOauthTokens,
+          oauth: info.oauth ?? null,
         };
       }
     }
@@ -4605,6 +4616,108 @@ export class MCPServerManager {
     Map<string, Record<string, MCPSettingValue>>
   >();
 
+  /**
+   * Hook-time settings reads, per server instance and then workspace: in flight or settled.
+   * Concurrent hook calls join the same read, and a settled one (values, or undefined after a
+   * failure) is not repeated. Keyed by instance like settingsCache, so a recycled or replaced
+   * server is read again.
+   */
+  private readonly hookSettingsReads = new WeakMap<
+    MCPServerInstance,
+    Map<string, Promise<Record<string, MCPSettingValue> | undefined>>
+  >();
+
+  /**
+   * Settings for plugin hooks: every connected, enabled server of this
+   * workspace whose config key starts with `keyPrefix` (one plugin instance)
+   * and that has `openai/settings`, keyed by the plugin's own server name.
+   * Uses the cache; an empty cache is read once with a short timeout (all
+   * misses concurrently), and a failed read yields `{}` for that server.
+   * Never starts servers and never throws: hooks must not stall or break the turn.
+   */
+  async getSettingsForPluginHooks(
+    workspaceId: string,
+    keyPrefix: string,
+    timeoutMs: number
+  ): Promise<Record<string, Record<string, MCPSettingValue>>> {
+    // Null prototype: a plugin server named "__proto__" stays an own key (JSON keeps it).
+    const settings = Object.create(null) as Record<string, Record<string, MCPSettingValue>>;
+    const entry = this.workspaceServers.get(workspaceId);
+    if (entry === undefined) return settings;
+    const misses: Array<Promise<void>> = [];
+    for (const [name, instance] of entry.instances) {
+      const pluginServerName = entry.enabledServers[name]?.plugin?.serverName;
+      if (
+        !name.startsWith(keyPrefix) ||
+        pluginServerName === undefined ||
+        !entry.enabledServerNames.has(name) ||
+        instance.isClosed ||
+        instance.settings?.settingsCapability() === undefined
+      )
+        continue;
+      const cached = this.settingsCache.get(instance)?.get(workspaceId);
+      if (cached !== undefined) {
+        settings[pluginServerName] = cached;
+        continue;
+      }
+      misses.push(
+        this.readSettingsForHooks(instance, workspaceId, timeoutMs).then((values) => {
+          // Recheck after the await: a server disabled, removed or replaced meanwhile must not
+          // hand its settings to the hook.
+          const current = this.workspaceServers.get(workspaceId);
+          if (
+            current?.instances.get(name) !== instance ||
+            !current.enabledServerNames.has(name) ||
+            instance.isClosed
+          )
+            return;
+          settings[pluginServerName] = values ?? {};
+        })
+      );
+    }
+    // Concurrently: misses on several servers share one timeout window instead of adding up.
+    await Promise.all(misses);
+    return settings;
+  }
+
+  private readSettingsForHooks(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    timeoutMs: number
+  ): Promise<Record<string, MCPSettingValue> | undefined> {
+    const byWorkspace =
+      this.hookSettingsReads.get(instance) ??
+      new Map<string, Promise<Record<string, MCPSettingValue> | undefined>>();
+    this.hookSettingsReads.set(instance, byWorkspace);
+    let read = byWorkspace.get(workspaceId);
+    if (read === undefined) {
+      read = (async () => {
+        try {
+          const requestId = this.takeSettingsRequestId(instance, workspaceId);
+          const parsed = parseMCPSettingsReadResult(
+            await this.callSettingsTool(instance, workspaceId, "readTool", {}, { timeoutMs })
+          );
+          if ("error" in parsed) throw new Error(parsed.error);
+          // A newer request (a save or dialog read) began meanwhile: its cached values win.
+          if (this.cacheSettings(instance, workspaceId, requestId, parsed.values))
+            return parsed.values;
+          return this.settingsCache.get(instance)?.get(workspaceId) ?? parsed.values;
+        } catch (error) {
+          log.warn(
+            `[MCP] Settings read for plugin hooks failed for '${instance.name}'; passing {}`,
+            {
+              workspaceId,
+              error: getErrorMessage(error),
+            }
+          );
+          return undefined;
+        }
+      })();
+      byWorkspace.set(workspaceId, read);
+    }
+    return read;
+  }
+
   /** Last settings values read or saved for this workspace's current server instance, if any. */
   getCachedSettings(
     workspaceId: string,
@@ -4670,28 +4783,52 @@ export class MCPServerManager {
     return result.structuredContent;
   }
 
-  /** Read and validate a server's structured settings for one workspace (cached on success). */
+  /**
+   * Read and validate a server's structured settings for one workspace
+   * (cached on success). Null when the server has no `openai/settings`.
+   */
+  /**
+   * Whether this workspace runs the server now (enabled, connected). The
+   * workspace MCP dialog reads settings on open only then, so opening it never
+   * starts a server; Fetch Tools does.
+   */
+  isWorkspaceServerConnected(workspaceId: string, serverName: string): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    const instance = entry?.instances.get(serverName);
+    return (
+      entry?.enabledServerNames.has(serverName) === true &&
+      instance !== undefined &&
+      !instance.isClosed
+    );
+  }
+
   async readSettings(
     workspaceId: string,
     serverName: string,
-    options?: { signal?: AbortSignal; timeoutMs?: number }
-  ): Promise<MCPSettingsSnapshot> {
+    /** `noStart`: read only a running instance; never start or restart the server. */
+    options?: { signal?: AbortSignal; timeoutMs?: number; noStart?: boolean }
+  ): Promise<MCPSettingsSnapshot | null> {
+    const noSettings = Symbol("no settings");
     let source: { instance: MCPServerInstance; requestId: number } | undefined;
     const snapshot = await this.invokeServerOperation(
       workspaceId,
       serverName,
       `MCP settings read for '${serverName}'`,
       (instance) => {
+        if (instance.settings?.settingsCapability() === undefined)
+          return Promise.resolve(noSettings);
         source = { instance, requestId: this.takeSettingsRequestId(instance, workspaceId) };
         return this.callSettingsTool(instance, workspaceId, "readTool", {}, options);
       },
       (content) => {
+        if (content === noSettings) return null;
         const parsed = parseMCPSettingsReadResult(content);
         if ("error" in parsed) throw new Error(`MCP server '${serverName}': ${parsed.error}`);
         return parsed;
       },
       options
     );
+    if (snapshot === null) return null;
     for (const warning of snapshot.warnings)
       log.warn(`[MCP] Settings of '${serverName}': ${warning}`, { workspaceId });
     if (source !== undefined)
@@ -4750,6 +4887,27 @@ export class MCPServerManager {
     return (await this.mcpApps?.store.get(workspaceId, toolCallId)) ?? null;
   }
 
+  /** ui/update-model-context of the view of `record` (its result record binds the server). */
+  async setMcpAppModelContext(
+    workspaceId: string,
+    record: McpAppResultRecord,
+    text: string
+  ): Promise<void> {
+    assert(this.mcpApps, "MCP Apps support is not configured");
+    await this.mcpApps.store.setModelContext(workspaceId, {
+      toolCallId: record.toolCallId,
+      serverName: record.serverName,
+      toolName: record.toolName,
+      text,
+    });
+  }
+
+  /** The views' latest model context, newest first; none while MCP Apps is off. */
+  async getMcpAppModelContexts(workspaceId: string): Promise<readonly McpAppModelContext[]> {
+    if (this.mcpApps?.isEnabled() !== true) return [];
+    return this.mcpApps.store.getModelContexts(workspaceId);
+  }
+
   /** resources/read for an MCP Apps view, validated (mime, encoding, size). */
   async readMcpAppResource(
     workspaceId: string,
@@ -4764,6 +4922,28 @@ export class MCPServerManager {
       `MCP Apps view request for '${serverName}'`,
       (instance) => requireAppsConnection(instance).readResource(uri, options),
       (result) => extractMcpAppResource(result, uri),
+      options
+    );
+  }
+
+  /**
+   * resources/read issued by an MCP Apps view of `serverName` (the caller passes the view's own
+   * server, so reads never cross servers). Returns the server's raw ReadResourceResult. Any URI
+   * the server serves is allowed: the view is that server's own UI, so it reads nothing the
+   * server could not already hand it through a tool result.
+   */
+  async readMcpAppServerResource(
+    workspaceId: string,
+    serverName: string,
+    uri: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<unknown> {
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP Apps resource read for '${serverName}'`,
+      (instance) => requireAppsConnection(instance).readResource(uri, options),
+      (result): unknown => result,
       options
     );
   }
@@ -4824,9 +5004,11 @@ export class MCPServerManager {
     label: string,
     operation: (instance: MCPServerInstance) => Promise<R>,
     finalize: (result: R) => T,
-    options?: { signal?: AbortSignal }
+    /** `noStart`: skip the startup path, so only an already running instance is used. */
+    options?: { signal?: AbortSignal; noStart?: boolean }
   ): Promise<T> {
-    const lastOptions = this.lastWorkspaceRequestOptions.get(workspaceId);
+    const lastOptions =
+      options?.noStart === true ? undefined : this.lastWorkspaceRequestOptions.get(workspaceId);
     let stableSecrets: Record<string, string> | undefined;
     if (lastOptions !== undefined) {
       // First stabilize cached startup state against settings/trust/secret
@@ -5439,6 +5621,7 @@ export class MCPServerManager {
         const authProvider = await this.mcpOauthService?.getAuthProviderForServer({
           serverName: trimmedName,
           serverUrl: server.url,
+          oauth: server.oauth,
         });
 
         return testNamedServer({
@@ -6877,6 +7060,7 @@ export class MCPServerManager {
       : await this.mcpOauthService?.getAuthProviderForServer({
           serverName: name,
           serverUrl: info.url,
+          oauth: info.oauth,
         });
 
     if (signal.aborted) {

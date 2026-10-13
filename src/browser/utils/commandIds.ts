@@ -55,6 +55,7 @@ export const CommandIds = {
   // no longer need a hand-rolled CommandIds entry per tab.
   navOpenLogFile: () => "nav:open-log-file" as const,
   navOpenArtifacts: () => "nav:open-artifacts" as const,
+  navOpenAppView: (toolCallId: string) => `nav:open-app-view:${toolCallId}` as const,
   navOpenFileAsArtifact: () => "nav:open-file-as-artifact" as const,
 
   // Goal commands
