@@ -2,12 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUpRight, BookOpen } from "lucide-react";
 
 import { ChatInputDecoration } from "@/browser/components/ChatPane/ChatInputDecoration";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import {
   type AdditionalSystemContextSnapshot,
   getAdditionalSystemContextFocusGeneration,
   getAdditionalSystemContextVersion,
   queueAdditionalSystemContextSave,
+  readAdditionalSystemContextSnapshot,
   requestAdditionalSystemContextFocus,
   subscribeAdditionalSystemContextFocus,
   updateAdditionalSystemContextSnapshot,
@@ -48,19 +49,11 @@ interface ScratchpadState {
   setEnabled: (enabled: boolean) => void;
 }
 
-export function useChatInstructions(workspaceId: string): ScratchpadState {
-  const { api } = useAPI();
-  const snapshot = useAdditionalSystemContextSnapshot(workspaceId);
-  const [loading, setLoading] = useState(true);
+/** Shows "Saving…" once a save takes longer than the indicator delay. */
+function useSavingIndicator() {
   const [savingVisible, setSavingVisible] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const dirtyRef = useRef(false);
   const mountedRef = useRef(true);
   const savingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // The workspace whose instructions the editor shows (loaded, or failed to load). A re-run for it
-  // (a new API client after a reconnect) keeps the editor enabled and the user's edits: it does
-  // not flash "Loading…" or take focus from the textarea.
-  const loadedWorkspaceIdRef = useRef<string | null>(null);
 
   const clearSavingTimer = () => {
     if (savingTimerRef.current != null) {
@@ -77,13 +70,97 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
     };
   }, []);
 
+  const startSaving = useCallback(() => {
+    // Only show the "Saving…" message if the save takes more than a beat —
+    // sub-second writes shouldn't flicker the UI on every keystroke.
+    clearSavingTimer();
+    savingTimerRef.current = setTimeout(() => {
+      if (mountedRef.current) setSavingVisible(true);
+      savingTimerRef.current = null;
+    }, SAVING_INDICATOR_DELAY_MS);
+  }, []);
+
+  const hideSaving = useCallback(() => {
+    clearSavingTimer();
+    setSavingVisible(false);
+  }, []);
+
+  return { savingVisible, startSaving, hideSaving, mountedRef };
+}
+
+/**
+ * Sends the editor's saves through the store's save queue.
+ *
+ * The editor stays editable while Xum reconnects. An edit that no client received (made without a
+ * client, or its save cut off by the lost connection) is kept and sent to the next client.
+ * Otherwise it would look saved, and the reload would skip it as a local edit, but the backend
+ * would never get it.
+ */
+function useChatInstructionsSave(api: APIClient | null, setError: (error: string | null) => void) {
+  const { savingVisible, startSaving, hideSaving, mountedRef } = useSavingIndicator();
+  // The workspace whose latest edit no client has received yet.
+  const unsentWorkspaceIdRef = useRef<string | null>(null);
+
+  const send = useCallback(
+    (client: APIClient, workspaceId: string, next: AdditionalSystemContextSnapshot) => {
+      setError(null);
+      startSaving();
+      queueAdditionalSystemContextSave(client, workspaceId, next, {
+        onError: (err) => {
+          if (!mountedRef.current) return;
+          // A lost connection is not a save error: the next client gets the edit.
+          if (isAbortError(err)) {
+            unsentWorkspaceIdRef.current = workspaceId;
+            return;
+          }
+          setError(getErrorMessage(err));
+        },
+        onIdle: () => {
+          if (!mountedRef.current) return;
+          hideSaving();
+        },
+      });
+    },
+    [setError, startSaving, hideSaving, mountedRef]
+  );
+
+  // A new client (after a reconnect) gets the edit the last one did not, as the store holds it now.
+  useEffect(() => {
+    const unsentWorkspaceId = unsentWorkspaceIdRef.current;
+    if (api == null || unsentWorkspaceId == null) return;
+    unsentWorkspaceIdRef.current = null;
+    send(api, unsentWorkspaceId, readAdditionalSystemContextSnapshot(unsentWorkspaceId));
+  }, [api, send]);
+
+  const save = (workspaceId: string, next: AdditionalSystemContextSnapshot) => {
+    if (api == null) {
+      unsentWorkspaceIdRef.current = workspaceId;
+      return;
+    }
+    send(api, workspaceId, next);
+  };
+
+  return { savingVisible, save, hideSaving };
+}
+
+export function useChatInstructions(workspaceId: string): ScratchpadState {
+  const { api } = useAPI();
+  const snapshot = useAdditionalSystemContextSnapshot(workspaceId);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const { savingVisible, save, hideSaving } = useChatInstructionsSave(api, setError);
+  const dirtyRef = useRef(false);
+  // The workspace whose instructions the editor shows (loaded, or failed to load). A re-run for it
+  // (a new API client after a reconnect) keeps the editor enabled and the user's edits: it does
+  // not flash "Loading…" or take focus from the textarea.
+  const loadedWorkspaceIdRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (loadedWorkspaceIdRef.current !== workspaceId) {
       loadedWorkspaceIdRef.current = null;
       dirtyRef.current = false;
       setLoading(true);
-      setSavingVisible(false);
-      clearSavingTimer();
+      hideSaving();
     }
     setError(null);
 
@@ -116,34 +193,15 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
     return () => {
       cancelled = true;
     };
-  }, [api, workspaceId]);
+  }, [api, workspaceId, hideSaving]);
 
   const queue = useCallback(
     (next: AdditionalSystemContextSnapshot) => {
       dirtyRef.current = true;
       updateAdditionalSystemContextSnapshot(workspaceId, next);
-      if (!api) return;
-      setError(null);
-      // Only show the "Saving…" message if the save takes more than a beat —
-      // sub-second writes shouldn't flicker the UI on every keystroke.
-      clearSavingTimer();
-      savingTimerRef.current = setTimeout(() => {
-        if (mountedRef.current) setSavingVisible(true);
-        savingTimerRef.current = null;
-      }, SAVING_INDICATOR_DELAY_MS);
-      queueAdditionalSystemContextSave(api, workspaceId, next, {
-        onError: (err) => {
-          if (!mountedRef.current) return;
-          setError(getErrorMessage(err));
-        },
-        onIdle: () => {
-          if (!mountedRef.current) return;
-          clearSavingTimer();
-          setSavingVisible(false);
-        },
-      });
+      save(workspaceId, next);
     },
-    [api, workspaceId]
+    [save, workspaceId]
   );
 
   const setContent = useCallback(

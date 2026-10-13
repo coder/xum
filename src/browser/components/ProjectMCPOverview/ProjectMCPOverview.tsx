@@ -12,6 +12,28 @@ interface ProjectMCPOverviewProps {
   projectPath: string;
 }
 
+interface ShownServers {
+  projectPath: string;
+  servers: Record<string, MCPServerInfo>;
+}
+
+/** Reads the cached list from localStorage (no flash before the first load). */
+function cachedServers(projectPath: string): ShownServers {
+  return {
+    projectPath,
+    servers: readPersistedState<Record<string, MCPServerInfo>>(getMCPServersKey(projectPath), {}),
+  };
+}
+
+/**
+ * The servers to show for `projectPath`. ProjectPage keeps this card mounted across project
+ * navigation, and a load cut off by a lost connection keeps the shown list: never show another
+ * project's list under this one, show this project's cached list until its own load lands.
+ */
+function serversFor(shown: ShownServers, projectPath: string): Record<string, MCPServerInfo> {
+  return shown.projectPath === projectPath ? shown.servers : cachedServers(projectPath).servers;
+}
+
 export const ProjectMCPOverview: React.FC<ProjectMCPOverviewProps> = (props) => {
   const projectPath = props.projectPath;
   const { api } = useAPI();
@@ -19,10 +41,8 @@ export const ProjectMCPOverview: React.FC<ProjectMCPOverviewProps> = (props) => 
 
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  // Initialize from localStorage cache to avoid flash
-  const [servers, setServers] = React.useState<Record<string, MCPServerInfo>>(() =>
-    readPersistedState<Record<string, MCPServerInfo>>(getMCPServersKey(projectPath), {})
-  );
+  const [shown, setShown] = React.useState<ShownServers>(() => cachedServers(projectPath));
+  const servers = serversFor(shown, projectPath);
 
   React.useEffect(() => {
     if (!api || settings.isOpen) return;
@@ -34,7 +54,7 @@ export const ProjectMCPOverview: React.FC<ProjectMCPOverviewProps> = (props) => 
       .then((result) => {
         if (cancelled) return;
         const newServers = result ?? {};
-        setServers(newServers);
+        setShown({ projectPath, servers: newServers });
         // Cache for next load
         updatePersistedState(getMCPServersKey(projectPath), newServers);
         setError(null);
@@ -44,7 +64,7 @@ export const ProjectMCPOverview: React.FC<ProjectMCPOverviewProps> = (props) => 
         // A lost connection is not a load error: keep the shown servers (and the spinner) for
         // the next client, which loads them again.
         if (cancelled || isAbortError(err)) return;
-        setServers({});
+        setShown({ projectPath, servers: {} });
         setError(err instanceof Error ? err.message : "Failed to load MCP servers");
         setLoading(false);
       });

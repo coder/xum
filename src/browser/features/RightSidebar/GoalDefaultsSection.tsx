@@ -3,7 +3,7 @@ import React from "react";
 import { useEffect, useRef, useState } from "react";
 
 import { Input } from "@/browser/components/Input/Input";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { GoalDefaultsControls } from "@/browser/features/Settings/Sections/GoalsSection";
 import { cn } from "@/common/lib/utils";
@@ -68,11 +68,80 @@ function parseTurnCapValue(value: string): number | null {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+interface GoalOverrideWrite {
+  workspaceId: string;
+  override: WorkspaceGoalDefaultsOverride;
+  onSaved: (() => void) | undefined;
+}
+
+/**
+ * Serializes workspace-default writes. The backend setter reads → mutates → writes the full
+ * config record, so two writes in flight could land out of order — a slower first request could
+ * complete after a later edit and overwrite it on disk while the UI continues to show the latest
+ * optimistic state, silently reverting the user's edit on next refetch. Each write waits for the
+ * previous one.
+ *
+ * The controls stay editable while Xum reconnects. A write that no client received (made without
+ * a client, or cut off by the lost connection) is kept until `sendUnsent` hands it to the next
+ * client. Otherwise the edit would look saved but never reach the backend.
+ */
+class GoalOverrideWriter {
+  private chain: Promise<void> = Promise.resolve();
+  private latest: WorkspaceGoalDefaultsOverride | null = null;
+  private unsent: GoalOverrideWrite | null = null;
+  private readonly writesByWorkspace = new Map<string, number>();
+
+  /**
+   * How many writes this workspace has had. A read that began before a write must not show its
+   * (older) answer over the written value.
+   */
+  writeCount(workspaceId: string): number {
+    return this.writesByWorkspace.get(workspaceId) ?? 0;
+  }
+
+  write(api: APIClient | null, edit: GoalOverrideWrite): void {
+    this.writesByWorkspace.set(edit.workspaceId, this.writeCount(edit.workspaceId) + 1);
+    this.latest = edit.override;
+    if (api == null) {
+      this.unsent = edit;
+      return;
+    }
+    this.unsent = null;
+    this.chain = this.chain.then(() =>
+      api.workspace.goalDefaults
+        .set({
+          workspaceId: edit.workspaceId,
+          defaultBudgetCents: edit.override.defaultBudgetCents,
+          defaultTurnCap: edit.override.defaultTurnCap,
+          alwaysRequireExplicitBudget: edit.override.alwaysRequireExplicitBudget,
+        })
+        .then(() => {
+          // Notify parent so prefilled create-form inputs can re-read the effective defaults.
+          edit.onSaved?.();
+        })
+        .catch((error: unknown) => {
+          // Other errors are swallowed (the optimistic edit already updated local state), as
+          // in the global panel. A newer edit replaces a lost one.
+          if (isAbortError(error) && this.latest === edit.override) {
+            this.unsent = edit;
+          }
+        })
+    );
+  }
+
+  /** Sends the write the last client did not get to `api`. */
+  sendUnsent(api: APIClient): void {
+    if (this.unsent != null) {
+      this.write(api, this.unsent);
+    }
+  }
+}
+
 /**
  * The workspace's stored override, read once per workspace. The panel edits it optimistically
- * through `setEditedOverride`.
+ * through `edit`, which also writes it.
  */
-function useWorkspaceGoalOverride(workspaceId: string) {
+function useWorkspaceGoalOverride(workspaceId: string, onPersist: (() => void) | undefined) {
   const { api } = useAPI();
   const [override, setOverride] = useState<WorkspaceGoalDefaultsOverride | null>(null);
   // Distinguishes "loaded; no override stored" (override === null, isLoading
@@ -85,8 +154,8 @@ function useWorkspaceGoalOverride(workspaceId: string) {
   // The workspace whose override is loaded. A re-read for it (a new API client after a reconnect)
   // keeps the controls shown and enabled; only another workspace resets them.
   const loadedWorkspaceIdRef = useRef<string | null>(null);
-  // Counts the user's edits, so an edit made while a re-read is in flight wins over its result.
-  const editCountRef = useRef(0);
+  // Also counts the user's edits, so an edit made while a re-read is in flight wins over its result.
+  const [writer] = useState(() => new GoalOverrideWriter());
 
   // Workspace override is loaded once per workspaceId. `null` (the
   // canonical "no override" state) is what we expect for fresh workspaces.
@@ -100,12 +169,15 @@ function useWorkspaceGoalOverride(workspaceId: string) {
     }
     if (!api) return;
     let cancelled = false;
-    const editCountAtStart = editCountRef.current;
+    const writesAtStart = writer.writeCount(workspaceId);
+    // An edit the last client did not get goes to this one first. It counts as a write after the
+    // read began, so the read's answer (maybe still the older stored value) does not show over it.
+    writer.sendUnsent(api);
     void api.workspace.goalDefaults
       .get({ workspaceId })
       .then((value) => {
         if (cancelled) return;
-        if (editCountRef.current === editCountAtStart) {
+        if (writer.writeCount(workspaceId) === writesAtStart) {
           setOverride(value ?? null);
         }
         setIsLoading(false);
@@ -121,14 +193,14 @@ function useWorkspaceGoalOverride(workspaceId: string) {
     return () => {
       cancelled = true;
     };
-  }, [api, workspaceId]);
+  }, [api, workspaceId, writer]);
 
-  const setEditedOverride = (next: WorkspaceGoalDefaultsOverride) => {
-    editCountRef.current += 1;
+  const edit = (next: WorkspaceGoalDefaultsOverride) => {
     setOverride(next);
+    writer.write(api, { workspaceId, override: next, onSaved: onPersist });
   };
 
-  return { override, isLoading, setEditedOverride };
+  return { override, isLoading, edit };
 }
 
 export function GoalDefaultsSection(props: GoalDefaultsSectionProps) {
@@ -136,7 +208,8 @@ export function GoalDefaultsSection(props: GoalDefaultsSectionProps) {
   const [globalDefaults, setGlobalDefaults] = useState<GoalDefaults>(() => ({
     ...DEFAULT_GOAL_DEFAULTS,
   }));
-  const { override, isLoading, setEditedOverride } = useWorkspaceGoalOverride(props.workspaceId);
+  const onPersistProp = props.onPersist;
+  const { override, isLoading, edit } = useWorkspaceGoalOverride(props.workspaceId, onPersistProp);
 
   // Pull the global defaults so we can render inherited values inside the
   // workspace-override panel. We only re-read on mount/api change; updates
@@ -162,47 +235,12 @@ export function GoalDefaultsSection(props: GoalDefaultsSectionProps) {
     };
   }, [api]);
 
-  const onPersistProp = props.onPersist;
-  // Serialize workspace-default saves. The backend setter
-  // reads → mutates → writes the full config record, so two saves in
-  // flight could land out of order — a slower first request could
-  // complete after a later edit and overwrite it on disk while the UI
-  // continues to show the latest optimistic state, silently reverting
-  // the user's edit on next refetch. Chain saves via a promise ref so
-  // each request awaits the previous before issuing its own write.
-  const saveChainRef = useRef<Promise<void>>(Promise.resolve());
   const persistOverride = (next: WorkspaceGoalDefaultsOverride) => {
     // Ignore edits while the initial read is in flight.
     // Otherwise a stale all-null shape could overwrite saved overrides.
     // The UI also disables the toggles via `isLoading` below.
     if (isLoading) return;
-    setEditedOverride(next);
-    if (!api) return;
-    saveChainRef.current = saveChainRef.current
-      .catch(() => {
-        // Previous save failed; we already swallowed its error in its
-        // own `.catch`, but the chain still has to continue so the
-        // next save isn't permanently rejected.
-      })
-      .then(() =>
-        api.workspace.goalDefaults
-          .set({
-            workspaceId: props.workspaceId,
-            defaultBudgetCents: next.defaultBudgetCents,
-            defaultTurnCap: next.defaultTurnCap,
-            alwaysRequireExplicitBudget: next.alwaysRequireExplicitBudget,
-          })
-          .then(() => {
-            // Notify parent so prefilled create-form inputs can re-read
-            // the effective defaults. Errors are swallowed (the
-            // optimistic `setOverride` above already updated local
-            // state).
-            onPersistProp?.();
-          })
-          .catch(() => {
-            /* swallow — same rationale as global panel */
-          })
-      );
+    edit(next);
   };
 
   // Synthesize a "current override" object (all-null is what the

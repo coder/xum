@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act, cleanup, fireEvent, render, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
+import { useChatInstructions } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
 import { InstructionsTab } from "@/browser/components/InstructionsTab/InstructionsTab";
 import { ProjectMCPOverview } from "@/browser/components/ProjectMCPOverview/ProjectMCPOverview";
 import type { APIClient } from "@/browser/contexts/API";
@@ -44,6 +45,7 @@ let answerInstructions: () => Promise<unknown>;
 let answerChatInstructions: () => Promise<unknown>;
 let answerOverride: () => Promise<unknown>;
 let savedOverrides: unknown[] = [];
+let savedChatInstructions: Array<{ content: string; enabled: boolean }> = [];
 
 function board(goalId: string) {
   return { entries: [{ section: "upcoming", goal: { goalId } }] };
@@ -63,6 +65,10 @@ function serverOverrides(): TestApiOverrides<APIClient> {
       getGoalBoard: () => answerBoard(),
       getInstructions: () => answerInstructions(),
       getAdditionalSystemContext: () => answerChatInstructions(),
+      setAdditionalSystemContext: (input: { content: string; enabled: boolean }) => {
+        savedChatInstructions.push({ content: input.content, enabled: input.enabled });
+        return Promise.resolve({ content: input.content, enabled: input.enabled });
+      },
       goalDefaults: {
         get: () => answerOverride(),
         set: (input: unknown) => {
@@ -124,6 +130,7 @@ describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (
     window.localStorage.clear();
     harness = createConnectionHarness(mode, serverOverrides);
     savedOverrides = [];
+    savedChatInstructions = [];
   });
 
   afterEach(() => {
@@ -220,6 +227,85 @@ describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (
     next.resolve(turnCapOverride(7));
     await flush();
     expect(turnCap().value).toBe("9");
+  });
+});
+
+describe.each([...GAP_MODES])("edits and navigation while reconnecting (%s)", (mode) => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    window.localStorage.clear();
+    harness = createConnectionHarness(mode, serverOverrides);
+    savedOverrides = [];
+    savedChatInstructions = [];
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("a chat-instructions edit made while reconnecting reaches the next client", async () => {
+    // The instructions store is per workspace and process-wide: a fresh workspace per mode.
+    const workspaceId = `ws-offline-edit-${mode}`;
+    answerChatInstructions = () => Promise.resolve({ content: "be brief", enabled: true });
+    const view = renderHook(() => useChatInstructions(workspaceId), { wrapper: Wrapper });
+    await waitFor(() => expect(view.result.current.content).toBe("be brief"));
+
+    await drop();
+    act(() => view.result.current.setContent("be kind"));
+    await flush();
+    expect(view.result.current.error).toBeNull();
+
+    // The next server still stores the old text: the edit must reach it and stay on screen.
+    await reconnect();
+    await waitFor(() =>
+      expect(savedChatInstructions).toEqual([{ content: "be kind", enabled: true }])
+    );
+    expect(view.result.current.content).toBe("be kind");
+    expect(view.result.current.error).toBeNull();
+  });
+
+  test("a goal-defaults edit made while reconnecting reaches the next client", async () => {
+    answerOverride = () => Promise.resolve(turnCapOverride(5));
+    const view = render(<GoalDefaultsSection workspaceId="ws-1" embedded />, {
+      wrapper: Wrapper,
+    });
+    const turnCap = () =>
+      view.getByLabelText("Workspace default goal turn cap") as HTMLInputElement;
+    await waitFor(() => expect(turnCap().value).toBe("5"));
+
+    await drop();
+    fireEvent.change(turnCap(), { target: { value: "9" } });
+    fireEvent.blur(turnCap());
+    await flush();
+
+    // The next server still stores 5: the edit must reach it, and its read must not undo it.
+    await reconnect();
+    await waitFor(() => expect(savedOverrides).toHaveLength(1));
+    expect(savedOverrides[0]).toMatchObject({ workspaceId: "ws-1", defaultTurnCap: 9 });
+    expect(turnCap().value).toBe("9");
+  });
+
+  test("the MCP overview never shows one project's servers under another", async () => {
+    answerServers = () => Promise.resolve(servers("alpha"));
+    const view = render(<ProjectMCPOverview projectPath="/projects/a" />, { wrapper: Wrapper });
+    await view.findByText("alpha");
+
+    // Project B's first list is still loading when the connection drops and cuts it off.
+    answerServers = pending;
+    view.rerender(<ProjectMCPOverview projectPath="/projects/b" />);
+    await flush();
+    expect(view.queryByText("alpha")).toBeNull();
+    await drop();
+    expect(view.queryByText("alpha")).toBeNull();
+
+    answerServers = () => Promise.resolve(servers("beta"));
+    await reconnect();
+    await view.findByText("beta");
+    expect(view.queryByText("alpha")).toBeNull();
   });
 });
 
