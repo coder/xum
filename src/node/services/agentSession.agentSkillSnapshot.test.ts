@@ -51,6 +51,8 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
   async function createSessionHarness(args: {
     workspacePath: string;
+    /** Main checkout when it differs from the workspace's own checkout (worktrees). */
+    projectPath?: string;
     workspaceId?: string;
     runtimeConfig?: FrontendWorkspaceMetadata["runtimeConfig"];
     aiServiceOverrides?: Partial<AIService>;
@@ -60,7 +62,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       id: workspaceId,
       name: "ws",
       projectName: "proj",
-      projectPath: args.workspacePath,
+      projectPath: args.projectPath ?? args.workspacePath,
       namedWorkspacePath: args.workspacePath,
       runtimeConfig: args.runtimeConfig ?? { type: "local" },
     } as unknown as FrontendWorkspaceMetadata;
@@ -170,6 +172,41 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     const snapshotText = snapshotMessage.parts.find((p) => p.type === "text")?.text;
     expect(snapshotText).toContain("Project override for init skill.");
+  });
+
+  it("leaves ${CLAUDE_SKILL_DIR} literal for project skills read from the main checkout", async () => {
+    // A new worktree's first message resolves project skills from the project path
+    // (disableWorkspaceAgents). That copy is not the worktree's, so its path must
+    // not reach the snapshot: bash would run the main checkout's script.
+    const { workspacePath: projectPath } = await createTestWorkspaceWithSkill({
+      skillName: "proj-hello",
+      skillBody: "Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh",
+    });
+    const srcBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-src-"));
+    const worktreePath = path.join(srcBaseDir, "proj", "ws");
+    await fs.mkdir(worktreePath, { recursive: true });
+    const { session, messages } = await createSessionHarness({
+      projectPath,
+      workspacePath: worktreePath,
+      runtimeConfig: { type: "worktree", srcBaseDir },
+    });
+
+    const result = await session.sendMessage("do X", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      disableWorkspaceAgents: true,
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/proj-hello",
+        skillName: "proj-hello",
+        scope: "project",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const snapshotText = getMessageText(messages[0]);
+    expect(snapshotText).toContain("Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh");
+    expect(snapshotText).not.toContain(projectPath);
   });
 
   it("resolves checkout-level plugin skills for subproject execution paths (agent-plugins)", async () => {

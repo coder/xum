@@ -22,6 +22,9 @@ const BUILT_IN_REASON =
 const OFF_HOST_REASON =
   "This skill's files are on the Xum host, but bash in this workspace runs on another machine or in a container, where that path is not valid. Read its files with agent_skill_read_file.";
 
+const OTHER_CHECKOUT_REASON =
+  "This skill was read from the project's main checkout, not from this workspace's checkout. Call agent_skill_read for its directory in this workspace.";
+
 /**
  * True when commands run directly on the Xum host. Positive check on purpose:
  * SSH/Docker (RemoteRuntime), devcontainers (exec inside the container) and
@@ -39,15 +42,23 @@ function execsOnHost(runtime: Runtime): boolean {
  * - Built-in skills: none (embedded in the app bundle).
  * - Read through the workspace runtime itself (local, worktree, SSH/Docker
  *   project skills, Docker globals): the path is valid where bash runs.
- * - Read on the host while bash runs elsewhere (plugin and host-fallback global
- *   skills on SSH, every devcontainer read): none. A devcontainer sees the
+ * - Read on the host while bash runs elsewhere (host-fallback global skills on
+ *   SSH, every devcontainer read): none. A devcontainer sees the
  *   checkout under a different path, so a host path would mislead the model.
- *   Plugin skills are read on the host for every runtime (discovery is
- *   host-only), so in local/worktree workspaces they pass the host check.
+ *   Plugin discovery is host-only, so remote runtimes never see plugin skills;
+ *   in local/worktree workspaces plugin skills pass the host check.
  */
 export function resolveSkillDirectory(
   resolved: ResolvedAgentSkill,
-  workspaceRuntime: Runtime
+  workspaceRuntime: Runtime,
+  options?: {
+    /**
+     * The skill was discovered from a checkout other than the workspace's (a new
+     * worktree's first message resolves project skills from the main project
+     * path). Its project path names the other checkout's copy, so it is withheld.
+     */
+    discoveredOutsideWorkspace?: boolean;
+  }
 ): SkillDirectory {
   if (resolved.sourceRuntime == null) {
     assert(
@@ -55,6 +66,10 @@ export function resolveSkillDirectory(
       "only built-in skills resolve without a source runtime"
     );
     return { available: false, reason: BUILT_IN_REASON };
+  }
+
+  if (options?.discoveredOutsideWorkspace === true && resolved.package.scope === "project") {
+    return { available: false, reason: OTHER_CHECKOUT_REASON };
   }
 
   const sameRuntime = resolved.sourceRuntime === workspaceRuntime;

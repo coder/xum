@@ -103,7 +103,7 @@ A skill can ship scripts and other files next to `SKILL.md`. The skill does not 
   - `${CLAUDE_SKILL_DIR}`: the skill's directory.
   - `${CLAUDE_PLUGIN_ROOT}`: the plugin's directory. Xum replaces it only in plugin skills.
 
-Xum replaces the placeholders when the agent loads a skill with `agent_skill_read` and when you invoke it (`/{skill-name}` or `$skill-name`). For invoked skills, the order is: [arguments](#skill-arguments), then placeholders, then [dynamic context](#dynamic-context-injection-experiment). A directive such as `` !`sh ${CLAUDE_SKILL_DIR}/scripts/status.sh` `` therefore runs the bundled script.
+Xum replaces the placeholders when the agent loads a skill with `agent_skill_read` and when you invoke it (`/{skill-name}` or `$skill-name`). For invoked skills, the order is: [arguments](#skill-arguments), then placeholders, then [dynamic context](#dynamic-context-injection-experiment). A directive such as `` !`sh "${CLAUDE_SKILL_DIR}/scripts/status.sh"` `` therefore runs the bundled script. Xum inserts the path as plain text, so quote it in shell commands: a path can contain spaces.
 
 ```md
 ---
@@ -111,7 +111,7 @@ name: release-notes
 description: Draft release notes from merged PRs
 ---
 
-Run `sh ${CLAUDE_SKILL_DIR}/scripts/collect.sh` and summarize its output.
+Run `sh "${CLAUDE_SKILL_DIR}/scripts/collect.sh"` and summarize its output.
 ```
 
 Xum reports a directory only when the path is valid where `bash` runs. Otherwise `skillDir` is absent and `skillDirUnavailable` tells the agent why. The agent can still read every bundled file with `agent_skill_read_file`.
@@ -120,8 +120,10 @@ Xum reports a directory only when the path is valid where `bash` runs. Otherwise
 | -------------------------------------------------- | ----------------------------- | ------------------------------------------------- | ----------------------- |
 | Project skills                                     | Path                          | Path (on the remote)                              | No path                 |
 | Global and universal skills                        | Path                          | Docker: path. SSH: no path (read on the Xum host) | No path                 |
-| Plugin skills (read on the Xum host)               | Path                          | No path                                           | No path                 |
+| Plugin skills (read on the Xum host)               | Path                          | Not loaded (plugins load only on the Xum host)    | No path                 |
 | Built-in skills (bundled in the app, no directory) | No path                       | No path                                           | No path                 |
+
+When you invoke a project skill in the first message of a new worktree workspace, Xum reads the skill from the project's main checkout, because the new worktree can lack it. That copy is not the worktree's, so the placeholders stay literal and the agent gets the worktree path from `agent_skill_read`.
 
 When there is no directory, the placeholders stay as literal text. Xum does not expand `${PLUGIN_ROOT}` in skill bodies: Agent Plugins defines it only for [MCP server](/config/mcp-servers#agent-plugins-servers) configuration.
 

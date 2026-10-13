@@ -12890,7 +12890,9 @@ export class AgentSession {
       // bundled script. `runtime` is where bash and directives run.
       const substitutedBody = substituteSkillDirectoryPlaceholders(
         argumentBody,
-        resolveSkillDirectory(resolved, runtime)
+        resolveSkillDirectory(resolved, runtime, {
+          discoveredOutsideWorkspace: skillDiscoveryPath !== workspacePath,
+        })
       );
 
       // Dynamic context injection (default-off experiment): replace whole-line
