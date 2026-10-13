@@ -132,7 +132,8 @@ interface WorkspaceHeaderTitleInputProps {
  * Enter or leaving the field saves, Escape cancels. A failed save keeps the edit open and shows
  * the error under the field.
  */
-function WorkspaceHeaderTitleInput(props: WorkspaceHeaderTitleInputProps) {
+/** The draft, its save and its cancel. The field below only maps keys and renders. */
+function useTitleDraft(props: WorkspaceHeaderTitleInputProps) {
   const { updateWorkspaceTitle } = useWorkspaceContext();
   const [draft, setDraft] = useState(props.initialTitle);
   const titleError = usePopoverError();
@@ -159,6 +160,17 @@ function WorkspaceHeaderTitleInput(props: WorkspaceHeaderTitleInputProps) {
     phaseRef.current = "editing";
     showError(result.error ?? "Failed to update title");
   };
+  // A pending save still renames the workspace: Escape then must not look like a cancel
+  // (Codex on #6431). The field closes when the save settles.
+  const cancel = () => {
+    if (phaseRef.current === "editing") finish();
+  };
+
+  return { draft, setDraft, titleError, inputRef, save, cancel };
+}
+
+function WorkspaceHeaderTitleInput(props: WorkspaceHeaderTitleInputProps) {
+  const { draft, setDraft, titleError, inputRef, save, cancel } = useTitleDraft(props);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     // Typing in the field must not reach the window shortcuts.
@@ -168,7 +180,7 @@ function WorkspaceHeaderTitleInput(props: WorkspaceHeaderTitleInputProps) {
       void save();
     } else if (e.key === "Escape") {
       e.preventDefault();
-      finish();
+      cancel();
     }
   };
 

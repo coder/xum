@@ -565,6 +565,29 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(view.getByTestId("workspace-title-input")).toBeTruthy();
   });
 
+  it("ignores Escape while the save is pending, so the field closes only when it settles", async () => {
+    let settleSave: (result: { success: boolean }) => void = () => undefined;
+    updateWorkspaceTitleMock.mockImplementation(
+      () => new Promise((resolve) => (settleSave = resolve))
+    );
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    const input = view.getByTestId("workspace-title-input");
+    await typeTitle(input, "Renamed{Enter}");
+
+    // The rename is on its way: Escape must not show it as cancelled.
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(view.getByTestId("workspace-title-input")).toBe(input);
+
+    await act(async () => {
+      settleSave({ success: true });
+      await Promise.resolve();
+    });
+    expect(view.queryByTestId("workspace-title-input")).toBeNull();
+  });
+
   it("takes F2 only while the sidebar does not render the workspace's row", () => {
     const view = render(<WorkspaceMenuBar {...defaultProps} />);
     const row = document.createElement("div");
