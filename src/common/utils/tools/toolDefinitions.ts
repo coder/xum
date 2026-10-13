@@ -753,6 +753,20 @@ export const TaskAwaitToolArgsSchema = z
     // other completed report would silently lose its first offset_chars characters.
     const ids = new Set(args.task_ids ?? []);
     const offset = args.offset_chars ?? 0;
+    // Bash output has no report pages: each read returns the next unread output by itself, so
+    // an offset there would only mislead the model into thinking it skipped or re-read output.
+    const bashId = offset > 0 ? [...ids].find((id) => id.startsWith("bash:")) : undefined;
+    if (bashId !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "offset_chars pages agent reports, not bash output. Bash output pages by itself: call " +
+          `task_await(task_ids: [${JSON.stringify(bashId)}], timeout_secs: 0) without offset_chars ` +
+          "to read the next unread output.",
+        path: ["offset_chars"],
+      });
+      return;
+    }
     if (offset > 0 && ids.size !== 1) {
       const calls = [...ids].map(
         (id) =>
