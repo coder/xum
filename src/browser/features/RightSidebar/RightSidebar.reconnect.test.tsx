@@ -12,7 +12,12 @@ import {
   type ConnectionHarness,
 } from "@/browser/contexts/connection.testHarness";
 import type { TestApiOverrides } from "@/browser/testUtils";
-import { useDesktopAvailable, useLlmDebugLogsEnabled } from "./RightSidebar";
+import { getDefaultRightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
+import {
+  useDesktopAvailable,
+  useLlmDebugLogsEnabled,
+  useTerminalSessionSync,
+} from "./RightSidebar";
 
 /*
  * The sidebar drops its Debug and Desktop tabs when the setting (or capability) reads false.
@@ -23,11 +28,13 @@ import { useDesktopAvailable, useLlmDebugLogsEnabled } from "./RightSidebar";
 /** What the server answers; a test swaps it (or holds it) before a connect. */
 let answerConfig: () => Promise<unknown>;
 let answerCapability: () => Promise<unknown>;
+let answerSessions: () => Promise<unknown> = () => Promise.resolve([]);
 
 function serverOverrides(): TestApiOverrides<APIClient> {
   return {
     config: { getConfig: () => answerConfig() },
     desktop: { getCapability: () => answerCapability() },
+    terminal: { listSessions: () => answerSessions() },
   } as unknown as TestApiOverrides<APIClient>;
 }
 
@@ -90,6 +97,26 @@ describe.each([...GAP_MODES])("sidebar tab gates across a dropped connection (%s
     answerConfig = () => Promise.resolve({ llmDebugLogs: false });
     await reconnect();
     expect(view.result.current).toBe(false);
+  });
+
+  // The kept client's call fails at once while offline: that must not be an unhandled rejection.
+  test("the terminal session sync handles a list the drop cut off", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      answerSessions = pending;
+      const layout = getDefaultRightSidebarLayoutState();
+      renderHook(() => useTerminalSessionSync(useAPI().api, "ws-1", layout, () => undefined), {
+        wrapper: Wrapper,
+      });
+      await flush();
+      await drop();
+      await flush();
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 
   test("the desktop capability keeps its value through a read the drop cut off", async () => {

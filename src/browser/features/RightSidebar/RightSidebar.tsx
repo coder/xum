@@ -912,6 +912,97 @@ export function useLlmDebugLogsEnabled(api: APIClient | null): boolean | null {
 }
 
 /**
+ * The layout update that matches the terminal tabs of `layoutAtRequestStart` to the backend's
+ * sessions, or null when they already match: missing sessions get a tab, and tabs whose session
+ * is gone ("ghost" tabs) are removed.
+ */
+function reconcileTerminalTabs(
+  layoutAtRequestStart: RightSidebarLayoutState,
+  backendSessionIds: string[]
+): ((prev: RightSidebarLayoutState) => RightSidebarLayoutState) | null {
+  const backendSessionSet = new Set(backendSessionIds);
+
+  // Get current terminal tabs in layout
+  const currentTabs = collectAllTabs(layoutAtRequestStart.root);
+  const currentTerminalTabs = currentTabs.filter(isTerminalTab);
+  const currentTerminalSessionIds = new Set(
+    currentTerminalTabs.map(getTerminalSessionId).filter(Boolean)
+  );
+
+  // Find sessions that don't have tabs yet (add them)
+  const missingSessions = backendSessionIds.filter((sid) => !currentTerminalSessionIds.has(sid));
+
+  // Find tabs for sessions that no longer exist in backend (remove them)
+  const ghostTabs = currentTerminalTabs.filter((tab) => {
+    const sessionId = getTerminalSessionId(tab);
+    return sessionId && !backendSessionSet.has(sessionId);
+  });
+
+  if (missingSessions.length === 0 && ghostTabs.length === 0) return null;
+  return (prev) => {
+    let next = prev;
+
+    // Remove ghost tabs first
+    for (const ghostTab of ghostTabs) {
+      next = removeTabEverywhere(next, ghostTab);
+    }
+
+    // Add tabs for backend sessions that don't have tabs
+    for (const sessionId of missingSessions) {
+      next = addTabToFocusedTabset(next, makeTerminalTabType(sessionId), false);
+    }
+
+    return next;
+  };
+}
+
+/** Keeps the terminal tabs in sync with the backend's sessions (see the comment inside). */
+export function useTerminalSessionSync(
+  api: APIClient | null,
+  workspaceId: string,
+  layout: RightSidebarLayoutState,
+  setLayout: (updater: (prev: RightSidebarLayoutState) => RightSidebarLayoutState) => void
+): void {
+  // Sync terminal tabs with backend sessions on workspace mount.
+  // - Adds tabs for backend sessions that don't have tabs (restore after reload)
+  // - Removes "ghost" tabs for sessions that no longer exist (cleanup after app restart)
+  // Runs only on workspace change, not layout change (layout.root as a dependency would
+  // loop), so it snapshots the layout through a ref when the request starts. Comparing the
+  // backend list with that snapshot (not the latest layout) keeps terminals created or
+  // closed while the request is in flight from being removed or re-added.
+  const layoutForSessionSyncRef = React.useRef(layout);
+  React.useLayoutEffect(() => {
+    layoutForSessionSyncRef.current = layout;
+  });
+  React.useEffect(() => {
+    if (!api) return;
+
+    let cancelled = false;
+    const layoutAtRequestStart = layoutForSessionSyncRef.current;
+
+    void api.terminal
+      .listSessions({ workspaceId })
+      .then((backendSessionIds) => {
+        if (cancelled) return;
+
+        const reconcile = reconcileTerminalTabs(layoutAtRequestStart, backendSessionIds);
+        if (reconcile) setLayout(reconcile);
+      })
+      // A lost connection is no answer: the next client runs this sync again. The kept client's
+      // call fails at once while offline, and must not be an unhandled rejection.
+      .catch((error: unknown) => {
+        if (!isConnectionLostError(error)) {
+          console.error("Failed to sync terminal sessions:", error);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [api, workspaceId, setLayout]);
+}
+
+/**
  * Whether the workspace can show a Desktop tab: null while unknown, so the layout keeps the tab.
  */
 export function useDesktopAvailable(
@@ -1835,69 +1926,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
   }, [api, closeNonTerminalTab, handleCloseSideChat, layout, removeTerminalTab]);
 
-  // Sync terminal tabs with backend sessions on workspace mount.
-  // - Adds tabs for backend sessions that don't have tabs (restore after reload)
-  // - Removes "ghost" tabs for sessions that no longer exist (cleanup after app restart)
-  // Runs only on workspace change, not layout change (layout.root as a dependency would
-  // loop), so it snapshots the layout through a ref when the request starts. Comparing the
-  // backend list with that snapshot (not the latest layout) keeps terminals created or
-  // closed while the request is in flight from being removed or re-added.
-  const layoutForSessionSyncRef = React.useRef(layout);
-  React.useLayoutEffect(() => {
-    layoutForSessionSyncRef.current = layout;
-  });
-  React.useEffect(() => {
-    if (!api) return;
-
-    let cancelled = false;
-    const layoutAtRequestStart = layoutForSessionSyncRef.current;
-
-    void api.terminal.listSessions({ workspaceId }).then((backendSessionIds) => {
-      if (cancelled) return;
-
-      const backendSessionSet = new Set(backendSessionIds);
-
-      // Get current terminal tabs in layout
-      const currentTabs = collectAllTabs(layoutAtRequestStart.root);
-      const currentTerminalTabs = currentTabs.filter(isTerminalTab);
-      const currentTerminalSessionIds = new Set(
-        currentTerminalTabs.map(getTerminalSessionId).filter(Boolean)
-      );
-
-      // Find sessions that don't have tabs yet (add them)
-      const missingSessions = backendSessionIds.filter(
-        (sid) => !currentTerminalSessionIds.has(sid)
-      );
-
-      // Find tabs for sessions that no longer exist in backend (remove them)
-      const ghostTabs = currentTerminalTabs.filter((tab) => {
-        const sessionId = getTerminalSessionId(tab);
-        return sessionId && !backendSessionSet.has(sessionId);
-      });
-
-      if (missingSessions.length > 0 || ghostTabs.length > 0) {
-        setLayout((prev) => {
-          let next = prev;
-
-          // Remove ghost tabs first
-          for (const ghostTab of ghostTabs) {
-            next = removeTabEverywhere(next, ghostTab);
-          }
-
-          // Add tabs for backend sessions that don't have tabs
-          for (const sessionId of missingSessions) {
-            next = addTabToFocusedTabset(next, makeTerminalTabType(sessionId), false);
-          }
-
-          return next;
-        });
-      }
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, workspaceId, setLayout]);
+  useTerminalSessionSync(api, workspaceId, layout, setLayout);
 
   // Handler to update a terminal's title (from OSC sequences)
   // Also persists to localStorage for reload survival
