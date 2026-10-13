@@ -191,6 +191,24 @@ describe("TerminalSessionRouter across reconnects", () => {
     expect(second.attaches).toHaveLength(1);
   });
 
+  test("an empty first screen after a reconnect keeps the shown screen", async () => {
+    const first = fakeServer("first");
+    const router = new TerminalSessionRouter(first.client);
+    const view = recorder();
+    router.subscribe("t1", view.callbacks);
+    await settle();
+    first.attaches[0]?.push({ type: "screenState", data: "screen-1" });
+    await settle();
+
+    // A restarted server no longer knows the session: its screen is empty.
+    const second = fakeServer("second");
+    router.setClient(second.client);
+    await settle();
+    second.attaches[0]?.push({ type: "screenState", data: "" });
+    await settle();
+    expect(view.screens).toEqual([{ state: "screen-1", replace: false }]);
+  });
+
   test("an exited session is not restarted", async () => {
     const first = fakeServer("first");
     const router = new TerminalSessionRouter(first.client);
