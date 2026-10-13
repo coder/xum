@@ -3625,6 +3625,165 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  // Loaded session usage is repriced against the current provider config, except for
+  // gateway-billed rows, whose zero costs are real: repricing them would inflate totals.
+  describe("session usage repricing", () => {
+    // A flat-priced model: $5/M input and $25/M output tokens.
+    const BILLABLE_MODEL = "anthropic:claude-opus-4-5";
+    const OPUS_COST_OF_1000_IN_100_OUT = { input: 0.005, output: 0.0025 };
+    // No pricing metadata, unless a provider config maps it to a priced model.
+    const CUSTOM_MODEL = "ollama:custom";
+    const MAPPED_CUSTOM_CONFIG = {
+      ollama: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "custom", mappedToModel: BILLABLE_MODEL }],
+      },
+    };
+
+    const usageRow = (
+      costs: { input: number; output: number },
+      markers: { costsIncluded?: boolean; hasUnknownCosts?: boolean } = {}
+    ) => ({
+      input: { tokens: 1000, cost_usd: costs.input },
+      cached: { tokens: 0, cost_usd: 0 },
+      cacheCreate: { tokens: 0, cost_usd: 0 },
+      output: { tokens: 100, cost_usd: costs.output },
+      reasoning: { tokens: 0, cost_usd: 0 },
+      ...markers,
+    });
+    type UsageRow = ReturnType<typeof usageRow>;
+
+    /** Load one row as both the model's session bucket and the last request. */
+    const loadUsage = async (workspaceId: string, model: string, row: UsageRow) => {
+      mockGetSessionUsage.mockImplementation((input: { workspaceId: string }) =>
+        Promise.resolve(
+          input.workspaceId === workspaceId
+            ? {
+                byModel: { [model]: structuredClone(row) },
+                lastRequest: { model, usage: structuredClone(row), timestamp: 1 },
+                version: 1 as const,
+              }
+            : undefined
+        )
+      );
+      // A caught-up chat: before catch-up, usage reads come from a pre-replay snapshot.
+      mockChatScript([caughtUpEvent()], { keepOpen: true });
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.isSessionUsageKnown(workspaceId))).toBe(true);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).loading === false)).toBe(
+        true
+      );
+      // Repricing runs once the provider config has loaded too.
+      await tick(10);
+      const usage = store.getWorkspaceUsage(workspaceId);
+      return { bucket: usage.sessionByModel?.[model], lastRequest: usage.lastRequest?.usage };
+    };
+
+    const expectCosts = (row: unknown, costs: { input: number; output: number }) => {
+      expect(row).toMatchObject({ input: { tokens: 1000 }, output: { tokens: 100 } });
+      const priced = row as UsageRow;
+      expect(priced.input.cost_usd).toBeCloseTo(costs.input, 10);
+      expect(priced.output.cost_usd).toBeCloseTo(costs.output, 10);
+    };
+
+    it("reprices recorded costs with the current model pricing", async () => {
+      // One non-zero component is enough to rule out the legacy gateway-billed heuristic.
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-stale-costs",
+        BILLABLE_MODEL,
+        usageRow({ input: 0, output: 1 })
+      );
+
+      expectCosts(bucket, OPUS_COST_OF_1000_IN_100_OUT);
+      expectCosts(lastRequest, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+
+    it("keeps the zero costs of rows marked as gateway-billed", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-costs-included",
+        BILLABLE_MODEL,
+        // The costsIncluded marker wins over a stale unknown-cost flag.
+        usageRow({ input: 0, output: 0 }, { costsIncluded: true, hasUnknownCosts: true })
+      );
+
+      expectCosts(bucket, { input: 0, output: 0 });
+      expectCosts(lastRequest, { input: 0, output: 0 });
+    });
+
+    it("keeps legacy all-zero costs of a billable model as gateway-billed", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-legacy-zero-costs",
+        BILLABLE_MODEL,
+        usageRow({ input: 0, output: 0 })
+      );
+
+      expectCosts(bucket, { input: 0, output: 0 });
+      expectCosts(lastRequest, { input: 0, output: 0 });
+      expect(bucket).not.toHaveProperty("hasUnknownCosts");
+    });
+
+    it("prices rows recorded without pricing metadata", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-unknown-costs",
+        BILLABLE_MODEL,
+        usageRow({ input: 0, output: 0 }, { hasUnknownCosts: true })
+      );
+
+      expectCosts(bucket, OPUS_COST_OF_1000_IN_100_OUT);
+      expectCosts(lastRequest, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+
+    it("does not treat all-zero costs of an unpriced model as gateway-billed", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-unpriced-zero-costs",
+        CUSTOM_MODEL,
+        usageRow({ input: 0, output: 0 })
+      );
+
+      // Repricing an unpriced model strips the costs and flags them as unknown.
+      expect(bucket).toMatchObject({ hasUnknownCosts: true, input: { tokens: 1000 } });
+      expect(bucket?.input.cost_usd).toBeUndefined();
+      expect(lastRequest).toMatchObject({ hasUnknownCosts: true });
+    });
+
+    it("classifies a mapped custom model by the pricing of its mapped model", async () => {
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      recreateStore();
+
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-mapped-zero-costs",
+        CUSTOM_MODEL,
+        usageRow({ input: 0, output: 0 })
+      );
+
+      expectCosts(bucket, { input: 0, output: 0 });
+      expectCosts(lastRequest, { input: 0, output: 0 });
+      expect(bucket).not.toHaveProperty("hasUnknownCosts");
+    });
+
+    it("prices unknown-cost rows once a provider config change maps their model", async () => {
+      const workspaceId = "reprice-after-mapping";
+      const before = await loadUsage(workspaceId, CUSTOM_MODEL, usageRow({ input: 0, output: 0 }));
+      expect(before.bucket).toMatchObject({ hasUnknownCosts: true });
+
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      providerConfigChanges.push(undefined);
+
+      expect(
+        await waitUntil(
+          () =>
+            store.getWorkspaceUsage(workspaceId).sessionByModel?.[CUSTOM_MODEL]?.input.cost_usd !==
+            undefined
+        )
+      ).toBe(true);
+      const usage = store.getWorkspaceUsage(workspaceId);
+      expectCosts(usage.sessionByModel?.[CUSTOM_MODEL], OPUS_COST_OF_1000_IN_100_OUT);
+      expectCosts(usage.lastRequest?.usage, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+  });
+
   describe("syncWorkspaces", () => {
     it("should add new workspaces", async () => {
       const metadata1 = makeWorkspaceMetadata("workspace-1", {
