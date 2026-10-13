@@ -40,6 +40,33 @@ import {
   openArtifactsTab,
   pinAndOpenArtifact,
 } from "@/browser/features/RightSidebar/ArtifactsTab/openArtifact";
+import {
+  appViewDetails,
+  appViewServerNames,
+  getMcpAppViews,
+  openMcpAppViewTab,
+  transcriptViews,
+  type McpAppViewRef,
+} from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+
+/**
+ * The workspace's MCP App views (the loaded transcript's, then ones opened this session), each
+ * with its detail (appViewDetails).
+ */
+function appViewEntries(
+  workspaceId: string,
+  messages: Parameters<typeof transcriptViews>[1]
+): Array<{ view: McpAppViewRef; server: string; detail: string }> {
+  const fromTranscript = transcriptViews(workspaceId, messages);
+  const known = new Set(fromTranscript.map((view) => view.toolCallId));
+  const views = [
+    ...fromTranscript,
+    ...getMcpAppViews(workspaceId).filter((view) => !known.has(view.toolCallId)),
+  ];
+  const details = appViewDetails(views);
+  const servers = appViewServerNames(views);
+  return views.map((view, i) => ({ view, server: servers[i], detail: details[i] }));
+}
 import { isTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
   getOrderedBaseTabIds,
@@ -611,7 +638,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         const pinned = isWorkspacePinned(selectedMeta);
         list.push({
           id: CommandIds.workspaceTogglePinned(),
-          title: pinned ? "Unpin Current Chat" : "Pin Current Chat",
+          title: pinned ? "Unpin Current Workspace" : "Pin Current Workspace",
           subtitle: workspaceDisplayName,
           shortcutHint: formatKeybind(KEYBINDS.PIN_WORKSPACE),
           section: section.workspaces,
@@ -628,7 +655,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           // commands stay listed whenever the chat is pinned.
           list.push({
             id: CommandIds.workspaceMovePinnedUp(),
-            title: "Move Pinned Chat Up",
+            title: "Move Pinned Workspace Up",
             subtitle: workspaceDisplayName,
             shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_UP),
             section: section.workspaces,
@@ -636,7 +663,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           });
           list.push({
             id: CommandIds.workspaceMovePinnedDown(),
-            title: "Move Pinned Chat Down",
+            title: "Move Pinned Workspace Down",
             subtitle: workspaceDisplayName,
             shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_DOWN),
             section: section.workspaces,
@@ -894,6 +921,19 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 keywords: ["artifacts", "preview", "versions"],
                 run: () => openArtifactsTab(wsId),
               },
+              // One per MCP App view of the workspace (transcript or opened this session): opens
+              // its tab or focuses the one it has, the keyboard path to "Open in tab".
+              // The subtitle carries each call's detail, so several calls of one tool differ.
+              ...appViewEntries(wsId, p.selectedWorkspaceState?.messages ?? []).map(
+                ({ view, server, detail }) => ({
+                  id: CommandIds.navOpenAppView(view.toolCallId),
+                  title: `Open App View: ${view.label}`,
+                  subtitle: detail === "" ? server : `${server} · ${detail}`,
+                  section: section.navigation,
+                  keywords: ["app", "view", "mcp", "tab", view.serverName],
+                  run: () => openMcpAppViewTab(wsId, view),
+                })
+              ),
               {
                 id: CommandIds.navOpenFileAsArtifact(),
                 title: "Open File as Artifact…",

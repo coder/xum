@@ -54,6 +54,25 @@ export const AgentPluginPreviewSlashCommandSchema = z.object({
   description: z.string().optional(),
 });
 
+/**
+ * OpenAI `interface` presentation metadata (validated in openaiExtension.ts).
+ * Plain text: render as React text, never as HTML or markdown.
+ */
+export const AgentPluginInterfaceSummarySchema = z.object({
+  displayName: z.string(),
+  developerName: z.string(),
+  shortDescription: z.string(),
+  capabilities: z.array(z.string()).optional(),
+  /** https only. */
+  websiteURL: z.string().optional(),
+  privacyPolicyURL: z.string().optional(),
+  termsOfServiceURL: z.string().optional(),
+  supportURL: z.string().optional(),
+  /** `data:image/...;base64,` read through the contained capped reader; never a path. */
+  logoDataUrl: z.string().optional(),
+});
+export type AgentPluginInterfaceSummary = z.infer<typeof AgentPluginInterfaceSummarySchema>;
+
 /** Manifest metadata surfaced in the consent preview (UI-safe projection of plugin.json). */
 export const AgentPluginManifestSummarySchema = z.object({
   name: z.string(),
@@ -63,6 +82,7 @@ export const AgentPluginManifestSummarySchema = z.object({
   homepage: z.string().optional(),
   repository: z.string().optional(),
   license: z.string().optional(),
+  interface: AgentPluginInterfaceSummarySchema.optional(),
 });
 
 /**
@@ -107,6 +127,7 @@ export const AgentPluginListItemSchema = z.object({
   importedComponents: AgentPluginImportedComponentsSchema.optional(),
   importedSkillCount: z.number().int().nonnegative().optional(),
   importedMcpServerCount: z.number().int().nonnegative().optional(),
+  interface: AgentPluginInterfaceSummarySchema.optional(),
   /** Available counts include components not yet imported. */
   skillCount: z.number().int().nonnegative(),
   mcpServerCount: z.number().int().nonnegative(),

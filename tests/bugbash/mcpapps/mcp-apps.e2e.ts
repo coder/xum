@@ -4,10 +4,12 @@
  * The agent does each flow from what the screen shows (agent.act); exact checks pin the
  * outcome right after it, so a passing act is cached and replays without model calls.
  * The seed (mcpapps/seed.ts) holds four demo-app calls: 4d6 (with its stored result),
- * 2d20 (stored result removed), a failed 50d6, and get_server_time (no view).
+ * 2d20 (stored result removed), a failed 50d6, and get_server_time (no view). Views open in
+ * their own right-sidebar tabs ("Open in tab"); at phone width that tab shows in the full-screen
+ * sidebar.
  */
 import { describe, test } from "@e2e-dev/web";
-import { expect } from "e2e";
+import { expect, type Screen } from "e2e";
 import { openPlayground } from "../repros/helpers";
 
 /** The dice view of the one expanded card. Its frame title is "<tool> (<server>)". */
@@ -113,27 +115,11 @@ describe("MCP Apps views", { tags: ["mcp-apps"] }, () => {
   });
 });
 
-describe("App views in the Artifacts picker", { tags: ["mcp-apps"] }, () => {
-  test("every settled app call is listed, with labels that tell them apart", async ({
-    app,
-    agent,
-    screen,
-  }) => {
-    await app.open();
-    await agent.act(
-      "open the 'Bug bash playground' workspace, open the Artifacts tab in the right sidebar without using any tool card button, and open the artifact picker"
-    );
-    const options = screen.getByRole("option").filter({ hasText: "demo_app_show_dice_board" });
-    await expect(options).toHaveCount(3);
-    const labels = await options.allTextContents();
-    expect(new Set(labels).size, `labels: ${JSON.stringify(labels)}`).toBe(3);
-    expect(
-      labels.some((label) => label.includes("failed")),
-      "one entry says failed"
-    ).toBe(true);
-  });
+describe("App views in their own tabs", { tags: ["mcp-apps"] }, () => {
+  /** App tabs: "<tool> <server>", then the call's detail while several calls share a name. */
+  const appTabs = (screen: Screen) => screen.getByRole("tab", /demo_app_show_dice_board/);
 
-  test("Close returns to the files and keeps the view in the picker, across a reload", async ({
+  test("Open in tab moves the view to its tab; closing the tab brings it back", async ({
     app,
     agent,
     screen,
@@ -141,18 +127,65 @@ describe("App views in the Artifacts picker", { tags: ["mcp-apps"] }, () => {
   }) => {
     await app.open();
     await agent.act(
-      "open the 'Bug bash playground' workspace, open the Artifacts tab, and pick the app view of the 4d6 roll in the artifact picker"
+      "open the 'Bug bash playground' workspace, expand the demo_app_show_dice_board tool card of the 4d6 roll, and press that card's 'Open in tab' button"
     );
+    const tab = appTabs(screen).filter({ hasText: "4d6 roll" });
+    await expect(tab).toBeVisible({ timeout: 15_000 });
+    const view = browser.frameLocator(DICE_FRAME);
+    await expect(view.getByText("4d6 = 15")).toBeVisible({ timeout: 15_000 });
+    // One live instance: the card shows a placeholder instead of a second frame.
+    await expect(screen.getByRole("button", "Go to tab")).toBeVisible();
+    expect(
+      await browser.evaluate(
+        (selector: string) => document.querySelectorAll(selector).length,
+        DICE_FRAME
+      )
+    ).toBe(1);
+
+    await agent.act("close the demo_app_show_dice_board tab in the right sidebar");
+    await expect(appTabs(screen)).toHaveCount(0);
+    await expect(screen.getByRole("button", "Go to tab")).toBeHidden();
+    await expect(view.getByText("4d6 = 15")).toBeVisible({ timeout: 15_000 });
+  });
+
+  test("tabs of two calls of one tool have different names and survive a reload", async ({
+    app,
+    agent,
+    screen,
+    browser,
+  }) => {
+    await app.open();
+    await agent.act(
+      "open the 'Bug bash playground' workspace, then use 'Open in tab' on the demo_app_show_dice_board tool card of the 4d6 roll and on the one of the 2d20 roll"
+    );
+    await expect(appTabs(screen)).toHaveCount(2, { timeout: 15_000 });
+    const names = await appTabs(screen).allTextContents();
+    expect(new Set(names).size, `tab names: ${JSON.stringify(names)}`).toBe(2);
+
+    await browser.reload();
+    await expect(appTabs(screen)).toHaveCount(2, { timeout: 15_000 });
+  });
+
+  test("on a phone, Open in tab shows the view's tab in the full-screen sidebar", async ({
+    app,
+    agent,
+    screen,
+    browser,
+  }) => {
+    // Phone width on every target: the right sidebar is hidden there, so it opens full-screen.
+    await browser.setViewport({ width: 390, height: 844 });
+    await app.open();
+    await agent.act(
+      "open the 'Bug bash playground' workspace, expand the demo_app_show_dice_board tool card of the 4d6 roll, and press that card's 'Open in tab' button (an app window icon on narrow screens)"
+    );
+    await expect(screen.getByRole("button", "Close sidebar")).toBeVisible({ timeout: 15_000 });
+    await expect(appTabs(screen)).toHaveCount(1);
     const view = browser.frameLocator(DICE_FRAME);
     await expect(view.getByText("4d6 = 15")).toBeVisible({ timeout: 15_000 });
 
-    await agent.act("close the app view in the Artifacts tab");
-    await expect(screen.getByRole("button", "Close view")).toBeHidden();
-
-    await browser.reload();
-    await agent.act("open the artifact picker in the Artifacts tab");
-    await expect(
-      screen.getByRole("option").filter({ hasText: "demo_app_show_dice_board" })
-    ).toHaveCount(3);
+    await screen.getByRole("button", "Close sidebar").tap();
+    await expect(screen.getByRole("button", "Close sidebar")).toBeHidden();
+    // The tab stays open in the hidden sidebar, so the card points to it instead of a second view.
+    await expect(screen.getByRole("button", "Go to tab")).toBeVisible({ timeout: 15_000 });
   });
 });

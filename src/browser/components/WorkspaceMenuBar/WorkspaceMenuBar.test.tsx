@@ -28,6 +28,7 @@ import * as DebugLlmRequestModalModule from "../DebugLlmRequestModal/DebugLlmReq
 import * as ConfirmationModalModule from "../ConfirmationModal/ConfirmationModal";
 import * as PopoverErrorModule from "../PopoverError/PopoverError";
 import * as WorkspaceActionsMenuContentModule from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
+import type { WorkspaceActionId } from "../WorkspaceActionsMenuContent/workspaceActionItems";
 import * as WorkspaceTerminalIconModule from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -39,6 +40,7 @@ import {
   TERMINAL_CONTAINER_ATTR,
 } from "@/browser/utils/ui/keybinds";
 import { focusRightSidebarTab, readRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
+import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CODER_RUNTIME_PLACEHOLDER, type RuntimeConfig } from "@/common/types/runtime";
@@ -97,20 +99,22 @@ function getLastMenuContentProps() {
   const spy = WorkspaceActionsMenuContentModule.WorkspaceActionsMenuContent as unknown as {
     mock: {
       calls: Array<
-        [
-          {
-            onForkChat?: ((anchorEl: HTMLElement) => void) | null;
-            onEnterImmersiveReview?: (() => void) | null;
-            onOpenTouchFullscreenReview?: (() => void) | null;
-            onOpenSidebar?: (() => void) | null;
-            onOpenTerminal?: (() => void) | null;
-            onConfigureUnrelatedMessaging?: (() => void) | null;
-          },
-        ]
+        [ComponentProps<typeof WorkspaceActionsMenuContentModule.WorkspaceActionsMenuContent>]
       >;
     };
   };
   return spy.mock.calls.at(-1)?.[0];
+}
+
+// The handler of a row the menu shows now, or null when the row is hidden.
+function menuAction(id: WorkspaceActionId): ((anchorEl: HTMLElement) => void) | null {
+  const props = getLastMenuContentProps();
+  if (!props) return null;
+  const shown = WorkspaceActionsMenuContentModule.getShownWorkspaceActionGroups(
+    props.state,
+    props.actions
+  ).flat();
+  return shown.includes(id) ? (props.actions[id] ?? null) : null;
 }
 
 function resolveArchivePreflight(
@@ -290,14 +294,16 @@ function installWorkspaceMenuBarTestDoubles() {
   spyOn(PopoverErrorModule, "PopoverError").mockImplementation(
     (() => null) as unknown as typeof PopoverErrorModule.PopoverError
   );
-  spyOn(WorkspaceActionsMenuContentModule, "WorkspaceActionsMenuContent").mockImplementation(
-    ((props: { onArchiveChat?: ((anchorEl: HTMLElement) => void) | null }) =>
-      props.onArchiveChat ? (
-        <button type="button" onClick={(event) => props.onArchiveChat?.(event.currentTarget)}>
-          Archive chat
-        </button>
-      ) : null) as unknown as typeof WorkspaceActionsMenuContentModule.WorkspaceActionsMenuContent
-  );
+  spyOn(WorkspaceActionsMenuContentModule, "WorkspaceActionsMenuContent").mockImplementation(((
+    props: ComponentProps<typeof WorkspaceActionsMenuContentModule.WorkspaceActionsMenuContent>
+  ) =>
+    WorkspaceActionsMenuContentModule.getShownWorkspaceActionGroups(props.state, props.actions)
+      .flat()
+      .includes("archive") ? (
+      <button type="button" onClick={(event) => props.actions.archive?.(event.currentTarget)}>
+        Archive workspace
+      </button>
+    ) : null) as unknown as typeof WorkspaceActionsMenuContentModule.WorkspaceActionsMenuContent);
   spyOn(WorkspaceTerminalIconModule, "WorkspaceTerminalIcon").mockImplementation(
     (() => null) as unknown as typeof WorkspaceTerminalIconModule.WorkspaceTerminalIcon
   );
@@ -441,10 +447,9 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
     // Repo-dependent More-menu actions must be hidden: review events are
     // ignored by RightSidebar for scratch and forking scratch is unsupported.
-    const scratchMenuProps = getLastMenuContentProps();
-    expect(scratchMenuProps?.onForkChat).toBeNull();
-    expect(scratchMenuProps?.onEnterImmersiveReview).toBeNull();
-    expect(scratchMenuProps?.onOpenTouchFullscreenReview).toBeNull();
+    expect(menuAction("fork")).toBeNull();
+    expect(menuAction("immersiveReview")).toBeNull();
+    expect(menuAction("touchFullscreenReview")).toBeNull();
   });
 
   it("shows the archiving status only while this workspace has an archive request in flight", () => {
@@ -471,9 +476,8 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
     render(<WorkspaceMenuBar {...defaultProps} />);
 
-    const menuProps = getLastMenuContentProps();
-    expect(typeof menuProps?.onForkChat).toBe("function");
-    expect(typeof menuProps?.onEnterImmersiveReview).toBe("function");
+    expect(typeof menuAction("fork")).toBe("function");
+    expect(typeof menuAction("immersiveReview")).toBe("function");
   });
 
   it("offers the hidden sidebar as one row, and opens it full-screen", () => {
@@ -483,7 +487,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     const view = render(<WorkspaceMenuBar {...defaultProps} onOpenSidebar={onOpenSidebar} />);
 
     act(() => {
-      getLastMenuContentProps()?.onOpenSidebar?.();
+      menuAction("openSidebar")?.(document.body);
     });
     // Focus returns to the More button once the full-screen sidebar closes.
     expect(onOpenSidebar).toHaveBeenCalledWith(view.getByTestId("workspace-more-actions"));
@@ -494,7 +498,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
     render(<WorkspaceMenuBar {...defaultProps} onOpenSidebar={() => undefined} />);
 
-    expect(getLastMenuContentProps()?.onOpenSidebar).toBeNull();
+    expect(menuAction("openSidebar")).toBeNull();
   });
 
   it("offers the Sidebar row when the shell container hides the sidebar at wide viewports", () => {
@@ -516,7 +520,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       container: mount,
     });
 
-    expect(typeof getLastMenuContentProps()?.onOpenSidebar).toBe("function");
+    expect(typeof menuAction("openSidebar")).toBe("function");
     shell.remove();
   });
 
@@ -527,14 +531,14 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     );
 
     render(<WorkspaceMenuBar {...defaultProps} onOpenSidebar={() => undefined} />);
-    expect(getLastMenuContentProps()?.onOpenSidebar).toBeNull();
+    expect(menuAction("openSidebar")).toBeNull();
 
     narrow = true;
     act(() => {
       media.fireChange();
     });
 
-    expect(typeof getLastMenuContentProps()?.onOpenSidebar).toBe("function");
+    expect(typeof menuAction("openSidebar")).toBe("function");
   });
 
   // While the sidebar is hidden, the Timeline, Stats and Artifacts entry points show their tab in
@@ -579,6 +583,23 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       });
 
       expect(shown).toEqual(["timeline", "costs", "costs", "artifacts"]);
+    });
+
+    it('"Open in tab" shows the view\'s own app tab, openArtifact() the Artifacts tab', () => {
+      narrow();
+      setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
+      const { shown } = renderRecording();
+      act(() => {
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: "call-1" })
+        );
+      });
+      act(() => {
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.OPEN_ARTIFACT, { workspaceId, path: "report.md" })
+        );
+      });
+      expect(shown).toEqual([appViewTabFor("call-1"), "artifacts"]);
     });
 
     it("leave keys alone while the sidebar is visible or a modal is open", () => {
@@ -702,7 +723,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       expect(onOpenSidebar.mock.calls[0]?.[0]).toBe(stats);
 
       // The More menu offers the terminal instead.
-      act(() => getLastMenuContentProps()?.onOpenTerminal?.());
+      act(() => menuAction("openTerminal")?.(document.body));
       expect(onOpenTerminal).toHaveBeenCalledTimes(1);
     });
   });
@@ -735,7 +756,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   it.each([
     {
       opener: "More menu",
-      open: () => getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.(),
+      open: () => menuAction("configureMessaging")?.(document.body),
     },
     {
       opener: "keyboard shortcut",
@@ -791,7 +812,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
     const view = render(<WorkspaceMenuBar {...defaultProps} />);
     act(() => {
-      getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.();
+      menuAction("configureMessaging")?.(document.body);
     });
     // Workspace A: start a request and leave it in flight (switch locked, "Saving" shown).
     fireEvent.click(view.getByRole("switch", { name: CONSENT_SWITCH_NAME }));
@@ -808,7 +829,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
     expect(view.queryByRole("switch", { name: CONSENT_SWITCH_NAME })).toBeNull();
     act(() => {
-      getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.();
+      menuAction("configureMessaging")?.(document.body);
     });
     expect(
       (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
@@ -873,7 +894,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   ])("offers the consent action and shortcut for $runtime workspaces", ({ runtimeConfig }) => {
     render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
 
-    expect(typeof getLastMenuContentProps()?.onConfigureUnrelatedMessaging).toBe("function");
+    expect(typeof menuAction("configureMessaging")).toBe("function");
     act(() => {
       fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
     });
@@ -895,7 +916,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   ])("opens the dialog without the consent switch for $runtime workspaces", ({ runtimeConfig }) => {
     render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
 
-    expect(typeof getLastMenuContentProps()?.onConfigureUnrelatedMessaging).toBe("function");
+    expect(typeof menuAction("configureMessaging")).toBe("function");
     act(() => {
       fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
     });
@@ -924,7 +945,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       container: mount,
     });
 
-    expect(getLastMenuContentProps()?.onOpenSidebar).toBeNull();
+    expect(menuAction("openSidebar")).toBeNull();
 
     act(() => {
       fireEvent.keyDown(window, { key: "T", shiftKey: true });
@@ -953,7 +974,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     const view = render(<WorkspaceMenuBar {...defaultProps} />);
 
     act(() => {
-      fireEvent.click(view.getByRole("button", { name: "Archive chat" }));
+      fireEvent.click(view.getByRole("button", { name: "Archive workspace" }));
     });
 
     await waitFor(() => {
@@ -974,7 +995,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
     const view = render(<WorkspaceMenuBar {...defaultProps} />);
     act(() => {
-      fireEvent.click(view.getByRole("button", { name: "Archive chat" }));
+      fireEvent.click(view.getByRole("button", { name: "Archive workspace" }));
     });
     await waitFor(() => expect(resolvePreflight).toBeDefined());
 

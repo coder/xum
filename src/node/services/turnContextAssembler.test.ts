@@ -474,6 +474,79 @@ describe("assemblePromptPayload", () => {
       ...overrides,
     });
 
+  test("puts request context at the start of the newest user message, or last without one", async () => {
+    const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
+    const turns = [
+      createMuxMessage("u1", "user", "FIRST"),
+      createMuxMessage("a1", "assistant", "ANSWER"),
+    ];
+    const order = async (history: typeof turns) => {
+      const payload = await assemble({ history, requestContextMessage: context });
+      // Request-only: never part of the rows the request was built from.
+      expect(payload.providerRequestMessages.some((m) => m.id === "ctx")).toBe(false);
+      const wire = JSON.stringify(payload.messages);
+      return ["FIRST", "ANSWER", "VIEW-CONTEXT", "NEWEST"]
+        .filter((text) => wire.includes(text))
+        .sort((a, b) => wire.indexOf(a) - wire.indexOf(b));
+    };
+    expect(await order([...turns, createMuxMessage("u2", "user", "NEWEST")])).toEqual([
+      "FIRST",
+      "ANSWER",
+      "VIEW-CONTEXT",
+      "NEWEST",
+    ]);
+    // At the provider the two user rows are one message (mergeConsecutiveUserMessages): the
+    // context block first, then the user's text.
+    const merged = await assemble({
+      history: [...turns, createMuxMessage("u2", "user", "NEWEST")],
+      requestContextMessage: context,
+    });
+    expect(merged.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(JSON.stringify(merged.messages[2])).toContain("VIEW-CONTEXT\\nNEWEST");
+    expect(await order(turns)).toEqual(["FIRST", "ANSWER", "VIEW-CONTEXT"]);
+    const plain = await assemble({ history: turns });
+    const withContext = await assemble({ history: turns, requestContextMessage: context });
+    expect(withContext.system).toEqual(plain.system);
+  });
+
+  test("request context keeps every part of the user message it merges into", async () => {
+    const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
+    const svg = `data:image/svg+xml;base64,${Buffer.from("<svg><text>SVG-BODY</text></svg>").toString("base64")}`;
+    const history = [
+      createMuxMessage("u1", "user", "NEWEST", undefined, [
+        { type: "file", mediaType: "image/svg+xml", url: svg, filename: "chart.svg" },
+      ]),
+    ];
+    const payload = await assemble({ history, requestContextMessage: context });
+    expect(payload.messages.map((m) => m.role)).toEqual(["user"]);
+    const wire = JSON.stringify(payload.messages);
+    // The SVG reaches the provider as text, after the context and the user's own text.
+    expect(wire).toContain("SVG-BODY");
+    expect(wire.indexOf("VIEW-CONTEXT")).toBeLessThan(wire.indexOf("NEWEST"));
+    expect(wire.indexOf("NEWEST")).toBeLessThan(wire.indexOf("SVG-BODY"));
+  });
+
+  test("puts request context before the request a trailing partial assistant continues", async () => {
+    const context = createMuxMessage("ctx", "user", "VIEW-CONTEXT");
+    // The refusal fallback (and an interrupted turn) ends the history in the partial reply.
+    const history = [
+      createMuxMessage("u1", "user", "FIRST"),
+      createMuxMessage("a1", "assistant", "ANSWER"),
+      createMuxMessage("u2", "user", "NEWEST"),
+      createMuxMessage("a2", "assistant", "PARTIAL", { partial: true }),
+    ];
+    const payload = await assemble({ history, requestContextMessage: context });
+    const wire = JSON.stringify(payload.messages);
+    const order = ["FIRST", "ANSWER", "VIEW-CONTEXT", "NEWEST", "PARTIAL"]
+      .filter((text) => wire.includes(text))
+      .sort((a, b) => wire.indexOf(a) - wire.indexOf(b));
+    expect(order).toEqual(["FIRST", "ANSWER", "VIEW-CONTEXT", "NEWEST", "PARTIAL"]);
+    // Nothing but the continuation sentinel follows the partial reply.
+    const afterPartial = wire.slice(wire.indexOf("PARTIAL"));
+    expect(afterPartial).not.toContain("VIEW-CONTEXT");
+    expect(afterPartial).toContain("[CONTINUE]");
+  });
+
   test("replays tool_catalog_search results as tool references only for deferred tools", async () => {
     const history = [
       createMuxMessage("user", "user", "find it"),

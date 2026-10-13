@@ -13,6 +13,8 @@ const SCRIPT = path.join(REPO_ROOT, "scripts", "test-unit-ci.sh");
 // The first isolated file on shard 1/1; the fake bun misbehaves only for it so the
 // rest of the lane (other isolated files, tooling tests, the shared shard) is instant.
 const FIRST_ISOLATED_FILE = "src/node/services/workflows/WorkflowRunner.test.ts";
+// An isolated file that runs with coverage (no `no-coverage:` marker).
+const COVERED_ISOLATED_FILE = "src/node/services/coderOauthService.test.ts";
 
 let fakeBinDir: string;
 
@@ -24,13 +26,13 @@ afterEach(async () => {
   await rm(fakeBinDir, { recursive: true, force: true });
 });
 
-async function writeFakeBun(misbehavior: string): Promise<void> {
+async function writeFakeBun(misbehavior: string, file = FIRST_ISOLATED_FILE): Promise<void> {
   const fakeBun = path.join(fakeBinDir, "bun");
   await writeFile(
     fakeBun,
     [
       "#!/usr/bin/env bash",
-      `case " $* " in *" ${FIRST_ISOLATED_FILE} "*) ;; *) exit 0 ;; esac`,
+      `case " $* " in *" ${file} "*) ;; *) exit 0 ;; esac`,
       misbehavior,
       "",
     ].join("\n")
@@ -47,6 +49,8 @@ async function runLane(): Promise<{ exitCode: number; stdout: string }> {
       SHARD_INDEX: "1",
       SHARD_TOTAL: "1",
       BUN_TEST_STALL_SECS: "2",
+      // The nested lane must not delete the reports of the lane running this test.
+      UNIT_COVERAGE_DIR: path.join(fakeBinDir, "coverage"),
     },
     stdout: "pipe",
     stderr: "pipe",
@@ -100,4 +104,22 @@ test("leaves a slow bun alone while it keeps printing", async () => {
   expect(result.stdout).not.toContain("::error::");
   expect(result.stdout).toContain("(pass) slow > step 8");
   expect(result.exitCode).toBe(0);
+}, 60_000);
+
+test("runs the last crash retry of a covered isolated file without coverage", async () => {
+  const argsFile = path.join(fakeBinDir, "args");
+  await writeFakeBun(
+    [`echo "$*" >> "${argsFile}"`, 'case " $* " in *" --coverage "*) exit 139 ;; esac', "exit 0"].join(
+      "\n"
+    ),
+    COVERED_ISOLATED_FILE
+  );
+
+  const result = await runLane();
+
+  expect(result.exitCode).toBe(0);
+  const coverageDir = `--coverage-dir=${path.join(fakeBinDir, "coverage", "isolated")}/`;
+  const attempts = (await readFile(argsFile, "utf8")).trim().split("\n");
+  expect(attempts.map((args) => args.includes(coverageDir))).toEqual([true, true, false]);
+  expect(result.stdout).toContain("::warning::bun crashed twice under coverage");
 }, 60_000);

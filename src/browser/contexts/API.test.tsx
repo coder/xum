@@ -120,10 +120,11 @@ import type { UseAPIResult as _UseAPIResult, APIProvider as APIProviderType } fr
 const RealAPIModule: {
   APIProvider: typeof APIProviderType;
   useAPI: () => _UseAPIResult;
+  useLiveAPI: () => _UseAPIResult["api"];
   useConnectionLatencyMs: () => number | null;
 } = require("./API?real=1");
 /* eslint-enable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
-const { APIProvider, useAPI, useConnectionLatencyMs } = RealAPIModule;
+const { APIProvider, useAPI, useLiveAPI, useConnectionLatencyMs } = RealAPIModule;
 type UseAPIResult = _UseAPIResult;
 
 // Each observation carries the API context value by reference (apiState) plus the latency
@@ -363,6 +364,37 @@ describe("API reconnection", () => {
     await waitFor(() => {
       expect(MockWebSocket.instances.length).toBeGreaterThan(1);
     });
+  });
+
+  // The stores and deferred writes read useLiveAPI(). Until the provider keeps the last client
+  // in the gap, it must equal useAPI().api in every render, so they see exactly what they saw.
+  test("useLiveAPI() equals useAPI().api in every render across drops and reconnects", async () => {
+    const renders: Array<{ status: string; same: boolean; api: unknown }> = [];
+    function Probe() {
+      const state = useAPI();
+      const live = useLiveAPI();
+      renders.push({ status: state.status, same: live === state.api, api: state.api });
+      return null;
+    }
+    render(
+      <APIProvider createWebSocket={createMockWebSocket}>
+        <Probe />
+      </APIProvider>
+    );
+    for (let cycle = 0; cycle < 3; cycle++) {
+      const ws = MockWebSocket.lastInstance();
+      await act(async () => {
+        ws!.simulateOpen();
+        await new Promise((r) => setTimeout(r, 10));
+      });
+      act(() => {
+        ws!.simulateClose(1006);
+      });
+      await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(cycle + 1));
+    }
+    expect(renders.filter((r) => r.status === "connected")).not.toHaveLength(0);
+    expect(renders.filter((r) => r.status === "reconnecting")).not.toHaveLength(0);
+    expect(renders.filter((r) => !r.same)).toEqual([]);
   });
 
   test("shows auth_required on close with auth error codes (4401)", async () => {

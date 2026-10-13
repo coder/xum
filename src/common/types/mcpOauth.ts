@@ -71,6 +71,8 @@ export interface MCPOAuthTokens {
 export interface MCPOAuthClientInformation {
   client_id: string;
   client_secret?: string;
+  /** Stored for registered clients; a plugin-provided client's comes from its plugin config. */
+  token_endpoint_auth_method?: string;
   client_id_issued_at?: number;
   client_secret_expires_at?: number;
   /** See MCPOAuthTokens.authorization_server. */
