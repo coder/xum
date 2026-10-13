@@ -7407,6 +7407,148 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  // Timing stats stream from one refcounted backend subscription per workspace, opened only
+  // while the UI shows them.
+  describe("workspace timing stats", () => {
+    const snapshot = (generatedAt: number) => ({ workspaceId: "stats", generatedAt });
+    type StatsSnapshot = ReturnType<typeof snapshot>;
+
+    let feed: ControllableAsyncIterable<StatsSnapshot>;
+    let subscribeSignals: AbortSignal[];
+    const mockStatsSubscribe = mock(
+      (_input: { workspaceId: string }, options?: { signal?: AbortSignal }) => {
+        if (options?.signal) subscribeSignals.push(options.signal);
+        return Promise.resolve(feed.iterable);
+      }
+    );
+    const statsClient = () =>
+      ({
+        ...mockClient,
+        workspace: { ...mockClient.workspace, stats: { subscribe: mockStatsSubscribe } },
+      }) as unknown as Parameters<WorkspaceStore["setClient"]>[0];
+
+    beforeEach(() => {
+      feed = createControllableAsyncIterable<StatsSnapshot>();
+      subscribeSignals = [];
+      mockStatsSubscribe.mockClear();
+      resetStore();
+      store.setClient(statsClient());
+    });
+
+    it("shares one backend subscription between listeners and shows its snapshots", async () => {
+      const workspaceId = "stats-shared";
+      const listener = mock(() => undefined);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      // Registration alone does not subscribe: no UI shows the stats yet.
+      expect(mockStatsSubscribe).not.toHaveBeenCalled();
+
+      store.subscribeStats(workspaceId, listener);
+      store.subscribeStats(workspaceId, () => undefined);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(1);
+      expect(mockStatsSubscribe.mock.calls[0][0]).toEqual({ workspaceId });
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
+
+      feed.push(snapshot(1));
+      feed.push(snapshot(2));
+
+      expect(
+        await waitUntil(() => store.getWorkspaceStatsSnapshot(workspaceId)?.generatedAt === 2)
+      ).toBe(true);
+      expect(listener).toHaveBeenCalledTimes(2);
+    });
+
+    it("closes the backend subscription and drops the snapshot after the last listener", async () => {
+      const workspaceId = "stats-refcount";
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribeFirst = store.subscribeStats(workspaceId, () => undefined);
+      const unsubscribeSecond = store.subscribeStats(workspaceId, () => undefined);
+      feed.push(snapshot(1));
+      expect(await waitUntil(() => store.getWorkspaceStatsSnapshot(workspaceId) !== null)).toBe(
+        true
+      );
+
+      unsubscribeFirst();
+      expect(subscribeSignals[0].aborted).toBe(false);
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)?.generatedAt).toBe(1);
+
+      unsubscribeSecond();
+      expect(subscribeSignals[0].aborted).toBe(true);
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
+
+      // A later listener opens a fresh subscription.
+      store.subscribeStats(workspaceId, () => undefined);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it("ignores an extra unsubscribe call once every listener is gone", () => {
+      const workspaceId = "stats-underflow";
+      const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribe = store.subscribeStats(workspaceId, () => undefined);
+      unsubscribe();
+
+      unsubscribe();
+      expect(warn).toHaveBeenCalledWith(
+        `[WorkspaceStore] stats listener count underflow for ${workspaceId} (already 0)`
+      );
+      warn.mockRestore();
+
+      // The count did not go negative: the next listener subscribes again.
+      store.subscribeStats(workspaceId, () => undefined);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it("subscribes a listener that came before the workspace was registered", () => {
+      store.subscribeStats("stats-unregistered", () => undefined);
+      expect(mockStatsSubscribe).not.toHaveBeenCalled();
+
+      createAndAddWorkspace(store, "stats-unregistered", {}, false);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it("subscribes a listener that came before the client", () => {
+      store.setClient(null);
+      store.subscribeStats("stats-early", () => undefined);
+      createAndAddWorkspace(store, "stats-early", {}, false);
+      expect(mockStatsSubscribe).not.toHaveBeenCalled();
+
+      store.setClient(statsClient());
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(1);
+      expect(mockStatsSubscribe.mock.calls[0][0]).toEqual({ workspaceId: "stats-early" });
+    });
+
+    it("closes the subscription when the client changes or the workspace is removed", () => {
+      createAndAddWorkspace(store, "stats-reconnect", {}, false);
+      createAndAddWorkspace(store, "stats-removed", {}, false);
+      store.subscribeStats("stats-reconnect", () => undefined);
+      store.subscribeStats("stats-removed", () => undefined);
+      expect(subscribeSignals).toHaveLength(2);
+
+      // A reconnect resubscribes the workspaces that still have listeners.
+      store.setClient(statsClient());
+      expect(subscribeSignals.map((signal) => signal.aborted)).toEqual([true, true, false, false]);
+
+      store.removeWorkspace("stats-removed");
+      expect(subscribeSignals[3].aborted).toBe(true);
+      expect(subscribeSignals[2].aborted).toBe(false);
+    });
+
+    it("logs a failed subscription and keeps showing no snapshot", async () => {
+      const workspaceId = "stats-error";
+      const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+      mockStatsSubscribe.mockImplementationOnce(() => Promise.reject(new Error("stats gone")));
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeStats(workspaceId, () => undefined);
+
+      expect(await waitUntil(() => warn.mock.calls.length > 0)).toBe(true);
+      expect(warn.mock.calls[0][0]).toBe(
+        `[WorkspaceStore] Error in stats subscription for ${workspaceId}:`
+      );
+      warn.mockRestore();
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
+    });
+  });
+
   describe("model tracking", () => {
     it("should call onModelUsed when stream starts", async () => {
       // Setup mock stream
