@@ -28,8 +28,9 @@ const devcontainerWorkspace = workspace({
 });
 const scratchWorkspace = workspace({ kind: "scratch" });
 
-function press(key: "B" | "X", target: EventTarget = document.body) {
+function press(key: "B" | "X", target: EventTarget = document.body, repeat = false) {
   const event = new window.KeyboardEvent("keydown", {
+    repeat,
     key,
     code: `Key${key}`,
     ctrlKey: true,
@@ -115,5 +116,26 @@ describe("useWorkspaceActionKeybinds", () => {
     const worktree = renderKeybinds(repoWorkspace, "running");
     press("X");
     expect(worktree.onStopRuntime).not.toHaveBeenCalled();
+  });
+
+  // Codex on #6398: a held key auto-repeats, and each repeat would start another fork.
+  test("a held key runs its action once", () => {
+    const { onForkWorkspace } = renderKeybinds(repoWorkspace);
+    press("B");
+    expect(press("B", document.body, true).defaultPrevented).toBe(true);
+    press("B", document.body, true);
+    expect(onForkWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  // Codex on #6398: a modal covers the workspace, so its keys must not act behind it.
+  test("does nothing while a modal dialog is open", () => {
+    const { onForkWorkspace } = renderKeybinds(repoWorkspace);
+    const overlay = document.createElement("div");
+    overlay.setAttribute("data-modal-dialog-overlay", "");
+    overlay.setAttribute("data-state", "open");
+    document.body.appendChild(overlay);
+    expect(press("B").defaultPrevented).toBe(false);
+    expect(onForkWorkspace).not.toHaveBeenCalled();
+    overlay.remove();
   });
 });

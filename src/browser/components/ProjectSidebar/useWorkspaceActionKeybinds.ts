@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import type { RuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
 import {
   isAltGraphPressed,
+  isDialogOpen,
   isEditableElement,
   KEYBINDS,
   matchesKeybind,
@@ -38,6 +39,14 @@ function getKeyAction(
 }
 
 /**
+ * Ctrl+Alt chords: AltGr types characters with the same modifiers in text fields. A modal
+ * covers the workspace, so its keys must not act behind it.
+ */
+function keysMayAct(event: KeyboardEvent): boolean {
+  return !isEditableElement(event.target) && !isAltGraphPressed(event) && !isDialogOpen();
+}
+
+/**
  * Fork workspace and Stop container for the selected workspace (#6328). The workspace actions
  * menu handles the same keys for its own workspace while it is open, before they reach this
  * window listener.
@@ -48,13 +57,14 @@ export function useWorkspaceActionKeybinds(options: WorkspaceActionKeybindOption
   useEffect(() => {
     if (selectedWorkspaceId == null) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Ctrl+Alt chords: AltGr types characters with the same modifiers in text fields.
-      if (isEditableElement(e.target) || isAltGraphPressed(e)) return;
+      if (!keysMayAct(e)) return;
       const metadata = getWorkspaceMetadata(selectedWorkspaceId);
       if (!metadata) return;
       const action = getKeyAction(e, metadata, runtimeStatusStore.getStatus(selectedWorkspaceId));
       if (action === null) return;
       e.preventDefault();
+      // A held key auto-repeats: each repeat would start another fork or stop request.
+      if (e.repeat) return;
       (action === "fork" ? onForkWorkspace : onStopRuntime)(selectedWorkspaceId);
     };
     window.addEventListener("keydown", handleKeyDown);

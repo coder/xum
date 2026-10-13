@@ -189,6 +189,15 @@ describe("WorkspaceActionsMenuContent row shortcut keys (#6328)", () => {
     expect(windowKeys).toEqual([]);
   });
 
+  test("a held row key runs its row once", () => {
+    const actions = allActions();
+    renderSidebarMenu(actions);
+    pressKey(toKeyEvent(KEYBINDS.FORK_WORKSPACE));
+    pressKey({ ...toKeyEvent(KEYBINDS.FORK_WORKSPACE), repeat: true });
+    expect(actions.fork).toHaveBeenCalledTimes(1);
+    expect(windowKeys).toEqual([]);
+  });
+
   test("other keys still reach the global handlers", () => {
     renderSidebarMenu(allActions());
     pressKey(toKeyEvent(KEYBINDS.NEXT_WORKSPACE));

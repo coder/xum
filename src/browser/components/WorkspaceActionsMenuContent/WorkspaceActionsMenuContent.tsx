@@ -236,7 +236,8 @@ function handleRowShortcut(
   if (!match) return false;
   event.preventDefault();
   stopKeyboardPropagation(event);
-  if (!shown.includes(match.id)) return true;
+  // A held key auto-repeats: run the row once (Codex on #6398).
+  if (event.repeat || !shown.includes(match.id)) return true;
   const rowButton = event.currentTarget.querySelector<HTMLElement>(
     `[data-workspace-action-row="${match.id}"]`
   );
