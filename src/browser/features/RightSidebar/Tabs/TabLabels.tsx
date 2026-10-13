@@ -9,23 +9,17 @@
 
 import React from "react";
 import {
-  AppWindow,
-  BugPlay,
   ExternalLink,
-  Monitor,
-  Globe,
   Sparkles,
-  Target,
-  ListTree,
   MessagesSquare,
   Plus,
   Terminal as TerminalIcon,
-  Workflow,
   X,
 } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { getTerminalTabFallbackName } from "@/browser/types/rightSidebar";
 import { type ReviewStats } from "./registry";
+import { TAB_ICONS } from "./tabIcons";
 import { useAPI } from "@/browser/contexts/API";
 import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
@@ -76,7 +70,8 @@ export const StatsTabLabel: React.FC<StatsTabLabelProps> = ({ workspaceId }) => 
   }, [usage.sessionTotal, usage.liveCostUsage]);
 
   return (
-    <>
+    <span className="inline-flex items-center gap-1">
+      <TAB_ICONS.costs className="h-3 w-3 shrink-0" />
       Stats
       {sessionCost !== null && (
         // No own color: the count inherits the tab's. A muted count failed WCAG AA on the
@@ -85,7 +80,7 @@ export const StatsTabLabel: React.FC<StatsTabLabelProps> = ({ workspaceId }) => 
           ${sessionCost < 0.01 ? "<0.01" : sessionCost.toFixed(2)}
         </span>
       )}
-    </>
+    </span>
   );
 };
 
@@ -128,6 +123,7 @@ export const ReviewTabLabel: React.FC<ReviewTabLabelProps> = ({ reviewStats }) =
             aria-label={`Review — ${unreadAssisted} unread agent-flagged hunk${unreadAssisted === 1 ? "" : "s"}`}
             data-testid="review-tab-assisted-pizzazz"
           >
+            <TAB_ICONS.review className="h-3 w-3 shrink-0" aria-hidden="true" />
             Review
             <Sparkles className="h-3 w-3 shrink-0" aria-hidden="true" />
             <span className="counter-nums">{unreadAssisted}</span>
@@ -141,7 +137,8 @@ export const ReviewTabLabel: React.FC<ReviewTabLabelProps> = ({ reviewStats }) =
   }
 
   return (
-    <>
+    <span className="inline-flex items-center gap-1">
+      <TAB_ICONS.review className="h-3 w-3 shrink-0" />
       Review
       {reviewStats !== null && reviewStats.total > 0 && (
         // No own color: the count inherits the tab's. A muted count failed WCAG AA on the
@@ -150,14 +147,14 @@ export const ReviewTabLabel: React.FC<ReviewTabLabelProps> = ({ reviewStats }) =
           {reviewStats.read}/{reviewStats.total}
         </span>
       )}
-    </>
+    </span>
   );
 };
 
 /** Desktop tab label with monitor icon */
 export const DesktopTabLabel: React.FC = () => (
   <span className="inline-flex items-center gap-1">
-    <Monitor className="h-3 w-3 shrink-0" />
+    <TAB_ICONS.desktop className="h-3 w-3 shrink-0" />
     Desktop
   </span>
 );
@@ -165,7 +162,7 @@ export const DesktopTabLabel: React.FC = () => (
 /** Browser tab label with globe icon */
 export const BrowserTabLabel: React.FC = () => (
   <span className="inline-flex items-center gap-1">
-    <Globe className="h-3 w-3 shrink-0" />
+    <TAB_ICONS.browser className="h-3 w-3 shrink-0" />
     Browser
   </span>
 );
@@ -173,7 +170,7 @@ export const BrowserTabLabel: React.FC = () => (
 /** Debug tab label with bug icon */
 export const DebugTabLabel: React.FC = () => (
   <span className="inline-flex items-center gap-1">
-    <BugPlay className="h-3 w-3 shrink-0" />
+    <TAB_ICONS.debug className="h-3 w-3 shrink-0" />
     Debug
   </span>
 );
@@ -227,7 +224,7 @@ export const GoalTabLabel: React.FC<GoalTabLabelProps> = ({ workspaceId }) => {
       )}
       aria-label={ariaLabel}
     >
-      <Target className="h-3 w-3 shrink-0" />
+      <TAB_ICONS.goal className="h-3 w-3 shrink-0" />
       Goal
     </span>
   );
@@ -247,7 +244,7 @@ export const WorkflowsTabLabel: React.FC<WorkflowsTabLabelProps> = ({ workspaceI
   const activeCount = sidebarState?.activeWorkflowRunCount ?? 0;
   return (
     <span className="inline-flex items-center gap-1">
-      <Workflow className="h-3 w-3 shrink-0" />
+      <TAB_ICONS.workflows className="h-3 w-3 shrink-0" />
       Workflows
       {activeCount > 0 && (
         <span
@@ -263,13 +260,18 @@ export const WorkflowsTabLabel: React.FC<WorkflowsTabLabelProps> = ({ workspaceI
 };
 
 export function OutputTabLabel() {
-  return <>Output</>;
+  return (
+    <span className="inline-flex items-center gap-1">
+      <TAB_ICONS.output className="h-3 w-3 shrink-0" />
+      Output
+    </span>
+  );
 }
 
 export function TimelineTabLabel() {
   return (
     <span className="inline-flex items-center gap-1">
-      <ListTree className="h-3 w-3 shrink-0" />
+      <TAB_ICONS.timeline className="h-3 w-3 shrink-0" />
       Timeline
     </span>
   );
@@ -278,14 +280,19 @@ export function TimelineTabLabel() {
 export function ArtifactsTabLabel() {
   return (
     <span className="inline-flex items-center gap-1">
-      <AppWindow className="h-3 w-3 shrink-0" />
+      <TAB_ICONS.artifacts className="h-3 w-3 shrink-0" />
       Artifacts
     </span>
   );
 }
 
 export function MemoryTabLabel() {
-  return <>Memory</>;
+  return (
+    <span className="inline-flex items-center gap-1">
+      <TAB_ICONS.memory className="h-3 w-3 shrink-0" />
+      Memory
+    </span>
+  );
 }
 
 interface InstructionsTabLabelProps {
@@ -323,7 +330,8 @@ export const InstructionsTabLabel: React.FC<InstructionsTabLabelProps> = ({ work
   const showBadge = chatInstructionsActive || (fileCount != null && fileCount > 0);
 
   return (
-    <>
+    <span className="inline-flex items-center gap-1">
+      <TAB_ICONS.instructions className="h-3 w-3 shrink-0" />
       Instructions
       {showBadge && (
         // No own color: the count inherits the tab's. A muted count failed WCAG AA on the
@@ -346,7 +354,7 @@ export const InstructionsTabLabel: React.FC<InstructionsTabLabelProps> = ({ work
           )}
         </span>
       )}
-    </>
+    </span>
   );
 };
 

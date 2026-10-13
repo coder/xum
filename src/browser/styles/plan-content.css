@@ -128,8 +128,8 @@
  * Plan Table of Contents
  *
  * `.plan-toc-layout` wraps the plan card so an absolutely-positioned `aside`
- * (`.plan-toc-aside`) can break out to the LEFT of the centered `max-w-4xl`
- * transcript column. The aside has three width states controlled by container
+ * (`.plan-toc-aside`) can break out to the LEFT of the centered `max-w-chat`
+ * (--container-chat, 48rem) transcript column. The aside has three width states controlled by container
  * queries on the `transcript` scrollport in ChatPane:
  *
  *   1. hidden on narrow/mobile widths where even a hint would crowd content,
@@ -377,9 +377,9 @@
  * Hint visibility. The transcript container is queried at its CONTENT box
  * inline-size (padding excluded). The rail itself is a narrow text-only cue, but
  * its invisible column is wider so the text sits in the gutter instead of
- * touching the plan border.
+ * touching the plan border. Reveal point: the 48rem column plus 0.25rem of gutter.
  */
-@container transcript (min-width: 56.25rem) {
+@container transcript (min-width: 48.25rem) {
   .plan-toc-aware .plan-toc-aside {
     display: block;
   }
@@ -387,11 +387,12 @@
 
 /*
  * Full TOC visibility. The plan stays centered in the transcript; the TOC uses
- * the left gutter beside that centered column. The 78.5rem reveal point leaves
- * enough mirrored gutter for the centered rail before overflow clipping can occur,
- * including the 1600px wide Storybook viewport.
+ * the left gutter beside that centered column. The 70.5rem reveal point (the 48rem
+ * column plus a --plan-toc-wide-gutter on each side) leaves enough mirrored gutter
+ * for the centered rail before overflow clipping can occur. Container queries take
+ * no var(), so keep these sums in step with --container-chat.
  */
-@container transcript (min-width: 78.5rem) {
+@container transcript (min-width: 70.5rem) {
   .plan-toc-aware .plan-toc-aside {
     width: var(--plan-toc-wide-gutter);
     padding-inline: 0;

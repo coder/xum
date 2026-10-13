@@ -1,4 +1,5 @@
 import type { McpAppCspDeclaration } from "@/common/orpc/schemas/mcpApps";
+import { ARTIFACT_IN_PAGE_LINK_SCRIPT } from "./artifactBridge";
 import {
   ARTIFACT_CDN_FONT_SOURCES,
   ARTIFACT_CDN_SCRIPT_SOURCES,
@@ -78,6 +79,8 @@ export function grantMcpAppCsp(
  * host regardless of its granted connectDomains. Running first means no view script can keep a
  * reference, and `frame-src 'none'` keeps it from reaching a fresh window's constructors through
  * a child frame. HTML artifacts get the same removal from their bridge script.
+ * It also makes in-page `#` links jump within the view instead of navigating it away (same
+ * reason as for HTML artifacts: ARTIFACT_IN_PAGE_LINK_SCRIPT).
  */
 export const MCP_APP_PREAMBLE_SCRIPT = `(function () {
   "use strict";
@@ -86,6 +89,7 @@ export const MCP_APP_PREAMBLE_SCRIPT = `(function () {
       try { delete window[name]; } catch (error) {}
     }
   });
+  ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
 
 export function buildMcpAppCsp(granted: GrantedMcpAppCsp): string {

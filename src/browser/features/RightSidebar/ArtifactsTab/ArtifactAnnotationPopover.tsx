@@ -21,8 +21,7 @@ export function ArtifactAnnotationPopover(props: {
   onCancel: () => void;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  // `fixed` is relative to the nearest transformed ancestor (the centered Artifacts dialog on
-  // narrow windows), not the viewport. A zero-size probe at fixed 0,0 measures that origin so
+  // `fixed` is relative to the nearest transformed ancestor, if there is one, not the viewport. A zero-size probe at fixed 0,0 measures that origin so
   // viewport coordinates from the selection still land on it.
   const probeRef = useRef<HTMLDivElement>(null);
   const [origin, setOrigin] = useState({ x: 0, y: 0 });

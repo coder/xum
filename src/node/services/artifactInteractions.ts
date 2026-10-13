@@ -369,46 +369,41 @@ export async function listWorkspacesWithPendingInteractions(
   return found;
 }
 
+// window.xum.setState belongs to the artifact, not to one version: a republish keeps what the
+// user picked. Only send() still names a version (the one the user saw when they confirmed).
 export async function getArtifactInteractionState(
   sessionsDir: string,
-  input: { workspaceId: string; path: string; version: number | null }
-): Promise<Result<{ version: number; state: unknown }, string>> {
+  input: { workspaceId: string; path: string }
+): Promise<Result<{ state: unknown }, string>> {
   const segments = parseArtifactRelativePath(input.path);
   if (typeof segments === "string") return Err(segments);
   const sessionDir = sessionDirOf({ sessionsDir }, input.workspaceId);
-  const target = await resolveArtifactInteractionTarget(sessionDir, input.path, input.version);
-  return Ok({
-    version: target.version,
-    state: await readArtifactState(sessionDir, target.artifactId, target.version),
-  });
+  return Ok({ state: await readArtifactState(sessionDir, getArtifactId(input.path)) });
 }
 
 export async function setArtifactInteractionState(
   sessionsDir: string,
-  input: { workspaceId: string; path: string; version: number | null; state: unknown }
-): Promise<Result<{ version: number }, string>> {
+  input: { workspaceId: string; path: string; state: unknown }
+): Promise<Result<void, string>> {
   const segments = parseArtifactRelativePath(input.path);
   if (typeof segments === "string") return Err(segments);
   const error = validateJsonPayload(input.state, "State");
   if (error != null) return Err(error);
   const sessionDir = sessionDirOf({ sessionsDir }, input.workspaceId);
-  const target = await resolveArtifactInteractionTarget(sessionDir, input.path, input.version);
-  await writeArtifactState(sessionDir, target.artifactId, target.version, input.state);
-  return Ok({ version: target.version });
+  await writeArtifactState(sessionDir, getArtifactId(input.path), input.state);
+  return Ok(undefined);
 }
 
-/** artifact_list's view of the latest version's state: JSON, cut to the summary cap. */
+/** artifact_list's view of an artifact's state: JSON, cut to the summary cap. */
 export async function summarizeArtifactState(
   sessionDir: string,
   relPath: string
-): Promise<{ version: number; state: string; truncated: boolean } | null> {
-  const target = await resolveArtifactInteractionTarget(sessionDir, relPath, null);
-  const state = await readArtifactState(sessionDir, target.artifactId, target.version);
+): Promise<{ state: string; truncated: boolean } | null> {
+  const state = await readArtifactState(sessionDir, getArtifactId(relPath));
   if (state == null) return null;
   const text = JSON.stringify(state);
   const truncated = text.length > ARTIFACT_STATE_SUMMARY_MAX_CHARS;
   return {
-    version: target.version,
     state: truncated ? text.slice(0, ARTIFACT_STATE_SUMMARY_MAX_CHARS) : text,
     truncated,
   };
@@ -458,8 +453,8 @@ export async function sendInteractionRoute(
 
 export async function getStateRoute(
   context: InteractionRouteContext,
-  input: { workspaceId: string; path: string; version: number | null }
-): Promise<Result<{ version: number; state: unknown }, string>> {
+  input: { workspaceId: string; path: string }
+): Promise<Result<{ state: unknown }, string>> {
   const missing = await assertRouteWorkspace(context, input.workspaceId);
   if (missing != null) return Err(missing);
   return getArtifactInteractionState(context.config.sessionsDir, input);
@@ -467,8 +462,8 @@ export async function getStateRoute(
 
 export async function setStateRoute(
   context: InteractionRouteContext,
-  input: { workspaceId: string; path: string; version: number | null; state: unknown }
-): Promise<Result<{ version: number }, string>> {
+  input: { workspaceId: string; path: string; state: unknown }
+): Promise<Result<void, string>> {
   const missing = await assertRouteWorkspace(context, input.workspaceId);
   if (missing != null) return Err(missing);
   return setArtifactInteractionState(context.config.sessionsDir, input);
