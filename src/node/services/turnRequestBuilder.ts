@@ -79,6 +79,7 @@ import { type DurableEventJournal } from "@/node/utils/journal/durableEventJourn
 import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
+import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
 import type { StreamManager } from "./streamManager";
 import {
   type ModelFallbackOptions,
@@ -1138,6 +1139,12 @@ export class TurnRequestBuilder {
             : {}),
       };
     };
+    // One scope per built turn: every model this turn creates (fallback hops included) shares it,
+    // so the prefix detector can tell a turn-boundary break from a mid-turn one.
+    const promptCacheScope = this.dependencies.providerModelFactory.createPromptCacheTurnScope(
+      workspaceId,
+      this.dependencies.bindings.timelineService ?? NOOP_TIMELINE_RECORDER
+    );
     const prepareModelSeed = async (options: {
       rawModelString: string;
       requestedThinkingLevel: ThinkingLevel | undefined;
@@ -1190,6 +1197,7 @@ export class TurnRequestBuilder {
           workspaceId,
           providersConfig: providersConfigSnapshot,
           getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier ?? userServiceTier,
+          promptCacheScope,
         }
       );
       if (options.recordTiming) {
@@ -1616,6 +1624,11 @@ export class TurnRequestBuilder {
       effectiveAgentId === "compact" ||
       muxMetadata?.type === "compaction-request" ||
       latestUserMessage?.metadata?.muxMetadata?.type === "compaction-request";
+    // Before any request is sent: compaction prompts never extend the chat's prefix, and
+    // the baseline must clear even when the compaction model is not on an Anthropic route.
+    if (isCompactionRequest) promptCacheScope.markCompaction();
+    // The context the request is built from: a cleared or replaced history starts a new baseline.
+    promptCacheScope.setContextEpoch(providerRequestMessages[0]?.id);
     const tokenBudgetEnabled =
       !isCompactionRequest &&
       sessionHistoryEnabled &&
@@ -2166,6 +2179,7 @@ export class TurnRequestBuilder {
                 : undefined,
             taskAdapterFactory: (runId, workflowName) =>
               createProductionWorkflowTaskAdapter({
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
                 taskService: this.dependencies.bindings.taskService!,
                 parentWorkspaceId: workspaceId,
                 workflowRunId: runId,
@@ -3254,6 +3268,10 @@ export class TurnRequestBuilder {
           // Join key for the replay verifier: re-anchors this recorded run to
           // its turn-envelope row and assistant message (see DevToolsRun).
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
+          // Same epoch as the runtime prefix monitor: the replay audit resets its baseline on change.
+          ...(promptCacheScope.contextEpoch != null
+            ? { contextEpoch: promptCacheScope.contextEpoch }
+            : {}),
         });
         this.dependencies.trackPendingDevToolsRunMetadata(
           assistantMessageId,

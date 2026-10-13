@@ -82,12 +82,19 @@ import type {
   ExtensionMetadataService,
   ExtensionMetadataStreamingUpdate,
 } from "@/node/services/ExtensionMetadataService";
-import { coerceAgentStatus } from "@/node/utils/extensionMetadata";
+import {
+  isStreamAbortEvent,
+  isStreamEndEvent,
+  isStreamErrorEvent,
+  isStreamStartEvent,
+  isSuccessfulToolResult,
+  isToolCallEndEvent,
+  isWorkspaceEvent,
+  statusSetResultStatus,
+} from "@/node/services/aiServiceEventGuards";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
-import { resolveArtifactsLocation } from "@/node/services/artifactsOperations";
-import { createArtifactTurnSnapshotHooks } from "@/node/services/artifactVersionsOperations";
 import { ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE } from "@/common/constants/artifactInteractions";
 import {
   isNestedCompactionFollowUp,
@@ -138,6 +145,11 @@ import {
   HEADLESS_USAGE_FILE_NAME,
 } from "@/common/constants/paths";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import {
+  normalizeRepoRootProjectPath,
+  resolveExecuteBashScript,
+  selectRepoRootProject,
+} from "@/node/services/executeBashTargets";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import { generateGitStatusScript, parseGitStatusScriptOutput } from "@/common/utils/git/gitStatus";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
@@ -152,7 +164,6 @@ import {
   type PlanFileLocation,
 } from "@/node/utils/runtime/planLocation";
 import { detectDefaultTrunkBranch, listLocalBranches } from "@/node/git";
-import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { extractEditedFilePaths } from "@/common/utils/messages/extractEditedFiles";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import {
@@ -256,7 +267,7 @@ import type {
 } from "@/common/orpc/types";
 
 import type { z } from "zod";
-import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
+import type { SendMessageError } from "@/common/types/errors";
 // Aliased to avoid clashing with the private `formatSendMessageError` string formatter below.
 import {
   createStreamErrorMessage,
@@ -277,6 +288,7 @@ import { buildAskUserQuestionSummary } from "@/common/utils/tools/askUserQuestio
 import {
   AskUserQuestionToolArgsSchema,
   AskUserQuestionToolResultSchema,
+  type SubagentGitPatchArtifact,
 } from "@/common/utils/tools/toolDefinitions";
 import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
@@ -344,6 +356,10 @@ import {
   UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
 import {
+  canonicalGoalDefaultsOverride,
+  sameGoalDefaultsOverride,
+} from "@/common/utils/goals/resolveGoalSetIntent";
+import {
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
   type ThinkingLevel,
@@ -375,12 +391,6 @@ import {
   type GoalSyntheticMessageKind,
   type TaskTurnKind,
 } from "@/constants/goals";
-import type {
-  StreamStartEvent,
-  StreamEndEvent,
-  StreamAbortEvent,
-  ToolCallEndEvent,
-} from "@/common/types/stream";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type {
@@ -672,6 +682,73 @@ function mergeAgentAISettings(
     ...(autoModelRouting === true ? { autoModelRouting } : {}),
     ...(autoThinkingLevel === true ? { autoThinkingLevel } : {}),
   };
+}
+
+interface AgentAISettingsUpdateOptions {
+  persistSelectedAgentId?: boolean;
+  pinIntent?: AiSelectionIntent;
+  pinsOnly?: boolean;
+}
+
+interface AgentAISettingsUpdatePlan {
+  /** The merged settings to store for the agent, or undefined to leave its bucket alone. */
+  nextAgentSettings: WorkspaceAgentAISettings | undefined;
+  /** The task's pins after the update; the same reference when nothing is pinned. */
+  nextPins: TaskAiPins | undefined;
+  /** Whether the update selects the agent as the workspace's current agent. */
+  selectAgent: boolean;
+}
+
+// Pins apply only to new-style agent tasks (taskAiPins present; legacy tasks stay
+// frozen) and only for the task's own agent. Same reference = nothing to pin.
+function nextTaskAiPins(
+  entry: Workspace,
+  agentId: string,
+  aiSettings: WorkspaceAgentAISettings | null,
+  pinIntent: AiSelectionIntent | undefined
+): TaskAiPins | undefined {
+  if (
+    pinIntent == null ||
+    aiSettings == null ||
+    entry.taskAiPins == null ||
+    agentId !== resolveTaskAgentIdForResume(entry)
+  ) {
+    return entry.taskAiPins;
+  }
+  return applyAiSelectionIntentToPins(entry.taskAiPins, pinIntent, aiSettings);
+}
+
+/**
+ * What persisting `aiSettings` for `agentId` writes to `entry`. The snapshot fast path and
+ * the serialized write both plan with it, so they always agree on what changes.
+ */
+function planAgentAISettingsUpdate(
+  entry: Workspace,
+  agentId: string,
+  aiSettings: WorkspaceAgentAISettings | null,
+  options: AgentAISettingsUpdateOptions | undefined
+): AgentAISettingsUpdatePlan {
+  const pinsOnly = options?.pinsOnly === true;
+  const prev = entry.aiSettingsByAgent?.[agentId];
+  return {
+    nextAgentSettings:
+      aiSettings != null && !pinsOnly ? mergeAgentAISettings(prev, aiSettings) : undefined,
+    nextPins: nextTaskAiPins(entry, agentId, aiSettings, options?.pinIntent),
+    selectAgent: !pinsOnly && options?.persistSelectedAgentId === true,
+  };
+}
+
+function agentAISettingsUpdateChanges(
+  entry: Workspace,
+  agentId: string,
+  plan: AgentAISettingsUpdatePlan
+): boolean {
+  return (
+    (plan.nextAgentSettings != null &&
+      !isDeepStrictEqual(entry.aiSettingsByAgent?.[agentId], plan.nextAgentSettings)) ||
+    (plan.selectAgent && entry.agentId !== agentId) ||
+    plan.nextPins !== entry.taskAiPins
+  );
 }
 
 interface HeartbeatWorkspaceConfigEntry {
@@ -1050,15 +1127,6 @@ function registrationErrorWithLeftovers(
 ): unknown {
   if (rollback == null || rollback.leftovers.length === 0) return error;
   return new Error(withRollbackLeftovers(getErrorMessage(error), rollback.leftovers));
-}
-
-function normalizeRepoRootProjectPath(projectPath: string | null | undefined): string {
-  const normalizedPath = projectPath?.replaceAll("\\", "/").trim() ?? "";
-  if (!normalizedPath) {
-    return "";
-  }
-
-  return stripTrailingSlashes(path.posix.normalize(normalizedPath));
 }
 
 function buildArchiveLossyUntrackedFilesConfirmation(
@@ -1675,6 +1743,114 @@ async function collectReferencedStagedAttachmentPaths(input: {
   });
 }
 
+interface ChildPatchRollupTarget {
+  parentWorkspaceId: string;
+  parentSessionDir: string;
+  childWorkspaceId: string;
+  childSessionDir: string;
+}
+
+type ChildPatchArtifactEntries = Array<[string, SubagentGitPatchArtifact]>;
+
+/**
+ * Copy each child task's patch artifact dir into the parent session dir (only when the parent
+ * has none yet), refusing any source or destination outside its session dir.
+ */
+async function copyChildPatchArtifactDirs(
+  params: ChildPatchRollupTarget,
+  childEntries: ChildPatchArtifactEntries
+): Promise<void> {
+  for (const [taskId, childEntry] of childEntries) {
+    if (!taskId) continue;
+
+    for (const projectArtifact of childEntry.projectArtifacts) {
+      if (!projectArtifact.mboxPath) {
+        continue;
+      }
+
+      const srcDir = path.dirname(projectArtifact.mboxPath);
+      const destDir = path.dirname(
+        getSubagentGitPatchMboxPath(params.parentSessionDir, taskId, projectArtifact.storageKey)
+      );
+
+      if (!isPathInsideDir(params.childSessionDir, srcDir)) {
+        log.error("Refusing to roll up patch artifact outside child session dir", {
+          parentWorkspaceId: params.parentWorkspaceId,
+          childWorkspaceId: params.childWorkspaceId,
+          taskId,
+          childSessionDir: params.childSessionDir,
+          srcDir,
+        });
+        continue;
+      }
+
+      if (!isPathInsideDir(params.parentSessionDir, destDir)) {
+        log.error("Refusing to roll up patch artifact outside parent session dir", {
+          parentWorkspaceId: params.parentWorkspaceId,
+          childWorkspaceId: params.childWorkspaceId,
+          taskId,
+          parentSessionDir: params.parentSessionDir,
+          destDir,
+        });
+        continue;
+      }
+
+      await copyDirIfMissingBestEffort({
+        srcDir,
+        destDir,
+        logContext: {
+          parentWorkspaceId: params.parentWorkspaceId,
+          childWorkspaceId: params.childWorkspaceId,
+          artifact: "subagent-patches",
+          taskId,
+          projectPath: projectArtifact.projectPath,
+        },
+      });
+    }
+  }
+}
+
+/**
+ * Merge the child's patch artifact index into the parent's: an entry replaces the parent's
+ * only when it is newer, and its mbox paths point at the parent's copies.
+ */
+async function mergeChildPatchArtifactIndex(
+  params: ChildPatchRollupTarget,
+  childEntries: ChildPatchArtifactEntries
+): Promise<void> {
+  await updateSubagentGitPatchArtifactsFile({
+    workspaceId: params.parentWorkspaceId,
+    workspaceSessionDir: params.parentSessionDir,
+    update: (parentFile) => {
+      for (const [taskId, childEntry] of childEntries) {
+        if (!taskId) continue;
+        const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
+
+        const childUpdated = coerceUpdatedAtMs(childEntry);
+        const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
+
+        if (!existing || childUpdated > existingUpdated) {
+          parentFile.artifactsByChildTaskId[taskId] = {
+            ...childEntry,
+            childTaskId: taskId,
+            parentWorkspaceId: params.parentWorkspaceId,
+            projectArtifacts: childEntry.projectArtifacts.map((projectArtifact) => ({
+              ...projectArtifact,
+              mboxPath: projectArtifact.mboxPath
+                ? getSubagentGitPatchMboxPath(
+                    params.parentSessionDir,
+                    taskId,
+                    projectArtifact.storageKey
+                  )
+                : undefined,
+            })),
+          };
+        }
+      }
+    },
+  });
+}
+
 async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
   parentWorkspaceId: string;
   parentSessionDir: string;
@@ -1824,87 +2000,10 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
     const childArtifacts = await readSubagentGitPatchArtifactsFile(params.childSessionDir);
     const childEntries = Object.entries(childArtifacts.artifactsByChildTaskId);
 
-    for (const [taskId, childEntry] of childEntries) {
-      if (!taskId) continue;
-
-      for (const projectArtifact of childEntry.projectArtifacts) {
-        if (!projectArtifact.mboxPath) {
-          continue;
-        }
-
-        const srcDir = path.dirname(projectArtifact.mboxPath);
-        const destDir = path.dirname(
-          getSubagentGitPatchMboxPath(params.parentSessionDir, taskId, projectArtifact.storageKey)
-        );
-
-        if (!isPathInsideDir(params.childSessionDir, srcDir)) {
-          log.error("Refusing to roll up patch artifact outside child session dir", {
-            parentWorkspaceId: params.parentWorkspaceId,
-            childWorkspaceId: params.childWorkspaceId,
-            taskId,
-            childSessionDir: params.childSessionDir,
-            srcDir,
-          });
-          continue;
-        }
-
-        if (!isPathInsideDir(params.parentSessionDir, destDir)) {
-          log.error("Refusing to roll up patch artifact outside parent session dir", {
-            parentWorkspaceId: params.parentWorkspaceId,
-            childWorkspaceId: params.childWorkspaceId,
-            taskId,
-            parentSessionDir: params.parentSessionDir,
-            destDir,
-          });
-          continue;
-        }
-
-        await copyDirIfMissingBestEffort({
-          srcDir,
-          destDir,
-          logContext: {
-            parentWorkspaceId: params.parentWorkspaceId,
-            childWorkspaceId: params.childWorkspaceId,
-            artifact: "subagent-patches",
-            taskId,
-            projectPath: projectArtifact.projectPath,
-          },
-        });
-      }
-    }
+    await copyChildPatchArtifactDirs(params, childEntries);
 
     if (childEntries.length > 0) {
-      await updateSubagentGitPatchArtifactsFile({
-        workspaceId: params.parentWorkspaceId,
-        workspaceSessionDir: params.parentSessionDir,
-        update: (parentFile) => {
-          for (const [taskId, childEntry] of childEntries) {
-            if (!taskId) continue;
-            const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
-
-            const childUpdated = coerceUpdatedAtMs(childEntry);
-            const existingUpdated = existing ? coerceUpdatedAtMs(existing) : -1;
-
-            if (!existing || childUpdated > existingUpdated) {
-              parentFile.artifactsByChildTaskId[taskId] = {
-                ...childEntry,
-                childTaskId: taskId,
-                parentWorkspaceId: params.parentWorkspaceId,
-                projectArtifacts: childEntry.projectArtifacts.map((projectArtifact) => ({
-                  ...projectArtifact,
-                  mboxPath: projectArtifact.mboxPath
-                    ? getSubagentGitPatchMboxPath(
-                        params.parentSessionDir,
-                        taskId,
-                        projectArtifact.storageKey
-                      )
-                    : undefined,
-                })),
-              };
-            }
-          }
-        },
-      });
+      await mergeChildPatchArtifactIndex(params, childEntries);
     }
   } catch (error: unknown) {
     log.error("Failed to roll up subagent patch artifacts into parent", {
@@ -4423,28 +4522,6 @@ export class WorkspaceService
    * This tracks workspace recency and streaming status for VS Code extension integration.
    */
   private setupMetadataListeners(): void {
-    const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
-    const isWorkspaceEvent = (v: unknown): v is { workspaceId: string } =>
-      isObj(v) && "workspaceId" in v && typeof v.workspaceId === "string";
-    const isStreamStartEvent = (v: unknown): v is StreamStartEvent =>
-      isWorkspaceEvent(v) && "model" in v && typeof (v as { model: unknown }).model === "string";
-    const isStreamEndEvent = (v: unknown): v is StreamEndEvent =>
-      isWorkspaceEvent(v) &&
-      (!("metadata" in (v as Record<string, unknown>)) || isObj((v as StreamEndEvent).metadata));
-    const isStreamAbortEvent = (v: unknown): v is StreamAbortEvent => isWorkspaceEvent(v);
-    const isErrorEvent = (
-      v: unknown
-    ): v is { workspaceId: string; error: string; errorType?: StreamErrorType } =>
-      isWorkspaceEvent(v) && "error" in v && typeof (v as { error: unknown }).error === "string";
-    const isToolCallEndEvent = (v: unknown): v is ToolCallEndEvent =>
-      isWorkspaceEvent(v) &&
-      "toolName" in v &&
-      typeof (v as { toolName: unknown }).toolName === "string" &&
-      "result" in v;
-    const extractStatusSetResult = (result: unknown): WorkspaceAgentStatus | null =>
-      isObj(result) && result.success === true ? coerceAgentStatus(result) : null;
-    const isSuccessfulToolResult = (result: unknown): result is { success: true } =>
-      isObj(result) && result.success === true;
     // Update streaming status and recency on stream start
     this.aiService.on("stream-start", (data: unknown) => {
       if (isStreamStartEvent(data)) {
@@ -4488,7 +4565,7 @@ export class WorkspaceService
     });
 
     this.aiService.on("error", (data: unknown) => {
-      if (isErrorEvent(data)) {
+      if (isStreamErrorEvent(data)) {
         // Read the idle-compaction marker before stopStreamingStatus clears it, so a
         // mid-stream failure (e.g. provider rejecting the compaction model) stops the loop.
         if (this.idleCompactingWorkspaces.has(data.workspaceId)) {
@@ -4509,7 +4586,7 @@ export class WorkspaceService
       }
 
       if (data.toolName === "status_set") {
-        const agentStatus = extractStatusSetResult(data.result);
+        const agentStatus = statusSetResultStatus(data.result);
         if (!agentStatus) {
           return;
         }
@@ -4538,10 +4615,6 @@ export class WorkspaceService
   }
 
   private setupInitMetadataListeners(): void {
-    const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
-    const isWorkspaceEvent = (v: unknown): v is { workspaceId: string } =>
-      isObj(v) && "workspaceId" in v && typeof v.workspaceId === "string";
-
     // When init completes, refresh metadata so the UI can clear isInitializing and swap
     // "Cancel creation" back to the normal archive affordance.
     this.initStateManager.on("init-end", (event: unknown) => {
@@ -5461,20 +5534,7 @@ export class WorkspaceService
 
   private createSession(workspaceId: string): AgentSession {
     if (this.shuttingDown) throw new Error("Server is shutting down");
-    // Artifacts M4: snapshot changed artifacts when a logical turn completes unpublished.
-    const artifactTurnHooks = createArtifactTurnSnapshotHooks({
-      isEnabled: () => this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
-      sessionDir: path.join(this.config.sessionsDir, workspaceId),
-      resolveLocation: async () => {
-        const metadata = await this.getInfo(workspaceId);
-        return metadata
-          ? resolveArtifactsLocation(this.config.sessionsDir, workspaceId, metadata)
-          : null;
-      },
-    });
     return new AgentSession({
-      onLogicalTurnStarted: artifactTurnHooks.onLogicalTurnStarted,
-      onLogicalTurnCompleted: artifactTurnHooks.onLogicalTurnCompleted,
       contextManagement: this.contextManagement,
       effectRunner: this.effectRunner,
       appFiberScope: this.appFiberScope,
@@ -5550,6 +5610,7 @@ export class WorkspaceService
     const metadataUnsubscribe = session.onMetadataEvent((event) => {
       this.emit("metadata", {
         workspaceId: event.workspaceId,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         metadata: event.metadata!,
       });
     });
@@ -6482,8 +6543,10 @@ export class WorkspaceService
         break;
       }
 
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       if (!createResult!.success || !createResult!.workspacePath) {
         initLogger.logComplete(-1);
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         return Err(createResult!.error ?? "Failed to create workspace");
       }
 
@@ -6533,6 +6596,7 @@ export class WorkspaceService
       // entry for a live sibling and skip its own sanitization.
       // A deferred worktree has no files yet; it is sanitized once
       // materialized, before its init hook (see materializeDeferredCheckout).
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const pendingMaterialization = createResult!.pendingMaterialization;
       const sanitizeAtRegistration =
         (finalRuntimeConfig.type === "local" || finalRuntimeConfig.type === "worktree") &&
@@ -6556,6 +6620,7 @@ export class WorkspaceService
             // Force is what removes an unpopulated or hook-dirtied checkout, and its `branch -D`
             // is safe only on a branch this creation made.
             checkout:
+              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
               createResult!.createdBranch === true ? "force-delete" : "force-delete-keep-branch",
           });
         // #4745: nothing references this checkout before the registration write lands; undo the
@@ -6600,6 +6665,7 @@ export class WorkspaceService
             config.projects.set(owningProjectPath, projectConfig);
           }
           projectConfig.workspaces.push({
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             path: createResult!.workspacePath!,
             id: workspaceId,
             name: finalWorkspaceName,
@@ -6657,6 +6723,7 @@ export class WorkspaceService
         if (sanitizeAtRegistration) {
           const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
             workspaceId,
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             createResult!.workspacePath
           );
           if (sanitizeError !== undefined) {
@@ -6692,6 +6759,7 @@ export class WorkspaceService
           const unrelatedWorkspaceConsent = await this.grantCreationUnrelatedWorkspaceConsent(
             owningProjectPath,
             workspaceId,
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             createResult!.workspacePath
           );
           completeMetadata = { ...completeMetadata, unrelatedWorkspaceConsent };
@@ -6719,6 +6787,7 @@ export class WorkspaceService
           projectPath: owningProjectPath,
           branchName: finalBranchName,
           trunkBranch: normalizedTrunkBranch,
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           workspacePath: createResult!.workspacePath,
           initLogger,
           env: createEnv,
@@ -6739,6 +6808,7 @@ export class WorkspaceService
                 initParams,
                 pending: pendingMaterialization,
                 initAbortController,
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
                 createdBranch: createResult!.createdBranch === true,
                 // Removal, failed checkout or failed sanitization: the default never applies.
               }).finally(() => this.clearPendingDefaultUnrelatedConsent(workspaceId))
@@ -6767,6 +6837,7 @@ export class WorkspaceService
       return Ok({
         metadata: this.enrichFrontendMetadata(completeMetadata),
         // Lets a caller that undoes this creation keep a branch it merely reused (#4819).
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         createdBranch: createResult!.createdBranch === true,
       });
     } catch (error) {
@@ -8500,7 +8571,9 @@ export class WorkspaceService
       if (removedMetadata || persistedWorkspace) {
         await this.syncCodeWorkspaceFiles(
           removedMetadata ?? {
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             projectPath: persistedWorkspace!.projectPath,
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             projects: persistedWorkspace!.projects,
           },
           removedWorkspaceRoots
@@ -9552,7 +9625,8 @@ export class WorkspaceService
           ? (settings.whenBusy ?? undefined)
           : currentSettings?.whenBusy;
         const nextEnabled = hasEnabledUpdate
-          ? settings.enabled!
+          ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+            settings.enabled!
           : (currentSettings?.enabled ?? true);
         // Sparse like trigger/whenBusy: absent follows the global default at read time, so a
         // later global change applies too (#5692). Null clears; an absent key preserves.
@@ -9731,35 +9805,18 @@ export class WorkspaceService
       // Drop the whole record when every field is null — keeps the
       // config.json minimal and makes "no override" the canonical state
       // that resolves to global defaults.
-      const allNull =
-        override.defaultBudgetCents == null &&
-        override.defaultTurnCap == null &&
-        override.alwaysRequireExplicitBudget == null;
+      const next = canonicalGoalDefaultsOverride(override);
 
       // No-op fast path from a snapshot read: skip the queued write entirely when the
       // override already matches. Race-safe — equivalent to a serialized write of the
       // identical value landing first, and skipping cannot resurrect removed entries.
-      {
-        const snapshotEntry = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
-          projectPath,
-          workspaceId: normalizedWorkspaceId,
-          workspacePath,
-        });
-        const prior = snapshotEntry?.goalDefaults;
-        if (snapshotEntry && allNull && prior == null) {
-          return Ok(undefined);
-        }
-        if (
-          snapshotEntry &&
-          !allNull &&
-          prior != null &&
-          (prior.defaultBudgetCents ?? null) === (override.defaultBudgetCents ?? null) &&
-          (prior.defaultTurnCap ?? null) === (override.defaultTurnCap ?? null) &&
-          (prior.alwaysRequireExplicitBudget ?? null) ===
-            (override.alwaysRequireExplicitBudget ?? null)
-        ) {
-          return Ok(undefined);
-        }
+      const snapshotEntry = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
+        projectPath,
+        workspaceId: normalizedWorkspaceId,
+        workspacePath,
+      });
+      if (snapshotEntry && sameGoalDefaultsOverride(snapshotEntry.goalDefaults, next)) {
+        return Ok(undefined);
       }
 
       // Compare against the FRESH entry inside the serialized editConfig transform
@@ -9776,32 +9833,15 @@ export class WorkspaceService
           writeResult = Err(this.workspaceNotFoundError());
           return freshConfig;
         }
-
-        const prior = workspaceEntry.goalDefaults;
-        if (allNull) {
-          if (prior == null) {
-            writeResult = Ok({ changed: false });
-            return freshConfig;
-          }
+        if (sameGoalDefaultsOverride(workspaceEntry.goalDefaults, next)) {
+          writeResult = Ok({ changed: false });
+          return freshConfig;
+        }
+        if (next == null) {
           delete workspaceEntry.goalDefaults;
         } else {
-          const next: WorkspaceGoalDefaultsOverride = {
-            defaultBudgetCents: override.defaultBudgetCents ?? null,
-            defaultTurnCap: override.defaultTurnCap ?? null,
-            alwaysRequireExplicitBudget: override.alwaysRequireExplicitBudget ?? null,
-          };
-          const unchanged =
-            prior != null &&
-            (prior.defaultBudgetCents ?? null) === next.defaultBudgetCents &&
-            (prior.defaultTurnCap ?? null) === next.defaultTurnCap &&
-            (prior.alwaysRequireExplicitBudget ?? null) === next.alwaysRequireExplicitBudget;
-          if (unchanged) {
-            writeResult = Ok({ changed: false });
-            return freshConfig;
-          }
           workspaceEntry.goalDefaults = next;
         }
-
         writeResult = Ok({ changed: true });
         return freshConfig;
       });
@@ -10281,12 +10321,7 @@ export class WorkspaceService
 
       const enrichedMetadata = this.enrichFrontendMetadata(updatedMetadata);
 
-      const session = this.sessions.get(workspaceId);
-      if (session) {
-        session.emitMetadata(enrichedMetadata);
-      } else {
-        this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
-      }
+      this.publishWorkspaceMetadata(workspaceId, enrichedMetadata);
       const sharedDescendantIds = allMetadataUpdated
         .filter(
           (metadata) =>
@@ -10332,6 +10367,35 @@ export class WorkspaceService
     }
   }
 
+  /**
+   * Deliver a chat event through the given session when there is one, else on the bus. Callers
+   * pass the session they already hold, so the event goes where their own work went.
+   */
+  private publishChatEvent(
+    workspaceId: string,
+    session: AgentSession | undefined,
+    message: WorkspaceChatMessage
+  ): void {
+    if (session) {
+      session.emitChatEvent(message);
+    } else {
+      this.emit("chat", { workspaceId, message });
+    }
+  }
+
+  /** Deliver workspace metadata through the workspace's session when one exists, else on the bus. */
+  private publishWorkspaceMetadata(
+    workspaceId: string,
+    metadata: FrontendWorkspaceMetadata | null
+  ): void {
+    const session = this.sessions.get(workspaceId);
+    if (session) {
+      session.emitMetadata(metadata);
+    } else {
+      this.emit("metadata", { workspaceId, metadata });
+    }
+  }
+
   private async emitCurrentWorkspaceMetadata(workspaceId: string): Promise<void> {
     await this.emitCurrentWorkspaceMetadataBatch([workspaceId]);
   }
@@ -10347,12 +10411,7 @@ export class WorkspaceService
       const enrichedMetadata = this.enrichMaybeFrontendMetadata(
         metadataById.get(workspaceId) ?? null
       );
-      const session = this.sessions.get(workspaceId);
-      if (session) {
-        session.emitMetadata(enrichedMetadata);
-      } else {
-        this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
-      }
+      this.publishWorkspaceMetadata(workspaceId, enrichedMetadata);
     }
   }
 
@@ -11569,6 +11628,32 @@ export class WorkspaceService
   }
 
   /**
+   * Labels for the counted in-flight operations (bash exec, attachment staging, file
+   * completion, fork, MCP prompt discovery, refine) that archive and interrupt gates
+   * refuse on, in a fixed order so both gates report them alike.
+   */
+  private inFlightOperationLabels(workspaceId: string): string[] {
+    const counts: Array<[count: number, label: string]> = [
+      [this.preflightExecCounts.get(workspaceId) ?? 0, "a bash command executing"],
+      [this.preflightStagingCounts.get(workspaceId) ?? 0, "an attachment transfer in progress"],
+      [
+        this.preflightFileCompletionCounts.get(workspaceId) ?? 0,
+        "a file completion refresh in progress",
+      ],
+      [this.preflightForkCounts.get(workspaceId) ?? 0, "a fork of this workspace in progress"],
+      [
+        this.mcpPromptDiscoveries.get(workspaceId)?.size ?? 0,
+        "an MCP prompt discovery in progress",
+      ],
+      [
+        this.refineExclusionCounts.get(workspaceId) ?? 0,
+        "a refine apply or publication in progress",
+      ],
+    ];
+    return counts.filter(([count]) => count > 0).map(([, label]) => label);
+  }
+
+  /**
    * Arm the archive admission gate BEFORE a destructive pre-archive step (interrupt_active
    * turn interruption) and validate that no live user activity is already in flight. The
    * sink's refuseLiveUserActivity gate runs only inside archiveUnlocked — after the caller
@@ -11654,24 +11739,7 @@ export class WorkspaceService
         activityLabels.push("an active stream not attributable to the delegated turns");
       }
     }
-    if ((this.preflightExecCounts.get(workspaceId) ?? 0) > 0) {
-      activityLabels.push("a bash command executing");
-    }
-    if ((this.preflightStagingCounts.get(workspaceId) ?? 0) > 0) {
-      activityLabels.push("an attachment transfer in progress");
-    }
-    if ((this.preflightFileCompletionCounts.get(workspaceId) ?? 0) > 0) {
-      activityLabels.push("a file completion refresh in progress");
-    }
-    if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
-      activityLabels.push("a fork of this workspace in progress");
-    }
-    if ((this.mcpPromptDiscoveries.get(workspaceId)?.size ?? 0) > 0) {
-      activityLabels.push("an MCP prompt discovery in progress");
-    }
-    if ((this.refineExclusionCounts.get(workspaceId) ?? 0) > 0) {
-      activityLabels.push("a refine apply or publication in progress");
-    }
+    activityLabels.push(...this.inFlightOperationLabels(workspaceId));
     // In-flight native-terminal/editor opens passed their own archive guards before this
     // hold armed and surface only through the pending-open counters until their durable
     // markers persist; the sink's untrackable-app check would refuse on them after the
@@ -12112,24 +12180,7 @@ export class WorkspaceService
         if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
           activityLabels.push("a message send in progress");
         }
-        if ((this.preflightExecCounts.get(workspaceId) ?? 0) > 0) {
-          activityLabels.push("a bash command executing");
-        }
-        if ((this.preflightStagingCounts.get(workspaceId) ?? 0) > 0) {
-          activityLabels.push("an attachment transfer in progress");
-        }
-        if ((this.preflightFileCompletionCounts.get(workspaceId) ?? 0) > 0) {
-          activityLabels.push("a file completion refresh in progress");
-        }
-        if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
-          activityLabels.push("a fork of this workspace in progress");
-        }
-        if ((this.mcpPromptDiscoveries.get(workspaceId)?.size ?? 0) > 0) {
-          activityLabels.push("an MCP prompt discovery in progress");
-        }
-        if ((this.refineExclusionCounts.get(workspaceId) ?? 0) > 0) {
-          activityLabels.push("a refine apply or publication in progress");
-        }
+        activityLabels.push(...this.inFlightOperationLabels(workspaceId));
         if (liveActivity.queuedMessages) activityLabels.push("queued messages");
         if (liveActivity.backgroundBashProcesses) {
           activityLabels.push("running background bash processes");
@@ -12220,12 +12271,7 @@ export class WorkspaceService
           const updatedMetadata = allMetadata.find((m) => m.id === workspaceId);
           if (updatedMetadata) {
             const enrichedMetadata = this.enrichFrontendMetadata(updatedMetadata);
-            const session = this.sessions.get(workspaceId);
-            if (session) {
-              session.emitMetadata(enrichedMetadata);
-            } else {
-              this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
-            }
+            this.publishWorkspaceMetadata(workspaceId, enrichedMetadata);
           }
         } catch (error) {
           log.debug("Failed to emit metadata after init cancellation during archive", {
@@ -12463,6 +12509,7 @@ export class WorkspaceService
         // Pass acknowledgedUntrackedPaths to capture so it re-verifies at capture time,
         // closing the remaining race window between the final confirmation check and the
         // actual snapshot capture work.
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const captureResult = await this.worktreeArchiveSnapshotService!.captureSnapshotForArchive({
           workspaceId,
           workspaceMetadata: beforeArchiveMetadata,
@@ -12561,12 +12608,7 @@ export class WorkspaceService
       const updatedMetadata = allMetadata.find((m) => m.id === workspaceId);
       if (updatedMetadata) {
         const enrichedMetadata = this.enrichFrontendMetadata(updatedMetadata);
-        const session = this.sessions.get(workspaceId);
-        if (session) {
-          session.emitMetadata(enrichedMetadata);
-        } else {
-          this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
-        }
+        this.publishWorkspaceMetadata(workspaceId, enrichedMetadata);
       }
 
       // Lifecycle hooks run after we persist archivedAt.
@@ -12662,9 +12704,157 @@ export class WorkspaceService
     return await this.unarchiveUnlocked(workspaceId);
   }
 
+  /**
+   * Best effort (#4748): put unarchivedAt back to its value before this unarchive, unless a
+   * later edit already replaced it. A failed rollback must not replace the restore error, and
+   * the UI still needs what disk now says.
+   */
+  private async rollBackUnarchive(target: {
+    workspaceId: string;
+    projectPath: string;
+    workspacePath: string;
+    previousUnarchivedAt: string | undefined;
+    persistedUnarchivedAt: string;
+  }): Promise<void> {
+    const { workspaceId, projectPath, workspacePath, previousUnarchivedAt, persistedUnarchivedAt } =
+      target;
+    await this.config
+      .editConfig((config) => {
+        const projectConfig = config.projects.get(projectPath);
+        const workspaceEntry =
+          projectConfig?.workspaces.find((w) => w.id === workspaceId) ??
+          projectConfig?.workspaces.find((w) => w.path === workspacePath);
+        if (workspaceEntry?.unarchivedAt === persistedUnarchivedAt) {
+          if (previousUnarchivedAt === undefined) {
+            delete workspaceEntry.unarchivedAt;
+          } else {
+            workspaceEntry.unarchivedAt = previousUnarchivedAt;
+          }
+        }
+        return config;
+      })
+      .catch((rollbackError: unknown) => {
+        log.warn("Failed to roll back unarchive after a failed snapshot restore", {
+          workspaceId,
+          error: getErrorMessage(rollbackError),
+        });
+      });
+    await this.emitCurrentWorkspaceMetadata(workspaceId);
+  }
+
+  /**
+   * Restore the worktree archive snapshot of a workspace whose unarchive just persisted. When
+   * the restore fails, the unarchive is rolled back (unarchivedAt goes back to its previous
+   * value, if no later edit replaced it) so the workspace stays archived with its snapshot.
+   */
+  private async restoreArchiveSnapshotAfterUnarchive(
+    snapshotService: WorktreeArchiveSnapshotLifecycleService,
+    target: {
+      workspaceId: string;
+      projectPath: string;
+      workspacePath: string;
+      hookMetadata: WorkspaceMetadata;
+      previousUnarchivedAt: string | undefined;
+      persistedUnarchivedAt: string | undefined;
+    }
+  ): Promise<Result<void>> {
+    const { workspaceId, hookMetadata, persistedUnarchivedAt } = target;
+    // Durable before restore can recreate the checkout: a crash before rehydration finishes
+    // leaves the workspace unarchived, so only the startup sweep can finish the job (#4850).
+    await this.markStagedAttachmentRehydrationPending(workspaceId, hookMetadata);
+    const restoreResult = await snapshotService.restoreSnapshotAfterUnarchive({
+      workspaceId,
+      workspaceMetadata: hookMetadata,
+    });
+    if (!restoreResult.success) {
+      log.debug("Failed to restore worktree archive snapshot during unarchive", {
+        workspaceId,
+        error: restoreResult.error,
+      });
+      // The workspace goes back to archived; the next unarchive marks it again.
+      await this.clearStagedAttachmentRehydrationPending(workspaceId);
+      if (persistedUnarchivedAt) {
+        await this.rollBackUnarchive({ ...target, persistedUnarchivedAt });
+      }
+      return Err(restoreResult.error);
+    }
+    if (restoreResult.data === "restored") {
+      await this.rehydrateStagedAttachmentsAfterSnapshotRestore(workspaceId, hookMetadata);
+    } else {
+      await this.clearStagedAttachmentRehydrationPending(workspaceId);
+    }
+    return Ok(undefined);
+  }
+
+  /**
+   * Admission for committing an unarchive. Returns the release for whichever guard it took:
+   * a workspace use lease for a keep-mode unarchive (#4871), or the structural mutation gate
+   * when a snapshot must be restored (#4476).
+   */
+  private async acquireUnarchiveAdmission(
+    workspaceId: string
+  ): Promise<Result<() => Promise<void>>> {
+    const hasSnapshot = () =>
+      findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+        .worktreeArchiveSnapshot != null;
+
+    // #4871: a keep-mode unarchive restores no checkout, so the other backend's ordinary
+    // activity must not refuse it. It must still not mark the workspace active while the other
+    // backend deletes the worktree (or otherwise mutates it) under the gate: a use lease held
+    // from before the commit to the end (through lifecycle startup, e.g. starting a Coder
+    // workspace) either sees that gate (refuse) or is seen by its scan (Dekker ordering in
+    // workspaceUseLeases.ts), where a bare gate probe could race the mutator's archived check.
+    if (!hasSnapshot()) {
+      let unarchiveLease: WorkspaceUseLease;
+      try {
+        unarchiveLease = await workspaceUseLeasesFor(this.config).hold(workspaceId, "unarchive");
+      } catch (error) {
+        return Err(`Cannot unarchive workspace: ${getErrorMessage(error)}`);
+      }
+      const releaseUnarchiveLease = () =>
+        unarchiveLease.release().catch((error: unknown) => {
+          log.warn("Failed to release the unarchive use lease", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        });
+      // A snapshot archive the other backend finished before the lease is visible now, and no
+      // new one can start while it is held: restoring that snapshot needs the gate below. The
+      // lease is released if this check throws, as the caller's finally did before.
+      let snapshotAppeared: boolean;
+      try {
+        snapshotAppeared = hasSnapshot();
+      } catch (error) {
+        await releaseUnarchiveLease();
+        throw error;
+      }
+      if (!snapshotAppeared) {
+        return Ok(releaseUnarchiveLease);
+      }
+      await releaseUnarchiveLease();
+    }
+
+    // #4476: restoring a snapshot rewrites the checkout, so it refuses (before unarchiving)
+    // while another backend uses the workspace or its shared sub-agents.
+    // Nothing here stops this backend's own background processes, so they refuse too.
+    const gate = await this.acquireStructuralMutationGate(workspaceId, {
+      ignoreKinds: new Set(),
+      backgroundProcesses: "refuse",
+    });
+    if (!gate.success) return Err(`Cannot unarchive workspace: ${gate.error}`);
+    const releaseMutationGate = gate.data;
+    return Ok(() =>
+      releaseMutationGate().catch((error: unknown) => {
+        log.warn("Failed to release the mutation gate after unarchive", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      })
+    );
+  }
+
   private async unarchiveUnlocked(workspaceId: string): Promise<Result<void>> {
-    let releaseMutationGate: (() => Promise<void>) | undefined;
-    let releaseUnarchiveLease: (() => Promise<void>) | undefined;
+    let releaseAdmission: (() => Promise<void>) | undefined;
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
@@ -12679,49 +12869,9 @@ export class WorkspaceService
         return Ok(undefined);
       }
 
-      const hasSnapshot = () =>
-        findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
-          .worktreeArchiveSnapshot != null;
-
-      // #4871: a keep-mode unarchive restores no checkout, so the other backend's ordinary
-      // activity must not refuse it. It must still not mark the workspace active while the other
-      // backend deletes the worktree (or otherwise mutates it) under the gate: a use lease held
-      // from before the commit to the end (through lifecycle startup, e.g. starting a Coder
-      // workspace) either sees that gate (refuse) or is seen by its scan (Dekker ordering in
-      // workspaceUseLeases.ts), where a bare gate probe could race the mutator's archived check.
-      if (!hasSnapshot()) {
-        let unarchiveLease: WorkspaceUseLease;
-        try {
-          unarchiveLease = await workspaceUseLeasesFor(this.config).hold(workspaceId, "unarchive");
-        } catch (error) {
-          return Err(`Cannot unarchive workspace: ${getErrorMessage(error)}`);
-        }
-        releaseUnarchiveLease = () =>
-          unarchiveLease.release().catch((error: unknown) => {
-            log.warn("Failed to release the unarchive use lease", {
-              workspaceId,
-              error: getErrorMessage(error),
-            });
-          });
-        // A snapshot archive the other backend finished before the lease is visible now, and no
-        // new one can start while it is held: restoring that snapshot needs the gate below.
-        if (hasSnapshot()) {
-          await releaseUnarchiveLease();
-          releaseUnarchiveLease = undefined;
-        }
-      }
-
-      // #4476: restoring a snapshot rewrites the checkout, so it refuses (before unarchiving)
-      // while another backend uses the workspace or its shared sub-agents.
-      if (releaseUnarchiveLease == null) {
-        // Nothing here stops this backend's own background processes, so they refuse too.
-        const gate = await this.acquireStructuralMutationGate(workspaceId, {
-          ignoreKinds: new Set(),
-          backgroundProcesses: "refuse",
-        });
-        if (!gate.success) return Err(`Cannot unarchive workspace: ${gate.error}`);
-        releaseMutationGate = gate.data;
-      }
+      const admission = await this.acquireUnarchiveAdmission(workspaceId);
+      if (!admission.success) return Err(admission.error);
+      releaseAdmission = admission.data;
 
       let didUnarchive = false;
       let previousUnarchivedAt: string | undefined;
@@ -12767,12 +12917,7 @@ export class WorkspaceService
       const updatedMetadata = allMetadata.find((m) => m.id === workspaceId);
       if (updatedMetadata) {
         const enrichedMetadata = this.enrichFrontendMetadata(updatedMetadata);
-        const session = this.sessions.get(workspaceId);
-        if (session) {
-          session.emitMetadata(enrichedMetadata);
-        } else {
-          this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
-        }
+        this.publishWorkspaceMetadata(workspaceId, enrichedMetadata);
       }
 
       let hookMetadata: WorkspaceMetadata | undefined = updatedMetadata;
@@ -12789,53 +12934,19 @@ export class WorkspaceService
       }
 
       if (this.worktreeArchiveSnapshotService && hookMetadata) {
-        // Durable before restore can recreate the checkout: a crash before rehydration finishes
-        // leaves the workspace unarchived, so only the startup sweep can finish the job (#4850).
-        await this.markStagedAttachmentRehydrationPending(workspaceId, hookMetadata);
-        const restoreResult =
-          await this.worktreeArchiveSnapshotService.restoreSnapshotAfterUnarchive({
+        const restored = await this.restoreArchiveSnapshotAfterUnarchive(
+          this.worktreeArchiveSnapshotService,
+          {
             workspaceId,
-            workspaceMetadata: hookMetadata,
-          });
-        if (!restoreResult.success) {
-          log.debug("Failed to restore worktree archive snapshot during unarchive", {
-            workspaceId,
-            error: restoreResult.error,
-          });
-          // The workspace goes back to archived; the next unarchive marks it again.
-          await this.clearStagedAttachmentRehydrationPending(workspaceId);
-          if (persistedUnarchivedAt) {
-            // Best effort (#4748): a failed rollback must not replace the restore error, and the
-            // UI still needs what disk now says.
-            await this.config
-              .editConfig((config) => {
-                const projectConfig = config.projects.get(projectPath);
-                const workspaceEntry =
-                  projectConfig?.workspaces.find((w) => w.id === workspaceId) ??
-                  projectConfig?.workspaces.find((w) => w.path === workspacePath);
-                if (workspaceEntry && workspaceEntry.unarchivedAt === persistedUnarchivedAt) {
-                  if (previousUnarchivedAt === undefined) {
-                    delete workspaceEntry.unarchivedAt;
-                  } else {
-                    workspaceEntry.unarchivedAt = previousUnarchivedAt;
-                  }
-                }
-                return config;
-              })
-              .catch((rollbackError: unknown) => {
-                log.warn("Failed to roll back unarchive after a failed snapshot restore", {
-                  workspaceId,
-                  error: getErrorMessage(rollbackError),
-                });
-              });
-            await this.emitCurrentWorkspaceMetadata(workspaceId);
+            projectPath,
+            workspacePath,
+            hookMetadata,
+            previousUnarchivedAt,
+            persistedUnarchivedAt,
           }
-          return Err(restoreResult.error);
-        }
-        if (restoreResult.data === "restored") {
-          await this.rehydrateStagedAttachmentsAfterSnapshotRestore(workspaceId, hookMetadata);
-        } else {
-          await this.clearStagedAttachmentRehydrationPending(workspaceId);
+        );
+        if (!restored.success) {
+          return restored;
         }
       }
 
@@ -12885,13 +12996,7 @@ export class WorkspaceService
       const message = getErrorMessage(error);
       return Err(`Failed to unarchive workspace: ${message}`);
     } finally {
-      await releaseUnarchiveLease?.();
-      await releaseMutationGate?.().catch((error: unknown) => {
-        log.warn("Failed to release the mutation gate after unarchive", {
-          workspaceId,
-          error: getErrorMessage(error),
-        });
-      });
+      await releaseAdmission?.();
     }
   }
 
@@ -13495,47 +13600,26 @@ export class WorkspaceService
     // settings bucket. Persist whatever agent ID the caller chose so legacy Ask
     // settings can fade out naturally instead of being mixed into Auto.
 
-    // Pins apply only to new-style agent tasks (taskAiPins present; legacy tasks stay
-    // frozen) and only for the task's own agent. Same reference = nothing to pin.
-    const computeNextPins = (entry: Workspace): TaskAiPins | undefined => {
-      const pinIntent = options?.pinIntent;
-      if (
-        pinIntent == null ||
-        aiSettings == null ||
-        entry.taskAiPins == null ||
-        normalizedAgentId !== resolveTaskAgentIdForResume(entry)
-      ) {
-        return entry.taskAiPins;
-      }
-      return applyAiSelectionIntentToPins(entry.taskAiPins, pinIntent, aiSettings);
-    };
-
     // Hot path: this runs on every message send, so skip the queued write when a
     // snapshot read already shows no change. Skipping is race-safe — it is equivalent
     // to a serialized write of the identical value landing first, and not writing can
     // never resurrect concurrently removed entries.
-    {
-      const snapshotEntry = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
-        projectPath,
-        workspaceId,
-        workspacePath,
-      });
-      if (!snapshotEntry) {
-        return Err(this.workspaceNotFoundError());
-      }
-      const prev = snapshotEntry.aiSettingsByAgent?.[normalizedAgentId];
-      const aiSettingsChanged =
-        options?.pinsOnly !== true &&
-        aiSettings != null &&
-        !isDeepStrictEqual(prev, mergeAgentAISettings(prev, aiSettings));
-      const selectedAgentChanged =
-        options?.pinsOnly !== true &&
-        options?.persistSelectedAgentId === true &&
-        snapshotEntry.agentId !== normalizedAgentId;
-      const pinsChanged = computeNextPins(snapshotEntry) !== snapshotEntry.taskAiPins;
-      if (!aiSettingsChanged && !selectedAgentChanged && !pinsChanged) {
-        return Ok(false);
-      }
+    const snapshotEntry = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
+      projectPath,
+      workspaceId,
+      workspacePath,
+    });
+    if (!snapshotEntry) {
+      return Err(this.workspaceNotFoundError());
+    }
+    const snapshotPlan = planAgentAISettingsUpdate(
+      snapshotEntry,
+      normalizedAgentId,
+      aiSettings,
+      options
+    );
+    if (!agentAISettingsUpdateChanges(snapshotEntry, normalizedAgentId, snapshotPlan)) {
+      return Ok(false);
     }
 
     // Compare/merge against the FRESH entry inside the serialized editConfig transform
@@ -13553,36 +13637,29 @@ export class WorkspaceService
         return freshConfig;
       }
 
-      const prev = workspaceEntry.aiSettingsByAgent?.[normalizedAgentId];
-      const nextAgentSettings =
-        aiSettings != null && options?.pinsOnly !== true
-          ? mergeAgentAISettings(prev, aiSettings)
-          : undefined;
-      const aiSettingsChanged =
-        nextAgentSettings != null && !isDeepStrictEqual(prev, nextAgentSettings);
-      const selectedAgentChanged =
-        options?.pinsOnly !== true &&
-        options?.persistSelectedAgentId === true &&
-        workspaceEntry.agentId !== normalizedAgentId;
-      const nextPins = computeNextPins(workspaceEntry);
-      const pinsChanged = nextPins !== workspaceEntry.taskAiPins;
-      if (!aiSettingsChanged && !selectedAgentChanged && !pinsChanged) {
+      const plan = planAgentAISettingsUpdate(
+        workspaceEntry,
+        normalizedAgentId,
+        aiSettings,
+        options
+      );
+      if (!agentAISettingsUpdateChanges(workspaceEntry, normalizedAgentId, plan)) {
         writeResult = Ok(false);
         return freshConfig;
       }
 
-      if (pinsChanged) {
-        workspaceEntry.taskAiPins = nextPins;
+      if (plan.nextPins !== workspaceEntry.taskAiPins) {
+        workspaceEntry.taskAiPins = plan.nextPins;
       }
 
-      if (nextAgentSettings != null) {
+      if (plan.nextAgentSettings != null) {
         workspaceEntry.aiSettingsByAgent = {
           ...(workspaceEntry.aiSettingsByAgent ?? {}),
-          [normalizedAgentId]: nextAgentSettings,
+          [normalizedAgentId]: plan.nextAgentSettings,
         };
       }
 
-      if (options?.persistSelectedAgentId === true && options?.pinsOnly !== true) {
+      if (plan.selectAgent) {
         workspaceEntry.agentId = normalizedAgentId;
       }
 
@@ -13601,12 +13678,7 @@ export class WorkspaceService
       const updatedMetadata = await this.config.findWorkspaceMetadata(workspaceId);
       const enrichedMetadata = this.enrichMaybeFrontendMetadata(updatedMetadata);
 
-      const session = this.sessions.get(workspaceId);
-      if (session) {
-        session.emitMetadata(enrichedMetadata);
-      } else {
-        this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
-      }
+      this.publishWorkspaceMetadata(workspaceId, enrichedMetadata);
     }
 
     return Ok(true);
@@ -18248,13 +18320,15 @@ export class WorkspaceService
     );
   }
 
-  async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
-    // Perf harness replay mode (XUM_REPLAY_TAPES): real chat history stays untouched. Checked
-    // before any session or history work (clear, truncate).
-    if (isSessionTapeReplayMode()) {
-      return Err(SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE);
-    }
-    const effectivePercentage = percentage ?? 1.0;
+  /**
+   * Admission for truncateHistory, taken before the scope preflight and held across every
+   * await of the truncation. Returns the context-mutation admission guard, or null for a
+   * percentage <= 0 request, which only refuses while a turn is active.
+   */
+  private acquireTruncateHistoryAdmission(
+    workspaceId: string,
+    effectivePercentage: number
+  ): Result<Disposable | null> {
     // The admission guard is acquired BEFORE the scope preflight and held across every await
     // below: a turn admitted during any of them could snapshot the pre-truncation transcript
     // and stream across the mutation, and one admitted during the preflight itself could
@@ -18263,25 +18337,22 @@ export class WorkspaceService
     // that run's wake. The preflight cannot yet prove scope "none", so every request that
     // may remove rows (percentage > 0) pays the guard; percentage <= 0 is a deterministic
     // no-op that retires nothing and keeps the plain busy pre-check.
-    let admissionGuard: Disposable | null = null;
     if (effectivePercentage > 0) {
-      const guardResult = this.acquireContextMutationAdmissionGuard(
-        workspaceId,
-        "truncate history"
-      );
-      if (!guardResult.success) {
-        return Err(guardResult.error);
-      }
-      admissionGuard = guardResult.data;
-    } else if (
-      this.sessions.get(workspaceId)?.isBusy() ||
-      this.aiService.isStreaming(workspaceId)
-    ) {
+      return this.acquireContextMutationAdmissionGuard(workspaceId, "truncate history");
+    }
+    if (this.sessions.get(workspaceId)?.isBusy() || this.aiService.isStreaming(workspaceId)) {
       return Err(
         "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
       );
     }
-    using _admissionGuard = admissionGuard;
+    return Ok(null);
+  }
+
+  /** Which rows a truncation removes, decided up front; null when history cannot be read. */
+  private async classifyTruncationScope(
+    workspaceId: string,
+    effectivePercentage: number
+  ): Promise<"all" | "partial" | "none" | null> {
     // A token-proportional truncation below 100% can remove nothing (budget rounds to zero),
     // a proper prefix, or everything (historyService's full-delete fast path), and each scope
     // carries different obligations: an emptied transcript needs every full-clear guard, a
@@ -18290,20 +18361,118 @@ export class WorkspaceService
     // nothing, or active runs' wakes would settle superseded under an unchanged transcript.
     // Decide up front; historyService revalidates the dangerous drift directions under the
     // history write lock (refuseFullDelete / refuseRowRemoval / requireFullDelete below).
-    const truncationScope =
-      effectivePercentage >= 1.0
-        ? ("all" as const)
-        : effectivePercentage <= 0
-          ? ("none" as const)
-          : await this.historyService
-              .classifyTruncationRemoval(workspaceId, effectivePercentage)
-              .catch((error: unknown) => {
-                log.warn("History truncation scope preflight failed; refusing truncation", {
-                  workspaceId,
-                  error,
-                });
-                return null;
-              });
+    if (effectivePercentage >= 1.0) {
+      return "all";
+    }
+    if (effectivePercentage <= 0) {
+      return "none";
+    }
+    return await this.historyService
+      .classifyTruncationRemoval(workspaceId, effectivePercentage)
+      .catch((error: unknown) => {
+        log.warn("History truncation scope preflight failed; refusing truncation", {
+          workspaceId,
+          error,
+        });
+        return null;
+      });
+  }
+
+  /**
+   * Full-clear precondition, run under the admission guard and refine lock: refuse while a
+   * turn is active, and discard any pending auto-retry so it cannot replay the cleared context.
+   */
+  private async settleTurnWorkBeforeFullClear(
+    workspaceId: string,
+    session: AgentSession | undefined
+  ): Promise<Result<void>> {
+    // Recheck under the guard + lock: the admission block refuses ordinary
+    // turn starts during truncateHistory's earlier awaits (scope preflight,
+    // refine drain and lock), but in-turn compaction retries bypass admission
+    // gating when they cross a transient idle gap.
+    if (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
+      return Err(
+        "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
+      );
+    }
+    // r41: a retry scheduled before this clear would replay the discarded
+    // context after the guard releases — cancel it and drop the partial
+    // durably before the transcript goes away.
+    if (session) {
+      const retryDiscard = await session.discardAutoRetryForContextMutation();
+      if (!retryDiscard.success) {
+        return Err(
+          `Cannot clear history: pending retry state could not be discarded (${retryDiscard.error})`
+        );
+      }
+    }
+    return Ok(undefined);
+  }
+
+  /**
+   * After a full clear: require goal acknowledgment and durably discard the context derived
+   * from the cleared transcript (file state, post-compaction carryover, sandbox kernel state).
+   */
+  private async discardContextStateAfterFullClear(workspaceId: string): Promise<Result<void>> {
+    // A full chat clear removes the context the goal loop was using; require
+    // one user re-engagement before later continuation slices resume it.
+    try {
+      await this.workspaceGoalService?.requireUserAcknowledgment(workspaceId);
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+    this.sessions.get(workspaceId)?.clearFileState();
+    // Same new-segment invariant as resetContext: pre-clear read/skill
+    // carryover must not be injected after the transcript is gone, and the
+    // discard must be durable before the clear reports success (a stale
+    // persisted file would re-inject pre-clear context after a restart).
+    try {
+      await this.getOrCreateSession(workspaceId).clearPostCompactionState();
+    } catch (error) {
+      return Err(
+        `History was cleared, but the persisted post-compaction carryover could not be ` +
+          `durably discarded (${getErrorMessage(error)}). Pre-clear read/skill context may ` +
+          `be re-injected after a restart; retry once the session storage is writable.`
+      );
+    }
+    // The persistent RLM sandbox holds context DERIVED from the cleared
+    // transcript (vars populated by code execution), and its latest durable
+    // snapshot would restore it after a restart — later turns could read
+    // data from the supposedly cleared context through the kernel. Same
+    // durable invalidation + partial-failure posture as resetContext.
+    try {
+      await sandboxHostService.discardScope(
+        workspaceId,
+        path.join(this.config.sessionsDir, workspaceId)
+      );
+    } catch (error) {
+      log.error(
+        `Failed to durably invalidate sandbox state for ${workspaceId} after history clear; ` +
+          `the sandbox kernel stays unavailable until invalidation succeeds`,
+        error
+      );
+      return Err(
+        `History was cleared, but the sandbox kernel state could not be durably invalidated ` +
+          `(${getErrorMessage(error)}). The sandbox stays unavailable and cleared variables ` +
+          `may reappear after a restart; retry once the session storage is writable.`
+      );
+    }
+    return Ok(undefined);
+  }
+
+  async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
+    // Perf harness replay mode (XUM_REPLAY_TAPES): real chat history stays untouched. Checked
+    // before any session or history work (clear, truncate).
+    if (isSessionTapeReplayMode()) {
+      return Err(SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE);
+    }
+    const effectivePercentage = percentage ?? 1.0;
+    const admission = this.acquireTruncateHistoryAdmission(workspaceId, effectivePercentage);
+    if (!admission.success) {
+      return Err(admission.error);
+    }
+    using _admissionGuard = admission.data;
+    const truncationScope = await this.classifyTruncationScope(workspaceId, effectivePercentage);
     if (truncationScope == null) {
       // An unknown scope must not choose a side-effect set: labeling it a full clear would
       // discard goal/plan/retry state and advance the context epoch while rows may remain,
@@ -18333,26 +18502,10 @@ export class WorkspaceService
       refineLock = refineLockResult.data;
     }
     await using _refineLock = refineLock;
-    // Recheck under the guard + lock: the admission block refuses ordinary
-    // turn starts during the awaits above, but in-turn compaction retries
-    // bypass admission gating when they cross a transient idle gap.
-    if (
-      isFullClear &&
-      (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId))
-    ) {
-      return Err(
-        "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
-      );
-    }
-    // r41: a retry scheduled before this clear would replay the discarded
-    // context after the guard releases — cancel it and drop the partial
-    // durably before the transcript goes away.
-    if (isFullClear && session) {
-      const retryDiscard = await session.discardAutoRetryForContextMutation();
-      if (!retryDiscard.success) {
-        return Err(
-          `Cannot clear history: pending retry state could not be discarded (${retryDiscard.error})`
-        );
+    if (isFullClear) {
+      const ready = await this.settleTurnWorkBeforeFullClear(workspaceId, session);
+      if (!ready.success) {
+        return ready;
       }
     }
     // Kernel workflow run references belong to the conversation this truncation mutates: a
@@ -18374,10 +18527,11 @@ export class WorkspaceService
         );
       }
       // In-turn compaction retries bypass admission gating across a transient idle gap (see
-      // the full-clear recheck above), and this retirement is the last await before the
-      // rewrite for BOTH row-removing scopes: revalidate here or a retry admitted during it
-      // would have its history truncated underneath the stream. Refusing after retirement is
-      // the documented fail-safe direction (dropped wake, retrievable via resume).
+      // the full-clear recheck in settleTurnWorkBeforeFullClear), and this retirement is the
+      // last await before the rewrite for BOTH row-removing scopes: revalidate here or a retry
+      // admitted during it would have its history truncated underneath the stream. Refusing
+      // after retirement is the documented fail-safe direction (dropped wake, retrievable via
+      // resume).
       if (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
         return Err(
           "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
@@ -18449,58 +18603,14 @@ export class WorkspaceService
         historySequences: deletedSequences,
       };
       // Emit through the session so ORPC subscriptions receive the event
-      if (session) {
-        session.emitChatEvent(deleteMessage);
-      } else {
-        // Fallback to direct emit (legacy path)
-        this.emit("chat", { workspaceId, message: deleteMessage });
-      }
+      this.publishChatEvent(workspaceId, session, deleteMessage);
     }
 
     // On full clear (the plan file is already deleted), also clear file change tracking
     if (isFullClear) {
-      // A full chat clear removes the context the goal loop was using; require
-      // one user re-engagement before later continuation slices resume it.
-      try {
-        await this.workspaceGoalService?.requireUserAcknowledgment(workspaceId);
-      } catch (error) {
-        return Err(getErrorMessage(error));
-      }
-      this.sessions.get(workspaceId)?.clearFileState();
-      // Same new-segment invariant as resetContext: pre-clear read/skill
-      // carryover must not be injected after the transcript is gone, and the
-      // discard must be durable before the clear reports success (a stale
-      // persisted file would re-inject pre-clear context after a restart).
-      try {
-        await this.getOrCreateSession(workspaceId).clearPostCompactionState();
-      } catch (error) {
-        return Err(
-          `History was cleared, but the persisted post-compaction carryover could not be ` +
-            `durably discarded (${getErrorMessage(error)}). Pre-clear read/skill context may ` +
-            `be re-injected after a restart; retry once the session storage is writable.`
-        );
-      }
-      // The persistent RLM sandbox holds context DERIVED from the cleared
-      // transcript (vars populated by code execution), and its latest durable
-      // snapshot would restore it after a restart — later turns could read
-      // data from the supposedly cleared context through the kernel. Same
-      // durable invalidation + partial-failure posture as resetContext.
-      try {
-        await sandboxHostService.discardScope(
-          workspaceId,
-          path.join(this.config.sessionsDir, workspaceId)
-        );
-      } catch (error) {
-        log.error(
-          `Failed to durably invalidate sandbox state for ${workspaceId} after history clear; ` +
-            `the sandbox kernel stays unavailable until invalidation succeeds`,
-          error
-        );
-        return Err(
-          `History was cleared, but the sandbox kernel state could not be durably invalidated ` +
-            `(${getErrorMessage(error)}). The sandbox stays unavailable and cleared variables ` +
-            `may reappear after a restart; retry once the session storage is writable.`
-        );
+      const discarded = await this.discardContextStateAfterFullClear(workspaceId);
+      if (!discarded.success) {
+        return discarded;
       }
     }
 
@@ -18639,11 +18749,7 @@ export class WorkspaceService
       session?.clearUsageState();
 
       const typedBoundaryMessage = { ...boundaryMessage, type: "message" as const };
-      if (session) {
-        session.emitChatEvent(typedBoundaryMessage);
-      } else {
-        this.emit("chat", { workspaceId, message: typedBoundaryMessage });
-      }
+      this.publishChatEvent(workspaceId, session, typedBoundaryMessage);
 
       try {
         await this.workspaceGoalService?.requireUserAcknowledgment(workspaceId);
@@ -18934,9 +19040,7 @@ export class WorkspaceService
         if (cancellationError) {
           if (deletedSequences.length > 0) {
             const deleted: DeleteMessage = { type: "delete", historySequences: deletedSequences };
-            const session = this.sessions.get(workspaceId);
-            if (session) session.emitChatEvent(deleted);
-            else this.emit("chat", { workspaceId, message: deleted });
+            this.publishChatEvent(workspaceId, this.sessions.get(workspaceId), deleted);
           }
           return Err(cancellationError);
         }
@@ -18967,20 +19071,12 @@ export class WorkspaceService
           type: "delete",
           historySequences: deletedSequences,
         };
-        if (session) {
-          session.emitChatEvent(deleteMessage);
-        } else {
-          this.emit("chat", { workspaceId, message: deleteMessage });
-        }
+        this.publishChatEvent(workspaceId, session, deleteMessage);
       }
 
       // Add type: "message" for discriminated union (XumMessage doesn't have it)
       const typedSummaryMessage = { ...messageToAppend, type: "message" as const };
-      if (session) {
-        session.emitChatEvent(typedSummaryMessage);
-      } else {
-        this.emit("chat", { workspaceId, message: typedSummaryMessage });
-      }
+      this.publishChatEvent(workspaceId, session, typedSummaryMessage);
 
       // Optional cleanup when the caller explicitly requests it (the plan file itself was
       // deleted before the commit). Note: the propose_plan UI keeps the plan file on disk; this
@@ -20607,17 +20703,11 @@ export class WorkspaceService
       // Read trust state so tool_env is sourced only when the shared execution environment is trusted.
       const configSnapshot = this.config.loadConfigOrDefault();
 
-      let scriptToExecute = script;
-      if (command != null) {
-        if (command !== "git") {
-          return Err("executeBash command mode only supports git");
-        }
-
-        const commandArgs = args ?? [];
-        scriptToExecute = [shellQuote(command), ...commandArgs.map((arg) => shellQuote(arg))].join(
-          " "
-        );
+      const scriptResult = resolveExecuteBashScript(script, command, args);
+      if (!scriptResult.success) {
+        return Err(scriptResult.error);
       }
+      const scriptToExecute = scriptResult.data;
 
       // Multi-project script mode must stay at the shared container root so sibling repos remain
       // addressable even when task/child workspaces persist their primary-project checkout path.
@@ -20639,17 +20729,11 @@ export class WorkspaceService
         assert(cwdForExecution?.length, "Single-project repo-root execution requires a repo cwd");
       }
       if (multiProjectRuntimes && requiresRepoRootCwd) {
-        const repoRootRuntime = requestedRepoRootProjectPath
-          ? multiProjectRuntimes.find(
-              (runtimeEntry) =>
-                normalizeRepoRootProjectPath(runtimeEntry.projectPath) ===
-                requestedRepoRootProjectPath
-            )
-          : (multiProjectRuntimes.find(
-              (runtimeEntry) =>
-                normalizeRepoRootProjectPath(runtimeEntry.projectPath) ===
-                normalizeRepoRootProjectPath(metadata.projectPath)
-            ) ?? multiProjectRuntimes[0]);
+        const repoRootRuntime = selectRepoRootProject(
+          multiProjectRuntimes,
+          requestedRepoRootProjectPath,
+          metadata.projectPath
+        );
         if (!repoRootRuntime) {
           return Err(
             requestedRepoRootProjectPath
@@ -20682,6 +20766,7 @@ export class WorkspaceService
       });
 
       // Execute the script
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const result = (await bashTool.execute!(
         {
           script: scriptToExecute,
@@ -21005,6 +21090,11 @@ export class WorkspaceService
     }
   }
 
+  /** Cancel the workspace session's scheduled auto-retry of this goal's automatic turn. */
+  abandonGoalAutoRetry(workspaceId: string, goalId: string): void {
+    this.sessions.get(workspaceId)?.abandonGoalAutoRetry(goalId);
+  }
+
   async getGoalContinuationKickoffSendOptions(
     workspaceId: string
   ): Promise<SendMessageOptions | null> {
@@ -21060,6 +21150,10 @@ export class WorkspaceService
             },
           ]
         : undefined,
+      // A `/goal` sent before any chat message leaves the workspace without AI settings: the
+      // kickoff must then use the user's configured default model, as the composer does, not
+      // the built-in one (bug bash: the kickoff ran on a model the user had not picked).
+      defaultModel: config.defaultModel,
       definitionContext: await this.getAgentDefinitionContext(workspaceId),
     });
 

@@ -44,6 +44,7 @@ export class MutexMap<K> {
       await previousLock; // Wait for previous operation
       return await operation();
     } finally {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       releaseLock!();
       if (this.locks.get(key) === lockPromise) {
         this.locks.delete(key);

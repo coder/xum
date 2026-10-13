@@ -725,9 +725,9 @@ describe("continuous prefix prepareStep and journal", () => {
 
   it("rebuilds a flattened committed step cut in the prefix and swaps at the live anchor", async () => {
     const { run, swapState, store, swap } = await setupLiveSwap();
-    const committed = createMuxMessage("committed", "assistant", "", {
-      stepStartPartIndices: [0, 2],
-    });
+    // No stepStartPartIndices: a row from before they were persisted, the case where the
+    // rebuild still folds the tool-first step into the previous one (flattened cut).
+    const committed = createMuxMessage("committed", "assistant", "", {});
     committed.parts = [
       { type: "text", text: "summarized head must not return" },
       {
@@ -1456,9 +1456,14 @@ describe("continuous prefix prepareStep and journal", () => {
           swap.prefix = await rebuildContinuousPrefix(swap.journal, workspaceId);
         }
         const nextModel = `${family}:fallback-model`;
-        const rebuilt = createMuxMessage("live", "assistant", "", {
-          stepStartPartIndices: sliced ? [0, 2] : [0],
-        });
+        // Sliced: no stepStartPartIndices, so the rebuild folds the tool-first step into the
+        // head step (a row from before the indices were persisted).
+        const rebuilt = createMuxMessage(
+          "live",
+          "assistant",
+          "",
+          sliced ? {} : { stepStartPartIndices: [0] }
+        );
         rebuilt.parts = [
           ...(sliced
             ? [

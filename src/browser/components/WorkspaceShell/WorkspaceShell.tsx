@@ -12,12 +12,13 @@ import {
 import { useResizableSidebar } from "@/browser/hooks/useResizableSidebar";
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
+import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
 import {
   readPersistedState,
   updatePersistedState,
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
-import { guardCloseTab, holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
+import { guardSidebarKeys, holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
@@ -34,11 +35,16 @@ import {
   LEFT_SIDEBAR_DEFAULT_WIDTH_PX,
   LEFT_SIDEBAR_MAX_WIDTH_PX,
   LEFT_SIDEBAR_MIN_WIDTH_PX,
+  NARROW_VIEWPORT_MAX_WIDTH_PX,
 } from "@/constants/layout";
 import { ChatPane } from "../ChatPane/ChatPane";
 
 // ChatPane uses tailwind `min-w-96`.
 const CHAT_PANE_MIN_WIDTH_PX = 384;
+const WORKSPACE_SHELL_CONTAINER_STYLE = {
+  containerType: "inline-size",
+  containerName: "workspace-shell",
+} as const;
 
 const RIGHT_SIDEBAR_DEFAULT_WIDTH_PX = 400;
 const RIGHT_SIDEBAR_MIN_WIDTH_PX = 300;
@@ -101,11 +107,15 @@ const RightSidebar = React.lazy(async () => ({
 
 /**
  * While the sidebar chunk loads: hold its input. Once it has mounted: replay that input. After it
- * failed: only keep Cmd/Ctrl+W from closing the window (the held input is never replayed).
+ * failed: replay that input once too (on phones the menu bar acts on the artifact events, and it
+ * then opens the failure state), and keep the sidebar shortcuts' browser defaults guarded.
  */
 function SidebarInput(props: { held: HeldSidebarInput[]; mode: "hold" | "replay" | "failed" }) {
   useEffect(() => {
-    if (props.mode === "failed") return guardCloseTab();
+    if (props.mode === "failed") {
+      for (const replay of props.held.splice(0)) replay();
+      return guardSidebarKeys();
+    }
     if (props.mode === "hold") return holdSidebarInput(props.held);
     // An effect of RightSidebar's next sibling, so it runs after RightSidebar's own listeners exist.
     for (const replay of props.held.splice(0)) replay();
@@ -128,6 +138,26 @@ function FullscreenSidebarClose(props: { onClose?: () => void }) {
     button.focus();
     return restoreOthers;
   }, []);
+  // Like RightSidebar's closeIfWidened: once the layout widens, the CSS no longer shows this view
+  // full-screen (`position: fixed` lives only in the narrow rules), so close it and lift `inert`.
+  const onClose = props.onClose;
+  useEffect(() => {
+    const view = buttonRef.current?.closest<HTMLElement>(".right-sidebar-fullscreen");
+    if (view == null || onClose == null) return;
+    const closeIfWidened = () => {
+      if (window.getComputedStyle(view).position !== "fixed") onClose();
+    };
+    const mql = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    mql.addEventListener("change", closeIfWidened);
+    const resizeObserver =
+      typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(closeIfWidened);
+    const shell = view.closest("[data-workspace-shell]");
+    if (shell != null) resizeObserver?.observe(shell);
+    return () => {
+      mql.removeEventListener("change", closeIfWidened);
+      resizeObserver?.disconnect();
+    };
+  }, [onClose]);
   return (
     <Button ref={buttonRef} variant="outline" size="sm" onClick={props.onClose}>
       Close
@@ -136,7 +166,8 @@ function FullscreenSidebarClose(props: { onClose?: () => void }) {
 }
 
 /**
- * RightSidebar, keeping its box (collapsed: its 20 px rail) while its chunk loads or after it fails.
+ * RightSidebar, keeping its box while its chunk loads or after it fails. Collapsed, the sidebar takes
+ * no room (its overview card floats over the chat), so the loading box is empty and zero-width.
  * Under immersive review the box covers the workspace above the (still empty) review overlay, so the
  * loading and failure states stay visible.
  */
@@ -145,28 +176,35 @@ function LazyRightSidebar(
 ) {
   const { held, ...sidebarProps } = props;
   const collapsed = readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
-  // The failure state takes the expanded width even when collapsed: the 20 px rail would clip its
-  // Reload button, and the rail's expand control is part of the sidebar that failed to load.
-  const frame = (state: React.ReactNode, kind: "loading" | "failed") => (
-    <div
-      className={cn(
-        "bg-surface-primary flex flex-col overflow-hidden",
-        props.immersiveHidden
-          ? "absolute inset-0 z-[51] items-center justify-center gap-3"
-          : "border-l border-border-light flex-shrink-0 mobile-hide-right-sidebar",
-        props.fullscreen && "right-sidebar-fullscreen items-center justify-center gap-3"
-      )}
-      style={
-        props.immersiveHidden
-          ? undefined
-          : { width: collapsed && kind === "loading" ? 20 : props.width, maxWidth: "100%" }
-      }
-    >
-      {state}
-      {kind === "failed" && <SidebarInput held={held} mode="failed" />}
-      {props.fullscreen && <FullscreenSidebarClose onClose={props.onCloseFullscreen} />}
-    </div>
-  );
+  // The failure state takes the expanded width even when collapsed: it needs room for its Reload
+  // button, and the card's expand control is part of the sidebar that failed to load. The empty
+  // loading box keeps its element (not display:none), so shortcut routing still sees a sidebar
+  // the layout shows (isWorkspaceRightSidebarHidden).
+  const frame = (state: React.ReactNode, kind: "loading" | "failed") => {
+    const empty = collapsed && kind === "loading";
+    return (
+      <div
+        // globals.css stops reserving the overview card's room beside the chat: a failed sidebar
+        // shows docked, at its expanded width, with no card.
+        data-right-sidebar-load-failed={kind === "failed" || undefined}
+        className={cn(
+          "bg-surface-primary flex flex-col overflow-hidden",
+          props.immersiveHidden
+            ? "absolute inset-0 z-[51] items-center justify-center gap-3"
+            : "flex-shrink-0 mobile-hide-right-sidebar",
+          !props.immersiveHidden && !empty && "border-l border-border-light",
+          props.fullscreen && "right-sidebar-fullscreen items-center justify-center gap-3"
+        )}
+        style={
+          props.immersiveHidden ? undefined : { width: empty ? 0 : props.width, maxWidth: "100%" }
+        }
+      >
+        {state}
+        {kind === "failed" && <SidebarInput held={held} mode="failed" />}
+        {props.fullscreen && <FullscreenSidebarClose onClose={props.onCloseFullscreen} />}
+      </div>
+    );
+  };
   const pending = (
     <>
       <SidebarInput held={held} mode="hold" />
@@ -221,6 +259,13 @@ const WorkspacePlaceholder: React.FC<{
 export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const shellRef = useRef<HTMLDivElement>(null);
   const shellSize = useResizeObserver(shellRef);
+  const chatTranscriptFullWidth = useChatTranscriptFullWidth();
+  // Marks the shell so globals.css reserves the collapsed overview card's room beside the chat
+  // from the first paint, read from state rather than from the card element: the sidebar chunk
+  // loads lazily, and keying on the card would shift the transcript once it mounts.
+  const [rightSidebarCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
+    listener: true,
+  });
 
   // WorkspaceShell switches to flex-col at this breakpoint, so in that stacked mode the
   // right sidebar doesn't need to "leave room" for ChatPane beside it.
@@ -264,6 +309,11 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
     minWidth: RIGHT_SIDEBAR_MIN_WIDTH_PX,
     maxWidth: effectiveMaxWidthPx,
     storageKey: RIGHT_SIDEBAR_WIDTH_KEY,
+    // Like Codex desktop: dragging the handle far enough right collapses the sidebar into its
+    // overview card (and back out reopens it). RightSidebar listens to the same persisted key.
+    onDragCollapseChange: (collapsed) => {
+      updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, collapsed);
+    },
   });
 
   const { width: sidebarWidth, isResizing, startResize } = sidebar;
@@ -405,11 +455,17 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
       // Lets descendants (WorkspaceMenuBar's timeline gate) locate the shell that
       // owns the right-sidebar container query without prop-drilling layout state.
       data-workspace-shell=""
+      // A full-width transcript has no centered column for the collapsed right sidebar's overview
+      // card to sit beside, so globals.css keeps the card hidden (the header button stands in).
+      data-transcript-full-width={chatTranscriptFullWidth || undefined}
+      data-right-sidebar-collapsed={rightSidebarCollapsed || undefined}
       className={cn(
         "relative flex flex-1 flex-row bg-surface-primary text-light overflow-x-auto overflow-y-hidden [@media(max-width:768px)]:flex-col",
         props.className
       )}
-      style={{ containerType: "inline-size" }}
+      // Named so the header (inside ChatPane, which may hold containers of its own) can query
+      // the shell's width too: see the overview card rules in globals.css.
+      style={WORKSPACE_SHELL_CONTAINER_STYLE}
     >
       {/* Keep the transcript viewport mounted across workspace switches so the browser doesn't
           visually tear the pane while the new workspace content hydrates. ChatPane resets its

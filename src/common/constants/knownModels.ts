@@ -5,7 +5,15 @@
 import type { OpenAICyberAccessProgram } from "../types/openaiAccessPrograms";
 import { formatModelDisplayName } from "../utils/ai/modelDisplay";
 
-type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek" | "moonshotai" | "zai";
+type ModelProvider =
+  | "anthropic"
+  | "openai"
+  | "google"
+  | "xai"
+  | "meta"
+  | "deepseek"
+  | "moonshotai"
+  | "zai";
 
 interface KnownModelDefinition {
   /** Provider identifier used by SDK factories */
@@ -210,6 +218,12 @@ const MODEL_DEFINITIONS = {
     // Moonshot tokenizer available) for approximate counting.
     tokenizerOverride: "moonshotai/kimi-k2",
   },
+  // Only the public Muse Wonder API model, not Muse Code's Wonder Full variant.
+  MUSE_WONDER: {
+    provider: "meta",
+    providerModelId: "muse-wonder-1.0",
+    aliases: ["muse", "wonder", "muse-wonder"],
+  },
   GLM_53_FLASH: {
     provider: "zai",
     providerModelId: "glm-5.3-flash",
@@ -287,6 +301,7 @@ export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   ...Object.fromEntries(
     Object.values(KNOWN_MODELS)
       .filter((model) => Boolean(model.tokenizerOverride))
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       .map((model) => [model.id, model.tokenizerOverride!])
   ),
 };
