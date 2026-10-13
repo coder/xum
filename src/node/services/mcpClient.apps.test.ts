@@ -92,6 +92,16 @@ describe("MCP Apps view resources", () => {
     expect(blob.prefersBorder).toBeNull();
   });
 
+  test("accepts ChatGPT's text/html+skybridge templates", () => {
+    const uri = "ui://widget/board.html";
+    const view = extractMcpAppResource(
+      { contents: [{ uri, mimeType: "text/html+skybridge", text: "<div id=board></div>" }] },
+      uri
+    );
+    expect(view.html).toBe("<div id=board></div>");
+    expect(view.csp).toEqual({});
+  });
+
   test("rejects the wrong mime type, oversized views and mismatched URIs", async () => {
     const client = await connect(true);
     expect(() => extractMcpAppResource({ contents: [] }, "ui://chart/view")).toThrow(/no content/);

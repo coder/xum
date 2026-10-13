@@ -6,10 +6,49 @@
 
 export const MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui";
 export const MCP_APP_MIME_TYPE = "text/html;profile=mcp-app";
+/**
+ * ChatGPT Apps SDK templates (reached through `_meta["openai/outputTemplate"]`) are served as
+ * this legacy MIME type. Accepted for view resources next to MCP_APP_MIME_TYPE.
+ */
+export const MCP_APP_SKYBRIDGE_MIME_TYPE = "text/html+skybridge";
 /** Largest view resource (decoded HTML) the host accepts from resources/read. */
 export const MCP_APP_RESOURCE_MAX_BYTES = 2 * 1024 * 1024;
 /** Longest ui:// URI kept on tool metadata and display snapshots. */
 export const MCP_APP_RESOURCE_URI_MAX_CHARS = 512;
+/** Largest ui/update-model-context text (UTF-8 bytes) a view may store; larger is -32602. */
+export const MCP_APP_MODEL_CONTEXT_MAX_BYTES = 16 * 1024;
+/** Most domains in one declared CSP list (`_meta.ui.csp` or `openai/widgetCSP`, merged). */
+export const MCP_APP_CSP_DOMAINS_MAX = 32;
+/** Most approved view domains kept per server and project. */
+export const MCP_APP_VIEW_DOMAINS_MAX = 64;
+
+/**
+ * The origin a view may be granted for a declared CSP domain, or null. Only a bare https origin
+ * qualifies: no wildcard, path, query, fragment or credentials, so an approval names exactly the
+ * host (and port) the user saw in the strip.
+ */
+export function mcpAppGrantableOrigin(declared: string): string | null {
+  if (declared.includes("*")) return null;
+  let url: URL;
+  try {
+    url = new URL(declared);
+  } catch {
+    return null;
+  }
+  const bare =
+    url.protocol === "https:" &&
+    url.username === "" &&
+    url.password === "" &&
+    url.search === "" &&
+    url.hash === "" &&
+    (url.pathname === "/" || url.pathname === "");
+  return bare ? url.origin : null;
+}
+
+/** Longest URI a view may pass to resources/read (any scheme its server serves). */
+export const MCP_APP_READ_URI_MAX_CHARS = 2048;
+/** Most tool calls one mcpApps.getViewRecords request may name (the client splits longer lists). */
+export const MCP_APP_VIEW_RECORDS_MAX_IDS = 64;
 
 export type MCPToolVisibility = "model" | "app";
 
@@ -41,6 +80,11 @@ const DEFAULT_VISIBILITY: readonly MCPToolVisibility[] = ["model", "app"];
 
 /**
  * Read a tool definition's `_meta.ui` (or the deprecated flat `_meta["ui/resourceUri"]`).
+ * The view URI is taken from the first key present, in this order: `_meta.ui.resourceUri`,
+ * `_meta["ui/resourceUri"]`, then ChatGPT's compatibility alias `_meta["openai/outputTemplate"]`
+ * (so servers built for ChatGPT render here too). ChatGPT's `openai/visibility` and
+ * `openai/widgetAccessible` are not mapped: their documented semantics do not say how they
+ * combine with the spec's default visibility, so only `_meta.ui.visibility` counts.
  * The view URI and the visibility are parsed independently: an invalid or missing ui:// view
  * drops only `resourceUri`, never a declared visibility (a `visibility: ["app"]` helper must
  * stay hidden from the model). Returns undefined when neither is declared. Visibility defaults
@@ -49,7 +93,7 @@ const DEFAULT_VISIBILITY: readonly MCPToolVisibility[] = ["model", "app"];
 export function parseMCPToolUiMeta(meta: unknown): MCPToolUi | undefined {
   if (!isRecord(meta)) return undefined;
   const ui = isRecord(meta.ui) ? meta.ui : undefined;
-  const rawResourceUri = ui?.resourceUri ?? meta["ui/resourceUri"];
+  const rawResourceUri = ui?.resourceUri ?? meta["ui/resourceUri"] ?? meta["openai/outputTemplate"];
   const resourceUri = isMcpAppResourceUri(rawResourceUri) ? rawResourceUri : undefined;
   const rawVisibility = ui?.visibility;
   if (resourceUri === undefined && !Array.isArray(rawVisibility)) return undefined;

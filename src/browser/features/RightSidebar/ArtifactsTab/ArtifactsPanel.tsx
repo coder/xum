@@ -56,8 +56,6 @@ import { ArtifactVersionMenu } from "./ArtifactVersionMenu";
 import { useArtifactInteractions } from "./useArtifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { createCappedMemory, useCappedMemory } from "./cappedMemory";
-import { McpAppFrame } from "./McpAppFrame";
-import { appViewPickerDetails, mcpAppSelectionKey, useMcpAppViews } from "./mcpAppViewsStore";
 import {
   type ArtifactSelection,
   type ArtifactSelectionScope,
@@ -355,10 +353,6 @@ export function ArtifactsPanel(props: {
   } = useArtifactSelection(props.workspaceId);
   const setSelection = (next: Partial<ArtifactSelection>) =>
     writeArtifactSelection(props.workspaceId, next);
-  const appViews = useMcpAppViews(props.workspaceId);
-  const appViewDetails = appViewPickerDetails(appViews);
-  const selectedApp =
-    appViews.find((view) => mcpAppSelectionKey(view.toolCallId) === selectedPath) ?? null;
 
   const select = (next: { scope: ArtifactSelectionScope; path: string | null }) => {
     setActionError(null);
@@ -486,19 +480,18 @@ export function ArtifactsPanel(props: {
     ((selectedScope === "pinned" && pinned == null) ||
       (selectedScope === "shelf" && shelf == null));
 
-  const selected =
-    selectedApp != null || waitingForPinned
-      ? null
-      : resolveSelection({
-          scope: selectedScope,
-          path: selectedPath,
-          version: selectedVersion,
-          entries: entryGroups?.versioned ?? entries,
-          otherEntries: entryGroups?.other ?? [],
-          pinnedFiles,
-          versionOnlyPaths,
-          shelfEntries,
-        });
+  const selected = waitingForPinned
+    ? null
+    : resolveSelection({
+        scope: selectedScope,
+        path: selectedPath,
+        version: selectedVersion,
+        entries: entryGroups?.versioned ?? entries,
+        otherEntries: entryGroups?.other ?? [],
+        pinnedFiles,
+        versionOnlyPaths,
+        shelfEntries,
+      });
   const selectedArtifactPath = selected?.scope === "artifact" ? selected.path : null;
   const selectedVersionForFetch = selected?.scope === "artifact" ? selected.version : null;
 
@@ -725,20 +718,12 @@ export function ArtifactsPanel(props: {
     ...visibleOtherFiles.map((entry) => ({ scope: "artifact" as const, path: entry.path })),
   ];
   options.push(
-    ...shelfEntries.map((entry) => ({ scope: "shelf" as const, path: shelfSelectionPath(entry) })),
-    // App views come last, as in the picker.
-    ...appViews.map((view) => ({
-      scope: "artifact" as const,
-      path: mcpAppSelectionKey(view.toolCallId),
-    }))
+    ...shelfEntries.map((entry) => ({ scope: "shelf" as const, path: shelfSelectionPath(entry) }))
   );
 
   const selectRelative = (offset: number) => {
     if (options.length === 0) return;
-    const current =
-      selectedApp != null
-        ? { scope: "artifact" as const, path: mcpAppSelectionKey(selectedApp.toolCallId) }
-        : selected;
+    const current = selected;
     const index = current
       ? options.findIndex((o) => o.scope === current.scope && o.path === current.path)
       : -1;
@@ -809,17 +794,14 @@ export function ArtifactsPanel(props: {
   };
 
   // Which annotate flavour the selected artifact supports: text selection on Xum-rendered kinds,
-  // pins inside the sandboxed frame, or none (images, PDFs, pinned files, app views). A live view
+  // pins inside the sandboxed frame, or none (images, PDFs, pinned files). A live view
   // also waits for its version list: annotations record the version they were made on, and
   // before the list arrives that version is unknown.
   const annotationVersionKnown =
     selected?.scope === "artifact" &&
     (selected.version != null || (versionsState?.path === selected.path && !versionsState.stale));
   const annotateResult =
-    selectedApp == null &&
-    selected?.scope === "artifact" &&
-    annotationVersionKnown &&
-    readKey != null
+    selected?.scope === "artifact" && annotationVersionKnown && readKey != null
       ? readState?.key === readKey && readState.result?.status === "ok"
         ? readState.result
         : null
@@ -950,11 +932,11 @@ export function ArtifactsPanel(props: {
     if (showFullscreen) setFullscreenMode(false);
   };
 
-  // window.xum.send / setState for the selected artifact (M5b); pinned files and app views
+  // window.xum.send / setState for the selected artifact (M5b); pinned files
   // are not interactive.
   const interactions = useArtifactInteractions(
     props.workspaceId,
-    selectedApp == null && selected?.scope === "artifact"
+    selected?.scope === "artifact"
       ? {
           path: selected.path,
           version: selected.version,
@@ -977,14 +959,7 @@ export function ArtifactsPanel(props: {
   const downloadableResult = currentResult?.status === "ok" && !lossyText ? currentResult : null;
 
   const viewerBody =
-    selectedApp != null ? (
-      <McpAppFrame
-        // Reload remounts the view, so it re-fetches its resource and result.
-        key={`${selectedApp.toolCallId}\u0000${reloadTick}`}
-        workspaceId={props.workspaceId}
-        view={selectedApp}
-      />
-    ) : selected == null && !waitingForPinned ? null : currentRead?.result ? (
+    selected == null && !waitingForPinned ? null : currentRead?.result ? (
       <ArtifactViewer
         // Remount per file version so renderer state (zoom, JSON mode, frames) starts fresh.
         // Reload remounts too: an unchanged file keeps its read key, so without the tick an HTML
@@ -1102,19 +1077,9 @@ export function ArtifactsPanel(props: {
   const artbar = (
     <div className="border-border-light bg-sidebar flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
       <ArtifactPickerSelect
-        value={
-          selectedApp
-            ? mcpAppSelectionKey(selectedApp.toolCallId)
-            : selected
-              ? pickerValue(selected.scope, selected.path)
-              : ""
-        }
+        value={selected ? pickerValue(selected.scope, selected.path) : ""}
         onToggleOtherFiles={() => setOtherFilesExpanded(!otherFilesExpanded)}
         onValueChange={(value) => {
-          if (appViews.some((view) => mcpAppSelectionKey(view.toolCallId) === value)) {
-            select({ scope: "artifact", path: value });
-            return;
-          }
           const next = parsePickerValue(value);
           if (next) select(next);
         }}
@@ -1190,30 +1155,6 @@ export function ArtifactsPanel(props: {
                     <span className="min-w-0 truncate">{entry.file}</span>
                     <span className="text-muted shrink-0 text-[10px]">
                       {entry.scope} · pinned by {entry.pinnedBy === "agent" ? "agent" : "you"}
-                    </span>
-                  </span>
-                </SelectItem>
-              ))}
-            </SelectGroup>
-          )}
-          {appViews.length > 0 && (
-            <SelectGroup>
-              <SelectLabel>App views</SelectLabel>
-              {appViews.map((view, index) => (
-                <SelectItem
-                  key={view.toolCallId}
-                  value={mcpAppSelectionKey(view.toolCallId)}
-                  className="text-xs"
-                >
-                  {/* Several calls of one tool share a label: the arguments and the outcome
-                      tell them apart. */}
-                  <span className="flex min-w-0 items-center gap-2">
-                    <span className="min-w-0 truncate">
-                      {view.label} · {view.serverName}
-                    </span>
-                    {/* The detail gives way first; long names truncate too. */}
-                    <span className="text-muted min-w-0 shrink-[3] truncate text-[10px]">
-                      {appViewDetails[index]}
                     </span>
                   </span>
                 </SelectItem>
@@ -1361,19 +1302,6 @@ export function ArtifactsPanel(props: {
   // folder fails (runtime unreachable, container gone).
   const storedVersionSelected = selected?.scope === "artifact" && selected.version != null;
 
-  // App views do not depend on the artifacts folder: while any is open, the picker stays above
-  // a listing error, loading or unavailable message so the remaining views stay reachable (for
-  // example after closing the selected one).
-  const withAppPicker = (message: React.ReactNode): React.ReactNode =>
-    appViews.length > 0 ? (
-      <>
-        {artbar}
-        {message}
-      </>
-    ) : (
-      message
-    );
-
   const annotateHint = annotating ? (
     <div className="text-muted border-border-light border-b px-3 py-1 text-[11px]">
       {annotateSupport === "frame"
@@ -1404,14 +1332,7 @@ export function ArtifactsPanel(props: {
     );
 
   let body: React.ReactNode;
-  if (selectedApp != null) {
-    body = (
-      <>
-        {artbar}
-        <div className="min-h-0 flex-1 overflow-auto">{viewerBody}</div>
-      </>
-    );
-  } else if (
+  if (
     listError != null &&
     (listing == null || (selected == null && !waitingForPinned)) &&
     !storedVersionSelected
@@ -1419,14 +1340,12 @@ export function ArtifactsPanel(props: {
     // Only with nothing on screen: a failed re-list (a backend still starting after a reconnect)
     // keeps the last listing, and the error line below sits beside the artifact instead. With
     // nothing selected, "No artifacts yet" would present the failed refresh as an empty folder.
-    body = withAppPicker(<div className="text-danger p-4 text-xs">{listError}</div>);
+    body = <div className="text-danger p-4 text-xs">{listError}</div>;
   } else if (listing == null && !storedVersionSelected) {
-    body = withAppPicker(<div className="text-muted p-4 text-xs">Loading…</div>);
+    body = <div className="text-muted p-4 text-xs">Loading…</div>;
   } else if (listing != null && selected == null && !waitingForPinned && !listing.available) {
-    body = withAppPicker(
-      <div className="text-muted p-4 text-xs leading-relaxed">{listing.reason}</div>
-    );
-  } else if (selected == null && !waitingForPinned && appViews.length === 0) {
+    body = <div className="text-muted p-4 text-xs leading-relaxed">{listing.reason}</div>;
+  } else if (selected == null && !waitingForPinned) {
     body = (
       <div className="text-muted p-4 text-xs leading-relaxed">
         No artifacts yet. Files the agent writes to{" "}
