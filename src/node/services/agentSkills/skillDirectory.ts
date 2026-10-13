@@ -60,23 +60,12 @@ export function resolveSkillDirectory(
     discoveredOutsideWorkspace?: boolean;
   }
 ): SkillDirectory {
-  if (resolved.sourceRuntime == null) {
-    assert(
-      resolved.package.scope === "built-in",
-      "only built-in skills resolve without a source runtime"
-    );
-    return { available: false, reason: BUILT_IN_REASON };
-  }
-
-  if (options?.discoveredOutsideWorkspace === true && resolved.package.scope === "project") {
-    return { available: false, reason: OTHER_CHECKOUT_REASON };
-  }
-
-  const sameRuntime = resolved.sourceRuntime === workspaceRuntime;
-  const bothOnHost = execsOnHost(resolved.sourceRuntime) && execsOnHost(workspaceRuntime);
-  if (!sameRuntime && !bothOnHost) {
-    return { available: false, reason: OFF_HOST_REASON };
-  }
+  const reason = getSkillDirectoryUnavailableReason(
+    resolved,
+    workspaceRuntime,
+    options?.discoveredOutsideWorkspace === true
+  );
+  if (reason != null) return { available: false, reason };
 
   assert(resolved.skillDir.length > 0, "on-disk skills must have a skill directory");
   return {
@@ -84,6 +73,27 @@ export function resolveSkillDirectory(
     skillDir: resolved.skillDir,
     ...(resolved.pluginRoot != null ? { pluginRoot: resolved.pluginRoot } : {}),
   };
+}
+
+/** Why bash on `workspaceRuntime` cannot use the skill's path, or null when it can. */
+function getSkillDirectoryUnavailableReason(
+  resolved: ResolvedAgentSkill,
+  workspaceRuntime: Runtime,
+  discoveredOutsideWorkspace: boolean
+): string | null {
+  if (resolved.sourceRuntime == null) {
+    assert(
+      resolved.package.scope === "built-in",
+      "only built-in skills resolve without a source runtime"
+    );
+    return BUILT_IN_REASON;
+  }
+  if (discoveredOutsideWorkspace && resolved.package.scope === "project") {
+    return OTHER_CHECKOUT_REASON;
+  }
+  const sameRuntime = resolved.sourceRuntime === workspaceRuntime;
+  const bothOnHost = execsOnHost(resolved.sourceRuntime) && execsOnHost(workspaceRuntime);
+  return sameRuntime || bothOnHost ? null : OFF_HOST_REASON;
 }
 
 /**
