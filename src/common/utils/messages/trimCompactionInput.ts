@@ -141,32 +141,36 @@ export function trimCompactionInput(
   budgetTokens: number
 ): CompactionInputTrim {
   assert(Number.isFinite(budgetTokens) && budgetTokens > 0, "budgetTokens must be positive");
-  const unchanged = { messages, omittedToolResults: 0, omittedTurns: 0 };
   const requestIndex = messages.findLastIndex((message) => message.role === "user");
-  if (requestIndex <= 0) return unchanged;
   const total = messages.reduce((sum, message) => sum + estimateMuxMessageTokens(message), 0);
-  if (total <= budgetTokens) return unchanged;
+  if (requestIndex <= 0 || total <= budgetTokens) {
+    return { messages, omittedToolResults: 0, omittedTurns: 0 };
+  }
+  return trimOverBudget(new TrimState(withoutReasoning(messages)), budgetTokens);
+}
 
-  // Reasoning removal can drop rows, so find the request and the turns again afterwards.
-  const state = new TrimState(withoutReasoning(messages));
+/** Phases 2-4 on a history already over the budget and without reasoning. */
+function trimOverBudget(state: TrimState, budgetTokens: number): CompactionInputTrim {
+  // Reasoning removal can drop rows, so find the request and the turns on the new rows.
   const request = state.rows.findLastIndex((message) => message.role === "user");
   const starts = turnStarts(state.rows, request);
+  const firstTurn = starts[0] ?? request;
   const newestTurn = starts.at(-1) ?? request;
   state.placeholderOutputs(0, newestTurn, budgetTokens);
   const omittedTurns = state.dropOldestTurns(starts, budgetTokens);
   state.placeholderOutputs(newestTurn, request, budgetTokens);
 
   const keptFrom = starts[omittedTurns] ?? request;
+  const isKept = (index: number) => index < firstTurn || index >= keptFrom;
   const omittedToolResults = state.replaced.reduce(
-    (sum, count, index) =>
-      index < (starts[0] ?? request) || index >= keptFrom ? sum + count : sum,
+    (sum, count, index) => (isKept(index) ? sum + count : sum),
     0
   );
   const omitted = { omittedToolResults, omittedTurns };
   // Reasoning removal alone changes nothing the summary needs to know about.
-  const changed = omittedTurns > 0 || omitted.omittedToolResults > 0;
+  const changed = omittedTurns > 0 || omittedToolResults > 0;
   const kept = [
-    ...state.rows.slice(0, starts[0] ?? request),
+    ...state.rows.slice(0, firstTurn),
     ...state.rows.slice(keptFrom, request),
     changed ? appendOmissionNote(state.rows[request], omitted) : state.rows[request],
     ...state.rows.slice(request + 1),
