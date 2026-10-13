@@ -823,6 +823,13 @@ describe("thinking preservation by model", () => {
     ["claude-3-7-sonnet-20250219", true],
     ["claude-3-5-haiku-latest", true],
     ["claude-opus-4-5-20251101", false],
+    // Dotted minor versions, as some Anthropic-compatible routes write them.
+    ["claude-opus-4.5", false],
+    ["openrouter:anthropic/claude-sonnet-4.6", false],
+    ["claude-sonnet-4.5", true],
+    ["claude-3.7-sonnet", true],
+    // A version that does not parse cleanly is an unknown model, which keeps its thinking.
+    ["claude-opus-4.x", false],
     ["mux-gateway:anthropic/claude-sonnet-4-6", false],
     ["claude-haiku-5-5", false],
     ["claude-opus-5-5", false],

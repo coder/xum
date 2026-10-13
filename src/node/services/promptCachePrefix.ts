@@ -318,12 +318,14 @@ function referencedDefinitions(
 
 function claudeVersion(modelId: string): { family: string; version: number } | undefined {
   // Current ids: claude-<family>-<major>[-<minor>][-<date>]; a date is not a minor version.
-  const current = /claude-(opus|sonnet|haiku)-(\d+)(?:-(\d{1,2})(?!\d))?/.exec(modelId);
+  // Some routes write the minor with a dot (claude-opus-4.5). An id that does not end the
+  // version cleanly (claude-opus-4.x) is unknown, not an older model.
+  const current = /claude-(opus|sonnet|haiku)-(\d+)(?:[-.](\d{1,2})(?!\d))?(?![.\d])/.exec(modelId);
   if (current != null) {
     return { family: current[1], version: Number(current[2]) + Number(current[3] ?? 0) / 10 };
   }
   // Claude 3 ids: claude-3[-<minor>]-<family>.
-  const legacy = /claude-(\d)(?:-(\d))?-(opus|sonnet|haiku)/.exec(modelId);
+  const legacy = /claude-(\d)(?:[-.](\d))?-(opus|sonnet|haiku)/.exec(modelId);
   return legacy != null
     ? { family: legacy[3], version: Number(legacy[1]) + Number(legacy[2] ?? 0) / 10 }
     : undefined;
