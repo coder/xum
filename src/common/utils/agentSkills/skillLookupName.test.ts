@@ -52,14 +52,16 @@ describe("listInvocableSkills", () => {
 });
 
 describe("findInvocableSkill", () => {
-  const skills = [
-    { name: "tdd", pluginName: "pstack" },
-    { name: "review" },
-    { name: "other:review", pluginName: "other" },
-  ];
+  const skill = (name: string, pluginName?: string) => ({
+    name,
+    description: `${name} description`,
+    scope: "global" as const,
+    ...(pluginName != null ? { pluginName } : {}),
+  });
+  const skills = [skill("tdd", "pstack"), skill("review"), skill("other:review", "other")];
 
-  test("a qualified name also selects the plugin skill that won its bare name", () => {
-    expect(findInvocableSkill(skills, "pstack:tdd")).toBe(skills[0]);
+  test("a qualified name also selects the plugin skill that won its bare name, under the typed name", () => {
+    expect(findInvocableSkill(skills, "pstack:tdd")).toEqual({ ...skills[0], name: "pstack:tdd" });
     expect(findInvocableSkill(skills, "other:review")).toBe(skills[2]);
     // `review` is not a plugin skill, and `nope` is no plugin.
     expect(findInvocableSkill(skills, "pstack:review")).toBeUndefined();

@@ -86,8 +86,9 @@ describe("parseCommandWithSkillInvocation", () => {
       discovery: null,
     });
 
-    // One identity per skill: the indicator and snapshots keep the listed bare name.
-    expect(result.skillInvocation?.descriptor.name).toBe("tdd");
+    // The typed name is the identity: the send path resolves it again, so it must
+    // not turn into a bare `tdd` that another skill could own by then.
+    expect(result.skillInvocation?.descriptor.name).toBe("pstack:tdd");
   });
 
   test("a typed /pstack:tdd keeps the qualified name through the remote fallback", async () => {

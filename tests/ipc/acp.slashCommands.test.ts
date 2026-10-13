@@ -46,7 +46,7 @@ describe("ACP slash command support", () => {
       pluginName: "pstack",
     };
     const parsed = parseAcpSlashCommand("/pstack:plug-tdd now", mapSkillsByName([pluginSkill]));
-    expect(parsed).toMatchObject({ kind: "skill", descriptor: { name: "plug-tdd" } });
+    expect(parsed).toMatchObject({ kind: "skill", descriptor: { name: "pstack:plug-tdd" } });
     // The alias is a lookup only: the advertised command list stays bare.
     expect(buildAcpAvailableCommands([pluginSkill]).map((command) => command.name)).not.toContain(
       "pstack:plug-tdd"

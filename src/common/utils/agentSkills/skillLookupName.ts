@@ -61,19 +61,21 @@ export function resolveSkillReadIdentity(input: unknown, frontmatterName: string
 /**
  * The invocable skill a typed lookup name selects. An exact name wins. A
  * qualified `<plugin>:<skill>` also selects that plugin's skill when it won its
- * bare name and is listed bare, so `/pstack:tdd` works without a collision and
- * the skill keeps one identity (the bare name) on every surface.
+ * bare name and is listed bare, so `/pstack:tdd` works without a collision.
+ * The result carries the typed name: the send path resolves it again, and the
+ * bare name could pick another skill if precedence changed since the list loaded.
  */
-export function findInvocableSkill<T extends Pick<InvocableSkill, "name" | "pluginName">>(
-  skills: readonly T[],
+export function findInvocableSkill(
+  skills: readonly InvocableSkill[],
   lookupName: string
-): T | undefined {
+): InvocableSkill | undefined {
   const exact = skills.find((skill) => skill.name === lookupName);
   const lookup = exact == null ? parseSkillLookupName(lookupName) : null;
   if (lookup?.pluginName == null) return exact;
-  return skills.find(
+  const listed = skills.find(
     (skill) => skill.pluginName === lookup.pluginName && skill.name === lookup.skillName
   );
+  return listed == null ? undefined : { ...listed, name: lookupName };
 }
 
 /**

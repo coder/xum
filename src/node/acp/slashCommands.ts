@@ -151,7 +151,8 @@ function addQualifiedPluginAliases(byName: Map<string, AgentSkillDescriptor>): v
   for (const skill of [...byName.values()]) {
     if (skill.pluginName == null || skill.name.includes(":")) continue;
     const qualified = formatQualifiedSkillName(skill.pluginName, skill.name);
-    if (!byName.has(qualified)) byName.set(qualified, skill);
+    // The alias carries the typed name, which the send path resolves again.
+    if (!byName.has(qualified)) byName.set(qualified, { ...skill, name: qualified });
   }
 }
 
