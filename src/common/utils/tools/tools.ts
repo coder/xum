@@ -118,7 +118,7 @@ import {
   formatPathSkillsResultField,
   type PathSkillActivation,
 } from "@/node/services/agentSkills/pathSkillActivation";
-import { isPtcBridgedToolCallId } from "@/node/services/ptc/toolBridge";
+import { isPtcBridgedExecution } from "@/node/services/ptc/toolBridge";
 import type { GoalDefaults } from "@/constants/goals";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
 
@@ -520,15 +520,6 @@ function asSuccessfulToolResult(result: unknown): Record<string, unknown> | unde
   }
   const record = result as Record<string, unknown>;
   return record.success === true ? record : undefined;
-}
-
-/** True for an execution bridged from a code_execution guest (synthetic toolCallId). */
-function isPtcBridgedExecution(options: unknown): boolean {
-  const toolCallId =
-    options != null && typeof options === "object"
-      ? (options as { toolCallId?: unknown }).toolCallId
-      : undefined;
-  return typeof toolCallId === "string" && isPtcBridgedToolCallId(toolCallId);
 }
 
 /**
@@ -1271,11 +1262,12 @@ export async function getToolsForModel(
     finalTools = augmentedTools;
   }
 
-  // Apply hook wrapping first (hooks wrap each tool execution)
-  finalTools = wrapToolsWithHooks(finalTools, config);
-
-  // Path-scoped skill pointers ride the (post-hook) file tool results and are persisted.
+  // Path-scoped skill pointers ride the file tool results and are persisted. Wrap
+  // inside the hooks so matching sees the args a tool.execute hook may have rewritten.
   finalTools = wrapFileToolsWithPathSkills(finalTools, config);
+
+  // Apply hook wrapping (hooks wrap each tool execution)
+  finalTools = wrapToolsWithHooks(finalTools, config);
 
   // Then apply model-only notifications (adds notifications to results)
   finalTools = wrapToolsWithModelOnlyNotifications(finalTools, config);

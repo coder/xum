@@ -2,13 +2,18 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { z } from "zod";
 
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { PATH_SKILLS_RESULT_FIELD } from "@/common/types/tools";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { eventSpine } from "@/node/services/events/eventSpine";
+import type { IJSRuntime } from "@/node/services/ptc/runtime";
+import { ToolBridge } from "@/node/services/ptc/toolBridge";
 import { createPathSkillActivation } from "@/node/services/agentSkills/pathSkillActivation";
 import type { InitStateManager } from "@/node/services/initStateManager";
+import type { Tool } from "ai";
 
 import { getToolsForModel, type ToolConfiguration } from "./tools";
 
@@ -71,6 +76,34 @@ async function buildTools(
   );
 }
 
+/**
+ * The guest-facing `xum` object a real ToolBridge registers over the given tools.
+ * The runtime hands out hex nested-record call IDs, like QuickJS does.
+ */
+function bridgeGuestTools(tools: Record<string, ToolExecuteFn>): Record<string, ToolExecuteFn> {
+  const bridgeTools: Record<string, Tool> = {
+    file_read: {
+      description: "file_read",
+      inputSchema: z.object({ path: z.string() }),
+      execute: tools.file_read,
+    },
+  };
+  let guest: Record<string, ToolExecuteFn> = {};
+  const runtime = new Proxy({} as IJSRuntime, {
+    get: (_target, prop) => {
+      if (prop === "registerObject") {
+        return (name: string, obj: Record<string, ToolExecuteFn>) => {
+          if (name === "xum") guest = obj;
+        };
+      }
+      if (prop === "takeActiveHostCallId") return () => "a1b2c3d4e5";
+      return () => undefined;
+    },
+  });
+  new ToolBridge(bridgeTools).register(runtime);
+  return guest;
+}
+
 let callCounter = 0;
 async function call(
   execute: ToolExecuteFn,
@@ -98,16 +131,44 @@ describe("getToolsForModel - path-scoped skill activation", () => {
     expect(missing.success).toBe(false);
     expect(surfacedNames(missing)).toBeUndefined();
 
-    // A code_execution-bridged read reaches the guest, not the model: no pointer.
-    const bridged = await call(tools.file_read, { path: "src/foo.ts" }, "ptc-file_read-1");
-    expect(surfacedNames(bridged)).toBeUndefined();
-
     const foo = await call(tools.file_read, { path: path.join(workspace, "src", "foo.ts") });
     expect(foo.success).toBe(true);
     expect(surfacedNames(foo)).toEqual(["ts-rules"]);
 
     const bar = await call(tools.file_read, { path: "src/bar.ts" });
     expect(surfacedNames(bar)).toBeUndefined();
+  });
+
+  test("a code_execution-bridged read reaches the guest, not the model: no pointer", async () => {
+    const tools = await buildTools();
+    const guest = bridgeGuestTools(tools);
+
+    const bridged = (await guest.file_read({ path: "src/foo.ts" }, undefined)) as Record<
+      string,
+      unknown
+    >;
+    expect(bridged.success).toBe(true);
+    expect(surfacedNames(bridged)).toBeUndefined();
+    // The bridged read consumed nothing: a direct read still surfaces the skill.
+    expect(surfacedNames(await call(tools.file_read, { path: "src/foo.ts" }))).toEqual([
+      "ts-rules",
+    ]);
+  });
+
+  test("matching sees the path a tool.execute hook rewrote", async () => {
+    const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+      if (ctx.toolName === "file_read") ctx.args = { path: "src/foo.ts" };
+      await next();
+    });
+    try {
+      // Hooks run only for trusted workspaces.
+      const tools = await buildTools([], { trusted: true, workspaceId: "ws-1" });
+      const result = await call(tools.file_read, { path: "README.md" });
+      expect(result.success).toBe(true);
+      expect(surfacedNames(result)).toEqual(["ts-rules"]);
+    } finally {
+      unregister();
+    }
   });
 
   test("file_edit_replace_string on a matching file surfaces the skill", async () => {

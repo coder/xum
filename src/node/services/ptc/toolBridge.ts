@@ -112,15 +112,20 @@ function extractAdmissionHandle(result: unknown): TaskSpawnAdmissionHandle {
  * independent launches into one cohort, mixing completion/winner selection
  * across prompts.
  */
-const PTC_TOOL_CALL_ID_PREFIX = "ptc-";
-
 function syntheticToolCallId(toolName: string): string {
-  return `${PTC_TOOL_CALL_ID_PREFIX}${toolName}-${randomUUID()}`;
+  return `ptc-${toolName}-${randomUUID()}`;
 }
 
+/**
+ * Execute-options objects of tool calls bridged from a code_execution guest. Bridged
+ * calls usually carry the runtime's nested-record callId, which looks like any other
+ * toolCallId, so callers that must tell them apart check the options object itself.
+ */
+const bridgedExecutionOptions = new WeakSet<object>();
+
 /** True for a tool execution bridged from a code_execution guest (not a direct model call). */
-export function isPtcBridgedToolCallId(toolCallId: string): boolean {
-  return toolCallId.startsWith(PTC_TOOL_CALL_ID_PREFIX);
+export function isPtcBridgedExecution(options: unknown): boolean {
+  return typeof options === "object" && options !== null && bridgedExecutionOptions.has(options);
 }
 
 /**
@@ -337,13 +342,15 @@ export class ToolBridge {
 
         // Execute tool with full options (toolCallId and messages are required by type
         // but not used by most tools; messages stay synthetic for sandbox context)
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        const result: unknown = await boundTool.execute!(validatedArgs, {
+        const executeOptions = {
           abortSignal,
           toolCallId: bridgedToolCallId,
           messages: [],
           context: undefined,
-        });
+        };
+        bridgedExecutionOptions.add(executeOptions);
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+        const result: unknown = await boundTool.execute!(validatedArgs, executeOptions);
 
         // Ensure result is JSON-serializable
         return this.stripAttachmentParts(runtime, this.serializeResult(result));
