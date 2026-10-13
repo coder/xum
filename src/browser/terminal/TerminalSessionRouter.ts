@@ -444,12 +444,9 @@ export class TerminalSessionRouter {
 
   /** Cache and broadcast a full screen; the first one after a reattach replaces the old one. */
   private deliverScreen(session: SessionState, state: string): void {
+    session.screenState = state;
     const replace = session.replaceNextScreen;
     session.replaceNextScreen = false;
-    // The server sends "" for a session it does not know, e.g. after a server restart. Replacing
-    // with it would erase the last screen of a dead session, so the view keeps what it shows.
-    if (replace && state === "") return;
-    session.screenState = state;
     for (const callbacks of session.subscribers.values()) {
       if (replace) callbacks.onScreenState(state, { replace: true });
       else callbacks.onScreenState(state);
