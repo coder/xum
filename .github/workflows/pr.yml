@@ -644,6 +644,14 @@ jobs:
           done
           curl -sf http://localhost:3000/health | grep -q '"status":"ok"'
           curl -sf http://localhost:3000/version | grep -q '"mode":"server"'
+          # The runtime stage copies dist/ files by extension (#5964). Fetch one
+          # public/ file, one icon and the font the served page preloads, so a dropped
+          # pattern fails here.
+          curl -sf http://localhost:3000/manifest.json | grep -q '"icons"'
+          curl -sf -o /dev/null http://localhost:3000/icon-192.png
+          font=$(curl -sf http://localhost:3000/ | grep -o 'as="font"[^>]*href="\./[^"]*\.woff2"' | sed 's/.*href="\.\///; s/"$//')
+          test -n "$font"
+          curl -sf -o /dev/null "http://localhost:3000/$font"
           # /health passes without the analytics worker, which starts lazily (#5603).
           # Start the shipped worker bundle and open a DuckDB database through it.
           docker exec -i mux-test node - /app/dist/runtime/analyticsWorker.js < scripts/check-analytics-worker.cjs

@@ -128,6 +128,11 @@ COPY --from=builder /app/dist/*.html ./dist/
 COPY --from=builder /app/dist/*.css ./dist/
 COPY --from=builder /app/dist/*.js ./dist/
 COPY --from=builder /app/dist/*.br /app/dist/*.gz ./dist/
+# Vite also writes public/ (manifest, icons, font licenses) and hashed font files
+# to dist/ (#5964). Copy them by extension: dist/ also holds tsc output folders
+# and *.map files that the bundled server never reads.
+COPY --from=builder /app/dist/*.json /app/dist/*.ico /app/dist/*.png /app/dist/*.txt ./dist/
+COPY --from=builder /app/dist/*.woff /app/dist/*.woff2 /app/dist/*.ttf ./dist/
 
 # Copy TypeScript lib files used by the bundled PTC validator at server startup.
 COPY --from=builder /app/dist/typescript-lib ./dist/typescript-lib
