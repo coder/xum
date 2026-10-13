@@ -41,6 +41,8 @@ interface Generation {
   readonly id: number;
   readonly inner: Link;
   detached: boolean;
+  /** Aborted by detach(): settles the inner calls and streams even when no close event comes. */
+  readonly abort: AbortController;
   readonly pending: Set<(error: ConnectionLostError) => void>;
   readonly iterators: Set<LiveIterator>;
 }
@@ -80,6 +82,7 @@ export class ConnectionLink implements Link {
       id: this.nextId++,
       inner,
       detached: false,
+      abort: new AbortController(),
       pending: new Set(),
       iterators: new Set(),
     };
@@ -98,6 +101,10 @@ export class ConnectionLink implements Link {
     generation.pending.clear();
     for (const iterator of generation.iterators) iterator.end();
     generation.iterators.clear();
+    // The inner link must settle too: a socket that never sends its close event (a half-open
+    // one, a MessagePort) would otherwise keep every pending request, and the server keeps
+    // running the abandoned ones.
+    generation.abort.abort(lost);
   }
 
   call(path: string[], input: unknown, options: ClientOptions<ClientContext>): Promise<unknown> {
@@ -114,14 +121,22 @@ export class ConnectionLink implements Link {
     if (generation == null) {
       return Promise.reject(new ConnectionLostError());
     }
-    return settleUnlessLost(generation.inner.call(path, input, options), {
-      waiters: generation.pending,
-      mapValue: (output) =>
-        isAsyncIteratorObject(output) ? new GenerationIterator(output, generation, signal) : output,
-      mapError: (error) => toLinkError(error, generation, signal),
-      // detach() already rejected the caller. A stream that opened late must not leak.
-      dropLateValue: closeIfStream,
-    });
+    const innerSignal =
+      signal == null ? generation.abort.signal : AbortSignal.any([signal, generation.abort.signal]);
+    return settleUnlessLost(
+      generation.inner.call(path, input, { ...options, signal: innerSignal }),
+      {
+        waiters: generation.pending,
+        signal,
+        mapValue: (output) =>
+          isAsyncIteratorObject(output)
+            ? new GenerationIterator(output, generation, signal)
+            : output,
+        mapError: (error) => toLinkError(error, generation, signal),
+        // detach() already rejected the caller. A stream that opened late must not leak.
+        dropLateValue: closeIfStream,
+      }
+    );
   }
 }
 
@@ -157,6 +172,8 @@ function settleUnlessLost<T, R>(
   work: Promise<T>,
   hooks: {
     waiters: Set<(error: ConnectionLostError) => void>;
+    /** The caller's signal: an abort that is already there wins over the connection loss. */
+    signal: AbortSignal | undefined;
     mapValue: (value: T) => R;
     mapError: (error: unknown) => unknown;
     dropLateValue?: (value: T) => void;
@@ -167,7 +184,9 @@ function settleUnlessLost<T, R>(
     const lose = (error: ConnectionLostError) => {
       if (settled) return;
       settled = true;
-      reject(error);
+      // The caller aborted in the same task, before the inner link's rejection reached us.
+      // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- the caller's own reason, unchanged
+      reject(hooks.signal?.aborted ? hooks.signal.reason : error);
     };
     hooks.waiters.add(lose);
     work.then(
@@ -223,6 +242,7 @@ class GenerationIterator implements AsyncIteratorObject<unknown, unknown, unknow
     if (this.finished) return Promise.resolve({ done: true, value: undefined });
     return settleUnlessLost(this.inner.next(), {
       waiters: this.waiting,
+      signal: this.signal,
       mapValue: (result) => {
         if (result.done) this.finish();
         return result;

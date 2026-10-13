@@ -12,13 +12,14 @@ function controlledLink() {
   const calls: Array<{
     path: string[];
     input: unknown;
+    signal: AbortSignal | undefined;
     resolve: (value: unknown) => void;
     reject: (error: unknown) => void;
   }> = [];
   const link: Link = {
-    call: (path, input) =>
+    call: (path, input, options) =>
       new Promise((resolve, reject) => {
-        calls.push({ path, input, resolve, reject });
+        calls.push({ path, input, signal: options.signal, resolve, reject });
       }),
   };
   return { link, calls };
@@ -132,6 +133,34 @@ describe("ConnectionLink", () => {
       .call(["general", "ping"], undefined, { context: {}, signal: controller.signal })
       .catch((e: unknown) => e);
     expect(error).toBe(controller.signal.reason);
+    expect(isConnectionLostError(error)).toBe(false);
+  });
+
+  test("detach() aborts the inner call, so it settles without a close event", async () => {
+    const link = new ConnectionLink();
+    const inner = controlledLink();
+    link.attach(inner.link);
+    const pending = link.call(["workspace", "list"], undefined, NO_OPTIONS).catch(() => undefined);
+    const innerSignal = inner.calls[0]?.signal;
+    expect(innerSignal?.aborted).toBe(false);
+    link.detach();
+    await pending;
+    expect(innerSignal?.aborted).toBe(true);
+    expect(isConnectionLostError(innerSignal?.reason)).toBe(true);
+  });
+
+  test("a caller abort in the same task as detach() keeps the caller's reason", async () => {
+    const link = new ConnectionLink();
+    link.attach(controlledLink().link);
+    const controller = new AbortController();
+    const pending = link
+      .call(["general", "ping"], undefined, { context: {}, signal: controller.signal })
+      .catch((e: unknown) => e);
+    const reason = new DOMException("user cancelled", "AbortError");
+    controller.abort(reason);
+    link.detach();
+    const error: unknown = await pending;
+    expect(error).toBe(reason);
     expect(isConnectionLostError(error)).toBe(false);
   });
 
