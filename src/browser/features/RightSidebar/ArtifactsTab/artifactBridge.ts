@@ -14,9 +14,12 @@ import {
  * (experiment: "artifacts"). Security-owned contract:
  *
  * - Every message is an object `{ xumArtifact: 1, type, ... }`, validated with zod.
- * - Frame -> host (M3): `{ type: "key", key: "Escape" | "F", shiftKey }`, so Escape and
+ * - Frame -> host (M3): `{ type: "key", key: "Escape" | "F" | "C", shiftKey }`, so Escape and
  *   Shift+F can exit fullscreen while focus is inside the frame (the host never lets a frame
  *   message enter fullscreen: the artifact's script can post these without a key press).
+ *   C toggles annotate mode, which a click into the frame (focus then sits in it) made
+ *   unreachable from the keyboard. It can turn annotate mode on, so the host honours it only
+ *   during a live user gesture in this frame (hasLiveUserGesture, SandboxedArtifactFrame.tsx).
  * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) only fills the
  *   host-owned confirm strip, never sends by itself; `{ type: "setState", state }`
  *   (window.xum.setState) is persisted per artifact, for all its versions. Text and JSON sizes
@@ -64,7 +67,7 @@ const ArtifactKeyMessageSchema = z
   .object({
     ...bridgeEnvelope,
     type: z.literal("key"),
-    key: z.enum(["Escape", "F"]),
+    key: z.enum(["Escape", "F", "C"]),
     shiftKey: z.boolean(),
   })
   .strict();
@@ -487,6 +490,7 @@ export function buildArtifactBridgeScript(
     if (event.key === "Escape") key = "Escape";
     else if (isEditable(event.target)) return;
     else if (plain && event.shiftKey && (event.key === "F" || event.key === "f")) key = "F";
+    else if (plain && !event.shiftKey && (event.key === "c" || event.key === "C")) key = "C";
     if (key === null) return;
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: key, shiftKey: event.shiftKey }, "*");
   }, true);

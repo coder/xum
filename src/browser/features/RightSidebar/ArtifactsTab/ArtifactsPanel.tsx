@@ -42,7 +42,6 @@ import type {
   ArtifactShelfListing,
   ArtifactShelfScope,
 } from "@/common/orpc/schemas/artifacts";
-import { ARTIFACTS_SELECTION_MAX_WORKSPACES } from "@/common/constants/storage";
 import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
@@ -55,7 +54,7 @@ import { downloadArtifact } from "./artifactDownload";
 import { ArtifactVersionMenu } from "./ArtifactVersionMenu";
 import { useArtifactInteractions } from "./useArtifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
-import { createCappedMemory, useCappedMemory } from "./cappedMemory";
+import { useArtifactAnnotateMode } from "./useArtifactAnnotateMode";
 import {
   type ArtifactSelection,
   type ArtifactSelectionScope,
@@ -259,11 +258,6 @@ function ArtifactPickerSelect(props: {
   );
 }
 
-// Workspaces with annotate mode on. A sidebar tab switch unmounts the panel, and component state
-// alone turned annotate off while fullscreen kept it. Shared by every mounted panel of the
-// workspace (cappedMemory.ts). Bounded like the persisted selection map; only "on" is stored,
-// so a workspace dropped from the map is simply off.
-const annotatingWorkspaces = createCappedMemory<true>(ARTIFACTS_SELECTION_MAX_WORKSPACES);
 // Keys that extend a selection while Shift is held (caret browsing, screen readers). Releasing
 // Shift after one of them opens the comment box in annotate mode, as mouseup does (#5690). Not the
 // key's own keyup: the box takes focus, so a selection built from several presses would stop at
@@ -305,18 +299,6 @@ export function ArtifactsPanel(props: {
   // while the tab is open get a dot.
   const [seen, setSeen] = useState<ReadonlyMap<string, number> | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
-  // Annotate mode (M5b): comments on the selected artifact become review notes in the composer.
-  const annotateMode = useCappedMemory(
-    annotatingWorkspaces,
-    props.workspaceId,
-    (on) => on === true
-  );
-  const setAnnotateMode = (on: boolean) =>
-    annotatingWorkspaces.set(props.workspaceId, on ? true : undefined);
-  const [annotationPick, setAnnotationPick] = useState<{
-    key: string;
-    pick: ArtifactAnnotationPick;
-  } | null>(null);
   const reviews = useReviews(props.workspaceId);
   const panelRef = useRef<HTMLDivElement | null>(null);
   // Set by a Shift+arrow (etc.) press in the viewer; releasing Shift then opens the comment box.
@@ -627,6 +609,30 @@ export function ArtifactsPanel(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, props.workspaceId, readKey, reloadTick, retryTick]);
 
+  // Which annotate flavour the selected artifact supports: text selection on Xum-rendered kinds,
+  // pins inside the sandboxed frame, or none (images, PDFs, pinned files). A live view
+  // also waits for its version list: annotations record the version they were made on, and
+  // before the list arrives that version is unknown.
+  const annotationVersionKnown =
+    selected?.scope === "artifact" &&
+    (selected.version != null || (versionsState?.path === selected.path && !versionsState.stale));
+  const annotateResult =
+    selected?.scope === "artifact" && annotationVersionKnown && readKey != null
+      ? readState?.key === readKey && readState.result?.status === "ok"
+        ? readState.result
+        : null
+      : null;
+  const annotateSupport =
+    annotateResult == null ? null : getArtifactAnnotationSupport(annotateResult.kind);
+  const {
+    annotating,
+    pendingPick,
+    openAnnotation,
+    clearAnnotationPick,
+    toggleAnnotate,
+    escapeAnnotate,
+  } = useArtifactAnnotateMode(props.workspaceId, annotateSupport, readKey ?? "");
+
   // Nothing left to show: close fullscreen so it cannot pop back when a file reappears.
   if (fullscreen && selected == null && listing != null && !waitingForPinned) {
     setFullscreen(false);
@@ -636,7 +642,7 @@ export function ArtifactsPanel(props: {
   // The comment box sits at the selection's screen position, which the layout change moves:
   // left open, it floated over the sidebar far from its text. Annotate mode itself stays on.
   const setFullscreenMode = (next: boolean) => {
-    setAnnotationPick(null);
+    clearAnnotationPick();
     setFullscreen(next);
   };
 
@@ -665,8 +671,8 @@ export function ArtifactsPanel(props: {
     // behind nothing. Leave fullscreen once the panel has no box.
     const sizeObserver = new ResizeObserver(() => {
       if (panel.getClientRects().length > 0) return;
-      // setFullscreenMode's steps; its state setters are stable, so the effect needs no deps.
-      setAnnotationPick(null);
+      // setFullscreenMode's steps; both functions are stable, so the effect does not re-run.
+      clearAnnotationPick();
       setFullscreen(false);
     });
     sizeObserver.observe(panel);
@@ -688,7 +694,7 @@ export function ArtifactsPanel(props: {
       // focus on <body>.
       if (document.activeElement !== returnTo) panel.focus();
     };
-  }, [showFullscreen]);
+  }, [showFullscreen, clearAnnotationPick]);
 
   // Picker order: pinned files first, then artifacts, then deleted artifacts with stored
   // versions. A selected version whose working file is gone keeps its own entry so the picker
@@ -793,28 +799,8 @@ export function ArtifactsPanel(props: {
     setReloadTick((tick) => tick + 1);
   };
 
-  // Which annotate flavour the selected artifact supports: text selection on Xum-rendered kinds,
-  // pins inside the sandboxed frame, or none (images, PDFs, pinned files). A live view
-  // also waits for its version list: annotations record the version they were made on, and
-  // before the list arrives that version is unknown.
-  const annotationVersionKnown =
-    selected?.scope === "artifact" &&
-    (selected.version != null || (versionsState?.path === selected.path && !versionsState.stale));
-  const annotateResult =
-    selected?.scope === "artifact" && annotationVersionKnown && readKey != null
-      ? readState?.key === readKey && readState.result?.status === "ok"
-        ? readState.result
-        : null
-      : null;
-  const annotateSupport =
-    annotateResult == null ? null : getArtifactAnnotationSupport(annotateResult.kind);
-  const annotating = annotateMode && annotateSupport != null;
   const annotationVersion =
     selected?.scope === "artifact" ? (selected.version ?? latestKnownVersion ?? 0) : 0;
-  const pickKey = readKey ?? "";
-  const pendingPick = annotating && annotationPick?.key === pickKey ? annotationPick.pick : null;
-  const openAnnotation = (pick: ArtifactAnnotationPick) =>
-    setAnnotationPick({ key: pickKey, pick });
   const addAnnotation = (pick: ArtifactAnnotationPick, comment: string) => {
     if (selected?.scope !== "artifact") return;
     reviews.addReview({
@@ -825,23 +811,7 @@ export function ArtifactsPanel(props: {
       artifact: { version: annotationVersion, anchor: pick.anchor },
     });
     window.getSelection()?.removeAllRanges();
-    setAnnotationPick(null);
-  };
-  const toggleAnnotate = () => {
-    if (annotateSupport == null) return;
-    setAnnotationPick(null);
-    setAnnotateMode(!annotating);
-  };
-  // Escape steps out of annotating one layer at a time: an open comment box first, then annotate
-  // mode. Returns whether it consumed the key, so fullscreen closes only on a later Escape.
-  const escapeAnnotate = (): boolean => {
-    if (pendingPick != null) {
-      setAnnotationPick(null);
-      return true;
-    }
-    if (!annotating) return false;
-    setAnnotateMode(false);
-    return true;
+    clearAnnotationPick();
   };
 
   // Tab-scoped shortcuts: they only fire while focus is inside this panel (fullscreen included:
@@ -927,7 +897,14 @@ export function ArtifactsPanel(props: {
   // the frame or the toolbar button.
   // Escape peels the same layers as outside the frame (comment box, annotate mode, then
   // fullscreen); leaving annotate mode is an exit too, so the frame may trigger it.
+  // C toggles annotate mode as it does outside the frame: a click into the artifact moves focus
+  // into the frame, and C did nothing from then on. SandboxedArtifactFrame passes C on only
+  // during the user's own gesture in the frame, because it can turn annotate mode on.
   const handleFrameKey = (key: ArtifactFrameKey) => {
+    if (key === "C") {
+      toggleAnnotate();
+      return;
+    }
     if (key === "Escape" && escapeAnnotate()) return;
     if (showFullscreen) setFullscreenMode(false);
   };
@@ -1315,7 +1292,7 @@ export function ArtifactsPanel(props: {
   // first, while the box's control still holds it.
   const closeAnnotationBox = () => {
     if (document.activeElement != null) keepFocusForShortcuts(document.activeElement);
-    setAnnotationPick(null);
+    clearAnnotationPick();
   };
   const annotationPopover =
     pendingPick == null ? null : (
