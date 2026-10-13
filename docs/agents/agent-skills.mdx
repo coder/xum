@@ -123,9 +123,9 @@ Xum reports a directory only when the path is valid where `bash` runs. Otherwise
 | Plugin skills (read on the Xum host)               | Path                          | Not loaded (plugins load only on the Xum host)    | No path                 |
 | Built-in skills (bundled in the app, no directory) | No path                       | No path                                           | No path                 |
 
-When you invoke a project skill in the first message of a new worktree workspace, Xum reads the skill from the project's main checkout, because the new worktree can lack it. That copy is not the worktree's, so the placeholders stay literal and the agent gets the worktree path from `agent_skill_read`.
+When you invoke a project skill in the first message of a new worktree workspace, Xum reads the skill from the project's main checkout, because the new worktree can lack it. That copy is not the worktree's, so the placeholders stay literal. If the worktree has the skill, the agent gets its path from `agent_skill_read`.
 
-When there is no directory, the placeholders stay as literal text. Xum does not expand `${PLUGIN_ROOT}` in skill bodies: Agent Plugins defines it only for [MCP server](/config/mcp-servers#agent-plugins-servers) configuration.
+When there is no directory, the placeholders stay as literal text. Xum does not run a dynamic context directive that still contains a placeholder (a shell would expand it to an empty path). The directive's line then says why it did not run. Xum does not expand `${PLUGIN_ROOT}` in skill bodies: Agent Plugins defines it only for [MCP server](/config/mcp-servers#agent-plugins-servers) configuration.
 
 ## `SKILL.md` format
 

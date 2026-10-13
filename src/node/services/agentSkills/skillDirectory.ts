@@ -120,3 +120,21 @@ export function substituteSkillDirectoryPlaceholders(body: string, dir: SkillDir
     return dir.pluginRoot ?? match;
   });
 }
+
+/**
+ * Throw when `command` still contains a skill-directory placeholder.
+ *
+ * A placeholder stays literal when Xum has no valid path for it. A shell would
+ * expand `${CLAUDE_SKILL_DIR}` to an empty string, so a directive such as
+ * `sh "${CLAUDE_SKILL_DIR}/x.sh"` would run `/x.sh` from the filesystem root.
+ * Directive runners call this before executing a command.
+ */
+export function assertSkillDirectoryPlaceholdersResolved(command: string): void {
+  assert(typeof command === "string", "assertSkillDirectoryPlaceholdersResolved requires a string");
+  const unresolved = new RegExp(SKILL_DIRECTORY_PLACEHOLDER_RE.source).exec(command)?.[0];
+  if (unresolved != null) {
+    throw new Error(
+      `not run: ${unresolved} has no value in this workspace (call agent_skill_read for the skill directory)`
+    );
+  }
+}

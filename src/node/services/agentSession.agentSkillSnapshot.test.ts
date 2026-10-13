@@ -174,13 +174,14 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(snapshotText).toContain("Project override for init skill.");
   });
 
-  it("leaves ${CLAUDE_SKILL_DIR} literal for project skills read from the main checkout", async () => {
+  it("leaves ${CLAUDE_SKILL_DIR} literal and unrun for project skills read from the main checkout", async () => {
     // A new worktree's first message resolves project skills from the project path
     // (disableWorkspaceAgents). That copy is not the worktree's, so its path must
     // not reach the snapshot: bash would run the main checkout's script.
     const { workspacePath: projectPath } = await createTestWorkspaceWithSkill({
       skillName: "proj-hello",
-      skillBody: "Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh",
+      skillBody:
+        'Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh\n!`echo ran-$((20+22)) "${CLAUDE_SKILL_DIR}"`',
     });
     const srcBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-src-"));
     const worktreePath = path.join(srcBaseDir, "proj", "ws");
@@ -189,6 +190,9 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       projectPath,
       workspacePath: worktreePath,
       runtimeConfig: { type: "worktree", srcBaseDir },
+      aiServiceOverrides: {
+        isExperimentEnabled: mock((id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT),
+      },
     });
 
     const result = await session.sendMessage("do X", {
@@ -207,6 +211,10 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     const snapshotText = getMessageText(messages[0]);
     expect(snapshotText).toContain("Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh");
     expect(snapshotText).not.toContain(projectPath);
+    // A directive with the unresolved placeholder must not run: the shell would
+    // expand it to "" and hit a path at the filesystem root.
+    expect(snapshotText).not.toContain("ran-42");
+    expect(snapshotText).toContain("not run: ${CLAUDE_SKILL_DIR} has no value");
   });
 
   it("resolves checkout-level plugin skills for subproject execution paths (agent-plugins)", async () => {

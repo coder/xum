@@ -315,6 +315,7 @@ import {
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
 import {
+  assertSkillDirectoryPlaceholdersResolved,
   resolveSkillDirectory,
   substituteSkillDirectoryPlaceholders,
 } from "@/node/services/agentSkills/skillDirectory";
@@ -12988,6 +12989,10 @@ export class AgentSession {
         // lives behind hook/trust plumbing that is not reachable here, and directive
         // commands should not depend on tool-specific env anyway.
         execute: async (command) => {
+          // Never run a directive with an unresolved skill-directory placeholder:
+          // the shell would expand it to "" and target a path at the filesystem
+          // root. The thrown reason becomes the directive's failure note.
+          assertSkillDirectoryPlaceholdersResolved(command);
           const execResult = await execBuffered(args.runtime, command, {
             cwd: args.workspacePath,
             // Runtime-level timeout (seconds) actually kills the process; the
