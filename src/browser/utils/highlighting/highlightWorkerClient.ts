@@ -129,10 +129,12 @@ let workerStructurallyUnavailable = false;
 let warnedVscodeWorkerDisabled = false;
 // Languages the current worker has loaded (its `prepare` resolved). Cleared with the worker.
 const preparedLanguages = new Set<string>();
-// Rejects once the current worker fires `onerror`. A call races it, because recycleWorker's
-// Comlink `releaseProxy` drops the call's pending listener without rejecting it: a call to a dead
-// worker would wait out its limit, 20 s to start, or 5 s that also marked the input (#6303).
-let workerDied: Promise<never> | null = null;
+// Rejecters of the calls waiting on the current worker. Its `onerror` rejects them all, because
+// recycleWorker's Comlink `releaseProxy` drops a call's pending listener without rejecting it: a
+// call to a dead worker would wait out its limit, 20 s to start, or 5 s that also marked the
+// input (#6303). A set, not one long-pending promise raced by every call: each race would add a
+// reaction to that promise, kept (with its result) for the worker's whole life.
+let workerCalls: Set<(error: Error) => void> | null = null;
 // After a start time-out: one shared start of the next worker that every request whose worker did
 // not start waits on, then retries once (#6303). Null when none is pending.
 let workerRecovery: Promise<void> | null = null;
@@ -158,7 +160,7 @@ function recycleWorker(expectedWorker?: Worker): void {
   const currentWorkerAPI = workerAPI;
   worker = null;
   workerAPI = null;
-  workerDied = null;
+  workerCalls = null;
   preparedLanguages.clear();
 
   if (currentWorkerAPI !== null) {
@@ -212,13 +214,8 @@ function getWorkerAPI(): Comlink.Remote<HighlightWorkerAPI> | null {
       name: "shiki-highlighter", // Shows up in DevTools
     });
     worker = createdWorker;
-    let markDied: (error: Error) => void = () => undefined;
-    const died = new Promise<never>((_, reject) => {
-      markDied = reject;
-    });
-    // Nothing may be waiting when it dies: an unawaited rejection must not be reported.
-    died.catch(() => undefined);
-    workerDied = died;
+    const calls = new Set<(error: Error) => void>();
+    workerCalls = calls;
 
     createdWorker.onerror = (e) => {
       // A worker that errored out is not necessarily permanently broken — the
@@ -227,7 +224,7 @@ function getWorkerAPI(): Comlink.Remote<HighlightWorkerAPI> | null {
       // the active worker. Stale error events from already-replaced workers
       // must not terminate a healthy replacement.
       console.error("[highlightWorkerClient] Worker errored; recycling:", e);
-      markDied(new Error(WORKER_DIED_MARKER));
+      failWorkerCalls(calls);
       recycleWorker(createdWorker);
     };
 
@@ -295,9 +292,25 @@ export function isAbortedHighlight(error: unknown, signal: AbortSignal | undefin
   return signal?.aborted === true && error === signal.reason;
 }
 
-/** `call`, or a rejection once `died` rejects first (the worker fired `onerror`). */
-function untilWorkerDies<T>(call: Promise<T>, died: Promise<never> | null): Promise<T> {
-  return died === null ? call : Promise.race([call, died]);
+/** Rejects every call still waiting on a worker that fired `onerror`. */
+function failWorkerCalls(calls: Set<(error: Error) => void>): void {
+  for (const reject of calls) reject(new Error(WORKER_DIED_MARKER));
+  calls.clear();
+}
+
+/**
+ * `call`, or a rejection once its worker fires `onerror` first. The rejecter leaves `calls` when
+ * the call settles, so nothing outlives the call.
+ */
+function untilWorkerDies<T>(
+  call: Promise<T>,
+  calls: Set<(error: Error) => void> | null
+): Promise<T> {
+  if (calls === null) return call;
+  return new Promise<T>((resolve, reject) => {
+    calls.add(reject);
+    call.then(resolve, reject).finally(() => calls.delete(reject));
+  });
 }
 
 /** `call()`, or a rejection with Error(`marker`) once `ms` pass first. */
@@ -324,10 +337,10 @@ async function prepareWorker(language: string): Promise<void> {
   const api = getWorkerAPI();
   if (!api || preparedLanguages.has(language)) return;
   const startingWorker = worker ?? undefined;
-  const died = workerDied;
+  const calls = workerCalls;
   try {
     await raceTimeout(
-      () => untilWorkerDies(api.prepare(language), died),
+      () => untilWorkerDies(api.prepare(language), calls),
       WORKER_START_TIMEOUT_MS,
       START_TIMEOUT_MARKER
     );
@@ -524,7 +537,7 @@ async function requestHighlight(
           return highlightMainThread(code, language, theme, signal);
         }
 
-        return untilWorkerDies(api.highlight(code, language, theme), workerDied);
+        return untilWorkerDies(api.highlight(code, language, theme), workerCalls);
       },
       recycleWorker,
       HIGHLIGHT_TIMEOUT_MS,
@@ -537,6 +550,14 @@ async function requestHighlight(
     reportHighlightFailure(e, language, code.length);
     throw e;
   }
+}
+
+/**
+ * Test-only: how many calls still wait on the current worker. A settled call must leave this
+ * count, or every highlight of a long session would stay reachable (#6303).
+ */
+export function __pendingWorkerCallCountForTests(): number {
+  return workerCalls?.size ?? 0;
 }
 
 /**

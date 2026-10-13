@@ -15,6 +15,7 @@ import {
   highlightCode,
   highlightWithBudget,
   enqueueHighlightWithBudget,
+  __pendingWorkerCallCountForTests,
   __resetForTests,
 } from "./highlightWorkerClient";
 import {
@@ -551,6 +552,17 @@ describe("highlightCode worker start-up", () => {
     const chunks = groupDiffLines(["+const a = 1;"], 1, 1);
     const outcome = await settleWithin(highlightDiffChunks(chunks, "typescript", "dark"), 60_000);
     expect(outcome).toEqual({ error: "Error: HIGHLIGHT_WORKER_START_TIMEOUT" });
+  });
+
+  // Each call registers its rejecter with its worker; a settled call must remove it, or a long
+  // session would keep every highlight reachable until the worker dies.
+  it("settled highlights leave no pending rejecters on a live worker", async () => {
+    plan([0]);
+    const outcomes = await Promise.all(
+      ["a", "b", "c"].map((code) => settleWithin(highlightCode(code, "typescript", "dark"), 250))
+    );
+    expect(outcomes).toEqual(["a", "b", "c"].map((code) => ({ value: html(code) })));
+    expect(__pendingWorkerCallCountForTests()).toBe(0);
   });
 
   // #6303 item 3: Comlink's releaseProxy drops a pending call without rejecting it, so a call to
