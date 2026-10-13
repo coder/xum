@@ -46,7 +46,7 @@ export interface WrapperScriptOptions {
 
 /**
  * Build the wrapper script that captures exit code and sets up environment.
- * Pattern: trap 'echo $? > exit_code' EXIT && trap 'exit 143' TERM && cd /path && export K=V || exit; "$BASH" -c "$1" "$0"
+ * Pattern: set -- "$1" "$0" "$BASH" && trap 'echo $? > exit_code' EXIT && trap 'exit 143' TERM && cd /path && export K=V || exit; "$3" -c "$1" "$2"
  *
  * The user script is not part of the wrapper: buildSpawnCommand passes it as `$1`, and the
  * wrapper runs it in a child bash. The wrapper stays alive as the recorded PID (the process group
@@ -76,9 +76,10 @@ export function buildWrapperScript(options: WrapperScriptOptions): string {
   //
   // Instead, assign the (quoted) path to a variable and reference it from the trap.
   parts.push(`__MUX_EXIT_CODE_PATH=${shellQuote(options.exitCodePath)}`);
-  // Bash sets $BASH to its own path at startup. Saved before the env exports below, so an env
-  // entry named BASH cannot change which program runs the script.
-  parts.push(`__MUX_BASH="$BASH"`);
+  // Bash sets $BASH to its own path at startup. It is saved as positional parameter $3 (after
+  // the script in $1 and buildSpawnCommand's $0 in $2), not in a variable: the env exports below
+  // can replace any variable, including BASH, but not a positional parameter.
+  parts.push(`set -- "$1" "$0" "$BASH"`);
   parts.push(`trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT`);
   // Without a TERM trap, bash killed by SIGTERM runs the EXIT trap with `$?` = 0, so a stopped
   // process would record 0. This trap runs only on SIGTERM and makes the EXIT trap record 128+15,
@@ -101,8 +102,8 @@ export function buildWrapperScript(options: WrapperScriptOptions): string {
     }
   }
 
-  // A failed step skips the script (#5192). `"$0"` keeps the child's `$0` (and so the
-  // `bash: line N:` prefix of its error messages) the same as the wrapper's.
+  // A failed step skips the script (#5192). `"$2"` (the wrapper's `$0`) keeps the child's `$0`,
+  // and so the `bash: line N:` prefix of its error messages, the same as the wrapper's.
   //
   // While the child runs, a SIGTERM reaches the whole group, and bash runs the wrapper's TERM
   // trap only after the child exits, with `$?` set to the child's status: 143 when SIGTERM
@@ -110,7 +111,7 @@ export function buildWrapperScript(options: WrapperScriptOptions): string {
   // setup steps above there is no child status yet, so the TERM trap there exits 143. A SIGTERM
   // in the instant between this trap and the child's start records 0, like the gap between the
   // EXIT and TERM traps above.
-  return buildGuardedCommand(parts, `trap 'exit $?' TERM; "$__MUX_BASH" -c "$1" "$0"`);
+  return buildGuardedCommand(parts, `trap 'exit $?' TERM; "$3" -c "$1" "$2"`);
 }
 
 /**

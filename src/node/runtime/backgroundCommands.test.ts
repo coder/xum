@@ -44,7 +44,7 @@ describe("backgroundCommands", () => {
       });
 
       expect(result).toBe(
-        `__MUX_EXIT_CODE_PATH='/tmp/exit_code' && __MUX_BASH="$BASH" && trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT && trap 'exit 143' TERM && cd '/home/user/project' || exit; trap 'exit $?' TERM; "$__MUX_BASH" -c "$1" "$0"`
+        `__MUX_EXIT_CODE_PATH='/tmp/exit_code' && set -- "$1" "$0" "$BASH" && trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT && trap 'exit 143' TERM && cd '/home/user/project' || exit; trap 'exit $?' TERM; "$3" -c "$1" "$2"`
       );
     });
 
@@ -254,11 +254,11 @@ describe("backgroundCommands", () => {
       await fs.rm(root, { recursive: true, force: true });
     });
 
-    const spawnScript = (script: string) => {
+    const spawnScript = (script: string, env?: Record<string, string>) => {
       const exitCodePath = path.join(root, "exit_code");
       const outputPath = path.join(root, "output.log");
       const spawnCommand = buildSpawnCommand({
-        wrapperScript: buildWrapperScript({ exitCodePath, cwd: root }),
+        wrapperScript: buildWrapperScript({ exitCodePath, cwd: root, env }),
         script,
         outputPath,
       });
@@ -304,6 +304,18 @@ describe("backgroundCommands", () => {
         expect(await recordedExitCode(exitCodePath)).toBe(c.exitCode);
       });
     }
+
+    it("runs the script with the wrapper's bash whatever the env exports", async () => {
+      // Env entries come from project secrets: none of them can pick the program that runs the
+      // script, or print its value in a "command not found" error.
+      const { exitCodePath, outputPath } = spawnScript("echo ran\nexit 3", {
+        BASH: "secret-value",
+        __MUX_BASH: "secret-value",
+        PATH: "/nonexistent",
+      });
+      expect(await recordedExitCode(exitCodePath)).toBe(3);
+      expect(await fs.readFile(outputPath, "utf-8")).toBe("ran\n");
+    });
 
     it("records 143 when terminated during an exec", async () => {
       const { pid, exitCodePath, outputPath } = spawnScript("echo started\nexec sleep 30");
