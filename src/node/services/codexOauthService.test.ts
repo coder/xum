@@ -6,7 +6,6 @@ import {
   CODEX_OAUTH_CLIENT_ID,
   CODEX_OAUTH_DEVICE_TOKEN_POLL_URL,
   CODEX_OAUTH_DEVICE_USERCODE_URL,
-  CODEX_OAUTH_DEVICE_VERIFY_URL,
   CODEX_OAUTH_TOKEN_URL,
 } from "@/common/constants/codexOAuth";
 import type { Result } from "@/common/types/result";
@@ -626,7 +625,8 @@ describe("CodexOauthService", () => {
       if (!start.success) return;
       expect(start.data).toMatchObject({
         userCode: "WXYZ",
-        verifyUrl: CODEX_OAUTH_DEVICE_VERIFY_URL,
+        // The page the user opens to enter the code (an external contract).
+        verifyUrl: "https://auth.openai.com/codex/device",
         intervalSeconds: 2,
       });
       expect(JSON.parse(calls.userCode[0])).toEqual({ client_id: CODEX_OAUTH_CLIENT_ID });
@@ -766,33 +766,53 @@ describe("CodexOauthService", () => {
       });
     });
 
-    it("keeps polling while authorization is pending until the flow is cancelled", async () => {
-      // 403 and 404 both mean "user has not approved yet".
+    // Pending poll replies (403/404). `firstPoll` resolves once the first
+    // poll request is sent, so tests act on a real signal, not a sleep.
+    function mockPendingPoll(status: number) {
+      let firstPollSent: () => void = () => undefined;
+      const firstPoll = new Promise<void>((resolve) => {
+        firstPollSent = resolve;
+      });
+      const calls = mockDeviceEndpoints({
+        poll: () => {
+          firstPollSent();
+          return new Response("", { status });
+        },
+      });
+      return { calls, firstPoll };
+    }
+
+    it("keeps the flow pending on 403 and 404 until the wait times out", async () => {
+      // Both statuses mean "the user has not approved yet", not a failure.
       for (const status of [403, 404]) {
-        const calls = mockDeviceEndpoints({ poll: () => new Response("", { status }) });
+        const { calls, firstPoll } = mockPendingPoll(status);
         const start = await service.startDeviceFlow();
         if (!start.success) throw new Error(start.error);
 
-        const wait = service.waitForDeviceFlow(start.data.flowId);
-        // Let the first poll land, then cancel while the loop sleeps.
-        while (calls.poll.length === 0) {
-          await new Promise((resolve) => setTimeout(resolve, 5));
-        }
-        await service.cancelDeviceFlow(start.data.flowId);
+        const wait = service.waitForDeviceFlow(start.data.flowId, { timeoutMs: 50 });
+        await firstPoll;
 
-        expect(await wait).toEqual({ success: false, error: "OAuth flow cancelled" });
+        expect(await wait).toEqual({
+          success: false,
+          error: "Timed out waiting for device authorization",
+        });
+        // The next poll waits the interval plus 3 s, so only one was sent.
         expect(calls.poll).toHaveLength(1);
         expect(calls.token).toHaveLength(0);
       }
     });
 
-    it("times out the wait while authorization is still pending", async () => {
-      mockDeviceEndpoints({ poll: () => new Response("", { status: 404 }) });
+    it("cancelling stops a pending flow", async () => {
+      const { calls, firstPoll } = mockPendingPoll(403);
+      const start = await service.startDeviceFlow();
+      if (!start.success) throw new Error(start.error);
 
-      expect(await runDeviceFlow({ timeoutMs: 20 })).toEqual({
-        success: false,
-        error: "Timed out waiting for device authorization",
-      });
+      const wait = service.waitForDeviceFlow(start.data.flowId);
+      await firstPoll;
+      await service.cancelDeviceFlow(start.data.flowId);
+
+      expect(await wait).toEqual({ success: false, error: "OAuth flow cancelled" });
+      expect(calls.token).toHaveLength(0);
     });
 
     it("expires the flow when the device code has no lifetime left", async () => {
