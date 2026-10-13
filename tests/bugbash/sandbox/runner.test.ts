@@ -122,7 +122,10 @@ beforeEach(() => {
 afterEach(async () => {
   await Promise.all(sessions.splice(0).map((s) => s.cleanup()));
   process.env.PATH = savedPath;
-  process.env.TMPDIR = savedTmp;
+  // Assigning undefined stores the string "undefined" (Node, and Bun since 1.4), which
+  // os.tmpdir() then returns: unset the variable when CI never set it.
+  if (savedTmp === undefined) delete process.env.TMPDIR;
+  else process.env.TMPDIR = savedTmp;
   fs.rmSync(root, { recursive: true, force: true });
 });
 
