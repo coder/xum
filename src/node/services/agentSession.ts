@@ -439,6 +439,24 @@ type ResolvedSendMessageOptions = SendMessageOptions & {
   autoModelRoutingRecord?: AutoModelRoutingRecord;
 };
 
+/** Auto-retry abandon reason when the retried turn's goal no longer runs. */
+const GOAL_INACTIVE_RETRY_REASON = "goal_inactive";
+
+/**
+ * Whether a scheduled retry of a goal turn may still resend it: its goal is the current one and
+ * is in the status that turn kind runs in (a continuation needs an active goal, a budget wrap-up
+ * a budget-limited one). A retry without a goal id fails closed: it cannot prove which goal it
+ * belongs to, so a replacement goal could run the old goal's prompt.
+ */
+function isRetriedGoalStillRunning(
+  goal: Pick<GoalRecordV1, "goalId" | "status"> | null,
+  goalKind: GoalSyntheticMessageKind,
+  goalId: string | undefined
+): boolean {
+  if (goal == null || goalId == null || goal.goalId !== goalId) return false;
+  return goal.status === (goalKind === GOAL_BUDGET_LIMIT_KIND ? "budget_limited" : "active");
+}
+
 /** A heartbeat's own row: its turn, or the compaction that a compact heartbeat runs first. */
 function isHeartbeatTriggerMetadata(muxMetadata: MuxMessageMetadata | undefined): boolean {
   return (
@@ -1034,25 +1052,7 @@ interface AgentSessionOptions {
   onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Test seam for PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS (see completion policy). */
   planSnapshotCaptureTimeoutMs?: number;
-  /**
-   * A logical turn began: the session left idle. Successors admitted without an idle transition
-   * (queued-input preemption, compaction follow-up, handoff) continue the same logical turn;
-   * goal continuations start after idle, so each is a new one. Synchronous; must not throw.
-   */
-  onLogicalTurnStarted?: () => void;
-  /**
-   * The logical turn completed successfully and is about to go idle with no successor (never on
-   * stop, abort or terminal error). Awaited with LOGICAL_TURN_COMPLETED_TIMEOUT_MS before the
-   * turn finishes; failures are logged. Artifacts M4 snapshots changed artifacts here. The signal
-   * aborts when the bound fires, so the hook stops its reads and writes instead of running on.
-   */
-  onLogicalTurnCompleted?: (abortSignal: AbortSignal) => Promise<void>;
-  /** Test seam for LOGICAL_TURN_COMPLETED_TIMEOUT_MS. */
-  logicalTurnCompletedTimeoutMs?: number;
 }
-
-/** Bound on onLogicalTurnCompleted, so a stalled remote artifact read cannot hold the turn busy. */
-export const LOGICAL_TURN_COMPLETED_TIMEOUT_MS = 10_000;
 
 interface CachedMemoryContext {
   context: MemorySessionContext | null;
@@ -1314,18 +1314,8 @@ export class AgentSession {
   private readonly onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Last generation observed by phaseChanged and whether it was seen settling to idle. */
   private observedTurn: { id: symbol; idle: boolean } | undefined;
-  /**
-   * Abort controllers of the onLogicalTurnCompleted hooks runLogicalTurnCompleted is awaiting.
-   * A send admitted while one runs (completing -> preparing) is a new logical turn though no idle
-   * transition separates it: the running hook is aborted so its snapshot cannot capture part of
-   * the successor's writes (the successor's own completion snapshots everything still unversioned).
-   */
-  private readonly logicalTurnCompletionControllers = new Set<AbortController>();
   private readonly planSnapshotCaptureTimeoutMs: number;
   private readonly onBeforeTurnCompletion?: AgentSessionOptions["onBeforeTurnCompletion"];
-  private readonly onLogicalTurnStarted?: AgentSessionOptions["onLogicalTurnStarted"];
-  private readonly onLogicalTurnCompleted?: AgentSessionOptions["onLogicalTurnCompleted"];
-  private readonly logicalTurnCompletedTimeoutMs: number;
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
@@ -1366,25 +1356,6 @@ export class AgentSession {
       }
       if (this.coordinator.turnId === turnId && this.coordinator.phase === phase) {
         this.publishTurnPhase(phase, isCurrent);
-      }
-      // Leaving idle starts a logical turn; a successor replacing a live generation does not,
-      // unless the predecessor's logical turn already ended (its completion hook is running).
-      const admittedDuringCompletion =
-        this.logicalTurnCompletionControllers.size > 0 &&
-        previous != null &&
-        previous.id !== turnId;
-      if (admittedDuringCompletion) {
-        for (const controller of this.logicalTurnCompletionControllers) controller.abort();
-      }
-      if (phase !== "idle" && (previous == null || previous.idle || admittedDuringCompletion)) {
-        try {
-          this.onLogicalTurnStarted?.();
-        } catch (error) {
-          log.warn("onLogicalTurnStarted failed", {
-            workspaceId: this.workspaceId,
-            error: getErrorMessage(error),
-          });
-        }
       }
       // The coordinator transitions a generation to idle only from its owner's completion paths
       // (finished turn, failed/withdrawn preparation, preemption), so this is that turn's
@@ -1777,9 +1748,6 @@ export class AgentSession {
       onTurnSuperseded,
       onBeforeTurnCompletion,
       planSnapshotCaptureTimeoutMs,
-      onLogicalTurnStarted,
-      onLogicalTurnCompleted,
-      logicalTurnCompletedTimeoutMs,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -1818,10 +1786,6 @@ export class AgentSession {
     this.onTurnSettled = onTurnSettled;
     this.onTurnSuperseded = onTurnSuperseded;
     this.onBeforeTurnCompletion = onBeforeTurnCompletion;
-    this.onLogicalTurnStarted = onLogicalTurnStarted;
-    this.onLogicalTurnCompleted = onLogicalTurnCompleted;
-    this.logicalTurnCompletedTimeoutMs =
-      logicalTurnCompletedTimeoutMs ?? LOGICAL_TURN_COMPLETED_TIMEOUT_MS;
     this.planSnapshotCaptureTimeoutMs =
       planSnapshotCaptureTimeoutMs ?? PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS;
     assert(
@@ -2315,6 +2279,19 @@ export class AgentSession {
     return undefined;
   }
 
+  /**
+   * Cancel a scheduled auto-retry of this goal's automatic turn, so pausing or completing the
+   * goal clears the retry countdown at once instead of at the next backoff fire. A retry whose
+   * resend already started is left to finish, like any live goal turn.
+   */
+  abandonGoalAutoRetry(goalId: string): void {
+    assert(goalId.length > 0, "abandonGoalAutoRetry requires goalId");
+    if (!this.retryManager.isRetryPending) return;
+    const request = this.lastAutoRetryResumeRequest;
+    if (request?.goalKind == null || request.goalId !== goalId) return;
+    this.retryManager.abandon(GOAL_INACTIVE_RETRY_REASON);
+  }
+
   private async retryActiveStream(
     isCurrent = this.retryManager.captureGeneration(),
     signal?: AbortSignal
@@ -2331,6 +2308,33 @@ export class AgentSession {
     if (this.isWorkspaceArchivedOnDisk()) {
       this.emitRetryEvent({ type: "auto-retry-abandoned", reason: "workspace_archived" });
       return;
+    }
+
+    // A retried goal turn resends that goal's prompt. Drop it once the goal stopped running
+    // (paused, completed, cleared or replaced during the backoff): the retry would otherwise
+    // keep the goal's loop going after the user ended it.
+    // Without a goal service the goal's state is unknown: keep retrying as before.
+    const goalService = this.workspaceGoalService;
+    if (request.goalKind != null && goalService != null) {
+      let goal: GoalRecordV1 | null;
+      try {
+        goal = await goalService.getGoal(this.workspaceId);
+      } catch (error) {
+        // A local read failure says nothing about the goal: keep the retry, checked again next time.
+        if (this.coordinator.closing || !isCurrent()) return;
+        await this.handleStreamFailureForAutoRetry(
+          { type: "unknown", message: `goal_read_failed: ${getErrorMessage(error)}` },
+          isCurrent
+        );
+        return;
+      }
+      if (this.coordinator.closing || !isCurrent()) return;
+      if (!isRetriedGoalStillRunning(goal, request.goalKind, request.goalId)) {
+        // Retire through the manager: it also resets the attempt count, so the next goal's
+        // first failure does not inherit this goal's backoff.
+        this.retryManager.abandon(GOAL_INACTIVE_RETRY_REASON);
+        return;
+      }
     }
 
     const result = await this.resumeStream(request.options, {
@@ -6803,6 +6807,7 @@ export class AgentSession {
         continuation.parts = continuation.parts.map((part) =>
           part.type === "text" ? { ...part, text: part.text.replaceAll(id, newId) } : part
         );
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const { historySequence: _preludeSequence, ...rowMetadata } = row.metadata!;
         return {
           ...row,
@@ -6830,12 +6835,14 @@ export class AgentSession {
             row.metadata?.agentSkillSnapshot?.skillName === ref.skillName
         );
         if (!snapshot || preludeIds.has(snapshot.id)) return [];
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const { historySequence: _snapshotSequence, ...snapshotMetadata } = snapshot.metadata!;
         return [
           { ...snapshot, id: createAgentSkillSnapshotMessageId(), metadata: snapshotMetadata },
         ];
       });
       // The retry owns deduped skill copies too: a terminal rejection must quarantine them.
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       continuation.metadata!.requestPreludeMessageIds = [...skillSnapshots, ...requestPrelude].map(
         (row) => row.id
       );
@@ -10102,8 +10109,6 @@ export class AgentSession {
     let emittedStreamEnd = false;
     const completedCompactionRequest = this.activeCompactionRequest;
     let continuedAfterCompaction = false;
-    // A turn whose stream-end handling threw did not complete cleanly: no turn-end hook for it.
-    let streamEndCleanupFailed = false;
 
     try {
       this.activeCompactionRequest = undefined;
@@ -10319,7 +10324,6 @@ export class AgentSession {
         }
       }
     } catch (error) {
-      streamEndCleanupFailed = true;
       const streamEndCleanupError = getErrorMessage(error);
       log.error("stream-end cleanup failed", {
         workspaceId: this.workspaceId,
@@ -10345,14 +10349,6 @@ export class AgentSession {
       // Only clean up if we're still in COMPLETING — a new turn started by
       // dispatchPendingFollowUp() or sendQueuedMessages()
       // owns the stream state now.
-      if (
-        !streamEndCleanupFailed &&
-        this.coordinator.isCurrentOperation(operation) &&
-        this.coordinator.phase === "completing"
-      ) {
-        // Still completing means no successor took over: the logical turn ends here.
-        await this.runLogicalTurnCompleted();
-      }
       if (
         this.coordinator.isCurrentOperation(operation) &&
         this.coordinator.phase === "completing"
@@ -10460,36 +10456,6 @@ export class AgentSession {
         skipPromptHooks: true,
       }
     );
-  }
-
-  /** Bounded, failure-tolerant onLogicalTurnCompleted (see AgentSessionOptions). */
-  private async runLogicalTurnCompleted(): Promise<void> {
-    if (this.onLogicalTurnCompleted == null) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const controller = new AbortController();
-    this.logicalTurnCompletionControllers.add(controller);
-    try {
-      const outcome = await Promise.race([
-        this.onLogicalTurnCompleted(controller.signal).then(() => "done" as const),
-        new Promise<"timeout">((resolve) => {
-          timer = setTimeout(() => {
-            controller.abort();
-            resolve("timeout");
-          }, this.logicalTurnCompletedTimeoutMs);
-        }),
-      ]);
-      if (outcome === "timeout") {
-        log.warn("onLogicalTurnCompleted timed out", { workspaceId: this.workspaceId });
-      }
-    } catch (error) {
-      log.warn("onLogicalTurnCompleted failed", {
-        workspaceId: this.workspaceId,
-        error: getErrorMessage(error),
-      });
-    } finally {
-      this.logicalTurnCompletionControllers.delete(controller);
-      if (timer != null) clearTimeout(timer);
-    }
   }
 
   private attachAiListeners(): void {

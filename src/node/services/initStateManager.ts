@@ -261,9 +261,12 @@ export class InitStateManager extends EventEmitter {
 
     this.initPromises.set(workspaceId, {
       promise,
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       resolve: resolve!,
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       reject: reject!,
       hookPhasePromise,
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       resolveHookPhase: resolveHookPhase!,
     });
 

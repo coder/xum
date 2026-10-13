@@ -92,7 +92,8 @@ describe("MCP Apps views", { tags: ["mcp-apps"] }, () => {
     await card.getByRole("button", "Open in Artifacts").focus();
     // Measured at 1440x900 and 390x844: Tabs 1-4 cross the view's four buttons, Tab 5 leaves it.
     for (let tab = 0; tab < 5; tab++) await browser.keyboard.press("Tab");
-    const toggle = screen.getByRole("button", "Show input/output");
+    // Scoped to the 4d6 card: every tool card has its own "Show input/output" button.
+    const toggle = card.getByRole("button", "Show input/output");
     await expect(toggle).toBeFocused();
     // globals.css removes the browser outline: the button must draw its own focus style.
     const focus = await browser.evaluate(() => {

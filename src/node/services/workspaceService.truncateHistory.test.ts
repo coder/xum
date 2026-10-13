@@ -753,6 +753,38 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  test("a zero-percent truncation refuses while a stream is active and keeps history", async () => {
+    let streaming = true;
+    const { config, historyService, workspaceService, cleanup } = await createServices(
+      createMockAIService({ isStreaming: mock(() => streaming) })
+    );
+    const workspaceId = "zero-truncate-workspace";
+    try {
+      await config.addWorkspace("/tmp/zero-truncate-project", {
+        id: workspaceId,
+        name: "zero-truncate-workspace",
+        projectName: "zero-truncate-project",
+        projectPath: "/tmp/zero-truncate-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("zero-truncate-row", "user", "kept", { timestamp: Date.now() })
+      );
+
+      expect((await workspaceService.truncateHistory(workspaceId, 0)).success).toBe(false);
+      // The same request succeeds once the stream ends, so the refusal came from the stream.
+      streaming = false;
+      expect((await workspaceService.truncateHistory(workspaceId, 0)).success).toBe(true);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success ? history.data.map((row) => row.id) : null).toEqual([
+        "zero-truncate-row",
+      ]);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("context reset appends a boundary and preserves transcript history", async () => {
     const { config, historyService, workspaceService, cleanup } = await createServices();
     const workspaceId = "context-reset-preserves-history";

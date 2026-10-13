@@ -26,6 +26,7 @@ import {
   type EvaluationState,
 } from "@/common/types/evaluation";
 import { isKnownOpenAIServiceTier } from "@/common/utils/tokens/serviceTierPricing";
+import { getAnthropicCacheWrite1hTokens } from "@/common/utils/tokens/usageHelpers";
 
 /**
  * Effect service around AI SDK `experimental_evaluate` for the workflow
@@ -117,7 +118,7 @@ export interface EvaluationService {
 const USAGE_PROVIDER_METADATA_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   // `anthropic.usage.speed` (Fast mode pricing) is intentionally omitted:
   // evaluation models never request Fast mode, so they always bill Standard.
-  anthropic: ["cacheCreationInputTokens"],
+  anthropic: ["cacheCreationInputTokens", "cacheCreation1hInputTokens"],
   openai: ["reasoningTokens", "serviceTier"],
   mux: ["costsIncluded"],
   xai: ["costInUsdTicks"],
@@ -154,7 +155,32 @@ function projectUsageProviderMetadata(
       }
     }
   }
+  projectAnthropicCacheWrites(metadata, projected);
   return Object.keys(projected).length > 0 ? projected : null;
+}
+
+/**
+ * AI SDK 7 no longer puts `cacheCreationInputTokens` on Anthropic provider metadata, so
+ * evaluation calls priced cache writes as plain input and every write at the 5m rate.
+ * The raw response `usage` still carries the write total and its 5m/1h split: project
+ * both as counts so 1h writes bill at 2x input (`getAnthropicCacheWrite1hTokens`).
+ */
+function projectAnthropicCacheWrites(
+  metadata: SharedV4ProviderMetadata,
+  projected: Record<string, Record<string, number | boolean | string>>
+): void {
+  const rawUsage: unknown = metadata.anthropic?.usage;
+  const rawWrites =
+    rawUsage != null && typeof rawUsage === "object" && !Array.isArray(rawUsage)
+      ? (rawUsage as Record<string, unknown>).cache_creation_input_tokens
+      : undefined;
+  const writes = projected.anthropic?.cacheCreationInputTokens ?? rawWrites;
+  if (!isTokenCount(writes) || writes === 0) return;
+  const anthropic = (projected.anthropic ??= {});
+  anthropic.cacheCreationInputTokens = writes;
+  const oneHour = getAnthropicCacheWrite1hTokens(metadata, writes);
+  if (oneHour > 0) anthropic.cacheCreation1hInputTokens = oneHour;
+  else delete anthropic.cacheCreation1hInputTokens;
 }
 
 function isTokenCount(value: unknown): value is number {

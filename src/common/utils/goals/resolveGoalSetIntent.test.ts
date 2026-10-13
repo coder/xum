@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { DEFAULT_GOAL_DEFAULTS, type GoalDefaults } from "@/constants/goals";
 import {
+  canonicalGoalDefaultsOverride,
   mergeGoalDefaults,
   resolveModelGoalSetIntent,
+  sameGoalDefaultsOverride,
   type WorkspaceGoalDefaultsOverride,
 } from "./resolveGoalSetIntent";
 
@@ -99,5 +101,60 @@ describe("mergeGoalDefaults", () => {
       defaultTurnCap: 8,
       alwaysRequireExplicitBudget: false,
     });
+  });
+});
+
+const override = (
+  fields: Partial<WorkspaceGoalDefaultsOverride>
+): WorkspaceGoalDefaultsOverride => ({
+  defaultBudgetCents: null,
+  defaultTurnCap: null,
+  alwaysRequireExplicitBudget: null,
+  ...fields,
+});
+
+describe("canonicalGoalDefaultsOverride", () => {
+  test("keeps set fields, including 0 and false", () => {
+    expect(canonicalGoalDefaultsOverride(override({ defaultTurnCap: 5 }))).toEqual(
+      override({ defaultTurnCap: 5 })
+    );
+    expect(
+      canonicalGoalDefaultsOverride(
+        override({ defaultBudgetCents: 0, alwaysRequireExplicitBudget: false })
+      )
+    ).toEqual(override({ defaultBudgetCents: 0, alwaysRequireExplicitBudget: false }));
+  });
+
+  test("is null when every field is null", () => {
+    expect(canonicalGoalDefaultsOverride(override({}))).toBeNull();
+  });
+});
+
+describe("sameGoalDefaultsOverride", () => {
+  const next = canonicalGoalDefaultsOverride(override({ defaultBudgetCents: 500 }));
+
+  test("matches a stored record with the same fields", () => {
+    expect(sameGoalDefaultsOverride(override({ defaultBudgetCents: 500 }), next)).toBe(true);
+  });
+
+  test("differs when any field differs", () => {
+    expect(sameGoalDefaultsOverride(override({ defaultBudgetCents: 400 }), next)).toBe(false);
+    expect(
+      sameGoalDefaultsOverride(override({ defaultBudgetCents: 500, defaultTurnCap: 3 }), next)
+    ).toBe(false);
+    expect(
+      sameGoalDefaultsOverride(
+        override({ defaultBudgetCents: 500, alwaysRequireExplicitBudget: true }),
+        next
+      )
+    ).toBe(false);
+  });
+
+  test("clearing matches only when no record is stored", () => {
+    expect(sameGoalDefaultsOverride(undefined, null)).toBe(true);
+    expect(sameGoalDefaultsOverride(undefined, next)).toBe(false);
+    expect(sameGoalDefaultsOverride(override({ defaultBudgetCents: 500 }), null)).toBe(false);
+    // An all-null record is still a record: clearing removes it.
+    expect(sameGoalDefaultsOverride(override({}), null)).toBe(false);
   });
 });

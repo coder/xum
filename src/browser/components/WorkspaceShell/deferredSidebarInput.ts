@@ -16,6 +16,8 @@ export type HeldSidebarInput = () => void;
 const SIDEBAR_EVENTS = [
   CUSTOM_EVENTS.OPEN_GOAL_TAB,
   CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
+  // The header's stand-in for the collapsed overview card: the only expand control while loading.
+  CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR,
   CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
   CUSTOM_EVENTS.OPEN_ARTIFACT,
   CUSTOM_EVENTS.OPEN_REVIEW_IMMERSIVE,
@@ -67,12 +69,16 @@ export function holdSidebarInput(held: HeldSidebarInput[]): () => void {
 }
 
 /**
- * After the sidebar chunk failed to load: RightSidebar never mounts, so keep its guard that stops
- * Cmd/Ctrl+W from closing the window. Returns the cleanup.
+ * After the sidebar chunk failed to load: RightSidebar never mounts, so keep its guards that stop
+ * its shortcuts' browser defaults (Cmd/Ctrl+W closes the window, Cmd/Ctrl+1-9 switch browser tabs).
+ * Not Shift+I: it types a letter and has no browser default. Returns the cleanup.
  */
-export function guardCloseTab(): () => void {
+export function guardSidebarKeys(): () => void {
   const guard = (e: KeyboardEvent) => {
-    if (matchesKeybind(e, KEYBINDS.CLOSE_TAB)) e.preventDefault();
+    const sidebarKey =
+      SIDEBAR_KEYBINDS.some((keybind) => matchesKeybind(e, keybind)) ||
+      matchesNewSidebarTabKeybind(e);
+    if (sidebarKey) e.preventDefault();
   };
   window.addEventListener("keydown", guard);
   return () => window.removeEventListener("keydown", guard);
