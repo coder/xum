@@ -137,12 +137,15 @@ export class TerminalSessionRouter {
 
     // Deliver cached screenState if available (for late subscribers)
     if (session.screenState !== null) {
+      const cached = session.screenState;
       // Use setTimeout to ensure this happens after the caller has finished setup
       setTimeout(() => {
         const currentSession = this.sessions.get(sessionId);
         const currentCallbacks = currentSession?.subscribers.get(subscriberId);
-        if (currentCallbacks && currentSession && currentSession.screenState !== null) {
-          currentCallbacks.onScreenState(currentSession.screenState);
+        // A newer screen (a reattach) already reached this subscriber through the broadcast:
+        // writing it again would repeat the scrollback.
+        if (currentCallbacks && currentSession?.screenState === cached) {
+          currentCallbacks.onScreenState(cached);
         }
       }, 0);
     }

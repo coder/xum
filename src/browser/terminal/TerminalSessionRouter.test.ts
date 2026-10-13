@@ -208,6 +208,25 @@ describe("TerminalSessionRouter across reconnects", () => {
     expect(second.resizes).toEqual([{ cols: 100, rows: 30 }]);
   });
 
+  test("a subscriber that joins during a reattach gets the new screen once", async () => {
+    const first = fakeServer("first");
+    const router = new TerminalSessionRouter(first.client);
+    router.subscribe("t1", recorder().callbacks);
+    await settle();
+    first.attaches[0]?.push({ type: "screenState", data: "screen-1" });
+    await settle();
+
+    const second = fakeServer("second");
+    router.setClient(second.client);
+    await settle();
+    // Joins with screen-1 cached; the reattach screen lands before its deferred delivery runs.
+    const late = recorder();
+    router.subscribe("t1", late.callbacks);
+    second.attaches[0]?.push({ type: "screenState", data: "screen-2" });
+    await settle();
+    expect(late.screens).toEqual([{ state: "screen-2", replace: true }]);
+  });
+
   test("an exited session is not restarted", async () => {
     const first = fakeServer("first");
     const router = new TerminalSessionRouter(first.client);
