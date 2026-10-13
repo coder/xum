@@ -43,6 +43,8 @@ interface SessionState {
   subscribers: Map<number, TerminalSubscriberCallbacks>;
   /** Cached screen state (sent to new subscribers immediately) */
   screenState: string | null;
+  /** Bumped on each screen delivery: a deferred cached delivery checks it, not the text. */
+  screenVersion: number;
   /** Abort controller for the attach and exit streams of the current client */
   abortController: AbortController;
   /** Bumped on each new client: a stream of an older client stops delivering. */
@@ -120,6 +122,7 @@ export class TerminalSessionRouter {
       session = {
         subscribers: new Map(),
         screenState: null,
+        screenVersion: 0,
         abortController: new AbortController(),
         generation: 0,
         replaceNextScreen: false,
@@ -138,13 +141,14 @@ export class TerminalSessionRouter {
     // Deliver cached screenState if available (for late subscribers)
     if (session.screenState !== null) {
       const cached = session.screenState;
+      const cachedVersion = session.screenVersion;
       // Use setTimeout to ensure this happens after the caller has finished setup
       setTimeout(() => {
         const currentSession = this.sessions.get(sessionId);
         const currentCallbacks = currentSession?.subscribers.get(subscriberId);
         // A newer screen (a reattach) already reached this subscriber through the broadcast:
-        // writing it again would repeat the scrollback.
-        if (currentCallbacks && currentSession?.screenState === cached) {
+        // writing it again would repeat the scrollback, also when its text is the same.
+        if (currentCallbacks && currentSession?.screenVersion === cachedVersion) {
           currentCallbacks.onScreenState(cached);
         }
       }, 0);
@@ -473,6 +477,7 @@ export class TerminalSessionRouter {
   /** Cache and broadcast a full screen; the first one after a reattach replaces the old one. */
   private deliverScreen(session: SessionState, state: string): void {
     session.screenState = state;
+    session.screenVersion++;
     const replace = session.replaceNextScreen;
     session.replaceNextScreen = false;
     for (const callbacks of session.subscribers.values()) {
