@@ -95,7 +95,7 @@ describe("MarkdownFilePreview", () => {
     expect(fragmentLinks).toHaveLength(3);
     for (const href of fragmentLinks.slice(1)) {
       expect(href?.startsWith("#")).toBe(true);
-      expect(view.container.querySelector(`[id="${href?.slice(1)}"]`)).not.toBeNull();
+      expect(document.getElementById(href?.slice(1) ?? "")).not.toBeNull();
     }
   });
 });
