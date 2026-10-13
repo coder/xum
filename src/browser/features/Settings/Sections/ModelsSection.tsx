@@ -11,7 +11,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { useRouting } from "@/browser/hooks/useRouting";
@@ -127,6 +127,7 @@ export function shouldAllowRouteOverrideInSettings(modelId: string): boolean {
 
 export function ModelsSection() {
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { open: openSettings, close: closeSettings } = useSettings();
   const { config, loading, updateModelsOptimistically } = useProvidersConfig();
   const [lastProvider, setLastProvider] = usePersistedState(LAST_CUSTOM_MODEL_PROVIDER_KEY, "");
@@ -226,14 +227,14 @@ export function ModelsSection() {
       return false;
     }
 
-    if (!api) return false;
+    if (!liveApi) return false;
     setError(null);
 
     // Optimistic update - returns new models array for API call
     const updatedModels = updateModelsOptimistically(provider, (models) => [...models, modelId]);
 
     // Save in background
-    void api.providers.setModels({ provider, models: updatedModels });
+    void liveApi.providers.setModels({ provider, models: updatedModels });
     return true;
   };
 
@@ -514,7 +515,7 @@ export function ModelsSection() {
 
   const handleRemoveModel = useCallback(
     (provider: string, modelId: string) => {
-      if (!config || !api) return;
+      if (!config || !liveApi) return;
 
       // Optimistic update - returns new models array for API call
       const updatedModels = updateModelsOptimistically(provider, (models) =>
@@ -522,9 +523,9 @@ export function ModelsSection() {
       );
 
       // Save in background
-      void api.providers.setModels({ provider, models: updatedModels });
+      void liveApi.providers.setModels({ provider, models: updatedModels });
     },
-    [api, config, updateModelsOptimistically]
+    [liveApi, config, updateModelsOptimistically]
   );
 
   const handleStartEdit = useCallback(
@@ -573,7 +574,7 @@ export function ModelsSection() {
   }, []);
 
   const handleSaveEdit = useCallback(() => {
-    if (!config || !editing || !api) return;
+    if (!config || !editing || !liveApi) return;
 
     const trimmedModelId = editing.newModelId.trim();
     if (!trimmedModelId) {
@@ -634,8 +635,8 @@ export function ModelsSection() {
     setEditing(null);
 
     // Save in background
-    void api.providers.setModels({ provider: editing.provider, models: updatedModels });
-  }, [api, editing, config, modelExists, updateModelsOptimistically]);
+    void liveApi.providers.setModels({ provider: editing.provider, models: updatedModels });
+  }, [liveApi, editing, config, modelExists, updateModelsOptimistically]);
 
   // Show loading state while config is being fetched
   if (loading || !config) {
