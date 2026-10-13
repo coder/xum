@@ -16,6 +16,9 @@ import { AppLoader } from "../components/AppLoader/AppLoader";
 import "@/browser/components/AIView/AIView";
 import "@/browser/components/ProjectPage/ProjectPage";
 import "@/browser/components/ScratchPage/ScratchPage";
+// WorkspaceShell loads the right sidebar through its own React.lazy (#6206), so a story that shows
+// it waited for that chunk too (#6266). Importing it here puts it in the story bundle as well.
+import "@/browser/features/RightSidebar/RightSidebar";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
