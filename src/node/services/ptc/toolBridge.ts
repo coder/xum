@@ -117,15 +117,21 @@ function syntheticToolCallId(toolName: string): string {
 }
 
 /**
- * Execute-options objects of tool calls bridged from a code_execution guest. Bridged
- * calls usually carry the runtime's nested-record callId, which looks like any other
- * toolCallId, so callers that must tell them apart check the options object itself.
+ * Marks the execute options of a tool call bridged from a code_execution guest.
+ * Bridged calls usually carry the runtime's nested-record callId, which looks like any
+ * other toolCallId, so callers that must tell them apart check this key instead. An
+ * own symbol key survives the `{ ...options }` copies wrappers make on the way to the
+ * tool (withExecutionScope), and `Symbol.for` survives duplicated module instances.
  */
-const bridgedExecutionOptions = new WeakSet<object>();
+const PTC_BRIDGED_EXECUTION = Symbol.for("xum.ptc.bridgedExecution");
 
 /** True for a tool execution bridged from a code_execution guest (not a direct model call). */
 export function isPtcBridgedExecution(options: unknown): boolean {
-  return typeof options === "object" && options !== null && bridgedExecutionOptions.has(options);
+  return (
+    typeof options === "object" &&
+    options !== null &&
+    (options as Record<symbol, unknown>)[PTC_BRIDGED_EXECUTION] === true
+  );
 }
 
 /**
@@ -347,8 +353,8 @@ export class ToolBridge {
           toolCallId: bridgedToolCallId,
           messages: [],
           context: undefined,
+          [PTC_BRIDGED_EXECUTION]: true,
         };
-        bridgedExecutionOptions.add(executeOptions);
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const result: unknown = await boundTool.execute!(validatedArgs, executeOptions);
 

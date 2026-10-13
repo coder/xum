@@ -11,6 +11,8 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import type { IJSRuntime } from "@/node/services/ptc/runtime";
 import { ToolBridge } from "@/node/services/ptc/toolBridge";
+import type { ExecutionScope } from "@/node/services/toolCallDisplayRegistry";
+import { withExecutionScope } from "@/node/services/tools/withExecutionScope";
 import { createPathSkillActivation } from "@/node/services/agentSkills/pathSkillActivation";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { Tool } from "ai";
@@ -80,8 +82,11 @@ async function buildTools(
  * The guest-facing `xum` object a real ToolBridge registers over the given tools.
  * The runtime hands out hex nested-record call IDs, like QuickJS does.
  */
-function bridgeGuestTools(tools: Record<string, ToolExecuteFn>): Record<string, ToolExecuteFn> {
-  const bridgeTools: Record<string, Tool> = {
+function bridgeGuestTools(
+  tools: Record<string, ToolExecuteFn>,
+  scope: ExecutionScope
+): Record<string, ToolExecuteFn> {
+  const directTools: Record<string, Tool> = {
     file_read: {
       description: "file_read",
       inputSchema: z.object({ path: z.string() }),
@@ -100,7 +105,7 @@ function bridgeGuestTools(tools: Record<string, ToolExecuteFn>): Record<string, 
       return () => undefined;
     },
   });
-  new ToolBridge(bridgeTools).register(runtime);
+  new ToolBridge(withExecutionScope(directTools, scope)).register(runtime);
   return guest;
 }
 
@@ -140,8 +145,10 @@ describe("getToolsForModel - path-scoped skill activation", () => {
   });
 
   test("a code_execution-bridged read reaches the guest, not the model: no pointer", async () => {
+    // The stream binds its execution scope into every tool, which copies the execute
+    // options object: the bridged marker must survive that copy.
     const tools = await buildTools();
-    const guest = bridgeGuestTools(tools);
+    const guest = bridgeGuestTools(tools, { workspaceId: "ws-1", messageId: "m1", token: "t1" });
 
     const bridged = (await guest.file_read({ path: "src/foo.ts" }, undefined)) as Record<
       string,
