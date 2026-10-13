@@ -26,7 +26,6 @@ import {
   currentMcpAppViewDomainsSeq,
   publishMcpAppViewDomains,
   useMcpAppViewDomains,
-  useMcpAppViewDomainsRevocations,
 } from "./mcpAppViewDomainsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
@@ -269,7 +268,6 @@ export function McpAppFrame(props: {
       : null;
   const [domainsPromptId] = useState(newConfirmPromptId);
   const domainsArming = useConfirmArmed(domainsPrompt != null ? domainsPromptId : null);
-  useMcpAppViewDomainsRevocations(api, approvalProjectPath, boundServerName, approved);
   const allowDomains = async (origins: string[]) => {
     if (!api) return;
     try {

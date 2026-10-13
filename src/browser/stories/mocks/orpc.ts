@@ -2414,8 +2414,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             : { success: false as const, error: `No view for ${input.toolCallId}` }
         );
       },
-      // Kept like the backend's project config, so listViewDomains (which mounted views
-      // reconcile against) reports what the story approved.
+      // Kept like the backend's project config, so listViewDomains (Settings' list) reports
+      // what the story approved.
       approveViewDomains: (input: {
         toolCallId: string;
         serverName: string;

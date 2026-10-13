@@ -1530,7 +1530,7 @@ export const mcpApps = {
     output: ResultSchema(z.object({ approvedDomains: z.array(z.string()) }), z.string()),
   },
   listViewDomains: { input: z.void(), output: z.array(McpAppViewDomainsSchema) },
-  /** Mounted views of the server reload under the narrower policy (mcpAppViewDomainsStore). */
+  /** Mounted views of the server in this renderer reload under the narrower policy. */
   revokeViewDomains: {
     input: McpAppViewDomainsSchema.pick({ projectPath: true, serverName: true }),
     output: z.void(),
