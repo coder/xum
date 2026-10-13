@@ -171,12 +171,12 @@ export const Editor: Story = {
     // Wait for Shiki tokens so the snapshot never captures unhighlighted code.
     await waitFor(() => {
       for (const language of ["yaml", "bash"]) {
-        expect(
-          canvasElement.querySelector(`[data-code-language="${language}"] .code-line span`)
-        ).not.toBeNull();
+        if (!canvasElement.querySelector(`[data-code-language="${language}"] .code-line span`)) {
+          throw new Error(`${language} block is not highlighted yet`);
+        }
       }
     });
-    expect(canvas.queryByLabelText("Memory file content")).toBeNull();
+    await expect(canvas.queryByLabelText("Memory file content")).toBeNull();
     await userEvent.hover(canvasElement);
     blurActiveElement();
   },
