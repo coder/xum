@@ -6968,14 +6968,14 @@ describe("WorkspaceStore", () => {
       startedAtMs: 1,
     };
 
-    it("re-renders the workspace when a goal field it shows changes", async () => {
+    it("re-renders the workspace when a compared goal field changes", async () => {
       const workspaceId = "activity-goal-cost";
       const listener = mock(() => undefined);
       const releaseActivity = mockBackgroundActivityTransition(
         workspaceId,
         createActivitySnapshot(1, { streaming: false, goal }),
         [
-          // Only a field the UI does not show changes: no re-render.
+          // Only startedAtMs changes: no re-render.
           createActivitySnapshot(1, { streaming: false, goal: { ...goal, startedAtMs: 2 } }),
           createActivitySnapshot(1, { streaming: false, goal: { ...goal, costCents: 11 } }),
         ]
@@ -8677,7 +8677,7 @@ describe("areActivityGoalsEqual", () => {
     expect(areActivityGoalsEqual(goal, undefined)).toBe(false);
   });
 
-  it("detects a change in any goal field the UI shows", () => {
+  it("detects a change in any compared goal field", () => {
     const changes: Array<Partial<GoalSnapshot>> = [
       { goalId: "00000000-0000-4000-8000-000000000002" },
       { status: "paused" },
@@ -8693,7 +8693,7 @@ describe("areActivityGoalsEqual", () => {
     }
   });
 
-  it("ignores goal fields the UI does not show", () => {
+  it("ignores the goal fields it does not compare", () => {
     expect(
       areActivityGoalsEqual(goal, { ...goal, startedAtMs: 2, completionSummary: "done" })
     ).toBe(true);

@@ -640,8 +640,9 @@ function areAgentStatusesEqual(
 }
 
 /**
- * Compares the goal fields that the sidebar and the Goal tab show, so an activity snapshot
- * that changes only other goal fields (e.g. startedAtMs) does not re-render the workspace.
+ * Compares the goal fields whose change re-renders the workspace on an activity snapshot.
+ * startedAtMs and completionSummary are not compared: a change to only those fields does
+ * not re-render, as before this comparison moved out of applyWorkspaceActivitySnapshot.
  * A missing goal (null or undefined) equals only another missing goal.
  */
 export function areActivityGoalsEqual(
