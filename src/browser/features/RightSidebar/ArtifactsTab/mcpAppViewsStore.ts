@@ -7,7 +7,7 @@ import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
 import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
-import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolUtils";
+import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolStatus";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 
 /**
