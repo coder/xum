@@ -400,6 +400,29 @@ describe("turn.stop", () => {
     expect(h.events.filter((event) => event.type === "stream-end")).toHaveLength(1);
   });
 
+  test.each([
+    { name: "an ACP prompt", session: {}, send: { acpPromptId: "acp-prompt-1" } },
+    { name: "an xum run turn", session: { callerOwnsTurnEnd: true }, send: {} },
+  ])(
+    "$name runs its Stop hook but is not continued (its owner already saw the turn end)",
+    async (owner) => {
+      // Codex P1 (PRRT_kwDOPxxmWM6rxPMC): ACP resolves prompt() and xum run stops waiting on
+      // this stream-end, so a continuation would run after them.
+      const calls: StopCall[] = [];
+      addConsumer(keepGoing, calls);
+      const { h, streams } = await setup({ session: owner.session });
+
+      expect(
+        (await h.session.sendMessage("fix the tests", { ...options, ...owner.send })).success
+      ).toBe(true);
+      await settle(h);
+
+      expect(calls).toHaveLength(1);
+      expect(streams()).toBe(1);
+      expect(await userTexts(h)).toEqual(["fix the tests"]);
+    }
+  );
+
   test("an interrupted turn does not run the hooks", async () => {
     const calls: StopCall[] = [];
     addConsumer(keepGoing, calls);
