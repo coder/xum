@@ -54,25 +54,35 @@ describe("goal tool availability", () => {
     ).toEqual(["get_goal", "complete_goal"]);
   });
 
-  test.each(["paused", "complete"] as const)(
-    "allows get_goal for %s goals when set_goal is available for safe replacement",
-    (goalStatus) => {
-      expect(availableGoalToolNames({ goalStatus })).toEqual(["set_goal", "get_goal"]);
-    }
-  );
+  test("allows get_goal for complete goals when set_goal is available for safe replacement", () => {
+    expect(availableGoalToolNames({ goalStatus: "complete" })).toEqual(["set_goal", "get_goal"]);
+  });
 
-  test.each(["paused", "complete"] as const)(
-    "omits goal tools for %s goals on a child's automatic task turns",
-    (goalStatus) => {
-      expect(
-        availableGoalToolNames({
-          goalStatus,
-          parentWorkspaceId: "parent",
-          taskTurnKind: "recovery",
-        })
-      ).toEqual([]);
-    }
-  );
+  test("omits goal tools for complete goals on a child's automatic task turns", () => {
+    expect(
+      availableGoalToolNames({
+        goalStatus: "complete",
+        parentWorkspaceId: "parent",
+        taskTurnKind: "recovery",
+      })
+    ).toEqual([]);
+  });
+
+  // The work can finish while the loop is paused, so completing needs no resume.
+  test("allows completing a paused goal on every turn", () => {
+    expect(availableGoalToolNames({ goalStatus: "paused" })).toEqual([
+      "set_goal",
+      "get_goal",
+      "complete_goal",
+    ]);
+    expect(
+      availableGoalToolNames({
+        goalStatus: "paused",
+        parentWorkspaceId: "parent",
+        taskTurnKind: "recovery",
+      })
+    ).toEqual(["get_goal", "complete_goal"]);
+  });
 
   test("allows all goal tools for active goals in top-level workspaces", () => {
     expect(availableGoalToolNames({ goalStatus: "active" })).toEqual([

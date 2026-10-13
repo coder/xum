@@ -154,3 +154,6 @@ dogfood-output/
 .design-sync/node_modules
 .ds-sync/
 ds-bundle/
+
+# CRAP score snapshots (make crap)
+.metrics/

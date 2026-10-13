@@ -202,6 +202,7 @@ function getInputJsonSchema(tool: Tool): Record<string, unknown> {
 async function getResultTypeString(toolName: string): Promise<string | null> {
   // Check cache first
   if (cache.resultTypes.has(toolName)) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     return cache.resultTypes.get(toolName)!;
   }
 
