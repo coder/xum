@@ -34,7 +34,7 @@ import {
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { isConnectionLostError } from "@/browser/contexts/connectionLink";
+import { isConnectionLostError, isStreamFailure } from "@/browser/contexts/connectionLink";
 
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 
@@ -67,6 +67,11 @@ function getGitDescribe(version: unknown): string | undefined {
 
 interface TitleBarProps {
   onBeforeOpenSettings?: () => void;
+}
+
+/** An offline update check fails fast; the next one after the reconnect runs as usual. */
+function logCheckError(error: unknown): void {
+  if (!isConnectionLostError(error)) console.error(error);
 }
 
 export function TitleBar(props: TitleBarProps) {
@@ -138,16 +143,11 @@ export function TitleBar(props: TitleBarProps) {
         }
       } catch (error) {
         // A lost connection is not a stream error: the next client opens the stream again.
-        if (!signal.aborted && !isConnectionLostError(error)) {
+        if (isStreamFailure(error, signal)) {
           console.error("Update status stream error:", error);
         }
       }
     })();
-
-    // An offline check fails fast; the next one after the reconnect runs as usual.
-    const logCheckError = (error: unknown) => {
-      if (!isConnectionLostError(error)) console.error(error);
-    };
     // Check for updates on mount
     api.update.check({ source: "auto" }).catch(logCheckError);
 

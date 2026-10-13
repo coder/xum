@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { useAPI } from "@/browser/contexts/API";
 import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen";
-import { isConnectionLostError } from "@/browser/contexts/connectionLink";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
 
 /**
  * Full-viewport cover shown from the moment an update install is confirmed (status
@@ -35,7 +35,7 @@ export function UpdateRestartOverlay() {
         }
       } catch (error) {
         // A lost connection is not a stream error: the next client opens the stream again.
-        if (!signal.aborted && !isConnectionLostError(error)) {
+        if (isStreamFailure(error, signal)) {
           console.error("Update status stream error:", error);
         }
       }

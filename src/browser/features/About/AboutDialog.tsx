@@ -15,7 +15,7 @@ import {
   ToggleGroup,
   ToggleGroupItem,
 } from "@/browser/components/ToggleGroupPrimitive/ToggleGroupPrimitive";
-import { isConnectionLostError } from "@/browser/contexts/connectionLink";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
 
 const channelDescriptions: Record<UpdateChannel, string> = {
   stable: "Official releases only.",
@@ -140,7 +140,7 @@ export function AboutDialog() {
         }
       } catch (error) {
         // A lost connection is not a stream error: the next client opens the stream again.
-        if (!signal.aborted && !isConnectionLostError(error)) {
+        if (isStreamFailure(error, signal)) {
           console.error("Update status stream error:", error);
         }
       }

@@ -29,6 +29,14 @@ export function isConnectionLostError(error: unknown): error is ConnectionLostEr
   );
 }
 
+/**
+ * Whether a stream or call failure is a real error: not the caller's own abort, and not a lost
+ * connection (the next client starts the work again).
+ */
+export function isStreamFailure(error: unknown, signal: AbortSignal): boolean {
+  return !signal.aborted && !isConnectionLostError(error);
+}
+
 type Link = ClientLink<ClientContext>;
 
 /** A stream that detach() can end at once, even while its consumer waits on next(). */
@@ -276,11 +284,18 @@ class GenerationIterator implements AsyncIteratorObject<unknown, unknown, unknow
   async throw(error?: unknown): Promise<IteratorResult<unknown, unknown>> {
     // A finished or lost stream has no inner cleanup left to wait for, and after detach() nothing
     // would settle it: throw the error at once, as a finished generator does.
-    if (this.finished || this.inner.throw == null) {
+    const innerThrow = this.innerThrow();
+    if (innerThrow == null) {
       this.finish();
       throw error;
     }
-    return this.cleanUp(this.inner.throw(error));
+    return this.cleanUp(innerThrow(error));
+  }
+
+  /** The inner stream's throw(), unless this stream is finished or lost. */
+  private innerThrow(): ((error?: unknown) => Promise<IteratorResult<unknown, unknown>>) | null {
+    if (this.finished || this.inner.throw == null) return null;
+    return this.inner.throw.bind(this.inner);
   }
 
   [Symbol.asyncIterator](): this {
