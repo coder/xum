@@ -19,6 +19,7 @@ import {
 import { createDevToolsMiddleware, extractUsage } from "@/node/services/devToolsMiddleware";
 import { DevToolsService } from "@/node/services/devToolsService";
 import { wrapFetchWithAnthropicCacheControl } from "@/node/services/providerModelFactory";
+import { waitForCondition } from "@/node/services/testDispatchHelpers";
 
 function createTestConfig(opts: { sessionsDir: string; enabled?: boolean }): Config {
   const config = new Config(path.dirname(opts.sessionsDir));
@@ -689,6 +690,49 @@ describe("createDevToolsMiddleware", () => {
         cacheMarkersInjected: true,
         dispatched: true,
       });
+      expect(step?.promptCacheWire?.observedAt).toBeString();
+    });
+
+    it("keeps the wire facts of an OK response when the step aborts before doStream settles", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const service = new DevToolsService(config);
+      const wrapStream = getWrapStream(createDevToolsMiddleware("ws-1", service));
+      const route = { route: "anthropic", modelString: "anthropic:claude-opus-5-5" };
+      const cachingFetch = wrapFetchWithAnthropicCacheControl(
+        (() => Promise.resolve(new Response("{}"))) as unknown as typeof fetch,
+        "1h",
+        { routeIdentity: route }
+      );
+      const abort = new AbortController();
+      const params = { ...createMockParams(), abortSignal: abort.signal };
+      const send = () =>
+        cachingFetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: params.headers as Record<string, string>,
+          body: JSON.stringify({ messages: [] }),
+        });
+      const streaming = wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: async () => {
+          // Anthropic answered OK (the monitor observed it), then the user stopped the turn
+          // while the provider was still setting up the stream.
+          await send();
+          abort.abort();
+          throw new Error("aborted");
+        },
+        params,
+        model: createMockModel(),
+      });
+      await streaming.catch(() => undefined);
+
+      // The abort handler finalizes in the background; wait for that update.
+      const readStep = async () => {
+        const runs = await service.getRuns("ws-1");
+        return (await service.getRunWithSteps("ws-1", runs[0].id))?.steps[0];
+      };
+      await waitForCondition(async () => (await readStep())?.error === "Request aborted");
+      const step = await readStep();
+      expect(step?.promptCacheWire).toMatchObject({ ...route, dispatched: true });
       expect(step?.promptCacheWire?.observedAt).toBeString();
     });
 

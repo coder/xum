@@ -364,6 +364,22 @@ describe("auditStepPrefixes with recorded wire facts", () => {
     },
   });
 
+  test("mux-gateway steps are audited from their wire record", () => {
+    // The Gateway SDK reports provider "gateway", not "anthropic.*": the wire record the
+    // Anthropic cache wrapper wrote is what proves an Anthropic wire.
+    const gateway = (runId: string, texts: string[]): RecordedStepRequest => ({
+      ...wired(runId, texts, { route: "mux-gateway" }),
+      provider: "gateway",
+    });
+    const audit = auditStepPrefixes([gateway("run-1", ["a"]), gateway("run-2", ["b"])]);
+    expect(audit).toMatchObject({ comparedPairs: 1, breaks: [{ runId: "run-2" }] });
+    // Without a wire record (older logs), a non-Anthropic provider id is still skipped.
+    const { promptCacheWire: _wire, ...legacy } = gateway("run-3", ["c"]);
+    expect(auditStepPrefixes([legacy, { ...legacy, runId: "run-4" }])).toMatchObject({
+      comparedPairs: 0,
+    });
+  });
+
   test("steps on two routes of one model keep separate baselines", () => {
     // Direct Anthropic and a Coder gateway are separate caches, though both use the
     // AI SDK provider id "anthropic.messages" and the same model id.

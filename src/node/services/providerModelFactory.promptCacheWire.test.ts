@@ -6,6 +6,7 @@
 import { describe, expect, it } from "bun:test";
 
 import {
+  closeCapturedRequestBody,
   consumePromptCacheWire,
   DEVTOOLS_STEP_ID_HEADER,
 } from "@/node/services/devToolsHeaderCapture";
@@ -90,6 +91,18 @@ describe("wrapFetchWithAnthropicCacheControl — DevTools prompt-cache wire fact
       respond: () => Promise.resolve(new Response("{}")),
     });
     expect(consumePromptCacheWire("step-zdr")).toMatchObject({ cacheMarkersInjected: false });
+  });
+
+  it("keeps facts recorded before an abort and rejects attempts after it", async () => {
+    await send({ stepId: "step-abort", respond: () => Promise.resolve(new Response("{}")) });
+    // Abort cleanup before the provider call settled: the OK response was already observed.
+    closeCapturedRequestBody("step-abort");
+    // A fetch that ignored the abort reaches the wrapper later: it must not be recorded, or
+    // nothing would consume it (the abort's finalization already ran).
+    await send({ stepId: "step-abort", respond: () => Promise.reject(new Error("late")) });
+    expect(consumePromptCacheWire("step-abort")).toMatchObject({ dispatched: true });
+    await send({ stepId: "step-abort", respond: () => Promise.resolve(new Response("{}")) });
+    expect(consumePromptCacheWire("step-abort")).toBeUndefined();
   });
 
   it("records nothing without a DevTools step or a route identity", async () => {

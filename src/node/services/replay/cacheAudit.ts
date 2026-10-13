@@ -197,7 +197,11 @@ export interface StepPrefixAudit {
  * A pair with a request the fingerprint does not model (`unsupported`) is not
  * counted, and that request becomes the baseline.
  */
-/** AI SDK Anthropic provider ids start with "anthropic" (e.g. "anthropic.messages"). */
+/**
+ * Legacy check for steps without a wire record: the AI SDK provider id starts with "anthropic"
+ * for the Anthropic provider (e.g. "anthropic.messages"). A wire record proves an Anthropic
+ * wire by itself (see isMonitoredAnthropicStep).
+ */
 function isAnthropicStep(step: RecordedStepRequest): boolean {
   return step.provider?.startsWith("anthropic") === true;
 }
@@ -278,13 +282,17 @@ function stepObservedAtMs(step: RecordedStepRequest): number {
 }
 
 /**
- * The monitor observes a request only once the provider answered it OK with cache markers
- * injected: one that failed before, got an error status, or ran with caching off neither
- * created nor broke a cache entry. Older logs carry no wire facts and stay audited.
+ * Whether the runtime monitor observed this step on an Anthropic wire. A wire record decides:
+ * only the Anthropic cache wrapper writes one, also behind SDKs that report another provider
+ * id (the mux-gateway SDK reports "gateway"), and the monitor observes a request only once it
+ * was answered OK with cache markers injected. One that failed before, got an error status, or
+ * ran with caching off neither created nor broke a cache entry. Older logs carry no record:
+ * their Anthropic steps stay audited.
  */
-function isObservedByMonitor(step: RecordedStepRequest): boolean {
+function isMonitoredAnthropicStep(step: RecordedStepRequest): boolean {
   const wire = step.promptCacheWire;
-  return wire == null || (wire.dispatched && wire.cacheMarkersInjected && wire.observedAt != null);
+  if (wire == null) return isAnthropicStep(step);
+  return wire.dispatched && wire.cacheMarkersInjected && wire.observedAt != null;
 }
 
 /**
@@ -352,7 +360,7 @@ export function auditStepPrefixes(
     // Block order and normalization are Anthropic's, like the runtime detector, which
     // observes only Anthropic wires: other providers neither break nor replace the baseline.
     // Neither does a request the monitor did not observe.
-    if (!isAnthropicStep(step) || !isObservedByMonitor(step)) continue;
+    if (!isMonitoredAnthropicStep(step)) continue;
     const baselineKey = baselineKeyOf(step);
     let previous = baselines.get(baselineKey);
     // `/clear`, "start here" or a rollover replaced the context: a new baseline, no break.

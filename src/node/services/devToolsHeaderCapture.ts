@@ -192,10 +192,13 @@ export function discardCapturedRequestBody(stepId: string): void {
   closedCaptureSteps.delete(stepId);
 }
 
-/** Abort cleanup: drops the body and refuses later captures until the step settles. */
+/**
+ * Abort cleanup: drops the body and refuses later captures until the step settles. Wire facts
+ * already recorded stay for the abort's finalization to consume: a request that got its OK
+ * response before the abort was observed by the monitor, so the audit must see it too.
+ */
 export function closeCapturedRequestBody(stepId: string): void {
   capturedRequestBodies.delete(stepId);
-  capturedPromptCacheWires.delete(stepId);
   closedCaptureSteps.add(stepId);
 }
 
