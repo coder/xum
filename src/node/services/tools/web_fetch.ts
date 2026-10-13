@@ -437,7 +437,10 @@ function buildCurlCommand(
  * SSRF defense: it runs after curl already connected, so it can only keep a wrong route's
  * response out of the result; pinning prevents the connection. It needs %{proxy_used}
  * (curl 8.7+) and checks direct connections only: through a proxy, %{remote_ip} is the
- * proxy. A missing or malformed route line with a response is treated as a wrong route.
+ * proxy. A missing or malformed route line with a response is treated as a wrong route,
+ * and so is a direct connection that produced a response but reports no address (#5990).
+ * An empty address with no response is curl failing before it connected: its own error
+ * is reported instead.
  */
 function checkCurlRoute(
   result: runtimeHelpers.ExecResult,
@@ -452,8 +455,9 @@ function checkCurlRoute(
   const wrongDirectRoute =
     wellFormed &&
     proxyUsed === "0" &&
-    remoteIp !== "" &&
-    normalizeHostname(remoteIp) !== normalizeHostname(expectedAddress);
+    (remoteIp === ""
+      ? result.stdout.length > 0
+      : normalizeHostname(remoteIp) !== normalizeHostname(expectedAddress));
   if (wrongDirectRoute || (!wellFormed && result.stdout.length > 0)) {
     throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
   }
