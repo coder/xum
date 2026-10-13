@@ -619,6 +619,34 @@ describe("StreamManager - aborted stream usage persistence", () => {
     expect(event.metadata?.usage?.inputTokens).toBe(120);
   });
 
+  test("carries tool-model usage on the wire abort event, as on the committed partial", async () => {
+    const workspaceId = "abort-tool-usage-event";
+    const messageId = "abort-tool-usage-message";
+    const events: TurnEngineEvent[] = [];
+    const { streamManager } = await startHeldTurnForTests({
+      workspaceId,
+      messageId,
+      events,
+      chunks: (activeManager) => [
+        partialText,
+        finishStep(ABORT_STEP_USAGE),
+        () =>
+          activeManager().recordToolModelUsage(workspaceId, messageId, {
+            toolName: "task",
+            timestamp: 1,
+            model: KNOWN_MODELS.SONNET.id,
+            usage: { inputTokens: 70, outputTokens: 7, totalTokens: 77 },
+          }),
+      ],
+    });
+
+    await streamManager.stopStream(workspaceId, { abortReason: "user" });
+
+    // Parsed by the onChat wire schema, which strips fields it does not declare.
+    const event = StreamAbortEventSchema.parse(events.find((e) => e.type === "stream-abort"));
+    expect(event.metadata?.toolModelUsages?.map((usage) => usage.usage.inputTokens)).toEqual([70]);
+  });
+
   test.each(["commit-err", "commit-throw", "delete-err", "delete-throw"] as const)(
     "abort settles once and retains recovery data on %s",
     async (failure) => {

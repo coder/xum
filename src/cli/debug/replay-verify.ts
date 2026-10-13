@@ -6,6 +6,7 @@ import {
   REPLAY_FIXTURE_DIR,
   REPLAY_FIXTURE_WORKSPACE_ID,
 } from "@/node/services/replay/replayFixture";
+import type { StepPrefixAudit } from "@/node/services/replay/cacheAudit";
 import { collectFullHistory, replayVerifySession } from "@/node/services/replay/replayVerify";
 
 /**
@@ -31,6 +32,27 @@ export function resolveReplaySessionDir(workspaceId: string): {
     sessionDir: path.join(defaultConfig.sessionsDir, workspaceId),
     historyService: new HistoryService(defaultConfig),
   };
+}
+
+/** Print the prefix rule over every recorded step (shared with cache-audit). */
+export function printStepPrefixAudit(audit: StepPrefixAudit): void {
+  console.log(`\n--- Prompt-cache prefix rule over every recorded step ---`);
+  if (audit.auditedSteps === 0) {
+    console.log(
+      "No chat-turn runs in devtools.jsonl: only side calls, or runs recorded by an older " +
+        "binary without requestHistorySequence. Nothing to audit.\n"
+    );
+    return;
+  }
+  for (const found of audit.breaks) {
+    console.log(
+      `PREFIX BREAK  run ${found.runId} step ${found.stepNumber} (${found.boundary} boundary): ` +
+        found.description
+    );
+  }
+  console.log(
+    `${audit.breaks.length} prefix break(s) in ${audit.comparedPairs} consecutive request pair(s)\n`
+  );
 }
 
 /**
@@ -73,6 +95,8 @@ export async function replayVerifyCommand(workspaceId: string): Promise<void> {
       "No verifiable turns found. Replay verification needs turn-envelope rows " +
         "(durable-events.jsonl) AND recorded requests (devtools.jsonl via llmDebugLogs)."
     );
+    // The step audit needs only devtools.jsonl, so older logs without envelopes still get it.
+    printStepPrefixAudit(result.stepPrefix);
     return;
   }
 
@@ -107,7 +131,10 @@ export async function replayVerifyCommand(workspaceId: string): Promise<void> {
 
   const passed = result.turns.filter((turn) => turn.status === "PASS").length;
   const skipped = result.turns.filter((turn) => turn.status === "SKIPPED").length;
-  console.log(`\n${passed} PASS, ${failures} FAIL, ${skipped} SKIPPED\n`);
+  console.log(`\n${passed} PASS, ${failures} FAIL, ${skipped} SKIPPED`);
+  // Breaks are findings, not verification failures: a deliberate system
+  // prompt or toolset change breaks the prefix too, so they do not fail the run.
+  printStepPrefixAudit(result.stepPrefix);
   if (failures > 0) {
     process.exitCode = 1;
   }

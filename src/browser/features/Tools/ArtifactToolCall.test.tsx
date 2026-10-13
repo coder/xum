@@ -10,7 +10,6 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { ChatHostContextProvider } from "@/browser/contexts/ChatHostContext";
 import { CHAT_UI_FEATURE_IDS } from "@/common/constants/chatUiFeatures";
 import { ArtifactToolCall } from "./ArtifactToolCall";
-import { AttachFileToolCall } from "./AttachFileToolCall";
 import { APIProvider } from "@/browser/contexts/API";
 import { OpenAsArtifactButton } from "@/browser/features/RightSidebar/ArtifactsTab/OpenAsArtifactButton";
 import { createTestApiClient, resetTestExperiments, setTestExperiment } from "@/browser/testUtils";
@@ -149,33 +148,7 @@ describe("artifact chat cards", () => {
     expect(opens).toEqual([]);
   });
 
-  test("attach_file offers Open in Artifacts for a registered version", () => {
-    const result = {
-      type: "content",
-      value: [{ type: "text", text: "[File shown to user: report.md]" }],
-      ui_only: { artifact: { id: "art-report", version: 2, path: "report.md" } },
-    };
-    const card = (
-      <AttachFileToolCall
-        toolName="attach_file"
-        args={{ path: "report.md" }}
-        result={result}
-        status="completed"
-        workspaceId={WS}
-      />
-    );
-    const hidden = render(card);
-    // Gated on the artifacts experiment like every other entry point.
-    expect(hidden.queryByRole("button", { name: /Open in Artifacts/ })).toBeNull();
-    hidden.unmount();
-
-    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
-    const view = render(card);
-    fireEvent.click(view.getByRole("button", { name: /Open in Artifacts/ }));
-    expect(opens).toEqual([{ workspaceId: WS, path: "report.md", versionId: 2 }]);
-  });
-
-  test("hosts without an Artifacts surface get no open buttons on attach_file or file cards", () => {
+  test("hosts without an Artifacts surface get no open button on file cards", () => {
     setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
     const uiSupport = Object.fromEntries(
       CHAT_UI_FEATURE_IDS.map((id) => [id, id === "artifactsPanel" ? "unsupported" : "supported"])
@@ -183,22 +156,10 @@ describe("artifact chat cards", () => {
     const view = render(
       <APIProvider client={createTestApiClient({})}>
         <ChatHostContextProvider value={{ uiSupport, actions: {} }}>
-          <AttachFileToolCall
-            toolName="attach_file"
-            args={{ path: "report.md" }}
-            result={{
-              type: "content",
-              value: [{ type: "text", text: "[File shown to user: report.md]" }],
-              ui_only: { artifact: { id: "art-report", version: 2, path: "report.md" } },
-            }}
-            status="completed"
-            workspaceId={WS}
-          />
           <OpenAsArtifactButton workspaceId={WS} path="src/a.ts" />
         </ChatHostContextProvider>
       </APIProvider>
     );
-    expect(view.queryByRole("button", { name: /Open in Artifacts/ })).toBeNull();
     expect(view.queryByRole("button", { name: /as artifact/ })).toBeNull();
   });
 });

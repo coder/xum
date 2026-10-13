@@ -132,6 +132,7 @@ export const SecretsSection: React.FC = () => {
     secretsProjectPath && isProjectSecretsTarget(userProjects, secretsProjectPath)
       ? "project"
       : "global";
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const initialProject = initialScope === "project" ? secretsProjectPath! : "";
 
   const [scope, setScope] = useState<SecretsScope>(initialScope);

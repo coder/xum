@@ -3,6 +3,7 @@ import {
   hostIsQuiet,
   pairDiffs,
   qualifyHostPage,
+  runOnQuietHost,
   seedRewrites,
   serviceWorkerProofFailures,
   usefulContentShown,
@@ -85,4 +86,26 @@ test("a seed check ignores only the token stats cache the app adds to session-us
   expect(check('{"byModel":{"m":{}},"version":1,"tokenStatsCache":{}}')).toEqual([usage]);
   expect(check("{")).toEqual([usage]);
   expect(check(String(seed), [cfg], [usage])).toEqual([cfg, usage]);
+});
+
+test("never holds the lock while the host is busy, and bounds its waits and lock takes", async () => {
+  const events: string[] = [];
+  const withLock = <R>(fn: () => Promise<R>) => {
+    events.push("lock");
+    return fn().finally(() => events.push("unlock"));
+  };
+  const run = async () => void events.push("run");
+  const sleep = async () => void events.push("sleep");
+  // Busy twice, then quiet. Busy again at the probe inside the first hold, then quiet.
+  const probes = [false, false, true, false, true, true];
+  await runOnQuietHost({ isQuiet: () => probes.shift() ?? true, sleep }, withLock, run);
+  expect(events.splice(0)).toEqual(["sleep", "sleep", "lock", "unlock", "lock", "run", "unlock"]);
+  const flips = [true, false, true, false, true, false]; // quiet outside the lock, busy inside it
+  const flipping = { isQuiet: () => flips.shift() ?? false, sleep };
+  await expect(runOnQuietHost(flipping, withLock, run, 3)).rejects.toThrow("every lock take");
+  expect(events.splice(0)).toEqual(["lock", "unlock", "lock", "unlock", "lock", "unlock"]);
+  let busyProbes = 100; // busy for longer than the 60 probes (10 minutes) of one wait
+  const busy = { isQuiet: () => --busyProbes < 0, sleep };
+  await expect(runOnQuietHost(busy, withLock, run)).rejects.toThrow("busy for 10 minutes");
+  expect(events).not.toContain("lock");
 });

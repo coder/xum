@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
+import { refocusFallenFocus } from "@/browser/utils/ui/refocusFallenFocus";
 import {
   Download,
   Maximize2,
@@ -72,8 +73,39 @@ const ARTIFACTS_POLL_MS = 3000;
 interface ReadState {
   /** Identifies what was read (see Selection/readKey), so stale reads are never shown. */
   key: string;
+  /** With `error` set too: a re-read of the same key failed, and this is the last good result. */
   result: ArtifactReadResult | null;
   error: string | null;
+}
+
+interface VersionsState {
+  path: string;
+  list: ArtifactVersionList | null;
+  /** Why listVersions failed; shown instead of a stored version that cannot be resolved. */
+  error: string | null;
+  /**
+   * The list is from before a refresh that failed. It still renders stored versions and keeps
+   * the frame's state key, but its newest version may be outdated, so nothing records it.
+   */
+  stale: boolean;
+}
+
+/**
+ * A failed read. A re-read of the same key (Reload aside, the content is unchanged) keeps the
+ * result already shown: a request that fails right after a reconnect must not swap a live
+ * artifact for an error and then remount it once a retry succeeds.
+ */
+function keepReadResult(prev: ReadState | null, key: string, error: string): ReadState {
+  return prev?.key === key && prev.result != null
+    ? { key, result: prev.result, error }
+    : { key, result: null, error };
+}
+
+/** A failed listVersions keeps the list it already had for the path (see keepReadResult). */
+function keepVersionList(prev: VersionsState | null, path: string, error: string): VersionsState {
+  return prev?.path === path && prev.list != null
+    ? { path, list: prev.list, error: null, stale: true }
+    : { path, list: null, error, stale: false };
 }
 
 /**
@@ -104,8 +136,8 @@ function parsePickerValue(value: string): { scope: ArtifactSelectionScope; path:
 const OTHER_FILES_TOGGLE_VALUE = "toggle-other-files";
 
 /**
- * Splits the live files for the picker: files with stored versions (published, snapshotted at
- * turn end, or attached) lead, and the rest go under a collapsed "Other files" group. Agents
+ * Splits the live files for the picker: files with stored versions (published with the artifact
+ * tool) lead, and the rest go under a collapsed "Other files" group. Agents
  * keep supporting files (for example screenshots that a published HTML artifact references) in
  * the same folder, and a flat newest-first list buried the file they published. Returns null
  * when only one kind exists: the picker then stays a flat list, so a folder with no stored
@@ -266,8 +298,11 @@ export function ArtifactsPanel(props: {
   const [reloadTick, setReloadTick] = useState(0);
   const [readState, setReadState] = useState<ReadState | null>(null);
   // Whether the latest preview read failed: the next successful re-list (poll or file event)
-  // retries it, so a transient error does not stick until the selection changes.
+  // retries it, so a transient error does not stick until the selection changes. The retry
+  // re-reads through retryTick, not reloadTick: reloadTick remounts the viewer, and a read that
+  // failed right after a reconnect still has the last good content on screen.
   const readFailedRef = useRef(false);
+  const [retryTick, setRetryTick] = useState(0);
   // path -> modifiedMs the user has seen. Seeded with the first listing so only changes made
   // while the tab is open get a dot.
   const [seen, setSeen] = useState<ReadonlyMap<string, number> | null>(null);
@@ -306,12 +341,7 @@ export function ArtifactsPanel(props: {
   const listInFlightRef = useRef(false);
   const [pinned, setPinned] = useState<PinnedArtifactFiles | null>(null);
   const [shelf, setShelf] = useState<ArtifactShelfListing | null>(null);
-  const [versionsState, setVersionsState] = useState<{
-    path: string;
-    list: ArtifactVersionList | null;
-    /** Why listVersions failed; shown instead of a stored version that cannot be resolved. */
-    error: string | null;
-  } | null>(null);
+  const [versionsState, setVersionsState] = useState<VersionsState | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   // The "Other files" picker group (groupArtifactEntries). Not persisted: it starts collapsed.
   const [otherFilesExpanded, setOtherFilesExpanded] = useState(false);
@@ -354,7 +384,7 @@ export function ArtifactsPanel(props: {
         setListing(result.data);
         if (readFailedRef.current) {
           readFailedRef.current = false;
-          setReloadTick((tick) => tick + 1);
+          setRetryTick((tick) => tick + 1);
         }
         const entries = result.data.available ? result.data.entries : [];
         setSeen((prev) => prev ?? new Map(entries.map((e) => [e.path, e.modifiedMs])));
@@ -382,7 +412,11 @@ export function ArtifactsPanel(props: {
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
-        setPinned({ available: false, reason: getErrorMessage(error) });
+        // A request that fails in transit (a backend still starting after a reconnect) keeps
+        // the files already listed, so a selected pinned file stays on screen.
+        setPinned((prev) =>
+          prev?.available === true ? prev : { available: false, reason: getErrorMessage(error) }
+        );
       });
     return () => controller.abort();
   }, [api, props.workspaceId, refreshTick]);
@@ -400,8 +434,9 @@ export function ArtifactsPanel(props: {
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
-        // A failed shelf listing hides the group; the rest of the tab keeps working.
-        setShelf(null);
+        // A failed first shelf listing hides the group; the rest of the tab keeps working. A
+        // later failure (in transit, e.g. after a reconnect) keeps the entries already listed,
+        // so a selected shelf copy stays on screen: nothing to set.
       });
     return () => controller.abort();
   }, [api, props.workspaceId, refreshTick]);
@@ -413,15 +448,19 @@ export function ArtifactsPanel(props: {
     }, props.workspaceId);
   }, [props.workspaceId]);
 
-  // Writes by scripts or other tools emit no event, so poll while the window is visible.
+  // Writes by scripts or other tools emit no event, so poll while the window is visible. Not
+  // while Xum reconnects: each poll re-reads canvas data files, and those reads wait for the
+  // connection (useArtifactAssetReader), so ticks during an outage would only pile them up.
+  const online = api != null;
   useEffect(() => {
+    if (!online) return;
     const interval = window.setInterval(() => {
       if (document.visibilityState === "visible" && !listInFlightRef.current) {
         setRefreshTick((tick) => tick + 1);
       }
     }, ARTIFACTS_POLL_MS);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [online]);
 
   const entries: ArtifactEntry[] = listing?.available === true ? listing.entries : [];
   const pinnedFiles: PinnedArtifactFile[] = pinned?.available === true ? pinned.files : [];
@@ -463,8 +502,8 @@ export function ArtifactsPanel(props: {
   const selectedArtifactPath = selected?.scope === "artifact" ? selected.path : null;
   const selectedVersionForFetch = selected?.scope === "artifact" ? selected.version : null;
 
-  // Versions of the selected artifact, refetched on every refresh: a publish or turn-end
-  // snapshot adds a version without changing the working file.
+  // Versions of the selected artifact, refetched on every refresh: a publish of unchanged bytes
+  // can still change a version's kind, and another backend can publish.
   useEffect(() => {
     if (!api || selectedArtifactPath == null) return;
     const path = selectedArtifactPath;
@@ -473,15 +512,15 @@ export function ArtifactsPanel(props: {
       .listVersions({ workspaceId: props.workspaceId, path }, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
-        setVersionsState(
-          result.success
-            ? { path, list: result.data, error: null }
-            : { path, list: null, error: result.error }
-        );
+        if (result.success) {
+          setVersionsState({ path, list: result.data, error: null, stale: false });
+        } else {
+          setVersionsState((prev) => keepVersionList(prev, path, result.error));
+        }
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
-        setVersionsState({ path, list: null, error: getErrorMessage(error) });
+        setVersionsState((prev) => keepVersionList(prev, path, getErrorMessage(error)));
       });
     return () => controller.abort();
   }, [api, props.workspaceId, selectedArtifactPath, selectedVersionForFetch, refreshTick]);
@@ -489,6 +528,12 @@ export function ArtifactsPanel(props: {
   const versionList =
     selected?.scope === "artifact" && versionsState?.path === selected.path
       ? versionsState.list
+      : null;
+  // The newest stored version, for actions that record a version (Send, annotations, Pin to
+  // Shelf). Null while the list is stale: Send then resolves the version on the server.
+  const latestKnownVersion =
+    selected?.scope === "artifact" && versionsState?.path === selected.path && !versionsState.stale
+      ? (versionList?.versions[0]?.version ?? null)
       : null;
   const versionListError =
     selected?.scope === "artifact" && versionsState?.path === selected.path
@@ -576,18 +621,18 @@ export function ArtifactsPanel(props: {
           }
         } else {
           readFailedRef.current = true;
-          setReadState({ key: request.key, result: null, error: result.error });
+          setReadState((prev) => keepReadResult(prev, request.key, result.error));
         }
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
         readFailedRef.current = true;
-        setReadState({ key: request.key, result: null, error: getErrorMessage(error) });
+        setReadState((prev) => keepReadResult(prev, request.key, getErrorMessage(error)));
       });
     return () => controller.abort();
     // readKey identifies the request (scope, path, mtime or version): re-read when it changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, props.workspaceId, readKey, reloadTick]);
+  }, [api, props.workspaceId, readKey, reloadTick, retryTick]);
 
   // Nothing left to show: close fullscreen so it cannot pop back when a file reappears.
   if (fullscreen && selected == null && listing != null && !waitingForPinned) {
@@ -621,14 +666,7 @@ export function ArtifactsPanel(props: {
     // The dialog's focus scope also caught focus that fell out with a removed node: a poll that
     // swaps the viewer for a new version, or a closing comment box. Focus then sat on <body>, so
     // J/K and Escape missed the panel (Escape could even reach Escape-to-interrupt). Do the same.
-    // Watch all of <body>, not just the panel: a portaled menu outside it can take focus away
-    // too, and watching only the panel restored focus at its next change (#5715).
-    const observer = new MutationObserver(() => {
-      if (document.activeElement == null || document.activeElement === document.body) {
-        panel.focus();
-      }
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
+    const stopRefocus = refocusFallenFocus(panel);
     // A hidden ancestor hides the pinned panel too (the phone sidebar, hidden again after its
     // full-screen view closed on a rotation), which would leave the rest of the app inert
     // behind nothing. Leave fullscreen once the panel has no box.
@@ -641,7 +679,7 @@ export function ArtifactsPanel(props: {
     sizeObserver.observe(panel);
     return () => {
       sizeObserver.disconnect();
-      observer.disconnect();
+      stopRefocus();
       restore();
       // Back to the opener when it is still a control of this panel, else to the panel, so J/K
       // keep working without another click: keys from the panel's controls bubble to it. Not to
@@ -749,7 +787,7 @@ export function ArtifactsPanel(props: {
   // following the live file) to the shelf.
   const pinToShelf = (scope: ArtifactShelfScope) => {
     if (!api || selected?.scope !== "artifact" || versionList == null) return;
-    const version = selected.version ?? versionList.versions[0]?.version;
+    const version = selected.version ?? latestKnownVersion;
     if (version == null) return;
     api.artifacts
       .pinToShelf({
@@ -776,7 +814,7 @@ export function ArtifactsPanel(props: {
   // before the list arrives that version is unknown.
   const annotationVersionKnown =
     selected?.scope === "artifact" &&
-    (selected.version != null || versionsState?.path === selected.path);
+    (selected.version != null || (versionsState?.path === selected.path && !versionsState.stale));
   const annotateResult =
     selectedApp == null &&
     selected?.scope === "artifact" &&
@@ -790,9 +828,7 @@ export function ArtifactsPanel(props: {
     annotateResult == null ? null : getArtifactAnnotationSupport(annotateResult.kind);
   const annotating = annotateMode && annotateSupport != null;
   const annotationVersion =
-    selected?.scope === "artifact"
-      ? (selected.version ?? versionList?.versions[0]?.version ?? 0)
-      : 0;
+    selected?.scope === "artifact" ? (selected.version ?? latestKnownVersion ?? 0) : 0;
   const pickKey = readKey ?? "";
   const pendingPick = annotating && annotationPick?.key === pickKey ? annotationPick.pick : null;
   const openAnnotation = (pick: ArtifactAnnotationPick) =>
@@ -923,6 +959,8 @@ export function ArtifactsPanel(props: {
           path: selected.path,
           version: selected.version,
           latestVersion: versionList?.versions[0]?.version ?? null,
+          latestVersionStale: versionsState?.stale === true,
+          reloadTick,
         }
       : null
   );
@@ -1373,7 +1411,14 @@ export function ArtifactsPanel(props: {
         <div className="min-h-0 flex-1 overflow-auto">{viewerBody}</div>
       </>
     );
-  } else if (listError != null && !storedVersionSelected) {
+  } else if (
+    listError != null &&
+    (listing == null || (selected == null && !waitingForPinned)) &&
+    !storedVersionSelected
+  ) {
+    // Only with nothing on screen: a failed re-list (a backend still starting after a reconnect)
+    // keeps the last listing, and the error line below sits beside the artifact instead. With
+    // nothing selected, "No artifacts yet" would present the failed refresh as an empty folder.
     body = withAppPicker(<div className="text-danger p-4 text-xs">{listError}</div>);
   } else if (listing == null && !storedVersionSelected) {
     body = withAppPicker(<div className="text-muted p-4 text-xs">Loading…</div>);
@@ -1402,6 +1447,11 @@ export function ArtifactsPanel(props: {
         {listError != null && (
           <div className="text-danger border-border-light border-b px-3 py-1 text-[11px]">
             {listError}
+          </div>
+        )}
+        {currentRead?.result != null && currentRead.error != null && (
+          <div className="text-danger border-border-light border-b px-3 py-1 text-[11px]">
+            {currentRead.error}
           </div>
         )}
         {listing?.available === true && listing.truncated && (

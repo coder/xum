@@ -200,7 +200,8 @@ export const UserMessage: React.FC<UserMessageProps> = ({
           {
             label: "Previous message",
             onClick: hasPrev
-              ? () => navigation.onNavigate(navigation.prevUserMessageId!)
+              ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+                () => navigation.onNavigate(navigation.prevUserMessageId!)
               : undefined,
             disabled: !hasPrev,
             icon: <ChevronLeft className={!hasPrev ? "opacity-30" : undefined} />,
@@ -214,7 +215,8 @@ export const UserMessage: React.FC<UserMessageProps> = ({
           {
             label: "Next message",
             onClick: hasNext
-              ? () => navigation.onNavigate(navigation.nextUserMessageId!)
+              ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+                () => navigation.onNavigate(navigation.nextUserMessageId!)
               : undefined,
             disabled: !hasNext,
             icon: <ChevronRight className={!hasNext ? "opacity-30" : undefined} />,

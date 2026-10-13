@@ -1,6 +1,16 @@
 import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { flushSync } from "react-dom";
-import { AppWindow, BarChart3, Bell, BellOff, Ellipsis, Info, Menu, Pencil } from "lucide-react";
+import {
+  AppWindow,
+  BarChart3,
+  Bell,
+  BellOff,
+  Ellipsis,
+  Info,
+  Menu,
+  PanelRightOpen,
+  Pencil,
+} from "lucide-react";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { cn } from "@/common/lib/utils";
@@ -73,7 +83,7 @@ import {
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
 import type { TabType } from "@/browser/types/rightSidebar";
-import { useAgentSkills } from "@/browser/stores/AgentSkillsStore";
+import { useAgentSkills, useAgentSkillsLoaded } from "@/browser/stores/AgentSkillsStore";
 
 interface WorkspaceMenuBarProps {
   workspaceId: string;
@@ -187,6 +197,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   }
   const unrelatedMessagingModalOpen = unrelatedMessagingWorkspaceId === workspaceId;
   const skillList = useAgentSkills({ workspaceId, disableWorkspaceAgents: false });
+  const skillListLoaded = useAgentSkillsLoaded({ workspaceId, disableWorkspaceAgents: false });
   const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuBarRef = useRef<HTMLDivElement | null>(null);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
@@ -734,7 +745,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       className={cn(
         "bg-sidebar border-border-light flex items-center justify-between border-b px-2",
         isDesktop ? DESKTOP_TITLEBAR_HEIGHT_CLASS : "h-8",
-        rightSidebarCollapsed && "titlebar-safe-right-minus-sidebar titlebar-safe-right-gutter-2",
+        // A collapsed right sidebar floats below the header, so the header reaches the window's
+        // right edge and must clear the titlebar overlay controls itself.
+        rightSidebarCollapsed && "titlebar-safe-right titlebar-safe-right-gutter-2",
         // In desktop mode, make header draggable for window movement
         isDesktop && "titlebar-drag",
         // Keep header visible when iOS keyboard opens and causes scroll
@@ -930,6 +943,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           invalidSkills={skillList.invalidSkills}
           unavailableSources={skillList.unavailableSources}
           skillLoadErrors={skillLoadErrors}
+          loading={!skillListLoaded}
         />
         {editorError && <span className="text-danger-soft text-xs">{editorError}</span>}
         <div className="max-[480px]:hidden">
@@ -1015,6 +1029,33 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         )}
       </div>
       {!isPhoneHeader && moreActionsMenu}
+      {rightSidebarCollapsed && !isPhoneHeader && (
+        // Stands in for the collapsed sidebar's overview card where the card does not fit beside
+        // the transcript: globals.css shows exactly one of the two.
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() =>
+                window.dispatchEvent(
+                  createCustomEvent(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, { workspaceId })
+                )
+              }
+              aria-label="Expand right sidebar"
+              className={cn(
+                "right-sidebar-overview-expand text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0",
+                isDesktop && "titlebar-no-drag"
+              )}
+            >
+              <PanelRightOpen className="h-3.5 w-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" align="end">
+            Expand right sidebar
+          </TooltipContent>
+        </Tooltip>
+      )}
       <WorkspaceHeartbeatModal
         workspaceId={workspaceId}
         open={heartbeatModalOpen}
