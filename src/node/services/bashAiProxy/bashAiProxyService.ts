@@ -219,6 +219,23 @@ const BLOCK_REASON_TEXT: Record<BashAiProxyBlockReason, string> = {
   kill_switch: "XUM_DISABLE_PROJECT_AUTOMATION=1 is set",
 };
 
+/**
+ * The host vars of `route` that a bash command gets next to a provider key from secrets: the
+ * ones the Xum process env sets and the secrets do not replace.
+ */
+function hostNamesMixedWithSecretKey(
+  route: ProxyRoute,
+  runtime: RuntimeMode,
+  secretKeys: readonly string[]
+): string[] {
+  // SSH, Coder, Docker and devcontainer commands get the env of another machine or container.
+  if (runtime !== "local" && runtime !== "worktree") return [];
+  if (!secretKeys.includes(route.secretKeyName)) return [];
+  return route.hostRouteNames.filter(
+    (name) => !secretKeys.includes(name) && (process.env[name]?.trim() ?? "") !== ""
+  );
+}
+
 type RequestInitWithDispatcher = RequestInit & { dispatcher?: Dispatcher };
 
 // Same outbound behavior as chat requests (providerModelFactory): honor HTTP(S)_PROXY and never
@@ -284,13 +301,7 @@ export class BashAiProxyService {
     // Decide the routes first: an SSH forward costs a connection and up to 10 s on a first turn,
     // so a workspace that would get no variables never opens one.
     const routes = ROUTES.filter((route) => {
-      const secretName = route.envNames.find((name) => secretKeys.includes(name));
-      const skipReason =
-        secretName !== undefined
-          ? `a secret sets ${secretName}`
-          : this.upstreamFor(route) === undefined // nothing to pay with
-            ? "Xum has no API key for it, or it is disabled"
-            : undefined;
+      const skipReason = this.skipReasonFor(route, secretKeys);
       this.noteSkip(workspaceId, route.provider, skipReason);
       return skipReason === undefined;
     });
@@ -314,6 +325,16 @@ export class BashAiProxyService {
     for (const route of ROUTES) {
       this.noteSkip(workspaceId, route.provider, BLOCK_REASON_TEXT[reason]);
     }
+  }
+
+  /** Why envFor() gives a provider no variables, or undefined when it gets them. */
+  private skipReasonFor(route: ProxyRoute, secretKeys: readonly string[]): string | undefined {
+    // A secret comes first: it is the reason to fix even when Xum also has no key.
+    const secretName = route.envNames.find((name) => secretKeys.includes(name));
+    if (secretName !== undefined) return `a secret sets ${secretName}`;
+    if (this.upstreamFor(route) === undefined)
+      return "Xum has no API key for it, or it is disabled";
+    return undefined;
   }
 
   /**
@@ -347,16 +368,9 @@ export class BashAiProxyService {
     runtime: RuntimeMode,
     secretKeys: readonly string[]
   ): void {
-    // SSH, Coder, Docker and devcontainer commands get the env of another machine or container.
-    const inheritsHostEnv = runtime === "local" || runtime === "worktree";
     for (const route of ROUTES) {
       const key = `${workspaceId}\0${route.provider}`;
-      const hostNames =
-        inheritsHostEnv && secretKeys.includes(route.secretKeyName)
-          ? route.hostRouteNames.filter(
-              (name) => !secretKeys.includes(name) && (process.env[name]?.trim() ?? "") !== ""
-            )
-          : [];
+      const hostNames = hostNamesMixedWithSecretKey(route, runtime, secretKeys);
       if (hostNames.length === 0) {
         this.warnedMixes.delete(key);
         continue;
