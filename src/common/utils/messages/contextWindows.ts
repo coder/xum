@@ -4,6 +4,7 @@ import { isDurableContextBoundaryMarker } from "./compactionBoundary";
 
 export function getHistoryItemId(message: MuxMessage): string {
   const sequence = message.metadata?.historySequence;
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   return Number.isSafeInteger(sequence) && sequence! >= 0 ? String(sequence) : `m:${message.id}`;
 }
 /** Rows session_history never returns, so no prompt may advertise their item IDs. */

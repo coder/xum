@@ -1,7 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { useTheme } from "@/browser/contexts/ThemeContext";
+import {
+  toWorkspaceSelection,
+  useOptionalWorkspaceMetadata,
+  useWorkspaceActionsOptional,
+} from "@/browser/contexts/WorkspaceContext";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { useAppConfig, useUserPreferences } from "@/browser/stores/AppConfigStore";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { isWorkspaceArchived } from "@/common/utils/archive";
+import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createArtifactAssetLoader } from "./artifactAssets";
 import {
@@ -45,6 +53,39 @@ interface BuiltDocument {
   error: string | null;
 }
 
+/**
+ * SECURITY AUDIT: gate for `window.xum.openWorkspace`. The artifact's script can post it at any
+ * time, so the host honours it only while the user's own click or key press inside `frame` is
+ * live: focus is on the iframe (a click or Tab into a frame moves the app's activeElement to it,
+ * and a hidden frame cannot hold focus), and the app has transient user activation (a gesture
+ * in a child frame also activates its ancestors). Each check alone is not enough: typing in the
+ * composer also activates the app, and focus stays on the frame long after the click.
+ * No confirm strip: a switch sends nothing and reveals nothing to the frame, the user can switch
+ * back, and the right sidebar is keyed by workspace, so the switch unmounts this frame.
+ */
+function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
+  const activation = (navigator as Navigator & { userActivation?: { isActive?: boolean } })
+    .userActivation;
+  return frame != null && document.activeElement === frame && activation?.isActive === true;
+}
+
+/**
+ * The workspace an artifact names: a workspace ID (sub-agent task IDs are workspace IDs), or a
+ * workspace-turn task handle (`wst_...`), which tags the workspace it created, as the task
+ * tool's Open resolves it (TaskToolCall.tsx).
+ */
+function findArtifactWorkspace(
+  workspaces: ReadonlyMap<string, FrontendWorkspaceMetadata> | undefined,
+  id: string
+): FrontendWorkspaceMetadata | undefined {
+  const direct = workspaces?.get(id);
+  if (direct != null) return direct;
+  for (const metadata of workspaces?.values() ?? []) {
+    if (metadata.tags?.[WORKSPACE_TURN_TASK_TAGS.handle] === id) return metadata;
+  }
+  return undefined;
+}
+
 /** Denied until the saved preferences load, so a user who turned CDN scripts off never runs one. */
 export function useArtifactsAllowCdnScripts(): boolean {
   const loaded = useAppConfig((config) => config.userPreferences !== undefined);
@@ -78,6 +119,11 @@ export function SandboxedArtifactFrame(props: {
   const [initialTheme] = useState(theme);
   const [allowMessage] = useState(() => createBridgeRateLimiter());
   const [built, setBuilt] = useState<BuiltDocument | null>(null);
+  // openWorkspace targets: the app's active workspaces (archived ones are not in the map).
+  // Optional contexts: hosts without the workspace shell (the VS Code webview) open nothing.
+  const workspaces = useOptionalWorkspaceMetadata()?.workspaceMetadata;
+  const setSelectedWorkspace = useWorkspaceActionsOptional()?.setSelectedWorkspace;
+  const [openWorkspaceRefused, setOpenWorkspaceRefused] = useState(false);
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const { kind, content, path } = props;
   // SECURITY AUDIT: the persisted state goes into the srcdoc, never through postMessage (which
@@ -142,6 +188,25 @@ export function SandboxedArtifactFrame(props: {
         case "setState":
           interactions?.setState?.(message.state);
           break;
+        case "openWorkspace": {
+          // Like send/setState, only for interactive artifacts: pinned checkout files and shelf
+          // copies stay read-only. Ignored without a gesture, with no notice, so a script cannot
+          // spam the notice either.
+          if (interactions == null || !hasLiveUserGesture(frameRef.current)) break;
+          const target = findArtifactWorkspace(workspaces, message.workspaceId);
+          if (
+            target == null ||
+            setSelectedWorkspace == null ||
+            isWorkspaceArchived(target.archivedAt, target.unarchivedAt)
+          ) {
+            setOpenWorkspaceRefused(true);
+            break;
+          }
+          setOpenWorkspaceRefused(false);
+          // The same navigation the sidebar and the task tool's Open use.
+          setSelectedWorkspace(toWorkspaceSelection(target));
+          break;
+        }
         case "annotate": {
           // Only honoured while annotate mode is on, whatever the frame claims.
           const frame = frameRef.current;
@@ -153,7 +218,15 @@ export function SandboxedArtifactFrame(props: {
     };
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
-  }, [allowMessage, onFrameKey, interactions, onAnnotate, navigatedRef]);
+  }, [
+    allowMessage,
+    onFrameKey,
+    interactions,
+    onAnnotate,
+    navigatedRef,
+    workspaces,
+    setSelectedWorkspace,
+  ]);
 
   const annotating = onAnnotate != null;
   useEffect(() => {
@@ -184,6 +257,15 @@ export function SandboxedArtifactFrame(props: {
             </li>
           ))}
         </ul>
+      )}
+      {openWorkspaceRefused && (
+        <div
+          role="status"
+          className="text-muted border-border-light shrink-0 border-b px-3 py-1.5 text-[11px]"
+          data-testid="artifact-open-workspace-notice"
+        >
+          This artifact tried to open a workspace that is not available.
+        </div>
       )}
       {/* SECURITY AUDIT: agent-written HTML/SVG sink. sandbox stays exactly
           ARTIFACT_IFRAME_SANDBOX (opaque origin, scripts only), srcdoc always carries the CSP

@@ -929,6 +929,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         // bash getProcess/getOutput reads) run outside its internal try/catch and could reject.
         // Convert any stray rejection into an `error` result so the task still counts as settled —
         // otherwise the gate below could never reach `wantCount` or "all settled" and would stall.
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const promise = awaitOne(taskId, taskControllers.get(taskId)!.signal).catch(
           (error: unknown): Awaited<ReturnType<typeof awaitOne>> => ({
             status: "error",
@@ -981,6 +982,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       // those to land so every awaited task has a result before assembling the ordered array.
       await Promise.all(taskPromises);
 
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const results = uniqueTaskIds.map((taskId) => resultsByTaskId.get(taskId)!);
 
       return parseToolResult(TaskAwaitToolResultSchema, { results }, "task_await");

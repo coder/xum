@@ -22,7 +22,12 @@ export type AgentPeerMessageAdmissionError =
   | { code: "rate_limited"; retryAfterMs?: number };
 
 /** Routing relations that take the untrusted envelope path (everything except parent→child). */
-export type PeerPathRelation = "target_ancestor" | "peer" | "target_unrelated";
+export type PeerPathRelation =
+  | "target_ancestor"
+  | "peer"
+  | "target_unrelated"
+  | "target_main_chat"
+  | "target_side_chat";
 
 /**
  * Routing relation (sender-centric) → envelope relationship (what the recipient reads about the
@@ -33,6 +38,8 @@ const PEER_PATH_RELATIONSHIPS: Record<PeerPathRelation, AgentMessageRelationship
   target_ancestor: "descendant",
   peer: "sibling",
   target_unrelated: "unrelated",
+  target_main_chat: "side_chat",
+  target_side_chat: "main_chat",
 };
 
 export class AgentPeerMessageBroker {

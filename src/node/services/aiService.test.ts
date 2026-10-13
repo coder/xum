@@ -625,6 +625,12 @@ describe("AIService side-chat tool ceiling", () => {
             allTools: {
               file_read: readTool,
               models_list: readTool,
+              task_list: readTool,
+              task_send_message: readTool,
+              task: mutatingTool,
+              task_stop: mutatingTool,
+              task_remove: mutatingTool,
+              task_retitle: mutatingTool,
               bash: mutatingTool,
               native_search: nativeTool,
             },
@@ -640,6 +646,8 @@ describe("AIService side-chat tool ceiling", () => {
           harness.service.turnRequestBuilderBindings.extraTools = {
             // Grants alone cannot distinguish a safe built-in from a same-name replacement.
             file_read: mutatingTool,
+            task_list: mutatingTool,
+            task_send_message: mutatingTool,
             extra_mutation: mutatingTool,
             code_execution: mutatingTool,
           };
@@ -709,7 +717,12 @@ describe("AIService side-chat tool ceiling", () => {
           for (const request of [started, fallback.data]) {
             const tools = request.tools ?? {};
             if (sideChat) {
-              expect(Object.keys(tools).sort()).toEqual(["file_read", "models_list"]);
+              expect(Object.keys(tools).sort()).toEqual([
+                "file_read",
+                "models_list",
+                "task_list",
+                "task_send_message",
+              ]);
               expect(started.toolSearchState).toBeUndefined();
               expect(buildRequiredToolPatterns(started.toolPolicy)).toHaveLength(0);
             } else {
@@ -725,10 +738,13 @@ describe("AIService side-chat tool ceiling", () => {
             expect(listServers).not.toHaveBeenCalled();
             expect(getToolsForWorkspace).not.toHaveBeenCalled();
             expect(beforeHook.every((names) => !names.includes("code_execution"))).toBe(true);
-            const execute = started.tools?.file_read?.execute;
-            if (!execute) throw new Error("Expected granted local read tool");
-            await execute({}, { toolCallId: "read", messages: [], context: undefined });
-            expect(read).toHaveBeenCalledTimes(1);
+            for (const name of ["file_read", "task_list", "task_send_message"]) {
+              const execute = started.tools?.[name]?.execute;
+              if (!execute) throw new Error(`Expected granted built-in tool: ${name}`);
+              await execute({}, { toolCallId: name, messages: [], context: undefined });
+            }
+            // Same-name extra tools must not replace the trusted built-in messaging tools either.
+            expect(read).toHaveBeenCalledTimes(3);
           } else {
             expect(getToolsForWorkspace).toHaveBeenCalledTimes(1);
             expect(beforeHook.every((names) => names.includes("code_execution"))).toBe(true);
@@ -793,15 +809,19 @@ describe("AIService turn engine events", () => {
     /** Message id of a turn whose DevTools run metadata AIService is tracking. */
     trackedMessageId: string;
     clearPendingRunMetadataSpy: ReturnType<typeof mock>;
+    setPendingRunMetadataSpy: ReturnType<typeof mock>;
     [Symbol.dispose]: () => void;
   }> {
     const xumHome = new DisposableTempDir(tempDirName);
     const clearPendingRunMetadataSpy = mock(
       (_workspaceId: string, _metadataId?: string) => undefined
     );
+    const setPendingRunMetadataSpy = mock(
+      (_workspaceId: string, _metadataId: string, _metadata: unknown) => undefined
+    );
     const devToolsService = {
       enabled: true,
-      setPendingRunMetadata: mock(() => undefined),
+      setPendingRunMetadata: setPendingRunMetadataSpy,
       clearPendingRunMetadata: clearPendingRunMetadataSpy,
     } as unknown as DevToolsService;
     let setEventSinkSpy: ReturnType<typeof spyOn<StreamManager, "setEventSink">> | undefined;
@@ -845,6 +865,7 @@ describe("AIService turn engine events", () => {
       emitEngineEvent: sink,
       trackedMessageId,
       clearPendingRunMetadataSpy,
+      setPendingRunMetadataSpy,
       [Symbol.dispose]: () => xumHome[Symbol.dispose](),
     };
   }
@@ -861,6 +882,16 @@ describe("AIService turn engine events", () => {
 
   afterEach(() => {
     mock.restore();
+  });
+
+  it("queues the context epoch the prompt-cache monitor uses with the run metadata", async () => {
+    using harness = await createForwardingHarness("ai-service-context-epoch-run-metadata");
+    // The replay step audit resets its baseline when this changes (`/clear`, "start here").
+    expect(harness.setPendingRunMetadataSpy).toHaveBeenCalledWith(
+      workspaceId,
+      "stream-token",
+      expect.objectContaining({ contextEpoch: "user-message" })
+    );
   });
 
   it("forwards stream-abort without mutating a workspace partial", async () => {

@@ -1448,6 +1448,40 @@ describe("AgentPluginInstallService", () => {
     expect(preview.warnings.some((warning) => warning.includes("skills/escaping"))).toBe(true);
   });
 
+  test("a hooks.js or skill symlinked into the staged clone's .git is refused (#6161)", async () => {
+    // The staged clone keeps .git, whose config can carry the remote's credentials; a link
+    // into it passes plain realpath containment.
+    await fsPromises.symlink(".git/config", path.join(remoteDir, "hooks.js"));
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "leak"));
+    await fsPromises.symlink(
+      "../../.git/config",
+      path.join(remoteDir, "skills", "leak", "SKILL.md")
+    );
+    // A root file whose name only starts with ".git" is ordinary plugin content.
+    await fsPromises.writeFile(path.join(remoteDir, ".gitignore"), "node_modules\n");
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "ignored"));
+    await fsPromises.symlink(
+      "../../.gitignore",
+      path.join(remoteDir, "skills", "ignored", "notes.txt")
+    );
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "ignored", "SKILL.md"),
+      "---\nname: ignored\ndescription: Links a root .gitignore\n---\n\nBody.\n"
+    );
+    await commitAll(remoteDir, "links into .git");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.hook).toBeUndefined();
+    expect(preview.skills.map((skill) => skill.name)).toEqual(["greet", "ignored"]);
+    const warnings = preview.warnings.join("\n");
+    expect(warnings).toContain("hooks.js");
+    expect(warnings).toContain(".git directory");
+    // The skill scan refuses the link by the .git rule itself, not only by a failed parse.
+    expect(warnings).toContain("skills/leak: resolves into the plugin's .git directory");
+    // Nothing of the git config reaches the preview.
+    expect(JSON.stringify(preview)).not.toContain("repositoryformatversion");
+  });
+
   test("consent preview discloses executable hooks with their tool grants", async () => {
     // hooks.js loads automatically after install and can rewrite/block tool
     // calls — consent must surface it (with the grants the runtime honors).

@@ -14,8 +14,8 @@ import {
 import { expect, within, userEvent, waitFor } from "@storybook/test";
 import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
-// Tailwind's `max-w-4xl` in px, the cap the centered transcript and composer columns share.
-const CENTERED_COLUMN_MAX_WIDTH_PX = 896;
+// `max-w-chat` (--container-chat: 48rem) in px, the cap the centered transcript and composer columns share.
+const CENTERED_COLUMN_MAX_WIDTH_PX = 768;
 
 const meta = { ...appMeta, title: "App/Chat/Input" };
 export default meta;
@@ -1065,7 +1065,7 @@ async function assertDockSurfacesMatchTranscript(
     const column = transcript.getBoundingClientRect();
     const available = scrollport.clientWidth;
     if (expectation === "full-width") {
-      // Docked surfaces used to hardcode the same 4xl cap the centered column uses, so below that
+      // Docked surfaces used to hardcode the same cap the centered column uses, so below that
       // width they line up regardless and the regression would pass unnoticed.
       if (column.width <= CENTERED_COLUMN_MAX_WIDTH_PX) {
         throw new Error(
