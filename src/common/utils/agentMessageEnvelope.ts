@@ -17,6 +17,7 @@ const AGENT_MESSAGE_RELATIONSHIPS = [
   "unrelated",
   "main_chat",
   "side_chat",
+  "tagged",
 ] as const;
 export type AgentMessageRelationship = (typeof AGENT_MESSAGE_RELATIONSHIPS)[number];
 const AGENT_MESSAGE_RELATIONSHIP_SET = new Set<unknown>(AGENT_MESSAGE_RELATIONSHIPS);

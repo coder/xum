@@ -20,12 +20,13 @@ const TARGET_RELATION_LABELS: Record<
   target_unrelated: "unrelated",
   target_main_chat: "main_chat",
   target_side_chat: "side_chat",
+  target_tagged: "tagged",
 };
 
 /** Routing relation → the target's relation to the sender, as shown in tool results. */
 function targetRelationLabel(
   relation: AgentTreeTargetRelation
-): "descendant" | "ancestor" | "sibling" | "unrelated" | "main_chat" | "side_chat" {
+): "descendant" | "ancestor" | "sibling" | "unrelated" | "main_chat" | "side_chat" | "tagged" {
   return TARGET_RELATION_LABELS[relation];
 }
 

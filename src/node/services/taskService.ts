@@ -3,6 +3,7 @@ import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoo
 import { randomUUID } from "node:crypto";
 import {
   getValidAgentMessageDispatchMode,
+  getValidMessagingTag,
   getValidUnrelatedWorkspaceConsent,
 } from "@/common/orpc/schemas/workspace";
 import { isPlainObject } from "@/common/utils/isPlainObject";
@@ -1044,6 +1045,7 @@ export type AgentTreeTargetRelation =
   | "peer"
   | "target_main_chat"
   | "target_side_chat"
+  | "target_tagged"
   | "target_unrelated";
 
 export type SendAgentTreeMessageError = SendAgentTaskMessageError | AgentPeerMessageAdmissionError;
@@ -1143,11 +1145,11 @@ export interface TaskTreeAgentsResult {
    */
   callerPeerMessagingRestricted?: true;
   tasks: TreeAgentTaskInfo[];
-  /** Direct chat links only; these grant no task ancestry or lifecycle authority. */
+  /** Direct chat links and shared-@tag links; neither grants task ancestry or lifecycle authority. */
   relatedChats?: Array<{
     workspaceId: string;
     title?: string;
-    relationship: "main_chat" | "side_chat";
+    relationship: "main_chat" | "side_chat" | "tagged";
   }>;
 }
 
@@ -10966,8 +10968,8 @@ export class TaskService implements AgentTaskIntegration {
           admissionRefusal = { code: "not_found" as const };
           return true;
         }
-        // A side-chat link authorizes only its own main chat, not a permanent cross-runtime
-        // grant. Recheck after preparation and again when queued input dispatches.
+        // Chat links and @tags authorize only the currently linked pair/group, not a
+        // permanent cross-runtime grant. Recheck after preparation and at queued dispatch.
         if (
           this.resolveAgentTreeTargetRelation(
             freshCfg,
@@ -16028,7 +16030,30 @@ export class TaskService implements AgentTaskIntegration {
     return null;
   }
 
-  /** Relation for messaging only; side-chat links never enter the task ownership graph. */
+  /**
+   * User-set @tag link: two root chats whose user assigned the same messaging tag may
+   * intercommunicate. Tags are user-only consent (no agent tool sets them), shared-tag
+   * equality is mutual, and clearing/changing either side revokes the link because every
+   * admission re-resolves it. Root chats only: sub-agent children and side chats can
+   * neither carry nor bridge a tag link, so runtime-isolated top-level workspaces stay
+   * isolated unless their user explicitly tags them.
+   */
+  private sharesMessagingTag(sender: WorkspaceConfigEntry, target: WorkspaceConfigEntry): boolean {
+    if (
+      sender.sideChatParentWorkspaceId != null ||
+      target.sideChatParentWorkspaceId != null ||
+      coerceNonEmptyString(sender.parentWorkspaceId) != null ||
+      coerceNonEmptyString(target.parentWorkspaceId) != null ||
+      sender.id == null ||
+      sender.id === target.id
+    ) {
+      return false;
+    }
+    const tag = getValidMessagingTag(sender.messagingTag);
+    return tag != null && tag === getValidMessagingTag(target.messagingTag);
+  }
+
+  /** Relation for messaging only; chat links and tags never enter the task ownership graph. */
   private resolveAgentTreeTargetRelation(
     cfg: ProjectsConfig,
     parentById: Map<string, string>,
@@ -16044,9 +16069,29 @@ export class TaskService implements AgentTaskIntegration {
       sender.workspace.sideChatParentWorkspaceId == null &&
       target.workspace.sideChatParentWorkspaceId == null
     ) {
-      return this.resolveTaskAncestryRelation(parentById, senderWorkspaceId, targetId);
+      return this.resolveNonSideChatRelation(
+        sender.workspace,
+        target.workspace,
+        parentById,
+        senderWorkspaceId,
+        targetId
+      );
     }
     return this.resolveDirectChatRelation(sender.workspace, target.workspace);
+  }
+
+  /** Ancestry wins inside a tree; only cross-tree root pairs can be tag-linked. */
+  private resolveNonSideChatRelation(
+    sender: WorkspaceConfigEntry,
+    target: WorkspaceConfigEntry,
+    parentById: Map<string, string>,
+    senderWorkspaceId: string,
+    targetId: string
+  ): AgentTreeTargetRelation | null {
+    const ancestry = this.resolveTaskAncestryRelation(parentById, senderWorkspaceId, targetId);
+    return ancestry === "target_unrelated" && this.sharesMessagingTag(sender, target)
+      ? "target_tagged"
+      : ancestry;
   }
 
   /** Only task parent chains grant ancestry; chat links and workspace-turn ownership do not. */
@@ -16358,16 +16403,27 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
+  private relatedChatRelationship(
+    caller: WorkspaceConfigEntry,
+    candidate: WorkspaceConfigEntry
+  ): "main_chat" | "side_chat" | "tagged" | undefined {
+    const direct = this.resolveDirectChatRelation(caller, candidate);
+    if (direct === "target_main_chat") return "main_chat";
+    if (direct === "target_side_chat") return "side_chat";
+    return this.sharesMessagingTag(caller, candidate) ? "tagged" : undefined;
+  }
+
   private getRelatedChatInfo(
     caller: WorkspaceConfigEntry,
     candidate: WorkspaceConfigEntry
   ): NonNullable<TaskTreeAgentsResult["relatedChats"]>[number] | undefined {
-    const relation = this.resolveDirectChatRelation(caller, candidate);
-    if (relation == null || candidate.id == null) return undefined;
+    if (candidate.id == null) return undefined;
+    const relationship = this.relatedChatRelationship(caller, candidate);
+    if (relationship == null) return undefined;
     return {
       workspaceId: candidate.id,
       title: coerceNonEmptyString(candidate.title) ?? coerceNonEmptyString(candidate.name),
-      relationship: relation === "target_main_chat" ? "main_chat" : "side_chat",
+      relationship,
     };
   }
 

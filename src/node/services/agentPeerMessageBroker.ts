@@ -27,7 +27,8 @@ export type PeerPathRelation =
   | "peer"
   | "target_unrelated"
   | "target_main_chat"
-  | "target_side_chat";
+  | "target_side_chat"
+  | "target_tagged";
 
 /**
  * Routing relation (sender-centric) → envelope relationship (what the recipient reads about the
@@ -40,6 +41,7 @@ const PEER_PATH_RELATIONSHIPS: Record<PeerPathRelation, AgentMessageRelationship
   target_unrelated: "unrelated",
   target_main_chat: "side_chat",
   target_side_chat: "main_chat",
+  target_tagged: "tagged",
 };
 
 export class AgentPeerMessageBroker {
