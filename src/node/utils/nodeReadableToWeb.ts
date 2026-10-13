@@ -16,6 +16,15 @@ import assert from "@/common/utils/assert";
  * cancel destroys the source, and the source's end or error settles the web stream (a premature
  * close as an AbortError).
  */
+/** Node's adapter reports a premature close as an AbortError (handleKnownInternalErrors). */
+function toWebStreamError(error: NodeJS.ErrnoException): Error {
+  if (error.code !== "ERR_STREAM_PREMATURE_CLOSE") return error;
+  return Object.assign(new Error("The operation was aborted", { cause: error }), {
+    name: "AbortError",
+    code: "ABORT_ERR",
+  });
+}
+
 export function nodeReadableToWeb(source: Readable): ReadableStream<Uint8Array> {
   assert(
     !source.readableObjectMode && source.readableEncoding == null,
@@ -45,19 +54,8 @@ export function nodeReadableToWeb(source: Readable): ReadableStream<Uint8Array> 
   finished(source, { writable: false }, (error) => {
     if (settled) return;
     settled = true;
-    if (error == null) {
-      ctrl.close();
-      return;
-    }
-    // Node's adapter reports a premature close as an AbortError (handleKnownInternalErrors).
-    ctrl.error(
-      error.code === "ERR_STREAM_PREMATURE_CLOSE"
-        ? Object.assign(new Error("The operation was aborted", { cause: error }), {
-            name: "AbortError",
-            code: "ABORT_ERR",
-          })
-        : error
-    );
+    if (error == null) ctrl.close();
+    else ctrl.error(toWebStreamError(error));
   });
 
   source.pause();
