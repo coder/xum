@@ -152,7 +152,7 @@ paths: ["**/*.ts", "**/*.tsx"]
 ---
 ```
 
-- **Syntax:** a YAML list, or one comma-separated string (`paths: "src/**/*.ts, *.{ts,tsx}"`). A comma inside `{}` belongs to the glob.
+- **Syntax:** a YAML list, or one comma-separated string (`paths: "src/**/*.ts, *.{ts,tsx}"`). In the string form, a comma inside `{}` belongs to the glob, and patterns with `[` or `(` (character classes, extglobs) need the list form.
 - **Matching:** each glob is relative to the workspace root. `**/*.ts` matches `foo.ts` and `src/foo.ts`. Files in dot folders (for example `.github/`) match too. Files outside the workspace never match.
 - **Trigger:** a successful `file_read` or `file_edit_*` call on a matching file. Calls made from inside `code_execution` do not trigger it.
 - **What the model gets:** the tool result gets a `path_skills` field with the skill name and description, and asks the model to read the skill with `agent_skill_read`. Xum does not insert the skill body. Each skill surfaces at most once per context window. Xum skips it if the model already read the skill in that window.
