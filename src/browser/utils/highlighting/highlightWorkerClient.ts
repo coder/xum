@@ -56,6 +56,8 @@ const TIMEOUT_MARKER = "HIGHLIGHT_TIMEOUT";
 // those diffs show as plain text meanwhile, so a longer limit costs nothing on a healthy start.
 const WORKER_START_TIMEOUT_MS = 20_000;
 const START_TIMEOUT_MARKER = "HIGHLIGHT_WORKER_START_TIMEOUT";
+// The worker fired `onerror` (its script failed to load, or it crashed) while a call waited.
+const WORKER_DIED_MARKER = "HIGHLIGHT_WORKER_DIED";
 
 /**
  * True when the worker did not start in time. Transient, unlike a budget timeout: the input is
@@ -127,6 +129,13 @@ let workerStructurallyUnavailable = false;
 let warnedVscodeWorkerDisabled = false;
 // Languages the current worker has loaded (its `prepare` resolved). Cleared with the worker.
 const preparedLanguages = new Set<string>();
+// Rejects once the current worker fires `onerror`. A call races it, because recycleWorker's
+// Comlink `releaseProxy` drops the call's pending listener without rejecting it: a call to a dead
+// worker would wait out its limit, 20 s to start, or 5 s that also marked the input (#6303).
+let workerDied: Promise<never> | null = null;
+// After a start time-out: one shared start of the next worker that every request whose worker did
+// not start waits on, then retries once (#6303). Null when none is pending.
+let workerRecovery: Promise<void> | null = null;
 
 /**
  * Tear down the current worker so the next call to `getWorkerAPI` builds a
@@ -149,6 +158,7 @@ function recycleWorker(expectedWorker?: Worker): void {
   const currentWorkerAPI = workerAPI;
   worker = null;
   workerAPI = null;
+  workerDied = null;
   preparedLanguages.clear();
 
   if (currentWorkerAPI !== null) {
@@ -202,6 +212,13 @@ function getWorkerAPI(): Comlink.Remote<HighlightWorkerAPI> | null {
       name: "shiki-highlighter", // Shows up in DevTools
     });
     worker = createdWorker;
+    let markDied: (error: Error) => void = () => undefined;
+    const died = new Promise<never>((_, reject) => {
+      markDied = reject;
+    });
+    // Nothing may be waiting when it dies: an unawaited rejection must not be reported.
+    died.catch(() => undefined);
+    workerDied = died;
 
     createdWorker.onerror = (e) => {
       // A worker that errored out is not necessarily permanently broken — the
@@ -210,6 +227,7 @@ function getWorkerAPI(): Comlink.Remote<HighlightWorkerAPI> | null {
       // the active worker. Stale error events from already-replaced workers
       // must not terminate a healthy replacement.
       console.error("[highlightWorkerClient] Worker errored; recycling:", e);
+      markDied(new Error(WORKER_DIED_MARKER));
       recycleWorker(createdWorker);
     };
 
@@ -277,6 +295,11 @@ export function isAbortedHighlight(error: unknown, signal: AbortSignal | undefin
   return signal?.aborted === true && error === signal.reason;
 }
 
+/** `call`, or a rejection once `died` rejects first (the worker fired `onerror`). */
+function untilWorkerDies<T>(call: Promise<T>, died: Promise<never> | null): Promise<T> {
+  return died === null ? call : Promise.race([call, died]);
+}
+
 /** `call()`, or a rejection with Error(`marker`) once `ms` pass first. */
 async function raceTimeout<T>(call: () => Promise<T>, ms: number, marker: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -301,8 +324,13 @@ async function prepareWorker(language: string): Promise<void> {
   const api = getWorkerAPI();
   if (!api || preparedLanguages.has(language)) return;
   const startingWorker = worker ?? undefined;
+  const died = workerDied;
   try {
-    await raceTimeout(() => api.prepare(language), WORKER_START_TIMEOUT_MS, START_TIMEOUT_MARKER);
+    await raceTimeout(
+      () => untilWorkerDies(api.prepare(language), died),
+      WORKER_START_TIMEOUT_MS,
+      START_TIMEOUT_MARKER
+    );
   } catch (e) {
     if (isHighlightStartTimeout(e)) recycleWorker(startingWorker);
     throw e;
@@ -356,6 +384,28 @@ export async function highlightWithBudget(
   }
 }
 
+/** Runs `job` once every job queued before it has settled (the worker runs one at a time). */
+function enqueue<T>(job: () => Promise<T>): Promise<T> {
+  const result = workerHighlightQueue.then(job, job);
+  workerHighlightQueue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+
+/**
+ * Resolves once a worker is ready for `language` after a start time-out; rejects when that start
+ * times out too. Shared: the requests that wait on it trigger one more worker start between them,
+ * not one each, and a worker that never starts ends the wait instead of looping.
+ */
+function whenWorkerRecovered(language: string): Promise<void> {
+  workerRecovery ??= enqueue(() => prepareWorker(language)).finally(() => {
+    workerRecovery = null;
+  });
+  return workerRecovery;
+}
+
 /**
  * Serialize highlight attempts before applying the budget. The worker itself is
  * single-threaded, so concurrent Comlink calls would only queue on the worker;
@@ -377,14 +427,9 @@ export function enqueueHighlightWithBudget(
 ): Promise<string> {
   // The abort is checked only when the job reaches the front. A job that already runs keeps its
   // slot until it settles or times out, because the single worker is still busy with it.
-  const run = () =>
-    highlightWithBudget(code, language, theme, call, onTimeout, timeoutMs, signal, prepare);
-  const result = workerHighlightQueue.then(run, run);
-  workerHighlightQueue = result.then(
-    () => undefined,
-    () => undefined
+  return enqueue(() =>
+    highlightWithBudget(code, language, theme, call, onTimeout, timeoutMs, signal, prepare)
   );
-  return result;
 }
 
 /**
@@ -403,7 +448,7 @@ function reportHighlightFailure(e: unknown, language: string, codeLength: number
     // The input is not marked: the next render highlights on a new worker (#6292).
     console.warn(
       `[highlightWorkerClient] worker did not start within ${WORKER_START_TIMEOUT_MS}ms; ` +
-        `rendering ${language} as plain text for now`
+        `rendering ${language} as plain text until a worker is ready`
     );
   } else {
     // Non-timeout error — the worker may be in an indeterminate state. Recycle so the next call
@@ -441,6 +486,26 @@ export async function highlightCode(
   signal?: AbortSignal
 ): Promise<string> {
   try {
+    return await requestHighlight(code, language, theme, signal);
+  } catch (e) {
+    // A worker that did not start says nothing about this input. The caller shows plain text
+    // meanwhile and has no reason to ask again, so retry here, once, after a worker is ready:
+    // a mounted block then highlights without a remount (#6303).
+    if (!isHighlightStartTimeout(e)) throw e;
+    signal?.throwIfAborted();
+    await whenWorkerRecovered(language);
+    return requestHighlight(code, language, theme, signal);
+  }
+}
+
+/** One highlight request through the queue and its budget, with failures logged. */
+async function requestHighlight(
+  code: string,
+  language: string,
+  theme: "dark" | "light",
+  signal: AbortSignal | undefined
+): Promise<string> {
+  try {
     return await enqueueHighlightWithBudget(
       code,
       language,
@@ -459,7 +524,7 @@ export async function highlightCode(
           return highlightMainThread(code, language, theme, signal);
         }
 
-        return api.highlight(code, language, theme);
+        return untilWorkerDies(api.highlight(code, language, theme), workerDied);
       },
       recycleWorker,
       HIGHLIGHT_TIMEOUT_MS,
@@ -484,5 +549,6 @@ export function __resetForTests(): void {
   workerHighlightQueue = Promise.resolve();
   workerStructurallyUnavailable = false;
   warnedVscodeWorkerDisabled = false;
+  workerRecovery = null;
   timedOutInputs.clear();
 }
