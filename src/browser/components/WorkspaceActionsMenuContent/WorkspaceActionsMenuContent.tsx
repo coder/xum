@@ -241,9 +241,37 @@ function handleRowShortcut(
   const rowButton = event.currentTarget.querySelector<HTMLElement>(
     `[data-workspace-action-row="${match.id}"]`
   );
+  swallowHeldKey(event.nativeEvent.code || event.key);
   props.onCloseMenu();
   props.actions[match.id]?.(rowButton ?? event.currentTarget);
   return true;
+}
+
+/**
+ * The key closes the menu, so the repeats of a held key land outside it, where the window
+ * handlers act on the SELECTED workspace (Codex on #6398). Swallow that key's auto-repeats at the
+ * window's capture phase, before every bubble-phase handler, until it is released, pressed anew
+ * or the window blurs.
+ */
+function swallowHeldKey(code: string) {
+  const swallow = (e: KeyboardEvent) => {
+    if ((e.code || e.key) !== code) return;
+    // A new press of the key (not an auto-repeat) is the user's next action: let it through.
+    if (!e.repeat) return stop();
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  };
+  const release = (e: KeyboardEvent) => {
+    if ((e.code || e.key) === code) stop();
+  };
+  const stop = () => {
+    window.removeEventListener("keydown", swallow, true);
+    window.removeEventListener("keyup", release, true);
+    window.removeEventListener("blur", stop);
+  };
+  window.addEventListener("keydown", swallow, true);
+  window.addEventListener("keyup", release, true);
+  window.addEventListener("blur", stop);
 }
 
 function handleMenuKeyDown(

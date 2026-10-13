@@ -198,6 +198,31 @@ describe("WorkspaceActionsMenuContent row shortcut keys (#6328)", () => {
     expect(windowKeys).toEqual([]);
   });
 
+  // Codex on #6398: the key closes the menu, so its repeats land outside the menu, where the
+  // global handlers act on the selected workspace.
+  test("a held row key's repeats after the menu closes reach no global handler", () => {
+    const actions = allActions();
+    const { view } = renderSidebarMenu(actions);
+    pressKey(toKeyEvent(KEYBINDS.ARCHIVE_WORKSPACE));
+    expect(actions.archive).toHaveBeenCalledTimes(1);
+    view.unmount();
+
+    const fire = (type: "keydown" | "keyup", init: KeyboardEventInit) => {
+      const event = new window.KeyboardEvent(type, { ...init, bubbles: true, cancelable: true });
+      Object.defineProperty(event, "getModifierState", { value: () => false });
+      document.body.dispatchEvent(event);
+    };
+    const archive = toKeyEvent(KEYBINDS.ARCHIVE_WORKSPACE);
+    fire("keydown", { ...archive, repeat: true });
+    fire("keydown", { ...archive, repeat: true });
+    expect(windowKeys).toEqual([]);
+
+    // Released: the next press is a new one and reaches the global handlers again.
+    fire("keyup", archive);
+    fire("keydown", archive);
+    expect(windowKeys).toEqual(["Backspace"]);
+  });
+
   test("other keys still reach the global handlers", () => {
     renderSidebarMenu(allActions());
     pressKey(toKeyEvent(KEYBINDS.NEXT_WORKSPACE));
