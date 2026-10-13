@@ -664,6 +664,9 @@ async function main(): Promise<number> {
     backgroundProcessManager,
     workspaceGoalService,
     keepBackgroundProcesses,
+    // sendAndAwait returns on each stream-end, and the run can exit after it: a turn.stop
+    // continuation queued after stream-end would run unseen (Codex PRRT_kwDOPxxmWM6rxPMC).
+    callerOwnsTurnEnd: true,
     // Direct CLI registration bypasses WorkspaceService.create, so a
     // preserved checkout could carry a stale `plugin:` MCP override into a
     // same-name reinstall on the first send; sanitize before announcing.
