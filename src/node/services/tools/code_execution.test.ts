@@ -2893,6 +2893,7 @@ describe("createCodeExecutionTool", () => {
         ],
         deps: {
           isHookAllowed: () => Promise.resolve(true),
+          canCallPluginTool: () => true,
           callPluginTool: () =>
             Promise.resolve({
               structuredContent: { decision: "block", reason: "secrets stay out" },

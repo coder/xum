@@ -343,6 +343,7 @@ describe("createKernelFileLoader Codex PostToolUse block", () => {
       ],
       deps: {
         isHookAllowed: () => Promise.resolve(true),
+        canCallPluginTool: () => true,
         callPluginTool: () =>
           Promise.resolve({ structuredContent: { decision: "block", reason: "secrets stay out" } }),
         notifyUser: () => undefined,
