@@ -7,6 +7,7 @@ import { useAPI } from "@/browser/contexts/API";
 import type { analytics } from "@/common/orpc/schemas/analytics";
 import type { SavedQuery } from "@/common/types/savedQueries";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isAbortError } from "@/browser/utils/isAbortError";
 
 export type Summary = z.infer<typeof analytics.getSummary.output>;
 export type SpendOverTimeItem = z.infer<typeof analytics.getSpendOverTime.output>[number];
@@ -24,6 +25,8 @@ export interface AsyncState<T> {
   data: T | null;
   loading: boolean;
   error: string | null;
+  /** The query (JSON of its inputs) `data` answers; a reload of the same query keeps `data` shown. */
+  dataKey?: string;
 }
 
 type SummaryInput = z.input<typeof analytics.getSummary.input>;
@@ -103,16 +106,19 @@ function getAnalyticsNamespace(api: APIClient): AnalyticsNamespace | null {
 function runAnalyticsEffect<T>(
   api: APIClient | null,
   setState: React.Dispatch<React.SetStateAction<AsyncState<T>>>,
+  queryKey: readonly unknown[],
   fetcher: (analyticsApi: AnalyticsNamespace) => Promise<T>
 ): (() => void) | undefined {
-  if (!api) {
-    setState((previousState) => ({
-      data: previousState.data,
-      loading: true,
-      error: null,
-    }));
-    return;
-  }
+  const dataKey = JSON.stringify(queryKey);
+  // Stale-while-revalidate: a new client (reconnect) or no client keeps the shown data on
+  // screen. Only data of another query (or none) shows "loading".
+  setState((previousState) => ({
+    data: previousState.data,
+    loading: !isShownFor(previousState, dataKey),
+    error: null,
+    dataKey: previousState.dataKey,
+  }));
+  if (!api) return;
 
   const analyticsApi = getAnalyticsNamespace(api);
   if (!analyticsApi) {
@@ -120,28 +126,38 @@ function runAnalyticsEffect<T>(
     return;
   }
 
-  let ignore = false;
-  setState((previousState) => ({
-    data: previousState.data,
-    loading: true,
-    error: null,
-  }));
+  return startAnalyticsFetch(analyticsApi, setState, dataKey, fetcher);
+}
 
+function isShownFor<T>(state: AsyncState<T>, dataKey: string): boolean {
+  return state.data != null && state.dataKey === dataKey;
+}
+
+/** Runs `fetcher` and stores its answer under `dataKey`; returns the cancel function. */
+function startAnalyticsFetch<T>(
+  analyticsApi: AnalyticsNamespace,
+  setState: React.Dispatch<React.SetStateAction<AsyncState<T>>>,
+  dataKey: string,
+  fetcher: (analyticsApi: AnalyticsNamespace) => Promise<T>
+): () => void {
+  let ignore = false;
   void fetcher(analyticsApi)
     .then((data) => {
       if (ignore) {
         return;
       }
-      setState({ data, loading: false, error: null });
+      setState({ data, loading: false, error: null, dataKey });
     })
     .catch((error: unknown) => {
-      if (ignore) {
+      // A lost connection is no query failure: the reconnect runs the query again.
+      if (ignore || isAbortError(error)) {
         return;
       }
       setState((previousState) => ({
         data: previousState.data,
         loading: false,
         error: getErrorMessage(error),
+        dataKey: previousState.dataKey,
       }));
     });
 
@@ -167,7 +183,7 @@ export function useAnalyticsSummary(
   useEffect(() => {
     const fromDate = fromMs == null ? null : new Date(fromMs);
     const toDate = toMs == null ? null : new Date(toMs);
-    return runAnalyticsEffect(api, setState, (analyticsApi) =>
+    return runAnalyticsEffect(api, setState, [projectPath, fromMs, toMs], (analyticsApi) =>
       analyticsApi.getSummary({ projectPath: projectPath ?? null, from: fromDate, to: toDate })
     );
   }, [api, projectPath, fromMs, toMs]);
@@ -200,14 +216,18 @@ export function useAnalyticsSpendOverTime(params: {
   useEffect(() => {
     const fromDate = fromMs == null ? null : new Date(fromMs);
     const toDate = toMs == null ? null : new Date(toMs);
-    return runAnalyticsEffect(api, setState, (analyticsApi) =>
-      analyticsApi.getSpendOverTime({
-        projectPath: params.projectPath ?? null,
-        granularity: params.granularity,
-        from: fromDate,
-        to: toDate,
-        timeZone: params.timeZone ?? null,
-      })
+    return runAnalyticsEffect(
+      api,
+      setState,
+      [params.projectPath, params.granularity, params.timeZone, fromMs, toMs],
+      (analyticsApi) =>
+        analyticsApi.getSpendOverTime({
+          projectPath: params.projectPath ?? null,
+          granularity: params.granularity,
+          from: fromDate,
+          to: toDate,
+          timeZone: params.timeZone ?? null,
+        })
     );
   }, [api, params.projectPath, params.granularity, params.timeZone, fromMs, toMs]);
 
@@ -230,7 +250,7 @@ export function useAnalyticsSpendByProject(
   useEffect(() => {
     const fromDate = fromMs == null ? null : new Date(fromMs);
     const toDate = toMs == null ? null : new Date(toMs);
-    return runAnalyticsEffect(api, setState, (analyticsApi) =>
+    return runAnalyticsEffect(api, setState, [fromMs, toMs], (analyticsApi) =>
       analyticsApi.getSpendByProject({ from: fromDate, to: toDate })
     );
   }, [api, fromMs, toMs]);
@@ -255,7 +275,7 @@ export function useAnalyticsSpendByModel(
   useEffect(() => {
     const fromDate = fromMs == null ? null : new Date(fromMs);
     const toDate = toMs == null ? null : new Date(toMs);
-    return runAnalyticsEffect(api, setState, (analyticsApi) =>
+    return runAnalyticsEffect(api, setState, [projectPath, fromMs, toMs], (analyticsApi) =>
       analyticsApi.getSpendByModel({ projectPath: projectPath ?? null, from: fromDate, to: toDate })
     );
   }, [api, projectPath, fromMs, toMs]);
@@ -280,7 +300,7 @@ export function useAnalyticsTokensByModel(
   useEffect(() => {
     const fromDate = fromMs == null ? null : new Date(fromMs);
     const toDate = toMs == null ? null : new Date(toMs);
-    return runAnalyticsEffect(api, setState, (analyticsApi) =>
+    return runAnalyticsEffect(api, setState, [projectPath, fromMs, toMs], (analyticsApi) =>
       analyticsApi.getTokensByModel({
         projectPath: projectPath ?? null,
         from: fromDate,
@@ -315,7 +335,7 @@ export function useAnalyticsTimingDistribution(
   useEffect(() => {
     const fromDate = fromMs == null ? null : new Date(fromMs);
     const toDate = toMs == null ? null : new Date(toMs);
-    return runAnalyticsEffect(api, setState, (analyticsApi) =>
+    return runAnalyticsEffect(api, setState, [metric, projectPath, fromMs, toMs], (analyticsApi) =>
       analyticsApi.getTimingDistribution({
         metric,
         projectPath: projectPath ?? null,
@@ -345,7 +365,7 @@ export function useAnalyticsProviderCacheHitRatio(
   useEffect(() => {
     const fromDate = fromMs == null ? null : new Date(fromMs);
     const toDate = toMs == null ? null : new Date(toMs);
-    return runAnalyticsEffect(api, setState, (analyticsApi) =>
+    return runAnalyticsEffect(api, setState, [projectPath, fromMs, toMs], (analyticsApi) =>
       analyticsApi.getCacheHitRatioByProvider({
         projectPath: projectPath ?? null,
         from: fromDate,
@@ -374,7 +394,7 @@ export function useAnalyticsAgentCostBreakdown(
   useEffect(() => {
     const fromDate = fromMs == null ? null : new Date(fromMs);
     const toDate = toMs == null ? null : new Date(toMs);
-    return runAnalyticsEffect(api, setState, (analyticsApi) =>
+    return runAnalyticsEffect(api, setState, [projectPath, fromMs, toMs], (analyticsApi) =>
       analyticsApi.getAgentCostBreakdown({
         projectPath: projectPath ?? null,
         from: fromDate,
@@ -403,7 +423,7 @@ export function useAnalyticsDelegationSummary(
   useEffect(() => {
     const fromDate = fromMs == null ? null : new Date(fromMs);
     const toDate = toMs == null ? null : new Date(toMs);
-    return runAnalyticsEffect(api, setState, (analyticsApi) =>
+    return runAnalyticsEffect(api, setState, [projectPath, fromMs, toMs], (analyticsApi) =>
       analyticsApi.getDelegationSummary({
         projectPath: projectPath ?? null,
         from: fromDate,
@@ -432,7 +452,8 @@ export function useAnalyticsRawQuery() {
 
   const executeQuery = async (sql: string) => {
     if (!api) {
-      setState({ data: null, loading: false, error: "API client not initialized" });
+      // Offline, keep the shown result.
+      setState((prev) => ({ ...prev, loading: false, error: "API client not initialized" }));
       return;
     }
 
