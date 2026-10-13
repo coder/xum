@@ -744,6 +744,7 @@ export const DesktopWiringLive: Layer.Layer<
     timelineService.subscribeToWorkspace(workspaceService);
 
     mcpServerManager.setMcpOauthService(mcpOauthService);
+    (yield* AgentPluginInstall).setMcpOauthService(mcpOauthService);
     turnRequestBuilderBindings.codexOauthService = codexOauthService;
     turnRequestBuilderBindings.coderOauthService = coderOauthService;
 

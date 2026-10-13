@@ -41,11 +41,8 @@ import { isAbortError } from "@/browser/utils/isAbortError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { makeSideChatTabType, type TabType } from "@/browser/types/rightSidebar";
 import { openArtifact } from "./ArtifactsTab/openArtifact";
-import {
-  appViewPickerDetails,
-  openMcpAppView,
-  useMcpAppViews,
-} from "./ArtifactsTab/mcpAppViewsStore";
+import { appViewDetails, useMcpAppViews } from "./ArtifactsTab/mcpAppViewsStore";
+import { appViewTabFor } from "./AppViewTab/appViewTabs";
 import { TAB_ICONS } from "./Tabs/tabIcons";
 
 /**
@@ -426,13 +423,13 @@ const OverviewOutputs: React.FC<{
     [props.workspaceId]
   );
 
-  // Several calls of one MCP app tool share a label, so each row carries the Artifacts picker's
-  // detail (outcome, arguments, and `#n` for repeats) to tell them apart.
-  const appViewDetails = appViewPickerDetails(appViews);
+  // Several calls of one MCP app tool share a label, so each row carries the call's detail
+  // (outcome, arguments, and `#n` for repeats) to tell them apart.
+  const details = appViewDetails(appViews);
   // Both lists come newest first, but app views carry no time to merge them by. So that a new
   // app result is never pushed out by files, each kind keeps at least one of the capped rows
-  // when it has any. Each open selects the output, then hands the Artifacts tab focus (the
-  // activated row unmounts as the sidebar expands).
+  // when it has any. A file opens in the Artifacts tab; an app view in its own app tab (Artifacts
+  // lists only files). Either tab gets focus (the activated row unmounts as the sidebar expands).
   const appRows =
     appViews.length === 0
       ? 0
@@ -463,11 +460,8 @@ const OverviewOutputs: React.FC<{
       key: `app:${view.toolCallId}`,
       Icon: TAB_ICONS.artifacts,
       label: view.label,
-      sub: appViewDetails[index] || null,
-      open: () => {
-        openMcpAppView(props.workspaceId, view);
-        props.onOpenTab("artifacts");
-      },
+      sub: details[index] || null,
+      open: () => props.onOpenTab(appViewTabFor(view.toolCallId)),
     })),
   ];
   // A truncated walk can end before reaching any file (only a too-deep or unreadable folder), yet
