@@ -588,27 +588,34 @@ function takeLinesWithinByteCap(
   return { shown, rest: [], splitLine: false };
 }
 
+/**
+ * The filter arguments of the next-read call. The exact call, filter mode included: a read
+ * without filter_exclude would keep the lines this read dropped and drop the ones it kept.
+ */
+function formatFilterArgs(filter: string | undefined, filterExclude: boolean | undefined): string {
+  if (filter == null) return "";
+  return `, filter: ${JSON.stringify(filter)}${filterExclude === true ? ", filter_exclude: true" : ""}`;
+}
+
 /** Tells the model how to read what a capped getOutput read left unread. */
 function formatCappedReadNote(
   processId: string,
   unreadBytes: number,
+  continuesLine: boolean,
   toolName: string,
   filter: string | undefined,
   filterExclude: boolean | undefined
 ): string {
-  // The exact call, filter mode included: a read without filter_exclude would keep the lines
-  // this read dropped and drop the ones it kept.
-  const filterArgs =
-    filter == null
-      ? ""
-      : `, filter: ${JSON.stringify(filter)}${filterExclude === true ? ", filter_exclude: true" : ""}`;
+  const filterArgs = formatFilterArgs(filter, filterExclude);
   const call =
     toolName === "task_await"
       ? `task_await(task_ids: ["bash:${processId}"], timeout_secs: 0${filterArgs})`
       : `${toolName}(process_id: "${processId}", timeout_secs: 0${filterArgs})`;
+  // Says how the parts join, so line-oriented output (JSONL) can be rebuilt exactly.
+  const join = continuesLine ? "continues the current line" : "starts a new line";
   return (
     `Output capped at ${BASH_MAX_TOTAL_BYTES} bytes per read; ` +
-    `${unreadBytes} more bytes are unread. Read the next part with ${call}.`
+    `${unreadBytes} more bytes are unread. Read the next part with ${call}. The next part ${join}.`
   );
 }
 
@@ -2842,7 +2849,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const pollingToolName = noteToolName ?? "bash_output";
     // A capped read must say how to read the rest; polling advice would contradict it.
     const note = page.capped
-      ? formatCappedReadNote(processId, unreadBytes, pollingToolName, filter, filterExclude)
+      ? formatCappedReadNote(
+          processId,
+          unreadBytes,
+          page.unreadStartsWithKeptLine,
+          pollingToolName,
+          filter,
+          filterExclude
+        )
       : formatPollingNote(callCount, filterExclude, currentStatus === "running", pollingToolName);
 
     return {

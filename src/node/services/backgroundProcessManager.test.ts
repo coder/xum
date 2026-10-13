@@ -3574,6 +3574,40 @@ describe("BackgroundProcessManager", () => {
         });
       });
 
+      // Reads every page and joins them as the notes say: a capped read whose next part
+      // continues the current line joins directly, every other read ends a line.
+      async function drainAndRebuild(processId: string, filter?: string, exclude?: boolean) {
+        let text = "";
+        for (let attempt = 0; attempt < 1_000; attempt++) {
+          const read = await manager.getOutput(processId, filter, exclude, 0);
+          if (!read.success) throw new Error(read.error);
+          expect(Buffer.byteLength(read.output, "utf8")).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);
+          text += read.output;
+          if (!read.note?.includes("continues the current line")) text += "\n";
+          if (!read.note?.includes("more bytes are unread")) return text;
+        }
+        throw new Error("output never drained");
+      }
+
+      it("says whether the next part continues the current line", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        // JSONL with a record over the cap: the pages must rebuild every record.
+        const records = Array.from({ length: 400 }, (_, i) => ({
+          i,
+          s: "z".repeat(i === 7 ? BASH_MAX_TOTAL_BYTES * 2 : 60),
+        }));
+        const jsonl = `${records.map((r) => JSON.stringify(r)).join("\n")}\n`;
+        await fs.appendFile(path.join(result.outputDir, "output.log"), jsonl);
+
+        const text = await drainAndRebuild(result.processId);
+        expect(text).toBe(jsonl);
+      });
+
       it("keeps the rest after exit readable", async () => {
         const result = await manager.spawn(runtime, testWorkspaceId, "seq 1 20000", {
           cwd: process.cwd(),
