@@ -1,6 +1,3 @@
-diff --git a/node_modules/happy-dom/.bun-tag-cad71e1821a61f1f b/.bun-tag-cad71e1821a61f1f
-new file mode 100644
-index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
 diff --git a/lib/mutation-observer/MutationObserverListener.js b/lib/mutation-observer/MutationObserverListener.js
 index 3a68b9a76db624429603fb6847a7130769323773..3080ee9339022ef7f8a655f646575ea04202fc15 100644
 --- a/lib/mutation-observer/MutationObserverListener.js
