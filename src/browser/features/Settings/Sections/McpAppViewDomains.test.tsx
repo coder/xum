@@ -42,7 +42,10 @@ let subscribeCalls = 0;
 let subscriptions: AbortSignal[] = [];
 // The next listViewDomains read stays pending until the test settles it (a read in flight).
 let holdNextList = false;
-let heldList: { reject: (error: Error) => void } | null = null;
+let heldList: {
+  resolve: (list: McpAppViewDomains[]) => void;
+  reject: (error: Error) => void;
+} | null = null;
 // Each api() is a new connection; reads through an older one fail, as after a reconnect.
 let connection = 0;
 
@@ -101,8 +104,8 @@ function api(): APIClient {
         if (own !== connection) return Promise.reject(new Error("connection closed"));
         if (holdNextList) {
           holdNextList = false;
-          return new Promise<McpAppViewDomains[]>((_resolve, reject) => {
-            heldList = { reject };
+          return new Promise<McpAppViewDomains[]>((resolve, reject) => {
+            heldList = { resolve, reject };
           });
         }
         if (listFailures > 0) {
@@ -308,6 +311,52 @@ describe("MCP Apps allowed view domains", () => {
     await settle();
     await act(async () => {
       heldList?.reject(new Error("connection closed"));
+      await Promise.resolve();
+    });
+    await waitFor(async () => expect(await frameCsp(view)).not.toContain(API_ORIGIN));
+  });
+
+  test("a revoke during the first read after subscribing still reaches the mounted view", async () => {
+    // The mock's change stream, like the real one, attaches its listener on the first next().
+    const before = stored;
+    holdNextList = true;
+    const view = renderWith(<McpAppFrame workspaceId="ws" view={VIEW} />);
+    expect(await frameCsp(view)).toContain(`connect-src ${API_ORIGIN}`);
+    await waitFor(() => expect(heldList).not.toBeNull());
+    // Revoked while that read is in flight: the read answers with the list from before, and
+    // only the change event can report the revoke.
+    stored = [];
+    await act(async () => {
+      pushConfigChanged();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      heldList?.resolve(before);
+      await Promise.resolve();
+    });
+    await waitFor(async () => expect(await frameCsp(view)).not.toContain(API_ORIGIN));
+  });
+
+  test("a revoke during the read a change event started still reaches the mounted view", async () => {
+    const before = stored;
+    const view = renderWith(<McpAppFrame workspaceId="ws" view={VIEW} />);
+    expect(await frameCsp(view)).toContain(`connect-src ${API_ORIGIN}`);
+    await waitFor(() => expect(listCalls).toBeGreaterThan(0));
+    await settle();
+    // An unrelated change starts a read, and the revoke lands while that read is in flight.
+    holdNextList = true;
+    await act(async () => {
+      pushConfigChanged();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(heldList).not.toBeNull());
+    stored = [];
+    await act(async () => {
+      pushConfigChanged();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      heldList?.resolve(before);
       await Promise.resolve();
     });
     await waitFor(async () => expect(await frameCsp(view)).not.toContain(API_ORIGIN));

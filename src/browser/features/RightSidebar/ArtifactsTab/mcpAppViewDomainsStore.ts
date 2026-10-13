@@ -140,14 +140,23 @@ function startFollowing(api: APIClient, restart = false): void {
   // One failed read (a transient IPC error) must not end the stream: the next change retries.
   const reconcileOnce = () => reconcile(api).catch(() => undefined);
   const follow = async () => {
-    // Listener first, then the read: a revoke before the subscription is in the read, and one
-    // after it is an event, so none falls between the two.
     const changes = await api.config.onConfigChanged(undefined, { signal });
+    // The stream is lazy: its backend listener attaches on the first next(), not when it is
+    // returned. So the next event is requested before each read: a revoke before that request
+    // is in the read, and one after it is an event, so none falls between the two.
+    const iterator = changes[Symbol.asyncIterator]();
+    let nextEvent = iterator.next();
     state.ready = true;
     await reconcileOnce();
-    for await (const _ of changes) {
-      if (signal.aborted) break;
+    for (;;) {
+      const event = await nextEvent;
+      if (event.done) return;
+      if (signal.aborted) {
+        await iterator.return?.();
+        return;
+      }
       delivered = true;
+      nextEvent = iterator.next();
       await reconcileOnce();
     }
   };
