@@ -50,7 +50,8 @@ function splitTopLevelCommas(value: string): string[] {
   return parts;
 }
 
-function validateSkillPathPattern(pattern: string): string | undefined {
+/** Shape rules: the pattern must be a non-empty, bounded, workspace-relative include glob. */
+function validateSkillPathShape(pattern: string): string | undefined {
   if (pattern.length === 0) {
     return "patterns must not be empty";
   }
@@ -67,6 +68,14 @@ function validateSkillPathPattern(pattern: string): string | undefined {
   }
   if (pattern.split(/[/\\]/).includes("..")) {
     return `pattern '${pattern}' must not contain '..' segments`;
+  }
+  return undefined;
+}
+
+function validateSkillPathPattern(pattern: string): string | undefined {
+  const shapeError = validateSkillPathShape(pattern);
+  if (shapeError !== undefined) {
+    return shapeError;
   }
   try {
     picomatch(pattern, PICOMATCH_OPTIONS);
