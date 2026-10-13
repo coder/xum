@@ -141,6 +141,9 @@ export type SkillsCatalogReadToolResult =
       url: string;
       /** Set when body is one page of a longer body (see offset_chars). */
       nextCharOffset?: number;
+      startCharOffset?: number;
+      /** Content hash of the copy the pages come from; pass it back with offset_chars. */
+      snapshot?: string;
       note?: string;
     }
   | { success: false; error: string };

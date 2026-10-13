@@ -86,11 +86,26 @@ function getTaskIdsFromToolResult(result: unknown): string[] {
   return Array.from(taskIds);
 }
 
-/** The task_await call's offset_chars: where every completed report page it returned starts. */
-function getAwaitPageOffset(args: unknown): number {
-  if (typeof args !== "object" || args === null) return 0;
-  const offset = (args as { offset_chars?: unknown }).offset_chars;
-  return typeof offset === "number" && Number.isInteger(offset) && offset > 0 ? offset : 0;
+function toPageOffset(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * Where a completed report page starts: the result's startCharOffset (the start the pager
+ * used, which a surrogate pair can move back by one unit), else the call's offset_chars for
+ * results from before that field existed, else 0.
+ */
+function getReportPageOffset(result: unknown, args: unknown): number {
+  const fromResult =
+    typeof result === "object" && result !== null
+      ? toPageOffset((result as { startCharOffset?: unknown }).startCharOffset)
+      : undefined;
+  if (fromResult != null) return fromResult;
+  const fromArgs =
+    typeof args === "object" && args !== null
+      ? toPageOffset((args as { offset_chars?: unknown }).offset_chars)
+      : undefined;
+  return fromArgs ?? 0;
 }
 
 /**
@@ -240,7 +255,6 @@ export function computeTaskReportLinking(messages: DisplayedMessage[]): TaskRepo
   const incompleteReportTaskIds = new Set<string>();
   for (const msg of messages) {
     if (msg.type !== "tool" || msg.toolName !== "task_await") continue;
-    const pageOffset = getAwaitPageOffset(msg.args);
 
     const rawResult = msg.result;
     if (typeof rawResult !== "object" || rawResult === null) continue;
@@ -252,6 +266,7 @@ export function computeTaskReportLinking(messages: DisplayedMessage[]): TaskRepo
     for (const r of results) {
       const page = readCompletedAwaitReport(r);
       if (page == null) continue;
+      const pageOffset = getReportPageOffset(r, msg.args);
       const joined = joinReportPage(
         reportByTaskId.get(page.taskId)?.reportMarkdown,
         page.reportMarkdown,

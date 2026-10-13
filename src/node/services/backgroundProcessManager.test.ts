@@ -3439,6 +3439,51 @@ describe("BackgroundProcessManager", () => {
         expect(pages.join("")).toBe(`${longLine}\nM after`);
       });
 
+      it("names the filter mode in the next-read call", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const lines = Array.from({ length: 1_000 }, (_, i) => `keep ${i} ${"y".repeat(40)}`);
+        await fs.appendFile(path.join(result.outputDir, "output.log"), `${lines.join("\n")}\n`);
+
+        const read = await manager.getOutput(result.processId, "^drop", true, 0);
+        expect(read.success && read.note).toContain(
+          `bash_output(process_id: "${result.processId}", timeout_secs: 0, filter: "^drop", filter_exclude: true)`
+        );
+      });
+
+      it("keeps at most a few pages of unread output in memory", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        // About 30 pages of output, plus one line longer than the retention bound.
+        const lines = Array.from({ length: 8_000 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
+        lines.splice(4_000, 0, "L".repeat(BASH_MAX_TOTAL_BYTES * 5));
+        const text = `${lines.join("\n")}\n`;
+        await fs.appendFile(path.join(result.outputDir, "output.log"), text);
+
+        const first = await manager.getOutput(result.processId, undefined, undefined, 0);
+        expect(first.success).toBe(true);
+        const proc = await manager.getProcess(result.processId);
+        if (proc == null) throw new Error("process missing");
+        const retained = Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
+        expect(retained).toBeLessThanOrEqual(4 * BASH_MAX_TOTAL_BYTES);
+        // The rest stays on disk: the cursor sits right after what is in memory.
+        expect(proc.outputBytesRead).toBeLessThan(Buffer.byteLength(text, "utf8"));
+
+        // Nothing lost or read twice. (A split line's pieces come back as separate pages, so
+        // compare without line breaks.)
+        const { pages } = await readAllPages(result.processId);
+        const all = [first.success ? first.output : "", ...pages].join("").replaceAll("\n", "");
+        expect(all).toBe(lines.join(""));
+      });
+
       it("keeps the rest after exit readable", async () => {
         const result = await manager.spawn(runtime, testWorkspaceId, "seq 1 20000", {
           cwd: process.cwd(),

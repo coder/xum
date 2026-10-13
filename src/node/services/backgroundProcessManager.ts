@@ -591,19 +591,49 @@ function takeLinesWithinByteCap(
 /** Tells the model how to read what a capped getOutput read left unread. */
 function formatCappedReadNote(
   processId: string,
-  unread: string,
+  unreadBytes: number,
   toolName: string,
-  filter: string | undefined
+  filter: string | undefined,
+  filterExclude: boolean | undefined
 ): string {
+  // The exact call, filter mode included: a read without filter_exclude would keep the lines
+  // this read dropped and drop the ones it kept.
+  const filterArgs =
+    filter == null
+      ? ""
+      : `, filter: ${JSON.stringify(filter)}${filterExclude === true ? ", filter_exclude: true" : ""}`;
   const call =
     toolName === "task_await"
-      ? `task_await(task_ids: ["bash:${processId}"], timeout_secs: 0)`
-      : `${toolName}(process_id: "${processId}", timeout_secs: 0)`;
+      ? `task_await(task_ids: ["bash:${processId}"], timeout_secs: 0${filterArgs})`
+      : `${toolName}(process_id: "${processId}", timeout_secs: 0${filterArgs})`;
   return (
     `Output capped at ${BASH_MAX_TOTAL_BYTES} bytes per read; ` +
-    `${Buffer.byteLength(unread, "utf8")} more bytes are unread. Read the next part with ${call}` +
-    (filter ? " and the same filter." : ".")
+    `${unreadBytes} more bytes are unread. Read the next part with ${call}.`
   );
+}
+
+// Unread output kept in memory between reads, at most this many pages. A read still loads from
+// the cursor to the end of output.log; the rest past this bound goes back to the file: the
+// cursor moves back over it, so the next reads load it again.
+const MAX_RETAINED_UNREAD_BYTES = 4 * BASH_MAX_TOTAL_BYTES;
+
+/**
+ * Keep at most MAX_RETAINED_UNREAD_BYTES of `unread` (whole lines when one fits), and move the
+ * file cursor back over the rest. `unread` is the end of what the reads consumed from output.log,
+ * so the bytes it drops are exactly the ones before the cursor.
+ */
+function retainUnreadOutput(proc: BackgroundProcess, unread: string): void {
+  const unreadBytes = Buffer.byteLength(unread, "utf8");
+  if (unreadBytes <= MAX_RETAINED_UNREAD_BYTES) {
+    proc.incompleteLineBuffer = unread;
+    return;
+  }
+  const head = truncateUtf8Prefix(unread, MAX_RETAINED_UNREAD_BYTES);
+  const lastNewline = head.lastIndexOf("\n");
+  const kept = lastNewline >= 0 ? head.slice(0, lastNewline + 1) : head;
+  proc.incompleteLineBuffer = kept;
+  proc.outputBytesRead -= unreadBytes - Buffer.byteLength(kept, "utf8");
+  assert(proc.outputBytesRead >= 0, "the retained unread output must come from output.log");
 }
 
 /** Polling guidance for getOutput (see the callers' 3+ call heuristics). */
@@ -2667,7 +2697,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         // so preserve them in the line buffer; otherwise the next getOutput() would resume past
         // this content and silently drop it. This matters now that task_await aborts a still-
         // pending bash read once min_completed is satisfied (not just on user interrupt).
-        proc.incompleteLineBuffer = previousBuffer + accumulatedRaw;
+        retainUnreadOutput(proc, previousBuffer + accumulatedRaw);
         const elapsed_ms = Date.now() - startTime;
         return {
           success: true,
@@ -2727,7 +2757,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       proc.unreadStartsWithKeptLine === true,
       (line) => !filterRegex || filterRegex.test(line) !== (filterExclude === true)
     );
-    proc.incompleteLineBuffer = page.unread;
+    const unreadBytes = Buffer.byteLength(page.unread, "utf8");
+    retainUnreadOutput(proc, page.unread);
     proc.unreadStartsWithKeptLine = page.unreadStartsWithKeptLine;
 
     const shownThroughOffsetBeforeRead = proc.shownThroughOffset;
@@ -2792,7 +2823,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const pollingToolName = noteToolName ?? "bash_output";
     // A capped read must say how to read the rest; polling advice would contradict it.
     const note = page.capped
-      ? formatCappedReadNote(processId, page.unread, pollingToolName, filter)
+      ? formatCappedReadNote(processId, unreadBytes, pollingToolName, filter, filterExclude)
       : formatPollingNote(callCount, filterExclude, currentStatus === "running", pollingToolName);
 
     return {

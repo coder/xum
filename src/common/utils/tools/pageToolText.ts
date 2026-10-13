@@ -3,6 +3,11 @@ import assert from "@/common/utils/assert";
 
 export interface ToolTextPage {
   text: string;
+  /**
+   * Where `text` starts, present when the read asked for an offset. It can be one unit before
+   * offset_chars (a surrogate pair is never split), so readers join pages at this offset.
+   */
+  startCharOffset?: number;
   /** Present when text remains: pass it as offset_chars to read the next page. */
   nextCharOffset?: number;
 }
@@ -13,6 +18,13 @@ function isHighSurrogate(code: number): boolean {
 
 function isLowSurrogate(code: number): boolean {
   return code >= 0xdc00 && code <= 0xdfff;
+}
+
+/** `offset`, or one unit earlier when it sits between the halves of a surrogate pair. */
+function pairSafeStart(text: string, offset: number): number {
+  const insidePair =
+    isHighSurrogate(text.charCodeAt(offset - 1)) && isLowSurrogate(text.charCodeAt(offset));
+  return insidePair ? offset - 1 : offset;
 }
 
 /**
@@ -28,14 +40,14 @@ export function pageToolText(
 ): ToolTextPage {
   assert(Number.isInteger(offsetChars) && offsetChars >= 0, "offsetChars must be >= 0");
   assert(Number.isInteger(maxChars) && maxChars > 1, "maxChars must be > 1");
-  let start = Math.min(offsetChars, text.length);
-  if (isHighSurrogate(text.charCodeAt(start - 1)) && isLowSurrogate(text.charCodeAt(start))) {
-    start -= 1;
-  }
+  const start = pairSafeStart(text, Math.min(offsetChars, text.length));
   let end = Math.min(start + maxChars, text.length);
   if (end < text.length && isHighSurrogate(text.charCodeAt(end - 1))) end -= 1;
-  const page = text.slice(start, end);
-  return end < text.length ? { text: page, nextCharOffset: end } : { text: page };
+  return {
+    text: text.slice(start, end),
+    ...(offsetChars > 0 ? { startCharOffset: start } : {}),
+    ...(end < text.length ? { nextCharOffset: end } : {}),
+  };
 }
 
 /**
@@ -47,7 +59,7 @@ export function pageToolTextForResult(
   text: string,
   offsetChars: number | null | undefined,
   call: string
-): { text: string; nextCharOffset?: number; note?: string } {
+): ToolTextPage & { note?: string } {
   const page = pageToolText(text, offsetChars ?? 0);
   if (page.nextCharOffset == null) return page;
   const next = String(page.nextCharOffset);

@@ -823,6 +823,8 @@ export const TaskAwaitToolCompletedResultSchema = z
     note: z.string().optional(),
     /** Set when reportMarkdown is one page of a longer report (see offset_chars). */
     nextCharOffset: z.number().optional(),
+    /** Where this reportMarkdown page starts, when the call passed offset_chars. */
+    startCharOffset: z.number().optional(),
     artifacts: TaskAwaitToolArtifactsSchema.optional(),
   })
   .strict();
@@ -2853,6 +2855,10 @@ export const TOOL_DEFINITIONS = {
           .min(0)
           .nullish()
           .describe("Long bodies come in pages: pass the previous result's nextCharOffset."),
+        snapshot: z
+          .string()
+          .nullish()
+          .describe("With offset_chars: the previous result's snapshot."),
       })
       .strict(),
   },
