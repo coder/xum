@@ -484,8 +484,45 @@ describe("Codex package manifests (the com.openai extension discovery selected)"
     }
     const { plugin, diagnostics } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
     if (plugin === null) throw new Error(`not a plugin: ${JSON.stringify(diagnostics)}`);
-    return plugin;
+    return Object.assign(plugin, { diagnostics });
   }
+
+  test.each([
+    { name: "an empty hooks list", hooks: [] as unknown[] },
+    { name: "a hooks list whose only entry is invalid", hooks: ["/etc/hooks.json"] },
+  ])("$name turns the default hooks file off", async (fixture) => {
+    // Codex P1 (PRRT_kwDOPxxmWM6sFheU): trust is keyed by the definition, not the file, so a
+    // fallback to hooks/hooks.json would re-run a hook the plugin's update turned off.
+    using tmp = new DisposableTempDir("codex-hooks-pointer-off");
+    const plugin = await discovered(tmp.path, {
+      "plugin.json": {
+        $schema: SCHEMA,
+        name: "guard",
+        extensions: { "com.openai": { hooks: fixture.hooks } },
+      },
+      "hooks/hooks.json": stopHooks("default_scan"),
+    });
+
+    const { hooks } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks).toEqual([]);
+    // An invalid entry is reported (a discovery diagnostic); an empty list is a plain off switch.
+    expect(
+      plugin.diagnostics.some((diagnostic) => diagnostic.message.includes("hooks' entries"))
+    ).toBe(fixture.hooks.length > 0);
+  });
+
+  test("without a hooks field, the default hooks file loads", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-pointer-absent");
+    const plugin = await discovered(tmp.path, {
+      "plugin.json": { $schema: SCHEMA, name: "guard", extensions: { "com.openai": {} } },
+      "hooks/hooks.json": stopHooks("default_scan"),
+    });
+
+    const { hooks } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.source)).toEqual(["hooks/hooks.json"]);
+  });
 
   test("a .codex-plugin/plugin.json overlay's hooks pointer replaces the default file", async () => {
     // Codex PRRT_kwDOPxxmWM6r2kUR: the root plugin.json has no com.openai, so discovery takes it
