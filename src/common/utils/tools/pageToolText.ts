@@ -26,7 +26,21 @@ export function pageToolText(
   return end < text.length ? { text: page, nextCharOffset: end } : { text: page };
 }
 
-/** The note a paged tool result carries, naming the exact call that reads the next page. */
-export function formatNextPageNote(nextCharOffset: number, call: string): string {
-  return `Text continues: read the next page with ${call.replace("<offset>", String(nextCharOffset))}.`;
+/**
+ * pageToolText plus the fields a paged tool result carries: nextCharOffset and a note naming
+ * the exact call (with "<offset>" in `call`) that reads the next page. On the last page both
+ * are absent.
+ */
+export function pageToolTextForResult(
+  text: string,
+  offsetChars: number | null | undefined,
+  call: string
+): { text: string; nextCharOffset?: number; note?: string } {
+  const page = pageToolText(text, offsetChars ?? 0);
+  if (page.nextCharOffset == null) return page;
+  const next = String(page.nextCharOffset);
+  return {
+    ...page,
+    note: `Text continues: read the next page with ${call.replace("<offset>", next)}.`,
+  };
 }

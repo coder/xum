@@ -522,27 +522,40 @@ function takeBackgroundOutputPage(
 ): BackgroundOutputPage {
   const lines = raw.split("\n");
   const fragment = exited ? null : (lines.pop() ?? "");
+  const { shown, rest } = takeLinesWithinByteCap(
+    lines,
+    (line) => (!exited || line.length > 0) && keepLine(line)
+  );
+  const capped = rest.length > 0;
+  if (fragment != null) rest.push(fragment);
+  return { output: shown.join("\n"), unread: rest.join("\n"), capped };
+}
+
+/**
+ * Leading kept lines whose "\n"-joined size fits BASH_MAX_TOTAL_BYTES, and every line after
+ * them. When the first kept line alone is over the cap, its head is shown and its tail becomes
+ * the first remaining line, so each read makes progress.
+ */
+function takeLinesWithinByteCap(
+  lines: string[],
+  keepLine: (line: string) => boolean
+): { shown: string[]; rest: string[] } {
   const shown: string[] = [];
   let bytes = 0;
-  let index = 0;
-  for (; index < lines.length; index++) {
+  for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
-    if ((exited && line.length === 0) || !keepLine(line)) continue;
+    if (!keepLine(line)) continue;
     const lineBytes = Buffer.byteLength(line, "utf8") + (shown.length > 0 ? 1 : 0);
-    if (bytes + lineBytes > BASH_MAX_TOTAL_BYTES) {
-      if (shown.length === 0) {
-        const head = truncateUtf8Prefix(line, BASH_MAX_TOTAL_BYTES);
-        shown.push(head);
-        lines[index] = line.slice(head.length);
-      }
-      break;
+    if (bytes + lineBytes <= BASH_MAX_TOTAL_BYTES) {
+      shown.push(line);
+      bytes += lineBytes;
+      continue;
     }
-    shown.push(line);
-    bytes += lineBytes;
+    if (shown.length > 0) return { shown, rest: lines.slice(index) };
+    const head = truncateUtf8Prefix(line, BASH_MAX_TOTAL_BYTES);
+    return { shown: [head], rest: [line.slice(head.length), ...lines.slice(index + 1)] };
   }
-  const rest = lines.slice(index);
-  if (fragment != null) rest.push(fragment);
-  return { output: shown.join("\n"), unread: rest.join("\n"), capped: index < lines.length };
+  return { shown, rest: [] };
 }
 
 /** Tells the model how to read what a capped getOutput read left unread. */

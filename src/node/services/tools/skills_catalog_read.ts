@@ -2,7 +2,7 @@ import { tool } from "ai";
 
 import type { SkillsCatalogReadToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
-import { formatNextPageNote, pageToolText } from "@/common/utils/tools/pageToolText";
+import { pageToolTextForResult } from "@/common/utils/tools/pageToolText";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
@@ -35,7 +35,11 @@ export const createSkillsCatalogReadTool: ToolFactory = (_config: ToolConfigurat
         });
 
         // Catalog SKILL.md files can reach MAX_FILE_SIZE (1 MB): return the body in pages.
-        const page = pageToolText(parsed.body, offset_chars ?? 0);
+        const { text: body, ...paging } = pageToolTextForResult(
+          parsed.body,
+          offset_chars,
+          `skills_catalog_read(owner: "${owner}", repo: "${repo}", skillId: "${skillId}", offset_chars: <offset>)`
+        );
         return {
           success: true,
           skillId,
@@ -43,17 +47,9 @@ export const createSkillsCatalogReadTool: ToolFactory = (_config: ToolConfigurat
           repo,
           path: fetched.path,
           frontmatter: parsed.frontmatter,
-          body: page.text,
+          body,
           url: `https://github.com/${owner}/${repo}/blob/${fetched.branch}/${fetched.path}`,
-          ...(page.nextCharOffset != null
-            ? {
-                nextCharOffset: page.nextCharOffset,
-                note: formatNextPageNote(
-                  page.nextCharOffset,
-                  `skills_catalog_read(owner: "${owner}", repo: "${repo}", skillId: "${skillId}", offset_chars: <offset>)`
-                ),
-              }
-            : {}),
+          ...paging,
         };
       } catch (error) {
         return { success: false, error: getErrorMessage(error) };
