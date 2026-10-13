@@ -30,7 +30,6 @@ describe("isStaticMetadataBindingImmutable regex detection", () => {
       ["a nested block", "{ {} /meta/.test(s); }"],
       ["a block after a block", "{} {}\n/meta/.test(s);"],
       ["an else block", "if (a) {} else {}\n/meta/.test(s);"],
-      ["a block with no matching open brace", "}\n/meta/.test(s);"],
     ])("treats / after %s as a regex", (_label, statement) => {
       expect(immutableWith(statement)).toBe(true);
     });
@@ -51,12 +50,17 @@ describe("isStaticMetadataBindingImmutable regex detection", () => {
   });
 
   describe("after a closing parenthesis", () => {
-    test.each(["if", "while", "for", "switch", "with"])(
-      "treats / after a %s header as a regex",
-      (keyword) => {
-        expect(immutableWith(`${keyword} (x) /meta/.test(s);`)).toBe(true);
-      }
-    );
+    // Valid module code only: a `switch` header is always followed by its case
+    // block, and `with` is a syntax error in strict (module) code, so neither can
+    // put a "/" right after its ")".
+    test.each([
+      ["if", "if (x) /meta/.test(s);"],
+      ["while", "while (x) /meta/.test(s);"],
+      ["for", "for (;;) /meta/.test(s);"],
+      ["for...of", "for (const k of ks) /meta/.test(k);"],
+    ])("treats / after a %s header as a regex", (_label, statement) => {
+      expect(immutableWith(statement)).toBe(true);
+    });
 
     test("matches the header's own parenthesis past nested calls", () => {
       expect(immutableWith("if (f(x)) /meta/.test(s);")).toBe(true);
