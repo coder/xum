@@ -460,6 +460,13 @@ describe("highlightWithBudget", () => {
 // #6292: the first job of a worker also waited for the worker to start (script load, Shiki's
 // engine and the language's grammar). On a cold load that used up the 5 s budget, the input was
 // marked as wedged, and it stayed plain text for the rest of the session.
+/**
+ * Bun's default test timeout is 5 s. The tests that wait across the 20 s start limit in fake
+ * time take real macrotask hops for each step, so give them margin on a slow runner, while a
+ * real hang still fails in bounded time (#6337 review).
+ */
+const LONG_TEST_TIMEOUT_MS = 20_000;
+
 describe("highlightCode worker start-up", () => {
   let workers: ReturnType<typeof installFakeHighlightWorkers> | undefined;
   /** Workers start as `starts` says, in creation order. */
@@ -517,46 +524,58 @@ describe("highlightCode worker start-up", () => {
 
   // #6303: a request whose worker did not start rejected, and its block stayed plain text until
   // it remounted, although the next worker started fine.
-  it("a request whose worker did not start highlights once a later worker is ready", async () => {
-    const created = plan([null, 0]);
-    const first = highlightCode("const a = 1;", "typescript", "dark");
-    const queued = highlightCode("const b = 2;", "typescript", "dark");
-    const outcome = await settleWithin(first, 30_000);
-    expect(outcome).toEqual({ value: html("const a = 1;") });
-    expect(created[0].terminated).toBe(true);
-    expect(await settleWithin(queued, 250)).toEqual({ value: html("const b = 2;") });
-    // The queued request started the second worker; the retry used it.
-    expect(created).toHaveLength(2);
-    expect(created[1].highlighted).toEqual(["const b = 2;", "const a = 1;"]);
-  });
+  it(
+    "a request whose worker did not start highlights once a later worker is ready",
+    async () => {
+      const created = plan([null, 0]);
+      const first = highlightCode("const a = 1;", "typescript", "dark");
+      const queued = highlightCode("const b = 2;", "typescript", "dark");
+      const outcome = await settleWithin(first, 30_000);
+      expect(outcome).toEqual({ value: html("const a = 1;") });
+      expect(created[0].terminated).toBe(true);
+      expect(await settleWithin(queued, 250)).toEqual({ value: html("const b = 2;") });
+      // The queued request started the second worker; the retry used it.
+      expect(created).toHaveLength(2);
+      expect(created[1].highlighted).toEqual(["const b = 2;", "const a = 1;"]);
+    },
+    LONG_TEST_TIMEOUT_MS
+  );
 
-  it("a worker that never starts gets one shared recovery start, not a retry loop", async () => {
-    const created = plan([null, null, null]);
-    const first = highlightCode("const a = 1;", "typescript", "dark");
-    const queued = highlightCode("const b = 2;", "typescript", "dark");
-    const both = Promise.allSettled([first, queued]);
-    expect(await settleWithin(both, 90_000, 1_000)).not.toBe("pending");
-    for (const request of [first, queued]) {
-      await expect(request).rejects.toThrow("HIGHLIGHT_WORKER_START_TIMEOUT");
-    }
-    // A worker per request, plus one recovery start that both waited on. Nothing starts later.
-    expect(created).toHaveLength(3);
-    await advanceFakeTime(120_000, undefined, 1_000);
-    expect(created).toHaveLength(3);
-  });
+  it(
+    "a worker that never starts gets one shared recovery start, not a retry loop",
+    async () => {
+      const created = plan([null, null, null]);
+      const first = highlightCode("const a = 1;", "typescript", "dark");
+      const queued = highlightCode("const b = 2;", "typescript", "dark");
+      const both = Promise.allSettled([first, queued]);
+      expect(await settleWithin(both, 90_000, 1_000)).not.toBe("pending");
+      for (const request of [first, queued]) {
+        await expect(request).rejects.toThrow("HIGHLIGHT_WORKER_START_TIMEOUT");
+      }
+      // A worker per request, plus one recovery start that both waited on. Nothing starts later.
+      expect(created).toHaveLength(3);
+      await advanceFakeTime(120_000, undefined, 1_000);
+      expect(created).toHaveLength(3);
+    },
+    LONG_TEST_TIMEOUT_MS
+  );
 
   // DiffRenderer caches what highlightDiffChunks returns: a plain-text fallback would stay for
   // the session, so a worker that did not start must reject instead.
-  it("a diff whose workers did not start rejects instead of returning a plain-text fallback", async () => {
-    plan([null, null]);
-    const chunks = groupDiffLines(["+const a = 1;"], 1, 1);
-    const outcome = await settleWithin(
-      highlightDiffChunks(chunks, "typescript", "dark"),
-      60_000,
-      1_000
-    );
-    expect(outcome).toEqual({ error: "Error: HIGHLIGHT_WORKER_START_TIMEOUT" });
-  });
+  it(
+    "a diff whose workers did not start rejects instead of returning a plain-text fallback",
+    async () => {
+      plan([null, null]);
+      const chunks = groupDiffLines(["+const a = 1;"], 1, 1);
+      const outcome = await settleWithin(
+        highlightDiffChunks(chunks, "typescript", "dark"),
+        60_000,
+        1_000
+      );
+      expect(outcome).toEqual({ error: "Error: HIGHLIGHT_WORKER_START_TIMEOUT" });
+    },
+    LONG_TEST_TIMEOUT_MS
+  );
 
   // Each call registers its rejecter with its worker; a settled call must remove it, or a long
   // session would keep every highlight reachable until the worker dies.
@@ -588,16 +607,46 @@ describe("highlightCode worker start-up", () => {
   });
 
   // #6309: one language's failed recovery must not end another language's wait.
-  it("each language waits on its own recovery start", async () => {
-    const created = plan([null, null, null, 0]);
-    const ts = highlightCode("const a = 1;", "typescript", "dark");
-    const py = highlightCode("a = 1", "python", "dark");
-    const both = Promise.allSettled([ts, py]);
-    expect(await settleWithin(both, 120_000, 1_000)).not.toBe("pending");
-    await expect(ts).rejects.toThrow("HIGHLIGHT_WORKER_START_TIMEOUT");
-    await expect(py).resolves.toBe(html("a = 1"));
-    expect(created).toHaveLength(4);
-  });
+  it(
+    "each language waits on its own recovery start",
+    async () => {
+      const created = plan([null, null, null, 0]);
+      const ts = highlightCode("const a = 1;", "typescript", "dark");
+      const py = highlightCode("a = 1", "python", "dark");
+      const both = Promise.allSettled([ts, py]);
+      expect(await settleWithin(both, 120_000, 1_000)).not.toBe("pending");
+      await expect(ts).rejects.toThrow("HIGHLIGHT_WORKER_START_TIMEOUT");
+      await expect(py).resolves.toBe(html("a = 1"));
+      expect(created).toHaveLength(4);
+    },
+    LONG_TEST_TIMEOUT_MS
+  );
+
+  // #6303 item 4: a caller that aborted (an unmounted diff) still waited on its recovery start,
+  // and that start still ran on the serial queue for nobody, up to 20 s ahead of live work.
+  it(
+    "a recovery start whose waiters all aborted is skipped",
+    async () => {
+      const created = plan([null, 0, null]);
+      const controller = new AbortController();
+      const waiter = highlightCode("const a = 1;", "typescript", "dark", controller.signal);
+      // Keeps the queue busy, so the waiter's recovery start is still queued when it aborts.
+      const wedged = highlightCode(WEDGED_INPUT, "typescript", "dark");
+      // The first worker gives up at 20 s; the wedged job then starts the second worker.
+      await advanceFakeTime(21_000, undefined, 1_000);
+      expect(created).toHaveLength(2);
+
+      controller.abort();
+      expect(await settleWithin(waiter, 0)).toEqual({ error: String(controller.signal.reason) });
+      expect(await settleWithin(wedged, 10_000, 1_000)).toEqual({
+        error: "Error: HIGHLIGHT_TIMEOUT",
+      });
+      // Nobody waits on the recovery any more: it starts no third worker.
+      await advanceFakeTime(60_000, undefined, 1_000);
+      expect(created).toHaveLength(2);
+    },
+    LONG_TEST_TIMEOUT_MS
+  );
 
   it("a worker that crashes during a highlight rejects at once and does not mark the input", async () => {
     const created = plan([0, 0]);
