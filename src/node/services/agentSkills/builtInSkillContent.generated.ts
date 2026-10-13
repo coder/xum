@@ -2412,7 +2412,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- When a plugin skill loses its bare name to another skill, the model's skill index lists it under its qualified name. Plugin skills that win their bare name are listed only once, under the bare name.",
       "- A qualified name with no match (for example `nope:tdd` or `pstack:missing`) fails with `Agent skill not found: <name>`.",
       "",
-      "You can invoke a plugin skill by its qualified name too: type `/pstack:tdd` in the composer, or mention `$pstack:tdd` in a message. The slash menu and `$` suggestions list a shadowed plugin skill under its qualified name, and typing `tdd` also matches `pstack:tdd`. If `$tdd:notes` names no plugin skill, Xum loads `tdd` and leaves `:notes` as text.",
+      "You can invoke a plugin skill by its qualified name too: type `/pstack:tdd` in the composer, or mention `$pstack:tdd` in a message. The slash menu and `$` suggestions list a shadowed plugin skill under its qualified name, and typing `tdd` also matches `pstack:tdd`. If no plugin named `tdd` is installed, `$tdd:notes` loads the bare `tdd` skill and leaves `:notes` as text. If a `tdd` plugin is installed, `$tdd:notes` names one of its skills, and no skill attaches when that skill does not exist.",
       "",
       "Skill names in `SKILL.md` frontmatter and directory names stay bare. The qualified form applies only to lookups such as `agent_skill_read`, `agent_skill_read_file`, `/skill`, and `$skill`.",
       "",
