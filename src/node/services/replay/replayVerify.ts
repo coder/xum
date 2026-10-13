@@ -738,6 +738,18 @@ export async function replayVerifySession(params: {
         partialContinuation = JSON.parse(continuationJson) as MuxMessage;
       }
 
+      let mcpAppModelContext: MuxMessage | undefined;
+      if (envelope.data.mcpAppModelContextHash != null) {
+        const contextJson = await journal.blobs.getText(envelope.data.mcpAppModelContextHash);
+        if (contextJson == null) {
+          fail(
+            `MCP Apps model context blob ${envelope.data.mcpAppModelContextHash} missing from blob store`
+          );
+          continue;
+        }
+        mcpAppModelContext = JSON.parse(contextJson) as MuxMessage;
+      }
+
       // 1) System prompt: blob bytes vs the wire's system message.
       const systemPromptMatch = recordedSystemText(record.prompt) === systemPrompt;
 
@@ -772,6 +784,7 @@ export async function replayVerifySession(params: {
         planFilePath: envelope.data.planTransitionFilePath,
         postCompactionAttachments,
         partialContinuation,
+        mcpAppModelContext,
         deferLoadingToolNames: deferLoadingNamesFromRecordedTools(record.tools),
         workspaceId: params.workspaceId,
       });

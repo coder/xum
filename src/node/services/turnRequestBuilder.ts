@@ -76,6 +76,7 @@ import { isRlmModeEnabled } from "@/node/services/branchSummary";
 import type { ProviderService } from "@/node/services/providerService";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { type DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import { formatMcpAppModelContextSection } from "@/node/services/mcpAppResultStore";
 import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
@@ -2560,6 +2561,50 @@ export class TurnRequestBuilder {
         failedNames: mcpStats?.failedServerNames.join(", "),
       });
     }
+    // SECURITY AUDIT: MCP Apps model context (ui/update-model-context) is view output, i.e.
+    // untrusted text from an MCP server, sent to the model. It is a request-only user-role row
+    // placed right before the newest user row (assemblePromptPayload). At the provider,
+    // mergeConsecutiveUserMessages joins the two, so the newest user message starts with the
+    // labeled <mcp-app-context> block and the user's text follows it. Never the system prompt:
+    // unlike plugin request.assemble text, no user reviewed it, so it must not outrank tool
+    // results, and a view update must not change the cached system prefix. It is never written
+    // to chat.jsonl. It goes in only (1) for servers this turn actually enabled (the validated
+    // inventory above; none when the serve failed closed), (2) attributed to the server and view
+    // named by the view's result record, inside the block, whose text cannot close a <view> or
+    // the block, so nothing after the host's own closing tag can pose as the user's text, and
+    // (3) after a durable hook-context row, so "model-visible => logged" holds.
+    // Each view's latest update replaces its previous one in the store, so only the last update
+    // before this request is sent. It is kept for later turns too, not cleared on use: the spec
+    // says "This context will be used in future turns" (MCP Apps 2026-01-26).
+    let mcpAppContextMessage: MuxMessage | undefined;
+    if (!isSideChat && mcpServers !== undefined && this.dependencies.bindings.mcpServerManager) {
+      const enabledServers = new Set(
+        Object.entries(mcpServers)
+          .filter(([, info]) => !info.disabled)
+          .map(([name]) => name)
+      );
+      try {
+        const section = formatMcpAppModelContextSection(
+          await this.dependencies.bindings.mcpServerManager.getMcpAppModelContexts(workspaceId),
+          enabledServers
+        );
+        if (section !== undefined) {
+          await this.dependencies
+            .durableEventJournalFor(workspaceId)
+            .publishWithBlob(section, (blobHash) => ({
+              workspaceId,
+              kind: "hook-context",
+              data: { hookId: "mcp-apps:model-context", placement: "user-context", blobHash },
+            }));
+          mcpAppContextMessage = createMuxMessage("mcp-app-context", "user", section, {
+            synthetic: true,
+          });
+        }
+      } catch (error) {
+        // Self-healing: an unreadable store or journal drops the context, never the turn.
+        workspaceLog.warn("Dropping MCP Apps model context from the request", { error });
+      }
+    }
 
     type ModelSeed = typeof modelResult.data;
     const prepareModelRequest = async (options: {
@@ -2892,6 +2937,7 @@ export class TurnRequestBuilder {
               anthropicCacheTtl: effectiveAnthropicCacheTtl,
               workspaceId,
               tagHistoryItemIds: tokenBudgetEnabled,
+              requestContextMessage: mcpAppContextMessage,
             },
             {
               enabled: tokenBudgetEnabled,
@@ -2935,6 +2981,7 @@ export class TurnRequestBuilder {
             planFilePath,
             postCompactionAttachments,
             partialContinuationMessage: options.partialContinuationMessage,
+            mcpAppModelContextMessage: mcpAppContextMessage,
           });
         };
         const rebuildMessagesForThinkingLevel = async (level: ThinkingLevel) => {

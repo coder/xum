@@ -248,6 +248,12 @@ jobs:
         env:
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_TOTAL: ${{ strategy.job-total }}
+      # A shard writes one report per process: coverage/lcov.info for the shared
+      # process, plus coverage/isolated/<n>/ and coverage/tooling/ (see
+      # scripts/test-unit-ci.sh). Upload them all.
+      - name: List coverage reports
+        id: lcov
+        run: echo "files=$(find coverage -name lcov.info 2>/dev/null | LC_ALL=C sort | paste -sd, -)" >>"$GITHUB_OUTPUT"
       # Quality / CRAP merges every shard's report; keep them only briefly. A
       # failed shard's report is incomplete, so it uploads none and the summary
       # shows partial coverage. Informational: an upload error must not fail
@@ -257,13 +263,13 @@ jobs:
         continue-on-error: true
         with:
           name: crap-lcov-unit-${{ matrix.shard }}
-          path: coverage/lcov.info
+          path: coverage/**/lcov.info
           if-no-files-found: ignore
           retention-days: 3
       - uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/lcov.info
+          files: ${{ steps.lcov.outputs.files }}
           flags: unit-tests
           fail_ci_if_error: false
 
