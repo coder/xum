@@ -1680,6 +1680,42 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   );
 
+  // A model with no known window has no budget on the first attempt. Its retry must still
+  // trim (to the retry scale of the history's own estimate), or it resends the same request.
+  it.each([
+    { name: "first attempt is sent whole", scale: undefined, expected: ["t1", "t2", "t3"] },
+    { name: "retry trims to half the estimate", scale: 0.5, expected: ["t3"] },
+  ])("compaction on a model with an unknown window: $name", async (testCase) => {
+    using xumHome = new DisposableTempDir("ai-service-compaction-trim-unknown");
+    const metadata = createLocalWorkspaceMetadata("compaction-trim-unknown", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    const model = "openai:unlisted-model-without-stats";
+    expect(resolveCompactionInputBudgetTokens(model, undefined, null)).toBeUndefined();
+    // Three equal turns: half of their estimate has room for the newest one only.
+    const turns = ["t1", "t2", "t3"].flatMap((id) => [
+      createMuxMessage(id, "user", "x".repeat(40_000)),
+      createMuxMessage(`${id}-answer`, "assistant", "ok"),
+    ]);
+    const result = await harness.service.streamMessage({
+      workspaceId: metadata.id,
+      messages: [
+        ...turns,
+        createMuxMessage("request", "user", "Summarize.", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        }),
+      ],
+      modelString: model,
+      thinkingLevel: "off",
+      ...(testCase.scale != null ? { compactionInputBudgetScale: testCase.scale } : {}),
+    });
+
+    expect(result.success).toBe(true);
+    const userIds = harness.preparedPayloadMessageIds[0]?.filter(
+      (id) => id.startsWith("t") && !id.endsWith("-answer")
+    );
+    expect(userIds).toEqual([...testCase.expected]);
+  });
+
   // A model whose context_exceeded retry switches to 1M is not trimmed on the first attempt
   // (it summarized the full history before trimming existed); the 1M retry trims to the 1M
   // window, not to the 200k one.

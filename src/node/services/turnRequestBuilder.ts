@@ -10,6 +10,7 @@ import { measureAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
+import { estimateCompactionInputTokens } from "@/common/utils/messages/trimCompactionInput";
 import {
   anthropicBetweenToolsRouteAvailable,
   canSwitchToAnthropic1MContext,
@@ -490,22 +491,36 @@ export function resolveCompactionInputBudgetTokens(
   return limit == null ? undefined : Math.floor(limit * SUMMARIZER_INPUT_FRACTION * scale);
 }
 
-/** assemblePromptPayload's compaction budget option: set for compaction requests only. */
+/**
+ * assemblePromptPayload's compaction budget option: set for compaction requests only. A retry
+ * (scale set) on a model whose window is unknown has no window to derive a budget from; it
+ * trims to `scale` of the history's own estimate instead, so it does not resend the history
+ * that just hit context_exceeded unchanged.
+ */
 function compactionInputBudgetOption(
   isCompactionRequest: boolean,
-  modelString: string,
-  providerOptions: MuxProviderOptions | undefined,
-  providersConfig: ProvidersConfigMap | null | undefined,
+  model: {
+    modelString: string;
+    providerOptions: MuxProviderOptions | undefined;
+    providersConfig: ProvidersConfigMap | null | undefined;
+  },
+  history: MuxMessage[],
   scale: number | undefined
 ): { compactionInputBudgetTokens?: number } {
   if (!isCompactionRequest) return {};
-  const budget = resolveCompactionInputBudgetTokens(
-    modelString,
-    providerOptions,
-    providersConfig,
-    scale
-  );
+  const budget =
+    resolveCompactionInputBudgetTokens(
+      model.modelString,
+      model.providerOptions,
+      model.providersConfig,
+      scale
+    ) ?? (scale == null ? undefined : retryBudgetFromHistory(history, scale));
   return budget == null ? {} : { compactionInputBudgetTokens: budget };
+}
+
+function retryBudgetFromHistory(history: MuxMessage[], scale: number): number | undefined {
+  const budget = Math.floor(estimateCompactionInputTokens(history) * scale);
+  return budget > 0 ? budget : undefined;
 }
 
 /**
@@ -2919,9 +2934,12 @@ export class TurnRequestBuilder {
         // Recorded in the DevTools run so the replay verifier trims the same way.
         const compactionInputBudget = compactionInputBudgetOption(
           isCompactionRequest,
-          seed.rawModelString,
-          effectiveMuxProviderOptions,
-          seed.providersConfig,
+          {
+            modelString: seed.rawModelString,
+            providerOptions: effectiveMuxProviderOptions,
+            providersConfig: seed.providersConfig,
+          },
+          attemptProviderRequestMessages,
           compactionInputBudgetScale
         );
         // Shared by the initial build and thinking rebuilds so their assembly

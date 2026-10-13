@@ -20,8 +20,10 @@
  * budget (for example a huge user message): the caller sends it, and the context_exceeded retry
  * runs with half the budget.
  */
+import { IMAGE_TOKEN_ESTIMATE } from "@/common/constants/contextBudget";
 import type { MuxMessage } from "@/common/types/message";
 import assert from "@/common/utils/assert";
+import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 
 export interface CompactionInputTrim {
@@ -32,8 +34,63 @@ export interface CompactionInputTrim {
 
 type Part = MuxMessage["parts"][number];
 
+/** Media parts a row sends: user file parts, and media inside tool results. */
+function countMediaParts(message: MuxMessage): number {
+  let count = 0;
+  for (const part of message.parts) {
+    if (part.type === "file") count += 1;
+    else if (part.type === "dynamic-tool" && part.state === "output-available") {
+      count += estimateToolResultSize(part.output).imageParts;
+    }
+  }
+  return count;
+}
+
+/**
+ * A row's estimated tokens: chars/4 of its parts (estimateMuxMessageTokens, which counts base64
+ * as a tiny marker), plus IMAGE_TOKEN_ESTIMATE per media part, the allowance the request-time
+ * context check uses (contextBudget.ts). Without it a history of screenshots or PDFs looks
+ * small and is sent untrimmed. PDFs can cost more per part; the half-budget retry backs that.
+ */
+export function estimateCompactionRowTokens(message: MuxMessage): number {
+  return estimateMuxMessageTokens(message) + countMediaParts(message) * IMAGE_TOKEN_ESTIMATE;
+}
+
+/** The estimate trimCompactionInput fits to a budget, for a whole history. */
+export function estimateCompactionInputTokens(messages: MuxMessage[]): number {
+  return messages.reduce((sum, message) => sum + estimateCompactionRowTokens(message), 0);
+}
+
 function omittedToolResultText(tokens: number): string {
   return `[Tool result omitted to fit the compaction request: about ${tokens} tokens]`;
+}
+
+/**
+ * Step start indices after removing the parts where `kept` is false. Each step starts at its
+ * first kept part, a step with none left disappears, and the first kept part is always 0, so
+ * the list stays strictly ascending from 0 (insertStepStartPartsForSdk trusts only that shape).
+ * A list of other values is corrupted history: returned as is, and the SDK helper ignores it.
+ */
+function rebaseStepStarts(starts: unknown, kept: boolean[]): unknown {
+  const isIndexList = Array.isArray(starts) && starts.every((start) => Number.isSafeInteger(start));
+  return isIndexList ? rebaseIndexList(starts as number[], kept) : starts;
+}
+
+function rebaseIndexList(starts: number[], kept: boolean[]): number[] {
+  // newIndex[i]: how many kept parts come before part i.
+  const newIndex: number[] = [];
+  let count = 0;
+  for (const keep of kept) {
+    newIndex.push(count);
+    if (keep) count += 1;
+  }
+  const rebased: number[] = [];
+  starts.forEach((start, position) => {
+    const end = position + 1 < starts.length ? starts[position + 1] : kept.length;
+    const first = kept.findIndex((keep, index) => keep && index >= start && index < end);
+    if (first !== -1) rebased.push(newIndex[first]);
+  });
+  return rebased;
 }
 
 function withoutReasoning(messages: MuxMessage[]): MuxMessage[] {
@@ -41,9 +98,21 @@ function withoutReasoning(messages: MuxMessage[]): MuxMessage[] {
     if (message.role !== "assistant" || !message.parts.some((p) => p.type === "reasoning")) {
       return [message];
     }
-    const parts = message.parts.filter((part) => part.type !== "reasoning");
+    const kept = message.parts.map((part) => part.type !== "reasoning");
+    const parts = message.parts.filter((_part, index) => kept[index]);
     // An assistant row with nothing left would reach the provider as an empty message.
-    return parts.length > 0 ? [{ ...message, parts }] : [];
+    if (parts.length === 0) return [];
+    const starts = message.metadata?.stepStartPartIndices;
+    // The persisted step boundaries index into parts: rebase them onto the parts that remain,
+    // or the SDK would split the replayed steps at the wrong places.
+    const metadata =
+      starts === undefined || message.metadata == null
+        ? message.metadata
+        : {
+            ...message.metadata,
+            stepStartPartIndices: rebaseStepStarts(starts, kept) as number[],
+          };
+    return [{ ...message, parts, metadata }];
   });
 }
 
@@ -51,18 +120,22 @@ function isOutputPart(part: Part): boolean {
   return part.type === "dynamic-tool" && part.state === "output-available";
 }
 
-/** The row with every tool result replaced by a placeholder; the same row when it has none. */
-function withPlaceholderOutputs(message: MuxMessage): { message: MuxMessage; replaced: number } {
-  let replaced = 0;
-  const parts = message.parts.map((part): Part => {
-    if (part.type !== "dynamic-tool" || part.state !== "output-available") return part;
-    replaced += 1;
-    const tokens = estimateMuxMessageTokens({ ...message, parts: [part] });
-    // nestedCalls never reach the provider (convertToModelMessages reads input/output only),
-    // but they count in the estimate, so drop them with the output.
-    return { ...part, output: omittedToolResultText(tokens), nestedCalls: undefined };
-  });
-  return replaced === 0 ? { message, replaced } : { message: { ...message, parts }, replaced };
+/** The row with the tool result at `partIndex` replaced by a size placeholder. */
+function withPlaceholderOutput(message: MuxMessage, partIndex: number): MuxMessage {
+  const part = message.parts[partIndex];
+  assert(part.type === "dynamic-tool" && part.state === "output-available", "not a tool result");
+  const tokens = estimateCompactionRowTokens({ ...message, parts: [part] });
+  // nestedCalls never reach the provider (convertToModelMessages reads input/output only),
+  // but they count in the estimate, so drop them with the output.
+  const placeholder: Part = {
+    ...part,
+    output: omittedToolResultText(tokens),
+    nestedCalls: undefined,
+  };
+  const parts = message.parts.map((existing, index) =>
+    index === partIndex ? placeholder : existing
+  );
+  return { ...message, parts };
 }
 
 /** Start indices of the turns before `end`: user rows that follow a non-user row. */
@@ -85,22 +158,30 @@ class TrimState {
 
   constructor(rows: MuxMessage[]) {
     this.rows = [...rows];
-    this.tokens = this.rows.map(estimateMuxMessageTokens);
+    this.tokens = this.rows.map(estimateCompactionRowTokens);
     this.total = this.tokens.reduce((sum, value) => sum + value, 0);
     this.replaced = this.rows.map(() => 0);
   }
 
-  /** Replace tool results in rows [from, to), oldest first, until the total fits. */
+  /**
+   * Replace tool results in rows [from, to), oldest first and one result at a time, until the
+   * total fits: a row with several results keeps the ones the budget has room for.
+   */
   placeholderOutputs(from: number, to: number, budget: number): void {
     for (let index = from; index < to && this.total > budget; index++) {
-      if (!this.rows[index].parts.some(isOutputPart)) continue;
-      const { message, replaced } = withPlaceholderOutputs(this.rows[index]);
-      const tokens = estimateMuxMessageTokens(message);
-      this.total += tokens - this.tokens[index];
-      this.rows[index] = message;
-      this.tokens[index] = tokens;
-      this.replaced[index] = replaced;
+      for (let part = 0; part < this.rows[index].parts.length && this.total > budget; part++) {
+        if (isOutputPart(this.rows[index].parts[part])) this.replaceOutput(index, part);
+      }
     }
+  }
+
+  private replaceOutput(index: number, part: number): void {
+    const message = withPlaceholderOutput(this.rows[index], part);
+    const tokens = estimateCompactionRowTokens(message);
+    this.total += tokens - this.tokens[index];
+    this.rows[index] = message;
+    this.tokens[index] = tokens;
+    this.replaced[index] += 1;
   }
 
   /** Count the oldest turns (of `starts`, never the newest) to leave out until the total fits. */
@@ -142,7 +223,7 @@ export function trimCompactionInput(
 ): CompactionInputTrim {
   assert(Number.isFinite(budgetTokens) && budgetTokens > 0, "budgetTokens must be positive");
   const requestIndex = messages.findLastIndex((message) => message.role === "user");
-  const total = messages.reduce((sum, message) => sum + estimateMuxMessageTokens(message), 0);
+  const total = estimateCompactionInputTokens(messages);
   if (requestIndex <= 0 || total <= budgetTokens) {
     return { messages, omittedToolResults: 0, omittedTurns: 0 };
   }

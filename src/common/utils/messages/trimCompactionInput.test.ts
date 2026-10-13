@@ -135,4 +135,99 @@ describe("trimCompactionInput", () => {
       "request",
     ]);
   });
+
+  it("replaces only as many results of a multi-tool row as the budget needs", () => {
+    const row: MuxMessage = {
+      id: "multi-assistant",
+      role: "assistant",
+      parts: ["r1", "r2", "r3"].map((id) => ({
+        type: "dynamic-tool" as const,
+        toolCallId: id,
+        toolName: "file_read",
+        input: {},
+        state: "output-available" as const,
+        output: { content: "x".repeat(40_000) },
+      })),
+    };
+    const messages = [
+      createMuxMessage("u1", "user", "read three"),
+      row,
+      createMuxMessage("u2", "user", "next"),
+      createMuxMessage("a2", "assistant", "ok"),
+      COMPACTION_REQUEST,
+    ];
+    // Room for two of the three results.
+    const trim = trimCompactionInput(messages, 21_000);
+    const outputs = trim.messages
+      .find((message) => message.id === "multi-assistant")
+      ?.parts.map((part) =>
+        part.type === "dynamic-tool" && part.state === "output-available" ? part.output : null
+      );
+    expect(trim.omittedToolResults).toBe(1);
+    expect(outputs?.[0]).toMatch(/^\[Tool result omitted/);
+    expect(outputs?.slice(1)).toEqual([
+      { content: "x".repeat(40_000) },
+      { content: "x".repeat(40_000) },
+    ]);
+  });
+
+  it("rebases step boundaries onto the parts left after removing reasoning", () => {
+    const row: MuxMessage = {
+      id: "steps-assistant",
+      role: "assistant",
+      metadata: { stepStartPartIndices: [0, 2, 4] },
+      parts: [
+        { type: "reasoning", text: "plan" },
+        { type: "text", text: "step one" },
+        { type: "reasoning", text: "think" },
+        { type: "text", text: "step two" },
+        // A step of reasoning only: it disappears with its reasoning.
+        { type: "reasoning", text: "more" },
+      ],
+    };
+    const messages = [
+      ...toolTurn("a", 40_000),
+      createMuxMessage("b-user", "user", "go"),
+      row,
+      COMPACTION_REQUEST,
+    ];
+    const trim = trimCompactionInput(messages, 2_000);
+    const rebased = trim.messages.find((message) => message.id === "steps-assistant");
+    expect(rebased?.parts.map((part) => (part.type === "text" ? part.text : part.type))).toEqual([
+      "step one",
+      "step two",
+    ]);
+    expect(rebased?.metadata?.stepStartPartIndices).toEqual([0, 1]);
+  });
+
+  it("counts media parts so a screenshot-heavy history is trimmed", () => {
+    const screenshotTurn = (id: string): MuxMessage[] => [
+      createMuxMessage(`${id}-user`, "user", `look ${id}`),
+      {
+        id: `${id}-assistant`,
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: `${id}-call`,
+            toolName: "screenshot",
+            input: {},
+            state: "output-available",
+            output: {
+              type: "content",
+              value: Array.from({ length: 10 }, () => ({
+                type: "media",
+                data: "iVBORw0KGgo=",
+                mediaType: "image/png",
+              })),
+            },
+          },
+        ],
+      },
+    ];
+    const messages = [...screenshotTurn("a"), ...screenshotTurn("b"), COMPACTION_REQUEST];
+    // About 20 * 1,024 tokens of images; the base64 itself is a few characters.
+    const trim = trimCompactionInput(messages, 15_000);
+    expect(trim.omittedToolResults).toBe(1);
+  });
 });

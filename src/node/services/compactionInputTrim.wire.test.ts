@@ -48,9 +48,13 @@ const HISTORY: MuxMessage[] = [
   }),
 ];
 
-function assemble(provider: "anthropic" | "openai", compactionInputBudgetTokens?: number) {
+function assemble(
+  provider: "anthropic" | "openai",
+  compactionInputBudgetTokens?: number,
+  history: MuxMessage[] = HISTORY
+) {
   return assemblePromptPayload({
-    history: HISTORY,
+    history,
     systemMessage: "You summarize conversations.",
     modelString: provider === "anthropic" ? "anthropic:claude-haiku-4-5" : "openai:gpt-5.2",
     providerForMessages: provider,
@@ -148,4 +152,54 @@ describe("compaction input trim on the wire", () => {
       expect(JSON.stringify(payload.messages)).not.toContain("sig-");
     }
   );
+
+  test("a trimmed request keeps a step that opens with a tool call in its own message", async () => {
+    const tool = (id: string) => ({
+      type: "dynamic-tool" as const,
+      toolCallId: `call_${id}`,
+      toolName: "file_read",
+      input: { path: `${id}.ts` },
+      state: "output-available" as const,
+      output: { success: true, content: id },
+    });
+    const reasoning = (text: string) => ({
+      type: "reasoning" as const,
+      text,
+      providerOptions: { anthropic: { signature: `sig-${text}` } },
+    });
+    // Two sequential steps: the second opens with its reasoning, then a tool call.
+    const steps: MuxMessage = {
+      id: "steps-assistant",
+      role: "assistant",
+      metadata: { stepStartPartIndices: [0, 2] },
+      parts: [
+        reasoning("one"),
+        tool("s1"),
+        reasoning("two"),
+        tool("s2"),
+        { type: "text", text: "Done." },
+      ],
+    };
+    const history = [
+      ...toolTurn("old", 40_000),
+      createMuxMessage("steps-user", "user", "read twice"),
+      steps,
+      HISTORY[HISTORY.length - 1],
+    ];
+    // Trimmed (the old result becomes a placeholder), so reasoning is removed too.
+    const payload = await assemble("anthropic", 2_000, history);
+    const body = await wireBody("anthropic", payload);
+    expect(JSON.stringify(body)).toContain("Tool result omitted");
+    const messageOf = (callId: string) =>
+      (body.messages as Array<{ content: unknown }>).findIndex(
+        (message) =>
+          Array.isArray(message.content) &&
+          (message.content as Array<Record<string, unknown>>).some(
+            (block) => block.type === "tool_use" && block.id === callId
+          )
+      );
+    // Sequential steps replay as two assistant messages, not one parallel call.
+    expect(messageOf("call_s1")).toBeGreaterThanOrEqual(0);
+    expect(messageOf("call_s2")).toBeGreaterThan(messageOf("call_s1"));
+  });
 });
