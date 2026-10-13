@@ -11,6 +11,7 @@ import {
   WEB_FETCH_TIMEOUT_SECS,
   WEB_FETCH_MAX_OUTPUT_BYTES,
   WEB_FETCH_MAX_HTML_BYTES,
+  WEB_FETCH_MAX_ADDRESS_ATTEMPTS,
 } from "@/common/constants/toolLimits";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
@@ -497,7 +498,8 @@ function isPinnedAddressUnreachable(
 
 /**
  * One request for one target. A later validated address is tried only when the pinned one
- * was unreachable (#5977): at most once each, inside the same deadline, never unpinned.
+ * was unreachable (#5977): at most once each, at most WEB_FETCH_MAX_ADDRESS_ATTEMPTS in
+ * total, inside the same deadline, never unpinned.
  * Without the route line (curl before 8.7) a refused CONNECT looks the same as a dead
  * address, so that curl makes one attempt only.
  */
@@ -509,7 +511,7 @@ async function fetchTargetFromValidatedAddresses(
   abortSignal?: AbortSignal
 ): Promise<runtimeHelpers.ExecResult> {
   let result: runtimeHelpers.ExecResult | undefined;
-  for (const address of target.addresses) {
+  for (const address of target.addresses.slice(0, WEB_FETCH_MAX_ADDRESS_ATTEMPTS)) {
     const curlTimeoutSecs = getRemainingWebFetchTimeoutSecs(deadlineMs);
     const connectTo = target.pinned ? buildConnectToPin(target.url, address) : null;
     const raw = await runtimeHelpers.execBuffered(

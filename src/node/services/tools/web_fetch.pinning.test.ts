@@ -27,6 +27,7 @@ import type { WebFetchToolResult } from "@/common/types/tools";
 import { createWebFetchTool } from "./web_fetch";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import { ICONS_EXAMPLE_TLS } from "../../../../tests/fixtures/tls/iconsExample";
+import { WEB_FETCH_MAX_ADDRESS_ATTEMPTS } from "@/common/constants/toolLimits";
 
 type ExecArgs = Parameters<typeof runtimeHelpers.execBuffered>;
 const realExecBuffered = runtimeHelpers.execBuffered;
@@ -35,6 +36,17 @@ const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "127.0.0.2", "127.0.0.3", "::1"
 const PROXY_ENV = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "ALL_PROXY"];
 const PROXY_ENV_ALL = [...PROXY_ENV, "all_proxy", "NO_PROXY", "no_proxy", "CURL_HOME"];
 const hasCurl = Bun.which("curl") != null;
+// web_fetch falls back to another address only on curl 8.7+ (it needs %{proxy_used}); older
+// curl, like the Ubuntu 22.04 CI runner's, keeps one attempt (#5977). Assert the real version.
+const curlFallsBack = (() => {
+  if (!hasCurl) return false;
+  const match = /^curl (\d+)\.(\d+)\./.exec(
+    Bun.spawnSync(["curl", "-q", "--version"]).stdout.toString()
+  );
+  if (!match) throw new Error("could not read the curl version for the fallback tests");
+  const [major, minor] = [Number(match[1]), Number(match[2])];
+  return major > 8 || (major === 8 && minor >= 7);
+})();
 // Probed at load, because it.skipIf needs the answer before the suite runs (#5990): a host
 // without ::1 shows the IPv6 case as skipped, and CI fails it instead of losing coverage.
 const hasIpv6Loopback = await new Promise<boolean>((resolve) => {
@@ -257,13 +269,22 @@ describe.skipIf(!hasCurl)("web_fetch pins the validated address (real curl)", ()
   const pinnedAddresses = () =>
     fetchCommands.map((command) => /--connect-to '[^:]+:\d+:(.+):\d+'/.exec(command)?.[1]);
 
-  it("falls back to the next validated address when the first is unreachable (#5977)", async () => {
+  it(`${curlFallsBack ? "falls back to" : "does not fall back (curl < 8.7) to"} the next validated address when the first is unreachable (#5977)`, async () => {
     // 127.0.0.2 is validated and listed first, but nothing listens there.
     dns = { "rebind.test": ["127.0.0.2", "127.0.0.1"] };
     const result = await fetchUrl(`http://rebind.test:${v4.port}/`);
-    expect(result).toMatchObject({ success: true, content: "pinned ok" });
-    expect(pinnedAddresses()).toEqual(["127.0.0.2", "127.0.0.1"]);
-    expect(v4.hits).toEqual([{ host: `rebind.test:${v4.port}`, path: "/" }]);
+    if (curlFallsBack) {
+      expect(result).toMatchObject({ success: true, content: "pinned ok" });
+      expect(pinnedAddresses()).toEqual(["127.0.0.2", "127.0.0.1"]);
+      expect(v4.hits).toEqual([{ host: `rebind.test:${v4.port}`, path: "/" }]);
+    } else {
+      expect(result).toMatchObject({
+        success: false,
+        error: "Failed to fetch URL: Failed to connect",
+      });
+      expect(pinnedAddresses()).toEqual(["127.0.0.2"]);
+      expect(v4.hits).toEqual([]);
+    }
   });
 
   it("tries each validated address once, then reports the connect failure", async () => {
@@ -273,7 +294,7 @@ describe.skipIf(!hasCurl)("web_fetch pins the validated address (real curl)", ()
       success: false,
       error: "Failed to fetch URL: Failed to connect",
     });
-    expect(pinnedAddresses()).toEqual(["127.0.0.2", "127.0.0.3"]);
+    expect(pinnedAddresses()).toEqual(curlFallsBack ? ["127.0.0.2", "127.0.0.3"] : ["127.0.0.2"]);
   });
 
   it("does not retry another address after a TLS failure", async () => {
@@ -446,6 +467,30 @@ describe("web_fetch curl version probe", () => {
       expect(env.calls.fetches).toHaveLength(attempts);
     }
   );
+
+  it("caps the address fallback at WEB_FETCH_MAX_ADDRESS_ATTEMPTS attempts (#5977)", async () => {
+    const answers = [
+      "93.184.216.31",
+      "93.184.216.32",
+      "93.184.216.33",
+      "93.184.216.34",
+      "93.184.216.35",
+    ];
+    using env = setup(
+      version("8.7.1"),
+      () => ({
+        stdout: "",
+        stderr: "curl: (7) Failed to connect\nXUM_CURL_ROUTE=;0",
+        exitCode: 7,
+        duration: 1,
+      }),
+      "https://many.test/page",
+      answers
+    );
+    expect(await env.run()).toMatchObject({ success: false });
+    expect(env.calls.fetches).toHaveLength(WEB_FETCH_MAX_ADDRESS_ATTEMPTS);
+    expect(WEB_FETCH_MAX_ADDRESS_ATTEMPTS).toBeLessThan(answers.length);
+  });
 
   it("on curl before 8.7, pins without the route check", async () => {
     using env = setup(version("8.5.0"), () => response(""));
