@@ -17,6 +17,7 @@ import {
 } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
+import * as https from "node:https";
 import * as net from "node:net";
 import * as path from "node:path";
 import type { ExecResult } from "@/node/utils/runtime/helpers";
@@ -25,11 +26,12 @@ import * as blockedTargets from "@/node/utils/network/blockedTargets";
 import type { WebFetchToolResult } from "@/common/types/tools";
 import { createWebFetchTool } from "./web_fetch";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { ICONS_EXAMPLE_TLS } from "../../../../tests/fixtures/tls/iconsExample";
 
 type ExecArgs = Parameters<typeof runtimeHelpers.execBuffered>;
 const realExecBuffered = runtimeHelpers.execBuffered;
 const realIsBlockedIpAddress = blockedTargets.isBlockedIpAddress;
-const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "127.0.0.2", "::1"]);
+const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "127.0.0.2", "127.0.0.3", "::1"]);
 const PROXY_ENV = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "ALL_PROXY"];
 const PROXY_ENV_ALL = [...PROXY_ENV, "all_proxy", "NO_PROXY", "no_proxy", "CURL_HOME"];
 const hasCurl = Bun.which("curl") != null;
@@ -251,23 +253,50 @@ describe.skipIf(!hasCurl)("web_fetch pins the validated address (real curl)", ()
     }
   );
 
-  it("makes exactly one attempt when the selected address is dead (no fallback)", async () => {
+  /** The address each curl attempt was pinned to, in order. */
+  const pinnedAddresses = () =>
+    fetchCommands.map((command) => /--connect-to '[^:]+:\d+:(.+):\d+'/.exec(command)?.[1]);
+
+  it("falls back to the next validated address when the first is unreachable (#5977)", async () => {
     // 127.0.0.2 is validated and listed first, but nothing listens there.
     dns = { "rebind.test": ["127.0.0.2", "127.0.0.1"] };
+    const result = await fetchUrl(`http://rebind.test:${v4.port}/`);
+    expect(result).toMatchObject({ success: true, content: "pinned ok" });
+    expect(pinnedAddresses()).toEqual(["127.0.0.2", "127.0.0.1"]);
+    expect(v4.hits).toEqual([{ host: `rebind.test:${v4.port}`, path: "/" }]);
+  });
+
+  it("tries each validated address once, then reports the connect failure", async () => {
+    dns = { "rebind.test": ["127.0.0.2", "127.0.0.3"] };
     const result = await fetchUrl(`http://rebind.test:${v4.port}/`);
     expect(result).toMatchObject({
       success: false,
       error: "Failed to fetch URL: Failed to connect",
     });
-    expect(fetchCommands).toHaveLength(1);
-    expect(v4.hits).toEqual([]);
+    expect(pinnedAddresses()).toEqual(["127.0.0.2", "127.0.0.3"]);
+  });
+
+  it("does not retry another address after a TLS failure", async () => {
+    const tls = https.createServer(ICONS_EXAMPLE_TLS, (_req, res) => res.end("tls ok"));
+    await new Promise<void>((resolve) => tls.listen(0, "127.0.0.1", resolve));
+    try {
+      const port = (tls.address() as net.AddressInfo).port;
+      // The certificate does not cover rebind.test, so curl stops with exit 60.
+      dns = { "rebind.test": ["127.0.0.1", "127.0.0.2"] };
+      const result = await fetchUrl(`https://rebind.test:${port}/`);
+      expect(result.success).toBe(false);
+      expect(pinnedAddresses()).toEqual(["127.0.0.1"]);
+    } finally {
+      await new Promise<void>((resolve) => tls.close(() => resolve()));
+    }
   });
 
   it("makes exactly one attempt when the proxy denies the tunnel", async () => {
     const proxy = await startProxyFixture("deny");
     try {
       process.env.http_proxy = `http://${proxy.url}`;
-      dns = { "rebind.test": ["127.0.0.1"] };
+      // A second validated address must not be tried: the proxy, not the address, refused.
+      dns = { "rebind.test": ["127.0.0.1", "127.0.0.2"] };
       expect(await fetchUrl(`http://rebind.test:${v4.port}/`)).toMatchObject({ success: false });
       expect(fetchCommands).toHaveLength(1);
       expect(proxy.targets).toEqual([`CONNECT 127.0.0.1:${v4.port} HTTP/1.1`]);
@@ -314,12 +343,25 @@ describe("web_fetch curl version probe", () => {
   const httpOk = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nok";
   const url = "https://93.184.216.34/page"; // public IP literal: no resolver call
 
-  function setup(probe: () => Promise<ExecResult>, fetch: (command: string) => ExecResult) {
+  function setup(
+    probe: () => Promise<ExecResult>,
+    fetch: (command: string) => ExecResult,
+    target = url,
+    dnsAnswer: string[] = []
+  ) {
     const calls = { probes: 0, fetches: [] as string[] };
     spyOn(runtimeHelpers, "execBuffered").mockImplementation((_runtime, command) => {
       if (command === "curl -q --version") {
         calls.probes++;
         return probe();
+      }
+      if (command.startsWith("if command -v python3")) {
+        return Promise.resolve({
+          stdout: JSON.stringify(dnsAnswer),
+          stderr: "",
+          exitCode: 0,
+          duration: 1,
+        });
       }
       calls.fetches.push(command);
       return Promise.resolve(fetch(command));
@@ -328,7 +370,7 @@ describe("web_fetch curl version probe", () => {
     const tool = createWebFetchTool(createTestToolConfig(dir.path));
     const run = async () =>
       (await tool.execute!(
-        { url },
+        { url: target },
         { toolCallId: "p", messages: [], context: undefined }
       )) as WebFetchToolResult;
     return { calls, run, [Symbol.dispose]: () => dir[Symbol.dispose]() };
@@ -377,6 +419,33 @@ describe("web_fetch curl version probe", () => {
       error: "Failed to fetch URL: Failed to connect",
     });
   });
+
+  it.each([
+    ["8.7.1", 2],
+    ["8.5.0", 1],
+  ] as const)(
+    "on curl %s, a direct connect failure makes %i attempt(s) (#5977)",
+    async (curlVersion, attempts) => {
+      // Before 8.7 there is no route line, so a refused CONNECT and a dead address look
+      // the same: keep one attempt rather than retry blind.
+      using env = setup(
+        version(curlVersion),
+        () => ({
+          stdout: "",
+          stderr: "curl: (7) Failed to connect\nXUM_CURL_ROUTE=;0",
+          exitCode: 7,
+          duration: 1,
+        }),
+        "https://dual.test/page",
+        ["93.184.216.34", "93.184.216.35"]
+      );
+      expect(await env.run()).toEqual({
+        success: false,
+        error: "Failed to fetch URL: Failed to connect",
+      });
+      expect(env.calls.fetches).toHaveLength(attempts);
+    }
+  );
 
   it("on curl before 8.7, pins without the route check", async () => {
     using env = setup(version("8.5.0"), () => response(""));
