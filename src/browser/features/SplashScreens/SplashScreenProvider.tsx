@@ -4,6 +4,7 @@ import {
   useState,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   type ReactNode,
 } from "react";
@@ -16,11 +17,30 @@ import {
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useSettings } from "@/browser/contexts/SettingsContext";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
+import { ONBOARDING_VIEWED_KEY } from "@/common/constants/storage";
 
 /** Removes the static first-run view. Callers do it whenever the live wizard will not replace it. */
 export function removeFirstRunView(): void {
   document.getElementById(FIRST_RUN_VIEW_ID)?.remove();
+}
+
+/** Sets the early script's paint cache once these splash ids include the onboarding wizard. */
+function cacheViewedWizard(viewedIds: readonly string[]): void {
+  if (viewedIds.includes(ONBOARDING_WIZARD_SPLASH_ID)) {
+    updatePersistedState(ONBOARDING_VIEWED_KEY, true);
+  }
+}
+
+/**
+ * The static first-run view shows the wizard's gateway step. Once the queue is known and the
+ * wizard is not first (already viewed, read failed, splashes off, another splash), it must go.
+ */
+function useFirstRunViewQueueGuard(loaded: boolean, wizardIsFirst: boolean): void {
+  useLayoutEffect(() => {
+    if (loaded && !wizardIsFirst) removeFirstRunView();
+  }, [loaded, wizardIsFirst]);
 }
 
 const SplashScreenActiveContext = createContext(false);
@@ -63,6 +83,8 @@ function getActiveSplashQueue(viewedIds: readonly string[]): SplashConfig[] {
 async function markViewed(api: APIClient, splashId: string): Promise<boolean> {
   try {
     await api.splashScreens.markSplashScreenViewed({ splashId });
+    // Only a saved view may set the paint cache: markViewed also returns true after other errors.
+    cacheViewedWizard([splashId]);
   } catch (error) {
     if (isConnectionLostError(error)) return false;
     console.error("Failed to mark splash screen as viewed:", error);
@@ -89,6 +111,7 @@ export function SplashScreenProvider({ children }: { children: ReactNode }) {
     void (async () => {
       try {
         const viewedIds = await api.splashScreens.getViewedSplashScreens();
+        cacheViewedWizard(viewedIds);
         setQueue(getActiveSplashQueue(viewedIds));
       } catch (error) {
         // A lost connection is no load failure: keep the shown splash for the reconnect.
@@ -116,6 +139,7 @@ export function SplashScreenProvider({ children }: { children: ReactNode }) {
   const currentSplash = queue[0] ?? null;
   const isOnboardingSplash = currentSplash?.id === ONBOARDING_WIZARD_SPLASH_ID;
   const isPaused = isOnboardingSplash && onboardingPaused;
+  useFirstRunViewQueueGuard(loaded, isOnboardingSplash);
 
   useEffect(() => {
     if (!isOnboardingSplash || onboardingPaused || pausedOnboarding == null) {
