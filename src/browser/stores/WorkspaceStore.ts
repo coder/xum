@@ -639,6 +639,31 @@ function areAgentStatusesEqual(
   return a.emoji === b.emoji && a.message === b.message && (a.url ?? null) === (b.url ?? null);
 }
 
+/**
+ * Compares the goal fields that the sidebar and the Goal tab show, so an activity snapshot
+ * that changes only other goal fields (e.g. startedAtMs) does not re-render the workspace.
+ * A missing goal (null or undefined) equals only another missing goal.
+ */
+export function areActivityGoalsEqual(
+  a: GoalSnapshot | null | undefined,
+  b: GoalSnapshot | null | undefined
+): boolean {
+  if (a == null || b == null) {
+    return a == null && b == null;
+  }
+
+  return (
+    a.goalId === b.goalId &&
+    a.status === b.status &&
+    a.objective === b.objective &&
+    a.costCents === b.costCents &&
+    a.turnsUsed === b.turnsUsed &&
+    a.budgetCents === b.budgetCents &&
+    a.turnCap === b.turnCap &&
+    a.pendingPersistence === b.pendingPersistence
+  );
+}
+
 function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
   let max: number | undefined;
   for (const message of messages) {
@@ -3863,14 +3888,7 @@ export class WorkspaceStore {
       (previous?.activeBashMonitorCount ?? 0) !== (snapshot?.activeBashMonitorCount ?? 0) ||
       !areAgentStatusesEqual(previous?.displayStatus, snapshot?.displayStatus) ||
       !areAgentStatusesEqual(previous?.todoStatus, snapshot?.todoStatus) ||
-      previous?.goal?.goalId !== snapshot?.goal?.goalId ||
-      previous?.goal?.status !== snapshot?.goal?.status ||
-      previous?.goal?.objective !== snapshot?.goal?.objective ||
-      previous?.goal?.costCents !== snapshot?.goal?.costCents ||
-      previous?.goal?.turnsUsed !== snapshot?.goal?.turnsUsed ||
-      previous?.goal?.budgetCents !== snapshot?.goal?.budgetCents ||
-      previous?.goal?.turnCap !== snapshot?.goal?.turnCap ||
-      previous?.goal?.pendingPersistence !== snapshot?.goal?.pendingPersistence;
+      !areActivityGoalsEqual(previous?.goal, snapshot?.goal);
 
     if (!changed) {
       return;

@@ -49,6 +49,7 @@ import {
   getStatusStateKey,
 } from "@/common/constants/storage";
 import type { TodoItem } from "@/common/types/tools";
+import type { GoalSnapshot } from "@/common/types/goal";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import { revealTimelineTarget } from "@/browser/utils/timelineReveal";
 import type {
@@ -58,6 +59,7 @@ import type {
 } from "@/common/orpc/schemas/timeline";
 import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import {
+  areActivityGoalsEqual,
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
   WorkspaceStore,
@@ -6954,6 +6956,44 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  describe("activity goal updates", () => {
+    const goal: GoalSnapshot = {
+      goalId: "00000000-0000-4000-8000-000000000001",
+      status: "active",
+      objective: "Ship it",
+      budgetCents: 500,
+      costCents: 10,
+      turnsUsed: 1,
+      turnCap: 5,
+      startedAtMs: 1,
+    };
+
+    it("re-renders the workspace when a goal field it shows changes", async () => {
+      const workspaceId = "activity-goal-cost";
+      const listener = mock(() => undefined);
+      const releaseActivity = mockBackgroundActivityTransition(
+        workspaceId,
+        createActivitySnapshot(1, { streaming: false, goal }),
+        [
+          // Only a field the UI does not show changes: no re-render.
+          createActivitySnapshot(1, { streaming: false, goal: { ...goal, startedAtMs: 2 } }),
+          createActivitySnapshot(1, { streaming: false, goal: { ...goal, costCents: 11 } }),
+        ]
+      );
+      recreateStore();
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).goal != null)).toBe(true);
+      store.subscribeKey(workspaceId, listener);
+
+      releaseActivity();
+
+      expect(
+        await waitUntil(() => store.getWorkspaceState(workspaceId).goal?.costCents === 11)
+      ).toBe(true);
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("terminal activity", () => {
     it("propagates terminal activity to sidebar state", async () => {
       const workspaceId = "terminal-activity-workspace";
@@ -8615,6 +8655,48 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceHistoryEpoch(workspaceId)).toBeGreaterThan(epoch);
       expect(store.getWorkspaceLastUserPromptInfo(workspaceId)).toBeNull();
     });
+  });
+});
+
+describe("areActivityGoalsEqual", () => {
+  const goal: GoalSnapshot = {
+    goalId: "00000000-0000-4000-8000-000000000001",
+    status: "active",
+    objective: "Ship it",
+    budgetCents: 500,
+    costCents: 10,
+    turnsUsed: 1,
+    turnCap: 5,
+    startedAtMs: 1,
+  };
+
+  it("treats null and undefined as the same missing goal", () => {
+    expect(areActivityGoalsEqual(null, undefined)).toBe(true);
+    expect(areActivityGoalsEqual(undefined, undefined)).toBe(true);
+    expect(areActivityGoalsEqual(null, goal)).toBe(false);
+    expect(areActivityGoalsEqual(goal, undefined)).toBe(false);
+  });
+
+  it("detects a change in any goal field the UI shows", () => {
+    const changes: Array<Partial<GoalSnapshot>> = [
+      { goalId: "00000000-0000-4000-8000-000000000002" },
+      { status: "paused" },
+      { objective: "Ship it later" },
+      { budgetCents: null },
+      { costCents: 11 },
+      { turnsUsed: 2 },
+      { turnCap: null },
+      { pendingPersistence: true },
+    ];
+    for (const change of changes) {
+      expect(areActivityGoalsEqual(goal, { ...goal, ...change })).toBe(false);
+    }
+  });
+
+  it("ignores goal fields the UI does not show", () => {
+    expect(
+      areActivityGoalsEqual(goal, { ...goal, startedAtMs: 2, completionSummary: "done" })
+    ).toBe(true);
   });
 });
 
