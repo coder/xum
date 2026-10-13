@@ -12,31 +12,34 @@ import { projectWorkflowRun, selectPrimaryWorkflowRun } from "./projectWorkflowR
 import { useWorkflowRuns } from "./useWorkflowRuns";
 
 /**
- * Right-sidebar Workflows tab: a live, scannable view of the workspace's
- * durable workflow runs. Focuses the most recent active run by default; the
- * run-history list lets the user pin any prior run into focus.
+ * The empty state's script launcher for one workspace: the runnable scripts, the script being
+ * started, and the last start error.
  */
-export const WorkflowsTab: React.FC<{ workspaceId: string }> = (props) => {
+function useWorkflowLauncher(workspaceId: string, onStarted: () => void) {
   const { api } = useAPI();
-  const { runs, loading, error } = useWorkflowRuns(props.workspaceId);
-  const [overrideRunId, setOverrideRunId] = React.useState<string | null>(null);
   const [scripts, setScripts] = React.useState<AvailableWorkflow[]>([]);
   const [busyScriptPath, setBusyScriptPath] = React.useState<string | null>(null);
   const [runError, setRunError] = React.useState<string | null>(null);
+  // The workspace the launcher state belongs to.
+  const launcherWorkspaceIdRef = React.useRef<string | null>(null);
 
   // Discover runnable scripts for the empty-state list (one per workspace).
   React.useEffect(() => {
     // Reset launcher state first so a workspace switch never shows or launches a stale script
     // from the previous workspace — including if the new fetch is still pending or fails.
-    setScripts([]);
-    setBusyScriptPath(null);
-    setRunError(null);
+    // A re-run for the same workspace (a new API client after a reconnect) keeps the list.
+    if (launcherWorkspaceIdRef.current !== workspaceId) {
+      launcherWorkspaceIdRef.current = workspaceId;
+      setScripts([]);
+      setBusyScriptPath(null);
+      setRunError(null);
+    }
     if (api == null) {
       return;
     }
     let ignore = false;
     api.workflows
-      .listScripts({ workspaceId: props.workspaceId })
+      .listScripts({ workspaceId })
       .then((result) => {
         if (!ignore) {
           setScripts(result);
@@ -48,7 +51,7 @@ export const WorkflowsTab: React.FC<{ workspaceId: string }> = (props) => {
     return () => {
       ignore = true;
     };
-  }, [api, props.workspaceId]);
+  }, [api, workspaceId]);
 
   const runScript = async (script: AvailableWorkflow, args: Record<string, unknown>) => {
     if (api == null || busyScriptPath != null) {
@@ -58,20 +61,36 @@ export const WorkflowsTab: React.FC<{ workspaceId: string }> = (props) => {
     setRunError(null);
     try {
       await api.workflows.start({
-        workspaceId: props.workspaceId,
+        workspaceId,
         scriptPath: script.scriptPath,
         args,
         // Background the launch so the call returns immediately; the run then streams
         // into the tab via the subscription and becomes the focused run.
         runInBackground: true,
       });
-      setOverrideRunId(null);
+      onStarted();
     } catch (startError) {
       setRunError(startError instanceof Error ? startError.message : "Failed to start workflow");
     } finally {
       setBusyScriptPath(null);
     }
   };
+
+  return { scripts, busyScriptPath, runError, runScript };
+}
+
+/**
+ * Right-sidebar Workflows tab: a live, scannable view of the workspace's
+ * durable workflow runs. Focuses the most recent active run by default; the
+ * run-history list lets the user pin any prior run into focus.
+ */
+export const WorkflowsTab: React.FC<{ workspaceId: string }> = (props) => {
+  const { runs, loading, error } = useWorkflowRuns(props.workspaceId);
+  const [overrideRunId, setOverrideRunId] = React.useState<string | null>(null);
+  const { scripts, busyScriptPath, runError, runScript } = useWorkflowLauncher(
+    props.workspaceId,
+    () => setOverrideRunId(null)
+  );
 
   if (error != null) {
     return <div className="text-danger text-sm">Failed to load workflows: {error}</div>;
