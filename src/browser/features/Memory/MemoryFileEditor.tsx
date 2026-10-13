@@ -144,33 +144,52 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
         onSave={() => void handleSave()}
       />
       {saveError !== null && <SaveErrorBanner error={saveError} onReload={handleReload} />}
-      {loadError !== null ? (
-        <div className="text-error px-3 py-2 text-xs" role="alert">
-          {loadError}
-        </div>
-      ) : (
-        <>
-          {view.mode === "preview" && (
-            <div className="min-h-48 flex-1 overflow-auto p-3">
-              <MarkdownFilePreview content={draft} />
-            </div>
-          )}
-          {/* Stays mounted (hidden) in Preview, as GitHub's Write/Preview tabs
-              do, so a round trip keeps the caret and undo history. */}
-          <textarea
-            ref={textareaRef}
-            hidden={view.mode === "preview"}
-            // flex-1 fills the available height; the min-h floor keeps the
-            // editor usable on very short viewports.
-            className="min-h-48 flex-1 resize-none bg-transparent p-3 font-mono text-xs outline-none"
-            aria-label="Memory file content"
-            value={draft}
-            spellCheck={false}
-            onChange={(e) => setDraft(e.target.value)}
-          />
-        </>
-      )}
+      <MemoryFileBody
+        loadError={loadError}
+        mode={view.mode}
+        draft={draft}
+        textareaRef={textareaRef}
+        onDraftChange={setDraft}
+      />
     </div>
+  );
+}
+
+function MemoryFileBody(props: {
+  loadError: string | null;
+  mode: ViewMode;
+  draft: string;
+  textareaRef: RefObject<HTMLTextAreaElement | null>;
+  onDraftChange: (draft: string) => void;
+}) {
+  if (props.loadError !== null) {
+    return (
+      <div className="text-error px-3 py-2 text-xs" role="alert">
+        {props.loadError}
+      </div>
+    );
+  }
+  return (
+    <>
+      {props.mode === "preview" && (
+        <div className="min-h-48 flex-1 overflow-auto p-3">
+          <MarkdownFilePreview content={props.draft} />
+        </div>
+      )}
+      {/* Stays mounted (hidden) in Preview, as GitHub's Write/Preview tabs
+          do, so a round trip keeps the caret and undo history. */}
+      <textarea
+        ref={props.textareaRef}
+        hidden={props.mode === "preview"}
+        // flex-1 fills the available height; the min-h floor keeps the
+        // editor usable on very short viewports.
+        className="min-h-48 flex-1 resize-none bg-transparent p-3 font-mono text-xs outline-none"
+        aria-label="Memory file content"
+        value={props.draft}
+        spellCheck={false}
+        onChange={(e) => props.onDraftChange(e.target.value)}
+      />
+    </>
   );
 }
 
