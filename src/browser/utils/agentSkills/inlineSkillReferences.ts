@@ -4,6 +4,7 @@ import { SkillNameSchema, resolveSkillUserInvocable } from "@/common/orpc/schema
 import type { InvocableSkill } from "@/common/types/agentSkill";
 import {
   parseSkillLookupName,
+  findInvocableSkill,
   resolveSkillReadIdentity,
 } from "@/common/utils/agentSkills/skillLookupName";
 import type { AgentSkillReference } from "@/common/types/message";
@@ -310,8 +311,9 @@ async function resolveInlineSkill(
 ): Promise<InvocableSkill | null> {
   // user-invocable: false skills must be treated as nonexistent for inline $skill refs
   // (they remain model-invocable via agent_skill_read).
-  const skill = options.agentSkillDescriptors.find(
-    (descriptor) => descriptor.name === skillName && descriptor.userInvocable !== false
+  const skill = findInvocableSkill(
+    options.agentSkillDescriptors.filter((descriptor) => descriptor.userInvocable !== false),
+    skillName
   );
   if (skill) return skill;
   if (!options.api || !options.discovery) return null;

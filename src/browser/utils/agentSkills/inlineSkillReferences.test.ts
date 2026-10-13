@@ -265,6 +265,17 @@ describe("resolveInlineSkillReferences", () => {
     ).toEqual([{ skillName: "tdd", scope: "project", source: "inline" }]);
   });
 
+  test("a qualified $pstack:tdd selects the plugin skill that won its bare name", async () => {
+    expect(
+      await resolveInlineSkillReferences({
+        candidates: [candidate("pstack:tdd")],
+        agentSkillDescriptors: [{ ...descriptor("tdd"), pluginName: "pstack" }],
+        api: null,
+        discovery: null,
+      })
+    ).toEqual([{ skillName: "tdd", scope: "global", source: "inline" }]);
+  });
+
   test("collapses duplicate candidates", async () => {
     expect(
       await resolveInlineSkillReferences({
