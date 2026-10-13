@@ -1,6 +1,14 @@
 import "../../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, fireEvent, render, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import {
+  appViewTabFor,
+  withAppViewTab,
+} from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
+import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
+import { removeTabEverywhere } from "@/browser/utils/rightSidebarLayout";
+import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { isMcpAppViewHosted } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
 import { installDom } from "../../../../tests/ui/dom";
 import { APIContext, APIProvider } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
@@ -156,6 +164,43 @@ describe("GenericToolCall MCP Apps view", () => {
 
     fireEvent.click(view.getByRole("button", { name: "Hide input/output" }));
     expect(view.queryByText("Arguments")).toBeNull();
+  });
+
+  test("while its app tab is open the card shows a placeholder, not a second frame", async () => {
+    const view = renderAppCall("completed");
+    await view.findByTestId("mcp-app-frame");
+    // "Open in tab" adds the tab; the card drops its frame and offers the tab.
+    act(() => updateRightSidebarLayout("ws-app-card", (s) => withAppViewTab(s, "call-1")));
+    await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());
+    const goTo = view.getByRole("button", { name: "Go to tab" });
+    const opened: string[] = [];
+    const onOpen = (e: Event) =>
+      opened.push((e as CustomEvent<{ toolCallId: string }>).detail.toolCallId);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    fireEvent.click(goTo);
+    window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    expect(opened).toEqual(["call-1"]);
+    // Closing the tab brings the view back, mounted again (a new resource read).
+    act(() =>
+      updateRightSidebarLayout("ws-app-card", (s) =>
+        removeTabEverywhere(s, appViewTabFor("call-1"))
+      )
+    );
+    await view.findByTestId("mcp-app-frame");
+    expect(getViewCalls).toBe(2);
+  });
+
+  test("an expanded card is an inline target for its view, also while the tab has it", async () => {
+    const isCard = () => isMcpAppViewHosted("ws-app-card", "call-1", "card");
+    const view = renderAppCall("completed");
+    await view.findByTestId("mcp-app-frame");
+    expect(isCard()).toBe(true);
+    act(() => updateRightSidebarLayout("ws-app-card", (s) => withAppViewTab(s, "call-1")));
+    await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());
+    expect(isCard()).toBe(true);
+    // Collapsed, the card mounts no view: inline from the tab must not close it.
+    fireEvent.click(view.getByText("dice_show_dice_board"));
+    expect(isCard()).toBe(false);
   });
 
   test("a failed app call opens with its view and its error together", async () => {
