@@ -45,29 +45,50 @@ function readContentWithFileReadLimits(input: {
   const startIdx = startLineNumber - 1;
   const endIdx = input.limit != null ? startIdx + input.limit : lines.length;
 
+  const page = numberPageLines(lines, startIdx, Math.min(endIdx, lines.length));
+  if ("error" in page) {
+    return { success: false, error: page.error };
+  }
+
+  return {
+    success: true,
+    file_size: input.fileSize,
+    modifiedTime: input.modifiedTime,
+    lines_read: page.numberedLines.length,
+    content: page.numberedLines.join("\n"),
+  };
+}
+
+/** Numbers lines[startIdx, endIdx) as `<n>\t<line>` rows within the page caps. */
+function numberPageLines(
+  lines: string[],
+  startIdx: number,
+  endIdx: number
+): { numberedLines: string[] } | { error: string } {
   const numberedLines: string[] = [];
   let totalBytesAccumulated = 0;
-  const MAX_LINE_BYTES = 1024;
   const MAX_LINES = 1000;
   const MAX_TOTAL_BYTES = 16 * 1024; // 16KB
 
-  for (let i = startIdx; i < Math.min(endIdx, lines.length); i++) {
-    const line = lines[i];
+  // Unlike file_read, lines are never cut: skill markdown often keeps a whole
+  // paragraph on one line, and a silent per-line cut dropped instructions
+  // (agent_skill_read returns the SKILL.md body whole for the same reason).
+  // Only the page cap applies, and it fails loudly so the model pages instead.
+  for (let i = startIdx; i < endIdx; i++) {
     const lineNumber = i + 1;
-
-    let processedLine = line;
-    const lineBytes = Buffer.byteLength(line, "utf-8");
-    if (lineBytes > MAX_LINE_BYTES) {
-      processedLine = Buffer.from(line, "utf-8").subarray(0, MAX_LINE_BYTES).toString("utf-8");
-      processedLine += "... [truncated]";
-    }
-
-    const numberedLine = `${lineNumber}\t${processedLine}`;
+    const numberedLine = `${lineNumber}\t${lines[i]}`;
     const numberedLineBytes = Buffer.byteLength(numberedLine, "utf-8");
+
+    if (numberedLines.length === 0 && numberedLineBytes > MAX_TOTAL_BYTES) {
+      // Paging cannot shrink a single line, so say that instead of asking for
+      // a smaller offset/limit window.
+      return {
+        error: `Line ${lineNumber} is ${numberedLineBytes} bytes, more than the ${MAX_TOTAL_BYTES}-byte output limit, so agent_skill_read_file cannot return it.`,
+      };
+    }
 
     if (totalBytesAccumulated + numberedLineBytes > MAX_TOTAL_BYTES) {
       return {
-        success: false,
         error: `Output would exceed ${MAX_TOTAL_BYTES} bytes. Please read less at a time using offset and limit parameters.`,
       };
     }
@@ -77,24 +98,18 @@ function readContentWithFileReadLimits(input: {
 
     if (numberedLines.length > MAX_LINES) {
       return {
-        success: false,
         error: `Output would exceed ${MAX_LINES} lines. Please read less at a time using offset and limit parameters.`,
       };
     }
   }
 
-  return {
-    success: true,
-    file_size: input.fileSize,
-    modifiedTime: input.modifiedTime,
-    lines_read: numberedLines.length,
-    content: numberedLines.join("\n"),
-  };
+  return { numberedLines };
 }
 
 /**
  * Agent Skill read_file tool factory.
- * Reads a file within a skill directory with the same output limits as file_read.
+ * Reads a file within a skill directory with file_read's paging and page caps,
+ * but without its per-line cut (see readContentWithFileReadLimits).
  */
 export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
