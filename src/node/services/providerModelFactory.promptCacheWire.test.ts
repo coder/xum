@@ -43,13 +43,10 @@ describe("wrapFetchWithAnthropicCacheControl — DevTools prompt-cache wire fact
     const before = Date.now();
     await send({ stepId: "step-ok", respond: () => Promise.resolve(new Response("{}")) });
     const wire = consumePromptCacheWire("step-ok");
-    expect(wire).toMatchObject({
-      ...ROUTE,
-      // Query and credentials never reach the key.
-      endpoint: "https://gateway.example/v1/messages",
-      cacheMarkersInjected: true,
-      dispatched: true,
-    });
+    expect(wire).toMatchObject({ ...ROUTE, cacheMarkersInjected: true, dispatched: true });
+    // The endpoint is origin plus path; the query reaches it only as a hash (see requestEndpoint).
+    expect(wire?.endpoint).toStartWith("https://gateway.example/v1/messages?sha256:");
+    expect(wire?.endpoint).not.toContain("beta");
     const observedAt = Date.parse(wire?.observedAt ?? "");
     expect(observedAt).toBeGreaterThanOrEqual(before);
     expect(observedAt).toBeLessThanOrEqual(Date.now());
@@ -62,9 +59,11 @@ describe("wrapFetchWithAnthropicCacheControl — DevTools prompt-cache wire fact
       stepId: "step-529",
       respond: () => Promise.resolve(new Response("overloaded", { status: 529 })),
     });
-    expect(consumePromptCacheWire("step-529")).toEqual({
+    const wire = consumePromptCacheWire("step-529");
+    expect(wire?.endpoint).toMatch(/^https:\/\/gateway\.example\/v1\/messages\?sha256:/);
+    expect({ ...wire, endpoint: undefined }).toEqual({
       ...ROUTE,
-      endpoint: "https://gateway.example/v1/messages",
+      endpoint: undefined,
       cacheMarkersInjected: true,
       dispatched: true,
     });
