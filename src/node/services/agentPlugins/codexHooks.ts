@@ -18,8 +18,12 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { getErrorMessage } from "@/common/utils/errors";
 import { ensurePathContained } from "@/node/services/tools/skillFileUtils";
-import { readPluginFileWithinRootCapped, type AgentPluginInfo } from "./discovery";
-import { isPlainObject, isSafeContributesPath, type AgentPluginManifest } from "./manifest";
+import {
+  PLUGIN_MANIFEST_RELATIVE_PATH,
+  readPluginFileWithinRootCapped,
+  type AgentPluginInfo,
+} from "./discovery";
+import { isPlainObject } from "./manifest";
 
 /** Codex events Xum maps to its own hook points. */
 export const MAPPED_CODEX_HOOK_EVENTS = {
@@ -81,54 +85,27 @@ export interface PluginHooksLoadResult {
   warnings: string[];
 }
 
-/** One `extensions["com.openai"].hooks` entry: a relative hooks-file path or an inline object. */
-export type OpenAIPluginHooksEntry = string | Record<string, unknown>;
-
-/**
- * Adapter for the `extensions["com.openai"].hooks` pointer (path | path[] | object | object[]).
- * The A1 stack (`plugin-openai-extension`) parses the same field in `readOpenAIExtension`, with
- * the `.codex-plugin/plugin.json` fallback. When the stacks meet, replace this body with
- * `readOpenAIExtension(manifest).extension?.hooks` (same result type and rules).
- */
-export function readOpenAIHooksPointer(
-  manifest: Pick<AgentPluginManifest, "extensions">,
-  warnings: string[]
-): OpenAIPluginHooksEntry[] | undefined {
-  const openai = manifest.extensions?.["com.openai"];
-  if (!isPlainObject(openai) || openai.hooks === undefined) return undefined;
-  const entries: unknown[] = Array.isArray(openai.hooks) ? openai.hooks : [openai.hooks];
-  const hooks: OpenAIPluginHooksEntry[] = [];
-  for (const entry of entries) {
-    if (isPlainObject(entry)) {
-      hooks.push(entry);
-      continue;
-    }
-    const relative = typeof entry === "string" ? entry.replace(/[/\\]+$/, "") : undefined;
-    if (relative === undefined || !isSafeContributesPath(relative)) {
-      warnings.push(
-        `'extensions["com.openai"].hooks' entries must be relative paths inside the plugin or hooks objects; ignoring an entry`
-      );
-      continue;
-    }
-    hooks.push(relative);
-  }
-  return hooks;
-}
-
 /**
  * Read and parse a plugin's Codex hooks. An explicit `com.openai` pointer replaces the default
  * `hooks/hooks.json`; it never adds to it.
+ *
+ * The pointer is the `com.openai` extension discovery selected (root `plugin.json`, a Codex-only
+ * `.codex-plugin/plugin.json`, or the overlay next to a root manifest without one), already
+ * validated by readOpenAIExtension: the loader never reads `plugin.manifest` for it (Codex
+ * PRRT_kwDOPxxmWM6r2kUR). Inline entries are labeled with that manifest's path
+ * (PRRT_kwDOPxxmWM6r2kUY).
  */
 export async function loadPluginCodexHooks(
-  plugin: Pick<AgentPluginInfo, "rootPath" | "manifest">
+  plugin: Pick<AgentPluginInfo, "rootPath" | "openai" | "openaiManifestPath">
 ): Promise<PluginHooksLoadResult> {
   const warnings: string[] = [];
   const hooks: PluginHookDefinition[] = [];
-  const pointer = readOpenAIHooksPointer(plugin.manifest, warnings);
+  const pointer = plugin.openai?.hooks;
   const entries = pointer ?? [DEFAULT_HOOKS_FILE];
+  const inlineSource = path.normalize(plugin.openaiManifestPath ?? PLUGIN_MANIFEST_RELATIVE_PATH);
   for (const [index, entry] of entries.entries()) {
     if (typeof entry !== "string") {
-      parseHooksDocument(entry, `plugin.json#hooks[${index}]`, hooks, warnings);
+      parseHooksDocument(entry, `${inlineSource}#hooks[${index}]`, hooks, warnings);
       continue;
     }
     const content = await readHooksFile(plugin.rootPath, entry, pointer == null, warnings);
