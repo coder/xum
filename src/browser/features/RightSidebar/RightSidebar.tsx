@@ -22,7 +22,7 @@ import {
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, liveClientOf } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import {
@@ -917,6 +917,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // API for reading config and managing terminal sessions.
   const apiState = useAPI();
   const api = apiState.api;
+  const liveApi = liveClientOf(apiState);
   const desktopExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const artifactsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   const browserExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_BROWSER);
@@ -957,14 +958,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     // to mutate the existing goal record instead of archiving+recreating.
     editInPlace?: boolean;
   }) => {
-    if (!api) {
+    if (!liveApi) {
       throw new Error("Backend is not connected.");
     }
     // Target the goal this sidebar displayed: a goal replaced since then refuses the edit
     // (#5461) instead of receiving it.
     // Before the sidebar state loads, the displayed goal is unknown (not "no goal"): read it.
     const intendedGoalId = sidebarState == null ? undefined : intendedGoalIdOf(goal);
-    const result = await setGoalForIntendedGoal(api, workspaceId, intent, intendedGoalId);
+    const result = await setGoalForIntendedGoal(liveApi, workspaceId, intent, intendedGoalId);
     if (!result.success) {
       throw new Error(getGoalSetErrorMessage(result.error));
     }
@@ -1004,21 +1005,21 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   };
 
   const handleGoalClear = async () => {
-    if (!api) {
+    if (!liveApi) {
       throw new Error("Backend is not connected.");
     }
-    await api.workspace.clearGoal({ workspaceId });
+    await liveApi.workspace.clearGoal({ workspaceId });
   };
 
   const handleGoalCreate = async (intent: GoalCreateIntent) => {
-    if (!api) {
+    if (!liveApi) {
       throw new Error("Backend is not connected.");
     }
     // Apply shared defaults (turn cap + `alwaysRequireExplicitBudget`)
     // so the GoalTab form, slash command, and command palette produce
     // identical goals for identical inputs. Pass workspaceId so any
     // per-workspace override wins over the global.
-    const defaults = await loadGoalDefaults(api, workspaceId);
+    const defaults = await loadGoalDefaults(liveApi, workspaceId);
     const resolved = resolveGoalSetIntent(intent, defaults);
     if (hasGoalBudgetLimit(resolved.budgetCents)) {
       // Fetch provider config at submit time so quick submits before the
@@ -1027,7 +1028,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       // surfaces in lockstep.
       let freshProvidersConfig: unknown = providersConfig;
       try {
-        freshProvidersConfig = await api.providers.getConfig();
+        freshProvidersConfig = await liveApi.providers.getConfig();
       } catch {
         // Fall back to the hook value (which may still be null). Better
         // to surface the pricing-gate error than to leak the network

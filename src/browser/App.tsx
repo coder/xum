@@ -88,7 +88,7 @@ import type { UpdateChannel } from "@/common/types/project";
 import { useTelemetry } from "./hooks/useTelemetry";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useStartWorkspaceCreation } from "./hooks/useStartWorkspaceCreation";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
 import { getAutoRouting, getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
@@ -288,6 +288,8 @@ function AppInner() {
   const { layoutPresets, applySlotToWorkspace, saveCurrentWorkspaceToSlot } = useUILayouts();
   const { getMinOverride: getMinThinkingOverride } = useMinThinkingLevels();
   const { api, status, error, authenticate, retry } = useAPI();
+  // Handlers and command sources see null offline, even while useAPI() keeps the last client.
+  const liveApi = useLiveAPI();
   const [supportedUpdateChannels, setSupportedUpdateChannels] = useState<UpdateChannel[]>([]);
 
   useEffect(() => {
@@ -701,7 +703,8 @@ function AppInner() {
   const togglePremiumServiceTier = useCallback(
     async (targetServiceTier: PremiumServiceTier) => {
       const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
-      if (!api || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current) return;
+      if (!liveApi || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current)
+        return;
 
       // Creation composers use the same project-scoped model preference as their selector,
       // so the global shortcut remains available before the first workspace exists.
@@ -747,11 +750,11 @@ function AppInner() {
         if (provider === "openai") {
           const current =
             getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier;
-          setWorkspaceServiceTier(api, scopeId, toggleServiceTier(current, targetServiceTier));
+          setWorkspaceServiceTier(liveApi, scopeId, toggleServiceTier(current, targetServiceTier));
           return;
         }
         const patch = await applyFastModeToggle(
-          api.providers,
+          liveApi.providers,
           provider,
           providersConfig[provider],
           targetServiceTier
@@ -768,7 +771,7 @@ function AppInner() {
       }
     },
     [
-      api,
+      liveApi,
       creationScopeId,
       getModelForWorkspace,
       getRouteForModel,
@@ -813,14 +816,14 @@ function AppInner() {
         projectPaths.length >= 2,
         "createMultiProjectWorkspace requires at least two projects"
       );
-      if (!api) {
+      if (!liveApi) {
         throw new Error("Not connected to server");
       }
 
       const [primaryProjectPath] = projectPaths;
       assert(primaryProjectPath, "createMultiProjectWorkspace requires a primary project");
 
-      const branchResult = await api.projects.listBranches({ projectPath: primaryProjectPath });
+      const branchResult = await liveApi.projects.listBranches({ projectPath: primaryProjectPath });
       const candidateBranches = branchResult.branches.filter(
         (branch): branch is string => typeof branch === "string"
       );
@@ -841,7 +844,7 @@ function AppInner() {
       // Multi-project container names must stay unique and path-separator-free.
       const projects = createProjectRefs(projectPaths);
 
-      const metadata = await api.workspace.createMultiProject({
+      const metadata = await liveApi.workspace.createMultiProject({
         projects,
         branchName: `multi-${Date.now().toString(36)}`,
         trunkBranch,
@@ -866,7 +869,7 @@ function AppInner() {
       setSelectedWorkspace(toWorkspaceSelection(metadata));
       setMultiProjectWorkspaceModalOpen(false);
     },
-    [api, setSelectedWorkspace, setWorkspaceMetadata, telemetry, workspaceStore]
+    [liveApi, setSelectedWorkspace, setWorkspaceMetadata, telemetry, workspaceStore]
   );
 
   const archiveMergedWorkspacesInProjectFromPalette = useCallback(
@@ -874,7 +877,7 @@ function AppInner() {
       const trimmedProjectPath = projectPath.trim();
       if (!trimmedProjectPath) return;
 
-      if (!api) {
+      if (!liveApi) {
         if (typeof window !== "undefined") {
           window.alert("Cannot archive merged workspaces: API not connected");
         }
@@ -882,7 +885,7 @@ function AppInner() {
       }
 
       try {
-        const result = await api.workspace.archiveMergedInProject({
+        const result = await liveApi.workspace.archiveMergedInProject({
           projectPath: trimmedProjectPath,
         });
 
@@ -919,15 +922,15 @@ function AppInner() {
         }
       }
     },
-    [api]
+    [liveApi]
   );
 
   const getBranchesForProject = useCallback(
     async (projectPath: string): Promise<BranchListResult> => {
-      if (!api) {
+      if (!liveApi) {
         return { branches: [], recommendedTrunk: null };
       }
-      const branchResult = await api.projects.listBranches({ projectPath });
+      const branchResult = await liveApi.projects.listBranches({ projectPath });
       const sanitizedBranches = branchResult.branches.filter(
         (branch): branch is string => typeof branch === "string"
       );
@@ -942,7 +945,7 @@ function AppInner() {
         recommendedTrunk: recommended,
       };
     },
-    [api]
+    [liveApi]
   );
 
   const selectWorkspaceFromPalette = useCallback(
@@ -970,7 +973,7 @@ function AppInner() {
   );
   const removeSubagentFromPalette = async (workspaceId: string, title: string) => {
     const notice = await confirmAndRemoveSubagent({
-      api,
+      api: liveApi,
       confirm: confirmDialog,
       removeSubagent,
       workspaceId,
@@ -1114,7 +1117,7 @@ function AppInner() {
       }
     },
     onClearTimingStats: (workspaceId: string) => workspaceStore.clearTimingStats(workspaceId),
-    api,
+    api: liveApi,
     confirmDialog,
   };
 

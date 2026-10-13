@@ -87,7 +87,7 @@ import { useContextSwitchWarning } from "@/browser/hooks/useContextSwitchWarning
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
 import { CHAT_DOCK_GUTTER_CLASS } from "@/constants/layout";
 import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
@@ -355,6 +355,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const chatTranscriptFullWidth = useChatTranscriptFullWidth();
   const [transcriptDensity] = useTranscriptDensity();
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { workspaceMetadata } = useWorkspaceContext();
   const storeRaw = useWorkspaceStoreRaw();
   const aggregator = useWorkspaceAggregator(workspaceId);
@@ -1055,10 +1056,10 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   const handleQueuedDispatchModeChange = async (queueDispatchMode: QueueDispatchMode) => {
     clearQueuedActionError();
-    if (!api) {
+    if (!liveApi) {
       throw new Error("Workspace API is unavailable.");
     }
-    const result = await api.workspace.setQueuedMessageDispatchMode({
+    const result = await liveApi.workspace.setQueuedMessageDispatchMode({
       workspaceId,
       queueDispatchMode,
     });

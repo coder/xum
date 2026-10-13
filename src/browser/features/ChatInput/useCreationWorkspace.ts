@@ -33,7 +33,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -287,6 +287,7 @@ export function useCreationWorkspace({
   // Keep router state fresh synchronously so auto-navigation checks don't lag behind route changes.
   latestRouteRef.current = { currentWorkspaceId, currentProjectId, pendingDraftId };
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { getProjectConfig, refreshProjects, loading: projectsLoading } = useProjectContext();
   const { config: providersConfig } = useProvidersConfig();
   const [branches, setBranches] = useState<string[]>([]);
@@ -989,8 +990,8 @@ export function useCreationWorkspace({
         cancelLabel: "Don't create",
         onConfirm: async () => {
           try {
-            if (!api) throw new Error("API not available");
-            await api.projects.setTrust({
+            if (!liveApi) throw new Error("API not available");
+            await liveApi.projects.setTrust({
               projectPath: trustPrompt.projectPath,
               trusted: true,
             });

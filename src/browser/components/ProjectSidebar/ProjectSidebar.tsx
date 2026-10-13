@@ -42,7 +42,7 @@ import {
   isEditableElement,
   KEYBINDS,
 } from "@/browser/utils/ui/keybinds";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import {
   CUSTOM_EVENTS,
   getStorageChangeEvent,
@@ -659,18 +659,18 @@ function SidebarTitleEditKeybinds(props: {
   collapsed: boolean;
 }) {
   const { requestEdit, wrapGenerateTitle } = useTitleEdit();
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
 
   const regenerateTitleForWorkspace = useCallback(
     (workspaceId: string) => {
       wrapGenerateTitle(workspaceId, () => {
-        if (!api) {
+        if (!liveApi) {
           return Promise.resolve({ success: false, error: "Not connected to server" });
         }
-        return api.workspace.regenerateTitle({ workspaceId });
+        return liveApi.workspace.regenerateTitle({ workspaceId });
       });
     },
-    [wrapGenerateTitle, api]
+    [wrapGenerateTitle, liveApi]
   );
 
   useEffect(() => {

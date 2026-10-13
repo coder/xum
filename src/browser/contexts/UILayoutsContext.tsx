@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import assert from "@/common/utils/assert";
 import {
   DEFAULT_LAYOUT_PRESETS_CONFIG,
@@ -64,6 +64,7 @@ export function useUILayouts(): UILayoutsContextValue {
 
 export function UILayoutsProvider(props: { children: ReactNode }) {
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
 
   const [layoutPresets, setLayoutPresets] = useState<LayoutPresetsConfig>(
     DEFAULT_LAYOUT_PRESETS_CONFIG
@@ -119,14 +120,14 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
     async (next: LayoutPresetsConfig): Promise<void> => {
       const normalized = normalizeLayoutPresetsConfig(next);
 
-      if (!api) {
+      if (!liveApi) {
         throw new Error("ORPC client not initialized");
       }
 
-      await api.uiLayouts.saveAll({ layoutPresets: normalized });
+      await liveApi.uiLayouts.saveAll({ layoutPresets: normalized });
       setLayoutPresets(normalized);
     },
-    [api]
+    [liveApi]
   );
 
   useEffect(() => {

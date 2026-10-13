@@ -972,7 +972,7 @@ describe("WorkspaceContext", () => {
       const contexts = await setupWithConnection(mode);
       await contexts.harness.drop();
 
-      const notConnected = { success: false, error: "API not connected" };
+      const notConnected = { success: false as const, error: "API not connected" };
       await act(async () => {
         expect(await contexts.workspace().archiveWorkspace("ws-1")).toEqual(notConnected);
         expect(await contexts.workspace().unarchiveWorkspace("ws-1")).toEqual(notConnected);
@@ -987,9 +987,11 @@ describe("WorkspaceContext", () => {
         ).toEqual(notConnected);
         expect(await contexts.project().updateDisplayName("/alpha", "A")).toEqual(notConnected);
         expect(await contexts.project().getSecrets("/alpha")).toEqual([]);
-        await expect(
-          contexts.workspace().createWorkspace("/alpha", "branch", "main")
-        ).rejects.toThrow("API not connected");
+        const created: unknown = await contexts
+          .workspace()
+          .createWorkspace("/alpha", "branch", "main")
+          .catch((error: unknown) => error);
+        expect(created).toEqual(new Error("API not connected"));
       });
       expect(workspaceApi.archive).not.toHaveBeenCalled();
       expect(workspaceApi.unarchive).not.toHaveBeenCalled();
