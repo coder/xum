@@ -9,6 +9,7 @@ import type { OnStepSettled } from "./streamManager";
 import { measureAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
 import {
   anthropicBetweenToolsRouteAvailable,
   isAnthropic1MEffectivelyEnabled,
@@ -365,6 +366,11 @@ export interface StreamMessageOptions {
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
+   * Compaction requests only: the share of the compaction input budget to trim to (default 1).
+   * AgentSession passes 0.5 for the one retry after the request hit context_exceeded.
+   */
+  compactionInputBudgetScale?: number;
+  /**
    * Model floor already resolved by AgentSession (config.json
    * minThinkingLevelByModel → resolveMinimumThinkingLevel). Passed down so
    * mid-turn overrides clamp against the same floor as the send-time level;
@@ -454,6 +460,46 @@ function pinCoderInstanceRawProvidersConfig(
       additionalProviders: [{ name: instance.name, type: instance.type }],
     },
   };
+}
+
+/**
+ * The estimated token budget a compaction request's history must fit (trimCompactionInput):
+ * SUMMARIZER_INPUT_FRACTION of the model's effective window, the share continuous compaction's
+ * summarizer uses, so the system prompt and the summary fit beside it. Per attempt, because a
+ * fallback model has its own window. Undefined when the window is unknown: nothing is trimmed.
+ */
+export function resolveCompactionInputBudgetTokens(
+  modelString: string,
+  providerOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  scale = 1
+): number | undefined {
+  assert(scale > 0 && scale <= 1, "compaction input budget scale must be in (0, 1]");
+  const limit = getEffectiveContextLimit(
+    modelString,
+    isAnthropic1MEffectivelyEnabled(modelString, providerOptions, providersConfig),
+    providersConfig,
+    { openaiWireFormat: providerOptions?.openai?.wireFormat }
+  );
+  return limit == null ? undefined : Math.floor(limit * SUMMARIZER_INPUT_FRACTION * scale);
+}
+
+/** assemblePromptPayload's compaction budget option: set for compaction requests only. */
+function compactionInputBudgetOption(
+  isCompactionRequest: boolean,
+  modelString: string,
+  providerOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  scale: number | undefined
+): { compactionInputBudgetTokens?: number } {
+  if (!isCompactionRequest) return {};
+  const budget = resolveCompactionInputBudgetTokens(
+    modelString,
+    providerOptions,
+    providersConfig,
+    scale
+  );
+  return budget == null ? {} : { compactionInputBudgetTokens: budget };
 }
 
 /**
@@ -1004,6 +1050,7 @@ export class TurnRequestBuilder {
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
       openaiTruncationModeOverride,
+      compactionInputBudgetScale,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
     } = opts;
@@ -2892,6 +2939,13 @@ export class TurnRequestBuilder {
               anthropicCacheTtl: effectiveAnthropicCacheTtl,
               workspaceId,
               tagHistoryItemIds: tokenBudgetEnabled,
+              ...compactionInputBudgetOption(
+                isCompactionRequest,
+                seed.rawModelString,
+                effectiveMuxProviderOptions,
+                seed.providersConfig,
+                compactionInputBudgetScale
+              ),
             },
             {
               enabled: tokenBudgetEnabled,

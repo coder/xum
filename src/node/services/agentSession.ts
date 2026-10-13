@@ -107,6 +107,7 @@ import type {
   AcpPromptCorrelation,
 } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { COMPACTION_RETRY_INPUT_BUDGET_SCALE } from "@/constants/continuousCompaction";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
@@ -8577,6 +8578,7 @@ export class AgentSession {
           stream: { options },
         }),
         openaiTruncationModeOverride,
+        ...this.compactionRetryInputBudget(),
         // Mid-turn thinking overrides clamp against the same floor as the
         // send-time level above (single source of truth for the floor).
         minThinkingLevel,
@@ -8826,6 +8828,40 @@ export class AgentSession {
     };
   }
 
+  /**
+   * How the one compaction retry gets more room: OpenAI truncation for GPT-class models, 1M
+   * context for Anthropic models that can switch to it, and otherwise only the halved input
+   * budget every retry gets (trimCompactionInput drops more of the oldest history).
+   */
+  private resolveCompactionRetryPlan(context: {
+    modelString: string;
+    options?: SendMessageOptions;
+  }): { options?: SendMessageOptions; label: string; openaiTruncation?: "auto" } {
+    if (this.isGptClassModel(context.modelString)) {
+      return { options: context.options, label: "OpenAI truncation", openaiTruncation: "auto" };
+    }
+    const providersConfig = this.activeStreamContext?.providersConfig ?? null;
+    if (
+      this.supports1MContextRetry(context.modelString) &&
+      !this.is1MContextEnabledForModel(context.modelString, context.options, providersConfig)
+    ) {
+      const with1M = this.withAnthropic1MContext(context.modelString, context.options);
+      if (with1M) return { options: with1M, label: "Anthropic 1M context" };
+    }
+    return { options: context.options, label: "half the compaction input budget" };
+  }
+
+  /**
+   * The one retry of a compaction request that hit context_exceeded trims its input to half
+   * the budget (maybeRetryCompactionOnContextExceeded); every other request uses the default.
+   */
+  private compactionRetryInputBudget(): { compactionInputBudgetScale?: number } {
+    const request = this.activeCompactionRequest;
+    return request != null && this.compactionRetryAttempts.has(request.id)
+      ? { compactionInputBudgetScale: COMPACTION_RETRY_INPUT_BUDGET_SCALE }
+      : {};
+  }
+
   private isGptClassModel(modelString: string): boolean {
     const normalized = normalizeToCanonical(modelString);
     const [provider, modelName] = normalized.split(":", 2);
@@ -8847,39 +8883,18 @@ export class AgentSession {
       return false;
     }
 
-    const isGptClass = this.isGptClassModel(context.modelString);
-    const is1MCapable = this.supports1MContextRetry(context.modelString);
-
-    if (!isGptClass && !is1MCapable) {
-      return false;
-    }
-
-    let retryOptions = context.options;
-    if (is1MCapable) {
-      if (
-        this.is1MContextEnabledForModel(
-          context.modelString,
-          context.options,
-          this.activeStreamContext?.providersConfig ?? null
-        )
-      ) {
-        return false;
-      }
-
-      const retryOptionsWith1M = this.withAnthropic1MContext(context.modelString, context.options);
-      if (!retryOptionsWith1M) {
-        return false;
-      }
-      retryOptions = retryOptionsWith1M;
-    }
-
     if (this.compactionRetryAttempts.has(context.id)) {
       return false;
     }
 
+    // Every model gets one retry: the retry's request trims its input to half the budget
+    // (compactionInputBudgetScale in streamWithHistory), on top of the model-specific relief.
     this.compactionRetryAttempts.add(context.id);
-
-    const retryLabel = is1MCapable ? "Anthropic 1M context" : "OpenAI truncation";
+    const {
+      options: retryOptions,
+      label: retryLabel,
+      openaiTruncation,
+    } = this.resolveCompactionRetryPlan(context);
     log.info(`Compaction hit context limit; retrying once with ${retryLabel}`, {
       workspaceId: this.workspaceId,
       model: context.modelString,
@@ -8947,7 +8962,7 @@ export class AgentSession {
         preparedTurn,
         context.modelString,
         retryOptions,
-        isGptClass ? "auto" : undefined,
+        openaiTruncation,
         undefined,
         retryAgentInitiated,
         undefined,

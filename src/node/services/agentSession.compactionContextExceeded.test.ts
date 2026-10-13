@@ -2,19 +2,20 @@
  * A compaction request whose own input is over the model's context window must still recover.
  *
  * Since #6268 the next turn replays long tool results in full (no 12,000-char cut), so an
- * over-window compaction request is more likely. Xum sends it as is: the request-time context
- * check skips compaction (turnRequestBuilder tokenBudgetEnabled), and nothing trims the input.
- * On context_exceeded, maybeRetryCompactionOnContextExceeded retries only GPT-class models
- * (OpenAI truncation) and Anthropic models that can switch to 1M context. Every other model
- * ends in a terminal error, and the renderer does not auto-compact a failed compaction
- * request (useCompactAndRetry), so the workspace is stuck until the user drops history by hand.
+ * over-window compaction request is more likely. The request-time context check skips
+ * compaction (turnRequestBuilder tokenBudgetEnabled); trimCompactionInput fits the input to an
+ * estimated budget instead. When the estimate misses and the provider still answers
+ * context_exceeded, maybeRetryCompactionOnContextExceeded retries once on every model, and the
+ * retry trims to half the budget. Before this, models without OpenAI truncation or a 1M switch
+ * ended terminal, and the renderer does not auto-compact a failed compaction request
+ * (useCompactAndRetry), so the workspace stayed stuck.
  */
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { EventEmitter } from "events";
 
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { Err } from "@/common/types/result";
-import { expectReproFailure } from "@/node/utils/repro.testHarness";
+import { COMPACTION_RETRY_INPUT_BUDGET_SCALE } from "@/constants/continuousCompaction";
 import {
   createAgentSessionHarness,
   createFailedTurnHandle,
@@ -91,7 +92,14 @@ describe("AgentSession: compaction request over the context window", () => {
     try {
       await session.resumeStream({ model, agentId: "compact" } as SendMessageOptions);
       const decision = await session.waitForPendingStreamErrorRecoveryDecision(FAILED_MESSAGE_ID);
-      return { decision, streams: calls };
+      const budgetScales = streamMessage.mock.calls.map(
+        (call) => (call as unknown[])[0] as { compactionInputBudgetScale?: number }
+      );
+      return {
+        decision,
+        streams: calls,
+        budgetScales: budgetScales.map((options) => options.compactionInputBudgetScale),
+      };
     } finally {
       await session.dispose();
     }
@@ -103,14 +111,13 @@ describe("AgentSession: compaction request over the context window", () => {
     expect(decision).toBe("retry-started");
   });
 
-  // Repro (follow-up to #6268): no recovery for models without a GPT or 1M retry.
   test("a compaction request on a model without a 1M retry recovers", async () => {
-    await expectReproFailure(
-      async () => {
-        const { decision } = await runOverWindowCompaction("anthropic:claude-haiku-4-5");
-        expect(decision).toBe("retry-started");
-      },
-      { matcher: "toBe", expected: '"retry-started"', received: '"terminal"' }
+    const { decision, streams, budgetScales } = await runOverWindowCompaction(
+      "anthropic:claude-haiku-4-5"
     );
+    expect(decision).toBe("retry-started");
+    expect(streams).toBe(2);
+    // The first attempt trims to the full budget, the one retry to half of it.
+    expect(budgetScales).toEqual([undefined, COMPACTION_RETRY_INPUT_BUDGET_SCALE]);
   });
 });

@@ -84,7 +84,10 @@ import {
 } from "@/common/utils/tools/toolAvailability";
 import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
-import { assembleBudgetCheckedPromptPayload } from "./turnRequestBuilder";
+import {
+  assembleBudgetCheckedPromptPayload,
+  resolveCompactionInputBudgetTokens,
+} from "./turnRequestBuilder";
 import * as messagePipeline from "./messagePipeline";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
@@ -1585,6 +1588,68 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       if (!shouldBypass && !result.success) {
         expect(result.error.type).toBe("context_budget_exceeded");
       }
+    }
+  );
+
+  // A compaction request skips the preflight above, so its history is trimmed to the
+  // compaction budget instead (trimCompactionInput). Continuous compaction's fallback sends an
+  // auto-compaction request, so it reaches the same path.
+  it.each([
+    // Each turn is `turnShare` of the full budget: two turns overflow it.
+    { name: "a /compact request", kind: "compact", experiments: [], turnShare: 0.6 },
+    {
+      name: "continuous compaction's auto-compaction fallback",
+      kind: "auto-compaction",
+      experiments: [EXPERIMENT_IDS.CONTINUOUS_COMPACTION],
+      turnShare: 0.6,
+    },
+    // Two turns fit the full budget, but not the retry's half of it.
+    { name: "the half-budget retry", kind: "compact", experiments: [], turnShare: 0.3, scale: 0.5 },
+    { name: "an ordinary request", kind: "ordinary", experiments: [], turnShare: 0.6 },
+  ] as const)(
+    "applies the compaction input budget only to compaction requests: $name",
+    async (testCase) => {
+      using xumHome = new DisposableTempDir("ai-service-compaction-trim");
+      const metadata = createLocalWorkspaceMetadata("compaction-trim", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata, {
+        experimentsService: await experimentsServiceWith(xumHome.path, [...testCase.experiments]),
+      });
+      const model = "openai:gpt-5.2";
+      const budget = resolveCompactionInputBudgetTokens(model, undefined, null);
+      if (budget == null) throw new Error("expected a known context window");
+      const oldTurnChars = Math.floor(budget * testCase.turnShare) * 4;
+      const compactionMetadata = {
+        type: "compaction-request" as const,
+        rawCommand: "/compact",
+        parsed: {},
+        ...(testCase.kind === "auto-compaction" ? { source: "auto-compaction" as const } : {}),
+      };
+      const result = await harness.service.streamMessage({
+        workspaceId: metadata.id,
+        messages: [
+          createMuxMessage("old-user", "user", "x".repeat(oldTurnChars)),
+          createMuxMessage("old-assistant", "assistant", "ok"),
+          createMuxMessage("new-user", "user", "y".repeat(oldTurnChars)),
+          createMuxMessage("new-assistant", "assistant", "ok"),
+          createMuxMessage("request", "user", "Summarize.", {
+            ...(testCase.kind === "ordinary" ? {} : { muxMetadata: compactionMetadata }),
+          }),
+        ],
+        modelString: model,
+        thinkingLevel: "off",
+        ...("scale" in testCase ? { compactionInputBudgetScale: testCase.scale } : {}),
+      });
+
+      expect(result.success).toBe(true);
+      const ids = harness.preparedPayloadMessageIds[0];
+      // Over the budget, the oldest turn goes first; the newest turn and the request stay.
+      expect(ids).toEqual(
+        testCase.kind === "ordinary"
+          ? ["old-user", "old-assistant", "new-user", "new-assistant", "request"]
+          : ["new-user", "new-assistant", "request"]
+      );
+      const sent = JSON.stringify(harness.startStreamCalls[0]?.messages);
+      expect(sent.includes("1 oldest turns were left out")).toBe(testCase.kind !== "ordinary");
     }
   );
 

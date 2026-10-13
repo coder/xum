@@ -1,0 +1,151 @@
+/**
+ * Wire-level checks for the compaction input trim (trimCompactionInput via
+ * assemblePromptPayload): the request the provider receives stays valid, and an untrimmed
+ * compaction request stays byte-identical so its prompt-cache reads are intact.
+ */
+import { describe, expect, test } from "bun:test";
+import { createAnthropic } from "@ai-sdk/anthropic";
+import { createOpenAI } from "@ai-sdk/openai";
+import { generateText, type LanguageModel } from "ai";
+
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { assemblePromptPayload } from "./turnContextAssembler";
+
+function toolTurn(id: string, outputChars: number): MuxMessage[] {
+  return [
+    createMuxMessage(`${id}-user`, "user", `read ${id}`),
+    {
+      id: `${id}-assistant`,
+      role: "assistant",
+      parts: [
+        {
+          type: "reasoning",
+          text: `Plan for ${id}.`,
+          providerOptions: { anthropic: { signature: `sig-${id}` } },
+        },
+        { type: "text", text: `Reading ${id}.` },
+        {
+          type: "dynamic-tool",
+          toolCallId: `call_${id}`,
+          toolName: "file_read",
+          input: { path: `${id}.ts` },
+          state: "output-available",
+          output: { success: true, content: `${id}:${"x".repeat(outputChars)}` },
+        },
+        { type: "text", text: `Done with ${id}.` },
+      ],
+    },
+  ];
+}
+
+// Three turns of about 10k tokens each, then the compaction request.
+const HISTORY: MuxMessage[] = [
+  ...toolTurn("a", 40_000),
+  ...toolTurn("b", 40_000),
+  ...toolTurn("c", 40_000),
+  createMuxMessage("request", "user", "Summarize the conversation.", {
+    muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+  }),
+];
+
+function assemble(provider: "anthropic" | "openai", compactionInputBudgetTokens?: number) {
+  return assemblePromptPayload({
+    history: HISTORY,
+    systemMessage: "You summarize conversations.",
+    modelString: provider === "anthropic" ? "anthropic:claude-haiku-4-5" : "openai:gpt-5.2",
+    providerForMessages: provider,
+    // Thinking on: an untrimmed request must keep its signed thinking blocks.
+    effectiveThinkingLevel: "high",
+    effectiveAgentId: "compact",
+    toolNamesForSentinel: [],
+    workspaceId: "ws",
+    ...(compactionInputBudgetTokens != null ? { compactionInputBudgetTokens } : {}),
+  });
+}
+
+/** The JSON body the provider SDK would send for these messages (the fetch never answers). */
+async function wireBody(
+  provider: "anthropic" | "openai",
+  payload: Awaited<ReturnType<typeof assemble>>
+): Promise<Record<string, unknown>> {
+  let body: Record<string, unknown> | undefined;
+  const fetch = ((_url: unknown, init?: { body?: unknown }) => {
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return Promise.resolve(new Response("{}", { status: 400 }));
+  }) as unknown as typeof globalThis.fetch;
+  const model: LanguageModel =
+    provider === "anthropic"
+      ? createAnthropic({ apiKey: "k", baseURL: "http://wire.invalid/v1", fetch })(
+          "claude-haiku-4-5"
+        )
+      : createOpenAI({ apiKey: "k", baseURL: "http://wire.invalid/v1", fetch }).responses(
+          "gpt-5.2"
+        );
+  await generateText({
+    model,
+    system: payload.system,
+    messages: payload.messages,
+    // Xum keeps the cached Anthropic system row in messages (see assemblePromptPayload).
+    allowSystemInMessages: true,
+    maxRetries: 0,
+  }).catch(() => undefined);
+  if (body == null) throw new Error("the provider SDK sent no request");
+  return body;
+}
+
+/** Tool call IDs, and the IDs that have a result, in the provider's own wire format. */
+function toolPairs(provider: "anthropic" | "openai", body: Record<string, unknown>) {
+  const calls: string[] = [];
+  const results: string[] = [];
+  if (provider === "anthropic") {
+    for (const message of body.messages as Array<{ content: unknown }>) {
+      if (!Array.isArray(message.content)) continue;
+      for (const block of message.content as Array<Record<string, unknown>>) {
+        if (block.type === "tool_use") calls.push(String(block.id));
+        if (block.type === "tool_result") results.push(String(block.tool_use_id));
+      }
+    }
+  } else {
+    for (const item of body.input as Array<Record<string, unknown>>) {
+      if (item.type === "function_call") calls.push(String(item.call_id));
+      if (item.type === "function_call_output") results.push(String(item.call_id));
+    }
+  }
+  return { calls, results };
+}
+
+describe("compaction input trim on the wire", () => {
+  test.each(["anthropic", "openai"] as const)(
+    "%s: an untrimmed compaction request is byte-identical",
+    async (provider) => {
+      const plain = await assemble(provider);
+      const roomy = await assemble(provider, 1_000_000);
+      expect(JSON.stringify(roomy.messages)).toBe(JSON.stringify(plain.messages));
+      if (provider === "anthropic") expect(JSON.stringify(plain.messages)).toContain("sig-a");
+      expect(JSON.stringify(await wireBody(provider, roomy))).toBe(
+        JSON.stringify(await wireBody(provider, plain))
+      );
+    }
+  );
+
+  test.each(["anthropic", "openai"] as const)(
+    "%s: a trimmed request keeps every tool call paired with a result",
+    async (provider) => {
+      // Room for one full result: "a" and "b" become placeholders, "c" stays whole.
+      const payload = await assemble(provider, 12_000);
+      const body = await wireBody(provider, payload);
+      const text = JSON.stringify(body);
+      const { calls, results } = toolPairs(provider, body);
+
+      expect(calls).toEqual(["call_a", "call_b", "call_c"]);
+      expect(results).toEqual(calls);
+      expect(text).not.toContain(`a:${"x".repeat(100)}`);
+      expect(text).toContain(`c:${"x".repeat(100)}`);
+      expect(text).toContain("Tool result omitted to fit the compaction request");
+      expect(text).toContain("2 tool results were replaced by size placeholders");
+      // Thinking signatures are bound to the prefix the trim changed. (The SDK body here has
+      // no thinking config, so check the provider messages Xum hands it.)
+      expect(JSON.stringify(payload.messages)).not.toContain("sig-");
+    }
+  );
+});

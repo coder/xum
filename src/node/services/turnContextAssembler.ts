@@ -22,6 +22,7 @@ import {
 import type { Instructions, ModelMessage, SystemModelMessage, Tool } from "ai";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
+import { trimCompactionInput } from "@/common/utils/messages/trimCompactionInput";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
@@ -197,6 +198,11 @@ export interface AssemblePromptPayloadOptions {
   workspaceId: string;
   /** Token budget: end each persisted user row with its session_history item ID. */
   tagHistoryItemIds?: boolean;
+  /**
+   * Compaction requests only: the estimated token budget their history must fit
+   * (trimCompactionInput). Absent for every other request, which is never trimmed.
+   */
+  compactionInputBudgetTokens?: number;
 }
 
 /**
@@ -236,6 +242,14 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
   });
 }
 
+/** A compaction request's history fitted to its budget; any other request unchanged. */
+function trimToCompactionInputBudget(
+  messages: MuxMessage[],
+  budgetTokens: number | undefined
+): MuxMessage[] {
+  return budgetTokens == null ? messages : trimCompactionInput(messages, budgetTokens).messages;
+}
+
 export async function assemblePromptPayload(
   options: AssemblePromptPayloadOptions
 ): Promise<PromptPayload> {
@@ -244,11 +258,15 @@ export async function assemblePromptPayload(
     options.providerForMessages,
     options.effectiveThinkingLevel
   );
+  const providerRequestMessages = trimToCompactionInputBudget(
+    prepared.providerRequestMessages,
+    options.compactionInputBudgetTokens
+  );
   let messages = await prepareMessagesForProvider({
     messagesWithSentinel: addInterruptedSentinel(
       options.tagHistoryItemIds === true
-        ? tagUserRowsWithHistoryItemIds(prepared.providerRequestMessages)
-        : prepared.providerRequestMessages
+        ? tagUserRowsWithHistoryItemIds(providerRequestMessages)
+        : providerRequestMessages
     ),
     replayReceiptMessages: prepared.activeContextMessages,
     effectiveAgentId: options.effectiveAgentId,
@@ -312,7 +330,7 @@ export async function assemblePromptPayload(
   }
 
   return {
-    providerRequestMessages: prepared.providerRequestMessages,
+    providerRequestMessages,
     messages,
     system,
     tools: options.tools
