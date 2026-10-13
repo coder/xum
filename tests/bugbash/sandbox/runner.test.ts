@@ -1248,7 +1248,7 @@ async function selfCheckLaunch(over: Record<string, string>, args: string[]) {
       BUGBASH_BUDGET_USD: "1",
       ANTHROPIC_API_KEY: UPSTREAM_KEY,
       ANTHROPIC_BASE_URL: `${upstream.baseUrl}/v1`,
-      BUGBASH_MODEL: "anthropic:claude-haiku-4-5",
+      BUGBASH_MODEL: "anthropic:claude-haiku-5-5",
     };
     const o = { root: fs.realpathSync(root), cwd, env, stop: new AbortController().signal };
     const outcome = await launchJob(args, { ...o, log: () => undefined }).catch((e: unknown) => e);
@@ -1289,11 +1289,11 @@ test("B3: a real-mode explore job lets the app model through its proxy, and no k
     BUGBASH_AI: "real",
     BUGBASH_AI_RESOLVED: "real",
     BUGBASH_AI_REASON: "probe ok",
-    BUGBASH_APP_MODEL: "anthropic:claude-haiku-4-5",
+    BUGBASH_APP_MODEL: "anthropic:claude-haiku-5-5",
   };
   // The fake job sends one call for the app model: the proxy forwards it.
   const { outcome, lines, requests } = await exploreLaunch(
-    { RUN: "proxycall", CALLMODEL: "claude-haiku-4-5" },
+    { RUN: "proxycall", CALLMODEL: "claude-haiku-5-5" },
     real
   );
   expect(outcome).toEqual({ code: 7, cleanup: "removed" });
@@ -1301,10 +1301,10 @@ test("B3: a real-mode explore job lets the app model through its proxy, and no k
   const run = calls()
     .split("\n")
     .find((line) => line.startsWith("run "))!;
-  for (const env of ["BUGBASH_AI_RESOLVED=real", "BUGBASH_APP_MODEL=anthropic:claude-haiku-4-5"])
+  for (const env of ["BUGBASH_AI_RESOLVED=real", "BUGBASH_APP_MODEL=anthropic:claude-haiku-5-5"])
     expect(run).toContain(`--env ${env}`);
   expect(run).not.toContain(UPSTREAM_KEY);
-  expect(lines.join("\n")).toContain("real app AI anthropic:claude-haiku-4-5");
+  expect(lines.join("\n")).toContain("real app AI anthropic:claude-haiku-5-5");
   expectNothingLeft();
 });
 
@@ -1312,7 +1312,7 @@ const REAL = { BUGBASH_AI: "real", BUGBASH_AI_RESOLVED: "real" };
 const MOCK_MODE = { BUGBASH_AI: "mock", BUGBASH_AI_RESOLVED: undefined };
 test.each([
   ["a model the job does not list", "claude-opus-5-5", REAL],
-  ["the app model in mock mode", "claude-haiku-4-5", MOCK_MODE],
+  ["the app model in mock mode", "claude-haiku-5-5", MOCK_MODE],
 ])("B3: the proxy refuses %s", async (_name, model, env) => {
   const { outcome, requests } = await exploreLaunch({ RUN: "proxycall", CALLMODEL: model }, env);
   expect(outcome).toEqual({ code: 7, cleanup: "removed" });
@@ -1344,7 +1344,7 @@ test("B3: the app AI probe has a short deadline and ends at once on a stop", asy
     let started = Date.now();
     const late = await probeApp(
       job,
-      "claude-haiku-4-5",
+      "claude-haiku-5-5",
       new Ledger(1),
       new AbortController().signal,
       300
@@ -1353,7 +1353,7 @@ test("B3: the app AI probe has a short deadline and ends at once on a stop", asy
     expect(Date.now() - started).toBeLessThan(5_000);
     const stop = new AbortController();
     started = Date.now();
-    const probe = probeApp(job, "claude-haiku-4-5", new Ledger(1), stop.signal, 60_000);
+    const probe = probeApp(job, "claude-haiku-5-5", new Ledger(1), stop.signal, 60_000);
     while (upstream.requests.length < 2) await Bun.sleep(10);
     stop.abort("SIGINT");
     expect((await probe).status).not.toBe(200);
@@ -1555,6 +1555,25 @@ test("the command line refuses an ambient BUGBASH_AI_RESOLVED=real before any do
   expect(cli.status).toBe(2);
   expect(calls()).toBe("");
   expect(fs.existsSync(path.join(dir, output))).toBe(false);
+});
+
+// #6094 item 18: the entry handler maps an internal error (not a Refusal) to exit 4 and an
+// `error:` line, so a launcher bug never reads as e2e's exit 1 (a failed test) or as a refusal.
+// A TMPDIR that is a file makes the docker client folder's mkdtemp throw ENOTDIR.
+test("the command line exits 4 with an `error:` line on an internal error", () => {
+  const notADir = path.join(root, "tmpdir-is-a-file");
+  fs.writeFileSync(notADir, "");
+  const cli = spawnSync(process.execPath, ["sandbox/launch.ts", "--recover"], {
+    cwd: path.join(import.meta.dir, ".."),
+    encoding: "utf8",
+    env: { PATH: process.env.PATH, TMPDIR: notADir },
+  });
+  expect(cli.stderr).toMatch(/^sandbox error: ENOTDIR\b/m);
+  expect(cli.stderr).not.toContain("refused:");
+  expect(cli.status).toBe(4);
+  // The error came after the endpoint check and before any daemon command.
+  expect(calls()).toStartWith("context inspect");
+  expect(calls()).not.toContain("info ");
 });
 
 test("D2: the self-check fails on a partial or unknown container report", () => {
