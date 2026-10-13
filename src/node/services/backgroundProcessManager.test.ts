@@ -4244,7 +4244,7 @@ describe("BackgroundProcessManager", () => {
         dispose: () => Promise.resolve(),
         writeMeta: () => Promise.resolve(),
         getOutputFileSize: () => Promise.resolve(0),
-        readOutput: () => Promise.resolve({ content: "", newOffset: 0 }),
+        readOutput: () => Promise.resolve({ content: "", newOffset: 0, fileSize: 0 }),
       };
       manager.registerMigratedProcess(
         stubHandle,

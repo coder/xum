@@ -10,15 +10,15 @@ import { BG_EXIT_CODE_FILENAME, spawnProcess } from "./backgroundProcessExecutor
 
 /**
  * Delegates to a real LocalRuntime but is NOT an instanceof LocalBaseRuntime, so
- * spawnProcess treats it like a remote runtime; its exec throws for the spawn command
- * itself, simulating a transport-level (SSH/Coder channel) error after dispatch.
+ * spawnProcess treats it like a remote runtime. With `throwOnSpawn`, its exec throws for the
+ * spawn command itself, simulating a transport-level (SSH/Coder channel) error after dispatch.
  */
-function createRemoteLikeThrowingRuntime(base: LocalRuntime): LocalRuntime {
+function createRemoteLikeRuntime(base: LocalRuntime, throwOnSpawn = false): LocalRuntime {
   return new Proxy({} as LocalRuntime, {
     get(_target, prop) {
       if (prop === "exec") {
         return (command: string, opts: never) => {
-          if (command.includes("output.log")) {
+          if (throwOnSpawn && command.includes("output.log")) {
             throw new Error("SSH channel error after dispatch");
           }
           return base.exec(command, opts);
@@ -60,7 +60,7 @@ describe("spawnProcess", () => {
     const workspaceId = `remote-throw-${Date.now()}`;
     cleanupDirs.push(`${tempDir}/mux-bashes/${workspaceId}`);
 
-    const result = await spawnProcess(createRemoteLikeThrowingRuntime(base), "echo hi", {
+    const result = await spawnProcess(createRemoteLikeRuntime(base, true), "echo hi", {
       cwd: hostDir,
       workspaceId,
       processId: "ambiguous",
@@ -373,5 +373,69 @@ describe("spawnProcess", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     expect(groupAlive(result.pid)).toBe(false);
+  });
+
+  describe("bounded output reads", () => {
+    const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    // Every kind of byte a page edge can cut: multi-byte characters, invalid bytes, a truncated
+    // sequence, and lines that start with a byte-order mark.
+    const raw = Buffer.concat(
+      Array.from({ length: 300 }, (_, i) =>
+        Buffer.concat([
+          i % 3 === 0 ? bom : Buffer.alloc(0),
+          Buffer.from(`${i} é€😀`.repeat((i % 7) + 1)),
+          Buffer.from([0xff, 0xe2, 0x82]),
+          Buffer.from("\n"),
+        ])
+      )
+    );
+    const decode = (bytes: Buffer) => new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
+
+    async function spawnWithLog(kind: "local" | "remote", log: Buffer) {
+      const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-bounded-read-"));
+      cleanupDirs.push(hostDir);
+      const base = new LocalRuntime(hostDir);
+      const runtime = kind === "local" ? base : createRemoteLikeRuntime(base);
+      const result = await spawnProcess(runtime, "sleep 60", {
+        cwd: hostDir,
+        workspaceId: `bounded-read-${kind}-${Date.now()}`,
+        processId: "bounded-read",
+      });
+      if (!result.success) throw new Error(result.error);
+      handles.push(result.handle);
+      cleanupDirs.push(result.outputDir);
+      await fs.appendFile(path.join(result.outputDir, "output.log"), log);
+      return result.handle;
+    }
+
+    it.each(["local", "remote"] as const)(
+      "reads %s output in bounded pages that decode to the whole log",
+      async (kind) => {
+        const handle = await spawnWithLog(kind, raw);
+        let offset = 0;
+        let text = "";
+        for (let attempt = 0; attempt < 1_000 && offset < raw.length; attempt++) {
+          const read = await handle.readOutput(offset, 1_000);
+          // One page, plus at most 3 bytes to finish a character cut at its end.
+          expect(read.newOffset - offset).toBeGreaterThanOrEqual(1);
+          expect(read.newOffset - offset).toBeLessThanOrEqual(1_003);
+          expect(read.fileSize).toBe(raw.length);
+          text += read.content;
+          offset = read.newOffset;
+        }
+        expect(offset).toBe(raw.length);
+        expect(text).toBe(decode(raw));
+      }
+    );
+
+    // A decoder strips U+FEFF at the start of its input as a byte-order mark, and the offset
+    // came from the decoded size: the 3 bytes went missing and then came back on the next read.
+    it("keeps a byte-order mark at the start of a remote read", async () => {
+      const log = Buffer.concat([Buffer.from("a\n"), bom, Buffer.from("b\n")]);
+      const handle = await spawnWithLog("remote", log);
+      const read = await handle.readOutput(2);
+      expect(read.content).toBe("\uFEFFb\n");
+      expect(read.newOffset).toBe(log.length);
+    });
   });
 });

@@ -121,13 +121,24 @@ export interface BackgroundHandle {
    * Read output from output.log at the given byte offset.
    * Returns the content read and the new offset (for incremental reads).
    * Works on both local and SSH runtimes by using runtime.exec() internally.
+   * With `maxBytes`, loads at most that many bytes (plus up to 3 to finish a UTF-8 character),
+   * so paging through a large log reads each byte from disk once.
    */
-  readOutput(offset: number): Promise<{ content: string; newOffset: number }>;
+  readOutput(offset: number, maxBytes?: number): Promise<BackgroundOutputRead>;
 
   /** Strict output probe used only by monitor polling. */
   readOutputForMonitor?(
     offset: number
   ): Promise<BackgroundMonitorProbeResult<{ content: string; newOffset: number }>>;
+}
+
+/** One read of a background process's output.log. */
+export interface BackgroundOutputRead {
+  /** The bytes from the requested offset up to newOffset, decoded as UTF-8. */
+  content: string;
+  newOffset: number;
+  /** The file size the read saw: newOffset < fileSize when a bounded read left output unread. */
+  fileSize: number;
 }
 
 /**
