@@ -58,8 +58,11 @@ import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/Work
 import {
   forkWorkspaceFromMenu,
   getErrorAnchor,
+  requestGenerateWorkspaceTitle,
   stopWorkspaceRuntime,
 } from "../WorkspaceActionsMenuContent/workspaceActionHandlers";
+import { WorkspaceHeaderTitleInput } from "./WorkspaceHeaderTitleInput";
+import { isWorkspaceRowRendered } from "@/browser/utils/ui/workspaceDomNav";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
@@ -197,6 +200,31 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuBarRef = useRef<HTMLDivElement | null>(null);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  // The header's title edit, keyed by workspace: the menu bar is reused across workspaces, and an
+  // edit must rename the workspace it started for, never the one now in view (#6328).
+  const [titleEditWorkspaceId, setTitleEditWorkspaceId] = useState<string | null>(null);
+  if (titleEditWorkspaceId !== null && titleEditWorkspaceId !== workspaceId) {
+    setTitleEditWorkspaceId(null);
+  }
+  const titleInputWrapperRef = useRef<HTMLSpanElement | null>(null);
+  // Where focus goes when the edit ends: the control that had it, or the menu trigger when that
+  // control is gone (the menu row that started the edit unmounts with its menu).
+  const titleEditReturnFocusRef = useRef<Element | null>(null);
+  const startTitleEdit = () => {
+    titleEditReturnFocusRef.current = document.activeElement;
+    setTitleEditWorkspaceId(workspaceId);
+  };
+  const endTitleEdit = (editWorkspaceId: string, hadFocus: boolean) => {
+    // A save that settles after a switch to another workspace must not close that one's edit.
+    setTitleEditWorkspaceId((current) => (current === editWorkspaceId ? null : current));
+    if (!hadFocus) return;
+    const previous = titleEditReturnFocusRef.current;
+    const target =
+      previous instanceof HTMLElement && previous.isConnected && previous !== document.body
+        ? previous
+        : moreActionsButtonRef.current;
+    target?.focus();
+  };
   const archiveError = usePopoverError();
   const forkError = usePopoverError();
   const stopRuntimeError = usePopoverError();
@@ -537,6 +565,21 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
+  // F2 when the sidebar does not render this workspace's row (sidebar collapsed, or a collapsed
+  // project or section hides it): edit the title here. SidebarTitleEditKeybinds edits it in the
+  // row otherwise. Both read the same DOM check, so exactly one of them takes the key.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!matchesKeybind(e, KEYBINDS.EDIT_WORKSPACE_TITLE) || isEditableElement(e.target)) return;
+      if (isWorkspaceRowRendered(workspaceId)) return;
+      e.preventDefault();
+      titleEditReturnFocusRef.current = document.activeElement;
+      setTitleEditWorkspaceId(workspaceId);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [workspaceId]);
+
   // Keybind for opening MCP configuration
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -626,6 +669,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         onClick={(event: React.MouseEvent<HTMLDivElement>) => {
           event.stopPropagation();
         }}
+        onCloseAutoFocus={(event) => {
+          // Edit workspace title closed the menu: keep focus in the title field, not the trigger.
+          if (titleInputWrapperRef.current?.contains(document.activeElement)) {
+            event.preventDefault();
+          }
+        }}
       >
         {/* Keep MCP configuration in the more actions menu to keep the workspace menu bar lean. */}
         <WorkspaceActionsMenuContent
@@ -639,6 +688,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             isRightSidebarHidden: timelineSidebarHidden,
           }}
           actions={{
+            editTitle: startTitleEdit,
+            generateTitle: () => requestGenerateWorkspaceTitle(workspaceId),
             configureMcp: () => setMcpModalOpen(true),
             configureHeartbeat: () => setHeartbeatModalOpen(true),
             configureMessaging: () => setUnrelatedMessagingWorkspaceId(workspaceId),
@@ -706,9 +757,20 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <TooltipContent>Open sidebar ({formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)})</TooltipContent>
           </Tooltip>
         )}
-        <span className="min-w-0 truncate text-sm" data-testid="workspace-title">
-          {workspaceTitle ?? workspaceName}
-        </span>
+        {titleEditWorkspaceId === workspaceId ? (
+          <span ref={titleInputWrapperRef} className="flex min-w-0 flex-1">
+            <WorkspaceHeaderTitleInput
+              key={workspaceId}
+              workspaceId={workspaceId}
+              initialTitle={workspaceTitle ?? workspaceName}
+              onDone={(hadFocus) => endTitleEdit(workspaceId, hadFocus)}
+            />
+          </span>
+        ) : (
+          <span className="min-w-0 truncate text-sm" data-testid="workspace-title">
+            {workspaceTitle ?? workspaceName}
+          </span>
+        )}
         {/* Touch and keyboard users need a focusable control for workspace details. */}
         <Popover open={detailsPopoverOpen} onOpenChange={setDetailsPopoverOpen}>
           <Tooltip
