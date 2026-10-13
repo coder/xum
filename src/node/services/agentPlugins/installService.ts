@@ -43,7 +43,11 @@ import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdo
 import { log } from "@/node/services/log";
 import type { MCPServerInfo, MCPServerOAuthConfig } from "@/common/types/mcp";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
-import { readPluginClientSecrets } from "./openaiMcpAuth";
+import {
+  pluginClientSecretFor,
+  readPluginClientSecrets,
+  type PluginClientSecret,
+} from "./openaiMcpAuth";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
@@ -429,18 +433,20 @@ interface SurfaceServer {
 
 /** Per-scan memo: each `.mcp.json` is read and parsed once for all its servers. */
 type SecretReader = (
-  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>
+  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>,
+  clientId: string
 ) => Promise<string | undefined>;
 
 function createSecretReader(): SecretReader {
-  const files = new Map<string, Promise<Map<string, string>>>();
-  return (source) => {
+  const files = new Map<string, Promise<Map<string, PluginClientSecret>>>();
+  return (source, clientId) => {
     let secrets = files.get(source.mcpConfigPath);
     if (secrets === undefined) {
-      secrets = readPluginClientSecrets(source).catch(() => new Map<string, string>());
+      secrets = readPluginClientSecrets(source).catch(() => new Map<string, PluginClientSecret>());
       files.set(source.mcpConfigPath, secrets);
     }
-    return secrets.then((map) => map.get(source.serverName));
+    // Only the secret of the client this scan captured (#6297).
+    return secrets.then((map) => pluginClientSecretFor(map, source.serverName, clientId));
   };
 }
 
@@ -450,8 +456,8 @@ async function readSignIn(
   readSecret: SecretReader
 ): Promise<SurfaceSignIn> {
   const secret =
-    oauth?.clientSecretSource !== undefined
-      ? await readSecret(oauth.clientSecretSource)
+    oauth?.clientSecretSource !== undefined && oauth.clientId !== undefined
+      ? await readSecret(oauth.clientSecretSource, oauth.clientId)
       : undefined;
   return {
     url,
