@@ -1656,6 +1656,21 @@ export class MCPServerManager {
   >();
   /** Dedupes send-path background tool refreshes per instance; see refreshInstanceToolsInBackground. */
   private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<void>>();
+  /**
+   * Prompt catalogs of idle-stopped servers, by workspace, with the start
+   * config they were fetched under. The restart seeds each restarted
+   * instance's catalog from here before its awaited prompts/list, so a list
+   * that fails or times out (10 s) keeps the previous catalog instead of an
+   * empty one. Otherwise the `mcp_prompt_get` description loses that server's
+   * prompts for a turn, and the changed tools section rewrites the whole
+   * cached Anthropic prompt (seen live: Notion prompts dropped after an idle
+   * restart). Consumed by the next cold start; dropped on removal-style stops
+   * and plugin key-prefix invalidations.
+   */
+  private readonly idleStoppedPromptCatalogs = new Map<
+    string,
+    { configSignature: string; prompts: Map<string, MCPPrompt[]> }
+  >();
   // Bumped by removal-style stops (stopServers without retainRestartOptions).
   // Startups run outside any lock shared with removal, so an abort-abandoned
   // startup can finish after the workspace is gone; the epoch check makes it
@@ -2515,6 +2530,36 @@ export class MCPServerManager {
     entry.promptRefreshInFlight = refresh;
   }
 
+  /**
+   * Give servers restarted after an idle stop the catalog they had before it
+   * (see idleStoppedPromptCatalogs). Only under the identical start config:
+   * any config change (server added, removed, edited, signed in) starts
+   * empty as before. The awaited refresh still replaces the seed on success.
+   */
+  private seedPromptsFromIdleStop(
+    workspaceId: string,
+    configSignature: string,
+    instances: Map<string, MCPServerInstance>
+  ): void {
+    const saved = this.idleStoppedPromptCatalogs.get(workspaceId);
+    if (saved === undefined) return;
+    this.idleStoppedPromptCatalogs.delete(workspaceId);
+    if (saved.configSignature !== configSignature) return;
+    for (const [serverName, instance] of instances) {
+      const prompts = saved.prompts.get(serverName);
+      if (prompts !== undefined && instance.prompts.length === 0) instance.prompts = prompts;
+    }
+  }
+
+  /** A replaced plugin tree can serve other prompts under the same start config. */
+  private forgetIdleStoppedPrompts(serverKeyPrefix: string): void {
+    for (const saved of this.idleStoppedPromptCatalogs.values()) {
+      for (const serverName of [...saved.prompts.keys()]) {
+        if (serverName.startsWith(serverKeyPrefix)) saved.prompts.delete(serverName);
+      }
+    }
+  }
+
   private async refreshInstancePrompts(
     instances: Map<string, MCPServerInstance>,
     signal?: AbortSignal
@@ -2617,6 +2662,12 @@ export class MCPServerManager {
         log.info("[MCP] Stopping idle servers", {
           workspaceId,
           idleMinutes: Math.round(idleMs / 60_000),
+        });
+        this.idleStoppedPromptCatalogs.set(workspaceId, {
+          configSignature: entry.configSignature,
+          prompts: new Map(
+            [...entry.instances].map(([serverName, instance]) => [serverName, instance.prompts])
+          ),
         });
         void this.stopServers(workspaceId, { retainRestartOptions: true });
       }
@@ -3833,6 +3884,7 @@ export class MCPServerManager {
       );
       // Still-waiting servers were not attempted this time but are still down.
       const startFailedNames = [...startedFailedNames, ...carriedBackoff.waiting];
+      this.seedPromptsFromIdleStop(workspaceId, signature, instances);
 
       const stats = this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames);
 
@@ -5250,6 +5302,7 @@ export class MCPServerManager {
     // epoch snapshot against this record and close matching instances
     // instead of publishing them.
     this.prefixInvalidations.set(prefix, ++this.prefixInvalidationClock);
+    this.forgetIdleStoppedPrompts(prefix);
 
     // Close ONLY the matching instances. The rest of the workspace's servers
     // stay running: a live agent stream may hold a lease or be mid tool call
@@ -5430,6 +5483,7 @@ export class MCPServerManager {
       this.lastWorkspaceRequestOptions.delete(workspaceId);
       this.workspaceOptionsMutationCounts.delete(workspaceId);
       this.latestWorkspaceOverrides.delete(workspaceId);
+      this.idleStoppedPromptCatalogs.delete(workspaceId);
     }
     const entry = this.workspaceServers.get(workspaceId);
     if (!entry) return;
