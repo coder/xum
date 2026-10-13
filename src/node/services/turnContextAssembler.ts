@@ -22,6 +22,8 @@ import {
 import type { Instructions, ModelMessage, SystemModelMessage, Tool } from "ai";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
+import { trimCompactionInput } from "@/common/utils/messages/trimCompactionInput";
+import { createCompactionRowCounter, projectCompactionInput } from "./compactionInputSizing";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
@@ -199,6 +201,11 @@ export interface AssemblePromptPayloadOptions {
   /** Token budget: end each persisted user row with its session_history item ID. */
   tagHistoryItemIds?: boolean;
   /**
+   * Compaction requests only: the estimated token budget their history must fit
+   * (trimCompactionInput). Absent for every other request, which is never trimmed.
+   */
+  compactionInputBudgetTokens?: number;
+  /**
    * Request-only user-role context (MCP Apps model context), never persisted. It goes before the
    * newest user row (insertRequestContextMessage has the trailing-partial rule), or last when
    * the request ends without one, so the cached prefix (system prompt and earlier turns) is
@@ -270,6 +277,27 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
   });
 }
 
+/**
+ * A compaction request's history fitted to its budget; any other request unchanged. The trim
+ * sizes and edits the redacted projection the provider receives (projectCompactionInput),
+ * counting rows with the model's tokenizer. A history that fits keeps its original rows, so
+ * the request stays byte-identical.
+ */
+async function trimToCompactionInputBudget(
+  messages: MuxMessage[],
+  budgetTokens: number | undefined,
+  modelString: string
+): Promise<MuxMessage[]> {
+  if (budgetTokens == null) return messages;
+  const sized = projectCompactionInput(messages);
+  const trim = await trimCompactionInput(
+    sized,
+    budgetTokens,
+    createCompactionRowCounter(modelString)
+  );
+  return trim.messages === sized ? messages : trim.messages;
+}
+
 export async function assemblePromptPayload(
   options: AssemblePromptPayloadOptions
 ): Promise<PromptPayload> {
@@ -278,15 +306,26 @@ export async function assemblePromptPayload(
     options.providerForMessages,
     options.effectiveThinkingLevel
   );
+  // Prompt-hook context renders BEFORE the compaction trim: the trim counts each row's parts, not
+  // its metadata, so unrendered context (up to PLUGIN_HOOK_CONTEXT_MAX_CHARS per user row) would
+  // pass the budget and then grow the request past it in messagePipeline. Rendered rows drop
+  // the metadata, so messagePipeline's own pass renders nothing twice. It also renders before the
+  // token-budget [id: ...] tag, which must stay last.
+  const renderHookContextFirst =
+    options.compactionInputBudgetTokens != null || options.tagHistoryItemIds === true;
+  const providerRequestMessages = await trimToCompactionInputBudget(
+    renderHookContextFirst
+      ? renderPluginHookContextForProvider(prepared.providerRequestMessages)
+      : prepared.providerRequestMessages,
+    options.compactionInputBudgetTokens,
+    options.modelString
+  );
   let messages = await prepareMessagesForProvider({
     messagesWithSentinel: addInterruptedSentinel(
       insertRequestContextMessage(
         options.tagHistoryItemIds === true
-          ? // Hook context renders first so each tagged row still ends with its [id: ...] tag.
-            tagUserRowsWithHistoryItemIds(
-              renderPluginHookContextForProvider(prepared.providerRequestMessages)
-            )
-          : prepared.providerRequestMessages,
+          ? tagUserRowsWithHistoryItemIds(providerRequestMessages)
+          : providerRequestMessages,
         options.requestContextMessage
       )
     ),
@@ -352,7 +391,7 @@ export async function assemblePromptPayload(
   }
 
   return {
-    providerRequestMessages: prepared.providerRequestMessages,
+    providerRequestMessages,
     messages,
     system,
     tools: options.tools

@@ -262,9 +262,9 @@ describeIntegration("Workspace Archive (UI)", () => {
         const archiveButton = await waitFor(
           () => {
             // The archive button is inside a popover, search the whole document
-            // Look for the button containing "Archive chat" text
+            // Look for the button containing "Archive workspace" text
             const buttons = Array.from(document.querySelectorAll("button"));
-            const archiveBtn = buttons.find((b) => b.textContent?.includes("Archive chat"));
+            const archiveBtn = buttons.find((b) => b.textContent?.includes("Archive workspace"));
             if (!archiveBtn) throw new Error("Archive button not found in menu");
             return archiveBtn as HTMLElement;
           },
@@ -387,7 +387,7 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
       const archiveButton = await waitFor(
         () => {
           const buttons = Array.from(document.querySelectorAll("button"));
-          const archiveBtn = buttons.find((b) => b.textContent?.includes("Archive chat"));
+          const archiveBtn = buttons.find((b) => b.textContent?.includes("Archive workspace"));
           if (!archiveBtn) throw new Error("Archive button not found in menu");
           return archiveBtn as HTMLElement;
         },
