@@ -51,7 +51,11 @@ export type OpenAIPluginHooksEntry = string | Record<string, unknown>;
 export interface OpenAIPluginExtension {
   /** Relative path to the registered MCP server mapping (`.app.json`). */
   apps?: string;
-  /** Replaces the default `hooks/hooks.json` when present. Parsed only, never run. */
+  /**
+   * Replaces the default `hooks/hooks.json` when present. Parsed only, never run. Present (maybe
+   * empty) whenever the manifest has the field: `hooks: []`, or a list with no valid entry, turns
+   * the default file off, so a plugin update can disable its hooks (Codex PRRT_kwDOPxxmWM6sFheU).
+   */
   hooks?: OpenAIPluginHooksEntry[];
   /** Relative path to a packaged skill's SKILL.md. */
   onboardingSkill?: string;
@@ -195,7 +199,7 @@ export function normalizeOpenAIRelativePath(value: unknown): string | undefined 
   return segments.every((segment) => segment === ".") ? undefined : trimmed;
 }
 
-function readHooks(raw: unknown, warnings: string[]): OpenAIPluginHooksEntry[] | undefined {
+function readHooks(raw: unknown, warnings: string[]): OpenAIPluginHooksEntry[] {
   const entries: unknown[] = Array.isArray(raw) ? raw : [raw];
   const hooks: OpenAIPluginHooksEntry[] = [];
   for (const entry of entries) {
@@ -212,7 +216,7 @@ function readHooks(raw: unknown, warnings: string[]): OpenAIPluginHooksEntry[] |
     }
     hooks.push(relative);
   }
-  return hooks.length > 0 ? hooks : undefined;
+  return hooks;
 }
 
 /** Typed, validated view of `extensions["com.openai"]`; undefined when absent or not an object. */
@@ -240,8 +244,7 @@ export function readOpenAIExtension(manifest: Pick<AgentPluginManifest, "extensi
       );
   }
   if (raw.hooks !== undefined) {
-    const hooks = readHooks(raw.hooks, warnings);
-    if (hooks !== undefined) extension.hooks = hooks;
+    extension.hooks = readHooks(raw.hooks, warnings);
   }
   if (raw.interface !== undefined) {
     const parsed = readInterface(raw.interface, warnings);
