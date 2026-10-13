@@ -101,11 +101,24 @@ test("a focus move that never lands stops guarding after its task", async () => 
   deliverMutation();
   expect(document.activeElement).toBe(document.body);
 
-  // A later task: no focusin came, focus is still on <body>, and the next mutation recovers it.
+  // A later task: no focusin came and no further mutation comes. The skipped mutation is checked
+  // again when the guard expires, so focus does not stay on <body>.
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
   expect(second.isConnected).toBe(true);
-  deliverMutation();
   expect(document.activeElement).toBe(panel);
+  stop();
+});
+
+// The expiry rechecks only a mutation the guard skipped: a focusout alone (a click on blank
+// space) keeps waiting for a mutation, as before #6291.
+test("an expired focus move with no skipped mutation does not take focus", async () => {
+  const { panel, first, second } = buildPanel();
+  const stop = refocusFallenFocus(panel);
+  first.focus();
+  first.blur();
+  first.dispatchEvent(new window.FocusEvent("focusout", { bubbles: true, relatedTarget: second }));
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  expect(document.activeElement).toBe(document.body);
   stop();
 });
 
