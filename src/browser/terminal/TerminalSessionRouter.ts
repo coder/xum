@@ -318,7 +318,9 @@ export class TerminalSessionRouter {
    * (This is used by TerminalView to keep frontend and PTY dimensions in sync.)
    */
   resize(sessionId: string, cols: number, rows: number): Promise<void> {
-    const keep = () => this.sizes.set(sessionId, { cols, rows });
+    const keep = (): void => {
+      this.sizes.set(sessionId, { cols, rows });
+    };
     return this.withClient(
       // Offline, the size is kept and sent again once the streams restart.
       () => {
