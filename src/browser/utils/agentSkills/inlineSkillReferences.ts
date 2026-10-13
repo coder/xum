@@ -296,6 +296,9 @@ export async function resolveInlineSkillReferences(
     seenSkillNames.add(candidate.skillName);
 
     const skill =
+      findLocalInlineSkill(candidate.skillName, options) ??
+      // Prose like `$tdd:notes` with a loaded `tdd` needs no remote lookup.
+      findLocalProseFallback(candidate, options) ??
       (await resolveInlineSkill(candidate.skillName, options)) ??
       (await resolveInlineSkillFallback(candidate, options));
     if (!skill) {
@@ -318,24 +321,50 @@ async function resolveInlineSkillFallback(
   candidate: InlineSkillCandidate,
   options: InlineSkillResolveOptions
 ): Promise<InvocableSkill | null> {
+  const fallback = getProseFallbackName(candidate, options);
+  return fallback == null ? null : resolveInlineSkill(fallback, options);
+}
+
+/** The bare `$plugin` prefix to try, or null when the qualifier names a loaded plugin. */
+function getProseFallbackName(
+  candidate: InlineSkillCandidate,
+  options: InlineSkillResolveOptions
+): string | null {
   if (candidate.fallback == null) return null;
   const pluginName = parseSkillLookupName(candidate.skillName)?.pluginName;
-  if (options.agentSkillDescriptors.some((descriptor) => descriptor.pluginName === pluginName)) {
-    return null;
-  }
-  return resolveInlineSkill(candidate.fallback.skillName, options);
+  const knownPlugin = options.agentSkillDescriptors.some(
+    (descriptor) => descriptor.pluginName === pluginName
+  );
+  return knownPlugin ? null : candidate.fallback.skillName;
+}
+
+function findLocalProseFallback(
+  candidate: InlineSkillCandidate,
+  options: InlineSkillResolveOptions
+): InvocableSkill | null {
+  const fallback = getProseFallbackName(candidate, options);
+  return fallback == null ? null : findLocalInlineSkill(fallback, options);
+}
+
+// user-invocable: false skills must be treated as nonexistent for inline $skill refs
+// (they remain model-invocable via agent_skill_read).
+function findLocalInlineSkill(
+  skillName: string,
+  options: InlineSkillResolveOptions
+): InvocableSkill | null {
+  return (
+    findInvocableSkill(
+      options.agentSkillDescriptors.filter((descriptor) => descriptor.userInvocable !== false),
+      skillName
+    ) ?? null
+  );
 }
 
 async function resolveInlineSkill(
   skillName: string,
   options: InlineSkillResolveOptions
 ): Promise<InvocableSkill | null> {
-  // user-invocable: false skills must be treated as nonexistent for inline $skill refs
-  // (they remain model-invocable via agent_skill_read).
-  const skill = findInvocableSkill(
-    options.agentSkillDescriptors.filter((descriptor) => descriptor.userInvocable !== false),
-    skillName
-  );
+  const skill = findLocalInlineSkill(skillName, options);
   if (skill) return skill;
   if (!options.api || !options.discovery) return null;
   return resolveRemoteSkill({ skillName, api: options.api, discovery: options.discovery });

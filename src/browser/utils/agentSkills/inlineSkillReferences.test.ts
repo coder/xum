@@ -411,6 +411,21 @@ describe("plugin skill namespaces ($plugin:skill)", () => {
     ]);
   });
 
+  test("prose like $tdd:one resolves a loaded bare tdd with no remote lookup", async () => {
+    let remoteCalls = 0;
+    const refs = await resolveInlineSkillReferences({
+      candidates: extractInlineSkillReferenceCandidates("$tdd:one and $tdd:two"),
+      agentSkillDescriptors: [descriptor("tdd")],
+      api: apiClient(() => {
+        remoteCalls++;
+        return Promise.reject(new Error("not found"));
+      }),
+      discovery: { kind: "project", projectPath: "/repo" },
+    });
+    expect(refs).toEqual([{ skillName: "tdd", scope: "global", source: "inline" }]);
+    expect(remoteCalls).toBe(0);
+  });
+
   test("does not fall back to the bare prefix when the qualifier names a known plugin", async () => {
     // `$pstack:missing` meant a pstack skill: attaching an unrelated bare `pstack` would be wrong,
     // and the client cannot tell a missing skill from an unreadable one.
