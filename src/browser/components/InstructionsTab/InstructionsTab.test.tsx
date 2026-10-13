@@ -11,7 +11,8 @@ import { createTestApiClient } from "@/browser/testUtils";
 import type { InstructionFile, WorkspaceInstructions } from "@/common/types/instructions";
 import { InstructionsTab } from "./InstructionsTab";
 
-const AGENTS_MD = "---\ndescription: repo rules\n---\n# Repo rules\n\n- run the tests\n- keep diffs small\n";
+const AGENTS_MD =
+  "---\ndescription: repo rules\n---\n# Repo rules\n\n- run the tests\n- keep diffs small\n";
 
 function instructions(file: InstructionFile): WorkspaceInstructions {
   return {
