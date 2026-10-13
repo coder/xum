@@ -236,6 +236,10 @@ function hostNamesMixedWithSecretKey(
   );
 }
 
+function skipLogKey(workspaceId: string, provider: BashAiProxyProvider): string {
+  return `${workspaceId}\0${provider}`;
+}
+
 type RequestInitWithDispatcher = RequestInit & { dispatcher?: Dispatcher };
 
 // Same outbound behavior as chat requests (providerModelFactory): honor HTTP(S)_PROXY and never
@@ -300,18 +304,20 @@ export class BashAiProxyService {
     }
     // Decide the routes first: an SSH forward costs a connection and up to 10 s on a first turn,
     // so a workspace that would get no variables never opens one.
-    const routes = ROUTES.filter((route) => {
-      const skipReason = this.skipReasonFor(route, secretKeys);
-      this.noteSkip(workspaceId, route.provider, skipReason);
-      return skipReason === undefined;
-    });
+    const routes = ROUTES.filter(
+      (route) => !this.noteSkip(workspaceId, route.provider, this.skipReasonFor(route, secretKeys))
+    );
     if (routes.length === 0) return {};
     const port = await this.ensureStarted();
     if (port === undefined) return {};
     const origin = await this.originFor(workspaceId, runtime, port);
-    if (origin === undefined) return {};
+    if (origin === undefined) return this.noteUnreachable(workspaceId, runtime, routes);
     const env: Record<string, string> = {};
-    for (const route of routes) Object.assign(env, route.env(origin, this.keyFor(workspaceId)));
+    for (const route of routes) {
+      // The provider gets its variables: its next skip logs again.
+      this.loggedSkips.delete(skipLogKey(workspaceId, route.provider));
+      Object.assign(env, route.env(origin, this.keyFor(workspaceId)));
+    }
     return env;
   }
 
@@ -327,6 +333,22 @@ export class BashAiProxyService {
     }
   }
 
+  /** Logs why commands of this runtime cannot reach the proxy; returns envFor()'s empty env. */
+  private noteUnreachable(
+    workspaceId: string,
+    runtime: RuntimeMode,
+    routes: readonly ProxyRoute[]
+  ): Record<string, string> {
+    // originFor() gives no origin for Docker and devcontainer at all, and for SSH and Coder when
+    // another backend may share the Xum home or the reverse forward is not up.
+    const reason =
+      runtime === "docker" || runtime === "devcontainer"
+        ? `${runtime} commands have no route to Xum`
+        : "no SSH reverse forward to this host (a shared Xum home, or the forward failed)";
+    for (const route of routes) this.noteSkip(workspaceId, route.provider, reason);
+    return {};
+  }
+
   /** Why envFor() gives a provider no variables, or undefined when it gets them. */
   private skipReasonFor(route: ProxyRoute, secretKeys: readonly string[]): string | undefined {
     // A secret comes first: it is the reason to fix even when Xum also has no key.
@@ -339,23 +361,22 @@ export class BashAiProxyService {
 
   /**
    * Logs a skipped provider (#6357) once per workspace and provider, not on every turn. A new
-   * reason logs again, and so does the next skip after the provider got its variables.
+   * reason logs again, and so does the next skip after the provider got its variables (envFor
+   * clears the entry then). Returns whether the provider is skipped (a reason is given).
    */
   private noteSkip(
     workspaceId: string,
     provider: BashAiProxyProvider,
     reason: string | undefined
-  ): void {
-    const key = `${workspaceId}\0${provider}`;
-    if (reason === undefined) {
-      this.loggedSkips.delete(key);
-      return;
-    }
-    if (this.loggedSkips.get(key) === reason) return;
+  ): boolean {
+    if (reason === undefined) return false;
+    const key = skipLogKey(workspaceId, provider);
+    if (this.loggedSkips.get(key) === reason) return true;
     this.loggedSkips.set(key, reason);
     log.info(`[bash-ai-proxy] skipped ${provider}: ${reason}; its bash AI calls stay uncounted`, {
       workspaceId,
     });
+    return true;
   }
 
   /**

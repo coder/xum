@@ -877,6 +877,27 @@ describe("BashAiProxyService", () => {
       expect(skips()).toHaveLength(5);
     });
 
+    test("a runtime that cannot reach the proxy logs its reason once per provider", async () => {
+      for (let turn = 0; turn < 2; turn++) {
+        await proxy.envFor("ws-docker", "docker", []);
+        await proxy.envFor("ws-dc", "devcontainer", []);
+      }
+      // SSH while another backend may share the Xum home, for the provider that is not skipped.
+      rootShared = true;
+      await proxy.envFor("ws-ssh", "ssh", ["OPENAI_API_KEY"]);
+      expect(skips()).toEqual([
+        ["anthropic", "docker commands have no route to Xum"],
+        ["openai", "docker commands have no route to Xum"],
+        ["anthropic", "devcontainer commands have no route to Xum"],
+        ["openai", "devcontainer commands have no route to Xum"],
+        ["openai", "a secret sets OPENAI_API_KEY"],
+        [
+          "anthropic",
+          "no SSH reverse forward to this host (a shared Xum home, or the forward failed)",
+        ],
+      ]);
+    });
+
     test("a blocked workspace logs its reason once per provider, and only with the switch on", () => {
       for (let turn = 0; turn < 2; turn++) proxy.noteBlocked("ws-untrusted", "untrusted");
       proxy.noteBlocked("ws-kill", "kill_switch");

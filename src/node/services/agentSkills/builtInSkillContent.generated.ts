@@ -4927,7 +4927,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "1. Remove the provider key from secrets, and let commands use the host's gateway.",
       "2. Start Xum without the host's provider variables, so the key in secrets goes to the provider's own API.",
-      "3. Set the base URL in secrets too, for example `ANTHROPIC_BASE_URL=https://api.anthropic.com` or `OPENAI_BASE_URL=https://api.openai.com/v1`. This is enough only when the host sets no `ANTHROPIC_AUTH_TOKEN`: Xum does not inject a secret with an empty value.",
+      "3. Set in secrets every host variable from the table that the host sets, for example `ANTHROPIC_BASE_URL=https://api.anthropic.com`, or both `OPENAI_BASE_URL` and `OPENAI_API_BASE` as `https://api.openai.com/v1`. This does not work for a host `ANTHROPIC_AUTH_TOKEN`: Xum does not inject a secret with an empty value, so use option 1 or 2 there.",
       "",
       "A gateway token in secrets next to the host's gateway URL is a valid setup. Xum does not warn for it.",
       "",
