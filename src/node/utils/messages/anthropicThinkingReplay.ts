@@ -29,21 +29,42 @@ export function laterAnthropicThinkingReplayPoint(
  */
 const STRIP_MARKER = "stripThinkingReplay";
 
+/** The receipt's point, or undefined for an old receipt or a corrupted value. */
+function readReplayPoint(receipt: MuxMessage): AnthropicThinkingReplayPoint | undefined {
+  const point: unknown = receipt.metadata?.anthropicThinkingReplayFromStep;
+  if (point === "end") return point;
+  return typeof point === "number" && Number.isSafeInteger(point) && point >= 0 ? point : undefined;
+}
+
 /**
  * The first part index of the receipt row whose Anthropic thinking replays, or undefined
  * when the whole segment must lose it (old receipts, corrupted points, or a step point
  * without trusted step boundaries).
  */
 function keptFromPartIndex(receipt: MuxMessage): number | undefined {
-  const point: unknown = receipt.metadata?.anthropicThinkingReplayFromStep;
+  const point = readReplayPoint(receipt);
+  if (point === undefined || point === 0) return point;
   if (point === "end") return Number.POSITIVE_INFINITY;
-  if (typeof point !== "number" || !Number.isSafeInteger(point) || point < 0) return undefined;
-  if (point === 0) return 0;
   const starts: unknown = receipt.metadata?.stepStartPartIndices;
   if (!isTrustedStepStartList(starts)) return undefined;
   // Persisted boundaries drop starts at or past the row's last part (a step that produced
   // nothing), so a point past the list means the strip came after every part of the row.
   return point < starts.length ? starts[point] : Number.POSITIVE_INFINITY;
+}
+
+/** The segment's latest receipt row and the IDs of the segment rows after it. */
+function findLatestReceipt(
+  receiptRows: MuxMessage[]
+): { receipt: MuxMessage; laterIds: Set<string> } | null {
+  const segment = receiptRows.slice(findLatestContextBoundaryIndex(receiptRows) + 1);
+  const index = segment.findLastIndex(
+    (row) => row.role === "assistant" && row.metadata?.anthropicThinkingReplay === "off"
+  );
+  if (index < 0) return null;
+  return {
+    receipt: segment[index],
+    laterIds: new Set(segment.slice(index + 1).map((row) => row.id)),
+  };
 }
 
 function markRow(message: MuxMessage, keptFrom: number): MuxMessage {
@@ -84,12 +105,9 @@ function markAnthropicThinkingStrip(
   messages: MuxMessage[],
   receiptRows: MuxMessage[]
 ): MuxMessage[] | "all" | null {
-  const segment = receiptRows.slice(findLatestContextBoundaryIndex(receiptRows) + 1);
-  const receiptIndex = segment.findLastIndex(
-    (row) => row.role === "assistant" && row.metadata?.anthropicThinkingReplay === "off"
-  );
-  if (receiptIndex < 0) return null;
-  const receipt = segment[receiptIndex];
+  const latest = findLatestReceipt(receiptRows);
+  if (latest === null) return null;
+  const { receipt, laterIds } = latest;
   const keptFrom = keptFromPartIndex(receipt);
   if (keptFrom === undefined) return "all";
   // A request that edited the row (compaction input trim) moved the part indices.
@@ -97,15 +115,14 @@ function markAnthropicThinkingStrip(
   if (sentReceipt != null && sentReceipt.parts.length !== receipt.parts.length) return "all";
 
   // The repair of a turn with no output leaves an empty receipt row that request building
-  // filters out (#5886), so the rows after it mark where the kept region starts.
-  const laterIds = new Set(segment.slice(receiptIndex + 1).map((row) => row.id));
+  // filters out (#5886), so the rows after it also mark where the kept region starts.
   let beforeReceipt = true;
   return messages.map((message) => {
     if (message.id === receipt.id) {
       beforeReceipt = false;
       return markRow(message, keptFrom);
     }
-    if (laterIds.has(message.id)) beforeReceipt = false;
+    beforeReceipt &&= !laterIds.has(message.id);
     return beforeReceipt ? markRow(message, Number.POSITIVE_INFINITY) : message;
   });
 }

@@ -453,11 +453,11 @@ describe("reasoning replay in built provider requests", () => {
       it(`replays again after a ${boundary.kind} boundary that follows the receipt`, async () => {
         const history: MuxMessage[] = [
           createMuxMessage("user-1", "user", "first", { timestamp: 1000 }),
-          signedTurn("assistant-1", { anthropicThinkingReplay: "off" }),
-          signedTurn("assistant-1b", {
+          signedTurn("assistant-1a", {
             anthropicThinkingReplay: "off",
             anthropicThinkingReplayFromStep: "end",
           }),
+          signedTurn("assistant-1", { anthropicThinkingReplay: "off" }),
           boundary.row,
           createMuxMessage("user-2", "user", "second", { timestamp: 1002 }),
           signedTurn("assistant-2"),
