@@ -1557,6 +1557,25 @@ test("the command line refuses an ambient BUGBASH_AI_RESOLVED=real before any do
   expect(fs.existsSync(path.join(dir, output))).toBe(false);
 });
 
+// #6094 item 18: the entry handler maps an internal error (not a Refusal) to exit 4 and an
+// `error:` line, so a launcher bug never reads as e2e's exit 1 (a failed test) or as a refusal.
+// A TMPDIR that is a file makes the docker client folder's mkdtemp throw ENOTDIR.
+test("the command line exits 4 with an `error:` line on an internal error", () => {
+  const notADir = path.join(root, "tmpdir-is-a-file");
+  fs.writeFileSync(notADir, "");
+  const cli = spawnSync(process.execPath, ["sandbox/launch.ts", "--recover"], {
+    cwd: path.join(import.meta.dir, ".."),
+    encoding: "utf8",
+    env: { PATH: process.env.PATH, TMPDIR: notADir },
+  });
+  expect(cli.stderr).toMatch(/^sandbox error: ENOTDIR\b/m);
+  expect(cli.stderr).not.toContain("refused:");
+  expect(cli.status).toBe(4);
+  // The error came after the endpoint check and before any daemon command.
+  expect(calls()).toStartWith("context inspect");
+  expect(calls()).not.toContain("info ");
+});
+
 test("D2: the self-check fails on a partial or unknown container report", () => {
   expect(checkSet([...CONTAINER_CHECKS])).toEqual({ missing: [], unexpected: [] });
   // A report that stops early (the last check missing) names what is missing.
