@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import { createTestApiClient } from "@/browser/testUtils";
 import {
   hasProjectScopedSkillRef,
   parseCommandWithSkillInvocation,
@@ -75,6 +76,29 @@ describe("parseCommandWithSkillInvocation", () => {
     });
 
     expect(result.skillInvocation?.descriptor.name).toBe("tdd");
+  });
+
+  test("a typed /pstack:tdd keeps the qualified name through the remote fallback", async () => {
+    // The backend package carries the bare frontmatter name; `tdd` alone could load another skill.
+    const api = createTestApiClient({
+      agentSkills: {
+        get: () =>
+          Promise.resolve({
+            scope: "global" as const,
+            directoryName: "tdd",
+            frontmatter: { name: "tdd", description: "pstack tdd" },
+            body: "PSTACK",
+          }),
+      },
+    });
+    const result = await parseCommandWithSkillInvocation({
+      messageText: "/pstack:tdd now",
+      agentSkillDescriptors: [descriptor("tdd")],
+      api,
+      discovery: { kind: "project", projectPath: "/repo" },
+    });
+
+    expect(result.skillInvocation?.descriptor.name).toBe("pstack:tdd");
   });
 
   test("maps quoted MCP prompt arguments positionally and lets the last consume the remainder", async () => {

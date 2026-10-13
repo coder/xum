@@ -7,7 +7,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getPendingDraftSkillDiscoveryKey } from "@/common/constants/storage";
 import {
   getAgentSkillsStore,
-  useAgentSkills,
+  useInvocableSkills,
   type AgentSkillsDiscovery,
 } from "@/browser/stores/AgentSkillsStore";
 import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
@@ -25,7 +25,7 @@ import { getCommandGhostHint } from "@/browser/utils/slashCommands/registry";
 import { getSlashCommandSuggestions } from "@/browser/utils/slashCommands/suggestions";
 import { resolveSlashCommandExperimentValue } from "@/browser/utils/slashCommands/experimentVisibility";
 import type { SlashSuggestion } from "@/browser/utils/slashCommands/types";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import type { PluginSlashCommandDescriptor } from "@/common/orpc/schemas/agentPlugins";
 
@@ -43,7 +43,7 @@ interface SuggestionExperiments {
 }
 
 interface SynchronousSuggestionContext {
-  agentSkills: AgentSkillDescriptor[];
+  agentSkills: InvocableSkill[];
   mcpPrompts: MCPPromptDescriptor[];
   pluginCommands: PluginSlashCommandDescriptor[];
   variant: "creation" | "workspace";
@@ -214,7 +214,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
       : variant === "creation" && projectPath
         ? { projectPath }
         : null;
-  const agentSkills = useAgentSkills(skillDiscovery).skills;
+  const agentSkills = useInvocableSkills(skillDiscovery);
 
   const activeToken = detectActiveComposerToken(input, cursor);
   const activeTokenKey = tokenKey(activeToken) ?? "";

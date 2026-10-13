@@ -238,6 +238,54 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(snapshotText).toContain("Follow the plugin skill.");
   });
 
+  it("materializes <plugin>:<skill> refs from the named plugin (plugin skill namespaces)", async () => {
+    // A project `tdd` hides the pstack plugin's `tdd` for the bare name.
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "tdd",
+      skillBody: "PROJECT-TDD",
+    });
+    const pluginDir = path.join(workspacePath, ".mux", "plugins", "pstack");
+    await fs.mkdir(path.join(pluginDir, "skills", "tdd"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "pstack",
+      })
+    );
+    await fs.writeFile(
+      path.join(pluginDir, "skills", "tdd", "SKILL.md"),
+      "---\nname: tdd\ndescription: Plugin tdd\n---\n\nPSTACK-TDD\n"
+    );
+    const { session, messages } = await createSessionHarness({ workspacePath });
+
+    const result = await session.sendMessage("do X", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "normal",
+        agentSkillRefs: [
+          { skillName: "pstack:tdd", scope: "project", source: "slash" },
+          { skillName: "tdd", scope: "project", source: "inline" },
+          // Unknown plugin: skipped like any unknown inline skill.
+          { skillName: "nope:tdd", scope: "project", source: "inline" },
+        ],
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(messages).toHaveLength(3);
+    const [qualified, bare] = messages;
+    expect(qualified.metadata?.agentSkillSnapshot?.skillName).toBe("pstack:tdd");
+    expect(getMessageText(qualified)).toStartWith(
+      '<agent-skill name="pstack:tdd" scope="project">'
+    );
+    expect(getMessageText(qualified)).toContain("PSTACK-TDD");
+    expect(bare.metadata?.agentSkillSnapshot?.skillName).toBe("tdd");
+    expect(getMessageText(bare)).toContain("PROJECT-TDD");
+    expect(getMessageText(messages[2])).toBe("do X");
+  });
+
   it("dedupes identical skill snapshots when recently inserted", async () => {
     const workspaceId = "ws-test";
 

@@ -8,8 +8,8 @@ import type {
   SkillLoadError,
 } from "@/browser/utils/messages/StreamingMessageAggregator";
 import type {
-  AgentSkillDescriptor,
   AgentSkillIssue,
+  InvocableSkill,
   AgentSkillScope,
   AgentSkillUnavailableSource,
 } from "@/common/types/agentSkill";
@@ -17,8 +17,8 @@ import type {
 interface SkillIndicatorProps {
   /** Skills that have been loaded in the current session */
   loadedSkills: LoadedSkill[];
-  /** All available skills discovered for this project */
-  availableSkills: AgentSkillDescriptor[];
+  /** All available skills discovered for this project (shadowed plugin skills qualified) */
+  availableSkills: InvocableSkill[];
   /** Skills that were discovered but couldn't be loaded (SKILL.md parse errors, etc.) */
   invalidSkills?: AgentSkillIssue[];
   /** Skills roots that could not be read (e.g. the SSH host did not answer) */
@@ -39,7 +39,7 @@ const SCOPE_CONFIG: Array<{ scope: AgentSkillScope; label: string }> = [
 
 interface SkillsPopoverContentProps {
   loadedSkills: LoadedSkill[];
-  availableSkills: AgentSkillDescriptor[];
+  availableSkills: InvocableSkill[];
   invalidSkills: AgentSkillIssue[];
   unavailableSources: AgentSkillUnavailableSource[];
   skillLoadErrors: SkillLoadError[];
@@ -48,7 +48,7 @@ interface SkillsPopoverContentProps {
 const SkillsPopoverContent: React.FC<SkillsPopoverContentProps> = (props) => {
   const loadedSkillNames = new Set(props.loadedSkills.map((skill) => skill.name));
 
-  const skillsByScope = new Map<AgentSkillScope, AgentSkillDescriptor[]>();
+  const skillsByScope = new Map<AgentSkillScope, InvocableSkill[]>();
   for (const skill of props.availableSkills) {
     const existing = skillsByScope.get(skill.scope) ?? [];
     existing.push(skill);
