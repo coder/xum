@@ -462,6 +462,71 @@ describe("WorkspaceService sendMessage AI selection pins", () => {
     }
   });
 
+  test("selecting an agent persists even when its saved settings already match", async () => {
+    const fixture = await setupPinFixture({});
+    try {
+      await fixture.config.editConfig((cfg) => {
+        const workspace = cfg.projects
+          .get("/tmp/pin-project")
+          ?.workspaces.find((candidate) => candidate.id === fixture.workspaceId);
+        if (workspace == null) throw new Error("pin fixture workspace missing");
+        workspace.aiSettingsByAgent = {
+          ...workspace.aiSettingsByAgent,
+          plan: { model: SONNET, thinkingLevel: "medium" },
+        };
+        return cfg;
+      });
+
+      await fixture.workspaceService.sendMessage(fixture.workspaceId, "hi", {
+        agentId: "plan",
+        model: SONNET,
+        thinkingLevel: "medium",
+      });
+
+      expect(fixture.readEntry()?.agentId).toBe("plan");
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  test("the acceptance-time pin write keeps a selection made after preflight", async () => {
+    const fixture = await setupPinFixture(CHILD);
+    try {
+      // Another window switches the agent and its settings while this send is in flight.
+      fixture.fakeSession.sendMessage.mockImplementationOnce(
+        async (_message: string, _options: unknown, internal?: { onAccepted?: () => unknown }) => {
+          await fixture.config.editConfig((cfg) => {
+            const workspace = cfg.projects
+              .get("/tmp/pin-project")
+              ?.workspaces.find((candidate) => candidate.id === fixture.workspaceId);
+            if (workspace == null) throw new Error("pin fixture workspace missing");
+            workspace.agentId = "plan";
+            workspace.aiSettingsByAgent = { exec: { model: GPT, thinkingLevel: "high" } };
+            return cfg;
+          });
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+
+      const result = await fixture.workspaceService.sendMessage(fixture.workspaceId, "hi", {
+        agentId: "exec",
+        model: SONNET,
+        thinkingLevel: "medium",
+        aiSelectionIntent: { model: true },
+      });
+
+      expect(result.success).toBe(true);
+      expect(fixture.readEntry()?.agentId).toBe("plan");
+      expect(fixture.readEntry()?.aiSettingsByAgent?.exec).toEqual({
+        model: GPT,
+        thinkingLevel: "high",
+      });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   test.each([false, true])(
     "intent is stripped before AgentSession and the queue (busy=%s)",
     async (busy) => {

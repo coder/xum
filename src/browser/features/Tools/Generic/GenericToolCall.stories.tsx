@@ -10,7 +10,6 @@ import {
   AppViewTabLabel,
   AppViewTabPanel,
 } from "@/browser/features/RightSidebar/AppViewTab/AppViewTab";
-import { AppViewDialog } from "@/browser/features/RightSidebar/AppViewTab/AppViewDialog";
 import { withAppViewTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import { openMcpAppViewTab } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
@@ -280,23 +279,6 @@ export const McpAppTabLaptop: Story = {
           </div>
         </div>
       </div>
-    ),
-  play: ({ canvasElement }) => playTab(canvasElement),
-};
-
-/** Phones show the tab in a sheet (the right sidebar is hidden there). */
-export const McpAppTabPhoneSheet: Story = {
-  args: { toolName: "demo_app_show_dice_board" },
-  globals: { viewport: { value: "phone390", isRotated: false } },
-  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
-  render: () =>
-    withView(
-      <AppViewDialog
-        workspaceId={APP_TAB_WORKSPACE_ID}
-        toolCallId={APP_TAB_TOOL_CALL_ID}
-        open
-        onOpenChange={() => undefined}
-      />
     ),
   play: ({ canvasElement }) => playTab(canvasElement),
 };

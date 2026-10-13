@@ -7,6 +7,11 @@
 
 import { z } from "zod";
 
+/** Match the versioned Wonder family without treating similarly named custom models as Wonder. */
+export function isMuseWonderModel(modelString: string): boolean {
+  return /^muse-wonder-\d+(?:\.\d+)*$/.test(stripModelProviderPrefixes(modelString));
+}
+
 export const THINKING_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export const ThinkingLevelSchema = z.enum(THINKING_LEVELS);
@@ -46,11 +51,14 @@ export function getThinkingDisplayLabel(level: ThinkingLevel, modelString?: stri
       return "XHIGH";
     }
 
-    // Anthropic Opus 4.7+: xhigh is a distinct effort level from max
-    if (level === "xhigh" && anthropicSupportsNativeXhigh(modelString)) return "XHIGH";
-
-    // Grok 4.6/4.7: xhigh is a distinct native reasoning effort (their policies have no max).
-    if (level === "xhigh" && grokSupportsNativeXhigh(modelString)) return "XHIGH";
+    // These models expose native xhigh, distinct from max where max is supported.
+    if (
+      level === "xhigh" &&
+      [anthropicSupportsNativeXhigh, grokSupportsNativeXhigh, isMuseWonderModel].some(
+        (supportsNativeXhigh) => supportsNativeXhigh(modelString)
+      )
+    )
+      return "XHIGH";
   }
   return THINKING_DISPLAY_LABELS[level];
 }

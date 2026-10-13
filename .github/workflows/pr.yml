@@ -248,6 +248,18 @@ jobs:
         env:
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_TOTAL: ${{ strategy.job-total }}
+      # Quality / CRAP merges every shard's report; keep them only briefly. A
+      # failed shard's report is incomplete, so it uploads none and the summary
+      # shows partial coverage. Informational: an upload error must not fail
+      # this required job.
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: ${{ success() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        with:
+          name: crap-lcov-unit-${{ matrix.shard }}
+          path: coverage/lcov.info
+          if-no-files-found: ignore
+          retention-days: 3
       - uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -322,12 +334,73 @@ jobs:
           BACKEND: ${{ needs.changes.outputs.backend }}
           BROWSER: ${{ needs.changes.outputs.browser }}
           SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+      # Quality / CRAP merges every shard's report; keep them only briefly. A
+      # failed shard's report is incomplete, so it uploads none and the summary
+      # shows partial coverage. Informational: an upload error must not fail
+      # this required job.
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: ${{ success() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        with:
+          name: crap-lcov-integration-${{ matrix.shard }}
+          path: coverage/lcov.info
+          if-no-files-found: ignore
+          retention-days: 3
       - uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage/lcov.info
           flags: integration-tests
           fail_ci_if_error: false
+
+  crap:
+    name: Quality / CRAP
+    # Informational: not in Required, and scripts/crap/ci.ts always exits 0. A
+    # skipped or failed test shard leaves no report, which the summary shows as
+    # partial coverage.
+    needs: [changes, test-unit, test-integration]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    continue-on-error: true
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      # Compare against the merge commit's first parent: the base GitHub built
+      # the merge ref on. pull_request.base.sha can differ (a stacked PR's base
+      # branch merges into its own test ref, main moves), and then the report
+      # scores other PRs' changes. Read the parent from the raw commit object
+      # and fetch only it, so no PR commit enters the history: check.ts then
+      # reads no Crap-Debt trailers here, and in CI the crap-debt label is the
+      # escape hatch (trailers are for the local hook).
+      - name: Fetch the merge base
+        id: base
+        run: |
+          set -euo pipefail
+          sha=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)
+          git fetch --no-tags --depth=1 origin "$sha"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@b7a1c7ccf290d58743029c4f6903da283811b979 # v2.1.0
+        with:
+          bun-version: 1.3.12
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: crap-lcov-*
+          path: coverage-shards
+      - name: CRAP report
+        env:
+          BASE_REF: ${{ steps.base.outputs.sha }}
+          LCOV_DIR: coverage-shards
+          # Shard counts of the test-unit and test-integration matrices above.
+          EXPECTED_UNIT: "6"
+          EXPECTED_INTEGRATION: "3"
+          CRAP_DEBT_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'crap-debt') }}
+        run: bun scripts/crap/ci.ts
 
   test-storybook:
     name: Test / Storybook
@@ -414,6 +487,23 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=4096
           BUGBASH_REPROS: "0"
         run: make test-e2e PLAYWRIGHT_ARGS="tests/e2e/scenarios/windowLifecycle.spec.ts"
+      # A failed bug-bash repro writes its screen (accessibility tree, focus) under
+      # tests/bugbash/.e2e/, next to the report. On the host the app log goes to e2e.config.ts's
+      # default, .e2e/logs/app.log. Upload them, so a flaky failure (#5810) leaves evidence.
+      - name: Upload bug-bash repro failures
+        if: failure() && matrix.shard == '1/4'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: bugbash-repro-failures
+          path: |
+            tests/bugbash/.e2e/repros*/artifacts/**/failure/
+            tests/bugbash/.e2e/repros*/artifacts/**/screenshots/*-failure.png
+            tests/bugbash/.e2e/repros*/report.json
+            tests/bugbash/.e2e/logs/app.log
+          # Every path is under the hidden .e2e folder, which upload-artifact skips by default.
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
 
   bugbash-sandbox:
     # The bug-bash sandbox (#5714, #5931): its self-check (isolation, proxy and export refusals,
@@ -554,6 +644,14 @@ jobs:
           done
           curl -sf http://localhost:3000/health | grep -q '"status":"ok"'
           curl -sf http://localhost:3000/version | grep -q '"mode":"server"'
+          # The runtime stage copies dist/ files by extension (#5964). Fetch one
+          # public/ file, one icon and the font the served page preloads, so a dropped
+          # pattern fails here.
+          curl -sf http://localhost:3000/manifest.json | grep -q '"icons"'
+          curl -sf -o /dev/null http://localhost:3000/icon-192.png
+          font=$(curl -sf http://localhost:3000/ | grep -o 'as="font"[^>]*href="\./[^"]*\.woff2"' | sed 's/.*href="\.\///; s/"$//')
+          test -n "$font"
+          curl -sf -o /dev/null "http://localhost:3000/$font"
           # /health passes without the analytics worker, which starts lazily (#5603).
           # Start the shipped worker bundle and open a DuckDB database through it.
           docker exec -i mux-test node - /app/dist/runtime/analyticsWorker.js < scripts/check-analytics-worker.cjs

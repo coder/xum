@@ -18,7 +18,7 @@ afterEach(async () => {
 /** Every client-visible output of a test, so the key check covers all of them (P9). */
 const outputs: string[] = [];
 
-async function setup(options: { capUsd?: number; deadlineMs?: number } = {}) {
+async function setup(options: { capUsd?: number; deadlineMs?: number; baseUrl?: string } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xbb-proxy-"));
   fs.chmodSync(dir, 0o700);
   cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -31,7 +31,7 @@ async function setup(options: { capUsd?: number; deadlineMs?: number } = {}) {
   const socketPath = path.join(dir, "proxy.sock");
   const proxy = await startProxy({
     socketPath,
-    upstream: { baseUrl: fake.baseUrl, apiKey: KEY },
+    upstream: { baseUrl: options.baseUrl ?? fake.baseUrl, apiKey: KEY },
     job: { models: [MODEL] },
     ledger,
     deadlineMs: options.deadlineMs,
@@ -301,6 +301,34 @@ test.each(["cut", "stall"])(
     expect(probe).not.toBe("status 200");
   }
 );
+
+/** A loopback port that refuses connections: a server's port, after the server closed. */
+async function closedPort(): Promise<number> {
+  const server = net.createServer();
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const { port } = server.address() as net.AddressInfo;
+  await new Promise((done) => server.close(done));
+  return port;
+}
+
+test("U2: a call that cannot connect to the upstream is released at $0; one that reached it is kept", async () => {
+  const dead = await setup({ baseUrl: `http://127.0.0.1:${await closedPort()}` });
+  const refused = await send(dead.socketPath, body("hi"));
+  expect(refused.status).toBe(502);
+  expect(refused.text).toContain("upstream: unreachable"); // a fixed text: no host, no port
+  const [record] = await dead.recorded(1);
+  expect(record).toMatchObject({ outcome: "released", reason: "upstream: unreachable" });
+  expect(dead.ledger.totals()).toMatchObject({ spentNanoUsd: 0, reservedNanoUsd: 0, calls: 1 });
+  expect(dead.proxy.stats()).toMatchObject({ released: 1, kept: 0 });
+
+  // The request reached the upstream, which may bill it: the reservation stays counted.
+  const reset = await setup();
+  reset.fake.setMode("reset");
+  expect((await send(reset.socketPath, body("hi"))).status).toBe(502);
+  const [kept] = await reset.recorded(1);
+  expect(kept).toMatchObject({ outcome: "kept", reason: "upstream: failed" });
+  expect(reset.ledger.totals().spentNanoUsd).toBe(kept.reservedNanoUsd!);
+});
 
 test("close() rejects when a call cost more than its bound, so the job fails", async () => {
   const { socketPath, proxy, records, faults } = await setup();

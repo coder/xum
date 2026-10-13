@@ -502,6 +502,12 @@ export class AIService extends EventEmitter {
     this.mockAiStreamPlayer?.releaseStreamStartGate(workspaceId);
   }
 
+  /** Release a mock stream held before its tool calls (MockAiRouterReply.holdToolCalls). */
+  releaseMockToolCalls(workspaceId: string): void {
+    assert(this.mockAiStreamPlayer, "mock mode is off");
+    this.mockAiStreamPlayer.releaseToolCalls(workspaceId);
+  }
+
   enableMockMode(): void {
     this.mockModeEnabled = true;
 

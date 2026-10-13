@@ -1,4 +1,6 @@
 import { z } from "zod";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import type { PersistedToolModelUsage } from "@/common/types/message";
 import { MCPToolCallDisplaySchema } from "./mcp";
 import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
@@ -185,6 +187,35 @@ export const ContextBudgetRejectedMessageSchema = z.object({
   metadata: z.any().optional(),
 });
 
+/**
+ * One model-backed tool call or refused fallback attempt billed during a turn
+ * (`PersistedToolModelUsage`). Without it on the wire, onChat output validation strips
+ * `metadata.toolModelUsages`, and the renderer's per-turn cost views miss that spend.
+ */
+export const PersistedToolModelUsageSchema = z.object({
+  toolName: z.string(),
+  toolCallId: z.string().optional(),
+  timestamp: z.number().optional(),
+  model: z.string(),
+  metadataModel: z.string().optional(),
+  // Loose like `metadata.usage`: persisted usage predates the strict wire usage schema.
+  usage: z.custom<LanguageModelV2Usage>(
+    (value) => typeof value === "object" && value !== null && !Array.isArray(value)
+  ),
+  providerMetadata: z.record(z.string(), z.unknown()).optional(),
+}) satisfies z.ZodType<PersistedToolModelUsage>;
+
+/**
+ * `toolModelUsages` list, parsed entry by entry: a malformed or legacy entry is dropped
+ * alone and its valid siblings survive (a whole-array parse would discard all of them).
+ */
+export const PersistedToolModelUsagesSchema = z.array(z.unknown()).transform((entries) =>
+  entries.flatMap((entry) => {
+    const parsed = PersistedToolModelUsageSchema.safeParse(entry);
+    return parsed.success ? [parsed.data] : [];
+  })
+);
+
 // XumMessage (simplified)
 export const MuxMessageSchema = z.object({
   id: z.string(),
@@ -214,6 +245,8 @@ export const MuxMessageSchema = z.object({
       contextUsage: z.any().optional(),
       providerMetadata: z.record(z.string(), z.unknown()).optional(),
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
+      // Self-healing read path: a malformed persisted list must not fail the whole history parse.
+      toolModelUsages: PersistedToolModelUsagesSchema.optional().catch(undefined),
       stopCause: StreamStopCauseSchema.optional().catch(undefined),
       duration: z.number().optional(),
       ttftMs: z.number().optional(),

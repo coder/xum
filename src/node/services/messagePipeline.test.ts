@@ -704,3 +704,131 @@ describe("reasoning replay in built provider requests", () => {
     });
   });
 });
+
+describe("step boundaries in built provider requests", () => {
+  function bashPart(toolCallId: string): MuxMessage["parts"][number] {
+    return {
+      type: "dynamic-tool",
+      toolCallId,
+      toolName: "bash",
+      state: "output-available",
+      input: { script: toolCallId },
+      output: { success: true, output: toolCallId },
+    };
+  }
+
+  function history(parts: MuxMessage["parts"], stepStartPartIndices?: unknown): MuxMessage[] {
+    return [
+      createMuxMessage("user-1", "user", "go", { timestamp: 1000 }),
+      {
+        id: "assistant-1",
+        role: "assistant",
+        // Parsed like a chat.jsonl row (unchecked), so the self-healing cases can carry corrupted
+        // persisted values.
+        metadata: JSON.parse(
+          JSON.stringify({ timestamp: 1001, stepStartPartIndices })
+        ) as MuxMessage["metadata"],
+        parts,
+      },
+      createMuxMessage("user-2", "user", "continue", { timestamp: 1002 }),
+    ];
+  }
+
+  function build(messages: MuxMessage[], provider = "anthropic"): Promise<ModelMessage[]> {
+    return prepareMessagesForProvider({
+      messagesWithSentinel: messages,
+      effectiveAgentId: "exec",
+      toolNamesForSentinel: [],
+      providerForMessages: provider,
+      effectiveThinkingLevel: "off",
+      modelString: `${provider}:model`,
+      workspaceId: "test-ws",
+    });
+  }
+
+  /** Message roles with the tool-call / tool-result IDs and texts each one carries. */
+  function shape(messages: ModelMessage[]): string[] {
+    return messages.map((message) => {
+      const content = typeof message.content === "string" ? [] : message.content;
+      const items = content.map((part) =>
+        part.type === "tool-call" || part.type === "tool-result"
+          ? part.toolCallId
+          : part.type === "text"
+            ? JSON.stringify(part.text)
+            : part.type
+      );
+      return `${message.role}(${items.join(",")})`;
+    });
+  }
+
+  // Step 1: text + call-1. Step 2 opens with call-2. Step 3: the final text.
+  const twoSequentialCalls: MuxMessage["parts"] = [
+    { type: "text", text: "First." },
+    bashPart("call-1"),
+    bashPart("call-2"),
+    { type: "text", text: "Done." },
+  ];
+  const folded = [
+    'user("go")',
+    'assistant("First.",call-1,call-2)',
+    "tool(call-1,call-2)",
+    'assistant("Done.")',
+    'user("continue")',
+  ];
+
+  for (const provider of ["anthropic", "openai"]) {
+    it(`keeps a step that opens with a tool call in its own messages (${provider})`, async () => {
+      const result = await build(history(twoSequentialCalls, [0, 2, 3]), provider);
+      expect(shape(result)).toEqual([
+        'user("go")',
+        'assistant("First.",call-1)',
+        "tool(call-1)",
+        "assistant(call-2)",
+        "tool(call-2)",
+        'assistant("Done.")',
+        'user("continue")',
+      ]);
+    });
+  }
+
+  it("rebuilds rows without step indices as before (older history)", async () => {
+    expect(shape(await build(history(twoSequentialCalls)))).toEqual(folded);
+  });
+
+  it("ignores step indices that are unsorted, negative, fractional, not numbers or miss 0", async () => {
+    for (const corrupted of [[0, 3, 2], [0, -1, 2], [0, 1.5], [0, "2"], "0,2", { 0: 2 }, [2], []]) {
+      expect(shape(await build(history(twoSequentialCalls, corrupted)))).toEqual(folded);
+    }
+  });
+
+  it("skips step indices outside the row's parts and keeps the valid ones", async () => {
+    expect(shape(await build(history(twoSequentialCalls, [0, 99])))).toEqual(folded);
+    expect(shape(await build(history(twoSequentialCalls, [0, 2, 99])))).toEqual([
+      'user("go")',
+      'assistant("First.",call-1)',
+      "tool(call-1)",
+      "assistant(call-2)",
+      "tool(call-2)",
+      'assistant("Done.")',
+      'user("continue")',
+    ]);
+  });
+
+  it("leaves steps that open with text or reasoning as they were", async () => {
+    const parts: MuxMessage["parts"] = [
+      { type: "text", text: "Looking." },
+      bashPart("call-1"),
+      { type: "reasoning", text: "next" },
+      { type: "text", text: "Again." },
+      bashPart("call-2"),
+      { type: "text", text: "Done." },
+    ];
+    const withSteps = await build(history(parts, [0, 2, 5]), "openai");
+    expect(withSteps).toEqual(await build(history(parts), "openai"));
+  });
+
+  it("keeps parallel tool calls of one step in one assistant message", async () => {
+    const parallel = await build(history(twoSequentialCalls, [0, 3]));
+    expect(shape(parallel)).toEqual(folded);
+  });
+});

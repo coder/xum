@@ -11,6 +11,7 @@ import { preloadTestModules, type TestEnvironment } from "../../ipc/setup";
 
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import type { StreamStartEvent } from "@/common/types/stream";
 
 import { createAppHarness, type AppHarness } from "../harness";
 
@@ -203,7 +204,18 @@ describe("Send dispatch modes (mock AI router)", () => {
     const app = await createAppHarness({ branchPrefix: "queued-parallel-tool-step" });
 
     try {
+      // The send waits for workspace init, so the stream can start more than 1 s after the
+      // click: await its stream-start instead of racing it with waitFor's default (#6143).
+      const sourceStarted = new Promise<void>((resolve) => {
+        const onStart = (event: StreamStartEvent) => {
+          if (event.workspaceId !== app.workspaceId) return;
+          app.env.services.aiService.off("stream-start", onStart);
+          resolve();
+        };
+        app.env.services.aiService.on("stream-start", onStart);
+      });
       await app.chat.send("[mock:tool:parallel-step] Run both sibling tool calls");
+      await sourceStarted;
       await waitFor(() => {
         const state = workspaceStore.getWorkspaceSidebarState(app.workspaceId);
         if (!state.canInterrupt) {
@@ -219,6 +231,8 @@ describe("Send dispatch modes (mock AI router)", () => {
         expect(app.view.container.textContent).toContain("Queued");
         expect(app.view.container.textContent).toContain("Sends after this step");
       });
+      // The mock turn holds its tool calls until now, so the follow-up was queued mid-step.
+      app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
 
       await app.chat.expectTranscriptContains("parallel-step-a.txt");
       await app.chat.expectTranscriptContains("parallel-step-b.txt");
