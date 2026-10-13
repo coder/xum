@@ -2,6 +2,7 @@ import "../../tests/ui/dom";
 
 import { afterAll, beforeAll, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../tests/ui/dom";
+import { MarkdownFilePreview } from "@/browser/features/Messages/MarkdownFilePreview";
 // Type only: a value import would evaluate App before the mock below.
 import type * as AppModule from "@/browser/App";
 
@@ -9,7 +10,9 @@ import type * as AppModule from "@/browser/App";
 const loads: string[] = [];
 void mock.module("@/browser/components/AIView/AIView", () => {
   loads.push(window.location.pathname);
-  return { AIView: () => null };
+  // The real preview: MemoryFileEditor loads it through this module, and later suites in the same
+  // Bun process can still see this mock despite the afterAll restore below.
+  return { AIView: () => null, MarkdownFilePreview };
 });
 
 let cleanupDom: (() => void) | null = null;
