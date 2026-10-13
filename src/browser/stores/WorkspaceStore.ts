@@ -4395,6 +4395,36 @@ export class WorkspaceStore {
    * Subscribe to workspace chat events (history replay + live streaming).
    * Retries on unexpected iterator termination to avoid requiring a full app restart.
    */
+  /**
+   * onChat loop error policy: log the error, and return true to stop the loop when retrying
+   * cannot help (a refused session tape replay, or a workspace removed during validation).
+   */
+  private handleOnChatError(workspaceId: string, error: unknown, attemptAborted: boolean): boolean {
+    const abortError = isAbortError(error);
+    if (attemptAborted) {
+      if (!abortError)
+        console.warn(
+          "[WorkspaceStore] onChat subscription aborted for " + workspaceId + "; retrying..."
+        );
+    } else if (isSessionTapeReplayRefusal(error)) {
+      // Perf harness (XUM_REPLAY_TAPES): this workspace is mapped to a tape the backend
+      // cannot serve. Retrying cannot help and there is no live fallback: show the refusal
+      // and stop the loop.
+      this.showSessionTapeReplayRefusal(workspaceId, error.message);
+      return true;
+    } else if (isIteratorValidationFailed(error)) {
+      if (!this.isWorkspaceRegistered(workspaceId)) return true;
+      console.error(
+        "[WorkspaceStore] Event validation failed for " + workspaceId + ": " + error.message
+      );
+    } else if (!abortError)
+      console.error(
+        "[WorkspaceStore] Error in onChat subscription for " + workspaceId + ":",
+        error
+      );
+    return false;
+  }
+
   private async runOnChatSubscription(workspaceId: string, signal: AbortSignal): Promise<void> {
     await runSubscriptionLoop({
       name: "onChat(" + workspaceId + ")",
@@ -4476,30 +4506,8 @@ export class WorkspaceStore {
                 workspaceId +
                 "; retrying..."
         ),
-      onError: (error, { attemptAborted }) => {
-        const abortError = isAbortError(error);
-        if (attemptAborted) {
-          if (!abortError)
-            console.warn(
-              "[WorkspaceStore] onChat subscription aborted for " + workspaceId + "; retrying..."
-            );
-        } else if (isSessionTapeReplayRefusal(error)) {
-          // Perf harness (XUM_REPLAY_TAPES): this workspace is mapped to a tape the backend
-          // cannot serve. Retrying cannot help and there is no live fallback: show the refusal
-          // and stop the loop.
-          this.showSessionTapeReplayRefusal(workspaceId, error.message);
-          return true;
-        } else if (isIteratorValidationFailed(error)) {
-          if (!this.isWorkspaceRegistered(workspaceId)) return true;
-          console.error(
-            "[WorkspaceStore] Event validation failed for " + workspaceId + ": " + error.message
-          );
-        } else if (!abortError)
-          console.error(
-            "[WorkspaceStore] Error in onChat subscription for " + workspaceId + ":",
-            error
-          );
-      },
+      onError: (error, { attemptAborted }) =>
+        this.handleOnChatError(workspaceId, error, attemptAborted),
       onAttemptFinished: () => {
         // The transport withholds this callback once the loop signal is aborted, so the entry
         // is this loop's own attempt; the guard keeps that true by construction should a

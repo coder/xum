@@ -1817,6 +1817,36 @@ describe("WorkspaceStore", () => {
       }
     });
 
+    it("warns and retries when a client change aborts the attempt mid-error", async () => {
+      const workspaceId = "workspace-error-after-client-change";
+      let subscriptions = 0;
+      mockOnChat.mockImplementation(async function* (_input, options) {
+        subscriptions++;
+        if (subscriptions > 1) return await waitForAbortSignal(options?.signal);
+        await waitForAbortSignal(options?.signal);
+        // The transport fails with its own error, not an AbortError.
+        throw new Error("transport closed");
+      });
+      const consoleWarn = spyOn(console, "warn").mockImplementation(() => undefined);
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        createAndAddWorkspace(store, workspaceId);
+        expect(await waitUntil(() => subscriptions === 1)).toBe(true);
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+        store.setClient({ ...mockClient } as any);
+
+        expect(await waitUntil(() => subscriptions === 2)).toBe(true);
+        expect(consoleWarn.mock.calls.map(([message]) => message)).toContain(
+          `[WorkspaceStore] onChat subscription aborted for ${workspaceId}; retrying...`
+        );
+        expect(consoleError).not.toHaveBeenCalled();
+      } finally {
+        consoleWarn.mockRestore();
+        consoleError.mockRestore();
+        mockChatScript([], { keepOpen: true });
+      }
+    });
+
     it("keeps the pending first-message row while hidden snapshot rows stream in", async () => {
       // Skill, MCP prompt, and @file first sends persist hidden synthetic user rows before the
       // durable message; each live event bumps state, so the row must survive that bump.
