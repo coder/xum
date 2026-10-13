@@ -58,8 +58,11 @@ describe("resolveSkillDirectory for off-host workspaces", () => {
       expect(substituteSkillDirectoryPlaceholders(BODY, dir)).toBe(BODY);
     });
   }
+});
 
+describe("substituteSkillDirectoryPlaceholders", () => {
   it("inserts paths literally, even with replacement-pattern characters", () => {
+    const hostRuntime = new LocalRuntime("/host/project");
     const skill = resolvedSkill(hostRuntime, "/host/a$&b$1");
     expect(bodyFor(skill, hostRuntime)).toBe("sh /host/a$&b$1/scripts/x.sh");
   });
