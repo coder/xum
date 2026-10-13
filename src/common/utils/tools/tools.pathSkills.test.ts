@@ -10,7 +10,7 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { createPathSkillActivation } from "@/node/services/agentSkills/pathSkillActivation";
 import type { InitStateManager } from "@/node/services/initStateManager";
 
-import { getToolsForModel } from "./tools";
+import { getToolsForModel, type ToolConfiguration } from "./tools";
 
 type ToolExecuteFn = (args: unknown, options: unknown) => Promise<unknown>;
 
@@ -43,7 +43,10 @@ afterEach(async () => {
   await fs.rm(workspace, { recursive: true, force: true });
 });
 
-async function buildTools(messages: MuxMessage[] = []): Promise<Record<string, ToolExecuteFn>> {
+async function buildTools(
+  messages: MuxMessage[] = [],
+  extraConfig: Partial<ToolConfiguration> = {}
+): Promise<Record<string, ToolExecuteFn>> {
   const runtime = new LocalRuntime(workspace);
   const tools = await getToolsForModel(
     "noop:model",
@@ -58,6 +61,7 @@ async function buildTools(messages: MuxMessage[] = []): Promise<Record<string, T
         cwd: workspace,
         runtime,
       }),
+      ...extraConfig,
     },
     "ws-1",
     initStateManager
@@ -115,6 +119,28 @@ describe("getToolsForModel - path-scoped skill activation", () => {
     });
     expect(result.success).toBe(true);
     expect(surfacedNames(result)).toEqual(["ts-rules"]);
+  });
+
+  test("a skill the model reads earlier in the same turn is not pointed at again", async () => {
+    const skillDir = path.join(workspace, ".xum", "skills", "ts-rules");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      '---\nname: ts-rules\ndescription: TypeScript rules\npaths: ["**/*.ts"]\n---\nUse strict types.\n'
+    );
+    // A project scope makes agent_skill_read resolve the workspace's own skills roots.
+    const tools = await buildTools([], {
+      xumScope: {
+        type: "project",
+        xumHome: workspace,
+        projectRoot: workspace,
+        projectStorageAuthority: "host-local",
+      },
+    });
+
+    const read = await call(tools.agent_skill_read, { name: "ts-rules" });
+    expect(read.success).toBe(true);
+    expect(surfacedNames(await call(tools.file_read, { path: "src/foo.ts" }))).toBeUndefined();
   });
 
   test("a prior pointer, agent_skill_read or /skill snapshot in the window suppresses it; malformed rows do not throw", async () => {

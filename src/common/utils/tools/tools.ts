@@ -554,6 +554,22 @@ function attachPathSkills(
   return { ...record, [PATH_SKILLS_RESULT_FIELD]: formatPathSkillsResultField(matches) };
 }
 
+/**
+ * A skill the model reads mid-turn is already in context: later matching file calls
+ * in the same turn must not point at it again. (Earlier turns are covered by the
+ * history scan in createPathSkillActivation.)
+ */
+function markReadSkillSurfaced(
+  result: unknown,
+  args: unknown,
+  activation: PathSkillActivation
+): void {
+  const name = args != null && typeof args === "object" ? (args as { name?: unknown }).name : null;
+  if (asSuccessfulToolResult(result) !== undefined && typeof name === "string") {
+    activation.markSurfaced(name);
+  }
+}
+
 function wrapToolExecuteWithPathSkills(
   toolName: string,
   baseTool: Tool,
@@ -579,6 +595,10 @@ function wrapToolExecuteWithPathSkills(
     const result: unknown = await executeFn.call(baseTool, args, options);
     // Matching never fails the tool call: on error the original result is returned.
     try {
+      if (toolName === "agent_skill_read") {
+        markReadSkillSurfaced(result, args, activation);
+        return result;
+      }
       return attachPathSkills(result, args, options, activation);
     } catch (error) {
       log.debug("[getToolsForModel] path skill activation failed", { error, toolName });
@@ -599,7 +619,7 @@ function wrapFileToolsWithPathSkills(
   }
 
   const wrappedTools: Record<string, Tool> = { ...tools };
-  for (const toolName of [...FILE_READ_TOOL_NAMES, ...FILE_EDIT_TOOL_NAMES]) {
+  for (const toolName of [...FILE_READ_TOOL_NAMES, ...FILE_EDIT_TOOL_NAMES, "agent_skill_read"]) {
     const baseTool = tools[toolName];
     if (baseTool != null) {
       wrappedTools[toolName] = wrapToolExecuteWithPathSkills(toolName, baseTool, activation);

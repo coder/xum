@@ -2480,7 +2480,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- **What the model gets:** the tool result gets a `path_skills` field with the skill name and description, and asks the model to read the skill with `agent_skill_read`. Xum does not insert the skill body. Each skill surfaces at most once per context window. Xum skips it if the model already read the skill in that window.",
       "- **Index:** path-scoped skills are not in the model-facing skills index. They stay readable by name and invocable with `/{skill-name}`.",
       "- **`disable-model-invocation: true` wins:** a skill with both keys never surfaces on its own. It loads only when invoked explicitly.",
-      "- **Invalid patterns:** an unclosed bracket, an empty entry, an absolute path, or a `..` segment makes the whole skill invalid. Xum shows it with the error in the skills indicator and loads the other skills.",
+      "- **Invalid patterns:** an empty list, an unclosed bracket, an empty entry, an absolute path, or a `..` segment makes the whole skill invalid. Xum shows it with the error in the skills indicator and loads the other skills.",
       "",
       "### Example: `deep-review` skill",
       "",

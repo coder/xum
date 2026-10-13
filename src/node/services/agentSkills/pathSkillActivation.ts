@@ -23,6 +23,11 @@ export interface PathSkillActivation {
    * never surface the same skill twice.
    */
   takeMatches(toolPath: string): AgentSkillDescriptor[];
+  /**
+   * Record a skill the model read during this turn (agent_skill_read), so a later
+   * matching file call in the same turn does not point at it again.
+   */
+  markSurfaced(skillName: string): void;
 }
 
 /** Bounds one tool result's pointer even when many skills match one file. */
@@ -133,6 +138,9 @@ export function createPathSkillActivation(params: {
         surfaced.add(skill.name);
       }
       return matches;
+    },
+    markSurfaced(skillName) {
+      surfaced.add(skillName);
     },
   };
 }
