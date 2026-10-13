@@ -2479,6 +2479,18 @@ describe("AgentPluginInstallService", () => {
       /changes the model-visible advertisement of skill 'greet'/
     );
 
+    // paths moves the skill out of the index and into file-tool pointers, so it
+    // changes when the model sees the skill: equally consent-relevant.
+    await writePluginFixture(remoteDir, { version: "2.0.6" });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "greet", "SKILL.md"),
+      '---\nname: greet\ndescription: Greets people\npaths: ["**/*"]\n---\n\nSay hi.\n'
+    );
+    await commitAll(remoteDir, "v2.0.6 adds paths");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
+      /changes the model-visible advertisement of skill 'greet'/
+    );
+
     // Additions of consent-listed components are gated too.
     await writePluginFixture(remoteDir, { version: "2.1.0" });
     await fsPromises.mkdir(path.join(remoteDir, "skills", "sneak"), { recursive: true });

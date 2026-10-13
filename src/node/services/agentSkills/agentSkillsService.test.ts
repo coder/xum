@@ -1014,6 +1014,37 @@ describe("agentSkillsService", () => {
     ).toContain("must match directory name");
   });
 
+  test("discoverAgentSkills reports invalid paths globs and keeps valid path-scoped skills", async () => {
+    using project = new DisposableTempDir("agent-skills-paths");
+    using global = new DisposableTempDir("agent-skills-paths-global");
+    const projectSkillsRoot = path.join(project.path, ".mux", "skills");
+
+    for (const [name, pathsYaml] of [
+      ["ts-rules", 'paths: "src/**/*.ts, *.{ts,tsx}"'],
+      ["bad-glob", 'paths: ["src/[abc"]'],
+    ] as const) {
+      await fs.mkdir(path.join(projectSkillsRoot, name), { recursive: true });
+      await fs.writeFile(
+        path.join(projectSkillsRoot, name, "SKILL.md"),
+        `---\nname: ${name}\ndescription: d\n${pathsYaml}\n---\nBody\n`,
+        "utf-8"
+      );
+    }
+
+    const diagnostics = await discoverAgentSkills(new LocalRuntime(project.path), project.path, {
+      roots: { projectRoot: projectSkillsRoot, globalRoot: global.path },
+    });
+
+    expect(diagnostics.skills.find((s) => s.name === "ts-rules")?.paths).toEqual([
+      "src/**/*.ts",
+      "*.{ts,tsx}",
+    ]);
+    expect(diagnostics.skills.some((s) => s.name === "bad-glob")).toBe(false);
+    const issue = diagnostics.invalidSkills.find((i) => i.directoryName === "bad-glob");
+    expect(issue?.message).toContain("paths");
+    expect(issue?.message).toContain("src/[abc");
+  });
+
   test("discovers symlinked skill directories", async () => {
     using project = new DisposableTempDir("agent-skills-symlink");
     using skillSource = new DisposableTempDir("agent-skills-source");

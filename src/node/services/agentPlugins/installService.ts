@@ -41,6 +41,7 @@ import {
   resolveSkillAdvertise,
   resolveSkillWhenToUse,
 } from "@/common/orpc/schemas/agentSkill";
+import { resolveSkillPaths } from "@/common/utils/skills/skillPaths";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
 import type { MCPServerInfo, MCPServerOAuthConfig } from "@/common/types/mcp";
@@ -191,7 +192,44 @@ function stableStringify(value: unknown): string {
 type CollectedPluginSkill = AgentPluginPreviewSkill & {
   whenToUse?: string;
   advertise?: boolean;
+  paths?: string[];
 };
+
+/**
+ * EVERY model-visible advertisement field of a plugin skill: description, whenToUse
+ * (both interpolate into the agent_skill_read tool description on each request),
+ * advertise (a flip from hidden to visible surfaces a previously invisible skill), and
+ * paths (which files surface it). Changing any of them is re-consent territory, same as
+ * adding a skill. The fingerprint stays JSON (field boundaries are unambiguous); the
+ * display rendering is NOT used for comparison because a multi-line description could
+ * imitate it.
+ */
+function describeSkillAdvertisement(skill: CollectedPluginSkill): {
+  fingerprint: string;
+  display: string;
+} {
+  return {
+    fingerprint: JSON.stringify({
+      description: skill.description ?? null,
+      whenToUse: skill.whenToUse ?? null,
+      advertise: skill.advertise ?? null,
+      // Only path-scoped skills carry the key, so fingerprints of existing
+      // skills stay byte-identical (no spurious re-consent on update).
+      ...(skill.paths !== undefined ? { paths: skill.paths } : {}),
+    }),
+    display: formatSkillAdvertisementDisplay(skill),
+  };
+}
+
+/** The advertisement as the model sees it, shown in the update review. */
+function formatSkillAdvertisementDisplay(skill: CollectedPluginSkill): string {
+  return [
+    skill.description ?? "(no description)",
+    ...(skill.whenToUse !== undefined ? [`When to use: ${skill.whenToUse}`] : []),
+    ...(skill.advertise === false ? ["(not advertised to the model)"] : []),
+    ...(skill.paths !== undefined ? [`Surfaces on files matching: ${skill.paths.join(", ")}`] : []),
+  ].join("\n");
+}
 
 /** Result of resolving a user-supplied ref against the remote. */
 interface ResolvedRemoteRef {
@@ -1456,25 +1494,7 @@ export class AgentPluginInstallService {
     const readSecret = createSecretReader();
     const skills = new Map<string, { fingerprint: string; display: string }>();
     for (const skill of await this.collectSkills(plugin, warnings)) {
-      // EVERY model-visible advertisement field: description, whenToUse
-      // (both interpolate into the agent_skill_read tool description on each
-      // request), and advertise (a flip from hidden to visible surfaces a
-      // previously invisible skill). Changing any of them is re-consent
-      // territory, same as adding a skill. The fingerprint stays JSON (field
-      // boundaries are unambiguous); the display rendering is NOT used for
-      // comparison because a multi-line description could imitate it.
-      skills.set(skill.name, {
-        fingerprint: JSON.stringify({
-          description: skill.description ?? null,
-          whenToUse: skill.whenToUse ?? null,
-          advertise: skill.advertise ?? null,
-        }),
-        display: [
-          skill.description ?? "(no description)",
-          ...(skill.whenToUse !== undefined ? [`When to use: ${skill.whenToUse}`] : []),
-          ...(skill.advertise === false ? ["(not advertised to the model)"] : []),
-        ].join("\n"),
-      });
+      skills.set(skill.name, describeSkillAdvertisement(skill));
     }
     const agents = new Map<string, string>();
     for (const agent of await this.collectAgentFiles(plugin.agentsDir)) {
@@ -1889,6 +1909,8 @@ export class AgentPluginInstallService {
           // the same helpers the runtime uses.
           whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
           advertise: resolveSkillAdvertise(parsed.frontmatter),
+          // paths moves the skill from the static index to file-tool pointers.
+          paths: resolveSkillPaths(parsed.frontmatter),
         });
       } catch (error) {
         warnings.push(`skills/${dirName}: ${getErrorMessage(error)}`);
