@@ -1,14 +1,25 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { ArrowLeft } from "lucide-react";
 
 import { Button } from "@/browser/components/Button/Button";
+import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useAPI } from "@/browser/contexts/API";
+import { MarkdownFilePreview } from "@/browser/features/Messages/MarkdownFilePreview";
 import { RowActionButton } from "@/browser/features/RightSidebar/GoalBoardSections";
 import { isAbortError } from "@/browser/utils/isAbortError";
-import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { cn } from "@/common/lib/utils";
 import type { MemorySaveError } from "@/common/orpc/schemas/memory";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getLanguageFromPath } from "@/common/utils/git/languageDetector";
+
+type ViewMode = "preview" | "edit";
+
+const VIEW_MODE_OPTIONS: Array<ToggleOption<ViewMode>> = [
+  { value: "preview", label: "Preview" },
+  { value: "edit", label: "Edit" },
+];
 
 interface MemoryFileEditorProps {
   /** null = no workspace (Settings → Memory); only global paths are editable. */
@@ -22,6 +33,9 @@ interface MemoryFileEditorProps {
  * rejects stale saves as conflicts, which surface as a banner with a reload
  * affordance (reload discards the local draft by design — the alternative
  * silently overwrites the other writer's changes).
+ *
+ * Markdown files open in a rendered preview of the current draft; the toggle
+ * and its shortcut switch to the textarea and back without losing the draft.
  */
 export function MemoryFileEditor(props: MemoryFileEditorProps) {
   const { api } = useAPI();
@@ -35,6 +49,16 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
   // WorkspaceHeartbeatModal): controlled-textarea onChange does not fire in
   // happy-dom, and the DOM is authoritative for what the user typed anyway.
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const isMarkdown = getLanguageFromPath(props.path) === "markdown";
+  const [mode, setMode] = useState<ViewMode>(isMarkdown ? "preview" : "edit");
+
+  // Focus the editor on open so its shortcuts work at once (the clicked row
+  // unmounts, so focus would fall to <body>). Never the textarea: opening a
+  // file to read it must not pop up the phone keyboard.
+  useEffect(() => {
+    rootRef.current?.focus();
+  }, []);
 
   useEffect(() => {
     if (!api) return;
@@ -83,6 +107,28 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
     }
   };
 
+  const switchMode = (next: ViewMode) => {
+    if (next === mode) return;
+    if (next === "preview") {
+      const textarea = textareaRef.current;
+      if (textarea) setDraft(textarea.value);
+      // The textarea unmounts; keep focus inside the editor so the next
+      // shortcut press still reaches it.
+      if (textarea !== null && document.activeElement === textarea) rootRef.current?.focus();
+    }
+    setMode(next);
+  };
+
+  const handleKeyDown = (e: KeyboardEvent) => {
+    if (matchesKeybind(e, KEYBINDS.SAVE_EDIT)) {
+      e.preventDefault();
+      void handleSave();
+    } else if (isMarkdown && matchesKeybind(e, KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)) {
+      e.preventDefault();
+      switchMode(mode === "preview" ? "edit" : "preview");
+    }
+  };
+
   const handleReload = () => {
     setSaveError(null);
     setReloadTick((n) => n + 1);
@@ -91,12 +137,36 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
   return (
     // h-full fills block parents (sidebar tabpanel); flex-1 fills flex parents
     // (Settings → Memory). Each is inert in the other context.
-    <div className="flex h-full min-h-0 flex-1 flex-col">
+    // Shortcuts are scoped to the editor (as in the Artifacts panel): they fire
+    // from the textarea, the preview and the header controls, never elsewhere.
+    <div
+      ref={rootRef}
+      tabIndex={-1}
+      onKeyDown={handleKeyDown}
+      className="flex h-full min-h-0 flex-1 flex-col outline-none"
+    >
       <div className="border-border-light flex items-center gap-2 border-b px-2 py-2">
         <RowActionButton aria-label="Back to memory list" onClick={props.onBack}>
           <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
         </RowActionButton>
         <span className="min-w-0 flex-1 truncate text-xs font-medium">{props.path}</span>
+        {isMarkdown && (
+          <TooltipIfPresent
+            tooltip={
+              <>
+                Toggle preview
+                <span className="mobile-hide-shortcut-hints">
+                  {" "}
+                  ({formatKeybind(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)})
+                </span>
+              </>
+            }
+          >
+            <div className="shrink-0">
+              <ToggleGroup options={VIEW_MODE_OPTIONS} value={mode} onChange={switchMode} />
+            </div>
+          </TooltipIfPresent>
+        )}
         <Button
           size="sm"
           aria-label="Save memory file"
@@ -130,6 +200,10 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
         <div className="text-error px-3 py-2 text-xs" role="alert">
           {loadError}
         </div>
+      ) : mode === "preview" ? (
+        <div className="min-h-48 flex-1 overflow-auto p-3">
+          <MarkdownFilePreview content={draft} />
+        </div>
       ) : (
         <textarea
           ref={textareaRef}
@@ -139,13 +213,10 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
           aria-label="Memory file content"
           value={draft}
           spellCheck={false}
+          // Only Markdown files open in Preview, so a mounting textarea there
+          // means the user switched to Edit and wants to type.
+          autoFocus={isMarkdown}
           onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (matchesKeybind(e, KEYBINDS.SAVE_EDIT)) {
-              e.preventDefault();
-              void handleSave();
-            }
-          }}
         />
       )}
     </div>

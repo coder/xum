@@ -21,6 +21,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   CANCEL: "Cancel / Close modal",
   CANCEL_EDIT: "Cancel editing message",
   SAVE_EDIT: "Save edit",
+  TOGGLE_MARKDOWN_PREVIEW: "Toggle Markdown preview",
   INTERRUPT_STREAM_VIM: "Interrupt stream (Vim mode)",
   INTERRUPT_STREAM_NORMAL: "Interrupt stream",
   RESUME_STREAM: "Retry or continue interrupted stream",
@@ -211,7 +212,7 @@ const KEYBIND_GROUPS: Array<{
   },
   {
     label: "Editing",
-    keys: ["SAVE_EDIT", "CANCEL_EDIT"],
+    keys: ["SAVE_EDIT", "CANCEL_EDIT", "TOGGLE_MARKDOWN_PREVIEW"],
   },
   {
     label: "Navigation",

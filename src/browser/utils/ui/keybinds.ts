@@ -397,6 +397,10 @@ export const KEYBINDS = {
   /** Save edit (Cmd/Ctrl+Enter) */
   SAVE_EDIT: { key: "Enter", ctrl: true },
 
+  /** Toggle a Markdown file between rendered preview and the editor (memory file view) */
+  // macOS uses Cmd: Ctrl+E must keep moving to the end of the line inside the textarea.
+  TOGGLE_MARKDOWN_PREVIEW: { key: "e", ctrl: true, macCtrlBehavior: "command" },
+
   /** Interrupt active stream (destructive - stops AI generation) */
   // Vim mode: Ctrl+C (familiar from terminal interrupt)
   // Non-Vim mode: Esc (intuitive cancel/stop key)

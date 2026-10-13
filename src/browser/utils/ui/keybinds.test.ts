@@ -178,6 +178,18 @@ test("removed auto agent toggle keybind", () => {
   expect(KEYBINDS).not.toHaveProperty(removedKey);
 });
 
+describe("TOGGLE_MARKDOWN_PREVIEW keybind", () => {
+  test("uses Cmd+E on macOS so Ctrl+E keeps moving to the end of the line", () => {
+    globalThis.window = { api: { platform: "darwin" } } as unknown as Window & typeof globalThis;
+    expect(
+      matchesKeybind(createEvent({ key: "e", metaKey: true }), KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)
+    ).toBe(true);
+    expect(
+      matchesKeybind(createEvent({ key: "e", ctrlKey: true }), KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)
+    ).toBe(false);
+  });
+});
+
 describe("SEND_MESSAGE_AFTER_TURN keybind (Ctrl/Cmd+Enter)", () => {
   it("matches Ctrl+Enter", () => {
     globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;

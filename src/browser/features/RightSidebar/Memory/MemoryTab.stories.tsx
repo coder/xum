@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 
 import { APIProvider } from "@/browser/contexts/API";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -85,6 +85,22 @@ const MEMORY_FILES: MemoryFileInfo[] = [
   },
 ];
 
+const PREFERENCES_CONTENT = `---
+description: Coding style and tooling preferences
+---
+# Preferences
+
+- Use \`bun\` for every package script.
+- Keep diffs small and reviewable.
+- Prefer \`rg\` over \`grep\` when searching.
+
+## Validation
+
+\`\`\`bash
+make static-check
+\`\`\`
+`;
+
 const CONSOLIDATION_RECORD: MemoryConsolidationRecordPayload = {
   lastRunAt: Date.now() - 30 * 60 * 1000,
   trigger: "manual",
@@ -100,6 +116,7 @@ function renderTab(width: string) {
       client={createMockORPCClient({
         experiments: { [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true },
         memoryFiles: MEMORY_FILES,
+        memoryFileContents: new Map([["/memories/global/preferences.md", PREFERENCES_CONTENT]]),
         memoryConsolidationStatus: {
           workspaceRecord: null,
           projectRecord: CONSOLIDATION_RECORD,
@@ -149,8 +166,17 @@ export const Editor: Story = {
     const canvas = within(canvasElement);
     const row = await canvas.findByText("preferences.md");
     await userEvent.click(row);
-    await canvas.findByLabelText("Memory file content");
-    // Hide the focused textarea caret before Pixel captures the editor state.
+    // Markdown files open in the rendered preview, frontmatter as a yaml block.
+    await canvas.findByRole("heading", { name: "Preferences" });
+    // Wait for Shiki tokens so the snapshot never captures unhighlighted code.
+    await waitFor(() => {
+      for (const language of ["yaml", "bash"]) {
+        expect(
+          canvasElement.querySelector(`[data-code-language="${language}"] .code-line span`)
+        ).not.toBeNull();
+      }
+    });
+    expect(canvas.queryByLabelText("Memory file content")).toBeNull();
     await userEvent.hover(canvasElement);
     blurActiveElement();
   },
