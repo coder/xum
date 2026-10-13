@@ -67,7 +67,6 @@ export function summary(
     "",
     coverage,
     "Unit reports cover every Bun unit suite except the isolated ones marked `no-coverage:` in scripts/test-unit-ci.sh (Bun coverage crashes them). A suite whose coverage run crashed twice passes on a retry without coverage, so it has no report: its Test / Unit job shows a warning. No base coverage: the CRAP tax compares CC and only warns.",
-    "`.tsx` coverage comes from Bun unit tests only, because Jest does not collect `.tsx` coverage yet: a component only Jest UI tests render scores 0%.",
     "",
   ];
   if (report === null) {
