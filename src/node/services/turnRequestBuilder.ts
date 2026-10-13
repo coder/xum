@@ -665,7 +665,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   desktopSessionManager?: DesktopSessionManager;
   computerUseService?: ComputerUseService;
   /** Routes AI calls from bash commands through Xum so their spend is accounted. */
-  bashAiProxy?: Pick<BashAiProxyService, "envFor">;
+  bashAiProxy?: Pick<BashAiProxyService, "envFor" | "noteBlocked">;
 }
 
 /**
@@ -2215,6 +2215,12 @@ export class TurnRequestBuilder {
           error: getErrorMessage(error),
         });
       }
+    } else {
+      // Say why bash gets no proxy variables, so a user who turned the switch on can find out.
+      this.dependencies.bindings.bashAiProxy?.noteBlocked(
+        workspaceId,
+        projectAutomationDisabled() ? "kill_switch" : "untrusted"
+      );
     }
     const getWorkflowProjectTrusted = () =>
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);

@@ -8,6 +8,7 @@ import type { AddressInfo } from "node:net";
 
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
+import { log } from "@/node/services/log";
 import type { ProviderConfigRaw } from "@/node/utils/providerRequirements";
 
 import { ReverseForwardRefusedError, type ReverseForward } from "@/node/runtime/transports";
@@ -800,5 +801,140 @@ describe("BashAiProxyService", () => {
     // The Settings switch turns the whole feature off.
     enabled = false;
     expect(await proxy.envFor("ws-5", "local", [])).toEqual({});
+  });
+
+  describe("skip and mix logs", () => {
+    const HOST_NAMES = [
+      "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_AUTH_TOKEN",
+      "OPENAI_BASE_URL",
+      "OPENAI_API_BASE",
+    ] as const;
+    let savedHostEnv: Partial<Record<(typeof HOST_NAMES)[number], string>>;
+    let infoSpy: ReturnType<typeof spyOn<typeof log, "info">>;
+    let warnSpy: ReturnType<typeof spyOn<typeof log, "warn">>;
+
+    beforeEach(() => {
+      // The mix check reads the real process env, like LocalBaseRuntime.exec. Start clean.
+      savedHostEnv = {};
+      for (const name of HOST_NAMES) {
+        savedHostEnv[name] = process.env[name];
+        delete process.env[name];
+      }
+      infoSpy = spyOn(log, "info");
+      warnSpy = spyOn(log, "warn");
+    });
+
+    afterEach(() => {
+      infoSpy.mockRestore();
+      warnSpy.mockRestore();
+      for (const name of HOST_NAMES) {
+        const value = savedHostEnv[name];
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    });
+
+    /** [provider, reason] of each skip logged so far. */
+    function skips(): Array<[string, string]> {
+      return infoSpy.mock.calls.flatMap(([message]) => {
+        const match = /^\[bash-ai-proxy\] skipped (\w+): (.*?);/.exec(String(message));
+        return match ? [[match[1], match[2]] as [string, string]] : [];
+      });
+    }
+
+    function mixWarnings(): string[] {
+      return warnSpy.mock.calls
+        .map(([message]) => String(message))
+        .filter((message) => message.startsWith("[bash] a secret sets"));
+    }
+
+    test("a skipped provider is logged once per workspace with the reason that applies", async () => {
+      configs.openai = { ...configs.openai, enabled: false };
+      for (let turn = 0; turn < 3; turn++) {
+        await proxy.envFor("ws-skip", "local", ["ANTHROPIC_AUTH_TOKEN"]);
+      }
+      expect(skips()).toEqual([
+        ["anthropic", "a secret sets ANTHROPIC_AUTH_TOKEN"],
+        ["openai", "Xum has no API key for it, or it is disabled"],
+      ]);
+      // A secret wins over a missing key: it is the first thing to fix.
+      await proxy.envFor("ws-skip-2", "local", ["OPENAI_PROJECT_ID"]);
+      expect(skips().slice(2)).toEqual([["openai", "a secret sets OPENAI_PROJECT_ID"]]);
+
+      // A new reason logs again. So does the next skip after the provider got its variables.
+      await proxy.envFor("ws-skip", "local", ["ANTHROPIC_BASE_URL"]);
+      await proxy.envFor("ws-skip", "local", []);
+      await proxy.envFor("ws-skip", "local", ["ANTHROPIC_BASE_URL"]);
+      expect(skips().slice(3)).toEqual([
+        ["anthropic", "a secret sets ANTHROPIC_BASE_URL"],
+        ["anthropic", "a secret sets ANTHROPIC_BASE_URL"],
+      ]);
+
+      // With the switch off nothing is skipped, so nothing is logged.
+      enabled = false;
+      await proxy.envFor("ws-off-skip", "local", ["ANTHROPIC_API_KEY"]);
+      expect(skips()).toHaveLength(5);
+    });
+
+    test("a blocked workspace logs its reason once per provider, and only with the switch on", () => {
+      for (let turn = 0; turn < 2; turn++) proxy.noteBlocked("ws-untrusted", "untrusted");
+      proxy.noteBlocked("ws-kill", "kill_switch");
+      expect(skips()).toEqual([
+        ["anthropic", "the project is not trusted"],
+        ["openai", "the project is not trusted"],
+        ["anthropic", "XUM_DISABLE_PROJECT_AUTOMATION=1 is set"],
+        ["openai", "XUM_DISABLE_PROJECT_AUTOMATION=1 is set"],
+      ]);
+      enabled = false;
+      proxy.noteBlocked("ws-untrusted-off", "untrusted");
+      expect(skips()).toHaveLength(4);
+    });
+
+    test("a secret provider key next to a host base URL or token warns once, without values", async () => {
+      // No host route vars: the secret key is the only credential, no warning.
+      await proxy.envFor("ws-mix", "local", ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
+      expect(mixWarnings()).toEqual([]);
+
+      process.env.ANTHROPIC_BASE_URL = "https://gateway.example/api/v2/aibridge/anthropic";
+      process.env.ANTHROPIC_AUTH_TOKEN = "host-gateway-token";
+      process.env.OPENAI_API_BASE = "https://gateway.example/openai/v1";
+      // The switch does not matter: bash gets the mix either way.
+      enabled = false;
+      for (let turn = 0; turn < 3; turn++) {
+        await proxy.envFor("ws-mix", "worktree", ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
+      }
+      expect(mixWarnings()).toHaveLength(2);
+      const [anthropic, openai] = mixWarnings();
+      expect(anthropic).toContain("ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN");
+      expect(openai).toContain("OPENAI_API_BASE");
+      expect(openai).not.toContain("OPENAI_BASE_URL");
+      for (const message of mixWarnings()) {
+        expect(message).not.toContain("gateway.example");
+        expect(message).not.toContain("host-gateway-token");
+      }
+    });
+
+    test("no mix warning when the secrets also set the host vars, set no key, or bash runs elsewhere", async () => {
+      process.env.ANTHROPIC_BASE_URL = "https://gateway.example/anthropic";
+      process.env.ANTHROPIC_AUTH_TOKEN = "host-gateway-token";
+      process.env.OPENAI_BASE_URL = "https://gateway.example/openai/v1";
+      // The secrets replace every host var that would mix.
+      await proxy.envFor("ws-a", "local", [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+      ]);
+      // A gateway token as a secret next to the host's gateway URL is a valid setup.
+      await proxy.envFor("ws-b", "local", ["ANTHROPIC_AUTH_TOKEN", "OPENAI_ORG_ID"]);
+      // An empty host value routes nothing.
+      process.env.OPENAI_BASE_URL = " ";
+      await proxy.envFor("ws-c", "local", ["OPENAI_API_KEY"]);
+      // Remote and container commands do not inherit the Xum process env.
+      for (const runtime of ["ssh", "docker", "devcontainer"] as const) {
+        await proxy.envFor(`ws-${runtime}`, runtime, ["ANTHROPIC_API_KEY"]);
+      }
+      expect(mixWarnings()).toEqual([]);
+    });
   });
 });
