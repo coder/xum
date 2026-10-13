@@ -4,6 +4,7 @@ import AnthropicIcon from "@/browser/assets/icons/anthropic.svg?react";
 import OpenAIIcon from "@/browser/assets/icons/openai.svg?react";
 import GoogleIcon from "@/browser/assets/icons/google.svg?react";
 import XAIIcon from "@/browser/assets/icons/xai.svg?react";
+import MetaIcon from "@/browser/assets/icons/meta.svg?react";
 import OpenRouterIcon from "@/browser/assets/icons/openrouter.svg?react";
 import OllamaIcon from "@/browser/assets/icons/ollama.svg?react";
 import DeepSeekIcon from "@/browser/assets/icons/deepseek.svg?react";
@@ -29,6 +30,7 @@ const PROVIDER_ICONS: Partial<Record<ProviderName, React.FC>> = {
   openai: OpenAIIcon,
   google: GoogleIcon,
   xai: XAIIcon,
+  meta: MetaIcon,
   deepseek: DeepSeekIcon,
   moonshotai: MoonshotAIIcon,
   zai: ZaiIcon,

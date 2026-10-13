@@ -85,11 +85,13 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
     const suppressSet = useMemo(() => new Set(suppressKeys ?? []), [suppressKeys]);
 
     const withSelection = () => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const el = textareaRef.current!;
       return { start: el.selectionStart, end: el.selectionEnd };
     };
 
     const applyDomSelection = (next: Pick<vim.VimState, "cursor" | "mode" | "visualAnchor">) => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const el = textareaRef.current!;
       const domText = el.value;
       const clamp = (pos: number) => Math.max(0, Math.min(domText.length, pos));

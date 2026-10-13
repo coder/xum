@@ -31,6 +31,7 @@ import {
   Target,
   Timer,
   Trash2,
+  Unlink,
   WandSparkles,
   Workflow,
   type LucideIcon,
@@ -100,6 +101,7 @@ const TIMELINE_PRESENTATION: Record<TimelineEventKind, TimelinePresentation> = {
   "agent.event": { label: "Agent event", icon: Sparkles, category: "agent" },
   "agent.plan_proposed": { label: "Plan proposed", icon: Map, category: "agent" },
   "agent.notified": { label: "Notification sent", icon: Bell, category: "agent" },
+  "cache.prefix_break": { label: "Prompt cache prefix break", icon: Unlink, category: "context" },
 };
 
 /**

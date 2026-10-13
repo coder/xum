@@ -31,6 +31,8 @@ export interface AppConfigSnapshot {
   chatTranscriptFullWidth?: boolean;
   /** Read by the command palette to show the toggle's current state (#5791). */
   keepScreenAwake?: boolean;
+  /** The cadence of workspace heartbeats that use the default (the overview card shows it). */
+  heartbeatDefaultIntervalMs?: number;
   /** Backend experiment values; the only experiment state the renderer reads. */
   experiments?: Partial<Record<ExperimentId, boolean>>;
   userPreferences?: UserPreferences;
@@ -206,6 +208,7 @@ export class AppConfigStore {
           defaultRuntime: config.defaultRuntime ?? null,
           chatTranscriptFullWidth: config.chatTranscriptFullWidth === true,
           keepScreenAwake: config.keepScreenAwake === true,
+          heartbeatDefaultIntervalMs: config.heartbeatDefaultIntervalMs,
           experiments: config.experiments ?? {},
           userPreferences: config.userPreferences ?? EMPTY_USER_PREFERENCES,
         };
