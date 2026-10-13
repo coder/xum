@@ -60,6 +60,8 @@ describeIntegration("Workspace actions menus (UI)", () => {
       for (const [item, dialogName] of [
         ["Configure MCP servers", "Workspace MCP Configuration"],
         ["Messages from other workspaces", "Messages from other workspaces"],
+        // #6326: the heartbeat dialog was a React child of the row too.
+        ["Configure heartbeat", "Configure heartbeat"],
       ] as const) {
         const kebab = await waitFor(
           () => {
