@@ -22,6 +22,7 @@ export interface FindAdjacentWorkspaceIdOptions {
 /** Return all visible workspace IDs in DOM (sidebar) order. */
 export function getVisibleWorkspaceIds(): string[] {
   const els = document.querySelectorAll(WORKSPACE_ROW_SELECTOR);
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   return Array.from(els).map((el) => el.getAttribute("data-workspace-id")!);
 }
 

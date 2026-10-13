@@ -1,13 +1,12 @@
-// #6200 (open): in the fullscreen Artifacts panel, Tab from the Artifact picker goes Annotate,
-// then the panel itself, skipping Download, Exit fullscreen and Reload. Walks Tab and records
-// each stop.
+// #6200: in the fullscreen Artifacts panel, Tab from the Artifact picker went Annotate, then the
+// panel itself, skipping Download, Exit fullscreen and Reload. Walks Tab and records each stop.
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { openPlayground } from "./helpers";
 
 test(
   "Tab in the fullscreen Artifacts panel reaches every toolbar button",
-  { tags: ["bugbash", "known-failure", "6200"] },
+  { tags: ["bugbash", "6200"] },
   async ({ app, screen, browser }) => {
     // The web target's size, set here so the repro runs the same on every target: the narrow
     // layout hides the right sidebar.
@@ -26,7 +25,10 @@ test(
 
     await screen.getByRole("combobox", "Artifact").focus();
     const stops: string[] = [];
-    for (let i = 0; i < 4; i++) {
+    // The selected artifact depends on which repros ran before in the shared workspace. One with
+    // stored versions adds the version menu before Annotate, so walk until Reload (or a few
+    // presses past it) and check the stops from Annotate on.
+    for (let i = 0; i < 6 && stops.at(-1) !== "Reload artifact"; i++) {
       await browser.keyboard.press("Tab");
       stops.push(
         await browser.evaluate(() => {
@@ -35,6 +37,12 @@ test(
         })
       );
     }
-    expect(stops).toEqual(["Annotate", "Download artifact", "Exit fullscreen", "Reload artifact"]);
+    const fromAnnotate = stops.indexOf("Annotate");
+    expect(fromAnnotate >= 0 ? stops.slice(fromAnnotate) : stops).toEqual([
+      "Annotate",
+      "Download artifact",
+      "Exit fullscreen",
+      "Reload artifact",
+    ]);
   }
 );

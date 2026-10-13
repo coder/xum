@@ -111,7 +111,6 @@ export function BaseSelectorPopover({
 
   const handleSelect = (selected: string) => {
     onChange(selected);
-    setInputValue(selected);
     handleOpenChange(false);
   };
 
@@ -123,7 +122,6 @@ export function BaseSelectorPopover({
         handleOpenChange(false);
       }
     } else if (e.key === "Escape") {
-      setInputValue(value);
       handleOpenChange(false);
     }
   };

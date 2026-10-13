@@ -1134,6 +1134,17 @@ test.each(["401", "401html"])(
   }
 );
 
+test("#6094 item 13: a 403 on an MCP Apps job's probe names the probed model and BUGBASH_MODEL", async () => {
+  const { code } = await mcpLaunch({ RUN: "proxycall" }, {}, undefined, "403");
+  expect(code).toBeInstanceOf(Refusal);
+  const message = (code as Error).message;
+  // A 403 can also mean the key may not use that model, so the refusal names it.
+  expect(message).toMatch(/\(HTTP 403\).*claude-sonnet-5-5 \(BUGBASH_MODEL\)/);
+  expect(message).not.toMatch(/\/v1|sk-host/);
+  expect(calls()).not.toMatch(/^run /m);
+  expectNothingLeft();
+});
+
 test("B1: a proxied call that costs more than its bound fails the job (exit 5)", async () => {
   const { code, logged } = await mcpLaunch({ RUN: "proxycall", CALL: "[fake:overbill]" });
   expect(code).toBe(5);
@@ -1613,6 +1624,14 @@ test("D2: a launcher Refusal after the preflight exits 2 and starts no other job
   expect(await selfCheckExit(new AbortController().signal, (l) => lines.push(l), launch)).toBe(2);
   expect(launches).toBe(1);
   expect(lines.at(-1)).toBe("self-check refused: rootless Docker is not supported");
+});
+
+test("#6094 item 17: a launcher internal error in the self-check exits 4, not a failed check's 1", async () => {
+  const launch = async () =>
+    ({ cleanup: "none", error: new Error("docker cp: unexpected EOF") }) as const;
+  const lines: string[] = [];
+  expect(await selfCheckExit(new AbortController().signal, (l) => lines.push(l), launch)).toBe(4);
+  expect(lines.at(-1)).toBe("self-check error: docker cp: unexpected EOF");
 });
 
 test("U1: the Docker preflight reports an unknown cleanup instead of a refusal or success", async () => {

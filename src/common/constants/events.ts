@@ -150,6 +150,13 @@ export const CUSTOM_EVENTS = {
   OPEN_NEW_SIDEBAR_TAB: "mux:openNewSidebarTab",
 
   /**
+   * Expand the collapsed right sidebar on its focused tab, the same path as the overview card's
+   * Expand button. Sent by the header's stand-in for the card where the card would cover the
+   * transcript. Detail: { workspaceId: string }
+   */
+  EXPAND_RIGHT_SIDEBAR: "mux:expandRightSidebar",
+
+  /**
    * Open a /side chat as a right-sidebar tab of its parent workspace. Dispatched cancelable: the
    * sidebar calls preventDefault() once it shows the tab, and the sender falls back to opening
    * the side chat full-screen when nothing did (sidebar hidden on narrow viewports).
@@ -276,6 +283,9 @@ export interface CustomEventPayloads {
     openCompleteInput?: boolean;
   };
   [CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB]: {
+    workspaceId: string;
+  };
+  [CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR]: {
     workspaceId: string;
   };
   [CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB]: {

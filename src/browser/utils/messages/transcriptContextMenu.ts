@@ -376,6 +376,7 @@ function isSafeClipboardHref(href: string): boolean {
 }
 
 function isClipboardElementHidden(element: Element): boolean {
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const style = element.ownerDocument.defaultView!.getComputedStyle(element);
   return (
     style.display === "none" ||
@@ -418,11 +419,13 @@ function appendClipboardNodes(
   preserveSpanningTable = false,
   collectFootnotes = true
 ): void {
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const document = destination.ownerDocument!;
   for (const child of source.childNodes) {
     const isTaskMarker =
       child.nodeType === 1 &&
       (child as Element).matches('li > input[type="checkbox"][disabled]:first-child') &&
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       hasSelectedOwnListText(child.parentElement!, range);
     // Empty cells retain column positions and alignment without copying unselected text.
     const isTableStructure =
@@ -586,6 +589,7 @@ function appendClipboardNodes(
 function restoreSelectedFootnotes(container: HTMLElement): void {
   const definitions = new Map(
     Array.from(container.querySelectorAll("[data-clipboard-source-id]"), (element) => [
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       element.getAttribute("data-clipboard-source-id")!,
       element,
     ])
@@ -645,7 +649,9 @@ export function getTranscriptContextMenuMarkdown(
     return null;
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const range = options.selection!.getRangeAt(0);
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const quoteRoot = getEventTargetElement(range.startContainer)!.closest(
     TRANSCRIPT_QUOTE_ROOT_SELECTOR
   )!;
@@ -674,6 +680,7 @@ export function getTranscriptContextMenuMarkdown(
       node.nodeName === "SUP" && node.querySelector("[data-clipboard-footnote-ref]") !== null,
     replacement: (_content, node) =>
       "[^" +
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       node
         .querySelector("[data-clipboard-footnote-ref]")!
         .getAttribute("data-clipboard-footnote-ref") +

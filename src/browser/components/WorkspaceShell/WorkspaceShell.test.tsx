@@ -59,6 +59,7 @@ const SIDEBAR_EVENT_TYPES = [
   CUSTOM_EVENTS.OPEN_GOAL_TAB,
   CUSTOM_EVENTS.OPEN_ARTIFACT,
   CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
+  CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR,
 ];
 
 // Restore every module stubbed below (including the per-test WorkspaceStore double) after
@@ -480,13 +481,13 @@ describe("WorkspaceShell loading placeholders", () => {
   // T3 #5971: RightSidebar is code-split. Until its chunk loads, the shell keeps the sidebar's
   // place, and nothing meant for the sidebar is lost.
   describe("while the sidebar chunk loads", () => {
-    it("keeps the sidebar's box, the collapsed rail when collapsed", () => {
+    it("keeps the sidebar's box, empty when collapsed (the card floats, so it takes no room)", () => {
       gateSidebar();
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
       const view = render(<WorkspaceShell {...defaultProps} />);
       const box = view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
       expect(view.queryByTestId("right-sidebar")).toBeNull();
-      expect(box?.style.width).toBe("20px");
+      expect(box?.style.width).toBe("0px");
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
     });
 
@@ -551,6 +552,10 @@ describe("WorkspaceShell loading placeholders", () => {
       window.dispatchEvent(
         createCustomEvent(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, { workspaceId: "w" })
       );
+      // The header's stand-in for the collapsed overview card.
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, { workspaceId: "w" })
+      );
       fireEvent.click(view.getByRole("button", { name: "New terminal" }));
       expect(typed).toBe(true); // Shift+I in a text field stays a typed letter
       expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([[], 0]);
@@ -566,6 +571,7 @@ describe("WorkspaceShell loading placeholders", () => {
         CUSTOM_EVENTS.OPEN_GOAL_TAB,
         CUSTOM_EVENTS.OPEN_ARTIFACT,
         CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
+        CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR,
       ]);
       expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([["artifact"], 1]);
       expect(sideChatSeen).toBe(1); // and not replayed
@@ -605,10 +611,12 @@ describe("WorkspaceShell loading placeholders", () => {
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
       const view = render(<WorkspaceShell {...defaultProps} />);
       const box = () => view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
-      expect(box()?.style.width).toBe("20px");
+      expect(box()?.style.width).toBe("0px");
       await gate.fail();
       expect(box()?.contains(view.getByRole("alert"))).toBe(true);
-      expect(box()?.style.width).not.toBe("20px");
+      expect(box()?.style.width).not.toBe("0px");
+      // Docked, with no card: globals.css keys on this to stop reserving the card's room.
+      expect(box()?.hasAttribute("data-right-sidebar-load-failed")).toBe(true);
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
       consoleError.mockRestore();
     });
@@ -622,6 +630,95 @@ describe("WorkspaceShell loading placeholders", () => {
       expect(view.getByTestId("chat-pane")).toBeTruthy();
       // RightSidebar never mounts, so the shell keeps Cmd/Ctrl+W from closing the window.
       expect(fireEvent.keyDown(document.body, { key: "w", ctrlKey: true })).toBe(false);
+      consoleError.mockRestore();
+    });
+
+    it("closes the phone full-screen fallback when the layout widens before the chunk loads", () => {
+      gateSidebar();
+      rightSidebarDisplay = "none";
+      // Stands in for globals.css: the full-screen view is `position: fixed` only in the narrow
+      // layout. Removing this rule is the widen.
+      const narrowLayout = document.createElement("style");
+      narrowLayout.textContent = ".right-sidebar-fullscreen { position: fixed; }";
+      document.head.appendChild(narrowLayout);
+      const mediaQuery = new EventTarget();
+      spyOn(window, "matchMedia").mockImplementation(
+        () => Object.assign(mediaQuery, { matches: true }) as unknown as MediaQueryList
+      );
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      const opener = view.getByRole("button", { name: "Sidebar" });
+      fireEvent.click(opener);
+      expect(isInert(view.getByTestId("chat-pane"))).toBe(true);
+
+      // A media change that leaves the layout narrow keeps the view.
+      act(() => void mediaQuery.dispatchEvent(new Event("change")));
+      expect(view.getByRole("status").textContent).toBe("Loading sidebar...");
+
+      narrowLayout.remove();
+      act(() => void mediaQuery.dispatchEvent(new Event("change")));
+      expect(view.queryByRole("status")).toBeNull();
+      expect(isInert(view.getByTestId("chat-pane"))).toBe(false);
+      expect(document.activeElement).toBe(opener);
+    });
+
+    it("guards every sidebar shortcut after its chunk fails, but not typed Shift+I", async () => {
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      const gate = gateSidebar();
+      render(<WorkspaceShell {...defaultProps} />);
+      await gate.fail();
+      const tabs = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) =>
+        fireEvent.keyDown(document.body, { key: String(n), ctrlKey: true })
+      );
+      const newTab = new window.KeyboardEvent("keydown", {
+        key: "n",
+        code: "KeyN",
+        ctrlKey: true,
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      // happy-dom infers AltGraph from any Ctrl+Alt chord; model physical Ctrl+Alt here.
+      Object.defineProperty(newTab, "getModifierState", { value: () => false });
+      expect({
+        tabs,
+        artifacts: fireEvent.keyDown(document.body, { key: "K", ctrlKey: true, shiftKey: true }),
+        closeTab: fireEvent.keyDown(document.body, { key: "w", ctrlKey: true }),
+        newTab: fireEvent(document.body, newTab),
+        typedShiftI: fireEvent.keyDown(document.body, { key: "I", shiftKey: true }),
+      }).toEqual({
+        tabs: Array<boolean>(9).fill(false),
+        artifacts: false,
+        closeTab: false,
+        newTab: false,
+        typedShiftI: true,
+      });
+      consoleError.mockRestore();
+    });
+
+    it("releases the held events once when its chunk fails, so the menu bar still gets them", async () => {
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      const gate = gateSidebar();
+      render(<WorkspaceShell {...defaultProps} />);
+      // Stands in for WorkspaceMenuBar's phone listeners, subscribed after the hold (it re-subscribes
+      // whenever the full-screen view opens or closes). For an event dispatched on window, Chromium
+      // runs window listeners in registration order, so only a later listener is held from.
+      const menuBar: string[] = [];
+      const onEvent = (e: Event) => menuBar.push(e.type);
+      window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onEvent);
+      window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onEvent);
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_ARTIFACT, { workspaceId: "w" } as never)
+      );
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId: "w" } as never)
+      );
+      expect(menuBar).toEqual([]); // held while the chunk loads
+
+      await gate.fail();
+
+      expect(menuBar).toEqual([CUSTOM_EVENTS.OPEN_ARTIFACT, CUSTOM_EVENTS.OPEN_MCP_APP_VIEW]);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, onEvent);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onEvent);
       consoleError.mockRestore();
     });
   });
