@@ -667,6 +667,21 @@ function raisePreviousTaskSettingsDefaults(raw: unknown): Record<string, unknown
   return record;
 }
 
+/**
+ * Run the one-time raised-defaults migration on `parsed` (mutated in place) and return whether
+ * the config now needs a write-back: true when it already did or when this migration ran.
+ */
+function migrateRaisedTaskSettingsDefaults(
+  parsed: Partial<AppConfigOnDisk> & Record<string, unknown>,
+  configModified: boolean
+): boolean {
+  const migrations = normalizeConfigMigrations(parsed.migrations);
+  if (migrations.taskSettingsDefaultsRaised === true) return configModified;
+  parsed.taskSettings = raisePreviousTaskSettingsDefaults(parsed.taskSettings);
+  parsed.migrations = { ...migrations, taskSettingsDefaultsRaised: true };
+  return true;
+}
+
 function parseOptionalPort(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value)) {
     return undefined;
@@ -2220,12 +2235,7 @@ export class Config {
     }
     // The task-limit defaults were raised for orchestration fan-out and depth. Configs that
     // still hold the previous defaults (written by every save) move once; explicit values stay.
-    const taskLimitMigrations = normalizeConfigMigrations(parsed.migrations);
-    if (taskLimitMigrations.taskSettingsDefaultsRaised !== true) {
-      parsed.taskSettings = raisePreviousTaskSettingsDefaults(parsed.taskSettings);
-      parsed.migrations = { ...taskLimitMigrations, taskSettingsDefaultsRaised: true };
-      configModified = true;
-    }
+    configModified = migrateRaisedTaskSettingsDefaults(parsed, configModified);
     const taskSettings = normalizeTaskSettings(parsed.taskSettings);
 
     const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);
