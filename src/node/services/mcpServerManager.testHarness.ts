@@ -49,6 +49,8 @@ export interface FakeServerBehavior {
   hang?: boolean;
   /** MCP Apps client methods, used when the manager connects with MCP Apps enabled. */
   apps?: Partial<Pick<MCPClientHandle, "toolUi" | "hasTool" | "callToolForApp" | "readResource">>;
+  /** OpenAI structured settings client methods. */
+  settings?: Partial<Pick<MCPClientHandle, "settingsCapability" | "callSettingsTool">>;
 }
 
 type BehaviorSource =
@@ -269,6 +271,8 @@ export class FakeMcpServers {
         modern ? { kind: "modern" as const, discover: {} } : { kind: "legacy" as const },
       close: behavior.close ?? (() => Promise.resolve()),
       ...behavior.apps,
+      settingsCapability: () => undefined,
+      ...behavior.settings,
     };
     // Tests supply loosely typed prompt/result fixtures; the manager validates them itself.
     return handle as unknown as MCPClientHandle;

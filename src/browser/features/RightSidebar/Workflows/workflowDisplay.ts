@@ -99,6 +99,7 @@ export interface WorkflowTextPreview {
 export function countCodePoints(text: string): number {
   let count = 0;
   for (let i = 0; i < text.length; count += 1) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const code = text.codePointAt(i)!;
     i += code > 0xffff ? 2 : 1;
   }
@@ -124,6 +125,7 @@ export function getWorkflowTextPreview(
       truncated = true;
       break;
     }
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const code = text.codePointAt(i)!;
     i += code > 0xffff ? 2 : 1;
   }

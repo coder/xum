@@ -20,6 +20,7 @@ import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
 import type { ServiceTier } from "@/common/config/schemas/providersConfig";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { CODEX_ENDPOINT, CODEX_OAUTH_ROUTED_HEADER } from "@/common/constants/codexOAuth";
@@ -1345,6 +1346,163 @@ describe("ProviderModelFactory GitHub Copilot", () => {
       }
 
       expect(result.data).toHaveProperty("provider", "github-copilot.chat");
+    });
+  });
+});
+
+describe("ProviderModelFactory Meta", () => {
+  const metaOptions = (thinking: ThinkingLevel) => {
+    const options = buildProviderOptions("meta:muse-wonder-1.0", thinking);
+    if (!("openai" in options)) throw new Error("Meta must use the OpenAI SDK namespace");
+    return { openai: options.openai };
+  };
+
+  unsetEnvForEachTest(
+    "META_MODEL_API_KEY",
+    "MODEL_API_KEY",
+    "META_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL"
+  );
+
+  it("never uses ambient OpenAI credentials for Meta", async () => {
+    process.env.OPENAI_API_KEY = "openai-only-key";
+    await withTempConfig(async (_config, factory) => {
+      expect(await factory.createModel("meta:muse-wonder-1.0")).toEqual({
+        success: false,
+        error: { type: "api_key_not_found", provider: "meta" },
+      });
+    });
+  });
+
+  it.each([
+    [undefined, "https://api.meta.ai/v1/responses"],
+    ["https://meta-proxy.example.com", "https://meta-proxy.example.com/v1/responses"],
+    [
+      "https://meta-proxy.example.com/custom/v1/",
+      "https://meta-proxy.example.com/custom/v1/responses",
+    ],
+  ])("uses Meta credentials and the configured endpoint %s", async (baseUrl, expectedUrl) => {
+    process.env.OPENAI_API_KEY = "wrong-key";
+    process.env.OPENAI_BASE_URL = "https://wrong.example.com/v1";
+    process.env.META_MODEL_API_KEY = "env-meta-key";
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({
+        meta: { apiKey: "config-meta-key", baseUrl, headers: { "x-meta-test": "value" } },
+      });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("meta:muse-wonder-1.0");
+        if (!result.success) throw new Error(result.error.type);
+        await generateText({
+          model: result.data,
+          prompt: "hello",
+          providerOptions: metaOptions("max"),
+          maxRetries: 0,
+        }).catch(() => undefined);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].url).toBe(expectedUrl);
+        const headers = new Headers(calls[0].init.headers);
+        expect(headers.get("authorization")).toBe("Bearer config-meta-key");
+        expect(headers.get("x-meta-test")).toBe("value");
+        expect(parseSentBody(calls[0])).toMatchObject({
+          model: "muse-wonder-1.0",
+          store: false,
+          include: ["reasoning.encrypted_content"],
+          reasoning: { effort: "max", summary: "auto" },
+        });
+        expect(parseSentBody(calls[0])).not.toHaveProperty("service_tier");
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("replays encrypted reasoning and tool results across Responses steps", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ meta: { apiKey: "meta-key" } });
+      const calls: CapturedFetchCall[] = [];
+      const fakeFetch = Object.assign((input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({
+          url: input instanceof Request ? input.url : input.toString(),
+          init: init ?? {},
+        });
+        const output =
+          calls.length === 1
+            ? [
+                {
+                  type: "reasoning",
+                  id: "rs_meta",
+                  summary: [],
+                  encrypted_content: "encrypted-meta-reasoning",
+                },
+                {
+                  type: "function_call",
+                  id: "fc_meta",
+                  call_id: "call_meta",
+                  name: "multiply",
+                  arguments: '{"a":17,"b":19}',
+                },
+              ]
+            : [
+                {
+                  type: "message",
+                  id: "msg_meta",
+                  role: "assistant",
+                  content: [{ type: "output_text", text: "323", annotations: [] }],
+                },
+              ];
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: `resp_meta_${calls.length}`,
+              created_at: 0,
+              status: "completed",
+              model: "muse-wonder-1.0",
+              output,
+              usage: { input_tokens: 10, output_tokens: 5 },
+            }),
+            { headers: { "content-type": "application/json" } }
+          )
+        );
+      }, fetch) as typeof fetch;
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const model = await factory.createModel("meta:muse-wonder-1.0");
+        if (!model.success) throw new Error(model.error.type);
+        const result = await generateText({
+          model: model.data,
+          prompt: "Multiply 17 by 19 using the tool.",
+          providerOptions: metaOptions("high"),
+          tools: {
+            multiply: tool({
+              inputSchema: z.object({ a: z.number(), b: z.number() }),
+              execute: ({ a, b }) => Promise.resolve(a * b),
+            }),
+          },
+          stopWhen: stepCountIs(2),
+          maxRetries: 0,
+        });
+        expect(result.text).toBe("323");
+        expect(calls).toHaveLength(2);
+        expect(parseSentBody(calls[1]).input).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: "reasoning",
+              encrypted_content: "encrypted-meta-reasoning",
+            }),
+            expect.objectContaining({
+              type: "function_call_output",
+              call_id: "call_meta",
+              output: "323",
+            }),
+          ])
+        );
+        expect(parseSentBody(calls[1])).not.toHaveProperty("previous_response_id");
+      } finally {
+        fetchSpy.mockRestore();
+      }
     });
   });
 });

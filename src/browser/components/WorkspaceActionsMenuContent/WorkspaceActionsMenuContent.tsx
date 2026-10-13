@@ -28,7 +28,9 @@ function WorkspaceActionButton(props: WorkspaceActionButtonProps) {
   return (
     <button
       type="button"
-      className="text-content-secondary bg-surface-primary hover:bg-hover block w-full rounded-sm px-2 py-1.5 text-left text-xs whitespace-nowrap"
+      data-workspace-action-row
+      // focus:bg-hover marks the row the arrow keys reached, like the hover state (#6103).
+      className="text-content-secondary bg-surface-primary hover:bg-hover focus:bg-hover block w-full rounded-sm px-2 py-1.5 text-left text-xs whitespace-nowrap outline-none"
       onClick={props.onClick}
       data-testid={props.testId}
     >
@@ -86,7 +88,10 @@ interface WorkspaceActionsMenuContentProps {
  */
 export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentProps> = (props) => {
   return (
-    <>
+    // No menu role on purpose: the menu/menuitem pattern also requires roving Tab focus and
+    // changes how the sidebar row's long-press handling sees this portal. The Radix Popover
+    // stays a dialog of buttons, and the arrow keys are an extra on top of Tab (#6103).
+    <div onKeyDown={handleRowArrowKeys}>
       {props.onEditTitle && (
         <WorkspaceActionButton
           label="Edit chat title"
@@ -245,6 +250,19 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
           }}
         />
       )}
-    </>
+    </div>
   );
 };
+
+// ArrowDown/ArrowUp move focus between the rows and stop at the ends, as in ArtifactVersionMenu.
+// Tab still works. The popover focuses the first row when it opens (#6103).
+function handleRowArrowKeys(event: React.KeyboardEvent<HTMLElement>) {
+  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+  event.preventDefault();
+  const rows = Array.from(
+    event.currentTarget.querySelectorAll<HTMLElement>("[data-workspace-action-row]")
+  );
+  const index = rows.findIndex((row) => row === document.activeElement);
+  const next = event.key === "ArrowDown" ? index + 1 : index - 1;
+  rows[Math.min(Math.max(next, 0), rows.length - 1)]?.focus();
+}
