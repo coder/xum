@@ -3,9 +3,9 @@ import { GlobalWindow } from "happy-dom";
 
 import { PowerModeEngine } from "./PowerModeEngine";
 
-// The engine draws particles on a 2D canvas and shakes an element. happy-dom has no 2D context,
-// so a fake context records what the engine draws. happy-dom has no Web Audio either, so the
-// engine stays silent here. Math.random, performance.now and animation frames are controlled
+// The engine draws particles on a 2D canvas, shakes an element and plays Web Audio sounds.
+// happy-dom has no 2D context or Web Audio, so these fakes record what the engine draws and
+// which sound graph it builds. Math.random, performance.now and animation frames are controlled
 // per test.
 
 function createFakeContext() {
@@ -23,6 +23,79 @@ function createFakeContext() {
   return { ctx, fills };
 }
 
+class FakeParam {
+  value = 0;
+  setValueAtTime(value: number) {
+    this.value = value;
+  }
+  // Envelopes are not observable through the engine's API, so ramps record nothing.
+  linearRampToValueAtTime = () => undefined;
+  exponentialRampToValueAtTime = () => undefined;
+}
+
+class FakeNode {
+  type = "";
+  connectedTo: FakeNode[] = [];
+  disconnected = false;
+  gain = new FakeParam();
+  frequency = new FakeParam();
+  Q = new FakeParam();
+  playbackRate = new FakeParam();
+  buffer: unknown = null;
+  onended: (() => void) | null = null;
+  constructor(readonly kind: string) {}
+  connect(node: FakeNode) {
+    this.connectedTo.push(node);
+    return node;
+  }
+  disconnect() {
+    this.disconnected = true;
+  }
+  start = () => undefined;
+  stop = () => undefined;
+}
+
+class FakeAudioContext {
+  static created: FakeAudioContext[] = [];
+  state = "running";
+  currentTime = 0;
+  sampleRate = 100;
+  destination = new FakeNode("destination");
+  nodes: FakeNode[] = [];
+  buffersCreated = 0;
+  resumed = 0;
+  closed = 0;
+  constructor() {
+    FakeAudioContext.created.push(this);
+  }
+  private add(kind: string) {
+    const node = new FakeNode(kind);
+    this.nodes.push(node);
+    return node;
+  }
+  createGain = () => this.add("gain");
+  createBiquadFilter = () => this.add("filter");
+  createOscillator = () => this.add("oscillator");
+  createBufferSource = () => this.add("source");
+  createBuffer = (_channels: number, frames: number) => {
+    this.buffersCreated++;
+    const data = new Float32Array(frames);
+    return { length: frames, getChannelData: () => data };
+  };
+  resume = () => {
+    this.resumed++;
+    return Promise.resolve();
+  };
+  close = () => {
+    this.closed++;
+    this.state = "closed";
+    return Promise.resolve();
+  };
+  ofKind(kind: string) {
+    return this.nodes.filter((node) => node.kind === kind);
+  }
+}
+
 const globals = globalThis as unknown as Record<string, unknown>;
 const savedGlobals = ["window", "requestAnimationFrame", "cancelAnimationFrame"].map(
   (key) => [key, globals[key]] as const
@@ -38,6 +111,10 @@ function runFrame(time: number): void {
   const pending = [...frames.values()];
   frames.clear();
   for (const callback of pending) callback(time);
+}
+
+function setAudioContext(constructor: unknown): void {
+  Object.defineProperty(happyWindow, "AudioContext", { value: constructor, configurable: true });
 }
 
 function createCanvas(ctx: unknown): HTMLCanvasElement {
@@ -64,6 +141,8 @@ beforeEach(() => {
   now = 1000;
   spyOn(Math, "random").mockImplementation(() => random);
   spyOn(performance, "now").mockImplementation(() => now);
+  FakeAudioContext.created = [];
+  setAudioContext(FakeAudioContext);
 });
 
 afterEach(() => {
@@ -291,5 +370,170 @@ describe("PowerModeEngine shake", () => {
 
     engine.setShakeElement(null);
     expect(el.style.getPropertyValue("translate")).toBe("");
+  });
+});
+
+describe("PowerModeEngine sound", () => {
+  function audio(index = 0): FakeAudioContext {
+    const ctx = FakeAudioContext.created[index];
+    expect(ctx).toBeDefined();
+    return ctx;
+  }
+
+  const filterTypes = (ctx: FakeAudioContext) => ctx.ofKind("filter").map((node) => node.type);
+
+  test("plays a typewriter click and a gun shot through one quiet master gain", () => {
+    const engine = new PowerModeEngine();
+    random = 0;
+    engine.burst(0, 0);
+
+    const ctx = audio();
+    const [master, ...soundGains] = ctx.ofKind("gain");
+    expect(master.gain.value).toBe(0.12);
+    expect(master.connectedTo).toEqual([ctx.destination]);
+    expect(soundGains.every((gain) => gain.connectedTo[0] === master)).toBe(true);
+    expect(filterTypes(ctx)).toEqual(["highpass", "lowpass"]);
+    expect(ctx.ofKind("oscillator").map((node) => node.type)).toEqual(["triangle", "square"]);
+    // Both sounds share one noise buffer.
+    expect(ctx.buffersCreated).toBe(1);
+  });
+
+  test("gives delete sounds their own pitch", () => {
+    const engine = new PowerModeEngine();
+    random = 0;
+    engine.burst(0, 0, 1, { kind: "insert" });
+    now += 30;
+    engine.burst(0, 0, 1, { kind: "delete" });
+
+    const cutoffs = audio()
+      .ofKind("filter")
+      .map((node) => `${node.type}:${node.frequency.value}`);
+    expect(cutoffs).toEqual(["highpass:1200", "lowpass:700", "highpass:900", "lowpass:900"]);
+  });
+
+  test("picks sounds by chance, and higher intensity makes the gun likelier", () => {
+    const engine = new PowerModeEngine();
+    random = 0.1;
+    engine.burst(0, 0, 1);
+    expect(filterTypes(audio())).toEqual(["highpass"]);
+
+    now += 30;
+    engine.burst(0, 0, 12);
+    expect(filterTypes(audio())).toEqual(["highpass", "highpass", "lowpass"]);
+
+    // The click chance also grows with intensity: 61% at intensity 1, capped at 95%.
+    now += 30;
+    random = 0.7;
+    engine.burst(0, 0, 1);
+    expect(filterTypes(audio())).toHaveLength(3);
+    now += 30;
+    engine.burst(0, 0, 12);
+    expect(filterTypes(audio())).toEqual(["highpass", "highpass", "lowpass", "highpass"]);
+    now += 30;
+    random = 0.97;
+    engine.burst(0, 0, 12);
+    expect(filterTypes(audio())).toHaveLength(4);
+
+    // A delete at intensity 1 has a 41% click chance and a 3% gun chance.
+    now += 30;
+    random = 0.5;
+    engine.burst(0, 0, 1, { kind: "delete" });
+    expect(filterTypes(audio())).toHaveLength(4);
+  });
+
+  test("throttles sounds to one per 30ms, counting only bursts that played", () => {
+    const engine = new PowerModeEngine();
+    random = 0.99;
+    engine.burst(0, 0);
+    expect(FakeAudioContext.created).toHaveLength(0);
+
+    now += 1;
+    random = 0;
+    engine.burst(0, 0);
+    const played = audio().nodes.length;
+    now += 29;
+    engine.burst(0, 0);
+    expect(audio().nodes).toHaveLength(played);
+
+    now += 1;
+    engine.burst(0, 0);
+    expect(audio().nodes).toHaveLength(played * 2 - 1);
+  });
+
+  test("resumes a suspended context and disconnects each sound when it ends", () => {
+    const engine = new PowerModeEngine();
+    random = 0.1;
+    engine.burst(0, 0, 1);
+    const ctx = audio();
+    expect(ctx.resumed).toBe(0);
+
+    const [source] = ctx.ofKind("source");
+    source.onended?.();
+    // The click uses a noise source, a filter, two gains and an oscillator; the master stays.
+    expect(ctx.nodes.filter((node) => node.disconnected)).toHaveLength(5);
+    expect(ctx.ofKind("gain")[0].disconnected).toBe(false);
+
+    ctx.state = "suspended";
+    now += 30;
+    random = 0;
+    // This burst plays a click and a gun shot; the gun shot cleans up its own five nodes.
+    engine.burst(0, 0, 1);
+    expect(ctx.resumed).toBe(2);
+    const gunSource = ctx.ofKind("source")[2];
+    gunSource.onended?.();
+    expect(ctx.nodes.filter((node) => node.disconnected)).toHaveLength(10);
+  });
+
+  test("replaces a closed context and closes its context on stop", () => {
+    const engine = new PowerModeEngine();
+    random = 0;
+    engine.burst(0, 0);
+    audio().state = "closed";
+    now += 30;
+    engine.burst(0, 0);
+    expect(FakeAudioContext.created).toHaveLength(2);
+
+    engine.stop();
+    expect(audio(1).closed).toBe(1);
+    now += 30;
+    engine.burst(0, 0);
+    expect(FakeAudioContext.created).toHaveLength(3);
+  });
+
+  test("falls back to webkitAudioContext", () => {
+    setAudioContext(undefined);
+    Object.defineProperty(happyWindow, "webkitAudioContext", {
+      value: FakeAudioContext,
+      configurable: true,
+    });
+    random = 0;
+    new PowerModeEngine().burst(0, 0);
+    expect(FakeAudioContext.created).toHaveLength(1);
+  });
+
+  test("stays silent for good once Web Audio is missing or fails to start", () => {
+    setAudioContext(undefined);
+    const missing = new PowerModeEngine();
+    random = 0;
+    missing.burst(0, 0);
+    setAudioContext(FakeAudioContext);
+    now += 30;
+    missing.burst(0, 0);
+    expect(FakeAudioContext.created).toHaveLength(0);
+
+    let attempts = 0;
+    setAudioContext(
+      class {
+        constructor() {
+          attempts++;
+          throw new Error("blocked");
+        }
+      }
+    );
+    const failing = new PowerModeEngine();
+    failing.burst(0, 0);
+    now += 30;
+    failing.burst(0, 0);
+    expect(attempts).toBe(1);
   });
 });
