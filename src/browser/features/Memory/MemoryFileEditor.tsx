@@ -9,7 +9,12 @@ import { useAPI } from "@/browser/contexts/API";
 import { MarkdownFilePreview } from "@/browser/features/Messages/MarkdownFilePreview";
 import { RowActionButton } from "@/browser/features/RightSidebar/GoalBoardSections";
 import { isAbortError } from "@/browser/utils/isAbortError";
-import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import {
+  formatKeybind,
+  formatKeybindForAria,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import { cn } from "@/common/lib/utils";
 import type { MemorySaveError } from "@/common/orpc/schemas/memory";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -289,6 +294,8 @@ function MemoryFileHeader(props: MemoryFileHeaderProps) {
               options={VIEW_MODE_OPTIONS}
               value={props.mode}
               onChange={props.onModeChange}
+              // The tooltip describes this wrapper, not the focused button.
+              keyShortcuts={formatKeybindForAria(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)}
             />
           </div>
         </TooltipIfPresent>

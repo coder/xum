@@ -13,6 +13,7 @@ import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import * as RealExperimentsModule from "@/browser/hooks/useExperiments";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import { formatKeybindForAria, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   MemoryConsolidationRecordPayload,
@@ -476,6 +477,12 @@ describe("MemoryTab", () => {
     });
     expect(container.querySelector("h2")).toBeNull();
     expect(queryByRole("textbox", { name: "Memory file content" })).toBeNull();
+    // The shortcut tooltip describes the toggle's wrapper, so the focusable buttons carry it.
+    for (const name of ["Preview", "Edit"]) {
+      expect(queryByRole("button", { name })?.getAttribute("aria-keyshortcuts")).toBe(
+        formatKeybindForAria(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)
+      );
+    }
   });
 
   test("preview renders the unsaved draft and Save sends it from preview", async () => {
@@ -557,7 +564,7 @@ describe("MemoryTab", () => {
     fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
     const editor = await findByRole("textbox", { name: "Memory file content" });
 
-    // A repeat is still swallowed, so the browser's own Ctrl+E does not run either.
+    // A repeat is still swallowed, so the browser's own handling of the chord does not run either.
     expect(fireEvent.keyDown(editor, { key: "e", ctrlKey: true, repeat: true })).toBe(false);
     expect(queryByRole("textbox", { name: "Memory file content" })).toBe(editor);
   });

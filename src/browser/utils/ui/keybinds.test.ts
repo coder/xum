@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import {
+  formatKeybindForAria,
   isMac,
   matchesKeybind,
   matchesNewSidebarTabKeybind,
@@ -187,6 +188,25 @@ describe("TOGGLE_MARKDOWN_PREVIEW keybind", () => {
     expect(
       matchesKeybind(createEvent({ key: "e", ctrlKey: true }), KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)
     ).toBe(false);
+  });
+});
+
+describe("formatKeybindForAria", () => {
+  // aria-keyshortcuts must name the modifier the matcher accepts on each platform.
+  test("names Meta for a Ctrl keybind on macOS unless it keeps the Control key", () => {
+    globalThis.window = { api: { platform: "darwin" } } as unknown as Window & typeof globalThis;
+    expect(formatKeybindForAria(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)).toBe("Meta+E");
+    expect(formatKeybindForAria(KEYBINDS.INTERRUPT_STREAM_VIM)).toBe("Control+C");
+    expect(formatKeybindForAria({ key: "k", ctrl: true, meta: true })).toBe("Control+Meta+K");
+  });
+
+  test("names Control elsewhere and keeps the formatKeybind order and key names", () => {
+    globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+    expect(formatKeybindForAria(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)).toBe("Control+E");
+    expect(formatKeybindForAria({ key: "Enter", ctrl: true, alt: true, shift: true })).toBe(
+      "Control+Alt+Shift+Enter"
+    );
+    expect(formatKeybindForAria({ key: " ", shift: true })).toBe("Shift+Space");
   });
 });
 
