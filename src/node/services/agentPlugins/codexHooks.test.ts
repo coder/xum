@@ -4,6 +4,8 @@ import * as path from "node:path";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import type { AgentPluginManifest } from "./manifest";
 import { compileHookMatcher, loadPluginCodexHooks } from "./codexHooks";
+import { discoverAgentPluginAt } from "./discovery";
+import { readOpenAIExtension } from "./openaiExtension";
 
 const SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
@@ -23,7 +25,13 @@ async function writePlugin(
     name: "guard",
     ...(extensions !== undefined ? { extensions } : {}),
   };
-  return { rootPath, manifest };
+  // The com.openai view discovery gives the loader (root plugin.json supplies it here).
+  const openai = readOpenAIExtension(manifest).extension;
+  return {
+    rootPath,
+    manifest,
+    ...(openai !== undefined ? { openai, openaiManifestPath: "plugin.json" } : {}),
+  };
 }
 
 const scan = {
@@ -122,7 +130,8 @@ describe("loadPluginCodexHooks", () => {
     );
     const withPointer = (hooks: unknown[]) => ({
       rootPath: plugin.rootPath,
-      manifest: { ...plugin.manifest, extensions: { "com.openai": { hooks } } },
+      openai: readOpenAIExtension({ extensions: { "com.openai": { hooks } } }).extension,
+      openaiManifestPath: "plugin.json",
     });
     // The same file repeated is read once.
     expect((await loadPluginCodexHooks(plugin)).hooks).toHaveLength(1);
@@ -147,10 +156,10 @@ describe("loadPluginCodexHooks", () => {
 
     const { warnings } = await loadPluginCodexHooks(plugin);
 
-    // 1 count warning + 31 invalid raw entries (none past the first 32) + 1000 invalid groups:
-    // 50 are kept, plus a summary of the rest.
+    // Discovery's readOpenAIExtension drops the 100,000 invalid raw entries, so the loader sees
+    // one entry. Its 1000 invalid groups: 50 warnings are kept, plus a summary of the rest.
     expect(warnings).toHaveLength(51);
-    expect(warnings.at(-1)).toBe("982 more hook warnings not shown");
+    expect(warnings.at(-1)).toBe("950 more hook warnings not shown");
   });
 
   test("a hooks file path cannot take an inline source's hook keys", async () => {
@@ -253,9 +262,9 @@ describe("loadPluginCodexHooks", () => {
     const { hooks, warnings } = await loadPluginCodexHooks(plugin);
 
     expect(hooks.map((hook) => hook.event)).toEqual(["PostToolUse"]);
-    // One warning per dropped part, in discovery order.
+    // One warning per dropped part, in discovery order. The "../x" pointer entry never reaches
+    // the loader: discovery's readOpenAIExtension drops it and reports it as a diagnostic.
     const patterns = [
-      /must be relative paths/,
       /matcher is not a valid regex/,
       /'mcp_tool' handler has missing or invalid fields/,
       /unknown hook event 'Nonsense'/,
@@ -459,5 +468,76 @@ describe("loadPluginCodexHooks", () => {
     using tmp = new DisposableTempDir("codex-hooks-none");
     const plugin = await writePlugin(tmp.path, {});
     expect(await loadPluginCodexHooks(plugin)).toEqual({ hooks: [], warnings: [] });
+  });
+});
+
+describe("Codex package manifests (the com.openai extension discovery selected)", () => {
+  const stopHooks = (tool: string) => ({ hooks: { Stop: [{ hooks: [{ ...scan, tool }] }] } });
+
+  /** Writes `files` under a fresh plugin directory and runs real discovery on it. */
+  async function discovered(root: string, files: Record<string, unknown>) {
+    const pluginDir = path.join(root, "guard");
+    for (const [relative, content] of Object.entries(files)) {
+      const target = path.join(pluginDir, relative);
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.writeFile(target, typeof content === "string" ? content : JSON.stringify(content));
+    }
+    const { plugin, diagnostics } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+    if (plugin === null) throw new Error(`not a plugin: ${JSON.stringify(diagnostics)}`);
+    return plugin;
+  }
+
+  test("a .codex-plugin/plugin.json overlay's hooks pointer replaces the default file", async () => {
+    // Codex PRRT_kwDOPxxmWM6r2kUR: the root plugin.json has no com.openai, so discovery takes it
+    // from the overlay; the loader must follow it, not load the default hooks/hooks.json.
+    using tmp = new DisposableTempDir("codex-hooks-overlay-pointer");
+    const plugin = await discovered(tmp.path, {
+      "plugin.json": { $schema: SCHEMA, name: "guard" },
+      ".codex-plugin/plugin.json": { name: "guard", hooks: "./hooks/custom.json" },
+      "hooks/hooks.json": stopHooks("default_scan"),
+      "hooks/custom.json": stopHooks("custom_scan"),
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(warnings).toEqual([]);
+    expect(
+      hooks.map((hook) => [hook.source, hook.handler.type === "mcp_tool" && hook.handler.tool])
+    ).toEqual([["hooks/custom.json", "custom_scan"]]);
+  });
+
+  test.each([
+    {
+      name: "a Codex-only package",
+      files: { ".codex-plugin/plugin.json": { name: "guard", hooks: stopHooks("inline_scan") } },
+      source: ".codex-plugin/plugin.json#hooks[0]",
+    },
+    {
+      name: "a root plugin.json with a Codex overlay",
+      files: {
+        "plugin.json": { $schema: SCHEMA, name: "guard" },
+        ".codex-plugin/plugin.json": { name: "guard", hooks: stopHooks("inline_scan") },
+      },
+      source: ".codex-plugin/plugin.json#hooks[0]",
+    },
+    {
+      name: "a root plugin.json",
+      files: {
+        "plugin.json": {
+          $schema: SCHEMA,
+          name: "guard",
+          extensions: { "com.openai": { hooks: stopHooks("inline_scan") } },
+        },
+      },
+      source: "plugin.json#hooks[0]",
+    },
+  ])("inline hooks of $name are labeled with the manifest that declares them", async (fixture) => {
+    // Codex PRRT_kwDOPxxmWM6r2kUY: the label names a file the user can open.
+    using tmp = new DisposableTempDir("codex-hooks-inline-label");
+    const plugin = await discovered(tmp.path, fixture.files);
+
+    const { hooks } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.source)).toEqual([fixture.source]);
   });
 });
