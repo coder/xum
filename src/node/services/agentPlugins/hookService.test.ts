@@ -47,6 +47,7 @@ import {
 } from "./hookService";
 import { bumpContainerMutationEpoch, STAGING_DIR_NAME } from "./journals";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { buildPluginServerKey, resolvePluginInstanceId } from "./mcpConfig";
 
 const WORKSPACE_ID = "plugin-hooks-test";
 
@@ -490,6 +491,8 @@ describe("AgentPluginHookService", () => {
         expect(ensure).toHaveBeenCalledTimes(1);
         expect(ensure.mock.calls[0][0]).toMatchObject({
           projectRoot: h.config.rootDir,
+          // Project plugin instance IDs hash the project key, not the checkout.
+          projectKey: h.config.rootDir,
           projectTrusted: false,
         });
         if (mode !== "enabled") {
@@ -595,7 +598,7 @@ describe("AgentPluginHookService", () => {
         ).success
       ).toBe(true);
       expect(ensure).toHaveBeenCalledTimes(1);
-      expect(injected).toEqual(["base\n\nmodelString,workspaceId"]);
+      expect(injected).toEqual(["base\n\nmodelString,settings,workspaceId"]);
     } finally {
       ensure.mockRestore();
       await h.session.dispose();
@@ -631,6 +634,102 @@ describe("AgentPluginHookService", () => {
       expect(ctx.systemMessage).toBe("base");
     }
   );
+
+  test("hooks get their own plugin's MCP server settings", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "cad-hooks",
+      `({ "request.assemble": (input) => ({ context: "Units: " + input.settings.cad.units }) })`
+    );
+    const prefixes: string[] = [];
+    harness.service.setSettingsProvider((workspaceId, prefix) => {
+      expect(workspaceId).toBe(WORKSPACE_ID);
+      prefixes.push(prefix);
+      return Promise.resolve({ cad: { units: "mm" } });
+    });
+    await harness.ensure();
+    const ctx: RequestAssembleContext = {
+      workspaceId: WORKSPACE_ID,
+      modelString: "model",
+      systemMessage: "base",
+      tools: {},
+    };
+    await harness.spine.run("request.assemble", ctx);
+    expect(ctx.systemMessage).toBe("base\n\nUnits: mm");
+    // The same instance ID as the plugin's MCP server keys.
+    const instanceId = resolvePluginInstanceId(
+      { scope: "global", containerPath: harness.container, dirName: "cad-hooks" },
+      {}
+    );
+    expect(prefixes).toEqual([buildPluginServerKey(instanceId, "")]);
+  });
+
+  test.each(["dispose", "epoch"] as const)(
+    "a %s that lands while a hook reads its settings stops the call",
+    async (mode) => {
+      // Salvaged from #6040: the settings read must come before the revocation checks.
+      const harness = await createHarness();
+      await writeHookPlugin(
+        harness.container,
+        "revoked-mid-read",
+        `({ "tool.execute.before": () => ({ deny: "removed hook ran" }) })`,
+        { tools: ["file_read"] }
+      );
+      const gate = Promise.withResolvers<void>();
+      const reached = Promise.withResolvers<void>();
+      harness.service.setSettingsProvider(async () => {
+        reached.resolve();
+        await gate.promise;
+        return {};
+      });
+      await harness.ensure();
+      const mountSpy = spyOn(harness.sandboxHost, "withPersistentMount");
+      try {
+        const ctx = makeToolCtx("file_read", { path: "/repo/a.txt" });
+        const running = runTool(harness.spine, ctx);
+        await reached.promise;
+        if (mode === "dispose") await harness.service.disposeWorkspace(WORKSPACE_ID);
+        else {
+          const stagingRoot = path.join(harness.tmp.path, STAGING_DIR_NAME);
+          await fs.mkdir(stagingRoot, { recursive: true });
+          await bumpContainerMutationEpoch(stagingRoot);
+        }
+        gate.resolve();
+        await running;
+        expect(ctx.executed).toBe(true);
+        expect(ctx.blocked).toBeUndefined();
+        expect(mountSpy).not.toHaveBeenCalled();
+      } finally {
+        gate.resolve();
+        mountSpy.mockRestore();
+      }
+    }
+  );
+
+  test("a plugin revoked (epoch bump, e.g. another backend's update) before the hook call never has its settings server contacted", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "revoked-before-read",
+      `({ "tool.execute.before": () => ({ deny: "removed hook ran" }) })`,
+      { tools: ["file_read"] }
+    );
+    let settingsReads = 0;
+    harness.service.setSettingsProvider(() => {
+      settingsReads++;
+      return Promise.resolve({});
+    });
+    await harness.ensure();
+    // The middleware stays registered (no local teardown yet); only the epoch moved.
+    const ctx = makeToolCtx("file_read", { path: "/repo/a.txt" });
+    const stagingRoot = path.join(harness.tmp.path, STAGING_DIR_NAME);
+    await fs.mkdir(stagingRoot, { recursive: true });
+    await bumpContainerMutationEpoch(stagingRoot);
+    await runTool(harness.spine, ctx);
+    expect(ctx.blocked).toBeUndefined();
+    expect(settingsReads).toBe(0);
+  });
 
   test("an admitted context snapshot reacquires a dropped sandbox instead of retaining its runtime", async () => {
     const harness = await createHarness();

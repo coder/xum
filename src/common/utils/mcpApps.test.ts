@@ -20,6 +20,22 @@ describe("parseMCPToolUiMeta", () => {
     );
   });
 
+  test("accepts ChatGPT's openai/outputTemplate alias at the lowest precedence", () => {
+    expect(parseMCPToolUiMeta({ "openai/outputTemplate": "ui://widget/a.html" })).toEqual({
+      resourceUri: "ui://widget/a.html",
+      visibility: ["model", "app"],
+    });
+    const all = {
+      ui: { resourceUri: "ui://spec" },
+      "ui/resourceUri": "ui://legacy",
+      "openai/outputTemplate": "ui://openai",
+    };
+    expect(parseMCPToolUiMeta(all)?.resourceUri).toBe("ui://spec");
+    expect(parseMCPToolUiMeta({ ...all, ui: {} })?.resourceUri).toBe("ui://legacy");
+    // The alias keeps the ui:// rule.
+    expect(parseMCPToolUiMeta({ "openai/outputTemplate": "https://x/a.html" })).toBeUndefined();
+  });
+
   test("ignores tools without a valid ui:// resource", () => {
     expect(parseMCPToolUiMeta(undefined)).toBeUndefined();
     expect(parseMCPToolUiMeta({ ui: { resourceUri: "https://x/view.html" } })).toBeUndefined();

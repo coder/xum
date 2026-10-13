@@ -426,6 +426,10 @@ export const ProjectConfigSchema = z.object({
     description:
       "Custom system prompt appended for every workspace in this project (Settings → Instructions)",
   }),
+  mcpAppViewDomains: z.record(z.string(), z.array(z.string())).optional().meta({
+    description:
+      "MCP Apps: https origins the user allowed each MCP server's views to reach (server key -> origins), for every workspace of this project",
+  }),
   codeWorkspaceSyncPath: z.string().optional().meta({
     description:
       "Path to a VS Code .code-workspace file kept in sync with this project's active worktrees (relative paths resolve against the project root). Unset = sync disabled.",

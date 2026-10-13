@@ -99,6 +99,7 @@ export async function summarizeContinuousCompaction(args: {
     journal: sharedDurableEventJournal(sessionDir),
     xumHome: args.config.rootDir,
     projectRoot: pluginContext?.projectRoot,
+    projectKey: pluginContext?.projectKey,
     projectTrusted: isWorkspaceProjectTrusted(args.config, metadata.data),
   });
   args.signal.throwIfAborted();
