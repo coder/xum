@@ -19,7 +19,7 @@ import {
 import type { TimelineRecorder } from "@/node/services/timelineRecorder";
 
 /**
- * Baselines kept in memory, one per workspace and route/model identity; the least recently
+ * Baselines kept in memory, one per workspace and route/endpoint/model identity; the least recently
  * observed is dropped first.
  */
 const MAX_TRACKED_BASELINES = 128;
@@ -94,10 +94,12 @@ export interface PromptCacheTurnScope {
   setContextEpoch(epoch: string | undefined): void;
 }
 
-/** Requests compare only within one wire route and effective model. */
+/** Requests compare only within one wire route, endpoint and effective model. */
 export interface PromptCacheRouteIdentity {
   route: string;
   modelString: string;
+  /** Origin and path of the request URL: another base URL reaches another cache. */
+  endpoint: string;
 }
 
 export class PromptCachePrefixMonitor {
@@ -156,7 +158,7 @@ export class PromptCachePrefixMonitor {
   ): void {
     try {
       const workspaceId = scope.workspaceId;
-      const key = `${workspaceId}\0${identity.route}\0${identity.modelString}`;
+      const key = [workspaceId, identity.route, identity.endpoint, identity.modelString].join("\0");
       const previous = this.latest.get(key);
       // Re-inserting keeps Map order equal to recency, so eviction drops the oldest.
       this.latest.delete(key);
@@ -190,7 +192,12 @@ export class PromptCachePrefixMonitor {
         boundary: previous.scope === scope ? ("step" as const) : ("turn" as const),
       };
       const description = describePromptCacheBreak(comparison);
-      log.info("Prompt cache prefix break", { workspaceId, ...identity, ...promptCacheBreak });
+      log.info("Prompt cache prefix break", {
+        workspaceId,
+        route: identity.route,
+        modelString: identity.modelString,
+        ...promptCacheBreak,
+      });
       scope.recorder.record(workspaceId, {
         kind: "cache.prefix_break",
         source: { system: "chat" },
