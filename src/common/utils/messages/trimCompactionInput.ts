@@ -115,7 +115,7 @@ async function withPlaceholderOutput(
   assert(part.type === "dynamic-tool" && part.state === "output-available", "not a tool result");
   const tokens = await countRow({ ...message, parts: [part] });
   // nestedCalls never reach the provider (convertToModelMessages reads input/output only),
-  // but they count in the estimate, so drop them with the output.
+  // and sizing skips them. Drop them with the output so the summary input carries none.
   const placeholder: Part = {
     ...part,
     output: omittedToolResultText(tokens),

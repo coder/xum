@@ -62,7 +62,14 @@ function projectValue(value: unknown, media: { count: number }): unknown {
 
 export function projectRowForSizing(row: MuxMessage): CompactionRowSizingInput {
   const media = { count: 0 };
-  const projected = projectValue(row.parts, media);
+  // code_execution's nestedCalls are display-only: convertToModelMessages reads a tool part's
+  // input and output only. Counting them made a fitting history look over budget.
+  const parts = row.parts.map((part) => {
+    if (!("nestedCalls" in part)) return part;
+    const { nestedCalls: _nestedCalls, ...rest } = part;
+    return rest;
+  });
+  const projected = projectValue(parts, media);
   return { projected, mediaParts: media.count };
 }
 

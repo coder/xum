@@ -49,6 +49,45 @@ describe("trimCompactionInput", () => {
     expect(trim.omittedToolResults + trim.omittedTurns).toBe(0);
   });
 
+  it("does not count nested code_execution calls, which never reach the provider", async () => {
+    const nested = (withNestedCalls: boolean): MuxMessage[] => [
+      createMuxMessage("n-user", "user", "run the script"),
+      {
+        id: "n-assistant",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "n-call",
+            toolName: "code_execution",
+            input: { code: "await mux.file_read({ path: 'big.ts' })" },
+            state: "output-available",
+            output: { success: true, result: "done" },
+            ...(withNestedCalls
+              ? {
+                  nestedCalls: [
+                    {
+                      toolCallId: "n-nested",
+                      toolName: "file_read",
+                      input: { path: "big.ts" },
+                      output: { success: true, content: "x".repeat(40_000) },
+                      state: "output-available" as const,
+                    },
+                  ],
+                }
+              : {}),
+          },
+        ],
+      },
+      COMPACTION_REQUEST,
+    ];
+    const messages = nested(true);
+    // The budget fits the provider-bound history, which has no nestedCalls.
+    const trim = await trimCompactionInput(messages, tokensOf(nested(false)));
+    expect(trim.messages).toBe(messages);
+    expect(trim.omittedToolResults + trim.omittedTurns).toBe(0);
+  });
+
   it("replaces the oldest tool results first and keeps every call with a result", async () => {
     const messages = [...toolTurn("a", 40_000), ...toolTurn("b", 40_000), ...toolTurn("c", 400)];
     messages.push(COMPACTION_REQUEST);
