@@ -20,6 +20,13 @@ export interface DevToolsRun {
    * it, and the replay step audit resets its baseline then. Absent on older runs.
    */
   contextEpoch?: string;
+  /**
+   * The estimated token budget a compaction request's history was fitted to
+   * (trimCompactionInput). The replay verifier uses the same budget. Absent on requests
+   * without a budget (not compaction, a model that can still switch to 1M, an unknown
+   * window) and on older runs.
+   */
+  compactionInputBudgetTokens?: number;
 }
 
 /** A "step" = a single LLM round-trip within a run. */

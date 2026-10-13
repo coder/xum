@@ -62,6 +62,8 @@ export interface RecordedProviderRequest {
   usage: DevToolsUsage | null;
   /** Pairing key from the run row; absent on runs recorded by older binaries. */
   requestHistorySequence?: number;
+  /** See DevToolsRun.compactionInputBudgetTokens. */
+  compactionInputBudgetTokens?: number;
 }
 
 /** Every step of one recorded run, for the step-by-step prefix rule (cacheAudit.ts). */
@@ -177,6 +179,7 @@ function recordedRequestsFromLog(log: DevtoolsLogSnapshot): RecordedProviderRequ
       tools: step.input.tools,
       usage: stepUsageUpdates.get(step.id) ?? step.usage,
       ...(requestHistorySequence != null ? { requestHistorySequence } : {}),
+      compactionInputBudgetTokens: run.compactionInputBudgetTokens,
     });
   }
   return requests;
@@ -774,6 +777,7 @@ export async function replayVerifySession(params: {
         partialContinuation,
         deferLoadingToolNames: deferLoadingNamesFromRecordedTools(record.tools),
         workspaceId: params.workspaceId,
+        compactionInputBudgetTokens: record.compactionInputBudgetTokens,
       });
 
       // JSON round-trip the rebuilt prompt so both sides are plain JSON values

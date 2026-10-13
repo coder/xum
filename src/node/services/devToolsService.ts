@@ -266,7 +266,10 @@ function applyStepBackwardCompatibilityDefaults(step: DevToolsStep): DevToolsSte
 }
 
 type PendingRunMetadata = Partial<
-  Pick<DevToolsRun, "toolPolicy" | "requestHistorySequence" | "contextEpoch">
+  Pick<
+    DevToolsRun,
+    "toolPolicy" | "requestHistorySequence" | "contextEpoch" | "compactionInputBudgetTokens"
+  >
 >;
 
 export class DevToolsService extends EventEmitter {

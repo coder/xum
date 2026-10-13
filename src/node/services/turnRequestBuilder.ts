@@ -12,6 +12,7 @@ import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit
 import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
 import {
   anthropicBetweenToolsRouteAvailable,
+  canSwitchToAnthropic1MContext,
   isAnthropic1MEffectivelyEnabled,
 } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
@@ -466,7 +467,9 @@ function pinCoderInstanceRawProvidersConfig(
  * The estimated token budget a compaction request's history must fit (trimCompactionInput):
  * SUMMARIZER_INPUT_FRACTION of the model's effective window, the share continuous compaction's
  * summarizer uses, so the system prompt and the summary fit beside it. Per attempt, because a
- * fallback model has its own window. Undefined when the window is unknown: nothing is trimmed.
+ * fallback model has its own window. Undefined, so nothing is trimmed, when the window is
+ * unknown, or when the model can still switch to 1M context: its context_exceeded retry does
+ * that and trims to the 1M window, which keeps more history than a trim to 200k would.
  */
 export function resolveCompactionInputBudgetTokens(
   modelString: string,
@@ -475,6 +478,9 @@ export function resolveCompactionInputBudgetTokens(
   scale = 1
 ): number | undefined {
   assert(scale > 0 && scale <= 1, "compaction input budget scale must be in (0, 1]");
+  if (canSwitchToAnthropic1MContext(modelString, providerOptions, providersConfig)) {
+    return undefined;
+  }
   const limit = getEffectiveContextLimit(
     modelString,
     isAnthropic1MEffectivelyEnabled(modelString, providerOptions, providersConfig),
@@ -2910,6 +2916,14 @@ export class TurnRequestBuilder {
         const firstStepToolNames = new Set(
           forcedFirstStepToolNames?.length ? forcedFirstStepToolNames : toolNamesForSentinel
         );
+        // Recorded in the DevTools run so the replay verifier trims the same way.
+        const compactionInputBudget = compactionInputBudgetOption(
+          isCompactionRequest,
+          seed.rawModelString,
+          effectiveMuxProviderOptions,
+          seed.providersConfig,
+          compactionInputBudgetScale
+        );
         // Shared by the initial build and thinking rebuilds so their assembly
         // inputs cannot drift apart mid-turn. `measureOnly` assembles a candidate history and
         // returns its estimate without throwing: it runs after `request.assemble`, so no hook,
@@ -2939,13 +2953,7 @@ export class TurnRequestBuilder {
               anthropicCacheTtl: effectiveAnthropicCacheTtl,
               workspaceId,
               tagHistoryItemIds: tokenBudgetEnabled,
-              ...compactionInputBudgetOption(
-                isCompactionRequest,
-                seed.rawModelString,
-                effectiveMuxProviderOptions,
-                seed.providersConfig,
-                compactionInputBudgetScale
-              ),
+              ...compactionInputBudget,
             },
             {
               enabled: tokenBudgetEnabled,
@@ -3012,6 +3020,7 @@ export class TurnRequestBuilder {
           engineSystem: attemptPayload.system,
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
+          ...compactionInputBudget,
           measureMessages: (history: MuxMessage[]) =>
             assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel, { history }),
           systemMessageTokens: attemptSystemTokens,
@@ -3325,6 +3334,8 @@ export class TurnRequestBuilder {
           ...(promptCacheScope.contextEpoch != null
             ? { contextEpoch: promptCacheScope.contextEpoch }
             : {}),
+          // Undefined unless this is a budgeted compaction request (JSON drops the key).
+          compactionInputBudgetTokens: primaryRequest.compactionInputBudgetTokens,
         });
         this.dependencies.trackPendingDevToolsRunMetadata(
           assistantMessageId,

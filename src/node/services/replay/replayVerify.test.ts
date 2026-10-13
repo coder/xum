@@ -206,6 +206,32 @@ describe("replayVerifySession pairing", () => {
     expect(result.stepPrefix).toMatchObject({ comparedPairs: 0, breaks: [] });
   });
 
+  test("a trimmed compaction request replays with its recorded budget", async () => {
+    using tmp = new DisposableTempDir("replay-verify-compaction-trim");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    for (const text of ["First.", "Second."]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText: `${text} ${"x".repeat(8_000)}`,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+      });
+    }
+    // Production trimmed this request's history (trimCompactionInput) and recorded the budget.
+    await appendReplayFixtureTurn(ctx, {
+      userText: "Summarize the conversation.",
+      assistantText: "Summary.",
+      systemPrompt: SYSTEM_PROMPT,
+      tools: tools(),
+      compactionInputBudgetTokens: 2_500,
+    });
+
+    const result = await verify(ctx);
+    expect(result.turns.map((turn) => turn.status)).toEqual(["PASS", "PASS", "PASS"]);
+    const recorded = await fs.readFile(`${ctx.sessionDir}/devtools.jsonl`, "utf-8");
+    expect(recorded).toContain("1 oldest turns were left out");
+  });
+
   test("a headless run without a request sequence is skipped by the step audit", async () => {
     using tmp = new DisposableTempDir("replay-verify-headless");
     const ctx = createReplayFixtureSessionContext(tmp.path);

@@ -92,13 +92,18 @@ describe("AgentSession: compaction request over the context window", () => {
     try {
       await session.resumeStream({ model, agentId: "compact" } as SendMessageOptions);
       const decision = await session.waitForPendingStreamErrorRecoveryDecision(FAILED_MESSAGE_ID);
-      const budgetScales = streamMessage.mock.calls.map(
-        (call) => (call as unknown[])[0] as { compactionInputBudgetScale?: number }
+      const requests = streamMessage.mock.calls.map(
+        (call) =>
+          (call as unknown[])[0] as {
+            compactionInputBudgetScale?: number;
+            muxProviderOptions?: unknown;
+          }
       );
       return {
         decision,
         streams: calls,
-        budgetScales: budgetScales.map((options) => options.compactionInputBudgetScale),
+        budgetScales: requests.map((options) => options.compactionInputBudgetScale),
+        retryProviderOptions: requests[1]?.muxProviderOptions,
       };
     } finally {
       await session.dispose();
@@ -106,9 +111,22 @@ describe("AgentSession: compaction request over the context window", () => {
   }
 
   test("control: a GPT-class compaction retries with OpenAI truncation", async () => {
-    const { decision, streams } = await runOverWindowCompaction("openai:gpt-4o");
+    const { decision, streams, budgetScales } = await runOverWindowCompaction("openai:gpt-4o");
     expect(streams).toBe(2);
     expect(decision).toBe("retry-started");
+    // GPT-class keeps the first-attempt trim, and its retry trims to half the budget.
+    expect(budgetScales).toEqual([undefined, COMPACTION_RETRY_INPUT_BUDGET_SCALE]);
+  });
+
+  test("a model that can switch to 1M retries at 1M without the half budget", async () => {
+    const { decision, streams, budgetScales, retryProviderOptions } = await runOverWindowCompaction(
+      "anthropic:claude-sonnet-4-5"
+    );
+    expect(decision).toBe("retry-started");
+    expect(streams).toBe(2);
+    // The retry trims to 70% of the 1M window (turnRequestBuilder), not to half of 200k.
+    expect(budgetScales).toEqual([undefined, undefined]);
+    expect(retryProviderOptions).toMatchObject({ anthropic: { use1MContext: true } });
   });
 
   test("a compaction request on a model without a 1M retry recovers", async () => {

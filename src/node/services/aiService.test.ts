@@ -804,7 +804,10 @@ describe("AIService workspace metadata lookup", () => {
 describe("AIService turn engine events", () => {
   const workspaceId = "workspace-1";
 
-  async function createForwardingHarness(tempDirName: string): Promise<{
+  async function createForwardingHarness(
+    tempDirName: string,
+    request: Partial<Parameters<AIService["streamMessage"]>[0]> = {}
+  ): Promise<{
     historyService: HistoryService;
     service: AIService;
     /** The sink AIService installed on its engine (production wiring, not a private hook). */
@@ -856,6 +859,7 @@ describe("AIService turn engine events", () => {
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
+      ...request,
     });
     expect(result.success).toBe(true);
     const trackedMessageId = startStreamCalls[0]?.messageId;
@@ -894,6 +898,29 @@ describe("AIService turn engine events", () => {
       workspaceId,
       "stream-token",
       expect.objectContaining({ contextEpoch: "user-message" })
+    );
+  });
+
+  it("queues the compaction input budget so replay trims the same way", async () => {
+    using harness = await createForwardingHarness("ai-service-compaction-budget-run-metadata", {
+      messages: [
+        createMuxMessage("user-message", "user", "Summarize.", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        }),
+      ],
+      compactionInputBudgetScale: 0.5,
+    });
+    expect(harness.setPendingRunMetadataSpy).toHaveBeenCalledWith(
+      workspaceId,
+      "stream-token",
+      expect.objectContaining({
+        compactionInputBudgetTokens: resolveCompactionInputBudgetTokens(
+          "openai:gpt-5.2",
+          undefined,
+          null,
+          0.5
+        ),
+      })
     );
   });
 
@@ -1652,6 +1679,49 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(sent.includes("1 oldest turns were left out")).toBe(testCase.kind !== "ordinary");
     }
   );
+
+  // A model whose context_exceeded retry switches to 1M is not trimmed on the first attempt
+  // (it summarized the full history before trimming existed); the 1M retry trims to the 1M
+  // window, not to the 200k one.
+  it.each([
+    { name: "first attempt is not trimmed", use1M: false, expected: ["t1", "t2", "t3"] },
+    { name: "1M retry trims to the 1M window", use1M: true, expected: ["t2", "t3"] },
+  ])("compaction on a model that can switch to 1M: $name", async (testCase) => {
+    using xumHome = new DisposableTempDir("ai-service-compaction-trim-1m");
+    const metadata = createLocalWorkspaceMetadata("compaction-trim-1m", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, { useRequestedModelString: true });
+    const model = "anthropic:claude-sonnet-4-5";
+    const use1MOptions = { anthropic: { use1MContext: true, use1MContextModels: [model] } };
+    const budget1M = resolveCompactionInputBudgetTokens(model, use1MOptions, null);
+    expect(resolveCompactionInputBudgetTokens(model, undefined, null)).toBeUndefined();
+    if (budget1M == null) throw new Error("expected a 1M budget");
+    // Three turns of 40% of the 1M budget each: the 1M budget keeps two of them, a budget
+    // from the 200k window would keep only the newest.
+    const turnChars = Math.floor(budget1M * 0.4) * 4;
+    const turns = ["t1", "t2", "t3"].flatMap((id) => [
+      createMuxMessage(id, "user", "x".repeat(turnChars)),
+      createMuxMessage(`${id}-answer`, "assistant", "ok"),
+    ]);
+    const result = await harness.service.streamMessage({
+      workspaceId: metadata.id,
+      messages: [
+        ...turns,
+        createMuxMessage("request", "user", "Summarize.", {
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        }),
+      ],
+      modelString: model,
+      thinkingLevel: "off",
+      ...(testCase.use1M ? { muxProviderOptions: use1MOptions } : {}),
+    });
+
+    expect(result.success).toBe(true);
+    const userIds = harness.preparedPayloadMessageIds[0]?.filter((id) => id.startsWith("t"));
+    expect(userIds?.filter((id) => !id.endsWith("-answer"))).toEqual([...testCase.expected]);
+    // Untrimmed means the rows reach the provider as they are: no note on the request row.
+    const sent = JSON.stringify(harness.startStreamCalls[0]?.messages);
+    expect(sent.includes("Compaction input trimmed")).toBe(testCase.use1M);
+  });
 
   // Every top-level workspace may set a goal: delegated workspace turns,
   // heartbeats and goal continuations send no opt-in flag and must not be refused.
