@@ -280,32 +280,41 @@ FUNCTION_NODES = {
 }
 
 
-def inlined_literal(node) -> bool:
-    """Whether Bun inlines a const with this initializer.
+# Global names Bun inlines like literals (checked on Bun 1.4.3). Shadowing is
+# not resolved.
+INLINED_GLOBALS = {b"undefined", b"NaN", b"Infinity"}
+
+
+def inlined_literal(node):
+    """The literal node Bun inlines for a const with this initializer, or None.
 
     Kept to the cases checked on Bun 1.4.3: `1n`, `Number(2)`, `"a" + "b"` and
     `let`/`var` do not trigger the bug. Bun also folds `a${1}` into a literal;
-    only templates with no substitution count here.
+    only templates with no substitution count here. The zeroed run starts on
+    the returned node's line, which can be below a multi-line wrapper's `(`.
     """
 
     while node.type in LITERAL_WRAPPERS and node.named_children:
         node = node.named_children[0]
     if node.type == "unary_expression" and node.child_count == 2 and node.children[0].type == "-":
         node = node.children[1]
-        return node.type == "number" and not node.text.endswith(b"n")
+        numeric = node.type == "number" or (node.type == "identifier" and node.text in {b"NaN", b"Infinity"})
+        return node if numeric and not node.text.endswith(b"n") else None
     if node.type == "number":
-        return not node.text.endswith(b"n")
+        return None if node.text.endswith(b"n") else node
     if node.type == "template_string":
-        return not any(child.type == "template_substitution" for child in node.children)
-    return node.type in INLINED_LITERALS or (node.type == "identifier" and node.text == b"undefined")
+        return None if any(child.type == "template_substitution" for child in node.children) else node
+    if node.type in INLINED_LITERALS or (node.type == "identifier" and node.text in INLINED_GLOBALS):
+        return node
+    return None
 
 
 def runs_whenever_called(body, declaration) -> bool:
     """Whether nothing in `body` before `declaration` can skip it: no return, throw or call.
 
-    Every earlier statement must be a declaration whose values are all literals
-    (inlined_literal) or absent, so the declaration runs whenever the function
-    does.
+    Every earlier statement must declare plain names (a destructuring pattern
+    can throw) with literal values (inlined_literal) or none, so the
+    declaration runs whenever the function does.
     """
 
     for statement in body.named_children:
@@ -316,23 +325,30 @@ def runs_whenever_called(body, declaration) -> bool:
         if statement.type != "lexical_declaration":
             return False
         for declarator in statement.named_children:
+            name = declarator.child_by_field_name("name")
             value = declarator.child_by_field_name("value")
-            if value is not None and not inlined_literal(value):
+            if name is None or name.type != "identifier":
+                return False
+            if value is not None and inlined_literal(value) is None:
                 return False
     return True
 
 
 def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
-    """Literal consts by name: (value line, scope node) for each declaration.
+    """Literal consts by name: (literal line, scope node) for each declaration.
 
     Only module-scope consts and consts directly in a function body: a block
     inside a function (an `if` body) may not run when the function does. A
     body const after a statement that can return, throw or call is skipped
     too: when the function leaves early, a correct report also lists the const
     and an uncalled closure that uses it at 0.
+
+    Bun propagates a const alias (`const RAW = 2; const B = RAW;`): B counts,
+    with RAW's literal line, where Bun starts the zeroed run.
     """
 
     consts: dict[str, list[tuple[int, object]]] = {}
+    # descendants() walks in source order, so an alias sees its target.
     for node in descendants(root):
         if node.type != "lexical_declaration" or node.child_count == 0 or node.children[0].type != "const":
             continue
@@ -349,9 +365,21 @@ def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
         for declarator in node.named_children:
             name = declarator.child_by_field_name("name")
             value = declarator.child_by_field_name("value")
-            if name is None or value is None or name.type != "identifier" or not inlined_literal(value):
+            if name is None or value is None or name.type != "identifier":
                 continue
-            consts.setdefault(name.text.decode("utf-8"), []).append((value.start_point[0] + 1, scope))
+            literal = inlined_literal(value)
+            if literal is not None:
+                lines = [literal.start_point[0] + 1]
+            elif value.type == "identifier":
+                lines = [
+                    line
+                    for line, target in consts.get(value.text.decode("utf-8"), [])
+                    if target.start_byte <= value.start_byte < target.end_byte
+                ]
+            else:
+                lines = []
+            for line in lines:
+                consts.setdefault(name.text.decode("utf-8"), []).append((line, scope))
     return consts
 
 

@@ -442,9 +442,24 @@ def test_the_bun_repro_flags_the_function_between_the_const_and_its_uncalled_use
 
 
 def test_every_inlined_literal_kind_flags(tmp_path, capsys):
-    for value in ('"two"', "-0x1f", "true", "null", "undefined", "`two`", '"two" as const', "(2)"):
+    for value in ('"two"', "-0x1f", "true", "null", "undefined", "`two`", '"two" as const', "(2)", "NaN", "-Infinity"):
         source = REPRO.replace("const B = 2;", f"const B = {value};")
         assert suspects(capsys, tmp_path, source, REPRO_CALLED_ONLY)["called"] == (0.0, True), value
+
+
+def test_the_run_starts_on_the_literal_line_and_follows_const_aliases(tmp_path, capsys):
+    called = "export function called(x: number): number {\n  return x * 3;\n}\n"
+    unused = "export function unused(x: number) {\n  return [x, K];\n}\n"
+    # Bun 1.4.3: the `(` line ran, the zeroed run starts at the literal.
+    wrapped = f"const p = 0;\nconst K = (\n  5\n);\n{called}{unused}"
+    report = "DA:1,12\nDA:2,9\n" + "".join(f"DA:{line},0\n" for line in range(3, 9))
+    assert suspects(capsys, tmp_path, wrapped, report)["called"] == (0.0, True)
+    # Bun 1.4.3 propagates K = RAW and zeroes from RAW's line.
+    alias = f"const p = 0;\nconst RAW = 2;\nconst K = RAW;\n{called}{unused}"
+    report = "DA:1,12\n" + "".join(f"DA:{line},0\n" for line in range(2, 8))
+    assert suspects(capsys, tmp_path, alias, report)["called"] == (0.0, True)
+    not_const = alias.replace("const RAW = 2;", "let RAW = 2;")
+    assert suspects(capsys, tmp_path, not_const, report)["called"] == (0.0, False)
 
 
 def test_values_bun_does_not_inline_do_not_flag(tmp_path, capsys):
@@ -521,6 +536,9 @@ export function outer(items: number[]): number {
     # Any call before the const may throw, so it does not flag either.
     called_first = source.replace("  if (items.length === 0) return 0;\n", "  check(items);\n")
     assert suspects(capsys, tmp_path, called_first, report)["outer"][1] is False
+    # Destructuring can throw, even with a literal value.
+    destructured = source.replace("  if (items.length === 0) return 0;\n", "  const [seen] = 0 as any;\n")
+    assert suspects(capsys, tmp_path, destructured, report)["outer"][1] is False
     # Literal declarations before it cannot skip it.
     literal_first = source.replace("  if (items.length === 0) return 0;\n", "  let seen = 0;\n")
     assert suspects(capsys, tmp_path, literal_first, report)["outer"][1] is True
