@@ -273,6 +273,46 @@ describe("ConnectionLink", () => {
       expect(await iterator.next()).toEqual({ done: true, value: undefined });
     });
 
+    // The missing-close case: the inner stream's own cleanup never settles.
+    async function openHangingStream() {
+      const link = new ConnectionLink();
+      const inner = controlledLink();
+      link.attach(inner.link);
+      const hang = () => new Promise<IteratorResult<unknown>>(() => undefined);
+      const stream = {
+        next: hang,
+        return: hang,
+        throw: hang,
+        [Symbol.asyncIterator]() {
+          return stream;
+        },
+      };
+      const opened = link.call(["terminal", "attach"], undefined, NO_OPTIONS);
+      inner.calls[0]?.resolve(stream);
+      return { link, iterator: (await opened) as AsyncIteratorObject<unknown> };
+    }
+
+    test("detach() settles a return() whose inner cleanup hangs", async () => {
+      const { link, iterator } = await openHangingStream();
+      const returned = settleState(iterator.return!());
+      await flush();
+      expect(returned.status).toBe("pending");
+      link.detach();
+      await flush();
+      expect(returned).toEqual({ status: "resolved", value: { done: true, value: undefined } });
+    });
+
+    test("detach() settles a throw() whose inner cleanup hangs", async () => {
+      const { link, iterator } = await openHangingStream();
+      const thrown = settleState(iterator.throw!(new Error("consumer failed")));
+      await flush();
+      expect(thrown.status).toBe("pending");
+      link.detach();
+      await flush();
+      expect(thrown.status).toBe("rejected");
+      expect(isConnectionLostError(thrown.value)).toBe(true);
+    });
+
     test("a stream that opens after detach() is returned, not leaked", async () => {
       const link = new ConnectionLink();
       const inner = controlledLink();

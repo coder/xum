@@ -236,12 +236,14 @@ class GenerationIterator implements AsyncIteratorObject<unknown, unknown, unknow
 
   /** Called by detach(). */
   end(): void {
-    if (this.finished) return;
-    this.lost = true;
+    const wasFinished = this.finished;
     this.finish();
+    // Also settles a return() or throw() still waiting for the inner stream's cleanup.
     const lost = new ConnectionLostError();
     for (const lose of this.waiting) lose(lost);
     this.waiting.clear();
+    if (wasFinished) return;
+    this.lost = true;
     void returnQuietly(this.inner);
   }
 
@@ -265,16 +267,18 @@ class GenerationIterator implements AsyncIteratorObject<unknown, unknown, unknow
   }
 
   async return(value?: unknown): Promise<IteratorResult<unknown, unknown>> {
-    const wasFinished = this.finished;
-    this.finish();
-    if (!wasFinished) await returnQuietly(this.inner, value);
+    if (this.finished) return { done: true, value };
+    // A lost connection ends the cleanup too: the stream is done for the caller either way.
+    await this.cleanUp(returnQuietly(this.inner, value)).catch(() => undefined);
     return { done: true, value };
   }
 
   async throw(error?: unknown): Promise<IteratorResult<unknown, unknown>> {
-    this.finish();
-    if (this.inner.throw != null) return this.inner.throw(error);
-    throw error;
+    if (this.inner.throw == null) {
+      this.finish();
+      throw error;
+    }
+    return this.cleanUp(this.inner.throw(error));
   }
 
   [Symbol.asyncIterator](): this {
@@ -293,5 +297,20 @@ class GenerationIterator implements AsyncIteratorObject<unknown, unknown, unknow
   private finish(): void {
     this.finished = true;
     this.generation.iterators.delete(this);
+  }
+
+  /**
+   * Later pulls see a finished stream at once, but the iterator stays in its generation until
+   * `cleanup` settles: when the socket closed without a close event, the inner cleanup can hang,
+   * and only detach() can settle it then.
+   */
+  private cleanUp<T>(cleanup: Promise<T>): Promise<T> {
+    this.finished = true;
+    return settleUnlessLost(cleanup, {
+      waiters: this.waiting,
+      signal: this.signal,
+      mapValue: (value) => value,
+      mapError: (error) => toLinkError(error, this.generation, this.signal),
+    }).finally(() => this.generation.iterators.delete(this));
   }
 }
