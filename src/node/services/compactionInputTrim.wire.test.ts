@@ -137,7 +137,7 @@ describe("compaction input trim on the wire", () => {
     "%s: a trimmed request keeps every tool call paired with a result",
     async (provider) => {
       // Room for one full result: "a" and "b" become placeholders, "c" stays whole.
-      const payload = await assemble(provider, 12_000);
+      const payload = await assemble(provider, 14_000);
       const body = await wireBody(provider, payload);
       const text = JSON.stringify(body);
       const { calls, results } = toolPairs(provider, body);
@@ -240,11 +240,65 @@ describe("compaction input trim on the wire", () => {
       createMuxMessage("cjk-new-answer", "assistant", "ok"),
       HISTORY[HISTORY.length - 1],
     ];
-    const charsEstimate = estimateCompactionInputTokens(history);
+    const charsEstimate = await estimateCompactionInputTokens(history);
     // chars/4 says the history fits twice over; the real count is several times larger.
     const payload = await assemble("openai", charsEstimate * 2, history);
     const text = JSON.stringify(payload.messages);
     expect(text).toContain("Compaction input trimmed");
     expect(text).not.toContain(cjk.slice(0, 50));
+  });
+
+  test("a screenshot data URL that fits keeps the request untrimmed and byte-identical", async () => {
+    // About 1.5 MB of base64: the provider charges it as one image, not as text.
+    const screenshot = `data:image/png;base64,${"iVBORw0KGgoAAAANSUhEUgAA".repeat(64_000)}`;
+    const history: MuxMessage[] = [
+      {
+        id: "shot-user",
+        role: "user",
+        parts: [
+          { type: "text", text: "What is on this screen?" },
+          { type: "file", mediaType: "image/png", url: screenshot },
+        ],
+      },
+      createMuxMessage("shot-answer", "assistant", "A login form."),
+      createMuxMessage("next-user", "user", "next"),
+      createMuxMessage("next-answer", "assistant", "ok"),
+      HISTORY[HISTORY.length - 1],
+    ];
+    const plain = await assemble("openai", undefined, history);
+    const budgeted = await assemble("openai", 5_000, history);
+    expect(JSON.stringify(budgeted.messages)).toBe(JSON.stringify(plain.messages));
+  });
+
+  test("recounts a row after replacing its result, so dense text left in it still counts", async () => {
+    const cjk = "这是一个测试句子，用于检查分词器的密度。".repeat(400);
+    // One row: a large low-density result next to dense CJK text.
+    const mixed: MuxMessage = {
+      id: "mixed-assistant",
+      role: "assistant",
+      parts: [
+        { type: "text", text: cjk },
+        {
+          type: "dynamic-tool",
+          toolCallId: "call_big",
+          toolName: "file_read",
+          input: { path: "big.log" },
+          state: "output-available",
+          output: { success: true, content: "x".repeat(400_000) },
+        },
+      ],
+    };
+    const history: MuxMessage[] = [
+      createMuxMessage("mixed-user", "user", "read the log"),
+      mixed,
+      createMuxMessage("next-user", "user", "next"),
+      createMuxMessage("next-answer", "assistant", "ok"),
+      HISTORY[HISTORY.length - 1],
+    ];
+    // After the result is replaced, the CJK text alone is still over this budget.
+    const payload = await assemble("openai", 6_000, history);
+    const text = JSON.stringify(payload.messages);
+    expect(text).toContain("1 oldest turns were left out");
+    expect(text).not.toContain(cjk.slice(0, 40));
   });
 });

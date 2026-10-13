@@ -20,11 +20,12 @@
  * budget (for example a huge user message): the caller sends it, and the context_exceeded retry
  * runs with half the budget.
  */
-import { IMAGE_TOKEN_ESTIMATE } from "@/common/constants/contextBudget";
 import type { MuxMessage } from "@/common/types/message";
 import assert from "@/common/utils/assert";
-import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
-import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
+import {
+  estimateCompactionRowTokens,
+  type CountCompactionRowTokens,
+} from "@/common/utils/messages/compactionRowSizing";
 
 export interface CompactionInputTrim {
   messages: MuxMessage[];
@@ -34,48 +35,13 @@ export interface CompactionInputTrim {
 
 type Part = MuxMessage["parts"][number];
 
-/** Media parts a row sends: user file parts, and media inside tool results. */
-function countMediaParts(message: MuxMessage): number {
-  let count = 0;
-  for (const part of message.parts) {
-    if (part.type === "file") count += 1;
-    else if (part.type === "dynamic-tool" && part.state === "output-available") {
-      count += estimateToolResultSize(part.output).imageParts;
-    }
-  }
-  return count;
-}
-
-/**
- * A row's estimated tokens: chars/4 of its parts (estimateMuxMessageTokens, which counts base64
- * as a tiny marker), plus IMAGE_TOKEN_ESTIMATE per media part, the allowance the request-time
- * context check uses (contextBudget.ts). Without it a history of screenshots or PDFs looks
- * small and is sent untrimmed. PDFs can cost more per part; the half-budget retry backs that.
- */
-export function estimateCompactionRowTokens(message: MuxMessage): number {
-  return estimateMuxMessageTokens(message) + countMediaParts(message) * IMAGE_TOKEN_ESTIMATE;
-}
-
-/**
- * Per-row multipliers from a model-aware count (measureCompactionTokenFactors): how many times
- * more tokens the model's tokenizer counts for a row than estimateCompactionRowTokens. chars/4
- * undercounts dense text (CJK about 5x, emoji about 8x), so the cutoff uses the larger count.
- * Rows without a factor (and placeholder rows, which keep their row's factor) use 1.
- */
-export type CompactionTokenFactors = ReadonlyMap<string, number>;
-
-function rowTokens(message: MuxMessage, factors: CompactionTokenFactors | undefined): number {
-  const factor = factors?.get(message.id) ?? 1;
-  assert(Number.isFinite(factor) && factor >= 1, "token factors must be finite and >= 1");
-  return Math.ceil(estimateCompactionRowTokens(message) * factor);
-}
-
-/** The estimate trimCompactionInput fits to a budget, for a whole history. */
-export function estimateCompactionInputTokens(
+/** The size trimCompactionInput fits to a budget, for a whole history. */
+export async function estimateCompactionInputTokens(
   messages: MuxMessage[],
-  factors?: CompactionTokenFactors
-): number {
-  return messages.reduce((sum, message) => sum + rowTokens(message, factors), 0);
+  countRow: CountCompactionRowTokens = estimateCompactionRowTokens
+): Promise<number> {
+  const counts = await Promise.all(messages.map(async (message) => countRow(message)));
+  return counts.reduce((sum, count) => sum + count, 0);
 }
 
 function omittedToolResultText(tokens: number): string {
@@ -140,14 +106,14 @@ function isOutputPart(part: Part): boolean {
 }
 
 /** The row with the tool result at `partIndex` replaced by a size placeholder. */
-function withPlaceholderOutput(
+async function withPlaceholderOutput(
   message: MuxMessage,
   partIndex: number,
-  factors: CompactionTokenFactors | undefined
-): MuxMessage {
+  countRow: CountCompactionRowTokens
+): Promise<MuxMessage> {
   const part = message.parts[partIndex];
   assert(part.type === "dynamic-tool" && part.state === "output-available", "not a tool result");
-  const tokens = rowTokens({ ...message, parts: [part] }, factors);
+  const tokens = await countRow({ ...message, parts: [part] });
   // nestedCalls never reach the provider (convertToModelMessages reads input/output only),
   // but they count in the estimate, so drop them with the output.
   const placeholder: Part = {
@@ -174,36 +140,49 @@ function turnStarts(messages: MuxMessage[], end: number): number[] {
 
 class TrimState {
   readonly rows: MuxMessage[];
+  /** Each row's count; a row the trim changes is counted again (replaceOutput). */
   readonly tokens: number[];
   total: number;
   /** Tool results replaced per row; rows of dropped turns do not count in the note. */
   readonly replaced: number[];
 
-  constructor(
+  private constructor(
     rows: MuxMessage[],
-    private readonly factors: CompactionTokenFactors | undefined
+    tokens: number[],
+    private readonly countRow: CountCompactionRowTokens
   ) {
-    this.rows = [...rows];
-    this.tokens = this.rows.map((row) => rowTokens(row, factors));
-    this.total = this.tokens.reduce((sum, value) => sum + value, 0);
-    this.replaced = this.rows.map(() => 0);
+    this.rows = rows;
+    this.tokens = tokens;
+    this.total = tokens.reduce((sum, value) => sum + value, 0);
+    this.replaced = rows.map(() => 0);
+  }
+
+  static async create(rows: MuxMessage[], countRow: CountCompactionRowTokens) {
+    const tokens = await Promise.all(rows.map(async (row) => countRow(row)));
+    return new TrimState([...rows], tokens, countRow);
   }
 
   /**
    * Replace tool results in rows [from, to), oldest first and one result at a time, until the
    * total fits: a row with several results keeps the ones the budget has room for.
    */
-  placeholderOutputs(from: number, to: number, budget: number): void {
+  async placeholderOutputs(from: number, to: number, budget: number): Promise<void> {
     for (let index = from; index < to && this.total > budget; index++) {
       for (let part = 0; part < this.rows[index].parts.length && this.total > budget; part++) {
-        if (isOutputPart(this.rows[index].parts[part])) this.replaceOutput(index, part);
+        if (isOutputPart(this.rows[index].parts[part])) await this.replaceOutput(index, part);
       }
     }
   }
 
-  private replaceOutput(index: number, part: number): void {
-    const message = withPlaceholderOutput(this.rows[index], part, this.factors);
-    const tokens = rowTokens(message, this.factors);
+  /**
+   * Replace one result, and count its row again: a count derived from the old row would
+   * misjudge what remains (a dense text next to a large sparse result). A placeholder that is
+   * not smaller than its result (`true`, "ok") is not applied: it would grow the request.
+   */
+  private async replaceOutput(index: number, part: number): Promise<void> {
+    const message = await withPlaceholderOutput(this.rows[index], part, this.countRow);
+    const tokens = await this.countRow(message);
+    if (tokens >= this.tokens[index]) return;
     this.total += tokens - this.tokens[index];
     this.rows[index] = message;
     this.tokens[index] = tokens;
@@ -248,30 +227,50 @@ function appendOmissionNote(request: MuxMessage, trim: Omit<CompactionInputTrim,
   return { ...request, parts };
 }
 
-export function trimCompactionInput(
+/**
+ * `countRow` sizes one row (compactionRowSizing.ts). The node caller counts with the model's
+ * tokenizer; the default counts chars/4. Each row is counted once, then again only when the
+ * trim changes it.
+ */
+export async function trimCompactionInput(
   messages: MuxMessage[],
   budgetTokens: number,
-  factors?: CompactionTokenFactors
-): CompactionInputTrim {
+  countRow: CountCompactionRowTokens = estimateCompactionRowTokens
+): Promise<CompactionInputTrim> {
   assert(Number.isFinite(budgetTokens) && budgetTokens > 0, "budgetTokens must be positive");
   const requestIndex = messages.findLastIndex((message) => message.role === "user");
-  const total = estimateCompactionInputTokens(messages, factors);
-  if (requestIndex <= 0 || total <= budgetTokens) {
+  if (requestIndex <= 0) return { messages, omittedToolResults: 0, omittedTurns: 0 };
+  // Rows reasoning removal leaves as they are reuse their first count.
+  const counted = new Map<MuxMessage, number>();
+  const countOnce = async (row: MuxMessage) => {
+    const cached = counted.get(row);
+    if (cached != null) return cached;
+    const tokens = await countRow(row);
+    counted.set(row, tokens);
+    return tokens;
+  };
+  if ((await estimateCompactionInputTokens(messages, countOnce)) <= budgetTokens) {
     return { messages, omittedToolResults: 0, omittedTurns: 0 };
   }
-  return trimOverBudget(new TrimState(withoutReasoning(messages), factors), budgetTokens);
+  return trimOverBudget(
+    await TrimState.create(withoutReasoning(messages), countOnce),
+    budgetTokens
+  );
 }
 
 /** Phases 2-4 on a history already over the budget and without reasoning. */
-function trimOverBudget(state: TrimState, budgetTokens: number): CompactionInputTrim {
+async function trimOverBudget(
+  state: TrimState,
+  budgetTokens: number
+): Promise<CompactionInputTrim> {
   // Reasoning removal keeps every row (emptied ones too), so these are the original indices.
   const request = state.rows.findLastIndex((message) => message.role === "user");
   const starts = turnStarts(state.rows, request);
   const firstTurn = starts[0] ?? request;
   const newestTurn = starts.at(-1) ?? request;
-  state.placeholderOutputs(0, newestTurn, budgetTokens);
+  await state.placeholderOutputs(0, newestTurn, budgetTokens);
   const omittedTurns = state.dropOldestTurns(starts, budgetTokens);
-  state.placeholderOutputs(newestTurn, request, budgetTokens);
+  await state.placeholderOutputs(newestTurn, request, budgetTokens);
 
   const keptFrom = starts[omittedTurns] ?? request;
   const isKept = (index: number) => index < firstTurn || index >= keptFrom;

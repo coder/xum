@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
-import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
+import { estimateCompactionRowTokens } from "./compactionRowSizing";
 import { trimCompactionInput } from "./trimCompactionInput";
 
 const COMPACTION_REQUEST = createMuxMessage("request", "user", "Summarize the conversation.");
@@ -29,7 +29,7 @@ function toolTurn(id: string, outputChars: number): MuxMessage[] {
 }
 
 function tokensOf(messages: MuxMessage[]): number {
-  return messages.reduce((sum, message) => sum + estimateMuxMessageTokens(message), 0);
+  return messages.reduce((sum, message) => sum + estimateCompactionRowTokens(message), 0);
 }
 
 function outputOf(messages: MuxMessage[], id: string): unknown {
@@ -42,18 +42,18 @@ function outputOf(messages: MuxMessage[], id: string): unknown {
 }
 
 describe("trimCompactionInput", () => {
-  it("returns the same array when the history fits", () => {
+  it("returns the same array when the history fits", async () => {
     const messages = [...toolTurn("a", 4_000), ...toolTurn("b", 4_000), COMPACTION_REQUEST];
-    const trim = trimCompactionInput(messages, tokensOf(messages));
+    const trim = await trimCompactionInput(messages, tokensOf(messages));
     expect(trim.messages).toBe(messages);
     expect(trim.omittedToolResults + trim.omittedTurns).toBe(0);
   });
 
-  it("replaces the oldest tool results first and keeps every call with a result", () => {
+  it("replaces the oldest tool results first and keeps every call with a result", async () => {
     const messages = [...toolTurn("a", 40_000), ...toolTurn("b", 40_000), ...toolTurn("c", 400)];
     messages.push(COMPACTION_REQUEST);
     // Room for one large result: only the oldest one becomes a placeholder.
-    const trim = trimCompactionInput(messages, 12_000 + 1_000);
+    const trim = await trimCompactionInput(messages, 12_000 + 1_000);
 
     expect(trim).toMatchObject({ omittedToolResults: 1, omittedTurns: 0 });
     expect(outputOf(trim.messages, "a")).toMatch(/^\[Tool result omitted .* about \d+ tokens\]$/);
@@ -71,7 +71,7 @@ describe("trimCompactionInput", () => {
     );
   });
 
-  it("drops the oldest whole turns next and always keeps the newest turn and the request", () => {
+  it("drops the oldest whole turns next and always keeps the newest turn and the request", async () => {
     const summary = createMuxMessage("summary", "assistant", "Earlier summary.", {
       compacted: "user",
     });
@@ -81,7 +81,7 @@ describe("trimCompactionInput", () => {
     ];
     const messages = [summary, ...huge("a"), ...huge("b"), ...huge("c"), COMPACTION_REQUEST];
 
-    const trim = trimCompactionInput(messages, 11_000);
+    const trim = await trimCompactionInput(messages, 11_000);
     expect(trim.omittedTurns).toBe(2);
     expect(trim.messages.map((message) => message.id)).toEqual([
       "summary",
@@ -91,7 +91,7 @@ describe("trimCompactionInput", () => {
     ]);
 
     // Even a budget the newest turn cannot meet keeps it and the request.
-    const tight = trimCompactionInput(messages, 1);
+    const tight = await trimCompactionInput(messages, 1);
     expect(tight.messages.map((message) => message.id)).toEqual([
       "summary",
       "c-user",
@@ -100,22 +100,22 @@ describe("trimCompactionInput", () => {
     ]);
   });
 
-  it("replaces the newest turn's tool results only as a last resort", () => {
+  it("replaces the newest turn's tool results only as a last resort", async () => {
     const messages = [...toolTurn("a", 40_000), ...toolTurn("b", 40_000), COMPACTION_REQUEST];
-    const olderOnly = trimCompactionInput(messages, 11_000);
+    const olderOnly = await trimCompactionInput(messages, 11_000);
     expect(olderOnly).toMatchObject({ omittedToolResults: 1, omittedTurns: 0 });
     expect(outputOf(olderOnly.messages, "b")).toEqual({
       success: true,
       content: "x".repeat(40_000),
     });
 
-    const lastResort = trimCompactionInput(messages, 1_000);
+    const lastResort = await trimCompactionInput(messages, 1_000);
     // The note counts only placeholders in kept rows: turn "a" was left out whole.
     expect(lastResort).toMatchObject({ omittedToolResults: 1, omittedTurns: 1 });
     expect(outputOf(lastResort.messages, "b")).toMatch(/^\[Tool result omitted/);
   });
 
-  it("keeps a snapshot cluster with the turn it belongs to", () => {
+  it("keeps a snapshot cluster with the turn it belongs to", async () => {
     const snapshot = createMuxMessage("b-snapshot", "user", "z".repeat(400), {
       synthetic: true,
     });
@@ -127,7 +127,7 @@ describe("trimCompactionInput", () => {
       createMuxMessage("b-assistant", "assistant", "ok"),
       COMPACTION_REQUEST,
     ];
-    const trim = trimCompactionInput(messages, 1_000);
+    const trim = await trimCompactionInput(messages, 1_000);
     expect(trim.messages.map((message) => message.id)).toEqual([
       "b-snapshot",
       "b-user",
@@ -136,7 +136,7 @@ describe("trimCompactionInput", () => {
     ]);
   });
 
-  it("replaces only as many results of a multi-tool row as the budget needs", () => {
+  it("replaces only as many results of a multi-tool row as the budget needs", async () => {
     const row: MuxMessage = {
       id: "multi-assistant",
       role: "assistant",
@@ -157,7 +157,7 @@ describe("trimCompactionInput", () => {
       COMPACTION_REQUEST,
     ];
     // Room for two of the three results.
-    const trim = trimCompactionInput(messages, 21_000);
+    const trim = await trimCompactionInput(messages, 21_000);
     const outputs = trim.messages
       .find((message) => message.id === "multi-assistant")
       ?.parts.map((part) =>
@@ -171,7 +171,7 @@ describe("trimCompactionInput", () => {
     ]);
   });
 
-  it("rebases step boundaries onto the parts left after removing reasoning", () => {
+  it("rebases step boundaries onto the parts left after removing reasoning", async () => {
     const row: MuxMessage = {
       id: "steps-assistant",
       role: "assistant",
@@ -191,7 +191,7 @@ describe("trimCompactionInput", () => {
       row,
       COMPACTION_REQUEST,
     ];
-    const trim = trimCompactionInput(messages, 2_000);
+    const trim = await trimCompactionInput(messages, 2_000);
     const rebased = trim.messages.find((message) => message.id === "steps-assistant");
     expect(rebased?.parts.map((part) => (part.type === "text" ? part.text : part.type))).toEqual([
       "step one",
@@ -200,7 +200,7 @@ describe("trimCompactionInput", () => {
     expect(rebased?.metadata?.stepStartPartIndices).toEqual([0, 1]);
   });
 
-  it("counts media parts so a screenshot-heavy history is trimmed", () => {
+  it("counts media parts so a screenshot-heavy history is trimmed", async () => {
     const screenshotTurn = (id: string): MuxMessage[] => [
       createMuxMessage(`${id}-user`, "user", `look ${id}`),
       {
@@ -227,11 +227,11 @@ describe("trimCompactionInput", () => {
     ];
     const messages = [...screenshotTurn("a"), ...screenshotTurn("b"), COMPACTION_REQUEST];
     // About 20 * 1,024 tokens of images; the base64 itself is a few characters.
-    const trim = trimCompactionInput(messages, 15_000);
+    const trim = await trimCompactionInput(messages, 15_000);
     expect(trim.omittedToolResults).toBe(1);
   });
 
-  it("keeps the turn boundary of a reasoning-only row it removes", () => {
+  it("keeps the turn boundary of a reasoning-only row it removes", async () => {
     // A stream that crashed early left an assistant row with only reasoning between u2 and u3.
     const messages: MuxMessage[] = [
       createMuxMessage("u1", "user", "y".repeat(40_000)),
@@ -242,20 +242,51 @@ describe("trimCompactionInput", () => {
       createMuxMessage("a3", "assistant", "ok"),
       COMPACTION_REQUEST,
     ];
-    const trim = trimCompactionInput(messages, 1_000);
+    const trim = await trimCompactionInput(messages, 1_000);
     // u2 is its own turn and is dropped; the emptied row is not sent.
     expect(trim.messages.map((message) => message.id)).toEqual(["u3", "a3", "request"]);
     expect(trim.omittedTurns).toBe(2);
   });
 
-  it("sizes rows with model-aware factors when given", () => {
-    const messages = [...toolTurn("a", 4_000), ...toolTurn("b", 4_000), COMPACTION_REQUEST];
-    const budget = tokensOf(messages) + 100;
-    expect(trimCompactionInput(messages, budget).messages).toBe(messages);
-    // A tokenizer that counts row "a-assistant" 5x denser pushes the history over the budget.
-    const dense = new Map([["a-assistant", 5]]);
-    const trim = trimCompactionInput(messages, budget, dense);
-    expect(trim.omittedToolResults).toBe(1);
-    expect(outputOf(trim.messages, "a")).toMatch(/^\[Tool result omitted/);
+  it("keeps a short result instead of growing the row with a placeholder", async () => {
+    const row: MuxMessage = {
+      id: "short-assistant",
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "short",
+          toolName: "file_exists",
+          input: {},
+          state: "output-available",
+          output: true,
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: "long",
+          toolName: "file_read",
+          input: {},
+          state: "output-available",
+          output: { content: "x".repeat(40_000) },
+        },
+      ],
+    };
+    const messages = [
+      createMuxMessage("u1", "user", "check then read"),
+      row,
+      createMuxMessage("u2", "user", "next"),
+      createMuxMessage("a2", "assistant", "ok"),
+      COMPACTION_REQUEST,
+    ];
+    // Replacing the long result fits the budget; the short one comes first and stays.
+    const trim = await trimCompactionInput(messages, 2_000);
+    const outputs = trim.messages
+      .find((message) => message.id === "short-assistant")
+      ?.parts.map((part) =>
+        part.type === "dynamic-tool" && part.state === "output-available" ? part.output : null
+      );
+    expect(trim).toMatchObject({ omittedToolResults: 1, omittedTurns: 0 });
+    expect(outputs?.[0]).toBe(true);
+    expect(outputs?.[1]).toMatch(/^\[Tool result omitted/);
   });
 });

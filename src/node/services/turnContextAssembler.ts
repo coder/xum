@@ -23,7 +23,7 @@ import type { Instructions, ModelMessage, SystemModelMessage, Tool } from "ai";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
 import { trimCompactionInput } from "@/common/utils/messages/trimCompactionInput";
-import { sizeCompactionInput } from "./compactionInputSizing";
+import { createCompactionRowCounter, projectCompactionInput } from "./compactionInputSizing";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
@@ -278,8 +278,9 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
 
 /**
  * A compaction request's history fitted to its budget; any other request unchanged. The trim
- * sizes and edits the redacted projection the provider receives (sizeCompactionInput). A
- * history that fits keeps its original rows, so the request stays byte-identical.
+ * sizes and edits the redacted projection the provider receives (projectCompactionInput),
+ * counting rows with the model's tokenizer. A history that fits keeps its original rows, so
+ * the request stays byte-identical.
  */
 async function trimToCompactionInputBudget(
   messages: MuxMessage[],
@@ -287,9 +288,13 @@ async function trimToCompactionInputBudget(
   modelString: string
 ): Promise<MuxMessage[]> {
   if (budgetTokens == null) return messages;
-  const { sized, factors } = await sizeCompactionInput(messages, modelString);
-  const trimmed = trimCompactionInput(sized, budgetTokens, factors).messages;
-  return trimmed === sized ? messages : trimmed;
+  const sized = projectCompactionInput(messages);
+  const trim = await trimCompactionInput(
+    sized,
+    budgetTokens,
+    createCompactionRowCounter(modelString)
+  );
+  return trim.messages === sized ? messages : trim.messages;
 }
 
 export async function assemblePromptPayload(
