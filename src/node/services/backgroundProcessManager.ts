@@ -619,21 +619,40 @@ const MAX_RETAINED_UNREAD_BYTES = 4 * BASH_MAX_TOTAL_BYTES;
 
 /**
  * Keep at most MAX_RETAINED_UNREAD_BYTES of `unread` (whole lines when one fits), and move the
- * file cursor back over the rest. `unread` is the end of what the reads consumed from output.log,
- * so the bytes it drops are exactly the ones before the cursor.
+ * file cursor back over the rest, so the next reads load it from output.log again.
+ *
+ * `unread` is the end of what the reads consumed, and `decodedThisRead` is the text this call
+ * decoded from the bytes just before the cursor (both end at the cursor). The cursor counts raw
+ * bytes, the text is decoded: an invalid byte (Latin-1, binary, a character cut at a read
+ * boundary) decodes to U+FFFD, 3 bytes for 1. So the cursor only moves back over text that
+ * maps 1:1 onto raw bytes: a suffix of `decodedThisRead` with no U+FFFD (every other character
+ * decodes from exactly its own UTF-8 bytes). What cannot be rewound stays in memory, as it did
+ * before reads were capped.
  */
-function retainUnreadOutput(proc: BackgroundProcess, unread: string): void {
-  const unreadBytes = Buffer.byteLength(unread, "utf8");
-  if (unreadBytes <= MAX_RETAINED_UNREAD_BYTES) {
+function retainUnreadOutput(
+  proc: BackgroundProcess,
+  unread: string,
+  decodedThisRead: string
+): void {
+  const head = truncateUtf8Prefix(unread, MAX_RETAINED_UNREAD_BYTES);
+  if (head.length === unread.length) {
     proc.incompleteLineBuffer = unread;
     return;
   }
-  const head = truncateUtf8Prefix(unread, MAX_RETAINED_UNREAD_BYTES);
   const lastNewline = head.lastIndexOf("\n");
-  const kept = lastNewline >= 0 ? head.slice(0, lastNewline + 1) : head;
-  proc.incompleteLineBuffer = kept;
-  proc.outputBytesRead -= unreadBytes - Buffer.byteLength(kept, "utf8");
-  assert(proc.outputBytesRead >= 0, "the retained unread output must come from output.log");
+  const dropped = unread.slice(lastNewline >= 0 ? lastNewline + 1 : head.length);
+  const rewound = dropped.slice(rewindableStart(dropped, decodedThisRead.length));
+  const outputBytesRead = proc.outputBytesRead - Buffer.byteLength(rewound, "utf8");
+  // Checked before any state changes: a failed assert must leave the process as it was.
+  assert(outputBytesRead >= 0, "the rewound unread output must come from output.log");
+  proc.incompleteLineBuffer = unread.slice(0, unread.length - rewound.length);
+  proc.outputBytesRead = outputBytesRead;
+}
+
+/** Where the rewindable part of `dropped` starts (see retainUnreadOutput). */
+function rewindableStart(dropped: string, decodedThisReadLength: number): number {
+  const afterLastReplacement = dropped.lastIndexOf("\uFFFD") + 1;
+  return Math.max(afterLastReplacement, dropped.length - decodedThisReadLength);
 }
 
 /** Polling guidance for getOutput (see the callers' 3+ call heuristics). */
@@ -2697,7 +2716,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         // so preserve them in the line buffer; otherwise the next getOutput() would resume past
         // this content and silently drop it. This matters now that task_await aborts a still-
         // pending bash read once min_completed is satisfied (not just on user interrupt).
-        retainUnreadOutput(proc, previousBuffer + accumulatedRaw);
+        retainUnreadOutput(proc, previousBuffer + accumulatedRaw, accumulatedRaw);
         const elapsed_ms = Date.now() - startTime;
         return {
           success: true,
@@ -2758,7 +2777,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       (line) => !filterRegex || filterRegex.test(line) !== (filterExclude === true)
     );
     const unreadBytes = Buffer.byteLength(page.unread, "utf8");
-    retainUnreadOutput(proc, page.unread);
+    retainUnreadOutput(proc, page.unread, accumulatedRaw);
     proc.unreadStartsWithKeptLine = page.unreadStartsWithKeptLine;
 
     const shownThroughOffsetBeforeRead = proc.shownThroughOffset;

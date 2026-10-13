@@ -812,6 +812,20 @@ describe("task_await tool", () => {
     expect(issue({ task_ids: ["t1", "t2"], offset_chars: 0 })).toBeNull();
   });
 
+  it("refuses offset_chars for bash output and names the call that reads it", () => {
+    const schema = TOOL_DEFINITIONS.task_await.schema;
+    const issue = (args: Record<string, unknown>) => {
+      const parsed = schema.safeParse(args);
+      return parsed.success ? null : parsed.error.issues[0]?.message;
+    };
+    const readAgain = 'task_await(task_ids: ["bash:p1"], timeout_secs: 0) without offset_chars';
+    expect(issue({ task_ids: ["bash:p1"], offset_chars: 1000 })).toContain(readAgain);
+    // With other IDs too, the bash rule wins: the single-ID hint would name a refused call.
+    expect(issue({ task_ids: ["t1", "bash:p1"], offset_chars: 1000 })).toContain(readAgain);
+    expect(issue({ task_ids: ["bash:p1"], offset_chars: 0 })).toBeNull();
+    expect(issue({ task_ids: ["bash:p1"] })).toBeNull();
+  });
+
   it("propagates report-time AI settings into completed results", async () => {
     using tempDir = new TestTempDir("test-task-await-tool-report-settings");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });

@@ -82,18 +82,18 @@ function pinMissNote(requested: string | undefined, current: string): string {
   );
 }
 
-/**
- * The skill for one page. A first page always fetches and, when the body has more pages,
- * pins the copy under its snapshot. A later page reads its snapshot's pin. A miss (expired,
- * evicted, unknown or absent snapshot) fetches again; when that copy has other bytes than the
- * requested snapshot, the page says so.
- */
 /** The pinned copy a later page asks for by snapshot; undefined for a first page or a miss. */
 function findPinnedSkillForPage(args: SkillsCatalogReadToolArgs, now: number) {
   if ((args.offset_chars ?? 0) <= 0 || args.snapshot == null) return undefined;
   return readPinnedSkill(pinKey(args.owner, args.repo, args.skillId, args.snapshot), now);
 }
 
+/**
+ * The skill for one page. A first page always fetches and, when the body has more pages,
+ * pins the copy under its snapshot. A later page reads its snapshot's pin. A miss (expired,
+ * evicted, unknown or absent snapshot) fetches again; when that copy has other bytes than the
+ * requested snapshot, the page says so.
+ */
 async function loadSkillForPage(
   args: SkillsCatalogReadToolArgs
 ): Promise<PinnedSkill & { pinNote?: string }> {

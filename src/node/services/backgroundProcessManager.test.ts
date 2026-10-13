@@ -3484,6 +3484,96 @@ describe("BackgroundProcessManager", () => {
         expect(all).toBe(lines.join(""));
       });
 
+      // The cursor counts raw bytes and the text is decoded: an invalid byte decodes to U+FFFD
+      // (3 UTF-8 bytes for 1 raw byte), so a rewind by the text's size moved it too far back.
+      describe("output that is not valid UTF-8", () => {
+        async function readEverything(processId: string, logSize: number) {
+          const pages: string[] = [];
+          for (let attempt = 0; attempt < 200; attempt++) {
+            const read = await manager.getOutput(processId, undefined, undefined, 0);
+            expect(read.success).toBe(true);
+            if (!read.success) throw new Error(read.error);
+            const proc = await manager.getProcess(processId);
+            expect(proc?.outputBytesRead).toBeGreaterThanOrEqual(0);
+            expect(proc?.outputBytesRead).toBeLessThanOrEqual(logSize);
+            pages.push(read.output);
+            if (!read.note?.includes("more bytes are unread")) return pages;
+          }
+          throw new Error("output never drained");
+        }
+
+        it("reads 120 KB of 0xff bytes back once, in order", async () => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) return;
+          // 120 lines of 1,000 0xff bytes: each decodes to 1,000 U+FFFD (3,000 bytes).
+          const line = Buffer.alloc(1_000, 0xff);
+          const raw = Buffer.concat(
+            Array.from({ length: 120 }, (_, i) =>
+              Buffer.concat([Buffer.from(`${i}:`), line, Buffer.from("\n")])
+            )
+          );
+          await fs.appendFile(path.join(result.outputDir, "output.log"), raw);
+
+          const pages = await readEverything(result.processId, raw.length);
+          expect(pages.length).toBeGreaterThan(4);
+          const expected = Array.from({ length: 120 }, (_, i) => `${i}:${"\uFFFD".repeat(1_000)}`);
+          expect(pages.join("\n")).toBe(expected.join("\n"));
+        });
+
+        it("still rewinds over valid text after an invalid byte", async () => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) return;
+          const lines = Array.from({ length: 4_000 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
+          const raw = Buffer.concat([
+            Buffer.from([0xff, 0x0a]),
+            Buffer.from(`${lines.join("\n")}\n`),
+          ]);
+          await fs.appendFile(path.join(result.outputDir, "output.log"), raw);
+
+          const first = await manager.getOutput(result.processId, undefined, undefined, 0);
+          expect(first.success).toBe(true);
+          const retained = (await manager.getProcess(result.processId))?.incompleteLineBuffer ?? "";
+          expect(Buffer.byteLength(retained, "utf8")).toBeLessThanOrEqual(4 * BASH_MAX_TOTAL_BYTES);
+          const rest = await readEverything(result.processId, raw.length);
+          const pages = [first.success ? first.output : "", ...rest];
+          // The invalid byte is in the first page: the rest is valid, so memory stays bounded.
+          expect(pages.join("\n")).toBe(["\uFFFD", ...lines].join("\n"));
+        });
+
+        it("keeps a character cut at a read boundary once, with the lines around it", async () => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) return;
+          const outputPath = path.join(result.outputDir, "output.log");
+          const lines = Array.from({ length: 4_000 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
+          // The first read ends inside "é" (0xC3 0xA9): its two halves decode separately.
+          const head = Buffer.concat([
+            Buffer.from(`${lines.join("\n")}\ncut-`),
+            Buffer.from([0xc3]),
+          ]);
+          await fs.appendFile(outputPath, head);
+          const first = await manager.getOutput(result.processId, undefined, undefined, 0);
+          expect(first.success).toBe(true);
+          const tail = Buffer.concat([Buffer.from([0xa9]), Buffer.from("-end\nafter\n")]);
+          await fs.appendFile(outputPath, tail);
+
+          const rest = await readEverything(result.processId, head.length + tail.length);
+          const all = [first.success ? first.output : "", ...rest].join("\n");
+          expect(all).toBe([...lines, "cut-\uFFFD\uFFFD-end", "after"].join("\n"));
+        });
+      });
+
       it("keeps the rest after exit readable", async () => {
         const result = await manager.spawn(runtime, testWorkspaceId, "seq 1 20000", {
           cwd: process.cwd(),
