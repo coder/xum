@@ -37,6 +37,72 @@ const DISABLED_INLINE_SKILL_PREVIEW_CONTEXT: InlineSkillPreviewContextValue = {
   renderInlineSkillPreview: (_skillName, label) => label,
 };
 
+/** The hover-card badge for one inline skill reference, or null without a usable snapshot. */
+function renderSnapshotPreview(
+  snapshots: InlineSkillSnapshotMap,
+  skillName: string,
+  label: string
+): React.ReactNode {
+  const snapshot = snapshots[skillName];
+  if (!snapshot) {
+    return null;
+  }
+
+  const snapshotMarkdown = buildAgentSkillSnapshotMarkdown(snapshot.snapshot);
+  if (!snapshotMarkdown) {
+    return null;
+  }
+
+  return (
+    <HoverCard openDelay={150}>
+      <HoverCardTrigger asChild>
+        <AgentSkillBadge className="cursor-help">{label}</AgentSkillBadge>
+      </HoverCardTrigger>
+      {/* Keep skill preview above chat chrome and fully opaque while hovering. */}
+      <HoverCardPortal>
+        <HoverCardContent
+          align="start"
+          side="top"
+          className="border-border-medium bg-modal-bg z-[1600] max-h-[360px] w-[520px] max-w-[80vw] overflow-auto border-2 p-3"
+        >
+          <InlineSkillPreviewContext.Provider value={DISABLED_INLINE_SKILL_PREVIEW_CONTEXT}>
+            <MarkdownRenderer content={snapshotMarkdown} preserveLineBreaks />
+          </InlineSkillPreviewContext.Provider>
+        </HoverCardContent>
+      </HoverCardPortal>
+    </HoverCard>
+  );
+}
+
+/**
+ * `$tdd:notes` with no `tdd:notes` skill loaded the bare `tdd`: badge only
+ * `$tdd` and keep `:notes` as text, like the send path does.
+ */
+function renderInlineSkillPreviewFromSnapshots(
+  snapshots: InlineSkillSnapshotMap,
+  skillName: string,
+  label: string,
+  fallbackSkillName?: string
+): React.ReactNode {
+  const preview = renderSnapshotPreview(snapshots, skillName, label);
+  if (preview != null || fallbackSkillName == null) {
+    return preview ?? label;
+  }
+
+  const fallbackLabel = `$${fallbackSkillName}`;
+  const fallbackPreview = label.startsWith(fallbackLabel)
+    ? renderSnapshotPreview(snapshots, fallbackSkillName, fallbackLabel)
+    : null;
+  return fallbackPreview == null ? (
+    label
+  ) : (
+    <>
+      {fallbackPreview}
+      {label.slice(fallbackLabel.length)}
+    </>
+  );
+}
+
 export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
   content,
   className,
@@ -54,68 +120,19 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
       filePreview={filePreview}
     />
   );
-  const renderSnapshotPreview = (
-    snapshots: NonNullable<MarkdownRendererProps["inlineSkillSnapshots"]>,
-    skillName: string,
-    label: string
-  ): React.ReactNode => {
-    const snapshot = snapshots[skillName];
-    if (!snapshot) {
-      return null;
-    }
-
-    const snapshotMarkdown = buildAgentSkillSnapshotMarkdown(snapshot.snapshot);
-    if (!snapshotMarkdown) {
-      return null;
-    }
-
-    return (
-      <HoverCard openDelay={150}>
-        <HoverCardTrigger asChild>
-          <AgentSkillBadge className="cursor-help">{label}</AgentSkillBadge>
-        </HoverCardTrigger>
-        {/* Keep skill preview above chat chrome and fully opaque while hovering. */}
-        <HoverCardPortal>
-          <HoverCardContent
-            align="start"
-            side="top"
-            className="border-border-medium bg-modal-bg z-[1600] max-h-[360px] w-[520px] max-w-[80vw] overflow-auto border-2 p-3"
-          >
-            <InlineSkillPreviewContext.Provider value={DISABLED_INLINE_SKILL_PREVIEW_CONTEXT}>
-              <MarkdownRenderer content={snapshotMarkdown} preserveLineBreaks />
-            </InlineSkillPreviewContext.Provider>
-          </HoverCardContent>
-        </HoverCardPortal>
-      </HoverCard>
-    );
-  };
   const markdownContent =
     inlineSkillSnapshots === undefined ? (
       markdownCore
     ) : (
       <InlineSkillPreviewContext.Provider
         value={{
-          renderInlineSkillPreview: (skillName, label, fallbackSkillName) => {
-            const preview = renderSnapshotPreview(inlineSkillSnapshots, skillName, label);
-            if (preview != null || fallbackSkillName == null) {
-              return preview ?? label;
-            }
-
-            // `$tdd:notes` with no `tdd:notes` skill loaded the bare `tdd`: badge
-            // only `$tdd` and keep `:notes` as text, like the send path does.
-            const fallbackLabel = `$${fallbackSkillName}`;
-            const fallbackPreview = label.startsWith(fallbackLabel)
-              ? renderSnapshotPreview(inlineSkillSnapshots, fallbackSkillName, fallbackLabel)
-              : null;
-            return fallbackPreview == null ? (
-              label
-            ) : (
-              <>
-                {fallbackPreview}
-                {label.slice(fallbackLabel.length)}
-              </>
-            );
-          },
+          renderInlineSkillPreview: (skillName, label, fallbackSkillName) =>
+            renderInlineSkillPreviewFromSnapshots(
+              inlineSkillSnapshots,
+              skillName,
+              label,
+              fallbackSkillName
+            ),
         }}
       >
         {markdownCore}

@@ -14,10 +14,7 @@ import { CopyButton } from "@/browser/components/CopyButton/CopyButton";
 import { resolveBrowserLocalhostProxyTemplate } from "@/browser/utils/browserLocalhostProxyTemplate";
 import { normalizeLocalhostProxyUrl } from "@/common/utils/localhostProxyUrl";
 import { InlineSkillPreviewContext } from "./InlineSkillPreviewContext";
-import {
-  INLINE_SKILL_HREF_FALLBACK_SEPARATOR,
-  INTERNAL_INLINE_SKILL_HREF_PREFIX,
-} from "./inlineSkillMarkdown";
+import { decodeInlineSkillHref, INTERNAL_INLINE_SKILL_HREF_PREFIX } from "./inlineSkillMarkdown";
 import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 
 // Lazy so the `mermaid` package stays off the first load (T3, #5971): diagrams render only
@@ -404,26 +401,6 @@ function getTextFromReactNode(node: ReactNode): string {
   });
 
   return text;
-}
-
-function decodeInlineSkillHref(
-  href: string
-): { skillName: string; fallbackSkillName?: string } | null {
-  const [encodedSkillName = "", encodedFallback] = href
-    .slice(INTERNAL_INLINE_SKILL_HREF_PREFIX.length)
-    .split(INLINE_SKILL_HREF_FALLBACK_SEPARATOR);
-  if (encodedSkillName.length === 0) {
-    return null;
-  }
-
-  try {
-    const skillName = decodeURIComponent(encodedSkillName);
-    return encodedFallback
-      ? { skillName, fallbackSkillName: decodeURIComponent(encodedFallback) }
-      : { skillName };
-  } catch {
-    return null;
-  }
 }
 
 function InlineSkillAnchor(props: { href: string; children?: ReactNode }): ReactNode {
