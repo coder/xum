@@ -561,7 +561,7 @@ const localPlugin = {
           },
         ],
         messages: {
-          copy: 'require("{{specifier}}") loads a second copy of a repo module. Bun\'s LCOV keeps only the last-loaded copy of a file, so in a shared CI shard this copy can replace the coverage that the module\'s own tests recorded (#6339). To get the real exports past a module mock, snapshot `{ ...RealModule }` from a static `import * as RealModule` at file scope, before the mock.module call.',
+          copy: '"{{specifier}}" loads a second copy of a repo module. Bun\'s LCOV keeps only the last-loaded copy of a file, so in a shared CI shard this copy can replace the coverage that the module\'s own tests recorded (#6339). To get the real exports past a module mock, snapshot `{ ...RealModule }` from a static `import * as RealModule` at file scope, before the mock.module call.',
         },
       },
       create(context) {
@@ -571,8 +571,17 @@ const localPlugin = {
           ] ?? []
         );
         // Package specifiers (react-dnd?real=1) stay allowed: their coverage is not reported.
-        const isRepoQueryCopy = (specifier) =>
-          (specifier.startsWith("@/") || specifier.startsWith(".")) && specifier.includes("?");
+        // Asset loader queries (logo.svg?react) are the module's only specifier, not a copy.
+        const isRepoQueryCopy = (specifier) => {
+          const queryStart = specifier.indexOf("?");
+          return (
+            (specifier.startsWith("@/") || specifier.startsWith(".")) &&
+            queryStart !== -1 &&
+            !/\.(svg|png|jpe?g|gif|webp|avif|ico|css|json|txt|md|html|wasm|woff2?|ttf)$/.test(
+              specifier.slice(0, queryStart)
+            )
+          );
+        };
         const check = (node, source) => {
           if (
             source?.type === "Literal" &&
@@ -591,6 +600,16 @@ const localPlugin = {
           },
           ImportExpression(node) {
             check(node, node.source);
+          },
+          // Type-only imports and exports load nothing at runtime.
+          ImportDeclaration(node) {
+            if (node.importKind !== "type") check(node, node.source);
+          },
+          ExportNamedDeclaration(node) {
+            if (node.exportKind !== "type") check(node, node.source);
+          },
+          ExportAllDeclaration(node) {
+            if (node.exportKind !== "type") check(node, node.source);
           },
         };
       },
@@ -2845,6 +2864,9 @@ export default defineConfig([
             "src/browser/contexts/API.test.tsx": ["./API?real=1"],
             "src/browser/features/Analytics/SavedQuerySqlDialog.test.tsx": [
               "./SavedQuerySqlDialog?real=1",
+            ],
+            "src/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection.test.tsx": [
+              "./useBrowserBridgeConnection.ts?test-isolation=static",
             ],
             "src/browser/utils/feedbackToast.test.tsx": ["../components/Dialog/Dialog?real=1"],
             "src/browser/utils/perf/appShellReady.test.ts": ["./appShellReady?fresh=1"],
