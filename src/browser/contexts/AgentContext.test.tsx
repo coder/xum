@@ -12,7 +12,11 @@ import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { AgentProvider, useAgent, type AgentContextValue } from "./AgentContext";
 import { APIProvider, type APIClient } from "./API";
-import { createConnectionHarness, GAP_MODES, type ConnectionHarness } from "./connection.testHarness";
+import {
+  createConnectionHarness,
+  GAP_MODES,
+  type ConnectionHarness,
+} from "./connection.testHarness";
 import { ProjectProvider } from "./ProjectContext";
 import { RouterProvider } from "./RouterContext";
 import { WorkspaceProvider } from "./WorkspaceContext";
