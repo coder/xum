@@ -107,7 +107,7 @@ import type { TimelineService } from "@/node/services/timelineService";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FileState } from "@/node/services/agentSession";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 import type { GoalDefaults } from "@/constants/goals";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
 
@@ -335,7 +335,7 @@ export interface ToolConfiguration {
   /** Available sub-agents for the task tool description (dynamic context) */
   availableSubagents?: AgentDefinitionDescriptor[];
   /** Available skills for the agent_skill_read tool description (dynamic context) */
-  availableSkills?: AgentSkillDescriptor[];
+  availableSkills?: InvocableSkill[];
   /**
    * Session-segment memory index for the memory tool description (dynamic
    * context, same disclosure mechanic as skills). Absent when no snapshot was

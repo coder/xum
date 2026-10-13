@@ -8,7 +8,7 @@ import { ThinkingLevelSchema } from "../../types/thinking";
 import { isValidModelFormat } from "@/common/utils/ai/models";
 import { AgentIdSchema } from "./agentDefinition";
 import { StreamErrorTypeSchema } from "./errors";
-import { AgentSkillScopeSchema, SkillNameSchema } from "./agentSkill";
+import { AgentSkillScopeSchema, SkillLookupNameSchema } from "./agentSkill";
 import { WorkflowRunIdSchema, WorkflowRunRecordSchema } from "./workflow";
 
 export const FilePartSchema = z.object({
@@ -290,7 +290,9 @@ export const MuxMessageSchema = z.object({
       // Ignore malformed snapshot metadata so one row cannot fail the whole history parse.
       agentSkillSnapshot: z
         .object({
-          skillName: SkillNameSchema,
+          // A lookup name: `<plugin>:<skill>` for a qualified invocation. Older
+          // builds drop only this metadata (.catch below), not the row.
+          skillName: SkillLookupNameSchema,
           scope: AgentSkillScopeSchema,
           sha256: z.string(),
           frontmatterYaml: z.string().optional(),

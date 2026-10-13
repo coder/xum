@@ -80,6 +80,18 @@ Updates preserve explicit selections: newly available skills and MCP servers sta
   remaining directory cannot be distinguished from an unmanaged plugin and may expose everything.
 </Warning>
 
+#### Plugin skill namespaces
+
+A plugin skill has two names: its bare name (`tdd`) and a qualified name `<plugin>:<skill>` (`pstack:tdd`), the same convention Claude Code uses for plugin components.
+
+- A bare name keeps the precedence above. If you have a global `tdd` skill, `tdd` loads your skill and `pstack:tdd` loads the skill from the `pstack` plugin.
+- A qualified name only loads a skill from the named plugin. It never falls back to a project, global, or built-in skill. If a project plugin and a global plugin have the same plugin name, the project plugin wins.
+- If two plugins ship the same skill name, the bare name loads the first one, and each stays reachable as `alpha:tdd` and `beta:tdd`.
+- When a plugin skill loses its bare name to another skill, the model's skill index lists it under its qualified name. Plugin skills that win their bare name are listed only once, under the bare name.
+- A qualified name with no match (for example `nope:tdd` or `pstack:missing`) fails with `Agent skill not found: <name>`.
+
+Skill names in `SKILL.md` frontmatter and directory names stay bare. The qualified form applies only to lookups such as `agent_skill_read` and `agent_skill_read_file`.
+
 ## Skill layout
 
 A skill is a directory named after the skill:

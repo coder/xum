@@ -4,7 +4,7 @@ import type { AgentSkillReadToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS } from "@/common/constants/toolLimits";
-import { SkillNameSchema } from "@/common/orpc/schemas";
+import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
 import { getErrorMessage } from "@/common/utils/errors";
 import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
@@ -73,11 +73,11 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
       }
 
       // Defensive: validate again even though inputSchema should guarantee shape.
-      const parsedName = SkillNameSchema.safeParse(name);
-      if (!parsedName.success) {
+      // The schema regex cannot express the full plugin-name grammar.
+      if (parseSkillLookupName(name) == null) {
         return {
           success: false,
-          error: parsedName.error.message,
+          error: `Invalid skill name: ${name}`,
         };
       }
 
@@ -90,16 +90,11 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
           xumScope: config.xumScope ?? null,
           includeClaudeSkills,
         });
-        const resolved = await readAgentSkill(
-          skillCtx.runtime,
-          skillCtx.workspacePath,
-          parsedName.data,
-          {
-            roots: skillCtx.roots,
-            containment: skillCtx.containment,
-            includeClaudeSkills,
-          }
-        );
+        const resolved = await readAgentSkill(skillCtx.runtime, skillCtx.workspacePath, name, {
+          roots: skillCtx.roots,
+          containment: skillCtx.containment,
+          includeClaudeSkills,
+        });
         return {
           success: true,
           skill: resolved.package,
