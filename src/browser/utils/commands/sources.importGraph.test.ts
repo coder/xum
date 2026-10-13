@@ -6,7 +6,10 @@ import * as path from "path";
 // eagerly), so everything its static imports reach ships in main-*.js. #6133 made it
 // reach tool-card code through mcpAppViewsStore -> toolUtils.tsx (+7.4 KB br, #6349).
 // Dynamic `import()` edges load later, so the walk follows static imports only.
-const ENTRY = path.join(import.meta.dir, "sources.ts");
+// Paths are kept with "/" separators so the substring checks below also hold on Windows,
+// where path.join and Bun.resolveSync return backslashes (fs and the resolver accept both).
+const toPosix = (file: string): string => file.replaceAll("\\", "/");
+const ENTRY = toPosix(path.join(import.meta.dir, "sources.ts"));
 const FORBIDDEN = [
   "/src/browser/features/Tools/Shared/ToolPrimitives",
   "/src/browser/features/Tools/Shared/toolUtils",
@@ -31,7 +34,7 @@ async function staticImportGraph(entry: string): Promise<{
       if (imp.kind !== "import-statement") continue;
       let resolved: string;
       try {
-        resolved = Bun.resolveSync(imp.path, path.dirname(file));
+        resolved = toPosix(Bun.resolveSync(imp.path, path.dirname(file)));
       } catch {
         unresolved.add(imp.path);
         continue;
