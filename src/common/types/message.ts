@@ -1073,13 +1073,22 @@ export interface MuxMetadata {
   /** Present when the composer's Auto entry classified this turn's difficulty. */
   autoModelRouting?: AutoModelRoutingRecord;
   /**
-   * Receipt of an Anthropic thinking-signature repair: this turn retried without replayed
-   * thinking after a 400 "Invalid `signature` in `thinking` block". Preserved thinking binds
-   * each block to its prefix, and putting removed blocks back invalidates every later block,
-   * so request building strips Anthropic thinking for the rest of the context segment (until
-   * the next compaction or reset boundary) once any row carries this.
+   * Receipt of an Anthropic thinking strip: a request of this turn sent earlier thinking
+   * without its blocks (signature repair, in-turn prefix change, or server-tool containment).
+   * Preserved thinking binds each block to its prefix, and putting removed blocks back
+   * invalidates every later block, so request building keeps the removed blocks out until the
+   * next compaction or reset boundary. Where the strip ends: anthropicThinkingReplayFromStep.
    */
   anthropicThinkingReplay?: "off";
+  /**
+   * Where the receipt's strip ends, so later requests keep the thinking the turn kept sending
+   * (prompt-cache prefix, mechanism 11). A number is a step of THIS row (an index into
+   * stepStartPartIndices): earlier rows and this row's earlier steps lose their Anthropic
+   * thinking, this step and later keep it. "end": this row loses all of it (#5887 server
+   * tool). Rows after this one keep theirs. Absent (older builds): every row of the segment
+   * loses it.
+   */
+  anthropicThinkingReplayFromStep?: number | "end";
   // Last step's provider metadata (for context window cache display)
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
