@@ -611,7 +611,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         const pinned = isWorkspacePinned(selectedMeta);
         list.push({
           id: CommandIds.workspaceTogglePinned(),
-          title: pinned ? "Unpin Current Chat" : "Pin Current Chat",
+          title: pinned ? "Unpin Current Workspace" : "Pin Current Workspace",
           subtitle: workspaceDisplayName,
           shortcutHint: formatKeybind(KEYBINDS.PIN_WORKSPACE),
           section: section.workspaces,
@@ -628,7 +628,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           // commands stay listed whenever the chat is pinned.
           list.push({
             id: CommandIds.workspaceMovePinnedUp(),
-            title: "Move Pinned Chat Up",
+            title: "Move Pinned Workspace Up",
             subtitle: workspaceDisplayName,
             shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_UP),
             section: section.workspaces,
@@ -636,7 +636,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           });
           list.push({
             id: CommandIds.workspaceMovePinnedDown(),
-            title: "Move Pinned Chat Down",
+            title: "Move Pinned Workspace Down",
             subtitle: workspaceDisplayName,
             shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_DOWN),
             section: section.workspaces,

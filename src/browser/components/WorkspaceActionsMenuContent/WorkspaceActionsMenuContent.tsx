@@ -94,7 +94,7 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
     <div onKeyDown={handleRowArrowKeys}>
       {props.onEditTitle && (
         <WorkspaceActionButton
-          label="Edit chat title"
+          label="Edit workspace title"
           shortcut={formatKeybind(KEYBINDS.EDIT_WORKSPACE_TITLE)}
           shortcutClassName={props.shortcutClassName}
           icon={<Pencil className="h-3 w-3 shrink-0" />}
@@ -209,7 +209,7 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
       )}
       {props.onForkChat && (
         <WorkspaceActionButton
-          label="Fork chat"
+          label="Fork workspace"
           icon={<GitBranch className="h-3 w-3 shrink-0" />}
           onClick={(e) => {
             e.stopPropagation();
@@ -220,7 +220,7 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
       )}
       {props.onTogglePinned && (
         <WorkspaceActionButton
-          label={props.isPinned ? "Unpin chat" : "Pin chat"}
+          label={props.isPinned ? "Unpin workspace" : "Pin workspace"}
           shortcut={formatKeybind(KEYBINDS.PIN_WORKSPACE)}
           shortcutClassName={props.shortcutClassName}
           icon={
@@ -239,7 +239,7 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
       )}
       {props.onArchiveChat && (
         <WorkspaceActionButton
-          label="Archive chat"
+          label="Archive workspace"
           shortcut={formatKeybind(KEYBINDS.ARCHIVE_WORKSPACE)}
           shortcutClassName={props.shortcutClassName}
           icon={<ArchiveIcon className="h-3 w-3 shrink-0" />}

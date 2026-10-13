@@ -37,7 +37,7 @@ describe("WorkspaceActionsMenuContent keyboard navigation (#6103)", () => {
 
   test("ArrowDown and ArrowUp move focus between the rows and stop at the ends", () => {
     const { view } = renderMenu();
-    const rows = [/Configure MCP servers/, /Configure heartbeat/, /Archive chat/].map((name) =>
+    const rows = [/Configure MCP servers/, /Configure heartbeat/, /Archive workspace/].map((name) =>
       view.getByRole("button", { name })
     );
     // Exactly these rows, in this order.

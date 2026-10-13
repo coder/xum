@@ -1114,7 +1114,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         if (result.success) {
           return;
         }
-        workspaceForkError.showError(workspaceId, result.error ?? "Failed to fork chat", anchor);
+        workspaceForkError.showError(
+          workspaceId,
+          result.error ?? "Failed to fork workspace",
+          anchor
+        );
       } catch (error) {
         // IPC/transport failures throw instead of returning { success: false }
         const message = getErrorMessage(error);
@@ -3798,7 +3802,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           />
           <PopoverError
             error={workspaceArchiveError.error}
-            prefix="Failed to archive chat"
+            prefix="Failed to archive workspace"
             onDismiss={workspaceArchiveError.clearError}
           />
           <PopoverError
@@ -3808,7 +3812,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           />
           <PopoverError
             error={workspaceForkError.error}
-            prefix="Failed to fork chat"
+            prefix="Failed to fork workspace"
             onDismiss={workspaceForkError.clearError}
           />
           <PopoverError

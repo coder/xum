@@ -294,7 +294,7 @@ function installWorkspaceMenuBarTestDoubles() {
     ((props: { onArchiveChat?: ((anchorEl: HTMLElement) => void) | null }) =>
       props.onArchiveChat ? (
         <button type="button" onClick={(event) => props.onArchiveChat?.(event.currentTarget)}>
-          Archive chat
+          Archive workspace
         </button>
       ) : null) as unknown as typeof WorkspaceActionsMenuContentModule.WorkspaceActionsMenuContent
   );
@@ -953,7 +953,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     const view = render(<WorkspaceMenuBar {...defaultProps} />);
 
     act(() => {
-      fireEvent.click(view.getByRole("button", { name: "Archive chat" }));
+      fireEvent.click(view.getByRole("button", { name: "Archive workspace" }));
     });
 
     await waitFor(() => {
@@ -974,7 +974,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
     const view = render(<WorkspaceMenuBar {...defaultProps} />);
     act(() => {
-      fireEvent.click(view.getByRole("button", { name: "Archive chat" }));
+      fireEvent.click(view.getByRole("button", { name: "Archive workspace" }));
     });
     await waitFor(() => expect(resolvePreflight).toBeDefined());
 

@@ -516,7 +516,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           sourceWorkspaceId: workspaceId,
         });
         if (!result.success) {
-          forkError.showError(workspaceId, result.error ?? "Failed to fork chat", anchor);
+          forkError.showError(workspaceId, result.error ?? "Failed to fork workspace", anchor);
         }
       } catch (error) {
         const message = getErrorMessage(error);
@@ -1107,12 +1107,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       />
       <PopoverError
         error={forkError.error}
-        prefix="Failed to fork chat"
+        prefix="Failed to fork workspace"
         onDismiss={forkError.clearError}
       />
       <PopoverError
         error={archiveError.error}
-        prefix="Failed to archive chat"
+        prefix="Failed to archive workspace"
         onDismiss={archiveError.clearError}
       />
     </div>
