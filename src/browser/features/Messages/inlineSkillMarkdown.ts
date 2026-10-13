@@ -15,10 +15,24 @@ function createTextNode(value: string): Text {
   return { type: "text", value };
 }
 
-function createInlineSkillLink(skillName: string, visibleText: string): Link {
+/**
+ * Separates a qualified `$plugin:skill` name from its bare fallback in the href.
+ * encodeURIComponent always escapes `/`, so it cannot appear inside either name.
+ */
+export const INLINE_SKILL_HREF_FALLBACK_SEPARATOR = "/";
+
+function createInlineSkillLink(
+  skillName: string,
+  visibleText: string,
+  fallbackSkillName?: string
+): Link {
+  const fallback =
+    fallbackSkillName != null
+      ? `${INLINE_SKILL_HREF_FALLBACK_SEPARATOR}${encodeURIComponent(fallbackSkillName)}`
+      : "";
   return {
     type: "link",
-    url: `${INTERNAL_INLINE_SKILL_HREF_PREFIX}${encodeURIComponent(skillName)}`,
+    url: `${INTERNAL_INLINE_SKILL_HREF_PREFIX}${encodeURIComponent(skillName)}${fallback}`,
     children: [createTextNode(visibleText)],
   };
 }
@@ -59,7 +73,9 @@ function buildInlineSkillReplacementNodes(textNode: Text): PhrasingContent[] | n
       replacements.push(createTextNode(text.slice(previousEnd, candidate.startIndex)));
     }
 
-    replacements.push(createInlineSkillLink(candidate.skillName, visibleText));
+    replacements.push(
+      createInlineSkillLink(candidate.skillName, visibleText, candidate.fallback?.skillName)
+    );
     previousEnd = candidate.endIndex;
   }
 

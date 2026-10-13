@@ -56,6 +56,17 @@ describe("Inline skill Markdown rendering", () => {
     expect(badges.map((badge) => badge.textContent)).toEqual(["$deep-review", "$tdd"]);
   });
 
+  test("badges a qualified reference, or only its bare prefix when that loaded instead", () => {
+    const view = renderMarkdown("Use $pstack:tdd and $tdd:notes here", {
+      "pstack:tdd": createSkillSnapshot("pstack:tdd"),
+      tdd: createSkillSnapshot("tdd"),
+    });
+
+    const badges = getSkillBadges(view.container);
+    expect(badges.map((badge) => badge.textContent)).toEqual(["$pstack:tdd", "$tdd"]);
+    expect(view.container.textContent).toContain("$tdd:notes here");
+  });
+
   test("does not badge inline code or fenced code block tokens", () => {
     const view = renderMarkdown("Use `$tdd` here.\n\n```\n$deep-review\n```", {
       "deep-review": createSkillSnapshot("deep-review"),
