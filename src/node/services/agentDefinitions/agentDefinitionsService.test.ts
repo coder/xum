@@ -1045,7 +1045,7 @@ base: a
         // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
         await expect(
           readAgentDefinition(runtime, checkout.path, "checkout-helper")
-        ).rejects.toThrow();
+        ).rejects.toThrow("Agent definition not found");
       } finally {
         if (previousRoot === undefined) delete process.env.XUM_ROOT;
         else process.env.XUM_ROOT = previousRoot;
