@@ -398,6 +398,17 @@ function TimelineRuleRow(props: {
   );
 }
 
+/** One label/value row of a cache break; a row without a value is not shown. */
+function PromptCacheBreakRow(props: { label: string; value: string | undefined }) {
+  if (props.value == null) return null;
+  return (
+    <>
+      <span>{props.label}</span>
+      <span className="text-content-secondary min-w-0 break-words">{props.value}</span>
+    </>
+  );
+}
+
 function PromptCacheBreakDetails(props: { event: TimelineEvent }) {
   const view = getPromptCacheBreakView(props.event);
   if (view == null) return null;
@@ -405,10 +416,9 @@ function PromptCacheBreakDetails(props: { event: TimelineEvent }) {
     <span className="text-muted counter-nums mt-1 grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-[11px]">
       {/* Wrap instead of truncating: the tool name and size at the end are what a reader needs. */}
       <span className="col-span-2 min-w-0 break-words">{view.position}</span>
-      <span>Before</span>
-      <span className="text-content-secondary min-w-0 break-words">{view.before}</span>
-      <span>After</span>
-      <span className="text-content-secondary min-w-0 break-words">{view.after}</span>
+      <PromptCacheBreakRow label="Before" value={view.before} />
+      <PromptCacheBreakRow label="After" value={view.after} />
+      <PromptCacheBreakRow label="Changed" value={view.changedOptions} />
     </span>
   );
 }

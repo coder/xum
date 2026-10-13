@@ -227,7 +227,7 @@ test("B3: a probe answered 200 gives every charter the real app AI, except [mock
   expect(real.o.env).toMatchObject({
     BUGBASH_AI: "real",
     BUGBASH_AI_RESOLVED: "real",
-    BUGBASH_APP_MODEL: "anthropic:claude-haiku-4-5",
+    BUGBASH_APP_MODEL: "anthropic:claude-haiku-5-5",
   });
   expect(mock.o.env).toMatchObject({ BUGBASH_AI: "mock" });
   expect(mock.o.env.BUGBASH_AI_RESOLVED).toBeUndefined();
@@ -250,7 +250,7 @@ test.each([
   // U2: one probe in every mode; a mock run probes the explorer's upstream instead.
   expect(probes).toHaveLength(1);
   const mock = "BUGBASH_AI" in over && over.BUGBASH_AI === "mock";
-  expect(probeModels).toEqual([mock ? "claude-sonnet-5-5" : "claude-haiku-4-5"]);
+  expect(probeModels).toEqual([mock ? "claude-sonnet-5-5" : "claude-haiku-5-5"]);
 });
 
 test("B3: a stop during the app AI probe ends the run before any job", async () => {
@@ -440,7 +440,7 @@ test("U4: the estimate scales the measured cost, and its headroom covers the cal
   const opusApp = estimateRun({ ...run6, appModel: OPUS });
   expect(opusApp.estimateUsd).toBeGreaterThan(base.estimateUsd);
   expect(opusApp.headroomUsd).toBeGreaterThan(base.headroomUsd);
-  const haiku = estimateRun({ ...run6, appModel: "anthropic:claude-haiku-4-5" });
+  const haiku = estimateRun({ ...run6, appModel: "anthropic:claude-haiku-5-5" });
   expect(haiku.recommendedUsd).toBe(base.recommendedUsd);
 });
 
@@ -500,7 +500,7 @@ test.each([
     // A 403 can also mean the key may not use the probed model (#6094 item 13): name the model
     // and the variable that picks it. A mock run probes an explorer model, else the app model.
     if (status === 403) {
-      expect(refusal).toContain("claude-haiku-4-5");
+      expect(refusal).toContain("claude-haiku-5-5");
       expect(refusal).toContain("BUGBASH_APP_MODEL");
     }
   }
