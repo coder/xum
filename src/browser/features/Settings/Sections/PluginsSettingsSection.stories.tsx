@@ -6,6 +6,7 @@ import { userEvent, within } from "@storybook/test";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { PIXEL_DISABLED } from "@/browser/stories/meta";
 import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
 import type { AgentPluginHooks, AgentPluginListItem } from "@/common/orpc/schemas/agentPlugins";
 
@@ -578,6 +579,10 @@ export const UpdateRequiresReviewPhoneViewport: Story = {
 
 /** Settings hook review: a trusted hook, a changed one that needs review, and one Xum never runs. */
 export const HooksReview: Story = {
+  // The three hook review stories stay out of Pixel snapshots: the repo-wide snapshot budget
+  // (scripts/check-storybook-snapshot-budget.mjs) is at its ceiling. Their plays still check the
+  // review states, the Trust gate and the phone-width overflow.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <PluginsSectionStoryShell options={hooksReviewOptions()}>
       <PluginsSettingsSection />
@@ -605,9 +610,8 @@ export const HooksReviewPhoneViewport: Story = {
   },
   parameters: {
     layout: "fullscreen",
-    pixel: {
-      matrix: { themes: ["dark"], viewports: ["phone"] },
-    },
+    // Out of Pixel snapshots, like HooksReview (snapshot budget).
+    pixel: PIXEL_DISABLED,
   },
   render: () => (
     <PluginsSectionStoryShell options={hooksReviewOptions()}>
@@ -637,9 +641,8 @@ export const HooksReviewTruncatedInputPhoneViewport: Story = {
   },
   parameters: {
     layout: "fullscreen",
-    pixel: {
-      matrix: { themes: ["dark"], viewports: ["phone"] },
-    },
+    // Out of Pixel snapshots, like HooksReview (snapshot budget).
+    pixel: PIXEL_DISABLED,
   },
   render: () => {
     const hooks = structuredClone(GRILL_HOOKS);
