@@ -21,9 +21,6 @@ import {
   type McpAppHostContext,
 } from "./mcpAppHost";
 import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
-import { appViewTabFor } from "../AppViewTab/appViewTabs";
-import { removeTabEverywhere } from "@/browser/utils/rightSidebarLayout";
-import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import {
   beginMcpAppViewDomainsRequest,
   currentMcpAppViewDomainsSeq,
@@ -173,7 +170,7 @@ export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
   variant?: McpAppFrameVariant;
-  /** Panel only: closes the panel's host (its app tab or sheet). */
+  /** Panel only: closes the panel's host (its app tab). */
   onClose?: () => void;
 }) {
   const inline = props.variant === "inline";
@@ -206,9 +203,19 @@ export function McpAppFrame(props: {
   const hostRef = useRef<McpAppHost | null>(null);
   const { workspaceId, view } = props;
   const { toolCallId, serverName, resourceUri } = view;
+  // The view's host lives as long as its frame. The API is null while Xum reconnects and a new
+  // client afterwards; tearing the host down for either reset the view. So the host calls tools
+  // through the latest client, and a call made while offline fails.
+  const apiRef = useRef(api);
+  useEffect(() => {
+    apiRef.current = api;
+  }, [api]);
+  // Fetched once per tool call: a reconnect must not fetch it again (a failed refetch replaced a
+  // working view with an error). A failed fetch is retried with the next client.
+  const viewLoaded = loaded?.toolCallId === toolCallId && loaded.view != null;
 
   useEffect(() => {
-    if (!api) return;
+    if (!api || viewLoaded) return;
     const controller = new AbortController();
     const domainsSeq = currentMcpAppViewDomainsSeq();
     api.mcpApps
@@ -227,7 +234,7 @@ export function McpAppFrame(props: {
         }
       });
     return () => controller.abort();
-  }, [api, workspaceId, toolCallId, serverName, resourceUri]);
+  }, [api, workspaceId, toolCallId, serverName, resourceUri, viewLoaded]);
 
   const current = loaded?.toolCallId === toolCallId ? loaded : null;
   // The result record binds the view to the call that produced it (server, server-local tool
@@ -306,12 +313,12 @@ export function McpAppFrame(props: {
   });
 
   useEffect(() => {
-    if (srcDoc == null || grant == null || !api || guard.navigated) return;
+    if (srcDoc == null || grant == null || guard.navigated) return;
     const getHostContext = (): McpAppHostContext => ({
       theme: latest.current.theme,
       styles: { variables: readStyleVariables() },
-      // The mode follows where this instance lives: its app tab (or phone sheet) is the view's
-      // fullscreen, its tool card the inline mode. A move mounts a new instance there.
+      // The mode follows where this instance lives: its app tab (full-screen sidebar on phones)
+      // is the view's fullscreen, its tool card the inline mode. A move mounts a new instance.
       displayMode: inline ? "inline" : "fullscreen",
       availableDisplayModes: ["inline", "fullscreen"],
       containerDimensions: {
@@ -341,7 +348,9 @@ export function McpAppFrame(props: {
       },
       getHostContext,
       callTool: async (toolName, args, consented) => {
-        const result = await api.mcpApps.callTool({
+        const client = apiRef.current;
+        if (client == null) throw new Error("Xum is reconnecting. Try again once it is back.");
+        const result = await client.mcpApps.callTool({
           workspaceId,
           serverName: boundServerName,
           toolName,
@@ -353,7 +362,9 @@ export function McpAppFrame(props: {
       },
       // Same server binding as callTool: reads go only to the server that produced the view.
       readResource: async (uri) => {
-        const result = await api.mcpApps.readResource({
+        const client = apiRef.current;
+        if (client == null) throw new Error("Xum is reconnecting. Try again once it is back.");
+        const result = await client.mcpApps.readResource({
           workspaceId,
           serverName: boundServerName,
           uri,
@@ -363,7 +374,9 @@ export function McpAppFrame(props: {
       },
       // Bound like callTool: the backend attributes the context to the view's result record.
       updateModelContext: async (text) => {
-        const result = await api.mcpApps.updateModelContext({
+        const client = apiRef.current;
+        if (client == null) throw new Error("Xum is reconnecting. Try again once it is back.");
+        const result = await client.mcpApps.updateModelContext({
           workspaceId,
           toolCallId,
           serverName: boundServerName,
@@ -415,11 +428,6 @@ export function McpAppFrame(props: {
             return;
           }
           latest.current.onClose?.();
-          // The phone sheet's close only closes the dialog: drop the stored tab too, or the
-          // card keeps its placeholder and the hidden sidebar mounts the view again.
-          updateRightSidebarLayout(workspaceId, (layout) =>
-            removeTabEverywhere(layout, appViewTabFor(toolCallId))
-          );
         };
       },
       log: (message, data) =>
@@ -445,7 +453,6 @@ export function McpAppFrame(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     srcDoc,
-    api,
     workspaceId,
     serverName,
     boundServerName,

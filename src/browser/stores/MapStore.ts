@@ -58,6 +58,7 @@ export class MapStore<K, V> {
       this.cache.set(key, compute());
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     return this.cache.get(key)!;
   }
 

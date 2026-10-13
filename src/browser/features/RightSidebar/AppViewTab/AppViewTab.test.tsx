@@ -2,7 +2,7 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import {
   appViewDetails,
@@ -14,7 +14,6 @@ import { APIProvider } from "@/browser/contexts/API";
 import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { createTestApiClient } from "@/browser/testUtils";
 import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab";
-import { AppViewDialog } from "./AppViewDialog";
 
 describe("AppViewTabPanel", () => {
   let cleanupDom: (() => void) | null = null;
@@ -62,71 +61,6 @@ describe("AppViewTabPanel", () => {
       expect(view.queryByTestId("mcp-app-frame")).toBeNull();
       fireEvent.click(view.getByRole("button", { name: "Close" }));
       expect(closed).toBe(1);
-    } finally {
-      registered.mockRestore();
-      state.mockRestore();
-    }
-  });
-
-  test("the phone sheet and a tab in the hidden sidebar never both run the view", async () => {
-    const store = useWorkspaceStoreRaw();
-    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
-      (id) => id === "ws-sheet"
-    );
-    const state = spyOn(store, "getWorkspaceState").mockImplementation(
-      () =>
-        ({
-          messages: [],
-          loading: false,
-          isHydratingTranscript: false,
-        }) as unknown as WorkspaceState
-    );
-    openMcpAppViewTab("ws-sheet", {
-      toolCallId: "call-s",
-      serverName: "dice",
-      resourceUri: "ui://dice/board.html",
-      toolName: "show",
-      label: "Board",
-      arguments: {},
-      cancelled: false,
-      failed: false,
-    });
-    const client = createTestApiClient({
-      mcpApps: {
-        getView: () =>
-          Promise.resolve({
-            success: true as const,
-            data: {
-              html: "<p>view</p>",
-              csp: {},
-              prefersBorder: null,
-              resultAvailable: true,
-              result: { content: [] },
-              invocation: null,
-            },
-          }),
-      },
-    });
-    try {
-      const panel = (host: "tab" | "sheet") => (
-        <AppViewTabPanel
-          workspaceId="ws-sheet"
-          toolCallId="call-s"
-          host={host}
-          onClose={() => undefined}
-        />
-      );
-      const view = render(
-        <ThemeProvider forcedTheme="dark">
-          <APIProvider client={client}>
-            {panel("tab")}
-            {panel("sheet")}
-          </APIProvider>
-        </ThemeProvider>
-      );
-      await view.findByTestId("mcp-app-frame");
-      await waitFor(() => expect(view.getByRole("button", { name: "Go to tab" })).toBeTruthy());
-      expect(view.getAllByTestId("mcp-app-frame")).toHaveLength(1);
     } finally {
       registered.mockRestore();
       state.mockRestore();
@@ -349,67 +283,6 @@ describe("AppViewTabPanel", () => {
     } finally {
       registered.mockRestore();
       state.mockRestore();
-    }
-  });
-
-  test("a long unbroken server name truncates in the phone sheet header, not the close button", () => {
-    // The longest configured key, without a break opportunity. happy-dom cannot measure layout,
-    // so this pins the flex contract: every box from the header row down to the server text can
-    // shrink and clips, and the close button follows in the same row without shrinking.
-    const server = "s".repeat(80);
-    openMcpAppViewTab("ws-long", {
-      toolCallId: "call-long",
-      serverName: server,
-      resourceUri: "ui://long/view",
-      toolName: "show",
-      label: "Board",
-      arguments: {},
-      cancelled: false,
-      failed: false,
-    });
-    const store = useWorkspaceStoreRaw();
-    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(() => false);
-    try {
-      const client = createTestApiClient({
-        mcpApps: { getView: () => Promise.resolve({ success: false as const, error: "offline" }) },
-      });
-      const view = render(
-        <ThemeProvider forcedTheme="dark">
-          <APIProvider client={client}>
-            <AppViewDialog
-              workspaceId="ws-long"
-              toolCallId="call-long"
-              open
-              onOpenChange={() => undefined}
-            />
-            <div data-testid="tab-strip">
-              <AppViewTabLabel workspaceId="ws-long" toolCallId="call-long" />
-            </div>
-          </APIProvider>
-        </ThemeProvider>
-      );
-      const dialog = within(view.getByTestId("app-view-dialog"));
-      const title = dialog.getByRole("heading");
-      const row = title.parentElement;
-      const close = dialog.getByRole("button", { name: "Close" });
-      expect(close.parentElement).toBe(row);
-      expect(close.previousElementSibling).toBe(title);
-      expect(close.classList.contains("shrink-0")).toBe(true);
-      const serverText = within(title).getByText(server);
-      expect(serverText.classList.contains("truncate")).toBe(true);
-      for (
-        let el: HTMLElement | null = serverText;
-        el !== row && el != null;
-        el = el.parentElement
-      ) {
-        expect([el.tagName, el.classList.contains("min-w-0")]).toEqual([el.tagName, true]);
-        expect([el.tagName, el.classList.contains("shrink-0")]).toEqual([el.tagName, false]);
-      }
-      // The tab strip label is unchanged: its server keeps its width (the tab clips it).
-      const tabServer = within(view.getByTestId("tab-strip")).getByText(server);
-      expect(tabServer.classList.contains("shrink-0")).toBe(true);
-    } finally {
-      registered.mockRestore();
     }
   });
 

@@ -83,7 +83,7 @@ export const createArtifactListTool: ToolFactory = (config) =>
               `${scratchDir.replace(/\/+$/, "")}/${ARTIFACTS_DIR_NAME}`,
               abortSignal
             );
-      // Latest published/snapshotted version per artifact (M4), so the model can refer to "v3".
+      // Latest published version per artifact (M4), so the model can refer to "v3".
       const latestByPath = new Map<string, { version: number; label: string | null }>();
       if (config.workspaceSessionDir != null) {
         for (const index of await listArtifactIndexes(config.workspaceSessionDir)) {
@@ -92,7 +92,7 @@ export const createArtifactListTool: ToolFactory = (config) =>
             latestByPath.set(index.path, { version: latest.version, label: latest.label });
         }
       }
-      // window.xum.setState of the latest version (M5b). Only sandboxed HTML/SVG can set state,
+      // window.xum.setState of the artifact (M5b). Only sandboxed HTML/SVG can set state,
       // and only artifacts with a stored directory (versions or state) can have any, so the rest
       // skip the read. The reads run a bounded batch at a time instead of one by one.
       const stateByPath = new Map<string, Awaited<ReturnType<typeof summarizeArtifactState>>>();
@@ -128,7 +128,6 @@ export const createArtifactListTool: ToolFactory = (config) =>
           ...(state != null
             ? {
                 state: state.state,
-                stateVersion: state.version,
                 ...(state.truncated ? { stateTruncated: true } : {}),
               }
             : {}),

@@ -424,6 +424,74 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
+  // #6117 covered a close that leaves tabs in the pane. These cover the close of a pane's last
+  // tab: the pane empties (or collapses), and focus must still land on a tab, not <body>.
+  const closeByKeyboard = (close: HTMLElement) => {
+    close.focus();
+    // A focused button turns Enter into a click on itself.
+    fireEvent.click(close);
+  };
+  const activeTabDescription = () => {
+    const active = document.activeElement;
+    return active?.getAttribute("role") === "tab"
+      ? `tab ${active.getAttribute("aria-controls") ?? ""}`
+      : (active?.tagName ?? "none");
+  };
+
+  test("closing the only pane's last tab by keyboard focuses the New tab", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs"]));
+    try {
+      closeByKeyboard(
+        await findRequiredElement(
+          sidebar,
+          'button[aria-label="Close Stats"]',
+          "Close Stats not found"
+        )
+      );
+      await findSidebarPanel(sidebar, "-panel-new");
+      await waitFor(() => expect(activeTabDescription()).toMatch(/^tab .*-panel-new$/));
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("closing a split pane's last tab by keyboard focuses the other pane's tab", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      const layout: RightSidebarLayoutState = {
+        version: 1,
+        openTabsOnly: true,
+        nextId: 3,
+        focusedTabsetId: "tabset-2",
+        root: {
+          type: "split",
+          id: "split-1",
+          direction: "vertical",
+          sizes: [50, 50],
+          children: [
+            { type: "tabset", id: "tabset-1", tabs: ["costs"], activeTab: "costs" },
+            { type: "tabset", id: "tabset-2", tabs: ["review"], activeTab: "review" },
+          ],
+        },
+      };
+      updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
+    });
+    try {
+      closeByKeyboard(
+        await findRequiredElement(
+          sidebar,
+          'button[aria-label="Close Review"]',
+          "Close Review not found"
+        )
+      );
+      await waitFor(() => {
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+      });
+      await waitFor(() => expect(activeTabDescription()).toMatch(/^tab .*-panel-costs$/));
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
   test("Close Tab leaves the tab alone while the interactive browser has focus", async () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() =>
       seedLayout(["costs", "review"], "review")
@@ -493,6 +561,39 @@ describeIntegration("RightSidebar (UI)", () => {
         const tablist = sidebar.querySelector('[role="tablist"]');
         if (!tablist) throw new Error("Tablist should be visible after expand");
       });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("the header's stand-in for the overview card expands the sidebar onto its focused tab", async () => {
+    const { view, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+      seedLayout(["costs"]);
+    });
+
+    try {
+      // globals.css shows this button only where the card would cover the transcript; the DOM
+      // carries it whenever the sidebar is collapsed.
+      const expandButton = await waitFor(() =>
+        within(view.container).getByRole("button", { name: "Expand right sidebar" })
+      );
+      fireEvent.click(expandButton);
+
+      // Same path as the card's Expand: focus lands on the sidebar's tab instead of falling to
+      // the page body when the header button unmounts.
+      await waitFor(() => {
+        const costsTab = view.container.querySelector<HTMLElement>(
+          '[role="tab"][aria-controls*="costs"]'
+        );
+        if (costsTab?.getAttribute("aria-selected") !== "true") {
+          throw new Error("Stats tab should be selected after expanding from the header");
+        }
+        expect(document.activeElement).toBe(costsTab);
+      });
+      expect(
+        within(view.container).queryByRole("button", { name: "Expand right sidebar" })
+      ).toBeNull();
     } finally {
       await cleanup();
     }
@@ -795,6 +896,54 @@ describeIntegration("RightSidebar (UI)", () => {
           throw new Error(`Expected width <= ${expectedMaxWidth}, got ${width}`);
         }
       });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("dragging the handle far right collapses into the overview card, which reopens Review", async () => {
+    const { view, sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      seedLayout(["costs"]);
+    });
+
+    try {
+      const resizeHandle = await findRequiredElement(
+        sidebar,
+        '[class*="cursor-col-resize"]',
+        "Resize handle not found"
+      );
+      const widthBeforeDrag = getSidebarWidth(sidebar);
+
+      // Moving the handle right by the sidebar's whole width asks for a 0px sidebar, far past
+      // the snap point, so the sidebar collapses instead of holding at its minimum width.
+      fireEvent.mouseDown(resizeHandle, { clientX: 800 });
+      fireEvent.mouseMove(document, { clientX: 800 + widthBeforeDrag });
+      fireEvent.mouseUp(document);
+
+      const card = await waitFor(() => {
+        const element = view.container.querySelector<HTMLElement>(RIGHT_SIDEBAR_SELECTOR);
+        if (!element) throw new Error("Collapsed sidebar not found");
+        if (element.querySelector('[role="tablist"]')) {
+          throw new Error("Sidebar should collapse when dragged past the snap point");
+        }
+        return element;
+      });
+
+      // The card's Changes row reopens the sidebar on Review, at the width it had before the drag.
+      fireEvent.click(within(card).getByRole("button", { name: /Changes/ }));
+      const expanded = await findRequiredElement(
+        view.container,
+        RIGHT_SIDEBAR_SELECTOR,
+        "RightSidebar not found after expand"
+      );
+      await waitFor(() => {
+        const reviewTab = expanded.querySelector('[role="tab"][aria-controls*="review"]');
+        if (reviewTab?.getAttribute("aria-selected") !== "true") {
+          throw new Error("Review tab should be selected after expanding from the card");
+        }
+      });
+      expect(getSidebarWidth(expanded)).toBe(widthBeforeDrag);
     } finally {
       await cleanup();
     }
