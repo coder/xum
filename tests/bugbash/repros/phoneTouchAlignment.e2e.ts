@@ -78,6 +78,41 @@ for (const width of [390, 768]) {
 }
 
 test(
+  "Checkboxes keep their size and line up with their labels on a touch phone",
+  { tags: ["bugbash", "touch-alignment", "5835"] },
+  async ({ app, screen, browser }) => {
+    await browser.setViewport({ width: 390, height: 844 });
+    await openPlayground(app, screen, browser);
+    await openSettings(browser, screen);
+    await screen.getByRole("button", "Backup").tap();
+    await applyTouchPointerRules(browser);
+
+    // Before the fix the 44px minimum drew each checkbox as a 44px square, and its middle sat
+    // 14px below the middle of its label's first line. Inside a label the button shrink-wraps the
+    // drawn box, so the button's size is the drawn size.
+    const measure = () =>
+      browser.evaluate(() => {
+        const checkbox = document.querySelector('[role=dialog] label button[role="checkbox"]');
+        const title = checkbox?.nextElementSibling?.firstElementChild;
+        const row = checkbox?.closest("label");
+        if (!checkbox || !title || !row) return null;
+        const b = checkbox.getBoundingClientRect();
+        const t = title.getBoundingClientRect();
+        return {
+          drawnBox: Math.round(Math.max(b.width, b.height)),
+          centerGap: Math.abs(b.top + b.height / 2 - (t.top + t.height / 2)),
+          rowHeight: Math.round(row.getBoundingClientRect().height),
+        };
+      });
+    await expect.poll(async () => (await measure())?.drawnBox ?? 999).toBeLessThanOrEqual(20);
+    const result = await measure();
+    expect(result?.centerGap ?? 999).toBeLessThanOrEqual(2);
+    // The label row stays a 44px touch target.
+    expect(result?.rowHeight ?? 0).toBeGreaterThanOrEqual(44);
+  }
+);
+
+test(
   "A reply's model and time stay on one line on a touch phone",
   // mock-only: the mock reply's model name is long enough to wrap; a real Haiku reply can fit
   // beside the buttons even with the bug.

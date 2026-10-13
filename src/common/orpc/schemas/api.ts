@@ -180,6 +180,9 @@ import {
   MCPRemoveGlobalParamsSchema,
   MCPRemoveParamsSchema,
   MCPServerMapSchema,
+  MCPSettingsReadInputSchema,
+  MCPSettingsSnapshotSchema,
+  MCPSettingsUpdateParamsSchema,
   MCPSetEnabledGlobalParamsSchema,
   MCPSetEnabledParamsSchema,
   MCPSetToolAllowlistGlobalParamsSchema,
@@ -827,7 +830,8 @@ export const mcpOauth = {
     output: z.void(),
   },
   getAuthStatus: {
-    input: z.object({ serverUrl: z.string() }).strict(),
+    /** `serverName` applies that configured server's plugin client (see getAuthStatusForApi). */
+    input: z.object({ serverUrl: z.string(), serverName: z.string().optional() }).strict(),
     output: z.object({
       serverUrl: z.string().optional(),
       isLoggedIn: z.boolean(),
@@ -1133,6 +1137,29 @@ export const projects = {
  */
 export const mcp = {
   designStatus: { input: z.void(), output: ClaudeDesignStatusSchema },
+  /** OpenAI structured settings of one workspace server (`openai/settings`). */
+  settings: {
+    read: {
+      input: MCPSettingsReadInputSchema,
+      /**
+       * Per server name: null when the server has no `openai/settings` capability;
+       * `{ notConnected: true }` when `ifConnected` found it not running.
+       */
+      output: z.record(
+        z.string(),
+        ResultSchema(
+          z
+            .union([MCPSettingsSnapshotSchema, z.object({ notConnected: z.literal(true) })])
+            .nullable(),
+          z.string()
+        )
+      ),
+    },
+    update: {
+      input: MCPSettingsUpdateParamsSchema,
+      output: ResultSchema(MCPSettingsSnapshotSchema.shape.values, z.string()),
+    },
+  },
   configureDesign: {
     input: ClaudeDesignSettingsSchema.pick({ source: true, reuseEnabled: true }).partial({
       source: true,

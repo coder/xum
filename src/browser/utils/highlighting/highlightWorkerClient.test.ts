@@ -9,6 +9,9 @@
  * main-thread Shiki because JSDOM has no Worker).
  */
 
+import * as Comlink from "comlink";
+import { groupDiffLines } from "./diffChunking";
+import { highlightDiffChunks } from "./highlightDiffChunk";
 import {
   highlightCode,
   highlightWithBudget,
@@ -298,7 +301,7 @@ describe("highlightWithBudget", () => {
       20
     );
 
-    await Promise.resolve();
+    await flushQueue();
     expect(firstStarted).toBe(true);
     expect(secondStarted).toBe(false);
 
@@ -442,5 +445,156 @@ describe("highlightWithBudget", () => {
     expect(cacheProbes).toHaveLength(1);
     await Promise.all(cacheProbes);
     expect(cacheHitObservedInsideOnTimeout).toBe(true);
+  });
+});
+
+// #6292: the first job of a worker also waited for the worker to start (script load, Shiki's
+// engine and the language's grammar). On a cold load that used up the 5 s budget, the input was
+// marked as wedged, and it stayed plain text for the rest of the session.
+describe("highlightCode worker start-up", () => {
+  const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+  const originalWorker = globalThis.Worker;
+  /** This input never finishes highlighting (catastrophic backtracking). */
+  const WEDGED = "wedged input";
+
+  /** When the next fake worker starts: ms until it answers messages, or null for never. */
+  let startDelays: Array<number | null> = [];
+  let created: FakeWorker[] = [];
+
+  /** A Worker that speaks Comlink over a real MessageChannel and starts after a delay. */
+  class FakeWorker {
+    readonly port: MessagePort;
+    terminated = false;
+    readonly highlighted: string[] = [];
+    onerror: ((event: unknown) => void) | null = null;
+    constructor() {
+      const startDelay = startDelays.shift();
+      if (startDelay === undefined) throw new Error("No start delay for this fake worker");
+      const channel = new MessageChannel();
+      this.port = channel.port1;
+      created.push(this);
+      const api = {
+        prepare: () => Promise.resolve(),
+        highlight: (code: string) => {
+          this.highlighted.push(code);
+          return new Promise<string>((resolve) => {
+            if (code !== WEDGED) setTimeout(() => resolve(`<pre>${code}</pre>`), 10);
+          });
+        },
+      };
+      // Messages posted before the worker starts wait in the port, as they do for a real worker.
+      if (startDelay !== null) setTimeout(() => Comlink.expose(api, channel.port2), startDelay);
+    }
+    postMessage(message: unknown, transfer: Transferable[] = []) {
+      this.port.postMessage(message, transfer);
+    }
+    addEventListener(type: string, listener: EventListener) {
+      this.port.addEventListener(type, listener);
+    }
+    removeEventListener(type: string, listener: EventListener) {
+      this.port.removeEventListener(type, listener);
+    }
+    start() {
+      this.port.start();
+    }
+    terminate() {
+      this.terminated = true;
+      this.port.close();
+    }
+  }
+
+  /** Lets real MessageChannel deliveries (macrotasks) and their promise chains run. */
+  async function deliverMessages(): Promise<void> {
+    for (let i = 0; i < 10; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+
+  /**
+   * How `promise` settles while fake time advances by up to `ms`, in steps that each deliver the
+   * messages they release. "pending" when it has not settled by then (never a hung test).
+   */
+  async function settleWithin<T>(promise: Promise<T>, ms: number) {
+    let outcome: { value: T } | { error: string } | "pending" = "pending";
+    promise.then(
+      (value) => (outcome = { value }),
+      (error: unknown) => (outcome = { error: String(error) })
+    );
+    await deliverMessages();
+    for (let elapsed = 0; elapsed < ms && outcome === "pending"; elapsed += 50) {
+      fakeTimers.advanceTimersByTime(Math.min(50, ms - elapsed));
+      await deliverMessages();
+    }
+    return outcome;
+  }
+
+  let warnSpy: { mockRestore: () => void } | undefined;
+  beforeEach(() => {
+    startDelays = [];
+    created = [];
+    __resetForTests();
+    globalThis.Worker = FakeWorker as unknown as typeof Worker;
+    warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+    warnSpy?.mockRestore();
+    __resetForTests();
+    if (originalWorker === undefined) Reflect.deleteProperty(globalThis, "Worker");
+    else globalThis.Worker = originalWorker;
+  });
+
+  it("a worker that starts slower than the budget still highlights the input", async () => {
+    startDelays = [6_000];
+    const outcome = await settleWithin(highlightCode("const a = 1;", "typescript", "dark"), 6_500);
+    expect(outcome).toEqual({ value: "<pre>const a = 1;</pre>" });
+    expect(created.map((w) => w.terminated)).toEqual([false]);
+
+    // Not marked as wedged: the next render of the same input reaches the worker again.
+    const again = await settleWithin(highlightCode("const a = 1;", "typescript", "dark"), 250);
+    expect(again).toEqual({ value: "<pre>const a = 1;</pre>" });
+    expect(created[0].highlighted).toEqual(["const a = 1;", "const a = 1;"]);
+  });
+
+  it("an input that wedges a warm worker ends it in 5 s and is skipped afterwards", async () => {
+    startDelays = [0, 0];
+    expect(await settleWithin(highlightCode("ok", "typescript", "dark"), 250)).toEqual({
+      value: "<pre>ok</pre>",
+    });
+
+    const outcome = await settleWithin(highlightCode(WEDGED, "typescript", "dark"), 5_000);
+    expect(outcome).toEqual({ error: "Error: HIGHLIGHT_TIMEOUT" });
+    expect(created.map((w) => w.terminated)).toEqual([true]);
+
+    // Marked: the next render fails fast, without a new worker.
+    const again = await settleWithin(highlightCode(WEDGED, "typescript", "dark"), 250);
+    expect(again).toEqual({ error: "Error: HIGHLIGHT_TIMEOUT" });
+    expect(created).toHaveLength(1);
+  });
+
+  it("a worker that never starts is ended, and the next request gets a new worker", async () => {
+    startDelays = [null, 0];
+    const first = highlightCode("const a = 1;", "typescript", "dark");
+    const queued = highlightCode("const b = 2;", "typescript", "dark");
+    const outcome = await settleWithin(first, 30_000);
+    expect(outcome).toEqual({ error: "Error: HIGHLIGHT_WORKER_START_TIMEOUT" });
+    expect(created[0].terminated).toBe(true);
+
+    // The queue moved on to a new worker.
+    expect(await settleWithin(queued, 250)).toEqual({ value: "<pre>const b = 2;</pre>" });
+    // The input was not marked: it highlights on the new worker.
+    expect(await settleWithin(highlightCode("const a = 1;", "typescript", "dark"), 250)).toEqual({
+      value: "<pre>const a = 1;</pre>",
+    });
+    expect(created).toHaveLength(2);
+  });
+
+  // DiffRenderer caches what highlightDiffChunks returns: a plain-text fallback would stay for
+  // the session, so a worker that did not start must reject instead.
+  it("a diff whose worker did not start rejects instead of returning a plain-text fallback", async () => {
+    startDelays = [null];
+    const chunks = groupDiffLines(["+const a = 1;"], 1, 1);
+    const outcome = await settleWithin(highlightDiffChunks(chunks, "typescript", "dark"), 30_000);
+    expect(outcome).toEqual({ error: "Error: HIGHLIGHT_WORKER_START_TIMEOUT" });
   });
 });

@@ -73,7 +73,7 @@ const CONTRIBUTES_KEYS = new Set<string>([...CONTRIBUTES_PATH_KEYS, "slashComman
  * enforced again at discovery time; rejecting obvious escapes here yields
  * clearer manifest-level warnings.
  */
-function isSafeContributesPath(value: string): boolean {
+export function isSafeContributesPath(value: string): boolean {
   if (value.length === 0 || value.includes("\0")) {
     return false;
   }
@@ -230,7 +230,7 @@ const OPTIONAL_STRING_FIELDS = [
 
 const AUTHOR_KEYS = ["name", "email", "url"] as const;
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
