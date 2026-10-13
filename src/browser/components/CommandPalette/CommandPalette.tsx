@@ -55,21 +55,6 @@ interface PaletteGroup {
   items: PaletteItem[];
 }
 
-// An action with a prompt needs its input, so open the palette on the prompt (the workspace menu
-// bar's Edit title row, #6202). Others run directly.
-function runOrPrompt(
-  action: CommandAction,
-  open: () => void,
-  startPrompt: (action: CommandAction) => void
-): void {
-  if (action.prompt) {
-    open();
-    startPrompt(action);
-    return;
-  }
-  void action.run();
-}
-
 export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext }) => {
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationExperimentEnabled = useExperimentValue(
@@ -82,7 +67,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
 
   const commandPanelRef = useRef<HTMLDivElement | null>(null);
   const paletteOpenOriginRef = useRef<HTMLElement | null>(null);
-  const { isOpen, initialQuery, open, close, getActions, addRecent, recent } = useCommandRegistry();
+  const { isOpen, initialQuery, close, getActions, addRecent, recent } = useCommandRegistry();
   const agentSkills = useAgentSkills(
     isOpen && slashWorkspaceId
       ? { workspaceId: slashWorkspaceId, disableWorkspaceAgents: false }
@@ -176,13 +161,14 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
         return;
       }
 
-      runOrPrompt(action, open, startPrompt);
+      // Run the action directly
+      void action.run();
       addRecent(action.id);
     };
 
     window.addEventListener(CUSTOM_EVENTS.EXECUTE_COMMAND, handleExecuteCommand);
     return () => window.removeEventListener(CUSTOM_EVENTS.EXECUTE_COMMAND, handleExecuteCommand);
-  }, [getActions, open, startPrompt, addRecent]);
+  }, [getActions, startPrompt, addRecent]);
 
   const handlePromptValue = useCallback(
     (value: string) => {

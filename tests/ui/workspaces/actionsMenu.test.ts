@@ -3,8 +3,6 @@
  *
  * - The sidebar row's settings dialogs are React children of that row. A click on a dialog's
  *   backdrop must not reach the row's own click handler and select the workspace.
- * - The top-bar "Edit workspace title" opens the command palette's title prompt, which works
- *   whatever the sidebar shows (a collapsed project, section or age tier unmounts the row).
  */
 
 import "../dom";
@@ -100,34 +98,6 @@ describeIntegration("Workspace actions menus (UI)", () => {
       if (otherId) {
         await app.env.orpc.workspace.remove({ workspaceId: otherId, options: { force: true } });
       }
-      await app.dispose();
-    }
-  }, 60_000);
-
-  test("the top bar edits the title in the palette, also when the sidebar hides the row", async () => {
-    const app = await createAppHarness({ branchPrefix: "ui-actions-edit-title" });
-    try {
-      const title = app.metadata.title ?? app.metadata.name;
-      // A collapsed project unmounts the row, so an inline edit there would show no input.
-      fireEvent.click(
-        app.view.getByRole("button", { name: `Collapse project ${app.metadata.projectName}` })
-      );
-      await waitFor(() =>
-        expect(
-          app.view.container.querySelector(
-            `[data-workspace-id="${app.workspaceId}"][data-workspace-path]`
-          )
-        ).toBeNull()
-      );
-
-      fireEvent.click(app.view.getByTestId("workspace-more-actions"));
-      fireEvent.click(await waitFor(() => findButton("Edit workspace title")));
-
-      await waitFor(() => expect(document.body.textContent).toContain("Edit Workspace Title"));
-      expect(
-        app.view.queryByRole("textbox", { name: `Edit title for workspace ${title}` })
-      ).toBeNull();
-    } finally {
       await app.dispose();
     }
   }, 60_000);

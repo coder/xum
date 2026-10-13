@@ -98,6 +98,10 @@ const UNPIN_ROW: ActionRow = {
   icon: <PinOff />,
 };
 const HIDE_SUB_AGENTS_ROW: ActionRow = { label: "Hide sub-agents", icon: <EyeOff /> };
+// Sidebar rows: the menu bar handles these shortcuts for the SELECTED workspace, so a hint in
+// another row's menu would promise the wrong target (Codex on #6301).
+const SIDEBAR_MCP_ROW: ActionRow = { ...ACTION_ROWS.configureMcp, keybind: undefined };
+const SIDEBAR_MESSAGING_ROW: ActionRow = { ...ACTION_ROWS.configureMessaging, keybind: undefined };
 
 interface WorkspaceActionButtonProps {
   row: ActionRow;
@@ -156,6 +160,10 @@ export function getShownWorkspaceActionGroups(
 function getActionRow(id: WorkspaceActionId, props: WorkspaceActionsMenuContentProps): ActionRow {
   if (id === "togglePinned" && props.isPinned) return UNPIN_ROW;
   if (id === "toggleSubAgents" && props.subAgentsExpanded === true) return HIDE_SUB_AGENTS_ROW;
+  if (props.state.surface === "sidebar") {
+    if (id === "configureMcp") return SIDEBAR_MCP_ROW;
+    if (id === "configureMessaging") return SIDEBAR_MESSAGING_ROW;
+  }
   return ACTION_ROWS[id];
 }
 

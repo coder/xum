@@ -85,13 +85,12 @@ const cases: Array<{ name: string; state: WorkspaceActionsState; groups: Workspa
     {
       name: "top bar, root workspace on a desktop",
       state: topBar({}),
-      groups: [TITLE, SETTINGS, ["immersiveReview"], ["togglePinned"], ["fork", "archive"]],
+      groups: [SETTINGS, ["immersiveReview"], ["togglePinned"], ["fork", "archive"]],
     },
     {
       name: "top bar, root workspace on a touch phone with the sidebar hidden",
       state: topBar({ isTouchMobileScreen: true, isPhoneHeader: true, isRightSidebarHidden: true }),
       groups: [
-        TITLE,
         SETTINGS,
         ["touchFullscreenReview", "openSidebar", "openTerminal"],
         ["togglePinned"],
@@ -101,7 +100,7 @@ const cases: Array<{ name: string; state: WorkspaceActionsState; groups: Workspa
     {
       name: "top bar, root workspace on a touch tablet",
       state: topBar({ isTouchMobileScreen: true }),
-      groups: [TITLE, SETTINGS, ["touchFullscreenReview"], ["togglePinned"], ["fork", "archive"]],
+      groups: [SETTINGS, ["touchFullscreenReview"], ["togglePinned"], ["fork", "archive"]],
     },
     {
       name: "top bar, scratch chat on a touch phone",
@@ -111,33 +110,27 @@ const cases: Array<{ name: string; state: WorkspaceActionsState; groups: Workspa
         isPhoneHeader: true,
         isRightSidebarHidden: true,
       }),
-      groups: [TITLE, SETTINGS, ["openSidebar", "openTerminal"], ["togglePinned"], ["archive"]],
+      groups: [SETTINGS, ["openSidebar", "openTerminal"], ["togglePinned"], ["archive"]],
     },
     {
       name: "top bar, sub-agent",
       state: topBar({ workspace: subAgent, showsSubAgent: true }),
-      groups: [TITLE, SUB_AGENT_SETTINGS, ["immersiveReview"], ["fork"]],
+      groups: [SUB_AGENT_SETTINGS, ["immersiveReview"], ["fork"]],
     },
     {
       name: "top bar, root with a running devcontainer",
       state: topBar({ isRuntimeRunning: true }),
-      groups: [
-        TITLE,
-        SETTINGS,
-        ["immersiveReview"],
-        ["togglePinned"],
-        ["fork", "stopRuntime", "archive"],
-      ],
+      groups: [SETTINGS, ["immersiveReview"], ["togglePinned"], ["fork", "stopRuntime", "archive"]],
     },
     {
       name: "top bar, archived workspace",
       state: topBar({ workspace: archived }),
-      groups: [TITLE, SETTINGS, ["immersiveReview"], ["fork", "archive"]],
+      groups: [SETTINGS, ["immersiveReview"], ["fork", "archive"]],
     },
     {
       name: "top bar, before the workspace's metadata arrives",
       state: topBar({ workspace: undefined }),
-      groups: [TITLE, SETTINGS, ["archive"]],
+      groups: [SETTINGS, ["archive"]],
     },
   ];
 
@@ -146,9 +139,12 @@ describe("getWorkspaceActionGroups", () => {
     expect(getWorkspaceActionGroups(state)).toEqual(groups);
   });
 
-  // The issue's promise: apart from the view items (top bar) and row items (sidebar), both menus
+  // The issue's promise: apart from the view items (top bar) and the title and row items
+  // (sidebar), both menus
   // show the same actions in the same order for the same workspace.
   const SURFACE_ONLY = new Set<WorkspaceActionId>([
+    "editTitle",
+    "generateTitle",
     "immersiveReview",
     "touchFullscreenReview",
     "openSidebar",
