@@ -28,6 +28,10 @@
  *    stripsEarlierTurnThinking), earlier turns' thinking blocks are left out,
  *    as Anthropic strips them.
  *
+ * Each sentinel also keeps its options beside the hash (server tools and the
+ * format only as a digest), so a break in a sentinel names the options that
+ * changed.
+ *
  * A request reuses the cache up to the first differing block, so a follow-up
  * request stays warm only when the previous request's blocks are a prefix of
  * its own. cache_control markers move to the newest block on every request,
@@ -53,6 +57,11 @@
  */
 
 import { createHash } from "node:crypto";
+import {
+  describeChangedOption,
+  type PromptCacheChangedOption,
+  type PromptCacheOptionValue,
+} from "@/common/utils/ai/promptCacheChangedOption";
 import { isDeferLoadingTool } from "@/common/utils/tools/toolCatalog";
 
 export const PROMPT_CACHE_SECTIONS = ["tools", "system", "messages"] as const;
@@ -71,6 +80,12 @@ export interface PromptCacheBlockSummary {
 export interface PromptCacheBlock extends PromptCacheBlockSummary {
   section: PromptCacheSection;
   hash: string;
+  /**
+   * Only on the `system_options` and `message_options` sentinels: each option
+   * as reported (a digest for KEY_ONLY_OPTIONS), so a break can name the
+   * option that changed. The hash still decides whether the block matched.
+   */
+  options?: Record<string, PromptCacheOptionValue>;
   /** Set on the single block of a request the fingerprint does not model (see Scope). */
   unsupported?: PromptCacheUnsupportedReason;
 }
@@ -87,6 +102,8 @@ export interface PromptCachePrefixBreak {
   previous: PromptCacheBlockSummary;
   /** Absent when the next request is shorter than the previous one. */
   next?: PromptCacheBlockSummary;
+  /** Set when both first differing blocks are the same options sentinel. */
+  changedOptions?: PromptCacheChangedOption[];
 }
 
 export type PromptCachePrefixComparison =
@@ -100,6 +117,32 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function label(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value.slice(0, 128) : undefined;
+}
+
+/**
+ * Options a break names by key only: server tool configurations hold
+ * arguments (domains, locations) and the structured-output format holds a
+ * JSON schema with its descriptions. They are kept as a digest.
+ */
+const KEY_ONLY_OPTIONS = new Set(["serverTools", "format"]);
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+/** The reportable form of one sentinel's options (see PromptCacheBlock.options). */
+function optionValues(sentinel: Record<string, unknown>): Record<string, PromptCacheOptionValue> {
+  const values: Record<string, PromptCacheOptionValue> = {};
+  for (const [key, value] of Object.entries(sentinel)) {
+    if (key === "type") continue;
+    const serialized = JSON.stringify(value) ?? "null";
+    if (KEY_ONLY_OPTIONS.has(key)) values[key] = sha256(serialized).slice(0, 16);
+    else if (typeof value === "string") values[key] = value.slice(0, 128);
+    else if (value === null || typeof value === "number" || typeof value === "boolean") {
+      values[key] = value;
+    } else values[key] = serialized.slice(0, 128);
+  }
+  return values;
 }
 
 /**
@@ -509,7 +552,7 @@ export function fingerprintAnthropicRequest(
   const toolNamesByCallId = new Map<string, string>();
   const toolDefinitions = new Map<string, unknown>();
   const referenceContext = { toolDefinitions, toolSearchNames: toolSearchToolNames(body.tools) };
-  const push = (section: PromptCacheSection, role: string, value: unknown): void => {
+  const push = (section: PromptCacheSection, role: string, value: unknown): PromptCacheBlock => {
     const serialized = JSON.stringify(value) ?? "null";
     const record = isRecord(value) ? value : {};
     const type = label(record.type) ?? (section === "tools" ? "tool" : typeof value);
@@ -522,17 +565,21 @@ export function fingerprintAnthropicRequest(
     // Tool definitions hold application JSON, not references.
     const expansion =
       section === "tools" ? "" : referencedDefinitions(value, role, referenceContext);
-    const hash = createHash("sha256")
-      .update(`${section}\0${role}\0${serialized}${expansion}`)
-      .digest("hex");
-    blocks.push({
+    const hash = sha256(`${section}\0${role}\0${serialized}${expansion}`);
+    const block: PromptCacheBlock = {
       section,
       role,
       type,
       length: serialized.length,
       ...(toolName != null ? { toolName } : {}),
       hash: hash.slice(0, 16),
-    });
+    };
+    blocks.push(block);
+    return block;
+  };
+  // The sentinel is hashed as before; its options are kept beside the hash.
+  const pushOptions = (section: PromptCacheSection, sentinel: Record<string, unknown>): void => {
+    push(section, "request", sentinel).options = optionValues(sentinel);
   };
 
   const rawMessages: unknown = Array.isArray(body.messages) ? body.messages : body.prompt;
@@ -570,7 +617,7 @@ export function fingerprintAnthropicRequest(
       push("tools", "tool", withoutBlockMarker(tool));
     }
   }
-  push("system", "request", {
+  pushOptions("system", {
     type: "system_options",
     serverTools: serverTools
       .map((entry) => ({ ...entry, key: JSON.stringify(entry.config) }))
@@ -585,7 +632,7 @@ export function fingerprintAnthropicRequest(
   for (const part of leading.flatMap((entry) => entry.system)) {
     push("system", "system", normalizeContentBlock(part));
   }
-  push("messages", "request", {
+  pushOptions("messages", {
     type: "message_options",
     thinking: body.thinking ?? null,
     effort: isRecord(body.output_config) ? (body.output_config.effort ?? null) : null,
@@ -602,8 +649,29 @@ export function fingerprintAnthropicRequest(
 }
 
 function summarize(block: PromptCacheBlock): PromptCacheBlockSummary {
-  const { section: _section, hash: _hash, ...summary } = block;
+  const { section: _section, hash: _hash, options: _options, ...summary } = block;
   return summary;
+}
+
+/** The options that differ when both blocks are the same options sentinel, else undefined. */
+function changedOptions(
+  previous: PromptCacheBlock,
+  next: PromptCacheBlock | undefined
+): PromptCacheChangedOption[] | undefined {
+  if (previous.options == null || next?.options == null || previous.type !== next.type) {
+    return undefined;
+  }
+  const before = previous.options;
+  const after = next.options;
+  const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])];
+  const changed = keys
+    .filter((key) => before[key] !== after[key])
+    .map((key) =>
+      KEY_ONLY_OPTIONS.has(key)
+        ? { key }
+        : { key, previous: before[key] ?? null, next: after[key] ?? null }
+    );
+  return changed.length > 0 ? changed : undefined;
 }
 
 /**
@@ -637,6 +705,7 @@ export function comparePromptCachePrefix(
     nextBlock != null && order(nextBlock) < order(previousBlock)
       ? nextBlock.section
       : previousBlock.section;
+  const changed = changedOptions(previousBlock, nextBlock);
   return {
     kind: "break",
     section,
@@ -645,6 +714,7 @@ export function comparePromptCachePrefix(
     nextBlockCount: next.length,
     previous: summarize(previousBlock),
     ...(nextBlock != null ? { next: summarize(nextBlock) } : {}),
+    ...(changed != null ? { changedOptions: changed } : {}),
   };
 }
 
@@ -659,6 +729,9 @@ export function describePromptCacheBreak(comparison: PromptCachePrefixBreak): st
   return (
     `Prompt cache prefix broke in ${comparison.section} at block ${comparison.blockIndex} ` +
     `of ${comparison.previousBlockCount}: ` +
-    `${describeBlock(comparison.previous)} -> ${describeBlock(comparison.next)}`
+    `${describeBlock(comparison.previous)} -> ${describeBlock(comparison.next)}` +
+    (comparison.changedOptions != null
+      ? `; changed options: ${comparison.changedOptions.map(describeChangedOption).join(", ")}`
+      : "")
   );
 }

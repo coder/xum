@@ -409,6 +409,12 @@ function PromptCacheBreakDetails(props: { event: TimelineEvent }) {
       <span className="text-content-secondary min-w-0 break-words">{view.before}</span>
       <span>After</span>
       <span className="text-content-secondary min-w-0 break-words">{view.after}</span>
+      {view.changedOptions != null && (
+        <>
+          <span>Changed</span>
+          <span className="text-content-secondary min-w-0 break-words">{view.changedOptions}</span>
+        </>
+      )}
     </span>
   );
 }
