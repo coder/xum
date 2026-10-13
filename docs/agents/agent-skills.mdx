@@ -156,6 +156,7 @@ paths: ["**/*.ts", "**/*.tsx"]
 - **Matching:** each glob is relative to the workspace root. `**/*.ts` matches `foo.ts` and `src/foo.ts`. Files in dot folders (for example `.github/`) match too. Files outside the workspace never match.
 - **Trigger:** a successful `file_read` or `file_edit_*` call on a matching file. Calls made from inside `code_execution` do not trigger it.
 - **What the model gets:** the tool result gets a `path_skills` field with the skill name and description, and asks the model to read the skill with `agent_skill_read`. Xum does not insert the skill body. Each skill surfaces at most once per context window. Xum skips it if the model already read the skill in that window.
+- **Limits:** at most 3 skills surface per tool call, and only the first 100 model-invocable path-scoped skills can activate.
 - **Index:** path-scoped skills are not in the model-facing skills index. They stay readable by name and invocable with `/{skill-name}`.
 - **`disable-model-invocation: true` wins:** a skill with both keys never surfaces on its own. It loads only when invoked explicitly.
 - **Invalid patterns:** an empty list, an unclosed bracket, an empty entry, a negated pattern (`!…`), a backslash (use `/`), an absolute path, or a `..` segment makes the whole skill invalid. Xum shows it with the error in the skills indicator and loads the other skills.

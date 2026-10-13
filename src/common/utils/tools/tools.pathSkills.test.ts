@@ -13,7 +13,10 @@ import type { IJSRuntime } from "@/node/services/ptc/runtime";
 import { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { ExecutionScope } from "@/node/services/toolCallDisplayRegistry";
 import { withExecutionScope } from "@/node/services/tools/withExecutionScope";
-import { createPathSkillActivation } from "@/node/services/agentSkills/pathSkillActivation";
+import {
+  createPathSkillActivation,
+  MAX_PATH_SCOPED_SKILLS,
+} from "@/node/services/agentSkills/pathSkillActivation";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { Tool } from "ai";
 
@@ -209,6 +212,36 @@ describe("getToolsForModel - path-scoped skill activation", () => {
     const read = await call(tools.agent_skill_read, { name: "ts-rules" });
     expect(read.success).toBe(true);
     expect(surfacedNames(await call(tools.file_read, { path: "src/foo.ts" }))).toBeUndefined();
+  });
+
+  test("a skill carried in the post-compaction snapshot is not pointed at again", () => {
+    const runtime = new LocalRuntime(workspace);
+    const activation = createPathSkillActivation({
+      skills: SKILLS,
+      messages: [],
+      loadedSkillNames: ["ts-rules"],
+      cwd: workspace,
+      runtime,
+    });
+    expect(activation?.takeMatches("src/foo.ts")).toEqual([]);
+  });
+
+  test("only the first MAX_PATH_SCOPED_SKILLS path-scoped skills can activate", () => {
+    const runtime = new LocalRuntime(workspace);
+    const many = Array.from({ length: MAX_PATH_SCOPED_SKILLS + 1 }, (_, i) => ({
+      name: `skill-${i}`,
+      description: "d",
+      scope: "project" as const,
+      // Only the skill past the cap matches, so any match proves the cap leaked.
+      paths: [i === MAX_PATH_SCOPED_SKILLS ? "**/*.ts" : "never/**"],
+    }));
+    const activation = createPathSkillActivation({
+      skills: many,
+      messages: [],
+      cwd: workspace,
+      runtime,
+    });
+    expect(activation?.takeMatches("src/foo.ts")).toEqual([]);
   });
 
   test("a prior pointer, agent_skill_read or /skill snapshot in the window suppresses it; malformed rows do not throw", async () => {

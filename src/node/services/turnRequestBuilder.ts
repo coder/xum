@@ -198,7 +198,10 @@ import {
   WORKFLOW_RESULT_METADATA_TYPE,
 } from "@/common/utils/workflowRunMessages";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
-import { createPathSkillActivation } from "@/node/services/agentSkills/pathSkillActivation";
+import {
+  createPathSkillActivation,
+  loadedSnapshotSkillNames,
+} from "@/node/services/agentSkills/pathSkillActivation";
 import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
@@ -2635,6 +2638,9 @@ export class TurnRequestBuilder {
       pathSkillActivation: createPathSkillActivation({
         skills: availableSkills,
         messages: activeContextMessages,
+        // The first request after compaction re-injects loaded skills from this
+        // attachment, outside history: those skills need no pointer either.
+        loadedSkillNames: loadedSnapshotSkillNames(postCompactionAttachments),
         cwd: workspacePath,
         runtime,
       }),

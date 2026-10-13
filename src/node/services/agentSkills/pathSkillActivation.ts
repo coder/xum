@@ -1,8 +1,10 @@
 import { PATH_SKILLS_RESULT_FIELD, type PathSkillsResultField } from "@/common/types/tools";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { MuxMessage } from "@/common/types/message";
 import { deriveProjectRelativePath } from "@/common/utils/review/assistedReview";
-import { matchesSkillPaths } from "@/common/utils/skills/skillPaths";
+import { createSkillPathsMatcher } from "@/common/utils/skills/skillPaths";
+import { log } from "@/node/services/log";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { resolvePathWithinCwd } from "@/node/services/tools/fileCommon";
 import { formatSkillIndexDescription } from "@/node/services/tools/agent_skill_read";
@@ -32,6 +34,12 @@ export interface PathSkillActivation {
 
 /** Bounds one tool result's pointer even when many skills match one file. */
 const MAX_SKILLS_PER_TOOL_CALL = 3;
+
+/**
+ * Bounds per-turn glob compilation: skills come from untrusted repositories, and each
+ * may carry up to 50 patterns. Skills past the cap never activate (logged).
+ */
+export const MAX_PATH_SCOPED_SKILLS = 100;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value != null && typeof value === "object" && !Array.isArray(value)
@@ -105,22 +113,62 @@ function toWorkspaceRelativePath(
  * `messages` must be the current context window (already sliced at the latest
  * context boundary): pointers from before a boundary no longer reach the model.
  */
+/** Model-invocable path-scoped skills, capped (disable-model-invocation wins over paths). */
+function eligiblePathSkills(
+  skills: readonly AgentSkillDescriptor[] | undefined
+): AgentSkillDescriptor[] {
+  // Like Cursor and Claude Code, a disable-model-invocation / advertise: false skill
+  // loads only when explicitly invoked.
+  const eligible = (skills ?? []).filter(
+    (skill) => skill.paths !== undefined && skill.advertise !== false
+  );
+  if (eligible.length > MAX_PATH_SCOPED_SKILLS) {
+    log.warn("Too many path-scoped skills; only the first ones can activate", {
+      count: eligible.length,
+      max: MAX_PATH_SCOPED_SKILLS,
+    });
+  }
+  return eligible.slice(0, MAX_PATH_SCOPED_SKILLS);
+}
+
+/** A lazily compiled matcher per skill, kept only for this turn (no process-wide cache). */
+function createTurnMatcher(): (skill: AgentSkillDescriptor, relativePath: string) => boolean {
+  const matchers = new Map<string, (path: string) => boolean>();
+  return (skill, relativePath) => {
+    let matcher = matchers.get(skill.name);
+    if (matcher === undefined) {
+      matcher = createSkillPathsMatcher(skill.paths ?? []);
+      matchers.set(skill.name, matcher);
+    }
+    return matcher(relativePath);
+  };
+}
+
+/** Names of the skills a post-compaction `loaded_skills_snapshot` re-injects. */
+export function loadedSnapshotSkillNames(
+  attachments: readonly PostCompactionAttachment[] | null | undefined
+): string[] {
+  return (attachments ?? []).flatMap((attachment) =>
+    attachment.type === "loaded_skills_snapshot" ? attachment.skills.map((skill) => skill.name) : []
+  );
+}
+
 export function createPathSkillActivation(params: {
   skills: readonly AgentSkillDescriptor[] | undefined;
   messages: readonly MuxMessage[];
+  /** Skills already in the request outside history (post-compaction loaded-skill snapshot). */
+  loadedSkillNames?: readonly string[];
   cwd: string;
   runtime: Runtime;
 }): PathSkillActivation | undefined {
-  // disable-model-invocation / advertise: false wins over paths: like Cursor and
-  // Claude Code, such a skill loads only when explicitly invoked.
-  const eligible = (params.skills ?? []).filter(
-    (skill) => skill.paths !== undefined && skill.advertise !== false
-  );
+  const eligible = eligiblePathSkills(params.skills);
   if (eligible.length === 0) {
     return undefined;
   }
 
   const surfaced = collectSurfacedSkillNames(params.messages);
+  for (const name of params.loadedSkillNames ?? []) surfaced.add(name);
+  const matches = createTurnMatcher();
 
   return {
     takeMatches(toolPath) {
@@ -129,15 +177,13 @@ export function createPathSkillActivation(params: {
         return [];
       }
 
-      const matches = eligible
-        .filter(
-          (skill) => !surfaced.has(skill.name) && matchesSkillPaths(skill.paths ?? [], relativePath)
-        )
+      const matched = eligible
+        .filter((skill) => !surfaced.has(skill.name) && matches(skill, relativePath))
         .slice(0, MAX_SKILLS_PER_TOOL_CALL);
-      for (const skill of matches) {
+      for (const skill of matched) {
         surfaced.add(skill.name);
       }
-      return matches;
+      return matched;
     },
     markSurfaced(skillName) {
       surfaced.add(skillName);
