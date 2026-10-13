@@ -63,6 +63,7 @@ export function useSmoothStreamingText(
   // Frame callback stored as a ref so effects don't depend on it, preventing
   // teardown/restart of the RAF loop on every text delta. Reads from refs and
   // the stable engine instance, so the captured closure is always correct.
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const frameRef = useRef<FrameRequestCallback>(null!);
   frameRef.current = (timestampMs: number) => {
     if (previousTimestampRef.current !== null) {

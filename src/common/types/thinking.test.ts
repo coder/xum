@@ -13,6 +13,14 @@ import {
   parseThinkingInput,
 } from "./thinking";
 
+describe("Muse Wonder thinking labels", () => {
+  test("distinguishes native xhigh from max without changing other model labels", () => {
+    expect(getThinkingDisplayLabel("xhigh", "meta:muse-wonder-1.0")).toBe("XHIGH");
+    expect(getThinkingDisplayLabel("max", "meta:muse-wonder-1.0")).toBe("MAX");
+    expect(getThinkingDisplayLabel("xhigh", "meta:muse-wonder-1.0-custom")).toBe("MAX");
+  });
+});
+
 describe("getThinkingDisplayLabel", () => {
   test("returns MAX for xhigh/max on Anthropic models", () => {
     expect(getThinkingDisplayLabel("xhigh", "anthropic:claude-opus-4-6")).toBe("MAX");

@@ -59,14 +59,10 @@ async function withLock<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-async function waitForQuietHost() {
+function hostIsQuietNow(): boolean {
   const psiFile = "/proc/pressure/cpu";
-  for (let i = 0; i < 60; i++) {
-    const psi = fs.existsSync(psiFile) ? fs.readFileSync(psiFile, "utf8") : null;
-    if (core.hostIsQuiet(os.loadavg()[0], psi, os.availableParallelism())) return;
-    await sleep(10_000);
-  }
-  throw new Error("the host stayed busy for 10 minutes: the block is aborted");
+  const psi = fs.existsSync(psiFile) ? fs.readFileSync(psiFile, "utf8") : null;
+  return core.hostIsQuiet(os.loadavg()[0], psi, os.availableParallelism());
 }
 
 /** PIDs of the processes whose environment holds the entry (Linux /proc; elsewhere none are found). */
@@ -122,8 +118,8 @@ async function startServer(tree: string, root: string, home: string, logFile: st
 /** One navigation with a fresh root (and seed), server and browser. Values in seconds. */
 async function measure(o: Common & { tree: string; mode: Signal; name: string }) {
   // One lock hold per run, from seed creation to folder removal, never per block (see the header).
-  return withLock(async () => {
-    await waitForQuietHost();
+  // Never on a busy host either: runOnQuietHost waits for quiet outside the lock.
+  return core.runOnQuietHost({ isQuiet: hostIsQuietNow, sleep }, withLock, async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "page-timing-"));
     const [seedDir, log] = [path.join(tmp, "seed"), path.join(o.out, `${o.name}.server.log`)];
     let home = path.join(tmp, "home"); // a P2 run uses its seed's home

@@ -188,9 +188,6 @@ export interface AgentSessionHarnessOptions extends Pick<
   | "onTurnSuperseded"
   | "onBeforeTurnCompletion"
   | "planSnapshotCaptureTimeoutMs"
-  | "onLogicalTurnStarted"
-  | "onLogicalTurnCompleted"
-  | "logicalTurnCompletedTimeoutMs"
   | "onPostCompactionStateChange"
   | "sessionUsageService"
   | "autoModelRouter"
@@ -302,9 +299,6 @@ export async function createAgentSessionHarness(
     onTurnSuperseded: options.onTurnSuperseded,
     onBeforeTurnCompletion: options.onBeforeTurnCompletion,
     planSnapshotCaptureTimeoutMs: options.planSnapshotCaptureTimeoutMs,
-    onLogicalTurnStarted: options.onLogicalTurnStarted,
-    onLogicalTurnCompleted: options.onLogicalTurnCompleted,
-    logicalTurnCompletedTimeoutMs: options.logicalTurnCompletedTimeoutMs,
     onPostCompactionStateChange: options.onPostCompactionStateChange,
     sessionUsageService: options.sessionUsageService,
     autoModelRouter: options.autoModelRouter,

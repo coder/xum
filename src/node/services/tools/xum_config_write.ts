@@ -52,6 +52,7 @@ export const createXumConfigWriteTool: ToolFactory = (config: ToolConfiguration)
           };
         }
 
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const xumHome = config.xumScope!.xumHome;
         const registryEntry = CONFIG_FILE_REGISTRY[args.file];
         const rewrite = async (

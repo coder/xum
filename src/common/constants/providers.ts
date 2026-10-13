@@ -10,6 +10,10 @@
  * Simple providers (requiresApiKey + standard factory pattern) need NO aiService.ts changes.
  */
 
+import type { OpenAIProviderSettings } from "@ai-sdk/openai";
+import { META_API_BASE_URL } from "@/constants/modelDiscovery";
+import { normalizeOpenAICompatibleBaseURL } from "@/common/utils/providers/baseUrl";
+
 /**
  * Union type of all supported provider names
  */
@@ -19,6 +23,7 @@ export type ProviderName =
   | "openai"
   | "google"
   | "xai"
+  | "meta"
   | "deepseek"
   | "moonshotai"
   | "zai"
@@ -146,6 +151,22 @@ export const PROVIDER_DEFINITIONS = {
     displayName: "xAI",
     import: () => import("@ai-sdk/xai"),
     factoryName: "createXai",
+    requiresApiKey: true,
+    kind: "direct",
+  },
+  meta: {
+    displayName: "Meta",
+    // Adapt the endpoint, not the SDK namespace: encrypted reasoning uses the
+    // existing openai persistence/replay path without inheriting OpenAI settings.
+    import: () =>
+      import("@ai-sdk/openai").then(({ createOpenAI }) => ({
+        createMeta: (config: OpenAIProviderSettings) =>
+          createOpenAI({
+            ...config,
+            baseURL: normalizeOpenAICompatibleBaseURL(config.baseURL ?? META_API_BASE_URL),
+          }),
+      })),
+    factoryName: "createMeta",
     requiresApiKey: true,
     kind: "direct",
   },

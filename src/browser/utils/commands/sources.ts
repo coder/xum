@@ -1270,7 +1270,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
 
     if (
       !isPendingGoalPersistence &&
-      (goal?.status === "active" || goal?.status === "budget_limited")
+      (goal?.status === "active" || goal?.status === "paused" || goal?.status === "budget_limited")
     ) {
       list.push({
         id: CommandIds.goalMarkComplete(),

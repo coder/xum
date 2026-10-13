@@ -770,8 +770,10 @@ export class MCPConfigService {
         };
         cfg.servers[name] =
           transport === "stdio"
-            ? { transport: "stdio", command: input.command!, ...base }
-            : { transport, url: input.url!, headers: input.headers, ...base };
+            ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+              { transport: "stdio", command: input.command!, ...base }
+            : // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+              { transport, url: input.url!, headers: input.headers, ...base };
         await this.saveGlobalConfig(cfg);
         return Ok(undefined);
       });
