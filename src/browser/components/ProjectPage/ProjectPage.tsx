@@ -207,6 +207,9 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   const { api } = useAPI();
   const chatInputRef = useRef<ChatInputAPI | null>(null);
   const pendingAgentsInitSendRef = useRef(false);
+  // #6038: "Run /init" sends through the creation composer, which cannot send while its branch
+  // list loads (or failed). Off until the composer reports it can send.
+  const [creationSendBlocked, setCreationSendBlocked] = useState(true);
   const [showAgentsInitNudge, setShowAgentsInitNudge] = usePersistedState<boolean>(
     getAgentsInitNudgeKey(projectPath),
     false,
@@ -360,6 +363,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
                       <AgentsInitBanner
                         onRunInit={handleRunAgentsInit}
                         onDismiss={handleDismissAgentsInit}
+                        runDisabled={creationSendBlocked}
                       />
                     )}
                     {/* ChatInput for workspace creation. */}
@@ -373,6 +377,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
                       pendingSubProjectPath={pendingSubProjectPath}
                       pendingDraftId={pendingDraftId}
                       onReady={handleChatReady}
+                      onCreationSendBlockedChange={setCreationSendBlocked}
                       onWorkspaceCreated={onWorkspaceCreated}
                     />
                     {providersLoading ? (
