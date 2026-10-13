@@ -84,6 +84,9 @@ export interface SessionUsageFile {
   /** Cached token statistics (consumer/file breakdown) for Costs tab */
   tokenStatsCache?: SessionUsageTokenStatsCacheV1;
 
+  /** When a fork reset this ledger (see SessionUsageFileSchema.forkedAt). */
+  forkedAt?: number;
+
   version: 1;
 }
 
@@ -622,11 +625,13 @@ export class SessionUsageService {
    * Reset a workspace's persisted cost ledger while keeping copied chat history intact.
    *
    * Forked workspaces need an explicit empty session-usage.json so later reads do not
-   * rebuild historical costs from the copied messages.
+   * rebuild historical costs from the copied messages. `forkedAt` marks where the fork's
+   * own history begins (see SessionUsageFileSchema).
    */
-  async resetSessionUsage(workspaceId: string): Promise<void> {
+  async resetSessionUsage(workspaceId: string, forkedAt: number): Promise<void> {
+    assert(Number.isSafeInteger(forkedAt), "resetSessionUsage requires a ms timestamp");
     return this.fileLocks.withLock(workspaceId, async () => {
-      await this.writeFile(workspaceId, this.createEmptyUsageFile());
+      await this.writeFile(workspaceId, { ...this.createEmptyUsageFile(), forkedAt });
     });
   }
 

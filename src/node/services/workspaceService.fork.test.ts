@@ -657,6 +657,7 @@ describe("WorkspaceService fork", () => {
     );
 
     try {
+      const forkStartedAt = Date.now();
       const result = await workspaceService.fork(sourceWorkspaceId, "fork-child");
       expect(result.success).toBe(true);
       if (!result.success) {
@@ -664,8 +665,12 @@ describe("WorkspaceService fork", () => {
       }
       expect(result.data.metadata.forkFamilyBaseName).toBeUndefined();
 
-      const forkedUsage = await sessionUsageService.getSessionUsage(newWorkspaceId);
+      // Empty ledger, marked after the copy: every copied row predates `forkedAt`.
+      const { forkedAt, ...forkedUsage } = (await sessionUsageService.getSessionUsage(
+        newWorkspaceId
+      )) ?? { byModel: {}, version: 1 };
       expect(forkedUsage).toEqual({ byModel: {}, version: 1 });
+      expect(forkedAt).toBeGreaterThanOrEqual(forkStartedAt);
 
       const forkedMessages: string[] = [];
       const historyResult = await historyService.iterateFullHistory(

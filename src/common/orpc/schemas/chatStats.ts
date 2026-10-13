@@ -128,5 +128,12 @@ export const SessionUsageFileSchema = z.object({
     .record(z.string(), z.union([z.literal(true), RolledUpChildEntrySchema]))
     .optional(),
   tokenStatsCache: SessionUsageTokenStatsCacheSchema.optional(),
+  /**
+   * Set when a fork reset this ledger (ms since epoch). Rows with an earlier or equal
+   * timestamp were copied from the parent, so per-turn views skip them. A timestamp, not a
+   * history sequence: editing an inherited message in the fork reuses lower sequences.
+   * Self-healing: a malformed value is ignored (old forks keep showing inherited turns).
+   */
+  forkedAt: z.number().nonnegative().optional().catch(undefined),
   version: z.literal(1),
 });

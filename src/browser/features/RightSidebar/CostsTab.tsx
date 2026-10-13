@@ -12,7 +12,7 @@ import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { TOKEN_COMPONENT_COLORS, formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
-import { getCacheHealth } from "@/common/utils/tokens/cacheHealth";
+import { getSessionCacheHealth } from "@/common/utils/tokens/cacheHealth";
 import { PromptCacheHealth } from "./PromptCacheHealth";
 
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
@@ -338,7 +338,7 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
           {sessionUsage !== undefined &&
             sessionUsage.cached.tokens + sessionUsage.cacheCreate.tokens > 0 && (
               <PromptCacheHealth
-                session={getCacheHealth(sessionUsage)}
+                session={getSessionCacheHealth(usage.sessionByModel, usage.liveCostUsage)}
                 turns={usage.recentTurnCacheHealth ?? []}
               />
             )}

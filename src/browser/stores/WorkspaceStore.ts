@@ -399,6 +399,52 @@ export interface WorkspaceUsageState {
   recentTurnCacheHealth?: TurnCacheHealth[];
 }
 
+/**
+ * Prompt-cache health of the newest completed assistant turns, newest first.
+ *
+ * A turn sums every usage the session ledger charges for its message (its own usage plus
+ * model-backed tool and refused-attempt usage), so a turn's rewrite cost matches its share
+ * of the session cost.
+ */
+function getRecentTurnCacheHealth(
+  messages: readonly MuxMessage[],
+  forkedAt: number | undefined
+): TurnCacheHealth[] {
+  const turns: TurnCacheHealth[] = [];
+  for (let i = messages.length - 1; i >= 0 && turns.length < RECENT_TURN_CACHE_HEALTH_LIMIT; i--) {
+    const turn = getTurnCacheHealth(messages[i], forkedAt);
+    if (turn) turns.push(turn);
+  }
+  return turns;
+}
+
+/** One message's turn row, or undefined when the message is not a priced own turn. */
+function getTurnCacheHealth(
+  msg: MuxMessage,
+  forkedAt: number | undefined
+): TurnCacheHealth | undefined {
+  const metadata = msg.metadata;
+  // Compaction summaries keep `usage` but CompactionHandler strips their
+  // providerMetadata (cache-write counts included), so their cache health is unknown.
+  if (msg.role !== "assistant" || metadata === undefined || metadata.compacted) return undefined;
+  // Rows a fork copied from its parent are not the fork's own turns.
+  if (isInheritedForkRow(metadata.timestamp, forkedAt)) return undefined;
+  // Priced exactly as SessionUsageService's history rebuild: neither the current
+  // model nor the live provider mapping, only the record-time model identity.
+  const turnUsages = getAssistantMessageModelUsages(metadata);
+  if (turnUsages.length === 0) return undefined;
+  return { messageId: msg.id, timestamp: metadata.timestamp, ...getCacheHealth(turnUsages) };
+}
+
+/**
+ * True for a row a fork copied from its parent: at or before the ledger's `forkedAt`.
+ * Rows without a timestamp, and workspaces without the marker (old forks, non-forks),
+ * count as the workspace's own.
+ */
+function isInheritedForkRow(timestamp: number | undefined, forkedAt: number | undefined): boolean {
+  return timestamp !== undefined && forkedAt !== undefined && timestamp <= forkedAt;
+}
+
 /** Turns shown in the Costs tab's prompt-cache table; bounds work per usage bump. */
 const RECENT_TURN_CACHE_HEALTH_LIMIT = 10;
 
@@ -3390,33 +3436,7 @@ export class WorkspaceStore {
         return undefined;
       })();
 
-      // A turn sums every usage the session ledger charges for its message (its own
-      // usage plus model-backed tool and refused-attempt usage), so a turn's rewrite
-      // cost matches its share of the session cost.
-      const recentTurnCacheHealth: TurnCacheHealth[] = [];
-      for (
-        let i = messages.length - 1;
-        i >= 0 && recentTurnCacheHealth.length < RECENT_TURN_CACHE_HEALTH_LIMIT;
-        i--
-      ) {
-        const msg = messages[i];
-        // Compaction summaries keep `usage` but CompactionHandler strips their
-        // providerMetadata (cache-write counts included), so their cache health is unknown.
-        if (msg.role !== "assistant" || msg.metadata?.compacted) continue;
-        const turnUsage = sumUsageHistory(
-          // No fallback to the current model: a row without a record-time model stays
-          // "unknown" (rewrite cost "-"), as in SessionUsageService's history rebuild.
-          getAssistantMessageModelUsages(msg.metadata, {
-            resolveMetadataModel: (msgModel) => this.resolveMetadataModel(msgModel),
-          }).map((entry) => entry.usage)
-        );
-        if (!turnUsage) continue;
-        recentTurnCacheHealth.push({
-          messageId: msg.id,
-          timestamp: msg.metadata?.timestamp,
-          ...getCacheHealth(turnUsage),
-        });
-      }
+      const recentTurnCacheHealth = getRecentTurnCacheHealth(messages, sessionData?.forkedAt);
 
       // Live streaming data (unchanged)
       const activeStreamId = aggregator.getActiveStreamMessageId();

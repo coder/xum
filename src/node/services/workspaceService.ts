@@ -1407,14 +1407,16 @@ async function resetForkedSessionUsage(
   workspaceId: string,
   sessionDir: string
 ): Promise<void> {
+  // After the history copy: every copied row is at or before this time, the fork's own later.
+  const forkedAt = Date.now();
   if (sessionUsageService) {
-    await sessionUsageService.resetSessionUsage(workspaceId);
+    await sessionUsageService.resetSessionUsage(workspaceId, forkedAt);
     return;
   }
 
   await fsPromises.writeFile(
     path.join(sessionDir, "session-usage.json"),
-    JSON.stringify({ byModel: {}, version: 1 }, null, 2)
+    JSON.stringify({ byModel: {}, version: 1, forkedAt }, null, 2)
   );
 }
 
