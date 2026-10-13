@@ -100,6 +100,8 @@ Options:
 - `BUGBASH_EFFORT`: low, medium (default), high, xhigh or max. A higher effort raises the
   estimate as a marked guess.
 - `make bug-bash` refuses `BUGBASH_MODEL`, which only `make mcp-apps-e2e` reads.
+- Every model-driven job refuses `BUGBASH_SCENARIO`: its `bash-ai-proxy` scenario needs project
+  automation, which those jobs turn off.
 
 MCP Apps: `make mcp-apps-e2e BUGBASH_BUDGET_USD=5` runs `tests/bugbash/mcpapps/mcp-apps.e2e.ts`
 (7 tests on web and phone) with `BUGBASH_MODEL` (default Sonnet 5.5). It pins the mock app AI,
@@ -161,7 +163,9 @@ Xum rules:
 - Run repros on the host with `make test-bugbash-repros` (Node 22.22.3+ or 24.8+ as `E2E_NODE`, and
   `node_modules/.bin/e2e-web install chromium` once). One repro:
   `make test-bugbash-repros BUGBASH_REPRO_ARGS="repros/<slug>.e2e.ts"`. With a key set, the
-  non-mock repros make paid app-model calls: use `BUGBASH_AI=mock` for none. Run e2e through the
+  non-mock repros make paid app-model calls: use `BUGBASH_AI=mock` for none. A rejected key fails
+  the target, and `make test-e2e` too, even after Playwright passed: a mock run must not hide a
+  broken setup. `BUGBASH_REPROS=0` skips the repro phase of `make test-e2e`. Run e2e through the
   make targets: `e2e.config.ts` refuses an unresolved app AI mode unless `BUGBASH_AI=mock`.
 - After fixing findings, rerun the bug bash on the changed behaviors until a round finds no
   regression, incomplete fix or new defect in changed code. File unrelated older bugs as issues.
