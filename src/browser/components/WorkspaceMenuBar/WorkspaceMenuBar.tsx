@@ -65,7 +65,7 @@ import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 
 import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -149,7 +149,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   onOpenSidebar,
   sidebarFullscreen = false,
 }) => {
-  const { api } = useAPI();
   const liveApi = useLiveAPI();
   const { preflightArchiveWorkspace, archiveWorkspace, archivingWorkspaceIds, setWorkspacePinned } =
     useWorkspaceActions();

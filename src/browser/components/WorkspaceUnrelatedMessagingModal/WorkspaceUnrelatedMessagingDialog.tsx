@@ -1,4 +1,4 @@
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   isLocalProjectRuntime,
@@ -21,7 +21,8 @@ interface WorkspaceUnrelatedMessagingDialogProps {
 
 /** The "Messages from other workspaces" dialog wired to the backend, for both menus (#6202). */
 export function WorkspaceUnrelatedMessagingDialog(props: WorkspaceUnrelatedMessagingDialogProps) {
-  const { api } = useAPI();
+  // The live client only: offline the saves return "Not connected to server".
+  const api = useLiveAPI();
   const { workspaceId } = props;
   // Mirrors TaskService.isLocalUnrelatedMessagingEndpoint: unrelated delivery requires local or
   // worktree runtimes on both endpoints, so remote/container workspaces get no consent switch —

@@ -12,7 +12,7 @@ import { Checkbox } from "../Checkbox/Checkbox";
 import { Input } from "@/browser/components/Input/Input";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import { DirectoryTree } from "../DirectoryTree/DirectoryTree";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { formatKeybind, isMac } from "@/browser/utils/ui/keybinds";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -31,7 +31,6 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
   onClose,
   onSelectPath,
 }) => {
-  const { api } = useAPI();
   const liveApi = useLiveAPI();
   const [root, setRoot] = useState<FileTreeNode | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -111,13 +110,16 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
 
     // If user has typed a different path, try to load it first
     if (trimmedInput && trimmedInput !== root?.path) {
-      if (!api) return;
+      if (!liveApi) {
+        setError("Not connected to server");
+        return;
+      }
       setIsLoading(true);
       setError(null);
       setCanCreateFolder(false);
 
       try {
-        const result = await api.general.listDirectory({ path: trimmedInput });
+        const result = await liveApi.general.listDirectory({ path: trimmedInput });
         if (!result.success) {
           const errorMessage = typeof result.error === "string" ? result.error : "Unknown error";
           const isNotFound =
@@ -151,17 +153,21 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
 
     onSelectPath(root.path);
     onClose();
-  }, [onClose, onSelectPath, root, pathInput, api]);
+  }, [onClose, onSelectPath, root, pathInput, liveApi]);
 
   const handleCreateFolder = useCallback(async () => {
     const trimmedPath = pathInput.trim();
-    if (!trimmedPath || !api) return;
+    if (!trimmedPath) return;
+    if (!liveApi) {
+      setError("Not connected to server");
+      return;
+    }
 
     setIsLoading(true);
     setError(null);
 
     try {
-      const createResult = await api.general.createDirectory({ path: trimmedPath });
+      const createResult = await liveApi.general.createDirectory({ path: trimmedPath });
       if (!createResult.success) {
         setError(createResult.error ?? "Failed to create folder");
         setCanCreateFolder(false);
@@ -177,7 +183,7 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
     } finally {
       setIsLoading(false);
     }
-  }, [pathInput, api, loadDirectory]);
+  }, [pathInput, liveApi, loadDirectory]);
 
   const handleOpenChange = useCallback(
     (open: boolean) => {

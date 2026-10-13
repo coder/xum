@@ -627,7 +627,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   };
 
   const handleBulkDeleteWorktree = async () => {
-    if (!api) {
+    if (!liveApi) {
       return;
     }
 
@@ -655,7 +655,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
       setDeleteWorktreeIds((prev) => new Set(prev).add(id));
 
       try {
-        const result = await api.workspace.deleteWorktree({ workspaceId: id });
+        const result = await liveApi.workspace.deleteWorktree({ workspaceId: id });
         if (!result.success) {
           setBulkOperation((prev) =>
             prev

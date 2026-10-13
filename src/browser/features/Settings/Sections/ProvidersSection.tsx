@@ -1340,13 +1340,17 @@ export function ProvidersSection() {
 
   const disconnectCoderOauth = async () => {
     const attempt = ++coderLoginAttemptRef.current;
-    if (!api) return;
+    if (!liveApi) {
+      setCoderLoginStatus("error");
+      setCoderLoginError("Xum API not connected.");
+      return;
+    }
 
     // Awaited: an unsettled flow could otherwise commit a login AFTER the
     // disconnect below cleared credentials, silently reconnecting the account.
     if (coderFlowId) {
       try {
-        await api.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
+        await liveApi.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
       } catch {
         // Proceed with disconnect regardless.
       }
@@ -1358,7 +1362,7 @@ export function ProvidersSection() {
     setCoderLoginStatus("idle");
 
     try {
-      const result = await api.coderOauth.disconnect();
+      const result = await liveApi.coderOauth.disconnect();
 
       if (attempt !== coderLoginAttemptRef.current) return;
 

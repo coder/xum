@@ -350,7 +350,7 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
    * Returns true if compaction was attempted, false if preconditions not met.
    */
   const autoCompact = useCallback(async (): Promise<boolean> => {
-    if (!api || !triggerUserMessage || triggerUserMessage.compactionRequest) {
+    if (!liveApi || !triggerUserMessage || triggerUserMessage.compactionRequest) {
       return false;
     }
 
@@ -363,7 +363,7 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       const followUpContent = buildFollowUpFromSource(triggerUserMessage);
 
       const result = await executeCompaction({
-        api,
+        api: liveApi,
         workspaceId: props.workspaceId,
         sendMessageOptions,
         model: compactionSuggestion?.modelId,
@@ -388,12 +388,12 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         setIsRetryingWithCompaction(false);
       }
     }
-  }, [api, compactionSuggestion?.modelId, props.workspaceId, triggerUserMessage]);
+  }, [liveApi, compactionSuggestion?.modelId, props.workspaceId, triggerUserMessage]);
 
   // Auto-trigger compaction on context_exceeded for seamless recovery.
   // Only auto-compact if we have a compaction suggestion; otherwise show manual UI.
   const shouldAutoCompact =
-    api &&
+    liveApi &&
     isContextExceeded &&
     providersConfig !== undefined &&
     compactionSuggestion &&

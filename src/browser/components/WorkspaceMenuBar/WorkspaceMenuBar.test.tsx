@@ -176,6 +176,10 @@ function installWorkspaceMenuBarTestDoubles() {
   spyOn(APIModule, "useAPI").mockImplementation(
     () => ({ api: mockApi }) as unknown as ReturnType<typeof APIModule.useAPI>
   );
+  // Handlers read the live client; the same double stands for a live connection.
+  spyOn(APIModule, "useLiveAPI").mockImplementation(
+    () => mockApi as ReturnType<typeof APIModule.useLiveAPI>
+  );
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>
       ({
