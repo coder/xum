@@ -165,6 +165,11 @@ function inlineMaxHeight(): number {
   return Math.min(INLINE_MAX_HEIGHT, Math.round(window.innerHeight * 0.8));
 }
 
+/** Allow waits for the arming delay and for a live client (offline it would dismiss the prompt). */
+function isAllowDisabled(armed: boolean, liveApi: unknown): boolean {
+  return !armed || liveApi == null;
+}
+
 export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
@@ -271,10 +276,11 @@ export function McpAppFrame(props: {
   const [domainsPromptId] = useState(newConfirmPromptId);
   const domainsArming = useConfirmArmed(domainsPrompt != null ? domainsPromptId : null);
   const allowDomains = async (origins: string[]) => {
-    if (!api) return;
+    // Offline the prompt stays, with Allow disabled: a failed call would dismiss it for good.
+    if (!liveApi) return;
     try {
       const requestSeq = beginMcpAppViewDomainsRequest();
-      const result = await api.mcpApps.approveViewDomains({
+      const result = await liveApi.mcpApps.approveViewDomains({
         workspaceId,
         toolCallId,
         serverName: boundServerName,
@@ -524,7 +530,7 @@ export function McpAppFrame(props: {
           <button
             type="button"
             // Disabled briefly after the strip appears (confirmArming.ts), like the consent strip.
-            disabled={!domainsArming.armed}
+            disabled={isAllowDisabled(domainsArming.armed, liveApi)}
             onPointerDown={domainsArming.onPointerDown}
             onClick={(event) =>
               domainsArming.guardClick(event, () => void allowDomains(domainsPrompt))
