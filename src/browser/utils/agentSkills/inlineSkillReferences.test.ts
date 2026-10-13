@@ -273,7 +273,7 @@ describe("resolveInlineSkillReferences", () => {
         api: null,
         discovery: null,
       })
-    ).toEqual([{ skillName: "tdd", scope: "global", source: "inline" }]);
+    ).toEqual([{ skillName: "pstack:tdd", scope: "global", source: "inline" }]);
   });
 
   test("collapses duplicate candidates", async () => {
