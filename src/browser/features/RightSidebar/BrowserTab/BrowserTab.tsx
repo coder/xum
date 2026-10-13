@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent }
 import { Check, ChevronDown, Globe2, Loader2, Play, TriangleAlert } from "lucide-react";
 import { useAPI } from "@/browser/contexts/API";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getBrowserSelectedSessionKey } from "@/common/constants/storage";
 import { cn } from "@/common/lib/utils";
@@ -121,6 +122,10 @@ function matchesBrowserPageTabRef(tab: BrowserPageTab, tabRef: string | null): b
   return tabRef != null && tab.tabId === tabRef;
 }
 
+function errorMessageOr(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
 function areBrowserPageTabsEqual(first: BrowserPageTab[], second: BrowserPageTab[]): boolean {
   return JSON.stringify(first) === JSON.stringify(second);
 }
@@ -186,9 +191,8 @@ export function BrowserTab(props: BrowserTabProps) {
 
   useEffect(() => {
     if (api == null) {
+      // Keep the discovered sessions through a reconnect: the new client re-lists them.
       setDiscoveryError("Browser API client is unavailable.");
-      setDiscoveredSessions([]);
-      setOtherDiscoveredSessions([]);
       return;
     }
 
@@ -216,15 +220,14 @@ export function BrowserTab(props: BrowserTabProps) {
           chooseSelectedSession(currentSessionName, result.sessions)
         );
       } catch (error) {
-        if (cancelled) {
+        // A lost connection is not a discovery failure; the next client re-lists the sessions.
+        if (cancelled || isAbortError(error)) {
           return;
         }
 
         // Preserve the last known discovery result so transient refresh failures do not
         // tear down an otherwise healthy browser bridge.
-        setDiscoveryError(
-          error instanceof Error ? error.message : "Failed to discover browser sessions."
-        );
+        setDiscoveryError(errorMessageOr(error, "Failed to discover browser sessions."));
       } finally {
         discoveryRefreshInFlightRef.current = false;
       }
@@ -243,11 +246,13 @@ export function BrowserTab(props: BrowserTabProps) {
   }, [api, props.workspaceId, setSelectedCurrentSessionName]);
 
   useEffect(() => {
-    if (
-      api == null ||
-      selectedSessionName == null ||
-      selectedDiscoveredSessionStatus !== "attachable"
-    ) {
+    // Without a client (a reconnect), keep the tab strip of the selected session as it is: the
+    // new client re-lists its tabs, and only another session resets them below.
+    if (api == null) {
+      tabRefreshInFlightSessionNameRef.current = null;
+      return;
+    }
+    if (selectedSessionName == null || selectedDiscoveredSessionStatus !== "attachable") {
       tabRefreshInFlightSessionNameRef.current = null;
       pageTabsSessionNameRef.current = null;
       setPageTabs((currentTabs) => (currentTabs.length === 0 ? currentTabs : []));
@@ -298,14 +303,12 @@ export function BrowserTab(props: BrowserTabProps) {
         );
         setPageTabsError(null);
       } catch (error) {
-        if (cancelled) {
+        if (cancelled || isAbortError(error)) {
           return;
         }
 
         setPageTabsError(
-          error instanceof Error
-            ? error.message
-            : `Failed to list browser tabs for session "${selectedSessionName}".`
+          errorMessageOr(error, `Failed to list browser tabs for session "${selectedSessionName}".`)
         );
       } finally {
         if (tabRefreshInFlightSessionNameRef.current === selectedSessionName) {

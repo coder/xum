@@ -22,7 +22,7 @@ import {
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import { useAPI, liveClientOf } from "@/browser/contexts/API";
+import { useAPI, liveClientOf, type APIClient } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import {
@@ -39,6 +39,7 @@ import type { GoalCreateIntent } from "@/browser/features/RightSidebar/GoalTab";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { getErrorMessage } from "@/common/utils/errors";
 import { showFeedbackToast } from "@/browser/utils/feedbackToast";
 import { openSideChat } from "@/browser/utils/chatCommands";
@@ -847,6 +848,115 @@ const RegistryTabPanel: React.FC<{
   );
 };
 
+/**
+ * Whether LLM debug logs are on: null until the config is read, so the layout keeps its Debug
+ * tab until the setting is known. A toggle (the LLM_DEBUG_LOGS_CHANGED event) wins over a config
+ * read still in flight.
+ */
+export function useLlmDebugLogsEnabled(api: APIClient | null): boolean | null {
+  const [llmDebugLogsEnabled, setLlmDebugLogsEnabled] = React.useState<boolean | null>(null);
+  const debugLogsLocalOverrideRef = React.useRef(false);
+
+  React.useEffect(() => {
+    // Without a client (a reconnect), keep the last known value: the layout keeps its tabs.
+    if (!api) {
+      return;
+    }
+
+    // Reset local override so a fresh config fetch can set the initial value.
+    debugLogsLocalOverrideRef.current = false;
+    let cancelled = false;
+
+    void api.config
+      .getConfig()
+      .then((cfg) => {
+        if (cancelled) {
+          return;
+        }
+
+        // If the user toggled debug logs while this config fetch was in flight,
+        // the event listener has already set the authoritative value.
+        if (debugLogsLocalOverrideRef.current) {
+          return;
+        }
+
+        setLlmDebugLogsEnabled(cfg.llmDebugLogs === true);
+      })
+      .catch((error: unknown) => {
+        // A lost connection says nothing about the setting: keep the Debug tab for the next client.
+        if (cancelled || isAbortError(error)) {
+          return;
+        }
+
+        setLlmDebugLogsEnabled(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
+
+  React.useEffect(() => {
+    const handleLlmDebugLogsChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ enabled: boolean }>).detail;
+      debugLogsLocalOverrideRef.current = true;
+      setLlmDebugLogsEnabled(detail?.enabled === true);
+    };
+
+    window.addEventListener(CUSTOM_EVENTS.LLM_DEBUG_LOGS_CHANGED, handleLlmDebugLogsChanged);
+    return () =>
+      window.removeEventListener(CUSTOM_EVENTS.LLM_DEBUG_LOGS_CHANGED, handleLlmDebugLogsChanged);
+  }, []);
+
+  return llmDebugLogsEnabled;
+}
+
+/**
+ * Whether the workspace can show a Desktop tab: null while unknown, so the layout keeps the tab.
+ */
+export function useDesktopAvailable(
+  api: APIClient | null,
+  desktopExperimentEnabled: boolean,
+  workspaceId: string
+): boolean | null {
+  const [desktopAvailable, setDesktopAvailable] = React.useState<boolean | null>(null);
+
+  React.useEffect(() => {
+    if (!desktopExperimentEnabled) {
+      setDesktopAvailable(false);
+      return;
+    }
+
+    // A degraded (slow) connection still has a usable api; only a missing api means offline.
+    // Offline keeps the last known value, so the layout keeps its Desktop tab.
+    if (!api) {
+      return;
+    }
+
+    let cancelled = false;
+
+    void api.desktop
+      .getCapability({ workspaceId })
+      .then((capability) => {
+        if (!cancelled) {
+          setDesktopAvailable(capability.available);
+        }
+      })
+      .catch((error: unknown) => {
+        // A lost connection is not a missing capability: keep the Desktop tab for the next client.
+        if (!cancelled && !isAbortError(error)) {
+          setDesktopAvailable(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [api, desktopExperimentEnabled, workspaceId]);
+
+  return desktopAvailable;
+}
+
 const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   workspaceId,
   workspacePath,
@@ -942,9 +1052,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // Opening the tab by shortcut leaves focus where it was (usually the chat input), so the
   // panel claims focus once it renders, like terminals do with autoFocusTerminalSession.
   const [autoFocusArtifacts, setAutoFocusArtifacts] = React.useState(false);
-  const [llmDebugLogsEnabled, setLlmDebugLogsEnabled] = React.useState<boolean | null>(null);
-  const [desktopAvailable, setDesktopAvailable] = React.useState<boolean | null>(null);
-  const debugLogsLocalOverrideRef = React.useRef(false);
+  const llmDebugLogsEnabled = useLlmDebugLogsEnabled(api);
+  const desktopAvailable = useDesktopAvailable(api, desktopExperimentEnabled, workspaceId);
 
   const setDisplayedGoal = async (intent: {
     // RightSidebar buttons only ever request user-facing transitions;
@@ -1044,56 +1153,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       ...(resolved.turnCap != null ? { turnCap: resolved.turnCap } : {}),
     });
   };
-
-  React.useEffect(() => {
-    if (!api) {
-      setLlmDebugLogsEnabled(null);
-      return;
-    }
-
-    // Reset local override so a fresh config fetch can set the initial value.
-    debugLogsLocalOverrideRef.current = false;
-    let cancelled = false;
-
-    void api.config
-      .getConfig()
-      .then((cfg) => {
-        if (cancelled) {
-          return;
-        }
-
-        // If the user toggled debug logs while this config fetch was in flight,
-        // the event listener has already set the authoritative value.
-        if (debugLogsLocalOverrideRef.current) {
-          return;
-        }
-
-        setLlmDebugLogsEnabled(cfg.llmDebugLogs === true);
-      })
-      .catch(() => {
-        if (cancelled) {
-          return;
-        }
-
-        setLlmDebugLogsEnabled(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api]);
-
-  React.useEffect(() => {
-    const handleLlmDebugLogsChanged = (event: Event) => {
-      const detail = (event as CustomEvent<{ enabled: boolean }>).detail;
-      debugLogsLocalOverrideRef.current = true;
-      setLlmDebugLogsEnabled(detail?.enabled === true);
-    };
-
-    window.addEventListener(CUSTOM_EVENTS.LLM_DEBUG_LOGS_CHANGED, handleLlmDebugLogsChanged);
-    return () =>
-      window.removeEventListener(CUSTOM_EVENTS.LLM_DEBUG_LOGS_CHANGED, handleLlmDebugLogsChanged);
-  }, []);
 
   // A tool explicitly requested for new layouts (RIGHT_SIDEBAR_TAB_KEY). Without one, a
   // workspace starts with just the New tab, which guides the user to the tools.
@@ -1223,38 +1282,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     initialActiveTab,
     setLayoutRaw,
   });
-
-  React.useEffect(() => {
-    if (!desktopExperimentEnabled) {
-      setDesktopAvailable(false);
-      return;
-    }
-
-    // A degraded (slow) connection still has a usable api; only a missing api means offline.
-    if (!api) {
-      setDesktopAvailable(null);
-      return;
-    }
-
-    let cancelled = false;
-
-    void api.desktop
-      .getCapability({ workspaceId })
-      .then((capability) => {
-        if (!cancelled) {
-          setDesktopAvailable(capability.available);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setDesktopAvailable(false);
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, desktopExperimentEnabled, workspaceId]);
 
   React.useEffect(() => {
     if (desktopAvailable == null) {
