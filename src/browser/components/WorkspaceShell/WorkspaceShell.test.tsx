@@ -62,11 +62,16 @@ const SIDEBAR_EVENT_TYPES = [
   CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR,
 ];
 
+// Snapshot the real exports at file scope, before any test mocks the module. Do not load a second
+// copy with require("...WorkspaceStore?real=1"): Bun's LCOV keeps only the last-loaded copy of a
+// file, so a later second copy replaces WorkspaceStore.test.ts's coverage of WorkspaceStore.ts.
+const realWorkspaceStore = { ...RealWorkspaceStoreModule };
+
 // Restore every module stubbed below (including the per-test WorkspaceStore double) after
 // this suite so the stubs cannot leak into later files.
 restoreModulesAfterSuite([
   ["lottie-react", { ...RealLottieModule }],
-  ["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }],
+  ["@/browser/stores/WorkspaceStore", realWorkspaceStore],
   ["@/browser/components/ChatPane/ChatPane", { ...RealChatPaneModule }],
   ["@/browser/features/RightSidebar/RightSidebar", { ...RealRightSidebarModule }],
   ["@/browser/contexts/ThemeContext", { ...RealThemeContextModule }],
@@ -86,10 +91,7 @@ void mock.module("lottie-react", () => ({
 
 function installTestDoubles() {
   // Preserve the remaining WorkspaceStore exports because Bun mock.module state is global across test files.
-  /* eslint-disable @typescript-eslint/no-require-imports */
-  const actualWorkspaceStore =
-    require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
-  /* eslint-enable @typescript-eslint/no-require-imports */
+  const actualWorkspaceStore = realWorkspaceStore;
 
   void mock.module("@/browser/stores/WorkspaceStore", () => ({
     ...actualWorkspaceStore,

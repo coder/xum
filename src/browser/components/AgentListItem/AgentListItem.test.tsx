@@ -45,6 +45,11 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkspaceSelection } from "./AgentListItem";
 import type { AgentListItem as AgentListItemComponent } from "./AgentListItem";
 
+// Snapshot the real exports at file scope, before any test mocks the module. Do not load a second
+// copy with require("...WorkspaceStore?real=1"): Bun's LCOV keeps only the last-loaded copy of a
+// file, so a later second copy replaces WorkspaceStore.test.ts's coverage of WorkspaceStore.ts.
+const realWorkspaceStore = { ...RealWorkspaceStoreModule };
+
 // Restore the provider contexts after the suite; partial row stubs must not
 // replace the real contexts used by later full Settings renders.
 restoreModulesAfterSuite([
@@ -59,7 +64,7 @@ restoreModulesAfterSuite([
   ["@/browser/hooks/useWorkspaceUnread", { ...RealWorkspaceUnreadModule }],
   ["@/browser/stores/RuntimeStatusStore", { ...RealRuntimeStatusStoreModule }],
   ["@/browser/hooks/useWorkspaceFallbackModel", { ...RealWorkspaceFallbackModelModule }],
-  ["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }],
+  ["@/browser/stores/WorkspaceStore", realWorkspaceStore],
 ]);
 
 let AgentListItem!: typeof AgentListItemComponent;
@@ -206,8 +211,7 @@ function installAgentListItemTestDoubles() {
     require("@/browser/stores/RuntimeStatusStore?real=1") as typeof RuntimeStatusStoreModuleType;
   const actualWorkspaceFallbackModel =
     require("@/browser/hooks/useWorkspaceFallbackModel?real=1") as typeof WorkspaceFallbackModelModuleType;
-  const actualWorkspaceStore =
-    require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
+  const actualWorkspaceStore = realWorkspaceStore;
   /* eslint-enable @typescript-eslint/no-require-imports */
 
   void mock.module("react-dnd", () => ({
